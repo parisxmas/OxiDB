@@ -92,6 +92,12 @@ public sealed class OxiDbClient : IDisposable
         return JsonDocument.Parse(raw);
     }
 
+    public JsonDocument Aggregate(string collection, string pipelineJson)
+    {
+        var raw = Call(() => NativeInterop.Aggregate(_conn, collection, pipelineJson));
+        return JsonDocument.Parse(raw);
+    }
+
     private string Call(Func<nint> nativeCall)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

@@ -278,6 +278,29 @@ pub unsafe extern "C" fn oxidb_drop_collection(
     unsafe { send_request(conn, &req) }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_aggregate(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+    pipeline_json: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let pipeline_str = match unsafe { cstr_to_str(pipeline_json) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let pipeline: serde_json::Value = match serde_json::from_str(pipeline_str) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+    let req =
+        serde_json::json!({"cmd": "aggregate", "collection": col, "pipeline": pipeline});
+    unsafe { send_request(conn, &req) }
+}
+
 /// Free a string returned by any `oxidb_*` function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_free_string(ptr: *mut c_char) {
