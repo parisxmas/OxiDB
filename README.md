@@ -11,7 +11,8 @@ A fast, embeddable document database engine written in Rust.
 - **Sort, skip, and limit** via `FindOptions`
 - **Automatic date detection** — date strings are stored as `i64` millis for fast comparison
 - **Compaction** to reclaim space from deleted documents
-- **TCP server** with a length-prefixed JSON protocol
+- **Aggregation pipeline** — 10 MongoDB-style stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`
+- **TCP server** with a length-prefixed JSON protocol and thread pool
 - **C FFI library** and **.NET client**
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block each other
 
@@ -103,6 +104,77 @@ db.create_composite_index("events", vec!["type".into(), "created_at".into()])?;
 
 Indexes are automatically backfilled from existing documents and kept in sync on every insert, update, and delete.
 
+## Aggregation Pipeline
+
+Run multi-stage data processing pipelines, MongoDB-style:
+
+```rust
+use serde_json::json;
+
+let results = db.aggregate("orders", &json!([
+    {"$match": {"status": "completed"}},
+    {"$group": {"_id": "$category", "total": {"$sum": "$amount"}, "count": {"$sum": 1}}},
+    {"$sort": {"total": -1}},
+    {"$limit": 10}
+]))?;
+```
+
+### Stages
+
+| Stage         | Description                                        |
+|---------------|----------------------------------------------------|
+| `$match`      | Filter documents (uses index if leading stage)     |
+| `$group`      | Group by key with accumulators                     |
+| `$sort`       | Sort by fields (1 = asc, -1 = desc)               |
+| `$skip`       | Skip N documents                                   |
+| `$limit`      | Limit to N documents                               |
+| `$project`    | Include, exclude, or compute fields                |
+| `$count`      | Replace docs with a single count document          |
+| `$unwind`     | Expand array fields into one document per element  |
+| `$addFields`  | Add computed fields while preserving existing ones |
+| `$lookup`     | Left outer join with another collection            |
+
+### Accumulators (for `$group`)
+
+`$sum`, `$avg`, `$min`, `$max`, `$count`, `$first`, `$last`, `$push`
+
+### Expressions
+
+Field references (`"$fieldName"`), literals, and arithmetic operators (`$add`, `$subtract`, `$multiply`, `$divide`). Dot-notation is supported for nested fields (`"$user.address.city"`).
+
+### Examples
+
+**Group with null key (aggregate all documents):**
+
+```json
+[{"$group": {"_id": null, "avgPrice": {"$avg": "$price"}, "maxPrice": {"$max": "$price"}}}]
+```
+
+**Unwind + group (tag frequency):**
+
+```json
+[
+    {"$unwind": "$tags"},
+    {"$group": {"_id": "$tags", "count": {"$sum": 1}}},
+    {"$sort": {"count": -1}}
+]
+```
+
+**Lookup (cross-collection join):**
+
+```json
+[{"$lookup": {"from": "products", "localField": "productId", "foreignField": "_id", "as": "product"}}]
+```
+
+**Project with computed fields:**
+
+```json
+[
+    {"$addFields": {"total": {"$multiply": ["$price", "$qty"]}}},
+    {"$project": {"name": 1, "total": 1, "_id": 0}}
+]
+```
+
 ## Compaction
 
 Deleted documents are soft-deleted (status byte flipped) and remain on disk until compaction:
@@ -123,11 +195,11 @@ Compaction rewrites the data file atomically (write to temp, fsync, rename) and 
 ### Running
 
 ```bash
-# Defaults: 127.0.0.1:4444, data dir ./oxidb_data
+# Defaults: 127.0.0.1:4444, data dir ./oxidb_data, 4 worker threads
 cargo run --bin oxidb-server
 
-# Custom address and data directory
-OXIDB_ADDR=0.0.0.0:4444 OXIDB_DATA=/var/lib/oxidb cargo run --bin oxidb-server
+# Custom settings
+OXIDB_ADDR=0.0.0.0:4444 OXIDB_DATA=/var/lib/oxidb OXIDB_POOL_SIZE=8 cargo run --bin oxidb-server
 ```
 
 ### Protocol
@@ -170,6 +242,7 @@ Max message size is 16 MiB.
 | `create_collection`      | `collection`                                       |
 | `list_collections`       | —                                                  |
 | `drop_collection`        | `collection`                                       |
+| `aggregate`              | `collection`, `pipeline`                           |
 | `compact`                | `collection`                                       |
 
 Sort values: `1` for ascending, `-1` for descending.
@@ -189,6 +262,7 @@ Key functions:
 OxiDbConn* oxidb_connect(const char* host, uint16_t port);
 char*      oxidb_insert(OxiDbConn* conn, const char* collection, const char* doc_json);
 char*      oxidb_find(OxiDbConn* conn, const char* collection, const char* query_json);
+char*      oxidb_aggregate(OxiDbConn* conn, const char* collection, const char* pipeline_json);
 void       oxidb_free_string(char* ptr);
 void       oxidb_disconnect(OxiDbConn* conn);
 ```
@@ -206,6 +280,15 @@ using var db = OxiDbClient.Connect("127.0.0.1", 4444);
 
 db.Insert("users", "{\"name\":\"Alice\",\"age\":30}");
 var result = db.Find("users", "{\"age\":{\"$gte\":18}}");
+
+// Aggregation pipeline
+var stats = db.Aggregate("orders", """
+    [
+        {"$match": {"status": "completed"}},
+        {"$group": {"_id": "$category", "total": {"$sum": "$amount"}}},
+        {"$sort": {"total": -1}}
+    ]
+""");
 ```
 
 ## Architecture
