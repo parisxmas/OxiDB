@@ -301,6 +301,175 @@ pub unsafe extern "C" fn oxidb_aggregate(
     unsafe { send_request(conn, &req) }
 }
 
+// ---------------------------------------------------------------------------
+// Blob storage + FTS
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_create_bucket(
+    conn: *mut OxiDbConn,
+    bucket: *const c_char,
+) -> *mut c_char {
+    let b = match unsafe { cstr_to_str(bucket) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "create_bucket", "bucket": b});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_list_buckets(conn: *mut OxiDbConn) -> *mut c_char {
+    let req = serde_json::json!({"cmd": "list_buckets"});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_delete_bucket(
+    conn: *mut OxiDbConn,
+    bucket: *const c_char,
+) -> *mut c_char {
+    let b = match unsafe { cstr_to_str(bucket) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "delete_bucket", "bucket": b});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_put_object(
+    conn: *mut OxiDbConn,
+    bucket: *const c_char,
+    key: *const c_char,
+    data_b64: *const c_char,
+    content_type: *const c_char,
+    metadata_json: *const c_char,
+) -> *mut c_char {
+    let b = match unsafe { cstr_to_str(bucket) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let k = match unsafe { cstr_to_str(key) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let d = match unsafe { cstr_to_str(data_b64) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let ct = unsafe { cstr_to_str(content_type) }.unwrap_or("application/octet-stream");
+    let meta: serde_json::Value = unsafe { cstr_to_str(metadata_json) }
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or(serde_json::json!({}));
+
+    let req = serde_json::json!({
+        "cmd": "put_object",
+        "bucket": b,
+        "key": k,
+        "data": d,
+        "content_type": ct,
+        "metadata": meta,
+    });
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_get_object(
+    conn: *mut OxiDbConn,
+    bucket: *const c_char,
+    key: *const c_char,
+) -> *mut c_char {
+    let b = match unsafe { cstr_to_str(bucket) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let k = match unsafe { cstr_to_str(key) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "get_object", "bucket": b, "key": k});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_head_object(
+    conn: *mut OxiDbConn,
+    bucket: *const c_char,
+    key: *const c_char,
+) -> *mut c_char {
+    let b = match unsafe { cstr_to_str(bucket) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let k = match unsafe { cstr_to_str(key) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "head_object", "bucket": b, "key": k});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_delete_object(
+    conn: *mut OxiDbConn,
+    bucket: *const c_char,
+    key: *const c_char,
+) -> *mut c_char {
+    let b = match unsafe { cstr_to_str(bucket) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let k = match unsafe { cstr_to_str(key) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "delete_object", "bucket": b, "key": k});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_list_objects(
+    conn: *mut OxiDbConn,
+    bucket: *const c_char,
+    prefix: *const c_char,
+    limit: i32,
+) -> *mut c_char {
+    let b = match unsafe { cstr_to_str(bucket) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let mut req = serde_json::json!({"cmd": "list_objects", "bucket": b});
+    if let Some(p) = unsafe { cstr_to_str(prefix) } {
+        req["prefix"] = serde_json::json!(p);
+    }
+    if limit > 0 {
+        req["limit"] = serde_json::json!(limit);
+    }
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_search(
+    conn: *mut OxiDbConn,
+    query: *const c_char,
+    bucket: *const c_char,
+    limit: i32,
+) -> *mut c_char {
+    let q = match unsafe { cstr_to_str(query) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let mut req = serde_json::json!({"cmd": "search", "query": q});
+    if let Some(b) = unsafe { cstr_to_str(bucket) } {
+        req["bucket"] = serde_json::json!(b);
+    }
+    if limit > 0 {
+        req["limit"] = serde_json::json!(limit);
+    }
+    unsafe { send_request(conn, &req) }
+}
+
 /// Free a string returned by any `oxidb_*` function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_free_string(ptr: *mut c_char) {
