@@ -44,11 +44,17 @@ public sealed class OxiDbClient : IDisposable
         return JsonDocument.Parse(raw);
     }
 
+    public JsonDocument Find(string collection, Filter filter) =>
+        Find(collection, filter.ToJson());
+
     public JsonDocument FindOne(string collection, string queryJson)
     {
         var raw = Call(() => NativeInterop.FindOne(_conn, collection, queryJson));
         return JsonDocument.Parse(raw);
     }
+
+    public JsonDocument FindOne(string collection, Filter filter) =>
+        FindOne(collection, filter.ToJson());
 
     public JsonDocument Update(string collection, string queryJson, string updateJson)
     {
@@ -56,11 +62,17 @@ public sealed class OxiDbClient : IDisposable
         return JsonDocument.Parse(raw);
     }
 
+    public JsonDocument Update(string collection, Filter filter, UpdateDef update) =>
+        Update(collection, filter.ToJson(), update.ToJson());
+
     public JsonDocument Delete(string collection, string queryJson)
     {
         var raw = Call(() => NativeInterop.Delete(_conn, collection, queryJson));
         return JsonDocument.Parse(raw);
     }
+
+    public JsonDocument Delete(string collection, Filter filter) =>
+        Delete(collection, filter.ToJson());
 
     public JsonDocument Count(string collection)
     {

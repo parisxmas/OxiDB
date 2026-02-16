@@ -62,7 +62,7 @@ Console.WriteLine("Running queries...");
 
 // Query 1: Find all electronics
 sw.Restart();
-using var electronicsResult = db.Find(Collection, "{\"category\":\"electronics\"}");
+using var electronicsResult = db.Find(Collection, Filter.Eq("category", "electronics"));
 sw.Stop();
 var electronicsData = electronicsResult.RootElement.GetProperty("data");
 var electronicsCount = electronicsData.GetArrayLength();
@@ -70,7 +70,7 @@ Console.WriteLine($"  Find category='electronics': {electronicsCount:N0} docs in
 
 // Query 2: Find one specific product
 sw.Restart();
-using var oneResult = db.FindOne(Collection, "{\"name\":\"Product 5000\"}");
+using var oneResult = db.FindOne(Collection, Filter.Eq("name", "Product 5000"));
 sw.Stop();
 var oneData = oneResult.RootElement.GetProperty("data");
 Console.WriteLine($"  FindOne name='Product 5000': found in {sw.Elapsed.TotalMilliseconds:F1}ms");
@@ -78,14 +78,14 @@ Console.WriteLine($"    -> {oneData}");
 
 // Query 3: Find all books
 sw.Restart();
-using var booksResult = db.Find(Collection, "{\"category\":\"books\"}");
+using var booksResult = db.Find(Collection, Filter.Eq("category", "books"));
 sw.Stop();
 var booksCount = booksResult.RootElement.GetProperty("data").GetArrayLength();
 Console.WriteLine($"  Find category='books': {booksCount:N0} docs in {sw.Elapsed.TotalMilliseconds:F1}ms");
 
 // Query 4: Find all food items
 sw.Restart();
-using var foodResult = db.Find(Collection, "{\"category\":\"food\"}");
+using var foodResult = db.Find(Collection, Filter.Eq("category", "food"));
 sw.Stop();
 var foodCount = foodResult.RootElement.GetProperty("data").GetArrayLength();
 Console.WriteLine($"  Find category='food': {foodCount:N0} docs in {sw.Elapsed.TotalMilliseconds:F1}ms");
@@ -95,13 +95,13 @@ Console.WriteLine();
 Console.WriteLine("Running update...");
 
 sw.Restart();
-using var updateResult = db.Update(Collection, "{\"name\":\"Product 0\"}", "{\"$set\":{\"price\":999.99,\"featured\":true}}");
+using var updateResult = db.Update(Collection, Filter.Eq("name", "Product 0"), UpdateDef.Set("price", 999.99) + UpdateDef.Set("featured", true));
 sw.Stop();
 var modified = updateResult.RootElement.GetProperty("data").GetProperty("modified").GetInt32();
 Console.WriteLine($"  Updated {modified} doc(s) in {sw.Elapsed.TotalMilliseconds:F1}ms");
 
 // Verify update
-using var verifyResult = db.FindOne(Collection, "{\"name\":\"Product 0\"}");
+using var verifyResult = db.FindOne(Collection, Filter.Eq("name", "Product 0"));
 var updatedDoc = verifyResult.RootElement.GetProperty("data");
 Console.WriteLine($"    -> {updatedDoc}");
 
@@ -110,7 +110,7 @@ Console.WriteLine();
 Console.WriteLine("Running delete...");
 
 sw.Restart();
-using var deleteResult = db.Delete(Collection, "{\"name\":\"Product 9999\"}");
+using var deleteResult = db.Delete(Collection, Filter.Eq("name", "Product 9999"));
 sw.Stop();
 var deleted = deleteResult.RootElement.GetProperty("data").GetProperty("deleted").GetInt32();
 Console.WriteLine($"  Deleted {deleted} doc(s) in {sw.Elapsed.TotalMilliseconds:F1}ms");
