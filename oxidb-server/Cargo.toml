@@ -8,3 +8,4 @@ description = "TCP server for OxiDB document database"
 oxidb = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
