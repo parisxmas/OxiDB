@@ -26,6 +26,9 @@ pub enum Error {
     #[error("unique constraint violated: field '{field}' value already exists")]
     UniqueViolation { field: String },
 
+    #[error("invalid pipeline: {0}")]
+    InvalidPipeline(String),
+
     #[error("document must be a JSON object")]
     NotAnObject,
 }

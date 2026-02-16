@@ -122,8 +122,10 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
-            match db.find(col, &json!({})) {
-                Ok(docs) => ok_response(json!({ "count": docs.len() })),
+            let empty = json!({});
+            let query = request.get("query").unwrap_or(&empty);
+            match db.count(col, query) {
+                Ok(n) => ok_response(json!({ "count": n })),
                 Err(e) => err_response(&e.to_string()),
             }
         }
@@ -218,6 +220,21 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
                     "new_size": stats.new_size,
                     "docs_kept": stats.docs_kept
                 })),
+                Err(e) => err_response(&e.to_string()),
+            }
+        }
+
+        "aggregate" => {
+            let col = match collection {
+                Some(c) => c,
+                None => return err_response("missing 'collection'"),
+            };
+            let pipeline = match request.get("pipeline") {
+                Some(p) => p,
+                None => return err_response("missing 'pipeline'"),
+            };
+            match db.aggregate(col, pipeline) {
+                Ok(docs) => ok_response(json!(docs)),
                 Err(e) => err_response(&e.to_string()),
             }
         }

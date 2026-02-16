@@ -48,6 +48,9 @@ internal static partial class NativeInterop
     [LibraryImport(LibName, EntryPoint = "oxidb_drop_collection", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint DropCollection(nint conn, string collection);
 
+    [LibraryImport(LibName, EntryPoint = "oxidb_aggregate", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint Aggregate(nint conn, string collection, string pipelineJson);
+
     [LibraryImport(LibName, EntryPoint = "oxidb_free_string")]
     internal static partial void FreeString(nint ptr);
 }

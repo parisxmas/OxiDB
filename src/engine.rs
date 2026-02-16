@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::collection::{Collection, CompactStats};
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
+use crate::pipeline::Pipeline;
 use crate::query::FindOptions;
 
 /// The main OxiDB engine. Manages multiple collections.
@@ -145,8 +146,35 @@ impl OxiDb {
         col.write().unwrap().create_composite_index(fields)
     }
 
+    pub fn count(&self, collection: &str, query: &Value) -> Result<usize> {
+        let col = self.get_or_create_collection(collection)?;
+        let col = col.read().unwrap();
+        if query.as_object().is_some_and(|m| m.is_empty()) {
+            Ok(col.count())
+        } else {
+            Ok(col.find(query)?.len())
+        }
+    }
+
     pub fn compact(&self, collection: &str) -> Result<CompactStats> {
         let col = self.get_or_create_collection(collection)?;
         col.write().unwrap().compact()
+    }
+
+    pub fn aggregate(&self, collection: &str, pipeline_json: &Value) -> Result<Vec<Value>> {
+        let pipeline = Pipeline::parse(pipeline_json)?;
+        let (leading_match, start_idx) = pipeline.take_leading_match();
+
+        let query = match leading_match {
+            Some(q) => q.clone(),
+            None => json!({}),
+        };
+        let initial_docs = self.find(collection, &query)?;
+
+        let lookup_fn = |foreign: &str, query: &Value| -> Result<Vec<Value>> {
+            self.find(foreign, query)
+        };
+
+        pipeline.execute_from(start_idx, initial_docs, &lookup_fn)
     }
 }
