@@ -17,6 +17,8 @@ A fast, embeddable document database engine written in Rust.
 - **Full-text search** — automatic text extraction, inverted index with TF-IDF ranked search
 - **TCP server** with a length-prefixed JSON protocol and thread pool
 - **C FFI library** and **.NET client**
+- **Web UI** — React + Node.js document management app with file upload and combined search
+- **Standalone CLI indexer** — batch-index files from any server via TCP
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block each other
 
 ## Quick Start
