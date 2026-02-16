@@ -21,7 +21,7 @@ pub struct OxiDb {
     data_dir: PathBuf,
     collections: RwLock<HashMap<String, Arc<RwLock<Collection>>>>,
     blob_store: BlobStore,
-    fts_index: RwLock<FtsIndex>,
+    fts_index: Arc<RwLock<FtsIndex>>,
 }
 
 impl OxiDb {
@@ -34,7 +34,7 @@ impl OxiDb {
             data_dir: data_dir.to_path_buf(),
             collections: RwLock::new(HashMap::new()),
             blob_store,
-            fts_index: RwLock::new(fts_index),
+            fts_index: Arc::new(RwLock::new(fts_index)),
         })
     }
 
@@ -214,12 +214,17 @@ impl OxiDb {
             .blob_store
             .put_object(bucket, key, data, content_type, metadata)?;
 
-        if let Some(text) = fts::extract_text(data, content_type) {
-            self.fts_index
-                .write()
-                .unwrap()
-                .index_document(bucket, key, &text)?;
-        }
+        // Spawn background thread for text extraction + indexing
+        let fts = Arc::clone(&self.fts_index);
+        let data_owned = data.to_vec();
+        let ct = content_type.to_string();
+        let b = bucket.to_string();
+        let k = key.to_string();
+        std::thread::spawn(move || {
+            if let Some(text) = fts::extract_text(&data_owned, &ct) {
+                let _ = fts.write().unwrap().index_document(&b, &k, &text);
+            }
+        });
 
         Ok(serde_json::to_value(&meta)?)
     }
@@ -236,10 +241,15 @@ impl OxiDb {
 
     pub fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.blob_store.delete_object(bucket, key)?;
-        self.fts_index
-            .write()
-            .unwrap()
-            .remove_document(bucket, key)?;
+
+        // Spawn background thread for FTS removal
+        let fts = Arc::clone(&self.fts_index);
+        let b = bucket.to_string();
+        let k = key.to_string();
+        std::thread::spawn(move || {
+            let _ = fts.write().unwrap().remove_document(&b, &k);
+        });
+
         Ok(())
     }
 
