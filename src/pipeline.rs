@@ -111,7 +111,7 @@ pub struct Pipeline {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn resolve_field(doc: &Value, path: &str) -> Value {
+pub(crate) fn resolve_field(doc: &Value, path: &str) -> Value {
     let mut current = doc;
     for part in path.split('.') {
         match current {
@@ -125,7 +125,7 @@ fn resolve_field(doc: &Value, path: &str) -> Value {
     current.clone()
 }
 
-fn set_field(doc: &mut Value, path: &str, value: Value) {
+pub(crate) fn set_field(doc: &mut Value, path: &str, value: Value) {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = doc;
     for (i, part) in parts.iter().enumerate() {

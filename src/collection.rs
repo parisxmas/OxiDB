@@ -426,10 +426,15 @@ impl Collection {
     /// Update documents matching a query atomically. Returns number of updated documents.
     /// If any unique constraint is violated, no documents are modified.
     pub fn update(&mut self, query_json: &Value, update_json: &Value) -> Result<u64> {
-        let set_fields = update_json
-            .get("$set")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| Error::InvalidQuery("update must contain $set object".into()))?;
+        // Validate update document has at least one operator
+        let update_obj = update_json
+            .as_object()
+            .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
+        if update_obj.is_empty() {
+            return Err(Error::InvalidQuery(
+                "update must contain at least one operator".into(),
+            ));
+        }
 
         // Find matching doc IDs first
         let matching = self.find(query_json)?;
@@ -458,12 +463,8 @@ impl Collection {
                 let mut data: Value = serde_json::from_slice(&bytes)?;
                 let old_doc = Document::new(id, data.clone())?;
 
-                // Apply $set
-                if let Some(obj) = data.as_object_mut() {
-                    for (k, v) in set_fields {
-                        obj.insert(k.clone(), v.clone());
-                    }
-                }
+                // Apply ALL update operators
+                crate::update::apply_update(&mut data, update_json)?;
 
                 // Check unique constraints (exclude self)
                 self.check_unique_constraints(&data, Some(id))?;
