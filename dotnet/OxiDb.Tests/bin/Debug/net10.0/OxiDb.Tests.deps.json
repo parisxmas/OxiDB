@@ -1,0 +1,39 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "OxiDb.Tests/1.0.0": {
+        "dependencies": {
+          "OxiDb.Client": "1.0.0"
+        },
+        "runtime": {
+          "OxiDb.Tests.dll": {}
+        }
+      },
+      "OxiDb.Client/1.0.0": {
+        "runtime": {
+          "OxiDb.Client.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "OxiDb.Tests/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "OxiDb.Client/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}

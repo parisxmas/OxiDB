@@ -1,0 +1,157 @@
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+
+use serde_json::Value as JsonValue;
+
+/// Index value with type-aware ordering.
+/// Dates are stored as i64 millisecond timestamps for fast comparison —
+/// this is the core advantage over PostgreSQL JSONB which stores dates as text.
+#[derive(Debug, Clone)]
+pub enum IndexValue {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Float(f64),
+    DateTime(i64), // millis since epoch — fast integer comparison
+    String(String),
+}
+
+impl Eq for IndexValue {}
+
+impl Hash for IndexValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            IndexValue::Null => {}
+            IndexValue::Boolean(b) => b.hash(state),
+            IndexValue::Integer(i) => i.hash(state),
+            IndexValue::Float(f) => f.to_bits().hash(state),
+            IndexValue::DateTime(ms) => ms.hash(state),
+            IndexValue::String(s) => s.hash(state),
+        }
+    }
+}
+
+impl PartialEq for IndexValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl PartialOrd for IndexValue {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IndexValue {
+    fn cmp(&self, other: &Self) -> Ordering {
+        use IndexValue::*;
+        match (self, other) {
+            (Null, Null) => Ordering::Equal,
+            (Null, _) => Ordering::Less,
+            (_, Null) => Ordering::Greater,
+
+            (Boolean(a), Boolean(b)) => a.cmp(b),
+            (Boolean(_), _) => Ordering::Less,
+            (_, Boolean(_)) => Ordering::Greater,
+
+            (Integer(a), Integer(b)) => a.cmp(b),
+            (Integer(a), Float(b)) => (*a as f64).total_cmp(b),
+            (Float(a), Integer(b)) => a.total_cmp(&(*b as f64)),
+            (Float(a), Float(b)) => a.total_cmp(b),
+            (Integer(_) | Float(_), _) => Ordering::Less,
+            (_, Integer(_) | Float(_)) => Ordering::Greater,
+
+            (DateTime(a), DateTime(b)) => a.cmp(b),
+            (DateTime(_), _) => Ordering::Less,
+            (_, DateTime(_)) => Ordering::Greater,
+
+            (String(a), String(b)) => a.cmp(b),
+        }
+    }
+}
+
+impl IndexValue {
+    /// Convert a JSON value to an IndexValue.
+    /// String values are automatically checked for date formats and stored
+    /// as DateTime(millis) for fast numeric comparison.
+    pub fn from_json(value: &JsonValue) -> Self {
+        match value {
+            JsonValue::Null => IndexValue::Null,
+            JsonValue::Bool(b) => IndexValue::Boolean(*b),
+            JsonValue::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    IndexValue::Integer(i)
+                } else if let Some(f) = n.as_f64() {
+                    IndexValue::Float(f)
+                } else {
+                    IndexValue::Null
+                }
+            }
+            JsonValue::String(s) => Self::parse_string(s),
+            // Arrays/objects: serialize to string for indexing
+            other => IndexValue::String(other.to_string()),
+        }
+    }
+
+    fn parse_string(s: &str) -> Self {
+        // Try RFC 3339 / ISO 8601 with timezone: "2024-01-15T10:30:00Z"
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return IndexValue::DateTime(dt.timestamp_millis());
+        }
+        // Try ISO 8601 without timezone: "2024-01-15T10:30:00"
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+            return IndexValue::DateTime(dt.and_utc().timestamp_millis());
+        }
+        // Try space-separated datetime: "2024-01-15 10:30:00"
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            return IndexValue::DateTime(dt.and_utc().timestamp_millis());
+        }
+        // Try date only: "2024-01-15"
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            if let Some(dt) = d.and_hms_opt(0, 0, 0) {
+                return IndexValue::DateTime(dt.and_utc().timestamp_millis());
+            }
+        }
+        IndexValue::String(s.to_string())
+    }
+
+    /// Check if this value matches a JSON value for query comparison.
+    /// Handles cross-type matching (e.g., DateTime index vs string query).
+    pub fn matches_json(&self, json: &JsonValue) -> bool {
+        let other = IndexValue::from_json(json);
+        self == &other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_parsing() {
+        let v = IndexValue::from_json(&JsonValue::String("2024-01-15T10:30:00Z".into()));
+        assert!(matches!(v, IndexValue::DateTime(_)));
+    }
+
+    #[test]
+    fn date_ordering() {
+        let a = IndexValue::from_json(&JsonValue::String("2024-01-01".into()));
+        let b = IndexValue::from_json(&JsonValue::String("2024-06-15".into()));
+        assert!(a < b);
+    }
+
+    #[test]
+    fn type_ordering() {
+        let null = IndexValue::Null;
+        let boolean = IndexValue::Boolean(true);
+        let integer = IndexValue::Integer(42);
+        let date = IndexValue::DateTime(1000);
+        let string = IndexValue::String("hello".into());
+        assert!(null < boolean);
+        assert!(boolean < integer);
+        assert!(integer < date);
+        assert!(date < string);
+    }
+}

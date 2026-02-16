@@ -1,0 +1,11 @@
+[package]
+name = "oxidb-client-ffi"
+version = "0.1.0"
+edition = "2024"
+description = "C-compatible FFI client library for OxiDB server"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde_json = "1"
