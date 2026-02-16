@@ -1,6 +1,8 @@
+use base64::Engine;
 use oxidb::OxiDb;
 use oxidb::query::parse_find_options;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 fn ok_response(data: Value) -> Value {
@@ -235,6 +237,156 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
             };
             match db.aggregate(col, pipeline) {
                 Ok(docs) => ok_response(json!(docs)),
+                Err(e) => err_response(&e.to_string()),
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Blob storage + FTS commands
+        // -------------------------------------------------------------------
+
+        "create_bucket" => {
+            let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return err_response("missing 'bucket'"),
+            };
+            match db.create_bucket(bucket) {
+                Ok(()) => ok_response(json!("bucket created")),
+                Err(e) => err_response(&e.to_string()),
+            }
+        }
+
+        "list_buckets" => {
+            let buckets = db.list_buckets();
+            ok_response(json!(buckets))
+        }
+
+        "delete_bucket" => {
+            let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return err_response("missing 'bucket'"),
+            };
+            match db.delete_bucket(bucket) {
+                Ok(()) => ok_response(json!("bucket deleted")),
+                Err(e) => err_response(&e.to_string()),
+            }
+        }
+
+        "put_object" => {
+            let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return err_response("missing 'bucket'"),
+            };
+            let key = match request.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return err_response("missing 'key'"),
+            };
+            let data_b64 = match request.get("data").and_then(|v| v.as_str()) {
+                Some(d) => d,
+                None => return err_response("missing 'data' (base64)"),
+            };
+            let data = match base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                Ok(d) => d,
+                Err(e) => return err_response(&format!("invalid base64: {e}")),
+            };
+            let content_type = request
+                .get("content_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/octet-stream");
+            let metadata: HashMap<String, String> = request
+                .get("metadata")
+                .and_then(|v| v.as_object())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match db.put_object(bucket, key, &data, content_type, metadata) {
+                Ok(meta) => ok_response(meta),
+                Err(e) => err_response(&e.to_string()),
+            }
+        }
+
+        "get_object" => {
+            let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return err_response("missing 'bucket'"),
+            };
+            let key = match request.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return err_response("missing 'key'"),
+            };
+            match db.get_object(bucket, key) {
+                Ok((data, meta)) => {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+                    ok_response(json!({
+                        "content": encoded,
+                        "metadata": meta,
+                    }))
+                }
+                Err(e) => err_response(&e.to_string()),
+            }
+        }
+
+        "head_object" => {
+            let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return err_response("missing 'bucket'"),
+            };
+            let key = match request.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return err_response("missing 'key'"),
+            };
+            match db.head_object(bucket, key) {
+                Ok(meta) => ok_response(meta),
+                Err(e) => err_response(&e.to_string()),
+            }
+        }
+
+        "delete_object" => {
+            let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return err_response("missing 'bucket'"),
+            };
+            let key = match request.get("key").and_then(|v| v.as_str()) {
+                Some(k) => k,
+                None => return err_response("missing 'key'"),
+            };
+            match db.delete_object(bucket, key) {
+                Ok(()) => ok_response(json!("object deleted")),
+                Err(e) => err_response(&e.to_string()),
+            }
+        }
+
+        "list_objects" => {
+            let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return err_response("missing 'bucket'"),
+            };
+            let prefix = request.get("prefix").and_then(|v| v.as_str());
+            let limit = request
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            match db.list_objects(bucket, prefix, limit) {
+                Ok(list) => ok_response(json!(list)),
+                Err(e) => err_response(&e.to_string()),
+            }
+        }
+
+        "search" => {
+            let query = match request.get("query").and_then(|v| v.as_str()) {
+                Some(q) => q,
+                None => return err_response("missing 'query'"),
+            };
+            let bucket = request.get("bucket").and_then(|v| v.as_str());
+            let limit = request
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
+            match db.search(bucket, query, limit) {
+                Ok(results) => ok_response(json!(results)),
                 Err(e) => err_response(&e.to_string()),
             }
         }

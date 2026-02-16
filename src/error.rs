@@ -31,6 +31,12 @@ pub enum Error {
 
     #[error("document must be a JSON object")]
     NotAnObject,
+
+    #[error("blob not found: {bucket}/{key}")]
+    BlobNotFound { bucket: String, key: String },
+
+    #[error("bucket not found: {0}")]
+    BucketNotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
