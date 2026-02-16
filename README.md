@@ -8,6 +8,7 @@ A fast, embeddable document database engine written in Rust.
 - **Write-ahead log (WAL)** with CRC32 checksums for crash safety
 - **Field, unique, and composite indexes** backed by BTreeMap for range scans
 - **Query operators**: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$and`, `$or`
+- **Update operators**: `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
 - **Sort, skip, and limit** via `FindOptions`
 - **Automatic date detection** — date strings are stored as `i64` millis for fast comparison
 - **Compaction** to reclaim space from deleted documents
@@ -76,6 +77,66 @@ Multiple conditions on different fields are implicitly ANDed:
 
 ```json
 {"status": "active", "age": {"$gte": 18}}
+```
+
+## Update Operators
+
+Updates support 12 MongoDB-style operators. Multiple operators can be combined in a single update. All operators support dot-notation for nested fields.
+
+### Field Operators
+
+| Operator       | Example                                          | Description                            |
+|----------------|--------------------------------------------------|----------------------------------------|
+| `$set`         | `{"$set": {"age": 31}}`                         | Set field value                        |
+| `$unset`       | `{"$unset": {"temp": ""}}`                      | Remove field                           |
+| `$inc`         | `{"$inc": {"count": 1}}`                        | Increment by value (creates if missing)|
+| `$mul`         | `{"$mul": {"price": 1.1}}`                      | Multiply by value (0 if missing)       |
+| `$min`         | `{"$min": {"low": 50}}`                         | Set to value if less than current      |
+| `$max`         | `{"$max": {"high": 100}}`                       | Set to value if greater than current   |
+| `$rename`      | `{"$rename": {"old": "new"}}`                   | Rename field                           |
+| `$currentDate` | `{"$currentDate": {"updated_at": true}}`        | Set to current ISO 8601 datetime       |
+
+### Array Operators
+
+| Operator     | Example                                   | Description                              |
+|--------------|-------------------------------------------|------------------------------------------|
+| `$push`      | `{"$push": {"tags": "new"}}`             | Append to array (creates if missing)     |
+| `$pull`      | `{"$pull": {"tags": "old"}}`             | Remove all matching elements             |
+| `$addToSet`  | `{"$addToSet": {"tags": "unique"}}`      | Append only if not already present       |
+| `$pop`       | `{"$pop": {"arr": 1}}`                   | Remove last (1) or first (-1) element    |
+
+### Examples
+
+**Combine multiple operators:**
+
+```rust
+let modified = db.update(
+    "users",
+    &json!({"name": "Alice"}),
+    &json!({
+        "$set": {"status": "active"},
+        "$inc": {"login_count": 1},
+        "$currentDate": {"last_login": true}
+    }),
+)?;
+```
+
+**Nested field updates with dot-notation:**
+
+```rust
+db.update(
+    "users",
+    &json!({"name": "Alice"}),
+    &json!({"$set": {"address.city": "NYC", "address.zip": "10001"}}),
+)?;
+```
+
+**Array manipulation:**
+
+```rust
+db.update("posts", &json!({"_id": 1}), &json!({"$push": {"tags": "rust"}}))?;
+db.update("posts", &json!({"_id": 1}), &json!({"$pull": {"tags": "draft"}}))?;
+db.update("posts", &json!({"_id": 1}), &json!({"$addToSet": {"tags": "database"}}))?;
 ```
 
 ## Sort, Skip, Limit
