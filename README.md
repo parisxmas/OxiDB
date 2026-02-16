@@ -12,6 +12,8 @@ A fast, embeddable document database engine written in Rust.
 - **Automatic date detection** — date strings are stored as `i64` millis for fast comparison
 - **Compaction** to reclaim space from deleted documents
 - **Aggregation pipeline** — 10 MongoDB-style stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`
+- **S3-like blob storage** — buckets, put/get/head/delete/list objects with metadata and CRC32 etags
+- **Full-text search** — automatic text extraction, inverted index with TF-IDF ranked search
 - **TCP server** with a length-prefixed JSON protocol and thread pool
 - **C FFI library** and **.NET client**
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block each other
@@ -175,6 +177,65 @@ Field references (`"$fieldName"`), literals, and arithmetic operators (`$add`, `
 ]
 ```
 
+## Blob Storage
+
+Store and retrieve binary objects (files, images, PDFs, etc.) in S3-style buckets:
+
+```rust
+use std::collections::HashMap;
+
+// Create a bucket
+db.create_bucket("docs")?;
+
+// Upload an object
+let data = b"Hello World";
+let meta = db.put_object("docs", "hello.txt", data, "text/plain", HashMap::new())?;
+
+// Retrieve an object
+let (data, meta) = db.get_object("docs", "hello.txt")?;
+
+// Get metadata only (no data read)
+let meta = db.head_object("docs", "hello.txt")?;
+
+// List objects with optional prefix filter
+let objects = db.list_objects("docs", Some("reports/"), None)?;
+
+// Delete an object
+db.delete_object("docs", "hello.txt")?;
+
+// List and delete buckets
+let buckets = db.list_buckets();
+db.delete_bucket("docs")?;
+```
+
+Objects are stored on disk as `_blobs/<bucket>/<id>.data` with a JSON metadata sidecar (`<id>.meta`). Each object gets a CRC32 etag and supports user-defined metadata.
+
+## Full-Text Search
+
+Text content from uploaded objects is automatically indexed. Supported content types:
+
+| Content Type | Extraction |
+|---|---|
+| `text/*` | UTF-8 decode (HTML tags stripped for `text/html`) |
+| `application/json` | Recursive string value extraction |
+| Other | Not indexed (blob stored only) |
+
+Search uses TF-IDF scoring to rank results:
+
+```rust
+// Upload text objects (automatically indexed)
+db.put_object("docs", "report.txt", b"database performance tuning guide", "text/plain", HashMap::new())?;
+db.put_object("docs", "notes.md", b"quick notes about database queries", "text/plain", HashMap::new())?;
+
+// Search across all buckets
+let results = db.search(None, "database performance", 10)?;
+
+// Search within a specific bucket
+let results = db.search(Some("docs"), "database", 10)?;
+```
+
+Each result includes `bucket`, `key`, and `score` (TF-IDF relevance).
+
 ## Compaction
 
 Deleted documents are soft-deleted (status byte flipped) and remain on disk until compaction:
@@ -244,8 +305,45 @@ Max message size is 16 MiB.
 | `drop_collection`        | `collection`                                       |
 | `aggregate`              | `collection`, `pipeline`                           |
 | `compact`                | `collection`                                       |
+| `create_bucket`          | `bucket`                                           |
+| `list_buckets`           | --                                                 |
+| `delete_bucket`          | `bucket`                                           |
+| `put_object`             | `bucket`, `key`, `data` (base64), `content_type?`, `metadata?` |
+| `get_object`             | `bucket`, `key`                                    |
+| `head_object`            | `bucket`, `key`                                    |
+| `delete_object`          | `bucket`, `key`                                    |
+| `list_objects`           | `bucket`, `prefix?`, `limit?`                      |
+| `search`                 | `query`, `bucket?`, `limit?`                       |
 
 Sort values: `1` for ascending, `-1` for descending.
+
+### Blob & Search Examples
+
+**Put an object (binary data is base64-encoded):**
+
+```json
+{"cmd": "put_object", "bucket": "docs", "key": "report.txt",
+ "data": "SGVsbG8gV29ybGQ=", "content_type": "text/plain",
+ "metadata": {"author": "Alice"}}
+```
+
+**Get an object:**
+
+```json
+{"cmd": "get_object", "bucket": "docs", "key": "report.txt"}
+```
+```json
+{"ok": true, "data": {"content": "SGVsbG8gV29ybGQ=", "metadata": {"key": "report.txt", "bucket": "docs", "size": 11, ...}}}
+```
+
+**Search:**
+
+```json
+{"cmd": "search", "query": "database performance", "bucket": "docs", "limit": 10}
+```
+```json
+{"ok": true, "data": [{"bucket": "docs", "key": "report.txt", "score": 2.45}]}
+```
 
 ## C FFI
 
@@ -302,6 +400,16 @@ Each collection is stored as an append-only file of records:
 ```
 
 `status` is `0` (active) or `1` (deleted). Deletes flip the byte in place — no rewrite needed.
+
+### Blob & FTS Storage
+
+```
+<data_dir>/
+├── _blobs/<bucket>/<id>.data     # binary content
+├── _blobs/<bucket>/<id>.meta     # JSON metadata (key, size, etag, content_type, ...)
+├── _fts/index.json               # persisted inverted index
+├── users.dat / users.wal         # existing collections (unchanged)
+```
 
 ### Write-Ahead Log
 
