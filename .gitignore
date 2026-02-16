@@ -5,6 +5,18 @@
 dotnet/**/bin/
 dotnet/**/obj/
 
+# Java / Maven
+**/target/
+*.class
+*.jar
+
+# Python
+__pycache__/
+*.pyc
+
+# Julia
+julia/**/Manifest.toml
+
 # OxiDB data
 oxidb_data/
 *.dat

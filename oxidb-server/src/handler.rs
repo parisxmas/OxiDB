@@ -14,7 +14,7 @@ fn err_response(msg: &str) -> Value {
 }
 
 /// Handle a single JSON request and return a JSON response.
-pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
+pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u64>) -> Value {
     let cmd = match request.get("cmd").and_then(|v| v.as_str()) {
         Some(c) => c,
         None => return err_response("missing or invalid 'cmd' field"),
@@ -25,6 +25,43 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
     match cmd {
         "ping" => ok_response(json!("pong")),
 
+        // -------------------------------------------------------------------
+        // Transaction commands
+        // -------------------------------------------------------------------
+
+        "begin_tx" => {
+            if active_tx.is_some() {
+                return err_response("transaction already active");
+            }
+            let tx_id = db.begin_transaction();
+            *active_tx = Some(tx_id);
+            ok_response(json!({ "tx_id": tx_id }))
+        }
+
+        "commit_tx" => {
+            match active_tx.take() {
+                Some(tx_id) => match db.commit_transaction(tx_id) {
+                    Ok(()) => ok_response(json!("committed")),
+                    Err(e) => err_response(&e.to_string()),
+                },
+                None => err_response("no active transaction"),
+            }
+        }
+
+        "rollback_tx" => {
+            match active_tx.take() {
+                Some(tx_id) => {
+                    let _ = db.rollback_transaction(tx_id);
+                    ok_response(json!("rolled back"))
+                }
+                None => err_response("no active transaction"),
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // CRUD commands (tx-aware)
+        // -------------------------------------------------------------------
+
         "insert" => {
             let col = match collection {
                 Some(c) => c,
@@ -34,9 +71,16 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
                 Some(d) => d.clone(),
                 None => return err_response("missing 'doc'"),
             };
-            match db.insert(col, doc) {
-                Ok(id) => ok_response(json!({ "id": id })),
-                Err(e) => err_response(&e.to_string()),
+            if let Some(tx_id) = *active_tx {
+                match db.tx_insert(tx_id, col, doc) {
+                    Ok(()) => ok_response(json!("buffered")),
+                    Err(e) => err_response(&e.to_string()),
+                }
+            } else {
+                match db.insert(col, doc) {
+                    Ok(id) => ok_response(json!({ "id": id })),
+                    Err(e) => err_response(&e.to_string()),
+                }
             }
         }
 
@@ -49,9 +93,18 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
                 Some(arr) => arr.clone(),
                 None => return err_response("missing or invalid 'docs' array"),
             };
-            match db.insert_many(col, docs) {
-                Ok(ids) => ok_response(json!(ids)),
-                Err(e) => err_response(&e.to_string()),
+            if let Some(tx_id) = *active_tx {
+                for doc in docs {
+                    if let Err(e) = db.tx_insert(tx_id, col, doc) {
+                        return err_response(&e.to_string());
+                    }
+                }
+                ok_response(json!("buffered"))
+            } else {
+                match db.insert_many(col, docs) {
+                    Ok(ids) => ok_response(json!(ids)),
+                    Err(e) => err_response(&e.to_string()),
+                }
             }
         }
 
@@ -62,13 +115,20 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
             };
             let empty = json!({});
             let query = request.get("query").unwrap_or(&empty);
-            let opts = match parse_find_options(request) {
-                Ok(o) => o,
-                Err(e) => return err_response(&e.to_string()),
-            };
-            match db.find_with_options(col, query, &opts) {
-                Ok(docs) => ok_response(json!(docs)),
-                Err(e) => err_response(&e.to_string()),
+            if let Some(tx_id) = *active_tx {
+                match db.tx_find(tx_id, col, query) {
+                    Ok(docs) => ok_response(json!(docs)),
+                    Err(e) => err_response(&e.to_string()),
+                }
+            } else {
+                let opts = match parse_find_options(request) {
+                    Ok(o) => o,
+                    Err(e) => return err_response(&e.to_string()),
+                };
+                match db.find_with_options(col, query, &opts) {
+                    Ok(docs) => ok_response(json!(docs)),
+                    Err(e) => err_response(&e.to_string()),
+                }
             }
         }
 
@@ -98,9 +158,16 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
                 Some(u) => u,
                 None => return err_response("missing 'update'"),
             };
-            match db.update(col, query, update) {
-                Ok(count) => ok_response(json!({ "modified": count })),
-                Err(e) => err_response(&e.to_string()),
+            if let Some(tx_id) = *active_tx {
+                match db.tx_update(tx_id, col, query, update) {
+                    Ok(()) => ok_response(json!("buffered")),
+                    Err(e) => err_response(&e.to_string()),
+                }
+            } else {
+                match db.update(col, query, update) {
+                    Ok(count) => ok_response(json!({ "modified": count })),
+                    Err(e) => err_response(&e.to_string()),
+                }
             }
         }
 
@@ -113,9 +180,16 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value) -> Value {
                 Some(q) => q,
                 None => return err_response("missing 'query'"),
             };
-            match db.delete(col, query) {
-                Ok(count) => ok_response(json!({ "deleted": count })),
-                Err(e) => err_response(&e.to_string()),
+            if let Some(tx_id) = *active_tx {
+                match db.tx_delete(tx_id, col, query) {
+                    Ok(()) => ok_response(json!("buffered")),
+                    Err(e) => err_response(&e.to_string()),
+                }
+            } else {
+                match db.delete(col, query) {
+                    Ok(count) => ok_response(json!({ "deleted": count })),
+                    Err(e) => err_response(&e.to_string()),
+                }
             }
         }
 

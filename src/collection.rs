@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -19,6 +19,17 @@ pub struct CompactStats {
     pub docs_kept: usize,
 }
 
+/// A prepared mutation from transactional prepare_tx_* methods.
+pub struct PreparedMutation {
+    pub wal_entry: WalEntry,
+    pub doc_id: DocumentId,
+    pub new_bytes: Vec<u8>,
+    pub old_loc: Option<DocLocation>,
+    pub old_doc: Option<Document>,
+    pub new_data: Value,
+    pub is_delete: bool,
+}
+
 pub struct Collection {
     name: String,
     data_dir: PathBuf,
@@ -27,26 +38,39 @@ pub struct Collection {
     primary_index: HashMap<DocumentId, DocLocation>,
     field_indexes: HashMap<String, FieldIndex>,
     composite_indexes: Vec<CompositeIndex>,
+    version_index: HashMap<DocumentId, u64>,
     next_id: DocumentId,
 }
 
 impl Collection {
     /// Create or open a collection backed by a data file.
     pub fn open(name: &str, data_dir: &Path) -> Result<Self> {
+        Self::open_with_committed_txs(name, data_dir, &HashSet::new())
+    }
+
+    /// Create or open a collection, filtering WAL recovery by committed tx_ids.
+    pub fn open_with_committed_txs(
+        name: &str,
+        data_dir: &Path,
+        committed_tx_ids: &HashSet<u64>,
+    ) -> Result<Self> {
         let data_path = data_dir.join(format!("{}.dat", name));
         let wal_path = data_dir.join(format!("{}.wal", name));
         let storage = Storage::open(&data_path)?;
         let wal = Wal::open(&wal_path)?;
 
         let mut primary_index = HashMap::new();
+        let mut version_index = HashMap::new();
         let mut next_id: DocumentId = 1;
 
-        // Rebuild primary index from existing data
+        // Rebuild primary index and version index from existing data
         for (offset, bytes) in storage.iter_active()? {
             let doc: Value = serde_json::from_slice(&bytes)?;
             if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
                 let length = bytes.len() as u32;
                 primary_index.insert(id, DocLocation { offset, length });
+                let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                version_index.insert(id, ver);
                 if id >= next_id {
                     next_id = id + 1;
                 }
@@ -54,7 +78,13 @@ impl Collection {
         }
 
         // WAL recovery: replay any pending entries
-        wal.recover(&storage, &mut primary_index, &mut next_id)?;
+        wal.recover(
+            &storage,
+            &mut primary_index,
+            &mut next_id,
+            committed_tx_ids,
+            &mut version_index,
+        )?;
 
         Ok(Self {
             name: name.to_string(),
@@ -64,6 +94,7 @@ impl Collection {
             primary_index,
             field_indexes: HashMap::new(),
             composite_indexes: Vec::new(),
+            version_index,
             next_id,
         })
     }
@@ -188,10 +219,10 @@ impl Collection {
 
         let id = self.next_id;
 
-        // Inject _id
-        data.as_object_mut()
-            .unwrap()
-            .insert("_id".to_string(), Value::Number(id.into()));
+        // Inject _id and _version
+        let obj = data.as_object_mut().unwrap();
+        obj.insert("_id".to_string(), Value::Number(id.into()));
+        obj.insert("_version".to_string(), Value::Number(1.into()));
 
         // Check unique constraints BEFORE any disk writes
         self.check_unique_constraints(&data, None)?;
@@ -201,10 +232,7 @@ impl Collection {
         let bytes = serde_json::to_vec(&data)?;
 
         // WAL: log before mutating .dat
-        self.wal.log(&WalEntry::Insert {
-            doc_id: id,
-            doc_bytes: bytes.clone(),
-        })?;
+        self.wal.log(&WalEntry::insert(id, bytes.clone()))?;
 
         let loc = self.storage.append(&bytes)?;
 
@@ -213,6 +241,7 @@ impl Collection {
 
         let doc = Document::new(id, data)?;
         self.primary_index.insert(id, loc);
+        self.version_index.insert(id, 1);
 
         // Update all field indexes
         for idx in self.field_indexes.values_mut() {
@@ -243,9 +272,9 @@ impl Collection {
                 return Err(Error::NotAnObject);
             }
             let id = self.next_id + prepared.len() as u64;
-            data.as_object_mut()
-                .unwrap()
-                .insert("_id".to_string(), Value::Number(id.into()));
+            let obj = data.as_object_mut().unwrap();
+            obj.insert("_id".to_string(), Value::Number(id.into()));
+            obj.insert("_version".to_string(), Value::Number(1.into()));
 
             // Check against existing index
             self.check_unique_constraints(&data, None)?;
@@ -275,10 +304,7 @@ impl Collection {
         // Phase 2: WAL log all entries → single fsync
         let wal_entries: Vec<WalEntry> = prepared
             .iter()
-            .map(|(id, _, bytes)| WalEntry::Insert {
-                doc_id: *id,
-                doc_bytes: bytes.clone(),
-            })
+            .map(|(id, _, bytes)| WalEntry::insert(*id, bytes.clone()))
             .collect();
         self.wal.log_batch(&wal_entries)?;
 
@@ -299,6 +325,7 @@ impl Collection {
         self.next_id += prepared.len() as u64;
         for ((id, data, _), (_, loc)) in prepared.into_iter().zip(locs.iter()) {
             self.primary_index.insert(id, *loc);
+            self.version_index.insert(id, 1);
             let doc = Document::new(id, data)?;
             for idx in self.field_indexes.values_mut() {
                 idx.insert(&doc);
@@ -466,6 +493,13 @@ impl Collection {
                 // Apply ALL update operators
                 crate::update::apply_update(&mut data, update_json)?;
 
+                // Increment _version
+                let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                let new_version = old_version + 1;
+                data.as_object_mut()
+                    .unwrap()
+                    .insert("_version".to_string(), Value::Number(new_version.into()));
+
                 // Check unique constraints (exclude self)
                 self.check_unique_constraints(&data, Some(id))?;
 
@@ -487,10 +521,7 @@ impl Collection {
         // Phase 2: WAL log all updates → single fsync
         let wal_entries: Vec<WalEntry> = ops
             .iter()
-            .map(|op| WalEntry::Update {
-                doc_id: op.id,
-                doc_bytes: op.new_bytes.clone(),
-            })
+            .map(|op| WalEntry::update(op.id, op.new_bytes.clone()))
             .collect();
         self.wal.log_batch(&wal_entries)?;
 
@@ -510,6 +541,8 @@ impl Collection {
         let count = ops.len() as u64;
         for (op, new_loc) in ops.into_iter().zip(new_locs) {
             self.primary_index.insert(op.id, new_loc);
+            let new_version = op.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
+            self.version_index.insert(op.id, new_version);
             let new_doc = Document::new(op.id, op.new_data)?;
             for idx in self.field_indexes.values_mut() {
                 idx.remove(&op.old_doc);
@@ -558,7 +591,7 @@ impl Collection {
         // Phase 2: WAL log all deletes → single fsync
         let wal_entries: Vec<WalEntry> = ops
             .iter()
-            .map(|op| WalEntry::Delete { doc_id: op.id })
+            .map(|op| WalEntry::delete(op.id))
             .collect();
         self.wal.log_batch(&wal_entries)?;
 
@@ -575,6 +608,7 @@ impl Collection {
         let count = ops.len() as u64;
         for op in ops {
             self.primary_index.remove(&op.id);
+            self.version_index.remove(&op.id);
             for idx in self.field_indexes.values_mut() {
                 idx.remove(&op.doc);
             }
@@ -634,7 +668,8 @@ impl Collection {
         self.primary_index = new_primary_index;
         self.next_id = next_id;
 
-        // Rebuild all indexes
+        // Rebuild all indexes and version_index
+        self.version_index.clear();
         for idx in self.field_indexes.values_mut() {
             idx.clear();
         }
@@ -644,6 +679,8 @@ impl Collection {
         for (&id, &loc) in &self.primary_index {
             let bytes = self.storage.read(loc)?;
             let data: Value = serde_json::from_slice(&bytes)?;
+            let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+            self.version_index.insert(id, ver);
             let doc = Document::new(id, data)?;
             for idx in self.field_indexes.values_mut() {
                 idx.insert(&doc);
@@ -658,6 +695,221 @@ impl Collection {
             new_size,
             docs_kept,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // Version tracking
+    // -----------------------------------------------------------------------
+
+    /// Get the current version of a document (0 if not found).
+    pub fn get_version(&self, doc_id: DocumentId) -> u64 {
+        self.version_index.get(&doc_id).copied().unwrap_or(0)
+    }
+
+    /// Log a batch of WAL entries (used by the engine during transactional commit).
+    pub fn log_wal_batch(&self, entries: &[WalEntry]) -> Result<()> {
+        self.wal.log_batch(entries)
+    }
+
+    /// Checkpoint the WAL (used by the engine after transactional apply).
+    pub fn checkpoint_wal(&self) -> Result<()> {
+        self.wal.checkpoint()
+    }
+
+    // -----------------------------------------------------------------------
+    // Transactional prepare helpers (called by engine with write lock held)
+    // -----------------------------------------------------------------------
+
+    /// Prepare a transactional insert. Returns (doc_id, PreparedMutation).
+    /// Does NOT touch WAL or storage -- caller orchestrates.
+    pub fn prepare_tx_insert(&mut self, mut data: Value, tx_id: u64) -> Result<PreparedMutation> {
+        if !data.is_object() {
+            return Err(Error::NotAnObject);
+        }
+
+        let id = self.next_id;
+        let obj = data.as_object_mut().unwrap();
+        obj.insert("_id".to_string(), Value::Number(id.into()));
+        obj.insert("_version".to_string(), Value::Number(1.into()));
+
+        self.check_unique_constraints(&data, None)?;
+
+        self.next_id += 1;
+
+        let bytes = serde_json::to_vec(&data)?;
+
+        Ok(PreparedMutation {
+            wal_entry: WalEntry::Insert { doc_id: id, doc_bytes: bytes.clone(), tx_id },
+            doc_id: id,
+            new_bytes: bytes,
+            old_loc: None,
+            old_doc: None,
+            new_data: data,
+            is_delete: false,
+        })
+    }
+
+    /// Prepare transactional updates. Returns Vec<PreparedMutation>.
+    pub fn prepare_tx_update(
+        &mut self,
+        query_json: &Value,
+        update_json: &Value,
+        tx_id: u64,
+    ) -> Result<Vec<PreparedMutation>> {
+        let update_obj = update_json
+            .as_object()
+            .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
+        if update_obj.is_empty() {
+            return Err(Error::InvalidQuery(
+                "update must contain at least one operator".into(),
+            ));
+        }
+
+        let matching = self.find(query_json)?;
+        if matching.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut mutations = Vec::with_capacity(matching.len());
+
+        for doc_data in &matching {
+            let id = doc_data
+                .get("_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| Error::InvalidQuery("document missing _id".into()))?;
+
+            if let Some(&old_loc) = self.primary_index.get(&id) {
+                let bytes = self.storage.read(old_loc)?;
+                let mut data: Value = serde_json::from_slice(&bytes)?;
+                let old_doc = Document::new(id, data.clone())?;
+
+                crate::update::apply_update(&mut data, update_json)?;
+
+                let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                let new_version = old_version + 1;
+                data.as_object_mut()
+                    .unwrap()
+                    .insert("_version".to_string(), Value::Number(new_version.into()));
+
+                self.check_unique_constraints(&data, Some(id))?;
+
+                let new_bytes = serde_json::to_vec(&data)?;
+                mutations.push(PreparedMutation {
+                    wal_entry: WalEntry::Update { doc_id: id, doc_bytes: new_bytes.clone(), tx_id },
+                    doc_id: id,
+                    new_bytes,
+                    old_loc: Some(old_loc),
+                    old_doc: Some(old_doc),
+                    new_data: data,
+                    is_delete: false,
+                });
+            }
+        }
+
+        Ok(mutations)
+    }
+
+    /// Prepare transactional deletes. Returns Vec<PreparedMutation>.
+    pub fn prepare_tx_delete(
+        &mut self,
+        query_json: &Value,
+        tx_id: u64,
+    ) -> Result<Vec<PreparedMutation>> {
+        let matching = self.find(query_json)?;
+        if matching.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut mutations = Vec::with_capacity(matching.len());
+
+        for doc_data in &matching {
+            let id = doc_data
+                .get("_id")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| Error::InvalidQuery("document missing _id".into()))?;
+
+            if let Some(&loc) = self.primary_index.get(&id) {
+                let doc = Document::new(id, doc_data.clone())?;
+                mutations.push(PreparedMutation {
+                    wal_entry: WalEntry::Delete { doc_id: id, tx_id },
+                    doc_id: id,
+                    new_bytes: vec![],
+                    old_loc: Some(loc),
+                    old_doc: Some(doc),
+                    new_data: Value::Null,
+                    is_delete: true,
+                });
+            }
+        }
+
+        Ok(mutations)
+    }
+
+    /// Apply a batch of prepared mutations to storage and update indexes.
+    /// WAL should already have been logged by the caller.
+    pub fn apply_prepared(&mut self, mutations: &mut Vec<PreparedMutation>) -> Result<()> {
+        // Apply to storage
+        for m in mutations.iter() {
+            if m.is_delete {
+                if let Some(loc) = m.old_loc {
+                    self.storage.mark_deleted_no_sync(loc)?;
+                }
+            } else if let Some(old_loc) = m.old_loc {
+                // Update
+                self.storage.mark_deleted_no_sync(old_loc)?;
+            }
+        }
+
+        // Inserts and updates: append new bytes
+        let mut new_locs = Vec::with_capacity(mutations.len());
+        for m in mutations.iter() {
+            if m.is_delete {
+                new_locs.push(None);
+            } else {
+                let loc = self.storage.append_no_sync(&m.new_bytes)?;
+                new_locs.push(Some(loc));
+            }
+        }
+        self.storage.sync()?;
+
+        // Update in-memory indexes
+        for (i, m) in mutations.iter().enumerate() {
+            if m.is_delete {
+                self.primary_index.remove(&m.doc_id);
+                self.version_index.remove(&m.doc_id);
+                if let Some(ref old_doc) = m.old_doc {
+                    for idx in self.field_indexes.values_mut() {
+                        idx.remove(old_doc);
+                    }
+                    for idx in &mut self.composite_indexes {
+                        idx.remove(old_doc);
+                    }
+                }
+            } else if let Some(loc) = new_locs[i] {
+                self.primary_index.insert(m.doc_id, loc);
+                let ver = m.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
+                self.version_index.insert(m.doc_id, ver);
+
+                if let Some(ref old_doc) = m.old_doc {
+                    for idx in self.field_indexes.values_mut() {
+                        idx.remove(old_doc);
+                    }
+                    for idx in &mut self.composite_indexes {
+                        idx.remove(old_doc);
+                    }
+                }
+                if let Ok(new_doc) = Document::new(m.doc_id, m.new_data.clone()) {
+                    for idx in self.field_indexes.values_mut() {
+                        idx.insert(&new_doc);
+                    }
+                    for idx in &mut self.composite_indexes {
+                        idx.insert(&new_doc);
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -687,6 +939,26 @@ mod tests {
         let doc = col.get(id).unwrap().unwrap();
         assert_eq!(doc["name"], "Alice");
         assert_eq!(doc["_id"], id);
+    }
+
+    #[test]
+    fn insert_assigns_version_1() {
+        let mut col = temp_collection("test");
+        let id = col.insert(json!({"name": "Alice"})).unwrap();
+        let doc = col.get(id).unwrap().unwrap();
+        assert_eq!(doc["_version"], 1);
+        assert_eq!(col.get_version(id), 1);
+    }
+
+    #[test]
+    fn update_increments_version() {
+        let mut col = temp_collection("test");
+        let id = col.insert(json!({"name": "Alice"})).unwrap();
+        assert_eq!(col.get_version(id), 1);
+        col.update(&json!({"_id": id}), &json!({"$set": {"name": "Bob"}})).unwrap();
+        let doc = col.get(id).unwrap().unwrap();
+        assert_eq!(doc["_version"], 2);
+        assert_eq!(col.get_version(id), 2);
     }
 
     #[test]

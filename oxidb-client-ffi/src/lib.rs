@@ -470,6 +470,28 @@ pub unsafe extern "C" fn oxidb_search(
     unsafe { send_request(conn, &req) }
 }
 
+// ---------------------------------------------------------------------------
+// Transaction commands
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_begin_tx(conn: *mut OxiDbConn) -> *mut c_char {
+    let req = serde_json::json!({"cmd": "begin_tx"});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_commit_tx(conn: *mut OxiDbConn) -> *mut c_char {
+    let req = serde_json::json!({"cmd": "commit_tx"});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_rollback_tx(conn: *mut OxiDbConn) -> *mut c_char {
+    let req = serde_json::json!({"cmd": "rollback_tx"});
+    unsafe { send_request(conn, &req) }
+}
+
 /// Free a string returned by any `oxidb_*` function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_free_string(ptr: *mut c_char) {

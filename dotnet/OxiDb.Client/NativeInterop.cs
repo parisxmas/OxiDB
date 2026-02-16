@@ -80,6 +80,17 @@ internal static partial class NativeInterop
     [LibraryImport(LibName, EntryPoint = "oxidb_search", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint Search(nint conn, string query, string? bucket, int limit);
 
+    // Transactions
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_begin_tx")]
+    internal static partial nint BeginTx(nint conn);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_commit_tx")]
+    internal static partial nint CommitTx(nint conn);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_rollback_tx")]
+    internal static partial nint RollbackTx(nint conn);
+
     [LibraryImport(LibName, EntryPoint = "oxidb_free_string")]
     internal static partial void FreeString(nint ptr);
 }

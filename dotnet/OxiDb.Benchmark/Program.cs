@@ -1,11 +1,12 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using OxiDb.Client;
 
 const string Collection = "bench_15m";
 const int TotalRecords = 15_000_000;
-const int BatchSize = 5_000;
+const int BatchSize = 1_000;
 const int TotalBatches = TotalRecords / BatchSize;
 
 // ─── Synthetic data generators ─────────────────────────────
@@ -26,79 +27,104 @@ Console.Write("Connecting to OxiDB... ");
 using var db = OxiDbClient.Connect("127.0.0.1", 4444);
 Console.WriteLine(db.Ping());
 
-// ─── Setup collection ──────────────────────────────────────
-Console.Write("Dropping old collection if exists... ");
-try { db.DropCollection(Collection); } catch { }
-Console.WriteLine("done");
-
-Console.Write("Creating indexes... ");
-sw.Restart();
-
-// Insert + delete a dummy doc to ensure collection exists before creating indexes
-db.Insert(Collection, """{"_setup": true}""");
-db.Delete(Collection, """{"_setup": true}""");
-
-db.CreateIndex(Collection, "category");
-db.CreateIndex(Collection, "city");
-db.CreateIndex(Collection, "status");
-db.CreateIndex(Collection, "price");
-db.CreateIndex(Collection, "rating");
-db.CreateIndex(Collection, "year");
-db.CreateCompositeIndex(Collection, """["category", "city"]""");
-db.CreateCompositeIndex(Collection, """["status", "year"]""");
-sw.Stop();
-Console.WriteLine($"done ({sw.ElapsedMilliseconds} ms — 6 single + 2 composite indexes)");
-Console.WriteLine();
-
-// ─── Insert 15M records ────────────────────────────────────
-Console.WriteLine($"Inserting {TotalRecords:N0} records in batches of {BatchSize:N0}...");
-Console.WriteLine();
-
-var rng = new Random(42);
-var totalInsertSw = Stopwatch.StartNew();
-long insertedCount = 0;
-var lastReport = Stopwatch.StartNew();
-
-for (int batch = 0; batch < TotalBatches; batch++)
+// ─── Check if data already exists ──────────────────────────
+long existingCount = 0;
+try
 {
-    var sb = new StringBuilder(BatchSize * 220);
-    sb.Append('[');
-    for (int i = 0; i < BatchSize; i++)
-    {
-        if (i > 0) sb.Append(',');
-        long id = (long)batch * BatchSize + i;
-        var category = categories[rng.Next(categories.Length)];
-        var city = cities[rng.Next(cities.Length)];
-        var status = statuses[rng.Next(statuses.Length)];
-        var price = Math.Round(rng.NextDouble() * 10000, 2);
-        var rating = Math.Round(rng.NextDouble() * 5, 1);
-        var year = 2015 + rng.Next(11);
-        var stock = rng.Next(10000);
-        var tag1 = tags[rng.Next(tags.Length)];
-        var tag2 = tags[rng.Next(tags.Length)];
-
-        sb.Append($@"{{""name"":""Product {id}"",""category"":""{category}"",""city"":""{city}"",""status"":""{status}"",""price"":{price},""rating"":{rating},""year"":{year},""stock"":{stock},""tags"":[""{tag1}"",""{tag2}""],""description"":""Product {id} in {category} from {city}. Status {status}, rating {rating}.""}}");
-    }
-    sb.Append(']');
-
-    using var result = db.InsertMany(Collection, sb.ToString());
-    insertedCount += BatchSize;
-
-    if (lastReport.ElapsedMilliseconds >= 5000 || batch == TotalBatches - 1)
-    {
-        var elapsed = totalInsertSw.Elapsed;
-        var rate = insertedCount / elapsed.TotalSeconds;
-        var pct = (double)insertedCount / TotalRecords * 100;
-        var eta = TimeSpan.FromSeconds((TotalRecords - insertedCount) / Math.Max(rate, 1));
-        Console.WriteLine($"  [{pct,6:F1}%] {insertedCount,12:N0} / {TotalRecords:N0}  |  {rate,10:N0} docs/sec  |  elapsed {elapsed:mm\\:ss}  |  ETA {eta:mm\\:ss}");
-        lastReport.Restart();
-    }
+    using var cr = db.Count(Collection);
+    existingCount = cr.RootElement.GetProperty("data").GetProperty("count").GetInt64();
 }
+catch { }
 
-totalInsertSw.Stop();
-var totalRate = TotalRecords / totalInsertSw.Elapsed.TotalSeconds;
-Console.WriteLine();
-Console.WriteLine($"  *** INSERT COMPLETE: {TotalRecords:N0} records in {totalInsertSw.Elapsed:mm\\:ss\\.ff}  ({totalRate:N0} docs/sec) ***");
+if (existingCount >= TotalRecords)
+{
+    Console.WriteLine($"Collection already has {existingCount:N0} records — skipping insert.");
+}
+else
+{
+    if (existingCount == 0)
+    {
+        Console.Write("Creating collection + indexes... ");
+        sw.Restart();
+        db.Insert(Collection, """{"_setup": true}""");
+        db.Delete(Collection, """{"_setup": true}""");
+        db.CreateIndex(Collection, "category");
+        db.CreateIndex(Collection, "city");
+        db.CreateIndex(Collection, "status");
+        db.CreateIndex(Collection, "price");
+        db.CreateIndex(Collection, "rating");
+        db.CreateIndex(Collection, "year");
+        db.CreateCompositeIndex(Collection, """["category", "city"]""");
+        db.CreateCompositeIndex(Collection, """["status", "year"]""");
+        sw.Stop();
+        Console.WriteLine($"done ({sw.ElapsedMilliseconds} ms — 6 single + 2 composite)");
+    }
+    else
+    {
+        Console.WriteLine($"Resuming insert — {existingCount:N0} records already present.");
+    }
+
+    long startFrom = existingCount;
+    int startBatch = (int)(startFrom / BatchSize);
+    Console.WriteLine($"Inserting {TotalRecords - startFrom:N0} remaining records (batch size {BatchSize:N0})...");
+    Console.WriteLine();
+
+    var rng = new Random(42);
+    // Fast-forward RNG to match the batch we're resuming from
+    for (long skip = 0; skip < startFrom; skip++)
+    {
+        rng.Next(categories.Length); rng.Next(cities.Length); rng.Next(statuses.Length);
+        rng.NextDouble(); rng.NextDouble(); rng.Next(11); rng.Next(10000);
+        rng.Next(tags.Length); rng.Next(tags.Length);
+    }
+
+    var totalInsertSw = Stopwatch.StartNew();
+    long insertedCount = 0;
+    var lastReport = Stopwatch.StartNew();
+
+    for (int batch = startBatch; batch < TotalBatches; batch++)
+    {
+        var sb = new StringBuilder(BatchSize * 220);
+        sb.Append('[');
+        for (int i = 0; i < BatchSize; i++)
+        {
+            if (i > 0) sb.Append(',');
+            long id = (long)batch * BatchSize + i;
+            var category = categories[rng.Next(categories.Length)];
+            var city = cities[rng.Next(cities.Length)];
+            var status = statuses[rng.Next(statuses.Length)];
+            var price = Math.Round(rng.NextDouble() * 10000, 2).ToString(CultureInfo.InvariantCulture);
+            var rating = Math.Round(rng.NextDouble() * 5, 1).ToString(CultureInfo.InvariantCulture);
+            var year = 2015 + rng.Next(11);
+            var stock = rng.Next(10000);
+            var tag1 = tags[rng.Next(tags.Length)];
+            var tag2 = tags[rng.Next(tags.Length)];
+
+            sb.Append($$"""{"name":"Product {{id}}","category":"{{category}}","city":"{{city}}","status":"{{status}}","price":{{price}},"rating":{{rating}},"year":{{year}},"stock":{{stock}},"tags":["{{tag1}}","{{tag2}}"],"description":"Product {{id}} in {{category}} from {{city}}"}""");
+        }
+        sb.Append(']');
+
+        using var result = db.InsertMany(Collection, sb.ToString());
+        insertedCount += BatchSize;
+
+        if (lastReport.ElapsedMilliseconds >= 5000 || batch == TotalBatches - 1)
+        {
+            var total = startFrom + insertedCount;
+            var elapsed = totalInsertSw.Elapsed;
+            var rate = insertedCount / elapsed.TotalSeconds;
+            var pct = (double)total / TotalRecords * 100;
+            var remaining = TotalRecords - total;
+            var eta = TimeSpan.FromSeconds(remaining / Math.Max(rate, 1));
+            Console.WriteLine($"  [{pct,6:F1}%] {total,12:N0} / {TotalRecords:N0}  |  {rate,10:N0} docs/sec  |  elapsed {elapsed:mm\\:ss}  |  ETA {eta:mm\\:ss}");
+            lastReport.Restart();
+        }
+    }
+
+    totalInsertSw.Stop();
+    var totalRate = insertedCount / totalInsertSw.Elapsed.TotalSeconds;
+    Console.WriteLine();
+    Console.WriteLine($"  *** INSERT COMPLETE: {insertedCount:N0} new records in {totalInsertSw.Elapsed:mm\\:ss\\.ff}  ({totalRate:N0} docs/sec) ***");
+}
 Console.WriteLine();
 
 // ─── Verify count ──────────────────────────────────────────
