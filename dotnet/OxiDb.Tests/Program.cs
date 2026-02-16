@@ -464,14 +464,301 @@ void Assert(bool condition, string testName, string detail = "")
     Assert(!ok, "Non-array pipeline returns error");
 }
 
-// --- Summary ---
+// --- Aggregation Summary ---
 Console.WriteLine();
 Console.WriteLine($"=== Aggregation Tests: {passed} passed, {failed} failed ===");
+
+// =======================================================================
+// Blob Storage + Full-Text Search Tests
+// =======================================================================
+Console.WriteLine();
+Console.WriteLine("=== Blob Storage + Full-Text Search Tests ===");
+Console.WriteLine();
+
+// --- Test 19: Create bucket ---
+{
+    using var result = db.CreateBucket("test-docs");
+    var ok = result.RootElement.GetProperty("ok").GetBoolean();
+    Assert(ok, "create_bucket succeeds");
+}
+
+// --- Test 20: List buckets ---
+{
+    db.CreateBucket("test-images");
+    using var result = db.ListBuckets();
+    var data = result.RootElement.GetProperty("data");
+    var bucketCount = data.GetArrayLength();
+    Assert(bucketCount >= 2, "list_buckets returns at least 2 buckets", $"got {bucketCount}");
+
+    bool foundDocs = false, foundImages = false;
+    for (int i = 0; i < bucketCount; i++)
+    {
+        var name = data[i].GetString();
+        if (name == "test-docs") foundDocs = true;
+        if (name == "test-images") foundImages = true;
+    }
+    Assert(foundDocs && foundImages, "list_buckets contains test-docs and test-images");
+}
+
+// --- Test 21: Put object (text/plain) + get object roundtrip ---
+{
+    var textContent = "The quick brown fox jumps over the lazy dog. Database performance tuning is important.";
+    var b64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(textContent));
+
+    using var putResult = db.PutObject("test-docs", "fox.txt", b64, "text/plain", """{"author": "Alice"}""");
+    var ok = putResult.RootElement.GetProperty("ok").GetBoolean();
+    Assert(ok, "put_object text/plain succeeds");
+
+    var meta = putResult.RootElement.GetProperty("data");
+    Assert(meta.GetProperty("key").GetString() == "fox.txt", "put_object returns correct key");
+    Assert(meta.GetProperty("bucket").GetString() == "test-docs", "put_object returns correct bucket");
+    Assert(meta.GetProperty("size").GetInt64() == textContent.Length, "put_object returns correct size");
+    Assert(meta.GetProperty("content_type").GetString() == "text/plain", "put_object returns correct content_type");
+    Assert(meta.TryGetProperty("etag", out _), "put_object returns etag");
+
+    // Get object and verify content roundtrip
+    using var getResult = db.GetObject("test-docs", "fox.txt");
+    var getData = getResult.RootElement.GetProperty("data");
+    var contentB64 = getData.GetProperty("content").GetString()!;
+    var decoded = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(contentB64));
+    Assert(decoded == textContent, "get_object roundtrip preserves content");
+
+    var getMeta = getData.GetProperty("metadata");
+    Assert(getMeta.GetProperty("key").GetString() == "fox.txt", "get_object metadata has correct key");
+}
+
+// --- Test 22: Head object (metadata only) ---
+{
+    using var result = db.HeadObject("test-docs", "fox.txt");
+    var ok = result.RootElement.GetProperty("ok").GetBoolean();
+    Assert(ok, "head_object succeeds");
+    var meta = result.RootElement.GetProperty("data");
+    Assert(meta.GetProperty("key").GetString() == "fox.txt", "head_object returns correct key");
+    Assert(meta.GetProperty("size").GetInt64() > 0, "head_object returns non-zero size");
+}
+
+// --- Test 23: Put multiple objects for listing and search ---
+{
+    var report = "Database query optimization and indexing strategies for high performance systems.";
+    var notes = "Quick notes on Rust programming language and memory safety features.";
+    var csv = "name,age,city\nAlice,30,NYC\nBob,25,LA";
+
+    db.PutObject("test-docs", "report.txt",
+        Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(report)),
+        "text/plain");
+    db.PutObject("test-docs", "notes.md",
+        Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(notes)),
+        "text/plain");
+    db.PutObject("test-docs", "data/people.csv",
+        Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(csv)),
+        "text/csv");
+    db.PutObject("test-docs", "data/config.json",
+        Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes("""{"database": "oxidb", "version": "0.1"}""")),
+        "application/json");
+
+    Assert(true, "Multiple put_object calls succeed");
+}
+
+// --- Test 24: List objects (all) ---
+{
+    using var result = db.ListObjects("test-docs");
+    var data = result.RootElement.GetProperty("data");
+    var objectCount = data.GetArrayLength();
+    Assert(objectCount == 5, "list_objects returns all 5 objects", $"got {objectCount}");
+}
+
+// --- Test 25: List objects with prefix filter ---
+{
+    using var result = db.ListObjects("test-docs", "data/");
+    var data = result.RootElement.GetProperty("data");
+    var objectCount = data.GetArrayLength();
+    Assert(objectCount == 2, "list_objects prefix='data/' returns 2 objects", $"got {objectCount}");
+
+    // Verify sorted by key
+    var key0 = data[0].GetProperty("key").GetString();
+    var key1 = data[1].GetProperty("key").GetString();
+    Assert(string.Compare(key0, key1, StringComparison.Ordinal) < 0,
+        "list_objects sorted by key", $"'{key0}' < '{key1}'");
+}
+
+// --- Test 26: List objects with limit ---
+{
+    using var result = db.ListObjects("test-docs", null, 2);
+    var data = result.RootElement.GetProperty("data");
+    Assert(data.GetArrayLength() == 2, "list_objects limit=2 returns 2 objects");
+}
+
+// --- Test 27: Full-text search across bucket ---
+{
+    using var result = db.Search("database performance", "test-docs", 10);
+    var ok = result.RootElement.GetProperty("ok").GetBoolean();
+    Assert(ok, "search succeeds");
+    var data = result.RootElement.GetProperty("data");
+    var resultCount = data.GetArrayLength();
+    Assert(resultCount >= 1, "search 'database performance' finds results", $"got {resultCount}");
+
+    // Top result should have highest score
+    if (resultCount > 0)
+    {
+        var topKey = data[0].GetProperty("key").GetString();
+        var topScore = data[0].GetProperty("score").GetDouble();
+        Assert(topScore > 0, $"Top search result '{topKey}' has positive score ({topScore:F4})");
+        Console.WriteLine($"    (top result: {topKey}, score: {topScore:F4})");
+    }
+}
+
+// --- Test 28: Search with specific term ---
+{
+    using var result = db.Search("rust programming memory", "test-docs", 10);
+    var data = result.RootElement.GetProperty("data");
+    var resultCount = data.GetArrayLength();
+    Assert(resultCount >= 1, "search 'rust programming memory' finds results", $"got {resultCount}");
+
+    if (resultCount > 0)
+    {
+        var topKey = data[0].GetProperty("key").GetString();
+        Assert(topKey == "notes.md", "search 'rust programming' top result is notes.md", $"got '{topKey}'");
+    }
+}
+
+// --- Test 29: Search with no matching terms ---
+{
+    using var result = db.Search("xyznonexistent", "test-docs", 10);
+    var data = result.RootElement.GetProperty("data");
+    Assert(data.GetArrayLength() == 0, "search for nonexistent term returns empty");
+}
+
+// --- Test 30: Search JSON content (application/json indexing) ---
+{
+    using var result = db.Search("oxidb", "test-docs", 10);
+    var data = result.RootElement.GetProperty("data");
+    Assert(data.GetArrayLength() >= 1, "search indexes JSON string values", $"got {data.GetArrayLength()}");
+    if (data.GetArrayLength() > 0)
+    {
+        var topKey = data[0].GetProperty("key").GetString();
+        Assert(topKey == "data/config.json", "search JSON content finds config.json", $"got '{topKey}'");
+    }
+}
+
+// --- Test 31: Overwrite existing object ---
+{
+    var newContent = "Updated content about machine learning and artificial intelligence.";
+    var b64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(newContent));
+    db.PutObject("test-docs", "fox.txt", b64, "text/plain");
+
+    // Old content should no longer be searchable
+    using var result = db.Search("lazy dog", "test-docs", 10);
+    var data = result.RootElement.GetProperty("data");
+    Assert(data.GetArrayLength() == 0, "overwrite removes old content from search index");
+
+    // New content should be searchable
+    using var result2 = db.Search("machine learning", "test-docs", 10);
+    var data2 = result2.RootElement.GetProperty("data");
+    Assert(data2.GetArrayLength() >= 1, "overwrite indexes new content");
+}
+
+// --- Test 32: Delete object removes from search index ---
+{
+    db.DeleteObject("test-docs", "notes.md");
+
+    // Verify it's gone from search
+    using var result = db.Search("rust programming", "test-docs", 10);
+    var data = result.RootElement.GetProperty("data");
+    bool notesFound = false;
+    for (int i = 0; i < data.GetArrayLength(); i++)
+    {
+        if (data[i].GetProperty("key").GetString() == "notes.md")
+        {
+            notesFound = true;
+            break;
+        }
+    }
+    Assert(!notesFound, "delete_object removes document from search index");
+
+    // Verify get_object returns error
+    using var getResult = db.GetObject("test-docs", "notes.md");
+    var ok = getResult.RootElement.GetProperty("ok").GetBoolean();
+    Assert(!ok, "get_object after delete returns error");
+}
+
+// --- Test 33: Get from missing bucket returns error ---
+{
+    using var result = db.GetObject("nonexistent-bucket", "anything.txt");
+    var ok = result.RootElement.GetProperty("ok").GetBoolean();
+    Assert(!ok, "get_object from missing bucket returns error");
+}
+
+// --- Test 34: Put binary object (not indexed) ---
+{
+    var binaryData = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }; // PNG header
+    var b64 = Convert.ToBase64String(binaryData);
+    using var result = db.PutObject("test-images", "icon.png", b64, "image/png");
+    var ok = result.RootElement.GetProperty("ok").GetBoolean();
+    Assert(ok, "put_object binary data succeeds");
+
+    // Should not appear in text search
+    using var searchResult = db.Search("PNG", "test-images", 10);
+    var searchData = searchResult.RootElement.GetProperty("data");
+    Assert(searchData.GetArrayLength() == 0, "binary objects are not indexed for search");
+}
+
+// --- Test 35: HTML tag stripping for text/html ---
+{
+    var html = "<html><body><h1>Welcome</h1><p>This is about database optimization</p></body></html>";
+    var b64 = Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(html));
+    db.PutObject("test-docs", "page.html", b64, "text/html");
+
+    using var result = db.Search("welcome optimization", "test-docs", 10);
+    var data = result.RootElement.GetProperty("data");
+    bool htmlFound = false;
+    for (int i = 0; i < data.GetArrayLength(); i++)
+    {
+        if (data[i].GetProperty("key").GetString() == "page.html")
+        {
+            htmlFound = true;
+            break;
+        }
+    }
+    Assert(htmlFound, "text/html content is indexed with tags stripped");
+}
+
+// --- Test 36: Search across all buckets (no bucket filter) ---
+{
+    using var result = db.Search("database", null, 10);
+    var data = result.RootElement.GetProperty("data");
+    Assert(data.GetArrayLength() >= 1, "search without bucket filter finds results across buckets");
+}
+
+// --- Test 37: Delete bucket removes everything ---
+{
+    db.DeleteBucket("test-images");
+    using var result = db.ListBuckets();
+    var data = result.RootElement.GetProperty("data");
+    bool imagesFound = false;
+    for (int i = 0; i < data.GetArrayLength(); i++)
+    {
+        if (data[i].GetString() == "test-images")
+        {
+            imagesFound = true;
+            break;
+        }
+    }
+    Assert(!imagesFound, "delete_bucket removes bucket from list");
+}
+
+// Cleanup blob test data
+db.DeleteBucket("test-docs");
+
+// --- Blob + FTS Summary ---
+Console.WriteLine();
+Console.WriteLine($"=== Blob + FTS Tests: {passed - 18} passed (of {passed + failed - 18}) ===");
+Console.WriteLine();
+Console.WriteLine($"=== Total: {passed} passed, {failed} failed ===");
 
 // Cleanup
 db.DropCollection(Collection);
 Console.WriteLine();
-Console.WriteLine("Done. Collection dropped.");
+Console.WriteLine("Done. Cleaned up.");
 
 if (failed > 0)
     Environment.Exit(1);

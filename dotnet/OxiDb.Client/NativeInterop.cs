@@ -51,6 +51,35 @@ internal static partial class NativeInterop
     [LibraryImport(LibName, EntryPoint = "oxidb_aggregate", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint Aggregate(nint conn, string collection, string pipelineJson);
 
+    // Blob storage + FTS
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_create_bucket", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint CreateBucket(nint conn, string bucket);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_list_buckets")]
+    internal static partial nint ListBuckets(nint conn);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_delete_bucket", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint DeleteBucket(nint conn, string bucket);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_put_object", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint PutObject(nint conn, string bucket, string key, string dataB64, string? contentType, string? metadataJson);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_get_object", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint GetObject(nint conn, string bucket, string key);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_head_object", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint HeadObject(nint conn, string bucket, string key);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_delete_object", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint DeleteObject(nint conn, string bucket, string key);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_list_objects", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint ListObjects(nint conn, string bucket, string? prefix, int limit);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_search", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint Search(nint conn, string query, string? bucket, int limit);
+
     [LibraryImport(LibName, EntryPoint = "oxidb_free_string")]
     internal static partial void FreeString(nint ptr);
 }

@@ -98,6 +98,62 @@ public sealed class OxiDbClient : IDisposable
         return JsonDocument.Parse(raw);
     }
 
+    // Blob storage + FTS
+
+    public JsonDocument CreateBucket(string bucket)
+    {
+        var raw = Call(() => NativeInterop.CreateBucket(_conn, bucket));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument ListBuckets()
+    {
+        var raw = Call(() => NativeInterop.ListBuckets(_conn));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument DeleteBucket(string bucket)
+    {
+        var raw = Call(() => NativeInterop.DeleteBucket(_conn, bucket));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument PutObject(string bucket, string key, string dataB64, string? contentType = null, string? metadataJson = null)
+    {
+        var raw = Call(() => NativeInterop.PutObject(_conn, bucket, key, dataB64, contentType, metadataJson));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument GetObject(string bucket, string key)
+    {
+        var raw = Call(() => NativeInterop.GetObject(_conn, bucket, key));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument HeadObject(string bucket, string key)
+    {
+        var raw = Call(() => NativeInterop.HeadObject(_conn, bucket, key));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument DeleteObject(string bucket, string key)
+    {
+        var raw = Call(() => NativeInterop.DeleteObject(_conn, bucket, key));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument ListObjects(string bucket, string? prefix = null, int limit = 0)
+    {
+        var raw = Call(() => NativeInterop.ListObjects(_conn, bucket, prefix, limit));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument Search(string query, string? bucket = null, int limit = 0)
+    {
+        var raw = Call(() => NativeInterop.Search(_conn, query, bucket, limit));
+        return JsonDocument.Parse(raw);
+    }
+
     private string Call(Func<nint> nativeCall)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
