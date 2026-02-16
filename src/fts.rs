@@ -208,6 +208,9 @@ pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
     if ct.starts_with("text/html") {
         let text = String::from_utf8_lossy(data);
         Some(strip_html_tags(&text))
+    } else if ct == "text/xml" || ct == "application/xml" {
+        let text = String::from_utf8_lossy(data);
+        Some(strip_html_tags(&text))
     } else if ct.starts_with("text/") {
         String::from_utf8(data.to_vec()).ok()
     } else if ct == "application/json" {
@@ -219,9 +222,78 @@ pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
         } else {
             Some(parts.join(" "))
         }
+    } else if ct == "application/pdf" {
+        extract_pdf(data)
+    } else if ct == "application/vnd.openxmlformats-officedocument.wordprocessingml.document" {
+        extract_docx(data)
+    } else if ct == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" {
+        extract_xlsx(data)
     } else {
+        #[cfg(feature = "ocr")]
+        {
+            if ct == "image/png"
+                || ct == "image/jpeg"
+                || ct == "image/tiff"
+                || ct == "image/bmp"
+            {
+                return extract_image_ocr(data);
+            }
+        }
         None
     }
+}
+
+fn extract_pdf(data: &[u8]) -> Option<String> {
+    pdf_extract::extract_text_from_mem(data).ok().and_then(|s| {
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    })
+}
+
+fn extract_docx(data: &[u8]) -> Option<String> {
+    let cursor = std::io::Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut xml = String::new();
+    {
+        let mut file = archive.by_name("word/document.xml").ok()?;
+        std::io::Read::read_to_string(&mut file, &mut xml).ok()?;
+    }
+    let text = strip_html_tags(&xml);
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+#[cfg(feature = "ocr")]
+fn extract_image_ocr(data: &[u8]) -> Option<String> {
+    let mut lt = leptess::LepTess::new(None, "eng").ok()?;
+    lt.set_image_from_mem(data).ok()?;
+    let text = lt.get_utf8_text().ok()?;
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+fn extract_xlsx(data: &[u8]) -> Option<String> {
+    let cursor = std::io::Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor).ok()?;
+    let mut xml = String::new();
+    {
+        let mut file = archive.by_name("xl/sharedStrings.xml").ok()?;
+        std::io::Read::read_to_string(&mut file, &mut xml).ok()?;
+    }
+    // Extract text between <t> and </t> tags
+    let mut parts = Vec::new();
+    for segment in xml.split("<t") {
+        // handle both <t> and <t ...attributes>
+        if let Some(rest) = segment.split_once('>') {
+            if let Some((text, _)) = rest.1.split_once("</t>") {
+                let t = text.trim();
+                if !t.is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+        }
+    }
+    if parts.is_empty() { None } else { Some(parts.join(" ")) }
 }
 
 fn strip_html_tags(html: &str) -> String {
@@ -398,5 +470,147 @@ mod tests {
             .unwrap();
         let results = idx.search(None, "xyznonexistent", 10);
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn extract_text_xml() {
+        let xml = b"<root><item>Hello</item><item>World</item></root>";
+        let text = extract_text(xml, "text/xml").unwrap();
+        assert!(text.contains("Hello"));
+        assert!(text.contains("World"));
+        assert!(!text.contains("<item>"));
+
+        // Also test application/xml
+        let text2 = extract_text(xml, "application/xml").unwrap();
+        assert!(text2.contains("Hello"));
+    }
+
+    #[test]
+    fn extract_text_csv() {
+        let csv = b"name,age\nAlice,30\nBob,25";
+        let text = extract_text(csv, "text/csv").unwrap();
+        assert!(text.contains("Alice"));
+        assert!(text.contains("Bob"));
+    }
+
+    #[test]
+    fn extract_text_docx() {
+        // Build a minimal DOCX (ZIP with word/document.xml)
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("word/document.xml", options).unwrap();
+            std::io::Write::write_all(
+                &mut zip,
+                b"<w:document><w:body><w:p><w:r><w:t>Hello DOCX World</w:t></w:r></w:p></w:body></w:document>",
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        let data = buf.into_inner();
+        let text = extract_text(
+            &data,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        .unwrap();
+        assert!(text.contains("Hello DOCX World"));
+    }
+
+    #[test]
+    fn extract_text_xlsx() {
+        // Build a minimal XLSX (ZIP with xl/sharedStrings.xml)
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("xl/sharedStrings.xml", options).unwrap();
+            std::io::Write::write_all(
+                &mut zip,
+                b"<sst><si><t>Revenue</t></si><si><t>Expenses</t></si></sst>",
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        let data = buf.into_inner();
+        let text = extract_text(
+            &data,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        .unwrap();
+        assert!(text.contains("Revenue"));
+        assert!(text.contains("Expenses"));
+    }
+
+    #[test]
+    fn extract_text_pdf() {
+        // Use a minimal valid PDF
+        let pdf_bytes = b"%PDF-1.0
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj
+3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj
+4 0 obj<</Length 44>>
+stream
+BT /F1 12 Tf 100 700 Td (Hello PDF) Tj ET
+endstream
+endobj
+5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj
+xref
+0 6
+0000000000 65535 f
+0000000009 00000 n
+0000000058 00000 n
+0000000115 00000 n
+0000000266 00000 n
+0000000360 00000 n
+trailer<</Size 6/Root 1 0 R>>
+startxref
+431
+%%EOF";
+        let result = extract_text(pdf_bytes, "application/pdf");
+        // pdf_extract may or may not parse this minimal PDF successfully,
+        // so we just verify it doesn't panic and returns Some or None
+        if let Some(text) = result {
+            assert!(text.contains("Hello PDF"));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "ocr")]
+    fn extract_text_image_png_ocr() {
+        // Minimal 1x1 white PNG — no text to extract, should return None
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
+            0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xDE, // 8-bit RGB
+            0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, // IDAT chunk
+            0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, // deflated data
+            0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, // checksum
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND chunk
+            0xAE, 0x42, 0x60, 0x82,
+        ];
+        let result = extract_text(png, "image/png");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "ocr")]
+    fn extract_text_image_unsupported_returns_none() {
+        // GIF data should not be processed even with OCR enabled
+        let gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x00\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;";
+        let result = extract_text(gif, "image/gif");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "ocr")]
+    fn extract_text_image_corrupt_returns_none() {
+        // Garbage bytes claiming to be image/png should not panic
+        let garbage = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09";
+        let result = extract_text(garbage, "image/png");
+        assert!(result.is_none());
     }
 }

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "TCP server for OxiDB document database"
 
+[features]
+default = []
+ocr = ["oxidb/ocr"]
+
 [dependencies]
 oxidb = { path = ".." }
 serde = { version = "1", features = ["derive"] }

@@ -212,13 +212,19 @@ Objects are stored on disk as `_blobs/<bucket>/<id>.data` with a JSON metadata s
 
 ## Full-Text Search
 
-Text content from uploaded objects is automatically indexed. Supported content types:
+Text content from uploaded objects is automatically indexed in a background thread so `put_object` returns immediately. Supported content types:
 
-| Content Type | Extraction |
-|---|---|
-| `text/*` | UTF-8 decode (HTML tags stripped for `text/html`) |
-| `application/json` | Recursive string value extraction |
-| Other | Not indexed (blob stored only) |
+| Content Type | Extensions | Extraction |
+|---|---|---|
+| `text/html` | .html | Strip HTML tags |
+| `text/xml`, `application/xml` | .xml | Strip XML tags |
+| `text/*` | .txt, .md, .csv, .tsv, .log | UTF-8 decode |
+| `application/json` | .json | Recursive string value extraction |
+| `application/pdf` | .pdf | PDF text extraction (`pdf-extract`) |
+| `application/vnd.openxmlformats-officedocument.wordprocessingml.document` | .docx | Unzip → extract `word/document.xml` → strip tags |
+| `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | .xlsx | Unzip → extract shared strings |
+| `image/png`, `image/jpeg`, `image/tiff`, `image/bmp` | .png, .jpg, .tiff, .bmp | OCR via Tesseract (requires `ocr` feature) |
+| Other | * | Not indexed (blob stored only) |
 
 Search uses TF-IDF scoring to rank results:
 
@@ -235,6 +241,28 @@ let results = db.search(Some("docs"), "database", 10)?;
 ```
 
 Each result includes `bucket`, `key`, and `score` (TF-IDF relevance).
+
+### OCR / ICR (Image Text Extraction)
+
+With the `ocr` feature enabled, uploaded images (PNG, JPEG, TIFF, BMP) are automatically processed with Tesseract OCR to extract printed and handwritten text, which is then indexed for full-text search.
+
+**Install system dependencies:**
+
+```bash
+# macOS
+brew install tesseract leptonica
+
+# Ubuntu / Debian
+sudo apt-get install libtesseract-dev libleptonica-dev tesseract-ocr-eng
+```
+
+**Build with OCR support:**
+
+```bash
+cargo build --workspace --features ocr
+```
+
+Without the `ocr` feature (the default), the project compiles and runs normally — image blobs are stored but not text-indexed.
 
 ## Compaction
 
