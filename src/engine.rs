@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
 
 use serde_json::{json, Value};
 
@@ -12,6 +12,19 @@ use crate::fts::{self, FtsIndex};
 use crate::pipeline::Pipeline;
 use crate::query::FindOptions;
 
+enum FtsJob {
+    Index {
+        data: Vec<u8>,
+        content_type: String,
+        bucket: String,
+        key: String,
+    },
+    Remove {
+        bucket: String,
+        key: String,
+    },
+}
+
 /// The main OxiDB engine. Manages multiple collections.
 ///
 /// Thread-safe: uses a `RwLock` on the collections map and per-collection
@@ -22,6 +35,7 @@ pub struct OxiDb {
     collections: RwLock<HashMap<String, Arc<RwLock<Collection>>>>,
     blob_store: BlobStore,
     fts_index: Arc<RwLock<FtsIndex>>,
+    fts_tx: mpsc::SyncSender<FtsJob>,
 }
 
 impl OxiDb {
@@ -29,12 +43,31 @@ impl OxiDb {
     pub fn open(data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let blob_store = BlobStore::open(data_dir)?;
-        let fts_index = FtsIndex::open(data_dir)?;
+        let fts_index = Arc::new(RwLock::new(FtsIndex::open(data_dir)?));
+
+        let (fts_tx, fts_rx) = mpsc::sync_channel::<FtsJob>(256);
+        let fts_worker = Arc::clone(&fts_index);
+        std::thread::spawn(move || {
+            while let Ok(job) = fts_rx.recv() {
+                match job {
+                    FtsJob::Index { data, content_type, bucket, key } => {
+                        if let Some(text) = fts::extract_text(&data, &content_type) {
+                            let _ = fts_worker.write().unwrap().index_document(&bucket, &key, &text);
+                        }
+                    }
+                    FtsJob::Remove { bucket, key } => {
+                        let _ = fts_worker.write().unwrap().remove_document(&bucket, &key);
+                    }
+                }
+            }
+        });
+
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             collections: RwLock::new(HashMap::new()),
             blob_store,
-            fts_index: Arc::new(RwLock::new(fts_index)),
+            fts_index,
+            fts_tx,
         })
     }
 
@@ -214,16 +247,11 @@ impl OxiDb {
             .blob_store
             .put_object(bucket, key, data, content_type, metadata)?;
 
-        // Spawn background thread for text extraction + indexing
-        let fts = Arc::clone(&self.fts_index);
-        let data_owned = data.to_vec();
-        let ct = content_type.to_string();
-        let b = bucket.to_string();
-        let k = key.to_string();
-        std::thread::spawn(move || {
-            if let Some(text) = fts::extract_text(&data_owned, &ct) {
-                let _ = fts.write().unwrap().index_document(&b, &k, &text);
-            }
+        let _ = self.fts_tx.send(FtsJob::Index {
+            data: data.to_vec(),
+            content_type: content_type.to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
         });
 
         Ok(serde_json::to_value(&meta)?)
@@ -242,12 +270,9 @@ impl OxiDb {
     pub fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.blob_store.delete_object(bucket, key)?;
 
-        // Spawn background thread for FTS removal
-        let fts = Arc::clone(&self.fts_index);
-        let b = bucket.to_string();
-        let k = key.to_string();
-        std::thread::spawn(move || {
-            let _ = fts.write().unwrap().remove_document(&b, &k);
+        let _ = self.fts_tx.send(FtsJob::Remove {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
         });
 
         Ok(())
