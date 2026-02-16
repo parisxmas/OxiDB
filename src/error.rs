@@ -37,6 +37,20 @@ pub enum Error {
 
     #[error("bucket not found: {0}")]
     BucketNotFound(String),
+
+    #[error("transaction conflict on '{collection}' doc {doc_id}: expected version {expected_version}, found {actual_version}")]
+    TransactionConflict {
+        collection: String,
+        doc_id: u64,
+        expected_version: u64,
+        actual_version: u64,
+    },
+
+    #[error("transaction not found: {0}")]
+    TransactionNotFound(u64),
+
+    #[error("no active transaction")]
+    NoActiveTransaction,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -110,6 +110,26 @@ public sealed class OxiDbClient : IDisposable
         return JsonDocument.Parse(raw);
     }
 
+    // Transactions
+
+    public JsonDocument BeginTransaction()
+    {
+        var raw = Call(() => NativeInterop.BeginTx(_conn));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument CommitTransaction()
+    {
+        var raw = Call(() => NativeInterop.CommitTx(_conn));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument RollbackTransaction()
+    {
+        var raw = Call(() => NativeInterop.RollbackTx(_conn));
+        return JsonDocument.Parse(raw);
+    }
+
     // Blob storage + FTS
 
     public JsonDocument CreateBucket(string bucket)

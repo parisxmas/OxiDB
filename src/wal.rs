@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -16,9 +16,34 @@ const OP_DELETE: u8 = 3;
 
 /// A WAL entry representing a pending mutation.
 pub enum WalEntry {
-    Insert { doc_id: DocumentId, doc_bytes: Vec<u8> },
-    Update { doc_id: DocumentId, doc_bytes: Vec<u8> },
-    Delete { doc_id: DocumentId },
+    Insert { doc_id: DocumentId, doc_bytes: Vec<u8>, tx_id: u64 },
+    Update { doc_id: DocumentId, doc_bytes: Vec<u8>, tx_id: u64 },
+    Delete { doc_id: DocumentId, tx_id: u64 },
+}
+
+impl WalEntry {
+    /// Create an Insert entry with tx_id=0 (non-transactional).
+    pub fn insert(doc_id: DocumentId, doc_bytes: Vec<u8>) -> Self {
+        WalEntry::Insert { doc_id, doc_bytes, tx_id: 0 }
+    }
+
+    /// Create an Update entry with tx_id=0 (non-transactional).
+    pub fn update(doc_id: DocumentId, doc_bytes: Vec<u8>) -> Self {
+        WalEntry::Update { doc_id, doc_bytes, tx_id: 0 }
+    }
+
+    /// Create a Delete entry with tx_id=0 (non-transactional).
+    pub fn delete(doc_id: DocumentId) -> Self {
+        WalEntry::Delete { doc_id, tx_id: 0 }
+    }
+
+    pub fn tx_id(&self) -> u64 {
+        match self {
+            WalEntry::Insert { tx_id, .. } => *tx_id,
+            WalEntry::Update { tx_id, .. } => *tx_id,
+            WalEntry::Delete { tx_id, .. } => *tx_id,
+        }
+    }
 }
 
 /// Write-ahead log for crash-safe mutations.
@@ -88,20 +113,34 @@ impl Wal {
     }
 
     /// Read all valid entries from the WAL and replay them idempotently.
+    /// Entries with tx_id != 0 are only replayed if tx_id is in committed_tx_ids.
     pub fn recover(
         &self,
         storage: &Storage,
         primary_index: &mut HashMap<DocumentId, DocLocation>,
         next_id: &mut DocumentId,
+        committed_tx_ids: &HashSet<u64>,
+        version_index: &mut HashMap<DocumentId, u64>,
     ) -> Result<()> {
         let entries = self.read_entries()?;
 
         for entry in entries {
+            // Skip uncommitted transactional entries
+            let tx_id = entry.tx_id();
+            if tx_id != 0 && !committed_tx_ids.contains(&tx_id) {
+                continue;
+            }
+
             match entry {
-                WalEntry::Insert { doc_id, doc_bytes } => {
+                WalEntry::Insert { doc_id, doc_bytes, .. } => {
                     // Skip if already present in primary_index
                     if primary_index.contains_key(&doc_id) {
                         continue;
+                    }
+                    // Read _version from the doc bytes
+                    if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&doc_bytes) {
+                        let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                        version_index.insert(doc_id, ver);
                     }
                     let loc = storage.append(&doc_bytes)?;
                     primary_index.insert(doc_id, loc);
@@ -109,7 +148,7 @@ impl Wal {
                         *next_id = doc_id + 1;
                     }
                 }
-                WalEntry::Update { doc_id, doc_bytes } => {
+                WalEntry::Update { doc_id, doc_bytes, .. } => {
                     if let Some(&old_loc) = primary_index.get(&doc_id) {
                         // Read current doc bytes; if different, apply update
                         let current_bytes = storage.read(old_loc)?;
@@ -119,13 +158,18 @@ impl Wal {
                             primary_index.insert(doc_id, new_loc);
                         }
                     }
-                    // If doc_id not in index, skip (already deleted or never existed)
+                    // Update version_index from the new doc bytes
+                    if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&doc_bytes) {
+                        let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                        version_index.insert(doc_id, ver);
+                    }
                 }
-                WalEntry::Delete { doc_id } => {
+                WalEntry::Delete { doc_id, .. } => {
                     if let Some(&loc) = primary_index.get(&doc_id) {
                         storage.mark_deleted(loc)?;
                         primary_index.remove(&doc_id);
                     }
+                    version_index.remove(&doc_id);
                 }
             }
         }
@@ -146,25 +190,29 @@ impl Wal {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Payload format: [op_type: u8][tx_id: u64 LE][doc_id: u64 LE][doc_bytes...]
     fn serialize_entry(entry: &WalEntry) -> Vec<u8> {
         match entry {
-            WalEntry::Insert { doc_id, doc_bytes } => {
-                let mut payload = Vec::with_capacity(1 + 8 + doc_bytes.len());
+            WalEntry::Insert { doc_id, doc_bytes, tx_id } => {
+                let mut payload = Vec::with_capacity(1 + 8 + 8 + doc_bytes.len());
                 payload.push(OP_INSERT);
+                payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
                 payload.extend_from_slice(doc_bytes);
                 payload
             }
-            WalEntry::Update { doc_id, doc_bytes } => {
-                let mut payload = Vec::with_capacity(1 + 8 + doc_bytes.len());
+            WalEntry::Update { doc_id, doc_bytes, tx_id } => {
+                let mut payload = Vec::with_capacity(1 + 8 + 8 + doc_bytes.len());
                 payload.push(OP_UPDATE);
+                payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
                 payload.extend_from_slice(doc_bytes);
                 payload
             }
-            WalEntry::Delete { doc_id } => {
-                let mut payload = Vec::with_capacity(1 + 8);
+            WalEntry::Delete { doc_id, tx_id } => {
+                let mut payload = Vec::with_capacity(1 + 8 + 8);
                 payload.push(OP_DELETE);
+                payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
                 payload
             }
@@ -223,35 +271,27 @@ impl Wal {
         Ok(entries)
     }
 
+    /// Payload format: [op_type: u8][tx_id: u64 LE][doc_id: u64 LE][doc_bytes...]
     fn parse_payload(payload: &[u8]) -> Option<WalEntry> {
-        if payload.is_empty() {
-            return None;
+        if payload.len() < 17 {
+            return None; // minimum: 1 (op) + 8 (tx_id) + 8 (doc_id)
         }
 
         let op_type = payload[0];
+        let tx_id = u64::from_le_bytes(payload[1..9].try_into().ok()?);
+        let doc_id = u64::from_le_bytes(payload[9..17].try_into().ok()?);
+
         match op_type {
             OP_INSERT => {
-                if payload.len() < 9 {
-                    return None;
-                }
-                let doc_id = u64::from_le_bytes(payload[1..9].try_into().ok()?);
-                let doc_bytes = payload[9..].to_vec();
-                Some(WalEntry::Insert { doc_id, doc_bytes })
+                let doc_bytes = payload[17..].to_vec();
+                Some(WalEntry::Insert { doc_id, doc_bytes, tx_id })
             }
             OP_UPDATE => {
-                if payload.len() < 9 {
-                    return None;
-                }
-                let doc_id = u64::from_le_bytes(payload[1..9].try_into().ok()?);
-                let doc_bytes = payload[9..].to_vec();
-                Some(WalEntry::Update { doc_id, doc_bytes })
+                let doc_bytes = payload[17..].to_vec();
+                Some(WalEntry::Update { doc_id, doc_bytes, tx_id })
             }
             OP_DELETE => {
-                if payload.len() < 9 {
-                    return None;
-                }
-                let doc_id = u64::from_le_bytes(payload[1..9].try_into().ok()?);
-                Some(WalEntry::Delete { doc_id })
+                Some(WalEntry::Delete { doc_id, tx_id })
             }
             _ => None,
         }

@@ -480,6 +480,88 @@ var stats = db.Aggregate("orders", """
 """);
 ```
 
+## Java / Spring Boot
+
+Add the starter to your `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>com.oxidb</groupId>
+    <artifactId>oxidb-spring-boot-starter</artifactId>
+    <version>0.1.0</version>
+</dependency>
+```
+
+Configure in `application.properties`:
+
+```properties
+oxidb.host=127.0.0.1
+oxidb.port=4444
+oxidb.timeout-ms=5000
+```
+
+Use the auto-configured client:
+
+```java
+@RestController
+public class MyController {
+
+    @Autowired
+    private OxiDbClient db;
+
+    @PostMapping("/users")
+    public JsonNode createUser(@RequestBody String json) {
+        return db.insert("users", json);
+    }
+
+    @GetMapping("/users")
+    public JsonNode listUsers() {
+        return db.find("users", Map.of());
+    }
+}
+```
+
+Transactions with automatic commit/rollback:
+
+```java
+db.withTransaction(() -> {
+    db.insert("ledger", Map.of("action", "debit",  "amount", 100));
+    db.insert("ledger", Map.of("action", "credit", "amount", 100));
+});
+```
+
+See `examples/spring-boot` for a full working app with REST endpoints for all OxiDB features.
+
+## Julia
+
+The Julia client (`julia/OxiDb`) communicates with oxidb-server over TCP using the length-prefixed JSON protocol. Zero dependencies beyond `JSON3`.
+
+```julia
+using OxiDb
+
+client = connect_oxidb("127.0.0.1", 4444)
+
+# CRUD
+insert(client, "users", Dict("name" => "Alice", "age" => 30))
+docs = find(client, "users", Dict("name" => "Alice"))
+update(client, "users", Dict("name" => "Alice"), Dict("\$set" => Dict("age" => 31)))
+delete(client, "users", Dict("name" => "Alice"))
+n = count_docs(client, "users")
+
+# Transactions with automatic commit/rollback
+transaction(client) do
+    insert(client, "ledger", Dict("action" => "debit",  "amount" => 100))
+    insert(client, "ledger", Dict("action" => "credit", "amount" => 100))
+end
+
+# Blob storage
+create_bucket(client, "files")
+put_object(client, "files", "hello.txt", Vector{UInt8}("Hello!"))
+data, meta = get_object(client, "files", "hello.txt")
+
+close(client)
+```
+
 ## Architecture
 
 ### Storage (.dat files)

@@ -1,5 +1,5 @@
-mod handler;
-mod protocol;
+use oxidb_server::handler;
+use oxidb_server::protocol;
 
 use std::env;
 use std::net::{TcpListener, TcpStream};
@@ -15,6 +15,8 @@ fn handle_client(mut stream: TcpStream, db: &Arc<OxiDb>) {
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
     eprintln!("client connected: {peer}");
+
+    let mut active_tx: Option<u64> = None;
 
     loop {
         let msg = match protocol::read_message(&mut stream) {
@@ -40,13 +42,18 @@ fn handle_client(mut stream: TcpStream, db: &Arc<OxiDb>) {
             }
         };
 
-        let response = handler::handle_request(db, &request);
+        let response = handler::handle_request(db, &request, &mut active_tx);
         let resp_bytes = response.to_string().into_bytes();
 
         if let Err(e) = protocol::write_message(&mut stream, &resp_bytes) {
             eprintln!("write error to {peer}: {e}");
             break;
         }
+    }
+
+    // Auto-rollback on disconnect
+    if let Some(tx_id) = active_tx {
+        let _ = db.rollback_transaction(tx_id);
     }
 
     eprintln!("client disconnected: {peer}");

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use serde_json::{json, Value};
 
@@ -11,6 +12,8 @@ use crate::error::{Error, Result};
 use crate::fts::{self, FtsIndex};
 use crate::pipeline::Pipeline;
 use crate::query::FindOptions;
+use crate::transaction::{ReadRecord, Transaction, WriteOp};
+use crate::tx_log::{TransactionId, TxCommitLog};
 
 enum FtsJob {
     Index {
@@ -36,6 +39,9 @@ pub struct OxiDb {
     blob_store: BlobStore,
     fts_index: Arc<RwLock<FtsIndex>>,
     fts_tx: mpsc::SyncSender<FtsJob>,
+    tx_log: TxCommitLog,
+    next_tx_id: AtomicU64,
+    active_transactions: RwLock<HashMap<TransactionId, Mutex<Transaction>>>,
 }
 
 impl OxiDb {
@@ -44,6 +50,10 @@ impl OxiDb {
         std::fs::create_dir_all(data_dir)?;
         let blob_store = BlobStore::open(data_dir)?;
         let fts_index = Arc::new(RwLock::new(FtsIndex::open(data_dir)?));
+
+        // Open transaction commit log and read committed tx_ids for recovery
+        let tx_log = TxCommitLog::open(data_dir)?;
+        let committed_tx_ids = tx_log.read_committed()?;
 
         let (fts_tx, fts_rx) = mpsc::sync_channel::<FtsJob>(256);
         let fts_worker = Arc::clone(&fts_index);
@@ -62,12 +72,20 @@ impl OxiDb {
             }
         });
 
+        // After recovery, clear the commit log (all committed txns are now applied)
+        if !committed_tx_ids.is_empty() {
+            tx_log.clear()?;
+        }
+
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             collections: RwLock::new(HashMap::new()),
             blob_store,
             fts_index,
             fts_tx,
+            tx_log,
+            next_tx_id: AtomicU64::new(1),
+            active_transactions: RwLock::new(HashMap::new()),
         })
     }
 
@@ -220,6 +238,250 @@ impl OxiDb {
     }
 
     // -----------------------------------------------------------------------
+    // Transaction methods
+    // -----------------------------------------------------------------------
+
+    /// Begin a new transaction. Returns the transaction ID.
+    pub fn begin_transaction(&self) -> TransactionId {
+        let tx_id = self.next_tx_id.fetch_add(1, Ordering::SeqCst);
+        let tx = Transaction::new(tx_id);
+        self.active_transactions.write().unwrap().insert(tx_id, Mutex::new(tx));
+        tx_id
+    }
+
+    /// Buffer an insert within a transaction.
+    pub fn tx_insert(&self, tx_id: TransactionId, collection: &str, doc: Value) -> Result<()> {
+        let txs = self.active_transactions.read().unwrap();
+        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
+        let mut tx = tx_mutex.lock().unwrap();
+        tx.collections_involved.insert(collection.to_string());
+        tx.write_ops.push(WriteOp::Insert {
+            collection: collection.to_string(),
+            data: doc,
+        });
+        Ok(())
+    }
+
+    /// Execute a read within a transaction, recording versions for OCC.
+    pub fn tx_find(&self, tx_id: TransactionId, collection: &str, query: &Value) -> Result<Vec<Value>> {
+        let col = self.get_or_create_collection(collection)?;
+        let col_guard = col.read().unwrap();
+        let results = col_guard.find(query)?;
+
+        // Record read versions
+        let txs = self.active_transactions.read().unwrap();
+        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
+        let mut tx = tx_mutex.lock().unwrap();
+        tx.collections_involved.insert(collection.to_string());
+
+        for doc in &results {
+            if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                let version = col_guard.get_version(doc_id);
+                tx.read_set.push(ReadRecord {
+                    collection: collection.to_string(),
+                    doc_id,
+                    version,
+                });
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Buffer an update within a transaction, recording read versions.
+    pub fn tx_update(
+        &self,
+        tx_id: TransactionId,
+        collection: &str,
+        query: &Value,
+        update: &Value,
+    ) -> Result<()> {
+        // Read to find matching docs and record their versions
+        let col = self.get_or_create_collection(collection)?;
+        let col_guard = col.read().unwrap();
+        let matching = col_guard.find(query)?;
+
+        let txs = self.active_transactions.read().unwrap();
+        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
+        let mut tx = tx_mutex.lock().unwrap();
+        tx.collections_involved.insert(collection.to_string());
+
+        for doc in &matching {
+            if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                let version = col_guard.get_version(doc_id);
+                tx.read_set.push(ReadRecord {
+                    collection: collection.to_string(),
+                    doc_id,
+                    version,
+                });
+            }
+        }
+
+        tx.write_ops.push(WriteOp::Update {
+            collection: collection.to_string(),
+            query: query.clone(),
+            update: update.clone(),
+        });
+        Ok(())
+    }
+
+    /// Buffer a delete within a transaction, recording read versions.
+    pub fn tx_delete(
+        &self,
+        tx_id: TransactionId,
+        collection: &str,
+        query: &Value,
+    ) -> Result<()> {
+        let col = self.get_or_create_collection(collection)?;
+        let col_guard = col.read().unwrap();
+        let matching = col_guard.find(query)?;
+
+        let txs = self.active_transactions.read().unwrap();
+        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
+        let mut tx = tx_mutex.lock().unwrap();
+        tx.collections_involved.insert(collection.to_string());
+
+        for doc in &matching {
+            if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                let version = col_guard.get_version(doc_id);
+                tx.read_set.push(ReadRecord {
+                    collection: collection.to_string(),
+                    doc_id,
+                    version,
+                });
+            }
+        }
+
+        tx.write_ops.push(WriteOp::Delete {
+            collection: collection.to_string(),
+            query: query.clone(),
+        });
+        Ok(())
+    }
+
+    /// Commit a transaction using OCC validation.
+    pub fn commit_transaction(&self, tx_id: TransactionId) -> Result<()> {
+        // 1. Remove transaction from active set
+        let tx = {
+            let mut txs = self.active_transactions.write().unwrap();
+            txs.remove(&tx_id)
+                .ok_or(Error::TransactionNotFound(tx_id))?
+        };
+        let tx = tx.into_inner().unwrap();
+
+        // 2. Acquire write locks on all involved collections in BTreeSet order (deadlock-free)
+        let mut locked_collections: Vec<(String, Arc<RwLock<Collection>>)> = Vec::new();
+        for col_name in &tx.collections_involved {
+            let col = self.get_or_create_collection(col_name)?;
+            locked_collections.push((col_name.clone(), col));
+        }
+
+        // Acquire write guards -- we hold them for the duration of commit
+        let mut write_guards: HashMap<String, std::sync::RwLockWriteGuard<Collection>> = HashMap::new();
+        for (name, col_arc) in &locked_collections {
+            write_guards.insert(name.clone(), col_arc.write().unwrap());
+        }
+
+        // 3. OCC validation: verify all recorded versions match current versions
+        for record in &tx.read_set {
+            if let Some(col) = write_guards.get(&record.collection) {
+                let current_version = col.get_version(record.doc_id);
+                if current_version != record.version {
+                    return Err(Error::TransactionConflict {
+                        collection: record.collection.clone(),
+                        doc_id: record.doc_id,
+                        expected_version: record.version,
+                        actual_version: current_version,
+                    });
+                }
+            }
+        }
+
+        // 4. Prepare: execute each WriteOp against the locked collection
+        //    Collect WAL entries and mutations per collection
+        let mut all_mutations: HashMap<String, Vec<crate::collection::PreparedMutation>> = HashMap::new();
+
+        for op in tx.write_ops {
+            match op {
+                WriteOp::Insert { collection, data } => {
+                    let col = write_guards.get_mut(&collection).unwrap();
+                    let mutation = col.prepare_tx_insert(data, tx_id)?;
+                    all_mutations.entry(collection).or_default().push(mutation);
+                }
+                WriteOp::Update { collection, query, update } => {
+                    let col = write_guards.get_mut(&collection).unwrap();
+                    let mutations = col.prepare_tx_update(&query, &update, tx_id)?;
+                    all_mutations.entry(collection).or_default().extend(mutations);
+                }
+                WriteOp::Delete { collection, query } => {
+                    let col = write_guards.get_mut(&collection).unwrap();
+                    let mutations = col.prepare_tx_delete(&query, tx_id)?;
+                    all_mutations.entry(collection).or_default().extend(mutations);
+                }
+            }
+        }
+
+        // 5. WAL log: for each collection, log WAL entries with single fsync each
+        for (col_name, mutations) in &all_mutations {
+            let col = write_guards.get(col_name).unwrap();
+            let entries: Vec<crate::wal::WalEntry> = mutations
+                .iter()
+                .map(|m| match &m.wal_entry {
+                    crate::wal::WalEntry::Insert { doc_id, doc_bytes, tx_id } => {
+                        crate::wal::WalEntry::Insert {
+                            doc_id: *doc_id,
+                            doc_bytes: doc_bytes.clone(),
+                            tx_id: *tx_id,
+                        }
+                    }
+                    crate::wal::WalEntry::Update { doc_id, doc_bytes, tx_id } => {
+                        crate::wal::WalEntry::Update {
+                            doc_id: *doc_id,
+                            doc_bytes: doc_bytes.clone(),
+                            tx_id: *tx_id,
+                        }
+                    }
+                    crate::wal::WalEntry::Delete { doc_id, tx_id } => {
+                        crate::wal::WalEntry::Delete {
+                            doc_id: *doc_id,
+                            tx_id: *tx_id,
+                        }
+                    }
+                })
+                .collect();
+            col.log_wal_batch(&entries)?;
+        }
+
+        // 6. COMMIT POINT: mark transaction as committed in the global log
+        self.tx_log.mark_committed(tx_id)?;
+
+        // 7. Apply: for each collection, apply mutations to storage
+        for (col_name, mut mutations) in all_mutations {
+            let col = write_guards.get_mut(&col_name).unwrap();
+            col.apply_prepared(&mut mutations)?;
+        }
+
+        // 8. Checkpoint: for each collection, checkpoint WAL
+        for (col_name, _) in &locked_collections {
+            let col = write_guards.get(col_name).unwrap();
+            col.checkpoint_wal()?;
+        }
+
+        // 9. Cleanup: remove tx_id from commit log
+        self.tx_log.remove_committed(tx_id)?;
+
+        // 10. Write locks drop automatically when write_guards goes out of scope
+        Ok(())
+    }
+
+    /// Rollback a transaction, discarding all buffered operations.
+    pub fn rollback_transaction(&self, tx_id: TransactionId) -> Result<()> {
+        let mut txs = self.active_transactions.write().unwrap();
+        txs.remove(&tx_id);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Blob storage methods
     // -----------------------------------------------------------------------
 
@@ -308,5 +570,132 @@ impl OxiDb {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    fn temp_db() -> OxiDb {
+        let dir = tempdir().unwrap();
+        OxiDb::open(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn tx_insert_commit() {
+        let db = temp_db();
+        let tx_id = db.begin_transaction();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
+        db.commit_transaction(tx_id).unwrap();
+
+        let docs = db.find("users", &json!({})).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["name"], "Alice");
+    }
+
+    #[test]
+    fn tx_insert_rollback() {
+        let db = temp_db();
+        let tx_id = db.begin_transaction();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
+        db.rollback_transaction(tx_id).unwrap();
+
+        let docs = db.find("users", &json!({})).unwrap();
+        assert_eq!(docs.len(), 0);
+    }
+
+    #[test]
+    fn tx_multi_collection_commit() {
+        let db = temp_db();
+        let tx_id = db.begin_transaction();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
+        db.tx_insert(tx_id, "orders", json!({"item": "Widget"})).unwrap();
+        db.commit_transaction(tx_id).unwrap();
+
+        let users = db.find("users", &json!({})).unwrap();
+        let orders = db.find("orders", &json!({})).unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(orders.len(), 1);
+    }
+
+    #[test]
+    fn tx_multi_collection_rollback() {
+        let db = temp_db();
+        let tx_id = db.begin_transaction();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
+        db.tx_insert(tx_id, "orders", json!({"item": "Widget"})).unwrap();
+        db.rollback_transaction(tx_id).unwrap();
+
+        let users = db.find("users", &json!({})).unwrap();
+        let orders = db.find("orders", &json!({})).unwrap();
+        assert_eq!(users.len(), 0);
+        assert_eq!(orders.len(), 0);
+    }
+
+    #[test]
+    fn tx_occ_conflict() {
+        let db = temp_db();
+        // Insert a doc outside of a transaction
+        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
+
+        // TX1 reads the doc
+        let tx1 = db.begin_transaction();
+        let docs = db.tx_find(tx1, "users", &json!({"name": "Alice"})).unwrap();
+        assert_eq!(docs.len(), 1);
+
+        // TX2 updates the doc and commits
+        let tx2 = db.begin_transaction();
+        db.tx_update(tx2, "users", &json!({"name": "Alice"}), &json!({"$set": {"age": 31}})).unwrap();
+        db.commit_transaction(tx2).unwrap();
+
+        // TX1 tries to update -- should get a conflict since the version changed
+        db.tx_update(tx1, "users", &json!({"name": "Alice"}), &json!({"$set": {"age": 32}})).unwrap();
+        let result = db.commit_transaction(tx1);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::TransactionConflict { .. } => {}
+            other => panic!("Expected TransactionConflict, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_no_conflict() {
+        let db = temp_db();
+        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
+        db.insert("users", json!({"name": "Bob", "age": 25})).unwrap();
+
+        // TX1 reads and updates Alice
+        let tx1 = db.begin_transaction();
+        db.tx_find(tx1, "users", &json!({"name": "Alice"})).unwrap();
+        db.tx_update(tx1, "users", &json!({"name": "Alice"}), &json!({"$set": {"age": 31}})).unwrap();
+
+        // TX2 reads and updates Bob (different doc)
+        let tx2 = db.begin_transaction();
+        db.tx_find(tx2, "users", &json!({"name": "Bob"})).unwrap();
+        db.tx_update(tx2, "users", &json!({"name": "Bob"}), &json!({"$set": {"age": 26}})).unwrap();
+
+        // Both should succeed
+        db.commit_transaction(tx1).unwrap();
+        db.commit_transaction(tx2).unwrap();
+
+        let alice = db.find_one("users", &json!({"name": "Alice"})).unwrap().unwrap();
+        let bob = db.find_one("users", &json!({"name": "Bob"})).unwrap().unwrap();
+        assert_eq!(alice["age"], 31);
+        assert_eq!(bob["age"], 26);
+    }
+
+    #[test]
+    fn auto_rollback_on_drop() {
+        let db = temp_db();
+        let tx_id = db.begin_transaction();
+        db.tx_insert(tx_id, "users", json!({"name": "Ghost"})).unwrap();
+        // Simulate disconnect: just rollback without commit
+        db.rollback_transaction(tx_id).unwrap();
+
+        let docs = db.find("users", &json!({})).unwrap();
+        assert_eq!(docs.len(), 0);
     }
 }
