@@ -1,0 +1,11 @@
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/obj/Debug/net10.0/OxiDb.Client.GeneratedMSBuildEditorConfig.editorconfig
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/obj/Debug/net10.0/OxiDb.Client.AssemblyInfoInputs.cache
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/obj/Debug/net10.0/OxiDb.Client.AssemblyInfo.cs
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/obj/Debug/net10.0/OxiDb.Client.csproj.CoreCompileInputs.cache
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/bin/Debug/net10.0/OxiDb.Client.deps.json
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/bin/Debug/net10.0/OxiDb.Client.dll
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/bin/Debug/net10.0/OxiDb.Client.pdb
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/obj/Debug/net10.0/OxiDb.Client.dll
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/obj/Debug/net10.0/refint/OxiDb.Client.dll
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/obj/Debug/net10.0/OxiDb.Client.pdb
+/Users/barisakin/source/docdb/dotnet/OxiDb.Client/obj/Debug/net10.0/ref/OxiDb.Client.dll
