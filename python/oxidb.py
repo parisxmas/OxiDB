@@ -45,6 +45,7 @@ class OxiDbClient:
 
     def __init__(self, host: str = "127.0.0.1", port: int = 4444, timeout: float = 5.0):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(timeout)
         self._sock.connect((host, port))
 
@@ -67,8 +68,7 @@ class OxiDbClient:
     # ------------------------------------------------------------------
 
     def _send_raw(self, data: bytes):
-        self._sock.sendall(struct.pack("<I", len(data)))
-        self._sock.sendall(data)
+        self._sock.sendall(struct.pack("<I", len(data)) + data)
 
     def _recv_raw(self) -> bytes:
         length_bytes = self._recv_exact(4)

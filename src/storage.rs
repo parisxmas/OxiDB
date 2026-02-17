@@ -1,8 +1,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use crate::crypto::EncryptionKey;
 use crate::error::Result;
 
 const RECORD_ACTIVE: u8 = 0;
@@ -22,17 +23,23 @@ struct StorageInner {
 
 /// Append-only file storage for documents.
 ///
-/// Record format: [status: u8][length: u32 LE][json_bytes]
+/// Record format: [status: u8][length: u32 LE][payload]
 /// - status 0 = active, 1 = deleted (soft delete)
+/// - payload is either raw json_bytes or encrypted bytes
 ///
 /// Thread-safe: all file operations are serialized via an internal Mutex.
 pub struct Storage {
     _path: PathBuf,
     inner: Mutex<StorageInner>,
+    encryption: Option<Arc<EncryptionKey>>,
 }
 
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_encryption(path, None)
+    }
+
+    pub fn open_with_encryption(path: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -52,19 +59,37 @@ impl Storage {
                 file,
                 current_offset,
             }),
+            encryption,
         })
+    }
+
+    /// Encrypt doc_bytes if encryption is enabled.
+    fn maybe_encrypt(&self, doc_bytes: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryption {
+            Some(key) => key.encrypt(doc_bytes),
+            None => Ok(doc_bytes.to_vec()),
+        }
+    }
+
+    /// Decrypt payload if encryption is enabled.
+    fn maybe_decrypt(&self, payload: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryption {
+            Some(key) => key.decrypt(payload),
+            None => Ok(payload.to_vec()),
+        }
     }
 
     /// Append a document to the data file, returns its location.
     pub fn append(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
+        let payload = self.maybe_encrypt(doc_bytes)?;
         let mut inner = self.inner.lock().unwrap();
         let offset = inner.current_offset;
-        let length = doc_bytes.len() as u32;
+        let length = payload.len() as u32;
 
         inner.file.seek(SeekFrom::End(0))?;
         inner.file.write_all(&[RECORD_ACTIVE])?;
         inner.file.write_all(&length.to_le_bytes())?;
-        inner.file.write_all(doc_bytes)?;
+        inner.file.write_all(&payload)?;
         inner.file.sync_data()?;
 
         inner.current_offset += 1 + 4 + length as u64;
@@ -78,7 +103,8 @@ impl Storage {
         inner.file.seek(SeekFrom::Start(loc.offset + 5))?;
         let mut buf = vec![0u8; loc.length as usize];
         inner.file.read_exact(&mut buf)?;
-        Ok(buf)
+        drop(inner);
+        self.maybe_decrypt(&buf)
     }
 
     /// Soft-delete a record by flipping its status byte.
@@ -92,14 +118,15 @@ impl Storage {
 
     /// Append a document without fsync (caller must call `sync()` after batch).
     pub fn append_no_sync(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
+        let payload = self.maybe_encrypt(doc_bytes)?;
         let mut inner = self.inner.lock().unwrap();
         let offset = inner.current_offset;
-        let length = doc_bytes.len() as u32;
+        let length = payload.len() as u32;
 
         inner.file.seek(SeekFrom::End(0))?;
         inner.file.write_all(&[RECORD_ACTIVE])?;
         inner.file.write_all(&length.to_le_bytes())?;
-        inner.file.write_all(doc_bytes)?;
+        inner.file.write_all(&payload)?;
 
         inner.current_offset += 1 + 4 + length as u64;
 
@@ -151,7 +178,12 @@ impl Storage {
             if status == RECORD_ACTIVE {
                 let mut data = vec![0u8; length as usize];
                 inner.file.read_exact(&mut data)?;
-                results.push((pos, data));
+                // Decrypt if needed — must drop inner lock first? No, we can decrypt with it held.
+                let plaintext = match &self.encryption {
+                    Some(key) => key.decrypt(&data)?,
+                    None => data,
+                };
+                results.push((pos, plaintext));
             } else {
                 inner.file.seek(SeekFrom::Current(length as i64))?;
             }

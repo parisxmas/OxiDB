@@ -51,6 +51,12 @@ pub enum Error {
 
     #[error("no active transaction")]
     NoActiveTransaction,
+
+    #[error("encryption error: {0}")]
+    Encryption(String),
+
+    #[error("decryption error: {0}")]
+    Decryption(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

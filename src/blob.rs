@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::EncryptionKey;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -25,10 +26,15 @@ struct BucketState {
 pub struct BlobStore {
     base_dir: PathBuf,
     buckets: RwLock<HashMap<String, BucketState>>,
+    encryption: Option<Arc<EncryptionKey>>,
 }
 
 impl BlobStore {
     pub fn open(data_dir: &Path) -> Result<Self> {
+        Self::open_with_encryption(data_dir, None)
+    }
+
+    pub fn open_with_encryption(data_dir: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
         let base_dir = data_dir.join("_blobs");
         std::fs::create_dir_all(&base_dir)?;
 
@@ -39,7 +45,7 @@ impl BlobStore {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
                     let bucket_name = entry.file_name().to_string_lossy().to_string();
-                    let state = Self::scan_bucket(&entry.path())?;
+                    let state = Self::scan_bucket(&entry.path(), &encryption)?;
                     buckets.insert(bucket_name, state);
                 }
             }
@@ -48,10 +54,11 @@ impl BlobStore {
         Ok(Self {
             base_dir,
             buckets: RwLock::new(buckets),
+            encryption,
         })
     }
 
-    fn scan_bucket(bucket_path: &Path) -> Result<BucketState> {
+    fn scan_bucket(bucket_path: &Path, encryption: &Option<Arc<EncryptionKey>>) -> Result<BucketState> {
         let mut keys = HashMap::new();
         let mut max_id: u64 = 0;
 
@@ -60,7 +67,11 @@ impl BlobStore {
             let name = entry.file_name().to_string_lossy().to_string();
             if let Some(id_str) = name.strip_suffix(".meta") {
                 if let Ok(id) = id_str.parse::<u64>() {
-                    let meta_bytes = std::fs::read(entry.path())?;
+                    let raw_meta = std::fs::read(entry.path())?;
+                    let meta_bytes = match encryption {
+                        Some(key) => key.decrypt(&raw_meta)?,
+                        None => raw_meta,
+                    };
                     let meta: ObjectMeta = serde_json::from_slice(&meta_bytes)?;
                     keys.insert(meta.key.clone(), id);
                     if id >= max_id {
@@ -160,9 +171,17 @@ impl BlobStore {
             metadata,
         };
 
-        std::fs::write(self.data_path(bucket, id), data)?;
+        let data_to_write = match &self.encryption {
+            Some(key) => key.encrypt(data)?,
+            None => data.to_vec(),
+        };
+        std::fs::write(self.data_path(bucket, id), data_to_write)?;
         let meta_json = serde_json::to_vec(&meta)?;
-        std::fs::write(self.meta_path(bucket, id), meta_json)?;
+        let meta_to_write = match &self.encryption {
+            Some(key) => key.encrypt(&meta_json)?,
+            None => meta_json,
+        };
+        std::fs::write(self.meta_path(bucket, id), meta_to_write)?;
 
         Ok(meta)
     }
@@ -177,8 +196,16 @@ impl BlobStore {
             key: key.to_string(),
         })?;
 
-        let data = std::fs::read(self.data_path(bucket, id))?;
-        let meta_bytes = std::fs::read(self.meta_path(bucket, id))?;
+        let raw_data = std::fs::read(self.data_path(bucket, id))?;
+        let data = match &self.encryption {
+            Some(key) => key.decrypt(&raw_data)?,
+            None => raw_data,
+        };
+        let raw_meta = std::fs::read(self.meta_path(bucket, id))?;
+        let meta_bytes = match &self.encryption {
+            Some(key) => key.decrypt(&raw_meta)?,
+            None => raw_meta,
+        };
         let meta: ObjectMeta = serde_json::from_slice(&meta_bytes)?;
 
         Ok((data, meta))
@@ -194,7 +221,11 @@ impl BlobStore {
             key: key.to_string(),
         })?;
 
-        let meta_bytes = std::fs::read(self.meta_path(bucket, id))?;
+        let raw_meta = std::fs::read(self.meta_path(bucket, id))?;
+        let meta_bytes = match &self.encryption {
+            Some(key) => key.decrypt(&raw_meta)?,
+            None => raw_meta,
+        };
         let meta: ObjectMeta = serde_json::from_slice(&meta_bytes)?;
         Ok(meta)
     }
@@ -250,7 +281,11 @@ impl BlobStore {
         let mut results = Vec::new();
 
         for (_, &id) in matching_keys.into_iter().take(limit) {
-            let meta_bytes = std::fs::read(self.meta_path(bucket, id))?;
+            let raw_meta = std::fs::read(self.meta_path(bucket, id))?;
+            let meta_bytes = match &self.encryption {
+                Some(key) => key.decrypt(&raw_meta)?,
+                None => raw_meta,
+            };
             let meta: ObjectMeta = serde_json::from_slice(&meta_bytes)?;
             results.push(meta);
         }

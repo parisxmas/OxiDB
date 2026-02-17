@@ -1,13 +1,14 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
 use crate::index::{CompositeIndex, FieldIndex};
-use crate::query::{self, FindOptions, Query, QueryOp, SortOrder};
+use crate::query::{self, FindOptions, Query, SortOrder};
 use crate::storage::{DocLocation, Storage};
 use crate::value::IndexValue;
 use crate::wal::{Wal, WalEntry};
@@ -53,12 +54,13 @@ pub struct Collection {
     /// In-memory document cache: doc_id → parsed JSON Value.
     /// Eliminates JSON deserialization on read paths (refcount bump only).
     doc_cache: HashMap<DocumentId, Arc<Value>>,
+    encryption: Option<Arc<EncryptionKey>>,
 }
 
 impl Collection {
     /// Create or open a collection backed by a data file.
     pub fn open(name: &str, data_dir: &Path) -> Result<Self> {
-        Self::open_with_committed_txs(name, data_dir, &HashSet::new())
+        Self::open_with_options(name, data_dir, &HashSet::new(), None)
     }
 
     /// Create or open a collection, filtering WAL recovery by committed tx_ids.
@@ -67,10 +69,20 @@ impl Collection {
         data_dir: &Path,
         committed_tx_ids: &HashSet<u64>,
     ) -> Result<Self> {
+        Self::open_with_options(name, data_dir, committed_tx_ids, None)
+    }
+
+    /// Create or open a collection with optional encryption and tx recovery.
+    pub fn open_with_options(
+        name: &str,
+        data_dir: &Path,
+        committed_tx_ids: &HashSet<u64>,
+        encryption: Option<Arc<EncryptionKey>>,
+    ) -> Result<Self> {
         let data_path = data_dir.join(format!("{}.dat", name));
         let wal_path = data_dir.join(format!("{}.wal", name));
-        let storage = Storage::open(&data_path)?;
-        let wal = Wal::open(&wal_path)?;
+        let storage = Storage::open_with_encryption(&data_path, encryption.clone())?;
+        let wal = Wal::open_with_encryption(&wal_path, encryption.clone())?;
 
         let mut primary_index = HashMap::new();
         let mut version_index = HashMap::new();
@@ -112,6 +124,7 @@ impl Collection {
             version_index,
             next_id,
             doc_cache,
+            encryption,
         })
     }
 
@@ -363,16 +376,33 @@ impl Collection {
         self.find_with_options(query_json, &FindOptions::default())
     }
 
+    /// Find documents returning Arc references — avoids Value::clone.
+    /// Used by the aggregation pipeline which only needs to read fields.
+    pub fn find_arcs(&self, query_json: &Value) -> Result<Vec<Arc<Value>>> {
+        self.find_with_options_arcs(query_json, &FindOptions::default())
+    }
+
     /// Find documents matching a query with sort/skip/limit options.
     pub fn find_with_options(
         &self,
         query_json: &Value,
         opts: &FindOptions,
     ) -> Result<Vec<Value>> {
+        let arcs = self.find_with_options_arcs(query_json, opts)?;
+        Ok(arcs.into_iter().map(|a| Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone())).collect())
+    }
+
+    /// Find documents matching a query with sort/skip/limit options,
+    /// returning Arc references. Avoids Value::clone — results are
+    /// zero-copy references into the cache.
+    pub fn find_with_options_arcs(
+        &self,
+        query_json: &Value,
+        opts: &FindOptions,
+    ) -> Result<Vec<Arc<Value>>> {
         let query = query::parse_query(query_json)?;
 
-        // Fast path: Query::All with no sort — iterate cache directly,
-        // avoid O(n log n) BTreeSet allocation entirely.
+        // Fast path: Query::All with no sort — iterate cache directly.
         if matches!(query, Query::All) && opts.sort.is_none() {
             let skip = opts.skip.unwrap_or(0) as usize;
             let limit = opts.limit.map(|l| l as usize).unwrap_or(usize::MAX);
@@ -386,14 +416,12 @@ impl Collection {
                 if results.len() >= limit {
                     break;
                 }
-                results.push((**data).clone());
+                results.push(Arc::clone(data));
             }
             return Ok(results);
         }
 
-        // Fast path: index-backed sort with early termination
-        // When sorting on a single indexed field with a limit, iterate the
-        // index in order and stop early instead of loading all documents.
+        // Fast path: index-backed sort with early termination.
         if let Some(sort_fields) = &opts.sort {
             if sort_fields.len() == 1 {
                 let (sort_field, sort_order) = &sort_fields[0];
@@ -405,10 +433,9 @@ impl Collection {
                         SortOrder::Asc => {
                             'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
                                 for &id in doc_ids {
-                                    if let Some(&loc) = self.primary_index.get(&id) {
-                                        let data = self.read_doc_value(id, loc)?;
-                                        if query::matches_value(&query, &data) {
-                                            results.push((*data).clone());
+                                    if let Some(data) = self.doc_cache.get(&id) {
+                                        if query::matches_value(&query, data) {
+                                            results.push(Arc::clone(data));
                                             if results.len() >= need {
                                                 break 'outer_asc;
                                             }
@@ -420,10 +447,9 @@ impl Collection {
                         SortOrder::Desc => {
                             'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
                                 for &id in doc_ids.iter().rev() {
-                                    if let Some(&loc) = self.primary_index.get(&id) {
-                                        let data = self.read_doc_value(id, loc)?;
-                                        if query::matches_value(&query, &data) {
-                                            results.push((*data).clone());
+                                    if let Some(data) = self.doc_cache.get(&id) {
+                                        if query::matches_value(&query, data) {
+                                            results.push(Arc::clone(data));
                                             if results.len() >= need {
                                                 break 'outer_desc;
                                             }
@@ -454,22 +480,15 @@ impl Collection {
             }
         }
 
-        // Standard path: scan candidates
-        // Try index-accelerated lookup
-        let all_ids: BTreeSet<DocumentId>;
-        let candidate_ids = {
-            // Only build BTreeSet if we actually need it for index lookup
-            all_ids = self.primary_index.keys().copied().collect();
-            query::execute_indexed(
-                &query,
-                &self.field_indexes,
-                &self.composite_indexes,
-                &all_ids,
-            )
-        };
+        // Standard path: try index-accelerated lookup
+        let candidate_ids = query::execute_indexed(
+            &query,
+            &self.field_indexes,
+            &self.composite_indexes,
+        );
 
-        // Early-limit optimisation: when there is no sort (and no skip),
-        // we can stop scanning as soon as we have enough results.
+        let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
+
         let early_limit: Option<usize> = if opts.sort.is_none() && opts.skip.is_none() {
             opts.limit.map(|l| l as usize)
         } else {
@@ -479,12 +498,10 @@ impl Collection {
         let mut results = Vec::new();
 
         if let Some(ref indexed_ids) = candidate_ids {
-            // Index gave us candidate IDs — iterate those
             for &id in indexed_ids {
-                if let Some(&loc) = self.primary_index.get(&id) {
-                    let data = self.read_doc_value(id, loc)?;
-                    if query::matches_value(&query, &data) {
-                        results.push((*data).clone());
+                if let Some(data) = self.doc_cache.get(&id) {
+                    if skip_post_filter || query::matches_value(&query, data) {
+                        results.push(Arc::clone(data));
                         if let Some(limit) = early_limit {
                             if results.len() >= limit {
                                 break;
@@ -494,10 +511,9 @@ impl Collection {
                 }
             }
         } else {
-            // No index — iterate cache directly, skip BTreeSet allocation
-            for (&_id, data) in &self.doc_cache {
-                if query::matches_value(&query, &data) {
-                    results.push((**data).clone());
+            for (_id, data) in &self.doc_cache {
+                if query::matches_value(&query, data) {
+                    results.push(Arc::clone(data));
                     if let Some(limit) = early_limit {
                         if results.len() >= limit {
                             break;
@@ -547,26 +563,31 @@ impl Collection {
     /// Find a single document matching a query.
     pub fn find_one(&self, query_json: &Value) -> Result<Option<Value>> {
         let query = query::parse_query(query_json)?;
-        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
 
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &self.field_indexes,
-            &self.composite_indexes,
-            &all_ids,
-        );
+        // Try index-accelerated lookup
+        let candidate_ids = if !matches!(query, Query::All) {
+            query::execute_indexed(
+                &query,
+                &self.field_indexes,
+                &self.composite_indexes,
+            )
+        } else {
+            None
+        };
+
+        let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
                 if let Some(&loc) = self.primary_index.get(&id) {
                     let data = self.read_doc_value(id, loc)?;
-                    if query::matches_value(&query, &data) {
+                    if skip_post_filter || query::matches_value(&query, &data) {
                         return Ok(Some((*data).clone()));
                     }
                 }
             }
         } else {
-            // No index — iterate cache directly
+            // No index — iterate cache directly (no BTreeSet allocation)
             for (_id, data) in &self.doc_cache {
                 if query::matches_value(&query, &data) {
                     return Ok(Some((**data).clone()));
@@ -603,12 +624,10 @@ impl Collection {
         // Single-pass: scan candidates, filter, and prepare updates inline
         // (avoids the double-read of calling find() then re-reading from storage)
         let query = query::parse_query(query_json)?;
-        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
         let candidate_ids = query::execute_indexed(
             &query,
             &self.field_indexes,
             &self.composite_indexes,
-            &all_ids,
         );
 
         // Phase 1: prepare all updates and validate constraints upfront
@@ -720,12 +739,10 @@ impl Collection {
     pub fn delete(&mut self, query_json: &Value) -> Result<u64> {
         // Single-pass: scan candidates and collect matches directly
         let query = query::parse_query(query_json)?;
-        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
         let candidate_ids = query::execute_indexed(
             &query,
             &self.field_indexes,
             &self.composite_indexes,
-            &all_ids,
         );
 
         // Phase 1: collect all deletions
@@ -805,25 +822,25 @@ impl Collection {
     pub fn count_matching(&self, query_json: &Value) -> Result<usize> {
         let query = query::parse_query(query_json)?;
 
-        // Fast path: simple equality on an indexed field — use index directly
-        if let Query::Field { ref field, ref op } = query {
-            if let QueryOp::Eq(value) = op {
-                if let Some(idx) = self.field_indexes.get(field.as_str()) {
-                    return Ok(idx.find_eq(value).len());
-                }
-            }
+        // Fast path: count directly from index (no BTreeSet, no doc reads)
+        if let Some(count) = query::count_indexed(&query, &self.field_indexes) {
+            return Ok(count);
         }
 
-        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
+        // Slow path: need to scan docs
         let candidate_ids = query::execute_indexed(
             &query,
             &self.field_indexes,
             &self.composite_indexes,
-            &all_ids,
         );
+
+        let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
 
         let mut count = 0;
         if let Some(ref indexed_ids) = candidate_ids {
+            if skip_post_filter {
+                return Ok(indexed_ids.len());
+            }
             for &id in indexed_ids {
                 if let Some(&loc) = self.primary_index.get(&id) {
                     let data = self.read_doc_value(id, loc)?;
@@ -851,9 +868,9 @@ impl Collection {
 
         let old_size = self.storage.file_size();
 
-        // Create temp storage
+        // Create temp storage (with same encryption key if present)
         let tmp_path = self.data_dir.join(format!("{}.dat.tmp", self.name));
-        let new_storage = Storage::open(&tmp_path)?;
+        let new_storage = Storage::open_with_encryption(&tmp_path, self.encryption.clone())?;
 
         // Copy active records to new file
         let active_records = self.storage.iter_active()?;
@@ -882,7 +899,7 @@ impl Collection {
         std::fs::rename(&tmp_path, &dat_path)?;
 
         // Replace storage with new instance pointing to the renamed file
-        self.storage = Storage::open(&dat_path)?;
+        self.storage = Storage::open_with_encryption(&dat_path, self.encryption.clone())?;
         self.primary_index = new_primary_index;
         self.next_id = next_id;
 
@@ -987,12 +1004,10 @@ impl Collection {
 
         // Single-pass scan with cache
         let query = query::parse_query(query_json)?;
-        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
         let candidate_ids = query::execute_indexed(
             &query,
             &self.field_indexes,
             &self.composite_indexes,
-            &all_ids,
         );
 
         let mut mutations = Vec::new();
@@ -1056,12 +1071,10 @@ impl Collection {
     ) -> Result<Vec<PreparedMutation>> {
         // Single-pass scan with cache
         let query = query::parse_query(query_json)?;
-        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
         let candidate_ids = query::execute_indexed(
             &query,
             &self.field_indexes,
             &self.composite_indexes,
-            &all_ids,
         );
 
         let mut mutations = Vec::new();

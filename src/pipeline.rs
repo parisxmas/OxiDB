@@ -1,11 +1,32 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
 use crate::query::{self, SortOrder};
 use crate::value::IndexValue;
+
+// ---------------------------------------------------------------------------
+// DocRef trait — allows exec_group to work with both Value and Arc<Value>
+// ---------------------------------------------------------------------------
+
+trait DocRef {
+    fn as_value(&self) -> &Value;
+}
+
+impl DocRef for Value {
+    fn as_value(&self) -> &Value {
+        self
+    }
+}
+
+impl DocRef for Arc<Value> {
+    fn as_value(&self) -> &Value {
+        self
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Expression
@@ -438,15 +459,16 @@ fn compute_group_key_hash(val: &Value) -> GroupKeyHash {
     }
 }
 
-fn exec_group(
-    docs: Vec<Value>,
+fn exec_group<D: DocRef>(
+    docs: &[D],
     key: &GroupKey,
     accumulators: &[(String, Accumulator)],
 ) -> Result<Vec<Value>> {
     let mut groups: HashMap<GroupKeyHash, (Value, Vec<AccumulatorState>)> = HashMap::new();
     let mut insertion_order: Vec<GroupKeyHash> = Vec::new();
 
-    for doc in &docs {
+    for doc in docs {
+        let doc = doc.as_value();
         let key_val = match key {
             GroupKey::Null => Value::Null,
             GroupKey::Single(expr) => expr.eval(doc),
@@ -859,6 +881,80 @@ impl Pipeline {
         }
     }
 
+    /// Check whether the stage at `idx` is a $group.
+    pub fn is_group_at(&self, idx: usize) -> bool {
+        matches!(self.stages.get(idx), Some(Stage::Group { .. }))
+    }
+
+    /// Execute pipeline stages from Arc-based input (avoids Value::clone on
+    /// initial docs). Stages that only read ($match, $group, $sort, $skip,
+    /// $limit, $count) work directly on Arc references. When a mutating stage
+    /// is encountered, the remaining Arcs are converted to owned Values.
+    pub fn execute_from_arcs<F>(
+        &self,
+        start: usize,
+        mut docs: Vec<Arc<Value>>,
+        lookup_fn: &F,
+    ) -> Result<Vec<Value>>
+    where
+        F: Fn(&str, &Value) -> Result<Vec<Value>>,
+    {
+        for (i, stage) in self.stages[start..].iter().enumerate() {
+            match stage {
+                Stage::Match(val) => {
+                    let query = query::parse_query(val)?;
+                    docs.retain(|doc| query::matches_value(&query, doc));
+                }
+                Stage::Group { key, accumulators } => {
+                    // $group reads by reference → produces small owned Vec<Value>
+                    let result = exec_group(&docs, key, accumulators)?;
+                    // Continue with owned pipeline for remaining stages
+                    return self.execute_from(start + i + 1, result, lookup_fn);
+                }
+                Stage::Sort(fields) => {
+                    docs.sort_by(|a, b| {
+                        for (field, order) in fields {
+                            let av = resolve_field_ref(a, field);
+                            let bv = resolve_field_ref(b, field);
+                            let aiv = av.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
+                            let biv = bv.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
+                            let cmp = aiv.cmp(&biv);
+                            let cmp = match order {
+                                SortOrder::Asc => cmp,
+                                SortOrder::Desc => cmp.reverse(),
+                            };
+                            if cmp != std::cmp::Ordering::Equal {
+                                return cmp;
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                }
+                Stage::Skip(n) => {
+                    docs = docs.into_iter().skip(*n as usize).collect();
+                }
+                Stage::Limit(n) => {
+                    docs.truncate(*n as usize);
+                }
+                Stage::Count(field) => {
+                    let count = docs.len();
+                    return self.execute_from(
+                        start + i + 1,
+                        vec![json!({ field.as_str(): count })],
+                        lookup_fn,
+                    );
+                }
+                // Stages that need mutation: convert to owned and delegate
+                _ => {
+                    let owned: Vec<Value> = docs.into_iter().map(|arc| (*arc).clone()).collect();
+                    return self.execute_from(start + i, owned, lookup_fn);
+                }
+            }
+        }
+        // All stages processed on arcs — convert final result to owned
+        Ok(docs.into_iter().map(|arc| (*arc).clone()).collect())
+    }
+
     /// Execute pipeline stages starting from `start` index.
     pub fn execute_from<F>(
         &self,
@@ -873,7 +969,7 @@ impl Pipeline {
         for stage in &self.stages[start..] {
             current = match stage {
                 Stage::Match(val) => exec_match(current, val)?,
-                Stage::Group { key, accumulators } => exec_group(current, key, accumulators)?,
+                Stage::Group { key, accumulators } => exec_group(&current, key, accumulators)?,
                 Stage::Sort(fields) => exec_sort(current, fields),
                 Stage::Skip(n) => exec_skip(current, *n),
                 Stage::Limit(n) => exec_limit(current, *n),
@@ -1030,7 +1126,7 @@ mod tests {
         .unwrap();
 
         if let Stage::Group { key, accumulators } = &stage {
-            let result = exec_group(docs, key, accumulators).unwrap();
+            let result = exec_group(&docs, key, accumulators).unwrap();
             assert_eq!(result.len(), 2);
 
             let a = result.iter().find(|d| d["_id"] == "A").unwrap();
@@ -1056,7 +1152,7 @@ mod tests {
         .unwrap();
 
         if let Stage::Group { key, accumulators } = &stage {
-            let result = exec_group(docs, key, accumulators).unwrap();
+            let result = exec_group(&docs, key, accumulators).unwrap();
             assert_eq!(result.len(), 1);
             assert_eq!(result[0]["avg_score"], json!(20));
         }
@@ -1077,7 +1173,7 @@ mod tests {
         .unwrap();
 
         if let Stage::Group { key, accumulators } = &stage {
-            let result = exec_group(docs, key, accumulators).unwrap();
+            let result = exec_group(&docs, key, accumulators).unwrap();
             assert_eq!(result[0]["min_v"], json!(1));
             assert_eq!(result[0]["max_v"], json!(9));
         }
@@ -1097,7 +1193,7 @@ mod tests {
         .unwrap();
 
         if let Stage::Group { key, accumulators } = &stage {
-            let result = exec_group(docs, key, accumulators).unwrap();
+            let result = exec_group(&docs, key, accumulators).unwrap();
             let active = result.iter().find(|d| d["_id"] == "active").unwrap();
             assert_eq!(active["n"], json!(2));
         }
@@ -1118,7 +1214,7 @@ mod tests {
         .unwrap();
 
         if let Stage::Group { key, accumulators } = &stage {
-            let result = exec_group(docs, key, accumulators).unwrap();
+            let result = exec_group(&docs, key, accumulators).unwrap();
             assert_eq!(result[0]["f"], json!("first"));
             assert_eq!(result[0]["l"], json!("last"));
         }
@@ -1138,7 +1234,7 @@ mod tests {
         .unwrap();
 
         if let Stage::Group { key, accumulators } = &stage {
-            let result = exec_group(docs, key, accumulators).unwrap();
+            let result = exec_group(&docs, key, accumulators).unwrap();
             let x = result.iter().find(|d| d["_id"] == "X").unwrap();
             assert_eq!(x["values"], json!([1, 2]));
             let y = result.iter().find(|d| d["_id"] == "Y").unwrap();
@@ -1156,7 +1252,7 @@ mod tests {
         .unwrap();
 
         if let Stage::Group { key, accumulators } = &stage {
-            let result = exec_group(docs, key, accumulators).unwrap();
+            let result = exec_group(&docs, key, accumulators).unwrap();
             assert_eq!(result.len(), 1);
             assert_eq!(result[0]["_id"], Value::Null);
             assert_eq!(result[0]["total"], json!(6));
@@ -1177,7 +1273,7 @@ mod tests {
         .unwrap();
 
         if let Stage::Group { key, accumulators } = &stage {
-            let result = exec_group(docs, key, accumulators).unwrap();
+            let result = exec_group(&docs, key, accumulators).unwrap();
             assert_eq!(result.len(), 2);
         }
     }
@@ -1197,7 +1293,7 @@ mod tests {
         .unwrap();
 
         if let Stage::Group { key, accumulators } = &stage {
-            let result = exec_group(docs, key, accumulators).unwrap();
+            let result = exec_group(&docs, key, accumulators).unwrap();
             let a = result.iter().find(|d| d["_id"] == "A").unwrap();
             assert_eq!(a["count"], json!(2));
         }
