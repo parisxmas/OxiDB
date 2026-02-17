@@ -96,6 +96,21 @@ impl IndexValue {
     }
 
     fn parse_string(s: &str) -> Self {
+        // Fast path: skip date parsing for strings that don't look like dates.
+        // Valid date strings start with YYYY-MM (4 digits + '-' + 2 digits).
+        let b = s.as_bytes();
+        if b.len() < 10
+            || !b[0].is_ascii_digit()
+            || !b[1].is_ascii_digit()
+            || !b[2].is_ascii_digit()
+            || !b[3].is_ascii_digit()
+            || b[4] != b'-'
+            || !b[5].is_ascii_digit()
+            || !b[6].is_ascii_digit()
+        {
+            return IndexValue::String(s.to_string());
+        }
+
         // Try RFC 3339 / ISO 8601 with timezone: "2024-01-15T10:30:00Z"
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
             return IndexValue::DateTime(dt.timestamp_millis());
