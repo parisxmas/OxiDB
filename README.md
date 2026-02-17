@@ -532,6 +532,36 @@ db.withTransaction(() -> {
 
 See `examples/spring-boot` for a full working app with REST endpoints for all OxiDB features.
 
+## PHP
+
+The PHP client (`php/src/OxiDbClient.php`) is a zero-dependency TCP client using only built-in PHP functions:
+
+```php
+require_once 'src/OxiDbClient.php';
+
+$db = new \OxiDb\OxiDbClient('127.0.0.1', 4444);
+
+// CRUD
+$db->insert('users', ['name' => 'Alice', 'age' => 30]);
+$docs = $db->find('users', ['name' => 'Alice']);
+$db->update('users', ['name' => 'Alice'], ['$set' => ['age' => 31]]);
+$db->delete('users', ['name' => 'Alice']);
+$n = $db->count('users');
+
+// Transactions
+$db->transaction(function () use ($db) {
+    $db->insert('ledger', ['action' => 'debit',  'amount' => 100]);
+    $db->insert('ledger', ['action' => 'credit', 'amount' => 100]);
+});
+
+// Blobs
+$db->createBucket('files');
+$db->putObject('files', 'hello.txt', 'Hello!');
+[$data, $meta] = $db->getObject('files', 'hello.txt');
+
+$db->close();
+```
+
 ## Ruby
 
 The Ruby client (`ruby/lib/oxidb.rb`) is a zero-dependency gem using only the standard library:
