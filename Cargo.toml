@@ -28,3 +28,9 @@ tempfile = "3"
 [[example]]
 name = "demo"
 path = "examples/demo.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

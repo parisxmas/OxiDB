@@ -89,6 +89,21 @@ impl Wal {
         Ok(())
     }
 
+    /// Serialize and append a WAL entry without fsync.
+    /// Caller is responsible for ensuring durability (e.g. storage fsync follows).
+    pub fn log_no_sync(&self, entry: &WalEntry) -> Result<()> {
+        let payload = Self::serialize_entry(entry);
+        let crc = Self::compute_crc(&payload);
+
+        let mut file = self.inner.lock().unwrap();
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&crc.to_le_bytes())?;
+        file.write_all(&(payload.len() as u32).to_le_bytes())?;
+        file.write_all(&payload)?;
+
+        Ok(())
+    }
+
     /// Write multiple WAL entries with a single fsync.
     pub fn log_batch(&self, entries: &[WalEntry]) -> Result<()> {
         let mut file = self.inner.lock().unwrap();
