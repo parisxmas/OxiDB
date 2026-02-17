@@ -624,31 +624,105 @@ data, meta, _ := client.GetObject("files", "hello.txt")
 
 ## Julia
 
-The Julia client (`julia/OxiDb`) communicates with oxidb-server over TCP using the length-prefixed JSON protocol. Zero dependencies beyond `JSON3`.
+The Julia client (`julia/OxiDb`) communicates with oxidb-server over TCP using the length-prefixed JSON protocol. Only dependency is `JSON3`.
 
 ```julia
 using OxiDb
 
 client = connect_oxidb("127.0.0.1", 4444)
+```
 
-# CRUD
+### CRUD
+
+```julia
+# Insert
 insert(client, "users", Dict("name" => "Alice", "age" => 30))
-docs = find(client, "users", Dict("name" => "Alice"))
-update(client, "users", Dict("name" => "Alice"), Dict("\$set" => Dict("age" => 31)))
-delete(client, "users", Dict("name" => "Alice"))
-n = count_docs(client, "users")
+insert_many(client, "users", [
+    Dict("name" => "Bob", "age" => 25),
+    Dict("name" => "Charlie", "age" => 35)
+])
 
-# Transactions with automatic commit/rollback
+# Find with options
+docs = find(client, "users", Dict("name" => "Alice"))
+docs = find(client, "users", Dict(); sort=Dict("age" => 1), limit=10, skip=0)
+doc  = find_one(client, "users", Dict("name" => "Alice"))
+
+# Update
+update(client, "users", Dict("name" => "Alice"), Dict("\$set" => Dict("age" => 31)))
+
+# Delete
+delete(client, "users", Dict("name" => "Charlie"))
+
+# Count
+n = count_docs(client, "users")
+```
+
+### Collections & Indexes
+
+```julia
+create_collection(client, "orders")
+cols = list_collections(client)
+drop_collection(client, "orders")
+
+create_index(client, "users", "name")
+create_unique_index(client, "users", "email")
+create_composite_index(client, "users", ["name", "age"])
+```
+
+### Aggregation
+
+```julia
+results = aggregate(client, "users", [
+    Dict("\$match" => Dict("age" => Dict("\$gte" => 18))),
+    Dict("\$group" => Dict("_id" => nothing, "avg_age" => Dict("\$avg" => "\$age"))),
+    Dict("\$sort"  => Dict("avg_age" => -1))
+])
+```
+
+### Transactions
+
+```julia
+# Auto-commit on success, auto-rollback on exception
 transaction(client) do
     insert(client, "ledger", Dict("action" => "debit",  "amount" => 100))
     insert(client, "ledger", Dict("action" => "credit", "amount" => 100))
 end
 
-# Blob storage
-create_bucket(client, "files")
-put_object(client, "files", "hello.txt", Vector{UInt8}("Hello!"))
-data, meta = get_object(client, "files", "hello.txt")
+# Manual control
+begin_tx(client)
+insert(client, "ledger", Dict("action" => "refund", "amount" => 50))
+commit_tx(client)   # or rollback_tx(client)
+```
 
+### Blob Storage
+
+```julia
+create_bucket(client, "files")
+list_buckets(client)
+
+put_object(client, "files", "hello.txt", Vector{UInt8}("Hello from Julia!");
+           content_type="text/plain", metadata=Dict("author" => "julia"))
+data, meta = get_object(client, "files", "hello.txt")
+head = head_object(client, "files", "hello.txt")
+objs = list_objects(client, "files"; prefix="hello", limit=10)
+
+delete_object(client, "files", "hello.txt")
+delete_bucket(client, "files")
+```
+
+### Full-Text Search
+
+```julia
+results = search(client, "hello world"; bucket="files", limit=10)
+```
+
+### Compaction
+
+```julia
+stats = compact(client, "users")  # returns Dict with old_size, new_size, docs_kept
+```
+
+```julia
 close(client)
 ```
 
