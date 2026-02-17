@@ -532,6 +532,36 @@ db.withTransaction(() -> {
 
 See `examples/spring-boot` for a full working app with REST endpoints for all OxiDB features.
 
+## Go
+
+The Go client (`go/oxidb`) is a zero-dependency TCP client using only the standard library:
+
+```go
+import "github.com/parisxmas/OxiDB/go/oxidb"
+
+client, _ := oxidb.ConnectDefault() // 127.0.0.1:4444
+defer client.Close()
+
+// CRUD
+client.Insert("users", map[string]any{"name": "Alice", "age": 30})
+docs, _ := client.Find("users", map[string]any{"name": "Alice"}, nil)
+client.Update("users", map[string]any{"name": "Alice"}, map[string]any{"$set": map[string]any{"age": 31}})
+client.Delete("users", map[string]any{"name": "Alice"})
+n, _ := client.Count("users", map[string]any{})
+
+// Transactions
+client.WithTransaction(func() error {
+    client.Insert("ledger", map[string]any{"action": "debit", "amount": 100})
+    client.Insert("ledger", map[string]any{"action": "credit", "amount": 100})
+    return nil
+})
+
+// Blobs
+client.CreateBucket("files")
+client.PutObject("files", "hello.txt", []byte("Hello!"), "text/plain", nil)
+data, meta, _ := client.GetObject("files", "hello.txt")
+```
+
 ## Julia
 
 The Julia client (`julia/OxiDb`) communicates with oxidb-server over TCP using the length-prefixed JSON protocol. Zero dependencies beyond `JSON3`.
