@@ -30,6 +30,9 @@ pub struct PreparedMutation {
     pub is_delete: bool,
 }
 
+/// Maximum number of documents to cache in memory per collection.
+const DOC_CACHE_CAPACITY: usize = 10_000;
+
 pub struct Collection {
     name: String,
     data_dir: PathBuf,
@@ -40,6 +43,9 @@ pub struct Collection {
     composite_indexes: Vec<CompositeIndex>,
     version_index: HashMap<DocumentId, u64>,
     next_id: DocumentId,
+    /// In-memory document cache: doc_id → serialized JSON bytes.
+    /// Avoids disk reads on find/find_one/get for recently accessed documents.
+    doc_cache: HashMap<DocumentId, Vec<u8>>,
 }
 
 impl Collection {
@@ -61,9 +67,10 @@ impl Collection {
 
         let mut primary_index = HashMap::new();
         let mut version_index = HashMap::new();
+        let mut doc_cache = HashMap::new();
         let mut next_id: DocumentId = 1;
 
-        // Rebuild primary index and version index from existing data
+        // Rebuild primary index, version index, and doc cache from existing data
         for (offset, bytes) in storage.iter_active()? {
             let doc: Value = serde_json::from_slice(&bytes)?;
             if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
@@ -71,6 +78,9 @@ impl Collection {
                 primary_index.insert(id, DocLocation { offset, length });
                 let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                 version_index.insert(id, ver);
+                if doc_cache.len() < DOC_CACHE_CAPACITY {
+                    doc_cache.insert(id, bytes);
+                }
                 if id >= next_id {
                     next_id = id + 1;
                 }
@@ -96,11 +106,30 @@ impl Collection {
             composite_indexes: Vec::new(),
             version_index,
             next_id,
+            doc_cache,
         })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Read document bytes by id, using cache if available, falling back to storage.
+    fn read_doc_bytes(&self, id: DocumentId, loc: DocLocation) -> Result<Vec<u8>> {
+        if let Some(bytes) = self.doc_cache.get(&id) {
+            return Ok(bytes.clone());
+        }
+        self.storage.read(loc)
+    }
+
+    /// Insert bytes into the cache, evicting nothing if at capacity (simple cap).
+    fn cache_put(&mut self, id: DocumentId, bytes: Vec<u8>) {
+        if self.doc_cache.len() < DOC_CACHE_CAPACITY {
+            self.doc_cache.insert(id, bytes);
+        } else if self.doc_cache.contains_key(&id) {
+            // Update existing entry even at capacity
+            self.doc_cache.insert(id, bytes);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -231,8 +260,8 @@ impl Collection {
 
         let bytes = serde_json::to_vec(&data)?;
 
-        // WAL: log before mutating .dat
-        self.wal.log(&WalEntry::insert(id, bytes.clone()))?;
+        // WAL: log before mutating .dat (no fsync — storage.append will fsync)
+        self.wal.log_no_sync(&WalEntry::insert(id, bytes.clone()))?;
 
         let loc = self.storage.append(&bytes)?;
 
@@ -242,6 +271,7 @@ impl Collection {
         let doc = Document::new(id, data)?;
         self.primary_index.insert(id, loc);
         self.version_index.insert(id, 1);
+        self.cache_put(id, bytes);
 
         // Update all field indexes
         for idx in self.field_indexes.values_mut() {
@@ -323,9 +353,10 @@ impl Collection {
 
         // Phase 5: update in-memory indexes (all constraints passed, safe to commit)
         self.next_id += prepared.len() as u64;
-        for ((id, data, _), (_, loc)) in prepared.into_iter().zip(locs.iter()) {
+        for ((id, data, bytes), (_, loc)) in prepared.into_iter().zip(locs.iter()) {
             self.primary_index.insert(id, *loc);
             self.version_index.insert(id, 1);
+            self.cache_put(id, bytes);
             let doc = Document::new(id, data)?;
             for idx in self.field_indexes.values_mut() {
                 idx.insert(&doc);
@@ -365,7 +396,7 @@ impl Collection {
         let mut results = Vec::new();
         for &id in ids_to_scan {
             if let Some(&loc) = self.primary_index.get(&id) {
-                let bytes = self.storage.read(loc)?;
+                let bytes = self.read_doc_bytes(id, loc)?;
                 let data: Value = serde_json::from_slice(&bytes)?;
                 let doc = Document::new(id, data.clone())?;
                 if matches_with_post_filter(&query, &doc, candidate_ids.is_some()) {
@@ -427,7 +458,7 @@ impl Collection {
 
         for &id in ids_to_scan {
             if let Some(&loc) = self.primary_index.get(&id) {
-                let bytes = self.storage.read(loc)?;
+                let bytes = self.read_doc_bytes(id, loc)?;
                 let data: Value = serde_json::from_slice(&bytes)?;
                 let doc = Document::new(id, data.clone())?;
                 if matches_with_post_filter(&query, &doc, candidate_ids.is_some()) {
@@ -442,7 +473,7 @@ impl Collection {
     /// Get a document by its _id directly.
     pub fn get(&self, id: DocumentId) -> Result<Option<Value>> {
         if let Some(&loc) = self.primary_index.get(&id) {
-            let bytes = self.storage.read(loc)?;
+            let bytes = self.read_doc_bytes(id, loc)?;
             let data: Value = serde_json::from_slice(&bytes)?;
             Ok(Some(data))
         } else {
@@ -543,6 +574,7 @@ impl Collection {
             self.primary_index.insert(op.id, new_loc);
             let new_version = op.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
             self.version_index.insert(op.id, new_version);
+            self.cache_put(op.id, op.new_bytes);
             let new_doc = Document::new(op.id, op.new_data)?;
             for idx in self.field_indexes.values_mut() {
                 idx.remove(&op.old_doc);
@@ -609,6 +641,7 @@ impl Collection {
         for op in ops {
             self.primary_index.remove(&op.id);
             self.version_index.remove(&op.id);
+            self.doc_cache.remove(&op.id);
             for idx in self.field_indexes.values_mut() {
                 idx.remove(&op.doc);
             }
@@ -668,8 +701,9 @@ impl Collection {
         self.primary_index = new_primary_index;
         self.next_id = next_id;
 
-        // Rebuild all indexes and version_index
+        // Rebuild all indexes, version_index, and doc_cache
         self.version_index.clear();
+        self.doc_cache.clear();
         for idx in self.field_indexes.values_mut() {
             idx.clear();
         }
@@ -678,6 +712,9 @@ impl Collection {
         }
         for (&id, &loc) in &self.primary_index {
             let bytes = self.storage.read(loc)?;
+            if self.doc_cache.len() < DOC_CACHE_CAPACITY {
+                self.doc_cache.insert(id, bytes.clone());
+            }
             let data: Value = serde_json::from_slice(&bytes)?;
             let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             self.version_index.insert(id, ver);
@@ -877,6 +914,7 @@ impl Collection {
             if m.is_delete {
                 self.primary_index.remove(&m.doc_id);
                 self.version_index.remove(&m.doc_id);
+                self.doc_cache.remove(&m.doc_id);
                 if let Some(ref old_doc) = m.old_doc {
                     for idx in self.field_indexes.values_mut() {
                         idx.remove(old_doc);
@@ -889,6 +927,7 @@ impl Collection {
                 self.primary_index.insert(m.doc_id, loc);
                 let ver = m.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
                 self.version_index.insert(m.doc_id, ver);
+                self.cache_put(m.doc_id, m.new_bytes.clone());
 
                 if let Some(ref old_doc) = m.old_doc {
                     for idx in self.field_indexes.values_mut() {

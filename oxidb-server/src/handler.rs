@@ -14,15 +14,18 @@ fn err_response(msg: &str) -> Value {
 }
 
 /// Handle a single JSON request and return a JSON response.
-pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u64>) -> Value {
-    let cmd = match request.get("cmd").and_then(|v| v.as_str()) {
+pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) -> Value {
+    let cmd = match request.get("cmd").and_then(|v| v.as_str().map(|s| s.to_string())) {
         Some(c) => c,
         None => return err_response("missing or invalid 'cmd' field"),
     };
 
-    let collection = request.get("collection").and_then(|v| v.as_str());
+    let collection: Option<String> = request.get("collection").and_then(|v| v.as_str().map(|s| s.to_string()));
 
-    match cmd {
+    // Take ownership of mutable request for extracting fields without cloning
+    let mut request = request;
+
+    match cmd.as_str() {
         "ping" => ok_response(json!("pong")),
 
         // -------------------------------------------------------------------
@@ -63,13 +66,13 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         // -------------------------------------------------------------------
 
         "insert" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
-            let doc = match request.get("doc") {
-                Some(d) => d.clone(),
-                None => return err_response("missing 'doc'"),
+            let doc = match request.get_mut("doc").map(Value::take) {
+                Some(d) if !d.is_null() => d,
+                _ => return err_response("missing 'doc'"),
             };
             if let Some(tx_id) = *active_tx {
                 match db.tx_insert(tx_id, col, doc) {
@@ -85,13 +88,13 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "insert_many" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
-            let docs = match request.get("docs").and_then(|v| v.as_array()) {
-                Some(arr) => arr.clone(),
-                None => return err_response("missing or invalid 'docs' array"),
+            let docs = match request.get_mut("docs").map(Value::take) {
+                Some(Value::Array(arr)) => arr,
+                _ => return err_response("missing or invalid 'docs' array"),
             };
             if let Some(tx_id) = *active_tx {
                 for doc in docs {
@@ -109,7 +112,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "find" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -121,7 +124,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
                     Err(e) => err_response(&e.to_string()),
                 }
             } else {
-                let opts = match parse_find_options(request) {
+                let opts = match parse_find_options(&request) {
                     Ok(o) => o,
                     Err(e) => return err_response(&e.to_string()),
                 };
@@ -133,7 +136,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "find_one" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -146,7 +149,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "update" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -172,7 +175,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "delete" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -194,7 +197,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "count" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -207,7 +210,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "create_index" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -222,7 +225,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "create_unique_index" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -237,7 +240,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "create_composite_index" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -259,7 +262,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "create_collection" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -275,7 +278,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "drop_collection" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -286,7 +289,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "compact" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };
@@ -301,7 +304,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: &Value, active_tx: &mut Option<u
         }
 
         "aggregate" => {
-            let col = match collection {
+            let col = match collection.as_deref() {
                 Some(c) => c,
                 None => return err_response("missing 'collection'"),
             };

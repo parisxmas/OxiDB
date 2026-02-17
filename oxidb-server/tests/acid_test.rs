@@ -112,7 +112,7 @@ fn handle_client(mut stream: TcpStream, db: &Arc<OxiDb>) {
         };
 
         let response =
-            oxidb_server::handler::handle_request(db, &request, &mut active_tx);
+            oxidb_server::handler::handle_request(db, request, &mut active_tx);
         let resp_bytes = response.to_string().into_bytes();
 
         if write_message(&mut stream, &resp_bytes).is_err() {
