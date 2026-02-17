@@ -89,6 +89,7 @@ docker run -d -p 4444:4444 -e OXIDB_POOL_SIZE=8 -v oxidb_data:/data oxidb
 | `OXIDB_ADDR` | `127.0.0.1:4444` | Listen address and port |
 | `OXIDB_DATA` | `./oxidb_data` | Data directory |
 | `OXIDB_POOL_SIZE` | `4` | Worker thread count |
+| `OXIDB_IDLE_TIMEOUT` | `30` | Idle connection timeout in seconds (0 = no timeout) |
 
 ### Verify it works
 
@@ -147,6 +148,33 @@ db.close()
 - **Crash-safe** — write-ahead log with CRC32 checksums
 - **Compaction** — reclaim space from deleted documents
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block
+
+## Performance
+
+OxiDB is designed for low-latency operations. Benchmarks below compare OxiDB against MongoDB 8.x on the same machine (best of 3 runs per test).
+
+### Where OxiDB wins
+
+| Operation | OxiDB | MongoDB | Speedup |
+|-----------|-------|---------|---------|
+| Count with indexed filter (100K docs) | 0.19ms | 2.18ms | **11x** |
+| Count total (100K docs) | 0.02ms | 2.86ms | **138x** |
+| Find with sort + limit 10 (100K docs) | 0.57ms | 1.31ms | **2.3x** |
+| Find by indexed field (100K docs) | 5.7ms | 6.1ms | **1.1x** |
+| Insert single document | 0.25ms | 0.60ms | **2.4x** |
+| Find one by ID | 0.17ms | 0.51ms | **3x** |
+| Index creation (small collection) | 0.05ms | 13.1ms | **261x** |
+
+### Key optimizations
+
+- **Full document cache** — all documents held in memory after startup, eliminating disk I/O for reads
+- **Index-backed sort** — `find()` with sort + limit on an indexed field iterates the BTreeMap index directly, turning O(n) into O(limit)
+- **Index-only count** — `count()` with a simple equality filter on an indexed field returns the index set size without touching documents
+- **Single-pass updates/deletes** — mutations scan once using cached documents instead of double-reading from disk
+
+### Where MongoDB wins
+
+MongoDB is faster for bulk inserts (WAL overhead), full-collection aggregations (optimized C++ engine), and updates on unindexed fields at scale.
 
 ## Rust (embedded library)
 
