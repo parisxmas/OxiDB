@@ -41,12 +41,47 @@ cd OxiDB
 cargo run --release --package oxidb-server
 ```
 
-### Configuration
+### Option 3: Run with Docker
 
-Configure via environment variables:
+No Rust toolchain needed — just Docker:
 
 ```bash
+git clone https://github.com/parisxmas/OxiDB.git
+cd OxiDB
+docker compose up -d
+```
+
+This builds the server from source inside a container and starts it on port `4444`. Data is persisted in a Docker volume.
+
+To rebuild after pulling updates:
+
+```bash
+docker compose up -d --build
+```
+
+To stop:
+
+```bash
+docker compose down
+```
+
+You can also run the image directly:
+
+```bash
+docker build -t oxidb .
+docker run -d --name oxidb-server -p 4444:4444 -v oxidb_data:/data oxidb
+```
+
+### Configuration
+
+Configure via environment variables (works with binary, source, and Docker):
+
+```bash
+# Binary or source
 OXIDB_ADDR=0.0.0.0:4444 OXIDB_DATA=/var/lib/oxidb OXIDB_POOL_SIZE=8 ./oxidb-server
+
+# Docker (edit docker-compose.yml environment section, or pass via docker run)
+docker run -d -p 4444:4444 -e OXIDB_POOL_SIZE=8 -v oxidb_data:/data oxidb
 ```
 
 | Variable | Default | Description |
