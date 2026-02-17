@@ -1,0 +1,16 @@
+services:
+  oxidb:
+    build: .
+    container_name: oxidb-server
+    ports:
+      - "4444:4444"
+    volumes:
+      - oxidb_data:/data
+    environment:
+      - OXIDB_ADDR=0.0.0.0:4444
+      - OXIDB_DATA=/data
+      - OXIDB_POOL_SIZE=4
+    restart: unless-stopped
+
+volumes:
+  oxidb_data:
