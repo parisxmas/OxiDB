@@ -1,29 +1,121 @@
 # OxiDB
 
-A fast, embeddable document database engine written in Rust.
+A fast, embeddable document database written in Rust. Works like MongoDB but runs as a single binary with zero configuration.
+
+**Client libraries:** Python, Go, Ruby, Java/Spring Boot, Julia, PHP, .NET, C FFI
+
+## Installation
+
+### Option 1: Download a pre-built binary (easiest)
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/parisxmas/OxiDB/releases):
+
+| Platform | Download |
+|----------|----------|
+| macOS Apple Silicon (M1/M2/M3/M4) | `oxidb-server-macos-arm64.tar.gz` |
+| macOS Intel | `oxidb-server-macos-x86_64.tar.gz` |
+| Linux x86_64 | `oxidb-server-linux-x86_64.tar.gz` |
+| Windows x86_64 | `oxidb-server-windows-x86_64.zip` |
+
+```bash
+# macOS / Linux
+tar xzf oxidb-server-*.tar.gz
+./oxidb-server
+```
+
+```powershell
+# Windows
+Expand-Archive oxidb-server-windows-x86_64.zip
+.\oxidb-server.exe
+```
+
+The server starts on `127.0.0.1:4444` by default. Data is stored in `./oxidb_data/`.
+
+### Option 2: Build from source
+
+Requires [Rust](https://rustup.rs/) (1.70+):
+
+```bash
+git clone https://github.com/parisxmas/OxiDB.git
+cd OxiDB
+cargo run --release --package oxidb-server
+```
+
+### Configuration
+
+Configure via environment variables:
+
+```bash
+OXIDB_ADDR=0.0.0.0:4444 OXIDB_DATA=/var/lib/oxidb OXIDB_POOL_SIZE=8 ./oxidb-server
+```
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OXIDB_ADDR` | `127.0.0.1:4444` | Listen address and port |
+| `OXIDB_DATA` | `./oxidb_data` | Data directory |
+| `OXIDB_POOL_SIZE` | `4` | Worker thread count |
+
+### Verify it works
+
+```bash
+# In another terminal, test with a raw TCP command:
+echo -ne '\x11\x00\x00\x00{"cmd":"ping"}' | nc localhost 4444
+# You should see a response containing "pong"
+```
+
+## Using OxiDB from your language
+
+Once the server is running, connect to it from any supported language. Every client uses the same TCP protocol — just pick your language:
+
+| Language | Location | Install |
+|----------|----------|---------|
+| [Python](#python) | `python/oxidb.py` | Copy file, no dependencies |
+| [Go](#go) | `go/oxidb/` | `go get github.com/parisxmas/OxiDB/go/oxidb` |
+| [Ruby](#ruby) | `ruby/lib/oxidb.rb` | Copy file or use gemspec, no dependencies |
+| [Java / Spring Boot](#java--spring-boot) | `oxidb-spring-boot-starter/` | `mvn install`, then add Maven dependency |
+| [Julia](#julia) | `julia/OxiDb/` | `Pkg.develop(path="julia/OxiDb")` |
+| [PHP](#php) | `php/src/OxiDbClient.php` | Copy files, no dependencies |
+| [.NET](#net-client) | `dotnet/OxiDb.Client/` | Uses C FFI via P/Invoke |
+| [Rust (embedded)](#rust-embedded-library) | crate root | `oxidb = { path = "." }` |
+
+### Quick example (Python)
+
+```bash
+# 1. Start the server
+./oxidb-server
+
+# 2. In another terminal
+cp python/oxidb.py my_project/
+python3
+```
+
+```python
+from oxidb import OxiDbClient
+
+db = OxiDbClient("127.0.0.1", 4444)
+db.insert("users", {"name": "Alice", "age": 30})
+print(db.find("users", {"name": "Alice"}))
+# [{'_id': 1, '_version': 1, 'name': 'Alice', 'age': 30}]
+db.close()
+```
 
 ## Features
 
-- **Append-only storage** with single-byte soft deletes
-- **Write-ahead log (WAL)** with CRC32 checksums for crash safety
-- **Field, unique, and composite indexes** backed by BTreeMap for range scans
-- **Query operators**: `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$and`, `$or`
-- **Update operators**: `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
-- **Sort, skip, and limit** via `FindOptions`
-- **Automatic date detection** — date strings are stored as `i64` millis for fast comparison
-- **Compaction** to reclaim space from deleted documents
-- **Aggregation pipeline** — 10 MongoDB-style stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`
-- **S3-like blob storage** — buckets, put/get/head/delete/list objects with metadata and CRC32 etags
-- **Full-text search** — automatic text extraction, inverted index with TF-IDF ranked search
-- **TCP server** with a length-prefixed JSON protocol and thread pool
-- **C FFI library** and **.NET client**
-- **Web UI** — React + Node.js document management app with file upload and combined search
-- **Standalone CLI indexer** — batch-index files from any server via TCP
-- **Thread-safe** — `RwLock` per collection, concurrent readers never block each other
+- **Document database** — JSON documents, no schema required, collections auto-created on insert
+- **MongoDB-style queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$and`, `$or`
+- **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
+- **Aggregation pipeline** — 10 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`
+- **Indexes** — field, unique, and composite indexes with automatic backfill
+- **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
+- **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
+- **Full-text search** — automatic text extraction from 10+ formats, TF-IDF ranked search
+- **Crash-safe** — write-ahead log with CRC32 checksums
+- **Compaction** — reclaim space from deleted documents
+- **Thread-safe** — `RwLock` per collection, concurrent readers never block
 
-## Quick Start
+## Rust (embedded library)
 
-Add the dependency:
+Use OxiDB directly as a Rust library without the TCP server:
 
 ```toml
 [dependencies]
@@ -342,19 +434,9 @@ println!(
 
 Compaction rewrites the data file atomically (write to temp, fsync, rename) and rebuilds all indexes.
 
-## TCP Server
+## TCP Protocol
 
-### Running
-
-```bash
-# Defaults: 127.0.0.1:4444, data dir ./oxidb_data, 4 worker threads
-cargo run --bin oxidb-server
-
-# Custom settings
-OXIDB_ADDR=0.0.0.0:4444 OXIDB_DATA=/var/lib/oxidb OXIDB_POOL_SIZE=8 cargo run --bin oxidb-server
-```
-
-### Protocol
+### Wire Format
 
 Messages are length-prefixed JSON over TCP:
 
@@ -460,7 +542,15 @@ All operation functions return a JSON-encoded response string. The caller must f
 
 ## Python
 
-The Python client (`python/oxidb.py`) is a zero-dependency TCP client using only the standard library.
+Zero dependencies — uses only the Python standard library. Python 3.7+.
+
+**Install:** Copy the single file into your project:
+
+```bash
+cp python/oxidb.py your_project/
+```
+
+**Connect:**
 
 ```python
 from oxidb import OxiDbClient
@@ -565,7 +655,16 @@ client.close()
 
 ## .NET Client
 
-The .NET client (`dotnet/OxiDb.Client`) wraps the C FFI library via P/Invoke.
+Wraps the C FFI library via P/Invoke. Requires .NET 8+.
+
+**Install:** Build the FFI library first, then reference the project:
+
+```bash
+cargo build --release -p oxidb-client-ffi
+# Then add dotnet/OxiDb.Client as a project reference
+```
+
+**Connect:**
 
 ```csharp
 using OxiDb.Client;
@@ -645,6 +744,14 @@ var results = db.Search("hello world", bucket: "files", limit: 10);
 ```
 
 ## Java / Spring Boot
+
+Spring Boot 3.x auto-configuration starter. Java 17+.
+
+**Install:** Build and install the starter to your local Maven repository, then add it to your project:
+
+```bash
+cd oxidb-spring-boot-starter && mvn clean install
+```
 
 Add the starter to your `pom.xml`:
 
@@ -770,9 +877,19 @@ See `examples/spring-boot` for a full working REST app.
 
 ## PHP
 
-The PHP client (`php/src/OxiDbClient.php`) is a zero-dependency TCP client using only built-in PHP functions.
+Zero dependencies — uses only built-in PHP sockets and json. PHP 8.1+.
+
+**Install:** Copy the `php/src/` files into your project:
+
+```bash
+cp php/src/*.php your_project/
+```
+
+**Connect:**
 
 ```php
+require_once 'src/OxiDbException.php';
+require_once 'src/TransactionConflictException.php';
 require_once 'src/OxiDbClient.php';
 
 $db = new \OxiDb\OxiDbClient('127.0.0.1', 4444);
@@ -873,10 +990,18 @@ $db->close();
 
 ## Ruby
 
-The Ruby client (`ruby/lib/oxidb.rb`) is a zero-dependency gem using only the standard library.
+Zero dependencies — uses only the Ruby standard library. Ruby 3.0+.
+
+**Install:** Copy the single file into your project:
+
+```bash
+cp ruby/lib/oxidb.rb your_project/
+```
+
+**Connect:**
 
 ```ruby
-require "oxidb"
+require_relative "oxidb"
 
 db = OxiDb::Client.new("127.0.0.1", 4444)
 # or with a block:
@@ -979,7 +1104,15 @@ db.close
 
 ## Go
 
-The Go client (`go/oxidb`) is a zero-dependency TCP client using only the standard library.
+Zero dependencies — uses only the Go standard library. Go 1.21+.
+
+**Install:**
+
+```bash
+go get github.com/parisxmas/OxiDB/go/oxidb
+```
+
+**Connect:**
 
 ```go
 import "github.com/parisxmas/OxiDB/go/oxidb"
@@ -1087,7 +1220,16 @@ stats, _ := client.Compact("users") // map with old_size, new_size, docs_kept
 
 ## Julia
 
-The Julia client (`julia/OxiDb`) communicates with oxidb-server over TCP using the length-prefixed JSON protocol. Only dependency is `JSON3`.
+Only dependency is `JSON3`. Julia 1.6+.
+
+**Install:**
+
+```julia
+using Pkg
+Pkg.develop(path="julia/OxiDb")
+```
+
+**Connect:**
 
 ```julia
 using OxiDb
