@@ -189,6 +189,25 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        "update_one" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let query = match request.get("query") {
+                Some(q) => q,
+                None => return err_bytes("missing 'query'"),
+            };
+            let update = match request.get("update") {
+                Some(u) => u,
+                None => return err_bytes("missing 'update'"),
+            };
+            match db.update_one(col, query, update) {
+                Ok(count) => ok_bytes(json!({ "modified": count })),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         "delete" => {
             let col = match collection.as_deref() {
                 Some(c) => c,
@@ -208,6 +227,21 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                     Ok(count) => ok_bytes(json!({ "deleted": count })),
                     Err(e) => err_bytes(&e.to_string()),
                 }
+            }
+        }
+
+        "delete_one" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let query = match request.get("query") {
+                Some(q) => q,
+                None => return err_bytes("missing 'query'"),
+            };
+            match db.delete_one(col, query) {
+                Ok(count) => ok_bytes(json!({ "deleted": count })),
+                Err(e) => err_bytes(&e.to_string()),
             }
         }
 

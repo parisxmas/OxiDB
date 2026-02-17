@@ -610,7 +610,8 @@ impl Collection {
 
     /// Update documents matching a query atomically. Returns number of updated documents.
     /// If any unique constraint is violated, no documents are modified.
-    pub fn update(&mut self, query_json: &Value, update_json: &Value) -> Result<u64> {
+    /// `limit` caps the number of documents to update (e.g. `Some(1)` for update_one).
+    pub fn update(&mut self, query_json: &Value, update_json: &Value, limit: Option<usize>) -> Result<u64> {
         // Validate update document has at least one operator
         let update_obj = update_json
             .as_object()
@@ -621,8 +622,6 @@ impl Collection {
             ));
         }
 
-        // Single-pass: scan candidates, filter, and prepare updates inline
-        // (avoids the double-read of calling find() then re-reading from storage)
         let query = query::parse_query(query_json)?;
         let candidate_ids = query::execute_indexed(
             &query,
@@ -630,7 +629,36 @@ impl Collection {
             &self.composite_indexes,
         );
 
-        // Phase 1: prepare all updates and validate constraints upfront
+        // Phase 1: Find matching docs (with early termination via limit)
+        let mut matches: Vec<(DocumentId, Arc<Value>, DocLocation)> = Vec::new();
+
+        if let Some(ref indexed_ids) = candidate_ids {
+            for &id in indexed_ids {
+                if let Some(&old_loc) = self.primary_index.get(&id) {
+                    let data = self.read_doc_value(id, old_loc)?;
+                    if query::matches_value(&query, &data) {
+                        matches.push((id, data, old_loc));
+                        if limit.is_some_and(|l| matches.len() >= l) { break; }
+                    }
+                }
+            }
+        } else {
+            // No index — iterate cache directly, NO .collect()
+            for (&id, data) in &self.doc_cache {
+                if query::matches_value(&query, data) {
+                    if let Some(&old_loc) = self.primary_index.get(&id) {
+                        matches.push((id, Arc::clone(data), old_loc));
+                        if limit.is_some_and(|l| matches.len() >= l) { break; }
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 2: Prepare all updates and validate constraints upfront
         struct UpdateOp {
             id: DocumentId,
             old_loc: DocLocation,
@@ -638,57 +666,30 @@ impl Collection {
             new_data: Value,
             new_bytes: Vec<u8>,
         }
-        let mut ops = Vec::new();
+        let mut ops = Vec::with_capacity(matches.len());
 
-        // Closure that processes a single candidate
-        let mut process_candidate = |id: DocumentId, data: &Arc<Value>, old_loc: DocLocation| -> Result<()> {
-            if !query::matches_value(&query, &data) {
-                return Ok(());
-            }
+        for (id, data, old_loc) in &matches {
             let old_data = Arc::clone(data);
             let mut mutable_data = (**data).clone();
 
-            // Apply ALL update operators
             crate::update::apply_update(&mut mutable_data, update_json)?;
 
-            // Increment _version
             let old_version = mutable_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             let new_version = old_version + 1;
             mutable_data.as_object_mut()
                 .unwrap()
                 .insert("_version".to_string(), Value::Number(new_version.into()));
 
-            // Check unique constraints (exclude self)
-            self.check_unique_constraints(&mutable_data, Some(id))?;
+            self.check_unique_constraints(&mutable_data, Some(*id))?;
 
             let new_bytes = serde_json::to_vec(&mutable_data)?;
             ops.push(UpdateOp {
-                id,
-                old_loc,
+                id: *id,
+                old_loc: *old_loc,
                 old_data,
                 new_data: mutable_data,
                 new_bytes,
             });
-            Ok(())
-        };
-
-        if let Some(ref indexed_ids) = candidate_ids {
-            for &id in indexed_ids {
-                if let Some(&old_loc) = self.primary_index.get(&id) {
-                    let data = self.read_doc_value(id, old_loc)?;
-                    process_candidate(id, &data, old_loc)?;
-                }
-            }
-        } else {
-            // No index — iterate cache directly
-            let cache_snapshot: Vec<(DocumentId, Arc<Value>, DocLocation)> = self.doc_cache.iter()
-                .filter_map(|(&id, data)| {
-                    self.primary_index.get(&id).map(|&loc| (id, Arc::clone(data), loc))
-                })
-                .collect();
-            for (id, data, old_loc) in cache_snapshot {
-                process_candidate(id, &data, old_loc)?;
-            }
         }
 
         if ops.is_empty() {
@@ -736,8 +737,8 @@ impl Collection {
     }
 
     /// Delete documents matching a query atomically. Returns number deleted.
-    pub fn delete(&mut self, query_json: &Value) -> Result<u64> {
-        // Single-pass: scan candidates and collect matches directly
+    /// `limit` caps the number of documents to delete (e.g. `Some(1)` for delete_one).
+    pub fn delete(&mut self, query_json: &Value, limit: Option<usize>) -> Result<u64> {
         let query = query::parse_query(query_json)?;
         let candidate_ids = query::execute_indexed(
             &query,
@@ -745,7 +746,7 @@ impl Collection {
             &self.composite_indexes,
         );
 
-        // Phase 1: collect all deletions
+        // Phase 1: Find matching docs (with early termination via limit)
         struct DeleteOp {
             id: DocumentId,
             loc: DocLocation,
@@ -759,19 +760,18 @@ impl Collection {
                     let data = self.read_doc_value(id, loc)?;
                     if query::matches_value(&query, &data) {
                         ops.push(DeleteOp { id, loc, data });
+                        if limit.is_some_and(|l| ops.len() >= l) { break; }
                     }
                 }
             }
         } else {
-            // No index — iterate cache directly
-            let cache_snapshot: Vec<(DocumentId, Arc<Value>, DocLocation)> = self.doc_cache.iter()
-                .filter_map(|(&id, data)| {
-                    self.primary_index.get(&id).map(|&loc| (id, Arc::clone(data), loc))
-                })
-                .collect();
-            for (id, data, loc) in cache_snapshot {
-                if query::matches_value(&query, &data) {
-                    ops.push(DeleteOp { id, loc, data });
+            // No index — iterate cache directly, NO .collect()
+            for (&id, data) in &self.doc_cache {
+                if query::matches_value(&query, data) {
+                    if let Some(&loc) = self.primary_index.get(&id) {
+                        ops.push(DeleteOp { id, loc, data: Arc::clone(data) });
+                        if limit.is_some_and(|l| ops.len() >= l) { break; }
+                    }
                 }
             }
         }
@@ -1219,7 +1219,7 @@ mod tests {
         let mut col = temp_collection("test");
         let id = col.insert(json!({"name": "Alice"})).unwrap();
         assert_eq!(col.get_version(id), 1);
-        col.update(&json!({"_id": id}), &json!({"$set": {"name": "Bob"}})).unwrap();
+        col.update(&json!({"_id": id}), &json!({"$set": {"name": "Bob"}}), None).unwrap();
         let doc = col.get(id).unwrap().unwrap();
         assert_eq!(doc["_version"], 2);
         assert_eq!(col.get_version(id), 2);
@@ -1267,7 +1267,7 @@ mod tests {
         let id = col.insert(json!({"name": "Alice", "age": 30})).unwrap();
 
         let count = col
-            .update(&json!({"name": "Alice"}), &json!({"$set": {"age": 31}}))
+            .update(&json!({"name": "Alice"}), &json!({"$set": {"age": 31}}), None)
             .unwrap();
         assert_eq!(count, 1);
 
@@ -1281,7 +1281,7 @@ mod tests {
         col.insert(json!({"name": "Alice"})).unwrap();
         col.insert(json!({"name": "Bob"})).unwrap();
 
-        let count = col.delete(&json!({"name": "Alice"})).unwrap();
+        let count = col.delete(&json!({"name": "Alice"}), None).unwrap();
         assert_eq!(count, 1);
         assert_eq!(col.count(), 1);
     }
@@ -1320,6 +1320,7 @@ mod tests {
             .update(
                 &json!({"email": "alice@test.com"}),
                 &json!({"$set": {"name": "Alicia"}}),
+                None,
             )
             .unwrap();
         assert_eq!(count, 1);
@@ -1338,6 +1339,7 @@ mod tests {
         let result = col.update(
             &json!({"name": "Bob"}),
             &json!({"$set": {"email": "alice@test.com"}}),
+            None,
         );
         assert!(result.is_err());
 
@@ -1388,6 +1390,7 @@ mod tests {
             .update(
                 &json!({"status": "draft"}),
                 &json!({"$set": {"status": "published"}}),
+                None,
             )
             .unwrap();
         assert_eq!(count, 2);
@@ -1408,7 +1411,7 @@ mod tests {
         col.insert(json!({"status": "new", "title": "C"}))
             .unwrap();
 
-        let count = col.delete(&json!({"status": "old"})).unwrap();
+        let count = col.delete(&json!({"status": "old"}), None).unwrap();
         assert_eq!(count, 2);
         assert_eq!(col.count(), 1);
     }
@@ -1551,7 +1554,7 @@ mod tests {
         let size_before = col.storage.file_size();
 
         // Delete 7 of them
-        col.delete(&json!({"n": {"$lt": 7}})).unwrap();
+        col.delete(&json!({"n": {"$lt": 7}}), None).unwrap();
         assert_eq!(col.count(), 3);
 
         // File size is unchanged after delete (soft delete)
