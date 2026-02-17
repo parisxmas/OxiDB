@@ -1,8 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
+use serde_json::Value;
+
 use crate::document::{Document, DocumentId};
 use crate::value::IndexValue;
+
+/// Resolve a field path (with dot notation) directly on a &Value.
+fn resolve_value_field<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = data;
+    for part in path.split('.') {
+        current = current.as_object()?.get(part)?;
+    }
+    Some(current)
+}
 
 // ---------------------------------------------------------------------------
 // Single-field index
@@ -51,11 +62,32 @@ impl FieldIndex {
         }
     }
 
+    /// Insert using a &Value directly — avoids constructing a Document.
+    pub fn insert_value(&mut self, id: DocumentId, data: &Value) {
+        if let Some(value) = resolve_value_field(data, &self.field) {
+            let key = IndexValue::from_json(value);
+            self.tree.entry(key).or_default().insert(id);
+        }
+    }
+
     pub fn remove(&mut self, doc: &Document) {
         if let Some(value) = doc.get_field(&self.field) {
             let key = IndexValue::from_json(value);
             if let Some(set) = self.tree.get_mut(&key) {
                 set.remove(&doc.id);
+                if set.is_empty() {
+                    self.tree.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Remove using a &Value directly — avoids constructing a Document.
+    pub fn remove_value(&mut self, id: DocumentId, data: &Value) {
+        if let Some(value) = resolve_value_field(data, &self.field) {
+            let key = IndexValue::from_json(value);
+            if let Some(set) = self.tree.get_mut(&key) {
+                set.remove(&id);
                 if set.is_empty() {
                     self.tree.remove(&key);
                 }
@@ -150,6 +182,19 @@ impl CompositeIndex {
         self.fields.join("_")
     }
 
+    fn extract_key_from_value(&self, data: &Value) -> CompositeKey {
+        let values = self
+            .fields
+            .iter()
+            .map(|f| {
+                resolve_value_field(data, f)
+                    .map(IndexValue::from_json)
+                    .unwrap_or(IndexValue::Null)
+            })
+            .collect();
+        CompositeKey(values)
+    }
+
     fn extract_key(&self, doc: &Document) -> CompositeKey {
         let values = self
             .fields
@@ -168,10 +213,27 @@ impl CompositeIndex {
         self.tree.entry(key).or_default().insert(doc.id);
     }
 
+    /// Insert using a &Value directly — avoids constructing a Document.
+    pub fn insert_value(&mut self, id: DocumentId, data: &Value) {
+        let key = self.extract_key_from_value(data);
+        self.tree.entry(key).or_default().insert(id);
+    }
+
     pub fn remove(&mut self, doc: &Document) {
         let key = self.extract_key(doc);
         if let Some(set) = self.tree.get_mut(&key) {
             set.remove(&doc.id);
+            if set.is_empty() {
+                self.tree.remove(&key);
+            }
+        }
+    }
+
+    /// Remove using a &Value directly — avoids constructing a Document.
+    pub fn remove_value(&mut self, id: DocumentId, data: &Value) {
+        let key = self.extract_key_from_value(data);
+        if let Some(set) = self.tree.get_mut(&key) {
+            set.remove(&id);
             if set.is_empty() {
                 self.tree.remove(&key);
             }

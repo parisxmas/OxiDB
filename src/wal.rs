@@ -119,11 +119,34 @@ impl Wal {
         Ok(())
     }
 
+    /// Write multiple WAL entries without fsync.
+    /// Caller relies on storage fsync for durability; WAL is best-effort.
+    pub fn log_batch_no_sync(&self, entries: &[WalEntry]) -> Result<()> {
+        let mut file = self.inner.lock().unwrap();
+        file.seek(SeekFrom::End(0))?;
+        for entry in entries {
+            let payload = Self::serialize_entry(entry);
+            let crc = Self::compute_crc(&payload);
+            file.write_all(&crc.to_le_bytes())?;
+            file.write_all(&(payload.len() as u32).to_le_bytes())?;
+            file.write_all(&payload)?;
+        }
+        Ok(())
+    }
+
     /// Truncate the WAL to 0 (checkpoint), then fsync.
     pub fn checkpoint(&self) -> Result<()> {
         let file = self.inner.lock().unwrap();
         file.set_len(0)?;
         file.sync_data()?;
+        Ok(())
+    }
+
+    /// Truncate the WAL to 0 without fsync.
+    /// Stale WAL entries are replayed idempotently on recovery if truncation is lost.
+    pub fn checkpoint_no_sync(&self) -> Result<()> {
+        let file = self.inner.lock().unwrap();
+        file.set_len(0)?;
         Ok(())
     }
 

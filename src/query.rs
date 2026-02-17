@@ -283,6 +283,46 @@ pub fn matches_doc(query: &Query, doc: &Document) -> bool {
     }
 }
 
+/// Resolve a field path (with dot notation) directly on a &Value.
+fn resolve_field_ref<'a>(data: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+    let mut current = data;
+    for part in path.split('.') {
+        current = current.as_object()?.get(part)?;
+    }
+    Some(current)
+}
+
+/// Like `matches_doc` but operates directly on `&Value`, avoiding Document construction.
+pub fn matches_value(query: &Query, data: &JsonValue) -> bool {
+    match query {
+        Query::All => true,
+        Query::Field { field, op } => {
+            let field_val = resolve_field_ref(data, field);
+            match op {
+                QueryOp::Exists(expected) => field_val.is_some() == *expected,
+                _ => {
+                    let Some(val) = field_val else {
+                        return false;
+                    };
+                    let iv = IndexValue::from_json(val);
+                    match op {
+                        QueryOp::Eq(v) => iv == *v,
+                        QueryOp::Ne(v) => iv != *v,
+                        QueryOp::Gt(v) => iv > *v,
+                        QueryOp::Gte(v) => iv >= *v,
+                        QueryOp::Lt(v) => iv < *v,
+                        QueryOp::Lte(v) => iv <= *v,
+                        QueryOp::In(vals) => vals.contains(&iv),
+                        QueryOp::Exists(_) => unreachable!(),
+                    }
+                }
+            }
+        }
+        Query::And(subs) => subs.iter().all(|s| matches_value(s, data)),
+        Query::Or(subs) => subs.iter().any(|s| matches_value(s, data)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

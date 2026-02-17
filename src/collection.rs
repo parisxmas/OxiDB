@@ -1,15 +1,25 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::document::{Document, DocumentId};
+use crate::document::DocumentId;
 use crate::error::{Error, Result};
 use crate::index::{CompositeIndex, FieldIndex};
 use crate::query::{self, FindOptions, Query, QueryOp, SortOrder};
 use crate::storage::{DocLocation, Storage};
 use crate::value::IndexValue;
 use crate::wal::{Wal, WalEntry};
+
+/// Resolve a field path (with dot notation) directly on a &Value.
+fn resolve_field_in_value<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = data;
+    for part in path.split('.') {
+        current = current.as_object()?.get(part)?;
+    }
+    Some(current)
+}
 
 /// Statistics returned after a compaction run.
 #[derive(Debug, Clone)]
@@ -25,7 +35,7 @@ pub struct PreparedMutation {
     pub doc_id: DocumentId,
     pub new_bytes: Vec<u8>,
     pub old_loc: Option<DocLocation>,
-    pub old_doc: Option<Document>,
+    pub old_data: Option<Value>,
     pub new_data: Value,
     pub is_delete: bool,
 }
@@ -40,9 +50,9 @@ pub struct Collection {
     composite_indexes: Vec<CompositeIndex>,
     version_index: HashMap<DocumentId, u64>,
     next_id: DocumentId,
-    /// In-memory document cache: doc_id → serialized JSON bytes.
-    /// Avoids disk reads on find/find_one/get for recently accessed documents.
-    doc_cache: HashMap<DocumentId, Vec<u8>>,
+    /// In-memory document cache: doc_id → parsed JSON Value.
+    /// Eliminates JSON deserialization on read paths (refcount bump only).
+    doc_cache: HashMap<DocumentId, Arc<Value>>,
 }
 
 impl Collection {
@@ -75,7 +85,7 @@ impl Collection {
                 primary_index.insert(id, DocLocation { offset, length });
                 let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                 version_index.insert(id, ver);
-                doc_cache.insert(id, bytes);
+                doc_cache.insert(id, Arc::new(doc));
                 if id >= next_id {
                     next_id = id + 1;
                 }
@@ -109,17 +119,19 @@ impl Collection {
         &self.name
     }
 
-    /// Read document bytes by id, using cache if available, falling back to storage.
-    fn read_doc_bytes(&self, id: DocumentId, loc: DocLocation) -> Result<Vec<u8>> {
-        if let Some(bytes) = self.doc_cache.get(&id) {
-            return Ok(bytes.clone());
+    /// Read document value by id, using cache if available, falling back to disk+parse on miss.
+    fn read_doc_value(&self, id: DocumentId, loc: DocLocation) -> Result<Arc<Value>> {
+        if let Some(val) = self.doc_cache.get(&id) {
+            return Ok(Arc::clone(val));
         }
-        self.storage.read(loc)
+        let bytes = self.storage.read(loc)?;
+        let data: Value = serde_json::from_slice(&bytes)?;
+        Ok(Arc::new(data))
     }
 
-    /// Insert bytes into the cache (no capacity limit — all docs are cached).
-    fn cache_put(&mut self, id: DocumentId, bytes: Vec<u8>) {
-        self.doc_cache.insert(id, bytes);
+    /// Insert a parsed Value into the cache (no capacity limit — all docs are cached).
+    fn cache_put(&mut self, id: DocumentId, val: Arc<Value>) {
+        self.doc_cache.insert(id, val);
     }
 
     // -----------------------------------------------------------------------
@@ -134,12 +146,9 @@ impl Collection {
 
         let mut idx = FieldIndex::new(field.to_string());
 
-        // Backfill from existing documents
-        for (&id, &loc) in &self.primary_index.clone() {
-            let bytes = self.storage.read(loc)?;
-            let data: Value = serde_json::from_slice(&bytes)?;
-            let doc = Document::new(id, data)?;
-            idx.insert(&doc);
+        // Backfill from cache — no disk reads, no JSON parsing, no Value clones
+        for (&id, data) in &self.doc_cache {
+            idx.insert_value(id, data);
         }
 
         self.field_indexes.insert(field.to_string(), idx);
@@ -155,13 +164,9 @@ impl Collection {
 
         let mut idx = FieldIndex::new_unique(field.to_string());
 
-        // Backfill and check for uniqueness violations
-        for (&id, &loc) in &self.primary_index.clone() {
-            let bytes = self.storage.read(loc)?;
-            let data: Value = serde_json::from_slice(&bytes)?;
-            let doc = Document::new(id, data)?;
-
-            if let Some(value) = doc.get_field(field) {
+        // Backfill from cache — no disk reads, no JSON parsing, no Value clones
+        for (&id, data) in &self.doc_cache {
+            if let Some(value) = resolve_field_in_value(data, field) {
                 let iv = IndexValue::from_json(value);
                 if idx.check_unique(&iv, None) {
                     return Err(Error::UniqueViolation {
@@ -170,7 +175,7 @@ impl Collection {
                 }
             }
 
-            idx.insert(&doc);
+            idx.insert_value(id, data);
         }
 
         self.field_indexes.insert(field.to_string(), idx);
@@ -186,12 +191,9 @@ impl Collection {
 
         let mut idx = CompositeIndex::new(fields);
 
-        // Backfill
-        for (&id, &loc) in &self.primary_index.clone() {
-            let bytes = self.storage.read(loc)?;
-            let data: Value = serde_json::from_slice(&bytes)?;
-            let doc = Document::new(id, data)?;
-            idx.insert(&doc);
+        // Backfill from cache — no disk reads, no JSON parsing, no Value clones
+        for (&id, data) in &self.doc_cache {
+            idx.insert_value(id, data);
         }
 
         let idx_name = idx.name();
@@ -209,12 +211,11 @@ impl Collection {
         data: &Value,
         exclude_id: Option<DocumentId>,
     ) -> Result<()> {
-        let tmp_doc = Document::new(exclude_id.unwrap_or(0), data.clone())?;
         for idx in self.field_indexes.values() {
             if !idx.unique {
                 continue;
             }
-            if let Some(value) = tmp_doc.get_field(&idx.field) {
+            if let Some(value) = resolve_field_in_value(data, &idx.field) {
                 let iv = IndexValue::from_json(value);
                 if idx.check_unique(&iv, exclude_id) {
                     return Err(Error::UniqueViolation {
@@ -255,21 +256,20 @@ impl Collection {
 
         let loc = self.storage.append(&bytes)?;
 
-        // WAL: checkpoint after .dat is durable
-        self.wal.checkpoint()?;
+        // WAL: lazy checkpoint (no fsync — stale entries replay idempotently)
+        self.wal.checkpoint_no_sync()?;
 
-        let doc = Document::new(id, data)?;
+        let cached = Arc::new(data);
         self.primary_index.insert(id, loc);
         self.version_index.insert(id, 1);
-        self.cache_put(id, bytes);
+        self.cache_put(id, Arc::clone(&cached));
 
-        // Update all field indexes
+        // Update all field indexes (value-based, no Document clone)
         for idx in self.field_indexes.values_mut() {
-            idx.insert(&doc);
+            idx.insert_value(id, &cached);
         }
-        // Update all composite indexes
         for idx in &mut self.composite_indexes {
-            idx.insert(&doc);
+            idx.insert_value(id, &cached);
         }
 
         Ok(id)
@@ -299,13 +299,12 @@ impl Collection {
             // Check against existing index
             self.check_unique_constraints(&data, None)?;
 
-            // Check intra-batch uniqueness
-            let tmp_doc = Document::new(id, data.clone())?;
+            // Check intra-batch uniqueness (no Document clone needed)
             for idx in self.field_indexes.values() {
                 if !idx.unique {
                     continue;
                 }
-                if let Some(value) = tmp_doc.get_field(&idx.field) {
+                if let Some(value) = resolve_field_in_value(&data, &idx.field) {
                     let iv = IndexValue::from_json(value);
                     let field_map = pending_unique.entry(idx.field.clone()).or_default();
                     if field_map.contains_key(&iv) {
@@ -321,14 +320,14 @@ impl Collection {
             prepared.push((id, data, bytes));
         }
 
-        // Phase 2: WAL log all entries → single fsync
+        // Phase 2: WAL log all entries (no fsync — storage fsync provides durability)
         let wal_entries: Vec<WalEntry> = prepared
             .iter()
             .map(|(id, _, bytes)| WalEntry::insert(*id, bytes.clone()))
             .collect();
-        self.wal.log_batch(&wal_entries)?;
+        self.wal.log_batch_no_sync(&wal_entries)?;
 
-        // Phase 3: append all to .dat without per-record fsync → single fsync
+        // Phase 3: append all to .dat → single fsync (the only fsync in this method)
         let mut ids = Vec::with_capacity(prepared.len());
         let mut locs = Vec::with_capacity(prepared.len());
         for (id, _, bytes) in &prepared {
@@ -338,21 +337,21 @@ impl Collection {
         }
         self.storage.sync()?;
 
-        // Phase 4: checkpoint WAL → single fsync
-        self.wal.checkpoint()?;
+        // Phase 4: lazy WAL checkpoint (no fsync)
+        self.wal.checkpoint_no_sync()?;
 
         // Phase 5: update in-memory indexes (all constraints passed, safe to commit)
         self.next_id += prepared.len() as u64;
-        for ((id, data, bytes), (_, loc)) in prepared.into_iter().zip(locs.iter()) {
+        for ((id, data, _bytes), (_, loc)) in prepared.into_iter().zip(locs.iter()) {
             self.primary_index.insert(id, *loc);
             self.version_index.insert(id, 1);
-            self.cache_put(id, bytes);
-            let doc = Document::new(id, data)?;
+            let cached = Arc::new(data);
+            self.cache_put(id, Arc::clone(&cached));
             for idx in self.field_indexes.values_mut() {
-                idx.insert(&doc);
+                idx.insert_value(id, &cached);
             }
             for idx in &mut self.composite_indexes {
-                idx.insert(&doc);
+                idx.insert_value(id, &cached);
             }
         }
 
@@ -372,14 +371,14 @@ impl Collection {
     ) -> Result<Vec<Value>> {
         let query = query::parse_query(query_json)?;
 
-        // Fast path: Query::All with no sort — iterate HashMap directly,
+        // Fast path: Query::All with no sort — iterate cache directly,
         // avoid O(n log n) BTreeSet allocation entirely.
         if matches!(query, Query::All) && opts.sort.is_none() {
             let skip = opts.skip.unwrap_or(0) as usize;
             let limit = opts.limit.map(|l| l as usize).unwrap_or(usize::MAX);
             let mut results = Vec::new();
             let mut skipped = 0;
-            for (&id, &loc) in &self.primary_index {
+            for (_id, data) in &self.doc_cache {
                 if skipped < skip {
                     skipped += 1;
                     continue;
@@ -387,9 +386,7 @@ impl Collection {
                 if results.len() >= limit {
                     break;
                 }
-                let bytes = self.read_doc_bytes(id, loc)?;
-                let data: Value = serde_json::from_slice(&bytes)?;
-                results.push(data);
+                results.push((**data).clone());
             }
             return Ok(results);
         }
@@ -409,11 +406,9 @@ impl Collection {
                             'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
                                 for &id in doc_ids {
                                     if let Some(&loc) = self.primary_index.get(&id) {
-                                        let bytes = self.read_doc_bytes(id, loc)?;
-                                        let data: Value = serde_json::from_slice(&bytes)?;
-                                        let doc = Document::new(id, data.clone())?;
-                                        if query::matches_doc(&query, &doc) {
-                                            results.push(data);
+                                        let data = self.read_doc_value(id, loc)?;
+                                        if query::matches_value(&query, &data) {
+                                            results.push((*data).clone());
                                             if results.len() >= need {
                                                 break 'outer_asc;
                                             }
@@ -426,11 +421,9 @@ impl Collection {
                             'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
                                 for &id in doc_ids.iter().rev() {
                                     if let Some(&loc) = self.primary_index.get(&id) {
-                                        let bytes = self.read_doc_bytes(id, loc)?;
-                                        let data: Value = serde_json::from_slice(&bytes)?;
-                                        let doc = Document::new(id, data.clone())?;
-                                        if query::matches_doc(&query, &doc) {
-                                            results.push(data);
+                                        let data = self.read_doc_value(id, loc)?;
+                                        if query::matches_value(&query, &data) {
+                                            results.push((*data).clone());
                                             if results.len() >= need {
                                                 break 'outer_desc;
                                             }
@@ -462,17 +455,18 @@ impl Collection {
         }
 
         // Standard path: scan candidates
-        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
-
         // Try index-accelerated lookup
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &self.field_indexes,
-            &self.composite_indexes,
-            &all_ids,
-        );
-
-        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
+        let all_ids: BTreeSet<DocumentId>;
+        let candidate_ids = {
+            // Only build BTreeSet if we actually need it for index lookup
+            all_ids = self.primary_index.keys().copied().collect();
+            query::execute_indexed(
+                &query,
+                &self.field_indexes,
+                &self.composite_indexes,
+                &all_ids,
+            )
+        };
 
         // Early-limit optimisation: when there is no sort (and no skip),
         // we can stop scanning as soon as we have enough results.
@@ -483,13 +477,27 @@ impl Collection {
         };
 
         let mut results = Vec::new();
-        for &id in ids_to_scan {
-            if let Some(&loc) = self.primary_index.get(&id) {
-                let bytes = self.read_doc_bytes(id, loc)?;
-                let data: Value = serde_json::from_slice(&bytes)?;
-                let doc = Document::new(id, data.clone())?;
-                if matches_with_post_filter(&query, &doc, candidate_ids.is_some()) {
-                    results.push(data);
+
+        if let Some(ref indexed_ids) = candidate_ids {
+            // Index gave us candidate IDs — iterate those
+            for &id in indexed_ids {
+                if let Some(&loc) = self.primary_index.get(&id) {
+                    let data = self.read_doc_value(id, loc)?;
+                    if query::matches_value(&query, &data) {
+                        results.push((*data).clone());
+                        if let Some(limit) = early_limit {
+                            if results.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // No index — iterate cache directly, skip BTreeSet allocation
+            for (&_id, data) in &self.doc_cache {
+                if query::matches_value(&query, &data) {
+                    results.push((**data).clone());
                     if let Some(limit) = early_limit {
                         if results.len() >= limit {
                             break;
@@ -548,15 +556,20 @@ impl Collection {
             &all_ids,
         );
 
-        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
-
-        for &id in ids_to_scan {
-            if let Some(&loc) = self.primary_index.get(&id) {
-                let bytes = self.read_doc_bytes(id, loc)?;
-                let data: Value = serde_json::from_slice(&bytes)?;
-                let doc = Document::new(id, data.clone())?;
-                if matches_with_post_filter(&query, &doc, candidate_ids.is_some()) {
-                    return Ok(Some(data));
+        if let Some(ref indexed_ids) = candidate_ids {
+            for &id in indexed_ids {
+                if let Some(&loc) = self.primary_index.get(&id) {
+                    let data = self.read_doc_value(id, loc)?;
+                    if query::matches_value(&query, &data) {
+                        return Ok(Some((*data).clone()));
+                    }
+                }
+            }
+        } else {
+            // No index — iterate cache directly
+            for (_id, data) in &self.doc_cache {
+                if query::matches_value(&query, &data) {
+                    return Ok(Some((**data).clone()));
                 }
             }
         }
@@ -567,9 +580,8 @@ impl Collection {
     /// Get a document by its _id directly.
     pub fn get(&self, id: DocumentId) -> Result<Option<Value>> {
         if let Some(&loc) = self.primary_index.get(&id) {
-            let bytes = self.read_doc_bytes(id, loc)?;
-            let data: Value = serde_json::from_slice(&bytes)?;
-            Ok(Some(data))
+            let data = self.read_doc_value(id, loc)?;
+            Ok(Some((*data).clone()))
         } else {
             Ok(None)
         }
@@ -598,49 +610,65 @@ impl Collection {
             &self.composite_indexes,
             &all_ids,
         );
-        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
         // Phase 1: prepare all updates and validate constraints upfront
         struct UpdateOp {
             id: DocumentId,
             old_loc: DocLocation,
-            old_doc: Document,
+            old_data: Arc<Value>,
             new_data: Value,
             new_bytes: Vec<u8>,
         }
         let mut ops = Vec::new();
 
-        for &id in ids_to_scan {
-            if let Some(&old_loc) = self.primary_index.get(&id) {
-                let bytes = self.read_doc_bytes(id, old_loc)?;
-                let mut data: Value = serde_json::from_slice(&bytes)?;
-                let doc = Document::new(id, data.clone())?;
-                if !query::matches_doc(&query, &doc) {
-                    continue;
+        // Closure that processes a single candidate
+        let mut process_candidate = |id: DocumentId, data: &Arc<Value>, old_loc: DocLocation| -> Result<()> {
+            if !query::matches_value(&query, &data) {
+                return Ok(());
+            }
+            let old_data = Arc::clone(data);
+            let mut mutable_data = (**data).clone();
+
+            // Apply ALL update operators
+            crate::update::apply_update(&mut mutable_data, update_json)?;
+
+            // Increment _version
+            let old_version = mutable_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+            let new_version = old_version + 1;
+            mutable_data.as_object_mut()
+                .unwrap()
+                .insert("_version".to_string(), Value::Number(new_version.into()));
+
+            // Check unique constraints (exclude self)
+            self.check_unique_constraints(&mutable_data, Some(id))?;
+
+            let new_bytes = serde_json::to_vec(&mutable_data)?;
+            ops.push(UpdateOp {
+                id,
+                old_loc,
+                old_data,
+                new_data: mutable_data,
+                new_bytes,
+            });
+            Ok(())
+        };
+
+        if let Some(ref indexed_ids) = candidate_ids {
+            for &id in indexed_ids {
+                if let Some(&old_loc) = self.primary_index.get(&id) {
+                    let data = self.read_doc_value(id, old_loc)?;
+                    process_candidate(id, &data, old_loc)?;
                 }
-                let old_doc = doc;
-
-                // Apply ALL update operators
-                crate::update::apply_update(&mut data, update_json)?;
-
-                // Increment _version
-                let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                let new_version = old_version + 1;
-                data.as_object_mut()
-                    .unwrap()
-                    .insert("_version".to_string(), Value::Number(new_version.into()));
-
-                // Check unique constraints (exclude self)
-                self.check_unique_constraints(&data, Some(id))?;
-
-                let new_bytes = serde_json::to_vec(&data)?;
-                ops.push(UpdateOp {
-                    id,
-                    old_loc,
-                    old_doc,
-                    new_data: data,
-                    new_bytes,
-                });
+            }
+        } else {
+            // No index — iterate cache directly
+            let cache_snapshot: Vec<(DocumentId, Arc<Value>, DocLocation)> = self.doc_cache.iter()
+                .filter_map(|(&id, data)| {
+                    self.primary_index.get(&id).map(|&loc| (id, Arc::clone(data), loc))
+                })
+                .collect();
+            for (id, data, old_loc) in cache_snapshot {
+                process_candidate(id, &data, old_loc)?;
             }
         }
 
@@ -653,9 +681,9 @@ impl Collection {
             .iter()
             .map(|op| WalEntry::update(op.id, op.new_bytes.clone()))
             .collect();
-        self.wal.log_batch(&wal_entries)?;
+        self.wal.log_batch_no_sync(&wal_entries)?;
 
-        // Phase 3: apply all mutations to .dat → single fsync
+        // Phase 3: apply all mutations to .dat → single fsync (the only fsync)
         let mut new_locs = Vec::with_capacity(ops.len());
         for op in &ops {
             let new_loc = self.storage.append_no_sync(&op.new_bytes)?;
@@ -664,8 +692,8 @@ impl Collection {
         }
         self.storage.sync()?;
 
-        // Phase 4: checkpoint WAL → single fsync
-        self.wal.checkpoint()?;
+        // Phase 4: lazy WAL checkpoint (no fsync)
+        self.wal.checkpoint_no_sync()?;
 
         // Phase 5: update in-memory state
         let count = ops.len() as u64;
@@ -673,15 +701,15 @@ impl Collection {
             self.primary_index.insert(op.id, new_loc);
             let new_version = op.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
             self.version_index.insert(op.id, new_version);
-            self.cache_put(op.id, op.new_bytes);
-            let new_doc = Document::new(op.id, op.new_data)?;
+            let cached = Arc::new(op.new_data);
+            self.cache_put(op.id, Arc::clone(&cached));
             for idx in self.field_indexes.values_mut() {
-                idx.remove(&op.old_doc);
-                idx.insert(&new_doc);
+                idx.remove_value(op.id, &op.old_data);
+                idx.insert_value(op.id, &cached);
             }
             for idx in &mut self.composite_indexes {
-                idx.remove(&op.old_doc);
-                idx.insert(&new_doc);
+                idx.remove_value(op.id, &op.old_data);
+                idx.insert_value(op.id, &cached);
             }
         }
 
@@ -699,23 +727,34 @@ impl Collection {
             &self.composite_indexes,
             &all_ids,
         );
-        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
         // Phase 1: collect all deletions
         struct DeleteOp {
             id: DocumentId,
             loc: DocLocation,
-            doc: Document,
+            data: Arc<Value>,
         }
         let mut ops = Vec::new();
 
-        for &id in ids_to_scan {
-            if let Some(&loc) = self.primary_index.get(&id) {
-                let bytes = self.read_doc_bytes(id, loc)?;
-                let data: Value = serde_json::from_slice(&bytes)?;
-                let doc = Document::new(id, data)?;
-                if query::matches_doc(&query, &doc) {
-                    ops.push(DeleteOp { id, loc, doc });
+        if let Some(ref indexed_ids) = candidate_ids {
+            for &id in indexed_ids {
+                if let Some(&loc) = self.primary_index.get(&id) {
+                    let data = self.read_doc_value(id, loc)?;
+                    if query::matches_value(&query, &data) {
+                        ops.push(DeleteOp { id, loc, data });
+                    }
+                }
+            }
+        } else {
+            // No index — iterate cache directly
+            let cache_snapshot: Vec<(DocumentId, Arc<Value>, DocLocation)> = self.doc_cache.iter()
+                .filter_map(|(&id, data)| {
+                    self.primary_index.get(&id).map(|&loc| (id, Arc::clone(data), loc))
+                })
+                .collect();
+            for (id, data, loc) in cache_snapshot {
+                if query::matches_value(&query, &data) {
+                    ops.push(DeleteOp { id, loc, data });
                 }
             }
         }
@@ -724,21 +763,21 @@ impl Collection {
             return Ok(0);
         }
 
-        // Phase 2: WAL log all deletes → single fsync
+        // Phase 2: WAL log all deletes (no fsync — storage fsync provides durability)
         let wal_entries: Vec<WalEntry> = ops
             .iter()
             .map(|op| WalEntry::delete(op.id))
             .collect();
-        self.wal.log_batch(&wal_entries)?;
+        self.wal.log_batch_no_sync(&wal_entries)?;
 
-        // Phase 3: mark all deleted in .dat → single fsync
+        // Phase 3: mark all deleted in .dat → single fsync (the only fsync)
         for op in &ops {
             self.storage.mark_deleted_no_sync(op.loc)?;
         }
         self.storage.sync()?;
 
-        // Phase 4: checkpoint WAL → single fsync
-        self.wal.checkpoint()?;
+        // Phase 4: lazy WAL checkpoint (no fsync)
+        self.wal.checkpoint_no_sync()?;
 
         // Phase 5: update in-memory state
         let count = ops.len() as u64;
@@ -747,10 +786,10 @@ impl Collection {
             self.version_index.remove(&op.id);
             self.doc_cache.remove(&op.id);
             for idx in self.field_indexes.values_mut() {
-                idx.remove(&op.doc);
+                idx.remove_value(op.id, &op.data);
             }
             for idx in &mut self.composite_indexes {
-                idx.remove(&op.doc);
+                idx.remove_value(op.id, &op.data);
             }
         }
 
@@ -782,15 +821,21 @@ impl Collection {
             &self.composite_indexes,
             &all_ids,
         );
-        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
         let mut count = 0;
-        for &id in ids_to_scan {
-            if let Some(&loc) = self.primary_index.get(&id) {
-                let bytes = self.read_doc_bytes(id, loc)?;
-                let data: Value = serde_json::from_slice(&bytes)?;
-                let doc = Document::new(id, data)?;
-                if query::matches_doc(&query, &doc) {
+        if let Some(ref indexed_ids) = candidate_ids {
+            for &id in indexed_ids {
+                if let Some(&loc) = self.primary_index.get(&id) {
+                    let data = self.read_doc_value(id, loc)?;
+                    if query::matches_value(&query, &data) {
+                        count += 1;
+                    }
+                }
+            }
+        } else {
+            // No index — iterate cache directly, zero clones
+            for (_id, data) in &self.doc_cache {
+                if query::matches_value(&query, &data) {
                     count += 1;
                 }
             }
@@ -850,18 +895,18 @@ impl Collection {
         for idx in &mut self.composite_indexes {
             idx.clear();
         }
-        for (&id, &loc) in &self.primary_index {
+        for (&id, &loc) in &self.primary_index.clone() {
             let bytes = self.storage.read(loc)?;
-            self.doc_cache.insert(id, bytes.clone());
             let data: Value = serde_json::from_slice(&bytes)?;
             let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             self.version_index.insert(id, ver);
-            let doc = Document::new(id, data)?;
+            let cached = Arc::new(data);
+            self.doc_cache.insert(id, Arc::clone(&cached));
             for idx in self.field_indexes.values_mut() {
-                idx.insert(&doc);
+                idx.insert_value(id, &cached);
             }
             for idx in &mut self.composite_indexes {
-                idx.insert(&doc);
+                idx.insert_value(id, &cached);
             }
         }
 
@@ -918,7 +963,7 @@ impl Collection {
             doc_id: id,
             new_bytes: bytes,
             old_loc: None,
-            old_doc: None,
+            old_data: None,
             new_data: data,
             is_delete: false,
         })
@@ -949,40 +994,54 @@ impl Collection {
             &self.composite_indexes,
             &all_ids,
         );
-        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
         let mut mutations = Vec::new();
 
-        for &id in ids_to_scan {
-            if let Some(&old_loc) = self.primary_index.get(&id) {
-                let bytes = self.read_doc_bytes(id, old_loc)?;
-                let mut data: Value = serde_json::from_slice(&bytes)?;
-                let doc = Document::new(id, data.clone())?;
-                if !query::matches_doc(&query, &doc) {
-                    continue;
+        let mut process_candidate = |id: DocumentId, cached: &Arc<Value>, old_loc: DocLocation| -> Result<()> {
+            if !query::matches_value(&query, &cached) {
+                return Ok(());
+            }
+            let old_data = (**cached).clone();
+            let mut data = (**cached).clone();
+
+            crate::update::apply_update(&mut data, update_json)?;
+
+            let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+            let new_version = old_version + 1;
+            data.as_object_mut()
+                .unwrap()
+                .insert("_version".to_string(), Value::Number(new_version.into()));
+
+            self.check_unique_constraints(&data, Some(id))?;
+
+            let new_bytes = serde_json::to_vec(&data)?;
+            mutations.push(PreparedMutation {
+                wal_entry: WalEntry::Update { doc_id: id, doc_bytes: new_bytes.clone(), tx_id },
+                doc_id: id,
+                new_bytes,
+                old_loc: Some(old_loc),
+                old_data: Some(old_data),
+                new_data: data,
+                is_delete: false,
+            });
+            Ok(())
+        };
+
+        if let Some(ref indexed_ids) = candidate_ids {
+            for &id in indexed_ids {
+                if let Some(&old_loc) = self.primary_index.get(&id) {
+                    let data = self.read_doc_value(id, old_loc)?;
+                    process_candidate(id, &data, old_loc)?;
                 }
-                let old_doc = doc;
-
-                crate::update::apply_update(&mut data, update_json)?;
-
-                let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                let new_version = old_version + 1;
-                data.as_object_mut()
-                    .unwrap()
-                    .insert("_version".to_string(), Value::Number(new_version.into()));
-
-                self.check_unique_constraints(&data, Some(id))?;
-
-                let new_bytes = serde_json::to_vec(&data)?;
-                mutations.push(PreparedMutation {
-                    wal_entry: WalEntry::Update { doc_id: id, doc_bytes: new_bytes.clone(), tx_id },
-                    doc_id: id,
-                    new_bytes,
-                    old_loc: Some(old_loc),
-                    old_doc: Some(old_doc),
-                    new_data: data,
-                    is_delete: false,
-                });
+            }
+        } else {
+            let cache_snapshot: Vec<(DocumentId, Arc<Value>, DocLocation)> = self.doc_cache.iter()
+                .filter_map(|(&id, data)| {
+                    self.primary_index.get(&id).map(|&loc| (id, Arc::clone(data), loc))
+                })
+                .collect();
+            for (id, data, old_loc) in cache_snapshot {
+                process_candidate(id, &data, old_loc)?;
             }
         }
 
@@ -1004,27 +1063,40 @@ impl Collection {
             &self.composite_indexes,
             &all_ids,
         );
-        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
         let mut mutations = Vec::new();
 
-        for &id in ids_to_scan {
-            if let Some(&loc) = self.primary_index.get(&id) {
-                let bytes = self.read_doc_bytes(id, loc)?;
-                let data: Value = serde_json::from_slice(&bytes)?;
-                let doc = Document::new(id, data)?;
-                if !query::matches_doc(&query, &doc) {
-                    continue;
+        let mut process_candidate = |id: DocumentId, cached: &Arc<Value>, loc: DocLocation| -> Result<()> {
+            if !query::matches_value(&query, &cached) {
+                return Ok(());
+            }
+            mutations.push(PreparedMutation {
+                wal_entry: WalEntry::Delete { doc_id: id, tx_id },
+                doc_id: id,
+                new_bytes: vec![],
+                old_loc: Some(loc),
+                old_data: Some((**cached).clone()),
+                new_data: Value::Null,
+                is_delete: true,
+            });
+            Ok(())
+        };
+
+        if let Some(ref indexed_ids) = candidate_ids {
+            for &id in indexed_ids {
+                if let Some(&loc) = self.primary_index.get(&id) {
+                    let data = self.read_doc_value(id, loc)?;
+                    process_candidate(id, &data, loc)?;
                 }
-                mutations.push(PreparedMutation {
-                    wal_entry: WalEntry::Delete { doc_id: id, tx_id },
-                    doc_id: id,
-                    new_bytes: vec![],
-                    old_loc: Some(loc),
-                    old_doc: Some(doc),
-                    new_data: Value::Null,
-                    is_delete: true,
-                });
+            }
+        } else {
+            let cache_snapshot: Vec<(DocumentId, Arc<Value>, DocLocation)> = self.doc_cache.iter()
+                .filter_map(|(&id, data)| {
+                    self.primary_index.get(&id).map(|&loc| (id, Arc::clone(data), loc))
+                })
+                .collect();
+            for (id, data, loc) in cache_snapshot {
+                process_candidate(id, &data, loc)?;
             }
         }
 
@@ -1064,49 +1136,40 @@ impl Collection {
                 self.primary_index.remove(&m.doc_id);
                 self.version_index.remove(&m.doc_id);
                 self.doc_cache.remove(&m.doc_id);
-                if let Some(ref old_doc) = m.old_doc {
+                if let Some(ref old_data) = m.old_data {
                     for idx in self.field_indexes.values_mut() {
-                        idx.remove(old_doc);
+                        idx.remove_value(m.doc_id, old_data);
                     }
                     for idx in &mut self.composite_indexes {
-                        idx.remove(old_doc);
+                        idx.remove_value(m.doc_id, old_data);
                     }
                 }
             } else if let Some(loc) = new_locs[i] {
                 self.primary_index.insert(m.doc_id, loc);
                 let ver = m.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
                 self.version_index.insert(m.doc_id, ver);
-                self.cache_put(m.doc_id, m.new_bytes.clone());
+                let cached = Arc::new(m.new_data.clone());
+                self.cache_put(m.doc_id, Arc::clone(&cached));
 
-                if let Some(ref old_doc) = m.old_doc {
+                if let Some(ref old_data) = m.old_data {
                     for idx in self.field_indexes.values_mut() {
-                        idx.remove(old_doc);
+                        idx.remove_value(m.doc_id, old_data);
                     }
                     for idx in &mut self.composite_indexes {
-                        idx.remove(old_doc);
+                        idx.remove_value(m.doc_id, old_data);
                     }
                 }
-                if let Ok(new_doc) = Document::new(m.doc_id, m.new_data.clone()) {
-                    for idx in self.field_indexes.values_mut() {
-                        idx.insert(&new_doc);
-                    }
-                    for idx in &mut self.composite_indexes {
-                        idx.insert(&new_doc);
-                    }
+                for idx in self.field_indexes.values_mut() {
+                    idx.insert_value(m.doc_id, &cached);
+                }
+                for idx in &mut self.composite_indexes {
+                    idx.insert_value(m.doc_id, &cached);
                 }
             }
         }
 
         Ok(())
     }
-}
-
-/// If we used an index, we still need to post-filter for conditions
-/// the index didn't fully cover. If no index was used, always filter.
-fn matches_with_post_filter(query: &Query, doc: &Document, _used_index: bool) -> bool {
-    // Always apply the full query as a post-filter for correctness.
-    // Index results are candidates; the post-filter ensures precision.
-    query::matches_doc(query, doc)
 }
 
 #[cfg(test)]

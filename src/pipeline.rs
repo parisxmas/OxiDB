@@ -1,8 +1,8 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use serde_json::{json, Map, Value};
 
-use crate::document::Document;
 use crate::error::{Error, Result};
 use crate::query::{self, SortOrder};
 use crate::value::IndexValue;
@@ -111,18 +111,17 @@ pub struct Pipeline {
 // Helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn resolve_field(doc: &Value, path: &str) -> Value {
+/// Resolve a field path by reference — zero allocations.
+fn resolve_field_ref<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
     let mut current = doc;
     for part in path.split('.') {
-        match current {
-            Value::Object(map) => match map.get(part) {
-                Some(v) => current = v,
-                None => return Value::Null,
-            },
-            _ => return Value::Null,
-        }
+        current = current.as_object()?.get(part)?;
     }
-    current.clone()
+    Some(current)
+}
+
+pub(crate) fn resolve_field(doc: &Value, path: &str) -> Value {
+    resolve_field_ref(doc, path).cloned().unwrap_or(Value::Null)
 }
 
 pub(crate) fn set_field(doc: &mut Value, path: &str, value: Value) {
@@ -220,6 +219,15 @@ fn parse_expression(val: &Value) -> Result<Expression> {
 }
 
 impl Expression {
+    /// Fast numeric evaluation — avoids Value clone for FieldRef and Literal.
+    fn eval_num(&self, doc: &Value) -> Option<f64> {
+        match self {
+            Expression::Literal(v) => v.as_f64(),
+            Expression::FieldRef(path) => resolve_field_ref(doc, path)?.as_f64(),
+            _ => to_f64(&self.eval(doc)),
+        }
+    }
+
     fn eval(&self, doc: &Value) -> Value {
         match self {
             Expression::Literal(v) => v.clone(),
@@ -403,14 +411,31 @@ fn exec_match(docs: Vec<Value>, match_val: &Value) -> Result<Vec<Value>> {
     let query = query::parse_query(match_val)?;
     Ok(docs
         .into_iter()
-        .filter(|doc| {
-            if let Ok(d) = Document::new(0, doc.clone()) {
-                query::matches_doc(&query, &d)
-            } else {
-                false
-            }
-        })
+        .filter(|doc| query::matches_value(&query, doc))
         .collect())
+}
+
+/// Hashable group key — avoids serde_json::to_string for hashing.
+#[derive(Clone, Eq, PartialEq)]
+struct GroupKeyHash(Vec<IndexValue>);
+
+impl Hash for GroupKeyHash {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for v in &self.0 {
+            v.hash(state);
+        }
+    }
+}
+
+fn compute_group_key_hash(val: &Value) -> GroupKeyHash {
+    match val {
+        Value::Null => GroupKeyHash(vec![IndexValue::Null]),
+        Value::Object(map) => {
+            GroupKeyHash(map.values().map(IndexValue::from_json).collect())
+        }
+        _ => GroupKeyHash(vec![IndexValue::from_json(val)]),
+    }
 }
 
 fn exec_group(
@@ -418,8 +443,8 @@ fn exec_group(
     key: &GroupKey,
     accumulators: &[(String, Accumulator)],
 ) -> Result<Vec<Value>> {
-    let mut groups: HashMap<String, (Value, Vec<AccumulatorState>)> = HashMap::new();
-    let mut insertion_order: Vec<String> = Vec::new();
+    let mut groups: HashMap<GroupKeyHash, (Value, Vec<AccumulatorState>)> = HashMap::new();
+    let mut insertion_order: Vec<GroupKeyHash> = Vec::new();
 
     for doc in &docs {
         let key_val = match key {
@@ -434,10 +459,10 @@ fn exec_group(
             }
         };
 
-        let key_str = serde_json::to_string(&key_val).unwrap();
+        let key_hash = compute_group_key_hash(&key_val);
 
-        let (_, states) = groups.entry(key_str.clone()).or_insert_with(|| {
-            insertion_order.push(key_str.clone());
+        let (_, states) = groups.entry(key_hash.clone()).or_insert_with(|| {
+            insertion_order.push(key_hash.clone());
             let initial: Vec<AccumulatorState> = accumulators
                 .iter()
                 .map(|(_, acc)| match acc {
@@ -454,19 +479,19 @@ fn exec_group(
                     Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
                 })
                 .collect();
-            (key_val.clone(), initial)
+            (key_val, initial)
         });
 
         for (i, (_, acc)) in accumulators.iter().enumerate() {
             let state = &mut states[i];
             match (acc, state) {
                 (Accumulator::Sum(expr), AccumulatorState::Sum(s)) => {
-                    if let Some(n) = to_f64(&expr.eval(doc)) {
+                    if let Some(n) = expr.eval_num(doc) {
                         *s += n;
                     }
                 }
                 (Accumulator::Avg(expr), AccumulatorState::Avg { sum, count }) => {
-                    if let Some(n) = to_f64(&expr.eval(doc)) {
+                    if let Some(n) = expr.eval_num(doc) {
                         *sum += n;
                         *count += 1;
                     }
@@ -525,8 +550,8 @@ fn exec_group(
     }
 
     let mut results = Vec::new();
-    for key_str in &insertion_order {
-        let (key_val, states) = groups.remove(key_str).unwrap();
+    for key_hash in &insertion_order {
+        let (key_val, states) = groups.remove(key_hash).unwrap();
         let mut doc = Map::new();
         doc.insert("_id".to_string(), key_val);
 
@@ -559,10 +584,10 @@ fn exec_group(
 fn exec_sort(mut docs: Vec<Value>, sort_fields: &[(String, SortOrder)]) -> Vec<Value> {
     docs.sort_by(|a, b| {
         for (field, order) in sort_fields {
-            let av = resolve_field(a, field);
-            let bv = resolve_field(b, field);
-            let aiv = IndexValue::from_json(&av);
-            let biv = IndexValue::from_json(&bv);
+            let av = resolve_field_ref(a, field);
+            let bv = resolve_field_ref(b, field);
+            let aiv = av.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
+            let biv = bv.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
             let cmp = aiv.cmp(&biv);
             let cmp = match order {
                 SortOrder::Asc => cmp,
