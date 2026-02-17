@@ -458,19 +458,153 @@ void       oxidb_disconnect(OxiDbConn* conn);
 
 All operation functions return a JSON-encoded response string. The caller must free it with `oxidb_free_string`.
 
+## Python
+
+The Python client (`python/oxidb.py`) is a zero-dependency TCP client using only the standard library.
+
+```python
+from oxidb import OxiDbClient
+
+client = OxiDbClient("127.0.0.1", 4444)
+# or as a context manager:
+# with OxiDbClient("127.0.0.1", 4444) as client:
+```
+
+### CRUD
+
+```python
+# Insert
+client.insert("users", {"name": "Alice", "age": 30})
+client.insert_many("users", [
+    {"name": "Bob", "age": 25},
+    {"name": "Charlie", "age": 35},
+])
+
+# Find with options
+docs = client.find("users", {"name": "Alice"})
+docs = client.find("users", {}, sort={"age": 1}, skip=0, limit=10)
+doc  = client.find_one("users", {"name": "Alice"})
+
+# Update
+client.update("users", {"name": "Alice"}, {"$set": {"age": 31}})
+
+# Delete
+client.delete("users", {"name": "Charlie"})
+
+# Count
+n = client.count("users")
+```
+
+### Collections & Indexes
+
+```python
+client.create_collection("orders")
+cols = client.list_collections()
+client.drop_collection("orders")
+
+client.create_index("users", "name")
+client.create_unique_index("users", "email")
+client.create_composite_index("users", ["name", "age"])
+```
+
+### Aggregation
+
+```python
+results = client.aggregate("users", [
+    {"$match": {"age": {"$gte": 18}}},
+    {"$group": {"_id": "$category", "total": {"$sum": "$amount"}}},
+    {"$sort": {"total": -1}},
+])
+```
+
+### Transactions
+
+```python
+# Auto-commit on success, auto-rollback on exception
+with client.transaction():
+    client.insert("ledger", {"action": "debit",  "amount": 100})
+    client.insert("ledger", {"action": "credit", "amount": 100})
+
+# Manual control
+client.begin_tx()
+client.insert("ledger", {"action": "refund", "amount": 50})
+client.commit_tx()   # or client.rollback_tx()
+```
+
+### Blob Storage
+
+```python
+client.create_bucket("files")
+client.list_buckets()
+
+client.put_object("files", "hello.txt", b"Hello from Python!",
+                  content_type="text/plain", metadata={"author": "py"})
+data, meta = client.get_object("files", "hello.txt")
+head = client.head_object("files", "hello.txt")
+objs = client.list_objects("files", prefix="hello", limit=10)
+
+client.delete_object("files", "hello.txt")
+client.delete_bucket("files")
+```
+
+### Full-Text Search
+
+```python
+results = client.search("hello world", bucket="files", limit=10)
+```
+
+### Compaction
+
+```python
+stats = client.compact("users")  # returns {old_size, new_size, docs_kept}
+```
+
+```python
+client.close()
+```
+
 ## .NET Client
 
-The .NET client (`dotnet/OxiDb.Client`) wraps the C FFI library via P/Invoke:
+The .NET client (`dotnet/OxiDb.Client`) wraps the C FFI library via P/Invoke.
 
 ```csharp
 using OxiDb.Client;
 
 using var db = OxiDbClient.Connect("127.0.0.1", 4444);
+```
 
+### CRUD
+
+```csharp
+// Insert
 db.Insert("users", "{\"name\":\"Alice\",\"age\":30}");
-var result = db.Find("users", "{\"age\":{\"$gte\":18}}");
 
-// Aggregation pipeline
+// Find
+var docs = db.Find("users", "{\"name\":\"Alice\"}");
+var doc  = db.FindOne("users", "{\"name\":\"Alice\"}");
+
+// With Filter/UpdateDef builders
+var docs2 = db.Find("users", Filter.Gte("age", 18));
+db.Update("users", Filter.Eq("name", "Alice"), UpdateDef.Set("age", 31));
+db.Delete("users", Filter.Eq("name", "Charlie"));
+
+// Count
+var count = db.Count("users");
+```
+
+### Collections & Indexes
+
+```csharp
+db.ListCollections();
+db.DropCollection("orders");
+
+db.CreateIndex("users", "name");
+db.CreateCompositeIndex("users", "[\"name\", \"age\"]");
+```
+
+### Aggregation
+
+```csharp
 var stats = db.Aggregate("orders", """
     [
         {"$match": {"status": "completed"}},
@@ -478,6 +612,36 @@ var stats = db.Aggregate("orders", """
         {"$sort": {"total": -1}}
     ]
 """);
+```
+
+### Transactions
+
+```csharp
+db.BeginTransaction();
+db.Insert("ledger", "{\"action\":\"debit\",\"amount\":100}");
+db.Insert("ledger", "{\"action\":\"credit\",\"amount\":100}");
+db.CommitTransaction();   // or db.RollbackTransaction()
+```
+
+### Blob Storage
+
+```csharp
+db.CreateBucket("files");
+db.ListBuckets();
+
+db.PutObject("files", "hello.txt", Convert.ToBase64String(data), "text/plain");
+var obj = db.GetObject("files", "hello.txt");
+var head = db.HeadObject("files", "hello.txt");
+var objs = db.ListObjects("files", prefix: "hello", limit: 10);
+
+db.DeleteObject("files", "hello.txt");
+db.DeleteBucket("files");
+```
+
+### Full-Text Search
+
+```csharp
+var results = db.Search("hello world", bucket: "files", limit: 10);
 ```
 
 ## Java / Spring Boot
@@ -500,126 +664,425 @@ oxidb.port=4444
 oxidb.timeout-ms=5000
 ```
 
-Use the auto-configured client:
+Inject the auto-configured client:
 
 ```java
-@RestController
-public class MyController {
-
-    @Autowired
-    private OxiDbClient db;
-
-    @PostMapping("/users")
-    public JsonNode createUser(@RequestBody String json) {
-        return db.insert("users", json);
-    }
-
-    @GetMapping("/users")
-    public JsonNode listUsers() {
-        return db.find("users", Map.of());
-    }
-}
+@Autowired
+private OxiDbClient db;
 ```
 
-Transactions with automatic commit/rollback:
+### CRUD
 
 ```java
+// Insert
+db.insert("users", Map.of("name", "Alice", "age", 30));
+db.insertMany("users", List.of(
+    Map.of("name", "Bob", "age", 25),
+    Map.of("name", "Charlie", "age", 35)
+));
+
+// Find with options
+JsonNode docs = db.find("users", Map.of("name", "Alice"));
+JsonNode docs2 = db.find("users", Map.of(), Map.of("age", 1), 0, 10); // sort, skip, limit
+JsonNode doc = db.findOne("users", Map.of("name", "Alice"));
+
+// Also accepts JSON strings
+JsonNode docs3 = db.find("users", "{\"age\":{\"$gte\":18}}");
+
+// Update
+db.update("users", Map.of("name", "Alice"), Map.of("$set", Map.of("age", 31)));
+
+// Delete
+db.delete("users", Map.of("name", "Charlie"));
+
+// Count
+int n = db.count("users");
+```
+
+### Collections & Indexes
+
+```java
+db.createCollection("orders");
+db.listCollections();
+db.dropCollection("orders");
+
+db.createIndex("users", "name");
+db.createUniqueIndex("users", "email");
+db.createCompositeIndex("users", List.of("name", "age"));
+```
+
+### Aggregation
+
+```java
+JsonNode results = db.aggregate("users", """
+    [
+        {"$match": {"age": {"$gte": 18}}},
+        {"$group": {"_id": "$category", "total": {"$sum": "$amount"}}},
+        {"$sort": {"total": -1}}
+    ]
+""");
+```
+
+### Transactions
+
+```java
+// Auto-commit on success, auto-rollback on exception
 db.withTransaction(() -> {
     db.insert("ledger", Map.of("action", "debit",  "amount", 100));
     db.insert("ledger", Map.of("action", "credit", "amount", 100));
 });
+
+// Manual control
+db.beginTx();
+db.insert("ledger", Map.of("action", "refund", "amount", 50));
+db.commitTx();   // or db.rollbackTx()
 ```
 
-See `examples/spring-boot` for a full working app with REST endpoints for all OxiDB features.
+### Blob Storage
+
+```java
+db.createBucket("files");
+db.listBuckets();
+
+db.putObject("files", "hello.txt", "Hello!".getBytes(), "text/plain", Map.of("author", "java"));
+JsonNode obj = db.getObject("files", "hello.txt");
+byte[] content = db.decodeObjectContent(obj);
+JsonNode head = db.headObject("files", "hello.txt");
+JsonNode objs = db.listObjects("files", "hello", 10);
+
+db.deleteObject("files", "hello.txt");
+db.deleteBucket("files");
+```
+
+### Full-Text Search
+
+```java
+JsonNode results = db.search("hello world", "files", 10);
+```
+
+### Compaction
+
+```java
+JsonNode stats = db.compact("users"); // old_size, new_size, docs_kept
+```
+
+See `examples/spring-boot` for a full working REST app.
 
 ## PHP
 
-The PHP client (`php/src/OxiDbClient.php`) is a zero-dependency TCP client using only built-in PHP functions:
+The PHP client (`php/src/OxiDbClient.php`) is a zero-dependency TCP client using only built-in PHP functions.
 
 ```php
 require_once 'src/OxiDbClient.php';
 
 $db = new \OxiDb\OxiDbClient('127.0.0.1', 4444);
+```
 
-// CRUD
+### CRUD
+
+```php
+// Insert
 $db->insert('users', ['name' => 'Alice', 'age' => 30]);
-$docs = $db->find('users', ['name' => 'Alice']);
-$db->update('users', ['name' => 'Alice'], ['$set' => ['age' => 31]]);
-$db->delete('users', ['name' => 'Alice']);
-$n = $db->count('users');
+$db->insertMany('users', [
+    ['name' => 'Bob', 'age' => 25],
+    ['name' => 'Charlie', 'age' => 35],
+]);
 
-// Transactions
+// Find with options
+$docs = $db->find('users', ['name' => 'Alice']);
+$docs = $db->find('users', [], ['age' => 1], 0, 10); // sort, skip, limit
+$doc  = $db->findOne('users', ['name' => 'Alice']);
+
+// Update
+$db->update('users', ['name' => 'Alice'], ['$set' => ['age' => 31]]);
+
+// Delete
+$db->delete('users', ['name' => 'Charlie']);
+
+// Count
+$n = $db->count('users');
+```
+
+### Collections & Indexes
+
+```php
+$db->createCollection('orders');
+$db->listCollections();
+$db->dropCollection('orders');
+
+$db->createIndex('users', 'name');
+$db->createUniqueIndex('users', 'email');
+$db->createCompositeIndex('users', ['name', 'age']);
+```
+
+### Aggregation
+
+```php
+$results = $db->aggregate('users', [
+    ['$match' => ['age' => ['$gte' => 18]]],
+    ['$group' => ['_id' => '$category', 'total' => ['$sum' => '$amount']]],
+    ['$sort'  => ['total' => -1]],
+]);
+```
+
+### Transactions
+
+```php
+// Auto-commit on success, auto-rollback on exception
 $db->transaction(function () use ($db) {
     $db->insert('ledger', ['action' => 'debit',  'amount' => 100]);
     $db->insert('ledger', ['action' => 'credit', 'amount' => 100]);
 });
 
-// Blobs
-$db->createBucket('files');
-$db->putObject('files', 'hello.txt', 'Hello!');
-[$data, $meta] = $db->getObject('files', 'hello.txt');
+// Manual control
+$db->beginTx();
+$db->insert('ledger', ['action' => 'refund', 'amount' => 50]);
+$db->commitTx();   // or $db->rollbackTx()
+```
 
+### Blob Storage
+
+```php
+$db->createBucket('files');
+$db->listBuckets();
+
+$db->putObject('files', 'hello.txt', 'Hello from PHP!', 'text/plain', ['author' => 'php']);
+[$data, $meta] = $db->getObject('files', 'hello.txt');
+$head = $db->headObject('files', 'hello.txt');
+$objs = $db->listObjects('files', 'hello', 10);
+
+$db->deleteObject('files', 'hello.txt');
+$db->deleteBucket('files');
+```
+
+### Full-Text Search
+
+```php
+$results = $db->search('hello world', 'files', 10);
+```
+
+### Compaction
+
+```php
+$stats = $db->compact('users'); // old_size, new_size, docs_kept
+```
+
+```php
 $db->close();
 ```
 
 ## Ruby
 
-The Ruby client (`ruby/lib/oxidb.rb`) is a zero-dependency gem using only the standard library:
+The Ruby client (`ruby/lib/oxidb.rb`) is a zero-dependency gem using only the standard library.
 
 ```ruby
 require "oxidb"
 
 db = OxiDb::Client.new("127.0.0.1", 4444)
+# or with a block:
+# OxiDb::Client.open("127.0.0.1", 4444) { |db| ... }
+```
 
-# CRUD
+### CRUD
+
+```ruby
+# Insert
 db.insert("users", { "name" => "Alice", "age" => 30 })
-docs = db.find("users", { "name" => "Alice" })
-db.update("users", { "name" => "Alice" }, { "$set" => { "age" => 31 } })
-db.delete("users", { "name" => "Alice" })
-n = db.count("users")
+db.insert_many("users", [
+  { "name" => "Bob", "age" => 25 },
+  { "name" => "Charlie", "age" => 35 }
+])
 
-# Transactions
+# Find with options
+docs = db.find("users", { "name" => "Alice" })
+docs = db.find("users", {}, sort: { "age" => 1 }, skip: 0, limit: 10)
+doc  = db.find_one("users", { "name" => "Alice" })
+
+# Update
+db.update("users", { "name" => "Alice" }, { "$set" => { "age" => 31 } })
+
+# Delete
+db.delete("users", { "name" => "Charlie" })
+
+# Count
+n = db.count("users")
+```
+
+### Collections & Indexes
+
+```ruby
+db.create_collection("orders")
+db.list_collections
+db.drop_collection("orders")
+
+db.create_index("users", "name")
+db.create_unique_index("users", "email")
+db.create_composite_index("users", ["name", "age"])
+```
+
+### Aggregation
+
+```ruby
+results = db.aggregate("users", [
+  { "$match" => { "age" => { "$gte" => 18 } } },
+  { "$group" => { "_id" => "$category", "total" => { "$sum" => "$amount" } } },
+  { "$sort"  => { "total" => -1 } }
+])
+```
+
+### Transactions
+
+```ruby
+# Auto-commit on success, auto-rollback on exception
 db.transaction do
   db.insert("ledger", { "action" => "debit",  "amount" => 100 })
   db.insert("ledger", { "action" => "credit", "amount" => 100 })
 end
 
-# Blobs
-db.create_bucket("files")
-db.put_object("files", "hello.txt", "Hello!")
-data, meta = db.get_object("files", "hello.txt")
+# Manual control
+db.begin_tx
+db.insert("ledger", { "action" => "refund", "amount" => 50 })
+db.commit_tx   # or db.rollback_tx
+```
 
+### Blob Storage
+
+```ruby
+db.create_bucket("files")
+db.list_buckets
+
+db.put_object("files", "hello.txt", "Hello from Ruby!",
+              content_type: "text/plain", metadata: { "author" => "ruby" })
+data, meta = db.get_object("files", "hello.txt")
+head = db.head_object("files", "hello.txt")
+objs = db.list_objects("files", prefix: "hello", limit: 10)
+
+db.delete_object("files", "hello.txt")
+db.delete_bucket("files")
+```
+
+### Full-Text Search
+
+```ruby
+results = db.search("hello world", bucket: "files", limit: 10)
+```
+
+### Compaction
+
+```ruby
+stats = db.compact("users") # returns { "old_size" => ..., "new_size" => ..., "docs_kept" => ... }
+```
+
+```ruby
 db.close
 ```
 
 ## Go
 
-The Go client (`go/oxidb`) is a zero-dependency TCP client using only the standard library:
+The Go client (`go/oxidb`) is a zero-dependency TCP client using only the standard library.
 
 ```go
 import "github.com/parisxmas/OxiDB/go/oxidb"
 
 client, _ := oxidb.ConnectDefault() // 127.0.0.1:4444
 defer client.Close()
+```
 
-// CRUD
+### CRUD
+
+```go
+// Insert
 client.Insert("users", map[string]any{"name": "Alice", "age": 30})
-docs, _ := client.Find("users", map[string]any{"name": "Alice"}, nil)
-client.Update("users", map[string]any{"name": "Alice"}, map[string]any{"$set": map[string]any{"age": 31}})
-client.Delete("users", map[string]any{"name": "Alice"})
-n, _ := client.Count("users", map[string]any{})
+client.InsertMany("users", []map[string]any{
+    {"name": "Bob", "age": 25},
+    {"name": "Charlie", "age": 35},
+})
 
-// Transactions
+// Find with options
+docs, _ := client.Find("users", map[string]any{"name": "Alice"}, nil)
+limit := 10
+docs, _ = client.Find("users", map[string]any{}, &oxidb.FindOptions{
+    Sort: map[string]any{"age": 1}, Limit: &limit,
+})
+doc, _ := client.FindOne("users", map[string]any{"name": "Alice"})
+
+// Update
+client.Update("users", map[string]any{"name": "Alice"}, map[string]any{"$set": map[string]any{"age": 31}})
+
+// Delete
+client.Delete("users", map[string]any{"name": "Charlie"})
+
+// Count
+n, _ := client.Count("users", map[string]any{})
+```
+
+### Collections & Indexes
+
+```go
+client.CreateCollection("orders")
+cols, _ := client.ListCollections()
+client.DropCollection("orders")
+
+client.CreateIndex("users", "name")
+client.CreateUniqueIndex("users", "email")
+client.CreateCompositeIndex("users", []string{"name", "age"})
+```
+
+### Aggregation
+
+```go
+results, _ := client.Aggregate("users", []map[string]any{
+    {"$match": map[string]any{"age": map[string]any{"$gte": 18}}},
+    {"$group": map[string]any{"_id": "$category", "total": map[string]any{"$sum": "$amount"}}},
+    {"$sort": map[string]any{"total": -1}},
+})
+```
+
+### Transactions
+
+```go
+// Auto-commit on success, auto-rollback on error
 client.WithTransaction(func() error {
     client.Insert("ledger", map[string]any{"action": "debit", "amount": 100})
     client.Insert("ledger", map[string]any{"action": "credit", "amount": 100})
     return nil
 })
 
-// Blobs
+// Manual control
+client.BeginTx()
+client.Insert("ledger", map[string]any{"action": "refund", "amount": 50})
+client.CommitTx()   // or client.RollbackTx()
+```
+
+### Blob Storage
+
+```go
 client.CreateBucket("files")
-client.PutObject("files", "hello.txt", []byte("Hello!"), "text/plain", nil)
+client.ListBuckets()
+
+client.PutObject("files", "hello.txt", []byte("Hello from Go!"), "text/plain", map[string]string{"author": "go"})
 data, meta, _ := client.GetObject("files", "hello.txt")
+head, _ := client.HeadObject("files", "hello.txt")
+prefix := "hello"
+objs, _ := client.ListObjects("files", &prefix, &limit)
+
+client.DeleteObject("files", "hello.txt")
+client.DeleteBucket("files")
+```
+
+### Full-Text Search
+
+```go
+results, _ := client.Search("hello world", nil, 10)
+// or filter by bucket:
+bucket := "files"
+results, _ = client.Search("hello world", &bucket, 10)
+```
+
+### Compaction
+
+```go
+stats, _ := client.Compact("users") // map with old_size, new_size, docs_kept
 ```
 
 ## Julia
