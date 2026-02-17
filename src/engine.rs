@@ -211,7 +211,7 @@ impl OxiDb {
         if query.as_object().is_some_and(|m| m.is_empty()) {
             Ok(col.count())
         } else {
-            Ok(col.find(query)?.len())
+            col.count_matching(query)
         }
     }
 

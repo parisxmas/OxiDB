@@ -6,7 +6,7 @@ use serde_json::Value;
 use crate::document::{Document, DocumentId};
 use crate::error::{Error, Result};
 use crate::index::{CompositeIndex, FieldIndex};
-use crate::query::{self, FindOptions, Query, SortOrder};
+use crate::query::{self, FindOptions, Query, QueryOp, SortOrder};
 use crate::storage::{DocLocation, Storage};
 use crate::value::IndexValue;
 use crate::wal::{Wal, WalEntry};
@@ -29,9 +29,6 @@ pub struct PreparedMutation {
     pub new_data: Value,
     pub is_delete: bool,
 }
-
-/// Maximum number of documents to cache in memory per collection.
-const DOC_CACHE_CAPACITY: usize = 10_000;
 
 pub struct Collection {
     name: String,
@@ -78,9 +75,7 @@ impl Collection {
                 primary_index.insert(id, DocLocation { offset, length });
                 let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                 version_index.insert(id, ver);
-                if doc_cache.len() < DOC_CACHE_CAPACITY {
-                    doc_cache.insert(id, bytes);
-                }
+                doc_cache.insert(id, bytes);
                 if id >= next_id {
                     next_id = id + 1;
                 }
@@ -122,14 +117,9 @@ impl Collection {
         self.storage.read(loc)
     }
 
-    /// Insert bytes into the cache, evicting nothing if at capacity (simple cap).
+    /// Insert bytes into the cache (no capacity limit — all docs are cached).
     fn cache_put(&mut self, id: DocumentId, bytes: Vec<u8>) {
-        if self.doc_cache.len() < DOC_CACHE_CAPACITY {
-            self.doc_cache.insert(id, bytes);
-        } else if self.doc_cache.contains_key(&id) {
-            // Update existing entry even at capacity
-            self.doc_cache.insert(id, bytes);
-        }
+        self.doc_cache.insert(id, bytes);
     }
 
     // -----------------------------------------------------------------------
@@ -381,6 +371,97 @@ impl Collection {
         opts: &FindOptions,
     ) -> Result<Vec<Value>> {
         let query = query::parse_query(query_json)?;
+
+        // Fast path: Query::All with no sort — iterate HashMap directly,
+        // avoid O(n log n) BTreeSet allocation entirely.
+        if matches!(query, Query::All) && opts.sort.is_none() {
+            let skip = opts.skip.unwrap_or(0) as usize;
+            let limit = opts.limit.map(|l| l as usize).unwrap_or(usize::MAX);
+            let mut results = Vec::new();
+            let mut skipped = 0;
+            for (&id, &loc) in &self.primary_index {
+                if skipped < skip {
+                    skipped += 1;
+                    continue;
+                }
+                if results.len() >= limit {
+                    break;
+                }
+                let bytes = self.read_doc_bytes(id, loc)?;
+                let data: Value = serde_json::from_slice(&bytes)?;
+                results.push(data);
+            }
+            return Ok(results);
+        }
+
+        // Fast path: index-backed sort with early termination
+        // When sorting on a single indexed field with a limit, iterate the
+        // index in order and stop early instead of loading all documents.
+        if let Some(sort_fields) = &opts.sort {
+            if sort_fields.len() == 1 {
+                let (sort_field, sort_order) = &sort_fields[0];
+                if let Some(field_idx) = self.field_indexes.get(sort_field) {
+                    let need = opts.skip.unwrap_or(0) as usize + opts.limit.unwrap_or(u64::MAX) as usize;
+                    let mut results = Vec::new();
+
+                    match sort_order {
+                        SortOrder::Asc => {
+                            'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
+                                for &id in doc_ids {
+                                    if let Some(&loc) = self.primary_index.get(&id) {
+                                        let bytes = self.read_doc_bytes(id, loc)?;
+                                        let data: Value = serde_json::from_slice(&bytes)?;
+                                        let doc = Document::new(id, data.clone())?;
+                                        if query::matches_doc(&query, &doc) {
+                                            results.push(data);
+                                            if results.len() >= need {
+                                                break 'outer_asc;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        SortOrder::Desc => {
+                            'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
+                                for &id in doc_ids.iter().rev() {
+                                    if let Some(&loc) = self.primary_index.get(&id) {
+                                        let bytes = self.read_doc_bytes(id, loc)?;
+                                        let data: Value = serde_json::from_slice(&bytes)?;
+                                        let doc = Document::new(id, data.clone())?;
+                                        if query::matches_doc(&query, &doc) {
+                                            results.push(data);
+                                            if results.len() >= need {
+                                                break 'outer_desc;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Apply skip
+                    if let Some(skip) = opts.skip {
+                        let skip = skip as usize;
+                        if skip >= results.len() {
+                            results.clear();
+                        } else {
+                            results = results.into_iter().skip(skip).collect();
+                        }
+                    }
+
+                    // Apply limit
+                    if let Some(limit) = opts.limit {
+                        results.truncate(limit as usize);
+                    }
+
+                    return Ok(results);
+                }
+            }
+        }
+
+        // Standard path: scan candidates
         let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
 
         // Try index-accelerated lookup
@@ -393,6 +474,14 @@ impl Collection {
 
         let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
+        // Early-limit optimisation: when there is no sort (and no skip),
+        // we can stop scanning as soon as we have enough results.
+        let early_limit: Option<usize> = if opts.sort.is_none() && opts.skip.is_none() {
+            opts.limit.map(|l| l as usize)
+        } else {
+            None
+        };
+
         let mut results = Vec::new();
         for &id in ids_to_scan {
             if let Some(&loc) = self.primary_index.get(&id) {
@@ -401,6 +490,11 @@ impl Collection {
                 let doc = Document::new(id, data.clone())?;
                 if matches_with_post_filter(&query, &doc, candidate_ids.is_some()) {
                     results.push(data);
+                    if let Some(limit) = early_limit {
+                        if results.len() >= limit {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -494,11 +588,17 @@ impl Collection {
             ));
         }
 
-        // Find matching doc IDs first
-        let matching = self.find(query_json)?;
-        if matching.is_empty() {
-            return Ok(0);
-        }
+        // Single-pass: scan candidates, filter, and prepare updates inline
+        // (avoids the double-read of calling find() then re-reading from storage)
+        let query = query::parse_query(query_json)?;
+        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
+        let candidate_ids = query::execute_indexed(
+            &query,
+            &self.field_indexes,
+            &self.composite_indexes,
+            &all_ids,
+        );
+        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
         // Phase 1: prepare all updates and validate constraints upfront
         struct UpdateOp {
@@ -508,18 +608,17 @@ impl Collection {
             new_data: Value,
             new_bytes: Vec<u8>,
         }
-        let mut ops = Vec::with_capacity(matching.len());
+        let mut ops = Vec::new();
 
-        for doc_data in &matching {
-            let id = doc_data
-                .get("_id")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| Error::InvalidQuery("document missing _id".into()))?;
-
+        for &id in ids_to_scan {
             if let Some(&old_loc) = self.primary_index.get(&id) {
-                let bytes = self.storage.read(old_loc)?;
+                let bytes = self.read_doc_bytes(id, old_loc)?;
                 let mut data: Value = serde_json::from_slice(&bytes)?;
-                let old_doc = Document::new(id, data.clone())?;
+                let doc = Document::new(id, data.clone())?;
+                if !query::matches_doc(&query, &doc) {
+                    continue;
+                }
+                let old_doc = doc;
 
                 // Apply ALL update operators
                 crate::update::apply_update(&mut data, update_json)?;
@@ -591,10 +690,16 @@ impl Collection {
 
     /// Delete documents matching a query atomically. Returns number deleted.
     pub fn delete(&mut self, query_json: &Value) -> Result<u64> {
-        let matching = self.find(query_json)?;
-        if matching.is_empty() {
-            return Ok(0);
-        }
+        // Single-pass: scan candidates and collect matches directly
+        let query = query::parse_query(query_json)?;
+        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
+        let candidate_ids = query::execute_indexed(
+            &query,
+            &self.field_indexes,
+            &self.composite_indexes,
+            &all_ids,
+        );
+        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
         // Phase 1: collect all deletions
         struct DeleteOp {
@@ -602,17 +707,16 @@ impl Collection {
             loc: DocLocation,
             doc: Document,
         }
-        let mut ops = Vec::with_capacity(matching.len());
+        let mut ops = Vec::new();
 
-        for doc_data in &matching {
-            let id = doc_data
-                .get("_id")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| Error::InvalidQuery("document missing _id".into()))?;
-
+        for &id in ids_to_scan {
             if let Some(&loc) = self.primary_index.get(&id) {
-                let doc = Document::new(id, doc_data.clone())?;
-                ops.push(DeleteOp { id, loc, doc });
+                let bytes = self.read_doc_bytes(id, loc)?;
+                let data: Value = serde_json::from_slice(&bytes)?;
+                let doc = Document::new(id, data)?;
+                if query::matches_doc(&query, &doc) {
+                    ops.push(DeleteOp { id, loc, doc });
+                }
             }
         }
 
@@ -656,6 +760,42 @@ impl Collection {
     /// Returns the number of documents in the collection.
     pub fn count(&self) -> usize {
         self.primary_index.len()
+    }
+
+    /// Count documents matching a query without building a Vec<Value>.
+    pub fn count_matching(&self, query_json: &Value) -> Result<usize> {
+        let query = query::parse_query(query_json)?;
+
+        // Fast path: simple equality on an indexed field — use index directly
+        if let Query::Field { ref field, ref op } = query {
+            if let QueryOp::Eq(value) = op {
+                if let Some(idx) = self.field_indexes.get(field.as_str()) {
+                    return Ok(idx.find_eq(value).len());
+                }
+            }
+        }
+
+        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
+        let candidate_ids = query::execute_indexed(
+            &query,
+            &self.field_indexes,
+            &self.composite_indexes,
+            &all_ids,
+        );
+        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
+
+        let mut count = 0;
+        for &id in ids_to_scan {
+            if let Some(&loc) = self.primary_index.get(&id) {
+                let bytes = self.read_doc_bytes(id, loc)?;
+                let data: Value = serde_json::from_slice(&bytes)?;
+                let doc = Document::new(id, data)?;
+                if query::matches_doc(&query, &doc) {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
     }
 
     /// Compact the data file by rewriting only active records.
@@ -712,9 +852,7 @@ impl Collection {
         }
         for (&id, &loc) in &self.primary_index {
             let bytes = self.storage.read(loc)?;
-            if self.doc_cache.len() < DOC_CACHE_CAPACITY {
-                self.doc_cache.insert(id, bytes.clone());
-            }
+            self.doc_cache.insert(id, bytes.clone());
             let data: Value = serde_json::from_slice(&bytes)?;
             let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             self.version_index.insert(id, ver);
@@ -802,23 +940,28 @@ impl Collection {
             ));
         }
 
-        let matching = self.find(query_json)?;
-        if matching.is_empty() {
-            return Ok(vec![]);
-        }
+        // Single-pass scan with cache
+        let query = query::parse_query(query_json)?;
+        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
+        let candidate_ids = query::execute_indexed(
+            &query,
+            &self.field_indexes,
+            &self.composite_indexes,
+            &all_ids,
+        );
+        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
-        let mut mutations = Vec::with_capacity(matching.len());
+        let mut mutations = Vec::new();
 
-        for doc_data in &matching {
-            let id = doc_data
-                .get("_id")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| Error::InvalidQuery("document missing _id".into()))?;
-
+        for &id in ids_to_scan {
             if let Some(&old_loc) = self.primary_index.get(&id) {
-                let bytes = self.storage.read(old_loc)?;
+                let bytes = self.read_doc_bytes(id, old_loc)?;
                 let mut data: Value = serde_json::from_slice(&bytes)?;
-                let old_doc = Document::new(id, data.clone())?;
+                let doc = Document::new(id, data.clone())?;
+                if !query::matches_doc(&query, &doc) {
+                    continue;
+                }
+                let old_doc = doc;
 
                 crate::update::apply_update(&mut data, update_json)?;
 
@@ -852,21 +995,27 @@ impl Collection {
         query_json: &Value,
         tx_id: u64,
     ) -> Result<Vec<PreparedMutation>> {
-        let matching = self.find(query_json)?;
-        if matching.is_empty() {
-            return Ok(vec![]);
-        }
+        // Single-pass scan with cache
+        let query = query::parse_query(query_json)?;
+        let all_ids: BTreeSet<DocumentId> = self.primary_index.keys().copied().collect();
+        let candidate_ids = query::execute_indexed(
+            &query,
+            &self.field_indexes,
+            &self.composite_indexes,
+            &all_ids,
+        );
+        let ids_to_scan = candidate_ids.as_ref().unwrap_or(&all_ids);
 
-        let mut mutations = Vec::with_capacity(matching.len());
+        let mut mutations = Vec::new();
 
-        for doc_data in &matching {
-            let id = doc_data
-                .get("_id")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| Error::InvalidQuery("document missing _id".into()))?;
-
+        for &id in ids_to_scan {
             if let Some(&loc) = self.primary_index.get(&id) {
-                let doc = Document::new(id, doc_data.clone())?;
+                let bytes = self.read_doc_bytes(id, loc)?;
+                let data: Value = serde_json::from_slice(&bytes)?;
+                let doc = Document::new(id, data)?;
+                if !query::matches_doc(&query, &doc) {
+                    continue;
+                }
                 mutations.push(PreparedMutation {
                     wal_entry: WalEntry::Delete { doc_id: id, tx_id },
                     doc_id: id,

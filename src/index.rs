@@ -109,6 +109,16 @@ impl FieldIndex {
         result
     }
 
+    /// Iterate (value, doc_ids) in ascending order.
+    pub fn iter_asc(&self) -> impl Iterator<Item = (&IndexValue, &BTreeSet<DocumentId>)> {
+        self.tree.iter()
+    }
+
+    /// Iterate (value, doc_ids) in descending order.
+    pub fn iter_desc(&self) -> impl Iterator<Item = (&IndexValue, &BTreeSet<DocumentId>)> {
+        self.tree.iter().rev()
+    }
+
     /// Remove all entries from the index while keeping field/unique metadata.
     pub fn clear(&mut self) {
         self.tree.clear();
