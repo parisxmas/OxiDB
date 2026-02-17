@@ -206,12 +206,22 @@ impl OxiDb {
 
     pub fn update(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().unwrap().update(query, update)
+        col.write().unwrap().update(query, update, None)
+    }
+
+    pub fn update_one(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
+        let col = self.get_or_create_collection(collection)?;
+        col.write().unwrap().update(query, update, Some(1))
     }
 
     pub fn delete(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().unwrap().delete(query)
+        col.write().unwrap().delete(query, None)
+    }
+
+    pub fn delete_one(&self, collection: &str, query: &Value) -> Result<u64> {
+        let col = self.get_or_create_collection(collection)?;
+        col.write().unwrap().delete(query, Some(1))
     }
 
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {

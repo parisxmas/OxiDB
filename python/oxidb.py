@@ -153,15 +153,26 @@ class OxiDbClient:
         return self._checked({"cmd": "find_one", "collection": collection, "query": query or {}})
 
     def update(self, collection: str, query: dict, update: dict):
-        """Update documents matching a query. Returns {"modified": n} outside tx."""
+        """Update all documents matching a query. Returns {"modified": n} outside tx."""
         return self._checked({
             "cmd": "update", "collection": collection,
             "query": query, "update": update,
         })
 
+    def update_one(self, collection: str, query: dict, update: dict):
+        """Update the first document matching a query. Returns {"modified": n}."""
+        return self._checked({
+            "cmd": "update_one", "collection": collection,
+            "query": query, "update": update,
+        })
+
     def delete(self, collection: str, query: dict):
-        """Delete documents matching a query. Returns {"deleted": n} outside tx."""
+        """Delete all documents matching a query. Returns {"deleted": n} outside tx."""
         return self._checked({"cmd": "delete", "collection": collection, "query": query})
+
+    def delete_one(self, collection: str, query: dict):
+        """Delete the first document matching a query. Returns {"deleted": n}."""
+        return self._checked({"cmd": "delete_one", "collection": collection, "query": query})
 
     def count(self, collection: str, query: dict = None) -> int:
         """Count documents matching a query."""
