@@ -101,6 +101,44 @@ impl FieldIndex {
         self.tree.get(value).cloned().unwrap_or_default()
     }
 
+    /// Count matching docs without building a BTreeSet.
+    pub fn count_eq(&self, value: &IndexValue) -> usize {
+        self.tree.get(value).map_or(0, |ids| ids.len())
+    }
+
+    /// Count docs in a range without building a BTreeSet.
+    pub fn count_range(
+        &self,
+        start: Bound<&IndexValue>,
+        end: Bound<&IndexValue>,
+    ) -> usize {
+        let mut count = 0;
+        for (_key, ids) in self.tree.range((start, end)) {
+            count += ids.len();
+        }
+        count
+    }
+
+    /// Count docs matching any of the given values.
+    pub fn count_in(&self, values: &[IndexValue]) -> usize {
+        let mut count = 0;
+        for v in values {
+            if let Some(ids) = self.tree.get(v) {
+                count += ids.len();
+            }
+        }
+        count
+    }
+
+    /// Total count of all indexed docs.
+    pub fn count_all(&self) -> usize {
+        let mut count = 0;
+        for ids in self.tree.values() {
+            count += ids.len();
+        }
+        count
+    }
+
     pub fn find_ne(&self, value: &IndexValue) -> BTreeSet<DocumentId> {
         let mut result = BTreeSet::new();
         for (k, ids) in &self.tree {

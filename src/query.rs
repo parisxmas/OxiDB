@@ -192,7 +192,6 @@ pub fn execute_indexed(
     query: &Query,
     field_indexes: &std::collections::HashMap<String, FieldIndex>,
     composite_indexes: &[CompositeIndex],
-    all_ids: &BTreeSet<DocumentId>,
 ) -> Option<BTreeSet<DocumentId>> {
     match query {
         Query::All => None, // None = full scan needed
@@ -200,7 +199,7 @@ pub fn execute_indexed(
         Query::And(subs) => {
             let mut result: Option<BTreeSet<DocumentId>> = None;
             for sub in subs {
-                if let Some(ids) = execute_indexed(sub, field_indexes, composite_indexes, all_ids) {
+                if let Some(ids) = execute_indexed(sub, field_indexes, composite_indexes) {
                     result = Some(match result {
                         Some(existing) => &existing & &ids,
                         None => ids,
@@ -213,7 +212,7 @@ pub fn execute_indexed(
             let mut all_resolved = true;
             let mut result = BTreeSet::new();
             for sub in subs {
-                if let Some(ids) = execute_indexed(sub, field_indexes, composite_indexes, all_ids) {
+                if let Some(ids) = execute_indexed(sub, field_indexes, composite_indexes) {
                     result = &result | &ids;
                 } else {
                     all_resolved = false;
@@ -290,6 +289,119 @@ fn resolve_field_ref<'a>(data: &'a JsonValue, path: &str) -> Option<&'a JsonValu
         current = current.as_object()?.get(part)?;
     }
     Some(current)
+}
+
+/// Returns true if every condition in the query is backed by a field index,
+/// meaning `execute_indexed` returns the exact set of matching IDs and no
+/// post-filtering with `matches_value` is needed.
+pub fn is_fully_indexed(
+    query: &Query,
+    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+) -> bool {
+    match query {
+        Query::All => true,
+        Query::Field { field, op } => {
+            // $exists can't be resolved by index
+            if matches!(op, QueryOp::Exists(_)) {
+                return false;
+            }
+            field_indexes.contains_key(field.as_str())
+        }
+        Query::And(subs) => subs.iter().all(|s| is_fully_indexed(s, field_indexes)),
+        Query::Or(subs) => subs.iter().all(|s| is_fully_indexed(s, field_indexes)),
+    }
+}
+
+/// Count matching documents using only indexes (no BTreeSet allocation).
+/// Returns None if the query can't be counted by index alone.
+pub fn count_indexed(
+    query: &Query,
+    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+) -> Option<usize> {
+    match query {
+        Query::All => None, // caller should use primary_index.len()
+        Query::Field { field, op } => {
+            let idx = field_indexes.get(field.as_str())?;
+            Some(match op {
+                QueryOp::Eq(v) => idx.count_eq(v),
+                QueryOp::Ne(_v) => return None, // expensive, fall through
+                QueryOp::Gt(v) => idx.count_range(Bound::Excluded(v), Bound::Unbounded),
+                QueryOp::Gte(v) => idx.count_range(Bound::Included(v), Bound::Unbounded),
+                QueryOp::Lt(v) => idx.count_range(Bound::Unbounded, Bound::Excluded(v)),
+                QueryOp::Lte(v) => idx.count_range(Bound::Unbounded, Bound::Included(v)),
+                QueryOp::In(vals) => idx.count_in(vals),
+                QueryOp::Exists(_) => return None,
+            })
+        }
+        Query::And(subs) => {
+            // Common case: AND of range conditions on the SAME indexed field
+            // e.g. {created_at: {$gte: "2023-01-01", $lt: "2024-01-01"}}
+            count_single_field_and(subs, field_indexes)
+        }
+        Query::Or(_) => None,
+    }
+}
+
+/// Handle AND of range conditions on the same field — count without BTreeSet.
+fn count_single_field_and(
+    subs: &[Query],
+    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+) -> Option<usize> {
+    let mut field_name: Option<&str> = None;
+    let mut gte_bound: Option<&IndexValue> = None;
+    let mut gt_bound: Option<&IndexValue> = None;
+    let mut lt_bound: Option<&IndexValue> = None;
+    let mut lte_bound: Option<&IndexValue> = None;
+    let mut eq_value: Option<&IndexValue> = None;
+
+    for sub in subs {
+        match sub {
+            Query::Field { field, op } => {
+                if let Some(name) = field_name {
+                    if name != field {
+                        return None; // Different fields — can't merge into single range
+                    }
+                } else {
+                    field_name = Some(field);
+                }
+                match op {
+                    QueryOp::Gte(v) => gte_bound = Some(v),
+                    QueryOp::Gt(v) => gt_bound = Some(v),
+                    QueryOp::Lt(v) => lt_bound = Some(v),
+                    QueryOp::Lte(v) => lte_bound = Some(v),
+                    QueryOp::Eq(v) => eq_value = Some(v),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    let field = field_name?;
+    let idx = field_indexes.get(field)?;
+
+    // If there's an eq value, the range constraints must also be satisfied
+    if let Some(eq_val) = eq_value {
+        return Some(idx.count_eq(eq_val));
+    }
+
+    let start = if let Some(v) = gte_bound {
+        Bound::Included(v)
+    } else if let Some(v) = gt_bound {
+        Bound::Excluded(v)
+    } else {
+        Bound::Unbounded
+    };
+
+    let end = if let Some(v) = lt_bound {
+        Bound::Excluded(v)
+    } else if let Some(v) = lte_bound {
+        Bound::Included(v)
+    } else {
+        Bound::Unbounded
+    };
+
+    Some(idx.count_range(start, end))
 }
 
 /// Like `matches_doc` but operates directly on `&Value`, avoiding Document construction.

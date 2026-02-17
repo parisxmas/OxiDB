@@ -1,5 +1,6 @@
 pub mod blob;
 pub mod collection;
+pub mod crypto;
 pub mod document;
 pub mod engine;
 pub mod error;
@@ -15,6 +16,7 @@ pub mod value;
 pub mod wal;
 
 pub use collection::{Collection, CompactStats};
+pub use crypto::EncryptionKey;
 pub use document::DocumentId;
 pub use engine::OxiDb;
 pub use error::{Error, Result};

@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::blob::BlobStore;
 use crate::collection::{Collection, CompactStats};
+use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
 use crate::fts::{self, FtsIndex};
@@ -42,13 +43,19 @@ pub struct OxiDb {
     tx_log: TxCommitLog,
     next_tx_id: AtomicU64,
     active_transactions: RwLock<HashMap<TransactionId, Mutex<Transaction>>>,
+    encryption: Option<Arc<EncryptionKey>>,
 }
 
 impl OxiDb {
     /// Open or create a database at the given directory.
     pub fn open(data_dir: &Path) -> Result<Self> {
+        Self::open_with_options(data_dir, None)
+    }
+
+    /// Open or create a database with optional encryption key.
+    pub fn open_with_options(data_dir: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
-        let blob_store = BlobStore::open(data_dir)?;
+        let blob_store = BlobStore::open_with_encryption(data_dir, encryption.clone())?;
         let fts_index = Arc::new(RwLock::new(FtsIndex::open(data_dir)?));
 
         // Open transaction commit log and read committed tx_ids for recovery
@@ -86,6 +93,7 @@ impl OxiDb {
             tx_log,
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
+            encryption,
         })
     }
 
@@ -104,7 +112,12 @@ impl OxiDb {
         if let Some(col) = cols.get(name) {
             return Ok(Arc::clone(col));
         }
-        let col = Collection::open(name, &self.data_dir)?;
+        let col = Collection::open_with_options(
+            name,
+            &self.data_dir,
+            &std::collections::HashSet::new(),
+            self.encryption.clone(),
+        )?;
         let arc = Arc::new(RwLock::new(col));
         cols.insert(name.to_string(), Arc::clone(&arc));
         Ok(arc)
@@ -116,7 +129,12 @@ impl OxiDb {
         if cols.contains_key(name) {
             return Err(Error::CollectionAlreadyExists(name.to_string()));
         }
-        let col = Collection::open(name, &self.data_dir)?;
+        let col = Collection::open_with_options(
+            name,
+            &self.data_dir,
+            &std::collections::HashSet::new(),
+            self.encryption.clone(),
+        )?;
         cols.insert(name.to_string(), Arc::new(RwLock::new(col)));
         Ok(())
     }
@@ -169,6 +187,16 @@ impl OxiDb {
     ) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
         col.read().unwrap().find_with_options(query, opts)
+    }
+
+    pub fn find_with_options_arcs(
+        &self,
+        collection: &str,
+        query: &Value,
+        opts: &FindOptions,
+    ) -> Result<Vec<Arc<Value>>> {
+        let col = self.get_or_create_collection(collection)?;
+        col.read().unwrap().find_with_options_arcs(query, opts)
     }
 
     pub fn find_one(&self, collection: &str, query: &Value) -> Result<Option<Value>> {
@@ -228,13 +256,16 @@ impl OxiDb {
             Some(q) => q.clone(),
             None => json!({}),
         };
-        let initial_docs = self.find(collection, &query)?;
 
         let lookup_fn = |foreign: &str, query: &Value| -> Result<Vec<Value>> {
             self.find(foreign, query)
         };
 
-        pipeline.execute_from(start_idx, initial_docs, &lookup_fn)
+        // Fast path: use Arc-based pipeline to avoid cloning all initial docs.
+        // This is critical for aggregation over large datasets (200K+ docs).
+        let col = self.get_or_create_collection(collection)?;
+        let arcs = col.read().unwrap().find_arcs(&query)?;
+        pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn)
     }
 
     // -----------------------------------------------------------------------

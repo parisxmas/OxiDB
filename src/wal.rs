@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crc32fast::Hasher;
 
+use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::error::Result;
 use crate::storage::{DocLocation, Storage};
@@ -52,11 +53,16 @@ impl WalEntry {
 pub struct Wal {
     inner: Mutex<File>,
     path: PathBuf,
+    encryption: Option<Arc<EncryptionKey>>,
 }
 
 impl Wal {
     /// Open or create a WAL file.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_encryption(path, None)
+    }
+
+    pub fn open_with_encryption(path: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -71,12 +77,13 @@ impl Wal {
         Ok(Self {
             inner: Mutex::new(file),
             path: path.to_path_buf(),
+            encryption,
         })
     }
 
     /// Serialize and append a WAL entry, then fsync.
     pub fn log(&self, entry: &WalEntry) -> Result<()> {
-        let payload = Self::serialize_entry(entry);
+        let payload = self.serialize_entry(entry)?;
         let crc = Self::compute_crc(&payload);
 
         let mut file = self.inner.lock().unwrap();
@@ -90,9 +97,8 @@ impl Wal {
     }
 
     /// Serialize and append a WAL entry without fsync.
-    /// Caller is responsible for ensuring durability (e.g. storage fsync follows).
     pub fn log_no_sync(&self, entry: &WalEntry) -> Result<()> {
-        let payload = Self::serialize_entry(entry);
+        let payload = self.serialize_entry(entry)?;
         let crc = Self::compute_crc(&payload);
 
         let mut file = self.inner.lock().unwrap();
@@ -109,7 +115,7 @@ impl Wal {
         let mut file = self.inner.lock().unwrap();
         file.seek(SeekFrom::End(0))?;
         for entry in entries {
-            let payload = Self::serialize_entry(entry);
+            let payload = self.serialize_entry(entry)?;
             let crc = Self::compute_crc(&payload);
             file.write_all(&crc.to_le_bytes())?;
             file.write_all(&(payload.len() as u32).to_le_bytes())?;
@@ -120,12 +126,11 @@ impl Wal {
     }
 
     /// Write multiple WAL entries without fsync.
-    /// Caller relies on storage fsync for durability; WAL is best-effort.
     pub fn log_batch_no_sync(&self, entries: &[WalEntry]) -> Result<()> {
         let mut file = self.inner.lock().unwrap();
         file.seek(SeekFrom::End(0))?;
         for entry in entries {
-            let payload = Self::serialize_entry(entry);
+            let payload = self.serialize_entry(entry)?;
             let crc = Self::compute_crc(&payload);
             file.write_all(&crc.to_le_bytes())?;
             file.write_all(&(payload.len() as u32).to_le_bytes())?;
@@ -143,7 +148,6 @@ impl Wal {
     }
 
     /// Truncate the WAL to 0 without fsync.
-    /// Stale WAL entries are replayed idempotently on recovery if truncation is lost.
     pub fn checkpoint_no_sync(&self) -> Result<()> {
         let file = self.inner.lock().unwrap();
         file.set_len(0)?;
@@ -151,7 +155,6 @@ impl Wal {
     }
 
     /// Read all valid entries from the WAL and replay them idempotently.
-    /// Entries with tx_id != 0 are only replayed if tx_id is in committed_tx_ids.
     pub fn recover(
         &self,
         storage: &Storage,
@@ -229,31 +232,49 @@ impl Wal {
     // -----------------------------------------------------------------------
 
     /// Payload format: [op_type: u8][tx_id: u64 LE][doc_id: u64 LE][doc_bytes...]
-    fn serialize_entry(entry: &WalEntry) -> Vec<u8> {
+    /// When encryption is enabled, doc_bytes are encrypted before inclusion in payload.
+    /// CRC is computed over the final (possibly encrypted) payload.
+    fn serialize_entry(&self, entry: &WalEntry) -> Result<Vec<u8>> {
         match entry {
             WalEntry::Insert { doc_id, doc_bytes, tx_id } => {
-                let mut payload = Vec::with_capacity(1 + 8 + 8 + doc_bytes.len());
+                let encrypted = self.maybe_encrypt(doc_bytes)?;
+                let mut payload = Vec::with_capacity(1 + 8 + 8 + encrypted.len());
                 payload.push(OP_INSERT);
                 payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
-                payload.extend_from_slice(doc_bytes);
-                payload
+                payload.extend_from_slice(&encrypted);
+                Ok(payload)
             }
             WalEntry::Update { doc_id, doc_bytes, tx_id } => {
-                let mut payload = Vec::with_capacity(1 + 8 + 8 + doc_bytes.len());
+                let encrypted = self.maybe_encrypt(doc_bytes)?;
+                let mut payload = Vec::with_capacity(1 + 8 + 8 + encrypted.len());
                 payload.push(OP_UPDATE);
                 payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
-                payload.extend_from_slice(doc_bytes);
-                payload
+                payload.extend_from_slice(&encrypted);
+                Ok(payload)
             }
             WalEntry::Delete { doc_id, tx_id } => {
                 let mut payload = Vec::with_capacity(1 + 8 + 8);
                 payload.push(OP_DELETE);
                 payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
-                payload
+                Ok(payload)
             }
+        }
+    }
+
+    fn maybe_encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryption {
+            Some(key) => key.encrypt(data),
+            None => Ok(data.to_vec()),
+        }
+    }
+
+    fn maybe_decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        match &self.encryption {
+            Some(key) => key.decrypt(data),
+            None => Ok(data.to_vec()),
         }
     }
 
@@ -297,7 +318,7 @@ impl Wal {
             }
 
             // Parse payload
-            if let Some(entry) = Self::parse_payload(&payload) {
+            if let Some(entry) = self.parse_payload(&payload) {
                 entries.push(entry);
             } else {
                 break; // Malformed payload
@@ -309,8 +330,8 @@ impl Wal {
         Ok(entries)
     }
 
-    /// Payload format: [op_type: u8][tx_id: u64 LE][doc_id: u64 LE][doc_bytes...]
-    fn parse_payload(payload: &[u8]) -> Option<WalEntry> {
+    /// Payload format: [op_type: u8][tx_id: u64 LE][doc_id: u64 LE][encrypted_doc_bytes...]
+    fn parse_payload(&self, payload: &[u8]) -> Option<WalEntry> {
         if payload.len() < 17 {
             return None; // minimum: 1 (op) + 8 (tx_id) + 8 (doc_id)
         }
@@ -321,11 +342,11 @@ impl Wal {
 
         match op_type {
             OP_INSERT => {
-                let doc_bytes = payload[17..].to_vec();
+                let doc_bytes = self.maybe_decrypt(&payload[17..]).ok()?;
                 Some(WalEntry::Insert { doc_id, doc_bytes, tx_id })
             }
             OP_UPDATE => {
-                let doc_bytes = payload[17..].to_vec();
+                let doc_bytes = self.maybe_decrypt(&payload[17..]).ok()?;
                 Some(WalEntry::Update { doc_id, doc_bytes, tx_id })
             }
             OP_DELETE => {

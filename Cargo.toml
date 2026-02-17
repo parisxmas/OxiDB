@@ -18,6 +18,8 @@ serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 crc32fast = "1"
+aes-gcm = "0.10"
+rand = "0.9"
 zip = "2"
 pdf-extract = "0.7"
 leptess = { version = "0.14", optional = true }
