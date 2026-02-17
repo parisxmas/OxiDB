@@ -9,7 +9,7 @@ COPY oxidb-client-ffi/ oxidb-client-ffi/
 
 RUN cargo build --release --package oxidb-server
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

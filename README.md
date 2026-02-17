@@ -151,30 +151,121 @@ db.close()
 
 ## Performance
 
-OxiDB is designed for low-latency operations. Benchmarks below compare OxiDB against MongoDB 8.x on the same machine (best of 3 runs per test).
+OxiDB is designed for low-latency operations. All benchmarks run on the same Linux server (Debian 6.1, x86_64) with both databases in Docker containers. Best of 3 runs per test.
 
-### Where OxiDB wins
+### Benchmark 1: 200K Documents (DateTime-Focused)
+
+200,000 employee records with 8 indexes, testing inserts, queries, counts, aggregation, and updates.
+
+**Result: OxiDB wins 23 of 38 tests**
+
+#### Index Creation (200K docs)
+
+| Operation | OxiDB | MongoDB | Winner |
+|-----------|-------|---------|--------|
+| Index on `department` | 216ms | 309ms | **OxiDB 1.4x** |
+| Index on `level` | 148ms | 256ms | **OxiDB 1.7x** |
+| Index on `status` | 199ms | 258ms | **OxiDB 1.3x** |
+| Index on `salary` | 298ms | 348ms | **OxiDB 1.2x** |
+
+#### Count Operations (200K docs)
+
+| Operation | OxiDB | MongoDB | Winner |
+|-----------|-------|---------|--------|
+| Count all docs | 0.44ms | 70.65ms | **OxiDB 161x** |
+| Count by department | 0.26ms | 5.71ms | **OxiDB 22x** |
+| Count by date range | 1.16ms | 12.19ms | **OxiDB 11x** |
+| Count by salary range | 4.88ms | 37.55ms | **OxiDB 8x** |
+
+#### Sorted Queries (200K docs)
+
+| Operation | OxiDB | MongoDB | Winner |
+|-----------|-------|---------|--------|
+| Sort by created_at desc, limit 10 | 0.28ms | 0.61ms | **OxiDB 2.2x** |
+| Sort by updated_at desc, skip 50, limit 20 | 0.32ms | 0.71ms | **OxiDB 2.2x** |
+| Sort by salary desc, limit 10 | 0.24ms | 0.49ms | **OxiDB 2.1x** |
+| Sort by created_at asc, limit 100 | 0.63ms | 0.92ms | **OxiDB 1.5x** |
+
+#### Indexed Field Queries (200K docs)
+
+| Operation | OxiDB | MongoDB | Winner |
+|-----------|-------|---------|--------|
+| Find by status (indexed) | 272ms | 500ms | **OxiDB 1.8x** |
+| Find by salary range | 348ms | 476ms | **OxiDB 1.4x** |
+| Find by country (indexed) | 94ms | 121ms | **OxiDB 1.3x** |
+| Find by department (indexed) | 104ms | 125ms | **OxiDB 1.2x** |
+| Wide date range (1 year) | 285ms | 436ms | **OxiDB 1.5x** |
+
+#### Filtered Aggregation (200K docs)
+
+| Operation | OxiDB | MongoDB | Winner |
+|-----------|-------|---------|--------|
+| match(country=US) + group by level | 21.6ms | 43.8ms | **OxiDB 2.0x** |
+| match(dept=eng) + group by country | 24.6ms | 38.4ms | **OxiDB 1.6x** |
+
+#### Where MongoDB Wins (200K docs)
+
+| Operation | OxiDB | MongoDB | Winner |
+|-----------|-------|---------|--------|
+| Bulk insert 200K docs | 6750ms | 3290ms | **MongoDB 2.1x** |
+| Update single doc | 207ms | 1.2ms | **MongoDB 173x** |
+| Update by indexed field | 174ms | 58ms | **MongoDB 3.0x** |
+| Full-scan aggregation (group all) | 263ms | 156ms | **MongoDB 1.7x** |
+| Narrow date range (1 week) | 61ms | 6ms | **MongoDB 10x** |
+
+### Benchmark 2: Feature-Focused (Small-Medium Collections)
+
+Mixed workloads: single inserts, batch inserts, indexes, finds, counts, updates, aggregation, deletes on 5-1000 doc collections.
+
+**Result: OxiDB wins 25 of 30 tests (1.73x overall faster)**
+
+| Category | OxiDB Wins | Highlights |
+|----------|-----------|------------|
+| Index creation | 3/3 | **34x-66x** faster |
+| Find queries | 7/7 | **2x-3.5x** faster |
+| Count | 2/2 | **2.7x-6.4x** faster |
+| Aggregation | 5/5 | **2.4x-3.9x** faster |
+| Delete | 1/1 | **3.1x** faster |
+| Inserts | 2/5 | Wins small batches |
 
 | Operation | OxiDB | MongoDB | Speedup |
 |-----------|-------|---------|---------|
-| Count with indexed filter (100K docs) | 0.19ms | 2.18ms | **11x** |
-| Count total (100K docs) | 0.02ms | 2.86ms | **138x** |
-| Find with sort + limit 10 (100K docs) | 0.57ms | 1.31ms | **2.3x** |
-| Find by indexed field (100K docs) | 5.7ms | 6.1ms | **1.1x** |
-| Insert single document | 0.25ms | 0.60ms | **2.4x** |
-| Find one by ID | 0.17ms | 0.51ms | **3x** |
-| Index creation (small collection) | 0.05ms | 13.1ms | **261x** |
+| Create unique index | 0.25ms | 16.6ms | **66x** |
+| Create index | 0.30ms | 17.0ms | **57x** |
+| Count (1K docs) | 0.10ms | 0.63ms | **6.4x** |
+| Aggregate: group + sort + limit | 0.10ms | 0.38ms | **3.9x** |
+| Count all users | 0.09ms | 0.31ms | **3.6x** |
+| Aggregate: match + count | 0.10ms | 0.34ms | **3.5x** |
+| Find with range ($gte) | 0.09ms | 0.32ms | **3.5x** |
+| Find with $in | 0.10ms | 0.33ms | **3.4x** |
+| Find all users | 0.10ms | 0.32ms | **3.3x** |
+| Delete by query | 0.09ms | 0.28ms | **3.1x** |
+| Aggregate 1K docs (group by 10) | 0.41ms | 1.23ms | **3.0x** |
+| Find all 1000 docs | 1.09ms | 1.94ms | **1.8x** |
+| Insert 5 users (single) | 25.7ms | 42.9ms | **1.7x** |
 
-### Key optimizations
+### Key Optimizations
 
 - **Full document cache** — all documents held in memory after startup, eliminating disk I/O for reads
 - **Index-backed sort** — `find()` with sort + limit on an indexed field iterates the BTreeMap index directly, turning O(n) into O(limit)
 - **Index-only count** — `count()` with a simple equality filter on an indexed field returns the index set size without touching documents
 - **Single-pass updates/deletes** — mutations scan once using cached documents instead of double-reading from disk
 
-### Where MongoDB wins
+### Summary
 
-MongoDB is faster for bulk inserts (WAL overhead), full-collection aggregations (optimized C++ engine), and updates on unindexed fields at scale.
+| Workload | OxiDB vs MongoDB |
+|----------|-----------------|
+| Count operations | **8x-161x** faster |
+| Index creation (small collections) | **34x-66x** faster |
+| Sorted find + limit | **1.5x-2.2x** faster |
+| Indexed field queries | **1.2x-1.8x** faster |
+| Filtered aggregation ($match + $group) | **1.6x-2.0x** faster |
+| Small collection reads/aggregations | **2x-4x** faster |
+| Bulk inserts (200K+) | MongoDB **2x** faster |
+| Single-doc updates | MongoDB **3x-173x** faster |
+| Full-table aggregation (no $match) | MongoDB **1.7x** faster |
+
+OxiDB excels at **read-heavy workloads** — queries, counts, sorted pagination, filtered aggregations. MongoDB wins on **write-heavy operations** — bulk inserts, in-place updates, full-collection scans. For typical web application patterns (index, query, count, paginate), OxiDB delivers consistently lower latency.
 
 ## Rust (embedded library)
 
