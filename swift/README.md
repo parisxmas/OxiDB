@@ -20,16 +20,34 @@ For `OxiDBDatabase` (embedded mode):
 
 ## Getting the FFI Libraries
 
-### Prebuilt Binary (no Rust needed)
+### Prebuilt Binaries (no Rust needed)
 
-Download the prebuilt library from the [latest release](https://github.com/parisxmas/OxiDB/releases/latest):
+Download from the [latest release](https://github.com/parisxmas/OxiDB/releases/latest):
+
+**Embedded FFI** (`OxiDBDatabase` — recommended for mobile):
+
+```bash
+# macOS arm64 (Apple Silicon)
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.6.0/oxidb-embedded-ffi-macos-arm64.tar.gz
+tar xzf oxidb-embedded-ffi-macos-arm64.tar.gz
+sudo cp liboxidb_embedded_ffi.dylib liboxidb_embedded_ffi.a /usr/local/lib/
+sudo cp oxidb_embedded.h /usr/local/include/
+
+# iOS device (arm64)
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.6.0/oxidb-embedded-ffi-ios-arm64.tar.gz
+tar xzf oxidb-embedded-ffi-ios-arm64.tar.gz
+
+# iOS simulator (arm64, Apple Silicon Mac)
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.6.0/oxidb-embedded-ffi-ios-sim-arm64.tar.gz
+tar xzf oxidb-embedded-ffi-ios-sim-arm64.tar.gz
+```
+
+**Client FFI** (`OxiDBClient` — TCP server mode):
 
 ```bash
 # macOS arm64 (Apple Silicon)
 curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.6.0/oxidb-client-ffi-macos-arm64.tar.gz
 tar xzf oxidb-client-ffi-macos-arm64.tar.gz
-
-# Install system-wide
 sudo cp liboxidb_client_ffi.dylib /usr/local/lib/
 sudo cp oxidb.h /usr/local/include/
 ```
