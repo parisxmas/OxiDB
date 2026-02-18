@@ -81,7 +81,7 @@ function _lib_path()
         end
     elseif Sys.islinux()
         lib_name = "liboxidb_embedded_ffi.so"
-        error("No prebuilt Linux binary yet. Build from source: cargo build --release -p oxidb-embedded-ffi")
+        tarball = "oxidb-embedded-ffi-linux-x86_64.tar.gz"
     elseif Sys.iswindows()
         lib_name = "oxidb_embedded_ffi.dll"
         tarball = "oxidb-embedded-ffi-windows-x86_64.tar.gz"
