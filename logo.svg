@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 340" width="880" height="340">
+  <defs>
+    <linearGradient id="cylBody" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#6d6d6d"/>
+      <stop offset="12%" stop-color="#999"/>
+      <stop offset="30%" stop-color="#b8b8b8"/>
+      <stop offset="45%" stop-color="#c6c6c6"/>
+      <stop offset="55%" stop-color="#b0b0b0"/>
+      <stop offset="70%" stop-color="#969696"/>
+      <stop offset="85%" stop-color="#aaa"/>
+      <stop offset="100%" stop-color="#686868"/>
+    </linearGradient>
+    <linearGradient id="cylTop" x1="0" y1="0" x2="0.7" y2="1">
+      <stop offset="0%" stop-color="#b0b0b0"/>
+      <stop offset="40%" stop-color="#cccccc"/>
+      <stop offset="100%" stop-color="#888"/>
+    </linearGradient>
+    <linearGradient id="cylBottom" x1="0" y1="0" x2="0.5" y2="1">
+      <stop offset="0%" stop-color="#808080"/>
+      <stop offset="100%" stop-color="#555"/>
+    </linearGradient>
+    <linearGradient id="rust" x1="0.3" y1="0" x2="0.7" y2="1">
+      <stop offset="0%" stop-color="#c95d22"/>
+      <stop offset="100%" stop-color="#a24016"/>
+    </linearGradient>
+    <clipPath id="cylClip">
+      <path d="M82,60 L82,272 Q82,298 165,298 Q248,298 248,272 L248,60 Q248,34 165,34 Q82,34 82,60 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- === DATABASE CYLINDER === -->
+  <g>
+    <!-- Body fill -->
+    <path d="M82,60 L82,272 Q82,298 165,298 Q248,298 248,272 L248,60 Z" fill="url(#cylBody)"/>
+
+    <!-- Brushed metal lines -->
+    <g clip-path="url(#cylClip)" opacity="0.18">
+      <line x1="96" y1="34" x2="96" y2="298" stroke="#ccc" stroke-width="1"/>
+      <line x1="108" y1="34" x2="108" y2="298" stroke="#d5d5d5" stroke-width="0.7"/>
+      <line x1="122" y1="34" x2="122" y2="298" stroke="#c0c0c0" stroke-width="0.8"/>
+      <line x1="135" y1="34" x2="135" y2="298" stroke="#d0d0d0" stroke-width="0.6"/>
+      <line x1="148" y1="34" x2="148" y2="298" stroke="#c8c8c8" stroke-width="0.7"/>
+      <line x1="160" y1="34" x2="160" y2="298" stroke="#d2d2d2" stroke-width="0.5"/>
+      <line x1="175" y1="34" x2="175" y2="298" stroke="#c5c5c5" stroke-width="0.8"/>
+      <line x1="188" y1="34" x2="188" y2="298" stroke="#d0d0d0" stroke-width="0.6"/>
+      <line x1="202" y1="34" x2="202" y2="298" stroke="#c8c8c8" stroke-width="0.7"/>
+      <line x1="215" y1="34" x2="215" y2="298" stroke="#d3d3d3" stroke-width="0.5"/>
+      <line x1="228" y1="34" x2="228" y2="298" stroke="#bbb" stroke-width="0.8"/>
+      <line x1="240" y1="34" x2="240" y2="298" stroke="#c5c5c5" stroke-width="0.6"/>
+    </g>
+
+    <!-- Bottom ellipse -->
+    <ellipse cx="165" cy="272" rx="83" ry="26" fill="url(#cylBottom)"/>
+
+    <!-- Middle band ellipses (the two separator grooves) -->
+    <ellipse cx="165" cy="132" rx="83" ry="22" fill="none" stroke="#5a5a5a" stroke-width="2.5" opacity="0.35"/>
+    <ellipse cx="165" cy="200" rx="83" ry="22" fill="none" stroke="#5a5a5a" stroke-width="2.5" opacity="0.35"/>
+
+    <!-- Darker band strips -->
+    <g clip-path="url(#cylClip)">
+      <rect x="82" y="126" width="166" height="12" fill="#5e5e5e" opacity="0.3"/>
+      <rect x="82" y="194" width="166" height="12" fill="#5e5e5e" opacity="0.3"/>
+    </g>
+
+    <!-- Top ellipse -->
+    <ellipse cx="165" cy="60" rx="83" ry="26" fill="url(#cylTop)"/>
+    <ellipse cx="165" cy="60" rx="83" ry="26" fill="none" stroke="#999" stroke-width="1.2"/>
+    <ellipse cx="165" cy="60" rx="68" ry="18" fill="#8a8a8a" opacity="0.3"/>
+  </g>
+
+  <!-- === GEAR COG (rust orange, overlapping cylinder left side) === -->
+  <g transform="translate(128, 185)">
+    <!-- 8-tooth gear using proper geometry -->
+    <!-- Outer radius=88, root radius=68, tooth half-angle ~10deg -->
+    <path d="
+      M-7,-88 L7,-88 L9,-68 L23,-64 L31,-82 L44,-74 L36,-58 L48,-46 L64,-54 L72,-40
+      L56,-32 L58,-16 L78,-12 L78,2 L58,6 L56,22 L72,30 L64,44 L48,36 L36,48
+      L44,64 L31,72 L23,54 L9,58 L7,78 L-7,78 L-9,58 L-23,54 L-31,72 L-44,64
+      L-36,48 L-48,36 L-64,44 L-72,30 L-56,22 L-58,6 L-78,2 L-78,-12 L-58,-16
+      L-56,-32 L-72,-40 L-64,-54 L-48,-46 L-36,-58 L-44,-74 L-31,-82 L-23,-64
+      L-9,-68 Z"
+      fill="url(#rust)" stroke="#7d3312" stroke-width="2" stroke-linejoin="round"/>
+
+    <!-- Inner ring -->
+    <circle cx="0" cy="-5" r="30" fill="url(#rust)" stroke="#7d3312" stroke-width="2"/>
+
+    <!-- 8 spokes -->
+    <rect x="-4" y="-65" width="8" height="120" rx="2" fill="#843615" opacity="0.6"/>
+    <rect x="-56" y="-9" width="112" height="8" rx="2" fill="#843615" opacity="0.6"/>
+    <rect x="-4" y="-50" width="8" height="90" rx="2" fill="#843615" opacity="0.5" transform="rotate(45,0,-5)"/>
+    <rect x="-4" y="-50" width="8" height="90" rx="2" fill="#843615" opacity="0.5" transform="rotate(-45,0,-5)"/>
+
+    <!-- Center hub -->
+    <circle cx="0" cy="-5" r="14" fill="#c45820"/>
+    <circle cx="0" cy="-5" r="6" fill="#7d3312"/>
+  </g>
+
+  <!-- === TEXT: OxiDB === -->
+  <text x="410" y="210" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-weight="800" font-size="120" letter-spacing="-1">
+    <tspan fill="#bf4a18">Oxi</tspan><tspan fill="#3c3c3c">DB</tspan>
+  </text>
+</svg>
