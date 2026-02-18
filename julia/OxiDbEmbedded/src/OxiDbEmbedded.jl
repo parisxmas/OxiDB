@@ -70,7 +70,7 @@ Base.showerror(io::IO, e::TransactionConflictError) = print(io, "TransactionConf
 # Library download
 # ------------------------------------------------------------------
 
-const _RELEASE_VERSION = "v0.6.0"
+const _RELEASE_VERSION = "v0.7.0"
 const _RELEASE_BASE = "https://github.com/parisxmas/OxiDB/releases/download/$(_RELEASE_VERSION)"
 const _LIB_DIR = joinpath(@__DIR__, "..", "lib")
 
