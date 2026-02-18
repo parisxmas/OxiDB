@@ -1,6 +1,8 @@
-# OxiDB
+<p align="center">
+  <img src="logo.svg" alt="OxiDB" width="500">
+</p>
 
-A fast, embeddable document database written in Rust. Works like MongoDB but runs as a single binary with zero configuration.
+<p align="center">A fast, embeddable document database written in Rust. Works like MongoDB but runs as a single binary with zero configuration.</p>
 
 **Client libraries:** Python, Go, Ruby, Java/Spring Boot, Julia, PHP, .NET, Swift/iOS, C FFI
 
