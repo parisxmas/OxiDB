@@ -24,6 +24,7 @@ let package = Package(
             exclude: ["include"],
             linkerSettings: [
                 .linkedLibrary("oxidb_client_ffi"),
+                .linkedLibrary("oxidb_embedded_ffi"),
             ]
         ),
     ]

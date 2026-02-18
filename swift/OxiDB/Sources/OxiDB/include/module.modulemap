@@ -3,3 +3,9 @@ module COxiDB {
     link "oxidb_client_ffi"
     export *
 }
+
+module COxiDBEmbedded {
+    header "oxidb_embedded.h"
+    link "oxidb_embedded_ffi"
+    export *
+}
