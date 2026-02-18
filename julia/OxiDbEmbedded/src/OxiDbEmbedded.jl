@@ -84,7 +84,7 @@ function _lib_path()
         error("No prebuilt Linux binary yet. Build from source: cargo build --release -p oxidb-embedded-ffi")
     elseif Sys.iswindows()
         lib_name = "oxidb_embedded_ffi.dll"
-        error("No prebuilt Windows binary yet. Build from source: cargo build --release -p oxidb-embedded-ffi")
+        tarball = "oxidb-embedded-ffi-windows-x86_64.tar.gz"
     else
         error("Unsupported platform: $(Sys.KERNEL)")
     end

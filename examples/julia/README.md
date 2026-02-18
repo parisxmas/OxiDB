@@ -38,6 +38,7 @@ close(db)
 | Platform | Architecture | Status |
 |----------|-------------|--------|
 | macOS | arm64 (Apple Silicon) | Prebuilt available |
+| Windows | x86_64 | Prebuilt available |
 | macOS | x86_64 | Build from source |
 | Linux | x86_64 | Build from source |
 
