@@ -129,6 +129,20 @@ drop_collection(db, "orders")
 create_index(db, "users", "name")
 create_unique_index(db, "users", "email")
 create_composite_index(db, "users", ["name", "age"])
+create_text_index(db, "users", ["name", "bio"])
+```
+
+### Document Full-Text Search
+
+```julia
+# Create a text index on fields you want to search
+create_text_index(db, "articles", ["title", "body"])
+
+# Search returns matching documents with _score field, sorted by relevance
+results = text_search(db, "articles", "rust programming"; limit=10)
+for doc in results
+    println("$(doc["title"]) (score: $(doc["_score"]))")
+end
 ```
 
 ### Aggregation

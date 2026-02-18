@@ -126,6 +126,10 @@ try db.delete(collection: "users", query: ["name": "Alice"])
 try db.createIndex(collection: "users", field: "email")
 try db.createCompositeIndex(collection: "users", fields: ["city", "age"])
 
+// Full-text search on documents
+try db.createTextIndex(collection: "articles", fields: ["title", "body"])
+let results = try db.textSearch(collection: "articles", query: "rust programming", limit: 10)
+
 // Aggregation
 let result = try db.aggregate(collection: "users", pipeline: [
     ["$group": ["_id": "city", "count": ["$count": true]]],
@@ -253,6 +257,8 @@ do {
 - `createIndex(collection:field:)` - Single-field index
 - `createUniqueIndex(collection:field:)` - Unique index (embedded only)
 - `createCompositeIndex(collection:fields:)` - Multi-field index
+- `createTextIndex(collection:fields:)` - Full-text search index (embedded only)
+- `textSearch(collection:query:limit:)` - Search documents by text (embedded only)
 
 ### Collections (both classes)
 - `createCollection(_:)` - Create collection explicitly (embedded only)

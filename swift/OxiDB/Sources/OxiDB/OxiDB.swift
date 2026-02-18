@@ -420,6 +420,17 @@ public final class OxiDBDatabase {
         return try execute(["cmd": "create_composite_index", "collection": collection, "fields": fields])
     }
 
+    /// Create a full-text search index on the specified string fields.
+    @discardableResult
+    public func createTextIndex(collection: String, fields: [String]) throws -> [String: Any] {
+        return try execute(["cmd": "create_text_index", "collection": collection, "fields": fields])
+    }
+
+    /// Full-text search on collection documents. Returns matching documents with `_score` field.
+    public func textSearch(collection: String, query: String, limit: Int = 10) throws -> [String: Any] {
+        return try execute(["cmd": "text_search", "collection": collection, "query": query, "limit": limit])
+    }
+
     // MARK: - Collections
 
     /// Create a collection explicitly.

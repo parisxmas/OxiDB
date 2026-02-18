@@ -325,6 +325,47 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
             }
         }
 
+        "create_text_index" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let fields = match request.get("fields").and_then(|v| v.as_array()) {
+                Some(arr) => {
+                    let strs: Option<Vec<String>> =
+                        arr.iter().map(|v| v.as_str().map(String::from)).collect();
+                    match strs {
+                        Some(s) => s,
+                        None => return err_bytes("'fields' must be an array of strings"),
+                    }
+                }
+                None => return err_bytes("missing 'fields' array"),
+            };
+            match db.create_text_index(col, fields) {
+                Ok(()) => ok_bytes(json!("text index created")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "text_search" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let query = match request.get("query").and_then(|v| v.as_str()) {
+                Some(q) => q,
+                None => return err_bytes("missing 'query' string"),
+            };
+            let limit = request
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
+            match db.text_search(col, query, limit) {
+                Ok(results) => ok_bytes(json!(results)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         // --- Collections ---
 
         "create_collection" => {

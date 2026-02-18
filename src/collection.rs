@@ -7,6 +7,7 @@ use serde_json::Value;
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
+use crate::fts::CollectionTextIndex;
 use crate::index::{CompositeIndex, FieldIndex};
 use crate::query::{self, FindOptions, Query, SortOrder};
 use crate::storage::{DocLocation, Storage};
@@ -49,6 +50,7 @@ pub struct Collection {
     primary_index: HashMap<DocumentId, DocLocation>,
     field_indexes: HashMap<String, FieldIndex>,
     composite_indexes: Vec<CompositeIndex>,
+    text_index: Option<CollectionTextIndex>,
     version_index: HashMap<DocumentId, u64>,
     next_id: DocumentId,
     /// In-memory document cache: doc_id → parsed JSON Value.
@@ -121,6 +123,7 @@ impl Collection {
             primary_index,
             field_indexes: HashMap::new(),
             composite_indexes: Vec::new(),
+            text_index: None,
             version_index,
             next_id,
             doc_cache,
@@ -214,6 +217,44 @@ impl Collection {
         Ok(idx_name)
     }
 
+    /// Create a full-text search index on the specified fields.
+    /// Rebuilds from existing documents in cache.
+    pub fn create_text_index(&mut self, fields: Vec<String>) -> Result<()> {
+        if self.text_index.is_some() {
+            return Err(Error::IndexAlreadyExists("_text".to_string()));
+        }
+
+        let mut idx = CollectionTextIndex::new(fields);
+
+        // Backfill from cache
+        for (&id, data) in &self.doc_cache {
+            idx.index_doc(id, data);
+        }
+
+        self.text_index = Some(idx);
+        Ok(())
+    }
+
+    /// Full-text search on collection documents. Returns matching documents with `_score` field.
+    pub fn text_search(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
+        let idx = self.text_index.as_ref().ok_or_else(|| {
+            Error::InvalidQuery("no text index on this collection; create one with create_text_index".into())
+        })?;
+
+        let search_results = idx.search(query, limit);
+        let mut docs = Vec::with_capacity(search_results.len());
+        for result in search_results {
+            if let Some(data) = self.doc_cache.get(&result.doc_id) {
+                let mut doc = (**data).clone();
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.insert("_score".to_string(), serde_json::json!(result.score));
+                }
+                docs.push(doc);
+            }
+        }
+        Ok(docs)
+    }
+
     // -----------------------------------------------------------------------
     // Unique constraint checks
     // -----------------------------------------------------------------------
@@ -283,6 +324,9 @@ impl Collection {
         }
         for idx in &mut self.composite_indexes {
             idx.insert_value(id, &cached);
+        }
+        if let Some(ref mut text_idx) = self.text_index {
+            text_idx.index_doc(id, &cached);
         }
 
         Ok(id)
@@ -365,6 +409,9 @@ impl Collection {
             }
             for idx in &mut self.composite_indexes {
                 idx.insert_value(id, &cached);
+            }
+            if let Some(ref mut text_idx) = self.text_index {
+                text_idx.index_doc(id, &cached);
             }
         }
 
@@ -731,6 +778,9 @@ impl Collection {
                 idx.remove_value(op.id, &op.old_data);
                 idx.insert_value(op.id, &cached);
             }
+            if let Some(ref mut text_idx) = self.text_index {
+                text_idx.index_doc(op.id, &cached);
+            }
         }
 
         Ok(count)
@@ -807,6 +857,9 @@ impl Collection {
             }
             for idx in &mut self.composite_indexes {
                 idx.remove_value(op.id, &op.data);
+            }
+            if let Some(ref mut text_idx) = self.text_index {
+                text_idx.remove_doc(op.id);
             }
         }
 
@@ -912,6 +965,9 @@ impl Collection {
         for idx in &mut self.composite_indexes {
             idx.clear();
         }
+        if let Some(ref mut text_idx) = self.text_index {
+            text_idx.clear();
+        }
         for (&id, &loc) in &self.primary_index.clone() {
             let bytes = self.storage.read(loc)?;
             let data: Value = serde_json::from_slice(&bytes)?;
@@ -924,6 +980,9 @@ impl Collection {
             }
             for idx in &mut self.composite_indexes {
                 idx.insert_value(id, &cached);
+            }
+            if let Some(ref mut text_idx) = self.text_index {
+                text_idx.index_doc(id, &cached);
             }
         }
 
@@ -1157,6 +1216,9 @@ impl Collection {
                         idx.remove_value(m.doc_id, old_data);
                     }
                 }
+                if let Some(ref mut text_idx) = self.text_index {
+                    text_idx.remove_doc(m.doc_id);
+                }
             } else if let Some(loc) = new_locs[i] {
                 self.primary_index.insert(m.doc_id, loc);
                 let ver = m.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
@@ -1177,6 +1239,9 @@ impl Collection {
                 }
                 for idx in &mut self.composite_indexes {
                     idx.insert_value(m.doc_id, &cached);
+                }
+                if let Some(ref mut text_idx) = self.text_index {
+                    text_idx.index_doc(m.doc_id, &cached);
                 }
             }
         }

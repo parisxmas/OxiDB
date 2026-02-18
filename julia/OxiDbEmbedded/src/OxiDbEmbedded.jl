@@ -35,6 +35,7 @@ export OxiDatabase, OxiDbError, TransactionConflictError,
        count_docs,
        # Indexes
        create_index, create_unique_index, create_composite_index,
+       create_text_index,
        # Aggregation
        aggregate,
        # Compaction
@@ -44,8 +45,10 @@ export OxiDatabase, OxiDbError, TransactionConflictError,
        # Blob storage
        create_bucket, list_buckets, delete_bucket,
        put_object, get_object, head_object, delete_object, list_objects,
-       # FTS
-       search
+       # FTS (blobs)
+       search,
+       # FTS (documents)
+       text_search
 
 # ------------------------------------------------------------------
 # Exceptions
@@ -340,6 +343,28 @@ Create a composite index on multiple fields.
 """
 create_composite_index(db::OxiDatabase, collection::AbstractString, fields::Vector{<:AbstractString}) =
     _checked(db, Dict("cmd" => "create_composite_index", "collection" => collection, "fields" => fields))
+
+"""
+    create_text_index(db, collection, fields)
+
+Create a full-text search index on the specified string fields.
+"""
+create_text_index(db::OxiDatabase, collection::AbstractString, fields::Vector{<:AbstractString}) =
+    _checked(db, Dict("cmd" => "create_text_index", "collection" => collection, "fields" => fields))
+
+# ------------------------------------------------------------------
+# Document full-text search
+# ------------------------------------------------------------------
+
+"""
+    text_search(db, collection, query; limit=10)
+
+Full-text search on collection documents. Returns matching documents with `_score` field.
+Requires a text index created with `create_text_index`.
+"""
+function text_search(db::OxiDatabase, collection::AbstractString, query::AbstractString; limit::Integer=10)
+    _checked(db, Dict("cmd" => "text_search", "collection" => collection, "query" => query, "limit" => limit))
+end
 
 # ------------------------------------------------------------------
 # Aggregation
