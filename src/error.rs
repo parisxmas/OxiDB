@@ -52,6 +52,9 @@ pub enum Error {
     #[error("no active transaction")]
     NoActiveTransaction,
 
+    #[error("index not found: {0}")]
+    IndexNotFound(String),
+
     #[error("encryption error: {0}")]
     Encryption(String),
 

@@ -347,6 +347,32 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
             }
         }
 
+        "list_indexes" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            match db.list_indexes(col) {
+                Ok(indexes) => ok_bytes(json!(indexes)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "drop_index" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let index = match request.get("index").and_then(|v| v.as_str()) {
+                Some(i) => i,
+                None => return err_bytes("missing 'index'"),
+            };
+            match db.drop_index(col, index) {
+                Ok(()) => ok_bytes(json!("index dropped")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         "text_search" => {
             let col = match collection.as_deref() {
                 Some(c) => c,

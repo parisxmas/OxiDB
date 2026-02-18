@@ -23,6 +23,15 @@ fn resolve_field_in_value<'a>(data: &'a Value, path: &str) -> Option<&'a Value> 
     Some(current)
 }
 
+/// Metadata about an index on a collection.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct IndexInfo {
+    pub name: String,
+    pub index_type: String,
+    pub fields: Vec<String>,
+    pub unique: bool,
+}
+
 /// Statistics returned after a compaction run.
 #[derive(Debug, Clone)]
 pub struct CompactStats {
@@ -233,6 +242,52 @@ impl Collection {
 
         self.text_index = Some(idx);
         Ok(())
+    }
+
+    /// List all indexes on this collection.
+    pub fn list_indexes(&self) -> Vec<IndexInfo> {
+        let mut indexes = Vec::new();
+        for idx in self.field_indexes.values() {
+            indexes.push(IndexInfo {
+                name: idx.field.clone(),
+                index_type: if idx.unique { "unique".to_string() } else { "field".to_string() },
+                fields: vec![idx.field.clone()],
+                unique: idx.unique,
+            });
+        }
+        for idx in &self.composite_indexes {
+            indexes.push(IndexInfo {
+                name: idx.name(),
+                index_type: "composite".to_string(),
+                fields: idx.fields.clone(),
+                unique: false,
+            });
+        }
+        if let Some(ref text_idx) = self.text_index {
+            indexes.push(IndexInfo {
+                name: "_text".to_string(),
+                index_type: "text".to_string(),
+                fields: text_idx.fields().to_vec(),
+                unique: false,
+            });
+        }
+        indexes
+    }
+
+    /// Drop an index by name.
+    pub fn drop_index(&mut self, name: &str) -> Result<()> {
+        if self.field_indexes.remove(name).is_some() {
+            return Ok(());
+        }
+        if let Some(pos) = self.composite_indexes.iter().position(|i| i.name() == name) {
+            self.composite_indexes.remove(pos);
+            return Ok(());
+        }
+        if name == "_text" && self.text_index.is_some() {
+            self.text_index = None;
+            return Ok(());
+        }
+        Err(Error::IndexNotFound(name.to_string()))
     }
 
     /// Full-text search on collection documents. Returns matching documents with `_score` field.
