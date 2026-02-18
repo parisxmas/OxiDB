@@ -117,6 +117,7 @@ Once the server is running, connect to it from any supported language. Every cli
 | [Ruby](#ruby) | `ruby/lib/oxidb.rb` | Copy file or use gemspec, no dependencies |
 | [Java / Spring Boot](#java--spring-boot) | `oxidb-spring-boot-starter/` | `mvn install`, then add Maven dependency |
 | [Julia](#julia) | `julia/OxiDb/` | TCP client or embedded (no server needed) |
+| [Swift/iOS](#swiftios) | `swift/OxiDB/` | Embedded (no server) or TCP client |
 | [PHP](#php) | `php/src/OxiDbClient.php` | Copy files, no dependencies |
 | [.NET](#net-client) | `dotnet/OxiDb.Client/` | Uses C FFI via P/Invoke |
 | [Rust (embedded)](#rust-embedded-library) | crate root | `oxidb = { path = "." }` |
@@ -1569,6 +1570,166 @@ stats = compact(client, "users")  # returns Dict with old_size, new_size, docs_k
 ```julia
 close(client)
 ```
+
+## Swift/iOS
+
+Swift 5.9+, macOS 13+, iOS 16+. Two modes: **embedded** (no server, recommended for mobile) and **TCP client**.
+
+### Getting the FFI Libraries
+
+Download prebuilt binaries from [GitHub Releases](https://github.com/parisxmas/OxiDB/releases/latest):
+
+```bash
+# Embedded FFI — macOS arm64
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-embedded-ffi-macos-arm64.tar.gz
+tar xzf oxidb-embedded-ffi-macos-arm64.tar.gz
+sudo cp liboxidb_embedded_ffi.dylib liboxidb_embedded_ffi.a /usr/local/lib/
+sudo cp oxidb_embedded.h /usr/local/include/
+
+# Embedded FFI — iOS device (arm64)
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-embedded-ffi-ios-arm64.tar.gz
+
+# Embedded FFI — iOS simulator (arm64, Apple Silicon)
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-embedded-ffi-ios-sim-arm64.tar.gz
+```
+
+Or build from source:
+
+```bash
+cargo build --release -p oxidb-embedded-ffi                              # macOS
+cargo build --release -p oxidb-embedded-ffi --target aarch64-apple-ios   # iOS
+```
+
+### Installation (Swift Package Manager)
+
+Add to your `Package.swift`:
+
+```swift
+dependencies: [
+    .package(path: "../swift/OxiDB")  // adjust path as needed
+]
+```
+
+### Embedded Mode (no server needed)
+
+```swift
+import OxiDB
+
+// Open database
+let db = try OxiDBDatabase.open(path: "/path/to/mydb")
+
+// Or with encryption
+let db = try OxiDBDatabase.open(path: "/path/to/mydb", encryptionKeyPath: "/path/to/key")
+
+// Insert
+try db.insert(collection: "users", document: [
+    "name": "Alice", "age": 30, "city": "New York"
+])
+try db.insertMany(collection: "users", documents: [
+    ["name": "Bob", "age": 25],
+    ["name": "Charlie", "age": 35]
+])
+
+// Query
+let users = try db.find(collection: "users", query: ["city": "New York"])
+let alice = try db.findOne(collection: "users", query: ["name": "Alice"])
+
+// Update
+try db.update(
+    collection: "users",
+    query: ["name": "Alice"],
+    update: ["$set": ["age": 31]]
+)
+
+// Delete
+try db.delete(collection: "users", query: ["name": "Charlie"])
+
+// Count
+let n = try db.count(collection: "users")
+```
+
+### Indexes
+
+```swift
+try db.createIndex(collection: "users", field: "email")
+try db.createUniqueIndex(collection: "users", field: "email")
+try db.createCompositeIndex(collection: "users", fields: ["city", "age"])
+```
+
+### Full-Text Search
+
+```swift
+// Create text index on document fields
+try db.createTextIndex(collection: "articles", fields: ["title", "body"])
+
+// Search with TF-IDF ranking
+let results = try db.textSearch(collection: "articles", query: "rust programming", limit: 10)
+// Each result includes _score field
+```
+
+### Aggregation
+
+```swift
+let result = try db.aggregate(collection: "users", pipeline: [
+    ["$group": ["_id": "city", "count": ["$count": true]]],
+    ["$sort": ["count": -1]]
+])
+```
+
+### Transactions
+
+```swift
+// Auto-commit on success, auto-rollback on error
+try db.transaction {
+    try db.insert(collection: "ledger", document: ["from": "A", "to": "B", "amount": 100])
+    try db.insert(collection: "ledger", document: ["from": "B", "to": "C", "amount": 50])
+}
+```
+
+### Blob Storage
+
+```swift
+try db.createBucket("files")
+let data = Data("Hello, World!".utf8).base64EncodedString()
+try db.putObject(bucket: "files", key: "greeting.txt", dataBase64: data, contentType: "text/plain")
+let obj = try db.getObject(bucket: "files", key: "greeting.txt")
+```
+
+### Collections
+
+```swift
+try db.createCollection("orders")
+let cols = try db.listCollections()
+try db.dropCollection("orders")
+try db.compact(collection: "users")
+```
+
+### Client Mode (TCP server)
+
+```swift
+import OxiDB
+
+let client = try OxiDBClient.connect(host: "127.0.0.1", port: 4444)
+try client.insert(collection: "users", document: ["name": "Alice", "age": 30])
+let users = try client.find(collection: "users", query: ["age": ["$gte": 25]])
+client.disconnect()
+```
+
+### Error Handling
+
+```swift
+do {
+    let result = try db.find(collection: "users", query: [:])
+} catch OxiDBError.databaseOpenFailed {
+    print("Failed to open database")
+} catch OxiDBError.operationFailed(let msg) {
+    print("Operation failed: \(msg)")
+} catch OxiDBError.transactionConflict(let msg) {
+    print("Transaction conflict: \(msg)")
+}
+```
+
+See [`swift/README.md`](swift/README.md) for full API reference and [`examples/ios/`](examples/ios/) for a working iOS demo app.
 
 ## Architecture
 
