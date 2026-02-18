@@ -1,0 +1,5 @@
+module COxiDB {
+    header "oxidb.h"
+    link "oxidb_client_ffi"
+    export *
+}
