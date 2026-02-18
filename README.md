@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.svg" alt="OxiDB" width="500">
+  <img src="logo.png" alt="OxiDB" width="500">
 </p>
 
 <p align="center">A fast, embeddable document database written in Rust. Works like MongoDB but runs as a single binary with zero configuration.</p>
