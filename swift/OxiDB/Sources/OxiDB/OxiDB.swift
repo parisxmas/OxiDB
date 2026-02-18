@@ -1,6 +1,10 @@
 import Foundation
+#if canImport(COxiDB)
 import COxiDB
+#endif
+#if canImport(COxiDBEmbedded)
 import COxiDBEmbedded
+#endif
 
 // MARK: - Error Types
 
@@ -55,6 +59,7 @@ private func jsonString(_ value: Any) throws -> String {
 
 // MARK: - Client
 
+#if canImport(COxiDB)
 public final class OxiDBClient {
     private var conn: OpaquePointer?
 
@@ -287,6 +292,8 @@ public final class OxiDBClient {
         return try parseResponse(str)
     }
 }
+
+#endif // canImport(COxiDB)
 
 // MARK: - Embedded Database
 
