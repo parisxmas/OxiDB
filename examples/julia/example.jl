@@ -1,9 +1,10 @@
 #!/usr/bin/env julia
 #
-# OxiDB Julia Example — demonstrates every feature of the database server.
+# OxiDB Julia Example (TCP client) — demonstrates every feature via the database server.
 #
 # Prerequisites:
 #   1. Start oxidb-server on 127.0.0.1:4444
+#      Download prebuilt: https://github.com/parisxmas/OxiDB/releases/latest
 #   2. Run: cd examples/julia && julia --project=. -e 'using Pkg; Pkg.instantiate()'
 #   3. Run: julia --project=. example.jl
 #
