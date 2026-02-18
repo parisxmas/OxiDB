@@ -320,6 +320,30 @@ impl CommandExecutor for EmbeddedExecutor {
                     Err(e) => err_val(&e.to_string()),
                 }
             }
+            "list_indexes" => {
+                let col = match collection.as_deref() {
+                    Some(c) => c,
+                    None => return err_val("missing 'collection'"),
+                };
+                match self.db.list_indexes(col) {
+                    Ok(indexes) => ok_val(json!(indexes)),
+                    Err(e) => err_val(&e.to_string()),
+                }
+            }
+            "drop_index" => {
+                let col = match collection.as_deref() {
+                    Some(c) => c,
+                    None => return err_val("missing 'collection'"),
+                };
+                let index = match request.get("index").and_then(|v| v.as_str()) {
+                    Some(i) => i,
+                    None => return err_val("missing 'index'"),
+                };
+                match self.db.drop_index(col, index) {
+                    Ok(()) => ok_val(json!("index dropped")),
+                    Err(e) => err_val(&e.to_string()),
+                }
+            }
             "text_search" => {
                 let col = match collection.as_deref() {
                     Some(c) => c,

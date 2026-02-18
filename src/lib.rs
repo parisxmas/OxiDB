@@ -15,7 +15,7 @@ pub mod storage;
 pub mod value;
 pub mod wal;
 
-pub use collection::{Collection, CompactStats};
+pub use collection::{Collection, CompactStats, IndexInfo};
 pub use crypto::EncryptionKey;
 pub use document::DocumentId;
 pub use engine::OxiDb;

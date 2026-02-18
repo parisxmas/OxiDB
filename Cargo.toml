@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli"]
+members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli", "oxidb-app/src-tauri"]
 resolver = "3"
 
 [package]

@@ -6,7 +6,7 @@ use std::sync::{mpsc, Arc, Mutex, RwLock};
 use serde_json::{json, Value};
 
 use crate::blob::BlobStore;
-use crate::collection::{Collection, CompactStats};
+use crate::collection::{Collection, CompactStats, IndexInfo};
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
@@ -241,6 +241,16 @@ impl OxiDb {
     ) -> Result<String> {
         let col = self.get_or_create_collection(collection)?;
         col.write().unwrap().create_composite_index(fields)
+    }
+
+    pub fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>> {
+        let col = self.get_or_create_collection(collection)?;
+        Ok(col.read().unwrap().list_indexes())
+    }
+
+    pub fn drop_index(&self, collection: &str, index_name: &str) -> Result<()> {
+        let col = self.get_or_create_collection(collection)?;
+        col.write().unwrap().drop_index(index_name)
     }
 
     pub fn count(&self, collection: &str, query: &Value) -> Result<usize> {
