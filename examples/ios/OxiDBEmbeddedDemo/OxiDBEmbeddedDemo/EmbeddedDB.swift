@@ -36,13 +36,17 @@ final class EmbeddedDB: ObservableObject {
     }
 
     @discardableResult
-    func execute(_ cmd: [String: Any]) -> [String: Any]? {
+    func execute(_ cmd: [String: Any]) -> (result: [String: Any], ms: Double)? {
         guard let h = handle else { return nil }
         guard let data = try? JSONSerialization.data(withJSONObject: cmd),
-              let json = String(data: data, encoding: .utf8),
-              let result = oxidb_execute(UnsafeMutableRawPointer(h), json) else {
+              let json = String(data: data, encoding: .utf8) else {
             return nil
         }
+        let start = CFAbsoluteTimeGetCurrent()
+        guard let result = oxidb_execute(UnsafeMutableRawPointer(h), json) else {
+            return nil
+        }
+        let ms = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
         defer { oxidb_free_string(result) }
         let str = String(cString: result)
         guard let rData = str.data(using: .utf8),
@@ -53,14 +57,18 @@ final class EmbeddedDB: ObservableObject {
             log("Error: \(parsed["error"] ?? "unknown")", isError: true)
             return nil
         }
-        return parsed
+        return (parsed, ms)
     }
 
     // MARK: - Demo Operations
 
+    private func fmt(_ ms: Double) -> String {
+        String(format: "%.2fms", ms)
+    }
+
     func ping() {
         if let r = execute(["cmd": "ping"]) {
-            log("Ping: \(r["data"] ?? "")")
+            log("Ping: \(r.result["data"] ?? "") (\(fmt(r.ms)))")
         }
     }
 
@@ -71,14 +79,14 @@ final class EmbeddedDB: ObservableObject {
             ["name": "Charlie", "age": 35, "city": "New York"],
         ]
         if let r = execute(["cmd": "insert_many", "collection": "users", "docs": docs]) {
-            log("Inserted: \(r["data"] ?? "")")
+            log("Inserted: \(r.result["data"] ?? "") (\(fmt(r.ms)))")
         }
     }
 
     func query() {
         if let r = execute(["cmd": "find", "collection": "users", "query": ["city": "New York"]]) {
-            if let data = r["data"] as? [[String: Any]] {
-                log("Found \(data.count) docs in New York:")
+            if let data = r.result["data"] as? [[String: Any]] {
+                log("Found \(data.count) docs in New York (\(fmt(r.ms))):")
                 for doc in data { log("  \(doc)") }
             }
         }
@@ -86,13 +94,13 @@ final class EmbeddedDB: ObservableObject {
 
     func count() {
         if let r = execute(["cmd": "count", "collection": "users"]) {
-            log("Count: \(r["data"] ?? "")")
+            log("Count: \(r.result["data"] ?? "") (\(fmt(r.ms)))")
         }
     }
 
     func createIndex() {
-        if execute(["cmd": "create_index", "collection": "users", "field": "city"]) != nil {
-            log("Index created on 'city'")
+        if let r = execute(["cmd": "create_index", "collection": "users", "field": "city"]) {
+            log("Index created on 'city' (\(fmt(r.ms)))")
         }
     }
 
@@ -102,19 +110,19 @@ final class EmbeddedDB: ObservableObject {
             ["$sort": ["count": -1]]
         ]
         if let r = execute(["cmd": "aggregate", "collection": "users", "pipeline": pipeline]) {
-            log("Aggregation: \(r["data"] ?? "")")
+            log("Aggregation: \(r.result["data"] ?? "") (\(fmt(r.ms)))")
         }
     }
 
     func listCollections() {
         if let r = execute(["cmd": "list_collections"]) {
-            log("Collections: \(r["data"] ?? "")")
+            log("Collections: \(r.result["data"] ?? "") (\(fmt(r.ms)))")
         }
     }
 
     func dropUsers() {
-        if execute(["cmd": "drop_collection", "collection": "users"]) != nil {
-            log("Dropped 'users' collection")
+        if let r = execute(["cmd": "drop_collection", "collection": "users"]) {
+            log("Dropped 'users' collection (\(fmt(r.ms)))")
         }
     }
 
