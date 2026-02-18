@@ -74,9 +74,29 @@ cargo build --release -p oxidb-embedded-ffi --target aarch64-apple-ios
 
 ## Installation
 
-### Swift Package Manager
+### Swift Package Manager (recommended)
 
-Add to your `Package.swift`:
+**From Xcode:** File → Add Package Dependencies → Enter the URL:
+
+```
+https://github.com/parisxmas/OxiDB.git
+```
+
+Xcode will automatically download the prebuilt embedded library (XCFramework). No Rust toolchain or manual library setup needed.
+
+**From `Package.swift`:**
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/parisxmas/OxiDB.git", from: "0.7.0")
+]
+```
+
+Then add `"OxiDB"` to your target's dependencies.
+
+### Local Development (from source)
+
+If you prefer to build from source or need the TCP client mode:
 
 ```swift
 dependencies: [
