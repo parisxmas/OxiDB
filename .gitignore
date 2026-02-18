@@ -14,6 +14,11 @@ dotnet/**/obj/
 __pycache__/
 *.pyc
 
+# Swift
+swift/**/.build/
+*.xcuserstate
+xcuserdata/
+
 # Julia
 julia/**/Manifest.toml
 
