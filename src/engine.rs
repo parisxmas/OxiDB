@@ -258,6 +258,21 @@ impl OxiDb {
         col.write().unwrap().compact()
     }
 
+    pub fn create_text_index(&self, collection: &str, fields: Vec<String>) -> Result<()> {
+        let col = self.get_or_create_collection(collection)?;
+        col.write().unwrap().create_text_index(fields)
+    }
+
+    pub fn text_search(
+        &self,
+        collection: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Value>> {
+        let col = self.get_or_create_collection(collection)?;
+        col.read().unwrap().text_search(query, limit)
+    }
+
     pub fn aggregate(&self, collection: &str, pipeline_json: &Value) -> Result<Vec<Value>> {
         let pipeline = Pipeline::parse(pipeline_json)?;
         let (leading_match, start_idx) = pipeline.take_leading_match();

@@ -65,11 +65,12 @@ Both examples exercise the full feature set:
 - Collection management (create, list, drop)
 - CRUD (insert, insert_many, find, find_one, update, delete, count)
 - Update operators ($set, $inc, $unset, $push, $pull, $addToSet, $rename, $currentDate, $mul, $min, $max)
-- Indexes (single-field, unique, composite)
+- Indexes (single-field, unique, composite, text)
+- Document full-text search (create_text_index + text_search)
 - Aggregation pipeline ($match, $group, $sort, $skip, $limit, $count, $project, $addFields, $lookup, $unwind)
 - Transactions (auto-commit and manual rollback)
 - Blob storage (buckets, put/get/head/list/delete objects)
-- Full-text search
+- Blob full-text search
 - Compaction
 
 The embedded example additionally demonstrates `update_one` and `delete_one` (embedded-only operations).

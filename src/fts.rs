@@ -46,7 +46,7 @@ fn make_doc_id(bucket: &str, key: &str) -> String {
     format!("{}\t{}", bucket, key)
 }
 
-fn tokenize(text: &str) -> Vec<String> {
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() > 1)
@@ -200,6 +200,164 @@ impl FtsIndex {
         std::fs::write(&self.index_path, json)?;
         Ok(())
     }
+}
+
+// ------------------------------------------------------------------
+// Per-collection document full-text search
+// ------------------------------------------------------------------
+
+use crate::document::DocumentId;
+
+/// Posting entry for a single document in the collection text index.
+#[derive(Clone)]
+struct DocPosting {
+    doc_id: DocumentId,
+    frequency: u32,
+}
+
+/// In-memory inverted index for full-text search on collection documents.
+/// Indexes specified string fields using TF-IDF scoring.
+pub struct CollectionTextIndex {
+    fields: Vec<String>,
+    /// term → list of postings
+    postings: HashMap<String, Vec<DocPosting>>,
+    /// doc_id → total indexed terms count
+    doc_term_counts: HashMap<DocumentId, u32>,
+}
+
+pub struct DocSearchResult {
+    pub doc_id: DocumentId,
+    pub score: f64,
+}
+
+impl CollectionTextIndex {
+    pub fn new(fields: Vec<String>) -> Self {
+        Self {
+            fields,
+            postings: HashMap::new(),
+            doc_term_counts: HashMap::new(),
+        }
+    }
+
+    pub fn fields(&self) -> &[String] {
+        &self.fields
+    }
+
+    /// Extract text from the specified fields of a document value.
+    fn extract_doc_text(&self, data: &serde_json::Value) -> String {
+        let mut parts = Vec::new();
+        for field in &self.fields {
+            if let Some(val) = resolve_field(data, field) {
+                match val {
+                    serde_json::Value::String(s) => parts.push(s.clone()),
+                    serde_json::Value::Array(arr) => {
+                        for item in arr {
+                            if let serde_json::Value::String(s) = item {
+                                parts.push(s.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        parts.join(" ")
+    }
+
+    /// Index a document. Removes any existing entry for this doc_id first.
+    pub fn index_doc(&mut self, doc_id: DocumentId, data: &serde_json::Value) {
+        self.remove_doc(doc_id);
+
+        let text = self.extract_doc_text(data);
+        let tokens = tokenize(&text);
+        let total_terms = tokens.len() as u32;
+
+        if total_terms == 0 {
+            return;
+        }
+
+        // Count term frequencies
+        let mut term_freq: HashMap<String, u32> = HashMap::new();
+        for token in &tokens {
+            *term_freq.entry(token.clone()).or_insert(0) += 1;
+        }
+
+        // Add postings
+        for (term, freq) in term_freq {
+            self.postings
+                .entry(term)
+                .or_default()
+                .push(DocPosting { doc_id, frequency: freq });
+        }
+
+        self.doc_term_counts.insert(doc_id, total_terms);
+    }
+
+    /// Remove a document from the index.
+    pub fn remove_doc(&mut self, doc_id: DocumentId) {
+        if self.doc_term_counts.remove(&doc_id).is_none() {
+            return; // not indexed
+        }
+        let mut empty_terms = Vec::new();
+        for (term, postings) in self.postings.iter_mut() {
+            postings.retain(|p| p.doc_id != doc_id);
+            if postings.is_empty() {
+                empty_terms.push(term.clone());
+            }
+        }
+        for term in empty_terms {
+            self.postings.remove(&term);
+        }
+    }
+
+    /// Search the index. Returns doc_ids with TF-IDF scores, sorted by score descending.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<DocSearchResult> {
+        let query_terms = tokenize(query);
+        if query_terms.is_empty() || self.doc_term_counts.is_empty() {
+            return Vec::new();
+        }
+
+        let total_docs = self.doc_term_counts.len() as f64;
+        let mut scores: HashMap<DocumentId, f64> = HashMap::new();
+
+        for term in &query_terms {
+            if let Some(postings) = self.postings.get(term) {
+                let docs_with_term = postings.len() as f64;
+                let idf = (total_docs / docs_with_term).ln() + 1.0;
+
+                for posting in postings {
+                    if let Some(&total_terms) = self.doc_term_counts.get(&posting.doc_id) {
+                        let tf = posting.frequency as f64 / total_terms as f64;
+                        *scores.entry(posting.doc_id).or_insert(0.0) += tf * idf;
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<DocSearchResult> = scores
+            .into_iter()
+            .map(|(doc_id, score)| DocSearchResult { doc_id, score })
+            .collect();
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        results
+    }
+
+    /// Clear the entire index (used during compaction rebuild).
+    pub fn clear(&mut self) {
+        self.postings.clear();
+        self.doc_term_counts.clear();
+    }
+}
+
+/// Resolve a dotted field path in a JSON value.
+fn resolve_field<'a>(data: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut current = data;
+    for part in path.split('.') {
+        current = current.as_object()?.get(part)?;
+    }
+    Some(current)
 }
 
 pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
@@ -612,5 +770,90 @@ startxref
         let garbage = b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09";
         let result = extract_text(garbage, "image/png");
         assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // CollectionTextIndex tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn collection_text_index_basic() {
+        let mut idx = CollectionTextIndex::new(vec!["title".to_string(), "body".to_string()]);
+        let doc = serde_json::json!({
+            "_id": 1,
+            "title": "Rust programming language",
+            "body": "Rust is a systems programming language focused on safety"
+        });
+        idx.index_doc(1, &doc);
+
+        let results = idx.search("rust programming", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, 1);
+        assert!(results[0].score > 0.0);
+    }
+
+    #[test]
+    fn collection_text_index_ranking() {
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        let doc1 = serde_json::json!({"_id": 1, "text": "database database database engine"});
+        let doc2 = serde_json::json!({"_id": 2, "text": "the quick brown fox database"});
+        idx.index_doc(1, &doc1);
+        idx.index_doc(2, &doc2);
+
+        let results = idx.search("database", 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc_id, 1); // higher TF
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn collection_text_index_remove() {
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        idx.index_doc(1, &serde_json::json!({"text": "hello world"}));
+        idx.remove_doc(1);
+        let results = idx.search("hello", 10);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn collection_text_index_update() {
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        idx.index_doc(1, &serde_json::json!({"text": "old content about cats"}));
+        idx.index_doc(1, &serde_json::json!({"text": "new content about dogs"}));
+
+        assert!(idx.search("cats", 10).is_empty());
+        assert_eq!(idx.search("dogs", 10).len(), 1);
+    }
+
+    #[test]
+    fn collection_text_index_multi_field() {
+        let mut idx = CollectionTextIndex::new(vec!["title".to_string(), "tags".to_string()]);
+        let doc = serde_json::json!({
+            "title": "Rust Guide",
+            "tags": ["programming", "systems", "safety"]
+        });
+        idx.index_doc(1, &doc);
+
+        assert_eq!(idx.search("rust", 10).len(), 1);
+        assert_eq!(idx.search("programming", 10).len(), 1);
+        assert_eq!(idx.search("safety", 10).len(), 1);
+    }
+
+    #[test]
+    fn collection_text_index_no_match() {
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        idx.index_doc(1, &serde_json::json!({"text": "hello world"}));
+        let results = idx.search("xyznonexistent", 10);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn collection_text_index_limit() {
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        for i in 1..=10 {
+            idx.index_doc(i, &serde_json::json!({"text": format!("document about databases {}", i)}));
+        }
+        let results = idx.search("databases", 3);
+        assert_eq!(results.len(), 3);
     }
 }
