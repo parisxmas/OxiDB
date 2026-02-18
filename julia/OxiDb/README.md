@@ -45,9 +45,9 @@ julia examples/julia/embedded_example.jl
 | Platform | Architecture | Status |
 |----------|-------------|--------|
 | macOS | arm64 (Apple Silicon) | Prebuilt available |
+| Linux | x86_64 | Prebuilt available |
 | Windows | x86_64 | Prebuilt available |
 | macOS | x86_64 | Build from source |
-| Linux | x86_64 | Build from source |
 
 Build from source: `cargo build --release -p oxidb-embedded-ffi`
 
