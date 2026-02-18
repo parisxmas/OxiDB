@@ -27,6 +27,10 @@ oxidb_data/
 *.dat
 *.wal
 
+# Node
+node_modules/
+dist/
+
 # OS
 .DS_Store
 
