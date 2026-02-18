@@ -1437,13 +1437,23 @@ Julia 1.6+. Two modes available:
 
 ### Embedded Mode (no server needed)
 
-Uses the prebuilt native library via `ccall` — zero compilation required:
+Uses the `OxiDbEmbedded` package — prebuilt native library downloaded automatically:
 
-```bash
-julia examples/julia/embedded_example.jl
+```julia
+using Pkg
+Pkg.develop(path="julia/OxiDbEmbedded")
 ```
 
-The script auto-downloads the prebuilt `liboxidb_embedded_ffi` from [GitHub Releases](https://github.com/parisxmas/OxiDB/releases/latest) on first run. See [`examples/julia/README.md`](examples/julia/README.md) for details.
+```julia
+using OxiDbEmbedded
+
+db = open_db("/tmp/mydb")
+insert(db, "users", Dict("name" => "Alice", "age" => 30))
+docs = find(db, "users", Dict("name" => "Alice"))
+close(db)
+```
+
+Or run the full demo: `julia examples/julia/embedded_example.jl`
 
 ### TCP Client Mode
 

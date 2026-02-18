@@ -1,6 +1,8 @@
 [deps]
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 OxiDb = "a1b2c3d4-0000-0000-0000-000000000000"
+OxiDbEmbedded = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
 
 [sources]
 OxiDb = {path = "../../julia/OxiDb"}
+OxiDbEmbedded = {path = "../../julia/OxiDbEmbedded"}
