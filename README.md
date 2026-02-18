@@ -90,6 +90,11 @@ docker run -d -p 4444:4444 -e OXIDB_POOL_SIZE=8 -v oxidb_data:/data oxidb
 | `OXIDB_DATA` | `./oxidb_data` | Data directory |
 | `OXIDB_POOL_SIZE` | `4` | Worker thread count |
 | `OXIDB_IDLE_TIMEOUT` | `30` | Idle connection timeout in seconds (0 = no timeout) |
+| `OXIDB_ENCRYPTION_KEY` | — | Path to 32-byte AES-256 key file for encryption at rest |
+| `OXIDB_TLS_CERT` | — | Path to TLS certificate PEM file |
+| `OXIDB_TLS_KEY` | — | Path to TLS private key PEM file |
+| `OXIDB_AUTH` | `false` | Enable SCRAM-SHA-256 authentication (`true`/`1`) |
+| `OXIDB_AUDIT` | `false` | Enable audit logging (`true`/`1`) |
 
 ### Verify it works
 
@@ -145,9 +150,12 @@ db.close()
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
 - **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
 - **Full-text search** — automatic text extraction from 10+ formats, TF-IDF ranked search
-- **Crash-safe** — write-ahead log with CRC32 checksums
+- **Crash-safe** — write-ahead log with CRC32 checksums, verified by SIGKILL recovery tests
+- **Encryption at rest** — AES-256-GCM with per-record nonces, optional via `OXIDB_ENCRYPTION_KEY`
+- **Security** — TLS transport, SCRAM-SHA-256 authentication, role-based access control, audit logging
 - **Compaction** — reclaim space from deleted documents
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block
+- **Tested** — 17 concurrency/crash/encryption tests with 100 simultaneous connections
 
 ## Performance
 
@@ -261,6 +269,62 @@ Mixed workloads on 5-1000 doc collections: single inserts, batch inserts, indexe
 | Unindexed full scans | MongoDB **8x-15x** faster |
 
 OxiDB excels at **read-heavy workloads** — counts, sorted pagination, filtered aggregations, indexed lookups. MongoDB wins on **write-heavy operations** — bulk inserts, in-place updates, full-collection scans. For typical web application patterns (index, query, count, paginate), OxiDB delivers consistently lower latency.
+
+## Testing
+
+OxiDB includes 5 Python test suites (17 tests total) that verify correctness under heavy concurrency, crash scenarios, and encryption. All tests use 100 simultaneous connections unless noted.
+
+```bash
+# Start the server with enough threads for 100 connections
+env OXIDB_POOL_SIZE=110 OXIDB_IDLE_TIMEOUT=0 ./oxidb-server
+
+# Run individual test suites
+python3 examples/python/test_occ_and_integrity.py
+python3 examples/python/test_crash_recovery.py        # manages its own server
+python3 examples/python/test_collection_lifecycle.py
+python3 examples/python/test_encryption.py             # manages its own server
+python3 examples/python/memory_stress_test.py
+```
+
+### OCC & Data Integrity (`test_occ_and_integrity.py`)
+
+| Test | What it verifies |
+|------|-----------------|
+| **OCC Conflict Storm** | 100 connections x 50 rounds of read-modify-write transactions on a single document. Verifies final balance = 1000 + successful commits. 97.6% conflict rate, zero corruption. |
+| **Multi-Account Transfer** | 10 accounts, 100 connections doing random transfers via transactions. Verifies total sum is preserved exactly (conservation of money). |
+| **Data Integrity** | 100 workers each insert 50 docs with SHA-256 checksums, update 20, delete 10. Every surviving document verified byte-perfect. |
+| **Concurrent $inc Counter** | 100 connections x 100 atomic increments. Final value must equal exactly 10,000. |
+
+### Crash Recovery & WAL Replay (`test_crash_recovery.py`)
+
+| Test | What it verifies |
+|------|-----------------|
+| **Committed Data Survives** | Insert 500 docs, SIGKILL the server, restart — all documents intact with valid checksums. |
+| **Uncommitted Tx Lost** | Begin transaction, insert 100 docs, SIGKILL without committing — zero uncommitted docs after recovery. |
+| **Crash During Heavy Writes** | 50 concurrent writers, SIGKILL mid-flight — every confirmed insert survives, zero corruption. |
+
+### Collection Lifecycle (`test_collection_lifecycle.py`)
+
+| Test | What it verifies |
+|------|-----------------|
+| **Drop While Writing** | 50 writers + 1 dropper for 5s — all errors are clean, no panics or corruption. |
+| **Drop While Reading** | 50 readers + 1 dropper/reseeder for 5s — zero corrupt documents in any read. |
+| **Rapid Collection Churn** | 50 threads each create → write 30 docs → verify checksums → drop, all concurrently. |
+| **Cross-Collection Isolation** | Thrash one collection (drop/recreate) while verifying another is completely unaffected (9,800+ reads, zero corruption). |
+
+### Encryption at Rest (`test_encryption.py`)
+
+| Test | What it verifies |
+|------|-----------------|
+| **No Plaintext on Disk** | Write distinctive strings with encryption, scan raw `.dat`/`.wal` files — plaintext never appears. |
+| **Readable After Restart** | 200 docs byte-perfect after encrypted server restart (WAL replay with decryption). |
+| **Wrong Key Fails** | Write with key A, restart with key B — data access correctly rejected (AES-GCM auth tag mismatch). |
+| **Survives Crash** | 300 encrypted docs survive SIGKILL, plaintext never on disk, sample values verified after recovery. |
+| **Encryption Overhead** | Encrypted files are exactly 28 bytes/record larger (12B nonce + 16B AES-GCM auth tag). |
+
+### Memory Stress (`memory_stress_test.py`)
+
+100 concurrent connections performing mixed inserts, updates, queries, and deletes across multiple iterations with `drop_collection` between rounds. Monitors RSS growth to detect memory leaks.
 
 ## Rust (embedded library)
 
