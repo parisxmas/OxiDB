@@ -2,12 +2,14 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var db = EmbeddedDB()
+    @State private var searchQuery = ""
 
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
                 statusBar
                 actionButtons
+                ftsSection
                 logView
             }
             .navigationTitle("OxiDB Embedded")
@@ -47,6 +49,36 @@ struct ContentView: View {
             .padding(.horizontal)
         }
         .padding(.vertical, 8)
+        .disabled(!db.isOpen)
+        .opacity(db.isOpen ? 1.0 : 0.5)
+    }
+
+    private var ftsSection: some View {
+        VStack(spacing: 8) {
+            Divider()
+            Text("Full-Text Search").font(.caption).foregroundColor(.secondary)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ActionButton(title: "Add Articles", icon: "doc.text.fill") { db.insertArticles() }
+                    ActionButton(title: "Text Index", icon: "text.magnifyingglass") { db.createTextIndex() }
+                    ActionButton(title: "Drop Articles", icon: "trash") { db.dropArticles() }
+                }
+                .padding(.horizontal)
+            }
+            HStack(spacing: 8) {
+                TextField("Search articles...", text: $searchQuery)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .submitLabel(.search)
+                    .onSubmit { if !searchQuery.isEmpty { db.searchArticles(searchQuery) } }
+                Button("Search") { db.searchArticles(searchQuery) }
+                    .buttonStyle(.bordered)
+                    .font(.caption)
+                    .disabled(searchQuery.isEmpty)
+            }
+            .padding(.horizontal)
+        }
+        .padding(.bottom, 8)
         .disabled(!db.isOpen)
         .opacity(db.isOpen ? 1.0 : 0.5)
     }
