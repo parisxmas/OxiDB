@@ -39,3 +39,8 @@ dist/
 .vscode/
 *.swp
 *.swo
+
+# OxiDMS build artifacts
+OxiDMS/oxidms-server
+OxiDMS/frontend/node_modules/
+OxiDMS/frontend/dist/
