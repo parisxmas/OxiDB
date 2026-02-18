@@ -1,22 +1,46 @@
 # OxiDb.jl
 
-Julia client for [OxiDB](https://github.com/parisxmas/OxiDB) document database.
+Julia client for [OxiDB](https://github.com/parisxmas/OxiDB) document database. Two modes:
 
-Communicates with `oxidb-server` over TCP using the length-prefixed JSON protocol. Only dependency is `JSON3`.
+- **Embedded** — in-process via FFI, no server needed (prebuilt binary auto-downloaded)
+- **TCP client** — connects to a running `oxidb-server`
 
 ## Requirements
 
 - Julia 1.6+
-- A running `oxidb-server` instance (see [main README](../../README.md#installation))
 
-## Installation
+For embedded mode: macOS arm64 (Apple Silicon) — prebuilt binary downloaded automatically. Other platforms: build from source with `cargo build --release -p oxidb-embedded-ffi`.
+
+For TCP client mode: a running `oxidb-server` instance (see [main README](../../README.md#installation)).
+
+## Quick Start — Embedded (no server needed)
+
+```bash
+julia examples/julia/embedded_example.jl
+```
+
+That's it. The script auto-installs `JSON3` and auto-downloads the prebuilt native library on first run. See [`examples/julia/README.md`](../../examples/julia/README.md) for details.
+
+```julia
+# Or use the embedded FFI directly in your own code:
+using JSON3
+
+const LIB = "path/to/liboxidb_embedded_ffi"
+
+handle = ccall((:oxidb_open, LIB), Ptr{Cvoid}, (Cstring,), "/tmp/mydb")
+result = ccall((:oxidb_execute, LIB), Cstring, (Ptr{Cvoid}, Cstring), handle,
+               JSON3.write(Dict("cmd" => "ping")))
+println(unsafe_string(result))  # {"ok":true,"data":"pong"}
+ccall((:oxidb_free_string, LIB), Cvoid, (Cstring,), result)
+ccall((:oxidb_close, LIB), Cvoid, (Ptr{Cvoid},), handle)
+```
+
+## Quick Start — TCP Client
 
 ```julia
 using Pkg
 Pkg.develop(path="julia/OxiDb")
 ```
-
-## Quick Start
 
 ```julia
 using OxiDb
