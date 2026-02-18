@@ -2,7 +2,7 @@
 
 A fast, embeddable document database written in Rust. Works like MongoDB but runs as a single binary with zero configuration.
 
-**Client libraries:** Python, Go, Ruby, Java/Spring Boot, Julia, PHP, .NET, C FFI
+**Client libraries:** Python, Go, Ruby, Java/Spring Boot, Julia, PHP, .NET, Swift/iOS, C FFI
 
 ## Installation
 
@@ -114,7 +114,7 @@ Once the server is running, connect to it from any supported language. Every cli
 | [Go](#go) | `go/oxidb/` | `go get github.com/parisxmas/OxiDB/go/oxidb` |
 | [Ruby](#ruby) | `ruby/lib/oxidb.rb` | Copy file or use gemspec, no dependencies |
 | [Java / Spring Boot](#java--spring-boot) | `oxidb-spring-boot-starter/` | `mvn install`, then add Maven dependency |
-| [Julia](#julia) | `julia/OxiDb/` | `Pkg.develop(path="julia/OxiDb")` |
+| [Julia](#julia) | `julia/OxiDb/` | TCP client or embedded (no server needed) |
 | [PHP](#php) | `php/src/OxiDbClient.php` | Copy files, no dependencies |
 | [.NET](#net-client) | `dotnet/OxiDb.Client/` | Uses C FFI via P/Invoke |
 | [Rust (embedded)](#rust-embedded-library) | crate root | `oxidb = { path = "." }` |
@@ -1433,7 +1433,21 @@ stats, _ := client.Compact("users") // map with old_size, new_size, docs_kept
 
 ## Julia
 
-Only dependency is `JSON3`. Julia 1.6+.
+Julia 1.6+. Two modes available:
+
+### Embedded Mode (no server needed)
+
+Uses the prebuilt native library via `ccall` — zero compilation required:
+
+```bash
+julia examples/julia/embedded_example.jl
+```
+
+The script auto-downloads the prebuilt `liboxidb_embedded_ffi` from [GitHub Releases](https://github.com/parisxmas/OxiDB/releases/latest) on first run. See [`examples/julia/README.md`](examples/julia/README.md) for details.
+
+### TCP Client Mode
+
+Requires a running OxiDB server. Only dependency is `JSON3`.
 
 **Install:**
 
