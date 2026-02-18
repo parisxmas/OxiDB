@@ -887,6 +887,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxidb-embedded-ffi"
+version = "0.6.0"
+dependencies = [
+ "base64",
+ "oxidb",
+ "serde_json",
+]
+
+[[package]]
 name = "oxidb-server"
 version = "0.6.0"
 dependencies = [

@@ -1,0 +1,13 @@
+[package]
+name = "oxidb-embedded-ffi"
+version = "0.6.0"
+edition = "2024"
+description = "C-compatible FFI for embedded (in-process) OxiDB — no server required"
+
+[lib]
+crate-type = ["staticlib", "cdylib"]
+
+[dependencies]
+oxidb = { path = ".." }
+serde_json = "1"
+base64 = "0.22"
