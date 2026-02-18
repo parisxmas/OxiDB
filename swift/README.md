@@ -128,7 +128,7 @@ try db.createCompositeIndex(collection: "users", fields: ["city", "age"])
 
 // Aggregation
 let result = try db.aggregate(collection: "users", pipeline: [
-    ["$group": ["_by": "city", "count": ["$count": true]]],
+    ["$group": ["_id": "city", "count": ["$count": true]]],
     ["$sort": ["count": -1]]
 ])
 
@@ -186,7 +186,7 @@ try client.createCompositeIndex(collection: "users", fields: ["city", "age"])
 
 // Aggregation
 let result = try client.aggregate(collection: "users", pipeline: [
-    ["$group": ["_by": "city", "count": ["$count": true]]],
+    ["$group": ["_id": "city", "count": ["$count": true]]],
     ["$sort": ["count": -1]]
 ])
 
