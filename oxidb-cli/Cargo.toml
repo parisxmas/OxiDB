@@ -1,0 +1,17 @@
+[package]
+name = "oxidb-cli"
+version = "0.7.0"
+edition = "2024"
+description = "Interactive CLI and REPL for OxiDB with MongoDB-style syntax"
+
+[[bin]]
+name = "oxidb"
+path = "src/main.rs"
+
+[dependencies]
+oxidb = { path = ".." }
+clap = { version = "4", features = ["derive"] }
+rustyline = "15"
+serde_json = "1"
+colored = "2"
+base64 = "0.22"

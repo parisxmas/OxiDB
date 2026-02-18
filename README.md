@@ -106,6 +106,45 @@ echo -ne '\x11\x00\x00\x00{"cmd":"ping"}' | nc localhost 4444
 # You should see a response containing "pong"
 ```
 
+## CLI Tool
+
+OxiDB includes an interactive shell with MongoDB-style syntax. It supports both **embedded mode** (opens database files directly, no server needed) and **client mode** (connects to a running server via TCP).
+
+```bash
+# Build the CLI
+cargo build --release -p oxidb-cli
+
+# Embedded mode — opens database files directly
+./target/release/oxidb --data ./my_data
+
+# Client mode — connects to running server
+./target/release/oxidb --host 127.0.0.1 --port 4444
+
+# One-shot command (embedded)
+./target/release/oxidb --data ./my_data --eval 'db.users.find({})'
+```
+
+Example REPL session:
+
+```
+oxidb> db.users.insert({"name": "Alice", "age": 30})
+oxidb> db.users.find({}).sort({"age": -1}).limit(10)
+oxidb> db.users.count()
+oxidb> show collections
+oxidb> help
+```
+
+CLI flags:
+
+| Flag | Description |
+|------|-------------|
+| `--data <PATH>` | Database directory (embedded mode) |
+| `--host <HOST>` | Server host (client mode) |
+| `--port <PORT>` | Server port (default 4444) |
+| `--eval <EXPR>` | Execute expression and exit |
+| `--json` | Raw JSON output (no colors) |
+| `--encryption-key <PATH>` | Encryption key file (embedded mode) |
+
 ## Using OxiDB from your language
 
 Once the server is running, connect to it from any supported language. Every client uses the same TCP protocol — just pick your language:
@@ -1785,4 +1824,4 @@ Date strings (ISO 8601, RFC 3339, `YYYY-MM-DD`) are automatically detected and s
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+This project is licensed under the [MIT License](LICENSE).
