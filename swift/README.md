@@ -8,7 +8,23 @@ A Swift wrapper for OxiDB using the C FFI client library. Connects to an OxiDB s
 - macOS 13+ / iOS 16+
 - The `liboxidb_client_ffi` shared library (`.dylib` on macOS, `.a` for iOS)
 
-## Building the FFI Library
+## Getting the FFI Library
+
+### Prebuilt Binary (no Rust needed)
+
+Download the prebuilt library from the [latest release](https://github.com/parisxmas/OxiDB/releases/latest):
+
+```bash
+# macOS arm64 (Apple Silicon)
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.6.0/oxidb-client-ffi-macos-arm64.tar.gz
+tar xzf oxidb-client-ffi-macos-arm64.tar.gz
+
+# Install system-wide
+sudo cp liboxidb_client_ffi.dylib /usr/local/lib/
+sudo cp oxidb.h /usr/local/include/
+```
+
+### Build from Source
 
 ```bash
 # From the project root:
