@@ -1,0 +1,269 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		4A9B1C2D3E4F5A6B7C8D0E01 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A9B1C2D3E4F5A6B7C8D0D01 /* App.swift */; };
+		4A9B1C2D3E4F5A6B7C8D0E02 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A9B1C2D3E4F5A6B7C8D0D02 /* ContentView.swift */; };
+		4A9B1C2D3E4F5A6B7C8D0E03 /* EmbeddedDB.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A9B1C2D3E4F5A6B7C8D0D03 /* EmbeddedDB.swift */; };
+		4A9B1C2D3E4F5A6B7C8D0E04 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4A9B1C2D3E4F5A6B7C8D0D04 /* Assets.xcassets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		4A9B1C2D3E4F5A6B7C8D0D01 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
+		4A9B1C2D3E4F5A6B7C8D0D02 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		4A9B1C2D3E4F5A6B7C8D0D03 /* EmbeddedDB.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmbeddedDB.swift; sourceTree = "<group>"; };
+		4A9B1C2D3E4F5A6B7C8D0D04 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		4A9B1C2D3E4F5A6B7C8D0D06 /* OxiDBEmbeddedDemo.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OxiDBEmbeddedDemo.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		4A9B1C2D3E4F5A6B7C8D0D07 /* Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Bridging-Header.h"; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		4A9B1C2D3E4F5A6B7C8D0C02 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		4A9B1C2D3E4F5A6B7C8D0A02 /* root */ = {
+			isa = PBXGroup;
+			children = (
+				4A9B1C2D3E4F5A6B7C8D0A03 /* OxiDBEmbeddedDemo */,
+				4A9B1C2D3E4F5A6B7C8D0A04 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		4A9B1C2D3E4F5A6B7C8D0A03 /* OxiDBEmbeddedDemo */ = {
+			isa = PBXGroup;
+			children = (
+				4A9B1C2D3E4F5A6B7C8D0D01 /* App.swift */,
+				4A9B1C2D3E4F5A6B7C8D0D02 /* ContentView.swift */,
+				4A9B1C2D3E4F5A6B7C8D0D03 /* EmbeddedDB.swift */,
+				4A9B1C2D3E4F5A6B7C8D0D07 /* Bridging-Header.h */,
+				4A9B1C2D3E4F5A6B7C8D0D04 /* Assets.xcassets */,
+			);
+			path = OxiDBEmbeddedDemo;
+			sourceTree = "<group>";
+		};
+		4A9B1C2D3E4F5A6B7C8D0A04 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				4A9B1C2D3E4F5A6B7C8D0D06 /* OxiDBEmbeddedDemo.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		4A9B1C2D3E4F5A6B7C8D0B01 /* OxiDBEmbeddedDemo */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 4A9B1C2D3E4F5A6B7C8D0F06 /* Build configuration list for PBXNativeTarget "OxiDBEmbeddedDemo" */;
+			buildPhases = (
+				4A9B1C2D3E4F5A6B7C8D0C01 /* Sources */,
+				4A9B1C2D3E4F5A6B7C8D0C02 /* Frameworks */,
+				4A9B1C2D3E4F5A6B7C8D0C03 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OxiDBEmbeddedDemo;
+			productName = OxiDBEmbeddedDemo;
+			productReference = 4A9B1C2D3E4F5A6B7C8D0D06 /* OxiDBEmbeddedDemo.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		4A9B1C2D3E4F5A6B7C8D0A01 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+			};
+			buildConfigurationList = 4A9B1C2D3E4F5A6B7C8D0F05 /* Build configuration list for PBXProject "OxiDBEmbeddedDemo" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 4A9B1C2D3E4F5A6B7C8D0A02 /* root */;
+			productRefGroup = 4A9B1C2D3E4F5A6B7C8D0A04 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				4A9B1C2D3E4F5A6B7C8D0B01 /* OxiDBEmbeddedDemo */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		4A9B1C2D3E4F5A6B7C8D0C03 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4A9B1C2D3E4F5A6B7C8D0E04 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		4A9B1C2D3E4F5A6B7C8D0C01 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4A9B1C2D3E4F5A6B7C8D0E01 /* App.swift in Sources */,
+				4A9B1C2D3E4F5A6B7C8D0E02 /* ContentView.swift in Sources */,
+				4A9B1C2D3E4F5A6B7C8D0E03 /* EmbeddedDB.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		4A9B1C2D3E4F5A6B7C8D0F01 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		4A9B1C2D3E4F5A6B7C8D0F02 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_OPTIMIZATION_LEVEL = s;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		4A9B1C2D3E4F5A6B7C8D0F03 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../../../oxidb-embedded-ffi/include";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LIBRARY_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/../../../target/aarch64-apple-ios-sim/release",
+					"$(PROJECT_DIR)/../../../target/aarch64-apple-ios/release",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = "-loxidb_embedded_ffi";
+				PRODUCT_BUNDLE_IDENTIFIER = com.oxidb.embedded.demo;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "OxiDBEmbeddedDemo/Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		4A9B1C2D3E4F5A6B7C8D0F04 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../../../oxidb-embedded-ffi/include";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				LIBRARY_SEARCH_PATHS = (
+					"$(PROJECT_DIR)/../../../target/aarch64-apple-ios-sim/release",
+					"$(PROJECT_DIR)/../../../target/aarch64-apple-ios/release",
+				);
+				MARKETING_VERSION = 1.0;
+				OTHER_LDFLAGS = "-loxidb_embedded_ffi";
+				PRODUCT_BUNDLE_IDENTIFIER = com.oxidb.embedded.demo;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "OxiDBEmbeddedDemo/Bridging-Header.h";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		4A9B1C2D3E4F5A6B7C8D0F05 /* Build configuration list for PBXProject "OxiDBEmbeddedDemo" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4A9B1C2D3E4F5A6B7C8D0F01 /* Debug */,
+				4A9B1C2D3E4F5A6B7C8D0F02 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		4A9B1C2D3E4F5A6B7C8D0F06 /* Build configuration list for PBXNativeTarget "OxiDBEmbeddedDemo" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4A9B1C2D3E4F5A6B7C8D0F03 /* Debug */,
+				4A9B1C2D3E4F5A6B7C8D0F04 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = 4A9B1C2D3E4F5A6B7C8D0A01 /* Project object */;
+}
