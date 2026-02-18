@@ -86,7 +86,7 @@ final class OxiDBManager: ObservableObject {
         guard let client else { return }
         do {
             let pipeline: [[String: Any]] = [
-                ["$group": ["_by": "city", "count": ["$count": true]]],
+                ["$group": ["_id": "city", "count": ["$count": true]]],
                 ["$sort": ["count": -1]],
             ]
             let result = try client.aggregate(collection: "users", pipeline: pipeline)
