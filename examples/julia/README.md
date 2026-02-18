@@ -4,24 +4,36 @@ Two ways to use OxiDB from Julia:
 
 | Example | Mode | Server needed? |
 |---------|------|----------------|
-| `embedded_example.jl` | Embedded (in-process via FFI) | No |
-| `example.jl` | TCP client | Yes |
+| `embedded_example.jl` | Embedded (in-process via `OxiDbEmbedded`) | No |
+| `example.jl` | TCP client (via `OxiDb`) | Yes |
 
 ## Embedded Mode (recommended)
 
-Uses `ccall` to the prebuilt `liboxidb_embedded_ffi` library directly — no server needed. The library is **automatically downloaded** on first run.
+Uses the `OxiDbEmbedded` package — no server, no compilation needed.
 
 ```bash
 julia embedded_example.jl
 ```
 
-No setup required. The script:
-1. Auto-installs the `JSON3` package if missing
-2. Auto-downloads the prebuilt native library from [GitHub Releases](https://github.com/parisxmas/OxiDB/releases/latest) into `lib/` on first run
+The package auto-downloads the prebuilt native library from [GitHub Releases](https://github.com/parisxmas/OxiDB/releases/latest) on first run.
 
-Subsequent runs use the cached library.
+### Use in your own project
 
-### Supported platforms
+```julia
+using Pkg
+Pkg.develop(path="julia/OxiDbEmbedded")
+```
+
+```julia
+using OxiDbEmbedded
+
+db = open_db("/tmp/mydb")
+insert(db, "users", Dict("name" => "Alice", "age" => 30))
+docs = find(db, "users", Dict("name" => "Alice"))
+close(db)
+```
+
+### Supported platforms (prebuilt)
 
 | Platform | Architecture | Status |
 |----------|-------------|--------|
@@ -29,17 +41,11 @@ Subsequent runs use the cached library.
 | macOS | x86_64 | Build from source |
 | Linux | x86_64 | Build from source |
 
-To build from source instead:
-
-```bash
-cargo build --release -p oxidb-embedded-ffi
-```
-
-Then set `LIB_PATH` in the script to point to `target/release/liboxidb_embedded_ffi`.
+To build from source: `cargo build --release -p oxidb-embedded-ffi`
 
 ## TCP Client Mode
 
-Requires a running OxiDB server. Download the server binary from [GitHub Releases](https://github.com/parisxmas/OxiDB/releases/latest) or build with `cargo build --release -p oxidb-server`.
+Requires a running OxiDB server. Download from [GitHub Releases](https://github.com/parisxmas/OxiDB/releases/latest) or build with `cargo build --release -p oxidb-server`.
 
 ```bash
 # Start the server

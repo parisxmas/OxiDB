@@ -1,41 +1,58 @@
 # OxiDb.jl
 
-Julia client for [OxiDB](https://github.com/parisxmas/OxiDB) document database. Two modes:
+Julia client for [OxiDB](https://github.com/parisxmas/OxiDB) document database. Two packages:
 
-- **Embedded** — in-process via FFI, no server needed (prebuilt binary auto-downloaded)
-- **TCP client** — connects to a running `oxidb-server`
+| Package | Mode | Server needed? |
+|---------|------|----------------|
+| **`OxiDbEmbedded`** | In-process via FFI | No |
+| **`OxiDb`** | TCP client | Yes |
+
+Both share the same API (insert, find, update, delete, aggregate, transactions, blobs, FTS).
 
 ## Requirements
 
 - Julia 1.6+
 
-For embedded mode: macOS arm64 (Apple Silicon) — prebuilt binary downloaded automatically. Other platforms: build from source with `cargo build --release -p oxidb-embedded-ffi`.
+## Quick Start — Embedded (recommended)
 
-For TCP client mode: a running `oxidb-server` instance (see [main README](../../README.md#installation)).
+No server, no compilation. The prebuilt native library is downloaded automatically.
 
-## Quick Start — Embedded (no server needed)
+```julia
+using Pkg
+Pkg.develop(path="julia/OxiDbEmbedded")
+```
+
+```julia
+using OxiDbEmbedded
+
+db = open_db("/tmp/mydb")
+
+insert(db, "users", Dict("name" => "Alice", "age" => 30))
+docs = find(db, "users", Dict("name" => "Alice"))
+println(docs)
+
+close(db)
+```
+
+Or run the full demo:
 
 ```bash
 julia examples/julia/embedded_example.jl
 ```
 
-That's it. The script auto-installs `JSON3` and auto-downloads the prebuilt native library on first run. See [`examples/julia/README.md`](../../examples/julia/README.md) for details.
+### Supported platforms (prebuilt)
 
-```julia
-# Or use the embedded FFI directly in your own code:
-using JSON3
+| Platform | Architecture | Status |
+|----------|-------------|--------|
+| macOS | arm64 (Apple Silicon) | Prebuilt available |
+| macOS | x86_64 | Build from source |
+| Linux | x86_64 | Build from source |
 
-const LIB = "path/to/liboxidb_embedded_ffi"
-
-handle = ccall((:oxidb_open, LIB), Ptr{Cvoid}, (Cstring,), "/tmp/mydb")
-result = ccall((:oxidb_execute, LIB), Cstring, (Ptr{Cvoid}, Cstring), handle,
-               JSON3.write(Dict("cmd" => "ping")))
-println(unsafe_string(result))  # {"ok":true,"data":"pong"}
-ccall((:oxidb_free_string, LIB), Cvoid, (Cstring,), result)
-ccall((:oxidb_close, LIB), Cvoid, (Ptr{Cvoid},), handle)
-```
+Build from source: `cargo build --release -p oxidb-embedded-ffi`
 
 ## Quick Start — TCP Client
+
+Requires a running `oxidb-server` (see [main README](../../README.md#installation)).
 
 ```julia
 using Pkg
@@ -50,80 +67,73 @@ client = connect_oxidb("127.0.0.1", 4444)
 insert(client, "users", Dict("name" => "Alice", "age" => 30))
 docs = find(client, "users", Dict("name" => "Alice"))
 println(docs)
-# [Dict("_id" => 1, "_version" => 1, "name" => "Alice", "age" => 30)]
 
 close(client)
 ```
 
 ## API Reference
 
-### Connection
+Both packages export the same functions. Replace `db`/`client` interchangeably.
+
+### Open / Connect
 
 ```julia
-client = connect_oxidb("127.0.0.1", 4444)  # connect
-close(client)                                # disconnect
+# Embedded
+db = open_db("/tmp/mydb")
+db = open_db("/tmp/mydb"; encryption_key_path="/path/to/key")
+close(db)
+
+# TCP client
+client = connect_oxidb("127.0.0.1", 4444)
+close(client)
 ```
 
 ### CRUD
 
 | Function | Description |
 |----------|-------------|
-| `insert(client, collection, doc)` | Insert a document, returns `Dict("id" => ...)` |
-| `insert_many(client, collection, docs)` | Insert multiple documents |
-| `find(client, collection, query; sort, skip, limit)` | Find matching documents |
-| `find_one(client, collection, query)` | Find first matching document |
-| `update(client, collection, query, update)` | Update matching documents |
-| `delete(client, collection, query)` | Delete matching documents |
-| `count_docs(client, collection, query)` | Count matching documents |
+| `insert(db, collection, doc)` | Insert a document |
+| `insert_many(db, collection, docs)` | Insert multiple documents |
+| `find(db, collection, query; sort, skip, limit)` | Find matching documents |
+| `find_one(db, collection, query)` | Find first matching document |
+| `update(db, collection, query, update)` | Update matching documents |
+| `update_one(db, collection, query, update)` | Update first match (embedded only) |
+| `delete(db, collection, query)` | Delete matching documents |
+| `delete_one(db, collection, query)` | Delete first match (embedded only) |
+| `count_docs(db, collection, query)` | Count matching documents |
 
 ```julia
-# Insert
-insert(client, "users", Dict("name" => "Alice", "age" => 30))
-insert_many(client, "users", [
+insert(db, "users", Dict("name" => "Alice", "age" => 30))
+insert_many(db, "users", [
     Dict("name" => "Bob", "age" => 25),
     Dict("name" => "Charlie", "age" => 35)
 ])
 
-# Find with options
-docs = find(client, "users", Dict("age" => Dict("\$gte" => 18)))
-docs = find(client, "users", Dict(); sort=Dict("age" => 1), skip=0, limit=10)
-doc  = find_one(client, "users", Dict("name" => "Alice"))
+docs = find(db, "users", Dict("age" => Dict("\$gte" => 18)))
+docs = find(db, "users", Dict(); sort=Dict("age" => 1), skip=0, limit=10)
+doc  = find_one(db, "users", Dict("name" => "Alice"))
 
-# Update
-update(client, "users", Dict("name" => "Alice"), Dict("\$set" => Dict("age" => 31)))
-
-# Delete
-delete(client, "users", Dict("name" => "Charlie"))
-
-# Count
-n = count_docs(client, "users")
+update(db, "users", Dict("name" => "Alice"), Dict("\$set" => Dict("age" => 31)))
+delete(db, "users", Dict("name" => "Charlie"))
+n = count_docs(db, "users")
 ```
 
 ### Collections & Indexes
 
-| Function | Description |
-|----------|-------------|
-| `create_collection(client, name)` | Explicitly create a collection |
-| `list_collections(client)` | List all collection names |
-| `drop_collection(client, name)` | Drop a collection and its data |
-| `create_index(client, collection, field)` | Create a non-unique index |
-| `create_unique_index(client, collection, field)` | Create a unique index |
-| `create_composite_index(client, collection, fields)` | Create a multi-field index |
-
 ```julia
-create_collection(client, "orders")
-cols = list_collections(client)
-drop_collection(client, "orders")
+create_collection(db, "orders")
+list_collections(db)
+drop_collection(db, "orders")
 
-create_index(client, "users", "name")
-create_unique_index(client, "users", "email")
-create_composite_index(client, "users", ["name", "age"])
+create_index(db, "users", "name")
+create_unique_index(db, "users", "email")
+create_composite_index(db, "users", ["name", "age"])
 ```
 
 ### Aggregation
 
 ```julia
-results = aggregate(client, "orders", [
+results = aggregate(db, "orders", [
     Dict("\$match" => Dict("status" => "completed")),
     Dict("\$group" => Dict("_id" => "\$category", "total" => Dict("\$sum" => "\$amount"))),
     Dict("\$sort" => Dict("total" => -1)),
@@ -131,7 +141,7 @@ results = aggregate(client, "orders", [
 ])
 ```
 
-**Supported stages:** `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`
+**Stages:** `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`
 
 **Accumulators:** `$sum`, `$avg`, `$min`, `$max`, `$count`, `$first`, `$last`, `$push`
 
@@ -139,45 +149,44 @@ results = aggregate(client, "orders", [
 
 ```julia
 # Auto-commit on success, auto-rollback on exception
-transaction(client) do
-    insert(client, "ledger", Dict("action" => "debit",  "amount" => 100))
-    insert(client, "ledger", Dict("action" => "credit", "amount" => 100))
+transaction(db) do
+    insert(db, "ledger", Dict("action" => "debit",  "amount" => 100))
+    insert(db, "ledger", Dict("action" => "credit", "amount" => 100))
 end
 
 # Manual control
-begin_tx(client)
-insert(client, "ledger", Dict("action" => "refund", "amount" => 50))
-commit_tx(client)   # or rollback_tx(client)
+begin_tx(db)
+insert(db, "ledger", Dict("action" => "refund", "amount" => 50))
+commit_tx(db)   # or rollback_tx(db)
 ```
 
 ### Blob Storage
 
 ```julia
-# Buckets
-create_bucket(client, "files")
-list_buckets(client)
-delete_bucket(client, "files")
+create_bucket(db, "files")
+list_buckets(db)
 
-# Objects
-put_object(client, "files", "hello.txt", Vector{UInt8}("Hello!");
+put_object(db, "files", "hello.txt", Vector{UInt8}("Hello!");
            content_type="text/plain", metadata=Dict("author" => "julia"))
-data, meta = get_object(client, "files", "hello.txt")
-head = head_object(client, "files", "hello.txt")
-objs = list_objects(client, "files"; prefix="hello", limit=10)
-delete_object(client, "files", "hello.txt")
+data, meta = get_object(db, "files", "hello.txt")
+head = head_object(db, "files", "hello.txt")
+objs = list_objects(db, "files"; prefix="hello", limit=10)
+
+delete_object(db, "files", "hello.txt")
+delete_bucket(db, "files")
 ```
 
 ### Full-Text Search
 
 ```julia
-results = search(client, "hello world"; bucket="files", limit=10)
+results = search(db, "hello world"; bucket="files", limit=10)
 # Returns: [Dict("bucket" => "files", "key" => "doc.txt", "score" => 2.45), ...]
 ```
 
 ### Compaction
 
 ```julia
-stats = compact(client, "users")
+stats = compact(db, "users")
 # Returns: Dict("old_size" => 4096, "new_size" => 2048, "docs_kept" => 10)
 ```
 
@@ -185,7 +194,7 @@ stats = compact(client, "users")
 
 ```julia
 try
-    insert(client, "users", Dict("email" => "duplicate@test.com"))
+    insert(db, "users", Dict("email" => "duplicate@test.com"))
 catch e
     if e isa OxiDbError
         println("Database error: ", e.msg)
@@ -195,48 +204,12 @@ catch e
 end
 ```
 
-## Exported Symbols
-
-```julia
-# Types
-OxiDbClient, OxiDbError, TransactionConflictError
-
-# Connection
-connect_oxidb
-
-# CRUD
-insert, insert_many, find, find_one, update, delete, count_docs
-
-# Collections
-create_collection, list_collections, drop_collection
-
-# Indexes
-create_index, create_unique_index, create_composite_index
-
-# Aggregation & Compaction
-aggregate, compact
-
-# Transactions
-begin_tx, commit_tx, rollback_tx, transaction
-
-# Blob Storage
-create_bucket, list_buckets, delete_bucket,
-put_object, get_object, head_object, delete_object, list_objects
-
-# Search
-search
-
-# Utility
-ping
-```
-
 ## Running Tests
 
 ```bash
-# Start the server
+# Start the server (for TCP client tests)
 ./oxidb-server
 
-# Run tests
 cd julia/OxiDb
 julia --project=. test/runtests.jl
 ```
