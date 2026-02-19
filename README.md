@@ -2,7 +2,7 @@
   <img src="logo.png" alt="OxiDB" width="500">
 </p>
 
-<p align="center">A fast, embeddable document database written in Rust with Raft replication. Works like MongoDB but runs as a single binary with zero configuration.</p>
+<p align="center">A fast, embeddable document database written in Rust. Single binary, zero configuration, Raft replication, AES-256 encryption, SCRAM-SHA-256 auth, crash-safe WAL, and sub-second failover.</p>
 
 **Client libraries:** [Python](python/) | [Go](go/) | Ruby | Java/Spring Boot | [Julia](julia/) | PHP | [.NET](dotnet/) | [Swift/iOS](swift/) | [C FFI](oxidb-client-ffi/)
 
