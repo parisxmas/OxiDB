@@ -1,4 +1,5 @@
 pub mod blob;
+pub mod codec;
 pub mod collection;
 pub mod crypto;
 pub mod document;
