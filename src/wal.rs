@@ -356,3 +356,301 @@ impl Wal {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_wal(dir: &TempDir) -> Wal {
+        Wal::open(&dir.path().join("test.wal")).unwrap()
+    }
+
+    #[test]
+    fn log_and_read_insert() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        let entry = WalEntry::insert(1, b"doc_data".to_vec());
+        wal.log(&entry).unwrap();
+
+        let entries = wal.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            WalEntry::Insert { doc_id, doc_bytes, tx_id } => {
+                assert_eq!(*doc_id, 1);
+                assert_eq!(doc_bytes, b"doc_data");
+                assert_eq!(*tx_id, 0);
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn log_and_read_update() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        let entry = WalEntry::update(5, b"updated_data".to_vec());
+        wal.log(&entry).unwrap();
+
+        let entries = wal.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            WalEntry::Update { doc_id, doc_bytes, tx_id } => {
+                assert_eq!(*doc_id, 5);
+                assert_eq!(doc_bytes, b"updated_data");
+                assert_eq!(*tx_id, 0);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn log_and_read_delete() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        let entry = WalEntry::delete(10);
+        wal.log(&entry).unwrap();
+
+        let entries = wal.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            WalEntry::Delete { doc_id, tx_id } => {
+                assert_eq!(*doc_id, 10);
+                assert_eq!(*tx_id, 0);
+            }
+            _ => panic!("expected Delete"),
+        }
+    }
+
+    #[test]
+    fn log_batch() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        let entries = vec![
+            WalEntry::insert(1, b"a".to_vec()),
+            WalEntry::insert(2, b"b".to_vec()),
+            WalEntry::delete(1),
+        ];
+        wal.log_batch(&entries).unwrap();
+
+        let read = wal.read_entries().unwrap();
+        assert_eq!(read.len(), 3);
+    }
+
+    #[test]
+    fn checkpoint_clears_wal() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        wal.log(&WalEntry::insert(1, b"data".to_vec())).unwrap();
+        assert!(!wal.read_entries().unwrap().is_empty());
+
+        wal.checkpoint().unwrap();
+        assert!(wal.read_entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn crc_corruption_stops_replay() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("corrupt.wal");
+        let wal = Wal::open(&wal_path).unwrap();
+
+        wal.log(&WalEntry::insert(1, b"good".to_vec())).unwrap();
+        wal.log(&WalEntry::insert(2, b"will_corrupt".to_vec())).unwrap();
+        wal.log(&WalEntry::insert(3, b"after_corrupt".to_vec())).unwrap();
+
+        // Corrupt the CRC of the second entry
+        let mut file_data = std::fs::read(&wal_path).unwrap();
+        // First entry: 8 header + payload, then second starts
+        // Find the second entry's offset: parse first entry length
+        let first_payload_len = u32::from_le_bytes([
+            file_data[4], file_data[5], file_data[6], file_data[7],
+        ]) as usize;
+        let second_offset = 8 + first_payload_len;
+        // Corrupt the CRC bytes of the second entry
+        file_data[second_offset] ^= 0xFF;
+        std::fs::write(&wal_path, &file_data).unwrap();
+
+        // Reopen and read — should stop at corrupt entry
+        let wal2 = Wal::open(&wal_path).unwrap();
+        let entries = wal2.read_entries().unwrap();
+        assert_eq!(entries.len(), 1); // Only first entry survived
+    }
+
+    #[test]
+    fn transactional_entries_with_tx_id() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        let entry = WalEntry::Insert {
+            doc_id: 1,
+            doc_bytes: b"tx_data".to_vec(),
+            tx_id: 42,
+        };
+        wal.log(&entry).unwrap();
+
+        let entries = wal.read_entries().unwrap();
+        assert_eq!(entries[0].tx_id(), 42);
+    }
+
+    #[test]
+    fn recover_replays_insert() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+        let storage = Storage::open(&dir.path().join("data.dat")).unwrap();
+
+        // Log an insert
+        let doc_bytes = br#"{"name":"test","_version":1}"#;
+        wal.log(&WalEntry::insert(0, doc_bytes.to_vec())).unwrap();
+
+        let mut primary_index = HashMap::new();
+        let mut next_id = 0u64;
+        let committed = HashSet::new();
+        let mut version_index = HashMap::new();
+
+        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index)
+            .unwrap();
+
+        assert_eq!(primary_index.len(), 1);
+        assert!(primary_index.contains_key(&0));
+        assert_eq!(next_id, 1);
+    }
+
+    #[test]
+    fn recover_skips_uncommitted_tx() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+        let storage = Storage::open(&dir.path().join("data.dat")).unwrap();
+
+        // Log a transactional insert with tx_id=99 (not committed)
+        let entry = WalEntry::Insert {
+            doc_id: 0,
+            doc_bytes: br#"{"x":1}"#.to_vec(),
+            tx_id: 99,
+        };
+        wal.log(&entry).unwrap();
+
+        let mut primary_index = HashMap::new();
+        let mut next_id = 0u64;
+        let committed = HashSet::new(); // tx 99 not committed
+        let mut version_index = HashMap::new();
+
+        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index)
+            .unwrap();
+
+        assert!(primary_index.is_empty()); // Should be skipped
+    }
+
+    #[test]
+    fn recover_applies_committed_tx() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+        let storage = Storage::open(&dir.path().join("data.dat")).unwrap();
+
+        let entry = WalEntry::Insert {
+            doc_id: 0,
+            doc_bytes: br#"{"x":1,"_version":1}"#.to_vec(),
+            tx_id: 99,
+        };
+        wal.log(&entry).unwrap();
+
+        let mut primary_index = HashMap::new();
+        let mut next_id = 0u64;
+        let mut committed = HashSet::new();
+        committed.insert(99u64); // Mark tx 99 as committed
+        let mut version_index = HashMap::new();
+
+        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index)
+            .unwrap();
+
+        assert_eq!(primary_index.len(), 1);
+    }
+
+    #[test]
+    fn recover_delete_removes_from_index() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("test.wal");
+        let storage = Storage::open(&dir.path().join("data.dat")).unwrap();
+
+        // First, add a record directly to storage and primary_index
+        let doc_bytes = br#"{"x":1}"#;
+        let loc = storage.append(doc_bytes).unwrap();
+        let mut primary_index = HashMap::new();
+        primary_index.insert(0u64, loc);
+        let mut next_id = 1u64;
+        let committed = HashSet::new();
+        let mut version_index = HashMap::new();
+
+        // Now log a delete in WAL
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.log(&WalEntry::delete(0)).unwrap();
+
+        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index)
+            .unwrap();
+
+        assert!(primary_index.is_empty());
+    }
+
+    #[test]
+    fn encrypted_wal_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+        let enc_key = crate::crypto::EncryptionKey::load_from_file(&key_path).unwrap();
+
+        let wal = Wal::open_with_encryption(
+            &dir.path().join("encrypted.wal"),
+            Some(enc_key),
+        )
+        .unwrap();
+
+        let data = b"secret_doc_content";
+        wal.log(&WalEntry::insert(1, data.to_vec())).unwrap();
+
+        let entries = wal.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            WalEntry::Insert { doc_bytes, .. } => assert_eq!(doc_bytes, data),
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn remove_file_deletes_wal() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("remove_me.wal");
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.log(&WalEntry::insert(1, b"x".to_vec())).unwrap();
+        assert!(wal_path.exists());
+
+        wal.remove_file().unwrap();
+        assert!(!wal_path.exists());
+    }
+
+    #[test]
+    fn log_no_sync_and_batch_no_sync() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        wal.log_no_sync(&WalEntry::insert(1, b"a".to_vec())).unwrap();
+        wal.log_batch_no_sync(&[
+            WalEntry::insert(2, b"b".to_vec()),
+            WalEntry::insert(3, b"c".to_vec()),
+        ]).unwrap();
+
+        let entries = wal.read_entries().unwrap();
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn empty_wal_reads_nothing() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+        let entries = wal.read_entries().unwrap();
+        assert!(entries.is_empty());
+    }
+}

@@ -169,4 +169,105 @@ mod tests {
         assert!(integer < date);
         assert!(date < string);
     }
+
+    #[test]
+    fn date_only_parsing() {
+        let v = IndexValue::from_json(&JsonValue::String("2024-01-15".into()));
+        assert!(matches!(v, IndexValue::DateTime(_)));
+    }
+
+    #[test]
+    fn datetime_without_tz() {
+        let v = IndexValue::from_json(&JsonValue::String("2024-01-15T10:30:00".into()));
+        assert!(matches!(v, IndexValue::DateTime(_)));
+    }
+
+    #[test]
+    fn datetime_space_separated() {
+        let v = IndexValue::from_json(&JsonValue::String("2024-01-15 10:30:00".into()));
+        assert!(matches!(v, IndexValue::DateTime(_)));
+    }
+
+    #[test]
+    fn non_date_string_stays_string() {
+        let v = IndexValue::from_json(&JsonValue::String("hello world".into()));
+        assert!(matches!(v, IndexValue::String(_)));
+    }
+
+    #[test]
+    fn short_string_not_date() {
+        let v = IndexValue::from_json(&JsonValue::String("hi".into()));
+        assert!(matches!(v, IndexValue::String(_)));
+    }
+
+    #[test]
+    fn integer_from_json() {
+        let v = IndexValue::from_json(&serde_json::json!(42));
+        assert_eq!(v, IndexValue::Integer(42));
+    }
+
+    #[test]
+    fn float_from_json() {
+        let v = IndexValue::from_json(&serde_json::json!(3.14));
+        assert!(matches!(v, IndexValue::Float(_)));
+    }
+
+    #[test]
+    fn null_from_json() {
+        let v = IndexValue::from_json(&JsonValue::Null);
+        assert_eq!(v, IndexValue::Null);
+    }
+
+    #[test]
+    fn bool_from_json() {
+        let v = IndexValue::from_json(&serde_json::json!(true));
+        assert_eq!(v, IndexValue::Boolean(true));
+    }
+
+    #[test]
+    fn integer_float_cross_type_comparison() {
+        let i = IndexValue::Integer(42);
+        let f = IndexValue::Float(42.0);
+        assert_eq!(i, f);
+    }
+
+    #[test]
+    fn integer_float_ordering() {
+        let i = IndexValue::Integer(5);
+        let f = IndexValue::Float(5.5);
+        assert!(i < f);
+    }
+
+    #[test]
+    fn boolean_ordering() {
+        let f = IndexValue::Boolean(false);
+        let t = IndexValue::Boolean(true);
+        assert!(f < t);
+    }
+
+    #[test]
+    fn string_lexicographic_ordering() {
+        let a = IndexValue::String("apple".into());
+        let b = IndexValue::String("banana".into());
+        assert!(a < b);
+    }
+
+    #[test]
+    fn matches_json_date_string() {
+        let dt = IndexValue::from_json(&JsonValue::String("2024-06-15".into()));
+        assert!(dt.matches_json(&JsonValue::String("2024-06-15".into())));
+    }
+
+    #[test]
+    fn array_serialized_to_string() {
+        let v = IndexValue::from_json(&serde_json::json!([1, 2, 3]));
+        assert!(matches!(v, IndexValue::String(_)));
+    }
+
+    #[test]
+    fn negative_integer() {
+        let v = IndexValue::from_json(&serde_json::json!(-10));
+        assert_eq!(v, IndexValue::Integer(-10));
+        assert!(v < IndexValue::Integer(0));
+    }
 }
