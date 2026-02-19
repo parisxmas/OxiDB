@@ -584,6 +584,47 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        // -------------------------------------------------------------------
+        // Backup & Restore (admin-only via RBAC)
+        // -------------------------------------------------------------------
+
+        "backup" => {
+            let path = match request.get("path").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return err_bytes("missing 'path'"),
+            };
+            match db.backup(std::path::Path::new(path)) {
+                Ok(info) => ok_bytes(json!({
+                    "path": info.path,
+                    "size_bytes": info.size_bytes,
+                    "collections": info.collections,
+                })),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "restore" => {
+            let archive = match request.get("archive").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return err_bytes("missing 'archive'"),
+            };
+            let target = match request.get("target").and_then(|v| v.as_str()) {
+                Some(t) => t,
+                None => return err_bytes("missing 'target'"),
+            };
+            match oxidb::OxiDb::restore(
+                std::path::Path::new(archive),
+                std::path::Path::new(target),
+            ) {
+                Ok(info) => ok_bytes(json!({
+                    "path": info.path,
+                    "collections": info.collections,
+                    "message": "restore complete; restart server with this data directory to use",
+                })),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         _ => err_bytes(&format!("unknown command: {cmd}")),
     }
 }

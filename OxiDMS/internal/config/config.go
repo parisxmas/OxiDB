@@ -10,6 +10,7 @@ type Config struct {
 	JWTSecret    string
 	AdminEmail   string
 	AdminPass    string
+	GelfAddr     string
 }
 
 func Load() *Config {
@@ -21,6 +22,7 @@ func Load() *Config {
 		JWTSecret:  getEnv("DMS_JWT_SECRET", "oxidms-dev-secret-change-me"),
 		AdminEmail: getEnv("DMS_ADMIN_EMAIL", "admin@oxidms.local"),
 		AdminPass:  getEnv("DMS_ADMIN_PASS", "admin123"),
+		GelfAddr:   os.Getenv("DMS_GELF_ADDR"),
 	}
 }
 

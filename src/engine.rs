@@ -3,9 +3,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 
+use flate2::Compression;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use serde_json::{json, Value};
 
 use crate::blob::BlobStore;
+use crate::change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
 use crate::collection::{Collection, CompactStats, IndexInfo};
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
@@ -18,6 +22,21 @@ use crate::tx_log::{TransactionId, TxCommitLog};
 
 /// Callback type for forwarding engine log messages to an external sink.
 pub type LogCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Information about a completed backup operation.
+#[derive(Debug)]
+pub struct BackupInfo {
+    pub path: String,
+    pub size_bytes: u64,
+    pub collections: usize,
+}
+
+/// Information about a completed restore operation.
+#[derive(Debug)]
+pub struct RestoreInfo {
+    pub path: String,
+    pub collections: usize,
+}
 
 enum FtsJob {
     Index {
@@ -49,6 +68,7 @@ pub struct OxiDb {
     encryption: Option<Arc<EncryptionKey>>,
     verbose: bool,
     log_callback: Option<LogCallback>,
+    change_broker: ChangeStreamBroker,
 }
 
 impl OxiDb {
@@ -156,6 +176,7 @@ impl OxiDb {
             encryption,
             verbose,
             log_callback,
+            change_broker: ChangeStreamBroker::new(),
         })
     }
 
@@ -237,17 +258,76 @@ impl OxiDb {
     }
 
     // -----------------------------------------------------------------------
+    // Change stream methods
+    // -----------------------------------------------------------------------
+
+    /// Subscribe to change events. Returns a `WatchHandle` with the subscriber
+    /// ID, event receiver, and backpressure tracking.
+    ///
+    /// If `resume_after` is `Some(token)`, missed events are replayed from an
+    /// internal ring buffer. Returns `Err(ResumeError::TokenTooOld)` if the
+    /// token has been evicted.
+    pub fn watch(
+        &self,
+        filter: WatchFilter,
+        resume_after: Option<u64>,
+    ) -> std::result::Result<WatchHandle, ResumeError> {
+        self.change_broker.subscribe(filter, 256, resume_after)
+    }
+
+    /// Unsubscribe from change events.
+    pub fn unwatch(&self, id: SubscriberId) {
+        self.change_broker.unsubscribe(id);
+    }
+
+    // -----------------------------------------------------------------------
     // Convenience methods that delegate to collections
     // -----------------------------------------------------------------------
 
     pub fn insert(&self, collection: &str, doc: Value) -> Result<DocumentId> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().unwrap().insert(doc)
+        let emit = self.change_broker.has_subscribers();
+        let doc_clone = if emit { Some(doc.clone()) } else { None };
+        let id = col.write().unwrap().insert(doc)?;
+        if let Some(mut d) = doc_clone {
+            if let Some(obj) = d.as_object_mut() {
+                obj.insert("_id".to_string(), Value::Number(id.into()));
+                obj.insert("_version".to_string(), Value::Number(1.into()));
+            }
+            self.change_broker.emit(ChangeEvent {
+                token: 0,
+                operation: OperationType::Insert,
+                collection: collection.to_string(),
+                doc_id: id,
+                document: Some(d),
+                tx_id: None,
+            });
+        }
+        Ok(id)
     }
 
     pub fn insert_many(&self, collection: &str, docs: Vec<Value>) -> Result<Vec<DocumentId>> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().unwrap().insert_many(docs)
+        let emit = self.change_broker.has_subscribers();
+        let doc_clones: Option<Vec<Value>> = if emit { Some(docs.iter().cloned().collect()) } else { None };
+        let ids = col.write().unwrap().insert_many(docs)?;
+        if let Some(clones) = doc_clones {
+            for (mut d, &id) in clones.into_iter().zip(ids.iter()) {
+                if let Some(obj) = d.as_object_mut() {
+                    obj.insert("_id".to_string(), Value::Number(id.into()));
+                    obj.insert("_version".to_string(), Value::Number(1.into()));
+                }
+                self.change_broker.emit(ChangeEvent {
+                    token: 0,
+                    operation: OperationType::Insert,
+                    collection: collection.to_string(),
+                    doc_id: id,
+                    document: Some(d),
+                    tx_id: None,
+                });
+            }
+        }
+        Ok(ids)
     }
 
     pub fn find(&self, collection: &str, query: &Value) -> Result<Vec<Value>> {
@@ -282,22 +362,74 @@ impl OxiDb {
 
     pub fn update(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().unwrap().update(query, update, None)
+        let ids = col.write().unwrap().update(query, update, None)?;
+        if self.change_broker.has_subscribers() {
+            for &id in &ids {
+                self.change_broker.emit(ChangeEvent {
+                    token: 0,
+                    operation: OperationType::Update,
+                    collection: collection.to_string(),
+                    doc_id: id,
+                    document: None,
+                    tx_id: None,
+                });
+            }
+        }
+        Ok(ids.len() as u64)
     }
 
     pub fn update_one(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().unwrap().update(query, update, Some(1))
+        let ids = col.write().unwrap().update(query, update, Some(1))?;
+        if self.change_broker.has_subscribers() {
+            for &id in &ids {
+                self.change_broker.emit(ChangeEvent {
+                    token: 0,
+                    operation: OperationType::Update,
+                    collection: collection.to_string(),
+                    doc_id: id,
+                    document: None,
+                    tx_id: None,
+                });
+            }
+        }
+        Ok(ids.len() as u64)
     }
 
     pub fn delete(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().unwrap().delete(query, None)
+        let ids = col.write().unwrap().delete(query, None)?;
+        if self.change_broker.has_subscribers() {
+            for &id in &ids {
+                self.change_broker.emit(ChangeEvent {
+                    token: 0,
+                    operation: OperationType::Delete,
+                    collection: collection.to_string(),
+                    doc_id: id,
+                    document: None,
+                    tx_id: None,
+                });
+            }
+        }
+        Ok(ids.len() as u64)
     }
 
     pub fn delete_one(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().unwrap().delete(query, Some(1))
+        let ids = col.write().unwrap().delete(query, Some(1))?;
+        if self.change_broker.has_subscribers() {
+            for &id in &ids {
+                self.change_broker.emit(ChangeEvent {
+                    token: 0,
+                    operation: OperationType::Delete,
+                    collection: collection.to_string(),
+                    doc_id: id,
+                    document: None,
+                    tx_id: None,
+                });
+            }
+        }
+        Ok(ids.len() as u64)
     }
 
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
@@ -597,22 +729,69 @@ impl OxiDb {
         // 6. COMMIT POINT: mark transaction as committed in the global log
         self.tx_log.mark_committed(tx_id)?;
 
-        // 7. Apply: for each collection, apply mutations to storage
+        // 7. Collect event data before consuming mutations
+        let emit = self.change_broker.has_subscribers();
+        let pending_events: Vec<ChangeEvent> = if emit {
+            all_mutations
+                .iter()
+                .flat_map(|(col_name, mutations)| {
+                    mutations.iter().map(move |m| {
+                        if m.is_delete {
+                            ChangeEvent {
+                                token: 0,
+                                operation: OperationType::Delete,
+                                collection: col_name.clone(),
+                                doc_id: m.doc_id,
+                                document: None,
+                                tx_id: Some(tx_id),
+                            }
+                        } else if m.old_loc.is_some() {
+                            ChangeEvent {
+                                token: 0,
+                                operation: OperationType::Update,
+                                collection: col_name.clone(),
+                                doc_id: m.doc_id,
+                                document: None,
+                                tx_id: Some(tx_id),
+                            }
+                        } else {
+                            ChangeEvent {
+                                token: 0,
+                                operation: OperationType::Insert,
+                                collection: col_name.clone(),
+                                doc_id: m.doc_id,
+                                document: Some(m.new_data.clone()),
+                                tx_id: Some(tx_id),
+                            }
+                        }
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // 8. Apply: for each collection, apply mutations to storage
         for (col_name, mut mutations) in all_mutations {
             let col = write_guards.get_mut(&col_name).unwrap();
             col.apply_prepared(&mut mutations)?;
         }
 
-        // 8. Checkpoint: for each collection, checkpoint WAL
+        // 9. Checkpoint: for each collection, checkpoint WAL
         for (col_name, _) in &locked_collections {
             let col = write_guards.get(col_name).unwrap();
             col.checkpoint_wal()?;
         }
 
-        // 9. Cleanup: remove tx_id from commit log
+        // 10. Cleanup: remove tx_id from commit log
         self.tx_log.remove_committed(tx_id)?;
 
-        // 10. Write locks drop automatically when write_guards goes out of scope
+        // 11. Emit change events after successful commit
+        for event in pending_events {
+            self.change_broker.emit(event);
+        }
+
+        // 12. Write locks drop automatically when write_guards goes out of scope
         Ok(())
     }
 
@@ -712,6 +891,162 @@ impl OxiDb {
                 })
             })
             .collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // Backup & Restore
+    // -----------------------------------------------------------------------
+
+    /// Create a compressed tar.gz backup of the entire data directory.
+    ///
+    /// The backup flushes all indexes and WAL checkpoints before archiving,
+    /// then holds read locks on all collections to ensure a consistent snapshot.
+    pub fn backup(&self, output_path: &Path) -> Result<BackupInfo> {
+        // 1. Validate output path doesn't already exist
+        if output_path.exists() {
+            return Err(Error::Backup(format!(
+                "output path already exists: {}",
+                output_path.display()
+            )));
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = output_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        // 2. Discover all collection names from .dat files on disk
+        let disk_names = Self::discover_collection_names_on_disk(&self.data_dir)?;
+
+        // 3. Ensure all collections are loaded
+        for name in &disk_names {
+            let _ = self.get_or_create_collection(name)?;
+        }
+
+        // 4. Flush indexes and checkpoint WALs for each collection
+        {
+            let cols = self.collections.read().unwrap();
+            for col_arc in cols.values() {
+                let col = col_arc.write().unwrap();
+                col.save_index_data();
+                let _ = col.checkpoint_wal();
+            }
+        }
+
+        // 5. Acquire read locks on all collections for consistent snapshot
+        let cols = self.collections.read().unwrap();
+        let _read_guards: Vec<_> = cols.values()
+            .map(|c| c.read().unwrap())
+            .collect();
+
+        // 6. Create tar.gz archive
+        let file = std::fs::File::create(output_path)?;
+        let enc = GzEncoder::new(file, Compression::default());
+        let mut archive = tar::Builder::new(enc);
+
+        Self::add_dir_to_tar(&mut archive, &self.data_dir, &self.data_dir)?;
+
+        let enc = archive.into_inner().map_err(|e| Error::Backup(e.to_string()))?;
+        enc.finish().map_err(|e| Error::Backup(e.to_string()))?;
+
+        // 7. Return info
+        let metadata = std::fs::metadata(output_path)?;
+        Ok(BackupInfo {
+            path: output_path.to_string_lossy().into_owned(),
+            size_bytes: metadata.len(),
+            collections: disk_names.len(),
+        })
+    }
+
+    /// Restore a tar.gz backup archive to a target directory.
+    ///
+    /// This is a static method — the caller should open a new `OxiDb` instance
+    /// on the target directory after restoration.
+    pub fn restore(archive_path: &Path, target_dir: &Path) -> Result<RestoreInfo> {
+        // 1. Validate archive exists
+        if !archive_path.exists() {
+            return Err(Error::Backup(format!(
+                "archive not found: {}",
+                archive_path.display()
+            )));
+        }
+
+        // 2. Validate target directory is empty or doesn't exist
+        if target_dir.exists() {
+            let has_entries = std::fs::read_dir(target_dir)?
+                .next()
+                .is_some();
+            if has_entries {
+                return Err(Error::Backup(format!(
+                    "target directory is not empty: {}",
+                    target_dir.display()
+                )));
+            }
+        } else {
+            std::fs::create_dir_all(target_dir)?;
+        }
+
+        // 3. Extract tar.gz into target directory
+        let file = std::fs::File::open(archive_path)?;
+        let dec = GzDecoder::new(file);
+        let mut archive = tar::Archive::new(dec);
+        archive.unpack(target_dir)?;
+
+        // 4. Count .dat files
+        let collections = Self::discover_collection_names_on_disk(target_dir)?;
+
+        Ok(RestoreInfo {
+            path: target_dir.to_string_lossy().into_owned(),
+            collections: collections.len(),
+        })
+    }
+
+    /// Scan a directory for `*.dat` files and return collection names.
+    fn discover_collection_names_on_disk(dir: &Path) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        if !dir.exists() {
+            return Ok(names);
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("dat") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_string());
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// Recursively add directory contents to a tar archive, skipping `.tmp` files.
+    fn add_dir_to_tar<W: std::io::Write>(
+        archive: &mut tar::Builder<W>,
+        dir: &Path,
+        base: &Path,
+    ) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            // Skip .tmp files
+            if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                continue;
+            }
+
+            let rel = path.strip_prefix(base).unwrap_or(&path);
+
+            if path.is_dir() {
+                Self::add_dir_to_tar(archive, &path, base)?;
+            } else if path.is_file() {
+                archive
+                    .append_path_with_name(&path, rel)
+                    .map_err(|e| Error::Backup(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -845,5 +1180,172 @@ mod tests {
 
         let docs = db.find("users", &json!({})).unwrap();
         assert_eq!(docs.len(), 0);
+    }
+
+    #[test]
+    fn backup_creates_archive() {
+        let dir = tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        db.insert("users", json!({"name": "Alice"})).unwrap();
+        db.insert("orders", json!({"item": "Widget"})).unwrap();
+
+        let backup_path = dir.path().join("backup.tar.gz");
+        let info = db.backup(&backup_path).unwrap();
+
+        assert!(backup_path.exists());
+        assert!(info.size_bytes > 0);
+        assert_eq!(info.collections, 2);
+    }
+
+    #[test]
+    fn backup_fails_if_output_exists() {
+        let dir = tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        db.insert("users", json!({"name": "Alice"})).unwrap();
+
+        let backup_path = dir.path().join("backup.tar.gz");
+        std::fs::write(&backup_path, b"existing").unwrap();
+
+        let result = db.backup(&backup_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn restore_from_backup() {
+        let dir = tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        db.insert("users", json!({"name": "Alice"})).unwrap();
+        db.insert("users", json!({"name": "Bob"})).unwrap();
+        db.insert("orders", json!({"item": "Widget"})).unwrap();
+
+        let backup_path = dir.path().join("backup.tar.gz");
+        db.backup(&backup_path).unwrap();
+        drop(db);
+
+        let restore_dir = dir.path().join("restored");
+        let info = OxiDb::restore(&backup_path, &restore_dir).unwrap();
+        assert_eq!(info.collections, 2);
+
+        let db2 = OxiDb::open(&restore_dir).unwrap();
+        let users = db2.find("users", &json!({})).unwrap();
+        assert_eq!(users.len(), 2);
+        let orders = db2.find("orders", &json!({})).unwrap();
+        assert_eq!(orders.len(), 1);
+    }
+
+    #[test]
+    fn restore_fails_if_target_not_empty() {
+        let dir = tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        db.insert("users", json!({"name": "Alice"})).unwrap();
+
+        let backup_path = dir.path().join("backup.tar.gz");
+        db.backup(&backup_path).unwrap();
+
+        let restore_dir = dir.path().join("notempty");
+        std::fs::create_dir_all(&restore_dir).unwrap();
+        std::fs::write(restore_dir.join("file.txt"), b"data").unwrap();
+
+        let result = OxiDb::restore(&backup_path, &restore_dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not empty"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Change stream tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn watch_insert_emits_event() {
+        let db = temp_db();
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+
+        let id = db.insert("users", json!({"name": "Alice"})).unwrap();
+
+        let event = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(event.operation, OperationType::Insert);
+        assert_eq!(event.collection, "users");
+        assert_eq!(event.doc_id, id);
+        assert!(event.document.is_some());
+        assert!(event.token > 0);
+        let doc = event.document.unwrap();
+        assert_eq!(doc["name"], "Alice");
+        assert_eq!(doc["_id"], id);
+    }
+
+    #[test]
+    fn watch_update_emits_event() {
+        let db = temp_db();
+        let id = db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
+
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+        db.update("users", &json!({"name": "Alice"}), &json!({"$set": {"age": 31}})).unwrap();
+
+        let event = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(event.operation, OperationType::Update);
+        assert_eq!(event.collection, "users");
+        assert_eq!(event.doc_id, id);
+        assert!(event.document.is_none());
+    }
+
+    #[test]
+    fn watch_delete_emits_event() {
+        let db = temp_db();
+        let id = db.insert("users", json!({"name": "Alice"})).unwrap();
+
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+        db.delete("users", &json!({"name": "Alice"})).unwrap();
+
+        let event = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(event.operation, OperationType::Delete);
+        assert_eq!(event.collection, "users");
+        assert_eq!(event.doc_id, id);
+        assert!(event.document.is_none());
+    }
+
+    #[test]
+    fn watch_tx_commit_emits_events() {
+        let db = temp_db();
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+
+        let tx_id = db.begin_transaction();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
+        db.tx_insert(tx_id, "users", json!({"name": "Bob"})).unwrap();
+        db.commit_transaction(tx_id).unwrap();
+
+        let e1 = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let e2 = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(e1.operation, OperationType::Insert);
+        assert_eq!(e2.operation, OperationType::Insert);
+        assert!(e1.tx_id.is_some());
+        assert!(e2.tx_id.is_some());
+    }
+
+    #[test]
+    fn unwatch_stops_events() {
+        let db = temp_db();
+        let handle = db.watch(WatchFilter::All, None).unwrap();
+
+        db.unwatch(handle.id);
+        db.insert("users", json!({"name": "Alice"})).unwrap();
+
+        assert!(handle.rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn watch_filters_by_collection() {
+        let db = temp_db();
+        let handle = db.watch(WatchFilter::Collection("orders".to_string()), None).unwrap();
+
+        db.insert("users", json!({"name": "Alice"})).unwrap();
+        let order_id = db.insert("orders", json!({"item": "Widget"})).unwrap();
+
+        let event = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(event.collection, "orders");
+        assert_eq!(event.doc_id, order_id);
+
+        // No more events (the users insert was filtered out)
+        assert!(handle.rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
     }
 }

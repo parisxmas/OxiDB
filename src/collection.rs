@@ -378,7 +378,7 @@ impl Collection {
             vlog(&format!("[verbose] {}: collection ready", name));
         }
 
-        Ok(Self {
+        let collection = Self {
             name: name.to_string(),
             data_dir: data_dir.to_path_buf(),
             storage,
@@ -392,7 +392,14 @@ impl Collection {
             encryption,
             verbose,
             log_callback,
-        })
+        };
+
+        // Save index cache after rebuild so next restart loads from cache
+        if has_persisted_indexes && !indexes_from_cache {
+            collection.save_index_data();
+        }
+
+        Ok(collection)
     }
 
     pub fn name(&self) -> &str {
@@ -1197,10 +1204,10 @@ impl Collection {
         }
     }
 
-    /// Update documents matching a query atomically. Returns number of updated documents.
+    /// Update documents matching a query atomically. Returns IDs of updated documents.
     /// If any unique constraint is violated, no documents are modified.
     /// `limit` caps the number of documents to update (e.g. `Some(1)` for update_one).
-    pub fn update(&mut self, query_json: &Value, update_json: &Value, limit: Option<usize>) -> Result<u64> {
+    pub fn update(&mut self, query_json: &Value, update_json: &Value, limit: Option<usize>) -> Result<Vec<DocumentId>> {
         // Validate update document has at least one operator
         let update_obj = update_json
             .as_object()
@@ -1246,7 +1253,7 @@ impl Collection {
         }
 
         if matches.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         // Phase 2: Prepare all updates and validate constraints upfront
@@ -1283,7 +1290,7 @@ impl Collection {
         }
 
         if ops.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         // Phase 2: WAL log all updates → single fsync
@@ -1306,8 +1313,9 @@ impl Collection {
         self.wal.checkpoint_no_sync()?;
 
         // Phase 5: update in-memory state
-        let count = ops.len() as u64;
+        let mut updated_ids = Vec::with_capacity(ops.len());
         for (op, new_loc) in ops.into_iter().zip(new_locs) {
+            updated_ids.push(op.id);
             self.primary_index.insert(op.id, new_loc);
             let new_version = op.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
             self.version_index.insert(op.id, new_version);
@@ -1324,12 +1332,12 @@ impl Collection {
             }
         }
 
-        Ok(count)
+        Ok(updated_ids)
     }
 
-    /// Delete documents matching a query atomically. Returns number deleted.
+    /// Delete documents matching a query atomically. Returns IDs of deleted documents.
     /// `limit` caps the number of documents to delete (e.g. `Some(1)` for delete_one).
-    pub fn delete(&mut self, query_json: &Value, limit: Option<usize>) -> Result<u64> {
+    pub fn delete(&mut self, query_json: &Value, limit: Option<usize>) -> Result<Vec<DocumentId>> {
         let query = query::parse_query(query_json)?;
         let candidate_ids = query::execute_indexed(
             &query,
@@ -1370,7 +1378,7 @@ impl Collection {
         }
 
         if ops.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         // Phase 2: WAL log all deletes (no fsync — storage fsync provides durability)
@@ -1390,8 +1398,9 @@ impl Collection {
         self.wal.checkpoint_no_sync()?;
 
         // Phase 5: update in-memory state
-        let count = ops.len() as u64;
+        let mut deleted_ids = Vec::with_capacity(ops.len());
         for op in ops {
+            deleted_ids.push(op.id);
             self.primary_index.remove(&op.id);
             self.version_index.remove(&op.id);
             for idx in self.field_indexes.values_mut() {
@@ -1405,7 +1414,7 @@ impl Collection {
             }
         }
 
-        Ok(count)
+        Ok(deleted_ids)
     }
 
     /// Returns the number of documents in the collection.
@@ -1918,10 +1927,10 @@ mod tests {
         let (_dir, mut col) = temp_collection("test");
         let id = col.insert(json!({"name": "Alice", "age": 30})).unwrap();
 
-        let count = col
+        let ids = col
             .update(&json!({"name": "Alice"}), &json!({"$set": {"age": 31}}), None)
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(ids.len(), 1);
 
         let doc = col.get(id).unwrap().unwrap();
         assert_eq!(doc["age"], 31);
@@ -1933,8 +1942,8 @@ mod tests {
         col.insert(json!({"name": "Alice"})).unwrap();
         col.insert(json!({"name": "Bob"})).unwrap();
 
-        let count = col.delete(&json!({"name": "Alice"}), None).unwrap();
-        assert_eq!(count, 1);
+        let ids = col.delete(&json!({"name": "Alice"}), None).unwrap();
+        assert_eq!(ids.len(), 1);
         assert_eq!(col.count(), 1);
     }
 
@@ -1968,14 +1977,14 @@ mod tests {
             .unwrap();
 
         // Updating other fields on same doc should work (email unchanged)
-        let count = col
+        let ids = col
             .update(
                 &json!({"email": "alice@test.com"}),
                 &json!({"$set": {"name": "Alicia"}}),
                 None,
             )
             .unwrap();
-        assert_eq!(count, 1);
+        assert_eq!(ids.len(), 1);
     }
 
     #[test]
@@ -2038,14 +2047,14 @@ mod tests {
         col.insert(json!({"status": "draft", "title": "B"}))
             .unwrap();
 
-        let count = col
+        let ids = col
             .update(
                 &json!({"status": "draft"}),
                 &json!({"$set": {"status": "published"}}),
                 None,
             )
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(ids.len(), 2);
 
         let published = col.find(&json!({"status": "published"})).unwrap();
         assert_eq!(published.len(), 2);
@@ -2063,8 +2072,8 @@ mod tests {
         col.insert(json!({"status": "new", "title": "C"}))
             .unwrap();
 
-        let count = col.delete(&json!({"status": "old"}), None).unwrap();
-        assert_eq!(count, 2);
+        let ids = col.delete(&json!({"status": "old"}), None).unwrap();
+        assert_eq!(ids.len(), 2);
         assert_eq!(col.count(), 1);
     }
 

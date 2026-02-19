@@ -1,4 +1,5 @@
 pub mod blob;
+pub mod change_stream;
 pub mod codec;
 pub mod collection;
 pub mod crypto;
@@ -17,9 +18,10 @@ pub mod storage;
 pub mod value;
 pub mod wal;
 
+pub use change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
 pub use collection::{Collection, CompactStats, IndexInfo};
 pub use crypto::EncryptionKey;
 pub use document::DocumentId;
-pub use engine::{LogCallback, OxiDb};
+pub use engine::{BackupInfo, LogCallback, OxiDb, RestoreInfo};
 pub use error::{Error, Result};
 pub use tx_log::TransactionId;
