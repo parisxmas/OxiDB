@@ -6,7 +6,7 @@
 
 **Client libraries:** Python, Go, Ruby, Java/Spring Boot, Julia, PHP, .NET, Swift/iOS, C FFI
 
-## Installation
+## Installation.
 
 ### Option 1: Download a pre-built binary (easiest)
 
