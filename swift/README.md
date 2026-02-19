@@ -233,6 +233,92 @@ let results = try client.search(query: "hello world", limit: 10)
 client.disconnect()
 ```
 
+## Watching (Mutation Events)
+
+The Swift SDK supports **local mutation watching** on both `OxiDBClient` and `OxiDBDatabase`.
+
+- Local means events are emitted for operations executed through that Swift instance.
+- Event shape:
+  - `operation: OxiDBMutationOperation` (`insert`, `insert_many`, `update`, `delete`, `commit_tx`)
+  - `collection: String?`
+  - `timestamp: Date`
+  - `metadata: [String: Any]`
+
+### Option 1: Callback Observer
+
+```swift
+import OxiDB
+
+let db = try OxiDBDatabase.open(path: "/path/to/mydb")
+
+let observerID = db.addMutationObserver { event in
+    guard event.collection == "users" else { return }
+    print("WATCH \(event.operation.rawValue) collection=\(event.collection ?? "-")")
+    print("metadata=\(event.metadata)")
+}
+
+// ... run writes (insert/update/delete) ...
+
+db.removeMutationObserver(observerID)
+```
+
+### Option 2: AsyncStream
+
+```swift
+import OxiDB
+
+let db = try OxiDBDatabase.open(path: "/path/to/mydb")
+
+let task = Task {
+    for await event in db.mutationEvents() {
+        if event.collection == "users" {
+            print("async WATCH -> \(event.operation.rawValue)")
+        }
+    }
+}
+
+// later
+task.cancel()
+```
+
+### Rule-Based Watch Example (path changes)
+
+The SDK provides mutation events; you can build higher-level watch rules on top.
+Example: trigger when `users.city` is updated.
+
+```swift
+import OxiDB
+
+func pathWasUpdated(_ path: String, metadata: [String: Any]) -> Bool {
+    guard let update = metadata["update"] as? [String: Any] else { return false }
+    for (_, payload) in update {
+        guard let fields = payload as? [String: Any] else { continue }
+        for changedPath in fields.keys {
+            if changedPath == path || changedPath.hasPrefix(path + ".") || path.hasPrefix(changedPath + ".") {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+let db = try OxiDBDatabase.open(path: "/path/to/mydb")
+let id = db.addMutationObserver { event in
+    guard event.collection == "users", event.operation == .update else { return }
+    if pathWasUpdated("city", metadata: event.metadata) {
+        print("WATCH TRIGGER: users.city changed")
+    }
+}
+
+// ... use db ...
+db.removeMutationObserver(id)
+```
+
+Notes:
+- In embedded mode (`OxiDBDatabase`), events are emitted from successful `execute(_:)` commands.
+- In client mode (`OxiDBClient`), events are emitted from successful SDK write calls.
+- For app-level persistent watch rules (e.g. stored in `_config`), persist your rule docs and evaluate them inside your observer callback.
+
 ## Error Handling
 
 ```swift
@@ -301,3 +387,8 @@ do {
 
 ### Full-Text Search (both classes)
 - `search(query:bucket:limit:)` - Search indexed content
+
+### Mutation Watching (both classes)
+- `addMutationObserver(_:)` - Register callback observer
+- `removeMutationObserver(_:)` - Remove observer by UUID
+- `mutationEvents()` - Async stream of mutation events

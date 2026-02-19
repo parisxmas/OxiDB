@@ -28,6 +28,59 @@ public enum OxiDBError: Error, LocalizedError {
     }
 }
 
+// MARK: - Mutation Observing
+
+public enum OxiDBMutationOperation: String {
+    case insert
+    case insertMany = "insert_many"
+    case update
+    case delete
+    case commitTx = "commit_tx"
+}
+
+public struct OxiDBMutationEvent {
+    public let operation: OxiDBMutationOperation
+    public let collection: String?
+    public let timestamp: Date
+    public let metadata: [String: Any]
+}
+
+public protocol OxiDBMutationObservable: AnyObject {
+    @discardableResult
+    func addMutationObserver(_ handler: @escaping (OxiDBMutationEvent) -> Void) -> UUID
+    func removeMutationObserver(_ id: UUID)
+    func mutationEvents() -> AsyncStream<OxiDBMutationEvent>
+}
+
+private final class MutationObserverStore {
+    private let lock = NSLock()
+    private var observers: [UUID: (OxiDBMutationEvent) -> Void] = [:]
+
+    @discardableResult
+    func add(_ handler: @escaping (OxiDBMutationEvent) -> Void) -> UUID {
+        let id = UUID()
+        lock.lock()
+        observers[id] = handler
+        lock.unlock()
+        return id
+    }
+
+    func remove(_ id: UUID) {
+        lock.lock()
+        observers.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    func emit(_ event: OxiDBMutationEvent) {
+        lock.lock()
+        let handlers = Array(observers.values)
+        lock.unlock()
+        for handler in handlers {
+            handler(event)
+        }
+    }
+}
+
 // MARK: - Shared Helpers
 
 /// Parse a JSON response string and check for errors.
@@ -60,8 +113,9 @@ private func jsonString(_ value: Any) throws -> String {
 // MARK: - Client
 
 #if canImport(COxiDB)
-public final class OxiDBClient {
+public final class OxiDBClient: OxiDBMutationObservable {
     private var conn: OpaquePointer?
+    private let mutationObserverStore = MutationObserverStore()
 
     private init(conn: OpaquePointer) {
         self.conn = conn
@@ -87,6 +141,28 @@ public final class OxiDBClient {
         }
     }
 
+    // MARK: - Mutation Observing
+
+    @discardableResult
+    public func addMutationObserver(_ handler: @escaping (OxiDBMutationEvent) -> Void) -> UUID {
+        mutationObserverStore.add(handler)
+    }
+
+    public func removeMutationObserver(_ id: UUID) {
+        mutationObserverStore.remove(id)
+    }
+
+    public func mutationEvents() -> AsyncStream<OxiDBMutationEvent> {
+        AsyncStream { continuation in
+            let id = self.addMutationObserver { event in
+                continuation.yield(event)
+            }
+            continuation.onTermination = { [weak self] _ in
+                self?.removeMutationObserver(id)
+            }
+        }
+    }
+
     // MARK: - Core Operations
 
     /// Ping the server.
@@ -99,14 +175,18 @@ public final class OxiDBClient {
     @discardableResult
     public func insert(collection: String, document: [String: Any]) throws -> [String: Any] {
         let json = try jsonString(document)
-        return try call { oxidb_insert($0, collection, json) }
+        let result = try call { oxidb_insert($0, collection, json) }
+        emitMutation(operation: .insert, collection: collection, metadata: ["documentCount": 1])
+        return result
     }
 
     /// Insert multiple documents.
     @discardableResult
     public func insertMany(collection: String, documents: [[String: Any]]) throws -> [String: Any] {
         let json = try jsonString(documents)
-        return try call { oxidb_insert_many($0, collection, json) }
+        let result = try call { oxidb_insert_many($0, collection, json) }
+        emitMutation(operation: .insertMany, collection: collection, metadata: ["documentCount": documents.count])
+        return result
     }
 
     /// Find documents matching a query.
@@ -131,7 +211,9 @@ public final class OxiDBClient {
     public func update(collection: String, query: [String: Any], update: [String: Any]) throws -> [String: Any] {
         let queryJson = try jsonString(query)
         let updateJson = try jsonString(update)
-        return try call { oxidb_update($0, collection, queryJson, updateJson) }
+        let result = try call { oxidb_update($0, collection, queryJson, updateJson) }
+        emitMutation(operation: .update, collection: collection, metadata: ["single": false])
+        return result
     }
 
     /// Update a single document matching a query.
@@ -139,21 +221,27 @@ public final class OxiDBClient {
     public func updateOne(collection: String, query: [String: Any], update: [String: Any]) throws -> [String: Any] {
         let queryJson = try jsonString(query)
         let updateJson = try jsonString(update)
-        return try call { oxidb_update_one($0, collection, queryJson, updateJson) }
+        let result = try call { oxidb_update_one($0, collection, queryJson, updateJson) }
+        emitMutation(operation: .update, collection: collection, metadata: ["single": true])
+        return result
     }
 
     /// Delete documents matching a query.
     @discardableResult
     public func delete(collection: String, query: [String: Any]) throws -> [String: Any] {
         let json = try jsonString(query)
-        return try call { oxidb_delete($0, collection, json) }
+        let result = try call { oxidb_delete($0, collection, json) }
+        emitMutation(operation: .delete, collection: collection, metadata: ["single": false])
+        return result
     }
 
     /// Delete a single document matching a query.
     @discardableResult
     public func deleteOne(collection: String, query: [String: Any]) throws -> [String: Any] {
         let json = try jsonString(query)
-        return try call { oxidb_delete_one($0, collection, json) }
+        let result = try call { oxidb_delete_one($0, collection, json) }
+        emitMutation(operation: .delete, collection: collection, metadata: ["single": true])
+        return result
     }
 
     /// Count documents in a collection.
@@ -251,7 +339,9 @@ public final class OxiDBClient {
     /// Commit the current transaction.
     @discardableResult
     public func commitTransaction() throws -> [String: Any] {
-        return try call { oxidb_commit_tx($0) }
+        let result = try call { oxidb_commit_tx($0) }
+        emitMutation(operation: .commitTx, collection: nil)
+        return result
     }
 
     /// Rollback the current transaction.
@@ -349,6 +439,21 @@ public final class OxiDBClient {
         let str = String(cString: cStr)
         return try parseResponse(str)
     }
+
+    private func emitMutation(
+        operation: OxiDBMutationOperation,
+        collection: String?,
+        metadata: [String: Any] = [:]
+    ) {
+        mutationObserverStore.emit(
+            OxiDBMutationEvent(
+                operation: operation,
+                collection: collection,
+                timestamp: Date(),
+                metadata: metadata
+            )
+        )
+    }
 }
 
 #endif // canImport(COxiDB)
@@ -359,8 +464,9 @@ public final class OxiDBClient {
 ///
 /// Uses the same JSON command protocol as the TCP server, executed directly
 /// in-process via the `oxidb-embedded-ffi` library.
-public final class OxiDBDatabase {
+public final class OxiDBDatabase: OxiDBMutationObservable {
     private var handle: OpaquePointer?
+    private let mutationObserverStore = MutationObserverStore()
 
     private init(handle: OpaquePointer) {
         self.handle = handle
@@ -392,6 +498,28 @@ public final class OxiDBDatabase {
         if let h = handle {
             oxidb_close(UnsafeMutableRawPointer(h))
             handle = nil
+        }
+    }
+
+    // MARK: - Mutation Observing
+
+    @discardableResult
+    public func addMutationObserver(_ handler: @escaping (OxiDBMutationEvent) -> Void) -> UUID {
+        mutationObserverStore.add(handler)
+    }
+
+    public func removeMutationObserver(_ id: UUID) {
+        mutationObserverStore.remove(id)
+    }
+
+    public func mutationEvents() -> AsyncStream<OxiDBMutationEvent> {
+        AsyncStream { continuation in
+            let id = self.addMutationObserver { event in
+                continuation.yield(event)
+            }
+            continuation.onTermination = { [weak self] _ in
+                self?.removeMutationObserver(id)
+            }
         }
     }
 
@@ -663,6 +791,50 @@ public final class OxiDBDatabase {
         defer { COxiDBEmbedded.oxidb_free_string(cStr) }
 
         let str = String(cString: cStr)
-        return try parseResponse(str)
+        let response = try parseResponse(str)
+        emitMutationIfNeeded(command: command)
+        return response
+    }
+
+    private func emitMutationIfNeeded(command: [String: Any]) {
+        guard let cmd = command["cmd"] as? String else {
+            return
+        }
+
+        let collection = command["collection"] as? String
+        switch cmd {
+        case "insert":
+            emitMutation(operation: .insert, collection: collection, metadata: ["documentCount": 1])
+        case "insert_many":
+            let count = (command["docs"] as? [[String: Any]])?.count ?? 0
+            emitMutation(operation: .insertMany, collection: collection, metadata: ["documentCount": count])
+        case "update":
+            emitMutation(operation: .update, collection: collection, metadata: ["single": false])
+        case "update_one":
+            emitMutation(operation: .update, collection: collection, metadata: ["single": true])
+        case "delete":
+            emitMutation(operation: .delete, collection: collection, metadata: ["single": false])
+        case "delete_one":
+            emitMutation(operation: .delete, collection: collection, metadata: ["single": true])
+        case "commit_tx":
+            emitMutation(operation: .commitTx, collection: nil)
+        default:
+            break
+        }
+    }
+
+    private func emitMutation(
+        operation: OxiDBMutationOperation,
+        collection: String?,
+        metadata: [String: Any] = [:]
+    ) {
+        mutationObserverStore.emit(
+            OxiDBMutationEvent(
+                operation: operation,
+                collection: collection,
+                timestamp: Date(),
+                metadata: metadata
+            )
+        )
     }
 }
