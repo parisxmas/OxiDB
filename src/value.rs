@@ -95,7 +95,7 @@ impl IndexValue {
         }
     }
 
-    fn parse_string(s: &str) -> Self {
+    pub fn parse_string(s: &str) -> Self {
         // Fast path: skip date parsing for strings that don't look like dates.
         // Valid date strings start with YYYY-MM (4 digits + '-' + 2 digits).
         let b = s.as_bytes();
@@ -137,6 +137,26 @@ impl IndexValue {
     pub fn matches_json(&self, json: &JsonValue) -> bool {
         let other = IndexValue::from_json(json);
         self == &other
+    }
+
+    /// Returns the immediate successor in the ordering, if computable.
+    /// Used by composite index range queries for efficient reverse iteration.
+    pub fn try_successor(&self) -> Option<IndexValue> {
+        match self {
+            IndexValue::Null => Some(IndexValue::Boolean(false)),
+            IndexValue::Boolean(false) => Some(IndexValue::Boolean(true)),
+            IndexValue::Boolean(true) => Some(IndexValue::Integer(i64::MIN)),
+            IndexValue::Integer(n) if *n < i64::MAX => Some(IndexValue::Integer(n + 1)),
+            IndexValue::DateTime(n) if *n < i64::MAX => Some(IndexValue::DateTime(n + 1)),
+            IndexValue::DateTime(_) => Some(IndexValue::String(String::new())),
+            IndexValue::String(s) => {
+                // '\0' is the minimum byte, so s + "\0" is the immediate successor of s.
+                let mut next = s.clone();
+                next.push('\0');
+                Some(IndexValue::String(next))
+            }
+            _ => None, // Float and i64::MAX Integer: complex edge cases
+        }
     }
 }
 

@@ -1,17 +1,23 @@
 package service
 
 import (
+	"encoding/json"
+	"strconv"
+	"sync"
+
 	"github.com/parisxmas/OxiDB/OxiDMS/internal/db"
+	"github.com/parisxmas/OxiDB/OxiDMS/internal/models"
 	"github.com/parisxmas/OxiDB/OxiDMS/internal/repository"
 	"github.com/parisxmas/OxiDB/go/oxidb"
 )
 
 type SearchService struct {
 	pool *db.Pool
+	subs *repository.SubmissionRepo
 }
 
-func NewSearchService(pool *db.Pool) *SearchService {
-	return &SearchService{pool: pool}
+func NewSearchService(pool *db.Pool, subs *repository.SubmissionRepo) *SearchService {
+	return &SearchService{pool: pool, subs: subs}
 }
 
 type SearchRequest struct {
@@ -45,99 +51,83 @@ func (s *SearchService) Search(req SearchRequest) (*SearchResult, error) {
 	hasFilters := len(req.Filters) > 0
 	hasText := req.TextQuery != ""
 
-	// Mode 1: Structured only
+	// Mode 1: Structured only — run Find and Count in parallel
 	if hasFilters && !hasText {
 		query := buildQuery(req.FormID, req.Filters)
-		docs, err := c.Find(repository.SubmissionsCollection, query, &oxidb.FindOptions{
-			Skip:  &req.Skip,
-			Limit: &req.Limit,
-			Sort:  map[string]any{"createdAt": -1},
-		})
-		if err != nil {
-			return nil, err
+		var docs []map[string]any
+		var total int
+		var findErr, countErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			c1 := s.pool.Get()
+			docs, findErr = c1.Find(repository.SubmissionsCollection, query, &oxidb.FindOptions{
+				Skip:  &req.Skip,
+				Limit: &req.Limit,
+				Sort:  map[string]any{"createdAt": -1},
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			c2 := s.pool.Get()
+			total, countErr = c2.Count(repository.SubmissionsCollection, query)
+		}()
+		wg.Wait()
+		if findErr != nil {
+			return nil, findErr
 		}
-		total, _ := c.Count(repository.SubmissionsCollection, query)
+		if countErr != nil {
+			return nil, countErr
+		}
 		return &SearchResult{Docs: docs, Total: total, Mode: "structured"}, nil
 	}
 
-	// Mode 2: FTS only
+	// Mode 2: FTS only — use TextSearch directly on submissions collection
 	if !hasFilters && hasText {
-		bucket := repository.BlobBucket
-		ftsResults, err := c.Search(req.TextQuery, &bucket, 500)
+		subs, err := s.subs.TextSearch(req.TextQuery, req.Skip+req.Limit)
 		if err != nil {
 			return nil, err
 		}
 
-		// Look up submission docs that match FTS hits
-		docs := make([]map[string]any, 0)
-		for i, hit := range ftsResults {
-			if i < req.Skip {
-				continue
-			}
-			if len(docs) >= req.Limit {
-				break
-			}
-			key, _ := hit["key"].(string)
-			if key == "" {
-				continue
-			}
-			// Find document metadata by blobKey, then find submission
-			docMeta, err := c.FindOne(repository.DocumentsCollection, map[string]any{"blobKey": key})
-			if err != nil || docMeta == nil {
-				continue
-			}
-			subID, _ := docMeta["submissionId"].(string)
-			if subID == "" {
-				continue
-			}
-			sub, err := c.FindOne(repository.SubmissionsCollection, map[string]any{"_id": subID})
-			if err != nil || sub == nil {
-				continue
-			}
-			score, _ := hit["score"].(float64)
-			sub["_score"] = score
-			docs = append(docs, sub)
+		total := len(subs)
+		// Apply pagination
+		end := req.Skip + req.Limit
+		if end > total {
+			end = total
 		}
-		return &SearchResult{Docs: docs, Total: len(ftsResults), Mode: "fts"}, nil
+		docs := make([]map[string]any, 0)
+		if req.Skip < total {
+			for _, sub := range subs[req.Skip:end] {
+				doc := submissionToMap(sub)
+				docs = append(docs, doc)
+			}
+		}
+		return &SearchResult{Docs: docs, Total: total, Mode: "fts"}, nil
 	}
 
-	// Mode 3: Combined
+	// Mode 3: Combined — TextSearch + structured filter intersection
 	if hasFilters && hasText {
-		bucket := repository.BlobBucket
-		ftsResults, err := c.Search(req.TextQuery, &bucket, 500)
+		subs, err := s.subs.TextSearch(req.TextQuery, 500)
 		if err != nil {
 			return nil, err
 		}
 
 		structuredQuery := buildQuery(req.FormID, req.Filters)
 		docs := make([]map[string]any, 0)
-		for _, hit := range ftsResults {
-			key, _ := hit["key"].(string)
-			if key == "" {
-				continue
-			}
-			docMeta, err := c.FindOne(repository.DocumentsCollection, map[string]any{"blobKey": key})
-			if err != nil || docMeta == nil {
-				continue
-			}
-			subID, _ := docMeta["submissionId"].(string)
-			if subID == "" {
-				continue
-			}
-			// Check submission matches structured filters
+		for _, sub := range subs {
+			// Check if this submission matches the structured filters
 			combined := map[string]any{
 				"$and": []any{
-					map[string]any{"_id": subID},
+					map[string]any{"_id": toNumericID(sub.ID)},
 					structuredQuery,
 				},
 			}
-			sub, err := c.FindOne(repository.SubmissionsCollection, combined)
-			if err != nil || sub == nil {
+			match, err := c.FindOne(repository.SubmissionsCollection, combined)
+			if err != nil || match == nil {
 				continue
 			}
-			score, _ := hit["score"].(float64)
-			sub["_score"] = score
-			docs = append(docs, sub)
+			docs = append(docs, match)
 			if len(docs) >= req.Skip+req.Limit {
 				break
 			}
@@ -156,20 +146,37 @@ func (s *SearchService) Search(req SearchRequest) (*SearchResult, error) {
 		return &SearchResult{Docs: paged, Total: len(docs), Mode: "combined"}, nil
 	}
 
-	// No filters, no text — return all for form
+	// No filters, no text — return all for form (parallel Find + Count)
 	query := map[string]any{}
 	if req.FormID != "" {
 		query["formId"] = req.FormID
 	}
-	docs, err := c.Find(repository.SubmissionsCollection, query, &oxidb.FindOptions{
-		Skip:  &req.Skip,
-		Limit: &req.Limit,
-		Sort:  map[string]any{"createdAt": -1},
-	})
-	if err != nil {
-		return nil, err
+	var docs []map[string]any
+	var total int
+	var findErr, countErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		c1 := s.pool.Get()
+		docs, findErr = c1.Find(repository.SubmissionsCollection, query, &oxidb.FindOptions{
+			Skip:  &req.Skip,
+			Limit: &req.Limit,
+			Sort:  map[string]any{"createdAt": -1},
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		c2 := s.pool.Get()
+		total, countErr = c2.Count(repository.SubmissionsCollection, query)
+	}()
+	wg.Wait()
+	if findErr != nil {
+		return nil, findErr
 	}
-	total, _ := c.Count(repository.SubmissionsCollection, query)
+	if countErr != nil {
+		return nil, countErr
+	}
 	return &SearchResult{Docs: docs, Total: total, Mode: "all"}, nil
 }
 
@@ -207,4 +214,18 @@ func buildQuery(formID string, filters map[string]FilterDescriptor) map[string]a
 		return conditions[0].(map[string]any)
 	}
 	return map[string]any{"$and": conditions}
+}
+
+func submissionToMap(s models.Submission) map[string]any {
+	data, _ := json.Marshal(s)
+	var m map[string]any
+	json.Unmarshal(data, &m)
+	return m
+}
+
+func toNumericID(id string) any {
+	if n, err := strconv.ParseFloat(id, 64); err == nil {
+		return n
+	}
+	return id
 }

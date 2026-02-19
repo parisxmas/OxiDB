@@ -404,6 +404,52 @@ fn count_single_field_and(
     Some(idx.count_range(start, end))
 }
 
+/// Extract equality conditions from a query as a field→value map.
+/// Returns None if the query contains no equality conditions.
+/// Only extracts top-level $eq conditions (not nested in $or).
+pub fn extract_eq_conditions(query: &Query) -> Option<std::collections::HashMap<String, IndexValue>> {
+    let mut map = std::collections::HashMap::new();
+    match query {
+        Query::Field {
+            field,
+            op: QueryOp::Eq(v),
+        } => {
+            map.insert(field.clone(), v.clone());
+        }
+        Query::And(subs) => {
+            for sub in subs {
+                if let Query::Field {
+                    field,
+                    op: QueryOp::Eq(v),
+                } = sub
+                {
+                    map.insert(field.clone(), v.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(map)
+    }
+}
+
+/// Check if every condition in a query is a $eq on one of the given fields.
+/// Used to determine if a composite index prefix scan fully covers the query.
+pub fn is_eq_only_on(query: &Query, fields: &[String]) -> bool {
+    match query {
+        Query::All => false,
+        Query::Field {
+            field,
+            op: QueryOp::Eq(_),
+        } => fields.iter().any(|f| f == field),
+        Query::And(subs) => subs.iter().all(|s| is_eq_only_on(s, fields)),
+        _ => false,
+    }
+}
+
 /// Like `matches_doc` but operates directly on `&Value`, avoiding Document construction.
 pub fn matches_value(query: &Query, data: &JsonValue) -> bool {
     match query {
@@ -433,6 +479,105 @@ pub fn matches_value(query: &Query, data: &JsonValue) -> bool {
         Query::And(subs) => subs.iter().all(|s| matches_value(s, data)),
         Query::Or(subs) => subs.iter().any(|s| matches_value(s, data)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Raw JSONB matching — extract only queried fields, skip full decode
+// ---------------------------------------------------------------------------
+
+/// Check if raw JSONB bytes match the query WITHOUT full deserialization.
+/// Extracts only the fields referenced by the query using JSONB path lookup.
+/// Returns `None` for legacy JSON text (bytes starting with '{' or '[').
+pub fn matches_raw_jsonb(query: &Query, bytes: &[u8]) -> Option<bool> {
+    // Only works with JSONB binary, not legacy JSON text
+    if bytes.is_empty() || bytes[0] == b'{' || bytes[0] == b'[' {
+        return None;
+    }
+
+    let raw = jsonb::RawJsonb::new(bytes);
+    matches_raw_inner(query, &raw)
+}
+
+fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
+    match query {
+        Query::All => Some(true),
+        Query::Field { field, op } => {
+            let field_val = extract_raw_field_value(raw, field);
+            match op {
+                QueryOp::Exists(expected) => Some(field_val.is_some() == *expected),
+                _ => {
+                    let Some(iv) = field_val else {
+                        return Some(false);
+                    };
+                    Some(match op {
+                        QueryOp::Eq(v) => iv == *v,
+                        QueryOp::Ne(v) => iv != *v,
+                        QueryOp::Gt(v) => iv > *v,
+                        QueryOp::Gte(v) => iv >= *v,
+                        QueryOp::Lt(v) => iv < *v,
+                        QueryOp::Lte(v) => iv <= *v,
+                        QueryOp::In(vals) => vals.contains(&iv),
+                        QueryOp::Exists(_) => unreachable!(),
+                    })
+                }
+            }
+        }
+        Query::And(subs) => {
+            for sub in subs {
+                match matches_raw_inner(sub, raw) {
+                    Some(true) => continue,
+                    Some(false) => return Some(false),
+                    None => return None,
+                }
+            }
+            Some(true)
+        }
+        Query::Or(subs) => {
+            for sub in subs {
+                match matches_raw_inner(sub, raw) {
+                    Some(true) => return Some(true),
+                    Some(false) => continue,
+                    None => return None,
+                }
+            }
+            Some(false)
+        }
+    }
+}
+
+/// Extract a field value from raw JSONB using path lookup.
+/// Handles dot-notation (e.g., "data.experience") by traversing nested objects.
+fn extract_raw_field_value(raw: &jsonb::RawJsonb, field: &str) -> Option<IndexValue> {
+    use jsonb::keypath::KeyPath;
+    use std::borrow::Cow;
+
+    let parts: Vec<&str> = field.split('.').collect();
+    let keypath: Vec<KeyPath> = parts
+        .iter()
+        .map(|p| KeyPath::Name(Cow::Borrowed(p)))
+        .collect();
+
+    let owned = raw.get_by_keypath(keypath.iter()).ok()??;
+    let field_raw = owned.as_raw();
+
+    // Try scalar types in order of likelihood
+    if let Ok(Some(s)) = field_raw.as_str() {
+        return Some(IndexValue::parse_string(&s));
+    }
+    if let Ok(Some(n)) = field_raw.as_i64() {
+        return Some(IndexValue::Integer(n));
+    }
+    if let Ok(Some(f)) = field_raw.as_f64() {
+        return Some(IndexValue::Float(f));
+    }
+    if let Ok(Some(b)) = field_raw.as_bool() {
+        return Some(IndexValue::Boolean(b));
+    }
+    if let Ok(Some(())) = field_raw.as_null() {
+        return Some(IndexValue::Null);
+    }
+    // Complex types (array/object) — fall back to full decode
+    None
 }
 
 #[cfg(test)]

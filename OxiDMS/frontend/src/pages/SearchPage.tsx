@@ -9,6 +9,8 @@ import { Spinner } from '../components/ui/Spinner'
 import { FilterBuilder, type FilterValues } from '../components/search/FilterBuilder'
 import { SearchResults } from '../components/search/SearchResults'
 
+const PAGE_SIZE = 20
+
 export function SearchPage() {
   const [forms, setForms] = useState<Form[]>([])
   const [selectedFormId, setSelectedFormId] = useState('')
@@ -16,6 +18,8 @@ export function SearchPage() {
   const [filters, setFilters] = useState<FilterValues>({})
   const [result, setResult] = useState<SearchResultType | null>(null)
   const [searching, setSearching] = useState(false)
+  const [page, setPage] = useState(0)
+  const [elapsedMs, setElapsedMs] = useState<number | null>(null)
 
   useEffect(() => {
     api.get<Form[]>('/forms').then(setForms)
@@ -23,10 +27,9 @@ export function SearchPage() {
 
   const selectedForm = forms.find((f) => f._id === selectedFormId)
 
-  const handleSearch = async () => {
+  const runSearch = async (skipVal: number) => {
     setSearching(true)
     try {
-      // Build filters payload
       const apiFilters: Record<string, any> = {}
       for (const [key, val] of Object.entries(filters)) {
         if (val.min || val.max) {
@@ -36,19 +39,31 @@ export function SearchPage() {
         }
       }
 
+      const t0 = performance.now()
       const res = await api.post<SearchResultType>('/search', {
         formId: selectedFormId,
         filters: apiFilters,
         textQuery: textQuery.trim(),
-        skip: 0,
-        limit: 50,
+        skip: skipVal,
+        limit: PAGE_SIZE,
       })
+      setElapsedMs(performance.now() - t0)
       setResult(res)
     } catch (err: any) {
       toast.error(err.message)
     } finally {
       setSearching(false)
     }
+  }
+
+  const handleSearch = () => {
+    setPage(0)
+    runSearch(0)
+  }
+
+  const handlePageChange = (newPage: number) => {
+    setPage(newPage)
+    runSearch(newPage * PAGE_SIZE)
   }
 
   const fieldLabels: Record<string, string> = {}
@@ -80,7 +95,7 @@ export function SearchPage() {
             label="Full-text Search"
             value={textQuery}
             onChange={(e) => setTextQuery(e.target.value)}
-            placeholder="Search in documents..."
+            placeholder="Search in submission data..."
           />
         </div>
 
@@ -103,7 +118,14 @@ export function SearchPage() {
       {/* Results */}
       {result && (
         <div className="mt-6">
-          <SearchResults result={result} fieldLabels={Object.keys(fieldLabels).length > 0 ? fieldLabels : { _id: 'ID' }} />
+          <SearchResults
+            result={result}
+            fieldLabels={Object.keys(fieldLabels).length > 0 ? fieldLabels : { _id: 'ID' }}
+            page={page}
+            pageSize={PAGE_SIZE}
+            elapsedMs={elapsedMs}
+            onPageChange={handlePageChange}
+          />
         </div>
       )}
     </div>

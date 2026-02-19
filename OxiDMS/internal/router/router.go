@@ -15,6 +15,7 @@ func New(
 	docH *handler.DocumentHandler,
 	searchH *handler.SearchHandler,
 	dashH *handler.DashboardHandler,
+	adminH *handler.AdminHandler,
 ) *chi.Mux {
 	r := chi.NewRouter()
 
@@ -60,6 +61,10 @@ func New(
 
 			// Search
 			r.Post("/search", searchH.Search)
+
+			// Admin
+			r.Get("/admin/indexes", adminH.ListIndexes)
+			r.Post("/admin/compact", adminH.Compact)
 		})
 	})
 

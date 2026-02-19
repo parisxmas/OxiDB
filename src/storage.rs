@@ -159,9 +159,10 @@ impl Storage {
         &self._path
     }
 
-    /// Iterate all active records. Returns (offset, json_bytes) pairs.
-    /// Used for rebuilding indexes on startup.
-    pub fn iter_active(&self) -> Result<Vec<(u64, Vec<u8>)>> {
+    /// Iterate all active records. Returns (DocLocation, plaintext_bytes) pairs.
+    /// The DocLocation contains the correct on-disk payload length (which may
+    /// differ from plaintext length when encryption is enabled).
+    pub fn iter_active(&self) -> Result<Vec<(DocLocation, Vec<u8>)>> {
         let mut inner = self.inner.lock().unwrap();
         inner.file.seek(SeekFrom::Start(0))?;
         let file_len = inner.file.metadata()?.len();
@@ -178,12 +179,11 @@ impl Storage {
             if status == RECORD_ACTIVE {
                 let mut data = vec![0u8; length as usize];
                 inner.file.read_exact(&mut data)?;
-                // Decrypt if needed — must drop inner lock first? No, we can decrypt with it held.
                 let plaintext = match &self.encryption {
                     Some(key) => key.decrypt(&data)?,
                     None => data,
                 };
-                results.push((pos, plaintext));
+                results.push((DocLocation { offset: pos, length }, plaintext));
             } else {
                 inner.file.seek(SeekFrom::Current(length as i64))?;
             }
@@ -192,6 +192,94 @@ impl Storage {
         }
 
         Ok(results)
+    }
+
+    /// Stream active records one at a time via callback, avoiding the large
+    /// Vec allocation of `iter_active`.
+    pub fn for_each_active<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(DocLocation, Vec<u8>) -> Result<()>,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        inner.file.seek(SeekFrom::Start(0))?;
+        let file_len = inner.file.metadata()?.len();
+        let mut pos = 0u64;
+
+        while pos < file_len {
+            let mut header = [0u8; 5];
+            inner.file.read_exact(&mut header)?;
+
+            let status = header[0];
+            let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
+
+            if status == RECORD_ACTIVE {
+                let mut data = vec![0u8; length as usize];
+                inner.file.read_exact(&mut data)?;
+                let plaintext = match &self.encryption {
+                    Some(key) => key.decrypt(&data)?,
+                    None => data,
+                };
+                // Drop inner lock before callback (callback may need to read storage)
+                drop(inner);
+                f(DocLocation { offset: pos, length }, plaintext)?;
+                inner = self.inner.lock().unwrap();
+                // Re-seek to continue after this record
+                inner.file.seek(SeekFrom::Start(pos + 5 + length as u64))?;
+            } else {
+                inner.file.seek(SeekFrom::Current(length as i64))?;
+            }
+
+            pos += 5 + length as u64;
+        }
+
+        Ok(())
+    }
+    /// Sequential scan using a separate read-only file handle.
+    /// Does NOT hold the main mutex — other reads/writes can proceed concurrently.
+    /// Uses BufReader for efficient sequential I/O (OS read-ahead).
+    /// The callback receives raw (decrypted) bytes and returns Ok(true) to continue
+    /// or Ok(false) to stop early.
+    pub fn scan_readonly_while<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<bool>,
+    {
+        use std::io::BufReader;
+
+        let file = File::open(&self._path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        let mut pos = 0u64;
+        let mut buf = Vec::with_capacity(4096);
+        let mut decrypt_buf: Vec<u8>;
+
+        while pos < file_len {
+            let mut header = [0u8; 5];
+            reader.read_exact(&mut header)?;
+            let status = header[0];
+            let length =
+                u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+            if status == RECORD_ACTIVE {
+                buf.resize(length, 0);
+                reader.read_exact(&mut buf)?;
+                let bytes: &[u8] = match &self.encryption {
+                    Some(key) => {
+                        decrypt_buf = key.decrypt(&buf)?;
+                        &decrypt_buf
+                    }
+                    None => &buf,
+                };
+                if !f(bytes)? {
+                    break;
+                }
+            } else {
+                reader.seek(SeekFrom::Current(length as i64))?;
+            }
+
+            pos += 5 + length as u64;
+        }
+
+        Ok(())
     }
 }
 

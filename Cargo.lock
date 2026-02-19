@@ -199,9 +199,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.15.4"
+version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b7b6141e96a8c160799cc2d5adecd5cbbe5054cb8c7c4af53da0f83bb7ad256"
+checksum = "d9a7b350e3bb1767102698302bc37256cbd48422809984b98d292c40e2579aa9"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -324,9 +324,9 @@ dependencies = [
 
 [[package]]
 name = "bumpalo"
-version = "3.19.1"
+version = "3.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
+checksum = "5c6f81257d10a0f602a294ae4182251151ff97dbb504ef9afcdda4a64b24d9b4"
 
 [[package]]
 name = "bytemuck"
@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "aes-gcm",
  "chrono",
@@ -2846,7 +2846,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "oxidb",
@@ -2860,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-cli"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -2872,14 +2872,14 @@ dependencies = [
 
 [[package]]
 name = "oxidb-client-ffi"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "oxidb-embedded-ffi"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "oxidb",
@@ -2888,7 +2888,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2902,6 +2902,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "tikv-jemallocator",
 ]
 
 [[package]]
@@ -4703,6 +4704,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.116",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.6.1+5.3.0-1-ge13ca993e8ccb9ba9847cc330696e02839f328f7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd8aa5b2ab86a2cefa406d889139c162cbb230092f7d1d7cbc1716405d852a3b"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0359b4327f954e0567e69fb191cf1436617748813819c94b8cd4a431422d053a"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

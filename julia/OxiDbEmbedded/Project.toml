@@ -1,6 +1,6 @@
 name = "OxiDbEmbedded"
 uuid = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
-version = "0.2.0"
+version = "0.3.0"
 
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"

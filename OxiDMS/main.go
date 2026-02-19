@@ -36,12 +36,15 @@ func main() {
 	docRepo.EnsureIndexes()
 	docRepo.EnsureBucket()
 
+	// Create text index on submission data for full-text search
+	subRepo.EnsureTextIndex([]string{"data"})
+
 	// Services
 	authSvc := service.NewAuthService(userRepo, cfg.JWTSecret)
 	formSvc := service.NewFormService(formRepo, pool)
 	subSvc := service.NewSubmissionService(subRepo, formRepo)
 	docSvc := service.NewDocumentService(docRepo)
-	searchSvc := service.NewSearchService(pool)
+	searchSvc := service.NewSearchService(pool, subRepo)
 
 	// Seed admin user
 	if err := authSvc.SeedAdmin(cfg.AdminEmail, cfg.AdminPass); err != nil {
@@ -55,9 +58,10 @@ func main() {
 	docH := handler.NewDocumentHandler(docSvc)
 	searchH := handler.NewSearchHandler(searchSvc)
 	dashH := handler.NewDashboardHandler(formSvc, subSvc, docSvc, formRepo)
+	adminH := handler.NewAdminHandler(subRepo)
 
 	// Router
-	r := router.New(cfg.JWTSecret, authH, formH, subH, docH, searchH, dashH)
+	r := router.New(cfg.JWTSecret, authH, formH, subH, docH, searchH, dashH, adminH)
 
 	log.Printf("OxiDMS server starting on %s", cfg.HTTPAddr)
 	if err := http.ListenAndServe(cfg.HTTPAddr, r); err != nil {
