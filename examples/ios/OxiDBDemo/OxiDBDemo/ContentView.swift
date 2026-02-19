@@ -57,17 +57,29 @@ struct ContentView: View {
                 ActionButton(title: "Query", icon: "magnifyingglass") {
                     manager.queryDocuments()
                 }
+                ActionButton(title: "Update One", icon: "pencil.circle.fill") {
+                    manager.updateOneDemo()
+                }
+                ActionButton(title: "Delete One", icon: "minus.circle.fill") {
+                    manager.deleteOneDemo()
+                }
                 ActionButton(title: "Count", icon: "number") {
                     manager.countDocuments()
                 }
                 ActionButton(title: "Index", icon: "list.bullet.indent") {
                     manager.createIndexDemo()
                 }
+                ActionButton(title: "Indexes", icon: "list.number") {
+                    manager.listIndexes()
+                }
                 ActionButton(title: "Aggregate", icon: "chart.bar.fill") {
                     manager.aggregateDemo()
                 }
                 ActionButton(title: "Transaction", icon: "arrow.triangle.2.circlepath") {
                     manager.transactionDemo()
+                }
+                ActionButton(title: "Compact", icon: "arrow.down.right.and.arrow.up.left") {
+                    manager.compactDemo()
                 }
                 ActionButton(title: "Collections", icon: "folder.fill") {
                     manager.listCollections()

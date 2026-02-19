@@ -134,11 +134,26 @@ public final class OxiDBClient {
         return try call { oxidb_update($0, collection, queryJson, updateJson) }
     }
 
+    /// Update a single document matching a query.
+    @discardableResult
+    public func updateOne(collection: String, query: [String: Any], update: [String: Any]) throws -> [String: Any] {
+        let queryJson = try jsonString(query)
+        let updateJson = try jsonString(update)
+        return try call { oxidb_update_one($0, collection, queryJson, updateJson) }
+    }
+
     /// Delete documents matching a query.
     @discardableResult
     public func delete(collection: String, query: [String: Any]) throws -> [String: Any] {
         let json = try jsonString(query)
         return try call { oxidb_delete($0, collection, json) }
+    }
+
+    /// Delete a single document matching a query.
+    @discardableResult
+    public func deleteOne(collection: String, query: [String: Any]) throws -> [String: Any] {
+        let json = try jsonString(query)
+        return try call { oxidb_delete_one($0, collection, json) }
     }
 
     /// Count documents in a collection.
@@ -154,6 +169,12 @@ public final class OxiDBClient {
         return try call { oxidb_create_index($0, collection, field) }
     }
 
+    /// Create a unique index.
+    @discardableResult
+    public func createUniqueIndex(collection: String, field: String) throws -> [String: Any] {
+        return try call { oxidb_create_unique_index($0, collection, field) }
+    }
+
     /// Create a composite (multi-field) index.
     @discardableResult
     public func createCompositeIndex(collection: String, fields: [String]) throws -> [String: Any] {
@@ -161,7 +182,38 @@ public final class OxiDBClient {
         return try call { oxidb_create_composite_index($0, collection, json) }
     }
 
+    /// Create a full-text search index on the specified string fields.
+    @discardableResult
+    public func createTextIndex(collection: String, fields: [String]) throws -> [String: Any] {
+        let json = try jsonString(fields)
+        return try call { oxidb_create_text_index($0, collection, json) }
+    }
+
+    /// List all indexes on a collection.
+    public func listIndexes(collection: String) throws -> [String: Any] {
+        return try call { oxidb_list_indexes($0, collection) }
+    }
+
+    /// Drop an index from a collection.
+    @discardableResult
+    public func dropIndex(collection: String, index: String) throws -> [String: Any] {
+        return try call { oxidb_drop_index($0, collection, index) }
+    }
+
+    // MARK: - Text Search
+
+    /// Full-text search on collection documents.
+    public func textSearch(collection: String, query: String, limit: Int32 = 10) throws -> [String: Any] {
+        return try call { oxidb_text_search($0, collection, query, limit) }
+    }
+
     // MARK: - Collections
+
+    /// Create a collection explicitly.
+    @discardableResult
+    public func createCollection(_ name: String) throws -> [String: Any] {
+        return try call { oxidb_create_collection($0, name) }
+    }
 
     /// List all collections.
     public func listCollections() throws -> [String: Any] {
@@ -172,6 +224,12 @@ public final class OxiDBClient {
     @discardableResult
     public func dropCollection(_ name: String) throws -> [String: Any] {
         return try call { oxidb_drop_collection($0, name) }
+    }
+
+    /// Compact a collection (reclaim space from deleted documents).
+    @discardableResult
+    public func compact(collection: String) throws -> [String: Any] {
+        return try call { oxidb_compact($0, collection) }
     }
 
     // MARK: - Aggregation
@@ -431,6 +489,17 @@ public final class OxiDBDatabase {
     @discardableResult
     public func createTextIndex(collection: String, fields: [String]) throws -> [String: Any] {
         return try execute(["cmd": "create_text_index", "collection": collection, "fields": fields])
+    }
+
+    /// List all indexes on a collection.
+    public func listIndexes(collection: String) throws -> [String: Any] {
+        return try execute(["cmd": "list_indexes", "collection": collection])
+    }
+
+    /// Drop an index from a collection.
+    @discardableResult
+    public func dropIndex(collection: String, index: String) throws -> [String: Any] {
+        return try execute(["cmd": "drop_index", "collection": collection, "index": index])
     }
 
     /// Full-text search on collection documents. Returns matching documents with `_score` field.
