@@ -6,9 +6,11 @@ use serde_json::Value;
 
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
+use crate::engine::LogCallback;
 use crate::error::{Error, Result};
 use crate::fts::CollectionTextIndex;
 use crate::index::{CompositeIndex, FieldIndex};
+use crate::index_persist;
 use crate::query::{self, FindOptions, Query, SortOrder};
 use crate::storage::{DocLocation, Storage};
 use crate::value::IndexValue;
@@ -24,12 +26,19 @@ fn resolve_field_in_value<'a>(data: &'a Value, path: &str) -> Option<&'a Value> 
 }
 
 /// Metadata about an index on a collection.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexInfo {
     pub name: String,
     pub index_type: String,
     pub fields: Vec<String>,
     pub unique: bool,
+}
+
+/// Persisted index metadata (written to .idx files).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct IndexMetadata {
+    version: u32,
+    indexes: Vec<IndexInfo>,
 }
 
 /// Statistics returned after a compaction run.
@@ -63,12 +72,69 @@ pub struct Collection {
     version_index: HashMap<DocumentId, u64>,
     next_id: DocumentId,
     encryption: Option<Arc<EncryptionKey>>,
+    verbose: bool,
+    log_callback: Option<LogCallback>,
 }
 
 impl Collection {
+    /// Write a verbose message to stderr and forward to the GELF log callback if set.
+    fn vlog(&self, msg: &str) {
+        eprintln!("{msg}");
+        if let Some(cb) = &self.log_callback {
+            cb(msg);
+        }
+    }
+}
+
+/// Load persisted index definitions from a .idx file.
+fn load_index_metadata(path: &Path) -> Result<Vec<IndexInfo>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(path)?;
+    let meta: IndexMetadata = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::InvalidQuery(format!("corrupt .idx file: {}", e)))?;
+    Ok(meta.indexes)
+}
+
+impl Collection {
+    /// Persist current index definitions to a .idx file alongside the .dat file.
+    fn save_index_metadata(&self) -> Result<()> {
+        let indexes = self.list_indexes();
+        let meta = IndexMetadata {
+            version: 1,
+            indexes,
+        };
+        let path = self.data_dir.join(format!("{}.idx", self.name));
+        let json = serde_json::to_vec_pretty(&meta)?;
+        std::fs::write(&path, json)?;
+        Ok(())
+    }
+
+    /// Persist current index data (BTreeMap contents) to binary cache files.
+    /// Called after create_index, create_unique_index, create_composite_index, and compact.
+    pub fn save_index_data(&self) {
+        let doc_count = self.primary_index.len() as u64;
+        let next_id = self.next_id;
+
+        // Save field indexes (.fidx)
+        let fidx_path = self.data_dir.join(format!("{}.fidx", self.name));
+        let field_refs: Vec<&FieldIndex> = self.field_indexes.values().collect();
+        if let Err(e) = index_persist::save_field_indexes(&fidx_path, &field_refs, doc_count, next_id) {
+            eprintln!("[warn] {}: failed to save field index cache: {}", self.name, e);
+        }
+
+        // Save composite indexes (.cidx)
+        let cidx_path = self.data_dir.join(format!("{}.cidx", self.name));
+        let comp_refs: Vec<&CompositeIndex> = self.composite_indexes.iter().collect();
+        if let Err(e) = index_persist::save_composite_indexes(&cidx_path, &comp_refs, doc_count, next_id) {
+            eprintln!("[warn] {}: failed to save composite index cache: {}", self.name, e);
+        }
+    }
+
     /// Create or open a collection backed by a data file.
     pub fn open(name: &str, data_dir: &Path) -> Result<Self> {
-        Self::open_with_options(name, data_dir, &HashSet::new(), None)
+        Self::open_with_options(name, data_dir, &HashSet::new(), None, false, None)
     }
 
     /// Create or open a collection, filtering WAL recovery by committed tx_ids.
@@ -77,7 +143,7 @@ impl Collection {
         data_dir: &Path,
         committed_tx_ids: &HashSet<u64>,
     ) -> Result<Self> {
-        Self::open_with_options(name, data_dir, committed_tx_ids, None)
+        Self::open_with_options(name, data_dir, committed_tx_ids, None, false, None)
     }
 
     /// Create or open a collection with optional encryption and tx recovery.
@@ -86,17 +152,81 @@ impl Collection {
         data_dir: &Path,
         committed_tx_ids: &HashSet<u64>,
         encryption: Option<Arc<EncryptionKey>>,
+        verbose: bool,
+        log_callback: Option<LogCallback>,
     ) -> Result<Self> {
+        let vlog = |msg: &str| {
+            eprintln!("{msg}");
+            if let Some(cb) = &log_callback {
+                cb(msg);
+            }
+        };
+
         let data_path = data_dir.join(format!("{}.dat", name));
         let wal_path = data_dir.join(format!("{}.wal", name));
         let storage = Storage::open_with_encryption(&data_path, encryption.clone())?;
         let wal = Wal::open_with_encryption(&wal_path, encryption.clone())?;
 
+        if verbose {
+            let file_size = storage.file_size();
+            vlog(&format!("[verbose] {}: storage file {} bytes", name, file_size));
+        }
+
+        // Load persisted index definitions (if any)
+        let idx_path = data_dir.join(format!("{}.idx", name));
+        let persisted_indexes = load_index_metadata(&idx_path)?;
+        let has_persisted_indexes = !persisted_indexes.is_empty();
+
+        // Pre-create empty index structures from metadata
+        let mut field_indexes: HashMap<String, FieldIndex> = HashMap::new();
+        let mut composite_indexes: Vec<CompositeIndex> = Vec::new();
+        let mut text_index: Option<CollectionTextIndex> = None;
+
+        for info in &persisted_indexes {
+            match info.index_type.as_str() {
+                "field" => {
+                    field_indexes.insert(
+                        info.name.clone(),
+                        FieldIndex::new(info.name.clone()),
+                    );
+                }
+                "unique" => {
+                    field_indexes.insert(
+                        info.name.clone(),
+                        FieldIndex::new_unique(info.name.clone()),
+                    );
+                }
+                "composite" => {
+                    composite_indexes.push(CompositeIndex::new(info.fields.clone()));
+                }
+                "text" => {
+                    text_index = Some(CollectionTextIndex::new(info.fields.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        if verbose && has_persisted_indexes {
+            vlog(&format!(
+                "[verbose] {}: loaded {} index definitions from .idx (will rebuild during load)",
+                name,
+                persisted_indexes.len()
+            ));
+        }
+
         let mut primary_index = HashMap::new();
         let mut version_index = HashMap::new();
         let mut next_id: DocumentId = 1;
 
-        // Rebuild primary index and version index from .dat (streaming — no large Vec)
+        let load_start = std::time::Instant::now();
+        let mut doc_count: u64 = 0;
+
+        // Clone callback for use inside the closure
+        let inner_cb = log_callback.clone();
+
+        // Phase 1: Scan .dat for primary_index, version_index, next_id.
+        // Also rebuild text index (always from docs — not cached).
+        // Field/composite indexes are NOT rebuilt here; we try the cache first.
         storage.for_each_active(|loc, bytes| {
             let doc: Value = crate::codec::decode_doc(&bytes)?;
             if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
@@ -106,18 +236,147 @@ impl Collection {
                 if id >= next_id {
                     next_id = id + 1;
                 }
+
+                // Text index is always rebuilt from docs (not cached)
+                if let Some(ref mut ti) = text_index {
+                    ti.index_doc(id, &doc);
+                }
+            }
+            doc_count += 1;
+            if verbose && doc_count % 500_000 == 0 {
+                let msg = format!(
+                    "[verbose] {}: loaded {} documents... ({:.1}s)",
+                    name,
+                    doc_count,
+                    load_start.elapsed().as_secs_f64()
+                );
+                eprintln!("{msg}");
+                if let Some(cb) = &inner_cb {
+                    cb(&msg);
+                }
             }
             Ok(())
         })?;
 
-        // WAL recovery: replay any pending entries
+        if verbose {
+            vlog(&format!(
+                "[verbose] {}: {} documents loaded in {:.2}s (primary scan)",
+                name,
+                doc_count,
+                load_start.elapsed().as_secs_f64(),
+            ));
+        }
+
+        // Phase 2: Try loading cached index data (.fidx / .cidx)
+        let mut indexes_from_cache = false;
+        if has_persisted_indexes {
+            let fidx_path = data_dir.join(format!("{}.fidx", name));
+            let cidx_path = data_dir.join(format!("{}.cidx", name));
+
+            let cached_field = index_persist::load_field_indexes(
+                &fidx_path,
+                doc_count,
+                next_id,
+            );
+            let cached_composite = index_persist::load_composite_indexes(
+                &cidx_path,
+                doc_count,
+                next_id,
+            );
+
+            // Both must succeed for the cache to be valid
+            let field_ok = cached_field.is_some() || field_indexes.is_empty();
+            let comp_ok = cached_composite.is_some() || composite_indexes.is_empty();
+
+            if field_ok && comp_ok {
+                let cache_start = std::time::Instant::now();
+                if let Some(cached) = cached_field {
+                    // Replace empty index structures with cached ones
+                    field_indexes.clear();
+                    for idx in cached {
+                        field_indexes.insert(idx.field.clone(), idx);
+                    }
+                }
+                if let Some(cached) = cached_composite {
+                    composite_indexes = cached;
+                }
+                indexes_from_cache = true;
+                if verbose {
+                    vlog(&format!(
+                        "[verbose] {}: loaded index data from cache in {:.3}s",
+                        name,
+                        cache_start.elapsed().as_secs_f64(),
+                    ));
+                }
+            }
+        }
+
+        // Phase 2b: If cache was invalid, rebuild indexes from .dat (second pass)
+        if has_persisted_indexes && !indexes_from_cache {
+            if verbose {
+                vlog(&format!(
+                    "[verbose] {}: index cache invalid, rebuilding {} indexes from docs...",
+                    name,
+                    persisted_indexes.len(),
+                ));
+            }
+            let rebuild_start = std::time::Instant::now();
+            let mut rebuild_count = 0u64;
+            let inner_cb2 = log_callback.clone();
+
+            storage.for_each_active(|_loc, bytes| {
+                let doc: Value = crate::codec::decode_doc(&bytes)?;
+                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    for idx in field_indexes.values_mut() {
+                        idx.insert_value(id, &doc);
+                    }
+                    for idx in &mut composite_indexes {
+                        idx.insert_value(id, &doc);
+                    }
+                }
+                rebuild_count += 1;
+                if verbose && rebuild_count % 500_000 == 0 {
+                    let msg = format!(
+                        "[verbose] {}: index rebuild {} / {} docs ({:.1}s)",
+                        name,
+                        rebuild_count,
+                        doc_count,
+                        rebuild_start.elapsed().as_secs_f64()
+                    );
+                    eprintln!("{msg}");
+                    if let Some(cb) = &inner_cb2 {
+                        cb(&msg);
+                    }
+                }
+                Ok(())
+            })?;
+
+            if verbose {
+                vlog(&format!(
+                    "[verbose] {}: rebuilt {} indexes in {:.2}s",
+                    name,
+                    persisted_indexes.len(),
+                    rebuild_start.elapsed().as_secs_f64(),
+                ));
+            }
+        }
+
+        // Phase 3: WAL recovery (updates indexes too)
         wal.recover(
             &storage,
             &mut primary_index,
             &mut next_id,
             committed_tx_ids,
             &mut version_index,
+            &mut field_indexes,
+            &mut composite_indexes,
+            verbose,
+            &log_callback,
         )?;
+
+        if verbose {
+            vlog(&format!("[verbose] {}: collection ready", name));
+        }
 
         Ok(Self {
             name: name.to_string(),
@@ -125,12 +384,14 @@ impl Collection {
             storage,
             wal,
             primary_index,
-            field_indexes: HashMap::new(),
-            composite_indexes: Vec::new(),
-            text_index: None,
+            field_indexes,
+            composite_indexes,
+            text_index,
             version_index,
             next_id,
             encryption,
+            verbose,
+            log_callback,
         })
     }
 
@@ -182,36 +443,75 @@ impl Collection {
     // -----------------------------------------------------------------------
 
     /// Create a single-field index. Rebuilds from existing documents.
+    /// If the index already exists (e.g. rebuilt from persisted metadata on load),
+    /// returns Ok immediately — making this call idempotent.
     pub fn create_index(&mut self, field: &str) -> Result<()> {
         if self.field_indexes.contains_key(field) {
-            return Err(Error::IndexAlreadyExists(field.to_string()));
+            return Ok(());
         }
 
+        let total = self.primary_index.len();
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: creating index on '{}' ({} docs to scan)",
+                self.name, field, total
+            ));
+        }
+        let start = std::time::Instant::now();
+        let mut count = 0u64;
         let mut idx = FieldIndex::new(field.to_string());
 
         // Backfill from doc store
-        self.for_each_doc(|id, data| {
-            idx.insert_value(id, &data);
-            Ok(())
-        })?;
+        for (&id, &loc) in &self.primary_index {
+            let bytes = self.storage.read(loc)?;
+            let val = crate::codec::decode_doc(&bytes)?;
+            idx.insert_value(id, &val);
+            count += 1;
+            if self.verbose && count % 500_000 == 0 {
+                self.vlog(&format!(
+                    "[verbose] {}: index '{}' scanned {} / {} docs ({:.1}s)",
+                    self.name, field, count, total, start.elapsed().as_secs_f64()
+                ));
+            }
+        }
 
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: index '{}' ready ({} docs in {:.2}s)",
+                self.name, field, count, start.elapsed().as_secs_f64()
+            ));
+        }
         self.field_indexes.insert(field.to_string(), idx);
+        self.save_index_metadata()?;
+        self.save_index_data();
         Ok(())
     }
 
     /// Create a unique single-field index. Rebuilds from existing documents.
     /// Returns error if existing data violates uniqueness.
+    /// If the index already exists, returns Ok immediately (idempotent).
     pub fn create_unique_index(&mut self, field: &str) -> Result<()> {
         if self.field_indexes.contains_key(field) {
-            return Err(Error::IndexAlreadyExists(field.to_string()));
+            return Ok(());
         }
 
+        let total = self.primary_index.len();
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: creating unique index on '{}' ({} docs to scan)",
+                self.name, field, total
+            ));
+        }
+        let start = std::time::Instant::now();
+        let mut count = 0u64;
         let mut idx = FieldIndex::new_unique(field.to_string());
         let field_owned = field.to_string();
 
         // Backfill from doc store
-        self.for_each_doc(|id, data| {
-            if let Some(value) = resolve_field_in_value(&data, &field_owned) {
+        for (&id, &loc) in &self.primary_index {
+            let bytes = self.storage.read(loc)?;
+            let val = crate::codec::decode_doc(&bytes)?;
+            if let Some(value) = resolve_field_in_value(&val, &field_owned) {
                 let iv = IndexValue::from_json(value);
                 if idx.check_unique(&iv, None) {
                     return Err(Error::UniqueViolation {
@@ -219,50 +519,115 @@ impl Collection {
                     });
                 }
             }
-            idx.insert_value(id, &data);
-            Ok(())
-        })?;
+            idx.insert_value(id, &val);
+            count += 1;
+            if self.verbose && count % 500_000 == 0 {
+                self.vlog(&format!(
+                    "[verbose] {}: unique index '{}' scanned {} / {} docs ({:.1}s)",
+                    self.name, field, count, total, start.elapsed().as_secs_f64()
+                ));
+            }
+        }
 
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: unique index '{}' ready ({} docs in {:.2}s)",
+                self.name, field, count, start.elapsed().as_secs_f64()
+            ));
+        }
         self.field_indexes.insert(field.to_string(), idx);
+        self.save_index_metadata()?;
+        self.save_index_data();
         Ok(())
     }
 
     /// Create a composite (multi-field) index. Rebuilds from existing documents.
+    /// If the index already exists, returns Ok with the name (idempotent).
     pub fn create_composite_index(&mut self, fields: Vec<String>) -> Result<String> {
         let name = fields.join("_");
         if self.composite_indexes.iter().any(|i| i.name() == name) {
-            return Err(Error::IndexAlreadyExists(name));
+            return Ok(name);
         }
 
+        let total = self.primary_index.len();
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: creating composite index '{}' ({} docs to scan)",
+                self.name, name, total
+            ));
+        }
+        let start = std::time::Instant::now();
+        let mut count = 0u64;
         let mut idx = CompositeIndex::new(fields);
 
         // Backfill from doc store
-        self.for_each_doc(|id, data| {
-            idx.insert_value(id, &data);
-            Ok(())
-        })?;
+        for (&id, &loc) in &self.primary_index {
+            let bytes = self.storage.read(loc)?;
+            let val = crate::codec::decode_doc(&bytes)?;
+            idx.insert_value(id, &val);
+            count += 1;
+            if self.verbose && count % 500_000 == 0 {
+                self.vlog(&format!(
+                    "[verbose] {}: composite index '{}' scanned {} / {} docs ({:.1}s)",
+                    self.name, name, count, total, start.elapsed().as_secs_f64()
+                ));
+            }
+        }
 
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: composite index '{}' ready ({} docs in {:.2}s)",
+                self.name, name, count, start.elapsed().as_secs_f64()
+            ));
+        }
         let idx_name = idx.name();
         self.composite_indexes.push(idx);
+        self.save_index_metadata()?;
+        self.save_index_data();
         Ok(idx_name)
     }
 
     /// Create a full-text search index on the specified fields.
     /// Rebuilds from existing documents in doc store.
+    /// If the index already exists, returns Ok immediately (idempotent).
     pub fn create_text_index(&mut self, fields: Vec<String>) -> Result<()> {
         if self.text_index.is_some() {
-            return Err(Error::IndexAlreadyExists("_text".to_string()));
+            return Ok(());
         }
 
+        let total = self.primary_index.len();
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: creating text index on {:?} ({} docs to scan)",
+                self.name, fields, total
+            ));
+        }
+        let start = std::time::Instant::now();
+        let mut count = 0u64;
         let mut idx = CollectionTextIndex::new(fields);
 
         // Backfill from doc store
-        self.for_each_doc(|id, data| {
-            idx.index_doc(id, &data);
-            Ok(())
-        })?;
+        for (&id, &loc) in &self.primary_index {
+            let bytes = self.storage.read(loc)?;
+            let val = crate::codec::decode_doc(&bytes)?;
+            idx.index_doc(id, &val);
+            count += 1;
+            if self.verbose && count % 500_000 == 0 {
+                self.vlog(&format!(
+                    "[verbose] {}: text index scanned {} / {} docs ({:.1}s)",
+                    self.name, count, total, start.elapsed().as_secs_f64()
+                ));
+            }
+        }
 
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: text index ready ({} docs in {:.2}s)",
+                self.name, count, start.elapsed().as_secs_f64()
+            ));
+        }
         self.text_index = Some(idx);
+        self.save_index_metadata()?;
         Ok(())
     }
 
@@ -296,17 +661,20 @@ impl Collection {
         indexes
     }
 
-    /// Drop an index by name.
+    /// Drop an index by name and update persisted metadata.
     pub fn drop_index(&mut self, name: &str) -> Result<()> {
         if self.field_indexes.remove(name).is_some() {
+            self.save_index_metadata()?;
             return Ok(());
         }
         if let Some(pos) = self.composite_indexes.iter().position(|i| i.name() == name) {
             self.composite_indexes.remove(pos);
+            self.save_index_metadata()?;
             return Ok(());
         }
         if name == "_text" && self.text_index.is_some() {
             self.text_index = None;
+            self.save_index_metadata()?;
             return Ok(());
         }
         Err(Error::IndexNotFound(name.to_string()))
@@ -1197,6 +1565,9 @@ impl Collection {
             }
         }
 
+        // Save index data cache after compaction (indexes are fresh)
+        self.save_index_data();
+
         Ok(CompactStats {
             old_size,
             new_size,
@@ -1471,14 +1842,15 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn temp_collection(name: &str) -> Collection {
+    fn temp_collection(name: &str) -> (tempfile::TempDir, Collection) {
         let dir = tempdir().unwrap();
-        Collection::open(name, dir.path()).unwrap()
+        let col = Collection::open(name, dir.path()).unwrap();
+        (dir, col)
     }
 
     #[test]
     fn insert_and_get() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         let id = col.insert(json!({"name": "Alice", "age": 30})).unwrap();
         let doc = col.get(id).unwrap().unwrap();
         assert_eq!(doc["name"], "Alice");
@@ -1487,7 +1859,7 @@ mod tests {
 
     #[test]
     fn insert_assigns_version_1() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         let id = col.insert(json!({"name": "Alice"})).unwrap();
         let doc = col.get(id).unwrap().unwrap();
         assert_eq!(doc["_version"], 1);
@@ -1496,7 +1868,7 @@ mod tests {
 
     #[test]
     fn update_increments_version() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         let id = col.insert(json!({"name": "Alice"})).unwrap();
         assert_eq!(col.get_version(id), 1);
         col.update(&json!({"_id": id}), &json!({"$set": {"name": "Bob"}}), None).unwrap();
@@ -1507,7 +1879,7 @@ mod tests {
 
     #[test]
     fn find_with_index() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.create_index("status").unwrap();
         col.insert(json!({"status": "active", "name": "Alice"}))
             .unwrap();
@@ -1522,7 +1894,7 @@ mod tests {
 
     #[test]
     fn date_range_query() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.create_index("created_at").unwrap();
 
         col.insert(json!({"created_at": "2024-01-15T10:00:00Z", "name": "old"}))
@@ -1543,7 +1915,7 @@ mod tests {
 
     #[test]
     fn update_doc() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         let id = col.insert(json!({"name": "Alice", "age": 30})).unwrap();
 
         let count = col
@@ -1557,7 +1929,7 @@ mod tests {
 
     #[test]
     fn delete_doc() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.insert(json!({"name": "Alice"})).unwrap();
         col.insert(json!({"name": "Bob"})).unwrap();
 
@@ -1568,7 +1940,7 @@ mod tests {
 
     #[test]
     fn unique_index_enforced() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.create_unique_index("email").unwrap();
         col.insert(json!({"email": "alice@test.com", "name": "Alice"}))
             .unwrap();
@@ -1581,7 +1953,7 @@ mod tests {
 
     #[test]
     fn unique_index_allows_different_values() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.create_unique_index("email").unwrap();
         col.insert(json!({"email": "alice@test.com"})).unwrap();
         col.insert(json!({"email": "bob@test.com"})).unwrap();
@@ -1590,7 +1962,7 @@ mod tests {
 
     #[test]
     fn unique_index_update_same_doc_ok() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.create_unique_index("email").unwrap();
         col.insert(json!({"email": "alice@test.com", "name": "Alice"}))
             .unwrap();
@@ -1608,7 +1980,7 @@ mod tests {
 
     #[test]
     fn unique_index_update_conflict() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.create_unique_index("email").unwrap();
         col.insert(json!({"email": "alice@test.com", "name": "Alice"}))
             .unwrap();
@@ -1630,7 +2002,7 @@ mod tests {
 
     #[test]
     fn insert_many_unique_violation_rolls_back() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.create_unique_index("email").unwrap();
         col.insert(json!({"email": "alice@test.com"})).unwrap();
 
@@ -1646,7 +2018,7 @@ mod tests {
 
     #[test]
     fn insert_many_intra_batch_uniqueness() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.create_unique_index("email").unwrap();
 
         // Two docs in same batch with same email
@@ -1660,7 +2032,7 @@ mod tests {
 
     #[test]
     fn atomic_multi_doc_update() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.insert(json!({"status": "draft", "title": "A"}))
             .unwrap();
         col.insert(json!({"status": "draft", "title": "B"}))
@@ -1683,7 +2055,7 @@ mod tests {
 
     #[test]
     fn atomic_multi_doc_delete() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.insert(json!({"status": "old", "title": "A"}))
             .unwrap();
         col.insert(json!({"status": "old", "title": "B"}))
@@ -1702,7 +2074,7 @@ mod tests {
 
     #[test]
     fn sort_ascending() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.insert(json!({"name": "Charlie", "age": 35})).unwrap();
         col.insert(json!({"name": "Alice", "age": 25})).unwrap();
         col.insert(json!({"name": "Bob", "age": 30})).unwrap();
@@ -1720,7 +2092,7 @@ mod tests {
 
     #[test]
     fn sort_descending() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.insert(json!({"name": "Charlie", "age": 35})).unwrap();
         col.insert(json!({"name": "Alice", "age": 25})).unwrap();
         col.insert(json!({"name": "Bob", "age": 30})).unwrap();
@@ -1738,7 +2110,7 @@ mod tests {
 
     #[test]
     fn sort_multi_field() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         col.insert(json!({"dept": "eng", "age": 30, "name": "Bob"})).unwrap();
         col.insert(json!({"dept": "eng", "age": 25, "name": "Alice"})).unwrap();
         col.insert(json!({"dept": "sales", "age": 28, "name": "Charlie"})).unwrap();
@@ -1763,7 +2135,7 @@ mod tests {
 
     #[test]
     fn skip_and_limit() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         for i in 0..10 {
             col.insert(json!({"n": i})).unwrap();
         }
@@ -1783,7 +2155,7 @@ mod tests {
 
     #[test]
     fn limit_only() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         for i in 0..10 {
             col.insert(json!({"n": i})).unwrap();
         }
@@ -1801,7 +2173,7 @@ mod tests {
 
     #[test]
     fn skip_only() {
-        let mut col = temp_collection("test");
+        let (_dir, mut col) = temp_collection("test");
         for i in 0..5 {
             col.insert(json!({"n": i})).unwrap();
         }
@@ -1857,7 +2229,7 @@ mod tests {
 
     #[test]
     fn composite_index_backed_sort_desc() {
-        let mut col = temp_collection("comp_sort");
+        let (_dir, mut col) = temp_collection("comp_sort");
         col.create_index("formId").unwrap();
         col.create_composite_index(vec!["formId".into(), "createdAt".into()])
             .unwrap();
@@ -1910,7 +2282,7 @@ mod tests {
 
     #[test]
     fn composite_index_backed_sort_asc() {
-        let mut col = temp_collection("comp_sort_asc");
+        let (_dir, mut col) = temp_collection("comp_sort_asc");
         col.create_composite_index(vec!["status".into(), "score".into()])
             .unwrap();
 
@@ -1934,7 +2306,7 @@ mod tests {
     fn composite_index_sort_with_post_filter() {
         // Test that composite index sort works with extra query conditions
         // beyond the composite prefix fields (post-filtering).
-        let mut col = temp_collection("comp_sort_postfilter");
+        let (_dir, mut col) = temp_collection("comp_sort_postfilter");
         col.create_composite_index(vec!["formId".into(), "createdAt".into()])
             .unwrap();
 

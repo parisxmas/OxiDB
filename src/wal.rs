@@ -8,7 +8,9 @@ use crc32fast::Hasher;
 
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
+use crate::engine::LogCallback;
 use crate::error::Result;
+use crate::index::{CompositeIndex, FieldIndex};
 use crate::storage::{DocLocation, Storage};
 
 const OP_INSERT: u8 = 1;
@@ -155,6 +157,8 @@ impl Wal {
     }
 
     /// Read all valid entries from the WAL and replay them idempotently.
+    /// When field_indexes and composite_indexes are provided, WAL replay also
+    /// updates those indexes so that a cached index load remains consistent.
     pub fn recover(
         &self,
         storage: &Storage,
@@ -162,13 +166,34 @@ impl Wal {
         next_id: &mut DocumentId,
         committed_tx_ids: &HashSet<u64>,
         version_index: &mut HashMap<DocumentId, u64>,
+        field_indexes: &mut HashMap<String, FieldIndex>,
+        composite_indexes: &mut Vec<CompositeIndex>,
+        verbose: bool,
+        log_callback: &Option<LogCallback>,
     ) -> Result<()> {
+        let vlog = |msg: &str| {
+            eprintln!("{msg}");
+            if let Some(cb) = log_callback {
+                cb(msg);
+            }
+        };
+
         let entries = self.read_entries()?;
+
+        if verbose && !entries.is_empty() {
+            vlog(&format!("[verbose] WAL: {} entries to replay", entries.len()));
+        }
+
+        let mut inserts = 0u64;
+        let mut updates = 0u64;
+        let mut deletes = 0u64;
+        let mut skipped = 0u64;
 
         for entry in entries {
             // Skip uncommitted transactional entries
             let tx_id = entry.tx_id();
             if tx_id != 0 && !committed_tx_ids.contains(&tx_id) {
+                skipped += 1;
                 continue;
             }
 
@@ -176,21 +201,39 @@ impl Wal {
                 WalEntry::Insert { doc_id, doc_bytes, .. } => {
                     // Skip if already present in primary_index
                     if primary_index.contains_key(&doc_id) {
+                        skipped += 1;
                         continue;
                     }
                     // Read _version from the doc bytes
                     if let Ok(doc) = crate::codec::decode_doc(&doc_bytes) {
                         let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                         version_index.insert(doc_id, ver);
+                        // Update field and composite indexes
+                        for idx in field_indexes.values_mut() {
+                            idx.insert_value(doc_id, &doc);
+                        }
+                        for idx in composite_indexes.iter_mut() {
+                            idx.insert_value(doc_id, &doc);
+                        }
                     }
                     let loc = storage.append(&doc_bytes)?;
                     primary_index.insert(doc_id, loc);
                     if doc_id >= *next_id {
                         *next_id = doc_id + 1;
                     }
+                    inserts += 1;
                 }
                 WalEntry::Update { doc_id, doc_bytes, .. } => {
+                    // Remove old values from indexes before updating
                     if let Some(&old_loc) = primary_index.get(&doc_id) {
+                        if let Ok(old_doc) = crate::codec::decode_doc(&storage.read(old_loc)?) {
+                            for idx in field_indexes.values_mut() {
+                                idx.remove_value(doc_id, &old_doc);
+                            }
+                            for idx in composite_indexes.iter_mut() {
+                                idx.remove_value(doc_id, &old_doc);
+                            }
+                        }
                         // Read current doc bytes; if different, apply update
                         let current_bytes = storage.read(old_loc)?;
                         if current_bytes != doc_bytes {
@@ -199,20 +242,44 @@ impl Wal {
                             primary_index.insert(doc_id, new_loc);
                         }
                     }
-                    // Update version_index from the new doc bytes
+                    // Update version_index and indexes from the new doc bytes
                     if let Ok(doc) = crate::codec::decode_doc(&doc_bytes) {
                         let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                         version_index.insert(doc_id, ver);
+                        for idx in field_indexes.values_mut() {
+                            idx.insert_value(doc_id, &doc);
+                        }
+                        for idx in composite_indexes.iter_mut() {
+                            idx.insert_value(doc_id, &doc);
+                        }
                     }
+                    updates += 1;
                 }
                 WalEntry::Delete { doc_id, .. } => {
+                    // Remove from indexes before removing from primary
                     if let Some(&loc) = primary_index.get(&doc_id) {
+                        if let Ok(old_doc) = crate::codec::decode_doc(&storage.read(loc)?) {
+                            for idx in field_indexes.values_mut() {
+                                idx.remove_value(doc_id, &old_doc);
+                            }
+                            for idx in composite_indexes.iter_mut() {
+                                idx.remove_value(doc_id, &old_doc);
+                            }
+                        }
                         storage.mark_deleted(loc)?;
                         primary_index.remove(&doc_id);
                     }
                     version_index.remove(&doc_id);
+                    deletes += 1;
                 }
             }
+        }
+
+        if verbose && (inserts > 0 || updates > 0 || deletes > 0 || skipped > 0) {
+            vlog(&format!(
+                "[verbose] WAL: replayed {} inserts, {} updates, {} deletes, {} skipped",
+                inserts, updates, deletes, skipped
+            ));
         }
 
         self.checkpoint()?;
@@ -512,7 +579,9 @@ mod tests {
         let committed = HashSet::new();
         let mut version_index = HashMap::new();
 
-        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index)
+        let mut fi = HashMap::new();
+        let mut ci = Vec::new();
+        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert_eq!(primary_index.len(), 1);
@@ -538,8 +607,10 @@ mod tests {
         let mut next_id = 0u64;
         let committed = HashSet::new(); // tx 99 not committed
         let mut version_index = HashMap::new();
+        let mut fi = HashMap::new();
+        let mut ci = Vec::new();
 
-        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index)
+        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert!(primary_index.is_empty()); // Should be skipped
@@ -563,8 +634,10 @@ mod tests {
         let mut committed = HashSet::new();
         committed.insert(99u64); // Mark tx 99 as committed
         let mut version_index = HashMap::new();
+        let mut fi = HashMap::new();
+        let mut ci = Vec::new();
 
-        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index)
+        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert_eq!(primary_index.len(), 1);
@@ -584,12 +657,14 @@ mod tests {
         let mut next_id = 1u64;
         let committed = HashSet::new();
         let mut version_index = HashMap::new();
+        let mut fi = HashMap::new();
+        let mut ci = Vec::new();
 
         // Now log a delete in WAL
         let wal = Wal::open(&wal_path).unwrap();
         wal.log(&WalEntry::delete(0)).unwrap();
 
-        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index)
+        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert!(primary_index.is_empty());

@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
+use std::io::{self, Read, Write};
 
 use serde_json::Value as JsonValue;
 
@@ -137,6 +138,88 @@ impl IndexValue {
     pub fn matches_json(&self, json: &JsonValue) -> bool {
         let other = IndexValue::from_json(json);
         self == &other
+    }
+
+    // -- Binary serialization -------------------------------------------------
+
+    const TAG_NULL: u8 = 0;
+    const TAG_BOOL: u8 = 1;
+    const TAG_INT: u8 = 2;
+    const TAG_FLOAT: u8 = 3;
+    const TAG_DATETIME: u8 = 4;
+    const TAG_STRING: u8 = 5;
+
+    /// Serialize this value to a binary writer.
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        match self {
+            IndexValue::Null => w.write_all(&[Self::TAG_NULL]),
+            IndexValue::Boolean(b) => {
+                w.write_all(&[Self::TAG_BOOL])?;
+                w.write_all(&[*b as u8])
+            }
+            IndexValue::Integer(i) => {
+                w.write_all(&[Self::TAG_INT])?;
+                w.write_all(&i.to_le_bytes())
+            }
+            IndexValue::Float(f) => {
+                w.write_all(&[Self::TAG_FLOAT])?;
+                w.write_all(&f.to_le_bytes())
+            }
+            IndexValue::DateTime(ms) => {
+                w.write_all(&[Self::TAG_DATETIME])?;
+                w.write_all(&ms.to_le_bytes())
+            }
+            IndexValue::String(s) => {
+                w.write_all(&[Self::TAG_STRING])?;
+                let bytes = s.as_bytes();
+                w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+                w.write_all(bytes)
+            }
+        }
+    }
+
+    /// Deserialize a value from a binary reader.
+    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut tag = [0u8; 1];
+        r.read_exact(&mut tag)?;
+        match tag[0] {
+            Self::TAG_NULL => Ok(IndexValue::Null),
+            Self::TAG_BOOL => {
+                let mut b = [0u8; 1];
+                r.read_exact(&mut b)?;
+                Ok(IndexValue::Boolean(b[0] != 0))
+            }
+            Self::TAG_INT => {
+                let mut buf = [0u8; 8];
+                r.read_exact(&mut buf)?;
+                Ok(IndexValue::Integer(i64::from_le_bytes(buf)))
+            }
+            Self::TAG_FLOAT => {
+                let mut buf = [0u8; 8];
+                r.read_exact(&mut buf)?;
+                Ok(IndexValue::Float(f64::from_le_bytes(buf)))
+            }
+            Self::TAG_DATETIME => {
+                let mut buf = [0u8; 8];
+                r.read_exact(&mut buf)?;
+                Ok(IndexValue::DateTime(i64::from_le_bytes(buf)))
+            }
+            Self::TAG_STRING => {
+                let mut len_buf = [0u8; 4];
+                r.read_exact(&mut len_buf)?;
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut str_buf = vec![0u8; len];
+                r.read_exact(&mut str_buf)?;
+                let s = String::from_utf8(str_buf).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, e)
+                })?;
+                Ok(IndexValue::String(s))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown IndexValue tag: {}", tag[0]),
+            )),
+        }
     }
 
     /// Returns the immediate successor in the ordering, if computable.
@@ -289,5 +372,31 @@ mod tests {
         let v = IndexValue::from_json(&serde_json::json!(-10));
         assert_eq!(v, IndexValue::Integer(-10));
         assert!(v < IndexValue::Integer(0));
+    }
+
+    #[test]
+    fn binary_roundtrip_all_variants() {
+        let values = vec![
+            IndexValue::Null,
+            IndexValue::Boolean(false),
+            IndexValue::Boolean(true),
+            IndexValue::Integer(0),
+            IndexValue::Integer(-42),
+            IndexValue::Integer(i64::MAX),
+            IndexValue::Integer(i64::MIN),
+            IndexValue::Float(3.14),
+            IndexValue::Float(f64::NEG_INFINITY),
+            IndexValue::DateTime(1_700_000_000_000),
+            IndexValue::DateTime(-1_000),
+            IndexValue::String(String::new()),
+            IndexValue::String("hello world".into()),
+            IndexValue::String("日本語テスト".into()),
+        ];
+        for val in &values {
+            let mut buf = Vec::new();
+            val.write_to(&mut buf).unwrap();
+            let decoded = IndexValue::read_from(&mut &buf[..]).unwrap();
+            assert_eq!(val, &decoded, "roundtrip failed for {:?}", val);
+        }
     }
 }

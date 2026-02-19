@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Read, Write};
 use std::ops::Bound;
 
 use serde_json::Value;
@@ -193,6 +194,63 @@ impl FieldIndex {
     pub fn clear(&mut self) {
         self.tree.clear();
     }
+
+    // -- Binary serialization -------------------------------------------------
+
+    /// Serialize the entire field index to a binary writer.
+    /// Format: [field_name_len:u32][field_name][unique:u8][entry_count:u32]
+    ///   per entry: [IndexValue][doc_count:u32][doc_ids as u64 LE...]
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        // Field name
+        let name_bytes = self.field.as_bytes();
+        w.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
+        w.write_all(name_bytes)?;
+        // Unique flag
+        w.write_all(&[self.unique as u8])?;
+        // Entry count
+        w.write_all(&(self.tree.len() as u32).to_le_bytes())?;
+        for (key, ids) in &self.tree {
+            key.write_to(w)?;
+            w.write_all(&(ids.len() as u32).to_le_bytes())?;
+            for &id in ids {
+                w.write_all(&id.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Deserialize a field index from a binary reader.
+    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        // Field name
+        let mut len_buf = [0u8; 4];
+        r.read_exact(&mut len_buf)?;
+        let name_len = u32::from_le_bytes(len_buf) as usize;
+        let mut name_buf = vec![0u8; name_len];
+        r.read_exact(&mut name_buf)?;
+        let field = String::from_utf8(name_buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // Unique flag
+        let mut unique_buf = [0u8; 1];
+        r.read_exact(&mut unique_buf)?;
+        let unique = unique_buf[0] != 0;
+        // Entry count
+        r.read_exact(&mut len_buf)?;
+        let entry_count = u32::from_le_bytes(len_buf) as usize;
+        let mut tree = BTreeMap::new();
+        for _ in 0..entry_count {
+            let key = IndexValue::read_from(r)?;
+            r.read_exact(&mut len_buf)?;
+            let doc_count = u32::from_le_bytes(len_buf) as usize;
+            let mut ids = BTreeSet::new();
+            let mut id_buf = [0u8; 8];
+            for _ in 0..doc_count {
+                r.read_exact(&mut id_buf)?;
+                ids.insert(u64::from_le_bytes(id_buf));
+            }
+            tree.insert(key, ids);
+        }
+        Ok(Self { field, unique, tree })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +339,71 @@ impl CompositeIndex {
     /// Remove all entries from the index.
     pub fn clear(&mut self) {
         self.tree.clear();
+    }
+
+    // -- Binary serialization -------------------------------------------------
+
+    /// Serialize the entire composite index to a binary writer.
+    /// Format: [field_count:u32][field_names...][entry_count:u32]
+    ///   per entry: [key_values...][doc_count:u32][doc_ids as u64 LE...]
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        // Field names
+        w.write_all(&(self.fields.len() as u32).to_le_bytes())?;
+        for f in &self.fields {
+            let bytes = f.as_bytes();
+            w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+            w.write_all(bytes)?;
+        }
+        // Entry count
+        w.write_all(&(self.tree.len() as u32).to_le_bytes())?;
+        for (CompositeKey(values), ids) in &self.tree {
+            for v in values {
+                v.write_to(w)?;
+            }
+            w.write_all(&(ids.len() as u32).to_le_bytes())?;
+            for &id in ids {
+                w.write_all(&id.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Deserialize a composite index from a binary reader.
+    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut len_buf = [0u8; 4];
+        // Field names
+        r.read_exact(&mut len_buf)?;
+        let field_count = u32::from_le_bytes(len_buf) as usize;
+        let mut fields = Vec::with_capacity(field_count);
+        for _ in 0..field_count {
+            r.read_exact(&mut len_buf)?;
+            let name_len = u32::from_le_bytes(len_buf) as usize;
+            let mut name_buf = vec![0u8; name_len];
+            r.read_exact(&mut name_buf)?;
+            let name = String::from_utf8(name_buf)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            fields.push(name);
+        }
+        // Entry count
+        r.read_exact(&mut len_buf)?;
+        let entry_count = u32::from_le_bytes(len_buf) as usize;
+        let mut tree = BTreeMap::new();
+        for _ in 0..entry_count {
+            let mut key_values = Vec::with_capacity(field_count);
+            for _ in 0..field_count {
+                key_values.push(IndexValue::read_from(r)?);
+            }
+            r.read_exact(&mut len_buf)?;
+            let doc_count = u32::from_le_bytes(len_buf) as usize;
+            let mut ids = BTreeSet::new();
+            let mut id_buf = [0u8; 8];
+            for _ in 0..doc_count {
+                r.read_exact(&mut id_buf)?;
+                ids.insert(u64::from_le_bytes(id_buf));
+            }
+            tree.insert(CompositeKey(key_values), ids);
+        }
+        Ok(Self { fields, tree })
     }
 
     // -- Query helpers -------------------------------------------------------
@@ -687,5 +810,56 @@ mod tests {
         idx.insert_value(2, &json!({"address": {"city": "LA"}}));
 
         assert_eq!(idx.find_eq(&IndexValue::String("NYC".into())), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn field_index_binary_roundtrip() {
+        let mut idx = FieldIndex::new_unique("email".into());
+        idx.insert(&make_doc(1, json!({"email": "alice@test.com"})));
+        idx.insert(&make_doc(2, json!({"email": "bob@test.com"})));
+        idx.insert(&make_doc(3, json!({"email": "charlie@test.com"})));
+
+        let mut buf = Vec::new();
+        idx.write_to(&mut buf).unwrap();
+        let decoded = FieldIndex::read_from(&mut &buf[..]).unwrap();
+
+        assert_eq!(decoded.field, "email");
+        assert!(decoded.unique);
+        assert_eq!(decoded.find_eq(&IndexValue::String("alice@test.com".into())), BTreeSet::from([1]));
+        assert_eq!(decoded.find_eq(&IndexValue::String("bob@test.com".into())), BTreeSet::from([2]));
+        assert_eq!(decoded.count_all(), 3);
+    }
+
+    #[test]
+    fn field_index_binary_roundtrip_mixed_types() {
+        let mut idx = FieldIndex::new("val".into());
+        idx.insert(&make_doc(1, json!({"val": null})));
+        idx.insert(&make_doc(2, json!({"val": true})));
+        idx.insert(&make_doc(3, json!({"val": 42})));
+        idx.insert(&make_doc(4, json!({"val": 3.14})));
+        idx.insert(&make_doc(5, json!({"val": "2024-01-01"})));
+        idx.insert(&make_doc(6, json!({"val": "hello"})));
+
+        let mut buf = Vec::new();
+        idx.write_to(&mut buf).unwrap();
+        let decoded = FieldIndex::read_from(&mut &buf[..]).unwrap();
+        assert_eq!(decoded.count_all(), 6);
+        assert_eq!(decoded.find_eq(&IndexValue::Integer(42)), BTreeSet::from([3]));
+    }
+
+    #[test]
+    fn composite_index_binary_roundtrip() {
+        let mut idx = CompositeIndex::new(vec!["status".into(), "priority".into()]);
+        idx.insert(&make_doc(1, json!({"status": "active", "priority": 1})));
+        idx.insert(&make_doc(2, json!({"status": "active", "priority": 5})));
+        idx.insert(&make_doc(3, json!({"status": "closed", "priority": 1})));
+
+        let mut buf = Vec::new();
+        idx.write_to(&mut buf).unwrap();
+        let decoded = CompositeIndex::read_from(&mut &buf[..]).unwrap();
+
+        assert_eq!(decoded.fields, vec!["status", "priority"]);
+        let result = decoded.find_prefix(&[IndexValue::String("active".into())]);
+        assert_eq!(result, BTreeSet::from([1, 2]));
     }
 }
