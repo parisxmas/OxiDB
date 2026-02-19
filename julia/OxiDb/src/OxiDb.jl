@@ -45,7 +45,9 @@ export OxiDbClient, OxiDbError, TransactionConflictError,
        create_bucket, list_buckets, delete_bucket,
        put_object, get_object, head_object, delete_object, list_objects,
        # FTS (blobs)
-       search
+       search,
+       # SQL
+       sql
 
 # ------------------------------------------------------------------
 # Exceptions
@@ -517,5 +519,17 @@ function search(client::OxiDbClient, query::AbstractString;
     bucket !== nothing && (payload["bucket"] = bucket)
     _checked(client, payload)
 end
+
+# ------------------------------------------------------------------
+# SQL
+# ------------------------------------------------------------------
+
+"""
+    sql(client, query::AbstractString)
+
+Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES.
+"""
+sql(client::OxiDbClient, query::AbstractString) =
+    _checked(client, Dict("cmd" => "sql", "query" => query))
 
 end # module

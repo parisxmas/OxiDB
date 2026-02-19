@@ -536,6 +536,16 @@ func (c *Client) Search(query string, bucket *string, limit int) ([]map[string]a
 }
 
 // ------------------------------------------------------------------
+// SQL
+// ------------------------------------------------------------------
+
+// SQL executes a SQL query. Supports SELECT, INSERT, UPDATE, DELETE,
+// CREATE/DROP TABLE, CREATE INDEX, and SHOW TABLES.
+func (c *Client) SQL(query string) (any, error) {
+	return c.checked(map[string]any{"cmd": "sql", "query": query})
+}
+
+// ------------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------------
 

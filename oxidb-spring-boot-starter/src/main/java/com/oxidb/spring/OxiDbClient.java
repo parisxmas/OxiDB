@@ -462,6 +462,100 @@ public class OxiDbClient implements AutoCloseable {
     }
 
     // ------------------------------------------------------------------
+    // SQL
+    // ------------------------------------------------------------------
+
+    /** Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES. */
+    public JsonNode sql(String query) {
+        ObjectNode p = cmd("sql");
+        p.put("query", query);
+        return checked(p);
+    }
+
+    // ------------------------------------------------------------------
+    // Missing CRUD helpers
+    // ------------------------------------------------------------------
+
+    /** Update at most one document matching a query. */
+    public JsonNode updateOne(String collection, Map<String, Object> query, Map<String, Object> update) {
+        ObjectNode p = cmd("update_one");
+        p.put("collection", collection);
+        p.set("query", mapper.valueToTree(query));
+        p.set("update", mapper.valueToTree(update));
+        return checked(p);
+    }
+
+    /** Update at most one document using JSON strings. */
+    public JsonNode updateOne(String collection, String queryJson, String updateJson) {
+        try {
+            ObjectNode p = cmd("update_one");
+            p.put("collection", collection);
+            p.set("query", mapper.readTree(queryJson));
+            p.set("update", mapper.readTree(updateJson));
+            return checked(p);
+        } catch (JsonProcessingException e) {
+            throw new OxiDbException("Invalid JSON: " + e.getMessage(), e);
+        }
+    }
+
+    /** Delete at most one document matching a query. */
+    public JsonNode deleteOne(String collection, Map<String, Object> query) {
+        ObjectNode p = cmd("delete_one");
+        p.put("collection", collection);
+        p.set("query", mapper.valueToTree(query));
+        return checked(p);
+    }
+
+    /** Delete at most one document using a JSON query string. */
+    public JsonNode deleteOne(String collection, String queryJson) {
+        try {
+            ObjectNode p = cmd("delete_one");
+            p.put("collection", collection);
+            p.set("query", mapper.readTree(queryJson));
+            return checked(p);
+        } catch (JsonProcessingException e) {
+            throw new OxiDbException("Invalid JSON: " + e.getMessage(), e);
+        }
+    }
+
+    /** Create a full-text search index on the specified fields. */
+    public JsonNode createTextIndex(String collection, List<String> fields) {
+        ObjectNode p = cmd("create_text_index");
+        p.put("collection", collection);
+        p.set("fields", mapper.valueToTree(fields));
+        return checked(p);
+    }
+
+    /** List all indexes on a collection. */
+    public JsonNode listIndexes(String collection) {
+        ObjectNode p = cmd("list_indexes");
+        p.put("collection", collection);
+        return checked(p);
+    }
+
+    /** Drop an index by name. */
+    public JsonNode dropIndex(String collection, String indexName) {
+        ObjectNode p = cmd("drop_index");
+        p.put("collection", collection);
+        p.put("index", indexName);
+        return checked(p);
+    }
+
+    /** Full-text search on collection documents. */
+    public JsonNode textSearch(String collection, String query, int limit) {
+        ObjectNode p = cmd("text_search");
+        p.put("collection", collection);
+        p.put("query", query);
+        p.put("limit", limit);
+        return checked(p);
+    }
+
+    /** Full-text search with default limit of 10. */
+    public JsonNode textSearch(String collection, String query) {
+        return textSearch(collection, query, 10);
+    }
+
+    // ------------------------------------------------------------------
     // AutoCloseable
     // ------------------------------------------------------------------
 

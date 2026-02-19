@@ -36,6 +36,7 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "list_objects"
                 | "list_buckets"
                 | "search"
+                | "sql"
         ),
         Role::Read => matches!(
             cmd,
