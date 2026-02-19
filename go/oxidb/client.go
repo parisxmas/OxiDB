@@ -235,10 +235,39 @@ func (c *Client) Update(collection string, query, update map[string]any) (map[st
 	return map[string]any{"status": data}, nil
 }
 
+// UpdateOne updates at most one document matching a query.
+func (c *Client) UpdateOne(collection string, query, update map[string]any) (map[string]any, error) {
+	data, err := c.checked(map[string]any{
+		"cmd": "update_one", "collection": collection,
+		"query": query, "update": update,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if m, ok := data.(map[string]any); ok {
+		return m, nil
+	}
+	return map[string]any{"status": data}, nil
+}
+
 // Delete deletes documents matching a query.
 func (c *Client) Delete(collection string, query map[string]any) (map[string]any, error) {
 	data, err := c.checked(map[string]any{
 		"cmd": "delete", "collection": collection, "query": query,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if m, ok := data.(map[string]any); ok {
+		return m, nil
+	}
+	return map[string]any{"status": data}, nil
+}
+
+// DeleteOne deletes at most one document matching a query.
+func (c *Client) DeleteOne(collection string, query map[string]any) (map[string]any, error) {
+	data, err := c.checked(map[string]any{
+		"cmd": "delete_one", "collection": collection, "query": query,
 	})
 	if err != nil {
 		return nil, err
@@ -282,6 +311,42 @@ func (c *Client) CreateUniqueIndex(collection, field string) error {
 func (c *Client) CreateCompositeIndex(collection string, fields []string) error {
 	_, err := c.checked(map[string]any{"cmd": "create_composite_index", "collection": collection, "fields": fields})
 	return err
+}
+
+// CreateTextIndex creates a full-text search index on the specified fields.
+func (c *Client) CreateTextIndex(collection string, fields []string) error {
+	_, err := c.checked(map[string]any{
+		"cmd": "create_text_index", "collection": collection, "fields": fields,
+	})
+	return err
+}
+
+// ListIndexes returns metadata for all indexes on a collection.
+func (c *Client) ListIndexes(collection string) ([]map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "list_indexes", "collection": collection})
+	if err != nil {
+		return nil, err
+	}
+	return toMapSlice(data), nil
+}
+
+// DropIndex drops an index by name.
+func (c *Client) DropIndex(collection, index string) error {
+	_, err := c.checked(map[string]any{
+		"cmd": "drop_index", "collection": collection, "index": index,
+	})
+	return err
+}
+
+// TextSearch performs full-text search on a collection's text index.
+func (c *Client) TextSearch(collection, query string, limit int) ([]map[string]any, error) {
+	data, err := c.checked(map[string]any{
+		"cmd": "text_search", "collection": collection, "query": query, "limit": limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return toMapSlice(data), nil
 }
 
 // ------------------------------------------------------------------
