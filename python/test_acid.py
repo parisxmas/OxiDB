@@ -347,7 +347,54 @@ def test_indexes():
         c.create_unique_index("t_idx", "age")
         c.create_composite_index("t_idx", ["name", "city"])
         assert len(c.find("t_idx", {"name": "Alice"})) == 1
+
+        # list_indexes
+        indexes = c.list_indexes("t_idx")
+        assert len(indexes) >= 3
+
+        # drop_index
+        c.drop_index("t_idx", "name")
+        indexes_after = c.list_indexes("t_idx")
+        assert len(indexes_after) < len(indexes)
     cleanup("t_idx")
+
+
+def test_text_index_and_search():
+    cleanup("t_fts_doc")
+    with client() as c:
+        c.insert_many("t_fts_doc", [
+            {"title": "Rust Programming", "body": "Rust is safe and fast."},
+            {"title": "Python Scripting", "body": "Python is great for scripting."},
+            {"title": "Go Networking", "body": "Go excels at network services."},
+        ])
+        c.create_text_index("t_fts_doc", ["title", "body"])
+        results = c.text_search("t_fts_doc", "Rust")
+        assert len(results) >= 1
+        assert "_score" in results[0]
+        results2 = c.text_search("t_fts_doc", "Python scripting")
+        assert len(results2) >= 1
+    cleanup("t_fts_doc")
+
+
+def test_update_one_delete_one():
+    cleanup("t_one")
+    with client() as c:
+        c.insert_many("t_one", [
+            {"name": "A", "v": 1},
+            {"name": "B", "v": 1},
+            {"name": "C", "v": 1},
+        ])
+        # update_one — only first match
+        result = c.update_one("t_one", {"v": 1}, {"$set": {"v": 2}})
+        assert result["modified"] == 1
+        assert c.count("t_one", {"v": 2}) == 1
+        assert c.count("t_one", {"v": 1}) == 2
+
+        # delete_one — only first match
+        result = c.delete_one("t_one", {"v": 1})
+        assert result["deleted"] == 1
+        assert c.count("t_one") == 2
+    cleanup("t_one")
 
 
 def test_collection_management():
@@ -505,6 +552,8 @@ TESTS = [
     ("crud_no_tx", test_crud_no_tx),
     ("find_with_sort_skip_limit", test_find_with_sort_skip_limit),
     ("indexes", test_indexes),
+    ("text_index_and_search", test_text_index_and_search),
+    ("update_one_delete_one", test_update_one_delete_one),
     ("collection_management", test_collection_management),
     ("compact", test_compact),
     ("aggregate", test_aggregate),
