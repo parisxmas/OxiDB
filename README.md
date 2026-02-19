@@ -73,7 +73,7 @@ docker compose up -d
 ## Features
 
 - **Document database** — JSON documents, no schema required, collections auto-created on insert
-- **MongoDB-style queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$and`, `$or`
+- **MongoDB-style queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$regex`, `$and`, `$or`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
 - **Aggregation pipeline** — 10 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`
 - **Indexes** — field, unique, composite, and full-text indexes with automatic backfill; list and drop support
@@ -105,6 +105,7 @@ docker compose up -d
 | `$lte`     | `{"age": {"$lte": 100}}`                | Less than or equal         |
 | `$in`      | `{"cat": {"$in": ["a", "b"]}}`           | Value in array             |
 | `$exists`  | `{"email": {"$exists": true}}`           | Field exists / does not    |
+| `$regex`   | `{"name": {"$regex": "^A", "$options": "i"}}` | Regular expression match   |
 | `$and`     | `{"$and": [{"a": 1}, {"b": 2}]}`        | Logical AND (explicit)     |
 | `$or`      | `{"$or": [{"a": 1}, {"b": 2}]}`         | Logical OR                 |
 
@@ -288,36 +289,6 @@ If the client falls behind, an overflow notification is sent:
 Send `{"cmd": "unwatch"}` to stop receiving events and return to normal request mode.
 
 > **Note:** Watch requires Admin role when authentication is enabled. Not available over TLS connections in standalone mode.
-
-## Performance
-
-All benchmarks on the same Linux server (Debian 6.1, x86_64, 8 GB RAM), both databases in Docker. OxiDB vs MongoDB 6.0, best of 3 runs.
-
-### 1 Million Documents (8 indexes)
-
-| Category | OxiDB vs MongoDB |
-|----------|-----------------|
-| Count operations | **8x-987x** faster |
-| Sorted find + limit | **2x-2.4x** faster |
-| Filtered aggregation ($match + $group) | **1.4x-1.9x** faster |
-| Indexed field queries (large result sets) | **1x-1.8x** faster |
-| Bulk inserts (1M docs) | MongoDB **2.2x** faster |
-| Single-doc updates | MongoDB significantly faster |
-| Full-table aggregation (no $match) | MongoDB **1.8x-2x** faster |
-| Unindexed full scans | MongoDB **8x-15x** faster |
-
-### Small-Medium Collections (5-1K docs)
-
-**OxiDB wins 25 of 30 tests (1.73x overall faster)**
-
-| Category | Highlights |
-|----------|-----------|
-| Index creation | **34x-66x** faster |
-| Find queries | **2x-3.5x** faster |
-| Count | **2.7x-6.4x** faster |
-| Aggregation | **2.4x-3.9x** faster |
-
-OxiDB excels at **read-heavy workloads** — counts, sorted pagination, filtered aggregations, indexed lookups. MongoDB wins on **write-heavy operations** — bulk inserts, in-place updates, full-collection scans.
 
 ## Architecture
 

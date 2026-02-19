@@ -3024,7 +3024,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "aes-gcm",
  "chrono",
@@ -3034,6 +3034,7 @@ dependencies = [
  "leptess",
  "pdf-extract",
  "rand 0.9.2",
+ "regex",
  "serde",
  "serde_json",
  "tar",
@@ -3086,7 +3087,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
