@@ -80,6 +80,7 @@ pub enum QueryOp {
     Lte(IndexValue),
     In(Vec<IndexValue>),
     Exists(bool),
+    Regex(regex::Regex),
 }
 
 #[derive(Debug, Clone)]
@@ -128,7 +129,11 @@ pub fn parse_query(query: &JsonValue) -> Result<Query> {
                     let has_ops = ops.keys().any(|k| k.starts_with('$'));
                     if has_ops {
                         for (op_key, op_val) in ops {
-                            let op = parse_op(op_key, op_val)?;
+                            // $options is consumed by $regex, skip it
+                            if op_key == "$options" {
+                                continue;
+                            }
+                            let op = parse_op(op_key, op_val, ops)?;
                             conditions.push(Query::Field {
                                 field: field.to_string(),
                                 op,
@@ -159,7 +164,11 @@ pub fn parse_query(query: &JsonValue) -> Result<Query> {
     }
 }
 
-fn parse_op(op_key: &str, op_val: &JsonValue) -> Result<QueryOp> {
+fn parse_op(
+    op_key: &str,
+    op_val: &JsonValue,
+    sibling_ops: &serde_json::Map<String, JsonValue>,
+) -> Result<QueryOp> {
     match op_key {
         "$eq" => Ok(QueryOp::Eq(IndexValue::from_json(op_val))),
         "$ne" => Ok(QueryOp::Ne(IndexValue::from_json(op_val))),
@@ -178,6 +187,24 @@ fn parse_op(op_key: &str, op_val: &JsonValue) -> Result<QueryOp> {
                 .as_bool()
                 .ok_or_else(|| Error::InvalidQuery("$exists must be a boolean".into()))?;
             Ok(QueryOp::Exists(b))
+        }
+        "$regex" => {
+            let pattern = op_val
+                .as_str()
+                .ok_or_else(|| Error::InvalidQuery("$regex must be a string".into()))?;
+            let options = sibling_ops
+                .get("$options")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mut re_pattern = String::new();
+            if options.contains('i') {
+                re_pattern.push_str("(?i)");
+            }
+            re_pattern.push_str(pattern);
+            let re = regex::Regex::new(&re_pattern).map_err(|e| {
+                Error::InvalidQuery(format!("invalid regex: {}", e))
+            })?;
+            Ok(QueryOp::Regex(re))
         }
         _ => Err(Error::InvalidQuery(format!("unknown operator: {}", op_key))),
     }
@@ -244,7 +271,7 @@ fn execute_field_op(
         QueryOp::Lt(v) => idx.find_range(Bound::Unbounded, Bound::Excluded(v)),
         QueryOp::Lte(v) => idx.find_range(Bound::Unbounded, Bound::Included(v)),
         QueryOp::In(vals) => idx.find_in(vals),
-        QueryOp::Exists(_) => return None, // can't use index for $exists
+        QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
     })
 }
 
@@ -259,6 +286,11 @@ pub fn matches_doc(query: &Query, doc: &Document) -> bool {
             let field_val = doc.get_field(field);
             match op {
                 QueryOp::Exists(expected) => field_val.is_some() == *expected,
+                QueryOp::Regex(re) => {
+                    field_val
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| re.is_match(s))
+                }
                 _ => {
                     let Some(val) = field_val else {
                         return false;
@@ -272,7 +304,7 @@ pub fn matches_doc(query: &Query, doc: &Document) -> bool {
                         QueryOp::Lt(v) => iv < *v,
                         QueryOp::Lte(v) => iv <= *v,
                         QueryOp::In(vals) => vals.contains(&iv),
-                        QueryOp::Exists(_) => unreachable!(),
+                        QueryOp::Exists(_) | QueryOp::Regex(_) => unreachable!(),
                     }
                 }
             }
@@ -301,8 +333,8 @@ pub fn is_fully_indexed(
     match query {
         Query::All => true,
         Query::Field { field, op } => {
-            // $exists can't be resolved by index
-            if matches!(op, QueryOp::Exists(_)) {
+            // $exists and $regex can't be resolved by index
+            if matches!(op, QueryOp::Exists(_) | QueryOp::Regex(_)) {
                 return false;
             }
             field_indexes.contains_key(field.as_str())
@@ -330,7 +362,7 @@ pub fn count_indexed(
                 QueryOp::Lt(v) => idx.count_range(Bound::Unbounded, Bound::Excluded(v)),
                 QueryOp::Lte(v) => idx.count_range(Bound::Unbounded, Bound::Included(v)),
                 QueryOp::In(vals) => idx.count_in(vals),
-                QueryOp::Exists(_) => return None,
+                QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
             })
         }
         Query::And(subs) => {
@@ -458,6 +490,11 @@ pub fn matches_value(query: &Query, data: &JsonValue) -> bool {
             let field_val = resolve_field_ref(data, field);
             match op {
                 QueryOp::Exists(expected) => field_val.is_some() == *expected,
+                QueryOp::Regex(re) => {
+                    field_val
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| re.is_match(s))
+                }
                 _ => {
                     let Some(val) = field_val else {
                         return false;
@@ -471,7 +508,7 @@ pub fn matches_value(query: &Query, data: &JsonValue) -> bool {
                         QueryOp::Lt(v) => iv < *v,
                         QueryOp::Lte(v) => iv <= *v,
                         QueryOp::In(vals) => vals.contains(&iv),
-                        QueryOp::Exists(_) => unreachable!(),
+                        QueryOp::Exists(_) | QueryOp::Regex(_) => unreachable!(),
                     }
                 }
             }
@@ -502,6 +539,15 @@ fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
     match query {
         Query::All => Some(true),
         Query::Field { field, op } => {
+            // For $regex, we need the raw string — fall back to full decode
+            if matches!(op, QueryOp::Regex(_)) {
+                return extract_raw_string_value(raw, field).map(|opt_s| {
+                    let QueryOp::Regex(re) = op else {
+                        unreachable!()
+                    };
+                    opt_s.is_some_and(|s| re.is_match(&s))
+                });
+            }
             let field_val = extract_raw_field_value(raw, field);
             match op {
                 QueryOp::Exists(expected) => Some(field_val.is_some() == *expected),
@@ -517,7 +563,7 @@ fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
                         QueryOp::Lt(v) => iv < *v,
                         QueryOp::Lte(v) => iv <= *v,
                         QueryOp::In(vals) => vals.contains(&iv),
-                        QueryOp::Exists(_) => unreachable!(),
+                        QueryOp::Exists(_) | QueryOp::Regex(_) => unreachable!(),
                     })
                 }
             }
@@ -578,6 +624,32 @@ fn extract_raw_field_value(raw: &jsonb::RawJsonb, field: &str) -> Option<IndexVa
     }
     // Complex types (array/object) — fall back to full decode
     None
+}
+
+/// Extract a raw string value from JSONB for regex matching.
+/// Returns `Some(Some(string))` if the field is a string, `Some(None)` if the
+/// field exists but is not a string or is missing, `None` if JSONB extraction fails.
+fn extract_raw_string_value(raw: &jsonb::RawJsonb, field: &str) -> Option<Option<String>> {
+    use jsonb::keypath::KeyPath;
+    use std::borrow::Cow;
+
+    let parts: Vec<&str> = field.split('.').collect();
+    let keypath: Vec<KeyPath> = parts
+        .iter()
+        .map(|p| KeyPath::Name(Cow::Borrowed(p)))
+        .collect();
+
+    let owned = match raw.get_by_keypath(keypath.iter()) {
+        Ok(Some(v)) => v,
+        Ok(None) => return Some(None),
+        Err(_) => return None,
+    };
+    let field_raw = owned.as_raw();
+    match field_raw.as_str() {
+        Ok(Some(s)) => Some(Some(s.to_string())),
+        Ok(None) => Some(None),
+        Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -729,8 +801,47 @@ mod tests {
 
     #[test]
     fn unknown_operator_errors() {
-        let result = parse_query(&json!({"x": {"$regex": "abc"}}));
+        let result = parse_query(&json!({"x": {"$bogus": "abc"}}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn regex_basic() {
+        let q = parse_query(&json!({"name": {"$regex": "^Al"}})).unwrap();
+        let doc_match = Document::new(1, json!({"name": "Alice"})).unwrap();
+        let doc_no = Document::new(2, json!({"name": "Bob"})).unwrap();
+        assert!(matches_doc(&q, &doc_match));
+        assert!(!matches_doc(&q, &doc_no));
+    }
+
+    #[test]
+    fn regex_case_insensitive() {
+        let q = parse_query(&json!({"name": {"$regex": "alice", "$options": "i"}})).unwrap();
+        let doc = Document::new(1, json!({"name": "Alice"})).unwrap();
+        assert!(matches_doc(&q, &doc));
+    }
+
+    #[test]
+    fn regex_anchored() {
+        let q = parse_query(&json!({"email": {"$regex": "^admin@.*\\.com$"}})).unwrap();
+        let doc_match = Document::new(1, json!({"email": "admin@example.com"})).unwrap();
+        let doc_no = Document::new(2, json!({"email": "user@example.com"})).unwrap();
+        assert!(matches_doc(&q, &doc_match));
+        assert!(!matches_doc(&q, &doc_no));
+    }
+
+    #[test]
+    fn regex_non_string_no_match() {
+        let q = parse_query(&json!({"age": {"$regex": "30"}})).unwrap();
+        let doc = Document::new(1, json!({"age": 30})).unwrap();
+        assert!(!matches_doc(&q, &doc));
+    }
+
+    #[test]
+    fn regex_matches_value_function() {
+        let q = parse_query(&json!({"name": {"$regex": "ob$"}})).unwrap();
+        let data = json!({"name": "Bob"});
+        assert!(matches_value(&q, &data));
     }
 
     #[test]
