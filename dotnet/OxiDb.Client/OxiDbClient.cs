@@ -65,6 +65,15 @@ public sealed class OxiDbClient : IDisposable
     public JsonDocument Update(string collection, Filter filter, UpdateDef update) =>
         Update(collection, filter.ToJson(), update.ToJson());
 
+    public JsonDocument UpdateOne(string collection, string queryJson, string updateJson)
+    {
+        var raw = Call(() => NativeInterop.UpdateOne(_conn, collection, queryJson, updateJson));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument UpdateOne(string collection, Filter filter, UpdateDef update) =>
+        UpdateOne(collection, filter.ToJson(), update.ToJson());
+
     public JsonDocument Delete(string collection, string queryJson)
     {
         var raw = Call(() => NativeInterop.Delete(_conn, collection, queryJson));
@@ -73,6 +82,15 @@ public sealed class OxiDbClient : IDisposable
 
     public JsonDocument Delete(string collection, Filter filter) =>
         Delete(collection, filter.ToJson());
+
+    public JsonDocument DeleteOne(string collection, string queryJson)
+    {
+        var raw = Call(() => NativeInterop.DeleteOne(_conn, collection, queryJson));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument DeleteOne(string collection, Filter filter) =>
+        DeleteOne(collection, filter.ToJson());
 
     public JsonDocument Count(string collection)
     {
@@ -92,6 +110,42 @@ public sealed class OxiDbClient : IDisposable
         return JsonDocument.Parse(raw);
     }
 
+    public JsonDocument CreateUniqueIndex(string collection, string field)
+    {
+        var raw = Call(() => NativeInterop.CreateUniqueIndex(_conn, collection, field));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument CreateTextIndex(string collection, string fieldsJson)
+    {
+        var raw = Call(() => NativeInterop.CreateTextIndex(_conn, collection, fieldsJson));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument ListIndexes(string collection)
+    {
+        var raw = Call(() => NativeInterop.ListIndexes(_conn, collection));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument DropIndex(string collection, string indexName)
+    {
+        var raw = Call(() => NativeInterop.DropIndex(_conn, collection, indexName));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument TextSearch(string collection, string query, int limit = 10)
+    {
+        var raw = Call(() => NativeInterop.TextSearch(_conn, collection, query, limit));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument CreateCollection(string collection)
+    {
+        var raw = Call(() => NativeInterop.CreateCollection(_conn, collection));
+        return JsonDocument.Parse(raw);
+    }
+
     public JsonDocument ListCollections()
     {
         var raw = Call(() => NativeInterop.ListCollections(_conn));
@@ -107,6 +161,12 @@ public sealed class OxiDbClient : IDisposable
     public JsonDocument Aggregate(string collection, string pipelineJson)
     {
         var raw = Call(() => NativeInterop.Aggregate(_conn, collection, pipelineJson));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument Compact(string collection)
+    {
+        var raw = Call(() => NativeInterop.Compact(_conn, collection));
         return JsonDocument.Parse(raw);
     }
 
