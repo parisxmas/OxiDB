@@ -105,6 +105,16 @@ using var verifyResult = db.FindOne(Collection, Filter.Eq("name", "Product 0"));
 var updatedDoc = verifyResult.RootElement.GetProperty("data");
 Console.WriteLine($"    -> {updatedDoc}");
 
+// --- UpdateOne ---
+Console.WriteLine();
+Console.WriteLine("Running update_one...");
+
+sw.Restart();
+using var updateOneResult = db.UpdateOne(Collection, Filter.Eq("name", "Product 1"), UpdateDef.Set("highlighted", true));
+sw.Stop();
+var modifiedOne = updateOneResult.RootElement.GetProperty("data").GetProperty("modified").GetInt32();
+Console.WriteLine($"  UpdateOne: modified {modifiedOne} doc in {sw.Elapsed.TotalMilliseconds:F1}ms");
+
 // --- Delete ---
 Console.WriteLine();
 Console.WriteLine("Running delete...");
@@ -115,10 +125,91 @@ sw.Stop();
 var deleted = deleteResult.RootElement.GetProperty("data").GetProperty("deleted").GetInt32();
 Console.WriteLine($"  Deleted {deleted} doc(s) in {sw.Elapsed.TotalMilliseconds:F1}ms");
 
+// --- DeleteOne ---
+Console.WriteLine();
+Console.WriteLine("Running delete_one...");
+
+db.Insert(Collection, """{"name":"TempProduct","category":"temp","price":0}""");
+sw.Restart();
+using var deleteOneResult = db.DeleteOne(Collection, Filter.Eq("name", "TempProduct"));
+sw.Stop();
+var deletedOne = deleteOneResult.RootElement.GetProperty("data").GetProperty("deleted").GetInt32();
+Console.WriteLine($"  DeleteOne: deleted {deletedOne} doc in {sw.Elapsed.TotalMilliseconds:F1}ms");
+
 // Final count
 using var finalCount = db.Count(Collection);
 var remaining = finalCount.RootElement.GetProperty("data").GetProperty("count").GetInt32();
 Console.WriteLine($"  Final count: {remaining:N0}");
+
+// --- Index Management ---
+Console.WriteLine();
+Console.WriteLine("Running index management...");
+
+// CreateUniqueIndex
+db.CreateUniqueIndex(Collection, "name");
+Console.WriteLine("  Created unique index on 'name'");
+
+// ListIndexes
+using var indexList = db.ListIndexes(Collection);
+var indexData = indexList.RootElement.GetProperty("data");
+Console.WriteLine($"  ListIndexes: {indexData.GetArrayLength()} indexes");
+
+// DropIndex
+db.DropIndex(Collection, "name");
+Console.WriteLine("  Dropped index: name");
+
+using var indexList2 = db.ListIndexes(Collection);
+Console.WriteLine($"  Remaining indexes: {indexList2.RootElement.GetProperty("data").GetArrayLength()}");
+
+// --- Document Full-Text Search ---
+Console.WriteLine();
+Console.WriteLine("Running document text search...");
+
+const string ArticlesCol = "dotnet_articles";
+db.DropCollection(ArticlesCol);
+db.InsertMany(ArticlesCol, """
+    [
+        {"title": "Getting Started with Rust", "body": "Rust is a systems programming language focused on safety."},
+        {"title": "Go for Backend", "body": "Go excels at building fast backend services and APIs."},
+        {"title": "Rust and WebAssembly", "body": "Rust compiles to WebAssembly for fast web applications."}
+    ]
+""");
+db.CreateTextIndex(ArticlesCol, """["title", "body"]""");
+Console.WriteLine("  Created text index on articles [title, body]");
+
+using var textSearchResult = db.TextSearch(ArticlesCol, "Rust", 10);
+var textSearchData = textSearchResult.RootElement.GetProperty("data");
+Console.WriteLine($"  TextSearch('Rust'): {textSearchData.GetArrayLength()} results");
+for (int i = 0; i < textSearchData.GetArrayLength(); i++)
+{
+    var title = textSearchData[i].GetProperty("title").GetString();
+    var score = textSearchData[i].GetProperty("_score").GetDouble();
+    Console.WriteLine($"    {title} (score: {score:F4})");
+}
+db.DropCollection(ArticlesCol);
+
+// --- CreateCollection ---
+Console.WriteLine();
+Console.WriteLine("Running create_collection...");
+
+db.CreateCollection("dotnet_explicit");
+using var colList = db.ListCollections();
+Console.WriteLine($"  Collections after create: {colList.RootElement.GetProperty("data")}");
+db.DropCollection("dotnet_explicit");
+
+// --- Compact ---
+Console.WriteLine();
+Console.WriteLine("Running compact...");
+
+const string CompactCol = "compact_test";
+db.DropCollection(CompactCol);
+for (int i = 0; i < 20; i++)
+    db.Insert(CompactCol, $$"""{"seq":{{i}}}""");
+db.Delete(CompactCol, """{"seq":{"$lte":10}}""");
+using var compactResult = db.Compact(CompactCol);
+var compactData = compactResult.RootElement.GetProperty("data");
+Console.WriteLine($"  Compact: old_size={compactData.GetProperty("old_size")}, new_size={compactData.GetProperty("new_size")}, docs_kept={compactData.GetProperty("docs_kept")}");
+db.DropCollection(CompactCol);
 
 // =======================================================================
 // Aggregation Pipeline Tests

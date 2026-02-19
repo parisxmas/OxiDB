@@ -30,8 +30,14 @@ internal static partial class NativeInterop
     [LibraryImport(LibName, EntryPoint = "oxidb_update", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint Update(nint conn, string collection, string queryJson, string updateJson);
 
+    [LibraryImport(LibName, EntryPoint = "oxidb_update_one", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint UpdateOne(nint conn, string collection, string queryJson, string updateJson);
+
     [LibraryImport(LibName, EntryPoint = "oxidb_delete", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint Delete(nint conn, string collection, string queryJson);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_delete_one", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint DeleteOne(nint conn, string collection, string queryJson);
 
     [LibraryImport(LibName, EntryPoint = "oxidb_count", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint Count(nint conn, string collection);
@@ -42,14 +48,35 @@ internal static partial class NativeInterop
     [LibraryImport(LibName, EntryPoint = "oxidb_create_composite_index", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint CreateCompositeIndex(nint conn, string collection, string fieldsJson);
 
+    [LibraryImport(LibName, EntryPoint = "oxidb_create_unique_index", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint CreateUniqueIndex(nint conn, string collection, string field);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_create_text_index", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint CreateTextIndex(nint conn, string collection, string fieldsJson);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_list_indexes", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint ListIndexes(nint conn, string collection);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_drop_index", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint DropIndex(nint conn, string collection, string indexName);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_text_search", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint TextSearch(nint conn, string collection, string query, int limit);
+
     [LibraryImport(LibName, EntryPoint = "oxidb_list_collections")]
     internal static partial nint ListCollections(nint conn);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_create_collection", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint CreateCollection(nint conn, string collection);
 
     [LibraryImport(LibName, EntryPoint = "oxidb_drop_collection", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint DropCollection(nint conn, string collection);
 
     [LibraryImport(LibName, EntryPoint = "oxidb_aggregate", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint Aggregate(nint conn, string collection, string pipelineJson);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_compact", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint Compact(nint conn, string collection);
 
     // Blob storage + FTS
 

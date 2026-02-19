@@ -52,8 +52,10 @@ using var db = OxiDbClient.Connect(host: "127.0.0.1", port: 4444);
 | `InsertMany(collection, docsJson)` | Insert multiple documents |
 | `Find(collection, queryJson)` / `Find(collection, Filter)` | Find documents |
 | `FindOne(collection, queryJson)` / `FindOne(collection, Filter)` | Find first document |
-| `Update(collection, queryJson, updateJson)` / `Update(collection, Filter, UpdateDef)` | Update documents |
-| `Delete(collection, queryJson)` / `Delete(collection, Filter)` | Delete documents |
+| `Update(collection, queryJson, updateJson)` / `Update(collection, Filter, UpdateDef)` | Update all matching documents |
+| `UpdateOne(collection, queryJson, updateJson)` / `UpdateOne(collection, Filter, UpdateDef)` | Update first matching document |
+| `Delete(collection, queryJson)` / `Delete(collection, Filter)` | Delete all matching documents |
+| `DeleteOne(collection, queryJson)` / `DeleteOne(collection, Filter)` | Delete first matching document |
 | `Count(collection)` | Count documents |
 
 ```csharp
@@ -78,11 +80,30 @@ var count = db.Count("users");
 ### Collections & Indexes
 
 ```csharp
+db.CreateCollection("orders");
 db.ListCollections();
 db.DropCollection("orders");
 
 db.CreateIndex("users", "name");
+db.CreateUniqueIndex("users", "email");
 db.CreateCompositeIndex("users", "[\"name\", \"age\"]");
+db.CreateTextIndex("articles", "[\"title\", \"body\"]");
+
+var indexes = db.ListIndexes("users");
+db.DropIndex("users", "name");
+```
+
+### Document Full-Text Search
+
+```csharp
+db.CreateTextIndex("articles", "[\"title\", \"body\"]");
+var results = db.TextSearch("articles", "rust programming", limit: 10);
+```
+
+### Compaction
+
+```csharp
+var stats = db.Compact("users");
 ```
 
 ### Aggregation
