@@ -184,6 +184,38 @@ pub unsafe extern "C" fn oxidb_update(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_update_one(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+    query_json: *const c_char,
+    update_json: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let query_str = match unsafe { cstr_to_str(query_json) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let update_str = match unsafe { cstr_to_str(update_json) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let query: serde_json::Value = match serde_json::from_str(query_str) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+    let update: serde_json::Value = match serde_json::from_str(update_str) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+    let req =
+        serde_json::json!({"cmd": "update_one", "collection": col, "query": query, "update": update});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_delete(
     conn: *mut OxiDbConn,
     collection: *const c_char,
@@ -206,6 +238,28 @@ pub unsafe extern "C" fn oxidb_delete(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_delete_one(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+    query_json: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let query_str = match unsafe { cstr_to_str(query_json) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let query: serde_json::Value = match serde_json::from_str(query_str) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "delete_one", "collection": col, "query": query});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_count(
     conn: *mut OxiDbConn,
     collection: *const c_char,
@@ -215,6 +269,19 @@ pub unsafe extern "C" fn oxidb_count(
         None => return ptr::null_mut(),
     };
     let req = serde_json::json!({"cmd": "count", "collection": col});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_compact(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "compact", "collection": col});
     unsafe { send_request(conn, &req) }
 }
 
@@ -233,6 +300,24 @@ pub unsafe extern "C" fn oxidb_create_index(
         None => return ptr::null_mut(),
     };
     let req = serde_json::json!({"cmd": "create_index", "collection": col, "field": fld});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_create_unique_index(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+    field: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let fld = match unsafe { cstr_to_str(field) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "create_unique_index", "collection": col, "field": fld});
     unsafe { send_request(conn, &req) }
 }
 
@@ -260,8 +345,97 @@ pub unsafe extern "C" fn oxidb_create_composite_index(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_create_text_index(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+    fields_json: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let fields_str = match unsafe { cstr_to_str(fields_json) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let fields: serde_json::Value = match serde_json::from_str(fields_str) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+    let req =
+        serde_json::json!({"cmd": "create_text_index", "collection": col, "fields": fields});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_list_indexes(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "list_indexes", "collection": col});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_drop_index(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+    index: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let idx = match unsafe { cstr_to_str(index) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "drop_index", "collection": col, "index": idx});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_text_search(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+    query: *const c_char,
+    limit: i32,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let q = match unsafe { cstr_to_str(query) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let mut req = serde_json::json!({"cmd": "text_search", "collection": col, "query": q});
+    if limit > 0 {
+        req["limit"] = serde_json::json!(limit);
+    }
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_list_collections(conn: *mut OxiDbConn) -> *mut c_char {
     let req = serde_json::json!({"cmd": "list_collections"});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_create_collection(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "create_collection", "collection": col});
     unsafe { send_request(conn, &req) }
 }
 
