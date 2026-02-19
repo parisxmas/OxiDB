@@ -80,13 +80,13 @@ func (r *FormRepo) FindBySlug(slug string) (*models.Form, error) {
 func (r *FormRepo) Update(id string, form *models.Form) error {
 	c := r.pool.Get()
 	doc := formToDoc(form)
-	_, err := c.Update(FormsCollection, map[string]any{"_id": toNumericID(id)}, map[string]any{"$set": doc})
+	_, err := c.UpdateOne(FormsCollection, map[string]any{"_id": toNumericID(id)}, map[string]any{"$set": doc})
 	return err
 }
 
 func (r *FormRepo) Delete(id string) error {
 	c := r.pool.Get()
-	_, err := c.Delete(FormsCollection, map[string]any{"_id": toNumericID(id)})
+	_, err := c.DeleteOne(FormsCollection, map[string]any{"_id": toNumericID(id)})
 	return err
 }
 

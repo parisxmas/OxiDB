@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use oxidb_server::audit::{self, AuditEvent, AuditLog};
 use oxidb_server::auth::UserStore;
 use oxidb_server::handler;

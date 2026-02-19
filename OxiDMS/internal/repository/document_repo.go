@@ -105,7 +105,7 @@ func (r *DocumentRepo) FindBySubmission(submissionID string) ([]models.Document,
 
 func (r *DocumentRepo) Delete(id string) error {
 	c := r.pool.Get()
-	_, err := c.Delete(DocumentsCollection, map[string]any{"_id": toNumericID(id)})
+	_, err := c.DeleteOne(DocumentsCollection, map[string]any{"_id": toNumericID(id)})
 	return err
 }
 

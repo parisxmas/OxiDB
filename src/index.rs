@@ -307,6 +307,71 @@ impl CompositeIndex {
         result
     }
 
+    /// Iterate prefix-matching entries in ascending order, calling `f` for each DocumentId.
+    /// Entries are yielded in the natural BTreeMap order of the remaining (non-prefix) fields.
+    /// Return `false` from `f` to stop early.
+    pub fn for_each_prefix_asc<F>(&self, prefix: &[IndexValue], mut f: F)
+    where
+        F: FnMut(DocumentId) -> bool,
+    {
+        let start = CompositeKey(prefix.to_vec());
+        for (key, ids) in self.tree.range(start..) {
+            if key.0.len() < prefix.len() || key.0[..prefix.len()] != *prefix {
+                break;
+            }
+            for &id in ids {
+                if !f(id) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Iterate prefix-matching entries in descending order, calling `f` for each DocumentId.
+    /// Return `false` from `f` to stop early.
+    pub fn for_each_prefix_desc<F>(&self, prefix: &[IndexValue], mut f: F)
+    where
+        F: FnMut(DocumentId) -> bool,
+    {
+        if prefix.is_empty() {
+            return;
+        }
+
+        let lower = CompositeKey(prefix.to_vec());
+
+        // Try to compute tight upper bound for O(limit) reverse iteration.
+        if let Some(successor) = prefix.last().unwrap().try_successor() {
+            let mut upper_vec = prefix.to_vec();
+            *upper_vec.last_mut().unwrap() = successor;
+            let upper = CompositeKey(upper_vec);
+
+            for (_, ids) in self.tree.range(lower..upper).rev() {
+                for &id in ids.iter().rev() {
+                    if !f(id) {
+                        return;
+                    }
+                }
+            }
+        } else {
+            // Fallback: collect forward, iterate reverse.
+            let entries: Vec<_> = self
+                .tree
+                .range(lower..)
+                .take_while(|(key, _)| {
+                    key.0.len() >= prefix.len() && key.0[..prefix.len()] == *prefix
+                })
+                .collect();
+
+            for (_, ids) in entries.iter().rev() {
+                for &id in ids.iter().rev() {
+                    if !f(id) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Prefix + range on the next field.
     /// Example: index [status, created_at], query status="active" AND created_at > X
     pub fn find_prefix_range(

@@ -81,14 +81,46 @@ func (r *SubmissionRepo) FindByID(id string) (*models.Submission, error) {
 func (r *SubmissionRepo) Update(id string, sub *models.Submission) error {
 	c := r.pool.Get()
 	doc := submissionToDoc(sub)
-	_, err := c.Update(SubmissionsCollection, map[string]any{"_id": toNumericID(id)}, map[string]any{"$set": doc})
+	_, err := c.UpdateOne(SubmissionsCollection, map[string]any{"_id": toNumericID(id)}, map[string]any{"$set": doc})
 	return err
 }
 
 func (r *SubmissionRepo) Delete(id string) error {
 	c := r.pool.Get()
-	_, err := c.Delete(SubmissionsCollection, map[string]any{"_id": toNumericID(id)})
+	_, err := c.DeleteOne(SubmissionsCollection, map[string]any{"_id": toNumericID(id)})
 	return err
+}
+
+func (r *SubmissionRepo) TextSearch(query string, limit int) ([]models.Submission, error) {
+	c := r.pool.Get()
+	docs, err := c.TextSearch(SubmissionsCollection, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	subs := make([]models.Submission, 0, len(docs))
+	for _, d := range docs {
+		s, err := docToSubmission(d)
+		if err != nil {
+			continue
+		}
+		subs = append(subs, *s)
+	}
+	return subs, nil
+}
+
+func (r *SubmissionRepo) EnsureTextIndex(fields []string) error {
+	c := r.pool.Get()
+	return c.CreateTextIndex(SubmissionsCollection, fields)
+}
+
+func (r *SubmissionRepo) ListIndexes() ([]map[string]any, error) {
+	c := r.pool.Get()
+	return c.ListIndexes(SubmissionsCollection)
+}
+
+func (r *SubmissionRepo) Compact() (map[string]any, error) {
+	c := r.pool.Get()
+	return c.Compact(SubmissionsCollection)
 }
 
 func (r *SubmissionRepo) CountByFormID(formID string) (int, error) {
