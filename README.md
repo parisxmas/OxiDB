@@ -2,9 +2,9 @@
   <img src="logo.png" alt="OxiDB" width="500">
 </p>
 
-<p align="center">A fast, embeddable document database written in Rust. Single binary, zero configuration, Raft replication, AES-256 encryption, SCRAM-SHA-256 auth, crash-safe WAL, and sub-second failover.</p>
+<p align="center">A fast, embeddable document database written in Rust. SQL and MongoDB-style queries, single binary, zero configuration, Raft replication, AES-256 encryption, SCRAM-SHA-256 auth, crash-safe WAL, and sub-second failover.</p>
 
-**Client libraries:** [Python](python/) | [Go](go/) | Ruby | Java/Spring Boot | [Julia](julia/) | PHP | [.NET](dotnet/) | [Swift/iOS](swift/) | [C FFI](oxidb-client-ffi/)
+**Client libraries:** [Python](python/) | [Go](go/) | [Java/Spring Boot](oxidb-spring-boot-starter/) | [Julia](julia/) | [.NET](dotnet/) | [Swift/iOS](swift/) | [C FFI](oxidb-client-ffi/)
 
 ## Installation
 
@@ -17,18 +17,10 @@ Download the latest release for your platform from [GitHub Releases](https://git
 | macOS Apple Silicon (M1/M2/M3/M4) | `oxidb-server-macos-arm64.tar.gz` |
 | macOS Intel | `oxidb-server-macos-x86_64.tar.gz` |
 | Linux x86_64 | `oxidb-server-linux-x86_64.tar.gz` |
-| Windows x86_64 | `oxidb-server-windows-x86_64.zip` |
 
 ```bash
-# macOS / Linux
 tar xzf oxidb-server-*.tar.gz
 ./oxidb-server
-```
-
-```powershell
-# Windows
-Expand-Archive oxidb-server-windows-x86_64.zip
-.\oxidb-server.exe
 ```
 
 The server starts on `127.0.0.1:4444` by default. Data is stored in `./oxidb_data/`.
@@ -72,6 +64,7 @@ docker compose up -d
 
 ## Features
 
+- **SQL query language** — `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE INDEX`, `SHOW TABLES` with `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, `JOIN`, `LIMIT`, `OFFSET`
 - **Document database** — JSON documents, no schema required, collections auto-created on insert
 - **MongoDB-style queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$regex`, `$and`, `$or`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
@@ -91,7 +84,72 @@ docker compose up -d
 - **Compaction** — reclaim space from deleted documents with atomic file swap
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block
 - **CLI tool** — interactive shell with MongoDB-style syntax, embedded and client modes
-- **Multi-language clients** — Python, Go, Ruby, Java/Spring Boot, Julia, PHP, .NET, Swift/iOS — all zero or minimal dependencies
+- **Multi-language clients** — Python, Go, Java/Spring Boot, Julia, .NET, Swift/iOS — all zero or minimal dependencies
+
+## SQL Query Language
+
+OxiDB supports SQL as a query interface. SQL statements are parsed and translated to the document engine — no separate storage layer.
+
+### Supported Statements
+
+| Statement | Example |
+|-----------|---------|
+| `SELECT` | `SELECT * FROM users WHERE age > 21 ORDER BY name LIMIT 10` |
+| `SELECT` (aggregate) | `SELECT dept, AVG(salary) FROM employees GROUP BY dept HAVING AVG(salary) > 50000` |
+| `SELECT` (join) | `SELECT u.name, o.total FROM users u JOIN orders o ON u._id = o.user_id` |
+| `INSERT` | `INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25)` |
+| `UPDATE` | `UPDATE users SET age = 31 WHERE name = 'Alice'` |
+| `DELETE` | `DELETE FROM users WHERE age < 18` |
+| `CREATE TABLE` | `CREATE TABLE users (id INT, name TEXT)` |
+| `DROP TABLE` | `DROP TABLE users` |
+| `CREATE INDEX` | `CREATE INDEX idx_name ON users (name)` |
+| `SHOW TABLES` | `SHOW TABLES` |
+
+### WHERE Clause
+
+`=`, `!=`, `<>`, `>`, `>=`, `<`, `<=`, `AND`, `OR`, `IN (...)`, `IS NULL`, `IS NOT NULL`, `LIKE`, `BETWEEN ... AND ...`
+
+### Aggregate Functions
+
+`COUNT(*)`, `COUNT(field)`, `SUM(field)`, `AVG(field)`, `MIN(field)`, `MAX(field)`
+
+### Server Usage
+
+```json
+{"cmd": "sql", "query": "SELECT * FROM users WHERE age > 21 ORDER BY name LIMIT 10"}
+```
+
+### Client Library Usage
+
+```python
+# Python
+result = client.sql("SELECT name, age FROM users WHERE age > 21")
+```
+
+```go
+// Go
+result, err := client.SQL("SELECT name, age FROM users WHERE age > 21")
+```
+
+```java
+// Java
+JsonNode result = client.sql("SELECT name, age FROM users WHERE age > 21");
+```
+
+```julia
+# Julia
+result = sql(client, "SELECT name, age FROM users WHERE age > 21")
+```
+
+```csharp
+// .NET
+var result = client.Sql("SELECT name, age FROM users WHERE age > 21");
+```
+
+```swift
+// Swift
+let result = try client.sql(query: "SELECT name, age FROM users WHERE age > 21")
+```
 
 ## Query Operators
 
@@ -209,6 +267,7 @@ Max message size is 16 MiB.
 | `delete_object`          | `bucket`, `key`                                    |
 | `list_objects`           | `bucket`, `prefix?`, `limit?`                      |
 | `search`                 | `query`, `bucket?`, `limit?`                       |
+| `sql`                    | `query`                                            |
 | `watch`                  | `collection?`, `resume_after?`                     |
 | `unwatch`                | —                                                  |
 | `begin_tx`               | —                                                  |

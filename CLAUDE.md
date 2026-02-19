@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OxiDB is a fast, embeddable document database engine written in Rust. It can run as an embedded library, a standalone TCP server, or be accessed via client libraries (Python, Go, Ruby, Java/Spring Boot, PHP, Julia, .NET via C FFI).
+OxiDB is a fast, embeddable document database engine written in Rust. It supports both SQL and MongoDB-style queries. It can run as an embedded library, a standalone TCP server, or be accessed via client libraries (Python, Go, Java/Spring Boot, Julia, .NET, Swift/iOS via C FFI).
 
 ## Build Commands
 
@@ -41,7 +41,7 @@ Cargo workspace with three crates:
 - **`oxidb-server/`** — TCP server with SCRAM-SHA-256 auth, RBAC, TLS, audit logging
 - **`oxidb-client-ffi/`** — C-compatible FFI (`cdylib`) for language bindings
 
-Client libraries: `python/`, `go/`, `ruby/`, `php/`, `julia/`, `dotnet/`
+Client libraries: `python/`, `go/`, `julia/`, `dotnet/`, `swift/`, `oxidb-spring-boot-starter/`
 
 ## Architecture
 
