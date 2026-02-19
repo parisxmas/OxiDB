@@ -10,6 +10,11 @@ type contextKey string
 
 const UserContextKey contextKey = "user"
 
+// userSetter is satisfied by the logger middleware's statusWriter.
+type userSetter interface {
+	SetUser(string)
+}
+
 func Middleware(secret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -23,6 +28,10 @@ func Middleware(secret string) func(http.Handler) http.Handler {
 			if err != nil {
 				http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 				return
+			}
+			// Tag the request for the logger middleware
+			if us, ok := w.(userSetter); ok {
+				us.SetUser(claims.Email + "(" + claims.Role + ")")
 			}
 			ctx := context.WithValue(r.Context(), UserContextKey, claims)
 			next.ServeHTTP(w, r.WithContext(ctx))

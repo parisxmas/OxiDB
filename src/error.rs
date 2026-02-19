@@ -63,6 +63,9 @@ pub enum Error {
 
     #[error("codec error: {0}")]
     Codec(String),
+
+    #[error("backup error: {0}")]
+    Backup(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

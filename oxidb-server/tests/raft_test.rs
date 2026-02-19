@@ -1,3 +1,5 @@
+#![cfg(feature = "cluster")]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

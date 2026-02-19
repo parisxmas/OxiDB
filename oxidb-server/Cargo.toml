@@ -1,12 +1,13 @@
 [package]
 name = "oxidb-server"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 description = "TCP server for OxiDB document database"
 
 [features]
 default = []
 ocr = ["oxidb/ocr"]
+cluster = ["openraft", "tokio", "tokio-rustls"]
 
 [dependencies]
 oxidb = { path = ".." }
@@ -21,6 +22,11 @@ hmac = "0.12"
 rand = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 tikv-jemallocator = "0.6"
+openraft = { version = "0.9", features = ["serde"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "time", "macros", "sync"], optional = true }
+tokio-rustls = { version = "0.26", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+openraft = { version = "0.9", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "time", "macros", "sync"] }
