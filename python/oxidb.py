@@ -339,3 +339,11 @@ class OxiDbClient:
         if bucket is not None:
             payload["bucket"] = bucket
         return self._checked(payload)
+
+    # ------------------------------------------------------------------
+    # SQL
+    # ------------------------------------------------------------------
+
+    def sql(self, query: str):
+        """Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES."""
+        return self._checked({"cmd": "sql", "query": query})

@@ -118,6 +118,11 @@ internal static partial class NativeInterop
     [LibraryImport(LibName, EntryPoint = "oxidb_rollback_tx")]
     internal static partial nint RollbackTx(nint conn);
 
+    // SQL
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_sql", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint Sql(nint conn, string query);
+
     [LibraryImport(LibName, EntryPoint = "oxidb_free_string")]
     internal static partial void FreeString(nint ptr);
 }

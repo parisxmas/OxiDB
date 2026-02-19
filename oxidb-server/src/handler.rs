@@ -625,6 +625,23 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        "sql" => {
+            let query_str = match request.get("query").and_then(|v| v.as_str()) {
+                Some(q) => q,
+                None => return err_bytes("missing 'query' string"),
+            };
+            match oxidb::sql::execute_sql(db, query_str) {
+                Ok(result) => match result {
+                    oxidb::SqlResult::Select(docs) => ok_bytes(json!(docs)),
+                    oxidb::SqlResult::Insert(ids) => ok_bytes(json!({ "ids": ids })),
+                    oxidb::SqlResult::Update(count) => ok_bytes(json!({ "modified": count })),
+                    oxidb::SqlResult::Delete(count) => ok_bytes(json!({ "deleted": count })),
+                    oxidb::SqlResult::Ddl(msg) => ok_bytes(json!(msg)),
+                },
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         _ => err_bytes(&format!("unknown command: {cmd}")),
     }
 }

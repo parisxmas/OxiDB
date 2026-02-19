@@ -246,6 +246,12 @@ public sealed class OxiDbClient : IDisposable
         return JsonDocument.Parse(raw);
     }
 
+    public JsonDocument Sql(string query)
+    {
+        var raw = Call(() => NativeInterop.Sql(_conn, query));
+        return JsonDocument.Parse(raw);
+    }
+
     private string Call(Func<nint> nativeCall)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

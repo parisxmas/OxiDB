@@ -422,6 +422,13 @@ public final class OxiDBClient: OxiDBMutationObservable {
         return try call { oxidb_search($0, query, bucket, limit) }
     }
 
+    // MARK: - SQL
+
+    /// Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES.
+    public func sql(query: String) throws -> [String: Any] {
+        return try call { oxidb_sql($0, query) }
+    }
+
     // MARK: - Private Helpers
 
     private func call(_ fn: (UnsafeMutableRawPointer) -> UnsafeMutablePointer<CChar>?) throws -> [String: Any] {
@@ -770,6 +777,13 @@ public final class OxiDBDatabase: OxiDBMutationObservable {
         if let b = bucket { cmd["bucket"] = b }
         if let l = limit { cmd["limit"] = l }
         return try execute(cmd)
+    }
+
+    // MARK: - SQL
+
+    /// Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES.
+    public func sql(query: String) throws -> [String: Any] {
+        return try execute(["cmd": "sql", "query": query])
     }
 
     // MARK: - Raw Execute

@@ -666,6 +666,19 @@ pub unsafe extern "C" fn oxidb_rollback_tx(conn: *mut OxiDbConn) -> *mut c_char 
     unsafe { send_request(conn, &req) }
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_sql(
+    conn: *mut OxiDbConn,
+    query: *const c_char,
+) -> *mut c_char {
+    let q = match unsafe { cstr_to_str(query) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "sql", "query": q});
+    unsafe { send_request(conn, &req) }
+}
+
 /// Free a string returned by any `oxidb_*` function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_free_string(ptr: *mut c_char) {
