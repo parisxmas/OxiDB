@@ -64,9 +64,11 @@ docker compose up -d
 | `OXIDB_TLS_KEY` | — | Path to TLS private key PEM file |
 | `OXIDB_AUTH` | `false` | Enable SCRAM-SHA-256 authentication |
 | `OXIDB_AUDIT` | `false` | Enable audit logging |
-| `OXIDB_NODE_ID` | — | Numeric node ID to enable Raft replication |
+| `OXIDB_GELF_ADDR` | — | GELF UDP endpoint for centralized logging (e.g. `172.17.0.1:12201`) |
+| `OXIDB_VERBOSE` | `false` | Enable verbose startup logging (also `--verbose` flag) |
+| `OXIDB_NODE_ID` | — | Numeric node ID to enable Raft cluster mode |
 | `OXIDB_RAFT_ADDR` | `127.0.0.1:4445` | Raft inter-node communication address |
-| `OXIDB_RAFT_PEERS` | — | Comma-separated peer list: `"2=host2:4445,3=host3:4445"` |
+| `OXIDB_RAFT_PEERS` | — | Comma-separated peer list: `"1=host1:4445,2=host2:4445,3=host3:4445"` |
 
 ## Features
 
@@ -80,10 +82,12 @@ docker compose up -d
 - **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
 - **Full-text search** — automatic text extraction from 10+ formats (HTML, XML, PDF, DOCX, XLSX, images via OCR), TF-IDF ranked search
 - **Raft replication** — multi-node cluster via OpenRaft with automatic leader election, HAProxy-compatible health checks, and sub-second failover
+- **Change streams** — real-time `watch`/`unwatch` with collection filtering, backpressure handling, and token-based resume
 - **JSONB binary storage** — compact binary format for faster serialization; backward-compatible with existing JSON data files
 - **Crash-safe** — write-ahead log with CRC32 checksums, verified by SIGKILL recovery tests
 - **Encryption at rest** — AES-256-GCM with per-record nonces
 - **Security** — TLS transport, SCRAM-SHA-256 authentication, role-based access control (Admin/ReadWrite/Read), audit logging
+- **GELF logging** — centralized UDP logging to Graylog/Loki via `OXIDB_GELF_ADDR`
 - **Compaction** — reclaim space from deleted documents with atomic file swap
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block
 - **CLI tool** — interactive shell with MongoDB-style syntax, embedded and client modes
@@ -204,20 +208,43 @@ Max message size is 16 MiB.
 | `delete_object`          | `bucket`, `key`                                    |
 | `list_objects`           | `bucket`, `prefix?`, `limit?`                      |
 | `search`                 | `query`, `bucket?`, `limit?`                       |
+| `watch`                  | `collection?`, `resume_after?`                     |
+| `unwatch`                | —                                                  |
+| `begin_tx`               | —                                                  |
+| `commit_tx`              | —                                                  |
+| `rollback_tx`            | —                                                  |
 
 ## Raft Cluster
 
-Multi-node replication via [OpenRaft](https://github.com/databendlabs/openraft). All writes go through Raft consensus; reads execute locally.
+Multi-node replication via [OpenRaft](https://github.com/databendlabs/openraft). All writes go through Raft consensus; reads execute locally. Setting `OXIDB_NODE_ID` activates cluster mode with an async tokio runtime.
 
 ```bash
-# Node 1 (initial leader)
-OXIDB_NODE_ID=1 OXIDB_RAFT_ADDR=0.0.0.0:4445 OXIDB_ADDR=0.0.0.0:4444 ./oxidb-server
+# Build with cluster support
+cargo build --release -p oxidb-server --features cluster
+
+# Node 1
+OXIDB_NODE_ID=1 OXIDB_RAFT_ADDR=0.0.0.0:4445 OXIDB_ADDR=0.0.0.0:4444 \
+  OXIDB_RAFT_PEERS=1=node1:4445,2=node2:4445,3=node3:4445 \
+  OXIDB_DATA=./data1 ./target/release/oxidb-server
 
 # Node 2
-OXIDB_NODE_ID=2 OXIDB_RAFT_ADDR=0.0.0.0:4445 OXIDB_ADDR=0.0.0.0:4444 ./oxidb-server
+OXIDB_NODE_ID=2 OXIDB_RAFT_ADDR=0.0.0.0:4445 OXIDB_ADDR=0.0.0.0:4444 \
+  OXIDB_RAFT_PEERS=1=node1:4445,2=node2:4445,3=node3:4445 \
+  OXIDB_DATA=./data2 ./target/release/oxidb-server
 
 # Node 3
-OXIDB_NODE_ID=3 OXIDB_RAFT_ADDR=0.0.0.0:4445 OXIDB_ADDR=0.0.0.0:4444 ./oxidb-server
+OXIDB_NODE_ID=3 OXIDB_RAFT_ADDR=0.0.0.0:4445 OXIDB_ADDR=0.0.0.0:4444 \
+  OXIDB_RAFT_PEERS=1=node1:4445,2=node2:4445,3=node3:4445 \
+  OXIDB_DATA=./data3 ./target/release/oxidb-server
+```
+
+Then initialize the cluster via any client:
+
+```json
+{"cmd": "raft_init"}
+{"cmd": "raft_add_learner", "node_id": 2, "addr": "node2:4445"}
+{"cmd": "raft_add_learner", "node_id": 3, "addr": "node3:4445"}
+{"cmd": "raft_change_membership", "members": [1, 2, 3]}
 ```
 
 A ready-to-use 3-node cluster with HAProxy is included in `tests/cluster/`.
@@ -228,6 +255,39 @@ A ready-to-use 3-node cluster with HAProxy is included in `tests/cluster/`.
 | `raft_add_learner` | Add a node as learner (`node_id`, `addr`) |
 | `raft_change_membership` | Promote learners to voters (`members` array) |
 | `raft_metrics` | Get node state, term, leader ID, log indices |
+
+## Change Streams
+
+Subscribe to real-time change events (insert, update, delete) on a collection or the entire database.
+
+```json
+// Watch all collections
+{"cmd": "watch"}
+
+// Watch a specific collection
+{"cmd": "watch", "collection": "users"}
+
+// Resume from a specific point (after reconnect)
+{"cmd": "watch", "resume_after": 42}
+```
+
+The server responds with `{"ok": true, "data": "watching"}` then pushes events:
+
+```json
+{"event": "change", "data": {"op": "insert", "collection": "users", "doc": {...}, "seq": 43}}
+{"event": "change", "data": {"op": "update", "collection": "users", "doc": {...}, "seq": 44}}
+{"event": "change", "data": {"op": "delete", "collection": "users", "id": "abc123", "seq": 45}}
+```
+
+If the client falls behind, an overflow notification is sent:
+
+```json
+{"event": "overflow", "data": {"dropped": 12}}
+```
+
+Send `{"cmd": "unwatch"}` to stop receiving events and return to normal request mode.
+
+> **Note:** Watch requires Admin role when authentication is enabled. Not available over TLS connections in standalone mode.
 
 ## Performance
 
