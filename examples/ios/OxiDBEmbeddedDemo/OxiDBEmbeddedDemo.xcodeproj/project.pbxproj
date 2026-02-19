@@ -33,7 +33,7 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		4A9B1C2D3E4F5A6B7C8D0A02 /* root */ = {
+		4A9B1C2D3E4F5A6B7C8D0A02 = {
 			isa = PBXGroup;
 			children = (
 				4A9B1C2D3E4F5A6B7C8D0A03 /* OxiDBEmbeddedDemo */,
@@ -99,7 +99,7 @@
 				en,
 				Base,
 			);
-			mainGroup = 4A9B1C2D3E4F5A6B7C8D0A02 /* root */;
+			mainGroup = 4A9B1C2D3E4F5A6B7C8D0A02;
 			productRefGroup = 4A9B1C2D3E4F5A6B7C8D0A04 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -188,6 +188,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6HX53F48JT;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../../../oxidb-embedded-ffi/include";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -218,6 +219,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 6HX53F48JT;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/../../../oxidb-embedded-ffi/include";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -263,7 +265,6 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
-
 	};
 	rootObject = 4A9B1C2D3E4F5A6B7C8D0A01 /* Project object */;
 }
