@@ -485,4 +485,197 @@ mod tests {
         assert!(matches_doc(&q, &doc2));
         assert!(!matches_doc(&q, &doc3));
     }
+
+    #[test]
+    fn empty_query_matches_all() {
+        let q = parse_query(&json!({})).unwrap();
+        let doc = Document::new(1, json!({"anything": true})).unwrap();
+        assert!(matches_doc(&q, &doc));
+    }
+
+    #[test]
+    fn ne_operator() {
+        let q = parse_query(&json!({"status": {"$ne": "deleted"}})).unwrap();
+        let doc_ok = Document::new(1, json!({"status": "active"})).unwrap();
+        let doc_bad = Document::new(2, json!({"status": "deleted"})).unwrap();
+        assert!(matches_doc(&q, &doc_ok));
+        assert!(!matches_doc(&q, &doc_bad));
+    }
+
+    #[test]
+    fn in_operator() {
+        let q = parse_query(&json!({"color": {"$in": ["red", "blue"]}})).unwrap();
+        let doc_red = Document::new(1, json!({"color": "red"})).unwrap();
+        let doc_green = Document::new(2, json!({"color": "green"})).unwrap();
+        let doc_blue = Document::new(3, json!({"color": "blue"})).unwrap();
+        assert!(matches_doc(&q, &doc_red));
+        assert!(!matches_doc(&q, &doc_green));
+        assert!(matches_doc(&q, &doc_blue));
+    }
+
+    #[test]
+    fn exists_operator() {
+        let q = parse_query(&json!({"email": {"$exists": true}})).unwrap();
+        let doc_has = Document::new(1, json!({"email": "a@b.c"})).unwrap();
+        let doc_no = Document::new(2, json!({"name": "Bob"})).unwrap();
+        assert!(matches_doc(&q, &doc_has));
+        assert!(!matches_doc(&q, &doc_no));
+    }
+
+    #[test]
+    fn exists_false() {
+        let q = parse_query(&json!({"deleted_at": {"$exists": false}})).unwrap();
+        let doc_no = Document::new(1, json!({"name": "active"})).unwrap();
+        let doc_has = Document::new(2, json!({"name": "old", "deleted_at": "2024-01-01"})).unwrap();
+        assert!(matches_doc(&q, &doc_no));
+        assert!(!matches_doc(&q, &doc_has));
+    }
+
+    #[test]
+    fn nested_and_or() {
+        let q = parse_query(&json!({
+            "$and": [
+                {"$or": [{"a": 1}, {"a": 2}]},
+                {"b": {"$gt": 10}}
+            ]
+        }))
+        .unwrap();
+
+        let doc1 = Document::new(1, json!({"a": 1, "b": 20})).unwrap();
+        let doc2 = Document::new(2, json!({"a": 3, "b": 20})).unwrap();
+        let doc3 = Document::new(3, json!({"a": 1, "b": 5})).unwrap();
+        assert!(matches_doc(&q, &doc1));
+        assert!(!matches_doc(&q, &doc2));
+        assert!(!matches_doc(&q, &doc3));
+    }
+
+    #[test]
+    fn dot_notation_in_query() {
+        let q = parse_query(&json!({"address.city": "NYC"})).unwrap();
+        let doc = Document::new(1, json!({"address": {"city": "NYC"}})).unwrap();
+        let doc2 = Document::new(2, json!({"address": {"city": "LA"}})).unwrap();
+        assert!(matches_doc(&q, &doc));
+        assert!(!matches_doc(&q, &doc2));
+    }
+
+    #[test]
+    fn gt_and_lt_operators() {
+        let q = parse_query(&json!({"score": {"$gt": 50, "$lt": 100}})).unwrap();
+        let doc_in = Document::new(1, json!({"score": 75})).unwrap();
+        let doc_low = Document::new(2, json!({"score": 30})).unwrap();
+        let doc_high = Document::new(3, json!({"score": 100})).unwrap();
+        let doc_edge = Document::new(4, json!({"score": 50})).unwrap();
+        assert!(matches_doc(&q, &doc_in));
+        assert!(!matches_doc(&q, &doc_low));
+        assert!(!matches_doc(&q, &doc_high));
+        assert!(!matches_doc(&q, &doc_edge));
+    }
+
+    #[test]
+    fn lte_operator() {
+        let q = parse_query(&json!({"age": {"$lte": 18}})).unwrap();
+        let doc_under = Document::new(1, json!({"age": 15})).unwrap();
+        let doc_exact = Document::new(2, json!({"age": 18})).unwrap();
+        let doc_over = Document::new(3, json!({"age": 19})).unwrap();
+        assert!(matches_doc(&q, &doc_under));
+        assert!(matches_doc(&q, &doc_exact));
+        assert!(!matches_doc(&q, &doc_over));
+    }
+
+    #[test]
+    fn unknown_operator_errors() {
+        let result = parse_query(&json!({"x": {"$regex": "abc"}}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_query_not_object() {
+        let result = parse_query(&json!("string"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn matches_value_function() {
+        let q = parse_query(&json!({"name": "Alice"})).unwrap();
+        let data = json!({"name": "Alice", "age": 30});
+        assert!(matches_value(&q, &data));
+    }
+
+    #[test]
+    fn execute_indexed_eq() {
+        let mut idx = FieldIndex::new("status".into());
+        idx.insert_value(1, &json!({"status": "active"}));
+        idx.insert_value(2, &json!({"status": "inactive"}));
+        idx.insert_value(3, &json!({"status": "active"}));
+
+        let mut field_indexes = std::collections::HashMap::new();
+        field_indexes.insert("status".into(), idx);
+
+        let q = parse_query(&json!({"status": "active"})).unwrap();
+        let result = execute_indexed(&q, &field_indexes, &[]);
+        assert_eq!(result, Some(BTreeSet::from([1, 3])));
+    }
+
+    #[test]
+    fn execute_indexed_returns_none_for_unindexed() {
+        let field_indexes = std::collections::HashMap::new();
+        let q = parse_query(&json!({"unindexed": "val"})).unwrap();
+        let result = execute_indexed(&q, &field_indexes, &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn count_indexed_eq() {
+        let mut idx = FieldIndex::new("x".into());
+        idx.insert_value(1, &json!({"x": 10}));
+        idx.insert_value(2, &json!({"x": 10}));
+        idx.insert_value(3, &json!({"x": 20}));
+
+        let mut field_indexes = std::collections::HashMap::new();
+        field_indexes.insert("x".into(), idx);
+
+        let q = parse_query(&json!({"x": 10})).unwrap();
+        assert_eq!(count_indexed(&q, &field_indexes), Some(2));
+    }
+
+    #[test]
+    fn is_fully_indexed_check() {
+        let mut idx = FieldIndex::new("a".into());
+        idx.insert_value(1, &json!({"a": 1}));
+
+        let mut field_indexes = std::collections::HashMap::new();
+        field_indexes.insert("a".into(), idx);
+
+        let q1 = parse_query(&json!({"a": 1})).unwrap();
+        assert!(is_fully_indexed(&q1, &field_indexes));
+
+        let q2 = parse_query(&json!({"b": 1})).unwrap();
+        assert!(!is_fully_indexed(&q2, &field_indexes));
+
+        let q3 = parse_query(&json!({"a": {"$exists": true}})).unwrap();
+        assert!(!is_fully_indexed(&q3, &field_indexes));
+    }
+
+    #[test]
+    fn parse_find_options_sort() {
+        let req = json!({"sort": {"name": 1, "age": -1}, "skip": 5, "limit": 10});
+        let opts = parse_find_options(&req).unwrap();
+        assert!(opts.sort.is_some());
+        assert_eq!(opts.skip, Some(5));
+        assert_eq!(opts.limit, Some(10));
+    }
+
+    #[test]
+    fn parse_find_options_invalid_sort_direction() {
+        let req = json!({"sort": {"name": 2}});
+        let result = parse_find_options(&req);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn missing_field_no_match() {
+        let q = parse_query(&json!({"missing": "value"})).unwrap();
+        let doc = Document::new(1, json!({"other": "field"})).unwrap();
+        assert!(!matches_doc(&q, &doc));
+    }
 }

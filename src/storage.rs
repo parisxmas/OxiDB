@@ -194,3 +194,198 @@ impl Storage {
         Ok(results)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_storage(dir: &TempDir) -> Storage {
+        Storage::open(&dir.path().join("test.dat")).unwrap()
+    }
+
+    #[test]
+    fn append_and_read_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let storage = test_storage(&dir);
+        let data = b"hello world";
+        let loc = storage.append(data).unwrap();
+        let read_back = storage.read(loc).unwrap();
+        assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn append_multiple_records() {
+        let dir = TempDir::new().unwrap();
+        let storage = test_storage(&dir);
+        let loc1 = storage.append(b"first").unwrap();
+        let loc2 = storage.append(b"second").unwrap();
+        let loc3 = storage.append(b"third").unwrap();
+
+        assert_eq!(storage.read(loc1).unwrap(), b"first");
+        assert_eq!(storage.read(loc2).unwrap(), b"second");
+        assert_eq!(storage.read(loc3).unwrap(), b"third");
+        assert_ne!(loc1.offset, loc2.offset);
+        assert_ne!(loc2.offset, loc3.offset);
+    }
+
+    #[test]
+    fn soft_delete_hides_record() {
+        let dir = TempDir::new().unwrap();
+        let storage = test_storage(&dir);
+        let loc1 = storage.append(b"keep").unwrap();
+        let loc2 = storage.append(b"delete_me").unwrap();
+        let loc3 = storage.append(b"also_keep").unwrap();
+
+        storage.mark_deleted(loc2).unwrap();
+
+        let active = storage.iter_active().unwrap();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].1, b"keep");
+        assert_eq!(active[1].1, b"also_keep");
+
+        // Deleted record's bytes are still readable by direct offset
+        let raw = storage.read(loc2).unwrap();
+        assert_eq!(raw, b"delete_me");
+
+        // But loc1 and loc3 are still fine
+        assert_eq!(storage.read(loc1).unwrap(), b"keep");
+        assert_eq!(storage.read(loc3).unwrap(), b"also_keep");
+    }
+
+    #[test]
+    fn file_size_grows_correctly() {
+        let dir = TempDir::new().unwrap();
+        let storage = test_storage(&dir);
+        assert_eq!(storage.file_size(), 0);
+
+        let data = b"test";
+        storage.append(data).unwrap();
+        // header (1 status + 4 length) + payload
+        assert_eq!(storage.file_size(), 5 + data.len() as u64);
+    }
+
+    #[test]
+    fn iter_active_on_empty_file() {
+        let dir = TempDir::new().unwrap();
+        let storage = test_storage(&dir);
+        let active = storage.iter_active().unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn append_no_sync_and_manual_sync() {
+        let dir = TempDir::new().unwrap();
+        let storage = test_storage(&dir);
+
+        let loc1 = storage.append_no_sync(b"batch1").unwrap();
+        let loc2 = storage.append_no_sync(b"batch2").unwrap();
+        storage.sync().unwrap();
+
+        assert_eq!(storage.read(loc1).unwrap(), b"batch1");
+        assert_eq!(storage.read(loc2).unwrap(), b"batch2");
+    }
+
+    #[test]
+    fn mark_deleted_no_sync() {
+        let dir = TempDir::new().unwrap();
+        let storage = test_storage(&dir);
+
+        let loc = storage.append(b"will_delete").unwrap();
+        storage.mark_deleted_no_sync(loc).unwrap();
+        storage.sync().unwrap();
+
+        let active = storage.iter_active().unwrap();
+        assert!(active.is_empty());
+    }
+
+    #[test]
+    fn encrypted_storage_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+        let enc_key = EncryptionKey::load_from_file(&key_path).unwrap();
+
+        let storage = Storage::open_with_encryption(
+            &dir.path().join("encrypted.dat"),
+            Some(enc_key),
+        )
+        .unwrap();
+
+        let data = b"secret document payload";
+        let loc = storage.append(data).unwrap();
+        let read_back = storage.read(loc).unwrap();
+        assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn encrypted_data_not_plaintext() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+        let enc_key = EncryptionKey::load_from_file(&key_path).unwrap();
+
+        let data_path = dir.path().join("encrypted.dat");
+        let storage = Storage::open_with_encryption(&data_path, Some(enc_key)).unwrap();
+
+        let data = b"secret document payload";
+        storage.append(data).unwrap();
+
+        // Read raw file and verify plaintext is not visible
+        let raw = std::fs::read(&data_path).unwrap();
+        assert!(!raw.windows(data.len()).any(|w| w == data));
+    }
+
+    #[test]
+    fn encrypted_iter_active() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("test.key");
+        std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
+        let enc_key = EncryptionKey::load_from_file(&key_path).unwrap();
+
+        let storage = Storage::open_with_encryption(
+            &dir.path().join("encrypted.dat"),
+            Some(enc_key),
+        )
+        .unwrap();
+
+        storage.append(b"doc_a").unwrap();
+        let loc_b = storage.append(b"doc_b").unwrap();
+        storage.append(b"doc_c").unwrap();
+
+        storage.mark_deleted(loc_b).unwrap();
+
+        let active = storage.iter_active().unwrap();
+        assert_eq!(active.len(), 2);
+        assert_eq!(active[0].1, b"doc_a");
+        assert_eq!(active[1].1, b"doc_c");
+    }
+
+    #[test]
+    fn reopen_preserves_data() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("persist.dat");
+
+        let loc;
+        {
+            let storage = Storage::open(&path).unwrap();
+            loc = storage.append(b"persistent").unwrap();
+        }
+
+        // Reopen
+        let storage = Storage::open(&path).unwrap();
+        let data = storage.read(loc).unwrap();
+        assert_eq!(data, b"persistent");
+        let active = storage.iter_active().unwrap();
+        assert_eq!(active.len(), 1);
+    }
+
+    #[test]
+    fn large_payload() {
+        let dir = TempDir::new().unwrap();
+        let storage = test_storage(&dir);
+        let data = vec![0xABu8; 100_000];
+        let loc = storage.append(&data).unwrap();
+        assert_eq!(storage.read(loc).unwrap(), data);
+    }
+}

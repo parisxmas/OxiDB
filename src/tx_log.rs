@@ -104,3 +104,106 @@ impl TxCommitLog {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn empty_log_has_no_committed() {
+        let dir = TempDir::new().unwrap();
+        let log = TxCommitLog::open(dir.path()).unwrap();
+        let committed = log.read_committed().unwrap();
+        assert!(committed.is_empty());
+    }
+
+    #[test]
+    fn mark_and_read_committed() {
+        let dir = TempDir::new().unwrap();
+        let log = TxCommitLog::open(dir.path()).unwrap();
+
+        log.mark_committed(1).unwrap();
+        log.mark_committed(2).unwrap();
+        log.mark_committed(3).unwrap();
+
+        let committed = log.read_committed().unwrap();
+        assert_eq!(committed.len(), 3);
+        assert!(committed.contains(&1));
+        assert!(committed.contains(&2));
+        assert!(committed.contains(&3));
+    }
+
+    #[test]
+    fn remove_committed_entry() {
+        let dir = TempDir::new().unwrap();
+        let log = TxCommitLog::open(dir.path()).unwrap();
+
+        log.mark_committed(10).unwrap();
+        log.mark_committed(20).unwrap();
+        log.mark_committed(30).unwrap();
+
+        log.remove_committed(20).unwrap();
+
+        let committed = log.read_committed().unwrap();
+        assert_eq!(committed.len(), 2);
+        assert!(committed.contains(&10));
+        assert!(!committed.contains(&20));
+        assert!(committed.contains(&30));
+    }
+
+    #[test]
+    fn clear_empties_log() {
+        let dir = TempDir::new().unwrap();
+        let log = TxCommitLog::open(dir.path()).unwrap();
+
+        log.mark_committed(1).unwrap();
+        log.mark_committed(2).unwrap();
+        assert_eq!(log.read_committed().unwrap().len(), 2);
+
+        log.clear().unwrap();
+        assert!(log.read_committed().unwrap().is_empty());
+    }
+
+    #[test]
+    fn persistence_across_reopen() {
+        let dir = TempDir::new().unwrap();
+
+        {
+            let log = TxCommitLog::open(dir.path()).unwrap();
+            log.mark_committed(42).unwrap();
+            log.mark_committed(99).unwrap();
+        }
+
+        let log = TxCommitLog::open(dir.path()).unwrap();
+        let committed = log.read_committed().unwrap();
+        assert!(committed.contains(&42));
+        assert!(committed.contains(&99));
+    }
+
+    #[test]
+    fn remove_nonexistent_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let log = TxCommitLog::open(dir.path()).unwrap();
+
+        log.mark_committed(1).unwrap();
+        log.remove_committed(999).unwrap(); // Not in log
+
+        let committed = log.read_committed().unwrap();
+        assert_eq!(committed.len(), 1);
+        assert!(committed.contains(&1));
+    }
+
+    #[test]
+    fn duplicate_mark_committed() {
+        let dir = TempDir::new().unwrap();
+        let log = TxCommitLog::open(dir.path()).unwrap();
+
+        log.mark_committed(5).unwrap();
+        log.mark_committed(5).unwrap();
+
+        // HashSet deduplicates, so read_committed returns 1 entry
+        let committed = log.read_committed().unwrap();
+        assert!(committed.contains(&5));
+    }
+}

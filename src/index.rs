@@ -393,4 +393,234 @@ mod tests {
         let result = idx.find_prefix(&[IndexValue::String("active".into())]);
         assert_eq!(result, BTreeSet::from([1, 2]));
     }
+
+    #[test]
+    fn field_index_ne() {
+        let mut idx = FieldIndex::new("status".into());
+        idx.insert(&make_doc(1, json!({"status": "active"})));
+        idx.insert(&make_doc(2, json!({"status": "inactive"})));
+        idx.insert(&make_doc(3, json!({"status": "active"})));
+
+        let result = idx.find_ne(&IndexValue::String("active".into()));
+        assert_eq!(result, BTreeSet::from([2]));
+    }
+
+    #[test]
+    fn field_index_range_numeric() {
+        let mut idx = FieldIndex::new("score".into());
+        idx.insert(&make_doc(1, json!({"score": 10})));
+        idx.insert(&make_doc(2, json!({"score": 50})));
+        idx.insert(&make_doc(3, json!({"score": 90})));
+
+        let low = IndexValue::Integer(20);
+        let high = IndexValue::Integer(80);
+        let result = idx.find_range(Bound::Included(&low), Bound::Excluded(&high));
+        assert_eq!(result, BTreeSet::from([2]));
+    }
+
+    #[test]
+    fn field_index_in() {
+        let mut idx = FieldIndex::new("tag".into());
+        idx.insert(&make_doc(1, json!({"tag": "a"})));
+        idx.insert(&make_doc(2, json!({"tag": "b"})));
+        idx.insert(&make_doc(3, json!({"tag": "c"})));
+        idx.insert(&make_doc(4, json!({"tag": "a"})));
+
+        let result = idx.find_in(&[
+            IndexValue::String("a".into()),
+            IndexValue::String("c".into()),
+        ]);
+        assert_eq!(result, BTreeSet::from([1, 3, 4]));
+    }
+
+    #[test]
+    fn field_index_remove() {
+        let mut idx = FieldIndex::new("x".into());
+        let doc = make_doc(1, json!({"x": 42}));
+        idx.insert(&doc);
+        assert_eq!(idx.find_eq(&IndexValue::Integer(42)), BTreeSet::from([1]));
+
+        idx.remove(&doc);
+        assert!(idx.find_eq(&IndexValue::Integer(42)).is_empty());
+    }
+
+    #[test]
+    fn field_index_all_ids() {
+        let mut idx = FieldIndex::new("x".into());
+        idx.insert(&make_doc(1, json!({"x": "a"})));
+        idx.insert(&make_doc(2, json!({"x": "b"})));
+        idx.insert(&make_doc(3, json!({"y": "no_x"}))); // missing field, not indexed
+
+        assert_eq!(idx.all_ids(), BTreeSet::from([1, 2]));
+    }
+
+    #[test]
+    fn field_index_count_eq() {
+        let mut idx = FieldIndex::new("x".into());
+        idx.insert(&make_doc(1, json!({"x": 1})));
+        idx.insert(&make_doc(2, json!({"x": 1})));
+        idx.insert(&make_doc(3, json!({"x": 2})));
+
+        assert_eq!(idx.count_eq(&IndexValue::Integer(1)), 2);
+        assert_eq!(idx.count_eq(&IndexValue::Integer(2)), 1);
+        assert_eq!(idx.count_eq(&IndexValue::Integer(99)), 0);
+    }
+
+    #[test]
+    fn field_index_count_range() {
+        let mut idx = FieldIndex::new("x".into());
+        idx.insert(&make_doc(1, json!({"x": 10})));
+        idx.insert(&make_doc(2, json!({"x": 20})));
+        idx.insert(&make_doc(3, json!({"x": 30})));
+
+        let lo = IndexValue::Integer(15);
+        let hi = IndexValue::Integer(25);
+        assert_eq!(idx.count_range(Bound::Included(&lo), Bound::Included(&hi)), 1);
+    }
+
+    #[test]
+    fn field_index_count_all() {
+        let mut idx = FieldIndex::new("x".into());
+        idx.insert(&make_doc(1, json!({"x": 1})));
+        idx.insert(&make_doc(2, json!({"x": 2})));
+        assert_eq!(idx.count_all(), 2);
+    }
+
+    #[test]
+    fn field_index_count_in() {
+        let mut idx = FieldIndex::new("x".into());
+        idx.insert(&make_doc(1, json!({"x": "a"})));
+        idx.insert(&make_doc(2, json!({"x": "b"})));
+        idx.insert(&make_doc(3, json!({"x": "c"})));
+
+        assert_eq!(
+            idx.count_in(&[IndexValue::String("a".into()), IndexValue::String("c".into())]),
+            2
+        );
+    }
+
+    #[test]
+    fn unique_index_check() {
+        let mut idx = FieldIndex::new_unique("email".into());
+        assert!(idx.unique);
+
+        idx.insert(&make_doc(1, json!({"email": "a@b.c"})));
+        assert!(idx.check_unique(&IndexValue::String("a@b.c".into()), None));
+        assert!(!idx.check_unique(&IndexValue::String("a@b.c".into()), Some(1))); // exclude self
+        assert!(!idx.check_unique(&IndexValue::String("new@b.c".into()), None));
+    }
+
+    #[test]
+    fn field_index_clear() {
+        let mut idx = FieldIndex::new("x".into());
+        idx.insert(&make_doc(1, json!({"x": 1})));
+        assert_eq!(idx.count_all(), 1);
+
+        idx.clear();
+        assert_eq!(idx.count_all(), 0);
+    }
+
+    #[test]
+    fn field_index_insert_value() {
+        let mut idx = FieldIndex::new("name".into());
+        idx.insert_value(1, &json!({"name": "Alice"}));
+        idx.insert_value(2, &json!({"name": "Bob"}));
+
+        assert_eq!(idx.find_eq(&IndexValue::String("Alice".into())), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn field_index_remove_value() {
+        let mut idx = FieldIndex::new("name".into());
+        idx.insert_value(1, &json!({"name": "Alice"}));
+        idx.remove_value(1, &json!({"name": "Alice"}));
+        assert!(idx.find_eq(&IndexValue::String("Alice".into())).is_empty());
+    }
+
+    #[test]
+    fn field_index_iter_asc_desc() {
+        let mut idx = FieldIndex::new("x".into());
+        idx.insert(&make_doc(1, json!({"x": 3})));
+        idx.insert(&make_doc(2, json!({"x": 1})));
+        idx.insert(&make_doc(3, json!({"x": 2})));
+
+        let asc: Vec<_> = idx.iter_asc().map(|(v, _)| v.clone()).collect();
+        assert_eq!(asc, vec![IndexValue::Integer(1), IndexValue::Integer(2), IndexValue::Integer(3)]);
+
+        let desc: Vec<_> = idx.iter_desc().map(|(v, _)| v.clone()).collect();
+        assert_eq!(desc, vec![IndexValue::Integer(3), IndexValue::Integer(2), IndexValue::Integer(1)]);
+    }
+
+    #[test]
+    fn composite_index_exact() {
+        let mut idx = CompositeIndex::new(vec!["a".into(), "b".into()]);
+        idx.insert(&make_doc(1, json!({"a": "x", "b": 1})));
+        idx.insert(&make_doc(2, json!({"a": "x", "b": 2})));
+        idx.insert(&make_doc(3, json!({"a": "y", "b": 1})));
+
+        let key = CompositeKey(vec![IndexValue::String("x".into()), IndexValue::Integer(1)]);
+        assert_eq!(idx.find_exact(&key), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn composite_index_prefix_range() {
+        let mut idx = CompositeIndex::new(vec!["status".into(), "score".into()]);
+        idx.insert(&make_doc(1, json!({"status": "active", "score": 10})));
+        idx.insert(&make_doc(2, json!({"status": "active", "score": 50})));
+        idx.insert(&make_doc(3, json!({"status": "active", "score": 90})));
+        idx.insert(&make_doc(4, json!({"status": "closed", "score": 50})));
+
+        let prefix = &[IndexValue::String("active".into())];
+        let lo = IndexValue::Integer(20);
+        let hi = IndexValue::Integer(80);
+        let result = idx.find_prefix_range(prefix, Bound::Included(&lo), Bound::Included(&hi));
+        assert_eq!(result, BTreeSet::from([2]));
+    }
+
+    #[test]
+    fn composite_index_name() {
+        let idx = CompositeIndex::new(vec!["a".into(), "b".into(), "c".into()]);
+        assert_eq!(idx.name(), "a_b_c");
+    }
+
+    #[test]
+    fn composite_index_remove() {
+        let mut idx = CompositeIndex::new(vec!["a".into(), "b".into()]);
+        let doc = make_doc(1, json!({"a": 1, "b": 2}));
+        idx.insert(&doc);
+        let key = CompositeKey(vec![IndexValue::Integer(1), IndexValue::Integer(2)]);
+        assert_eq!(idx.find_exact(&key), BTreeSet::from([1]));
+
+        idx.remove(&doc);
+        assert!(idx.find_exact(&key).is_empty());
+    }
+
+    #[test]
+    fn composite_index_missing_field_uses_null() {
+        let mut idx = CompositeIndex::new(vec!["a".into(), "b".into()]);
+        idx.insert(&make_doc(1, json!({"a": 1}))); // b is missing → Null
+
+        let key = CompositeKey(vec![IndexValue::Integer(1), IndexValue::Null]);
+        assert_eq!(idx.find_exact(&key), BTreeSet::from([1]));
+    }
+
+    #[test]
+    fn composite_insert_remove_value() {
+        let mut idx = CompositeIndex::new(vec!["x".into(), "y".into()]);
+        idx.insert_value(1, &json!({"x": "a", "y": 1}));
+        let key = CompositeKey(vec![IndexValue::String("a".into()), IndexValue::Integer(1)]);
+        assert_eq!(idx.find_exact(&key), BTreeSet::from([1]));
+
+        idx.remove_value(1, &json!({"x": "a", "y": 1}));
+        assert!(idx.find_exact(&key).is_empty());
+    }
+
+    #[test]
+    fn dot_notation_in_index() {
+        let mut idx = FieldIndex::new("address.city".into());
+        idx.insert_value(1, &json!({"address": {"city": "NYC"}}));
+        idx.insert_value(2, &json!({"address": {"city": "LA"}}));
+
+        assert_eq!(idx.find_eq(&IndexValue::String("NYC".into())), BTreeSet::from([1]));
+    }
 }
