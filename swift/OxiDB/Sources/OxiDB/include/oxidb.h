@@ -27,15 +27,29 @@ char* oxidb_find(OxiDbConn* conn, const char* collection, const char* query_json
 char* oxidb_find_one(OxiDbConn* conn, const char* collection, const char* query_json);
 char* oxidb_update(OxiDbConn* conn, const char* collection, const char* query_json,
                    const char* update_json);
+char* oxidb_update_one(OxiDbConn* conn, const char* collection, const char* query_json,
+                       const char* update_json);
 char* oxidb_delete(OxiDbConn* conn, const char* collection, const char* query_json);
+char* oxidb_delete_one(OxiDbConn* conn, const char* collection, const char* query_json);
 char* oxidb_count(OxiDbConn* conn, const char* collection);
 
 char* oxidb_create_index(OxiDbConn* conn, const char* collection, const char* field);
+char* oxidb_create_unique_index(OxiDbConn* conn, const char* collection, const char* field);
 char* oxidb_create_composite_index(OxiDbConn* conn, const char* collection,
                                    const char* fields_json);
+char* oxidb_create_text_index(OxiDbConn* conn, const char* collection,
+                              const char* fields_json);
+char* oxidb_list_indexes(OxiDbConn* conn, const char* collection);
+char* oxidb_drop_index(OxiDbConn* conn, const char* collection, const char* index_name);
 
+/* Collection-level text search */
+char* oxidb_text_search(OxiDbConn* conn, const char* collection, const char* query,
+                        int32_t limit);
+
+char* oxidb_create_collection(OxiDbConn* conn, const char* collection);
 char* oxidb_list_collections(OxiDbConn* conn);
 char* oxidb_drop_collection(OxiDbConn* conn, const char* collection);
+char* oxidb_compact(OxiDbConn* conn, const char* collection);
 
 char* oxidb_aggregate(OxiDbConn* conn, const char* collection, const char* pipeline_json);
 

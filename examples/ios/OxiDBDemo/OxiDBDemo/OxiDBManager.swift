@@ -113,6 +113,30 @@ final class OxiDBManager: ObservableObject {
         }
     }
 
+    func updateOneDemo() {
+        guard let client else { return }
+        do {
+            let result = try client.updateOne(
+                collection: "users",
+                query: ["name": "Alice"],
+                update: ["$set": ["city": "Boston"]]
+            )
+            log("updateOne: \(result)")
+        } catch {
+            log("updateOne failed: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    func deleteOneDemo() {
+        guard let client else { return }
+        do {
+            let result = try client.deleteOne(collection: "users", query: ["name": "Bob"])
+            log("deleteOne: \(result)")
+        } catch {
+            log("deleteOne failed: \(error.localizedDescription)", isError: true)
+        }
+    }
+
     func countDocuments() {
         guard let client else { return }
         do {
@@ -120,6 +144,26 @@ final class OxiDBManager: ObservableObject {
             log("Count: \(result)")
         } catch {
             log("Count failed: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    func listIndexes() {
+        guard let client else { return }
+        do {
+            let result = try client.listIndexes(collection: "users")
+            log("Indexes: \(result)")
+        } catch {
+            log("List indexes failed: \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    func compactDemo() {
+        guard let client else { return }
+        do {
+            let result = try client.compact(collection: "users")
+            log("Compact: \(result)")
+        } catch {
+            log("Compact failed: \(error.localizedDescription)", isError: true)
         }
     }
 

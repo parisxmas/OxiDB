@@ -188,7 +188,7 @@ db.close()
 - **MongoDB-style queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$and`, `$or`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
 - **Aggregation pipeline** — 10 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`
-- **Indexes** — field, unique, and composite indexes with automatic backfill
+- **Indexes** — field, unique, composite, and full-text indexes with automatic backfill; list and drop support
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
 - **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
 - **Full-text search** — automatic text extraction from 10+ formats, TF-IDF ranked search
@@ -197,7 +197,7 @@ db.close()
 - **Security** — TLS transport, SCRAM-SHA-256 authentication, role-based access control, audit logging
 - **Compaction** — reclaim space from deleted documents
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block
-- **Tested** — 17 concurrency/crash/encryption tests with 100 simultaneous connections
+- **Tested** — 332 unit/integration tests covering storage, WAL, transactions, indexes, queries, handler, auth/RBAC, plus 17 concurrency/crash/encryption tests with 100 simultaneous connections
 
 ## Performance
 
@@ -723,11 +723,17 @@ Max message size is 16 MiB.
 | `find`                   | `collection`, `query`, `sort?`, `skip?`, `limit?`  |
 | `find_one`               | `collection`, `query`                              |
 | `update`                 | `collection`, `query`, `update`                    |
+| `update_one`             | `collection`, `query`, `update`                    |
 | `delete`                 | `collection`, `query`                              |
-| `count`                  | `collection`                                       |
+| `delete_one`             | `collection`, `query`                              |
+| `count`                  | `collection`, `query?`                             |
 | `create_index`           | `collection`, `field`                              |
 | `create_unique_index`    | `collection`, `field`                              |
 | `create_composite_index` | `collection`, `fields`                             |
+| `create_text_index`      | `collection`, `fields`                             |
+| `list_indexes`           | `collection`                                       |
+| `drop_index`             | `collection`, `index`                              |
+| `text_search`            | `collection`, `query`, `limit?`                    |
 | `create_collection`      | `collection`                                       |
 | `list_collections`       | —                                                  |
 | `drop_collection`        | `collection`                                       |
@@ -1394,11 +1400,17 @@ docs, _ = client.Find("users", map[string]any{}, &oxidb.FindOptions{
 })
 doc, _ := client.FindOne("users", map[string]any{"name": "Alice"})
 
-// Update
+// Update (all matching)
 client.Update("users", map[string]any{"name": "Alice"}, map[string]any{"$set": map[string]any{"age": 31}})
 
-// Delete
+// Update one (first match only)
+client.UpdateOne("users", map[string]any{"name": "Bob"}, map[string]any{"$set": map[string]any{"age": 26}})
+
+// Delete (all matching)
 client.Delete("users", map[string]any{"name": "Charlie"})
+
+// Delete one (first match only)
+client.DeleteOne("users", map[string]any{"name": "Bob"})
 
 // Count
 n, _ := client.Count("users", map[string]any{})
@@ -1414,6 +1426,14 @@ client.DropCollection("orders")
 client.CreateIndex("users", "name")
 client.CreateUniqueIndex("users", "email")
 client.CreateCompositeIndex("users", []string{"name", "age"})
+
+// Full-text search indexes
+client.CreateTextIndex("articles", []string{"title", "body"})
+results, _ := client.TextSearch("articles", "rust programming", 10)
+
+// Index management
+indexes, _ := client.ListIndexes("users")
+client.DropIndex("users", "name")
 ```
 
 ### Aggregation
@@ -1620,16 +1640,16 @@ Download prebuilt binaries from [GitHub Releases](https://github.com/parisxmas/O
 
 ```bash
 # Embedded FFI — macOS arm64
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-embedded-ffi-macos-arm64.tar.gz
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.8.0/oxidb-embedded-ffi-macos-arm64.tar.gz
 tar xzf oxidb-embedded-ffi-macos-arm64.tar.gz
 sudo cp liboxidb_embedded_ffi.dylib liboxidb_embedded_ffi.a /usr/local/lib/
 sudo cp oxidb_embedded.h /usr/local/include/
 
 # Embedded FFI — iOS device (arm64)
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-embedded-ffi-ios-arm64.tar.gz
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.8.0/oxidb-embedded-ffi-ios-arm64.tar.gz
 
 # Embedded FFI — iOS simulator (arm64, Apple Silicon)
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-embedded-ffi-ios-sim-arm64.tar.gz
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.8.0/oxidb-embedded-ffi-ios-sim-arm64.tar.gz
 ```
 
 Or build from source:
@@ -1653,7 +1673,7 @@ Xcode will automatically download the prebuilt native library (XCFramework). No 
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/parisxmas/OxiDB.git", from: "0.7.0")
+    .package(url: "https://github.com/parisxmas/OxiDB.git", from: "0.8.0")
 ]
 ```
 
@@ -1761,6 +1781,14 @@ import OxiDB
 let client = try OxiDBClient.connect(host: "127.0.0.1", port: 4444)
 try client.insert(collection: "users", document: ["name": "Alice", "age": 30])
 let users = try client.find(collection: "users", query: ["age": ["$gte": 25]])
+
+// All server operations available: updateOne, deleteOne, createUniqueIndex,
+// createTextIndex, textSearch, listIndexes, dropIndex, createCollection, compact
+try client.updateOne(collection: "users", query: ["name": "Alice"], update: ["$set": ["age": 31]])
+try client.deleteOne(collection: "users", query: ["name": "Alice"])
+try client.createTextIndex(collection: "articles", fields: ["title", "body"])
+let results = try client.textSearch(collection: "articles", query: "rust", limit: 10)
+try client.compact(collection: "users")
 client.disconnect()
 ```
 
