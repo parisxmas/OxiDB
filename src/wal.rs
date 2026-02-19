@@ -179,7 +179,7 @@ impl Wal {
                         continue;
                     }
                     // Read _version from the doc bytes
-                    if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&doc_bytes) {
+                    if let Ok(doc) = crate::codec::decode_doc(&doc_bytes) {
                         let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                         version_index.insert(doc_id, ver);
                     }
@@ -200,7 +200,7 @@ impl Wal {
                         }
                     }
                     // Update version_index from the new doc bytes
-                    if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&doc_bytes) {
+                    if let Ok(doc) = crate::codec::decode_doc(&doc_bytes) {
                         let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                         version_index.insert(doc_id, ver);
                     }

@@ -102,7 +102,7 @@ impl Collection {
 
         // Rebuild primary index, version index, and doc cache from existing data
         for (offset, bytes) in storage.iter_active()? {
-            let doc: Value = serde_json::from_slice(&bytes)?;
+            let doc: Value = crate::codec::decode_doc(&bytes)?;
             if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
                 let length = bytes.len() as u32;
                 primary_index.insert(id, DocLocation { offset, length });
@@ -150,7 +150,7 @@ impl Collection {
             return Ok(Arc::clone(val));
         }
         let bytes = self.storage.read(loc)?;
-        let data: Value = serde_json::from_slice(&bytes)?;
+        let data: Value = crate::codec::decode_doc(&bytes)?;
         Ok(Arc::new(data))
     }
 
@@ -358,7 +358,7 @@ impl Collection {
 
         self.next_id += 1;
 
-        let bytes = serde_json::to_vec(&data)?;
+        let bytes = crate::codec::encode_doc(&data)?;
 
         // WAL: log before mutating .dat (no fsync — storage.append will fsync)
         self.wal.log_no_sync(&WalEntry::insert(id, bytes.clone()))?;
@@ -428,7 +428,7 @@ impl Collection {
                 }
             }
 
-            let bytes = serde_json::to_vec(&data)?;
+            let bytes = crate::codec::encode_doc(&data)?;
             prepared.push((id, data, bytes));
         }
 
@@ -784,7 +784,7 @@ impl Collection {
 
             self.check_unique_constraints(&mutable_data, Some(*id))?;
 
-            let new_bytes = serde_json::to_vec(&mutable_data)?;
+            let new_bytes = crate::codec::encode_doc(&mutable_data)?;
             ops.push(UpdateOp {
                 id: *id,
                 old_loc: *old_loc,
@@ -986,12 +986,14 @@ impl Collection {
         let mut next_id: DocumentId = 1;
 
         for (_old_offset, bytes) in &active_records {
-            let doc: Value = serde_json::from_slice(bytes)?;
+            let doc: Value = crate::codec::decode_doc(bytes)?;
             let id = doc.get("_id").and_then(|v| v.as_u64()).ok_or_else(|| {
                 Error::InvalidQuery("document missing _id during compaction".into())
             })?;
 
-            let loc = new_storage.append_no_sync(bytes)?;
+            // Re-encode as JSONB (converts legacy JSON records on compact)
+            let new_bytes = crate::codec::encode_doc(&doc)?;
+            let loc = new_storage.append_no_sync(&new_bytes)?;
             new_primary_index.insert(id, loc);
             if id >= next_id {
                 next_id = id + 1;
@@ -1025,7 +1027,7 @@ impl Collection {
         }
         for (&id, &loc) in &self.primary_index.clone() {
             let bytes = self.storage.read(loc)?;
-            let data: Value = serde_json::from_slice(&bytes)?;
+            let data: Value = crate::codec::decode_doc(&bytes)?;
             let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             self.version_index.insert(id, ver);
             let cached = Arc::new(data);
@@ -1087,7 +1089,7 @@ impl Collection {
 
         self.next_id += 1;
 
-        let bytes = serde_json::to_vec(&data)?;
+        let bytes = crate::codec::encode_doc(&data)?;
 
         Ok(PreparedMutation {
             wal_entry: WalEntry::Insert { doc_id: id, doc_bytes: bytes.clone(), tx_id },
@@ -1143,7 +1145,7 @@ impl Collection {
 
             self.check_unique_constraints(&data, Some(id))?;
 
-            let new_bytes = serde_json::to_vec(&data)?;
+            let new_bytes = crate::codec::encode_doc(&data)?;
             mutations.push(PreparedMutation {
                 wal_entry: WalEntry::Update { doc_id: id, doc_bytes: new_bytes.clone(), tx_id },
                 doc_id: id,

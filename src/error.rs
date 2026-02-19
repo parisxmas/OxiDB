@@ -60,6 +60,9 @@ pub enum Error {
 
     #[error("decryption error: {0}")]
     Decryption(String),
+
+    #[error("codec error: {0}")]
+    Codec(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

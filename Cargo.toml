@@ -23,6 +23,7 @@ rand = "0.9"
 zip = "2"
 pdf-extract = "0.7"
 leptess = { version = "0.14", optional = true }
+jsonb = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
