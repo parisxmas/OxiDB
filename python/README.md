@@ -60,8 +60,10 @@ with OxiDbClient() as client:
 | `insert_many(collection, docs)` | Insert multiple documents |
 | `find(collection, query, *, sort, skip, limit)` | Find matching documents |
 | `find_one(collection, query)` | Find first matching document or `None` |
-| `update(collection, query, update)` | Update matching documents |
-| `delete(collection, query)` | Delete matching documents |
+| `update(collection, query, update)` | Update all matching documents |
+| `update_one(collection, query, update)` | Update first matching document |
+| `delete(collection, query)` | Delete all matching documents |
+| `delete_one(collection, query)` | Delete first matching document |
 | `count(collection, query)` | Count matching documents |
 
 ```python
@@ -97,6 +99,22 @@ db.drop_collection("orders")
 db.create_index("users", "name")
 db.create_unique_index("users", "email")
 db.create_composite_index("users", ["name", "age"])
+db.create_text_index("articles", ["title", "body"])
+
+indexes = db.list_indexes("users")
+db.drop_index("users", "name")
+```
+
+### Document Full-Text Search
+
+```python
+# Create a text index on fields you want to search
+db.create_text_index("articles", ["title", "body"])
+
+# Search returns matching documents with _score field, sorted by relevance
+results = db.text_search("articles", "rust programming", limit=10)
+for doc in results:
+    print(f"{doc['title']} (score: {doc['_score']})")
 ```
 
 ### Aggregation

@@ -195,6 +195,27 @@ class OxiDbClient:
         """Create a composite index on multiple fields."""
         return self._checked({"cmd": "create_composite_index", "collection": collection, "fields": fields})
 
+    def create_text_index(self, collection: str, fields: list):
+        """Create a full-text search index on the specified string fields."""
+        return self._checked({"cmd": "create_text_index", "collection": collection, "fields": fields})
+
+    def list_indexes(self, collection: str) -> list:
+        """List all indexes on a collection."""
+        return self._checked({"cmd": "list_indexes", "collection": collection})
+
+    def drop_index(self, collection: str, index_name: str):
+        """Drop an index by name from a collection."""
+        return self._checked({"cmd": "drop_index", "collection": collection, "index": index_name})
+
+    # ------------------------------------------------------------------
+    # Document full-text search
+    # ------------------------------------------------------------------
+
+    def text_search(self, collection: str, query: str, limit: int = 10) -> list:
+        """Full-text search on collection documents. Returns matching documents with _score field.
+        Requires a text index created with create_text_index()."""
+        return self._checked({"cmd": "text_search", "collection": collection, "query": query, "limit": limit})
+
     # ------------------------------------------------------------------
     # Aggregation
     # ------------------------------------------------------------------
