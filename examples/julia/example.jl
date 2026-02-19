@@ -36,7 +36,7 @@ function main()
     section("2. Collection Management")
 
     # Clean up from previous runs
-    for col in ["users", "orders", "ledger", "products", "events"]
+    for col in ["users", "orders", "ledger", "products", "events", "articles"]
         try; drop_collection(client, col); catch; end
     end
     for bucket in ["files", "docs"]
@@ -113,7 +113,7 @@ function main()
     println("  ", doc)
 
     # ------------------------------------------------------------------
-    # 5. Update
+    # 5. Update & UpdateOne
     # ------------------------------------------------------------------
     section("5. Update Documents")
 
@@ -173,6 +173,12 @@ function main()
     doc = find_one(client, "users", Dict("name" => "Alice"))
     println("After \$max(age, 32): age=", doc["age"])
 
+    # update_one — only modifies the first match
+    result = update_one(client, "users", Dict("name" => "Bob"), Dict("\$set" => Dict("verified" => true)))
+    println("UpdateOne Bob -> verified: modified=", result["modified"])
+    doc = find_one(client, "users", Dict("name" => "Bob"))
+    println("  Bob verified=", doc["verified"])
+
     # ------------------------------------------------------------------
     # 6. Count
     # ------------------------------------------------------------------
@@ -182,15 +188,21 @@ function main()
     println("Total users: ", n)
 
     # ------------------------------------------------------------------
-    # 7. Delete
+    # 7. Delete & DeleteOne
     # ------------------------------------------------------------------
     section("7. Delete Documents")
 
     insert(client, "users", Dict("name" => "Temp", "age" => 99))
     n_before = count_docs(client, "users")
-    delete(client, "users", Dict("name" => "Temp"))
+    delete_one(client, "users", Dict("name" => "Temp"))
     n_after = count_docs(client, "users")
-    println("Before delete: $n_before, after: $n_after")
+    println("DeleteOne: before=$n_before, after=$n_after")
+
+    insert(client, "users", Dict("name" => "Temp2", "age" => 98))
+    n_before = count_docs(client, "users")
+    delete(client, "users", Dict("name" => "Temp2"))
+    n_after = count_docs(client, "users")
+    println("Delete:    before=$n_before, after=$n_after")
 
     # ------------------------------------------------------------------
     # 8. Indexes
@@ -214,10 +226,52 @@ function main()
         println("Unique index enforced: ", e.msg)
     end
 
+    # List indexes
+    indexes = list_indexes(client, "users")
+    println("Indexes on 'users': $(length(indexes))")
+    for idx in indexes
+        println("  ", idx)
+    end
+
+    # Drop index
+    drop_index(client, "users", "name")
+    println("Dropped index: name")
+    indexes = list_indexes(client, "users")
+    println("Remaining indexes: $(length(indexes))")
+
     # ------------------------------------------------------------------
-    # 9. Aggregation Pipeline
+    # 9. Document Full-Text Search
     # ------------------------------------------------------------------
-    section("9. Aggregation Pipeline")
+    section("9. Document Full-Text Search")
+
+    insert_many(client, "articles", [
+        Dict("title" => "Getting Started with Rust",  "body" => "Rust is a systems programming language focused on safety, speed, and concurrency."),
+        Dict("title" => "Go for Backend Services",    "body" => "Go excels at building fast, concurrent backend services and APIs."),
+        Dict("title" => "Rust and WebAssembly",        "body" => "Rust compiles to WebAssembly for fast and safe web applications."),
+        Dict("title" => "Database Design Patterns",    "body" => "Document databases store data as JSON documents, offering flexibility."),
+        Dict("title" => "Building with Go and gRPC",   "body" => "gRPC and Go make a powerful combination for microservices."),
+    ])
+    println("Inserted 5 articles")
+
+    create_text_index(client, "articles", ["title", "body"])
+    println("Created text index on [title, body]")
+
+    results = text_search(client, "articles", "Rust"; limit=10)
+    println("TextSearch('Rust'): $(length(results)) results")
+    for r in results
+        println("  ", r["title"], " (score: ", r["_score"], ")")
+    end
+
+    results = text_search(client, "articles", "Go backend"; limit=10)
+    println("TextSearch('Go backend'): $(length(results)) results")
+    for r in results
+        println("  ", r["title"], " (score: ", r["_score"], ")")
+    end
+
+    # ------------------------------------------------------------------
+    # 10. Aggregation Pipeline
+    # ------------------------------------------------------------------
+    section("10. Aggregation Pipeline")
 
     # Insert some orders
     orders = [
@@ -337,7 +391,7 @@ function main()
     # ------------------------------------------------------------------
     # 10. Transactions
     # ------------------------------------------------------------------
-    section("10. Transactions")
+    section("11. Transactions")
 
     # Auto-commit transaction
     println("Auto-commit transaction (debit + credit):")
@@ -361,7 +415,7 @@ function main()
     # ------------------------------------------------------------------
     # 11. Blob Storage
     # ------------------------------------------------------------------
-    section("11. Blob Storage")
+    section("12. Blob Storage")
 
     create_bucket(client, "files")
     create_bucket(client, "docs")
@@ -405,7 +459,7 @@ function main()
     # ------------------------------------------------------------------
     # 12. Full-Text Search
     # ------------------------------------------------------------------
-    section("12. Full-Text Search")
+    section("13. Blob Full-Text Search")
 
     # Wait for indexing
     sleep(1)
@@ -425,7 +479,7 @@ function main()
     # ------------------------------------------------------------------
     # 13. Compaction
     # ------------------------------------------------------------------
-    section("13. Compaction")
+    section("14. Compaction")
 
     # Insert and delete some docs to create garbage
     for i in 1:20
@@ -444,7 +498,7 @@ function main()
     # ------------------------------------------------------------------
     section("Cleanup")
 
-    for col in ["users", "orders", "ledger", "products", "events"]
+    for col in ["users", "orders", "ledger", "products", "events", "articles"]
         try; drop_collection(client, col); catch; end
     end
     for bucket in ["files", "docs"]

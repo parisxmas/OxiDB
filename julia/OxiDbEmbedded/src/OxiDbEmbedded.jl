@@ -35,7 +35,9 @@ export OxiDatabase, OxiDbError, TransactionConflictError,
        count_docs,
        # Indexes
        create_index, create_unique_index, create_composite_index,
-       create_text_index,
+       create_text_index, list_indexes, drop_index,
+       # FTS (documents)
+       text_search,
        # Aggregation
        aggregate,
        # Compaction
@@ -46,9 +48,7 @@ export OxiDatabase, OxiDbError, TransactionConflictError,
        create_bucket, list_buckets, delete_bucket,
        put_object, get_object, head_object, delete_object, list_objects,
        # FTS (blobs)
-       search,
-       # FTS (documents)
-       text_search
+       search
 
 # ------------------------------------------------------------------
 # Exceptions
@@ -70,7 +70,7 @@ Base.showerror(io::IO, e::TransactionConflictError) = print(io, "TransactionConf
 # Library download
 # ------------------------------------------------------------------
 
-const _RELEASE_VERSION = "v0.7.0"
+const _RELEASE_VERSION = "v0.8.0"
 const _RELEASE_BASE = "https://github.com/parisxmas/OxiDB/releases/download/$(_RELEASE_VERSION)"
 const _LIB_DIR = joinpath(@__DIR__, "..", "lib")
 
@@ -351,6 +351,22 @@ Create a full-text search index on the specified string fields.
 """
 create_text_index(db::OxiDatabase, collection::AbstractString, fields::Vector{<:AbstractString}) =
     _checked(db, Dict("cmd" => "create_text_index", "collection" => collection, "fields" => fields))
+
+"""
+    list_indexes(db, collection)
+
+List all indexes on a collection. Returns a list of index descriptors.
+"""
+list_indexes(db::OxiDatabase, collection::AbstractString) =
+    _checked(db, Dict("cmd" => "list_indexes", "collection" => collection))
+
+"""
+    drop_index(db, collection, index_name)
+
+Drop an index by name from a collection.
+"""
+drop_index(db::OxiDatabase, collection::AbstractString, index_name::AbstractString) =
+    _checked(db, Dict("cmd" => "drop_index", "collection" => collection, "index" => index_name))
 
 # ------------------------------------------------------------------
 # Document full-text search
