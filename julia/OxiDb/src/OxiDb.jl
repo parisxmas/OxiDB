@@ -27,9 +27,14 @@ export OxiDbClient, OxiDbError, TransactionConflictError,
        # Collections
        create_collection, list_collections, drop_collection,
        # CRUD
-       insert, insert_many, find, find_one, update, delete, count_docs,
+       insert, insert_many, find, find_one,
+       update, update_one, delete, delete_one,
+       count_docs,
        # Indexes
        create_index, create_unique_index, create_composite_index,
+       create_text_index, list_indexes, drop_index,
+       # FTS (documents)
+       text_search,
        # Aggregation
        aggregate,
        # Compaction
@@ -39,7 +44,7 @@ export OxiDbClient, OxiDbError, TransactionConflictError,
        # Blob storage
        create_bucket, list_buckets, delete_bucket,
        put_object, get_object, head_object, delete_object, list_objects,
-       # FTS
+       # FTS (blobs)
        search
 
 # ------------------------------------------------------------------
@@ -220,7 +225,7 @@ end
 """
     update(client, collection, query::Dict, update_doc::Dict)
 
-Update documents matching a query.
+Update all documents matching a query.
 """
 function update(client::OxiDbClient, collection::AbstractString, query::Dict, update_doc::Dict)
     _checked(client, Dict("cmd" => "update", "collection" => collection,
@@ -228,12 +233,31 @@ function update(client::OxiDbClient, collection::AbstractString, query::Dict, up
 end
 
 """
+    update_one(client, collection, query::Dict, update_doc::Dict)
+
+Update the first document matching a query.
+"""
+function update_one(client::OxiDbClient, collection::AbstractString, query::Dict, update_doc::Dict)
+    _checked(client, Dict("cmd" => "update_one", "collection" => collection,
+                           "query" => query, "update" => update_doc))
+end
+
+"""
     delete(client, collection, query::Dict)
 
-Delete documents matching a query.
+Delete all documents matching a query.
 """
 function delete(client::OxiDbClient, collection::AbstractString, query::Dict)
     _checked(client, Dict("cmd" => "delete", "collection" => collection, "query" => query))
+end
+
+"""
+    delete_one(client, collection, query::Dict)
+
+Delete the first document matching a query.
+"""
+function delete_one(client::OxiDbClient, collection::AbstractString, query::Dict)
+    _checked(client, Dict("cmd" => "delete_one", "collection" => collection, "query" => query))
 end
 
 """
@@ -273,6 +297,44 @@ Create a composite index on multiple fields.
 """
 create_composite_index(client::OxiDbClient, collection::AbstractString, fields::Vector{<:AbstractString}) =
     _checked(client, Dict("cmd" => "create_composite_index", "collection" => collection, "fields" => fields))
+
+"""
+    create_text_index(client, collection, fields)
+
+Create a full-text search index on the specified string fields.
+"""
+create_text_index(client::OxiDbClient, collection::AbstractString, fields::Vector{<:AbstractString}) =
+    _checked(client, Dict("cmd" => "create_text_index", "collection" => collection, "fields" => fields))
+
+"""
+    list_indexes(client, collection)
+
+List all indexes on a collection. Returns a list of index descriptors.
+"""
+list_indexes(client::OxiDbClient, collection::AbstractString) =
+    _checked(client, Dict("cmd" => "list_indexes", "collection" => collection))
+
+"""
+    drop_index(client, collection, index_name)
+
+Drop an index by name from a collection.
+"""
+drop_index(client::OxiDbClient, collection::AbstractString, index_name::AbstractString) =
+    _checked(client, Dict("cmd" => "drop_index", "collection" => collection, "index" => index_name))
+
+# ------------------------------------------------------------------
+# Document full-text search
+# ------------------------------------------------------------------
+
+"""
+    text_search(client, collection, query; limit=10)
+
+Full-text search on collection documents. Returns matching documents with `_score` field.
+Requires a text index created with `create_text_index`.
+"""
+function text_search(client::OxiDbClient, collection::AbstractString, query::AbstractString; limit::Integer=10)
+    _checked(client, Dict("cmd" => "text_search", "collection" => collection, "query" => query, "limit" => limit))
+end
 
 # ------------------------------------------------------------------
 # Aggregation

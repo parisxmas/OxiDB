@@ -98,9 +98,9 @@ close(client)
 | `find(db, collection, query; sort, skip, limit)` | Find matching documents |
 | `find_one(db, collection, query)` | Find first matching document |
 | `update(db, collection, query, update)` | Update matching documents |
-| `update_one(db, collection, query, update)` | Update first match (embedded only) |
+| `update_one(db, collection, query, update)` | Update first match |
 | `delete(db, collection, query)` | Delete matching documents |
-| `delete_one(db, collection, query)` | Delete first match (embedded only) |
+| `delete_one(db, collection, query)` | Delete first match |
 | `count_docs(db, collection, query)` | Count matching documents |
 
 ```julia
@@ -130,6 +130,9 @@ create_index(db, "users", "name")
 create_unique_index(db, "users", "email")
 create_composite_index(db, "users", ["name", "age"])
 create_text_index(db, "users", ["name", "bio"])
+
+indexes = list_indexes(db, "users")
+drop_index(db, "users", "name")
 ```
 
 ### Document Full-Text Search

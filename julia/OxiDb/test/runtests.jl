@@ -63,6 +63,22 @@ const PORT = parse(Int, get(ENV, "OXIDB_PORT", "4444"))
         @test doc["age"] == 31
     end
 
+    @testset "update_one" begin
+        result = update_one(client, "jl_test",
+                            Dict("name" => "Alice"),
+                            Dict("\$set" => Dict("verified" => true)))
+        @test result["modified"] == 1
+
+        doc = find_one(client, "jl_test", Dict("name" => "Alice"))
+        @test doc["verified"] == true
+    end
+
+    @testset "delete_one" begin
+        insert(client, "jl_test", Dict("name" => "TempDel", "age" => 99))
+        result = delete_one(client, "jl_test", Dict("name" => "TempDel"))
+        @test result["deleted"] == 1
+    end
+
     @testset "delete" begin
         result = delete(client, "jl_test", Dict("name" => "Charlie"))
         @test result["deleted"] == 1
@@ -72,6 +88,30 @@ const PORT = parse(Int, get(ENV, "OXIDB_PORT", "4444"))
         create_index(client, "jl_test", "name")
         create_unique_index(client, "jl_test", "age")
         create_composite_index(client, "jl_test", ["name", "age"])
+    end
+
+    @testset "list_indexes" begin
+        indexes = list_indexes(client, "jl_test")
+        @test length(indexes) >= 3
+    end
+
+    @testset "drop_index" begin
+        drop_index(client, "jl_test", "name")
+        indexes = list_indexes(client, "jl_test")
+        # Should have one less index
+        names = [get(idx, "field", "") for idx in indexes]
+        @test !("name" in names)
+    end
+
+    @testset "text_index_and_search" begin
+        insert_many(client, "jl_articles", [
+            Dict("title" => "Rust Programming", "body" => "Rust is safe and fast."),
+            Dict("title" => "Julia Computing",  "body" => "Julia is great for scientific computing."),
+        ])
+        create_text_index(client, "jl_articles", ["title", "body"])
+        results = text_search(client, "jl_articles", "Rust")
+        @test length(results) >= 1
+        @test haskey(results[1], "_score")
     end
 
     @testset "aggregation" begin
@@ -124,6 +164,7 @@ const PORT = parse(Int, get(ENV, "OXIDB_PORT", "4444"))
     @testset "cleanup" begin
         drop_collection(client, "jl_test")
         drop_collection(client, "jl_tx")
+        drop_collection(client, "jl_articles")
         delete_bucket(client, "jl-bucket")
     end
 

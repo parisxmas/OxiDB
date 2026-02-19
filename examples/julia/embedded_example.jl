@@ -178,8 +178,48 @@ function main()
         println("Unique index enforced: ", e.msg)
     end
 
-    # 9. Aggregation Pipeline
-    section("9. Aggregation Pipeline")
+    # List indexes
+    indexes = list_indexes(db, "users")
+    println("Indexes on 'users': $(length(indexes))")
+    for idx in indexes
+        println("  ", idx)
+    end
+
+    # Drop index
+    drop_index(db, "users", "name")
+    println("Dropped index: name")
+    indexes = list_indexes(db, "users")
+    println("Remaining indexes: $(length(indexes))")
+
+    # 9. Document Full-Text Search
+    section("9. Document Full-Text Search")
+
+    insert_many(db, "articles", [
+        Dict("title" => "Getting Started with Rust",  "body" => "Rust is a systems programming language focused on safety, speed, and concurrency."),
+        Dict("title" => "Go for Backend Services",    "body" => "Go excels at building fast, concurrent backend services and APIs."),
+        Dict("title" => "Rust and WebAssembly",        "body" => "Rust compiles to WebAssembly for fast and safe web applications."),
+        Dict("title" => "Database Design Patterns",    "body" => "Document databases store data as JSON documents, offering flexibility."),
+        Dict("title" => "Building with Go and gRPC",   "body" => "gRPC and Go make a powerful combination for microservices."),
+    ])
+    println("Inserted 5 articles")
+
+    create_text_index(db, "articles", ["title", "body"])
+    println("Created text index on [title, body]")
+
+    results = text_search(db, "articles", "Rust"; limit=10)
+    println("TextSearch('Rust'): $(length(results)) results")
+    for r in results
+        println("  ", r["title"], " (score: ", r["_score"], ")")
+    end
+
+    results = text_search(db, "articles", "Go backend"; limit=10)
+    println("TextSearch('Go backend'): $(length(results)) results")
+    for r in results
+        println("  ", r["title"], " (score: ", r["_score"], ")")
+    end
+
+    # 10. Aggregation Pipeline
+    section("10. Aggregation Pipeline")
 
     orders = [
         Dict("customer" => "Alice",   "category" => "electronics", "amount" => 200, "status" => "completed"),
@@ -269,8 +309,8 @@ function main()
         println("  tag '", r["_id"], "' appears ", r["count"], " times")
     end
 
-    # 10. Transactions
-    section("10. Transactions")
+    # 11. Transactions
+    section("11. Transactions")
     println("Auto-commit transaction (debit + credit):")
     transaction(db) do
         insert(db, "ledger", Dict("action" => "debit",  "account" => "A", "amount" => 500))
@@ -286,8 +326,8 @@ function main()
     rollback_tx(db)
     println("  Ledger count after rollback: $(count_docs(db, "ledger")) (should be 2)")
 
-    # 11. Blob Storage
-    section("11. Blob Storage")
+    # 12. Blob Storage
+    section("12. Blob Storage")
     create_bucket(db, "files")
     create_bucket(db, "docs")
     println("Buckets: ", list_buckets(db))
@@ -317,8 +357,8 @@ function main()
     delete_object(db, "files", "data.csv")
     println("After deleting data.csv: $(length(list_objects(db, "files"))) objects remain")
 
-    # 12. Full-Text Search
-    section("12. Full-Text Search")
+    # 13. Blob Full-Text Search
+    section("13. Blob Full-Text Search")
     sleep(1)
 
     println("Search 'Julia':")
@@ -331,8 +371,8 @@ function main()
         println("  key=", r["key"], " score=", r["score"])
     end
 
-    # 13. Compaction
-    section("13. Compaction")
+    # 14. Compaction
+    section("14. Compaction")
     for i in 1:20
         insert(db, "events", Dict("type" => "test", "seq" => i))
     end
@@ -344,7 +384,7 @@ function main()
 
     # Cleanup
     section("Cleanup")
-    for col in ["users", "orders", "ledger", "products", "events"]
+    for col in ["users", "orders", "ledger", "products", "events", "articles"]
         try; drop_collection(db, col); catch; end
     end
     for bucket in ["files", "docs"]
