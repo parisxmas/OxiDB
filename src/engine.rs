@@ -16,6 +16,9 @@ use crate::query::FindOptions;
 use crate::transaction::{ReadRecord, Transaction, WriteOp};
 use crate::tx_log::{TransactionId, TxCommitLog};
 
+/// Callback type for forwarding engine log messages to an external sink.
+pub type LogCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
 enum FtsJob {
     Index {
         data: Vec<u8>,
@@ -44,23 +47,76 @@ pub struct OxiDb {
     next_tx_id: AtomicU64,
     active_transactions: RwLock<HashMap<TransactionId, Mutex<Transaction>>>,
     encryption: Option<Arc<EncryptionKey>>,
+    verbose: bool,
+    log_callback: Option<LogCallback>,
 }
 
 impl OxiDb {
     /// Open or create a database at the given directory.
     pub fn open(data_dir: &Path) -> Result<Self> {
-        Self::open_with_options(data_dir, None)
+        Self::open_internal(data_dir, None, false, None)
     }
 
     /// Open or create a database with optional encryption key.
     pub fn open_with_options(data_dir: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
+        Self::open_internal(data_dir, encryption, false, None)
+    }
+
+    /// Open or create a database with verbose logging enabled.
+    pub fn open_verbose(data_dir: &Path, encryption: Option<Arc<EncryptionKey>>, verbose: bool) -> Result<Self> {
+        Self::open_internal(data_dir, encryption, verbose, None)
+    }
+
+    /// Open with verbose logging and an external log callback (e.g. GELF).
+    pub fn open_with_log(
+        data_dir: &Path,
+        encryption: Option<Arc<EncryptionKey>>,
+        verbose: bool,
+        log_callback: LogCallback,
+    ) -> Result<Self> {
+        Self::open_internal(data_dir, encryption, verbose, Some(log_callback))
+    }
+
+    fn open_internal(
+        data_dir: &Path,
+        encryption: Option<Arc<EncryptionKey>>,
+        verbose: bool,
+        log_callback: Option<LogCallback>,
+    ) -> Result<Self> {
+        let vlog = |msg: &str| {
+            eprintln!("{msg}");
+            if let Some(cb) = &log_callback {
+                cb(msg);
+            }
+        };
+
+        if verbose {
+            vlog(&format!("[verbose] opening database at {}", data_dir.display()));
+        }
+
         std::fs::create_dir_all(data_dir)?;
         let blob_store = BlobStore::open_with_encryption(data_dir, encryption.clone())?;
+
+        if verbose {
+            vlog("[verbose] blob store opened");
+        }
+
         let fts_index = Arc::new(RwLock::new(FtsIndex::open(data_dir)?));
+
+        if verbose {
+            vlog("[verbose] FTS index loaded");
+        }
 
         // Open transaction commit log and read committed tx_ids for recovery
         let tx_log = TxCommitLog::open(data_dir)?;
         let committed_tx_ids = tx_log.read_committed()?;
+
+        if verbose && !committed_tx_ids.is_empty() {
+            vlog(&format!(
+                "[verbose] tx commit log: {} committed transactions to recover",
+                committed_tx_ids.len()
+            ));
+        }
 
         let (fts_tx, fts_rx) = mpsc::sync_channel::<FtsJob>(256);
         let fts_worker = Arc::clone(&fts_index);
@@ -79,6 +135,10 @@ impl OxiDb {
             }
         });
 
+        if verbose {
+            vlog("[verbose] FTS worker thread started");
+        }
+
         // After recovery, clear the commit log (all committed txns are now applied)
         if !committed_tx_ids.is_empty() {
             tx_log.clear()?;
@@ -94,6 +154,8 @@ impl OxiDb {
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
             encryption,
+            verbose,
+            log_callback,
         })
     }
 
@@ -106,19 +168,23 @@ impl OxiDb {
                 return Ok(Arc::clone(col));
             }
         }
-        // Slow path: write lock to create
-        let mut cols = self.collections.write().unwrap();
-        // Double-check after acquiring write lock
-        if let Some(col) = cols.get(name) {
-            return Ok(Arc::clone(col));
-        }
+        // Slow path: load the collection OUTSIDE the write lock so that other
+        // collections remain accessible while a large collection is loading.
         let col = Collection::open_with_options(
             name,
             &self.data_dir,
             &std::collections::HashSet::new(),
             self.encryption.clone(),
+            self.verbose,
+            self.log_callback.clone(),
         )?;
         let arc = Arc::new(RwLock::new(col));
+        // Briefly acquire write lock to insert
+        let mut cols = self.collections.write().unwrap();
+        // Double-check: another thread may have loaded the same collection
+        if let Some(existing) = cols.get(name) {
+            return Ok(Arc::clone(existing));
+        }
         cols.insert(name.to_string(), Arc::clone(&arc));
         Ok(arc)
     }
@@ -134,6 +200,8 @@ impl OxiDb {
             &self.data_dir,
             &std::collections::HashSet::new(),
             self.encryption.clone(),
+            self.verbose,
+            self.log_callback.clone(),
         )?;
         cols.insert(name.to_string(), Arc::new(RwLock::new(col)));
         Ok(())
@@ -145,17 +213,25 @@ impl OxiDb {
         cols.keys().cloned().collect()
     }
 
+    /// Flush all index data to disk for every loaded collection.
+    pub fn flush_indexes(&self) {
+        let cols = self.collections.read().unwrap();
+        for (_name, col_arc) in cols.iter() {
+            if let Ok(col) = col_arc.read() {
+                col.save_index_data();
+            }
+        }
+    }
+
     /// Drop a collection and its data.
     pub fn drop_collection(&self, name: &str) -> Result<()> {
         let mut cols = self.collections.write().unwrap();
         cols.remove(name);
-        let data_path = self.data_dir.join(format!("{}.dat", name));
-        if data_path.exists() {
-            std::fs::remove_file(data_path)?;
-        }
-        let wal_path = self.data_dir.join(format!("{}.wal", name));
-        if wal_path.exists() {
-            std::fs::remove_file(wal_path)?;
+        for ext in &["dat", "wal", "idx", "fidx", "cidx"] {
+            let path = self.data_dir.join(format!("{}.{}", name, ext));
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
         }
         Ok(())
     }
@@ -636,6 +712,12 @@ impl OxiDb {
                 })
             })
             .collect())
+    }
+}
+
+impl Drop for OxiDb {
+    fn drop(&mut self) {
+        self.flush_indexes();
     }
 }
 
