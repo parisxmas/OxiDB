@@ -28,17 +28,17 @@ Download from the [latest release](https://github.com/parisxmas/OxiDB/releases/l
 
 ```bash
 # macOS arm64 (Apple Silicon)
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-embedded-ffi-macos-arm64.tar.gz
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.13.0/oxidb-embedded-ffi-macos-arm64.tar.gz
 tar xzf oxidb-embedded-ffi-macos-arm64.tar.gz
 sudo cp liboxidb_embedded_ffi.dylib liboxidb_embedded_ffi.a /usr/local/lib/
 sudo cp oxidb_embedded.h /usr/local/include/
 
 # iOS device (arm64)
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-embedded-ffi-ios-arm64.tar.gz
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.13.0/oxidb-embedded-ffi-ios-arm64.tar.gz
 tar xzf oxidb-embedded-ffi-ios-arm64.tar.gz
 
 # iOS simulator (arm64, Apple Silicon Mac)
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-embedded-ffi-ios-sim-arm64.tar.gz
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.13.0/oxidb-embedded-ffi-ios-sim-arm64.tar.gz
 tar xzf oxidb-embedded-ffi-ios-sim-arm64.tar.gz
 ```
 
@@ -46,7 +46,7 @@ tar xzf oxidb-embedded-ffi-ios-sim-arm64.tar.gz
 
 ```bash
 # macOS arm64 (Apple Silicon)
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.7.0/oxidb-client-ffi-macos-arm64.tar.gz
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.13.0/oxidb-client-ffi-macos-arm64.tar.gz
 tar xzf oxidb-client-ffi-macos-arm64.tar.gz
 sudo cp liboxidb_client_ffi.dylib /usr/local/lib/
 sudo cp oxidb.h /usr/local/include/
@@ -88,7 +88,7 @@ Xcode will automatically download the prebuilt embedded library (XCFramework). N
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/parisxmas/OxiDB.git", from: "0.7.0")
+    .package(url: "https://github.com/parisxmas/OxiDB.git", from: "0.13.0")
 ]
 ```
 

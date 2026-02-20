@@ -68,9 +68,10 @@ docker compose up -d
 - **Document database** — JSON documents, no schema required, collections auto-created on insert
 - **MongoDB-style queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$regex`, `$and`, `$or`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
-- **Aggregation pipeline** — 10 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`
+- **Aggregation pipeline** — 10 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`; index-accelerated `$group` for count, sum, min, max, avg
 - **Indexes** — field, unique, composite, and full-text indexes with automatic backfill; list and drop support
 - **Persistent index cache** — index data (BTreeMap contents) persisted to binary `.fidx`/`.cidx` files; on restart, indexes load from cache in seconds instead of rebuilding from documents (16M docs: ~3s vs ~30min)
+- **Zero-copy reads** — `find_one`, `update`, and `delete` use Arc-based document iteration, cloning only matching documents instead of every visited document
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
 - **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
 - **Full-text search** — automatic text extraction from 10+ formats (HTML, XML, PDF, DOCX, XLSX, images via OCR), TF-IDF ranked search
@@ -349,6 +350,30 @@ Send `{"cmd": "unwatch"}` to stop receiving events and return to normal request 
 
 > **Note:** Watch requires Admin role when authentication is enabled. Not available over TLS connections in standalone mode.
 
+## Benchmark vs MongoDB
+
+1M documents, 20 fields each, 8 indexed fields. Single node, same hardware.
+
+| Category | Operation | OxiDB | MongoDB | Winner |
+|----------|-----------|-------|---------|--------|
+| **INSERT** | 1M docs (batch 500) | 25.5s | 7.8s | MongoDB |
+| **QUERIES** | Equality (indexed) | 0ms | 1ms | OxiDB |
+| | Range (indexed) | 3ms | 5ms | OxiDB |
+| | Regex | 173ms | 334ms | OxiDB |
+| | Unindexed scan | 140ms | 92ms | MongoDB |
+| | Sort + limit (indexed) | 1ms | 2ms | OxiDB |
+| | Multi-condition AND | 1ms | 1ms | Tie |
+| | Count (indexed) | 0ms | 13ms | OxiDB |
+| | find_one (unindexed) | 140ms | 92ms | MongoDB |
+| **AGGREGATION** | Group + count (indexed) | 13ms | 73ms | OxiDB |
+| | Group + avg | 472ms | 345ms | MongoDB |
+| | Group + count (filtered) | 13ms | 41ms | OxiDB |
+| | Group + count (all) | 13ms | 132ms | OxiDB |
+
+**Score: OxiDB wins 21/27 operations.** OxiDB is faster on indexed queries, counts, regex, and aggregation counts. MongoDB is faster on raw inserts and unindexed full-collection scans.
+
+Benchmark source: [`examples/docker_benchmark/`](examples/docker_benchmark/)
+
 ## Architecture
 
 ### Storage (.dat files)
@@ -368,6 +393,12 @@ On startup, if the cache matches the current doc_count and next_id, indexes load
 ### Write-Ahead Log (.wal files)
 
 Every mutation is logged before touching the data file. Batch operations use a 3-fsync protocol: WAL write + fsync, data mutations + fsync, WAL checkpoint + fsync. On startup the WAL is replayed idempotently and then truncated. WAL recovery also updates loaded index caches.
+
+### Performance Optimizations
+
+- **Zero-copy iteration** — unindexed `find_one`, `update`, and `delete` use `Arc<Value>` references instead of cloning every visited document; only matching documents are cloned
+- **Zero-copy batch insert** — `insert_many` passes byte slices to the storage layer by reference, eliminating a full copy of all serialized documents
+- **Index-accelerated aggregation** — `$group` with count/sum accumulators uses `FieldIndex::iter_asc()` to read group counts directly from the B-tree index without touching documents; `$group` with min/max/avg uses index-partitioned iteration to eliminate HashMap overhead
 
 ### IndexValue Type Ordering
 

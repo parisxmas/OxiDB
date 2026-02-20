@@ -66,6 +66,7 @@ pub struct Collection {
     storage: Storage,
     wal: Wal,
     primary_index: HashMap<DocumentId, DocLocation>,
+    doc_cache: HashMap<DocumentId, Arc<Value>>,
     field_indexes: HashMap<String, FieldIndex>,
     composite_indexes: Vec<CompositeIndex>,
     text_index: Option<CollectionTextIndex>,
@@ -215,6 +216,7 @@ impl Collection {
         }
 
         let mut primary_index = HashMap::new();
+        let mut doc_cache: HashMap<DocumentId, Arc<Value>> = HashMap::new();
         let mut version_index = HashMap::new();
         let mut next_id: DocumentId = 1;
 
@@ -224,7 +226,7 @@ impl Collection {
         // Clone callback for use inside the closure
         let inner_cb = log_callback.clone();
 
-        // Phase 1: Scan .dat for primary_index, version_index, next_id.
+        // Phase 1: Scan .dat for primary_index, doc_cache, version_index, next_id.
         // Also rebuild text index (always from docs — not cached).
         // Field/composite indexes are NOT rebuilt here; we try the cache first.
         storage.for_each_active(|loc, bytes| {
@@ -237,10 +239,14 @@ impl Collection {
                     next_id = id + 1;
                 }
 
+                let doc_arc = Arc::new(doc);
+
                 // Text index is always rebuilt from docs (not cached)
                 if let Some(ref mut ti) = text_index {
-                    ti.index_doc(id, &doc);
+                    ti.index_doc(id, &doc_arc);
                 }
+
+                doc_cache.insert(id, doc_arc);
             }
             doc_count += 1;
             if verbose && doc_count % 500_000 == 0 {
@@ -311,28 +317,24 @@ impl Collection {
             }
         }
 
-        // Phase 2b: If cache was invalid, rebuild indexes from .dat (second pass)
+        // Phase 2b: If cache was invalid, rebuild indexes from doc_cache (zero disk I/O)
         if has_persisted_indexes && !indexes_from_cache {
             if verbose {
                 vlog(&format!(
-                    "[verbose] {}: index cache invalid, rebuilding {} indexes from docs...",
+                    "[verbose] {}: index cache invalid, rebuilding {} indexes from doc_cache...",
                     name,
                     persisted_indexes.len(),
                 ));
             }
             let rebuild_start = std::time::Instant::now();
             let mut rebuild_count = 0u64;
-            let inner_cb2 = log_callback.clone();
 
-            storage.for_each_active(|_loc, bytes| {
-                let doc: Value = crate::codec::decode_doc(&bytes)?;
-                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                    for idx in field_indexes.values_mut() {
-                        idx.insert_value(id, &doc);
-                    }
-                    for idx in &mut composite_indexes {
-                        idx.insert_value(id, &doc);
-                    }
+            for (&id, arc) in &doc_cache {
+                for idx in field_indexes.values_mut() {
+                    idx.insert_value(id, arc);
+                }
+                for idx in &mut composite_indexes {
+                    idx.insert_value(id, arc);
                 }
                 rebuild_count += 1;
                 if verbose && rebuild_count % 500_000 == 0 {
@@ -343,13 +345,9 @@ impl Collection {
                         doc_count,
                         rebuild_start.elapsed().as_secs_f64()
                     );
-                    eprintln!("{msg}");
-                    if let Some(cb) = &inner_cb2 {
-                        cb(&msg);
-                    }
+                    vlog(&msg);
                 }
-                Ok(())
-            })?;
+            }
 
             if verbose {
                 vlog(&format!(
@@ -361,10 +359,11 @@ impl Collection {
             }
         }
 
-        // Phase 3: WAL recovery (updates indexes too)
+        // Phase 3: WAL recovery (updates indexes and doc_cache too)
         wal.recover(
             &storage,
             &mut primary_index,
+            &mut doc_cache,
             &mut next_id,
             committed_tx_ids,
             &mut version_index,
@@ -384,6 +383,7 @@ impl Collection {
             storage,
             wal,
             primary_index,
+            doc_cache,
             field_indexes,
             composite_indexes,
             text_index,
@@ -406,14 +406,24 @@ impl Collection {
         &self.name
     }
 
-    /// Read a document by its ID from storage.
+    /// Access the field indexes for index-accelerated aggregation.
+    pub fn field_indexes(&self) -> &HashMap<String, FieldIndex> {
+        &self.field_indexes
+    }
+
+    /// Access the document cache for index-accelerated aggregation.
+    pub fn doc_cache(&self) -> &HashMap<DocumentId, Arc<Value>> {
+        &self.doc_cache
+    }
+
+    /// Read a document by its ID from the in-memory cache.
     fn read_doc(&self, id: DocumentId) -> Result<Option<Value>> {
-        if let Some(&loc) = self.primary_index.get(&id) {
-            let bytes = self.storage.read(loc)?;
-            Ok(Some(crate::codec::decode_doc(&bytes)?))
-        } else {
-            Ok(None)
-        }
+        Ok(self.doc_cache.get(&id).map(|arc| (**arc).clone()))
+    }
+
+    /// Read a document by its ID, returning an Arc (zero-copy from cache).
+    fn read_doc_arc(&self, id: DocumentId) -> Option<Arc<Value>> {
+        self.doc_cache.get(&id).map(Arc::clone)
     }
 
     /// Iterate all documents, calling `f` for each one.
@@ -421,24 +431,20 @@ impl Collection {
     where
         F: FnMut(DocumentId, Value) -> Result<()>,
     {
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let val = crate::codec::decode_doc(&bytes)?;
-            f(id, val)?;
+        for (&id, arc) in &self.doc_cache {
+            f(id, (**arc).clone())?;
         }
         Ok(())
     }
 
-    /// Iterate all documents, calling `f` for each one.
+    /// Iterate all documents as Arc references. Zero-clone.
     /// Stops early when `f` returns `Ok(false)`.
-    fn for_each_doc_while<F>(&self, mut f: F) -> Result<()>
+    fn for_each_doc_arc_while<F>(&self, mut f: F) -> Result<()>
     where
-        F: FnMut(DocumentId, Value) -> Result<bool>,
+        F: FnMut(DocumentId, &Arc<Value>) -> Result<bool>,
     {
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let val = crate::codec::decode_doc(&bytes)?;
-            if !f(id, val)? {
+        for (&id, arc) in &self.doc_cache {
+            if !f(id, arc)? {
                 break;
             }
         }
@@ -468,11 +474,9 @@ impl Collection {
         let mut count = 0u64;
         let mut idx = FieldIndex::new(field.to_string());
 
-        // Backfill from doc store
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let val = crate::codec::decode_doc(&bytes)?;
-            idx.insert_value(id, &val);
+        // Backfill from doc cache (zero disk I/O)
+        for (&id, arc) in &self.doc_cache {
+            idx.insert_value(id, arc);
             count += 1;
             if self.verbose && count % 500_000 == 0 {
                 self.vlog(&format!(
@@ -514,11 +518,9 @@ impl Collection {
         let mut idx = FieldIndex::new_unique(field.to_string());
         let field_owned = field.to_string();
 
-        // Backfill from doc store
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let val = crate::codec::decode_doc(&bytes)?;
-            if let Some(value) = resolve_field_in_value(&val, &field_owned) {
+        // Backfill from doc cache (zero disk I/O)
+        for (&id, arc) in &self.doc_cache {
+            if let Some(value) = resolve_field_in_value(arc, &field_owned) {
                 let iv = IndexValue::from_json(value);
                 if idx.check_unique(&iv, None) {
                     return Err(Error::UniqueViolation {
@@ -526,7 +528,7 @@ impl Collection {
                     });
                 }
             }
-            idx.insert_value(id, &val);
+            idx.insert_value(id, arc);
             count += 1;
             if self.verbose && count % 500_000 == 0 {
                 self.vlog(&format!(
@@ -567,11 +569,9 @@ impl Collection {
         let mut count = 0u64;
         let mut idx = CompositeIndex::new(fields);
 
-        // Backfill from doc store
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let val = crate::codec::decode_doc(&bytes)?;
-            idx.insert_value(id, &val);
+        // Backfill from doc cache (zero disk I/O)
+        for (&id, arc) in &self.doc_cache {
+            idx.insert_value(id, arc);
             count += 1;
             if self.verbose && count % 500_000 == 0 {
                 self.vlog(&format!(
@@ -613,11 +613,9 @@ impl Collection {
         let mut count = 0u64;
         let mut idx = CollectionTextIndex::new(fields);
 
-        // Backfill from doc store
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let val = crate::codec::decode_doc(&bytes)?;
-            idx.index_doc(id, &val);
+        // Backfill from doc cache (zero disk I/O)
+        for (&id, arc) in &self.doc_cache {
+            idx.index_doc(id, arc);
             count += 1;
             if self.verbose && count % 500_000 == 0 {
                 self.vlog(&format!(
@@ -767,16 +765,20 @@ impl Collection {
         self.primary_index.insert(id, loc);
         self.version_index.insert(id, 1);
 
+        let data_arc = Arc::new(data);
+
         // Update all field indexes
         for idx in self.field_indexes.values_mut() {
-            idx.insert_value(id, &data);
+            idx.insert_value(id, &data_arc);
         }
         for idx in &mut self.composite_indexes {
-            idx.insert_value(id, &data);
+            idx.insert_value(id, &data_arc);
         }
         if let Some(ref mut text_idx) = self.text_index {
-            text_idx.index_doc(id, &data);
+            text_idx.index_doc(id, &data_arc);
         }
+
+        self.doc_cache.insert(id, data_arc);
 
         Ok(id)
     }
@@ -834,14 +836,16 @@ impl Collection {
         self.wal.log_batch_no_sync(&wal_entries)?;
 
         // Phase 3: append all to .dat → single fsync (the only fsync in this method)
+        let byte_slices: Vec<&[u8]> = prepared.iter().map(|(_, _, bytes)| bytes.as_slice()).collect();
+        let batch_locs = self.storage.append_batch_no_sync(&byte_slices)?;
+        self.storage.sync()?;
+
         let mut ids = Vec::with_capacity(prepared.len());
         let mut locs = Vec::with_capacity(prepared.len());
-        for (id, _, bytes) in &prepared {
-            let loc = self.storage.append_no_sync(bytes)?;
+        for ((id, _, _), loc) in prepared.iter().zip(batch_locs) {
             ids.push(*id);
             locs.push((*id, loc));
         }
-        self.storage.sync()?;
 
         // Phase 4: lazy WAL checkpoint (no fsync)
         self.wal.checkpoint_no_sync()?;
@@ -852,15 +856,17 @@ impl Collection {
         for ((id, data, _bytes), (_, loc)) in prepared.into_iter().zip(locs.iter()) {
             self.primary_index.insert(id, *loc);
             self.version_index.insert(id, 1);
+            let data_arc = Arc::new(data);
             for idx in self.field_indexes.values_mut() {
-                idx.insert_value(id, &data);
+                idx.insert_value(id, &data_arc);
             }
             for idx in &mut self.composite_indexes {
-                idx.insert_value(id, &data);
+                idx.insert_value(id, &data_arc);
             }
             if let Some(ref mut text_idx) = self.text_index {
-                text_idx.index_doc(id, &data);
+                text_idx.index_doc(id, &data_arc);
             }
+            self.doc_cache.insert(id, data_arc);
         }
 
         Ok(ids)
@@ -897,13 +903,13 @@ impl Collection {
     ) -> Result<Vec<Arc<Value>>> {
         let query = query::parse_query(query_json)?;
 
-        // Fast path: Query::All with no sort — iterate doc store directly.
+        // Fast path: Query::All with no sort — iterate doc cache directly.
         if matches!(query, Query::All) && opts.sort.is_none() {
             let skip = opts.skip.unwrap_or(0) as usize;
             let limit = opts.limit.map(|l| l as usize).unwrap_or(usize::MAX);
             let mut results = Vec::new();
             let mut skipped = 0;
-            self.for_each_doc_while(|_id, data| {
+            self.for_each_doc_arc_while(|_id, arc| {
                 if skipped < skip {
                     skipped += 1;
                     return Ok(true);
@@ -911,7 +917,7 @@ impl Collection {
                 if results.len() >= limit {
                     return Ok(false);
                 }
-                results.push(Arc::new(data));
+                results.push(Arc::clone(arc));
                 Ok(true)
             })?;
             return Ok(results);
@@ -929,9 +935,9 @@ impl Collection {
                         SortOrder::Asc => {
                             'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
                                 for &id in doc_ids {
-                                    if let Some(data) = self.read_doc(id)? {
-                                        if query::matches_value(&query, &data) {
-                                            results.push(Arc::new(data));
+                                    if let Some(arc) = self.read_doc_arc(id) {
+                                        if query::matches_value(&query, &arc) {
+                                            results.push(arc);
                                             if results.len() >= need {
                                                 break 'outer_asc;
                                             }
@@ -943,9 +949,9 @@ impl Collection {
                         SortOrder::Desc => {
                             'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
                                 for &id in doc_ids.iter().rev() {
-                                    if let Some(data) = self.read_doc(id)? {
-                                        if query::matches_value(&query, &data) {
-                                            results.push(Arc::new(data));
+                                    if let Some(arc) = self.read_doc_arc(id) {
+                                        if query::matches_value(&query, &arc) {
+                                            results.push(arc);
                                             if results.len() >= need {
                                                 break 'outer_desc;
                                             }
@@ -1005,32 +1011,14 @@ impl Collection {
                                 + opts.limit.unwrap_or(u64::MAX) as usize;
 
                             // Read + filter docs inline during composite index iteration.
-                            // Destructure self fields so the closure can borrow them
-                            // independently from comp_idx (which borrows composite_indexes).
-                            let primary_index = &self.primary_index;
-                            let storage = &self.storage;
+                            let doc_cache = &self.doc_cache;
                             let mut results: Vec<Arc<Value>> = Vec::new();
-                            let mut scan_error: Option<crate::error::Error> = None;
 
                             let mut handler = |id: DocumentId| -> bool {
-                                if let Some(&loc) = primary_index.get(&id) {
-                                    match storage.read(loc) {
-                                        Ok(bytes) => match crate::codec::decode_doc(&bytes) {
-                                            Ok(data) => {
-                                                if query::matches_value(&query, &data) {
-                                                    results.push(Arc::new(data));
-                                                    return results.len() < need;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                scan_error = Some(e);
-                                                return false;
-                                            }
-                                        },
-                                        Err(e) => {
-                                            scan_error = Some(e);
-                                            return false;
-                                        }
+                                if let Some(arc) = doc_cache.get(&id) {
+                                    if query::matches_value(&query, arc) {
+                                        results.push(Arc::clone(arc));
+                                        return results.len() < need;
                                     }
                                 }
                                 true
@@ -1043,10 +1031,6 @@ impl Collection {
                                 SortOrder::Desc => {
                                     comp_idx.for_each_prefix_desc(&prefix, &mut handler);
                                 }
-                            }
-
-                            if let Some(e) = scan_error {
-                                return Err(e);
                             }
 
                             // Apply skip
@@ -1072,11 +1056,6 @@ impl Collection {
         }
 
         // Standard path: try index-accelerated lookup
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &self.field_indexes,
-            &self.composite_indexes,
-        );
 
         let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
 
@@ -1088,11 +1067,41 @@ impl Collection {
 
         let mut results = Vec::new();
 
+        // Fast path: lazy index iteration for limit queries without sort/skip.
+        // Avoids materializing full BTreeSet of IDs.
+        if let Some(limit) = early_limit {
+            let doc_cache = &self.doc_cache;
+            let lazy_result = query::execute_indexed_lazy(
+                &query,
+                &self.field_indexes,
+                &mut |id| {
+                    if let Some(arc) = doc_cache.get(&id) {
+                        if skip_post_filter || query::matches_value(&query, arc) {
+                            results.push(Arc::clone(arc));
+                            if results.len() >= limit {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                },
+            );
+            if lazy_result.is_some() {
+                return Ok(results);
+            }
+        }
+
+        let candidate_ids = query::execute_indexed(
+            &query,
+            &self.field_indexes,
+            &self.composite_indexes,
+        );
+
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
-                if let Some(data) = self.read_doc(id)? {
-                    if skip_post_filter || query::matches_value(&query, &data) {
-                        results.push(Arc::new(data));
+                if let Some(arc) = self.read_doc_arc(id) {
+                    if skip_post_filter || query::matches_value(&query, &arc) {
+                        results.push(arc);
                         if let Some(limit) = early_limit {
                             if results.len() >= limit {
                                 break;
@@ -1102,9 +1111,9 @@ impl Collection {
                 }
             }
         } else {
-            self.for_each_doc_while(|_id, data| {
-                if query::matches_value(&query, &data) {
-                    results.push(Arc::new(data));
+            self.for_each_doc_arc_while(|_id, arc| {
+                if query::matches_value(&query, arc) {
+                    results.push(Arc::clone(arc));
                     if let Some(limit) = early_limit {
                         if results.len() >= limit {
                             return Ok(false);
@@ -1156,7 +1165,31 @@ impl Collection {
     pub fn find_one(&self, query_json: &Value) -> Result<Option<Value>> {
         let query = query::parse_query(query_json)?;
 
-        // Try index-accelerated lookup
+        let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
+
+        // Try lazy index path first — avoids materializing full BTreeSet
+        if !matches!(query, Query::All) {
+            let mut found: Option<Value> = None;
+            let doc_cache = &self.doc_cache;
+            let lazy_result = query::execute_indexed_lazy(
+                &query,
+                &self.field_indexes,
+                &mut |id| {
+                    if let Some(arc) = doc_cache.get(&id) {
+                        if skip_post_filter || query::matches_value(&query, arc) {
+                            found = Some((**arc).clone());
+                            return false;
+                        }
+                    }
+                    true
+                },
+            );
+            if lazy_result.is_some() {
+                return Ok(found);
+            }
+        }
+
+        // Fallback: full materialization path
         let candidate_ids = if !matches!(query, Query::All) {
             query::execute_indexed(
                 &query,
@@ -1166,8 +1199,6 @@ impl Collection {
         } else {
             None
         };
-
-        let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
@@ -1180,11 +1211,11 @@ impl Collection {
                 }
             }
         } else {
-            // No index — iterate doc store
+            // No index — iterate doc store (zero-copy: clone only the match)
             let mut found: Option<Value> = None;
-            self.for_each_doc_while(|_id, data| {
-                if query::matches_value(&query, &data) {
-                    found = Some(data);
+            self.for_each_doc_arc_while(|_id, arc| {
+                if query::matches_value(&query, arc) {
+                    found = Some((**arc).clone());
                     return Ok(false);
                 }
                 Ok(true)
@@ -1219,37 +1250,69 @@ impl Collection {
         }
 
         let query = query::parse_query(query_json)?;
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &self.field_indexes,
-            &self.composite_indexes,
-        );
 
         // Phase 1: Find matching docs (with early termination via limit)
         let mut matches: Vec<(DocumentId, Value, DocLocation)> = Vec::new();
 
-        if let Some(ref indexed_ids) = candidate_ids {
-            for &id in indexed_ids {
-                if let Some(&old_loc) = self.primary_index.get(&id) {
-                    if let Some(data) = self.read_doc(id)? {
-                        if query::matches_value(&query, &data) {
-                            matches.push((id, data, old_loc));
-                            if limit.is_some_and(|l| matches.len() >= l) { break; }
+        // Try lazy index path first for limited updates
+        let mut lazy_handled = false;
+        if limit.is_some() {
+            let doc_cache = &self.doc_cache;
+            let primary_index = &self.primary_index;
+            let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
+            let lim = limit.unwrap();
+            let lazy_result = query::execute_indexed_lazy(
+                &query,
+                &self.field_indexes,
+                &mut |id| {
+                    if let Some(arc) = doc_cache.get(&id) {
+                        if skip_post_filter || query::matches_value(&query, arc) {
+                            if let Some(&old_loc) = primary_index.get(&id) {
+                                matches.push((id, (**arc).clone(), old_loc));
+                                if matches.len() >= lim {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    true
+                },
+            );
+            if lazy_result.is_some() {
+                lazy_handled = true;
+            }
+        }
+
+        if !lazy_handled {
+            let candidate_ids = query::execute_indexed(
+                &query,
+                &self.field_indexes,
+                &self.composite_indexes,
+            );
+
+            if let Some(ref indexed_ids) = candidate_ids {
+                for &id in indexed_ids {
+                    if let Some(&old_loc) = self.primary_index.get(&id) {
+                        if let Some(data) = self.read_doc(id)? {
+                            if query::matches_value(&query, &data) {
+                                matches.push((id, data, old_loc));
+                                if limit.is_some_and(|l| matches.len() >= l) { break; }
+                            }
                         }
                     }
                 }
-            }
-        } else {
-            // No index — iterate doc store
-            self.for_each_doc_while(|id, data| {
-                if query::matches_value(&query, &data) {
-                    if let Some(&old_loc) = self.primary_index.get(&id) {
-                        matches.push((id, data, old_loc));
-                        if limit.is_some_and(|l| matches.len() >= l) { return Ok(false); }
+            } else {
+                // No index — iterate doc store (zero-copy: clone only matches)
+                self.for_each_doc_arc_while(|id, arc| {
+                    if query::matches_value(&query, arc) {
+                        if let Some(&old_loc) = self.primary_index.get(&id) {
+                            matches.push((id, (**arc).clone(), old_loc));
+                            if limit.is_some_and(|l| matches.len() >= l) { return Ok(false); }
+                        }
                     }
-                }
-                Ok(true)
-            })?;
+                    Ok(true)
+                })?;
+            }
         }
 
         if matches.is_empty() {
@@ -1330,6 +1393,7 @@ impl Collection {
             if let Some(ref mut text_idx) = self.text_index {
                 text_idx.index_doc(op.id, &op.new_data);
             }
+            self.doc_cache.insert(op.id, Arc::new(op.new_data));
         }
 
         Ok(updated_ids)
@@ -1339,11 +1403,6 @@ impl Collection {
     /// `limit` caps the number of documents to delete (e.g. `Some(1)` for delete_one).
     pub fn delete(&mut self, query_json: &Value, limit: Option<usize>) -> Result<Vec<DocumentId>> {
         let query = query::parse_query(query_json)?;
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &self.field_indexes,
-            &self.composite_indexes,
-        );
 
         // Phase 1: Find matching docs (with early termination via limit)
         struct DeleteOp {
@@ -1353,28 +1412,65 @@ impl Collection {
         }
         let mut ops = Vec::new();
 
-        if let Some(ref indexed_ids) = candidate_ids {
-            for &id in indexed_ids {
-                if let Some(&loc) = self.primary_index.get(&id) {
-                    if let Some(data) = self.read_doc(id)? {
-                        if query::matches_value(&query, &data) {
-                            ops.push(DeleteOp { id, loc, data });
-                            if limit.is_some_and(|l| ops.len() >= l) { break; }
+        // Try lazy index path first for limited deletes
+        let mut lazy_handled = false;
+        if limit.is_some() {
+            let doc_cache = &self.doc_cache;
+            let primary_index = &self.primary_index;
+            let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
+            let lim = limit.unwrap();
+            let lazy_result = query::execute_indexed_lazy(
+                &query,
+                &self.field_indexes,
+                &mut |id| {
+                    if let Some(arc) = doc_cache.get(&id) {
+                        if skip_post_filter || query::matches_value(&query, arc) {
+                            if let Some(&loc) = primary_index.get(&id) {
+                                ops.push(DeleteOp { id, loc, data: (**arc).clone() });
+                                if ops.len() >= lim {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    true
+                },
+            );
+            if lazy_result.is_some() {
+                lazy_handled = true;
+            }
+        }
+
+        if !lazy_handled {
+            let candidate_ids = query::execute_indexed(
+                &query,
+                &self.field_indexes,
+                &self.composite_indexes,
+            );
+
+            if let Some(ref indexed_ids) = candidate_ids {
+                for &id in indexed_ids {
+                    if let Some(&loc) = self.primary_index.get(&id) {
+                        if let Some(data) = self.read_doc(id)? {
+                            if query::matches_value(&query, &data) {
+                                ops.push(DeleteOp { id, loc, data });
+                                if limit.is_some_and(|l| ops.len() >= l) { break; }
+                            }
                         }
                     }
                 }
-            }
-        } else {
-            // No index — iterate doc store
-            self.for_each_doc_while(|id, data| {
-                if query::matches_value(&query, &data) {
-                    if let Some(&loc) = self.primary_index.get(&id) {
-                        ops.push(DeleteOp { id, loc, data });
-                        if limit.is_some_and(|l| ops.len() >= l) { return Ok(false); }
+            } else {
+                // No index — iterate doc store (zero-copy: clone only matches)
+                self.for_each_doc_arc_while(|id, arc| {
+                    if query::matches_value(&query, arc) {
+                        if let Some(&loc) = self.primary_index.get(&id) {
+                            ops.push(DeleteOp { id, loc, data: (**arc).clone() });
+                            if limit.is_some_and(|l| ops.len() >= l) { return Ok(false); }
+                        }
                     }
-                }
-                Ok(true)
-            })?;
+                    Ok(true)
+                })?;
+            }
         }
 
         if ops.is_empty() {
@@ -1403,6 +1499,7 @@ impl Collection {
             deleted_ids.push(op.id);
             self.primary_index.remove(&op.id);
             self.version_index.remove(&op.id);
+            self.doc_cache.remove(&op.id);
             for idx in self.field_indexes.values_mut() {
                 idx.remove_value(op.id, &op.data);
             }
@@ -1451,11 +1548,10 @@ impl Collection {
             if indexed_ids.len() > self.primary_index.len() / 2 {
                 return self.count_with_scan(&query);
             }
-            // Small candidate set — random access via index
+            // Small candidate set — random access via doc cache
             for &id in indexed_ids {
-                if let Some(&loc) = self.primary_index.get(&id) {
-                    let bytes = self.storage.read(loc)?;
-                    if self.raw_match_or_decode(&query, &bytes)? {
+                if let Some(arc) = self.doc_cache.get(&id) {
+                    if query::matches_value(&query, arc) {
                         count += 1;
                     }
                 }
@@ -1465,17 +1561,6 @@ impl Collection {
             return self.count_with_scan(&query);
         }
         Ok(count)
-    }
-
-    /// Check if raw bytes match a query. Uses JSONB path extraction for JSONB
-    /// binary records (avoids full decode), falls back to full decode for legacy JSON.
-    fn raw_match_or_decode(&self, query: &query::Query, bytes: &[u8]) -> Result<bool> {
-        if let Some(matched) = query::matches_raw_jsonb(query, bytes) {
-            Ok(matched)
-        } else {
-            let data = crate::codec::decode_doc(bytes)?;
-            Ok(query::matches_value(query, &data))
-        }
     }
 
     /// Count using sequential file scan with raw JSONB field extraction.
@@ -1547,8 +1632,9 @@ impl Collection {
         self.primary_index = new_primary_index;
         self.next_id = next_id;
 
-        // Rebuild all indexes and version_index
+        // Rebuild all indexes, version_index, and doc_cache
         self.version_index.clear();
+        self.doc_cache.clear();
         for idx in self.field_indexes.values_mut() {
             idx.clear();
         }
@@ -1563,15 +1649,17 @@ impl Collection {
             let data: Value = crate::codec::decode_doc(&bytes)?;
             let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             self.version_index.insert(id, ver);
+            let data_arc = Arc::new(data);
             for idx in self.field_indexes.values_mut() {
-                idx.insert_value(id, &data);
+                idx.insert_value(id, &data_arc);
             }
             for idx in &mut self.composite_indexes {
-                idx.insert_value(id, &data);
+                idx.insert_value(id, &data_arc);
             }
             if let Some(ref mut text_idx) = self.text_index {
-                text_idx.index_doc(id, &data);
+                text_idx.index_doc(id, &data_arc);
             }
+            self.doc_cache.insert(id, data_arc);
         }
 
         // Save index data cache after compaction (indexes are fresh)
@@ -1801,11 +1889,12 @@ impl Collection {
         }
         self.storage.sync()?;
 
-        // Update in-memory indexes and doc store
+        // Update in-memory indexes, doc_cache, and doc store
         for (i, m) in mutations.iter().enumerate() {
             if m.is_delete {
                 self.primary_index.remove(&m.doc_id);
                 self.version_index.remove(&m.doc_id);
+                self.doc_cache.remove(&m.doc_id);
                 if let Some(ref old_data) = m.old_data {
                     for idx in self.field_indexes.values_mut() {
                         idx.remove_value(m.doc_id, old_data);
@@ -1838,6 +1927,7 @@ impl Collection {
                 if let Some(ref mut text_idx) = self.text_index {
                     text_idx.index_doc(m.doc_id, &m.new_data);
                 }
+                self.doc_cache.insert(m.doc_id, Arc::new(m.new_data.clone()));
             }
         }
 

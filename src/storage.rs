@@ -133,6 +133,34 @@ impl Storage {
         Ok(DocLocation { offset, length })
     }
 
+    /// Append multiple documents without fsync, acquiring the mutex only once.
+    /// Returns a location for each item. Caller must call `sync()` after.
+    pub fn append_batch_no_sync(&self, items: &[&[u8]]) -> Result<Vec<DocLocation>> {
+        // Pre-encrypt all items outside the lock
+        let payloads: Vec<Vec<u8>> = items
+            .iter()
+            .map(|doc_bytes| self.maybe_encrypt(doc_bytes))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut inner = self.inner.lock().unwrap();
+        inner.file.seek(SeekFrom::End(0))?;
+
+        let mut locations = Vec::with_capacity(payloads.len());
+        for payload in &payloads {
+            let offset = inner.current_offset;
+            let length = payload.len() as u32;
+
+            inner.file.write_all(&[RECORD_ACTIVE])?;
+            inner.file.write_all(&length.to_le_bytes())?;
+            inner.file.write_all(payload)?;
+
+            inner.current_offset += 1 + 4 + length as u64;
+            locations.push(DocLocation { offset, length });
+        }
+
+        Ok(locations)
+    }
+
     /// Soft-delete without fsync (caller must call `sync()` after batch).
     pub fn mark_deleted_no_sync(&self, loc: DocLocation) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();

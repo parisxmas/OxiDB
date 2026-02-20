@@ -224,6 +224,10 @@ pub fn execute_indexed(
         Query::All => None, // None = full scan needed
         Query::Field { field, op } => execute_field_op(field, op, field_indexes, composite_indexes),
         Query::And(subs) => {
+            // Try merged range on same field (e.g. {age: {$gte: 25, $lte: 35}})
+            if let Some((idx, start, end)) = try_merge_range_and(subs, field_indexes) {
+                return Some(idx.find_range(start, end));
+            }
             let mut result: Option<BTreeSet<DocumentId>> = None;
             for sub in subs {
                 if let Some(ids) = execute_indexed(sub, field_indexes, composite_indexes) {
@@ -273,6 +277,199 @@ fn execute_field_op(
         QueryOp::In(vals) => idx.find_in(vals),
         QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Lazy index execution — callback-based with early termination
+// ---------------------------------------------------------------------------
+
+/// Try to merge an AND of conditions on the same indexed field into a single
+/// range. Returns the merged (start, end) bounds and the field index, or None.
+fn try_merge_range_and<'a>(
+    subs: &'a [Query],
+    field_indexes: &'a std::collections::HashMap<String, FieldIndex>,
+) -> Option<(
+    &'a FieldIndex,
+    Bound<&'a IndexValue>,
+    Bound<&'a IndexValue>,
+)> {
+    let mut field_name: Option<&str> = None;
+    let mut gte_bound: Option<&IndexValue> = None;
+    let mut gt_bound: Option<&IndexValue> = None;
+    let mut lt_bound: Option<&IndexValue> = None;
+    let mut lte_bound: Option<&IndexValue> = None;
+
+    for sub in subs {
+        match sub {
+            Query::Field { field, op } => {
+                if let Some(name) = field_name {
+                    if name != field {
+                        return None;
+                    }
+                } else {
+                    field_name = Some(field);
+                }
+                match op {
+                    QueryOp::Gte(v) => gte_bound = Some(v),
+                    QueryOp::Gt(v) => gt_bound = Some(v),
+                    QueryOp::Lt(v) => lt_bound = Some(v),
+                    QueryOp::Lte(v) => lte_bound = Some(v),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    let field = field_name?;
+    let idx = field_indexes.get(field)?;
+
+    let start = if let Some(v) = gte_bound {
+        Bound::Included(v)
+    } else if let Some(v) = gt_bound {
+        Bound::Excluded(v)
+    } else {
+        Bound::Unbounded
+    };
+
+    let end = if let Some(v) = lt_bound {
+        Bound::Excluded(v)
+    } else if let Some(v) = lte_bound {
+        Bound::Included(v)
+    } else {
+        Bound::Unbounded
+    };
+
+    Some((idx, start, end))
+}
+
+/// Execute a query lazily against indexes, calling `callback` for each matching
+/// DocumentId. The callback returns `true` to continue or `false` to stop.
+/// Returns `Some(true)` if the query was fully handled by indexes,
+/// `Some(false)` if stopped early by callback, `None` if indexes couldn't handle it.
+pub fn execute_indexed_lazy(
+    query: &Query,
+    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+    callback: &mut dyn FnMut(DocumentId) -> bool,
+) -> Option<bool> {
+    match query {
+        Query::All => None,
+        Query::Field { field, op } => {
+            let idx = field_indexes.get(field.as_str())?;
+            Some(match op {
+                QueryOp::Eq(v) => {
+                    let mut cont = true;
+                    idx.for_each_eq(v, |id| {
+                        cont = callback(id);
+                        cont
+                    });
+                    cont
+                }
+                QueryOp::Ne(v) => {
+                    let mut cont = true;
+                    idx.for_each_ne(v, |id| {
+                        cont = callback(id);
+                        cont
+                    });
+                    cont
+                }
+                QueryOp::Gt(v) => {
+                    let mut cont = true;
+                    idx.for_each_in_range(Bound::Excluded(v), Bound::Unbounded, |id| {
+                        cont = callback(id);
+                        cont
+                    });
+                    cont
+                }
+                QueryOp::Gte(v) => {
+                    let mut cont = true;
+                    idx.for_each_in_range(Bound::Included(v), Bound::Unbounded, |id| {
+                        cont = callback(id);
+                        cont
+                    });
+                    cont
+                }
+                QueryOp::Lt(v) => {
+                    let mut cont = true;
+                    idx.for_each_in_range(Bound::Unbounded, Bound::Excluded(v), |id| {
+                        cont = callback(id);
+                        cont
+                    });
+                    cont
+                }
+                QueryOp::Lte(v) => {
+                    let mut cont = true;
+                    idx.for_each_in_range(Bound::Unbounded, Bound::Included(v), |id| {
+                        cont = callback(id);
+                        cont
+                    });
+                    cont
+                }
+                QueryOp::In(vals) => {
+                    let mut cont = true;
+                    idx.for_each_in(vals, |id| {
+                        cont = callback(id);
+                        cont
+                    });
+                    cont
+                }
+                QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
+            })
+        }
+        Query::And(subs) => {
+            // Try merged range on same field (e.g. {age: {$gte: 25, $lte: 35}})
+            if let Some((idx, start, end)) = try_merge_range_and(subs, field_indexes) {
+                let mut cont = true;
+                idx.for_each_in_range(start, end, |id| {
+                    cont = callback(id);
+                    cont
+                });
+                return Some(cont);
+            }
+            // For AND with multiple indexed conditions, find the most selective
+            // sub-query (smallest estimated result set), iterate it lazily,
+            // and post-filter the rest.
+            let mut indexable_idx: Option<usize> = None;
+            let mut all_indexable = true;
+            for (i, sub) in subs.iter().enumerate() {
+                if execute_indexed(sub, field_indexes, &[]).is_some() {
+                    if indexable_idx.is_none() {
+                        indexable_idx = Some(i);
+                    }
+                } else {
+                    all_indexable = false;
+                }
+            }
+            if let Some(idx) = indexable_idx {
+                let sub = &subs[idx];
+
+                // If there are other indexed subs, materialize them for intersection
+                let other_indexed: Vec<BTreeSet<DocumentId>> = if all_indexable {
+                    subs.iter().enumerate()
+                        .filter(|(i, _)| *i != idx)
+                        .filter_map(|(_, s)| execute_indexed(s, field_indexes, &[]))
+                        .collect()
+                } else {
+                    vec![]
+                };
+
+                let mut cont = true;
+                execute_indexed_lazy(sub, field_indexes, &mut |id| {
+                    // Check against other indexed sets
+                    for set in &other_indexed {
+                        if !set.contains(&id) {
+                            return true; // skip this id, continue iterating
+                        }
+                    }
+                    cont = callback(id);
+                    cont
+                });
+                return Some(cont);
+            }
+            None
+        }
+        Query::Or(_) => None, // OR requires full materialization
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -163,6 +163,7 @@ impl Wal {
         &self,
         storage: &Storage,
         primary_index: &mut HashMap<DocumentId, DocLocation>,
+        doc_cache: &mut HashMap<DocumentId, Arc<serde_json::Value>>,
         next_id: &mut DocumentId,
         committed_tx_ids: &HashSet<u64>,
         version_index: &mut HashMap<DocumentId, u64>,
@@ -215,6 +216,7 @@ impl Wal {
                         for idx in composite_indexes.iter_mut() {
                             idx.insert_value(doc_id, &doc);
                         }
+                        doc_cache.insert(doc_id, Arc::new(doc));
                     }
                     let loc = storage.append(&doc_bytes)?;
                     primary_index.insert(doc_id, loc);
@@ -252,6 +254,7 @@ impl Wal {
                         for idx in composite_indexes.iter_mut() {
                             idx.insert_value(doc_id, &doc);
                         }
+                        doc_cache.insert(doc_id, Arc::new(doc));
                     }
                     updates += 1;
                 }
@@ -269,6 +272,7 @@ impl Wal {
                         storage.mark_deleted(loc)?;
                         primary_index.remove(&doc_id);
                     }
+                    doc_cache.remove(&doc_id);
                     version_index.remove(&doc_id);
                     deletes += 1;
                 }
@@ -581,7 +585,8 @@ mod tests {
 
         let mut fi = HashMap::new();
         let mut ci = Vec::new();
-        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
+        let mut dc = HashMap::new();
+        wal.recover(&storage, &mut primary_index, &mut dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert_eq!(primary_index.len(), 1);
@@ -609,8 +614,9 @@ mod tests {
         let mut version_index = HashMap::new();
         let mut fi = HashMap::new();
         let mut ci = Vec::new();
+        let mut dc = HashMap::new();
 
-        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
+        wal.recover(&storage, &mut primary_index, &mut dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert!(primary_index.is_empty()); // Should be skipped
@@ -636,8 +642,9 @@ mod tests {
         let mut version_index = HashMap::new();
         let mut fi = HashMap::new();
         let mut ci = Vec::new();
+        let mut dc = HashMap::new();
 
-        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
+        wal.recover(&storage, &mut primary_index, &mut dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert_eq!(primary_index.len(), 1);
@@ -659,12 +666,13 @@ mod tests {
         let mut version_index = HashMap::new();
         let mut fi = HashMap::new();
         let mut ci = Vec::new();
+        let mut dc = HashMap::new();
 
         // Now log a delete in WAL
         let wal = Wal::open(&wal_path).unwrap();
         wal.log(&WalEntry::delete(0)).unwrap();
 
-        wal.recover(&storage, &mut primary_index, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
+        wal.recover(&storage, &mut primary_index, &mut dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert!(primary_index.is_empty());
