@@ -1,6 +1,11 @@
 package router
 
 import (
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/parisxmas/OxiDB/OxiDMS/internal/auth"
 	"github.com/parisxmas/OxiDB/OxiDMS/internal/handler"
@@ -68,5 +73,36 @@ func New(
 		})
 	})
 
+	// Serve frontend SPA from /var/www/oxidms (falls back to index.html)
+	staticDir := getEnv("DMS_STATIC_DIR", "/var/www/oxidms")
+	spaHandler(r, staticDir)
+
 	return r
+}
+
+func spaHandler(r *chi.Mux, staticDir string) {
+	fs := http.Dir(staticDir)
+	fileServer := http.FileServer(fs)
+
+	r.Get("/*", func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+
+		// If path has a file extension and the file exists, serve it directly
+		if strings.Contains(filepath.Base(path), ".") {
+			if f, err := os.Stat(filepath.Join(staticDir, path)); err == nil && !f.IsDir() {
+				fileServer.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// SPA fallback: serve index.html for all other routes
+		http.ServeFile(w, r, filepath.Join(staticDir, "index.html"))
+	})
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

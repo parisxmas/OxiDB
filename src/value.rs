@@ -133,6 +133,31 @@ impl IndexValue {
         IndexValue::String(s.to_string())
     }
 
+    /// Convert this IndexValue back to a JSON value.
+    pub fn to_json(&self) -> JsonValue {
+        match self {
+            IndexValue::Null => JsonValue::Null,
+            IndexValue::Boolean(b) => JsonValue::Bool(*b),
+            IndexValue::Integer(i) => JsonValue::Number((*i).into()),
+            IndexValue::Float(f) => {
+                serde_json::Number::from_f64(*f)
+                    .map(JsonValue::Number)
+                    .unwrap_or(JsonValue::Null)
+            }
+            IndexValue::DateTime(ms) => {
+                // Convert back to ISO 8601 string
+                let secs = ms / 1000;
+                let nsecs = ((ms % 1000).abs() as u32) * 1_000_000;
+                if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsecs) {
+                    JsonValue::String(dt.to_rfc3339())
+                } else {
+                    JsonValue::Number((*ms).into())
+                }
+            }
+            IndexValue::String(s) => JsonValue::String(s.clone()),
+        }
+    }
+
     /// Check if this value matches a JSON value for query comparison.
     /// Handles cross-type matching (e.g., DateTime index vs string query).
     pub fn matches_json(&self, json: &JsonValue) -> bool {

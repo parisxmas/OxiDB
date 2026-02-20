@@ -507,8 +507,11 @@ impl OxiDb {
         // Fast path: use Arc-based pipeline to avoid cloning all initial docs.
         // This is critical for aggregation over large datasets (200K+ docs).
         let col = self.get_or_create_collection(collection)?;
-        let arcs = col.read().unwrap().find_arcs(&query)?;
-        pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn)
+        let col_guard = col.read().unwrap();
+        let arcs = col_guard.find_arcs(&query)?;
+        let field_indexes = col_guard.field_indexes();
+        let doc_cache = col_guard.doc_cache();
+        pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(field_indexes), Some(doc_cache))
     }
 
     // -----------------------------------------------------------------------

@@ -180,6 +180,73 @@ impl FieldIndex {
         result
     }
 
+    // -- Lazy iteration helpers (early-termination via callback) ---------------
+
+    /// Iterate IDs matching `value`, calling `f` per ID. Stops when `f` returns false.
+    pub fn for_each_eq<F>(&self, value: &IndexValue, mut f: F)
+    where
+        F: FnMut(DocumentId) -> bool,
+    {
+        if let Some(ids) = self.tree.get(value) {
+            for &id in ids {
+                if !f(id) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Iterate IDs NOT matching `value`, calling `f` per ID. Stops when `f` returns false.
+    pub fn for_each_ne<F>(&self, value: &IndexValue, mut f: F)
+    where
+        F: FnMut(DocumentId) -> bool,
+    {
+        for (k, ids) in &self.tree {
+            if k != value {
+                for &id in ids {
+                    if !f(id) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Iterate IDs in a range, calling `f` per ID. Stops when `f` returns false.
+    pub fn for_each_in_range<F>(
+        &self,
+        start: Bound<&IndexValue>,
+        end: Bound<&IndexValue>,
+        mut f: F,
+    ) where
+        F: FnMut(DocumentId) -> bool,
+    {
+        for (_key, ids) in self.tree.range((start, end)) {
+            for &id in ids {
+                if !f(id) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Iterate IDs matching any of the given values, calling `f` per ID.
+    /// Stops when `f` returns false.
+    pub fn for_each_in<F>(&self, values: &[IndexValue], mut f: F)
+    where
+        F: FnMut(DocumentId) -> bool,
+    {
+        for v in values {
+            if let Some(ids) = self.tree.get(v) {
+                for &id in ids {
+                    if !f(id) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Iterate (value, doc_ids) in ascending order.
     pub fn iter_asc(&self) -> impl Iterator<Item = (&IndexValue, &BTreeSet<DocumentId>)> {
         self.tree.iter()

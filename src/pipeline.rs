@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
+use crate::document::DocumentId;
 use crate::error::{Error, Result};
+use crate::index::FieldIndex;
 use crate::query::{self, SortOrder};
 use crate::value::IndexValue;
 
@@ -72,8 +74,8 @@ enum Accumulator {
 enum AccumulatorState {
     Sum(f64),
     Avg { sum: f64, count: u64 },
-    Min(Option<Value>),
-    Max(Option<Value>),
+    Min(Option<(Value, IndexValue)>),
+    Max(Option<(Value, IndexValue)>),
     Count(u64),
     First(Option<Value>),
     Last(Option<Value>),
@@ -239,6 +241,30 @@ fn parse_expression(val: &Value) -> Result<Expression> {
     }
 }
 
+/// Cow-like result for eval_ref: either a borrow from the doc or an owned value.
+enum ValRef<'a> {
+    Borrowed(&'a Value),
+    Owned(Value),
+}
+
+impl<'a> ValRef<'a> {
+    fn as_value(&self) -> &Value {
+        match self {
+            ValRef::Borrowed(v) => v,
+            ValRef::Owned(v) => v,
+        }
+    }
+
+    fn into_owned(self) -> Value {
+        match self {
+            ValRef::Borrowed(v) => v.clone(),
+            ValRef::Owned(v) => v,
+        }
+    }
+}
+
+static NULL_VALUE: Value = Value::Null;
+
 impl Expression {
     /// Fast numeric evaluation — avoids Value clone for FieldRef and Literal.
     fn eval_num(&self, doc: &Value) -> Option<f64> {
@@ -246,6 +272,21 @@ impl Expression {
             Expression::Literal(v) => v.as_f64(),
             Expression::FieldRef(path) => resolve_field_ref(doc, path)?.as_f64(),
             _ => to_f64(&self.eval(doc)),
+        }
+    }
+
+    /// Evaluate returning a reference when possible (FieldRef, Literal).
+    /// Avoids Value clones on the hot path.
+    fn eval_ref<'a>(&'a self, doc: &'a Value) -> ValRef<'a> {
+        match self {
+            Expression::Literal(v) => ValRef::Borrowed(v),
+            Expression::FieldRef(path) => {
+                match resolve_field_ref(doc, path) {
+                    Some(v) => ValRef::Borrowed(v),
+                    None => ValRef::Borrowed(&NULL_VALUE),
+                }
+            }
+            _ => ValRef::Owned(self.eval(doc)),
         }
     }
 
@@ -436,27 +477,86 @@ fn exec_match(docs: Vec<Value>, match_val: &Value) -> Result<Vec<Value>> {
         .collect())
 }
 
-/// Hashable group key — avoids serde_json::to_string for hashing.
-#[derive(Clone, Eq, PartialEq)]
-struct GroupKeyHash(Vec<IndexValue>);
-
-impl Hash for GroupKeyHash {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.len().hash(state);
-        for v in &self.0 {
-            v.hash(state);
+/// Hash a &Value the same way as IndexValue::from_json().hash() but without
+/// allocating a String for non-date string values.
+fn hash_json_value<H: Hasher>(val: &Value, state: &mut H) {
+    match val {
+        Value::Null => {
+            std::mem::discriminant(&IndexValue::Null).hash(state);
+        }
+        Value::Bool(b) => {
+            std::mem::discriminant(&IndexValue::Boolean(false)).hash(state);
+            b.hash(state);
+        }
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                std::mem::discriminant(&IndexValue::Integer(0)).hash(state);
+                i.hash(state);
+            } else if let Some(f) = n.as_f64() {
+                std::mem::discriminant(&IndexValue::Float(0.0)).hash(state);
+                f.to_bits().hash(state);
+            }
+        }
+        Value::String(s) => {
+            // Check if it would be parsed as a date
+            let b = s.as_bytes();
+            if b.len() >= 10
+                && b[0].is_ascii_digit()
+                && b[1].is_ascii_digit()
+                && b[2].is_ascii_digit()
+                && b[3].is_ascii_digit()
+                && b[4] == b'-'
+                && b[5].is_ascii_digit()
+                && b[6].is_ascii_digit()
+            {
+                // Might be a date — fall back to IndexValue for correct hashing
+                let iv = IndexValue::from_json(val);
+                iv.hash(state);
+            } else {
+                // Non-date string: hash directly without allocation
+                std::mem::discriminant(&IndexValue::String(String::new())).hash(state);
+                s.hash(state);
+            }
+        }
+        other => {
+            std::mem::discriminant(&IndexValue::String(String::new())).hash(state);
+            other.to_string().hash(state);
         }
     }
 }
 
-fn compute_group_key_hash(val: &Value) -> GroupKeyHash {
-    match val {
-        Value::Null => GroupKeyHash(vec![IndexValue::Null]),
-        Value::Object(map) => {
-            GroupKeyHash(map.values().map(IndexValue::from_json).collect())
-        }
-        _ => GroupKeyHash(vec![IndexValue::from_json(val)]),
+/// Fast group key hash computed directly from &Value references (zero allocation
+/// for common cases like string/number group keys).
+#[derive(Clone)]
+struct FastGroupKey(u64);
+
+impl PartialEq for FastGroupKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
     }
+}
+impl Eq for FastGroupKey {}
+
+impl Hash for FastGroupKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+fn compute_fast_key_single(val: &Value) -> FastGroupKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    1usize.hash(&mut hasher);
+    hash_json_value(val, &mut hasher);
+    FastGroupKey(hasher.finish())
+}
+
+fn compute_fast_key_multi<'a>(vals: impl Iterator<Item = &'a Value>, len: usize) -> FastGroupKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    len.hash(&mut hasher);
+    for val in vals {
+        hash_json_value(val, &mut hasher);
+    }
+    FastGroupKey(hasher.finish())
 }
 
 fn exec_group<D: DocRef>(
@@ -464,27 +564,43 @@ fn exec_group<D: DocRef>(
     key: &GroupKey,
     accumulators: &[(String, Accumulator)],
 ) -> Result<Vec<Value>> {
-    let mut groups: HashMap<GroupKeyHash, (Value, Vec<AccumulatorState>)> = HashMap::new();
-    let mut insertion_order: Vec<GroupKeyHash> = Vec::new();
+    // Pre-size with a reasonable estimate: sqrt(n) for typical cardinality
+    let estimated_groups = (docs.len() as f64).sqrt() as usize + 1;
+    let mut groups: HashMap<FastGroupKey, (Value, Vec<AccumulatorState>)> =
+        HashMap::with_capacity(estimated_groups);
+    let mut insertion_order: Vec<FastGroupKey> = Vec::with_capacity(estimated_groups);
 
     for doc in docs {
         let doc = doc.as_value();
-        let key_val = match key {
-            GroupKey::Null => Value::Null,
-            GroupKey::Single(expr) => expr.eval(doc),
+
+        // Compute group key hash directly from references — zero allocation
+        let key_hash = match key {
+            GroupKey::Null => FastGroupKey(0),
+            GroupKey::Single(expr) => {
+                let vr = expr.eval_ref(doc);
+                compute_fast_key_single(vr.as_value())
+            }
             GroupKey::Compound(fields) => {
-                let mut map = Map::new();
-                for (name, expr) in fields {
-                    map.insert(name.clone(), expr.eval(doc));
-                }
-                Value::Object(map)
+                // Evaluate all field refs first, then hash
+                let vals: Vec<ValRef> = fields.iter().map(|(_, expr)| expr.eval_ref(doc)).collect();
+                compute_fast_key_multi(vals.iter().map(|vr| vr.as_value()), vals.len())
             }
         };
 
-        let key_hash = compute_group_key_hash(&key_val);
-
         let (_, states) = groups.entry(key_hash.clone()).or_insert_with(|| {
             insertion_order.push(key_hash.clone());
+            // Materialize group key Value only once per group (not per doc)
+            let key_val = match key {
+                GroupKey::Null => Value::Null,
+                GroupKey::Single(expr) => expr.eval_ref(doc).into_owned(),
+                GroupKey::Compound(fields) => {
+                    let mut map = Map::new();
+                    for (name, expr) in fields {
+                        map.insert(name.clone(), expr.eval_ref(doc).into_owned());
+                    }
+                    Value::Object(map)
+                }
+            };
             let initial: Vec<AccumulatorState> = accumulators
                 .iter()
                 .map(|(_, acc)| match acc {
@@ -519,37 +635,31 @@ fn exec_group<D: DocRef>(
                     }
                 }
                 (Accumulator::Min(expr), AccumulatorState::Min(current)) => {
-                    let val = expr.eval(doc);
+                    let vr = expr.eval_ref(doc);
+                    let val = vr.as_value();
                     if !val.is_null() {
-                        *current = Some(match current.take() {
-                            None => val,
-                            Some(cur) => {
-                                let cur_iv = IndexValue::from_json(&cur);
-                                let new_iv = IndexValue::from_json(&val);
-                                if new_iv < cur_iv {
-                                    val
-                                } else {
-                                    cur
-                                }
-                            }
-                        });
+                        let new_iv = IndexValue::from_json(val);
+                        let should_replace = match current {
+                            None => true,
+                            Some((_, cur_iv)) => new_iv < *cur_iv,
+                        };
+                        if should_replace {
+                            *current = Some((val.clone(), new_iv));
+                        }
                     }
                 }
                 (Accumulator::Max(expr), AccumulatorState::Max(current)) => {
-                    let val = expr.eval(doc);
+                    let vr = expr.eval_ref(doc);
+                    let val = vr.as_value();
                     if !val.is_null() {
-                        *current = Some(match current.take() {
-                            None => val,
-                            Some(cur) => {
-                                let cur_iv = IndexValue::from_json(&cur);
-                                let new_iv = IndexValue::from_json(&val);
-                                if new_iv > cur_iv {
-                                    val
-                                } else {
-                                    cur
-                                }
-                            }
-                        });
+                        let new_iv = IndexValue::from_json(val);
+                        let should_replace = match current {
+                            None => true,
+                            Some((_, cur_iv)) => new_iv > *cur_iv,
+                        };
+                        if should_replace {
+                            *current = Some((val.clone(), new_iv));
+                        }
                     }
                 }
                 (Accumulator::Count, AccumulatorState::Count(c)) => {
@@ -557,21 +667,21 @@ fn exec_group<D: DocRef>(
                 }
                 (Accumulator::First(expr), AccumulatorState::First(current)) => {
                     if current.is_none() {
-                        *current = Some(expr.eval(doc));
+                        *current = Some(expr.eval_ref(doc).into_owned());
                     }
                 }
                 (Accumulator::Last(expr), AccumulatorState::Last(current)) => {
-                    *current = Some(expr.eval(doc));
+                    *current = Some(expr.eval_ref(doc).into_owned());
                 }
                 (Accumulator::Push(expr), AccumulatorState::Push(vec)) => {
-                    vec.push(expr.eval(doc));
+                    vec.push(expr.eval_ref(doc).into_owned());
                 }
                 _ => {}
             }
         }
     }
 
-    let mut results = Vec::new();
+    let mut results = Vec::with_capacity(insertion_order.len());
     for key_hash in &insertion_order {
         let (key_val, states) = groups.remove(key_hash).unwrap();
         let mut doc = Map::new();
@@ -587,8 +697,8 @@ fn exec_group<D: DocRef>(
                         number_to_value(sum / count as f64)
                     }
                 }
-                AccumulatorState::Min(v) => v.unwrap_or(Value::Null),
-                AccumulatorState::Max(v) => v.unwrap_or(Value::Null),
+                AccumulatorState::Min(v) => v.map(|(val, _)| val).unwrap_or(Value::Null),
+                AccumulatorState::Max(v) => v.map(|(val, _)| val).unwrap_or(Value::Null),
                 AccumulatorState::Count(c) => Value::Number(c.into()),
                 AccumulatorState::First(v) => v.unwrap_or(Value::Null),
                 AccumulatorState::Last(v) => v.unwrap_or(Value::Null),
@@ -762,6 +872,288 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Index-accelerated $group
+// ---------------------------------------------------------------------------
+
+/// Try to execute a $group stage using field indexes instead of hashing all docs.
+///
+/// **Count-only fast path** (Opt 4): When the group key is a single FieldRef and
+/// all accumulators are Count or Sum(Literal(1)), we can read counts directly
+/// from `FieldIndex::iter_asc()` without touching any documents at all.
+///
+/// **Index-partitioned fast path** (Opt 5): When the group key is a single FieldRef
+/// with a FieldIndex, iterate index entries to get pre-partitioned groups. For each
+/// group, look up docs from doc_cache and feed accumulators. Avoids HashMap overhead.
+///
+/// Returns `Some(results)` if an index path was used, `None` otherwise.
+fn try_index_group(
+    key: &GroupKey,
+    accumulators: &[(String, Accumulator)],
+    docs: &[Arc<Value>],
+    field_indexes: Option<&HashMap<String, FieldIndex>>,
+    doc_cache: Option<&HashMap<DocumentId, Arc<Value>>>,
+) -> Result<Option<Vec<Value>>> {
+    // Only optimize single-field group key
+    let group_field = match key {
+        GroupKey::Single(Expression::FieldRef(field)) => field.as_str(),
+        _ => return Ok(None),
+    };
+
+    let fi = match field_indexes.and_then(|fi| fi.get(group_field)) {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+
+    // Check if this is a count-only aggregation (Opt 4)
+    let is_count_only = accumulators.iter().all(|(_, acc)| {
+        matches!(
+            acc,
+            Accumulator::Count
+                | Accumulator::Sum(Expression::Literal(Value::Number(_)))
+        )
+    });
+
+    if is_count_only {
+        // If docs is the full collection (no $match filter), use index directly
+        // We detect this by checking if docs.len() >= total indexed doc count
+        let total_indexed: usize = fi.iter_asc().map(|(_, ids)| ids.len()).sum();
+        if docs.len() >= total_indexed {
+            // Pure index-only count: no doc reads at all
+            let mut results = Vec::new();
+            for (idx_val, doc_ids) in fi.iter_asc() {
+                if doc_ids.is_empty() {
+                    continue;
+                }
+                let group_count = doc_ids.len() as u64;
+                let key_val = idx_val.to_json();
+                let mut doc = Map::new();
+                doc.insert("_id".to_string(), key_val);
+                for (name, acc) in accumulators {
+                    let val = match acc {
+                        Accumulator::Count => Value::Number(group_count.into()),
+                        Accumulator::Sum(Expression::Literal(v)) => {
+                            if let Some(n) = v.as_f64() {
+                                number_to_value(n * group_count as f64)
+                            } else {
+                                Value::Number(group_count.into())
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    doc.insert(name.clone(), val);
+                }
+                results.push(Value::Object(doc));
+            }
+            // Handle docs that don't have the group field (null group)
+            let docs_without_field = docs.len() - total_indexed;
+            if docs_without_field > 0 {
+                let group_count = docs_without_field as u64;
+                let mut doc = Map::new();
+                doc.insert("_id".to_string(), Value::Null);
+                for (name, acc) in accumulators {
+                    let val = match acc {
+                        Accumulator::Count => Value::Number(group_count.into()),
+                        Accumulator::Sum(Expression::Literal(v)) => {
+                            if let Some(n) = v.as_f64() {
+                                number_to_value(n * group_count as f64)
+                            } else {
+                                Value::Number(group_count.into())
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    doc.insert(name.clone(), val);
+                }
+                results.push(Value::Object(doc));
+            }
+            return Ok(Some(results));
+        }
+        // If there was a $match filter, docs is a subset — fall through to Opt 5 path
+    }
+
+    // Opt 5: Index-partitioned group with any accumulators.
+    // Only works when we have doc_cache to look up individual docs.
+    let dc = match doc_cache {
+        Some(dc) => dc,
+        None => return Ok(None),
+    };
+
+    // Build a set of doc IDs that are in the current result set (post-$match).
+    // For large collections, this is more efficient than hashing group keys.
+    let total_indexed: usize = fi.iter_asc().map(|(_, ids)| ids.len()).sum();
+    // Only use this path when docs came from a full collection scan (no $match filter)
+    // or when the dataset is large enough to benefit from index partitioning.
+    // For filtered datasets, the standard hash-based path is fine since docs are already few.
+    if docs.len() < total_indexed {
+        return Ok(None);
+    }
+
+    let mut results = Vec::new();
+    for (idx_val, doc_ids) in fi.iter_asc() {
+        if doc_ids.is_empty() {
+            continue;
+        }
+        let key_val = idx_val.to_json();
+        let mut states: Vec<AccumulatorState> = accumulators
+            .iter()
+            .map(|(_, acc)| match acc {
+                Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
+                Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
+                Accumulator::Min(_) => AccumulatorState::Min(None),
+                Accumulator::Max(_) => AccumulatorState::Max(None),
+                Accumulator::Count => AccumulatorState::Count(0),
+                Accumulator::First(_) => AccumulatorState::First(None),
+                Accumulator::Last(_) => AccumulatorState::Last(None),
+                Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+            })
+            .collect();
+
+        for &doc_id in doc_ids {
+            if let Some(doc_arc) = dc.get(&doc_id) {
+                let doc = doc_arc.as_ref();
+                for (i, (_, acc)) in accumulators.iter().enumerate() {
+                    update_accumulator_state(&mut states[i], acc, doc);
+                }
+            }
+        }
+
+        let mut doc = Map::new();
+        doc.insert("_id".to_string(), key_val);
+        for ((name, _), state) in accumulators.iter().zip(states) {
+            doc.insert(name.clone(), finalize_accumulator(state));
+        }
+        results.push(Value::Object(doc));
+    }
+
+    // Handle docs without the group field (null group)
+    let docs_without_field = docs.len() - total_indexed;
+    if docs_without_field > 0 {
+        // Collect null-group doc IDs: all docs not in any index entry
+        let mut null_states: Vec<AccumulatorState> = accumulators
+            .iter()
+            .map(|(_, acc)| match acc {
+                Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
+                Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
+                Accumulator::Min(_) => AccumulatorState::Min(None),
+                Accumulator::Max(_) => AccumulatorState::Max(None),
+                Accumulator::Count => AccumulatorState::Count(0),
+                Accumulator::First(_) => AccumulatorState::First(None),
+                Accumulator::Last(_) => AccumulatorState::Last(None),
+                Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+            })
+            .collect();
+
+        // We need to find which docs don't have the group field.
+        // Build a HashSet of all indexed doc IDs for fast lookup.
+        let mut indexed_ids = std::collections::HashSet::with_capacity(total_indexed);
+        for (_, ids) in fi.iter_asc() {
+            for &id in ids {
+                indexed_ids.insert(id);
+            }
+        }
+        for doc_arc in docs {
+            if let Some(id) = doc_arc.get("_id").and_then(|v| v.as_u64()) {
+                if !indexed_ids.contains(&id) {
+                    let doc = doc_arc.as_ref();
+                    for (i, (_, acc)) in accumulators.iter().enumerate() {
+                        update_accumulator_state(&mut null_states[i], acc, doc);
+                    }
+                }
+            }
+        }
+
+        let mut doc = Map::new();
+        doc.insert("_id".to_string(), Value::Null);
+        for ((name, _), state) in accumulators.iter().zip(null_states) {
+            doc.insert(name.clone(), finalize_accumulator(state));
+        }
+        results.push(Value::Object(doc));
+    }
+
+    Ok(Some(results))
+}
+
+/// Update a single accumulator state with a document value.
+fn update_accumulator_state(state: &mut AccumulatorState, acc: &Accumulator, doc: &Value) {
+    match (acc, state) {
+        (Accumulator::Sum(expr), AccumulatorState::Sum(s)) => {
+            if let Some(n) = expr.eval_num(doc) {
+                *s += n;
+            }
+        }
+        (Accumulator::Avg(expr), AccumulatorState::Avg { sum, count }) => {
+            if let Some(n) = expr.eval_num(doc) {
+                *sum += n;
+                *count += 1;
+            }
+        }
+        (Accumulator::Min(expr), AccumulatorState::Min(current)) => {
+            let vr = expr.eval_ref(doc);
+            let val = vr.as_value();
+            if !val.is_null() {
+                let new_iv = IndexValue::from_json(val);
+                let should_replace = match current {
+                    None => true,
+                    Some((_, cur_iv)) => new_iv < *cur_iv,
+                };
+                if should_replace {
+                    *current = Some((val.clone(), new_iv));
+                }
+            }
+        }
+        (Accumulator::Max(expr), AccumulatorState::Max(current)) => {
+            let vr = expr.eval_ref(doc);
+            let val = vr.as_value();
+            if !val.is_null() {
+                let new_iv = IndexValue::from_json(val);
+                let should_replace = match current {
+                    None => true,
+                    Some((_, cur_iv)) => new_iv > *cur_iv,
+                };
+                if should_replace {
+                    *current = Some((val.clone(), new_iv));
+                }
+            }
+        }
+        (Accumulator::Count, AccumulatorState::Count(c)) => {
+            *c += 1;
+        }
+        (Accumulator::First(expr), AccumulatorState::First(current)) => {
+            if current.is_none() {
+                *current = Some(expr.eval_ref(doc).into_owned());
+            }
+        }
+        (Accumulator::Last(expr), AccumulatorState::Last(current)) => {
+            *current = Some(expr.eval_ref(doc).into_owned());
+        }
+        (Accumulator::Push(expr), AccumulatorState::Push(vec)) => {
+            vec.push(expr.eval_ref(doc).into_owned());
+        }
+        _ => {}
+    }
+}
+
+/// Convert an accumulator state into its final Value.
+fn finalize_accumulator(state: AccumulatorState) -> Value {
+    match state {
+        AccumulatorState::Sum(s) => number_to_value(s),
+        AccumulatorState::Avg { sum, count } => {
+            if count == 0 {
+                Value::Null
+            } else {
+                number_to_value(sum / count as f64)
+            }
+        }
+        AccumulatorState::Min(v) => v.map(|(val, _)| val).unwrap_or(Value::Null),
+        AccumulatorState::Max(v) => v.map(|(val, _)| val).unwrap_or(Value::Null),
+        AccumulatorState::Count(c) => Value::Number(c.into()),
+        AccumulatorState::First(v) => v.unwrap_or(Value::Null),
+        AccumulatorState::Last(v) => v.unwrap_or(Value::Null),
+        AccumulatorState::Push(v) => Value::Array(v),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline parsing & execution
 // ---------------------------------------------------------------------------
 
@@ -895,6 +1287,8 @@ impl Pipeline {
         start: usize,
         mut docs: Vec<Arc<Value>>,
         lookup_fn: &F,
+        field_indexes: Option<&HashMap<String, FieldIndex>>,
+        doc_cache: Option<&HashMap<DocumentId, Arc<Value>>>,
     ) -> Result<Vec<Value>>
     where
         F: Fn(&str, &Value) -> Result<Vec<Value>>,
@@ -906,6 +1300,16 @@ impl Pipeline {
                     docs.retain(|doc| query::matches_value(&query, doc));
                 }
                 Stage::Group { key, accumulators } => {
+                    // Try index-accelerated group path
+                    if let Some(result) = try_index_group(
+                        key,
+                        accumulators,
+                        &docs,
+                        field_indexes,
+                        doc_cache,
+                    )? {
+                        return self.execute_from(start + i + 1, result, lookup_fn);
+                    }
                     // $group reads by reference → produces small owned Vec<Value>
                     let result = exec_group(&docs, key, accumulators)?;
                     // Continue with owned pipeline for remaining stages
