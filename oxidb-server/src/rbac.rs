@@ -37,6 +37,9 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "list_buckets"
                 | "search"
                 | "sql"
+                | "call_procedure"
+                | "enable_schedule"
+                | "disable_schedule"
         ),
         Role::Read => matches!(
             cmd,
@@ -51,6 +54,10 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "get_object"
                 | "head_object"
                 | "search"
+                | "list_procedures"
+                | "get_procedure"
+                | "list_schedules"
+                | "get_schedule"
         ),
     }
 }

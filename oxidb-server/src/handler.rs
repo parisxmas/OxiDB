@@ -642,6 +642,124 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        // -------------------------------------------------------------------
+        // Stored procedures
+        // -------------------------------------------------------------------
+
+        "create_procedure" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n.to_string(),
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.create_procedure(&name, request) {
+                Ok(()) => ok_bytes(json!("procedure created")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "call_procedure" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            let params = request.get("params").cloned().unwrap_or(json!({}));
+            match db.call_procedure(name, params) {
+                Ok(val) => ok_bytes(val),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "list_procedures" => match db.list_procedures() {
+            Ok(names) => ok_bytes(json!(names)),
+            Err(e) => err_bytes(&e.to_string()),
+        },
+
+        "get_procedure" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.get_procedure(name) {
+                Ok(def) => ok_bytes(def),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "delete_procedure" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.delete_procedure(name) {
+                Ok(()) => ok_bytes(json!("procedure deleted")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Cron schedules
+        // -------------------------------------------------------------------
+
+        "create_schedule" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n.to_string(),
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.create_schedule(&name, request) {
+                Ok(()) => ok_bytes(json!("schedule created")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "list_schedules" => match db.list_schedules() {
+            Ok(schedules) => ok_bytes(json!(schedules)),
+            Err(e) => err_bytes(&e.to_string()),
+        },
+
+        "get_schedule" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.get_schedule(name) {
+                Ok(sched) => ok_bytes(sched),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "delete_schedule" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.delete_schedule(name) {
+                Ok(()) => ok_bytes(json!("schedule deleted")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "enable_schedule" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.enable_schedule(name) {
+                Ok(()) => ok_bytes(json!("schedule enabled")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "disable_schedule" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.disable_schedule(name) {
+                Ok(()) => ok_bytes(json!("schedule disabled")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         _ => err_bytes(&format!("unknown command: {cmd}")),
     }
 }

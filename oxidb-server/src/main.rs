@@ -644,6 +644,7 @@ fn main() {
         );
     }
     let db = Arc::new(db);
+    db.start_scheduler();
 
     // TLS
     let tls_config = match (env::var("OXIDB_TLS_CERT"), env::var("OXIDB_TLS_KEY")) {
