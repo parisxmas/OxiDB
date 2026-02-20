@@ -81,6 +81,8 @@ docker compose up -d
 - **Crash-safe** — write-ahead log with CRC32 checksums, verified by SIGKILL recovery tests
 - **Encryption at rest** — AES-256-GCM with per-record nonces
 - **Security** — TLS transport, SCRAM-SHA-256 authentication, role-based access control (Admin/ReadWrite/Read), audit logging
+- **Stored procedures** — JSON-defined multi-step procedures with control flow (`if`/`else`, `abort`, `return`), variable binding, and automatic transaction wrapping
+- **Cron scheduler** — built-in background scheduler that runs stored procedures on cron expressions (`"0 3 * * *"`) or fixed intervals (`"30s"`, `"5m"`, `"2h"`), with run history tracking
 - **GELF logging** — centralized UDP logging to Graylog/Loki via `OXIDB_GELF_ADDR`
 - **Compaction** — reclaim space from deleted documents with atomic file swap
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block
@@ -269,11 +271,108 @@ Max message size is 16 MiB.
 | `list_objects`           | `bucket`, `prefix?`, `limit?`                      |
 | `search`                 | `query`, `bucket?`, `limit?`                       |
 | `sql`                    | `query`                                            |
+| `create_procedure`       | `name`, `params`, `steps`                          |
+| `call_procedure`         | `name`, `params?`                                  |
+| `list_procedures`        | —                                                  |
+| `get_procedure`          | `name`                                             |
+| `delete_procedure`       | `name`                                             |
+| `create_schedule`        | `name`, `procedure`, `cron` or `every`, `params?`, `enabled?` |
+| `list_schedules`         | —                                                  |
+| `get_schedule`           | `name`                                             |
+| `delete_schedule`        | `name`                                             |
+| `enable_schedule`        | `name`                                             |
+| `disable_schedule`       | `name`                                             |
 | `watch`                  | `collection?`, `resume_after?`                     |
 | `unwatch`                | —                                                  |
 | `begin_tx`               | —                                                  |
 | `commit_tx`              | —                                                  |
 | `rollback_tx`            | —                                                  |
+
+## Stored Procedures
+
+Define multi-step procedures as JSON and execute them atomically within a transaction.
+
+```json
+{"cmd": "create_procedure", "name": "transfer_funds", "params": ["from", "to", "amount"], "steps": [
+  {"step": "find_one", "collection": "accounts", "query": {"account_id": "$param.from"}, "as": "sender"},
+  {"step": "if", "condition": {"$expr": {"$lt": ["$sender.balance", "$param.amount"]}},
+   "then": [{"step": "abort", "message": "insufficient funds"}]},
+  {"step": "update", "collection": "accounts", "query": {"account_id": "$param.from"}, "update": {"$inc": {"balance": -100}}},
+  {"step": "update", "collection": "accounts", "query": {"account_id": "$param.to"}, "update": {"$inc": {"balance": 100}}},
+  {"step": "return", "value": {"status": "ok"}}
+]}
+```
+
+### Step Types
+
+| Step | Description |
+|------|-------------|
+| `find` | Query documents, store result array in `as` variable |
+| `find_one` | Query single document, store in `as` variable |
+| `insert` | Insert a document |
+| `update` | Update matching documents |
+| `delete` | Delete matching documents |
+| `count` | Count matching documents, store in `as` variable |
+| `aggregate` | Run aggregation pipeline, store in `as` variable |
+| `set` | Set a variable to a value |
+| `if` | Conditional branching with `then`/`else` step arrays |
+| `abort` | Rollback transaction and return error |
+| `return` | Commit transaction and return value |
+
+Variables use `$param.name` for parameters and `$varname` for step results. Dot-notation is supported for nested access.
+
+## Cron Scheduler
+
+The built-in scheduler runs stored procedures on a schedule. Two modes are supported:
+
+- **Cron expression** — standard 5-field format: `minute hour dom month dow`
+- **Interval** — simple repeating duration: `"30s"`, `"5m"`, `"2h"`
+
+```json
+// Run a procedure every night at 3:00 AM
+{"cmd": "create_schedule", "name": "nightly_cleanup", "procedure": "cleanup_old_records", "params": {"days": 30}, "cron": "0 3 * * *"}
+
+// Run a procedure every 5 minutes
+{"cmd": "create_schedule", "name": "health_check", "procedure": "check_status", "every": "5m"}
+
+// List all schedules (includes last_run, last_status, run_count)
+{"cmd": "list_schedules"}
+
+// Pause a schedule
+{"cmd": "disable_schedule", "name": "nightly_cleanup"}
+
+// Resume a schedule
+{"cmd": "enable_schedule", "name": "nightly_cleanup"}
+
+// Delete a schedule
+{"cmd": "delete_schedule", "name": "nightly_cleanup"}
+```
+
+### Cron Expression Format
+
+```
+ ┌───────── minute (0-59)
+ │ ┌─────── hour (0-23)
+ │ │ ┌───── day of month (1-31)
+ │ │ │ ┌─── month (1-12)
+ │ │ │ │ ┌─ day of week (0-6, 0=Sun)
+ * * * * *
+```
+
+Each field supports: `*` (all), `N` (exact), `N-M` (range), `*/N` (step), `N,M,O` (list).
+
+### Schedule Commands
+
+| Command | RBAC | Description |
+|---------|------|-------------|
+| `create_schedule` | Admin | Create or replace a named schedule |
+| `list_schedules` | Read | List all schedules with status |
+| `get_schedule` | Read | Get a schedule by name |
+| `delete_schedule` | Admin | Delete a schedule |
+| `enable_schedule` | ReadWrite | Enable a paused schedule |
+| `disable_schedule` | ReadWrite | Pause a schedule |
+
+The scheduler thread starts automatically with the server. Schedule state (last run time, status, error, run count) is persisted in the `_schedules` system collection.
 
 ## Raft Cluster
 

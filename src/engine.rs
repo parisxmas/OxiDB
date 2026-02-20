@@ -69,6 +69,7 @@ pub struct OxiDb {
     verbose: bool,
     log_callback: Option<LogCallback>,
     change_broker: ChangeStreamBroker,
+    scheduler_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 
 impl OxiDb {
@@ -177,6 +178,7 @@ impl OxiDb {
             verbose,
             log_callback,
             change_broker: ChangeStreamBroker::new(),
+            scheduler_shutdown: Mutex::new(None),
         })
     }
 
@@ -897,6 +899,201 @@ impl OxiDb {
     }
 
     // -----------------------------------------------------------------------
+    // Stored procedures
+    // -----------------------------------------------------------------------
+
+    /// Create or replace a stored procedure.
+    pub fn create_procedure(&self, name: &str, body: Value) -> Result<()> {
+        // Validate the procedure definition
+        crate::procedure::parse_procedure(&body)?;
+
+        let col = self.get_or_create_collection("_procedures")?;
+        let mut col_guard = col.write().unwrap();
+
+        // Ensure unique index on name
+        let _ = col_guard.create_unique_index("name");
+
+        // Delete existing procedure with same name (upsert semantics)
+        let _ = col_guard.delete(&json!({"name": name}), None);
+
+        // Store the full definition with the name
+        let mut doc = body;
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert("name".to_string(), Value::String(name.to_string()));
+        }
+        col_guard.insert(doc)?;
+        Ok(())
+    }
+
+    /// Execute a stored procedure by name with the given parameters.
+    pub fn call_procedure(&self, name: &str, params: Value) -> Result<Value> {
+        let proc_def = {
+            let col = self.get_or_create_collection("_procedures")?;
+            let col_guard = col.read().unwrap();
+            col_guard
+                .find_one(&json!({"name": name}))?
+                .ok_or_else(|| Error::ProcedureNotFound(name.to_string()))?
+        };
+        crate::procedure::execute_procedure(self, &proc_def, &params)
+    }
+
+    /// List all stored procedure names.
+    pub fn list_procedures(&self) -> Result<Vec<String>> {
+        let col = self.get_or_create_collection("_procedures")?;
+        let col_guard = col.read().unwrap();
+        let docs = col_guard.find(&json!({}))?;
+        Ok(docs
+            .iter()
+            .filter_map(|d| d.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect())
+    }
+
+    /// Get a stored procedure definition by name.
+    pub fn get_procedure(&self, name: &str) -> Result<Value> {
+        let col = self.get_or_create_collection("_procedures")?;
+        let col_guard = col.read().unwrap();
+        col_guard
+            .find_one(&json!({"name": name}))?
+            .ok_or_else(|| Error::ProcedureNotFound(name.to_string()))
+    }
+
+    /// Delete a stored procedure by name.
+    pub fn delete_procedure(&self, name: &str) -> Result<()> {
+        let col = self.get_or_create_collection("_procedures")?;
+        let mut col_guard = col.write().unwrap();
+        let deleted = col_guard.delete(&json!({"name": name}), None)?;
+        if deleted.is_empty() {
+            return Err(Error::ProcedureNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Cron Scheduler
+    // -----------------------------------------------------------------------
+
+    /// Spawn the scheduler background thread that periodically runs due schedules.
+    pub fn start_scheduler(self: &Arc<Self>) {
+        let (tx, rx) = mpsc::sync_channel::<()>(0);
+        let db = Arc::clone(self);
+        std::thread::spawn(move || {
+            crate::scheduler::scheduler_loop(db, rx);
+        });
+        *self.scheduler_shutdown.lock().unwrap() = Some(tx);
+    }
+
+    /// Create or replace a named schedule.
+    pub fn create_schedule(&self, name: &str, mut def: Value) -> Result<()> {
+        // Validate: must have either "cron" or "every"
+        let has_cron = def.get("cron").and_then(|v| v.as_str()).is_some();
+        let has_every = def.get("every").and_then(|v| v.as_str()).is_some();
+        if !has_cron && !has_every {
+            return Err(Error::ScheduleError(
+                "schedule must have 'cron' or 'every' field".into(),
+            ));
+        }
+        if has_cron && has_every {
+            return Err(Error::ScheduleError(
+                "schedule cannot have both 'cron' and 'every'".into(),
+            ));
+        }
+
+        // Validate cron expression if present
+        if let Some(cron_str) = def.get("cron").and_then(|v| v.as_str()) {
+            crate::scheduler::parse_cron(cron_str)?;
+        }
+        // Validate interval if present
+        if let Some(every_str) = def.get("every").and_then(|v| v.as_str()) {
+            crate::scheduler::parse_interval(every_str)?;
+        }
+
+        // Validate procedure exists
+        let procedure = def
+            .get("procedure")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::ScheduleError("missing 'procedure' field".into()))?
+            .to_string();
+        // Check procedure exists
+        self.get_procedure(&procedure)?;
+
+        // Ensure required fields
+        if let Some(obj) = def.as_object_mut() {
+            obj.insert("name".to_string(), Value::String(name.to_string()));
+            obj.entry("enabled".to_string())
+                .or_insert(Value::Bool(true));
+            obj.entry("last_run".to_string())
+                .or_insert(Value::Null);
+            obj.entry("last_run_epoch".to_string())
+                .or_insert(json!(0));
+            obj.entry("last_status".to_string())
+                .or_insert(Value::Null);
+            obj.entry("last_error".to_string())
+                .or_insert(Value::Null);
+            obj.entry("run_count".to_string())
+                .or_insert(json!(0));
+        }
+
+        let col = self.get_or_create_collection("_schedules")?;
+        let mut col_guard = col.write().unwrap();
+        let _ = col_guard.create_unique_index("name");
+        // Upsert: delete existing, then insert
+        let _ = col_guard.delete(&json!({"name": name}), None);
+        col_guard.insert(def)?;
+        Ok(())
+    }
+
+    /// List all schedules.
+    pub fn list_schedules(&self) -> Result<Vec<Value>> {
+        let col = self.get_or_create_collection("_schedules")?;
+        let col_guard = col.read().unwrap();
+        col_guard.find(&json!({}))
+    }
+
+    /// Get a schedule by name.
+    pub fn get_schedule(&self, name: &str) -> Result<Value> {
+        let col = self.get_or_create_collection("_schedules")?;
+        let col_guard = col.read().unwrap();
+        col_guard
+            .find_one(&json!({"name": name}))?
+            .ok_or_else(|| Error::ScheduleError(format!("schedule not found: {name}")))
+    }
+
+    /// Delete a schedule by name.
+    pub fn delete_schedule(&self, name: &str) -> Result<()> {
+        let col = self.get_or_create_collection("_schedules")?;
+        let mut col_guard = col.write().unwrap();
+        let deleted = col_guard.delete(&json!({"name": name}), None)?;
+        if deleted.is_empty() {
+            return Err(Error::ScheduleError(format!("schedule not found: {name}")));
+        }
+        Ok(())
+    }
+
+    /// Enable a schedule.
+    pub fn enable_schedule(&self, name: &str) -> Result<()> {
+        // Verify it exists
+        self.get_schedule(name)?;
+        self.update(
+            "_schedules",
+            &json!({"name": name}),
+            &json!({"$set": {"enabled": true}}),
+        )?;
+        Ok(())
+    }
+
+    /// Disable (pause) a schedule.
+    pub fn disable_schedule(&self, name: &str) -> Result<()> {
+        // Verify it exists
+        self.get_schedule(name)?;
+        self.update(
+            "_schedules",
+            &json!({"name": name}),
+            &json!({"$set": {"enabled": false}}),
+        )?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Backup & Restore
     // -----------------------------------------------------------------------
 
@@ -1055,6 +1252,8 @@ impl OxiDb {
 
 impl Drop for OxiDb {
     fn drop(&mut self) {
+        // Shut down the scheduler thread (dropping the sender causes it to exit)
+        let _ = self.scheduler_shutdown.lock().unwrap().take();
         self.flush_indexes();
     }
 }
@@ -1350,5 +1549,230 @@ mod tests {
 
         // No more events (the users insert was filtered out)
         assert!(handle.rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+    }
+
+    #[test]
+    fn test_sp_demo() {
+        let db = temp_db();
+
+        // ── Seed data ──────────────────────────────────────────────
+        db.insert("accounts", json!({
+            "account_id": "ACC001", "owner": "Alice", "balance": 500
+        })).unwrap();
+        db.insert("accounts", json!({
+            "account_id": "ACC002", "owner": "Bob", "balance": 200
+        })).unwrap();
+
+        // ── 1. Create a stored procedure ───────────────────────────
+        db.create_procedure("transfer_funds", json!({
+            "name": "transfer_funds",
+            "params": ["from_account", "to_account", "amount"],
+            "steps": [
+                {
+                    "step": "find_one",
+                    "collection": "accounts",
+                    "query": { "account_id": "$param.from_account" },
+                    "as": "sender"
+                },
+                {
+                    "step": "find_one",
+                    "collection": "accounts",
+                    "query": { "account_id": "$param.to_account" },
+                    "as": "receiver"
+                },
+                {
+                    "step": "if",
+                    "condition": { "$expr": { "$lt": ["$sender.balance", "$param.amount"] } },
+                    "then": [
+                        { "step": "abort", "message": "insufficient funds" }
+                    ]
+                },
+                {
+                    "step": "update",
+                    "collection": "accounts",
+                    "query": { "account_id": "$param.from_account" },
+                    "update": { "$inc": { "balance": -150 } }
+                },
+                {
+                    "step": "update",
+                    "collection": "accounts",
+                    "query": { "account_id": "$param.to_account" },
+                    "update": { "$inc": { "balance": 150 } }
+                },
+                {
+                    "step": "return",
+                    "value": {
+                        "status": "ok",
+                        "from": "$param.from_account",
+                        "to": "$param.to_account",
+                        "amount": "$param.amount",
+                        "sender_old_balance": "$sender.balance",
+                        "receiver_old_balance": "$receiver.balance"
+                    }
+                }
+            ]
+        })).unwrap();
+
+        // ── 2. List procedures ─────────────────────────────────────
+        let procs = db.list_procedures().unwrap();
+        println!("\n=== Stored procedures: {:?}", procs);
+        assert_eq!(procs, vec!["transfer_funds"]);
+
+        // ── 3. Get procedure definition ────────────────────────────
+        let def = db.get_procedure("transfer_funds").unwrap();
+        println!("\n=== Procedure definition:\n{}", serde_json::to_string_pretty(&def).unwrap());
+
+        // ── 4. Call the procedure (success) ────────────────────────
+        let result = db.call_procedure("transfer_funds", json!({
+            "from_account": "ACC001",
+            "to_account": "ACC002",
+            "amount": 150
+        })).unwrap();
+        println!("\n=== Transfer result:\n{}", serde_json::to_string_pretty(&result).unwrap());
+        assert_eq!(result["status"], "ok");
+
+        // Verify balances after transfer
+        let alice = db.find_one("accounts", &json!({"account_id": "ACC001"})).unwrap().unwrap();
+        let bob = db.find_one("accounts", &json!({"account_id": "ACC002"})).unwrap().unwrap();
+        println!("\n=== After transfer:");
+        println!("  Alice: {}", alice["balance"]);
+        println!("  Bob:   {}", bob["balance"]);
+        assert_eq!(alice["balance"], 350);
+        assert_eq!(bob["balance"], 350);
+
+        // ── 5. Call the procedure (insufficient funds → abort) ─────
+        let err = db.call_procedure("transfer_funds", json!({
+            "from_account": "ACC001",
+            "to_account": "ACC002",
+            "amount": 9999
+        }));
+        println!("\n=== Insufficient funds error: {}", err.unwrap_err());
+
+        // Verify balances unchanged after abort
+        let alice = db.find_one("accounts", &json!({"account_id": "ACC001"})).unwrap().unwrap();
+        let bob = db.find_one("accounts", &json!({"account_id": "ACC002"})).unwrap().unwrap();
+        println!("  Alice still: {}", alice["balance"]);
+        println!("  Bob still:   {}", bob["balance"]);
+        assert_eq!(alice["balance"], 350);
+        assert_eq!(bob["balance"], 350);
+
+        // ── 6. Delete the procedure ────────────────────────────────
+        db.delete_procedure("transfer_funds").unwrap();
+        let procs = db.list_procedures().unwrap();
+        println!("\n=== After delete, procedures: {:?}", procs);
+        assert!(procs.is_empty());
+    }
+
+    #[test]
+    fn test_sp_nested_if() {
+        let db = temp_db();
+
+        // Seed: users with different ages and membership tiers
+        db.insert("users", json!({
+            "name": "Alice", "age": 25, "tier": "gold", "balance": 1000
+        })).unwrap();
+        db.insert("users", json!({
+            "name": "Bob", "age": 16, "tier": "silver", "balance": 500
+        })).unwrap();
+        db.insert("users", json!({
+            "name": "Charlie", "age": 30, "tier": "bronze", "balance": 50
+        })).unwrap();
+
+        // A procedure that classifies a user's discount based on nested rules:
+        //   - if age < 18 → "minor_not_eligible"
+        //   - else →
+        //       - if tier == "gold" →
+        //           - if balance >= 500 → 30% discount
+        //           - else → 20% discount
+        //       - else →
+        //           - if balance >= 200 → 10% discount
+        //           - else → 5% discount
+        db.create_procedure("calc_discount", json!({
+            "name": "calc_discount",
+            "params": ["username"],
+            "steps": [
+                {
+                    "step": "find_one",
+                    "collection": "users",
+                    "query": { "name": "$param.username" },
+                    "as": "user"
+                },
+                {
+                    "step": "if",
+                    "condition": { "$expr": { "$lt": ["$user.age", 18] } },
+                    "then": [
+                        { "step": "return", "value": {
+                            "user": "$param.username",
+                            "discount": 0,
+                            "reason": "minor_not_eligible"
+                        }}
+                    ],
+                    "else": [
+                        {
+                            "step": "if",
+                            "condition": { "$expr": { "$eq": ["$user.tier", "gold"] } },
+                            "then": [
+                                {
+                                    "step": "if",
+                                    "condition": { "$expr": { "$gte": ["$user.balance", 500] } },
+                                    "then": [
+                                        { "step": "return", "value": {
+                                            "user": "$param.username",
+                                            "discount": 30,
+                                            "reason": "gold_high_balance"
+                                        }}
+                                    ],
+                                    "else": [
+                                        { "step": "return", "value": {
+                                            "user": "$param.username",
+                                            "discount": 20,
+                                            "reason": "gold_low_balance"
+                                        }}
+                                    ]
+                                }
+                            ],
+                            "else": [
+                                {
+                                    "step": "if",
+                                    "condition": { "$expr": { "$gte": ["$user.balance", 200] } },
+                                    "then": [
+                                        { "step": "return", "value": {
+                                            "user": "$param.username",
+                                            "discount": 10,
+                                            "reason": "standard_high_balance"
+                                        }}
+                                    ],
+                                    "else": [
+                                        { "step": "return", "value": {
+                                            "user": "$param.username",
+                                            "discount": 5,
+                                            "reason": "standard_low_balance"
+                                        }}
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        })).unwrap();
+
+        // Alice: age 25, gold, balance 1000 → gold_high_balance (30%)
+        let r = db.call_procedure("calc_discount", json!({"username": "Alice"})).unwrap();
+        println!("\nAlice: {}", serde_json::to_string_pretty(&r).unwrap());
+        assert_eq!(r["discount"], 30);
+        assert_eq!(r["reason"], "gold_high_balance");
+
+        // Bob: age 16 → minor_not_eligible (0%)
+        let r = db.call_procedure("calc_discount", json!({"username": "Bob"})).unwrap();
+        println!("\nBob: {}", serde_json::to_string_pretty(&r).unwrap());
+        assert_eq!(r["discount"], 0);
+        assert_eq!(r["reason"], "minor_not_eligible");
+
+        // Charlie: age 30, bronze, balance 50 → standard_low_balance (5%)
+        let r = db.call_procedure("calc_discount", json!({"username": "Charlie"})).unwrap();
+        println!("\nCharlie: {}", serde_json::to_string_pretty(&r).unwrap());
+        assert_eq!(r["discount"], 5);
+        assert_eq!(r["reason"], "standard_low_balance");
     }
 }

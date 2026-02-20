@@ -66,6 +66,15 @@ pub enum Error {
 
     #[error("backup error: {0}")]
     Backup(String),
+
+    #[error("procedure not found: {0}")]
+    ProcedureNotFound(String),
+
+    #[error("procedure error: {0}")]
+    ProcedureError(String),
+
+    #[error("schedule error: {0}")]
+    ScheduleError(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
