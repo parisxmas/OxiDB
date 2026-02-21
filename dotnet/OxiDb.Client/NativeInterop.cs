@@ -123,6 +123,26 @@ internal static partial class NativeInterop
     [LibraryImport(LibName, EntryPoint = "oxidb_sql", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint Sql(nint conn, string query);
 
+    // Schedules
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_create_schedule", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint CreateSchedule(nint conn, string scheduleJson);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_list_schedules")]
+    internal static partial nint ListSchedules(nint conn);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_get_schedule", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint GetSchedule(nint conn, string name);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_delete_schedule", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint DeleteSchedule(nint conn, string name);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_enable_schedule", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint EnableSchedule(nint conn, string name);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_disable_schedule", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint DisableSchedule(nint conn, string name);
+
     [LibraryImport(LibName, EntryPoint = "oxidb_free_string")]
     internal static partial void FreeString(nint ptr);
 }

@@ -347,3 +347,38 @@ class OxiDbClient:
     def sql(self, query: str):
         """Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES."""
         return self._checked({"cmd": "sql", "query": query})
+
+    # ------------------------------------------------------------------
+    # Cron schedules
+    # ------------------------------------------------------------------
+
+    def create_schedule(self, name: str, procedure: str, cron: str = None, every: str = None, params: dict = None, enabled: bool = True):
+        """Create or replace a named schedule. Specify either cron or every."""
+        payload = {"cmd": "create_schedule", "name": name, "procedure": procedure, "enabled": enabled}
+        if cron is not None:
+            payload["cron"] = cron
+        if every is not None:
+            payload["every"] = every
+        if params is not None:
+            payload["params"] = params
+        return self._checked(payload)
+
+    def list_schedules(self) -> list:
+        """List all schedules with status."""
+        return self._checked({"cmd": "list_schedules"})
+
+    def get_schedule(self, name: str) -> dict:
+        """Get a schedule by name."""
+        return self._checked({"cmd": "get_schedule", "name": name})
+
+    def delete_schedule(self, name: str):
+        """Delete a schedule."""
+        return self._checked({"cmd": "delete_schedule", "name": name})
+
+    def enable_schedule(self, name: str):
+        """Enable a paused schedule."""
+        return self._checked({"cmd": "enable_schedule", "name": name})
+
+    def disable_schedule(self, name: str):
+        """Disable (pause) a schedule."""
+        return self._checked({"cmd": "disable_schedule", "name": name})

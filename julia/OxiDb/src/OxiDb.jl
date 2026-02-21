@@ -532,4 +532,66 @@ Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE,
 sql(client::OxiDbClient, query::AbstractString) =
     _checked(client, Dict("cmd" => "sql", "query" => query))
 
+# ------------------------------------------------------------------
+# Cron schedules
+# ------------------------------------------------------------------
+
+"""
+    create_schedule(client, name, procedure; cron=nothing, every=nothing, params=nothing, enabled=true)
+
+Create or replace a named schedule. Specify either `cron` or `every`.
+"""
+function create_schedule(client::OxiDbClient, name::AbstractString, procedure::AbstractString;
+                         cron::Union{AbstractString,Nothing}=nothing,
+                         every::Union{AbstractString,Nothing}=nothing,
+                         params::Union{Dict,Nothing}=nothing,
+                         enabled::Bool=true)
+    payload = Dict{String,Any}("cmd" => "create_schedule", "name" => name,
+                               "procedure" => procedure, "enabled" => enabled)
+    cron !== nothing && (payload["cron"] = cron)
+    every !== nothing && (payload["every"] = every)
+    params !== nothing && (payload["params"] = params)
+    _checked(client, payload)
+end
+
+"""
+    list_schedules(client)
+
+List all schedules with status.
+"""
+list_schedules(client::OxiDbClient) =
+    _checked(client, Dict("cmd" => "list_schedules"))
+
+"""
+    get_schedule(client, name)
+
+Get a schedule by name.
+"""
+get_schedule(client::OxiDbClient, name::AbstractString) =
+    _checked(client, Dict("cmd" => "get_schedule", "name" => name))
+
+"""
+    delete_schedule(client, name)
+
+Delete a schedule.
+"""
+delete_schedule(client::OxiDbClient, name::AbstractString) =
+    _checked(client, Dict("cmd" => "delete_schedule", "name" => name))
+
+"""
+    enable_schedule(client, name)
+
+Enable a paused schedule.
+"""
+enable_schedule(client::OxiDbClient, name::AbstractString) =
+    _checked(client, Dict("cmd" => "enable_schedule", "name" => name))
+
+"""
+    disable_schedule(client, name)
+
+Disable (pause) a schedule.
+"""
+disable_schedule(client::OxiDbClient, name::AbstractString) =
+    _checked(client, Dict("cmd" => "disable_schedule", "name" => name))
+
 end # module

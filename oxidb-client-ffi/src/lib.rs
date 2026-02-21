@@ -679,6 +679,85 @@ pub unsafe extern "C" fn oxidb_sql(
     unsafe { send_request(conn, &req) }
 }
 
+// ---------------------------------------------------------------------------
+// Cron scheduler
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_create_schedule(
+    conn: *mut OxiDbConn,
+    schedule_json: *const c_char,
+) -> *mut c_char {
+    let json_str = match unsafe { cstr_to_str(schedule_json) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let mut def: serde_json::Value = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+    def["cmd"] = serde_json::json!("create_schedule");
+    unsafe { send_request(conn, &def) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_list_schedules(conn: *mut OxiDbConn) -> *mut c_char {
+    let req = serde_json::json!({"cmd": "list_schedules"});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_get_schedule(
+    conn: *mut OxiDbConn,
+    name: *const c_char,
+) -> *mut c_char {
+    let n = match unsafe { cstr_to_str(name) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "get_schedule", "name": n});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_delete_schedule(
+    conn: *mut OxiDbConn,
+    name: *const c_char,
+) -> *mut c_char {
+    let n = match unsafe { cstr_to_str(name) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "delete_schedule", "name": n});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_enable_schedule(
+    conn: *mut OxiDbConn,
+    name: *const c_char,
+) -> *mut c_char {
+    let n = match unsafe { cstr_to_str(name) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "enable_schedule", "name": n});
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_disable_schedule(
+    conn: *mut OxiDbConn,
+    name: *const c_char,
+) -> *mut c_char {
+    let n = match unsafe { cstr_to_str(name) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let req = serde_json::json!({"cmd": "disable_schedule", "name": n});
+    unsafe { send_request(conn, &req) }
+}
+
 /// Free a string returned by any `oxidb_*` function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_free_string(ptr: *mut c_char) {

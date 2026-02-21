@@ -556,6 +556,75 @@ public class OxiDbClient implements AutoCloseable {
     }
 
     // ------------------------------------------------------------------
+    // Cron schedules
+    // ------------------------------------------------------------------
+
+    /** Create or replace a named schedule with a cron expression. */
+    public JsonNode createSchedule(String name, String procedure, String cron, Map<String, Object> params, boolean enabled) {
+        ObjectNode p = cmd("create_schedule");
+        p.put("name", name);
+        p.put("procedure", procedure);
+        p.put("cron", cron);
+        p.put("enabled", enabled);
+        if (params != null) p.set("params", mapper.valueToTree(params));
+        return checked(p);
+    }
+
+    /** Create a schedule with a cron expression (enabled by default, no params). */
+    public JsonNode createSchedule(String name, String procedure, String cron) {
+        return createSchedule(name, procedure, cron, null, true);
+    }
+
+    /** Create or replace a named schedule with an interval (e.g. "30s", "5m", "2h"). */
+    public JsonNode createScheduleInterval(String name, String procedure, String every, Map<String, Object> params, boolean enabled) {
+        ObjectNode p = cmd("create_schedule");
+        p.put("name", name);
+        p.put("procedure", procedure);
+        p.put("every", every);
+        p.put("enabled", enabled);
+        if (params != null) p.set("params", mapper.valueToTree(params));
+        return checked(p);
+    }
+
+    /** Create an interval schedule (enabled by default, no params). */
+    public JsonNode createScheduleInterval(String name, String procedure, String every) {
+        return createScheduleInterval(name, procedure, every, null, true);
+    }
+
+    /** List all schedules with status. */
+    public JsonNode listSchedules() {
+        return checked(cmd("list_schedules"));
+    }
+
+    /** Get a schedule by name. */
+    public JsonNode getSchedule(String name) {
+        ObjectNode p = cmd("get_schedule");
+        p.put("name", name);
+        return checked(p);
+    }
+
+    /** Delete a schedule. */
+    public JsonNode deleteSchedule(String name) {
+        ObjectNode p = cmd("delete_schedule");
+        p.put("name", name);
+        return checked(p);
+    }
+
+    /** Enable a paused schedule. */
+    public JsonNode enableSchedule(String name) {
+        ObjectNode p = cmd("enable_schedule");
+        p.put("name", name);
+        return checked(p);
+    }
+
+    /** Disable (pause) a schedule. */
+    public JsonNode disableSchedule(String name) {
+        ObjectNode p = cmd("disable_schedule");
+        p.put("name", name);
+        return checked(p);
+    }
+
+    // ------------------------------------------------------------------
     // AutoCloseable
     // ------------------------------------------------------------------
 
