@@ -252,6 +252,44 @@ public sealed class OxiDbClient : IDisposable
         return JsonDocument.Parse(raw);
     }
 
+    // Schedules
+
+    public JsonDocument CreateSchedule(string scheduleJson)
+    {
+        var raw = Call(() => NativeInterop.CreateSchedule(_conn, scheduleJson));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument ListSchedules()
+    {
+        var raw = Call(() => NativeInterop.ListSchedules(_conn));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument GetSchedule(string name)
+    {
+        var raw = Call(() => NativeInterop.GetSchedule(_conn, name));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument DeleteSchedule(string name)
+    {
+        var raw = Call(() => NativeInterop.DeleteSchedule(_conn, name));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument EnableSchedule(string name)
+    {
+        var raw = Call(() => NativeInterop.EnableSchedule(_conn, name));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument DisableSchedule(string name)
+    {
+        var raw = Call(() => NativeInterop.DisableSchedule(_conn, name));
+        return JsonDocument.Parse(raw);
+    }
+
     private string Call(Func<nint> nativeCall)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

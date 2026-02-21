@@ -546,6 +546,62 @@ func (c *Client) SQL(query string) (any, error) {
 }
 
 // ------------------------------------------------------------------
+// Cron schedules
+// ------------------------------------------------------------------
+
+// CreateSchedule creates or replaces a named schedule.
+// Pass a cron expression (e.g. "0 3 * * *") or an interval (e.g. "5m").
+func (c *Client) CreateSchedule(name, procedure string, opts map[string]any) (map[string]any, error) {
+	payload := map[string]any{"cmd": "create_schedule", "name": name, "procedure": procedure}
+	for k, v := range opts {
+		payload[k] = v
+	}
+	data, err := c.checked(payload)
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// ListSchedules lists all schedules with status.
+func (c *Client) ListSchedules() ([]map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "list_schedules"})
+	if err != nil {
+		return nil, err
+	}
+	return toMapSlice(data), nil
+}
+
+// GetSchedule gets a schedule by name.
+func (c *Client) GetSchedule(name string) (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "get_schedule", "name": name})
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// DeleteSchedule deletes a schedule.
+func (c *Client) DeleteSchedule(name string) error {
+	_, err := c.checked(map[string]any{"cmd": "delete_schedule", "name": name})
+	return err
+}
+
+// EnableSchedule enables a paused schedule.
+func (c *Client) EnableSchedule(name string) error {
+	_, err := c.checked(map[string]any{"cmd": "enable_schedule", "name": name})
+	return err
+}
+
+// DisableSchedule pauses a schedule.
+func (c *Client) DisableSchedule(name string) error {
+	_, err := c.checked(map[string]any{"cmd": "disable_schedule", "name": name})
+	return err
+}
+
+// ------------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------------
 

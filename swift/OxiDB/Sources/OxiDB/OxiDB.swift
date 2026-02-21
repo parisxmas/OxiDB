@@ -429,6 +429,45 @@ public final class OxiDBClient: OxiDBMutationObservable {
         return try call { oxidb_sql($0, query) }
     }
 
+    // MARK: - Schedules
+
+    /// Create or replace a named schedule.
+    @discardableResult
+    public func createSchedule(definition: [String: Any]) throws -> [String: Any] {
+        var def = definition
+        def["cmd"] = "create_schedule"
+        let json = try jsonString(def)
+        return try call { oxidb_create_schedule($0, json) }
+    }
+
+    /// List all schedules with status.
+    public func listSchedules() throws -> [String: Any] {
+        return try call { oxidb_list_schedules($0) }
+    }
+
+    /// Get a schedule by name.
+    public func getSchedule(name: String) throws -> [String: Any] {
+        return try call { oxidb_get_schedule($0, name) }
+    }
+
+    /// Delete a schedule.
+    @discardableResult
+    public func deleteSchedule(name: String) throws -> [String: Any] {
+        return try call { oxidb_delete_schedule($0, name) }
+    }
+
+    /// Enable a paused schedule.
+    @discardableResult
+    public func enableSchedule(name: String) throws -> [String: Any] {
+        return try call { oxidb_enable_schedule($0, name) }
+    }
+
+    /// Disable (pause) a schedule.
+    @discardableResult
+    public func disableSchedule(name: String) throws -> [String: Any] {
+        return try call { oxidb_disable_schedule($0, name) }
+    }
+
     // MARK: - Private Helpers
 
     private func call(_ fn: (UnsafeMutableRawPointer) -> UnsafeMutablePointer<CChar>?) throws -> [String: Any] {
@@ -784,6 +823,46 @@ public final class OxiDBDatabase: OxiDBMutationObservable {
     /// Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES.
     public func sql(query: String) throws -> [String: Any] {
         return try execute(["cmd": "sql", "query": query])
+    }
+
+    // MARK: - Schedules
+
+    /// Create or replace a named schedule.
+    @discardableResult
+    public func createSchedule(name: String, procedure: String, cron: String? = nil, every: String? = nil, params: [String: Any]? = nil, enabled: Bool = true) throws -> [String: Any] {
+        var cmd: [String: Any] = ["cmd": "create_schedule", "name": name, "procedure": procedure, "enabled": enabled]
+        if let c = cron { cmd["cron"] = c }
+        if let e = every { cmd["every"] = e }
+        if let p = params { cmd["params"] = p }
+        return try execute(cmd)
+    }
+
+    /// List all schedules with status.
+    public func listSchedules() throws -> [String: Any] {
+        return try execute(["cmd": "list_schedules"])
+    }
+
+    /// Get a schedule by name.
+    public func getSchedule(name: String) throws -> [String: Any] {
+        return try execute(["cmd": "get_schedule", "name": name])
+    }
+
+    /// Delete a schedule.
+    @discardableResult
+    public func deleteSchedule(name: String) throws -> [String: Any] {
+        return try execute(["cmd": "delete_schedule", "name": name])
+    }
+
+    /// Enable a paused schedule.
+    @discardableResult
+    public func enableSchedule(name: String) throws -> [String: Any] {
+        return try execute(["cmd": "enable_schedule", "name": name])
+    }
+
+    /// Disable (pause) a schedule.
+    @discardableResult
+    public func disableSchedule(name: String) throws -> [String: Any] {
+        return try execute(["cmd": "disable_schedule", "name": name])
     }
 
     // MARK: - Raw Execute
