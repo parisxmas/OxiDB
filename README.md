@@ -2,7 +2,7 @@
   <img src="logo.png" alt="OxiDB" width="500">
 </p>
 
-<p align="center">A fast, embeddable document database written in Rust. SQL and MongoDB-style queries, single binary, zero configuration, Raft replication, AES-256 encryption, SCRAM-SHA-256 auth, crash-safe WAL, and sub-second failover.</p>
+<p align="center">A fast, embeddable document database written in Rust. SQL and JSON-based queries, single binary, zero configuration, Raft replication, AES-256 encryption, SCRAM-SHA-256 auth, crash-safe WAL, and sub-second failover.</p>
 
 **Client libraries:** [Python](python/) | [Go](go/) | [Java/Spring Boot](oxidb-spring-boot-starter/) | [Julia](julia/) | [.NET](dotnet/) | [Swift/iOS](swift/) | [C FFI](oxidb-client-ffi/)
 
@@ -66,7 +66,7 @@ docker compose up -d
 
 - **SQL query language** — `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE INDEX`, `SHOW TABLES` with `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, `JOIN`, `LIMIT`, `OFFSET`
 - **Document database** — JSON documents, no schema required, collections auto-created on insert
-- **MongoDB-style queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$regex`, `$and`, `$or`
+- **JSON-based queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$regex`, `$and`, `$or`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
 - **Aggregation pipeline** — 10 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`; index-accelerated `$group` for count, sum, min, max, avg
 - **Indexes** — field, unique, composite, and full-text indexes with automatic backfill; list and drop support
@@ -86,7 +86,7 @@ docker compose up -d
 - **GELF logging** — centralized UDP logging to Graylog/Loki via `OXIDB_GELF_ADDR`
 - **Compaction** — reclaim space from deleted documents with atomic file swap
 - **Thread-safe** — `RwLock` per collection, concurrent readers never block
-- **CLI tool** — interactive shell with MongoDB-style syntax, embedded and client modes
+- **CLI tool** — interactive shell with JSON-based syntax, embedded and client modes
 - **Multi-language clients** — Python, Go, Java/Spring Boot, Julia, .NET, Swift/iOS — all zero or minimal dependencies
 
 ## SQL Query Language
@@ -449,27 +449,25 @@ Send `{"cmd": "unwatch"}` to stop receiving events and return to normal request 
 
 > **Note:** Watch requires Admin role when authentication is enabled. Not available over TLS connections in standalone mode.
 
-## Benchmark vs MongoDB
+## Benchmark
 
-1M documents, 20 fields each, 8 indexed fields. Single node, same hardware.
+1M documents, 20 fields each, 8 indexed fields. Single node.
 
-| Category | Operation | OxiDB | MongoDB | Winner |
-|----------|-----------|-------|---------|--------|
-| **INSERT** | 1M docs (batch 500) | 25.5s | 7.8s | MongoDB |
-| **QUERIES** | Equality (indexed) | 0ms | 1ms | OxiDB |
-| | Range (indexed) | 3ms | 5ms | OxiDB |
-| | Regex | 173ms | 334ms | OxiDB |
-| | Unindexed scan | 140ms | 92ms | MongoDB |
-| | Sort + limit (indexed) | 1ms | 2ms | OxiDB |
-| | Multi-condition AND | 1ms | 1ms | Tie |
-| | Count (indexed) | 0ms | 13ms | OxiDB |
-| | find_one (unindexed) | 140ms | 92ms | MongoDB |
-| **AGGREGATION** | Group + count (indexed) | 13ms | 73ms | OxiDB |
-| | Group + avg | 472ms | 345ms | MongoDB |
-| | Group + count (filtered) | 13ms | 41ms | OxiDB |
-| | Group + count (all) | 13ms | 132ms | OxiDB |
-
-**Score: OxiDB wins 21/27 operations.** OxiDB is faster on indexed queries, counts, regex, and aggregation counts. MongoDB is faster on raw inserts and unindexed full-collection scans.
+| Category | Operation | OxiDB |
+|----------|-----------|-------|
+| **INSERT** | 1M docs (batch 500) | 25.5s |
+| **QUERIES** | Equality (indexed) | 0ms |
+| | Range (indexed) | 3ms |
+| | Regex | 173ms |
+| | Unindexed scan | 140ms |
+| | Sort + limit (indexed) | 1ms |
+| | Multi-condition AND | 1ms |
+| | Count (indexed) | 0ms |
+| | find_one (unindexed) | 140ms |
+| **AGGREGATION** | Group + count (indexed) | 13ms |
+| | Group + avg | 472ms |
+| | Group + count (filtered) | 13ms |
+| | Group + count (all) | 13ms |
 
 Benchmark source: [`examples/docker_benchmark/`](examples/docker_benchmark/)
 

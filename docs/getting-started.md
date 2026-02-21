@@ -1,6 +1,6 @@
 # Getting Started
 
-OxiDB is a fast, embeddable document database engine written in Rust. It supports both SQL and MongoDB-style queries, and can run as an embedded library or a standalone TCP server.
+OxiDB is a fast, embeddable document database engine written in Rust. It supports both SQL and JSON-based queries, and can run as an embedded library or a standalone TCP server.
 
 ## Installation
 

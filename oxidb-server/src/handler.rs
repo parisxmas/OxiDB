@@ -760,6 +760,67 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        // -------------------------------------------------------------------
+        // Vector index commands
+        // -------------------------------------------------------------------
+
+        "create_vector_index" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let field = match request.get("field").and_then(|v| v.as_str()) {
+                Some(f) => f,
+                None => return err_bytes("missing 'field'"),
+            };
+            let dimension = match request.get("dimension").and_then(|v| v.as_u64()) {
+                Some(d) => d as usize,
+                None => return err_bytes("missing 'dimension'"),
+            };
+            let metric_str = request
+                .get("metric")
+                .and_then(|v| v.as_str())
+                .unwrap_or("cosine");
+            let metric = oxidb::vector::VectorIndex::parse_metric(metric_str);
+            match db.create_vector_index(col, field, dimension, metric) {
+                Ok(()) => ok_bytes(json!("vector index created")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "vector_search" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let field = match request.get("field").and_then(|v| v.as_str()) {
+                Some(f) => f,
+                None => return err_bytes("missing 'field'"),
+            };
+            let vector = match request.get("vector").and_then(|v| v.as_array()) {
+                Some(arr) => {
+                    let floats: Option<Vec<f32>> = arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
+                    match floats {
+                        Some(f) => f,
+                        None => return err_bytes("'vector' must be an array of numbers"),
+                    }
+                }
+                None => return err_bytes("missing 'vector' array"),
+            };
+            let limit = request
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
+            let ef_search = request
+                .get("ef_search")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            match db.vector_search(col, field, &vector, limit, ef_search) {
+                Ok(results) => ok_bytes(json!(results)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         _ => err_bytes(&format!("unknown command: {cmd}")),
     }
 }

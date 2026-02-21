@@ -19,6 +19,7 @@ pub mod tx_log;
 pub mod update;
 pub mod storage;
 pub mod value;
+pub mod vector;
 pub mod wal;
 
 pub use change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
@@ -29,3 +30,4 @@ pub use engine::{BackupInfo, LogCallback, OxiDb, RestoreInfo};
 pub use error::{Error, Result};
 pub use sql::{execute_sql, SqlResult};
 pub use tx_log::TransactionId;
+pub use vector::DistanceMetric;

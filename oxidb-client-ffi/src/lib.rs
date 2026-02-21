@@ -758,6 +758,73 @@ pub unsafe extern "C" fn oxidb_disable_schedule(
     unsafe { send_request(conn, &req) }
 }
 
+// ---------------------------------------------------------------------------
+// Vector index
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_create_vector_index(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+    field: *const c_char,
+    dimension: i32,
+    metric: *const c_char,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let fld = match unsafe { cstr_to_str(field) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let m = unsafe { cstr_to_str(metric) }.unwrap_or("cosine");
+    let req = serde_json::json!({
+        "cmd": "create_vector_index",
+        "collection": col,
+        "field": fld,
+        "dimension": dimension,
+        "metric": m,
+    });
+    unsafe { send_request(conn, &req) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_vector_search(
+    conn: *mut OxiDbConn,
+    collection: *const c_char,
+    field: *const c_char,
+    vector_json: *const c_char,
+    limit: i32,
+) -> *mut c_char {
+    let col = match unsafe { cstr_to_str(collection) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let fld = match unsafe { cstr_to_str(field) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let vec_str = match unsafe { cstr_to_str(vector_json) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+    let vector: serde_json::Value = match serde_json::from_str(vec_str) {
+        Ok(v) => v,
+        Err(_) => return ptr::null_mut(),
+    };
+    let mut req = serde_json::json!({
+        "cmd": "vector_search",
+        "collection": col,
+        "field": fld,
+        "vector": vector,
+    });
+    if limit > 0 {
+        req["limit"] = serde_json::json!(limit);
+    }
+    unsafe { send_request(conn, &req) }
+}
+
 /// Free a string returned by any `oxidb_*` function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_free_string(ptr: *mut c_char) {

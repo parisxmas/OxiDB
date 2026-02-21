@@ -290,6 +290,20 @@ public sealed class OxiDbClient : IDisposable
         return JsonDocument.Parse(raw);
     }
 
+    // Vector search
+
+    public JsonDocument CreateVectorIndex(string collection, string field, int dimension, string metric = "cosine")
+    {
+        var raw = Call(() => NativeInterop.CreateVectorIndex(_conn, collection, field, dimension, metric));
+        return JsonDocument.Parse(raw);
+    }
+
+    public JsonDocument VectorSearch(string collection, string field, string vectorJson, int limit = 10)
+    {
+        var raw = Call(() => NativeInterop.VectorSearch(_conn, collection, field, vectorJson, limit));
+        return JsonDocument.Parse(raw);
+    }
+
     private string Call(Func<nint> nativeCall)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

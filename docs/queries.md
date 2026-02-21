@@ -1,6 +1,6 @@
 # Querying Documents
 
-OxiDB supports MongoDB-style queries with comparison operators, logical combinators, dot notation for nested fields, and sort/skip/limit options.
+OxiDB supports JSON-based queries with comparison operators, logical combinators, dot notation for nested fields, and sort/skip/limit options.
 
 ## Basic Queries
 

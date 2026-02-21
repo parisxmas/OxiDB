@@ -1,6 +1,6 @@
 # SQL Query Language
 
-OxiDB supports a SQL interface that is translated internally to MongoDB-style queries and aggregation pipelines. This lets you work with familiar SQL syntax while using OxiDB's document storage.
+OxiDB supports a SQL interface that is translated internally to JSON-based queries and aggregation pipelines. This lets you work with familiar SQL syntax while using OxiDB's document storage.
 
 ## Running SQL Queries
 
@@ -280,6 +280,6 @@ try db.sql(query: "CREATE INDEX ON users (email)")
 
 ## See Also
 
-- [Querying Documents](queries.md) -- MongoDB-style query syntax
+- [Querying Documents](queries.md) -- JSON-based query syntax
 - [Aggregation](aggregation.md) -- pipeline stages that SQL maps to
 - [Indexes](indexes.md) -- indexes improve SQL query performance

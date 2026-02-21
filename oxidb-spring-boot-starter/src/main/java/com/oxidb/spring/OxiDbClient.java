@@ -556,6 +556,40 @@ public class OxiDbClient implements AutoCloseable {
     }
 
     // ------------------------------------------------------------------
+    // Vector search
+    // ------------------------------------------------------------------
+
+    /** Create a vector similarity search index on a field. Metric: "cosine", "euclidean", or "dot_product". */
+    public JsonNode createVectorIndex(String collection, String field, int dimension, String metric) {
+        ObjectNode p = cmd("create_vector_index");
+        p.put("collection", collection);
+        p.put("field", field);
+        p.put("dimension", dimension);
+        p.put("metric", metric != null ? metric : "cosine");
+        return checked(p);
+    }
+
+    /** Create a vector index with default cosine metric. */
+    public JsonNode createVectorIndex(String collection, String field, int dimension) {
+        return createVectorIndex(collection, field, dimension, "cosine");
+    }
+
+    /** Find the k nearest neighbors by vector similarity. Returns documents with _similarity and _distance fields. */
+    public JsonNode vectorSearch(String collection, String field, double[] vector, int limit) {
+        ObjectNode p = cmd("vector_search");
+        p.put("collection", collection);
+        p.put("field", field);
+        p.set("vector", mapper.valueToTree(vector));
+        p.put("limit", limit);
+        return checked(p);
+    }
+
+    /** Vector search with default limit of 10. */
+    public JsonNode vectorSearch(String collection, String field, double[] vector) {
+        return vectorSearch(collection, field, vector, 10);
+    }
+
+    // ------------------------------------------------------------------
     // Cron schedules
     // ------------------------------------------------------------------
 
