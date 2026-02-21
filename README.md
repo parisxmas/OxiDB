@@ -14,9 +14,9 @@ Download the latest release for your platform from [GitHub Releases](https://git
 
 | Platform | Download |
 |----------|----------|
-| macOS Apple Silicon (M1/M2/M3/M4) | `oxidb-server-macos-arm64.tar.gz` |
-| macOS Intel | `oxidb-server-macos-x86_64.tar.gz` |
-| Linux x86_64 | `oxidb-server-linux-x86_64.tar.gz` |
+| macOS Apple Silicon (M1/M2/M3/M4) | [`oxidb-server-macos-arm64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/download/v0.15.0/oxidb-server-macos-arm64.tar.gz) |
+| macOS Intel | [`oxidb-server-macos-x86_64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/download/v0.15.0/oxidb-server-macos-x86_64.tar.gz) |
+| Linux x86_64 | [`oxidb-server-linux-x86_64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/download/v0.15.0/oxidb-server-linux-x86_64.tar.gz) |
 
 ```bash
 tar xzf oxidb-server-*.tar.gz
