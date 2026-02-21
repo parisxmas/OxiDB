@@ -6,6 +6,7 @@ use crc32fast::Hasher;
 
 use crate::document::DocumentId;
 use crate::index::{CompositeIndex, FieldIndex};
+use crate::vector::VectorIndex;
 
 /// Magic bytes identifying an OxiDB index cache file.
 const MAGIC: &[u8; 4] = b"OXIX";
@@ -105,6 +106,53 @@ pub fn load_composite_indexes(
     let mut indexes = Vec::with_capacity(count);
     for _ in 0..count {
         indexes.push(CompositeIndex::read_from(&mut cursor).ok()?);
+    }
+    Some(indexes)
+}
+
+// ---------------------------------------------------------------------------
+// Vector indexes (.vidx)
+// ---------------------------------------------------------------------------
+
+/// Save vector indexes to a `.vidx` file atomically.
+pub fn save_vector_indexes(
+    path: &Path,
+    indexes: &[&VectorIndex],
+    doc_count: u64,
+    next_id: DocumentId,
+) -> io::Result<()> {
+    if indexes.is_empty() {
+        let _ = fs::remove_file(path);
+        return Ok(());
+    }
+
+    let mut body = Vec::new();
+    body.write_all(&(indexes.len() as u32).to_le_bytes())?;
+    for idx in indexes {
+        idx.write_to(&mut body)?;
+    }
+
+    write_cache_file(path, &body, doc_count, next_id)
+}
+
+/// Load vector indexes from a `.vidx` file.
+/// Returns `None` if the file doesn't exist, is corrupt, or doc_count/next_id don't match.
+pub fn load_vector_indexes(
+    path: &Path,
+    expected_doc_count: u64,
+    expected_next_id: DocumentId,
+) -> Option<Vec<VectorIndex>> {
+    let data = fs::read(path).ok()?;
+    let body = validate_cache_file(&data, expected_doc_count, expected_next_id)?;
+
+    let mut cursor = Cursor::new(body);
+    let mut len_buf = [0u8; 4];
+    io::Read::read_exact(&mut cursor, &mut len_buf).ok()?;
+    let count = u32::from_le_bytes(len_buf) as usize;
+
+    let mut indexes = Vec::with_capacity(count);
+    for _ in 0..count {
+        indexes.push(VectorIndex::read_from(&mut cursor).ok()?);
     }
     Some(indexes)
 }

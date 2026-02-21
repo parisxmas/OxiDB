@@ -105,9 +105,33 @@ String values matching ISO 8601, RFC 3339, or `YYYY-MM-DD` format are automatica
 
 For example, inserting `"2025-03-15T10:30:00Z"` stores the value as a DateTime index entry, so range queries like `{"date": {"$gte": "2025-01-01", "$lt": "2026-01-01"}}` work correctly.
 
+## Vector Index
+
+A vector index enables k-nearest-neighbor (KNN) similarity search on embedding fields. See [Vector Search](vector-search.md) for a full guide.
+
+```json
+{"command": "create_vector_index", "collection": "articles", "field": "embedding", "dimension": 384, "metric": "cosine"}
+```
+
+Supported distance metrics: `cosine` (default), `euclidean`, `dot_product`.
+
+Query with vector search:
+
+```json
+{"command": "vector_search", "collection": "articles", "field": "embedding", "vector": [0.1, 0.2, ...], "limit": 10}
+```
+
+Results include `_similarity` (0-1, higher is better) and `_distance` fields:
+
+```json
+{"ok": true, "data": [{"_id": 3, "title": "...", "_similarity": 0.95, "_distance": 0.05}, ...]}
+```
+
+For collections under 1000 vectors, exact (flat) search is used. For larger collections, an HNSW (Hierarchical Navigable Small World) graph provides fast approximate search.
+
 ## Persistent Index Cache
 
-Indexes are persisted as binary files (`.fidx` for field indexes, `.cidx` for composite indexes) and reloaded on startup, avoiding full rebuild from the document store.
+Indexes are persisted as binary files (`.fidx` for field indexes, `.cidx` for composite indexes, `.vidx` for vector indexes) and reloaded on startup, avoiding full rebuild from the document store.
 
 ## Client Examples
 
@@ -251,6 +275,7 @@ try db.dropIndex(collection: "users", index: "email")
 
 ## See Also
 
+- [Vector Search](vector-search.md) -- full guide to vector similarity search
 - [Querying Documents](queries.md) -- operators that benefit from indexes
 - [Aggregation](aggregation.md) -- `$match` stage uses indexes
 - [SQL](sql.md) -- `CREATE INDEX` DDL statement

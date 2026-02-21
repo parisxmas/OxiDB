@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OxiDB is a fast, embeddable document database engine written in Rust. It supports both SQL and MongoDB-style queries. It can run as an embedded library, a standalone TCP server, or be accessed via client libraries (Python, Go, Java/Spring Boot, Julia, .NET, Swift/iOS via C FFI).
+OxiDB is a fast, embeddable document database engine written in Rust. It supports both SQL and JSON-based queries. It can run as an embedded library, a standalone TCP server, or be accessed via client libraries (Python, Go, Java/Spring Boot, Julia, .NET, Swift/iOS via C FFI).
 
 ## Build Commands
 

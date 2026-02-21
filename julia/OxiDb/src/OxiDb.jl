@@ -35,6 +35,8 @@ export OxiDbClient, OxiDbError, TransactionConflictError,
        create_text_index, list_indexes, drop_index,
        # FTS (documents)
        text_search,
+       # Vector search
+       create_vector_index, vector_search,
        # Aggregation
        aggregate,
        # Compaction
@@ -336,6 +338,34 @@ Requires a text index created with `create_text_index`.
 """
 function text_search(client::OxiDbClient, collection::AbstractString, query::AbstractString; limit::Integer=10)
     _checked(client, Dict("cmd" => "text_search", "collection" => collection, "query" => query, "limit" => limit))
+end
+
+# ------------------------------------------------------------------
+# Vector search
+# ------------------------------------------------------------------
+
+"""
+    create_vector_index(client, collection, field, dimension; metric="cosine")
+
+Create a vector similarity search index on a field.
+Metric can be "cosine", "euclidean", or "dot_product".
+"""
+function create_vector_index(client::OxiDbClient, collection::AbstractString, field::AbstractString,
+                             dimension::Integer; metric::AbstractString="cosine")
+    _checked(client, Dict("cmd" => "create_vector_index", "collection" => collection,
+                           "field" => field, "dimension" => dimension, "metric" => metric))
+end
+
+"""
+    vector_search(client, collection, field, vector; limit=10)
+
+Find the k nearest neighbors by vector similarity.
+Returns documents with `_similarity` and `_distance` fields.
+"""
+function vector_search(client::OxiDbClient, collection::AbstractString, field::AbstractString,
+                       vector::Vector{<:Real}; limit::Integer=10)
+    _checked(client, Dict("cmd" => "vector_search", "collection" => collection,
+                           "field" => field, "vector" => vector, "limit" => limit))
 end
 
 # ------------------------------------------------------------------

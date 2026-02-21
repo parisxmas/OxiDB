@@ -91,6 +91,8 @@ data, meta = client.get_object("images", "photo.jpg")
 | `list_indexes(collection)` | List indexes |
 | `drop_index(collection, index)` | Drop index |
 | `text_search(collection, query, limit=10)` | Full-text search on collection |
+| `create_vector_index(collection, field, dimension, metric="cosine")` | Create vector index |
+| `vector_search(collection, field, vector, limit=10)` | Vector similarity search |
 | `aggregate(collection, pipeline)` | Run aggregation pipeline |
 | `compact(collection)` | Compact collection storage |
 | `begin_tx()` | Begin transaction |
@@ -214,6 +216,8 @@ results, _ := client.Find("users", map[string]any{}, opts)
 | `ListIndexes(collection)` | List indexes |
 | `DropIndex(collection, index)` | Drop index |
 | `TextSearch(collection, query, limit)` | Full-text search |
+| `CreateVectorIndex(collection, field, dimension, metric)` | Create vector index |
+| `VectorSearch(collection, field, vector, limit)` | Vector similarity search |
 | `Aggregate(collection, pipeline)` | Run aggregation |
 | `Compact(collection)` | Compact storage |
 | `BeginTx()` | Begin transaction |
@@ -347,6 +351,8 @@ All methods return `JsonNode` (Jackson) unless noted. Methods accept both `Map<S
 | `listIndexes(collection)` | List indexes |
 | `dropIndex(collection, index)` | Drop index |
 | `textSearch(collection, query, limit)` | Full-text search |
+| `createVectorIndex(collection, field, dimension, metric)` | Create vector index |
+| `vectorSearch(collection, field, vector, limit)` | Vector similarity search |
 | `aggregate(collection, pipeline)` | Run aggregation |
 | `compact(collection)` | Compact storage |
 | `beginTx()` | Begin transaction |
@@ -468,6 +474,8 @@ write("out.jpg", content)
 | `list_indexes(client, collection)` | List indexes |
 | `drop_index(client, collection, index)` | Drop index |
 | `text_search(client, collection, query; limit)` | Full-text search |
+| `create_vector_index(client, collection, field, dimension; metric)` | Create vector index |
+| `vector_search(client, collection, field, vector; limit)` | Vector similarity search |
 | `aggregate(client, collection, pipeline)` | Run aggregation |
 | `compact(client, collection)` | Compact storage |
 | `begin_tx(client)` | Begin transaction |
@@ -610,6 +618,8 @@ All methods return `JsonDocument`.
 | `ListIndexes(collection)` | List indexes |
 | `DropIndex(collection, index)` | Drop index |
 | `TextSearch(collection, query, limit)` | Full-text search |
+| `CreateVectorIndex(collection, field, dimension, metric)` | Create vector index |
+| `VectorSearch(collection, field, vectorJson, limit)` | Vector similarity search |
 | `Aggregate(collection, pipelineJson)` | Run aggregation |
 | `Compact(collection)` | Compact storage |
 | `BeginTransaction()` | Begin transaction |
@@ -746,6 +756,8 @@ All methods return `[String: Any]` or `[[String: Any]]`.
 | `listIndexes(collection:)` | List indexes |
 | `dropIndex(collection:index:)` | Drop index |
 | `textSearch(collection:query:limit:)` | Full-text search |
+| `createVectorIndex(collection:field:dimension:metric:)` | Create vector index |
+| `vectorSearch(collection:field:vector:limit:)` | Vector similarity search |
 | `aggregate(collection:pipeline:)` | Run aggregation |
 | `compact(collection:)` | Compact storage |
 | `beginTransaction()` | Begin transaction |

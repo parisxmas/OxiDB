@@ -1,6 +1,6 @@
 # Updating Documents
 
-OxiDB supports MongoDB-style update operators for modifying documents. Updates are applied atomically per document.
+OxiDB supports update operators for modifying documents. Updates are applied atomically per document.
 
 ## Field Operators
 

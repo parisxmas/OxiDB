@@ -349,6 +349,26 @@ class OxiDbClient:
         return self._checked({"cmd": "sql", "query": query})
 
     # ------------------------------------------------------------------
+    # Vector search
+    # ------------------------------------------------------------------
+
+    def create_vector_index(self, collection: str, field: str, dimension: int, metric: str = "cosine"):
+        """Create a vector similarity search index on a field.
+        Metric can be 'cosine', 'euclidean', or 'dot_product'."""
+        return self._checked({
+            "cmd": "create_vector_index", "collection": collection,
+            "field": field, "dimension": dimension, "metric": metric,
+        })
+
+    def vector_search(self, collection: str, field: str, vector: list, limit: int = 10) -> list:
+        """Find the k nearest neighbors by vector similarity.
+        Returns documents with _similarity and _distance fields."""
+        return self._checked({
+            "cmd": "vector_search", "collection": collection,
+            "field": field, "vector": vector, "limit": limit,
+        })
+
+    # ------------------------------------------------------------------
     # Cron schedules
     # ------------------------------------------------------------------
 

@@ -143,6 +143,14 @@ internal static partial class NativeInterop
     [LibraryImport(LibName, EntryPoint = "oxidb_disable_schedule", StringMarshalling = StringMarshalling.Utf8)]
     internal static partial nint DisableSchedule(nint conn, string name);
 
+    // Vector search
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_create_vector_index", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint CreateVectorIndex(nint conn, string collection, string field, int dimension, string metric);
+
+    [LibraryImport(LibName, EntryPoint = "oxidb_vector_search", StringMarshalling = StringMarshalling.Utf8)]
+    internal static partial nint VectorSearch(nint conn, string collection, string field, string vectorJson, int limit);
+
     [LibraryImport(LibName, EntryPoint = "oxidb_free_string")]
     internal static partial void FreeString(nint ptr);
 }

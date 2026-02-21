@@ -429,6 +429,22 @@ public final class OxiDBClient: OxiDBMutationObservable {
         return try call { oxidb_sql($0, query) }
     }
 
+    // MARK: - Vector Search
+
+    /// Create a vector similarity search index on a field.
+    /// Metric can be "cosine", "euclidean", or "dot_product".
+    @discardableResult
+    public func createVectorIndex(collection: String, field: String, dimension: Int, metric: String = "cosine") throws -> [String: Any] {
+        return try call { oxidb_create_vector_index($0, collection, field, Int32(dimension), metric) }
+    }
+
+    /// Find the k nearest neighbors by vector similarity.
+    /// Returns documents with _similarity and _distance fields.
+    public func vectorSearch(collection: String, field: String, vector: [Double], limit: Int32 = 10) throws -> [String: Any] {
+        let vectorJson = try jsonString(vector)
+        return try call { oxidb_vector_search($0, collection, field, vectorJson, limit) }
+    }
+
     // MARK: - Schedules
 
     /// Create or replace a named schedule.
@@ -823,6 +839,21 @@ public final class OxiDBDatabase: OxiDBMutationObservable {
     /// Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES.
     public func sql(query: String) throws -> [String: Any] {
         return try execute(["cmd": "sql", "query": query])
+    }
+
+    // MARK: - Vector Search
+
+    /// Create a vector similarity search index on a field.
+    /// Metric can be "cosine", "euclidean", or "dot_product".
+    @discardableResult
+    public func createVectorIndex(collection: String, field: String, dimension: Int, metric: String = "cosine") throws -> [String: Any] {
+        return try execute(["cmd": "create_vector_index", "collection": collection, "field": field, "dimension": dimension, "metric": metric])
+    }
+
+    /// Find the k nearest neighbors by vector similarity.
+    /// Returns documents with _similarity and _distance fields.
+    public func vectorSearch(collection: String, field: String, vector: [Double], limit: Int = 10) throws -> [String: Any] {
+        return try execute(["cmd": "vector_search", "collection": collection, "field": field, "vector": vector, "limit": limit])
     }
 
     // MARK: - Schedules

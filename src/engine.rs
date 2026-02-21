@@ -250,7 +250,7 @@ impl OxiDb {
     pub fn drop_collection(&self, name: &str) -> Result<()> {
         let mut cols = self.collections.write().unwrap();
         cols.remove(name);
-        for ext in &["dat", "wal", "idx", "fidx", "cidx"] {
+        for ext in &["dat", "wal", "idx", "fidx", "cidx", "vidx"] {
             let path = self.data_dir.join(format!("{}.{}", name, ext));
             if path.exists() {
                 std::fs::remove_file(path)?;
@@ -491,6 +491,29 @@ impl OxiDb {
     ) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
         col.read().unwrap().text_search(query, limit)
+    }
+
+    pub fn create_vector_index(
+        &self,
+        collection: &str,
+        field: &str,
+        dimension: usize,
+        metric: crate::vector::DistanceMetric,
+    ) -> Result<()> {
+        let col = self.get_or_create_collection(collection)?;
+        col.write().unwrap().create_vector_index(field, dimension, metric)
+    }
+
+    pub fn vector_search(
+        &self,
+        collection: &str,
+        field: &str,
+        query_vector: &[f32],
+        limit: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        let col = self.get_or_create_collection(collection)?;
+        col.read().unwrap().vector_search(field, query_vector, limit, ef_search)
     }
 
     pub fn aggregate(&self, collection: &str, pipeline_json: &Value) -> Result<Vec<Value>> {

@@ -122,6 +122,15 @@ See [Updating Documents](updates.md) for the full update operator reference.
 | `text_search` | `collection`, `query` | `limit` (default: 10) | `[{doc with _score}, ...]` | Read |
 | `search` | `query` | `bucket`, `limit` (default: 10) | `[{"bucket": "...", "key": "...", "score": N}]` | Read |
 
+### Vector Search
+
+| Command | Required Fields | Optional Fields | Return | Min Role |
+|---------|----------------|-----------------|--------|----------|
+| `create_vector_index` | `collection`, `field`, `dimension` | `metric` (default: `"cosine"`) | `{"ok": true}` | ReadWrite |
+| `vector_search` | `collection`, `field`, `vector` | `limit` (default: 10), `ef_search` | `[{doc with _similarity, _distance}, ...]` | Read |
+
+Supported `metric` values: `"cosine"`, `"euclidean"`, `"dot_product"`. See [Vector Search](vector-search.md).
+
 ### Aggregation
 
 | Command | Required Fields | Optional Fields | Return | Min Role |
@@ -221,8 +230,8 @@ Events are streamed as individual JSON messages. Not supported over TLS. See [Se
 | Role | Access Level |
 |------|-------------|
 | **Admin** | All commands |
-| **ReadWrite** | CRUD, transactions, indexes, collections, blobs, search, aggregation, SQL, `call_procedure`, `enable_schedule`, `disable_schedule` |
-| **Read** | `find`, `find_one`, `count`, `aggregate`, `text_search`, `search`, `list_*`, `get_*`, `head_object` |
+| **ReadWrite** | CRUD, transactions, indexes, collections, blobs, search, aggregation, SQL, `call_procedure`, `enable_schedule`, `disable_schedule`, `create_vector_index`, `vector_search` |
+| **Read** | `find`, `find_one`, `count`, `aggregate`, `text_search`, `search`, `vector_search`, `list_*`, `get_*`, `head_object` |
 
 ## See Also
 

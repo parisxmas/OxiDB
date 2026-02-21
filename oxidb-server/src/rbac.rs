@@ -40,6 +40,8 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "call_procedure"
                 | "enable_schedule"
                 | "disable_schedule"
+                | "create_vector_index"
+                | "vector_search"
         ),
         Role::Read => matches!(
             cmd,
@@ -58,6 +60,7 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "get_procedure"
                 | "list_schedules"
                 | "get_schedule"
+                | "vector_search"
         ),
     }
 }

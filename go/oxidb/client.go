@@ -546,6 +546,39 @@ func (c *Client) SQL(query string) (any, error) {
 }
 
 // ------------------------------------------------------------------
+// Vector search
+// ------------------------------------------------------------------
+
+// CreateVectorIndex creates a vector similarity search index on a field.
+// Metric can be "cosine", "euclidean", or "dot_product".
+func (c *Client) CreateVectorIndex(collection, field string, dimension int, metric string) error {
+	if metric == "" {
+		metric = "cosine"
+	}
+	_, err := c.checked(map[string]any{
+		"cmd": "create_vector_index", "collection": collection,
+		"field": field, "dimension": dimension, "metric": metric,
+	})
+	return err
+}
+
+// VectorSearch finds the k nearest neighbors by vector similarity.
+// Returns documents with _similarity and _distance fields.
+func (c *Client) VectorSearch(collection, field string, vector []float64, limit int) ([]map[string]any, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	data, err := c.checked(map[string]any{
+		"cmd": "vector_search", "collection": collection,
+		"field": field, "vector": vector, "limit": limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return toMapSlice(data), nil
+}
+
+// ------------------------------------------------------------------
 // Cron schedules
 // ------------------------------------------------------------------
 

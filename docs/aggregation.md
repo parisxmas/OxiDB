@@ -1,6 +1,6 @@
 # Aggregation Pipeline
 
-OxiDB supports a MongoDB-style aggregation pipeline for data analytics. A pipeline is an array of stages that process documents sequentially -- each stage transforms the output of the previous stage.
+OxiDB supports an aggregation pipeline for data analytics. A pipeline is an array of stages that process documents sequentially -- each stage transforms the output of the previous stage.
 
 ## Running a Pipeline
 

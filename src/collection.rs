@@ -11,6 +11,7 @@ use crate::error::{Error, Result};
 use crate::fts::CollectionTextIndex;
 use crate::index::{CompositeIndex, FieldIndex};
 use crate::index_persist;
+use crate::vector::{DistanceMetric, VectorIndex};
 use crate::query::{self, FindOptions, Query, SortOrder};
 use crate::storage::{DocLocation, Storage};
 use crate::value::IndexValue;
@@ -32,6 +33,10 @@ pub struct IndexInfo {
     pub index_type: String,
     pub fields: Vec<String>,
     pub unique: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
 }
 
 /// Persisted index metadata (written to .idx files).
@@ -70,6 +75,7 @@ pub struct Collection {
     field_indexes: HashMap<String, FieldIndex>,
     composite_indexes: Vec<CompositeIndex>,
     text_index: Option<CollectionTextIndex>,
+    vector_indexes: HashMap<String, VectorIndex>,
     version_index: HashMap<DocumentId, u64>,
     next_id: DocumentId,
     encryption: Option<Arc<EncryptionKey>>,
@@ -131,6 +137,13 @@ impl Collection {
         if let Err(e) = index_persist::save_composite_indexes(&cidx_path, &comp_refs, doc_count, next_id) {
             eprintln!("[warn] {}: failed to save composite index cache: {}", self.name, e);
         }
+
+        // Save vector indexes (.vidx)
+        let vidx_path = self.data_dir.join(format!("{}.vidx", self.name));
+        let vec_refs: Vec<&VectorIndex> = self.vector_indexes.values().collect();
+        if let Err(e) = index_persist::save_vector_indexes(&vidx_path, &vec_refs, doc_count, next_id) {
+            eprintln!("[warn] {}: failed to save vector index cache: {}", self.name, e);
+        }
     }
 
     /// Create or open a collection backed by a data file.
@@ -182,6 +195,7 @@ impl Collection {
         let mut field_indexes: HashMap<String, FieldIndex> = HashMap::new();
         let mut composite_indexes: Vec<CompositeIndex> = Vec::new();
         let mut text_index: Option<CollectionTextIndex> = None;
+        let mut vector_indexes: HashMap<String, VectorIndex> = HashMap::new();
 
         for info in &persisted_indexes {
             match info.index_type.as_str() {
@@ -202,6 +216,16 @@ impl Collection {
                 }
                 "text" => {
                     text_index = Some(CollectionTextIndex::new(info.fields.clone()));
+                }
+                "vector" => {
+                    if let (Some(dim), Some(metric_str)) = (info.dimension, info.metric.as_deref()) {
+                        let field = info.fields.first().cloned().unwrap_or_default();
+                        let metric = VectorIndex::parse_metric(metric_str);
+                        vector_indexes.insert(
+                            field.clone(),
+                            VectorIndex::new(field, dim, metric),
+                        );
+                    }
                 }
                 _ => {}
             }
@@ -273,11 +297,12 @@ impl Collection {
             ));
         }
 
-        // Phase 2: Try loading cached index data (.fidx / .cidx)
+        // Phase 2: Try loading cached index data (.fidx / .cidx / .vidx)
         let mut indexes_from_cache = false;
         if has_persisted_indexes {
             let fidx_path = data_dir.join(format!("{}.fidx", name));
             let cidx_path = data_dir.join(format!("{}.cidx", name));
+            let vidx_path = data_dir.join(format!("{}.vidx", name));
 
             let cached_field = index_persist::load_field_indexes(
                 &fidx_path,
@@ -289,12 +314,18 @@ impl Collection {
                 doc_count,
                 next_id,
             );
+            let cached_vector = index_persist::load_vector_indexes(
+                &vidx_path,
+                doc_count,
+                next_id,
+            );
 
             // Both must succeed for the cache to be valid
             let field_ok = cached_field.is_some() || field_indexes.is_empty();
             let comp_ok = cached_composite.is_some() || composite_indexes.is_empty();
+            let vec_ok = cached_vector.is_some() || vector_indexes.is_empty();
 
-            if field_ok && comp_ok {
+            if field_ok && comp_ok && vec_ok {
                 let cache_start = std::time::Instant::now();
                 if let Some(cached) = cached_field {
                     // Replace empty index structures with cached ones
@@ -305,6 +336,12 @@ impl Collection {
                 }
                 if let Some(cached) = cached_composite {
                     composite_indexes = cached;
+                }
+                if let Some(cached) = cached_vector {
+                    vector_indexes.clear();
+                    for idx in cached {
+                        vector_indexes.insert(idx.field.clone(), idx);
+                    }
                 }
                 indexes_from_cache = true;
                 if verbose {
@@ -335,6 +372,9 @@ impl Collection {
                 }
                 for idx in &mut composite_indexes {
                     idx.insert_value(id, arc);
+                }
+                for idx in vector_indexes.values_mut() {
+                    let _ = idx.insert(id, arc);
                 }
                 rebuild_count += 1;
                 if verbose && rebuild_count % 500_000 == 0 {
@@ -387,6 +427,7 @@ impl Collection {
             field_indexes,
             composite_indexes,
             text_index,
+            vector_indexes,
             version_index,
             next_id,
             encryption,
@@ -645,6 +686,8 @@ impl Collection {
                 index_type: if idx.unique { "unique".to_string() } else { "field".to_string() },
                 fields: vec![idx.field.clone()],
                 unique: idx.unique,
+                dimension: None,
+                metric: None,
             });
         }
         for idx in &self.composite_indexes {
@@ -653,6 +696,8 @@ impl Collection {
                 index_type: "composite".to_string(),
                 fields: idx.fields.clone(),
                 unique: false,
+                dimension: None,
+                metric: None,
             });
         }
         if let Some(ref text_idx) = self.text_index {
@@ -661,6 +706,18 @@ impl Collection {
                 index_type: "text".to_string(),
                 fields: text_idx.fields().to_vec(),
                 unique: false,
+                dimension: None,
+                metric: None,
+            });
+        }
+        for idx in self.vector_indexes.values() {
+            indexes.push(IndexInfo {
+                name: format!("_vec_{}", idx.field),
+                index_type: "vector".to_string(),
+                fields: vec![idx.field.clone()],
+                unique: false,
+                dimension: Some(idx.dimension),
+                metric: Some(idx.metric_str().to_string()),
             });
         }
         indexes
@@ -682,6 +739,13 @@ impl Collection {
             self.save_index_metadata()?;
             return Ok(());
         }
+        if let Some(field) = name.strip_prefix("_vec_")
+            && self.vector_indexes.remove(field).is_some()
+        {
+            self.save_index_metadata()?;
+            self.save_index_data();
+            return Ok(());
+        }
         Err(Error::IndexNotFound(name.to_string()))
     }
 
@@ -697,6 +761,85 @@ impl Collection {
             if let Some(mut doc) = self.read_doc(result.doc_id)? {
                 if let Some(obj) = doc.as_object_mut() {
                     obj.insert("_score".to_string(), serde_json::json!(result.score));
+                }
+                docs.push(doc);
+            }
+        }
+        Ok(docs)
+    }
+
+    // -----------------------------------------------------------------------
+    // Vector index methods
+    // -----------------------------------------------------------------------
+
+    /// Create a vector index on the specified field.
+    /// Rebuilds from existing documents in doc cache.
+    /// If an index already exists on this field, returns Ok immediately (idempotent).
+    pub fn create_vector_index(&mut self, field: &str, dimension: usize, metric: DistanceMetric) -> Result<()> {
+        if self.vector_indexes.contains_key(field) {
+            return Ok(());
+        }
+
+        let total = self.primary_index.len();
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: creating vector index on '{}' (dim={}, metric={}, {} docs to scan)",
+                self.name, field, dimension, metric.as_str(), total
+            ));
+        }
+        let start = std::time::Instant::now();
+        let mut count = 0u64;
+        let mut idx = VectorIndex::new(field.to_string(), dimension, metric);
+
+        // Backfill from doc cache (zero disk I/O)
+        for (&id, arc) in &self.doc_cache {
+            if let Err(e) = idx.insert(id, arc) {
+                if self.verbose {
+                    self.vlog(&format!(
+                        "[verbose] {}: vector index skip doc {}: {}",
+                        self.name, id, e
+                    ));
+                }
+            }
+            count += 1;
+            if self.verbose && count % 500_000 == 0 {
+                self.vlog(&format!(
+                    "[verbose] {}: vector index '{}' scanned {} / {} docs ({:.1}s)",
+                    self.name, field, count, total, start.elapsed().as_secs_f64()
+                ));
+            }
+        }
+
+        if self.verbose {
+            self.vlog(&format!(
+                "[verbose] {}: vector index '{}' ready ({} vectors from {} docs in {:.2}s)",
+                self.name, field, idx.len(), count, start.elapsed().as_secs_f64()
+            ));
+        }
+        self.vector_indexes.insert(field.to_string(), idx);
+        self.save_index_metadata()?;
+        self.save_index_data();
+        Ok(())
+    }
+
+    /// Perform vector similarity search. Returns matching documents with `_similarity` score.
+    pub fn vector_search(&self, field: &str, query_vector: &[f32], limit: usize, ef_search: Option<usize>) -> Result<Vec<Value>> {
+        let idx = self.vector_indexes.get(field).ok_or_else(|| {
+            Error::InvalidQuery(format!(
+                "no vector index on field '{}'; create one with create_vector_index",
+                field
+            ))
+        })?;
+
+        let search_results = idx.search(query_vector, limit, ef_search)
+            .map_err(|e| Error::InvalidQuery(e))?;
+
+        let mut docs = Vec::with_capacity(search_results.len());
+        for result in search_results {
+            if let Some(mut doc) = self.read_doc(result.doc_id)? {
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.insert("_similarity".to_string(), serde_json::json!(result.similarity));
+                    obj.insert("_distance".to_string(), serde_json::json!(result.distance));
                 }
                 docs.push(doc);
             }
@@ -776,6 +919,9 @@ impl Collection {
         }
         if let Some(ref mut text_idx) = self.text_index {
             text_idx.index_doc(id, &data_arc);
+        }
+        for idx in self.vector_indexes.values_mut() {
+            let _ = idx.insert(id, &data_arc);
         }
 
         self.doc_cache.insert(id, data_arc);
@@ -865,6 +1011,9 @@ impl Collection {
             }
             if let Some(ref mut text_idx) = self.text_index {
                 text_idx.index_doc(id, &data_arc);
+            }
+            for idx in self.vector_indexes.values_mut() {
+                let _ = idx.insert(id, &data_arc);
             }
             self.doc_cache.insert(id, data_arc);
         }
@@ -1393,6 +1542,10 @@ impl Collection {
             if let Some(ref mut text_idx) = self.text_index {
                 text_idx.index_doc(op.id, &op.new_data);
             }
+            for idx in self.vector_indexes.values_mut() {
+                idx.remove(op.id);
+                let _ = idx.insert(op.id, &op.new_data);
+            }
             self.doc_cache.insert(op.id, Arc::new(op.new_data));
         }
 
@@ -1508,6 +1661,9 @@ impl Collection {
             }
             if let Some(ref mut text_idx) = self.text_index {
                 text_idx.remove_doc(op.id);
+            }
+            for idx in self.vector_indexes.values_mut() {
+                idx.remove(op.id);
             }
         }
 
@@ -1644,6 +1800,9 @@ impl Collection {
         if let Some(ref mut text_idx) = self.text_index {
             text_idx.clear();
         }
+        for idx in self.vector_indexes.values_mut() {
+            idx.clear();
+        }
         for (&id, &loc) in &self.primary_index.clone() {
             let bytes = self.storage.read(loc)?;
             let data: Value = crate::codec::decode_doc(&bytes)?;
@@ -1658,6 +1817,9 @@ impl Collection {
             }
             if let Some(ref mut text_idx) = self.text_index {
                 text_idx.index_doc(id, &data_arc);
+            }
+            for idx in self.vector_indexes.values_mut() {
+                let _ = idx.insert(id, &data_arc);
             }
             self.doc_cache.insert(id, data_arc);
         }
@@ -1906,6 +2068,9 @@ impl Collection {
                 if let Some(ref mut text_idx) = self.text_index {
                     text_idx.remove_doc(m.doc_id);
                 }
+                for idx in self.vector_indexes.values_mut() {
+                    idx.remove(m.doc_id);
+                }
             } else if let Some(loc) = new_locs[i] {
                 self.primary_index.insert(m.doc_id, loc);
                 let ver = m.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
@@ -1926,6 +2091,10 @@ impl Collection {
                 }
                 if let Some(ref mut text_idx) = self.text_index {
                     text_idx.index_doc(m.doc_id, &m.new_data);
+                }
+                for idx in self.vector_indexes.values_mut() {
+                    idx.remove(m.doc_id);
+                    let _ = idx.insert(m.doc_id, &m.new_data);
                 }
                 self.doc_cache.insert(m.doc_id, Arc::new(m.new_data.clone()));
             }
