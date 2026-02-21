@@ -69,8 +69,9 @@ docker compose up -d
 - **JSON-based queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$regex`, `$and`, `$or`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
 - **Aggregation pipeline** — 10 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`; index-accelerated `$group` for count, sum, min, max, avg
-- **Indexes** — field, unique, composite, and full-text indexes with automatic backfill; list and drop support
-- **Persistent index cache** — index data (BTreeMap contents) persisted to binary `.fidx`/`.cidx` files; on restart, indexes load from cache in seconds instead of rebuilding from documents (16M docs: ~3s vs ~30min)
+- **Indexes** — field, unique, composite, full-text, and vector indexes with automatic backfill; list and drop support
+- **Vector search** — k-nearest-neighbor similarity search with cosine, Euclidean, and dot product metrics; flat (exact) for small collections, HNSW (approximate) for large; zero external dependencies
+- **Persistent index cache** — index data (BTreeMap contents) persisted to binary `.fidx`/`.cidx`/`.vidx` files; on restart, indexes load from cache in seconds instead of rebuilding from documents (16M docs: ~3s vs ~30min)
 - **Zero-copy reads** — `find_one`, `update`, and `delete` use Arc-based document iteration, cloning only matching documents instead of every visited document
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
 - **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
