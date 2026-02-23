@@ -1,0 +1,213 @@
+# TODO
+
+## Notes
+- Initialized project memory tracking file at `/Users/mrtksn/projects/OxiDB/TODO.md` per AGENTS.md instructions.
+- Added local Swift mutation-observer support in `/Users/mrtksn/projects/OxiDB/swift/OxiDB/Sources/OxiDB/OxiDB.swift`.
+- Introduced public Swift interfaces for observation:
+  - `OxiDBMutationOperation`
+  - `OxiDBMutationEvent`
+  - `OxiDBMutationObservable`
+- Implemented a thread-safe observer registry (`NSLock` + handler map) shared by `OxiDBClient` and `OxiDBDatabase`.
+- Emission behavior:
+  - `OxiDBClient` emits on successful `insert`, `insertMany`, `update`, `updateOne`, `delete`, `deleteOne`, `commitTransaction`.
+  - `OxiDBDatabase` emits centrally from `execute(_:)` when `cmd` is one of `insert`, `insert_many`, `update`, `update_one`, `delete`, `delete_one`, `commit_tx`.
+- Added `mutationEvents() -> AsyncStream<OxiDBMutationEvent>` convenience stream in both classes.
+- Build verification: `swift build --package-path swift/OxiDB` succeeded (required unsandboxed run due macOS Swift cache permissions).
+- Added mutation-watch demo wiring to embedded iOS sample app:
+  - `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`
+  - `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/ContentView.swift`
+- Embedded demo now includes:
+  - local mutation observer API (`addMutationObserver`, `removeMutationObserver`) in `EmbeddedDB`
+  - command-to-mutation mapping in `execute(_:)` success path
+  - automatic watcher logger that appends `WATCH ...` lines to the app log
+  - a `Watch Demo` UI action that runs tx + non-tx mutations to demonstrate event emission.
+- iOS demo validation: `xcodebuild ... OxiDBEmbeddedDemo ...` compiles Swift sources and fails at link-time because `liboxidb_embedded_ffi` is missing from configured search paths (`target/aarch64-apple-ios-sim/release`, `target/aarch64-apple-ios/release`).
+- Improved iOS embedded demo insertion UX for performance testing:
+  - `Insert` and `Add Articles` now open sheets where users can set insertion counts.
+  - Added preset counts (1k/5k/10k/50k for users, 1k/5k/10k/25k for articles).
+  - Added bulk insertion paths in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`:
+    - `insertUsers(count:batchSize:)`
+    - `insertArticles(count:batchSize:)`
+  - Bulk insertions run in batched `insert_many` calls and log throughput (`docs/sec`).
+  - Existing helpers `insertSample()` and `insertArticles()` are kept as wrappers for compatibility.
+- iOS demo build verification:
+  - full simulator build still fails for x86_64 if only arm64 simulator lib exists.
+  - arm64-only simulator build succeeds:
+    - `xcodebuild ... CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64`.
+- Improved iOS embedded demo querying UX with configurable scenarios:
+  - `Query` button now opens a sheet where users can configure:
+    - collection (`users`, `articles`, `watch_demo`)
+    - JSON query object
+    - optional sort field + direction
+    - optional `skip` and `limit`
+  - Added quick query presets in sheet (`{}`, city filter, age>= filter).
+  - Added `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift` method:
+    - `runQueryScenario(collection:queryJSON:sortField:sortDescending:skip:limit:)`
+  - Query execution now logs summary, first 5 rows, and remaining count for fast scenario comparison.
+- Query sheet + model changes verified with arm64 simulator build:
+  - `xcodebuild -project ... -scheme OxiDBEmbeddedDemo -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64` -> succeeded.
+- Added configurable **Edit Demo** flow for update testing:
+  - New `Edit Demo` action button in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/ContentView.swift`.
+  - New `EditScenarioSheet` with configurable:
+    - collection
+    - query JSON
+    - update JSON
+    - update mode (`update` vs `update_one`)
+  - Added update presets (`Set City`, `Inc Age`, `Add Tag`) for fast experimentation.
+  - Added model executor in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`:
+    - `runEditScenario(collection:queryJSON:updateJSON:single:)`
+  - Executor parses JSON safely, executes update command, and logs modified count + latency.
+- Edit demo changes verified with arm64 simulator build:
+  - `xcodebuild -project ... -scheme OxiDBEmbeddedDemo -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64` -> succeeded.
+- Reworked edit demo UX from generic update JSON to **single-document picker/editor**:
+  - Removed prior query/update JSON edit scenario UI.
+  - New edit sheet now:
+    - loads documents from selected collection (`users`, `articles`, `watch_demo`)
+    - lists docs with `_id` and summary
+    - lets user select one document
+    - allows editing that document JSON directly
+    - saves via `update_one` on selected `_id`.
+  - Added model APIs in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`:
+    - `listDocumentsForEditing(collection:limit:)`
+    - `updateDocumentByID(collection:documentID:editedJSON:)`
+  - Save behavior intentionally ignores `_id` / `_version` from edited JSON and applies `$set` for remaining fields.
+- Single-document editor flow verified with arm64 simulator build:
+  - `xcodebuild -project ... -scheme OxiDBEmbeddedDemo -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64` -> succeeded.
+- Reworked watch demo from one-shot mutation runner into configurable persisted watch rules:
+  - Backend updates in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`:
+    - Added `WatchRule` model + `@Published watchRules`.
+    - Added `_config`-backed rule APIs:
+      - `addDocumentWatchRule(collection:documentID:)`
+      - `addPropertyWatchRule(collection:documentID:propertyPath:)`
+      - `addQueryWatchRule(collection:queryJSON:)`
+      - `removeWatchRule(_:)`
+      - `loadWatchRules()`
+    - Added mutation-to-rule evaluation + trigger logging:
+      - evaluates document/property/query rules on write events
+      - logs structured trigger payload as `WATCH TRIGGER { ... }`
+      - skips `_config` collection to avoid self-trigger loops.
+    - Removed legacy `runMutationWatchDemo()` one-shot helper to avoid parallel watch flows in the sample.
+  - UI updates in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/ContentView.swift`:
+    - Replaced `Watch Demo` action with `Watch` sheet launcher.
+    - Added `WatchConfigurationSheet`:
+      - choose collection (`users`/`articles`)
+      - load and select documents
+      - configure rule mode (`document`, `property`, `query`)
+      - enter property path or query JSON
+      - add/delete persisted rules and view active rules list.
+    - Removed `watch_demo` option from Edit demo and Query demo collection pickers.
+- Watch configuration + rules build verification:
+  - `xcodebuild -project /Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo.xcodeproj -scheme OxiDBEmbeddedDemo -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64` -> succeeded.
+- Made watch-trigger feedback more prominent in the demo app:
+  - Added top transient banner/toast in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/ContentView.swift` that appears when a watch rule fires.
+  - Added watch-toast state + auto-dismiss timer in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`:
+    - `@Published watchToast`
+    - `showWatchToast(rule:event:matchedDoc:)`
+    - `dismissWatchToast()`
+  - `evaluateWatchRules(_:)` now triggers both log output and top banner output.
+- Watch banner build verification:
+  - `xcodebuild -project /Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo.xcodeproj -scheme OxiDBEmbeddedDemo -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64` -> succeeded.
+- Fixed bug: property/document watch rules could miss updates when `_id` in mutation metadata/query was `Int` instead of `NSNumber`.
+  - Fixed in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift` by adding normalized ID parsing helper `uint64FromAny(_:)` and using it in:
+    - `emitMutationIfNeeded(command:response:)`
+    - `eventAffectedDocumentIDs(_:)`
+  - This now handles `UInt64`, `UInt`, `Int`, `NSNumber`, and numeric `String` IDs consistently.
+- Bugfix verification:
+  - `xcodebuild -project /Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo.xcodeproj -scheme OxiDBEmbeddedDemo -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64` -> succeeded.
+- Regression test checklist (watch property trigger):
+  - [ ] Add property watch for existing doc `_id` in `users`.
+  - [ ] Update same doc using editor save.
+  - [ ] Confirm `WATCH TRIGGER ...` log appears and top banner is shown.
+  - [ ] Repeat with doc updates where query `_id` path is emitted as plain integer.
+- Fixed bug (follow-up): property watch could still appear not to trigger when rule path used nested form (e.g. `user.name`) but updates changed root field (`name`).
+  - Fixed in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`:
+    - Added `propertyPathMatches(watchPath:changedPath:)` with leaf-name fallback.
+    - Added document leaf fallback in `documentHasPath(...)` so `user.name` can match root `name` in demo data shape.
+- Added more general property watch support (collection-wide):
+  - Updated `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`:
+    - `addPropertyWatchRule(collection:documentID:propertyPath:)` now accepts optional `documentID`.
+    - Property rule evaluation now supports:
+      - specific document (`document_id` present)
+      - any document in collection (`document_id` absent).
+  - Updated `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/ContentView.swift`:
+    - Watch sheet property mode now has scope selector:
+      - `Selected Doc`
+      - `Any Document`
+    - Property path default changed to `name` and helper tip text added.
+- Build verification after general property watch changes:
+  - `xcodebuild -project /Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo.xcodeproj -scheme OxiDBEmbeddedDemo -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64` -> succeeded.
+- Regression test checklist (property scope + path fallback):
+  - [ ] Create property watch with `Scope = Selected Doc`, `Path = name`, then edit selected doc name.
+  - [ ] Create property watch with `Scope = Any Document`, `Path = name`, then edit any user name.
+  - [ ] Verify both flows show `WATCH TRIGGER ...` and top banner.
+  - [ ] Verify `Path = user.name` also triggers when editing root `name` in current demo schema.
+- Fixed bug: property path watch false positives (e.g., watch `city` firing on `age` edit).
+  - Root cause in `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`:
+    - `isPropertyTouched(...)` used fallback `documentHasPath(...)` for updates, so any document containing watched path triggered even when update touched different field.
+  - Fix:
+    - `isPropertyTouched(...)` now matches update operations strictly by changed update keys.
+    - Path-existence fallback is now limited to insert/insert_many flows only.
+    - Delete/commit no longer treated as property-touch events.
+- Build verification after false-positive fix:
+  - `xcodebuild -project /Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo.xcodeproj -scheme OxiDBEmbeddedDemo -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64` -> succeeded.
+- Regression test checklist (no false positives):
+  - [ ] Add property watch `city` (`Selected Doc` and `Any Document` variants).
+  - [ ] Edit only `age` on same doc.
+  - [ ] Confirm no `WATCH TRIGGER` log and no top banner.
+  - [ ] Edit `city` on watched scope and confirm trigger appears.
+- Fixed root cause behind duplicate/incorrect property triggers during Edit Demo saves:
+  - In `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo/EmbeddedDB.swift`, `updateDocumentByID(...)` previously sent full document in `$set` on every save.
+  - That made unrelated fields (e.g. `city`) appear in update payload even when user changed only `age`, causing property watches to fire incorrectly.
+  - Updated `updateDocumentByID(...)` to:
+    - fetch current document first,
+    - compute changed fields only,
+    - send `$set` with changed keys only.
+  - Added `jsonValueEquals(_:_:)` helper for field-level equality checks.
+- Build verification after edit-diff fix:
+  - `xcodebuild -project /Users/mrtksn/projects/OxiDB/examples/ios/OxiDBEmbeddedDemo/OxiDBEmbeddedDemo.xcodeproj -scheme OxiDBEmbeddedDemo -sdk iphonesimulator -configuration Debug build CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64` -> succeeded.
+- Regression test checklist (duplicate trigger investigation):
+  - [ ] Keep two rules: `document #1` and collection-wide `property city`.
+  - [ ] Edit doc #1 changing only `age`: expect exactly 1 trigger (`document`).
+  - [ ] Edit doc #1 changing `city`: expect exactly 2 triggers (`document` + `property`).
+  - [ ] Edit doc #2 changing only `age`: expect 0 property triggers.
+- Updated Swift docs with new watching functionality:
+  - Added comprehensive mutation-watching docs and sample code in `/Users/mrtksn/projects/OxiDB/swift/README.md`.
+  - New sections include:
+    - callback observer usage (`addMutationObserver` / `removeMutationObserver`)
+    - `AsyncStream` usage (`mutationEvents()`)
+    - sample rule-based path watch (`users.city`) built on `metadata["update"]`.
+  - Added API reference entries for mutation watching methods.
+
+## Decisions / Tradeoffs
+- Chosen scope is **SDK-local observation** (Option 1): only operations sent through a given Swift instance are observed.
+- For embedded mode, event emission is centralized in `execute(_:)` to also cover raw command usage and avoid duplicate emission across wrapper methods.
+- Event payload is lightweight (`operation`, `collection`, timestamp, metadata) and intentionally avoids before/after document snapshots.
+- Watch rules are stored as normal documents in `_config` (`type = watch_rule`) so they persist across app restarts without extra local storage.
+- Trigger output currently goes to log stream as structured JSON text for quick manual debugging in the demo UI.
+- Trigger output is now dual-channel in the demo: log line + temporary top banner for immediate visibility.
+- Swift README documents watching as SDK-local mutation observation and positions rule persistence/evaluation as app-layer logic.
+
+## Risks / Follow-up
+- Known limitation: no cross-process or cross-client visibility; external writers are not observed.
+- Metadata currently includes operation context only (`documentCount` / `single`) and not affected row counts from responses.
+- Follow-up: document the new API in `/Users/mrtksn/projects/OxiDB/swift/README.md` with examples.
+- Follow-up: add Swift tests for observer add/remove, async stream termination cleanup, and emit-on-success-only semantics.
+- iOS demo uses a local watcher helper in `EmbeddedDB` (FFI-level app) rather than importing `OxiDBDatabase` from Swift package; behavior matches Option 1 semantics but is not yet shared code.
+- Follow-up: if desired, migrate the iOS demo to consume `/Users/mrtksn/projects/OxiDB/swift/OxiDB` directly so the sample exercises the exact public SDK types.
+- If team needs universal simulator builds, add `x86_64` simulator `liboxidb_embedded_ffi` (or constrain simulator arch to arm64 in project settings).
+- Query-mode watch rules currently evaluate only insert/insert_many events (not updates that make an existing doc start matching).
+- Property watch checks nested update operator keys, then falls back to current document path existence check; this may over-report in some complex update patterns.
+- If many triggers fire rapidly, the banner currently shows the latest one (previous toast is replaced).
+
+## Pending
+- Add README examples for `addMutationObserver` and `mutationEvents()`.
+- Add Swift unit tests for mutation observation behavior.
+- Build `oxidb-embedded-ffi` for iOS simulator/device before running the iOS sample link step.
+- Optionally document the new insertion sheets in the iOS demo instructions.
+- Optionally document query sheet presets and scenario testing tips in iOS demo instructions.
+- Optionally document edit sheet presets and update-operator examples in iOS demo instructions.
+- Consider follow-up: support field removals (generate `$unset`) when keys are deleted in edited JSON.
+- Follow-up: add watch-rule enable/disable toggle (currently delete/recreate only).
+- Follow-up: add a dedicated trigger history view instead of relying only on log lines.
+- Follow-up: extend query-rule evaluation to include updates/deletes if product semantics require it.
+- Follow-up: add a small end-to-end watch snippet to `/Users/mrtksn/projects/OxiDB/examples/ios/OxiDBDemo/README.md` to mirror the Swift README section.

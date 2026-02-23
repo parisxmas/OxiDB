@@ -1,0 +1,43 @@
+[workspace]
+members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli", "oxidb-app/src-tauri"]
+resolver = "3"
+
+[package]
+name = "oxidb"
+version = "0.16.0"
+edition = "2024"
+description = "A fast document database engine with optimized date indexing"
+
+[features]
+default = []
+ocr = ["leptess"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+crc32fast = "1"
+aes-gcm = "0.10"
+rand = "0.9"
+zip = "2"
+pdf-extract = "0.7"
+leptess = { version = "0.14", optional = true }
+jsonb = "0.5"
+tar = "0.4"
+flate2 = "1"
+regex = "1"
+sqlparser = "0.59"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

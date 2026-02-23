@@ -1,0 +1,12 @@
+{
+  "": {
+    "swift-dependencies": "/Users/barisakin/source/docdb/.build/index-build/arm64-apple-macosx/debug/OxiDB.build/master.swiftdeps"
+  },
+  "/Users/barisakin/source/docdb/swift/OxiDB/Sources/OxiDB/OxiDB.swift": {
+    "dependencies": "/Users/barisakin/source/docdb/.build/index-build/arm64-apple-macosx/debug/OxiDB.build/OxiDB.d",
+    "object": "/Users/barisakin/source/docdb/.build/index-build/arm64-apple-macosx/debug/OxiDB.build/OxiDB.swift.o",
+    "swiftmodule": "/Users/barisakin/source/docdb/.build/index-build/arm64-apple-macosx/debug/OxiDB.build/OxiDB~partial.swiftmodule",
+    "swift-dependencies": "/Users/barisakin/source/docdb/.build/index-build/arm64-apple-macosx/debug/OxiDB.build/OxiDB.swiftdeps",
+    "diagnostics": "/Users/barisakin/source/docdb/.build/index-build/arm64-apple-macosx/debug/OxiDB.build/OxiDB.dia"
+  }
+}

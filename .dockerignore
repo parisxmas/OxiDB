@@ -1,0 +1,13 @@
+target/
+oxidb_data/
+.git/
+dotnet/
+python/
+julia/
+go/
+ruby/
+php/
+examples/spring-boot/
+oxidb-spring-boot-starter/
+*.md
+LICENSE

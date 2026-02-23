@@ -1,0 +1,30 @@
+services:
+  oxidb:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "4444:4444"
+    volumes:
+      - /Volumes/KINGSTON/bench_oxidb_data:/data
+    environment:
+      - OXIDB_ADDR=0.0.0.0:4444
+      - OXIDB_DATA=/data
+      - OXIDB_POOL_SIZE=4
+    healthcheck:
+      test: ["CMD-SHELL", "echo | nc -w1 localhost 4444 || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - /Volumes/KINGSTON/bench_mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
