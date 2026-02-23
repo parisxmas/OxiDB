@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -64,18 +65,19 @@ impl Storage {
     }
 
     /// Encrypt doc_bytes if encryption is enabled.
-    fn maybe_encrypt(&self, doc_bytes: &[u8]) -> Result<Vec<u8>> {
+    /// Returns `Cow::Borrowed` when no encryption (zero-copy), `Cow::Owned` when encrypted.
+    fn maybe_encrypt<'a>(&self, doc_bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         match &self.encryption {
-            Some(key) => key.encrypt(doc_bytes),
-            None => Ok(doc_bytes.to_vec()),
+            Some(key) => Ok(Cow::Owned(key.encrypt(doc_bytes)?)),
+            None => Ok(Cow::Borrowed(doc_bytes)),
         }
     }
 
     /// Decrypt payload if encryption is enabled.
-    fn maybe_decrypt(&self, payload: &[u8]) -> Result<Vec<u8>> {
+    fn maybe_decrypt(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
         match &self.encryption {
-            Some(key) => key.decrypt(payload),
-            None => Ok(payload.to_vec()),
+            Some(key) => key.decrypt(&payload),
+            None => Ok(payload),
         }
     }
 
@@ -104,7 +106,7 @@ impl Storage {
         let mut buf = vec![0u8; loc.length as usize];
         inner.file.read_exact(&mut buf)?;
         drop(inner);
-        self.maybe_decrypt(&buf)
+        self.maybe_decrypt(buf)
     }
 
     /// Soft-delete a record by flipping its status byte.
@@ -137,7 +139,7 @@ impl Storage {
     /// Returns a location for each item. Caller must call `sync()` after.
     pub fn append_batch_no_sync(&self, items: &[&[u8]]) -> Result<Vec<DocLocation>> {
         // Pre-encrypt all items outside the lock
-        let payloads: Vec<Vec<u8>> = items
+        let payloads: Vec<Cow<'_, [u8]>> = items
             .iter()
             .map(|doc_bytes| self.maybe_encrypt(doc_bytes))
             .collect::<Result<Vec<_>>>()?;
@@ -157,6 +159,50 @@ impl Storage {
             inner.current_offset += 1 + 4 + length as u64;
             locations.push(DocLocation { offset, length });
         }
+
+        Ok(locations)
+    }
+
+    /// Append multiple documents without fsync using a single write_all call.
+    /// Builds the entire batch into one buffer, reducing syscalls from 3*N to 1.
+    /// Returns a location for each item. Caller must call `sync()` after.
+    pub fn append_batch_no_sync_buffered(&self, items: &[&[u8]]) -> Result<Vec<DocLocation>> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+        // Pre-encrypt all items outside the lock
+        let payloads: Vec<Cow<'_, [u8]>> = items
+            .iter()
+            .map(|doc_bytes| self.maybe_encrypt(doc_bytes))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Build a single buffer for all records (also outside the lock)
+        let total_size: usize = payloads.iter().map(|p| 5 + p.len()).sum();
+        let mut buf = Vec::with_capacity(total_size);
+        // We'll compute offsets relative to 0, then shift by current_offset under lock
+        let mut relative_locations = Vec::with_capacity(payloads.len());
+        let mut rel_offset: u64 = 0;
+
+        for payload in &payloads {
+            let length = payload.len() as u32;
+            buf.push(RECORD_ACTIVE);
+            buf.extend_from_slice(&length.to_le_bytes());
+            buf.extend_from_slice(payload);
+            relative_locations.push((rel_offset, length));
+            rel_offset += 1 + 4 + length as u64;
+        }
+
+        // Single lock acquisition, single write
+        let mut inner = self.inner.lock().unwrap();
+        let base_offset = inner.current_offset;
+        inner.file.seek(SeekFrom::End(0))?;
+        inner.file.write_all(&buf)?;
+        inner.current_offset = base_offset + rel_offset;
+
+        let locations = relative_locations
+            .into_iter()
+            .map(|(rel, length)| DocLocation { offset: base_offset + rel, length })
+            .collect();
 
         Ok(locations)
     }

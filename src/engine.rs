@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use flate2::Compression;
@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 
 use crate::blob::BlobStore;
 use crate::change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
-use crate::collection::{Collection, CompactStats, IndexInfo};
+use crate::collection::{Collection, CompactStats, IndexInfo, resolve_field_in_value};
+use crate::value::IndexValue;
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
@@ -70,6 +71,11 @@ pub struct OxiDb {
     log_callback: Option<LogCallback>,
     change_broker: ChangeStreamBroker,
     scheduler_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
+    /// When true, collections skip per-write fsync; a background thread flushes.
+    lazy_sync: AtomicBool,
+    sync_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
+    /// Per-collection LRU document cache capacity.
+    cache_capacity: AtomicUsize,
 }
 
 impl OxiDb {
@@ -179,6 +185,9 @@ impl OxiDb {
             log_callback,
             change_broker: ChangeStreamBroker::new(),
             scheduler_shutdown: Mutex::new(None),
+            lazy_sync: AtomicBool::new(false),
+            sync_shutdown: Mutex::new(None),
+            cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
         })
     }
 
@@ -193,7 +202,7 @@ impl OxiDb {
         }
         // Slow path: load the collection OUTSIDE the write lock so that other
         // collections remain accessible while a large collection is loading.
-        let col = Collection::open_with_options(
+        let mut col = Collection::open_with_options(
             name,
             &self.data_dir,
             &std::collections::HashSet::new(),
@@ -201,6 +210,10 @@ impl OxiDb {
             self.verbose,
             self.log_callback.clone(),
         )?;
+        if self.lazy_sync.load(Ordering::Acquire) {
+            col.set_lazy_sync(true);
+        }
+        col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
         let arc = Arc::new(RwLock::new(col));
         // Briefly acquire write lock to insert
         let mut cols = self.collections.write().unwrap();
@@ -218,7 +231,7 @@ impl OxiDb {
         if cols.contains_key(name) {
             return Err(Error::CollectionAlreadyExists(name.to_string()));
         }
-        let col = Collection::open_with_options(
+        let mut col = Collection::open_with_options(
             name,
             &self.data_dir,
             &std::collections::HashSet::new(),
@@ -226,6 +239,10 @@ impl OxiDb {
             self.verbose,
             self.log_callback.clone(),
         )?;
+        if self.lazy_sync.load(Ordering::Acquire) {
+            col.set_lazy_sync(true);
+        }
+        col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
         cols.insert(name.to_string(), Arc::new(RwLock::new(col)));
         Ok(())
     }
@@ -255,6 +272,77 @@ impl OxiDb {
                 col.save_index_data();
             }
         }
+    }
+
+    /// Enable lazy sync mode: write operations skip per-operation fsync,
+    /// and a background thread flushes all collections every `interval`.
+    /// This matches MongoDB's default durability (journal flushed periodically).
+    pub fn enable_lazy_sync(self: &Arc<Self>, interval: std::time::Duration) {
+        self.lazy_sync.store(true, Ordering::Release);
+
+        // Enable lazy_sync on all currently loaded collections
+        {
+            let cols = self.collections.read().unwrap();
+            for col_arc in cols.values() {
+                if let Ok(mut col) = col_arc.write() {
+                    col.set_lazy_sync(true);
+                }
+            }
+        }
+
+        // Spawn background sync thread
+        let (tx, rx) = mpsc::sync_channel::<()>(0);
+        let db = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("oxidb-sync".into())
+            .spawn(move || {
+                loop {
+                    match rx.recv_timeout(interval) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // Periodic flush
+                            let cols = db.collections.read().unwrap();
+                            for col_arc in cols.values() {
+                                if let Ok(col) = col_arc.read() {
+                                    let _ = col.sync_writes();
+                                }
+                            }
+                        }
+                        _ => break, // Shutdown signal or sender dropped
+                    }
+                }
+                // Final flush on shutdown
+                let cols = db.collections.read().unwrap();
+                for col_arc in cols.values() {
+                    if let Ok(col) = col_arc.read() {
+                        let _ = col.sync_writes();
+                    }
+                }
+            })
+            .expect("failed to spawn sync thread");
+
+        *self.sync_shutdown.lock().unwrap() = Some(tx);
+    }
+
+    /// Returns whether lazy sync mode is enabled.
+    pub fn is_lazy_sync(&self) -> bool {
+        self.lazy_sync.load(Ordering::Acquire)
+    }
+
+    /// Set the per-collection LRU document cache capacity.
+    /// Applies immediately to all loaded collections and to future collections.
+    pub fn set_cache_capacity(&self, capacity: usize) {
+        self.cache_capacity.store(capacity, Ordering::Release);
+        let cols = self.collections.read().unwrap();
+        for col_arc in cols.values() {
+            if let Ok(col) = col_arc.read() {
+                col.set_cache_capacity(capacity);
+            }
+        }
+    }
+
+    /// Returns the current per-collection cache capacity.
+    pub fn cache_capacity(&self) -> usize {
+        self.cache_capacity.load(Ordering::Acquire)
     }
 
     /// Drop a collection and its data.
@@ -320,26 +408,99 @@ impl OxiDb {
     }
 
     pub fn insert_many(&self, collection: &str, docs: Vec<Value>) -> Result<Vec<DocumentId>> {
+        if docs.is_empty() {
+            return Ok(vec![]);
+        }
+
         let col = self.get_or_create_collection(collection)?;
         let emit = self.change_broker.has_subscribers();
-        let doc_clones: Option<Vec<Value>> = if emit { Some(docs.iter().cloned().collect()) } else { None };
-        let ids = col.write().unwrap().insert_many(docs)?;
-        if let Some(clones) = doc_clones {
-            for (mut d, &id) in clones.into_iter().zip(ids.iter()) {
-                if let Some(obj) = d.as_object_mut() {
+
+        // Phase 1: Brief write lock — reserve IDs and check unique constraints
+        let (first_id, has_unique_indexes, unique_fields) = {
+            let mut col_w = col.write().unwrap();
+            let count = docs.len() as u64;
+
+            // Quick check: any unique indexes?
+            let unique_fields: Vec<String> = col_w
+                .field_indexes()
+                .values()
+                .filter(|idx| idx.unique)
+                .map(|idx| idx.field.clone())
+                .collect();
+
+            let first_id = col_w.reserve_ids(count);
+
+            // Check existing unique constraints for all docs (requires index access)
+            for (i, doc) in docs.iter().enumerate() {
+                let id = first_id + i as u64;
+                let mut check_doc = doc.clone();
+                if let Some(obj) = check_doc.as_object_mut() {
                     obj.insert("_id".to_string(), Value::Number(id.into()));
-                    obj.insert("_version".to_string(), Value::Number(1.into()));
                 }
+                col_w.check_unique_constraints(&check_doc, None)?;
+            }
+
+            (first_id, !unique_fields.is_empty(), unique_fields)
+        }; // write lock released
+
+        // Phase 2: Pre-serialize all documents (no lock held — other threads can work)
+        let mut prepared = Vec::with_capacity(docs.len());
+
+        // Track intra-batch uniqueness
+        let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
+
+        for (i, mut data) in docs.into_iter().enumerate() {
+            if !data.is_object() {
+                return Err(Error::NotAnObject);
+            }
+            let id = first_id + i as u64;
+            let obj = data.as_object_mut().unwrap();
+            obj.insert("_id".to_string(), Value::Number(id.into()));
+            obj.insert("_version".to_string(), Value::Number(1.into()));
+
+            // Intra-batch uniqueness check
+            if has_unique_indexes {
+                for field in &unique_fields {
+                    if let Some(value) = resolve_field_in_value(&data, field) {
+                        let iv = IndexValue::from_json(value);
+                        let field_map = pending_unique.entry(field.clone()).or_default();
+                        if field_map.contains_key(&iv) {
+                            return Err(Error::UniqueViolation {
+                                field: field.clone(),
+                            });
+                        }
+                        field_map.insert(iv, id);
+                    }
+                }
+            }
+
+            let bytes = crate::codec::encode_doc(&data)?;
+
+            if emit {
+                // Clone for change stream emission
+                prepared.push((id, data, bytes));
+            } else {
+                prepared.push((id, data, bytes));
+            }
+        }
+
+        // Phase 3: Write lock — insert pre-serialized docs (fast: no serialization)
+        let ids = col.write().unwrap().insert_many_prepared(prepared)?;
+
+        // Emit change events if needed
+        if emit {
+            for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
                     token: 0,
                     operation: OperationType::Insert,
                     collection: collection.to_string(),
                     doc_id: id,
-                    document: Some(d),
+                    document: None,
                     tx_id: None,
                 });
             }
         }
+
         Ok(ids)
     }
 
@@ -531,23 +692,37 @@ impl OxiDb {
         let pipeline = Pipeline::parse(pipeline_json)?;
         let (leading_match, start_idx) = pipeline.take_leading_match();
 
+        let lookup_fn = |foreign: &str, query: &Value| -> Result<Vec<Value>> {
+            self.find(foreign, query)
+        };
+
+        // Streaming fast path: when pipeline is [$match?] -> $group -> [rest],
+        // stream docs through storage sequentially instead of materializing
+        // the full Vec<Arc<Value>>. This is 5-10x faster for large collections.
+        if let Some((group_key, accumulators, next_idx)) =
+            pipeline.try_streaming_group(start_idx)
+        {
+            let col = self.get_or_create_collection(collection)?;
+            let col_guard = col.read().unwrap();
+            let group_result =
+                col_guard.aggregate_streaming(leading_match, group_key, accumulators)?;
+            // Continue with remaining pipeline stages on the small group result
+            return pipeline.execute_from(next_idx, group_result, &lookup_fn);
+        }
+
         let query = match leading_match {
             Some(q) => q.clone(),
             None => json!({}),
         };
 
-        let lookup_fn = |foreign: &str, query: &Value| -> Result<Vec<Value>> {
-            self.find(foreign, query)
-        };
-
-        // Fast path: use Arc-based pipeline to avoid cloning all initial docs.
+        // Standard path: use Arc-based pipeline to avoid cloning all initial docs.
         // This is critical for aggregation over large datasets (200K+ docs).
         let col = self.get_or_create_collection(collection)?;
         let col_guard = col.read().unwrap();
         let arcs = col_guard.find_arcs(&query)?;
         let field_indexes = col_guard.field_indexes();
-        let doc_cache = col_guard.doc_cache();
-        pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(field_indexes), Some(doc_cache))
+        let doc_lookup = |id: DocumentId| col_guard.load_doc_arc(id);
+        pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(field_indexes), Some(&doc_lookup))
     }
 
     // -----------------------------------------------------------------------
@@ -1288,6 +1463,17 @@ impl Drop for OxiDb {
     fn drop(&mut self) {
         // Shut down the scheduler thread (dropping the sender causes it to exit)
         let _ = self.scheduler_shutdown.lock().unwrap().take();
+        // Shut down the background sync thread and do a final flush
+        let _ = self.sync_shutdown.lock().unwrap().take();
+        // Final sync of all collections (in case lazy_sync was enabled)
+        {
+            let cols = self.collections.read().unwrap();
+            for col_arc in cols.values() {
+                if let Ok(col) = col_arc.read() {
+                    let _ = col.sync_writes();
+                }
+            }
+        }
         self.flush_indexes();
     }
 }

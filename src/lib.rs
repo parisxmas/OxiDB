@@ -2,6 +2,7 @@ pub mod blob;
 pub mod change_stream;
 pub mod codec;
 pub mod collection;
+pub mod doc_cache;
 pub mod crypto;
 pub mod database_manager;
 pub mod document;

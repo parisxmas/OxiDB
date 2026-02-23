@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "oxidb"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 description = "A fast document database engine with optimized date indexing"
 
@@ -24,6 +24,7 @@ zip = "2"
 pdf-extract = "0.7"
 leptess = { version = "0.14", optional = true }
 jsonb = "0.5"
+lru = "0.12"
 tar = "0.4"
 flate2 = "1"
 regex = "1"
