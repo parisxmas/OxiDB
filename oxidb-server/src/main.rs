@@ -1,6 +1,14 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Configure jemalloc to aggressively return freed memory to the OS.
+/// `background_thread:true` enables periodic dirty page purging.
+/// `dirty_decay_ms:100` purges dirty pages after 100ms (default 10s).
+/// `muzzy_decay_ms:100` purges muzzy pages after 100ms (default 10s).
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "malloc_conf")]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:100,muzzy_decay_ms:100\0";
+
 use oxidb_server::audit::{self, AuditEvent, AuditLog};
 use oxidb_server::auth::UserStore;
 use oxidb_server::gelf::{GelfLevel, GelfLogger};
