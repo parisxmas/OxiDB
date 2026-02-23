@@ -801,26 +801,11 @@ fn extract_raw_field_value(raw: &jsonb::RawJsonb, field: &str) -> Option<IndexVa
         .collect();
 
     let owned = raw.get_by_keypath(keypath.iter()).ok()??;
-    let field_raw = owned.as_raw();
-
-    // Try scalar types in order of likelihood
-    if let Ok(Some(s)) = field_raw.as_str() {
-        return Some(IndexValue::parse_string(&s));
-    }
-    if let Ok(Some(n)) = field_raw.as_i64() {
-        return Some(IndexValue::Integer(n));
-    }
-    if let Ok(Some(f)) = field_raw.as_f64() {
-        return Some(IndexValue::Float(f));
-    }
-    if let Ok(Some(b)) = field_raw.as_bool() {
-        return Some(IndexValue::Boolean(b));
-    }
-    if let Ok(Some(())) = field_raw.as_null() {
-        return Some(IndexValue::Null);
-    }
-    // Complex types (array/object) — fall back to full decode
-    None
+    // Decode the extracted sub-value to serde_json::Value, then convert.
+    // Note: the as_i64()/as_str() accessors don't work on sub-values
+    // extracted via get_by_keypath — must use from_raw_jsonb instead.
+    let val: serde_json::Value = jsonb::from_raw_jsonb(&owned.as_raw()).ok()?;
+    Some(IndexValue::from_json(&val))
 }
 
 /// Extract a raw string value from JSONB for regex matching.
@@ -1130,5 +1115,16 @@ mod tests {
         let q = parse_query(&json!({"missing": "value"})).unwrap();
         let doc = Document::new(1, json!({"other": "field"})).unwrap();
         assert!(!matches_doc(&q, &doc));
+    }
+
+    #[test]
+    fn raw_jsonb_gt_integer() {
+        let doc = json!({"name": "Alice", "age": 30, "city": "NYC"});
+        let bytes = crate::codec::encode_doc(&doc).unwrap();
+        let q = parse_query(&json!({"age": {"$gt": 28}})).unwrap();
+        assert_eq!(matches_raw_jsonb(&q, &bytes), Some(true));
+
+        let q2 = parse_query(&json!({"age": {"$gt": 35}})).unwrap();
+        assert_eq!(matches_raw_jsonb(&q2, &bytes), Some(false));
     }
 }

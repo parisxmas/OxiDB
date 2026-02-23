@@ -2654,7 +2654,7 @@ fn handle_select_expressions<W: Write>(
         } else if upper_val == "CURRENT_USER" || upper_val == "SESSION_USER" {
             "oxidb".to_string()
         } else if upper_val == "VERSION()" {
-            "OxiDB 0.16.0 (PostgreSQL compatible)".to_string()
+            "OxiDB 0.17.0 (PostgreSQL compatible)".to_string()
         } else if upper_val.starts_with("CURRENT_SETTING(") {
             if upper_val.contains("SERVER_VERSION") {
                 "15.0".to_string()
