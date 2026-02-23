@@ -1,6 +1,9 @@
 # Rust
 /target/
 
+# Build artifacts
+.build/
+
 # .NET
 dotnet/**/bin/
 dotnet/**/obj/
