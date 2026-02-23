@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -7,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use crc32fast::Hasher;
 
 use crate::crypto::EncryptionKey;
+use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
 use crate::engine::LogCallback;
 use crate::error::Result;
@@ -151,12 +153,44 @@ impl Wal {
             payload.push(OP_INSERT);
             payload.extend_from_slice(&0u64.to_le_bytes()); // tx_id=0
             payload.extend_from_slice(&doc_id.to_le_bytes());
-            payload.extend_from_slice(&encrypted);
+            payload.extend_from_slice(&*encrypted);
             let crc = Self::compute_crc(&payload);
             file.write_all(&crc.to_le_bytes())?;
             file.write_all(&(payload.len() as u32).to_le_bytes())?;
             file.write_all(&payload)?;
         }
+        Ok(())
+    }
+
+    /// Write multiple insert entries without fsync using a single write_all call.
+    /// Builds the entire batch into one buffer, reducing syscalls from 3*N to 1.
+    pub fn log_batch_inserts_no_sync_buffered(&self, entries: &[(u64, &[u8])]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Estimate total buffer size: each entry = 8 (header) + 1 + 8 + 8 + payload
+        let est_size: usize = entries
+            .iter()
+            .map(|(_, doc_bytes)| 8 + 1 + 8 + 8 + doc_bytes.len() + 28) // +28 for possible encryption overhead
+            .sum();
+        let mut buf = Vec::with_capacity(est_size);
+
+        for &(doc_id, doc_bytes) in entries {
+            let encrypted = self.maybe_encrypt(doc_bytes)?;
+            let mut payload = Vec::with_capacity(1 + 8 + 8 + encrypted.len());
+            payload.push(OP_INSERT);
+            payload.extend_from_slice(&0u64.to_le_bytes()); // tx_id=0
+            payload.extend_from_slice(&doc_id.to_le_bytes());
+            payload.extend_from_slice(&*encrypted);
+            let crc = Self::compute_crc(&payload);
+            buf.extend_from_slice(&crc.to_le_bytes());
+            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&payload);
+        }
+
+        let mut file = self.inner.lock().unwrap();
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&buf)?;
         Ok(())
     }
 
@@ -182,7 +216,7 @@ impl Wal {
         &self,
         storage: &Storage,
         primary_index: &mut HashMap<DocumentId, DocLocation>,
-        doc_cache: &mut HashMap<DocumentId, Arc<serde_json::Value>>,
+        doc_cache: &DocCache,
         next_id: &mut DocumentId,
         committed_tx_ids: &HashSet<u64>,
         version_index: &mut HashMap<DocumentId, u64>,
@@ -235,7 +269,7 @@ impl Wal {
                         for idx in composite_indexes.iter_mut() {
                             idx.insert_value(doc_id, &doc);
                         }
-                        doc_cache.insert(doc_id, Arc::new(doc));
+                        doc_cache.put(doc_id, Arc::new(doc));
                     }
                     let loc = storage.append(&doc_bytes)?;
                     primary_index.insert(doc_id, loc);
@@ -273,7 +307,7 @@ impl Wal {
                         for idx in composite_indexes.iter_mut() {
                             idx.insert_value(doc_id, &doc);
                         }
-                        doc_cache.insert(doc_id, Arc::new(doc));
+                        doc_cache.put(doc_id, Arc::new(doc));
                     }
                     updates += 1;
                 }
@@ -291,7 +325,7 @@ impl Wal {
                         storage.mark_deleted(loc)?;
                         primary_index.remove(&doc_id);
                     }
-                    doc_cache.remove(&doc_id);
+                    doc_cache.remove(doc_id);
                     version_index.remove(&doc_id);
                     deletes += 1;
                 }
@@ -332,7 +366,7 @@ impl Wal {
                 payload.push(OP_INSERT);
                 payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
-                payload.extend_from_slice(&encrypted);
+                payload.extend_from_slice(&*encrypted);
                 Ok(payload)
             }
             WalEntry::Update { doc_id, doc_bytes, tx_id } => {
@@ -341,7 +375,7 @@ impl Wal {
                 payload.push(OP_UPDATE);
                 payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
-                payload.extend_from_slice(&encrypted);
+                payload.extend_from_slice(&*encrypted);
                 Ok(payload)
             }
             WalEntry::Delete { doc_id, tx_id } => {
@@ -354,10 +388,10 @@ impl Wal {
         }
     }
 
-    fn maybe_encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+    fn maybe_encrypt<'a>(&self, data: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         match &self.encryption {
-            Some(key) => key.encrypt(data),
-            None => Ok(data.to_vec()),
+            Some(key) => Ok(Cow::Owned(key.encrypt(data)?)),
+            None => Ok(Cow::Borrowed(data)),
         }
     }
 
@@ -604,8 +638,8 @@ mod tests {
 
         let mut fi = HashMap::new();
         let mut ci = Vec::new();
-        let mut dc = HashMap::new();
-        wal.recover(&storage, &mut primary_index, &mut dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
+        let dc = DocCache::new(1000);
+        wal.recover(&storage, &mut primary_index, &dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert_eq!(primary_index.len(), 1);
@@ -633,9 +667,9 @@ mod tests {
         let mut version_index = HashMap::new();
         let mut fi = HashMap::new();
         let mut ci = Vec::new();
-        let mut dc = HashMap::new();
+        let dc = DocCache::new(1000);
 
-        wal.recover(&storage, &mut primary_index, &mut dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
+        wal.recover(&storage, &mut primary_index, &dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert!(primary_index.is_empty()); // Should be skipped
@@ -661,9 +695,9 @@ mod tests {
         let mut version_index = HashMap::new();
         let mut fi = HashMap::new();
         let mut ci = Vec::new();
-        let mut dc = HashMap::new();
+        let dc = DocCache::new(1000);
 
-        wal.recover(&storage, &mut primary_index, &mut dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
+        wal.recover(&storage, &mut primary_index, &dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert_eq!(primary_index.len(), 1);
@@ -685,13 +719,13 @@ mod tests {
         let mut version_index = HashMap::new();
         let mut fi = HashMap::new();
         let mut ci = Vec::new();
-        let mut dc = HashMap::new();
+        let dc = DocCache::new(1000);
 
         // Now log a delete in WAL
         let wal = Wal::open(&wal_path).unwrap();
         wal.log(&WalEntry::delete(0)).unwrap();
 
-        wal.recover(&storage, &mut primary_index, &mut dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
+        wal.recover(&storage, &mut primary_index, &dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
             .unwrap();
 
         assert!(primary_index.is_empty());

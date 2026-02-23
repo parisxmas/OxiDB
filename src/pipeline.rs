@@ -35,7 +35,7 @@ impl DocRef for Arc<Value> {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-enum Expression {
+pub(crate) enum Expression {
     Literal(Value),
     FieldRef(String),
     Add(Vec<Expression>),
@@ -49,7 +49,7 @@ enum Expression {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-enum GroupKey {
+pub(crate) enum GroupKey {
     Null,
     Single(Expression),
     Compound(Vec<(String, Expression)>),
@@ -60,7 +60,7 @@ enum GroupKey {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-enum Accumulator {
+pub(crate) enum Accumulator {
     Sum(Expression),
     Avg(Expression),
     Min(Expression),
@@ -900,7 +900,7 @@ fn try_index_group(
     accumulators: &[(String, Accumulator)],
     docs: &[Arc<Value>],
     field_indexes: Option<&HashMap<String, FieldIndex>>,
-    doc_cache: Option<&HashMap<DocumentId, Arc<Value>>>,
+    doc_lookup: Option<&dyn Fn(DocumentId) -> Option<Arc<Value>>>,
 ) -> Result<Option<Vec<Value>>> {
     // Only optimize single-field group key
     let group_field = match key {
@@ -982,8 +982,8 @@ fn try_index_group(
 
     // Opt 5: Index-partitioned group with any accumulators.
     // Only works when we have doc_cache to look up individual docs.
-    let dc = match doc_cache {
-        Some(dc) => dc,
+    let dl = match doc_lookup {
+        Some(dl) => dl,
         None => return Ok(None),
     };
 
@@ -1018,7 +1018,7 @@ fn try_index_group(
             .collect();
 
         for &doc_id in doc_ids {
-            if let Some(doc_arc) = dc.get(&doc_id) {
+            if let Some(doc_arc) = dl(doc_id) {
                 let doc = doc_arc.as_ref();
                 for (i, (_, acc)) in accumulators.iter().enumerate() {
                     update_accumulator_state(&mut states[i], acc, doc);
@@ -1163,6 +1163,103 @@ fn finalize_accumulator(state: AccumulatorState) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming group execution (used by Collection::aggregate_streaming)
+// ---------------------------------------------------------------------------
+
+/// Streaming group aggregator that accumulates documents one at a time.
+/// Call `feed()` for each document, then `finalize()` to get results.
+pub(crate) struct StreamingGroup {
+    key: GroupKey,
+    accumulators: Vec<(String, Accumulator)>,
+    groups: HashMap<FastGroupKey, (Value, Vec<AccumulatorState>)>,
+    insertion_order: Vec<FastGroupKey>,
+}
+
+impl StreamingGroup {
+    pub(crate) fn new(key: &GroupKey, accumulators: &[(String, Accumulator)]) -> Self {
+        Self {
+            key: key.clone(),
+            accumulators: accumulators.to_vec(),
+            groups: HashMap::new(),
+            insertion_order: Vec::new(),
+        }
+    }
+
+    /// Feed a single document into the group accumulators.
+    pub(crate) fn feed(&mut self, doc: &Value) {
+        let key_hash = match &self.key {
+            GroupKey::Null => FastGroupKey(0),
+            GroupKey::Single(expr) => {
+                let vr = expr.eval_ref(doc);
+                compute_fast_key_single(vr.as_value())
+            }
+            GroupKey::Compound(fields) => {
+                let vals: Vec<ValRef> =
+                    fields.iter().map(|(_, expr)| expr.eval_ref(doc)).collect();
+                compute_fast_key_multi(vals.iter().map(|vr| vr.as_value()), vals.len())
+            }
+        };
+
+        if let Some((_, states)) = self.groups.get_mut(&key_hash) {
+            for (i, (_, acc)) in self.accumulators.iter().enumerate() {
+                update_accumulator(&mut states[i], acc, doc);
+            }
+            return;
+        }
+
+        // New group — materialize key Value only once
+        let key_val = match &self.key {
+            GroupKey::Null => Value::Null,
+            GroupKey::Single(expr) => expr.eval_ref(doc).into_owned(),
+            GroupKey::Compound(fields) => {
+                let mut map = Map::new();
+                for (name, expr) in fields {
+                    map.insert(name.clone(), expr.eval_ref(doc).into_owned());
+                }
+                Value::Object(map)
+            }
+        };
+        let mut initial: Vec<AccumulatorState> = self
+            .accumulators
+            .iter()
+            .map(|(_, acc)| match acc {
+                Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
+                Accumulator::Avg(_) => AccumulatorState::Avg {
+                    sum: 0.0,
+                    count: 0,
+                },
+                Accumulator::Min(_) => AccumulatorState::Min(None),
+                Accumulator::Max(_) => AccumulatorState::Max(None),
+                Accumulator::Count => AccumulatorState::Count(0),
+                Accumulator::First(_) => AccumulatorState::First(None),
+                Accumulator::Last(_) => AccumulatorState::Last(None),
+                Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+            })
+            .collect();
+        for (i, (_, acc)) in self.accumulators.iter().enumerate() {
+            update_accumulator(&mut initial[i], acc, doc);
+        }
+        self.insertion_order.push(key_hash.clone());
+        self.groups.insert(key_hash, (key_val, initial));
+    }
+
+    /// Finalize and return the grouped results.
+    pub(crate) fn finalize(mut self) -> Vec<Value> {
+        let mut results = Vec::with_capacity(self.insertion_order.len());
+        for key_hash in &self.insertion_order {
+            let (key_val, states) = self.groups.remove(key_hash).unwrap();
+            let mut doc = Map::new();
+            doc.insert("_id".to_string(), key_val);
+            for ((name, _), state) in self.accumulators.iter().zip(states) {
+                doc.insert(name.clone(), finalize_accumulator(state));
+            }
+            results.push(Value::Object(doc));
+        }
+        results
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline parsing & execution
 // ---------------------------------------------------------------------------
 
@@ -1287,6 +1384,21 @@ impl Pipeline {
         matches!(self.stages.get(idx), Some(Stage::Group { .. }))
     }
 
+    /// Detect if the pipeline (from `start`) begins with a `$group` stage,
+    /// and return references to its key, accumulators, and the index of the
+    /// next stage after `$group`.  Used by the streaming aggregation path.
+    pub(crate) fn try_streaming_group(
+        &self,
+        start: usize,
+    ) -> Option<(&GroupKey, &[(String, Accumulator)], usize)> {
+        match self.stages.get(start) {
+            Some(Stage::Group { key, accumulators }) => {
+                Some((key, accumulators, start + 1))
+            }
+            _ => None,
+        }
+    }
+
     /// Execute pipeline stages from Arc-based input (avoids Value::clone on
     /// initial docs). Stages that only read ($match, $group, $sort, $skip,
     /// $limit, $count) work directly on Arc references. When a mutating stage
@@ -1297,7 +1409,7 @@ impl Pipeline {
         mut docs: Vec<Arc<Value>>,
         lookup_fn: &F,
         field_indexes: Option<&HashMap<String, FieldIndex>>,
-        doc_cache: Option<&HashMap<DocumentId, Arc<Value>>>,
+        doc_lookup: Option<&dyn Fn(DocumentId) -> Option<Arc<Value>>>,
     ) -> Result<Vec<Value>>
     where
         F: Fn(&str, &Value) -> Result<Vec<Value>>,
@@ -1315,7 +1427,7 @@ impl Pipeline {
                         accumulators,
                         &docs,
                         field_indexes,
-                        doc_cache,
+                        doc_lookup,
                     )? {
                         return self.execute_from(start + i + 1, result, lookup_fn);
                     }

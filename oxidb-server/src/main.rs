@@ -768,6 +768,28 @@ fn main() {
     let db_manager = Arc::new(db_manager);
     db_manager.start_scheduler().expect("failed to start scheduler");
 
+    // Lazy sync mode: defer per-write fsync to a background thread (default: enabled).
+    // Matches MongoDB's default durability semantics (journal flushed every ~10ms).
+    // Disable with OXIDB_LAZY_SYNC=false for strict per-write durability.
+    let lazy_sync = env::var("OXIDB_LAZY_SYNC")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+    if lazy_sync {
+        let sync_interval_ms: u64 = env::var("OXIDB_SYNC_INTERVAL_MS")
+            .unwrap_or_else(|_| "10".to_string())
+            .parse()
+            .expect("OXIDB_SYNC_INTERVAL_MS must be a valid u64");
+        db.enable_lazy_sync(Duration::from_millis(sync_interval_ms));
+        eprintln!("lazy sync: enabled (interval={}ms)", sync_interval_ms);
+    }
+
+    // Document cache capacity per collection (default: 100,000).
+    if let Ok(cap_str) = env::var("OXIDB_CACHE_SIZE") {
+        let cap: usize = cap_str.parse().expect("OXIDB_CACHE_SIZE must be a valid usize");
+        db.set_cache_capacity(cap);
+        eprintln!("doc cache capacity: {cap} per collection");
+    }
+
     // TLS
     let tls_config = match (env::var("OXIDB_TLS_CERT"), env::var("OXIDB_TLS_KEY")) {
         (Ok(cert), Ok(key)) => {
