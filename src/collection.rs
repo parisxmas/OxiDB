@@ -587,19 +587,33 @@ impl Collection {
         let name = self.name.clone();
         let verbose = self.verbose;
 
-        // Backfill from storage using sequential streaming scan
+        // Backfill from storage using sequential streaming scan.
+        // Zero-decode path: extract only _id + indexed field from raw JSONB.
+        let field_owned = field.to_string();
         self.storage.scan_readonly_while(|bytes| {
-            let doc: Value = crate::codec::decode_doc(bytes)?;
-            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                let arc = Arc::new(doc);
-                idx.insert_value(id, &arc);
-                count += 1;
-                if verbose && count % 500_000 == 0 {
-                    eprintln!(
-                        "[verbose] {}: index '{}' scanned {} / {} docs ({:.1}s)",
-                        name, field, count, total, start.elapsed().as_secs_f64()
-                    );
+            if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
+                // JSONB binary — extract only the two fields we need
+                let raw = jsonb::RawJsonb::new(bytes);
+                if let Some(id) = extract_raw_u64(&raw, "_id") {
+                    if let Some(iv) = extract_raw_index_value(&raw, &field_owned) {
+                        idx.insert_raw(id, iv);
+                    }
+                    count += 1;
                 }
+            } else {
+                // Legacy JSON text — full decode fallback
+                let doc: Value = crate::codec::decode_doc(bytes)?;
+                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    let arc = Arc::new(doc);
+                    idx.insert_value(id, &arc);
+                    count += 1;
+                }
+            }
+            if verbose && count % 500_000 == 0 {
+                eprintln!(
+                    "[verbose] {}: index '{}' scanned {} / {} docs ({:.1}s)",
+                    name, field, count, total, start.elapsed().as_secs_f64()
+                );
             }
             Ok(true)
         })?;
@@ -639,28 +653,47 @@ impl Collection {
         let verbose = self.verbose;
         let mut unique_err: Option<Error> = None;
 
-        // Backfill from storage using sequential streaming scan
+        // Backfill from storage using sequential streaming scan.
+        // Zero-decode path: extract only _id + indexed field from raw JSONB.
         self.storage.scan_readonly_while(|bytes| {
-            let doc: Value = crate::codec::decode_doc(bytes)?;
-            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                let arc = Arc::new(doc);
-                if let Some(value) = resolve_field_in_value(&arc, &field_owned) {
-                    let iv = IndexValue::from_json(value);
-                    if idx.check_unique(&iv, None) {
-                        unique_err = Some(Error::UniqueViolation {
-                            field: field_owned.clone(),
-                        });
-                        return Ok(false);
+            if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
+                // JSONB binary — extract only the two fields we need
+                let raw = jsonb::RawJsonb::new(bytes);
+                if let Some(id) = extract_raw_u64(&raw, "_id") {
+                    if let Some(iv) = extract_raw_index_value(&raw, &field_owned) {
+                        if idx.check_unique(&iv, None) {
+                            unique_err = Some(Error::UniqueViolation {
+                                field: field_owned.clone(),
+                            });
+                            return Ok(false);
+                        }
+                        idx.insert_raw(id, iv);
                     }
+                    count += 1;
                 }
-                idx.insert_value(id, &arc);
-                count += 1;
-                if verbose && count % 500_000 == 0 {
-                    eprintln!(
-                        "[verbose] {}: unique index '{}' scanned {} / {} docs ({:.1}s)",
-                        name, field_owned, count, total, start.elapsed().as_secs_f64()
-                    );
+            } else {
+                // Legacy JSON text — full decode fallback
+                let doc: Value = crate::codec::decode_doc(bytes)?;
+                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    let arc = Arc::new(doc);
+                    if let Some(value) = resolve_field_in_value(&arc, &field_owned) {
+                        let iv = IndexValue::from_json(value);
+                        if idx.check_unique(&iv, None) {
+                            unique_err = Some(Error::UniqueViolation {
+                                field: field_owned.clone(),
+                            });
+                            return Ok(false);
+                        }
+                    }
+                    idx.insert_value(id, &arc);
+                    count += 1;
                 }
+            }
+            if verbose && count % 500_000 == 0 {
+                eprintln!(
+                    "[verbose] {}: unique index '{}' scanned {} / {} docs ({:.1}s)",
+                    name, field_owned, count, total, start.elapsed().as_secs_f64()
+                );
             }
             Ok(true)
         })?;
@@ -2483,6 +2516,34 @@ impl Collection {
 
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Raw JSONB helpers for zero-decode index creation
+// ---------------------------------------------------------------------------
+
+/// Extract a u64 value from a raw JSONB field (used for _id).
+fn extract_raw_u64(raw: &jsonb::RawJsonb, field: &str) -> Option<u64> {
+    use jsonb::keypath::KeyPath;
+    use std::borrow::Cow;
+    let keypath = [KeyPath::Name(Cow::Borrowed(field))];
+    let owned = raw.get_by_keypath(keypath.iter()).ok()??;
+    let val: Value = jsonb::from_raw_jsonb(&owned.as_raw()).ok()?;
+    val.as_u64()
+}
+
+/// Extract an IndexValue from a raw JSONB field (used for indexed field).
+fn extract_raw_index_value(raw: &jsonb::RawJsonb, field: &str) -> Option<IndexValue> {
+    use jsonb::keypath::KeyPath;
+    use std::borrow::Cow;
+    let parts: Vec<&str> = field.split('.').collect();
+    let keypath: Vec<KeyPath> = parts
+        .iter()
+        .map(|p| KeyPath::Name(Cow::Borrowed(p)))
+        .collect();
+    let owned = raw.get_by_keypath(keypath.iter()).ok()??;
+    let val: Value = jsonb::from_raw_jsonb(&owned.as_raw()).ok()?;
+    Some(IndexValue::from_json(&val))
 }
 
 #[cfg(test)]
