@@ -369,31 +369,37 @@ impl Collection {
             let rebuild_start = std::time::Instant::now();
             let mut rebuild_count = 0u64;
 
-            for (&id, &loc) in &primary_index {
-                let bytes = storage.read(loc)?;
-                let doc: Value = crate::codec::decode_doc(&bytes)?;
-                let doc_arc = Arc::new(doc);
-                for idx in field_indexes.values_mut() {
-                    idx.insert_value(id, &doc_arc);
+            // Use sequential streaming scan instead of per-doc random reads
+            storage.scan_readonly_while(|bytes| {
+                let doc: Value = crate::codec::decode_doc(bytes)?;
+                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    let doc_arc = Arc::new(doc);
+                    for idx in field_indexes.values_mut() {
+                        idx.insert_value(id, &doc_arc);
+                    }
+                    for idx in &mut composite_indexes {
+                        idx.insert_value(id, &doc_arc);
+                    }
+                    for idx in vector_indexes.values_mut() {
+                        let _ = idx.insert(id, &doc_arc);
+                    }
+                    rebuild_count += 1;
+                    if verbose && rebuild_count % 500_000 == 0 {
+                        let msg = format!(
+                            "[verbose] {}: index rebuild {} / {} docs ({:.1}s)",
+                            name,
+                            rebuild_count,
+                            doc_count,
+                            rebuild_start.elapsed().as_secs_f64()
+                        );
+                        eprintln!("{msg}");
+                        if let Some(cb) = &log_callback {
+                            cb(&msg);
+                        }
+                    }
                 }
-                for idx in &mut composite_indexes {
-                    idx.insert_value(id, &doc_arc);
-                }
-                for idx in vector_indexes.values_mut() {
-                    let _ = idx.insert(id, &doc_arc);
-                }
-                rebuild_count += 1;
-                if verbose && rebuild_count % 500_000 == 0 {
-                    let msg = format!(
-                        "[verbose] {}: index rebuild {} / {} docs ({:.1}s)",
-                        name,
-                        rebuild_count,
-                        doc_count,
-                        rebuild_start.elapsed().as_secs_f64()
-                    );
-                    vlog(&msg);
-                }
-            }
+                Ok(true)
+            })?;
 
             if verbose {
                 vlog(&format!(
@@ -578,21 +584,25 @@ impl Collection {
         let start = std::time::Instant::now();
         let mut count = 0u64;
         let mut idx = FieldIndex::new(field.to_string());
+        let name = self.name.clone();
+        let verbose = self.verbose;
 
-        // Backfill from storage
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let doc = crate::codec::decode_doc(&bytes)?;
-            let arc = Arc::new(doc);
-            idx.insert_value(id, &arc);
-            count += 1;
-            if self.verbose && count % 500_000 == 0 {
-                self.vlog(&format!(
-                    "[verbose] {}: index '{}' scanned {} / {} docs ({:.1}s)",
-                    self.name, field, count, total, start.elapsed().as_secs_f64()
-                ));
+        // Backfill from storage using sequential streaming scan
+        self.storage.scan_readonly_while(|bytes| {
+            let doc: Value = crate::codec::decode_doc(bytes)?;
+            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                let arc = Arc::new(doc);
+                idx.insert_value(id, &arc);
+                count += 1;
+                if verbose && count % 500_000 == 0 {
+                    eprintln!(
+                        "[verbose] {}: index '{}' scanned {} / {} docs ({:.1}s)",
+                        name, field, count, total, start.elapsed().as_secs_f64()
+                    );
+                }
             }
-        }
+            Ok(true)
+        })?;
 
         if self.verbose {
             self.vlog(&format!(
@@ -625,28 +635,38 @@ impl Collection {
         let mut count = 0u64;
         let mut idx = FieldIndex::new_unique(field.to_string());
         let field_owned = field.to_string();
+        let name = self.name.clone();
+        let verbose = self.verbose;
+        let mut unique_err: Option<Error> = None;
 
-        // Backfill from storage
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let doc = crate::codec::decode_doc(&bytes)?;
-            let arc = Arc::new(doc);
-            if let Some(value) = resolve_field_in_value(&arc, &field_owned) {
-                let iv = IndexValue::from_json(value);
-                if idx.check_unique(&iv, None) {
-                    return Err(Error::UniqueViolation {
-                        field: field_owned.clone(),
-                    });
+        // Backfill from storage using sequential streaming scan
+        self.storage.scan_readonly_while(|bytes| {
+            let doc: Value = crate::codec::decode_doc(bytes)?;
+            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                let arc = Arc::new(doc);
+                if let Some(value) = resolve_field_in_value(&arc, &field_owned) {
+                    let iv = IndexValue::from_json(value);
+                    if idx.check_unique(&iv, None) {
+                        unique_err = Some(Error::UniqueViolation {
+                            field: field_owned.clone(),
+                        });
+                        return Ok(false);
+                    }
+                }
+                idx.insert_value(id, &arc);
+                count += 1;
+                if verbose && count % 500_000 == 0 {
+                    eprintln!(
+                        "[verbose] {}: unique index '{}' scanned {} / {} docs ({:.1}s)",
+                        name, field_owned, count, total, start.elapsed().as_secs_f64()
+                    );
                 }
             }
-            idx.insert_value(id, &arc);
-            count += 1;
-            if self.verbose && count % 500_000 == 0 {
-                self.vlog(&format!(
-                    "[verbose] {}: unique index '{}' scanned {} / {} docs ({:.1}s)",
-                    self.name, field, count, total, start.elapsed().as_secs_f64()
-                ));
-            }
+            Ok(true)
+        })?;
+
+        if let Some(err) = unique_err {
+            return Err(err);
         }
 
         if self.verbose {
@@ -679,21 +699,25 @@ impl Collection {
         let start = std::time::Instant::now();
         let mut count = 0u64;
         let mut idx = CompositeIndex::new(fields);
+        let col_name = self.name.clone();
+        let verbose = self.verbose;
 
-        // Backfill from storage
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let doc = crate::codec::decode_doc(&bytes)?;
-            let arc = Arc::new(doc);
-            idx.insert_value(id, &arc);
-            count += 1;
-            if self.verbose && count % 500_000 == 0 {
-                self.vlog(&format!(
-                    "[verbose] {}: composite index '{}' scanned {} / {} docs ({:.1}s)",
-                    self.name, name, count, total, start.elapsed().as_secs_f64()
-                ));
+        // Backfill from storage using sequential streaming scan
+        self.storage.scan_readonly_while(|bytes| {
+            let doc: Value = crate::codec::decode_doc(bytes)?;
+            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                let arc = Arc::new(doc);
+                idx.insert_value(id, &arc);
+                count += 1;
+                if verbose && count % 500_000 == 0 {
+                    eprintln!(
+                        "[verbose] {}: composite index '{}' scanned {} / {} docs ({:.1}s)",
+                        col_name, name, count, total, start.elapsed().as_secs_f64()
+                    );
+                }
             }
-        }
+            Ok(true)
+        })?;
 
         if self.verbose {
             self.vlog(&format!(
@@ -726,21 +750,25 @@ impl Collection {
         let start = std::time::Instant::now();
         let mut count = 0u64;
         let mut idx = CollectionTextIndex::new(fields);
+        let name = self.name.clone();
+        let verbose = self.verbose;
 
-        // Backfill from storage
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let doc = crate::codec::decode_doc(&bytes)?;
-            let arc = Arc::new(doc);
-            idx.index_doc(id, &arc);
-            count += 1;
-            if self.verbose && count % 500_000 == 0 {
-                self.vlog(&format!(
-                    "[verbose] {}: text index scanned {} / {} docs ({:.1}s)",
-                    self.name, count, total, start.elapsed().as_secs_f64()
-                ));
+        // Backfill from storage using sequential streaming scan
+        self.storage.scan_readonly_while(|bytes| {
+            let doc: Value = crate::codec::decode_doc(bytes)?;
+            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                let arc = Arc::new(doc);
+                idx.index_doc(id, &arc);
+                count += 1;
+                if verbose && count % 500_000 == 0 {
+                    eprintln!(
+                        "[verbose] {}: text index scanned {} / {} docs ({:.1}s)",
+                        name, count, total, start.elapsed().as_secs_f64()
+                    );
+                }
             }
-        }
+            Ok(true)
+        })?;
 
         if self.verbose {
             self.vlog(&format!(
@@ -866,28 +894,33 @@ impl Collection {
         let start = std::time::Instant::now();
         let mut count = 0u64;
         let mut idx = VectorIndex::new(field.to_string(), dimension, metric);
+        let name = self.name.clone();
+        let verbose = self.verbose;
+        let field_owned = field.to_string();
 
-        // Backfill from storage
-        for (&id, &loc) in &self.primary_index {
-            let bytes = self.storage.read(loc)?;
-            let doc = crate::codec::decode_doc(&bytes)?;
-            let arc = Arc::new(doc);
-            if let Err(e) = idx.insert(id, &arc) {
-                if self.verbose {
-                    self.vlog(&format!(
-                        "[verbose] {}: vector index skip doc {}: {}",
-                        self.name, id, e
-                    ));
+        // Backfill from storage using sequential streaming scan
+        self.storage.scan_readonly_while(|bytes| {
+            let doc: Value = crate::codec::decode_doc(bytes)?;
+            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                let arc = Arc::new(doc);
+                if let Err(e) = idx.insert(id, &arc) {
+                    if verbose {
+                        eprintln!(
+                            "[verbose] {}: vector index skip doc {}: {}",
+                            name, id, e
+                        );
+                    }
+                }
+                count += 1;
+                if verbose && count % 500_000 == 0 {
+                    eprintln!(
+                        "[verbose] {}: vector index '{}' scanned {} / {} docs ({:.1}s)",
+                        name, field_owned, count, total, start.elapsed().as_secs_f64()
+                    );
                 }
             }
-            count += 1;
-            if self.verbose && count % 500_000 == 0 {
-                self.vlog(&format!(
-                    "[verbose] {}: vector index '{}' scanned {} / {} docs ({:.1}s)",
-                    self.name, field, count, total, start.elapsed().as_secs_f64()
-                ));
-            }
-        }
+            Ok(true)
+        })?;
 
         if self.verbose {
             self.vlog(&format!(
@@ -1413,9 +1446,11 @@ impl Collection {
                 }
             }
         } else {
-            self.for_each_doc_arc_while(|_id, arc| {
-                if query::matches_value(&query, arc) {
-                    results.push(Arc::clone(arc));
+            // No index — stream entire collection with filter.
+            // Sequential BufReader scan avoids per-doc Mutex + random seeks.
+            self.for_each_doc_streaming(|doc| {
+                if query::matches_value(&query, doc) {
+                    results.push(Arc::new(doc.clone()));
                     if let Some(limit) = early_limit {
                         if results.len() >= limit {
                             return Ok(false);
