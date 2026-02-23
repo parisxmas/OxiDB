@@ -489,6 +489,21 @@ impl Collection {
         &self.field_indexes
     }
 
+    /// Access the composite indexes.
+    pub fn composite_indexes(&self) -> &[CompositeIndex] {
+        &self.composite_indexes
+    }
+
+    /// Check if a text index exists.
+    pub fn has_text_index(&self) -> bool {
+        self.text_index.is_some()
+    }
+
+    /// Access the vector indexes.
+    pub fn vector_indexes(&self) -> &HashMap<String, VectorIndex> {
+        &self.vector_indexes
+    }
+
     /// Look up a document by ID. Checks LRU cache first, falls back to storage.
     pub fn load_doc_arc(&self, id: DocumentId) -> Option<Arc<Value>> {
         // Fast path: LRU cache hit
@@ -1157,23 +1172,36 @@ impl Collection {
         // Phase 5: update in-memory indexes
         self.next_id += prepared.len() as u64;
 
+        // Skip cache population for large batches — bulk inserts thrash
+        // the LRU cache (1M inserts into 100K cache = 900K wasted evictions
+        // that fragment the allocator). Cache is populated lazily on first read.
+        let skip_cache = prepared.len() > 1000;
+        let has_indexes = !self.field_indexes.is_empty()
+            || !self.composite_indexes.is_empty()
+            || self.text_index.is_some()
+            || !self.vector_indexes.is_empty();
+
         for ((id, data, _bytes), (_, loc)) in prepared.into_iter().zip(locs.iter()) {
             self.primary_index.insert(id, *loc);
             self.version_index.insert(id, 1);
-            let data_arc = Arc::new(data);
-            for idx in self.field_indexes.values_mut() {
-                idx.insert_value(id, &data_arc);
+            if has_indexes || !skip_cache {
+                let data_arc = Arc::new(data);
+                for idx in self.field_indexes.values_mut() {
+                    idx.insert_value(id, &data_arc);
+                }
+                for idx in &mut self.composite_indexes {
+                    idx.insert_value(id, &data_arc);
+                }
+                if let Some(ref mut text_idx) = self.text_index {
+                    text_idx.index_doc(id, &data_arc);
+                }
+                for idx in self.vector_indexes.values_mut() {
+                    let _ = idx.insert(id, &data_arc);
+                }
+                if !skip_cache {
+                    self.doc_cache.put(id, data_arc);
+                }
             }
-            for idx in &mut self.composite_indexes {
-                idx.insert_value(id, &data_arc);
-            }
-            if let Some(ref mut text_idx) = self.text_index {
-                text_idx.index_doc(id, &data_arc);
-            }
-            for idx in self.vector_indexes.values_mut() {
-                let _ = idx.insert(id, &data_arc);
-            }
-            self.doc_cache.put(id, data_arc);
         }
 
         Ok(ids)

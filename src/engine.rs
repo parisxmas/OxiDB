@@ -416,7 +416,7 @@ impl OxiDb {
         let emit = self.change_broker.has_subscribers();
 
         // Phase 1: Brief write lock — reserve IDs and check unique constraints
-        let (first_id, has_unique_indexes, unique_fields) = {
+        let (first_id, has_unique_indexes, unique_fields, need_values) = {
             let mut col_w = col.write().unwrap();
             let count = docs.len() as u64;
 
@@ -428,19 +428,27 @@ impl OxiDb {
                 .map(|idx| idx.field.clone())
                 .collect();
 
+            // Check if any indexes exist that will need the decoded Value
+            let need_values = !col_w.field_indexes().is_empty()
+                || !col_w.composite_indexes().is_empty()
+                || col_w.has_text_index()
+                || !col_w.vector_indexes().is_empty();
+
             let first_id = col_w.reserve_ids(count);
 
-            // Check existing unique constraints for all docs (requires index access)
-            for (i, doc) in docs.iter().enumerate() {
-                let id = first_id + i as u64;
-                let mut check_doc = doc.clone();
-                if let Some(obj) = check_doc.as_object_mut() {
-                    obj.insert("_id".to_string(), Value::Number(id.into()));
+            // Check existing unique constraints only when unique indexes exist
+            if !unique_fields.is_empty() {
+                for (i, doc) in docs.iter().enumerate() {
+                    let id = first_id + i as u64;
+                    let mut check_doc = doc.clone();
+                    if let Some(obj) = check_doc.as_object_mut() {
+                        obj.insert("_id".to_string(), Value::Number(id.into()));
+                    }
+                    col_w.check_unique_constraints(&check_doc, None)?;
                 }
-                col_w.check_unique_constraints(&check_doc, None)?;
             }
 
-            (first_id, !unique_fields.is_empty(), unique_fields)
+            (first_id, !unique_fields.is_empty(), unique_fields, need_values)
         }; // write lock released
 
         // Phase 2: Pre-serialize all documents (no lock held — other threads can work)
@@ -448,6 +456,11 @@ impl OxiDb {
 
         // Track intra-batch uniqueness
         let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
+
+        // When no indexes need the Value and batch is large, drop it after
+        // encoding to reduce allocator churn (otherwise jemalloc retains
+        // the freed pages, inflating RSS).
+        let keep_values = need_values || emit || docs.len() <= 1000;
 
         for (i, mut data) in docs.into_iter().enumerate() {
             if !data.is_object() {
@@ -476,11 +489,11 @@ impl OxiDb {
 
             let bytes = crate::codec::encode_doc(&data)?;
 
-            if emit {
-                // Clone for change stream emission
+            if keep_values {
                 prepared.push((id, data, bytes));
             } else {
-                prepared.push((id, data, bytes));
+                // Drop Value to free memory — only bytes are needed
+                prepared.push((id, Value::Null, bytes));
             }
         }
 
