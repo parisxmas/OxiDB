@@ -1664,15 +1664,63 @@ impl Collection {
                     let skip_post_filter =
                         query::is_fully_indexed(&query, &self.field_indexes);
                     if let Some(ref ids) = candidate_ids {
-                        // Indexed match — read only candidate docs
-                        for &id in ids {
-                            if let Some(arc) = self.load_doc_arc(id) {
+                        // Indexed match — batch pread + raw JSONB path
+                        let id_vec: Vec<u64> = ids.iter().copied().collect();
+
+                        // Phase 1: single-lock cache probe
+                        let cached = self.doc_cache.get_many(&id_vec);
+
+                        // Phase 2: collect cache misses with storage locations
+                        let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> =
+                            Vec::new();
+                        for (i, opt) in cached.iter().enumerate() {
+                            if opt.is_none() {
+                                if let Some(&loc) = self.primary_index.get(&id_vec[i]) {
+                                    miss_locs.push((i, loc));
+                                }
+                            }
+                        }
+
+                        // Phase 3: batch pread sorted by offset for I/O locality
+                        let batch_raw = if !miss_locs.is_empty() {
+                            self.storage.read_batch_lockfree(&mut miss_locs)?
+                        } else {
+                            Vec::new()
+                        };
+
+                        // Phase 4: feed cache hits
+                        for opt in cached.iter() {
+                            if let Some(arc) = opt {
+                                if skip_post_filter
+                                    || query::matches_value(&query, arc)
+                                {
+                                    group.feed(arc);
+                                }
+                            }
+                        }
+
+                        // Phase 5: feed cache misses from raw bytes
+                        if use_raw && skip_post_filter {
+                            // Fast path: index guarantees match, raw-eligible
+                            // — zero decode, just extract needed fields
+                            for (_i, bytes) in &batch_raw {
+                                group.feed_raw(bytes);
+                            }
+                        } else {
+                            // Need decode for post-filter or non-raw accumulators
+                            let mut cache_entries: Vec<(u64, Arc<Value>)> =
+                                Vec::with_capacity(batch_raw.len());
+                            for (i, bytes) in batch_raw {
+                                let doc = crate::codec::decode_doc(&bytes)?;
+                                let arc = Arc::new(doc);
                                 if skip_post_filter
                                     || query::matches_value(&query, &arc)
                                 {
                                     group.feed(&arc);
                                 }
+                                cache_entries.push((id_vec[i], arc));
                             }
+                            self.doc_cache.put_many(cache_entries);
                         }
                     } else if use_raw {
                         // No index — stream raw JSONB, filter + group inline
