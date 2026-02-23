@@ -80,6 +80,24 @@ impl DocCache {
         let cache = self.inner.lock().unwrap();
         cache.cap().get()
     }
+
+    /// Probe the cache for multiple IDs in a single lock acquisition.
+    /// Returns a Vec with Some(arc) for hits and None for misses,
+    /// in the same order as the input.
+    pub fn get_many(&self, ids: &[DocumentId]) -> Vec<Option<Arc<Value>>> {
+        let mut cache = self.inner.lock().unwrap();
+        ids.iter()
+            .map(|&id| cache.get(&id).map(Arc::clone))
+            .collect()
+    }
+
+    /// Insert multiple entries in a single lock acquisition.
+    pub fn put_many(&self, entries: impl IntoIterator<Item = (DocumentId, Arc<Value>)>) {
+        let mut cache = self.inner.lock().unwrap();
+        for (id, doc) in entries {
+            cache.put(id, doc);
+        }
+    }
 }
 
 #[cfg(test)]
