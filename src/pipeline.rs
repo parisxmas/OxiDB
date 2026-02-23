@@ -619,6 +619,99 @@ fn update_accumulator(state: &mut AccumulatorState, acc: &Accumulator, doc: &Val
     }
 }
 
+/// Update an accumulator from raw JSONB without full deserialization.
+#[inline(always)]
+fn update_accumulator_raw(state: &mut AccumulatorState, acc: &Accumulator, raw: &jsonb::RawJsonb) {
+    match (acc, state) {
+        (Accumulator::Sum(expr), AccumulatorState::Sum(s)) => {
+            if let Some(n) = eval_expr_f64_raw(expr, raw) {
+                *s += n;
+            }
+        }
+        (Accumulator::Avg(expr), AccumulatorState::Avg { sum, count }) => {
+            if let Some(n) = eval_expr_f64_raw(expr, raw) {
+                *sum += n;
+                *count += 1;
+            }
+        }
+        (Accumulator::Min(expr), AccumulatorState::Min(current)) => {
+            if let Some(owned) = eval_expr_raw_owned(expr, raw) {
+                if let Some(new_iv) = raw_to_index_value(&owned) {
+                    let should_replace = match current {
+                        None => true,
+                        Some((_, cur_iv)) => new_iv < *cur_iv,
+                    };
+                    if should_replace {
+                        *current = Some((raw_owned_to_value(&owned), new_iv));
+                    }
+                }
+            }
+        }
+        (Accumulator::Max(expr), AccumulatorState::Max(current)) => {
+            if let Some(owned) = eval_expr_raw_owned(expr, raw) {
+                if let Some(new_iv) = raw_to_index_value(&owned) {
+                    let should_replace = match current {
+                        None => true,
+                        Some((_, cur_iv)) => new_iv > *cur_iv,
+                    };
+                    if should_replace {
+                        *current = Some((raw_owned_to_value(&owned), new_iv));
+                    }
+                }
+            }
+        }
+        (Accumulator::Count, AccumulatorState::Count(c)) => {
+            *c += 1;
+        }
+        (Accumulator::First(expr), AccumulatorState::First(current)) => {
+            if current.is_none() {
+                if let Some(owned) = eval_expr_raw_owned(expr, raw) {
+                    *current = Some(raw_owned_to_value(&owned));
+                }
+            }
+        }
+        (Accumulator::Last(expr), AccumulatorState::Last(current)) => {
+            if let Some(owned) = eval_expr_raw_owned(expr, raw) {
+                *current = Some(raw_owned_to_value(&owned));
+            }
+        }
+        (Accumulator::Push(expr), AccumulatorState::Push(vec)) => {
+            if let Some(owned) = eval_expr_raw_owned(expr, raw) {
+                vec.push(raw_owned_to_value(&owned));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Evaluate a simple expression as f64 from raw JSONB.
+#[inline(always)]
+fn eval_expr_f64_raw(expr: &Expression, raw: &jsonb::RawJsonb) -> Option<f64> {
+    match expr {
+        Expression::Literal(v) => v.as_f64(),
+        Expression::FieldRef(path) => raw_field_f64(raw, path),
+        _ => None,
+    }
+}
+
+/// Evaluate a simple expression as OwnedValue from raw JSONB.
+#[inline(always)]
+fn eval_expr_raw_owned(expr: &Expression, raw: &jsonb::RawJsonb) -> Option<jsonb::OwnedJsonb> {
+    match expr {
+        Expression::FieldRef(path) => extract_raw_field(raw, path),
+        Expression::Literal(_) => {
+            None // Literals use the f64 fast path ($sum:1) — OwnedJsonb not needed
+        }
+        _ => None,
+    }
+}
+
+/// Convert a raw JSONB extracted field to IndexValue.
+fn raw_to_index_value(owned: &jsonb::OwnedJsonb) -> Option<IndexValue> {
+    let val: Value = jsonb::from_raw_jsonb(&owned.as_raw()).ok()?;
+    Some(IndexValue::from_json(&val))
+}
+
 fn exec_group<D: DocRef>(
     docs: &[D],
     key: &GroupKey,
@@ -1163,6 +1256,73 @@ fn finalize_accumulator(state: AccumulatorState) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Raw JSONB helpers for zero-decode aggregation
+// ---------------------------------------------------------------------------
+
+/// Extract a field from raw JSONB by dot-path (e.g. "address.city").
+fn extract_raw_field(raw: &jsonb::RawJsonb, path: &str) -> Option<jsonb::OwnedJsonb> {
+    use jsonb::keypath::KeyPath;
+    use std::borrow::Cow;
+    let parts: Vec<&str> = path.split('.').collect();
+    let keypath: Vec<KeyPath> = parts
+        .iter()
+        .map(|p| KeyPath::Name(Cow::Borrowed(p)))
+        .collect();
+    raw.get_by_keypath(keypath.iter()).ok()?
+}
+
+/// Extract a numeric value from a raw JSONB field.
+/// Decodes only the extracted field (not the whole document).
+fn raw_field_f64(raw: &jsonb::RawJsonb, path: &str) -> Option<f64> {
+    let owned = extract_raw_field(raw, path)?;
+    // Decode just this one field value to serde_json::Value
+    let val: Value = jsonb::from_raw_jsonb(&owned.as_raw()).ok()?;
+    val.as_f64()
+}
+
+/// Decode a raw JSONB extracted field into a serde_json::Value.
+/// Much cheaper than decoding the full document — only one field.
+fn raw_owned_to_value(owned: &jsonb::OwnedJsonb) -> Value {
+    jsonb::from_raw_jsonb(&owned.as_raw()).unwrap_or(Value::Null)
+}
+
+/// Hash a raw JSONB extracted field consistent with `hash_json_value`.
+/// Decodes only this field to Value, then hashes it.
+fn hash_raw_owned<H: Hasher>(owned: &jsonb::OwnedJsonb, state: &mut H) -> bool {
+    let val: Value = match jsonb::from_raw_jsonb(&owned.as_raw()) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    hash_json_value(&val, state);
+    true
+}
+
+/// Check if all expressions in the pipeline are raw-JSONB-compatible
+/// (only FieldRef and Literal — no arithmetic expressions).
+pub(crate) fn is_raw_eligible(key: &GroupKey, accumulators: &[(String, Accumulator)]) -> bool {
+    let key_ok = match key {
+        GroupKey::Null => true,
+        GroupKey::Single(e) => matches!(e, Expression::FieldRef(_) | Expression::Literal(_)),
+        GroupKey::Compound(fields) => fields
+            .iter()
+            .all(|(_, e)| matches!(e, Expression::FieldRef(_) | Expression::Literal(_))),
+    };
+    if !key_ok {
+        return false;
+    }
+    accumulators.iter().all(|(_, acc)| match acc {
+        Accumulator::Count => true,
+        Accumulator::Sum(e)
+        | Accumulator::Avg(e)
+        | Accumulator::Min(e)
+        | Accumulator::Max(e)
+        | Accumulator::First(e)
+        | Accumulator::Last(e)
+        | Accumulator::Push(e) => matches!(e, Expression::FieldRef(_) | Expression::Literal(_)),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Streaming group execution (used by Collection::aggregate_streaming)
 // ---------------------------------------------------------------------------
 
@@ -1238,6 +1398,133 @@ impl StreamingGroup {
             .collect();
         for (i, (_, acc)) in self.accumulators.iter().enumerate() {
             update_accumulator(&mut initial[i], acc, doc);
+        }
+        self.insertion_order.push(key_hash.clone());
+        self.groups.insert(key_hash, (key_val, initial));
+    }
+
+    /// Feed directly from raw JSONB bytes — extracts only the fields needed
+    /// for the group key and accumulators, skipping full deserialization.
+    /// Caller must ensure `is_raw_eligible()` is true.
+    pub(crate) fn feed_raw(&mut self, raw_bytes: &[u8]) {
+        // Legacy JSON text: fall back to full decode
+        if raw_bytes.is_empty() || raw_bytes[0] == b'{' || raw_bytes[0] == b'[' {
+            if let Ok(doc) = serde_json::from_slice::<Value>(raw_bytes) {
+                self.feed(&doc);
+            }
+            return;
+        }
+
+        let raw = jsonb::RawJsonb::new(raw_bytes);
+
+        // Compute group key hash directly from raw JSONB
+        let key_hash = match &self.key {
+            GroupKey::Null => FastGroupKey(0),
+            GroupKey::Single(expr) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                1usize.hash(&mut hasher);
+                match expr {
+                    Expression::FieldRef(path) => {
+                        if let Some(owned) = extract_raw_field(&raw, path) {
+                            if !hash_raw_owned(&owned, &mut hasher) {
+                                let doc: Value =
+                                    jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
+                                return self.feed(&doc);
+                            }
+                        } else {
+                            std::mem::discriminant(&IndexValue::Null).hash(&mut hasher);
+                        }
+                    }
+                    Expression::Literal(v) => hash_json_value(v, &mut hasher),
+                    _ => {
+                        let doc: Value = jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
+                        return self.feed(&doc);
+                    }
+                }
+                FastGroupKey(hasher.finish())
+            }
+            GroupKey::Compound(fields) => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                fields.len().hash(&mut hasher);
+                for (_, expr) in fields {
+                    match expr {
+                        Expression::FieldRef(path) => {
+                            if let Some(owned) = extract_raw_field(&raw, path) {
+                                if !hash_raw_owned(&owned, &mut hasher) {
+                                    let doc: Value =
+                                        jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
+                                    return self.feed(&doc);
+                                }
+                            } else {
+                                std::mem::discriminant(&IndexValue::Null).hash(&mut hasher);
+                            }
+                        }
+                        Expression::Literal(v) => hash_json_value(v, &mut hasher),
+                        _ => {
+                            let doc: Value =
+                                jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
+                            return self.feed(&doc);
+                        }
+                    }
+                }
+                FastGroupKey(hasher.finish())
+            }
+        };
+
+        // Fast path: existing group — update accumulators from raw JSONB
+        if let Some((_, states)) = self.groups.get_mut(&key_hash) {
+            for (i, (_, acc)) in self.accumulators.iter().enumerate() {
+                update_accumulator_raw(&mut states[i], acc, &raw);
+            }
+            return;
+        }
+
+        // New group — materialize key Value (happens only a few times)
+        let key_val = match &self.key {
+            GroupKey::Null => Value::Null,
+            GroupKey::Single(expr) => match expr {
+                Expression::FieldRef(path) => extract_raw_field(&raw, path)
+                    .as_ref()
+                    .map(raw_owned_to_value)
+                    .unwrap_or(Value::Null),
+                Expression::Literal(v) => v.clone(),
+                _ => Value::Null,
+            },
+            GroupKey::Compound(fields) => {
+                let mut map = Map::new();
+                for (name, expr) in fields {
+                    let v = match expr {
+                        Expression::FieldRef(path) => extract_raw_field(&raw, path)
+                            .as_ref()
+                            .map(raw_owned_to_value)
+                            .unwrap_or(Value::Null),
+                        Expression::Literal(v) => v.clone(),
+                        _ => Value::Null,
+                    };
+                    map.insert(name.clone(), v);
+                }
+                Value::Object(map)
+            }
+        };
+        let mut initial: Vec<AccumulatorState> = self
+            .accumulators
+            .iter()
+            .map(|(_, acc)| match acc {
+                Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
+                Accumulator::Avg(_) => AccumulatorState::Avg {
+                    sum: 0.0,
+                    count: 0,
+                },
+                Accumulator::Min(_) => AccumulatorState::Min(None),
+                Accumulator::Max(_) => AccumulatorState::Max(None),
+                Accumulator::Count => AccumulatorState::Count(0),
+                Accumulator::First(_) => AccumulatorState::First(None),
+                Accumulator::Last(_) => AccumulatorState::Last(None),
+                Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+            })
+            .collect();
+        for (i, (_, acc)) in self.accumulators.iter().enumerate() {
+            update_accumulator_raw(&mut initial[i], acc, &raw);
         }
         self.insertion_order.push(key_hash.clone());
         self.groups.insert(key_hash, (key_val, initial));
@@ -2301,5 +2588,40 @@ mod tests {
         let result = pipeline.execute_from(0, docs, &mock_lookup).unwrap();
         assert_eq!(result[0]["item_details"].as_array().unwrap().len(), 1);
         assert_eq!(result[1]["item_details"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn feed_raw_avg_basic() {
+        let key = GroupKey::Single(Expression::FieldRef("city".to_string()));
+        let accs = vec![("avg_age".to_string(), Accumulator::Avg(Expression::FieldRef("age".to_string())))];
+        assert!(is_raw_eligible(&key, &accs));
+
+        let mut group = StreamingGroup::new(&key, &accs);
+
+        let doc1 = json!({"name": "Alice", "age": 30, "city": "NYC"});
+        let doc2 = json!({"name": "Bob", "age": 25, "city": "LA"});
+        let doc3 = json!({"name": "Charlie", "age": 35, "city": "NYC"});
+
+        let enc1 = crate::codec::encode_doc(&doc1).unwrap();
+        let enc2 = crate::codec::encode_doc(&doc2).unwrap();
+        let enc3 = crate::codec::encode_doc(&doc3).unwrap();
+
+        group.feed_raw(&enc1);
+        group.feed_raw(&enc2);
+        group.feed_raw(&enc3);
+
+        let results = group.finalize();
+        eprintln!("results: {:?}", results);
+        assert_eq!(results.len(), 2);
+
+        for doc in &results {
+            let city = doc["_id"].as_str().unwrap();
+            let avg = doc["avg_age"].as_f64().unwrap();
+            match city {
+                "NYC" => assert!((avg - 32.5).abs() < 0.01, "NYC avg was {avg}"),
+                "LA" => assert!((avg - 25.0).abs() < 0.01, "LA avg was {avg}"),
+                other => panic!("unexpected city: {other}"),
+            }
+        }
     }
 }

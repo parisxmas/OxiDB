@@ -1623,22 +1623,37 @@ impl Collection {
     ) -> Result<Vec<Value>> {
         let mut group =
             crate::pipeline::StreamingGroup::new(group_key, accumulators);
+        let use_raw = crate::pipeline::is_raw_eligible(group_key, accumulators);
 
         match match_query_json {
             None => {
-                // No $match — stream entire collection
-                self.for_each_doc_streaming(|doc| {
-                    group.feed(doc);
-                    Ok(true)
-                })?;
-            }
-            Some(match_val) => {
-                let query = query::parse_query(match_val)?;
-                if matches!(query, Query::All) {
+                if use_raw {
+                    // Zero-decode: extract only needed fields from raw JSONB
+                    self.storage.scan_readonly_while(|bytes| {
+                        group.feed_raw(bytes);
+                        Ok(true)
+                    })?;
+                } else {
                     self.for_each_doc_streaming(|doc| {
                         group.feed(doc);
                         Ok(true)
                     })?;
+                }
+            }
+            Some(match_val) => {
+                let query = query::parse_query(match_val)?;
+                if matches!(query, Query::All) {
+                    if use_raw {
+                        self.storage.scan_readonly_while(|bytes| {
+                            group.feed_raw(bytes);
+                            Ok(true)
+                        })?;
+                    } else {
+                        self.for_each_doc_streaming(|doc| {
+                            group.feed(doc);
+                            Ok(true)
+                        })?;
+                    }
                 } else {
                     // Try index-accelerated candidate lookup
                     let candidate_ids = query::execute_indexed(
@@ -1659,8 +1674,22 @@ impl Collection {
                                 }
                             }
                         }
+                    } else if use_raw {
+                        // No index — stream raw JSONB, filter + group inline
+                        self.storage.scan_readonly_while(|bytes| {
+                            match query::matches_raw_jsonb(&query, bytes) {
+                                Some(true) => group.feed_raw(bytes),
+                                Some(false) => {}
+                                None => {
+                                    let doc = crate::codec::decode_doc(bytes)?;
+                                    if query::matches_value(&query, &doc) {
+                                        group.feed(&doc);
+                                    }
+                                }
+                            }
+                            Ok(true)
+                        })?;
                     } else {
-                        // No index — stream and filter inline
                         self.for_each_doc_streaming(|doc| {
                             if query::matches_value(&query, doc) {
                                 group.feed(doc);
