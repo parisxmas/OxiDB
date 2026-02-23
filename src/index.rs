@@ -71,6 +71,11 @@ impl FieldIndex {
         }
     }
 
+    /// Insert a pre-computed IndexValue directly, bypassing field resolution.
+    pub fn insert_raw(&mut self, id: DocumentId, key: IndexValue) {
+        self.tree.entry(key).or_default().insert(id);
+    }
+
     pub fn remove(&mut self, doc: &Document) {
         if let Some(value) = doc.get_field(&self.field) {
             let key = IndexValue::from_json(value);
