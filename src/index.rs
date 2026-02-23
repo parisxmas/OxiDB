@@ -7,6 +7,151 @@ use serde_json::Value;
 use crate::document::{Document, DocumentId};
 use crate::value::IndexValue;
 
+// ---------------------------------------------------------------------------
+// DocIdSet — compact storage for document ID sets in indexes
+// ---------------------------------------------------------------------------
+
+/// Compact storage for document ID sets in field/composite indexes.
+///
+/// Single-element sets (common for high-cardinality fields like order_id
+/// or amount) are stored inline without heap allocation, saving ~80 bytes
+/// per entry compared to `BTreeSet`.
+#[derive(Debug, Clone)]
+pub enum DocIdSet {
+    Empty,
+    One(DocumentId),
+    Set(BTreeSet<DocumentId>),
+}
+
+impl Default for DocIdSet {
+    fn default() -> Self {
+        DocIdSet::Empty
+    }
+}
+
+impl DocIdSet {
+    pub fn insert(&mut self, id: DocumentId) -> bool {
+        match self {
+            DocIdSet::Empty => {
+                *self = DocIdSet::One(id);
+                true
+            }
+            DocIdSet::One(existing) => {
+                if *existing == id {
+                    false
+                } else {
+                    let mut set = BTreeSet::new();
+                    set.insert(*existing);
+                    set.insert(id);
+                    *self = DocIdSet::Set(set);
+                    true
+                }
+            }
+            DocIdSet::Set(set) => set.insert(id),
+        }
+    }
+
+    pub fn remove(&mut self, id: &DocumentId) -> bool {
+        match self {
+            DocIdSet::Empty => false,
+            DocIdSet::One(existing) => {
+                if existing == id {
+                    *self = DocIdSet::Empty;
+                    true
+                } else {
+                    false
+                }
+            }
+            DocIdSet::Set(set) => {
+                let removed = set.remove(id);
+                if removed && set.len() == 1 {
+                    let remaining = *set.iter().next().unwrap();
+                    *self = DocIdSet::One(remaining);
+                }
+                removed
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        matches!(self, DocIdSet::Empty)
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            DocIdSet::Empty => 0,
+            DocIdSet::One(_) => 1,
+            DocIdSet::Set(set) => set.len(),
+        }
+    }
+
+    pub fn iter(&self) -> DocIdSetIter<'_> {
+        match self {
+            DocIdSet::Empty => DocIdSetIter::Empty,
+            DocIdSet::One(id) => DocIdSetIter::One(Some(id)),
+            DocIdSet::Set(set) => DocIdSetIter::Set(set.iter()),
+        }
+    }
+
+    /// Convert to a BTreeSet (for query result APIs that return BTreeSet).
+    pub fn to_btreeset(&self) -> BTreeSet<DocumentId> {
+        match self {
+            DocIdSet::Empty => BTreeSet::new(),
+            DocIdSet::One(id) => BTreeSet::from([*id]),
+            DocIdSet::Set(set) => set.clone(),
+        }
+    }
+}
+
+/// Iterator over DocIdSet elements in ascending order.
+pub enum DocIdSetIter<'a> {
+    Empty,
+    One(Option<&'a DocumentId>),
+    Set(std::collections::btree_set::Iter<'a, DocumentId>),
+}
+
+impl<'a> Iterator for DocIdSetIter<'a> {
+    type Item = &'a DocumentId;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            DocIdSetIter::Empty => None,
+            DocIdSetIter::One(id) => id.take(),
+            DocIdSetIter::Set(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            DocIdSetIter::Empty => (0, Some(0)),
+            DocIdSetIter::One(Some(_)) => (1, Some(1)),
+            DocIdSetIter::One(None) => (0, Some(0)),
+            DocIdSetIter::Set(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl<'a> DoubleEndedIterator for DocIdSetIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            DocIdSetIter::Empty => None,
+            DocIdSetIter::One(id) => id.take(),
+            DocIdSetIter::Set(iter) => iter.next_back(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a DocIdSet {
+    type Item = &'a DocumentId;
+    type IntoIter = DocIdSetIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 /// Resolve a field path (with dot notation) directly on a &Value.
 fn resolve_value_field<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
     let mut current = data;
@@ -24,7 +169,7 @@ fn resolve_value_field<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
 pub struct FieldIndex {
     pub field: String,
     pub unique: bool,
-    tree: BTreeMap<IndexValue, BTreeSet<DocumentId>>,
+    tree: BTreeMap<IndexValue, DocIdSet>,
 }
 
 impl FieldIndex {
@@ -48,7 +193,7 @@ impl FieldIndex {
     pub fn check_unique(&self, value: &IndexValue, exclude_id: Option<DocumentId>) -> bool {
         if let Some(ids) = self.tree.get(value) {
             match exclude_id {
-                Some(eid) => ids.iter().any(|id| *id != eid),
+                Some(eid) => ids.iter().any(|&id| id != eid),
                 None => !ids.is_empty(),
             }
         } else {
@@ -69,6 +214,11 @@ impl FieldIndex {
             let key = IndexValue::from_json(value);
             self.tree.entry(key).or_default().insert(id);
         }
+    }
+
+    /// Insert a pre-computed IndexValue directly, bypassing field resolution.
+    pub fn insert_raw(&mut self, id: DocumentId, key: IndexValue) {
+        self.tree.entry(key).or_default().insert(id);
     }
 
     pub fn remove(&mut self, doc: &Document) {
@@ -99,7 +249,10 @@ impl FieldIndex {
     // -- Query helpers -------------------------------------------------------
 
     pub fn find_eq(&self, value: &IndexValue) -> BTreeSet<DocumentId> {
-        self.tree.get(value).cloned().unwrap_or_default()
+        self.tree
+            .get(value)
+            .map(|ids| ids.to_btreeset())
+            .unwrap_or_default()
     }
 
     /// Count matching docs without building a BTreeSet.
@@ -248,12 +401,12 @@ impl FieldIndex {
     }
 
     /// Iterate (value, doc_ids) in ascending order.
-    pub fn iter_asc(&self) -> impl Iterator<Item = (&IndexValue, &BTreeSet<DocumentId>)> {
+    pub fn iter_asc(&self) -> impl Iterator<Item = (&IndexValue, &DocIdSet)> {
         self.tree.iter()
     }
 
     /// Iterate (value, doc_ids) in descending order.
-    pub fn iter_desc(&self) -> impl Iterator<Item = (&IndexValue, &BTreeSet<DocumentId>)> {
+    pub fn iter_desc(&self) -> impl Iterator<Item = (&IndexValue, &DocIdSet)> {
         self.tree.iter().rev()
     }
 
@@ -304,16 +457,24 @@ impl FieldIndex {
         r.read_exact(&mut len_buf)?;
         let entry_count = u32::from_le_bytes(len_buf) as usize;
         let mut tree = BTreeMap::new();
+        let mut id_buf = [0u8; 8];
         for _ in 0..entry_count {
             let key = IndexValue::read_from(r)?;
             r.read_exact(&mut len_buf)?;
             let doc_count = u32::from_le_bytes(len_buf) as usize;
-            let mut ids = BTreeSet::new();
-            let mut id_buf = [0u8; 8];
-            for _ in 0..doc_count {
+            let ids = if doc_count == 0 {
+                DocIdSet::Empty
+            } else if doc_count == 1 {
                 r.read_exact(&mut id_buf)?;
-                ids.insert(u64::from_le_bytes(id_buf));
-            }
+                DocIdSet::One(u64::from_le_bytes(id_buf))
+            } else {
+                let mut set = BTreeSet::new();
+                for _ in 0..doc_count {
+                    r.read_exact(&mut id_buf)?;
+                    set.insert(u64::from_le_bytes(id_buf));
+                }
+                DocIdSet::Set(set)
+            };
             tree.insert(key, ids);
         }
         Ok(Self { field, unique, tree })
@@ -330,7 +491,7 @@ pub struct CompositeKey(pub Vec<IndexValue>);
 #[derive(Debug)]
 pub struct CompositeIndex {
     pub fields: Vec<String>,
-    tree: BTreeMap<CompositeKey, BTreeSet<DocumentId>>,
+    tree: BTreeMap<CompositeKey, DocIdSet>,
 }
 
 impl CompositeIndex {
@@ -455,6 +616,7 @@ impl CompositeIndex {
         r.read_exact(&mut len_buf)?;
         let entry_count = u32::from_le_bytes(len_buf) as usize;
         let mut tree = BTreeMap::new();
+        let mut id_buf = [0u8; 8];
         for _ in 0..entry_count {
             let mut key_values = Vec::with_capacity(field_count);
             for _ in 0..field_count {
@@ -462,12 +624,19 @@ impl CompositeIndex {
             }
             r.read_exact(&mut len_buf)?;
             let doc_count = u32::from_le_bytes(len_buf) as usize;
-            let mut ids = BTreeSet::new();
-            let mut id_buf = [0u8; 8];
-            for _ in 0..doc_count {
+            let ids = if doc_count == 0 {
+                DocIdSet::Empty
+            } else if doc_count == 1 {
                 r.read_exact(&mut id_buf)?;
-                ids.insert(u64::from_le_bytes(id_buf));
-            }
+                DocIdSet::One(u64::from_le_bytes(id_buf))
+            } else {
+                let mut set = BTreeSet::new();
+                for _ in 0..doc_count {
+                    r.read_exact(&mut id_buf)?;
+                    set.insert(u64::from_le_bytes(id_buf));
+                }
+                DocIdSet::Set(set)
+            };
             tree.insert(CompositeKey(key_values), ids);
         }
         Ok(Self { fields, tree })
@@ -476,7 +645,10 @@ impl CompositeIndex {
     // -- Query helpers -------------------------------------------------------
 
     pub fn find_exact(&self, key: &CompositeKey) -> BTreeSet<DocumentId> {
-        self.tree.get(key).cloned().unwrap_or_default()
+        self.tree
+            .get(key)
+            .map(|ids| ids.to_btreeset())
+            .unwrap_or_default()
     }
 
     /// Prefix scan — e.g. for composite index [A, B, C], query on A only.
