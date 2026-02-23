@@ -1,0 +1,17 @@
+services:
+  oxidms:
+    build: .
+    container_name: oxidms-server
+    ports:
+      - "8085:8080"
+    environment:
+      - DMS_ADDR=:8080
+      - OXIDB_HOST=host.docker.internal
+      - OXIDB_PORT=4444
+      - DMS_POOL_SIZE=3
+      - DMS_JWT_SECRET=${DMS_JWT_SECRET:-oxidms-production-secret-change-me}
+      - DMS_ADMIN_EMAIL=${DMS_ADMIN_EMAIL:-admin@oxidms.local}
+      - DMS_ADMIN_PASS=${DMS_ADMIN_PASS:-admin123}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

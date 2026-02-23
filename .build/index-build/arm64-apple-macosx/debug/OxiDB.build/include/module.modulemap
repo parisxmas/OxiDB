@@ -1,0 +1,3 @@
+module OxiDB {
+    header "/Users/barisakin/source/docdb/.build/index-build/arm64-apple-macosx/debug/OxiDB.build/include/OxiDB-Swift.h"
+}

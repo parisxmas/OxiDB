@@ -1,0 +1,73 @@
+services:
+  oxidb-node1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      OXIDB_ADDR: "0.0.0.0:4444"
+      OXIDB_NODE_ID: "1"
+      OXIDB_RAFT_ADDR: "0.0.0.0:4445"
+      OXIDB_IDLE_TIMEOUT: "0"
+      OXIDB_DATA: "/data"
+    ports:
+      - "5501:4444"
+    volumes:
+      - node1-data:/data
+    networks:
+      - cluster
+
+  oxidb-node2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      OXIDB_ADDR: "0.0.0.0:4444"
+      OXIDB_NODE_ID: "2"
+      OXIDB_RAFT_ADDR: "0.0.0.0:4445"
+      OXIDB_IDLE_TIMEOUT: "0"
+      OXIDB_DATA: "/data"
+    ports:
+      - "5502:4444"
+    volumes:
+      - node2-data:/data
+    networks:
+      - cluster
+
+  oxidb-node3:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      OXIDB_ADDR: "0.0.0.0:4444"
+      OXIDB_NODE_ID: "3"
+      OXIDB_RAFT_ADDR: "0.0.0.0:4445"
+      OXIDB_IDLE_TIMEOUT: "0"
+      OXIDB_DATA: "/data"
+    ports:
+      - "5503:4444"
+    volumes:
+      - node3-data:/data
+    networks:
+      - cluster
+
+  haproxy:
+    image: haproxy:2.9-alpine
+    ports:
+      - "5500:5500"
+    volumes:
+      - ./haproxy-3node.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - oxidb-node1
+      - oxidb-node2
+      - oxidb-node3
+    networks:
+      - cluster
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  cluster:
+    driver: bridge

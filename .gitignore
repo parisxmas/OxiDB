@@ -1,0 +1,46 @@
+# Rust
+/target/
+
+# .NET
+dotnet/**/bin/
+dotnet/**/obj/
+
+# Java / Maven
+**/target/
+*.class
+*.jar
+
+# Python
+__pycache__/
+*.pyc
+
+# Swift
+swift/**/.build/
+*.xcuserstate
+xcuserdata/
+
+# Julia
+julia/**/Manifest.toml
+
+# OxiDB data
+oxidb_data/
+*.dat
+*.wal
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OxiDMS build artifacts
+OxiDMS/oxidms-server
+OxiDMS/frontend/node_modules/
+OxiDMS/frontend/dist/
