@@ -1554,14 +1554,30 @@ impl Collection {
                 }
             }
         } else {
-            // No index — stream entire collection with filter.
-            // Sequential BufReader scan avoids per-doc Mutex + random seeks.
-            self.for_each_doc_streaming(|doc| {
-                if query::matches_value(&query, doc) {
-                    results.push(Arc::new(doc.clone()));
-                    if let Some(limit) = early_limit {
-                        if results.len() >= limit {
-                            return Ok(false);
+            // No index — stream entire collection with zero-decode filter.
+            // Try raw JSONB matching first (extracts only queried fields);
+            // fall back to full decode only for legacy JSON text or on match.
+            self.storage.scan_readonly_while(|bytes| {
+                // Fast path: evaluate predicate on raw JSONB without full decode
+                if let Some(matched) = query::matches_raw_jsonb(&query, bytes) {
+                    if matched {
+                        let doc: Value = crate::codec::decode_doc(bytes)?;
+                        results.push(Arc::new(doc));
+                        if let Some(limit) = early_limit {
+                            if results.len() >= limit {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                } else {
+                    // Legacy JSON text — fall back to full decode + match
+                    let doc: Value = crate::codec::decode_doc(bytes)?;
+                    if query::matches_value(&query, &doc) {
+                        results.push(Arc::new(doc));
+                        if let Some(limit) = early_limit {
+                            if results.len() >= limit {
+                                return Ok(false);
+                            }
                         }
                     }
                 }
