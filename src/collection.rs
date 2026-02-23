@@ -495,9 +495,9 @@ impl Collection {
         if let Some(arc) = self.doc_cache.get(id) {
             return Some(arc);
         }
-        // Slow path: read from storage, decode, populate cache
+        // Slow path: lockfree pread from storage, decode, populate cache
         let loc = self.primary_index.get(&id)?;
-        let bytes = self.storage.read(*loc).ok()?;
+        let bytes = self.storage.read_lockfree(*loc).ok()?;
         let doc = crate::codec::decode_doc(&bytes).ok()?;
         let arc = Arc::new(doc);
         self.doc_cache.put(id, Arc::clone(&arc));
@@ -1433,13 +1433,60 @@ impl Collection {
         );
 
         if let Some(ref indexed_ids) = candidate_ids {
-            for &id in indexed_ids {
-                if let Some(arc) = self.read_doc_arc(id) {
-                    if skip_post_filter || query::matches_value(&query, &arc) {
-                        results.push(arc);
-                        if let Some(limit) = early_limit {
-                            if results.len() >= limit {
-                                break;
+            const BATCH_THRESHOLD: usize = 1024;
+
+            if indexed_ids.len() >= BATCH_THRESHOLD && early_limit.is_none() {
+                // Batch path: probe cache once, batch-read misses with sorted
+                // offsets for I/O locality, then batch-populate cache.
+                let ids: Vec<u64> = indexed_ids.iter().copied().collect();
+
+                // Phase 1: single-lock cache probe
+                let mut all_docs = self.doc_cache.get_many(&ids);
+
+                // Phase 2: collect cache misses with storage locations
+                let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = Vec::new();
+                for (i, opt) in all_docs.iter().enumerate() {
+                    if opt.is_none() {
+                        if let Some(&loc) = self.primary_index.get(&ids[i]) {
+                            miss_locs.push((i, loc));
+                        }
+                    }
+                }
+
+                if !miss_locs.is_empty() {
+                    // Phase 3: batch pread sorted by offset
+                    let batch = self.storage.read_batch_lockfree(&mut miss_locs)?;
+
+                    // Phase 4: decode and batch-populate cache
+                    let mut cache_entries: Vec<(u64, Arc<Value>)> =
+                        Vec::with_capacity(batch.len());
+                    for (i, bytes) in batch {
+                        let doc = crate::codec::decode_doc(&bytes)?;
+                        let arc = Arc::new(doc);
+                        cache_entries.push((ids[i], Arc::clone(&arc)));
+                        all_docs[i] = Some(arc);
+                    }
+                    self.doc_cache.put_many(cache_entries);
+                }
+
+                // Phase 5: build results
+                for opt in all_docs {
+                    if let Some(arc) = opt {
+                        if skip_post_filter || query::matches_value(&query, &arc) {
+                            results.push(arc);
+                        }
+                    }
+                }
+            } else {
+                // Per-doc path: good for small result sets or queries with limit
+                for &id in indexed_ids {
+                    if let Some(arc) = self.read_doc_arc(id) {
+                        if skip_post_filter || query::matches_value(&query, &arc) {
+                            results.push(arc);
+                            if let Some(limit) = early_limit {
+                                if results.len() >= limit {
+                                    break;
+                                }
                             }
                         }
                     }

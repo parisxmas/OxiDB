@@ -29,9 +29,11 @@ struct StorageInner {
 /// - payload is either raw json_bytes or encrypted bytes
 ///
 /// Thread-safe: all file operations are serialized via an internal Mutex.
+/// Reads can bypass the Mutex via `read_lockfree()` which uses `pread`.
 pub struct Storage {
     _path: PathBuf,
     inner: Mutex<StorageInner>,
+    read_file: File,
     encryption: Option<Arc<EncryptionKey>>,
 }
 
@@ -54,12 +56,16 @@ impl Storage {
 
         let current_offset = file.metadata()?.len();
 
+        // Separate read-only handle for lockfree pread operations.
+        let read_file = File::open(path)?;
+
         Ok(Self {
             _path: path.to_path_buf(),
             inner: Mutex::new(StorageInner {
                 file,
                 current_offset,
             }),
+            read_file,
             encryption,
         })
     }
@@ -107,6 +113,63 @@ impl Storage {
         inner.file.read_exact(&mut buf)?;
         drop(inner);
         self.maybe_decrypt(buf)
+    }
+
+    /// Read a document without acquiring the Mutex.
+    /// Uses `pread` (positional read) on Unix — a single atomic syscall
+    /// that neither seeks nor shares the file position with writers.
+    #[cfg(unix)]
+    pub fn read_lockfree(&self, loc: DocLocation) -> Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0u8; loc.length as usize];
+        self.read_file.read_at(&mut buf, loc.offset + 5)?;
+        self.maybe_decrypt(buf)
+    }
+
+    #[cfg(not(unix))]
+    pub fn read_lockfree(&self, loc: DocLocation) -> Result<Vec<u8>> {
+        self.read(loc)
+    }
+
+    /// Batch-read multiple documents without the Mutex.
+    /// Locations are sorted by offset internally for I/O locality.
+    /// Returns (index, bytes) pairs in sorted-offset order.
+    #[cfg(unix)]
+    pub fn read_batch_lockfree(
+        &self,
+        locs: &mut [(usize, DocLocation)],
+    ) -> Result<Vec<(usize, Vec<u8>)>> {
+        use std::os::unix::fs::FileExt;
+        locs.sort_unstable_by_key(|&(_, loc)| loc.offset);
+        let mut results = Vec::with_capacity(locs.len());
+        for &(idx, loc) in locs.iter() {
+            let mut buf = vec![0u8; loc.length as usize];
+            self.read_file.read_at(&mut buf, loc.offset + 5)?;
+            let buf = self.maybe_decrypt(buf)?;
+            results.push((idx, buf));
+        }
+        Ok(results)
+    }
+
+    #[cfg(not(unix))]
+    pub fn read_batch_lockfree(
+        &self,
+        locs: &mut [(usize, DocLocation)],
+    ) -> Result<Vec<(usize, Vec<u8>)>> {
+        let mut inner = self.inner.lock().unwrap();
+        locs.sort_unstable_by_key(|&(_, loc)| loc.offset);
+        let mut results = Vec::with_capacity(locs.len());
+        for &(idx, loc) in locs.iter() {
+            inner.file.seek(SeekFrom::Start(loc.offset + 5))?;
+            let mut buf = vec![0u8; loc.length as usize];
+            inner.file.read_exact(&mut buf)?;
+            results.push((idx, buf));
+        }
+        drop(inner);
+        results
+            .into_iter()
+            .map(|(idx, buf)| Ok((idx, self.maybe_decrypt(buf)?)))
+            .collect()
     }
 
     /// Soft-delete a record by flipping its status byte.
