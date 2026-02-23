@@ -977,6 +977,104 @@ where
 // Index-accelerated $group
 // ---------------------------------------------------------------------------
 
+/// Pure index-only count aggregation: when the group key is a single FieldRef
+/// with a FieldIndex and all accumulators are Count or Sum(Literal), we can
+/// read counts directly from the index without touching any documents.
+///
+/// `total_docs` is the total number of documents in the collection. When
+/// `match_query` is `None` (full collection scan), the null group is computed
+/// as `total_docs - total_indexed`.
+///
+/// Returns `Some(results)` if applicable, `None` otherwise.
+pub(crate) fn try_index_only_count(
+    key: &GroupKey,
+    accumulators: &[(String, Accumulator)],
+    field_indexes: &HashMap<String, FieldIndex>,
+    total_docs: usize,
+    match_query: Option<&Value>,
+) -> Option<Vec<Value>> {
+    // Only works for full collection scans (no $match filter)
+    if match_query.is_some() {
+        return None;
+    }
+
+    // Only single-field group key
+    let group_field = match key {
+        GroupKey::Single(Expression::FieldRef(field)) => field.as_str(),
+        _ => return None,
+    };
+
+    let fi = field_indexes.get(group_field)?;
+
+    // All accumulators must be count-only
+    let is_count_only = accumulators.iter().all(|(_, acc)| {
+        matches!(
+            acc,
+            Accumulator::Count
+                | Accumulator::Sum(Expression::Literal(Value::Number(_)))
+        )
+    });
+    if !is_count_only {
+        return None;
+    }
+
+    let total_indexed: usize = fi.iter_asc().map(|(_, ids)| ids.len()).sum();
+    if total_docs < total_indexed {
+        return None;
+    }
+
+    let mut results = Vec::new();
+    for (idx_val, doc_ids) in fi.iter_asc() {
+        if doc_ids.is_empty() {
+            continue;
+        }
+        let group_count = doc_ids.len() as u64;
+        let key_val = idx_val.to_json();
+        let mut doc = Map::new();
+        doc.insert("_id".to_string(), key_val);
+        for (name, acc) in accumulators {
+            let val = match acc {
+                Accumulator::Count => Value::Number(group_count.into()),
+                Accumulator::Sum(Expression::Literal(v)) => {
+                    if let Some(n) = v.as_f64() {
+                        number_to_value(n * group_count as f64)
+                    } else {
+                        Value::Number(group_count.into())
+                    }
+                }
+                _ => unreachable!(),
+            };
+            doc.insert(name.clone(), val);
+        }
+        results.push(Value::Object(doc));
+    }
+
+    // Handle docs that don't have the group field (null group)
+    let docs_without_field = total_docs - total_indexed;
+    if docs_without_field > 0 {
+        let group_count = docs_without_field as u64;
+        let mut doc = Map::new();
+        doc.insert("_id".to_string(), Value::Null);
+        for (name, acc) in accumulators {
+            let val = match acc {
+                Accumulator::Count => Value::Number(group_count.into()),
+                Accumulator::Sum(Expression::Literal(v)) => {
+                    if let Some(n) = v.as_f64() {
+                        number_to_value(n * group_count as f64)
+                    } else {
+                        Value::Number(group_count.into())
+                    }
+                }
+                _ => unreachable!(),
+            };
+            doc.insert(name.clone(), val);
+        }
+        results.push(Value::Object(doc));
+    }
+
+    Some(results)
+}
+
 /// Try to execute a $group stage using field indexes instead of hashing all docs.
 ///
 /// **Count-only fast path** (Opt 4): When the group key is a single FieldRef and
@@ -1255,6 +1353,55 @@ fn finalize_accumulator(state: AccumulatorState) -> Value {
     }
 }
 
+/// Merge two accumulator states (for parallel aggregation).
+/// `self_state` is from the earlier segment, `other` from the later.
+fn merge_accumulator_state(self_state: &mut AccumulatorState, other: AccumulatorState) {
+    match (self_state, other) {
+        (AccumulatorState::Sum(s), AccumulatorState::Sum(o)) => *s += o,
+        (AccumulatorState::Avg { sum, count }, AccumulatorState::Avg { sum: os, count: oc }) => {
+            *sum += os;
+            *count += oc;
+        }
+        (AccumulatorState::Count(c), AccumulatorState::Count(o)) => *c += o,
+        (AccumulatorState::Min(cur), AccumulatorState::Min(other_min)) => {
+            if let Some((ov, oiv)) = other_min {
+                let replace = match cur {
+                    None => true,
+                    Some((_, civ)) => oiv < *civ,
+                };
+                if replace {
+                    *cur = Some((ov, oiv));
+                }
+            }
+        }
+        (AccumulatorState::Max(cur), AccumulatorState::Max(other_max)) => {
+            if let Some((ov, oiv)) = other_max {
+                let replace = match cur {
+                    None => true,
+                    Some((_, civ)) => oiv > *civ,
+                };
+                if replace {
+                    *cur = Some((ov, oiv));
+                }
+            }
+        }
+        (AccumulatorState::First(cur), AccumulatorState::First(_)) => {
+            // Keep self (earlier segment)
+            let _ = cur;
+        }
+        (AccumulatorState::Last(_cur), AccumulatorState::Last(other_last)) => {
+            // Take other (later segment) if it has a value
+            if other_last.is_some() {
+                *_cur = other_last;
+            }
+        }
+        (AccumulatorState::Push(vec), AccumulatorState::Push(mut other_vec)) => {
+            vec.append(&mut other_vec);
+        }
+        _ => {}
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Raw JSONB helpers for zero-decode aggregation
 // ---------------------------------------------------------------------------
@@ -1287,9 +1434,63 @@ fn raw_owned_to_value(owned: &jsonb::OwnedJsonb) -> Value {
 }
 
 /// Hash a raw JSONB extracted field consistent with `hash_json_value`.
-/// Decodes only this field to Value, then hashes it.
+/// Uses RawJsonb accessors to avoid allocating a serde_json::Value for
+/// the common cases (null, bool, number, non-date string).
 fn hash_raw_owned<H: Hasher>(owned: &jsonb::OwnedJsonb, state: &mut H) -> bool {
-    let val: Value = match jsonb::from_raw_jsonb(&owned.as_raw()) {
+    let raw = owned.as_raw();
+
+    // Null
+    if let Ok(true) = raw.is_null() {
+        std::mem::discriminant(&IndexValue::Null).hash(state);
+        return true;
+    }
+
+    // Boolean
+    if let Ok(Some(b)) = raw.as_bool() {
+        std::mem::discriminant(&IndexValue::Boolean(false)).hash(state);
+        b.hash(state);
+        return true;
+    }
+
+    // Number — must match hash_json_value: integer path first, then float
+    if let Ok(true) = raw.is_number() {
+        if let Ok(Some(i)) = raw.as_i64() {
+            std::mem::discriminant(&IndexValue::Integer(0)).hash(state);
+            i.hash(state);
+        } else if let Ok(Some(f)) = raw.as_f64() {
+            std::mem::discriminant(&IndexValue::Float(0.0)).hash(state);
+            f.to_bits().hash(state);
+        }
+        return true;
+    }
+
+    // String — check for date pattern (same heuristic as hash_json_value)
+    if let Ok(Some(s)) = raw.as_str() {
+        let b = s.as_bytes();
+        if b.len() >= 10
+            && b[0].is_ascii_digit()
+            && b[1].is_ascii_digit()
+            && b[2].is_ascii_digit()
+            && b[3].is_ascii_digit()
+            && b[4] == b'-'
+            && b[5].is_ascii_digit()
+            && b[6].is_ascii_digit()
+        {
+            // Possible date string — use IndexValue for correct hashing
+            if let Ok(val) = jsonb::from_raw_jsonb(&raw) {
+                hash_json_value(&val, state);
+                return true;
+            }
+            return false;
+        }
+        // Non-date string: hash directly
+        std::mem::discriminant(&IndexValue::String(String::new())).hash(state);
+        s.hash(state);
+        return true;
+    }
+
+    // Arrays/Objects: fall back to full Value decode
+    let val: Value = match jsonb::from_raw_jsonb(&raw) {
         Ok(v) => v,
         Err(_) => return false,
     };
@@ -1528,6 +1729,25 @@ impl StreamingGroup {
         }
         self.insertion_order.push(key_hash.clone());
         self.groups.insert(key_hash, (key_val, initial));
+    }
+
+    /// Merge another StreamingGroup into this one (for combining parallel results).
+    /// The `other` group should come from a later segment so that First/Last
+    /// semantics are preserved (self = earlier, other = later).
+    pub(crate) fn merge(&mut self, mut other: Self) {
+        for key_hash in other.insertion_order {
+            let (key_val, other_states) = other.groups.remove(&key_hash).unwrap();
+            if let Some((_, self_states)) = self.groups.get_mut(&key_hash) {
+                // Merge accumulator states pairwise
+                for (s, o) in self_states.iter_mut().zip(other_states) {
+                    merge_accumulator_state(s, o);
+                }
+            } else {
+                // New group key from other — insert it
+                self.insertion_order.push(key_hash.clone());
+                self.groups.insert(key_hash, (key_val, other_states));
+            }
+        }
     }
 
     /// Finalize and return the grouped results.

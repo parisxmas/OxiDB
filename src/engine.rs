@@ -717,6 +717,19 @@ impl OxiDb {
         {
             let col = self.get_or_create_collection(collection)?;
             let col_guard = col.read().unwrap();
+
+            // Index-only count: if group key has an index and all accumulators
+            // are count-only, read counts directly from the index (zero I/O).
+            if let Some(index_result) = crate::pipeline::try_index_only_count(
+                group_key,
+                accumulators,
+                col_guard.field_indexes(),
+                col_guard.count(),
+                leading_match,
+            ) {
+                return pipeline.execute_from(next_idx, index_result, &lookup_fn);
+            }
+
             let group_result =
                 col_guard.aggregate_streaming(leading_match, group_key, accumulators)?;
             // Continue with remaining pipeline stages on the small group result

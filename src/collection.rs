@@ -1687,25 +1687,141 @@ impl Collection {
     }
 
     /// Execute a streaming `$group` aggregation without materializing all docs.
+    /// Compute segment boundaries for parallel scanning.
+    /// Returns a list of (start_offset, end_offset) pairs covering the whole file.
+    fn compute_scan_segments(&self, num_threads: usize) -> Vec<(u64, u64)> {
+        let file_size = self.storage.file_size();
+        if file_size == 0 || num_threads <= 1 {
+            return vec![(0, file_size)];
+        }
+        let mut offsets: Vec<u64> = self.primary_index.values().map(|loc| loc.offset).collect();
+        offsets.sort_unstable();
+        let n = offsets.len();
+        let mut boundaries = Vec::with_capacity(num_threads + 1);
+        boundaries.push(offsets[0]);
+        for i in 1..num_threads {
+            let idx = i * n / num_threads;
+            boundaries.push(offsets[idx]);
+        }
+        boundaries.push(file_size);
+        // Deduplicate adjacent boundaries
+        boundaries.dedup();
+        boundaries.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+
     /// Streams through storage sequentially, decoding each doc and feeding it
     /// to the group accumulators inline.
     ///
     /// When `match_query` is `Query::All`, scans the entire data file.
     /// When `match_query` is an indexed query, reads only candidate docs.
+    ///
+    /// For large collections (>= 100K docs) with raw-eligible pipelines,
+    /// uses parallel segmented scanning for significant speedup.
     pub(crate) fn aggregate_streaming(
         &self,
         match_query_json: Option<&Value>,
         group_key: &crate::pipeline::GroupKey,
         accumulators: &[(String, crate::pipeline::Accumulator)],
     ) -> Result<Vec<Value>> {
+        let use_raw = crate::pipeline::is_raw_eligible(group_key, accumulators);
+        let doc_count = self.primary_index.len();
+
+        // ── Parallel path: large collection + raw-eligible ───────────────
+        // Decide whether to use parallel full scan even for $match queries
+        // when the indexed candidate set is large (> 25% of collection).
+        let use_parallel = use_raw && doc_count >= 100_000;
+
+        if use_parallel {
+            // Determine if we have a $match filter
+            let match_query = match match_query_json {
+                Some(match_val) => {
+                    let q = query::parse_query(match_val)?;
+                    if matches!(q, Query::All) { None } else { Some(q) }
+                }
+                None => None,
+            };
+
+            // For $match with index, check if parallel full scan is better
+            // than indexed lookup. Parallel sequential I/O beats random pread
+            // when selectivity is low (many matches). Threshold: candidates > 10%
+            // of collection → prefer parallel full scan.
+            if let Some(ref query) = match_query {
+                let candidate_ids = query::execute_indexed(
+                    query,
+                    &self.field_indexes,
+                    &self.composite_indexes,
+                );
+                if let Some(ref ids) = candidate_ids {
+                    if ids.len() <= doc_count / 10 {
+                        // Small candidate set — indexed random-read is faster
+                        return self.aggregate_streaming_indexed(
+                            query, ids, group_key, accumulators, use_raw,
+                        );
+                    }
+                }
+            }
+
+            // Parallel segmented scan
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4);
+            let segments = self.compute_scan_segments(num_threads);
+
+            let match_query_ref = &match_query;
+            let result: Result<Vec<Value>> = std::thread::scope(|s| {
+                let handles: Vec<_> = segments
+                    .iter()
+                    .map(|&(start, end)| {
+                        s.spawn(move || {
+                            let mut local_group =
+                                crate::pipeline::StreamingGroup::new(group_key, accumulators);
+                            if let Some(ref query) = *match_query_ref {
+                                self.storage.scan_segment_readonly_while(start, end, |bytes| {
+                                    match query::matches_raw_jsonb(query, bytes) {
+                                        Some(true) => local_group.feed_raw(bytes),
+                                        Some(false) => {}
+                                        None => {
+                                            let doc = crate::codec::decode_doc(bytes)?;
+                                            if query::matches_value(query, &doc) {
+                                                local_group.feed(&doc);
+                                            }
+                                        }
+                                    }
+                                    Ok(true)
+                                })?;
+                            } else {
+                                self.storage.scan_segment_readonly_while(start, end, |bytes| {
+                                    local_group.feed_raw(bytes);
+                                    Ok(true)
+                                })?;
+                            }
+                            Ok::<_, crate::error::Error>(local_group)
+                        })
+                    })
+                    .collect();
+
+                let mut merged: Option<crate::pipeline::StreamingGroup> = None;
+                for handle in handles {
+                    let local_group: crate::pipeline::StreamingGroup = handle.join().unwrap()?;
+                    match merged {
+                        None => merged = Some(local_group),
+                        Some(ref mut m) => m.merge(local_group),
+                    }
+                }
+                Ok(merged
+                    .map(|g| g.finalize())
+                    .unwrap_or_default())
+            });
+            return result;
+        }
+
+        // ── Sequential path (small collection or non-raw) ───────────────
         let mut group =
             crate::pipeline::StreamingGroup::new(group_key, accumulators);
-        let use_raw = crate::pipeline::is_raw_eligible(group_key, accumulators);
 
         match match_query_json {
             None => {
                 if use_raw {
-                    // Zero-decode: extract only needed fields from raw JSONB
                     self.storage.scan_readonly_while(|bytes| {
                         group.feed_raw(bytes);
                         Ok(true)
@@ -1778,13 +1894,10 @@ impl Collection {
 
                         // Phase 5: feed cache misses from raw bytes
                         if use_raw && skip_post_filter {
-                            // Fast path: index guarantees match, raw-eligible
-                            // — zero decode, just extract needed fields
                             for (_i, bytes) in &batch_raw {
                                 group.feed_raw(bytes);
                             }
                         } else {
-                            // Need decode for post-filter or non-raw accumulators
                             let mut cache_entries: Vec<(u64, Arc<Value>)> =
                                 Vec::with_capacity(batch_raw.len());
                             for (i, bytes) in batch_raw {
@@ -1800,7 +1913,6 @@ impl Collection {
                             self.doc_cache.put_many(cache_entries);
                         }
                     } else if use_raw {
-                        // No index — stream raw JSONB, filter + group inline
                         self.storage.scan_readonly_while(|bytes| {
                             match query::matches_raw_jsonb(&query, bytes) {
                                 Some(true) => group.feed_raw(bytes),
@@ -1824,6 +1936,65 @@ impl Collection {
                     }
                 }
             }
+        }
+
+        Ok(group.finalize())
+    }
+
+    /// Indexed match path — batch pread + raw JSONB path (extracted for reuse).
+    fn aggregate_streaming_indexed(
+        &self,
+        query: &Query,
+        ids: &std::collections::BTreeSet<crate::document::DocumentId>,
+        group_key: &crate::pipeline::GroupKey,
+        accumulators: &[(String, crate::pipeline::Accumulator)],
+        use_raw: bool,
+    ) -> Result<Vec<Value>> {
+        let mut group = crate::pipeline::StreamingGroup::new(group_key, accumulators);
+        let skip_post_filter = query::is_fully_indexed(query, &self.field_indexes);
+        let id_vec: Vec<u64> = ids.iter().copied().collect();
+
+        let cached = self.doc_cache.get_many(&id_vec);
+
+        let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = Vec::new();
+        for (i, opt) in cached.iter().enumerate() {
+            if opt.is_none() {
+                if let Some(&loc) = self.primary_index.get(&id_vec[i]) {
+                    miss_locs.push((i, loc));
+                }
+            }
+        }
+
+        let batch_raw = if !miss_locs.is_empty() {
+            self.storage.read_batch_lockfree(&mut miss_locs)?
+        } else {
+            Vec::new()
+        };
+
+        for opt in cached.iter() {
+            if let Some(arc) = opt {
+                if skip_post_filter || query::matches_value(query, arc) {
+                    group.feed(arc);
+                }
+            }
+        }
+
+        if use_raw && skip_post_filter {
+            for (_i, bytes) in &batch_raw {
+                group.feed_raw(bytes);
+            }
+        } else {
+            let mut cache_entries: Vec<(u64, Arc<Value>)> =
+                Vec::with_capacity(batch_raw.len());
+            for (i, bytes) in batch_raw {
+                let doc = crate::codec::decode_doc(&bytes)?;
+                let arc = Arc::new(doc);
+                if skip_post_filter || query::matches_value(query, &arc) {
+                    group.feed(&arc);
+                }
+                cache_entries.push((id_vec[i], arc));
+            }
+            self.doc_cache.put_many(cache_entries);
         }
 
         Ok(group.finalize())

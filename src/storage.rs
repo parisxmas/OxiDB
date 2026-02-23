@@ -418,6 +418,60 @@ impl Storage {
 
         Ok(())
     }
+
+    /// Scan a segment [start_offset, end_offset) of the data file using its own
+    /// read-only file descriptor + BufReader. Safe to call from multiple threads
+    /// concurrently — each invocation opens an independent handle.
+    /// The callback returns Ok(true) to continue or Ok(false) to stop early.
+    pub fn scan_segment_readonly_while<F>(
+        &self,
+        start_offset: u64,
+        end_offset: u64,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<bool>,
+    {
+        use std::io::BufReader;
+
+        let file = File::open(&self._path)?;
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        reader.seek(SeekFrom::Start(start_offset))?;
+        let mut pos = start_offset;
+        let mut buf = Vec::with_capacity(4096);
+        let mut decrypt_buf: Vec<u8>;
+
+        while pos < end_offset {
+            let mut header = [0u8; 5];
+            if reader.read_exact(&mut header).is_err() {
+                break;
+            }
+            let status = header[0];
+            let length =
+                u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+            if status == RECORD_ACTIVE {
+                buf.resize(length, 0);
+                reader.read_exact(&mut buf)?;
+                let bytes: &[u8] = match &self.encryption {
+                    Some(key) => {
+                        decrypt_buf = key.decrypt(&buf)?;
+                        &decrypt_buf
+                    }
+                    None => &buf,
+                };
+                if !f(bytes)? {
+                    break;
+                }
+            } else {
+                reader.seek(SeekFrom::Current(length as i64))?;
+            }
+
+            pos += 5 + length as u64;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
