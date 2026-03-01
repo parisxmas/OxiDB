@@ -7,6 +7,9 @@
 # .NET
 dotnet/**/bin/
 dotnet/**/obj/
+tests/**/bin/
+tests/**/obj/
+test_output.log
 
 # Java / Maven
 **/target/
