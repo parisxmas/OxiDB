@@ -1,0 +1,19 @@
+<Project>
+
+  <PropertyGroup>
+    <Version>0.18.1</Version>
+    <Authors>OxiDB Contributors</Authors>
+    <Company>OxiDB</Company>
+    <Product>OxiDB</Product>
+    <Copyright>Copyright (c) OxiDB Contributors</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/oxidb/oxidb</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/oxidb/oxidb</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>database;document-database;nosql;embedded;oxidb</PackageTags>
+    <!-- Generate symbols for debugging -->
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+</Project>

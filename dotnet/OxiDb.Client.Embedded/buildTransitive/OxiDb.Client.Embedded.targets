@@ -1,0 +1,13 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+
+  <!--
+    This .targets file is automatically imported by projects that reference OxiDb.Client.Embedded via NuGet.
+    It ensures the correct native library (oxidb_embedded) is copied to the output directory.
+  -->
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)..\runtimes\**\*"
+          CopyToOutputDirectory="PreserveNewest"
+          Link="runtimes\%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+
+</Project>

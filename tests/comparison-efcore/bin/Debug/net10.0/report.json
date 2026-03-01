@@ -1,0 +1,287 @@
+{
+  "total": 28,
+  "oxi_wins": 12,
+  "pg_wins": 14,
+  "timings": [
+    {
+      "category": "Query",
+      "name": "OR (City=NY or London)",
+      "oxi_ms": 12.3071,
+      "pg_ms": 76.5637,
+      "winner": "oxidb",
+      "speedup": "6,2x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "Aggregation",
+      "name": "GroupBy Department \u002B Count",
+      "oxi_ms": 3.6522,
+      "pg_ms": 11.7608,
+      "winner": "oxidb",
+      "speedup": "3,2x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "Aggregation",
+      "name": "Average salary",
+      "oxi_ms": 3.1133,
+      "pg_ms": 4.1281,
+      "winner": "oxidb",
+      "speedup": "1,3x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "CRUD",
+      "name": "Count",
+      "oxi_ms": 1.2957,
+      "pg_ms": 1.9392,
+      "winner": "oxidb",
+      "speedup": "1,5x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "Query",
+      "name": "Bool filter (Verified=true)",
+      "oxi_ms": 1.1327,
+      "pg_ms": 1.8598,
+      "winner": "oxidb",
+      "speedup": "1,6x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "Concurrent",
+      "name": "100 mixed R/W",
+      "oxi_ms": 42.5187,
+      "pg_ms": 80.2042,
+      "winner": "oxidb",
+      "speedup": "1,9x",
+      "oxi_count": 100,
+      "pg_count": 100
+    },
+    {
+      "category": "Bulk",
+      "name": "Bulk update (Sales.Rating=5)",
+      "oxi_ms": 4.4587,
+      "pg_ms": 9.9771,
+      "winner": "oxidb",
+      "speedup": "2,2x",
+      "oxi_count": 4,
+      "pg_count": 4
+    },
+    {
+      "category": "Transactions",
+      "name": "Commit (insert in tx)",
+      "oxi_ms": 0,
+      "pg_ms": 3.5722,
+      "winner": "n/a",
+      "speedup": "n/a",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "Aggregation",
+      "name": "Top 5 by score",
+      "oxi_ms": 4.1566,
+      "pg_ms": 11.8339,
+      "winner": "oxidb",
+      "speedup": "2,8x",
+      "oxi_count": 5,
+      "pg_count": 5
+    },
+    {
+      "category": "Bulk",
+      "name": "Bulk delete (Status=inactive)",
+      "oxi_ms": 3490.7465,
+      "pg_ms": 7.447,
+      "winner": "postgresql",
+      "speedup": "468,7x",
+      "oxi_count": 511,
+      "pg_count": 512
+    },
+    {
+      "category": "Concurrent",
+      "name": "20 parallel reads",
+      "oxi_ms": 4.8524,
+      "pg_ms": 6.1022,
+      "winner": "oxidb",
+      "speedup": "1,3x",
+      "oxi_count": 20,
+      "pg_count": 20
+    },
+    {
+      "category": "Bulk",
+      "name": "Insert 10000",
+      "oxi_ms": 2533.8542,
+      "pg_ms": 648.2277,
+      "winner": "postgresql",
+      "speedup": "3,9x",
+      "oxi_count": 10000,
+      "pg_count": 10000
+    },
+    {
+      "category": "Transactions",
+      "name": "Rollback (insert \u002B rollback)",
+      "oxi_ms": 0,
+      "pg_ms": 2.7887,
+      "winner": "n/a",
+      "speedup": "n/a",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "CRUD",
+      "name": "Delete",
+      "oxi_ms": 246.5335,
+      "pg_ms": 7.867,
+      "winner": "postgresql",
+      "speedup": "31,3x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "Query",
+      "name": "Contains/In (3 cities)",
+      "oxi_ms": 216.3747,
+      "pg_ms": 35.0511,
+      "winner": "postgresql",
+      "speedup": "6,2x",
+      "oxi_count": 3764,
+      "pg_count": 3763
+    },
+    {
+      "category": "Aggregation",
+      "name": "Min/Max age",
+      "oxi_ms": 2.1679,
+      "pg_ms": 5.0836,
+      "winner": "oxidb",
+      "speedup": "2,3x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "Query",
+      "name": "Skip(10) \u002B Take(20)",
+      "oxi_ms": 251.2025,
+      "pg_ms": 5.3441,
+      "winner": "postgresql",
+      "speedup": "47,0x",
+      "oxi_count": 20,
+      "pg_count": 20
+    },
+    {
+      "category": "Query",
+      "name": "Greater than (Salary \u003E 100K)",
+      "oxi_ms": 225.7107,
+      "pg_ms": 9.1352,
+      "winner": "postgresql",
+      "speedup": "24,7x",
+      "oxi_count": 6264,
+      "pg_count": 6266
+    },
+    {
+      "category": "Query",
+      "name": "Not-equal (Status != inactive)",
+      "oxi_ms": 235.9193,
+      "pg_ms": 2.8362,
+      "winner": "postgresql",
+      "speedup": "83,2x",
+      "oxi_count": 6688,
+      "pg_count": 6688
+    },
+    {
+      "category": "CRUD",
+      "name": "Insert single",
+      "oxi_ms": 1.0241,
+      "pg_ms": 0.6742,
+      "winner": "postgresql",
+      "speedup": "1,5x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "CRUD",
+      "name": "InsertMany (500)",
+      "oxi_ms": 123.4305,
+      "pg_ms": 30.568,
+      "winner": "postgresql",
+      "speedup": "4,0x",
+      "oxi_count": 500,
+      "pg_count": 500
+    },
+    {
+      "category": "Query",
+      "name": "Sort desc \u002B Take(10)",
+      "oxi_ms": 294.2824,
+      "pg_ms": 5.1741,
+      "winner": "postgresql",
+      "speedup": "56,9x",
+      "oxi_count": 10,
+      "pg_count": 10
+    },
+    {
+      "category": "Aggregation",
+      "name": "Filtered count (Rating\u003E=4 AND Verified)",
+      "oxi_ms": 231.3778,
+      "pg_ms": 3.3092,
+      "winner": "postgresql",
+      "speedup": "69,9x",
+      "oxi_count": 4207,
+      "pg_count": 2073
+    },
+    {
+      "category": "Query",
+      "name": "Exact match (Department=Engineering)",
+      "oxi_ms": 237.1692,
+      "pg_ms": 2.1936,
+      "winner": "postgresql",
+      "speedup": "108,1x",
+      "oxi_count": 1315,
+      "pg_count": 1317
+    },
+    {
+      "category": "CRUD",
+      "name": "Update",
+      "oxi_ms": 0.6579,
+      "pg_ms": 3.5768,
+      "winner": "oxidb",
+      "speedup": "5,4x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "Query",
+      "name": "Compound (Dept=Eng AND Status=active)",
+      "oxi_ms": 236.6847,
+      "pg_ms": 2.7148,
+      "winner": "postgresql",
+      "speedup": "87,2x",
+      "oxi_count": 436,
+      "pg_count": 435
+    },
+    {
+      "category": "CRUD",
+      "name": "FindById",
+      "oxi_ms": 0.5257,
+      "pg_ms": 0.6151,
+      "winner": "oxidb",
+      "speedup": "1,2x",
+      "oxi_count": 0,
+      "pg_count": 0
+    },
+    {
+      "category": "Query",
+      "name": "Range (30 \u003C= Age \u003C= 40)",
+      "oxi_ms": 227.4391,
+      "pg_ms": 2.568,
+      "winner": "postgresql",
+      "speedup": "88,6x",
+      "oxi_count": 2895,
+      "pg_count": 2898
+    }
+  ]
+}

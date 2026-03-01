@@ -148,7 +148,7 @@ def main():
         # ============================================================
         # TEST 4: Chunk and embed all extracted text, store in vector index
         # ============================================================
-        print("\n[4/7] Embed and index (this may take a minute...)")
+        print("\n[4/7] Embed and index (this may take a minute...)") 
         # Clean old data
         try:
             client.delete(COLLECTION, {})

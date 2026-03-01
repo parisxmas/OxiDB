@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>OxiDb.Client.Embedded</RootNamespace>
+
+    <PackageId>OxiDb.Client.Embedded</PackageId>
+    <Description>Embedded (in-process) OxiDB client via native FFI. No server required — runs the database engine directly in your process.</Description>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\OxiDb.Client.Tcp\OxiDb.Client.Tcp.csproj" />
+  </ItemGroup>
+
+  <!--
+    Native libraries are placed in runtimes/<rid>/native/ by the pack script.
+    .NET automatically resolves the correct native library based on the runtime identifier.
+  -->
+  <ItemGroup>
+    <None Include="runtimes\**\*" Pack="true" PackagePath="runtimes" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- Include the .targets file so consuming projects copy native libs to output -->
+  <ItemGroup>
+    <None Include="buildTransitive\OxiDb.Client.Embedded.targets" Pack="true" PackagePath="buildTransitive" />
+    <None Include="buildTransitive\OxiDb.Client.Embedded.targets" Pack="true" PackagePath="build" />
+  </ItemGroup>
+
+</Project>
