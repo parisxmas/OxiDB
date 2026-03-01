@@ -1,0 +1,49 @@
+services:
+  oxidb:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "4444:4444"
+    tmpfs:
+      - /data
+    environment:
+      - OXIDB_ADDR=0.0.0.0:4444
+      - OXIDB_DATA=/data
+      - OXIDB_POOL_SIZE=4
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/4444' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  postgres:
+    image: postgres:16-bookworm
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    command:
+      - "postgres"
+      - "-c"
+      - "synchronous_commit=off"
+      - "-c"
+      - "fsync=off"
+      - "-c"
+      - "full_page_writes=off"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "max_connections=200"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+

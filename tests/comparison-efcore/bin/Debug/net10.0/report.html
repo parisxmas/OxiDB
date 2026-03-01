@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OxiDB vs PostgreSQL — EF Core Comparison Report</title>
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --border: #30363d; --text: #e6edf3; --dim: #8b949e; --green: #3fb950; --red: #f85149; --blue: #58a6ff; --yellow: #d29922; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); padding: 24px; }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+  .subtitle { color: var(--dim); font-size: 14px; margin-bottom: 32px; }
+  .summary { display: flex; gap: 16px; margin-bottom: 32px; flex-wrap: wrap; }
+  .summary-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px 28px; flex: 1; min-width: 160px; text-align: center; }
+  .summary-card .label { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .summary-card .value { font-size: 36px; font-weight: 700; }
+  .summary-card .value.green { color: var(--green); }
+  .summary-card .value.blue { color: var(--blue); }
+  .summary-card .value.yellow { color: var(--yellow); }
+  .category { background: var(--card); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 24px; overflow: hidden; }
+  .category h2 { font-size: 18px; font-weight: 600; padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+  .category h2 .badge { font-size: 12px; background: var(--border); color: var(--dim); padding: 2px 8px; border-radius: 10px; font-weight: 400; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; padding: 10px 16px; color: var(--dim); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+  td { padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  tr:last-child td { border-bottom: none; }
+  tr:hover { background: rgba(88,166,255,0.04); }
+  .time { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 13px; }
+  .winner { font-weight: 600; }
+  .oxi-win { color: var(--green); }
+  .pg-win { color: var(--blue); }
+  .tie { color: var(--dim); }
+  .speedup { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; color: var(--yellow); }
+  .bar-cell { width: 260px; }
+  .bar-container { display: flex; height: 20px; border-radius: 4px; overflow: hidden; background: var(--border); }
+  .bar-oxi { background: var(--green); min-width: 2px; }
+  .bar-pg { background: var(--blue); min-width: 2px; }
+  .footer { margin-top: 32px; text-align: center; color: var(--dim); font-size: 12px; padding: 16px; border-top: 1px solid var(--border); }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>OxiDB vs PostgreSQL</h1>
+<p class="subtitle">EF Core comparison report &mdash; 2026-03-01 04:35:42 UTC &mdash; 28 tests</p>
+
+<div class="summary">
+  <div class="summary-card"><div class="label">Total Tests</div><div class="value blue">28</div></div>
+  <div class="summary-card"><div class="label">OxiDB Wins</div><div class="value green">12</div></div>
+  <div class="summary-card"><div class="label">PostgreSQL Wins</div><div class="value blue">14</div></div>
+  <div class="summary-card"><div class="label">Ties / N/A</div><div class="value yellow">2</div></div>
+</div>
+<div class="category">
+<h2>Query <span class="badge">10 tests</span></h2>
+<table>
+<tr><th>Operation</th><th>OxiDB</th><th>PostgreSQL</th><th>Speedup</th><th>Winner</th><th class="bar-cell">Comparison</th></tr>
+<tr>
+  <td>OR (City=NY or London)</td>
+  <td class="time">12,3ms</td>
+  <td class="time">76,6ms</td>
+  <td class="speedup">6,2x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:13,8%" title="OxiDB: 12,3ms"></div><div class="bar-pg" style="width:86,2%" title="PostgreSQL: 76,6ms"></div></div></td>
+</tr>
+<tr>
+  <td>Bool filter (Verified=true)</td>
+  <td class="time">1,1ms</td>
+  <td class="time">1,9ms</td>
+  <td class="speedup">1,6x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:37,9%" title="OxiDB: 1,1ms"></div><div class="bar-pg" style="width:62,1%" title="PostgreSQL: 1,9ms"></div></div></td>
+</tr>
+<tr>
+  <td>Contains/In (3 cities)</td>
+  <td class="time">216,4ms</td>
+  <td class="time">35,1ms</td>
+  <td class="speedup">6,2x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:86,1%" title="OxiDB: 216,4ms"></div><div class="bar-pg" style="width:13,9%" title="PostgreSQL: 35,1ms"></div></div></td>
+</tr>
+<tr>
+  <td>Skip(10) + Take(20)</td>
+  <td class="time">251,2ms</td>
+  <td class="time">5,3ms</td>
+  <td class="speedup">47,0x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:97,9%" title="OxiDB: 251,2ms"></div><div class="bar-pg" style="width:2,1%" title="PostgreSQL: 5,3ms"></div></div></td>
+</tr>
+<tr>
+  <td>Greater than (Salary > 100K)</td>
+  <td class="time">225,7ms</td>
+  <td class="time">9,1ms</td>
+  <td class="speedup">24,7x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:96,1%" title="OxiDB: 225,7ms"></div><div class="bar-pg" style="width:3,9%" title="PostgreSQL: 9,1ms"></div></div></td>
+</tr>
+<tr>
+  <td>Not-equal (Status != inactive)</td>
+  <td class="time">235,9ms</td>
+  <td class="time">2,8ms</td>
+  <td class="speedup">83,2x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:98,8%" title="OxiDB: 235,9ms"></div><div class="bar-pg" style="width:1,2%" title="PostgreSQL: 2,8ms"></div></div></td>
+</tr>
+<tr>
+  <td>Sort desc + Take(10)</td>
+  <td class="time">294,3ms</td>
+  <td class="time">5,2ms</td>
+  <td class="speedup">56,9x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:98,3%" title="OxiDB: 294,3ms"></div><div class="bar-pg" style="width:1,7%" title="PostgreSQL: 5,2ms"></div></div></td>
+</tr>
+<tr>
+  <td>Exact match (Department=Engineering)</td>
+  <td class="time">237,2ms</td>
+  <td class="time">2,2ms</td>
+  <td class="speedup">108,1x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:99,1%" title="OxiDB: 237,2ms"></div><div class="bar-pg" style="width:0,9%" title="PostgreSQL: 2,2ms"></div></div></td>
+</tr>
+<tr>
+  <td>Compound (Dept=Eng AND Status=active)</td>
+  <td class="time">236,7ms</td>
+  <td class="time">2,7ms</td>
+  <td class="speedup">87,2x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:98,9%" title="OxiDB: 236,7ms"></div><div class="bar-pg" style="width:1,1%" title="PostgreSQL: 2,7ms"></div></div></td>
+</tr>
+<tr>
+  <td>Range (30 <= Age <= 40)</td>
+  <td class="time">227,4ms</td>
+  <td class="time">2,6ms</td>
+  <td class="speedup">88,6x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:98,9%" title="OxiDB: 227,4ms"></div><div class="bar-pg" style="width:1,1%" title="PostgreSQL: 2,6ms"></div></div></td>
+</tr>
+</table>
+</div>
+<div class="category">
+<h2>Aggregation <span class="badge">5 tests</span></h2>
+<table>
+<tr><th>Operation</th><th>OxiDB</th><th>PostgreSQL</th><th>Speedup</th><th>Winner</th><th class="bar-cell">Comparison</th></tr>
+<tr>
+  <td>GroupBy Department + Count</td>
+  <td class="time">3,7ms</td>
+  <td class="time">11,8ms</td>
+  <td class="speedup">3,2x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:23,7%" title="OxiDB: 3,7ms"></div><div class="bar-pg" style="width:76,3%" title="PostgreSQL: 11,8ms"></div></div></td>
+</tr>
+<tr>
+  <td>Average salary</td>
+  <td class="time">3,1ms</td>
+  <td class="time">4,1ms</td>
+  <td class="speedup">1,3x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:43,0%" title="OxiDB: 3,1ms"></div><div class="bar-pg" style="width:57,0%" title="PostgreSQL: 4,1ms"></div></div></td>
+</tr>
+<tr>
+  <td>Top 5 by score</td>
+  <td class="time">4,2ms</td>
+  <td class="time">11,8ms</td>
+  <td class="speedup">2,8x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:26,0%" title="OxiDB: 4,2ms"></div><div class="bar-pg" style="width:74,0%" title="PostgreSQL: 11,8ms"></div></div></td>
+</tr>
+<tr>
+  <td>Min/Max age</td>
+  <td class="time">2,2ms</td>
+  <td class="time">5,1ms</td>
+  <td class="speedup">2,3x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:29,9%" title="OxiDB: 2,2ms"></div><div class="bar-pg" style="width:70,1%" title="PostgreSQL: 5,1ms"></div></div></td>
+</tr>
+<tr>
+  <td>Filtered count (Rating>=4 AND Verified)</td>
+  <td class="time">231,4ms</td>
+  <td class="time">3,3ms</td>
+  <td class="speedup">69,9x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:98,6%" title="OxiDB: 231,4ms"></div><div class="bar-pg" style="width:1,4%" title="PostgreSQL: 3,3ms"></div></div></td>
+</tr>
+</table>
+</div>
+<div class="category">
+<h2>CRUD <span class="badge">6 tests</span></h2>
+<table>
+<tr><th>Operation</th><th>OxiDB</th><th>PostgreSQL</th><th>Speedup</th><th>Winner</th><th class="bar-cell">Comparison</th></tr>
+<tr>
+  <td>Count</td>
+  <td class="time">1,3ms</td>
+  <td class="time">1,9ms</td>
+  <td class="speedup">1,5x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:40,1%" title="OxiDB: 1,3ms"></div><div class="bar-pg" style="width:59,9%" title="PostgreSQL: 1,9ms"></div></div></td>
+</tr>
+<tr>
+  <td>Delete</td>
+  <td class="time">246,5ms</td>
+  <td class="time">7,9ms</td>
+  <td class="speedup">31,3x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:96,9%" title="OxiDB: 246,5ms"></div><div class="bar-pg" style="width:3,1%" title="PostgreSQL: 7,9ms"></div></div></td>
+</tr>
+<tr>
+  <td>Insert single</td>
+  <td class="time">1,0ms</td>
+  <td class="time">674us</td>
+  <td class="speedup">1,5x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:60,3%" title="OxiDB: 1,0ms"></div><div class="bar-pg" style="width:39,7%" title="PostgreSQL: 674us"></div></div></td>
+</tr>
+<tr>
+  <td>InsertMany (500)</td>
+  <td class="time">123,4ms</td>
+  <td class="time">30,6ms</td>
+  <td class="speedup">4,0x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:80,2%" title="OxiDB: 123,4ms"></div><div class="bar-pg" style="width:19,8%" title="PostgreSQL: 30,6ms"></div></div></td>
+</tr>
+<tr>
+  <td>Update</td>
+  <td class="time">658us</td>
+  <td class="time">3,6ms</td>
+  <td class="speedup">5,4x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:15,5%" title="OxiDB: 658us"></div><div class="bar-pg" style="width:84,5%" title="PostgreSQL: 3,6ms"></div></div></td>
+</tr>
+<tr>
+  <td>FindById</td>
+  <td class="time">526us</td>
+  <td class="time">615us</td>
+  <td class="speedup">1,2x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:46,1%" title="OxiDB: 526us"></div><div class="bar-pg" style="width:53,9%" title="PostgreSQL: 615us"></div></div></td>
+</tr>
+</table>
+</div>
+<div class="category">
+<h2>Concurrent <span class="badge">2 tests</span></h2>
+<table>
+<tr><th>Operation</th><th>OxiDB</th><th>PostgreSQL</th><th>Speedup</th><th>Winner</th><th class="bar-cell">Comparison</th></tr>
+<tr>
+  <td>100 mixed R/W</td>
+  <td class="time">42,5ms</td>
+  <td class="time">80,2ms</td>
+  <td class="speedup">1,9x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:34,6%" title="OxiDB: 42,5ms"></div><div class="bar-pg" style="width:65,4%" title="PostgreSQL: 80,2ms"></div></div></td>
+</tr>
+<tr>
+  <td>20 parallel reads</td>
+  <td class="time">4,9ms</td>
+  <td class="time">6,1ms</td>
+  <td class="speedup">1,3x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:44,3%" title="OxiDB: 4,9ms"></div><div class="bar-pg" style="width:55,7%" title="PostgreSQL: 6,1ms"></div></div></td>
+</tr>
+</table>
+</div>
+<div class="category">
+<h2>Bulk <span class="badge">3 tests</span></h2>
+<table>
+<tr><th>Operation</th><th>OxiDB</th><th>PostgreSQL</th><th>Speedup</th><th>Winner</th><th class="bar-cell">Comparison</th></tr>
+<tr>
+  <td>Bulk update (Sales.Rating=5)</td>
+  <td class="time">4,5ms</td>
+  <td class="time">10,0ms</td>
+  <td class="speedup">2,2x</td>
+  <td class="winner oxi-win">OxiDB</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:30,9%" title="OxiDB: 4,5ms"></div><div class="bar-pg" style="width:69,1%" title="PostgreSQL: 10,0ms"></div></div></td>
+</tr>
+<tr>
+  <td>Bulk delete (Status=inactive)</td>
+  <td class="time">3,49s</td>
+  <td class="time">7,4ms</td>
+  <td class="speedup">468,7x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:99,8%" title="OxiDB: 3,49s"></div><div class="bar-pg" style="width:0,2%" title="PostgreSQL: 7,4ms"></div></div></td>
+</tr>
+<tr>
+  <td>Insert 10000</td>
+  <td class="time">2,53s</td>
+  <td class="time">648,2ms</td>
+  <td class="speedup">3,9x</td>
+  <td class="winner pg-win">PostgreSQL</td>
+  <td class="bar-cell"><div class="bar-container"><div class="bar-oxi" style="width:79,6%" title="OxiDB: 2,53s"></div><div class="bar-pg" style="width:20,4%" title="PostgreSQL: 648,2ms"></div></div></td>
+</tr>
+</table>
+</div>
+<div class="category">
+<h2>Transactions <span class="badge">2 tests</span></h2>
+<table>
+<tr><th>Operation</th><th>OxiDB</th><th>PostgreSQL</th><th>Speedup</th><th>Winner</th><th class="bar-cell">Comparison</th></tr>
+<tr>
+  <td>Commit (insert in tx)</td>
+  <td class="time">-</td>
+  <td class="time">3,6ms</td>
+  <td class="speedup">-</td>
+  <td class="winner tie">-</td>
+  <td class="bar-cell"></td>
+</tr>
+<tr>
+  <td>Rollback (insert + rollback)</td>
+  <td class="time">-</td>
+  <td class="time">2,8ms</td>
+  <td class="speedup">-</td>
+  <td class="winner tie">-</td>
+  <td class="bar-cell"></td>
+</tr>
+</table>
+</div>
+<div class="footer">Generated by OxiDB vs PostgreSQL EF Core Comparison Test Suite &mdash; 28 tests across 6 categories</div>
+</div>
+</body>
+</html>

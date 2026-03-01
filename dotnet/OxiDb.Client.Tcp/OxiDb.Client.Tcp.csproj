@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>OxiDb.Client.Tcp</RootNamespace>
+
+    <PackageId>OxiDb.Client.Tcp</PackageId>
+    <Description>Pure managed TCP client for OxiDB document database server. Zero native dependencies.</Description>
+    <IsPackable>true</IsPackable>
+  </PropertyGroup>
+
+</Project>

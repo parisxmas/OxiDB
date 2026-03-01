@@ -9,10 +9,13 @@ COPY oxidb-client-ffi/ oxidb-client-ffi/
 COPY oxidb-embedded-ffi/ oxidb-embedded-ffi/
 COPY oxidb-cli/ oxidb-cli/
 
-# Create stub for oxidb-app workspace member (not needed for server build)
+# Create stubs for workspace members not needed for server build
 RUN mkdir -p oxidb-app/src-tauri/src && \
     echo '[package]\nname = "oxidb-app"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxidb-app/src-tauri/Cargo.toml && \
-    echo '' > oxidb-app/src-tauri/src/lib.rs
+    echo '' > oxidb-app/src-tauri/src/lib.rs && \
+    mkdir -p oxidb-wasm/src && \
+    echo '[package]\nname = "oxidb-wasm"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxidb-wasm/Cargo.toml && \
+    echo '' > oxidb-wasm/src/lib.rs
 
 RUN cargo build --release --package oxidb-server
 
