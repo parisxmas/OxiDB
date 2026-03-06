@@ -5,13 +5,46 @@ use sqlparser::ast::{
     ObjectType, OrderByExpr, OrderByKind, Query, SelectItem, SetExpr, Statement, TableFactor,
     TableObject, TableWithJoins,
 };
-use sqlparser::dialect::GenericDialect;
+use sqlparser::dialect::{
+    Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect,
+};
 use sqlparser::parser::Parser;
 
 use crate::database_manager::DatabaseManager;
 use crate::engine::OxiDb;
 use crate::error::{Error, Result};
 use crate::query::FindOptions;
+
+/// Supported SQL dialects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SqlDialect {
+    #[default]
+    Generic,
+    MySQL,
+    PostgreSQL,
+    MsSQL,
+}
+
+impl SqlDialect {
+    /// Parse a dialect name string (case-insensitive).
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "mysql" | "mariadb" => Self::MySQL,
+            "postgres" | "postgresql" | "pg" => Self::PostgreSQL,
+            "mssql" | "sqlserver" | "tsql" => Self::MsSQL,
+            _ => Self::Generic,
+        }
+    }
+
+    fn to_parser_dialect(&self) -> Box<dyn Dialect> {
+        match self {
+            Self::Generic => Box::new(GenericDialect {}),
+            Self::MySQL => Box::new(MySqlDialect {}),
+            Self::PostgreSQL => Box::new(PostgreSqlDialect {}),
+            Self::MsSQL => Box::new(MsSqlDialect {}),
+        }
+    }
+}
 
 /// Result of executing a SQL statement against the engine.
 #[derive(Debug)]
@@ -29,13 +62,18 @@ pub enum SqlResult {
 
 /// Parse and execute a SQL statement against the OxiDB engine.
 pub fn execute_sql(db: &OxiDb, sql: &str) -> Result<SqlResult> {
+    execute_sql_with_dialect(db, sql, SqlDialect::default())
+}
+
+/// Parse and execute a SQL statement using a specific SQL dialect.
+pub fn execute_sql_with_dialect(db: &OxiDb, sql: &str, dialect: SqlDialect) -> Result<SqlResult> {
     // Pre-parse database-level commands that sqlparser doesn't handle.
     if let Some(result) = try_database_command(sql, None)? {
         return Ok(result);
     }
 
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
+    let parser_dialect = dialect.to_parser_dialect();
+    let statements = Parser::parse_sql(parser_dialect.as_ref(), sql)
         .map_err(|e| Error::InvalidQuery(format!("SQL parse error: {e}")))?;
 
     if statements.is_empty() {
@@ -57,6 +95,7 @@ pub fn execute_sql_with_db_manager(
     db: &OxiDb,
     sql: &str,
     db_manager: Option<&DatabaseManager>,
+    dialect: SqlDialect,
 ) -> Result<SqlResult> {
     // Pre-parse database-level commands.
     if let Some(result) = try_database_command(sql, db_manager)? {
@@ -64,8 +103,8 @@ pub fn execute_sql_with_db_manager(
     }
 
     // Fall through to standard SQL execution.
-    let dialect = GenericDialect {};
-    let statements = Parser::parse_sql(&dialect, sql)
+    let parser_dialect = dialect.to_parser_dialect();
+    let statements = Parser::parse_sql(parser_dialect.as_ref(), sql)
         .map_err(|e| Error::InvalidQuery(format!("SQL parse error: {e}")))?;
 
     if statements.is_empty() {
@@ -144,6 +183,34 @@ fn try_database_command(
         ["USE", _name] => {
             let name = extract_identifier(trimmed, 1);
             Ok(Some(SqlResult::UseDatabase(name)))
+        }
+        // DESCRIBE / DESC table (MySQL-style)
+        ["DESCRIBE", _name] | ["DESC", _name] => {
+            let name = extract_identifier(trimmed, 1);
+            Ok(Some(SqlResult::Ddl(format!(
+                "collection '{name}' (document store — schema-free)"
+            ))))
+        }
+        // SHOW COLUMNS FROM table
+        ["SHOW", "COLUMNS", "FROM", _name] => {
+            let name = extract_identifier(trimmed, 3);
+            Ok(Some(SqlResult::Ddl(format!(
+                "collection '{name}' (document store — schema-free)"
+            ))))
+        }
+        // TRUNCATE TABLE
+        ["TRUNCATE", "TABLE", _name] | ["TRUNCATE", _name] => {
+            let idx = if words.len() == 3 { 2 } else { 1 };
+            let name = extract_identifier(trimmed, idx);
+            if let Some(mgr) = db_manager {
+                let db = mgr.get_database("oxidb").ok();
+                if let Some(db) = db {
+                    let _ = db.delete(&name, &serde_json::json!({}));
+                }
+            }
+            Ok(Some(SqlResult::Ddl(format!(
+                "collection '{name}' truncated"
+            ))))
         }
         // \\c or \connect (psql-style)
         _ if upper.starts_with("\\C ") || upper.starts_with("\\CONNECT ") => {
@@ -533,24 +600,57 @@ fn execute_join_select(
 
     for join in &from.joins {
         let right_table = extract_table_factor_name(&join.relation)?;
-        let constraint = extract_join_operator_constraint(&join.join_operator)?;
-        let (local_field, foreign_field) = extract_join_condition(&constraint)?;
 
         let is_left = matches!(
             &join.join_operator,
             JoinOperator::LeftOuter(_) | JoinOperator::LeftSemi(_) | JoinOperator::LeftAnti(_)
         );
 
+        let is_cross = matches!(&join.join_operator, JoinOperator::CrossJoin(_));
+
+        let pairs = if is_cross {
+            Vec::new()
+        } else {
+            let constraint = extract_join_operator_constraint(&join.join_operator)?;
+            extract_join_conditions(&constraint)?
+        };
+
         let as_field = format!("_{right_table}");
 
-        pipeline.push(json!({
-            "$lookup": {
+        if is_cross {
+            // CROSS JOIN: lookup all docs from the right table
+            pipeline.push(json!({
+                "$lookup": {
+                    "from": right_table,
+                    "localField": "_cross_no_match_",
+                    "foreignField": "_cross_no_match_",
+                    "as": as_field
+                }
+            }));
+        } else {
+            // Use the first equality pair for $lookup, extra pairs for filtering
+            let mut lookup_obj = json!({
                 "from": right_table,
-                "localField": local_field,
-                "foreignField": foreign_field,
+                "localField": pairs[0].local,
+                "foreignField": pairs[0].foreign,
                 "as": as_field
+            });
+
+            if pairs.len() > 1 {
+                let extra_local: Vec<Value> = pairs[1..]
+                    .iter()
+                    .map(|p| Value::String(p.local.clone()))
+                    .collect();
+                let extra_foreign: Vec<Value> = pairs[1..]
+                    .iter()
+                    .map(|p| Value::String(p.foreign.clone()))
+                    .collect();
+                lookup_obj["localFields"] = Value::Array(extra_local);
+                lookup_obj["foreignFields"] = Value::Array(extra_foreign);
             }
-        }));
+
+            pipeline.push(json!({"$lookup": lookup_obj}));
+        }
 
         pipeline.push(json!({
             "$unwind": {
@@ -610,22 +710,80 @@ fn extract_join_operator_constraint(op: &JoinOperator) -> Result<JoinConstraint>
     }
 }
 
-fn extract_join_condition(constraint: &JoinConstraint) -> Result<(String, String)> {
+/// A single equality pair from a JOIN ON condition.
+struct JoinFieldPair {
+    local: String,
+    foreign: String,
+}
+
+/// Extract all equality field pairs from a JOIN condition.
+/// Supports: `ON a.x = b.x`, `ON a.x = b.x AND a.y = b.y`, and `USING (x, y)`.
+fn extract_join_conditions(constraint: &JoinConstraint) -> Result<Vec<JoinFieldPair>> {
     match constraint {
-        JoinConstraint::On(expr) => match expr {
-            Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
-                let left_field = expr_to_field_name(left)?;
-                let right_field = expr_to_field_name(right)?;
-                Ok((left_field, right_field))
+        JoinConstraint::On(expr) => {
+            let mut pairs = Vec::new();
+            collect_join_equalities(expr, &mut pairs)?;
+            if pairs.is_empty() {
+                return Err(Error::InvalidQuery(
+                    "JOIN ON requires at least one equality condition".into(),
+                ));
             }
-            _ => Err(Error::InvalidQuery(
-                "JOIN ON must be a simple equality condition".into(),
-            )),
-        },
+            Ok(pairs)
+        }
+        JoinConstraint::Using(columns) => {
+            let pairs = columns
+                .iter()
+                .map(|col| {
+                    let name = object_name_to_string(col);
+                    JoinFieldPair {
+                        local: name.clone(),
+                        foreign: name,
+                    }
+                })
+                .collect::<Vec<_>>();
+            if pairs.is_empty() {
+                return Err(Error::InvalidQuery(
+                    "JOIN USING requires at least one column".into(),
+                ));
+            }
+            Ok(pairs)
+        }
+        JoinConstraint::Natural => {
+            Err(Error::InvalidQuery(
+                "NATURAL JOIN is not supported — use explicit ON or USING".into(),
+            ))
+        }
         _ => Err(Error::InvalidQuery(
-            "only JOIN ... ON is supported".into(),
+            "only JOIN ... ON and JOIN ... USING are supported".into(),
         )),
     }
+}
+
+/// Recursively collect `field = field` equalities from an AND tree.
+fn collect_join_equalities(expr: &Expr, pairs: &mut Vec<JoinFieldPair>) -> Result<()> {
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::And, right } => {
+            collect_join_equalities(left, pairs)?;
+            collect_join_equalities(right, pairs)?;
+        }
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let left_field = expr_to_field_name(left)?;
+            let right_field = expr_to_field_name(right)?;
+            pairs.push(JoinFieldPair {
+                local: left_field,
+                foreign: right_field,
+            });
+        }
+        Expr::Nested(inner) => {
+            collect_join_equalities(inner, pairs)?;
+        }
+        _ => {
+            return Err(Error::InvalidQuery(format!(
+                "unsupported JOIN condition: {expr} — only AND-ed equalities are supported"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -816,29 +974,28 @@ fn translate_expr(expr: &Expr) -> Result<Value> {
             Ok(json!({field: {"$exists": true}}))
         }
         Expr::InList { expr, list, negated } => {
-            if *negated {
-                return Err(Error::InvalidQuery("NOT IN is not supported".into()));
-            }
             let field = expr_to_field_name(expr)?;
             let values: Vec<Value> = list
                 .iter()
                 .map(translate_expr_to_value)
                 .collect::<Result<_>>()?;
-            Ok(json!({field: {"$in": values}}))
+            if *negated {
+                Ok(json!({field: {"$nin": values}}))
+            } else {
+                Ok(json!({field: {"$in": values}}))
+            }
         }
         Expr::Between { expr, low, high, negated } => {
-            if *negated {
-                return Err(Error::InvalidQuery("NOT BETWEEN is not supported".into()));
-            }
             let field = expr_to_field_name(expr)?;
             let low_val = translate_expr_to_value(low)?;
             let high_val = translate_expr_to_value(high)?;
-            Ok(json!({field: {"$gte": low_val, "$lte": high_val}}))
+            if *negated {
+                Ok(json!({"$or": [{field.clone(): {"$lt": low_val}}, {field: {"$gt": high_val}}]}))
+            } else {
+                Ok(json!({field: {"$gte": low_val, "$lte": high_val}}))
+            }
         }
         Expr::Like { expr, pattern, negated, .. } => {
-            if *negated {
-                return Err(Error::InvalidQuery("NOT LIKE is not supported".into()));
-            }
             let field = expr_to_field_name(expr)?;
             let pattern_str = match pattern.as_ref() {
                 Expr::Value(v) => value_with_span_to_string(v)?,
@@ -849,7 +1006,11 @@ fn translate_expr(expr: &Expr) -> Result<Value> {
                 }
             };
             let regex = like_to_regex(&pattern_str);
-            Ok(json!({field: {"$regex": regex}}))
+            if *negated {
+                Ok(json!({field: {"$not": {"$regex": regex}}}))
+            } else {
+                Ok(json!({field: {"$regex": regex}}))
+            }
         }
         _ => Err(Error::InvalidQuery(format!(
             "unsupported SQL expression: {expr}"

@@ -190,6 +190,204 @@ func TestIndexes(t *testing.T) {
 	}
 }
 
+func TestCompositeIndex(t *testing.T) {
+	c := getClient(t)
+	defer c.Close()
+
+	col := "go_composite_test"
+	_ = c.DropCollection(col)
+
+	// Insert test data with department + city + age fields
+	docs := []map[string]any{
+		{"name": "Alice", "department": "Engineering", "city": "Tokyo", "age": 30},
+		{"name": "Bob", "department": "Engineering", "city": "Paris", "age": 25},
+		{"name": "Charlie", "department": "Sales", "city": "Tokyo", "age": 35},
+		{"name": "Diana", "department": "Engineering", "city": "Tokyo", "age": 28},
+		{"name": "Eve", "department": "Sales", "city": "Paris", "age": 40},
+		{"name": "Frank", "department": "HR", "city": "London", "age": 33},
+		{"name": "Grace", "department": "Engineering", "city": "London", "age": 45},
+		{"name": "Hank", "department": "HR", "city": "Tokyo", "age": 29},
+	}
+	_, err := c.InsertMany(col, docs)
+	if err != nil {
+		t.Fatalf("insert_many: %v", err)
+	}
+
+	// Create composite index on (department, city)
+	if err := c.CreateCompositeIndex(col, []string{"department", "city"}); err != nil {
+		t.Fatalf("create composite index: %v", err)
+	}
+
+	// List indexes and verify composite index exists
+	indexes, err := c.ListIndexes(col)
+	if err != nil {
+		t.Fatalf("list_indexes: %v", err)
+	}
+	foundComposite := false
+	for _, idx := range indexes {
+		if name, _ := idx["name"].(string); name == "department_city" {
+			foundComposite = true
+		}
+	}
+	if !foundComposite {
+		t.Fatal("composite index 'department_city' not found in index list")
+	}
+
+	// Query using both fields of the composite index
+	t.Run("ExactMatchBothFields", func(t *testing.T) {
+		results, err := c.Find(col, map[string]any{
+			"department": "Engineering", "city": "Tokyo",
+		}, nil)
+		if err != nil {
+			t.Fatalf("find: %v", err)
+		}
+		if len(results) != 2 {
+			t.Fatalf("expected 2 docs (Alice, Diana), got %d", len(results))
+		}
+		for _, doc := range results {
+			if doc["department"] != "Engineering" || doc["city"] != "Tokyo" {
+				t.Fatalf("unexpected doc: %v", doc)
+			}
+		}
+	})
+
+	// Query using prefix of composite index (department only)
+	t.Run("PrefixMatch", func(t *testing.T) {
+		results, err := c.Find(col, map[string]any{
+			"department": "Engineering",
+		}, nil)
+		if err != nil {
+			t.Fatalf("find: %v", err)
+		}
+		if len(results) != 4 {
+			t.Fatalf("expected 4 Engineering docs, got %d", len(results))
+		}
+	})
+
+	// Count with composite index
+	t.Run("CountWithComposite", func(t *testing.T) {
+		n, err := c.Count(col, map[string]any{
+			"department": "Sales", "city": "Tokyo",
+		})
+		if err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("expected 1 (Charlie), got %d", n)
+		}
+	})
+
+	// Sorted query using composite index
+	t.Run("SortedByCompositeFields", func(t *testing.T) {
+		results, err := c.Find(col, map[string]any{}, &oxidb.FindOptions{
+			Sort: map[string]any{"department": 1, "city": 1},
+		})
+		if err != nil {
+			t.Fatalf("find sorted: %v", err)
+		}
+		if len(results) != 8 {
+			t.Fatalf("expected 8 docs, got %d", len(results))
+		}
+		// First doc should be Engineering/London (alphabetical)
+		dept, _ := results[0]["department"].(string)
+		if dept != "Engineering" {
+			t.Fatalf("expected first department=Engineering, got %q", dept)
+		}
+	})
+
+	// Update using composite-indexed fields
+	t.Run("UpdateWithComposite", func(t *testing.T) {
+		result, err := c.Update(col,
+			map[string]any{"department": "HR", "city": "London"},
+			map[string]any{"$set": map[string]any{"age": 34}},
+		)
+		if err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		mod, _ := result["modified"].(float64)
+		if int(mod) != 1 {
+			t.Fatalf("expected 1 modified, got %v", result["modified"])
+		}
+		doc, _ := c.FindOne(col, map[string]any{"name": "Frank"})
+		age, _ := doc["age"].(float64)
+		if int(age) != 34 {
+			t.Fatalf("expected age 34, got %v", doc["age"])
+		}
+	})
+
+	// Delete using composite-indexed fields
+	t.Run("DeleteWithComposite", func(t *testing.T) {
+		result, err := c.Delete(col, map[string]any{
+			"department": "Sales", "city": "Paris",
+		})
+		if err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+		del, _ := result["deleted"].(float64)
+		if int(del) != 1 {
+			t.Fatalf("expected 1 deleted (Eve), got %v", result["deleted"])
+		}
+		n, _ := c.Count(col, map[string]any{})
+		if n != 7 {
+			t.Fatalf("expected 7 remaining, got %d", n)
+		}
+	})
+
+	// Aggregation using composite-indexed match
+	t.Run("AggregateWithComposite", func(t *testing.T) {
+		results, err := c.Aggregate(col, []map[string]any{
+			{"$match": map[string]any{"department": "Engineering"}},
+			{"$group": map[string]any{
+				"_id":     "$city",
+				"avg_age": map[string]any{"$avg": "$age"},
+				"count":   map[string]any{"$sum": 1},
+			}},
+			{"$sort": map[string]any{"_id": 1}},
+		})
+		if err != nil {
+			t.Fatalf("aggregate: %v", err)
+		}
+		if len(results) != 3 {
+			t.Fatalf("expected 3 cities (London, Paris, Tokyo), got %d", len(results))
+		}
+	})
+
+	// Drop composite index
+	t.Run("DropCompositeIndex", func(t *testing.T) {
+		if err := c.DropIndex(col, "department_city"); err != nil {
+			t.Fatalf("drop_index: %v", err)
+		}
+		indexes, err := c.ListIndexes(col)
+		if err != nil {
+			t.Fatalf("list_indexes: %v", err)
+		}
+		for _, idx := range indexes {
+			if name, _ := idx["name"].(string); name == "department_city" {
+				t.Fatal("composite index still exists after drop")
+			}
+		}
+	})
+
+	// Triple composite index
+	t.Run("TripleCompositeIndex", func(t *testing.T) {
+		if err := c.CreateCompositeIndex(col, []string{"department", "city", "age"}); err != nil {
+			t.Fatalf("create triple composite: %v", err)
+		}
+		results, err := c.Find(col, map[string]any{
+			"department": "Engineering", "city": "Tokyo",
+		}, nil)
+		if err != nil {
+			t.Fatalf("find: %v", err)
+		}
+		if len(results) != 2 {
+			t.Fatalf("expected 2, got %d", len(results))
+		}
+	})
+
+	// Cleanup
+	_ = c.DropCollection(col)
+}
+
 func TestAggregation(t *testing.T) {
 	c := getClient(t)
 	defer c.Close()

@@ -790,6 +790,7 @@ fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
 
 /// Extract a field value from raw JSONB using path lookup.
 /// Handles dot-notation (e.g., "data.experience") by traversing nested objects.
+/// Uses direct scalar accessors to avoid full serde_json::Value allocation.
 fn extract_raw_field_value(raw: &jsonb::RawJsonb, field: &str) -> Option<IndexValue> {
     use jsonb::keypath::KeyPath;
     use std::borrow::Cow;
@@ -801,10 +802,26 @@ fn extract_raw_field_value(raw: &jsonb::RawJsonb, field: &str) -> Option<IndexVa
         .collect();
 
     let owned = raw.get_by_keypath(keypath.iter()).ok()??;
-    // Decode the extracted sub-value to serde_json::Value, then convert.
-    // Note: the as_i64()/as_str() accessors don't work on sub-values
-    // extracted via get_by_keypath — must use from_raw_jsonb instead.
-    let val: serde_json::Value = jsonb::from_raw_jsonb(&owned.as_raw()).ok()?;
+    let sub = owned.as_raw();
+
+    // Try scalar accessors directly — avoids allocating serde_json::Value
+    if let Ok(Some(())) = sub.as_null() {
+        return Some(IndexValue::Null);
+    }
+    if let Ok(Some(b)) = sub.as_bool() {
+        return Some(IndexValue::Boolean(b));
+    }
+    if let Ok(Some(i)) = sub.as_i64() {
+        return Some(IndexValue::Integer(i));
+    }
+    if let Ok(Some(f)) = sub.as_f64() {
+        return Some(IndexValue::Float(f));
+    }
+    if let Ok(Some(s)) = sub.as_str() {
+        return Some(IndexValue::parse_string(&s));
+    }
+    // Fallback for arrays/objects — full decode
+    let val: serde_json::Value = jsonb::from_raw_jsonb(&sub).ok()?;
     Some(IndexValue::from_json(&val))
 }
 

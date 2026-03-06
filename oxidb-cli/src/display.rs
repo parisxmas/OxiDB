@@ -198,43 +198,65 @@ pub fn print_help() {
 OxiDB CLI - Interactive shell for OxiDB
 
 Collection commands:
-  db.<col>.insert({...})                Insert a document
-  db.<col>.insertMany([{...}, ...])     Insert multiple documents
-  db.<col>.find({})                     Find documents
-  db.<col>.find({}).sort({}).limit(N)   Find with sort/limit/skip
-  db.<col>.findOne({...})               Find one document
-  db.<col>.update({q}, {u})             Update documents
-  db.<col>.updateOne({q}, {u})          Update one document
-  db.<col>.delete({...})                Delete documents
-  db.<col>.deleteOne({...})             Delete one document
-  db.<col>.count()                      Count documents
-  db.<col>.count({...})                 Count matching documents
-  db.<col>.aggregate([...])             Aggregation pipeline
-  db.<col>.createIndex("field")         Create index
-  db.<col>.createUniqueIndex("field")   Create unique index
-  db.<col>.createCompositeIndex([...])  Create composite index
-  db.<col>.createTextIndex([...])       Create text index
-  db.<col>.textSearch("query", N)       Full-text search
-  db.<col>.compact()                    Compact collection
-  db.<col>.drop()                       Drop collection
+  db.<col>.insert({...})                    Insert a document
+  db.<col>.insertMany([{...}, ...])         Insert multiple documents
+  db.<col>.find({})                         Find documents
+  db.<col>.find({}).sort({}).limit(N)       Find with sort/limit/skip
+  db.<col>.findOne({...})                   Find one document
+  db.<col>.update({q}, {u})                 Update documents
+  db.<col>.updateOne({q}, {u})              Update one document
+  db.<col>.delete({...})                    Delete documents
+  db.<col>.deleteOne({...})                 Delete one document
+  db.<col>.count()                          Count documents
+  db.<col>.count({...})                     Count matching documents
+  db.<col>.aggregate([...])                 Aggregation pipeline
+  db.<col>.compact()                        Compact collection
+  db.<col>.drop()                           Drop collection
+
+Index commands:
+  db.<col>.createIndex("field")             Create index
+  db.<col>.createUniqueIndex("field")       Create unique index
+  db.<col>.createCompositeIndex([...])      Create composite index
+  db.<col>.createTextIndex([...])           Create text index
+  db.<col>.listIndexes()                    List all indexes
+  db.<col>.dropIndex("name")               Drop an index
+
+Search commands:
+  db.<col>.textSearch("query", N)           Full-text search on collection
+  db.search("query", limit)                 Full-text search across blobs
+
+Vector search:
+  db.<col>.createVectorIndex("f", dim)      Create vector index (cosine)
+  db.<col>.createVectorIndex("f", dim, "euclidean")
+  db.<col>.vectorSearch("f", [...], limit)  k-NN vector search
+
+SQL:
+  SELECT * FROM users WHERE age > 25        Direct SQL queries
+  INSERT INTO users (name) VALUES ('Alice')
+  CREATE INDEX idx ON users (age)
 
 Database commands:
-  show collections                      List all collections
-  show buckets                          List all buckets
-  db.createCollection("name")           Create a collection
-  db.createBucket("name")               Create a bucket
-  db.deleteBucket("name")               Delete a bucket
-  db.search("query", limit)             Full-text search across blobs
+  show collections                          List all collections
+  show databases                            List all databases
+  show buckets                              List all buckets
+  show schedules                            List all schedules
+  db.createCollection("name")               Create a collection
+  db.createDatabase("name")                 Create a database
+  db.dropDatabase("name")                   Drop a database
+  db.useDatabase("name")                    Switch database
+  db.createBucket("name")                   Create a bucket
+  db.deleteBucket("name")                   Delete a bucket
+  db.backup("/path/to/backup")              Create a backup
 
 Transaction commands:
-  db.beginTransaction()                 Begin a transaction
-  db.commitTransaction()                Commit active transaction
-  db.rollbackTransaction()              Rollback active transaction
+  db.beginTransaction()                     Begin a transaction
+  db.commitTransaction()                    Commit active transaction
+  db.rollbackTransaction()                  Rollback active transaction
 
 Other:
-  ping                                  Check connectivity
-  help                                  Show this help
-  exit / quit                           Exit the shell
+  ping                                      Check connectivity
+  help                                      Show this help
+  exit / quit                               Exit the shell
 "#;
     println!("{}", help.trim());
 }

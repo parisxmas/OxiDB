@@ -10,6 +10,23 @@ use crate::error::Result;
 const RECORD_ACTIVE: u8 = 0;
 const RECORD_DELETED: u8 = 1;
 
+/// First 4 bytes of a zstd frame — used to detect compressed payloads.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Default zstd compression level.
+const ZSTD_LEVEL: i32 = 3;
+
+thread_local! {
+    /// Per-thread reusable zstd compressor — avoids context creation overhead per document.
+    static ZSTD_COMPRESSOR: std::cell::RefCell<zstd::bulk::Compressor<'static>> = std::cell::RefCell::new(
+        zstd::bulk::Compressor::new(ZSTD_LEVEL).expect("failed to create zstd compressor")
+    );
+    /// Per-thread reusable zstd decompressor.
+    static ZSTD_DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> = std::cell::RefCell::new(
+        zstd::bulk::Decompressor::new().expect("failed to create zstd decompressor")
+    );
+}
+
 /// Location of a document in the data file.
 #[derive(Debug, Clone, Copy)]
 pub struct DocLocation {
@@ -70,26 +87,60 @@ impl Storage {
         })
     }
 
-    /// Encrypt doc_bytes if encryption is enabled.
-    /// Returns `Cow::Borrowed` when no encryption (zero-copy), `Cow::Owned` when encrypted.
-    fn maybe_encrypt<'a>(&self, doc_bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
-        match &self.encryption {
-            Some(key) => Ok(Cow::Owned(key.encrypt(doc_bytes)?)),
-            None => Ok(Cow::Borrowed(doc_bytes)),
+    /// Compress with zstd using a reusable thread-local compressor.
+    /// Only returns compressed form if it actually shrinks the data.
+    fn maybe_compress<'a>(&self, data: &'a [u8]) -> Cow<'a, [u8]> {
+        ZSTD_COMPRESSOR.with(|c| {
+            match c.borrow_mut().compress(data) {
+                Ok(compressed) if compressed.len() < data.len() => Cow::Owned(compressed),
+                _ => Cow::Borrowed(data),
+            }
+        })
+    }
+
+    /// Decompress if the payload starts with the zstd magic number.
+    fn maybe_decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
+            // Use the frame content size header if available, otherwise estimate.
+            let exact = zstd::zstd_safe::get_frame_content_size(data);
+            let capacity = match exact {
+                Ok(Some(size)) => size as usize,
+                _ => std::cmp::max(data.len() * 16, 65536),
+            };
+            ZSTD_DECOMPRESSOR.with(|d| {
+                d.borrow_mut()
+                    .decompress(data, capacity)
+                    .map_err(|e| crate::error::Error::Io(
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                    ))
+            })
+        } else {
+            Ok(data.to_vec())
         }
     }
 
-    /// Decrypt payload if encryption is enabled.
-    fn maybe_decrypt(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+    /// Prepare payload for writing: compress → encrypt.
+    /// Returns `Cow::Borrowed` when no transformation needed (zero-copy).
+    fn prepare_payload<'a>(&self, doc_bytes: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        let compressed = self.maybe_compress(doc_bytes);
         match &self.encryption {
-            Some(key) => key.decrypt(&payload),
-            None => Ok(payload),
+            Some(key) => Ok(Cow::Owned(key.encrypt(&compressed)?)),
+            None => Ok(compressed),
         }
+    }
+
+    /// Decode payload after reading: decrypt → decompress.
+    fn decode_payload(&self, payload: &[u8]) -> Result<Vec<u8>> {
+        let decrypted = match &self.encryption {
+            Some(key) => key.decrypt(payload)?,
+            None => return self.maybe_decompress(payload),
+        };
+        self.maybe_decompress(&decrypted)
     }
 
     /// Append a document to the data file, returns its location.
     pub fn append(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
-        let payload = self.maybe_encrypt(doc_bytes)?;
+        let payload = self.prepare_payload(doc_bytes)?;
         let mut inner = self.inner.lock().unwrap();
         let offset = inner.current_offset;
         let length = payload.len() as u32;
@@ -112,7 +163,7 @@ impl Storage {
         let mut buf = vec![0u8; loc.length as usize];
         inner.file.read_exact(&mut buf)?;
         drop(inner);
-        self.maybe_decrypt(buf)
+        self.decode_payload(&buf)
     }
 
     /// Read a document without acquiring the Mutex.
@@ -123,7 +174,7 @@ impl Storage {
         use std::os::unix::fs::FileExt;
         let mut buf = vec![0u8; loc.length as usize];
         self.read_file.read_at(&mut buf, loc.offset + 5)?;
-        self.maybe_decrypt(buf)
+        self.decode_payload(&buf)
     }
 
     #[cfg(not(unix))]
@@ -145,8 +196,8 @@ impl Storage {
         for &(idx, loc) in locs.iter() {
             let mut buf = vec![0u8; loc.length as usize];
             self.read_file.read_at(&mut buf, loc.offset + 5)?;
-            let buf = self.maybe_decrypt(buf)?;
-            results.push((idx, buf));
+            let decoded = self.decode_payload(&buf)?;
+            results.push((idx, decoded));
         }
         Ok(results)
     }
@@ -168,7 +219,7 @@ impl Storage {
         drop(inner);
         results
             .into_iter()
-            .map(|(idx, buf)| Ok((idx, self.maybe_decrypt(buf)?)))
+            .map(|(idx, buf)| Ok((idx, self.decode_payload(&buf)?)))
             .collect()
     }
 
@@ -183,7 +234,7 @@ impl Storage {
 
     /// Append a document without fsync (caller must call `sync()` after batch).
     pub fn append_no_sync(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
-        let payload = self.maybe_encrypt(doc_bytes)?;
+        let payload = self.prepare_payload(doc_bytes)?;
         let mut inner = self.inner.lock().unwrap();
         let offset = inner.current_offset;
         let length = payload.len() as u32;
@@ -204,7 +255,7 @@ impl Storage {
         // Pre-encrypt all items outside the lock
         let payloads: Vec<Cow<'_, [u8]>> = items
             .iter()
-            .map(|doc_bytes| self.maybe_encrypt(doc_bytes))
+            .map(|doc_bytes| self.prepare_payload(doc_bytes))
             .collect::<Result<Vec<_>>>()?;
 
         let mut inner = self.inner.lock().unwrap();
@@ -226,18 +277,71 @@ impl Storage {
         Ok(locations)
     }
 
+    /// Compress + encrypt a batch of items in parallel using thread::scope.
+    /// Falls back to sequential for small batches or when encryption is enabled
+    /// (encryption uses per-call random nonces which are cheap, but we keep it simple).
+    fn prepare_payloads_parallel(&self, items: &[&[u8]]) -> Result<Vec<Vec<u8>>> {
+        const PAR_THRESHOLD: usize = 256;
+        let n = items.len();
+
+        if n < PAR_THRESHOLD || self.encryption.is_some() {
+            // Sequential path
+            return items
+                .iter()
+                .map(|doc_bytes| {
+                    let cow = self.prepare_payload(doc_bytes)?;
+                    Ok(cow.into_owned())
+                })
+                .collect();
+        }
+
+        // Parallel compression (no encryption)
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let chunk_size = (n + cpus - 1) / cpus;
+
+        let results: Vec<Result<Vec<Vec<u8>>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = items
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(|| {
+                        chunk
+                            .iter()
+                            .map(|doc_bytes| {
+                                let compressed = ZSTD_COMPRESSOR.with(|c| {
+                                    match c.borrow_mut().compress(doc_bytes) {
+                                        Ok(comp) if comp.len() < doc_bytes.len() => comp,
+                                        _ => doc_bytes.to_vec(),
+                                    }
+                                });
+                                Ok(compressed)
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    })
+                })
+                .collect();
+
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let mut payloads = Vec::with_capacity(n);
+        for chunk_result in results {
+            payloads.extend(chunk_result?);
+        }
+        Ok(payloads)
+    }
+
     /// Append multiple documents without fsync using a single write_all call.
     /// Builds the entire batch into one buffer, reducing syscalls from 3*N to 1.
+    /// For large batches, compression is parallelized across available CPU cores.
     /// Returns a location for each item. Caller must call `sync()` after.
     pub fn append_batch_no_sync_buffered(&self, items: &[&[u8]]) -> Result<Vec<DocLocation>> {
         if items.is_empty() {
             return Ok(vec![]);
         }
-        // Pre-encrypt all items outside the lock
-        let payloads: Vec<Cow<'_, [u8]>> = items
-            .iter()
-            .map(|doc_bytes| self.maybe_encrypt(doc_bytes))
-            .collect::<Result<Vec<_>>>()?;
+        // Compress + encrypt all items outside the lock (parallel for large batches)
+        let payloads = self.prepare_payloads_parallel(items)?;
 
         // Build a single buffer for all records (also outside the lock)
         let total_size: usize = payloads.iter().map(|p| 5 + p.len()).sum();
@@ -316,10 +420,7 @@ impl Storage {
             if status == RECORD_ACTIVE {
                 let mut data = vec![0u8; length as usize];
                 inner.file.read_exact(&mut data)?;
-                let plaintext = match &self.encryption {
-                    Some(key) => key.decrypt(&data)?,
-                    None => data,
-                };
+                let plaintext = self.decode_payload(&data)?;
                 results.push((DocLocation { offset: pos, length }, plaintext));
             } else {
                 inner.file.seek(SeekFrom::Current(length as i64))?;
@@ -352,10 +453,7 @@ impl Storage {
             if status == RECORD_ACTIVE {
                 let mut data = vec![0u8; length as usize];
                 inner.file.read_exact(&mut data)?;
-                let plaintext = match &self.encryption {
-                    Some(key) => key.decrypt(&data)?,
-                    None => data,
-                };
+                let plaintext = self.decode_payload(&data)?;
                 // Drop inner lock before callback (callback may need to read storage)
                 drop(inner);
                 f(DocLocation { offset: pos, length }, plaintext)?;
@@ -387,7 +485,6 @@ impl Storage {
         let mut reader = BufReader::with_capacity(256 * 1024, file);
         let mut pos = 0u64;
         let mut buf = Vec::with_capacity(4096);
-        let mut decrypt_buf: Vec<u8>;
 
         while pos < file_len {
             let mut header = [0u8; 5];
@@ -399,14 +496,8 @@ impl Storage {
             if status == RECORD_ACTIVE {
                 buf.resize(length, 0);
                 reader.read_exact(&mut buf)?;
-                let bytes: &[u8] = match &self.encryption {
-                    Some(key) => {
-                        decrypt_buf = key.decrypt(&buf)?;
-                        &decrypt_buf
-                    }
-                    None => &buf,
-                };
-                if !f(bytes)? {
+                let decoded = self.decode_payload(&buf)?;
+                if !f(&decoded)? {
                     break;
                 }
             } else {
@@ -439,7 +530,6 @@ impl Storage {
         reader.seek(SeekFrom::Start(start_offset))?;
         let mut pos = start_offset;
         let mut buf = Vec::with_capacity(4096);
-        let mut decrypt_buf: Vec<u8>;
 
         while pos < end_offset {
             let mut header = [0u8; 5];
@@ -453,14 +543,8 @@ impl Storage {
             if status == RECORD_ACTIVE {
                 buf.resize(length, 0);
                 reader.read_exact(&mut buf)?;
-                let bytes: &[u8] = match &self.encryption {
-                    Some(key) => {
-                        decrypt_buf = key.decrypt(&buf)?;
-                        &decrypt_buf
-                    }
-                    None => &buf,
-                };
-                if !f(bytes)? {
+                let decoded = self.decode_payload(&buf)?;
+                if !f(&decoded)? {
                     break;
                 }
             } else {

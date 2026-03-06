@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli", "oxidb-app/src-tauri"]
+members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli"]
 resolver = "3"
 
 [package]
 name = "oxidb"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 description = "A fast document database engine with optimized date indexing"
 
@@ -29,6 +29,7 @@ tar = "0.4"
 flate2 = "1"
 regex = "1"
 sqlparser = "0.59"
+zstd = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

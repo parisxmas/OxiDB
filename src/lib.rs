@@ -31,6 +31,6 @@ pub use database_manager::DatabaseManager;
 pub use document::DocumentId;
 pub use engine::{BackupInfo, LogCallback, OxiDb, RestoreInfo};
 pub use error::{Error, Result};
-pub use sql::{execute_sql, execute_sql_with_db_manager, SqlResult};
+pub use sql::{execute_sql, execute_sql_with_db_manager, execute_sql_with_dialect, SqlDialect, SqlResult};
 pub use tx_log::TransactionId;
 pub use vector::DistanceMetric;

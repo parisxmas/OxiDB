@@ -119,6 +119,8 @@ enum Stage {
         local_field: String,
         foreign_field: String,
         as_field: String,
+        /// Additional field pairs for composite join conditions.
+        extra_pairs: Vec<(String, String)>,
     },
 }
 
@@ -957,6 +959,7 @@ fn exec_lookup<F>(
     local_field: &str,
     foreign_field: &str,
     as_field: &str,
+    extra_pairs: &[(String, String)],
     lookup_fn: &F,
 ) -> Result<Vec<Value>>
 where
@@ -966,7 +969,19 @@ where
     for mut doc in docs {
         let local_val = resolve_field(&doc, local_field);
         let query = json!({ foreign_field: local_val });
-        let foreign_docs = lookup_fn(from, &query)?;
+        let mut foreign_docs = lookup_fn(from, &query)?;
+
+        // Filter by additional field pairs (composite join)
+        if !extra_pairs.is_empty() {
+            foreign_docs.retain(|foreign_doc| {
+                extra_pairs.iter().all(|(local_f, foreign_f)| {
+                    let lv = resolve_field(&doc, local_f);
+                    let fv = resolve_field(foreign_doc, foreign_f);
+                    lv == fv
+                })
+            });
+        }
+
         set_field(&mut doc, as_field, Value::Array(foreign_docs));
         result.push(doc);
     }
@@ -1856,11 +1871,26 @@ impl Pipeline {
                         .ok_or_else(|| {
                             Error::InvalidPipeline("$lookup requires 'as' string".into())
                         })?;
+                    // Optional extra field pairs for composite joins
+                    let extra_pairs = match (
+                        obj.get("localFields").and_then(|v| v.as_array()),
+                        obj.get("foreignFields").and_then(|v| v.as_array()),
+                    ) {
+                        (Some(lfs), Some(ffs)) => lfs
+                            .iter()
+                            .zip(ffs.iter())
+                            .filter_map(|(l, f)| {
+                                Some((l.as_str()?.to_string(), f.as_str()?.to_string()))
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
                     Stage::Lookup {
                         from: from.to_string(),
                         local_field: local_field.to_string(),
                         foreign_field: foreign_field.to_string(),
                         as_field: as_field.to_string(),
+                        extra_pairs,
                     }
                 }
                 _ => {
@@ -2017,7 +2047,8 @@ impl Pipeline {
                     local_field,
                     foreign_field,
                     as_field,
-                } => exec_lookup(current, from, local_field, foreign_field, as_field, lookup_fn)?,
+                    extra_pairs,
+                } => exec_lookup(current, from, local_field, foreign_field, as_field, extra_pairs, lookup_fn)?,
             };
         }
         Ok(current)
@@ -2554,7 +2585,7 @@ mod tests {
         };
 
         let result =
-            exec_lookup(docs, "inventory", "item", "sku", "matched", &mock_lookup).unwrap();
+            exec_lookup(docs, "inventory", "item", "sku", "matched", &[], &mock_lookup).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["matched"].as_array().unwrap().len(), 1);
         assert_eq!(result[1]["matched"].as_array().unwrap().len(), 2);

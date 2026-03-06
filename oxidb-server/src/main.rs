@@ -1,10 +1,9 @@
+#[cfg(not(target_os = "windows"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 /// Configure jemalloc to aggressively return freed memory to the OS.
-/// `background_thread:true` enables periodic dirty page purging.
-/// `dirty_decay_ms:100` purges dirty pages after 100ms (default 10s).
-/// `muzzy_decay_ms:100` purges muzzy pages after 100ms (default 10s).
+#[cfg(not(target_os = "windows"))]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "malloc_conf")]
 pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:100,muzzy_decay_ms:100\0";
@@ -274,6 +273,16 @@ fn dispatch_request(
             log_audit(state, session, &cmd, None, "ok", name);
             return handler::ok_bytes(serde_json::json!(format!("switched to database '{name}'")));
         }
+        "set_dialect" => {
+            let dialect_str = match request.get("dialect").and_then(|v| v.as_str()) {
+                Some(d) => d,
+                None => return handler::err_bytes("missing 'dialect' (mysql, postgresql, mssql, generic)"),
+            };
+            let dialect = oxidb::SqlDialect::from_str(dialect_str);
+            session.set_sql_dialect(dialect);
+            log_audit(state, session, &cmd, None, "ok", dialect_str);
+            return handler::ok_bytes(serde_json::json!(format!("SQL dialect set to {dialect:?}")));
+        }
         _ => {}
     }
 
@@ -310,7 +319,12 @@ fn dispatch_request(
             Some(q) => q,
             None => return handler::err_bytes("missing 'query' string"),
         };
-        match oxidb::sql::execute_sql_with_db_manager(&target_db, query_str, Some(&state.db_manager)) {
+        let dialect = request
+            .get("dialect")
+            .and_then(|v| v.as_str())
+            .map(oxidb::SqlDialect::from_str)
+            .unwrap_or(session.sql_dialect);
+        match oxidb::sql::execute_sql_with_db_manager(&target_db, query_str, Some(&state.db_manager), dialect) {
             Ok(result) => match result {
                 oxidb::SqlResult::Select(docs) => handler::ok_bytes(serde_json::json!(docs)),
                 oxidb::SqlResult::Insert(ids) => handler::ok_bytes(serde_json::json!({ "ids": ids })),
@@ -514,15 +528,17 @@ fn handle_connection(
             }
         };
 
-        let request: serde_json::Value = match serde_json::from_slice(&msg) {
+        let (request, wire_fmt) = match protocol::deserialize_message(&msg) {
             Ok(v) => v,
             Err(e) => {
                 let resp =
-                    serde_json::json!({"ok": false, "error": format!("invalid JSON: {e}")});
-                let _ = protocol::write_message(&mut writer, resp.to_string().as_bytes());
+                    serde_json::json!({"ok": false, "error": e});
+                let resp_bytes = protocol::serialize_response(&resp, protocol::WireFormat::Json);
+                let _ = protocol::write_message(&mut writer, &resp_bytes);
                 continue;
             }
         };
+        protocol::set_wire_format(wire_fmt);
 
         // Check for watch command
         match try_watch_request(&request, state, &session) {
@@ -564,7 +580,12 @@ fn handle_connection(
             Ok(None) => {}
         }
 
-        let resp_bytes = dispatch_request(&request, state, &mut session, &mut active_tx, peer);
+        // Pipeline command: process multiple commands in one roundtrip
+        let resp_bytes = if request.get("cmd").and_then(|v| v.as_str()) == Some("pipeline") {
+            handle_pipeline(&request, state, &mut session, &mut active_tx, peer)
+        } else {
+            dispatch_request(&request, state, &mut session, &mut active_tx, peer)
+        };
 
         if let Err(e) = protocol::write_message(&mut writer, &resp_bytes) {
             server_log!(state, GelfLevel::Error, format!("write error to {peer}: {e}"), extra: "peer" => peer);
@@ -574,6 +595,76 @@ fn handle_connection(
 
     if let Some(tx_id) = active_tx {
         let _ = state.db.rollback_transaction(tx_id);
+    }
+}
+
+/// Process a pipeline command: execute multiple commands in one roundtrip.
+/// Request: {"cmd":"pipeline","commands":[{...},{...},...]}
+/// Response: {"ok":true,"data":[<result1>,<result2>,...]}
+/// Each result is the raw bytes of the individual command response.
+fn handle_pipeline(
+    request: &serde_json::Value,
+    state: &ServerState,
+    session: &mut Session,
+    active_tx: &mut Option<u64>,
+    peer: &str,
+) -> Vec<u8> {
+    let commands = match request.get("commands").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return handler::err_bytes("pipeline: missing 'commands' array"),
+    };
+
+    match protocol::wire_format() {
+        protocol::WireFormat::Json => {
+            let mut buf = Vec::with_capacity(commands.len() * 128 + 64);
+            buf.extend_from_slice(b"{\"ok\":true,\"data\":[");
+            for (i, cmd) in commands.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                let resp = dispatch_request(cmd, state, session, active_tx, peer);
+                buf.extend_from_slice(&resp);
+            }
+            buf.extend_from_slice(b"]}");
+            buf
+        }
+        protocol::WireFormat::MsgPack => {
+            let mut buf = Vec::with_capacity(commands.len() * 128 + 64);
+            rmp::encode::write_map_len(&mut buf, 2).unwrap();
+            rmp::encode::write_str(&mut buf, "ok").unwrap();
+            rmp::encode::write_bool(&mut buf, true).unwrap();
+            rmp::encode::write_str(&mut buf, "data").unwrap();
+            rmp::encode::write_array_len(&mut buf, commands.len() as u32).unwrap();
+            for cmd in commands {
+                let resp = dispatch_request(cmd, state, session, active_tx, peer);
+                buf.extend_from_slice(&resp);
+            }
+            buf
+        }
+        protocol::WireFormat::OxiWire => {
+            // OxiWire pipeline: each sub-response is an OxiWire envelope [0xDB][status][value].
+            // We need to wrap them as maps {ok: bool, data/error: ...} inside the outer array.
+            let mut sub_values = Vec::with_capacity(commands.len());
+            for cmd in commands {
+                let resp = dispatch_request(cmd, state, session, active_tx, peer);
+                // resp is OxiWire: [0xDB][status][value]
+                // Decode it to reconstruct as a map value
+                if resp.len() >= 2 && resp[0] == oxidb_server::oxiwire::MAGIC {
+                    let status = resp[1];
+                    let mut pos = 2;
+                    let val = oxidb_server::oxiwire::decode_value(&resp, &mut pos)
+                        .unwrap_or(serde_json::Value::Null);
+                    if status == 0 {
+                        sub_values.push(serde_json::json!({"ok": true, "data": val}));
+                    } else {
+                        sub_values.push(serde_json::json!({"ok": false, "error": val}));
+                    }
+                } else {
+                    sub_values.push(serde_json::Value::Null);
+                }
+            }
+            handler::ok_bytes(serde_json::json!(sub_values))
+        }
     }
 }
 
@@ -605,15 +696,17 @@ fn handle_connection_single<S: Read + Write>(
             }
         };
 
-        let request: serde_json::Value = match serde_json::from_slice(&msg) {
+        let (request, wire_fmt) = match protocol::deserialize_message(&msg) {
             Ok(v) => v,
             Err(e) => {
                 let resp =
-                    serde_json::json!({"ok": false, "error": format!("invalid JSON: {e}")});
-                let _ = protocol::write_message(stream, resp.to_string().as_bytes());
+                    serde_json::json!({"ok": false, "error": e});
+                let resp_bytes = protocol::serialize_response(&resp, protocol::WireFormat::Json);
+                let _ = protocol::write_message(stream, &resp_bytes);
                 continue;
             }
         };
+        protocol::set_wire_format(wire_fmt);
 
         // Intercept watch/unwatch — not supported over TLS (can't split the stream)
         if request.get("cmd").and_then(|v| v.as_str()) == Some("watch") {
@@ -622,13 +715,17 @@ fn handle_connection_single<S: Read + Write>(
             continue;
         }
 
-        let resp_bytes = dispatch_request(
-            &request,
-            state,
-            &mut session,
-            &mut active_tx,
-            peer,
-        );
+        let resp_bytes = if request.get("cmd").and_then(|v| v.as_str()) == Some("pipeline") {
+            handle_pipeline(&request, state, &mut session, &mut active_tx, peer)
+        } else {
+            dispatch_request(
+                &request,
+                state,
+                &mut session,
+                &mut active_tx,
+                peer,
+            )
+        };
 
         if let Err(e) = protocol::write_message(stream, &resp_bytes) {
             server_log!(state, GelfLevel::Error, format!("write error to {peer}: {e}"), extra: "peer" => peer);

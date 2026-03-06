@@ -727,6 +727,567 @@ fn main() {
     println!("  OxiDB:   {:.1} MB", oxi_size as f64 / 1_048_576.0);
     println!("  SQLite:  {:.1} MB", sql_size as f64 / 1_048_576.0);
     println!();
+
+    // ── HTML Report ──────────────────────────────────────────────────────────
+    generate_html_report(
+        &results,
+        oxi_insert_ms,
+        sql_insert_ms,
+        insert_ratio,
+        oxi_size,
+        sql_size,
+    );
+}
+
+fn get_cpu_name() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if let Ok(out) = Command::new("sysctl").args(["-n", "machdep.cpu.brand_string"]).output() {
+            return String::from_utf8_lossy(&out.stdout).trim().to_string();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/cpuinfo") {
+            for line in content.lines() {
+                if line.starts_with("model name") {
+                    if let Some(name) = line.split(':').nth(1) {
+                        return name.trim().to_string();
+                    }
+                }
+            }
+        }
+    }
+    format!("{} ({} cores)", std::env::consts::ARCH, num_cpus())
+}
+
+fn get_total_ram() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if let Ok(out) = Command::new("sysctl").args(["-n", "hw.memsize"]).output() {
+            if let Ok(bytes) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                return format!("{} GB", bytes / (1024 * 1024 * 1024));
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
+            for line in content.lines() {
+                if line.starts_with("MemTotal") {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if let Ok(kb) = parts.get(1).unwrap_or(&"0").parse::<u64>() {
+                        return format!("{} GB", kb / (1024 * 1024));
+                    }
+                }
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
+fn num_cpus() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+fn generate_html_report(
+    results: &[BenchResult],
+    oxi_insert_ms: f64,
+    sql_insert_ms: f64,
+    insert_ratio: f64,
+    oxi_disk: u64,
+    sql_disk: u64,
+) {
+    let oxi_wins = 1_usize.wrapping_sub(1) // start at 0
+        + if oxi_insert_ms <= sql_insert_ms { 1 } else { 0 }
+        + results.iter().filter(|r| r.winner == "OxiDB").count();
+    let sql_wins = if sql_insert_ms < oxi_insert_ms { 1 } else { 0 }
+        + results.iter().filter(|r| r.winner == "SQLite").count();
+
+    let cpu = get_cpu_name();
+    let ram = get_total_ram();
+    let cores = num_cpus();
+    let os_arch = format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH);
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+    let total_tests = results.len() + 1; // +1 for insert
+
+    // Categorize results
+    let mut categories: Vec<(&str, Vec<&BenchResult>)> = Vec::new();
+    let mut finds = Vec::new();
+    let mut counts = Vec::new();
+    let mut aggs = Vec::new();
+    let mut updates = Vec::new();
+    for r in results {
+        if r.test.starts_with("Find") {
+            finds.push(r);
+        } else if r.test.starts_with("Count") {
+            counts.push(r);
+        } else if r.test.starts_with("Agg") {
+            aggs.push(r);
+        } else {
+            updates.push(r);
+        }
+    }
+    if !finds.is_empty() { categories.push(("Queries", finds)); }
+    if !counts.is_empty() { categories.push(("Counts", counts)); }
+    if !aggs.is_empty() { categories.push(("Aggregation", aggs)); }
+    if !updates.is_empty() { categories.push(("Updates &amp; Deletes", updates)); }
+
+    let cat_icon = |name: &str| -> &str {
+        match name {
+            "Queries" => "&#128269;",
+            "Counts" => "&#35;",
+            "Aggregation" => "&#8721;",
+            "Updates &amp; Deletes" => "&#9998;",
+            _ => "&#9679;",
+        }
+    };
+
+    let fmt_ms = |ms: f64| -> String {
+        if ms < 1.0 { format!("{:.0}&micro;s", ms * 1000.0) }
+        else if ms < 1000.0 { format!("{:.1}ms", ms) }
+        else { format!("{:.2}s", ms / 1000.0) }
+    };
+
+    let mut html = String::with_capacity(32_000);
+
+    html.push_str(&format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OxiDB vs SQLite — Embedded Benchmark</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Outfit:wght@300;400;500;600;700;800;900&display=swap');
+
+*{{margin:0;padding:0;box-sizing:border-box}}
+
+:root{{
+  --bg:#06080c;--surface:#0c1018;--card:#111820;--border:#1a2332;
+  --text:#c8d6e5;--dim:#5a6a7e;--bright:#e8f0f8;
+  --oxi:#22d666;--oxi-dim:#1a4a2e;--oxi-glow:rgba(34,214,102,0.12);
+  --sql:#60a5fa;--sql-dim:#1a2a4a;--sql-glow:rgba(96,165,250,0.12);
+  --accent:#f0c040;--red:#e84057;
+}}
+
+body{{
+  font-family:'Outfit',system-ui,sans-serif;
+  background:var(--bg);color:var(--text);
+  min-height:100vh;overflow-x:hidden;
+}}
+
+body::before{{
+  content:'';position:fixed;inset:0;z-index:9999;pointer-events:none;
+  opacity:0.025;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}}
+
+body::after{{
+  content:'';position:fixed;top:0;left:0;right:0;height:2px;z-index:100;
+  background:linear-gradient(90deg,transparent,var(--oxi),var(--accent),var(--sql),transparent);
+}}
+
+.wrap{{max-width:1100px;margin:0 auto;padding:48px 24px 80px}}
+
+header{{margin-bottom:32px}}
+header h1{{
+  font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;
+  color:var(--dim);letter-spacing:3px;text-transform:uppercase;margin-bottom:12px;
+}}
+header .title{{
+  font-size:42px;font-weight:800;letter-spacing:-1px;
+  background:linear-gradient(135deg,var(--oxi) 0%,#40e8a0 40%,var(--sql) 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  line-height:1.1;margin-bottom:16px;
+}}
+header .meta{{
+  font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--dim);
+  display:flex;gap:24px;flex-wrap:wrap;
+}}
+header .meta span::before{{content:'› ';color:var(--border)}}
+
+.methodology{{
+  font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.7;
+  color:var(--dim);margin-bottom:32px;padding:20px 24px;
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+}}
+.methodology strong{{color:var(--text);font-weight:600}}
+.methodology .hl-oxi{{color:var(--oxi)}}
+.methodology .hl-sql{{color:var(--sql)}}
+
+.env-panel{{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:24px 28px;margin-bottom:36px;position:relative;overflow:hidden;
+}}
+.env-panel::before{{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,var(--oxi),var(--border),var(--sql));
+}}
+.env-title{{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;
+  color:var(--dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;
+}}
+.env-grid{{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px 24px;
+}}
+.env-item{{display:flex;flex-direction:column;gap:2px}}
+.env-label{{
+  font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;
+  color:var(--dim);letter-spacing:1px;text-transform:uppercase;
+}}
+.env-value{{
+  font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;
+  color:var(--bright);
+}}
+
+.score-strip{{
+  display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:0;
+  background:var(--surface);border:1px solid var(--border);border-radius:16px;
+  padding:32px 40px;margin-bottom:48px;position:relative;overflow:hidden;
+}}
+.score-strip::before{{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(135deg,var(--oxi-glow),transparent 50%,var(--sql-glow));
+  pointer-events:none;
+}}
+.score-side{{text-align:center;position:relative}}
+.score-side .db-label{{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;
+  letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;
+}}
+.score-side .db-label.oxi{{color:var(--oxi)}}
+.score-side .db-label.sql{{color:var(--sql)}}
+.score-num{{font-size:72px;font-weight:900;line-height:1;letter-spacing:-3px}}
+.score-num.oxi{{color:var(--oxi)}}
+.score-num.sql{{color:var(--sql)}}
+.score-sub{{font-size:13px;color:var(--dim);margin-top:6px;font-weight:500}}
+.score-vs{{
+  font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;
+  color:var(--border);padding:0 24px;
+  display:flex;flex-direction:column;align-items:center;gap:4px;
+}}
+.score-vs::before,.score-vs::after{{content:'';width:1px;height:32px;background:var(--border)}}
+
+.cat{{margin-bottom:36px}}
+.cat-head{{
+  display:flex;align-items:center;gap:10px;
+  padding:14px 0;margin-bottom:2px;border-bottom:1px solid var(--border);
+}}
+.cat-icon{{
+  width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+  background:var(--card);border:1px solid var(--border);border-radius:8px;font-size:14px;flex-shrink:0;
+}}
+.cat-name{{font-size:16px;font-weight:700;color:var(--bright)}}
+.cat-count{{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim);margin-left:auto}}
+
+.row{{
+  display:grid;grid-template-columns:1fr 300px 100px;align-items:center;gap:16px;
+  padding:14px 0;border-bottom:1px solid rgba(26,35,50,0.6);transition:background 0.15s;
+}}
+.row:last-child{{border-bottom:none}}
+.row:hover{{background:rgba(34,214,102,0.02)}}
+.row-label{{font-size:14px;font-weight:500;color:var(--text)}}
+.row-label .row-counts{{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim)}}
+
+.duel{{display:flex;flex-direction:column;gap:5px}}
+.duel-row{{display:flex;align-items:center;gap:8px}}
+.duel-label{{
+  font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;
+  width:50px;text-align:right;flex-shrink:0;
+}}
+.duel-label.oxi{{color:var(--oxi)}}
+.duel-label.sql{{color:var(--sql)}}
+.duel-track{{flex:1;height:18px;background:var(--bg);border-radius:3px;overflow:hidden;position:relative}}
+.duel-fill{{height:100%;border-radius:3px;position:relative;transition:width 0.8s cubic-bezier(0.16,1,0.3,1)}}
+.duel-fill.oxi{{background:linear-gradient(90deg,var(--oxi-dim),var(--oxi))}}
+.duel-fill.sql{{background:linear-gradient(90deg,var(--sql-dim),var(--sql))}}
+.duel-fill.winner{{box-shadow:0 0 12px rgba(34,214,102,0.3)}}
+.duel-fill.winner.sql{{box-shadow:0 0 12px rgba(96,165,250,0.3)}}
+.duel-time{{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:500;
+  color:var(--dim);width:70px;flex-shrink:0;
+}}
+
+.result{{text-align:right}}
+.badge{{
+  display:inline-block;font-family:'JetBrains Mono',monospace;
+  font-size:11px;font-weight:700;padding:3px 10px;border-radius:4px;letter-spacing:0.5px;
+}}
+.badge-oxi{{background:var(--oxi-dim);color:var(--oxi)}}
+.badge-sql{{background:var(--sql-dim);color:var(--sql)}}
+.badge-tie{{background:var(--card);color:var(--dim)}}
+.speedup{{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--accent);display:block;margin-top:3px}}
+
+.res-grid{{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:8px}}
+.res-card{{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:24px;position:relative;overflow:hidden;
+}}
+.res-card::before{{content:'';position:absolute;top:0;left:0;right:0;height:2px}}
+.res-card.disk::before{{background:linear-gradient(90deg,var(--oxi),var(--sql))}}
+.res-title{{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;
+  color:var(--dim);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:20px;
+}}
+.res-bars{{display:flex;flex-direction:column;gap:12px}}
+.res-row{{display:flex;align-items:center;gap:12px}}
+.res-db{{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;width:60px;flex-shrink:0}}
+.res-db.oxi{{color:var(--oxi)}}
+.res-db.sql{{color:var(--sql)}}
+.res-track{{flex:1;height:24px;background:var(--bg);border-radius:4px;overflow:hidden}}
+.res-fill{{height:100%;border-radius:4px;display:flex;align-items:center;padding:0 10px;min-width:fit-content}}
+.res-fill.oxi{{background:linear-gradient(90deg,var(--oxi-dim),rgba(34,214,102,0.35))}}
+.res-fill.sql{{background:linear-gradient(90deg,var(--sql-dim),rgba(96,165,250,0.35))}}
+.res-val{{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:var(--bright);white-space:nowrap}}
+
+footer{{
+  margin-top:56px;padding-top:24px;border-top:1px solid var(--border);
+  display:flex;justify-content:space-between;align-items:center;
+  font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim);
+}}
+footer .oxi-tag{{color:var(--oxi)}}
+
+@keyframes grow{{from{{width:0}}to{{width:var(--w)}}}}
+.duel-fill,.res-fill{{animation:grow 0.8s cubic-bezier(0.16,1,0.3,1) forwards;width:0}}
+
+@media(max-width:768px){{
+  .score-strip{{grid-template-columns:1fr;gap:16px;padding:24px}}
+  .score-vs{{flex-direction:row;padding:8px 0}}
+  .score-vs::before,.score-vs::after{{width:32px;height:1px}}
+  .row{{grid-template-columns:1fr;gap:8px}}
+  .res-grid{{grid-template-columns:1fr}}
+  header .title{{font-size:28px}}
+  .score-num{{font-size:48px}}
+}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>embedded benchmark report</h1>
+  <div class="title">OxiDB vs SQLite</div>
+  <div class="meta">
+    <span>{total_tests} tests</span>
+    <span>{TOTAL_DOCS_FMT}K documents</span>
+    <span>{now}</span>
+    <span>best of 3 runs</span>
+  </div>
+</header>
+
+<div class="methodology">
+  Both databases run <strong>in-process</strong> (embedded, no network overhead).
+  <span class="hl-oxi">OxiDB</span> uses its native Rust API;
+  <span class="hl-sql">SQLite</span> uses <strong>rusqlite</strong> with WAL mode, mmap, and dedicated columns with indexes.
+  Data is stored on a temp directory. Each query test runs <strong>3 times</strong> and reports the best result.
+  SQLite has <strong>ANALYZE</strong> run after index creation for optimal query planning.
+</div>
+
+<div class="env-panel">
+  <div class="env-title">&#9881; Test Environment</div>
+  <div class="env-grid">
+    <div class="env-item"><div class="env-label">CPU</div><div class="env-value">{cpu}</div></div>
+    <div class="env-item"><div class="env-label">Cores</div><div class="env-value">{cores}</div></div>
+    <div class="env-item"><div class="env-label">Memory</div><div class="env-value">{ram}</div></div>
+    <div class="env-item"><div class="env-label">OS / Arch</div><div class="env-value">{os_arch}</div></div>
+    <div class="env-item"><div class="env-label">Rust</div><div class="env-value">{rust_ver}</div></div>
+    <div class="env-item"><div class="env-label">Storage</div><div class="env-value">temp directory (SSD)</div></div>
+  </div>
+</div>
+
+<div class="score-strip">
+  <div class="score-side">
+    <div class="db-label oxi">OxiDB</div>
+    <div class="score-num oxi">{oxi_wins}</div>
+    <div class="score-sub">wins</div>
+  </div>
+  <div class="score-vs">VS</div>
+  <div class="score-side">
+    <div class="db-label sql">SQLite</div>
+    <div class="score-num sql">{sql_wins}</div>
+    <div class="score-sub">wins</div>
+  </div>
+</div>
+"#,
+        total_tests = total_tests,
+        TOTAL_DOCS_FMT = TOTAL_DOCS / 1000,
+        now = now,
+        cpu = cpu,
+        cores = cores,
+        ram = ram,
+        os_arch = os_arch,
+        rust_ver = env!("CARGO_PKG_RUST_VERSION", "stable"),
+        oxi_wins = oxi_wins,
+        sql_wins = sql_wins,
+    ));
+
+    // Insert section
+    {
+        let max_dur = oxi_insert_ms.max(sql_insert_ms);
+        let oxi_pct = oxi_insert_ms / max_dur * 100.0;
+        let sql_pct = sql_insert_ms / max_dur * 100.0;
+        let (badge, speedup, oxi_w, sql_w) = if oxi_insert_ms <= sql_insert_ms {
+            (r#"<span class="badge badge-oxi">OxiDB</span>"#, insert_ratio, " winner", "")
+        } else {
+            (r#"<span class="badge badge-sql">SQLite</span>"#, oxi_insert_ms / sql_insert_ms, "", " winner")
+        };
+
+        html.push_str(&format!(r#"<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">&#9654;</div>
+  <div class="cat-name">Bulk Insert</div>
+  <div class="cat-count">1 test</div>
+</div>
+<div class="row">
+  <div class="row-label">Insert {total} documents <span class="row-counts">{total} / {total}</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi{oxi_w}" style="--w:{oxi_pct:.0}%;width:0"></div></div>
+      <div class="duel-time">{oxi_time}</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label sql">SQLite</div>
+      <div class="duel-track"><div class="duel-fill sql{sql_w}" style="--w:{sql_pct:.0}%;width:0"></div></div>
+      <div class="duel-time">{sql_time}</div>
+    </div>
+  </div>
+  <div class="result">{badge}<span class="speedup">{speedup:.1}x faster</span></div>
+</div>
+</div>
+"#,
+            total = TOTAL_DOCS,
+            oxi_w = oxi_w,
+            oxi_pct = oxi_pct,
+            oxi_time = fmt_ms(oxi_insert_ms),
+            sql_w = sql_w,
+            sql_pct = sql_pct,
+            sql_time = fmt_ms(sql_insert_ms),
+            badge = badge,
+            speedup = speedup,
+        ));
+    }
+
+    // Category sections
+    for (cat_name, entries) in &categories {
+        html.push_str(&format!(
+            r#"<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">{icon}</div>
+  <div class="cat-name">{name}</div>
+  <div class="cat-count">{count} tests</div>
+</div>
+"#,
+            icon = cat_icon(cat_name),
+            name = cat_name,
+            count = entries.len(),
+        ));
+
+        for r in entries {
+            let max_dur = r.oxidb_ms.max(r.sqlite_ms);
+            let oxi_pct = if max_dur > 0.0 { r.oxidb_ms / max_dur * 100.0 } else { 50.0 };
+            let sql_pct = if max_dur > 0.0 { r.sqlite_ms / max_dur * 100.0 } else { 50.0 };
+
+            let (badge, speedup_html, oxi_w, sql_w) = if r.oxidb_ms <= r.sqlite_ms {
+                (
+                    r#"<span class="badge badge-oxi">OxiDB</span>"#,
+                    format!(r#"<span class="speedup">{:.1}x faster</span>"#, r.ratio),
+                    " winner", "",
+                )
+            } else {
+                (
+                    r#"<span class="badge badge-sql">SQLite</span>"#,
+                    format!(r#"<span class="speedup">{:.1}x faster</span>"#, r.oxidb_ms / r.sqlite_ms),
+                    "", " winner",
+                )
+            };
+
+            html.push_str(&format!(
+                r#"<div class="row">
+  <div class="row-label">{label}</div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi{oxi_w}" style="--w:{oxi_pct:.0}%;width:0"></div></div>
+      <div class="duel-time">{oxi_time}</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label sql">SQLite</div>
+      <div class="duel-track"><div class="duel-fill sql{sql_w}" style="--w:{sql_pct:.0}%;width:0"></div></div>
+      <div class="duel-time">{sql_time}</div>
+    </div>
+  </div>
+  <div class="result">{badge}{speedup}</div>
+</div>
+"#,
+                label = r.test,
+                oxi_w = oxi_w,
+                oxi_pct = oxi_pct,
+                oxi_time = fmt_ms(r.oxidb_ms),
+                sql_w = sql_w,
+                sql_pct = sql_pct,
+                sql_time = fmt_ms(r.sqlite_ms),
+                badge = badge,
+                speedup = speedup_html,
+            ));
+        }
+        html.push_str("</div>\n");
+    }
+
+    // Disk usage section
+    let oxi_mb = oxi_disk as f64 / 1_048_576.0;
+    let sql_mb = sql_disk as f64 / 1_048_576.0;
+    let max_mb = oxi_mb.max(sql_mb);
+    let oxi_pct = if max_mb > 0.0 { oxi_mb / max_mb * 100.0 } else { 50.0 };
+    let sql_pct = if max_mb > 0.0 { sql_mb / max_mb * 100.0 } else { 50.0 };
+
+    html.push_str(&format!(r#"<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">&#9881;</div>
+  <div class="cat-name">Resources</div>
+</div>
+<div class="res-grid">
+  <div class="res-card disk">
+    <div class="res-title">Disk Usage</div>
+    <div class="res-bars">
+      <div class="res-row">
+        <div class="res-db oxi">OxiDB</div>
+        <div class="res-track"><div class="res-fill oxi" style="--w:{oxi_pct:.0}%;width:0"><span class="res-val">{oxi_mb:.1} MB</span></div></div>
+      </div>
+      <div class="res-row">
+        <div class="res-db sql">SQLite</div>
+        <div class="res-track"><div class="res-fill sql" style="--w:{sql_pct:.0}%;width:0"><span class="res-val">{sql_mb:.1} MB</span></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+</div>
+"#,
+        oxi_pct = oxi_pct,
+        oxi_mb = oxi_mb,
+        sql_pct = sql_pct,
+        sql_mb = sql_mb,
+    ));
+
+    html.push_str(&format!(r#"
+<footer>
+  <span><span class="oxi-tag">OxiDB</span> embedded benchmark suite</span>
+  <span>{} tests</span>
+</footer>
+
+</div>
+</body>
+</html>"#, total_tests));
+
+    let report_path = "tests/comparison-sqlite/report.html";
+    let _ = std::fs::create_dir_all("tests/comparison-sqlite");
+    if let Err(e) = std::fs::write(report_path, &html) {
+        eprintln!("Failed to write HTML report: {e}");
+        return;
+    }
+    println!("  HTML Report: {report_path}");
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {

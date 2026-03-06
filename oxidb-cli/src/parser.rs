@@ -37,8 +37,26 @@ pub fn parse(input: &str) -> Result<Value, String> {
         return match what {
             "collections" => Ok(json!({"cmd": "list_collections"})),
             "buckets" => Ok(json!({"cmd": "list_buckets"})),
+            "databases" | "dbs" => Ok(json!({"cmd": "list_databases"})),
+            "schedules" => Ok(json!({"cmd": "list_schedules"})),
             _ => Err(format!("unknown: show {what}")),
         };
+    }
+
+    // SQL: anything that looks like a SQL statement
+    {
+        let upper = input.to_uppercase();
+        if upper.starts_with("SELECT ")
+            || upper.starts_with("INSERT ")
+            || upper.starts_with("UPDATE ")
+            || upper.starts_with("DELETE ")
+            || upper.starts_with("CREATE TABLE ")
+            || upper.starts_with("DROP TABLE ")
+            || upper.starts_with("CREATE INDEX ")
+            || upper.starts_with("SHOW TABLES")
+        {
+            return Ok(json!({"cmd": "sql", "query": input}));
+        }
     }
 
     // Everything else must start with "db."
@@ -87,6 +105,22 @@ fn try_parse_db_method(input: &str) -> Result<Option<Value>, String> {
         "beginTransaction" => Ok(Some(json!({"cmd": "begin_tx"}))),
         "commitTransaction" => Ok(Some(json!({"cmd": "commit_tx"}))),
         "rollbackTransaction" => Ok(Some(json!({"cmd": "rollback_tx"}))),
+        "createDatabase" => {
+            let name = parse_string_arg(args_str)?;
+            Ok(Some(json!({"cmd": "create_database", "name": name})))
+        }
+        "dropDatabase" => {
+            let name = parse_string_arg(args_str)?;
+            Ok(Some(json!({"cmd": "drop_database", "name": name})))
+        }
+        "useDatabase" | "use" => {
+            let name = parse_string_arg(args_str)?;
+            Ok(Some(json!({"cmd": "use_db", "name": name})))
+        }
+        "backup" => {
+            let path = parse_string_arg(args_str)?;
+            Ok(Some(json!({"cmd": "backup", "path": path})))
+        }
         "search" => {
             let args = split_args(args_str)?;
             if args.is_empty() {
@@ -251,6 +285,47 @@ fn build_method_command(
         "aggregate" => {
             let pipeline: Value = parse_json_arg(args_str)?;
             Ok(json!({"cmd": "aggregate", "collection": collection, "pipeline": pipeline}))
+        }
+        "listIndexes" => {
+            Ok(json!({"cmd": "list_indexes", "collection": collection}))
+        }
+        "dropIndex" => {
+            let index = parse_string_arg(args_str)?;
+            Ok(json!({"cmd": "drop_index", "collection": collection, "index": index}))
+        }
+        "createVectorIndex" => {
+            let args = split_args(args_str)?;
+            if args.len() < 2 {
+                return Err("createVectorIndex requires (field, dimension[, metric])".into());
+            }
+            let field = parse_string_arg(args[0])?;
+            let dimension: u64 = args[1]
+                .trim()
+                .parse()
+                .map_err(|_| "invalid dimension".to_string())?;
+            let metric = if args.len() > 2 {
+                parse_string_arg(args[2])?
+            } else {
+                "cosine".to_string()
+            };
+            Ok(json!({"cmd": "create_vector_index", "collection": collection, "field": field, "dimension": dimension, "metric": metric}))
+        }
+        "vectorSearch" => {
+            let args = split_args(args_str)?;
+            if args.len() < 2 {
+                return Err("vectorSearch requires (field, vector[, limit])".into());
+            }
+            let field = parse_string_arg(args[0])?;
+            let vector: Value = parse_json_arg(args[1])?;
+            let limit = if args.len() > 2 {
+                args[2]
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| "invalid limit".to_string())?
+            } else {
+                10
+            };
+            Ok(json!({"cmd": "vector_search", "collection": collection, "field": field, "vector": vector, "limit": limit}))
         }
         "compact" => Ok(json!({"cmd": "compact", "collection": collection})),
         "drop" => Ok(json!({"cmd": "drop_collection", "collection": collection})),

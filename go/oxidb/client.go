@@ -1,9 +1,7 @@
 // Package oxidb provides a TCP client for oxidb-server.
 //
-// Protocol: each message is [4-byte little-endian length][JSON payload].
-// Server responds with {"ok": true, "data": ...} or {"ok": false, "error": "..."}.
-//
-// Zero external dependencies — uses only the Go standard library.
+// Protocol: each message is [4-byte little-endian length][payload].
+// Server responds with OxiWire binary format or JSON.
 package oxidb
 
 import (
@@ -16,12 +14,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/parisxmas/OxiDB/go/oxiwire"
 )
 
 // Client is a TCP client for oxidb-server. Thread-safe via mutex.
 type Client struct {
-	conn net.Conn
-	mu   sync.Mutex
+	conn    net.Conn
+	mu      sync.Mutex
+	oxiwire bool // use OxiWire binary format (fastest)
 }
 
 // Connect creates a new client connected to oxidb-server.
@@ -43,6 +44,11 @@ func ConnectDefault() (*Client, error) {
 // Close closes the TCP connection.
 func (c *Client) Close() error {
 	return c.conn.Close()
+}
+
+// UseOxiWire enables OxiDB's custom binary wire protocol (fastest).
+func (c *Client) UseOxiWire() {
+	c.oxiwire = true
 }
 
 // ------------------------------------------------------------------
@@ -76,20 +82,41 @@ func (c *Client) request(payload map[string]any) (map[string]any, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	jsonBytes, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("oxidb: marshal request: %w", err)
+	var reqBytes []byte
+	var err error
+	if c.oxiwire {
+		reqBytes = oxiwire.Marshal(payload)
+	} else {
+		reqBytes, err = json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("oxidb: marshal request: %w", err)
+		}
 	}
-	if err := c.sendRaw(jsonBytes); err != nil {
+	if err := c.sendRaw(reqBytes); err != nil {
 		return nil, fmt.Errorf("oxidb: send: %w", err)
 	}
 	respBytes, err := c.recvRaw()
 	if err != nil {
 		return nil, err
 	}
+
 	var resp map[string]any
-	if err := json.Unmarshal(respBytes, &resp); err != nil {
-		return nil, fmt.Errorf("oxidb: unmarshal response: %w", err)
+	if c.oxiwire && oxiwire.IsOxiWire(respBytes) {
+		ok, data, decErr := oxiwire.DecodeResponse(respBytes)
+		if decErr != nil {
+			return nil, fmt.Errorf("oxidb: decode oxiwire response: %w", decErr)
+		}
+		resp = map[string]any{"ok": ok, "data": data}
+		if !ok {
+			if errStr, isStr := data.(string); isStr {
+				resp["error"] = errStr
+			}
+		}
+	} else {
+		err = json.Unmarshal(respBytes, &resp)
+		if err != nil {
+			return nil, fmt.Errorf("oxidb: unmarshal response: %w", err)
+		}
 	}
 	return resp, nil
 }
@@ -200,11 +227,48 @@ func (c *Client) Find(collection string, query map[string]any, opts *FindOptions
 			payload["limit"] = *opts.Limit
 		}
 	}
+
+	// Fast path: OxiWire decodes directly to []map[string]any
+	if c.oxiwire {
+		return c.findOxiWire(payload)
+	}
+
 	data, err := c.checked(payload)
 	if err != nil {
 		return nil, err
 	}
 	return toMapSlice(data), nil
+}
+
+// findOxiWire is the fast path for Find using the OxiWire protocol.
+func (c *Client) findOxiWire(payload map[string]any) ([]map[string]any, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	reqBytes := oxiwire.Marshal(payload)
+	if err := c.sendRaw(reqBytes); err != nil {
+		return nil, fmt.Errorf("oxidb: send: %w", err)
+	}
+	respBytes, err := c.recvRaw()
+	if err != nil {
+		return nil, err
+	}
+
+	if !oxiwire.IsOxiWire(respBytes) {
+		return nil, fmt.Errorf("oxidb: expected OxiWire response")
+	}
+
+	// Check for error response (status byte = 1)
+	if len(respBytes) >= 2 && respBytes[1] != 0 {
+		_, data, _ := oxiwire.DecodeResponse(respBytes)
+		errMsg, _ := data.(string)
+		if errMsg == "" {
+			errMsg = "unknown error"
+		}
+		return nil, &Error{Msg: errMsg}
+	}
+
+	return oxiwire.DecodeDocArray(respBytes)
 }
 
 // FindOne returns a single document matching a query, or nil.
@@ -583,7 +647,6 @@ func (c *Client) VectorSearch(collection, field string, vector []float64, limit 
 // ------------------------------------------------------------------
 
 // CreateSchedule creates or replaces a named schedule.
-// Pass a cron expression (e.g. "0 3 * * *") or an interval (e.g. "5m").
 func (c *Client) CreateSchedule(name, procedure string, opts map[string]any) (map[string]any, error) {
 	payload := map[string]any{"cmd": "create_schedule", "name": name, "procedure": procedure}
 	for k, v := range opts {
@@ -675,7 +738,6 @@ func (c *Client) UseDatabase(name string) error {
 // ------------------------------------------------------------------
 
 // AuthSimple authenticates with username and password (simple auth).
-// Returns the role string on success.
 func (c *Client) AuthSimple(username, password string) (string, error) {
 	data, err := c.checked(map[string]any{
 		"cmd": "auth_simple", "username": username, "password": password,
@@ -745,6 +807,51 @@ func (c *Client) RevokeDbRole(username, database string) error {
 		"database": database,
 	})
 	return err
+}
+
+// ------------------------------------------------------------------
+// Pipeline — execute multiple commands in one roundtrip
+// ------------------------------------------------------------------
+
+// Pipeline sends multiple commands to the server in a single roundtrip.
+func (c *Client) Pipeline(commands []map[string]any) ([]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "pipeline", "commands": commands})
+	if err != nil {
+		return nil, err
+	}
+	arr, _ := data.([]any)
+	return arr, nil
+}
+
+// PipelineInsertMany sends multiple insert_many commands in a single roundtrip.
+func (c *Client) PipelineInsertMany(collection string, batches [][]map[string]any) (int, error) {
+	commands := make([]map[string]any, len(batches))
+	for i, batch := range batches {
+		commands[i] = map[string]any{
+			"cmd":        "insert_many",
+			"collection": collection,
+			"docs":       batch,
+		}
+	}
+	results, err := c.Pipeline(commands)
+	if err != nil {
+		return 0, err
+	}
+	total := 0
+	for _, r := range results {
+		m, ok := r.(map[string]any)
+		if !ok {
+			continue
+		}
+		if okFlag, _ := m["ok"].(bool); !okFlag {
+			errMsg, _ := m["error"].(string)
+			return total, &Error{Msg: errMsg}
+		}
+		if data, ok := m["data"].([]any); ok {
+			total += len(data)
+		}
+	}
+	return total, nil
 }
 
 // ------------------------------------------------------------------
