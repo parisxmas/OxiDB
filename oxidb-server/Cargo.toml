@@ -1,6 +1,6 @@
 [package]
 name = "oxidb-server"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 description = "TCP server for OxiDB document database"
 
@@ -21,7 +21,12 @@ sha2 = "0.10"
 hmac = "0.12"
 rand = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
+rmp = "0.8"
+rmp-serde = "1"
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 tikv-jemallocator = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
 openraft = { version = "0.9", features = ["serde"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "time", "macros", "sync"], optional = true }
 tokio-rustls = { version = "0.26", optional = true }

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use base64::Engine;
 use oxidb::OxiDb;
 use oxidb::query::parse_find_options;
+use oxidb::vector::DistanceMetric;
 use serde_json::{Value, json};
 
 pub trait CommandExecutor {
@@ -549,6 +550,100 @@ impl CommandExecutor for EmbeddedExecutor {
                     .unwrap_or(10) as usize;
                 match self.db.search(bucket, query, limit) {
                     Ok(results) => ok_val(json!(results)),
+                    Err(e) => err_val(&e.to_string()),
+                }
+            }
+
+            // --- SQL ---
+            "sql" => {
+                let query = match request.get("query").and_then(|v| v.as_str()) {
+                    Some(q) => q,
+                    None => return err_val("missing 'query'"),
+                };
+                match oxidb::sql::execute_sql(&self.db, query) {
+                    Ok(result) => {
+                        use oxidb::sql::SqlResult;
+                        match result {
+                            SqlResult::Select(rows) => ok_val(json!(rows)),
+                            SqlResult::Insert(ids) => ok_val(json!({"inserted_ids": ids})),
+                            SqlResult::Update(n) => ok_val(json!({"modified": n})),
+                            SqlResult::Delete(n) => ok_val(json!({"deleted": n})),
+                            SqlResult::Ddl(msg) => ok_val(json!(msg)),
+                            SqlResult::UseDatabase(name) => ok_val(json!(format!("switched to {name}"))),
+                            SqlResult::ShowDatabases(dbs) => ok_val(json!(dbs)),
+                        }
+                    }
+                    Err(e) => err_val(&e.to_string()),
+                }
+            }
+
+            // --- Vector search ---
+            "create_vector_index" => {
+                let col = match collection.as_deref() {
+                    Some(c) => c,
+                    None => return err_val("missing 'collection'"),
+                };
+                let field = match request.get("field").and_then(|v| v.as_str()) {
+                    Some(f) => f,
+                    None => return err_val("missing 'field'"),
+                };
+                let dimension = match request.get("dimension").and_then(|v| v.as_u64()) {
+                    Some(d) => d as usize,
+                    None => return err_val("missing 'dimension'"),
+                };
+                let metric_str = request
+                    .get("metric")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("cosine");
+                let metric = match metric_str {
+                    "euclidean" => DistanceMetric::Euclidean,
+                    "dot_product" | "dot" => DistanceMetric::DotProduct,
+                    _ => DistanceMetric::Cosine,
+                };
+                match self.db.create_vector_index(col, field, dimension, metric) {
+                    Ok(()) => ok_val(json!("vector index created")),
+                    Err(e) => err_val(&e.to_string()),
+                }
+            }
+            "vector_search" => {
+                let col = match collection.as_deref() {
+                    Some(c) => c,
+                    None => return err_val("missing 'collection'"),
+                };
+                let field = match request.get("field").and_then(|v| v.as_str()) {
+                    Some(f) => f,
+                    None => return err_val("missing 'field'"),
+                };
+                let vector = match request.get("vector").and_then(|v| v.as_array()) {
+                    Some(arr) => arr
+                        .iter()
+                        .filter_map(|v| v.as_f64().map(|f| f as f32))
+                        .collect::<Vec<f32>>(),
+                    None => return err_val("missing 'vector' array"),
+                };
+                let limit = request
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(10) as usize;
+                match self.db.vector_search(col, field, &vector, limit, None) {
+                    Ok(results) => ok_val(json!(results)),
+                    Err(e) => err_val(&e.to_string()),
+                }
+            }
+
+            // --- Backup ---
+            "backup" => {
+                let path = match request.get("path").and_then(|v| v.as_str()) {
+                    Some(p) => p,
+                    None => return err_val("missing 'path'"),
+                };
+                match self.db.backup(Path::new(path)) {
+                    Ok(info) => ok_val(json!({
+                        "status": "backup completed",
+                        "path": info.path,
+                        "size_bytes": info.size_bytes,
+                        "collections": info.collections
+                    })),
                     Err(e) => err_val(&e.to_string()),
                 }
             }

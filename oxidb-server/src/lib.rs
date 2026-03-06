@@ -2,6 +2,7 @@ pub mod audit;
 pub mod auth;
 pub mod gelf;
 pub mod handler;
+pub mod oxiwire;
 pub mod pg_wire;
 pub mod protocol;
 pub mod rbac;

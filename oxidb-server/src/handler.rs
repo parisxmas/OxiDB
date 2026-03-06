@@ -6,25 +6,80 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::auth::{Role, UserStore};
+use crate::protocol::{self, WireFormat, value_to_msgpack};
+
+/// Serialize a single document to MsgPack.
+fn doc_to_msgpack(doc: &Arc<Value>, buf: &mut Vec<u8>) {
+    value_to_msgpack(doc.as_ref(), buf);
+}
+
+/// Serialize a single document to JSON.
+fn doc_to_json(doc: &Arc<Value>, buf: &mut Vec<u8>) {
+    serde_json::to_writer(&mut *buf, doc.as_ref()).unwrap();
+}
 
 pub fn ok_bytes(data: Value) -> Vec<u8> {
-    serde_json::to_vec(&json!({ "ok": true, "data": data })).unwrap()
+    match protocol::wire_format() {
+        WireFormat::Json => serde_json::to_vec(&json!({ "ok": true, "data": data })).unwrap(),
+        WireFormat::MsgPack => {
+            let mut buf = Vec::with_capacity(256);
+            rmp::encode::write_map_len(&mut buf, 2).unwrap();
+            rmp::encode::write_str(&mut buf, "ok").unwrap();
+            rmp::encode::write_bool(&mut buf, true).unwrap();
+            rmp::encode::write_str(&mut buf, "data").unwrap();
+            value_to_msgpack(&data, &mut buf);
+            buf
+        }
+        WireFormat::OxiWire => crate::oxiwire::ok_response(&data),
+    }
 }
 
 pub fn err_bytes(msg: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({ "ok": false, "error": msg })).unwrap()
+    match protocol::wire_format() {
+        WireFormat::Json => serde_json::to_vec(&json!({ "ok": false, "error": msg })).unwrap(),
+        WireFormat::MsgPack => {
+            let mut buf = Vec::with_capacity(64 + msg.len());
+            rmp::encode::write_map_len(&mut buf, 2).unwrap();
+            rmp::encode::write_str(&mut buf, "ok").unwrap();
+            rmp::encode::write_bool(&mut buf, false).unwrap();
+            rmp::encode::write_str(&mut buf, "error").unwrap();
+            rmp::encode::write_str(&mut buf, msg).unwrap();
+            buf
+        }
+        WireFormat::OxiWire => crate::oxiwire::err_response(msg),
+    }
 }
 
 /// Serialize find results directly from Arc references — zero Value::clone.
+/// Uses a per-thread wire cache so hot documents are never re-serialized.
+/// On first query, each doc is serialized once; on subsequent queries the
+/// pre-serialized bytes are memcpy'd directly into the response buffer.
 fn ok_docs_bytes(docs: &[Arc<Value>]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(docs.len() * 200 + 64);
-    buf.extend_from_slice(b"{\"ok\":true,\"data\":[");
-    for (i, doc) in docs.iter().enumerate() {
-        if i > 0 { buf.push(b','); }
-        serde_json::to_writer(&mut buf, doc.as_ref()).unwrap();
+    match protocol::wire_format() {
+        WireFormat::Json => {
+            let mut buf = Vec::with_capacity(docs.len() * 200 + 64);
+            buf.extend_from_slice(b"{\"ok\":true,\"data\":[");
+            for (i, doc) in docs.iter().enumerate() {
+                if i > 0 { buf.push(b','); }
+                doc_to_json(doc, &mut buf);
+            }
+            buf.extend_from_slice(b"]}");
+            buf
+        }
+        WireFormat::MsgPack => {
+            let mut buf = Vec::with_capacity(docs.len() * 150 + 64);
+            rmp::encode::write_map_len(&mut buf, 2).unwrap();
+            rmp::encode::write_str(&mut buf, "ok").unwrap();
+            rmp::encode::write_bool(&mut buf, true).unwrap();
+            rmp::encode::write_str(&mut buf, "data").unwrap();
+            rmp::encode::write_array_len(&mut buf, docs.len() as u32).unwrap();
+            for doc in docs {
+                doc_to_msgpack(doc, &mut buf);
+            }
+            buf
+        }
+        WireFormat::OxiWire => crate::oxiwire::ok_docs_response_fast(docs),
     }
-    buf.extend_from_slice(b"]}");
-    buf
 }
 
 /// Handle a single JSON request and return pre-serialized JSON response bytes.
@@ -654,7 +709,12 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 Some(q) => q,
                 None => return err_bytes("missing 'query' string"),
             };
-            match oxidb::sql::execute_sql(db, query_str) {
+            let dialect = request
+                .get("dialect")
+                .and_then(|v| v.as_str())
+                .map(oxidb::SqlDialect::from_str)
+                .unwrap_or_default();
+            match oxidb::execute_sql_with_dialect(db, query_str, dialect) {
                 Ok(result) => match result {
                     oxidb::SqlResult::Select(docs) => ok_bytes(json!(docs)),
                     oxidb::SqlResult::Insert(ids) => ok_bytes(json!({ "ids": ids })),

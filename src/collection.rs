@@ -1326,8 +1326,10 @@ impl Collection {
                 if let Some(field_idx) = self.field_indexes.get(sort_field) {
                     let need = opts.skip.unwrap_or(0) as usize + opts.limit.unwrap_or(u64::MAX) as usize;
                     let mut results = Vec::new();
-                    let skip_filter = matches!(query, Query::All)
-                        || query::is_fully_indexed(&query, &self.field_indexes);
+                    // In index-backed sort we iterate the SORT field's index,
+                    // NOT the query fields' indexes — so we can only skip filtering
+                    // when there is no query filter at all.
+                    let skip_filter = matches!(query, Query::All);
 
                     match sort_order {
                         SortOrder::Asc => {
@@ -1554,35 +1556,103 @@ impl Collection {
                 }
             }
         } else {
-            // No index — stream entire collection with zero-decode filter.
-            // Try raw JSONB matching first (extracts only queried fields);
-            // fall back to full decode only for legacy JSON text or on match.
-            self.storage.scan_readonly_while(|bytes| {
-                // Fast path: evaluate predicate on raw JSONB without full decode
-                if let Some(matched) = query::matches_raw_jsonb(&query, bytes) {
-                    if matched {
-                        let doc: Value = crate::codec::decode_doc(bytes)?;
-                        results.push(Arc::new(doc));
-                        if let Some(limit) = early_limit {
-                            if results.len() >= limit {
-                                return Ok(false);
-                            }
-                        }
+            // No index — iterate all documents via parallel cache-first path.
+            // Probes LRU cache first (zero-cost for warm cache), falls
+            // back to disk + decompress only for cache misses.
+            let ids: Vec<DocumentId> = self.primary_index.keys().copied().collect();
+            let cached = self.doc_cache.get_many(&ids);
+
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4);
+
+            // Phase 1: parallel query matching on cached documents
+            let mut miss_indices: Vec<usize> = Vec::new();
+            if cached.len() >= 10_000 && num_threads > 1 && early_limit.is_none() {
+                let chunk_size = (cached.len() + num_threads - 1) / num_threads;
+                let (par_results, par_misses) = std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..num_threads)
+                        .map(|t| {
+                            let start = t * chunk_size;
+                            let end = ((t + 1) * chunk_size).min(cached.len());
+                            let slice = &cached[start..end];
+                            let q = &query;
+                            s.spawn(move || {
+                                let mut local_hits: Vec<Arc<Value>> = Vec::new();
+                                let mut local_miss: Vec<usize> = Vec::new();
+                                for (j, opt) in slice.iter().enumerate() {
+                                    if let Some(arc) = opt {
+                                        if query::matches_value(q, arc) {
+                                            local_hits.push(Arc::clone(arc));
+                                        }
+                                    } else {
+                                        local_miss.push(start + j);
+                                    }
+                                }
+                                (local_hits, local_miss)
+                            })
+                        })
+                        .collect();
+                    let mut all_results: Vec<Arc<Value>> = Vec::new();
+                    let mut all_misses: Vec<usize> = Vec::new();
+                    for h in handles {
+                        let (r, m) = h.join().unwrap();
+                        all_results.extend(r);
+                        all_misses.extend(m);
                     }
-                } else {
-                    // Legacy JSON text — fall back to full decode + match
-                    let doc: Value = crate::codec::decode_doc(bytes)?;
-                    if query::matches_value(&query, &doc) {
-                        results.push(Arc::new(doc));
-                        if let Some(limit) = early_limit {
-                            if results.len() >= limit {
-                                return Ok(false);
+                    (all_results, all_misses)
+                });
+                results.extend(par_results);
+                miss_indices = par_misses;
+            } else {
+                // Sequential path: small collections or queries with limit
+                for (i, opt) in cached.into_iter().enumerate() {
+                    if let Some(arc) = opt {
+                        if query::matches_value(&query, &arc) {
+                            results.push(arc);
+                            if let Some(limit) = early_limit {
+                                if results.len() >= limit {
+                                    break;
+                                }
                             }
                         }
+                    } else {
+                        miss_indices.push(i);
                     }
                 }
-                Ok(true)
-            })?;
+            }
+
+            // Phase 2: batch-read cache misses from disk (if any and not already at limit)
+            let at_limit = early_limit.map_or(false, |l| results.len() >= l);
+            if !miss_indices.is_empty() && !at_limit {
+                let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = miss_indices
+                    .iter()
+                    .filter_map(|&i| {
+                        self.primary_index.get(&ids[i]).map(|&loc| (i, loc))
+                    })
+                    .collect();
+
+                if !miss_locs.is_empty() {
+                    let batch = self.storage.read_batch_lockfree(&mut miss_locs)?;
+                    let mut cache_entries: Vec<(DocumentId, Arc<Value>)> =
+                        Vec::with_capacity(batch.len());
+
+                    for (i, bytes) in batch {
+                        let doc = crate::codec::decode_doc(&bytes)?;
+                        let arc = Arc::new(doc);
+                        cache_entries.push((ids[i], Arc::clone(&arc)));
+                        if query::matches_value(&query, &arc) {
+                            results.push(arc);
+                            if let Some(limit) = early_limit {
+                                if results.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    self.doc_cache.put_many(cache_entries);
+                }
+            }
         }
 
         // Apply sort → skip → limit pipeline
@@ -1742,9 +1812,10 @@ impl Collection {
             };
 
             // For $match with index, check if parallel full scan is better
-            // than indexed lookup. Parallel sequential I/O beats random pread
-            // when selectivity is low (many matches). Threshold: candidates > 10%
-            // of collection → prefer parallel full scan.
+            // than indexed lookup. With warm LRU cache, random reads via
+            // cached doc pointers are nearly free, so prefer the indexed path
+            // whenever candidates < 50% of collection. This avoids scanning
+            // the entire collection when an index can skip most documents.
             if let Some(ref query) = match_query {
                 let candidate_ids = query::execute_indexed(
                     query,
@@ -1752,7 +1823,7 @@ impl Collection {
                     &self.composite_indexes,
                 );
                 if let Some(ref ids) = candidate_ids {
-                    if ids.len() <= doc_count / 10 {
+                    if ids.len() <= doc_count / 2 {
                         // Small candidate set — indexed random-read is faster
                         return self.aggregate_streaming_indexed(
                             query, ids, group_key, accumulators, use_raw,

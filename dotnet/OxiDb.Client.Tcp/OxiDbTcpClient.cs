@@ -15,6 +15,7 @@ public sealed class OxiDbTcpClient : IOxiDbClient
     private readonly NetworkStream _stream;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private bool _disposed;
+    private bool _useOxiWire;
 
     private OxiDbTcpClient(TcpClient tcp)
     {
@@ -68,6 +69,12 @@ public sealed class OxiDbTcpClient : IOxiDbClient
         }
     }
 
+    /// <summary>
+    /// Enable OxiWire binary protocol for faster encoding/decoding.
+    /// Requests and responses use OxiDB's custom binary format instead of JSON.
+    /// </summary>
+    public void UseOxiWire() => _useOxiWire = true;
+
     // ── Low-level protocol ──────────────────────────────────────────────
 
     private async Task SendAsync(byte[] data, CancellationToken ct)
@@ -107,9 +114,28 @@ public sealed class OxiDbTcpClient : IOxiDbClient
         await _lock.WaitAsync(ct);
         try
         {
-            var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(payload);
-            await SendAsync(jsonBytes, ct);
+            byte[] reqBytes;
+            if (_useOxiWire)
+                reqBytes = OxiWire.EncodeRequest(payload);
+            else
+                reqBytes = JsonSerializer.SerializeToUtf8Bytes(payload);
+
+            await SendAsync(reqBytes, ct);
             var respBytes = await ReceiveAsync(ct);
+
+            if (_useOxiWire && OxiWire.IsOxiWire(respBytes))
+            {
+                var (ok, data) = OxiWire.DecodeResponse(respBytes);
+                if (!ok)
+                {
+                    var errMsg = data.ValueKind == JsonValueKind.String
+                        ? data.GetString() ?? "unknown error"
+                        : "unknown error";
+                    throw new OxiDbTcpException(errMsg);
+                }
+                return data;
+            }
+
             using var doc = JsonDocument.Parse(respBytes);
             var root = doc.RootElement;
 

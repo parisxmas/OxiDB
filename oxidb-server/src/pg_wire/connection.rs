@@ -281,7 +281,7 @@ fn dispatch_query<W: Write>(
     let sql = &normalize_pg_sql(sql, params);
 
     // Route to OxiDB SQL engine.
-    match oxidb::execute_sql(db, sql) {
+    match oxidb::execute_sql_with_dialect(db, sql, oxidb::SqlDialect::PostgreSQL) {
         Ok(result) => match result {
             oxidb::SqlResult::ShowDatabases(names) => {
                 let docs: Vec<serde_json::Value> = names
@@ -347,7 +347,7 @@ fn describe_query<W: Write>(writer: &mut W, db: &Arc<OxiDb>, raw_sql: &str) -> i
     if upper.starts_with("SELECT") || upper.starts_with("SHOW") {
         let normalized = normalize_pg_sql(sql, &[]);
         let infer_sql = limit_for_inference(&normalized);
-        match oxidb::execute_sql(db, &infer_sql) {
+        match oxidb::execute_sql_with_dialect(db, &infer_sql, oxidb::SqlDialect::PostgreSQL) {
             Ok(oxidb::SqlResult::Select(rows)) => {
                 let columns = types::infer_columns(&rows);
                 codec::write_row_description(writer, &columns)?;
@@ -1036,9 +1036,9 @@ fn handle_catalog_query<W: Write>(
 
         if let Some(tname) = table_name {
             // Introspect: find all unique top-level keys from the first few documents.
-            let sample = oxidb::execute_sql(db, &format!(
+            let sample = oxidb::execute_sql_with_dialect(db, &format!(
                 "SELECT * FROM \"{}\" LIMIT 20", tname
-            ));
+            ), oxidb::SqlDialect::PostgreSQL);
             let mut key_set = std::collections::BTreeMap::<String, i32>::new();
             // Always include _id as first column.
             key_set.insert("_id".to_string(), 23); // int4
