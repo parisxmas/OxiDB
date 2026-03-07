@@ -34,6 +34,7 @@ pub struct DatabaseManager {
     encryption: Option<Arc<EncryptionKey>>,
     verbose: bool,
     log_callback: Option<LogCallback>,
+    in_memory: bool,
 }
 
 impl DatabaseManager {
@@ -53,6 +54,7 @@ impl DatabaseManager {
             encryption,
             verbose,
             log_callback,
+            in_memory: false,
         };
 
         // Auto-migrate old flat layout if needed.
@@ -69,6 +71,24 @@ impl DatabaseManager {
         Ok(mgr)
     }
 
+    /// Create a pure in-memory database manager.
+    /// All databases and collections live only in RAM.
+    pub fn open_in_memory() -> Result<Self> {
+        let db = OxiDb::open_in_memory()?;
+        let arc = Arc::new(db);
+        let mut databases = HashMap::new();
+        databases.insert(DEFAULT_DATABASE.to_string(), arc);
+
+        Ok(Self {
+            data_dir: PathBuf::new(),
+            databases: RwLock::new(databases),
+            encryption: None,
+            verbose: false,
+            log_callback: None,
+            in_memory: true,
+        })
+    }
+
     /// Get or lazily open a database by name. Uses double-check locking.
     pub fn get_database(&self, name: &str) -> Result<Arc<OxiDb>> {
         // Normalize: "postgres" is an alias for "oxidb"
@@ -80,6 +100,10 @@ impl DatabaseManager {
             if let Some(db) = dbs.get(name) {
                 return Ok(Arc::clone(db));
             }
+        }
+
+        if self.in_memory {
+            return Err(Error::DatabaseNotFound(name.to_string()));
         }
 
         // Check that the database directory exists
@@ -110,15 +134,24 @@ impl DatabaseManager {
     pub fn create_database(&self, name: &str) -> Result<()> {
         validate_database_name(name)?;
 
-        let db_dir = self.data_dir.join(name);
-        if db_dir.exists() {
-            return Err(Error::DatabaseAlreadyExists(name.to_string()));
+        {
+            let dbs = self.databases.read().unwrap();
+            if dbs.contains_key(name) {
+                return Err(Error::DatabaseAlreadyExists(name.to_string()));
+            }
         }
 
-        std::fs::create_dir_all(&db_dir)?;
+        let db = if self.in_memory {
+            OxiDb::open_in_memory()?
+        } else {
+            let db_dir = self.data_dir.join(name);
+            if db_dir.exists() {
+                return Err(Error::DatabaseAlreadyExists(name.to_string()));
+            }
+            std::fs::create_dir_all(&db_dir)?;
+            self.open_db_instance(&db_dir)?
+        };
 
-        // Open it eagerly so it's ready to use.
-        let db = self.open_db_instance(&db_dir)?;
         let mut dbs = self.databases.write().unwrap();
         dbs.insert(name.to_string(), Arc::new(db));
 

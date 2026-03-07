@@ -45,12 +45,53 @@
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.19.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.19.0</h3>
+        <span class="version-date">2026-03-07</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>In-memory engine</strong> -- Full in-memory storage backend (<code>OXIDB_MODE=memory</code>). All features (SQL, indexes, transactions, aggregation, TTL) work unchanged. Uses <code>Vec&lt;u8&gt;</code>-backed storage with same record format as file-based engine.
+          </li>
+          <li>
+            <strong>TTL (time-to-live) support</strong> -- Per-document expiration via <code>_ttl</code> field (seconds). Background eviction thread with configurable interval. BTreeMap-indexed for efficient range queries on expiration timestamps.
+          </li>
+          <li>
+            <strong>Redis-compatible RESP protocol</strong> -- Full RESP2 parser/encoder. Any Redis client or <code>redis-cli</code> can connect via <code>OXIDB_REDIS_PORT</code>. Supports ~50 Redis commands: GET, SET, DEL, EXPIRE, TTL, KEYS, SCAN, HSET, HGET, HGETALL, LPUSH, RPUSH, LPOP, RPOP, LRANGE, SADD, SMEMBERS, INCR, DECR, MGET, MSET, RENAME, DBSIZE, FLUSHDB, INFO, and more.
+          </li>
+          <li>
+            <strong>Redis data model mapping</strong> -- Redis data types stored as OxiDB documents: strings in <code>_kv</code>, hashes in <code>_hash</code>, lists in <code>_list</code>, sets in <code>_set</code>. All queryable via SQL: <code>SELECT * FROM _kv WHERE _key LIKE 'session:%'</code>.
+          </li>
+          <li>
+            <strong>OxiDB vs Redis benchmark suite</strong> -- Comprehensive benchmark using <code>redis-benchmark</code> comparing single-command, pipelined (P=16), and large-payload (1KB/4KB) performance across 20 test scenarios.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Changed</h4>
+        <ul>
+          <li>
+            <strong>StorageBackend / WalBackend enums</strong> -- Collection storage layer refactored from concrete types to enum wrappers, enabling seamless switching between file and in-memory backends with zero API changes.
+          </li>
+          <li>
+            <strong>DatabaseManager in-memory support</strong> -- <code>DatabaseManager::open_in_memory()</code> constructor creates fully in-memory database instances. Multi-database mode supported.
+          </li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.18.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.18.0</h3>
         <span class="version-date">2026-03-05</span>
-        <span class="version-badge latest">latest</span>
       </div>
 
       <div class="change-group">
@@ -251,7 +292,7 @@
       </div>
     </div>
     <div class="footer-bottom">
-      <p>OxiDB v0.18.0 -- Built with Rust</p>
+      <p>OxiDB v0.19.0 -- Built with Rust</p>
     </div>
   </div>
 </footer>

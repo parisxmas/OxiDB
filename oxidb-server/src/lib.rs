@@ -6,6 +6,8 @@ pub mod oxiwire;
 pub mod pg_wire;
 pub mod protocol;
 pub mod rbac;
+pub mod redis_handler;
+pub mod resp;
 pub mod scram;
 pub mod session;
 pub mod tls;
