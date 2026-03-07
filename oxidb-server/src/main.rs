@@ -14,6 +14,7 @@ use oxidb_server::gelf::{GelfLevel, GelfLogger};
 use oxidb_server::handler;
 use oxidb_server::protocol;
 use oxidb_server::rbac;
+use oxidb_server::oximem;
 use oxidb_server::scram::ScramState;
 use oxidb_server::session::Session;
 use oxidb_server::tls;
@@ -788,15 +789,40 @@ fn handle_client(stream: TcpStream, state: &Arc<ServerState>, idle_timeout: Dura
     server_log!(state, GelfLevel::Informational, format!("client disconnected: {peer}"), extra: "peer" => &peer);
 }
 
-/// Handle a single Redis RESP client connection.
-fn handle_redis_client(stream: TcpStream, db: &Arc<OxiDb>) {
-    use oxidb_server::resp;
-    use oxidb_server::redis_handler;
+/// Log a RESP response value to stderr.
+fn log_resp_value(value: &oxidb_server::resp::RespValue) {
+    use oxidb_server::resp::RespValue;
+    match value {
+        RespValue::SimpleString(s) => eprintln!("[oximem] >> +{s}"),
+        RespValue::Error(s) => eprintln!("[oximem] >> -{s}"),
+        RespValue::Integer(n) => eprintln!("[oximem] >> :{n}"),
+        RespValue::BulkString(b) => {
+            let s = String::from_utf8_lossy(b);
+            if s.len() > 100 {
+                eprintln!("[oximem] >> ${}...({} bytes)", &s[..100], b.len());
+            } else {
+                eprintln!("[oximem] >> ${s}");
+            }
+        }
+        RespValue::Array(items) => eprintln!("[oximem] >> *{} items", items.len()),
+        RespValue::Null => eprintln!("[oximem] >> (nil)"),
+    }
+}
 
+/// Handle a single OxiMem RESP client connection.
+fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: bool) {
+    use oxidb_server::resp;
+
+    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
     let mut reader = BufReader::new(&stream);
     let mut writer = BufWriter::new(&stream);
 
+    if log {
+        eprintln!("[oximem] connected peer={peer}");
+    }
+
     loop {
+        // Read first command (blocking)
         let value = match resp::read_value(&mut reader) {
             Ok(v) => v,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
@@ -804,21 +830,201 @@ fn handle_redis_client(stream: TcpStream, db: &Arc<OxiDb>) {
             Err(_) => break,
         };
 
-        let args = match value {
-            resp::RespValue::Array(ref items) => items.as_slice(),
-            _ => {
-                let _ = resp::write_value(&mut writer, &resp::err("expected array"));
-                let _ = writer.flush();
-                continue;
+        // Check for SUBSCRIBE before normal dispatch
+        if let resp::RespValue::Array(ref items) = value {
+            if let Some(cmd) = items.first().and_then(|a| a.as_str()) {
+                if cmd.eq_ignore_ascii_case("SUBSCRIBE") {
+                    if log {
+                        let channels: Vec<&str> = items[1..].iter().filter_map(|a| a.as_str()).collect();
+                        eprintln!("[oximem] << SUBSCRIBE {}", channels.join(" "));
+                    }
+                    handle_oximem_subscribe(&stream, store, &mut reader, &mut writer, &items[1..]);
+                    return;
+                }
             }
-        };
-
-        let response = redis_handler::execute(db, args);
-        if resp::write_value(&mut writer, &response).is_err() {
-            break;
         }
+
+        // Fast path: no pipeline data buffered — execute directly, no Vec
+        if reader.buffer().is_empty() {
+            let args = match value {
+                resp::RespValue::Array(ref items) => items.as_slice(),
+                _ => {
+                    let _ = resp::write_value(&mut writer, &resp::err("expected array"));
+                    let _ = writer.flush();
+                    continue;
+                }
+            };
+            if log {
+                let cmd_str: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
+                eprintln!("[oximem] << {}", cmd_str.join(" "));
+            }
+            let response = oximem::execute(store, args);
+            if log {
+                log_resp_value(&response);
+            }
+            if resp::write_value(&mut writer, &response).is_err() {
+                break;
+            }
+        } else {
+            // Pipeline: collect all buffered commands
+            let mut batch = vec![value];
+            while !reader.buffer().is_empty() {
+                match resp::read_value(&mut reader) {
+                    Ok(v) => batch.push(v),
+                    Err(_) => break,
+                }
+            }
+
+            if !store.sql_enabled() {
+                // Lock-coalesced pipeline (fast in-memory mode)
+                let responses = oximem::execute_pipeline(store, &batch);
+                for response in &responses {
+                    if resp::write_value(&mut writer, response).is_err() {
+                        return;
+                    }
+                }
+            } else {
+                // SQL mode — execute one by one
+                for cmd in &batch {
+                    let args = match cmd {
+                        resp::RespValue::Array(items) => items.as_slice(),
+                        _ => {
+                            let _ = resp::write_value(&mut writer, &resp::err("expected array"));
+                            continue;
+                        }
+                    };
+                    let response = oximem::execute(store, args);
+                    if resp::write_value(&mut writer, &response).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Single flush for entire batch — key pipeline optimization
         if writer.flush().is_err() {
             break;
+        }
+    }
+}
+
+/// Subscription mode: receive published messages and handle SUBSCRIBE/UNSUBSCRIBE.
+fn handle_oximem_subscribe(
+    stream: &TcpStream,
+    store: &oximem::OxiMemStore,
+    reader: &mut BufReader<&TcpStream>,
+    writer: &mut BufWriter<&TcpStream>,
+    initial_channels: &[oxidb_server::resp::RespValue],
+) {
+    use oxidb_server::resp;
+
+    let mut receivers: Vec<(String, std::sync::mpsc::Receiver<(String, String)>)> = Vec::new();
+
+    // Subscribe to initial channels
+    for arg in initial_channels {
+        if let Some(ch) = arg.as_str() {
+            let rx = store.subscribe(ch);
+            receivers.push((ch.to_string(), rx));
+            // Send subscribe confirmation
+            let msg = resp::array(vec![
+                resp::bulk_string("subscribe"),
+                resp::bulk_string(ch),
+                resp::integer(receivers.len() as i64),
+            ]);
+            let _ = resp::write_value(writer, &msg);
+        }
+    }
+    let _ = writer.flush();
+
+    // Set read timeout so we can alternate between checking messages and reading commands
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+
+    loop {
+        // Deliver any pending messages
+        let mut wrote = false;
+        for (ch_name, rx) in &receivers {
+            while let Ok((channel, message)) = rx.try_recv() {
+                let msg = resp::array(vec![
+                    resp::bulk_string("message"),
+                    resp::bulk_string(&channel),
+                    resp::bulk_string(&message),
+                ]);
+                if resp::write_value(writer, &msg).is_err() {
+                    return;
+                }
+                wrote = true;
+                let _ = ch_name; // used for tracking
+            }
+        }
+        if wrote {
+            if writer.flush().is_err() {
+                return;
+            }
+        }
+
+        // Try to read a command (non-blocking due to timeout)
+        match resp::read_value(reader) {
+            Ok(value) => {
+                if let resp::RespValue::Array(ref items) = value {
+                    if let Some(cmd) = items.first().and_then(|a| a.as_str()) {
+                        if cmd.eq_ignore_ascii_case("SUBSCRIBE") {
+                            for arg in &items[1..] {
+                                if let Some(ch) = arg.as_str() {
+                                    let rx = store.subscribe(ch);
+                                    receivers.push((ch.to_string(), rx));
+                                    let msg = resp::array(vec![
+                                        resp::bulk_string("subscribe"),
+                                        resp::bulk_string(ch),
+                                        resp::integer(receivers.len() as i64),
+                                    ]);
+                                    let _ = resp::write_value(writer, &msg);
+                                }
+                            }
+                            let _ = writer.flush();
+                        } else if cmd.eq_ignore_ascii_case("UNSUBSCRIBE") {
+                            if items.len() > 1 {
+                                for arg in &items[1..] {
+                                    if let Some(ch) = arg.as_str() {
+                                        receivers.retain(|(name, _)| name != ch);
+                                        store.unsubscribe(ch);
+                                        let msg = resp::array(vec![
+                                            resp::bulk_string("unsubscribe"),
+                                            resp::bulk_string(ch),
+                                            resp::integer(receivers.len() as i64),
+                                        ]);
+                                        let _ = resp::write_value(writer, &msg);
+                                    }
+                                }
+                            } else {
+                                // Unsubscribe from all
+                                for (name, _) in &receivers {
+                                    store.unsubscribe(name);
+                                }
+                                receivers.clear();
+                                let msg = resp::array(vec![
+                                    resp::bulk_string("unsubscribe"),
+                                    resp::null(),
+                                    resp::integer(0),
+                                ]);
+                                let _ = resp::write_value(writer, &msg);
+                            }
+                            let _ = writer.flush();
+                            if receivers.is_empty() {
+                                return; // Exit subscription mode
+                            }
+                        } else if cmd.eq_ignore_ascii_case("PING") {
+                            let _ = resp::write_value(writer, &resp::array(vec![
+                                resp::bulk_string("pong"),
+                                resp::bulk_string(""),
+                            ]));
+                            let _ = writer.flush();
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(_) => break,
         }
     }
 }
@@ -891,9 +1097,9 @@ fn main() {
     };
     // In-memory mode: OXIDB_MODE=memory runs everything in RAM (no disk I/O).
     // All OxiDB features (SQL, indexes, transactions, aggregation, TTL) work unchanged.
-    let in_memory_mode = env::var("OXIDB_MODE")
-        .map(|v| v == "memory" || v == "in-memory")
-        .unwrap_or(false);
+    let oxidb_mode = env::var("OXIDB_MODE").unwrap_or_default();
+    let in_memory_mode = oxidb_mode == "memory" || oxidb_mode == "in-memory";
+    let mqtt_only_mode = oxidb_mode == "mqtt";
 
     let db_manager = if in_memory_mode {
         eprintln!("mode: in-memory (all data in RAM, no persistence)");
@@ -1057,28 +1263,47 @@ fn main() {
         });
     }
 
-    // Redis-compatible RESP listener (optional, enabled via OXIDB_REDIS_PORT)
-    let redis_port: u16 = env::var("OXIDB_REDIS_PORT")
+    // Command logging: OXIDB_LOG_COMMANDS=true logs all OxiMem/MQTT commands and responses
+    let log_commands = env::var("OXIDB_LOG_COMMANDS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    // Shared store for OxiMem + MQTT pub/sub interop
+    let oximem_sql = env::var("OXIDB_OXIMEM_SQL")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let shared_store = if oximem_sql {
+        Arc::new(oxidb_server::oximem::OxiMemStore::new_with_sql(Arc::clone(&state.db)))
+    } else {
+        Arc::new(oxidb_server::oximem::OxiMemStore::new())
+    };
+
+    // OxiMem RESP listener (optional, enabled via OXIDB_OXIMEM_PORT)
+    let oximem_port: u16 = env::var("OXIDB_OXIMEM_PORT")
         .unwrap_or_else(|_| "0".to_string())
         .parse()
-        .expect("OXIDB_REDIS_PORT must be a valid u16");
+        .expect("OXIDB_OXIMEM_PORT must be a valid u16");
 
-    if redis_port > 0 {
-        let redis_addr = format!("0.0.0.0:{redis_port}");
-        let redis_listener =
-            TcpListener::bind(&redis_addr).expect("failed to bind Redis RESP listener");
-        server_log!(state, GelfLevel::Notice, format!("Redis-compatible RESP listening on {redis_addr}"));
+    if oximem_port > 0 {
+        let oximem_addr = format!("0.0.0.0:{oximem_port}");
+        let oximem_listener =
+            TcpListener::bind(&oximem_addr).expect("failed to bind OxiMem RESP listener");
 
-        let state_redis = Arc::clone(&state);
+        let mode_label = if oximem_sql { "SQL mirroring" } else { "fast mode" };
+        server_log!(state, GelfLevel::Notice, format!("OxiMem RESP listening on {oximem_addr} ({mode_label})"));
+
+        let state_oximem = Arc::clone(&state);
+        let oximem_store = Arc::clone(&shared_store);
+        let oximem_log = log_commands;
         std::thread::spawn(move || {
-            for stream in redis_listener.incoming() {
+            for stream in oximem_listener.incoming() {
                 match stream {
                     Ok(s) => {
                         let _ = s.set_nodelay(true);
-                        let db = Arc::clone(&state_redis.db);
+                        let store = Arc::clone(&oximem_store);
                         std::thread::spawn(move || {
                             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                handle_redis_client(s, &db);
+                                handle_oximem_client(s, &store, oximem_log);
                             }));
                             if let Err(e) = result {
                                 let msg = if let Some(s) = e.downcast_ref::<&str>() {
@@ -1088,16 +1313,70 @@ fn main() {
                                 } else {
                                     "unknown panic".to_string()
                                 };
-                                eprintln!("[redis] connection handler panicked: {msg}");
+                                eprintln!("[oximem] connection handler panicked: {msg}");
                             }
                         });
                     }
                     Err(e) => {
-                        server_log!(state_redis, GelfLevel::Error, format!("[redis] accept error: {e}"));
+                        server_log!(state_oximem, GelfLevel::Error, format!("[oximem] accept error: {e}"));
                     }
                 }
             }
         });
+    }
+
+    // MQTT listener (optional, enabled via OXIDB_MQTT_PORT)
+    let mqtt_port: u16 = env::var("OXIDB_MQTT_PORT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("OXIDB_MQTT_PORT must be a valid u16");
+
+    if mqtt_port > 0 {
+        let mqtt_addr = format!("0.0.0.0:{mqtt_port}");
+        let mqtt_listener =
+            TcpListener::bind(&mqtt_addr).expect("failed to bind MQTT listener");
+        server_log!(state, GelfLevel::Notice, format!("MQTT listening on {mqtt_addr}"));
+
+        let state_mqtt = Arc::clone(&state);
+        let mqtt_store = Arc::clone(&shared_store);
+        let mqtt_log = log_commands;
+        std::thread::spawn(move || {
+            for stream in mqtt_listener.incoming() {
+                match stream {
+                    Ok(s) => {
+                        let _ = s.set_nodelay(true);
+                        let store = Arc::clone(&mqtt_store);
+                        std::thread::spawn(move || {
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                oxidb_server::mqtt::handle_client(s, &store, mqtt_log);
+                            }));
+                            if let Err(e) = result {
+                                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = e.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                eprintln!("[mqtt] connection handler panicked: {msg}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        server_log!(state_mqtt, GelfLevel::Error, format!("[mqtt] accept error: {e}"));
+                    }
+                }
+            }
+        });
+    }
+
+    // MQTT-only mode: skip the main OxiDB TCP listener
+    if mqtt_only_mode {
+        server_log!(state, GelfLevel::Notice, "MQTT-only mode — OxiDB TCP listener disabled".to_string());
+        // Block forever (MQTT listener runs in its own thread)
+        loop {
+            std::thread::park();
+        }
     }
 
     let (tx, rx) = mpsc::channel::<TcpStream>();
