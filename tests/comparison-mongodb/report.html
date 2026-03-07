@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OxiDB vs MongoDB — Benchmark</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Outfit:wght@300;400;500;600;700;800;900&display=swap');
+
+*{margin:0;padding:0;box-sizing:border-box}
+
+:root{
+  --bg:#06080c;--surface:#0c1018;--card:#111820;--border:#1a2332;
+  --text:#c8d6e5;--dim:#5a6a7e;--bright:#e8f0f8;
+  --oxi:#22d666;--oxi-dim:#1a4a2e;--oxi-glow:rgba(34,214,102,0.12);
+  --mongo:#00a86b;--mongo-dim:#0a3024;--mongo-glow:rgba(0,168,107,0.12);
+  --accent:#f0c040;--red:#e84057;
+}
+
+body{
+  font-family:'Outfit',system-ui,sans-serif;
+  background:var(--bg);color:var(--text);
+  min-height:100vh;overflow-x:hidden;
+}
+
+/* Grain overlay */
+body::before{
+  content:'';position:fixed;inset:0;z-index:9999;pointer-events:none;
+  opacity:0.025;
+  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* Top accent line */
+body::after{
+  content:'';position:fixed;top:0;left:0;right:0;height:2px;z-index:100;
+  background:linear-gradient(90deg,transparent,var(--oxi),var(--accent),var(--mongo),transparent);
+}
+
+.wrap{max-width:1100px;margin:0 auto;padding:48px 24px 80px}
+
+/* Header */
+header{margin-bottom:56px;position:relative}
+header h1{
+  font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;
+  color:var(--dim);letter-spacing:3px;text-transform:uppercase;
+  margin-bottom:12px;
+}
+header .title{
+  font-size:42px;font-weight:800;letter-spacing:-1px;
+  background:linear-gradient(135deg,var(--oxi) 0%,#40e8a0 40%,var(--accent) 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+  background-clip:text;
+  line-height:1.1;margin-bottom:16px;
+}
+header .meta{
+  font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--dim);
+  display:flex;gap:24px;flex-wrap:wrap;
+}
+header .meta span::before{content:'› ';color:var(--border)}
+
+/* Score strip */
+.score-strip{
+  display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:0;
+  background:var(--surface);border:1px solid var(--border);border-radius:16px;
+  padding:32px 40px;margin-bottom:48px;position:relative;overflow:hidden;
+}
+.score-strip::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(135deg,var(--oxi-glow),transparent 50%,var(--mongo-glow));
+  pointer-events:none;
+}
+.score-side{text-align:center;position:relative}
+.score-side .db-label{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;
+  letter-spacing:2px;text-transform:uppercase;margin-bottom:12px;
+}
+.score-side .db-label.oxi{color:var(--oxi)}
+.score-side .db-label.mongo{color:var(--mongo)}
+.score-num{font-size:72px;font-weight:900;line-height:1;letter-spacing:-3px}
+.score-num.oxi{color:var(--oxi)}
+.score-num.mongo{color:var(--mongo)}
+.score-sub{font-size:13px;color:var(--dim);margin-top:6px;font-weight:500}
+.score-vs{
+  font-family:'JetBrains Mono',monospace;font-size:14px;font-weight:700;
+  color:var(--border);padding:0 24px;
+  display:flex;flex-direction:column;align-items:center;gap:4px;
+}
+.score-vs::before,.score-vs::after{
+  content:'';width:1px;height:32px;background:var(--border);
+}
+
+/* Category sections */
+.cat{margin-bottom:36px}
+.cat-head{
+  display:flex;align-items:center;gap:10px;
+  padding:14px 0;margin-bottom:2px;
+  border-bottom:1px solid var(--border);
+}
+.cat-icon{
+  width:28px;height:28px;display:flex;align-items:center;justify-content:center;
+  background:var(--card);border:1px solid var(--border);border-radius:8px;
+  font-size:14px;flex-shrink:0;
+}
+.cat-name{font-size:16px;font-weight:700;color:var(--bright)}
+.cat-count{
+  font-family:'JetBrains Mono',monospace;font-size:11px;
+  color:var(--dim);margin-left:auto;
+}
+
+/* Rows */
+.row{
+  display:grid;grid-template-columns:1fr 300px 100px;align-items:center;gap:16px;
+  padding:14px 0;border-bottom:1px solid rgba(26,35,50,0.6);
+  transition:background 0.15s;
+}
+.row:last-child{border-bottom:none}
+.row:hover{background:rgba(34,214,102,0.02)}
+
+.row-label{font-size:14px;font-weight:500;color:var(--text)}
+.row-label .row-detail{
+  font-family:'JetBrains Mono',monospace;font-size:11px;
+  color:var(--dim);display:block;margin-top:3px;
+}
+.row-label .row-counts{
+  font-family:'JetBrains Mono',monospace;font-size:11px;
+  color:var(--dim);
+}
+
+/* Duel bar */
+.duel{display:flex;flex-direction:column;gap:5px}
+.duel-row{display:flex;align-items:center;gap:8px}
+.duel-label{
+  font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;
+  width:50px;text-align:right;flex-shrink:0;
+}
+.duel-label.oxi{color:var(--oxi)}
+.duel-label.mongo{color:var(--mongo)}
+.duel-track{flex:1;height:18px;background:var(--bg);border-radius:3px;overflow:hidden;position:relative}
+.duel-fill{
+  height:100%;border-radius:3px;position:relative;
+  transition:width 0.8s cubic-bezier(0.16,1,0.3,1);
+}
+.duel-fill.oxi{background:linear-gradient(90deg,var(--oxi-dim),var(--oxi))}
+.duel-fill.mongo{background:linear-gradient(90deg,var(--mongo-dim),var(--mongo))}
+.duel-fill.winner{box-shadow:0 0 12px rgba(34,214,102,0.3)}
+.duel-fill.winner.mongo{box-shadow:0 0 12px rgba(0,168,107,0.3)}
+.duel-time{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:500;
+  color:var(--dim);width:70px;flex-shrink:0;
+}
+
+/* Result badge */
+.result{text-align:right}
+.badge{
+  display:inline-block;font-family:'JetBrains Mono',monospace;
+  font-size:11px;font-weight:700;padding:3px 10px;border-radius:4px;
+  letter-spacing:0.5px;
+}
+.badge-oxi{background:var(--oxi-dim);color:var(--oxi)}
+.badge-mongo{background:var(--mongo-dim);color:var(--mongo)}
+.badge-tie{background:var(--card);color:var(--dim)}
+.speedup{
+  font-family:'JetBrains Mono',monospace;font-size:11px;
+  color:var(--accent);display:block;margin-top:3px;
+}
+
+/* Resource section */
+.res-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:8px}
+.res-card{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:24px;position:relative;overflow:hidden;
+}
+.res-card::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+}
+.res-card.disk::before{background:linear-gradient(90deg,var(--oxi),var(--mongo))}
+.res-card.mem::before{background:linear-gradient(90deg,var(--accent),var(--mongo))}
+.res-title{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;
+  color:var(--dim);letter-spacing:1.5px;text-transform:uppercase;margin-bottom:20px;
+}
+.res-bars{display:flex;flex-direction:column;gap:12px}
+.res-row{display:flex;align-items:center;gap:12px}
+.res-db{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;
+  width:60px;flex-shrink:0;
+}
+.res-db.oxi{color:var(--oxi)}
+.res-db.mongo{color:var(--mongo)}
+.res-track{flex:1;height:24px;background:var(--bg);border-radius:4px;overflow:hidden}
+.res-fill{height:100%;border-radius:4px;display:flex;align-items:center;padding:0 10px;min-width:fit-content}
+.res-fill.oxi{background:linear-gradient(90deg,var(--oxi-dim),rgba(34,214,102,0.35))}
+.res-fill.mongo{background:linear-gradient(90deg,var(--mongo-dim),rgba(0,168,107,0.35))}
+.res-val{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;
+  color:var(--bright);white-space:nowrap;
+}
+
+/* Methodology */
+.methodology{
+  font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.7;
+  color:var(--dim);margin-bottom:32px;padding:20px 24px;
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+}
+.methodology p{margin-bottom:8px}
+.methodology p:last-child{margin-bottom:0}
+.methodology strong{color:var(--text);font-weight:600}
+.methodology .hl-oxi{color:var(--oxi)}
+.methodology .hl-mongo{color:var(--mongo)}
+
+/* Environment panel */
+.env-panel{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:24px 28px;margin-bottom:36px;position:relative;overflow:hidden;
+}
+.env-panel::before{
+  content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,var(--oxi),var(--border),var(--mongo));
+}
+.env-title{
+  font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;
+  color:var(--dim);letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;
+  display:flex;align-items:center;gap:8px;
+}
+.env-title::before{content:'&#9881;';font-size:13px}
+.env-grid{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px 24px;
+}
+.env-item{display:flex;flex-direction:column;gap:2px}
+.env-label{
+  font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;
+  color:var(--dim);letter-spacing:1px;text-transform:uppercase;
+}
+.env-value{
+  font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:500;
+  color:var(--bright);
+}
+
+/* Footer */
+footer{
+  margin-top:56px;padding-top:24px;border-top:1px solid var(--border);
+  display:flex;justify-content:space-between;align-items:center;
+  font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim);
+}
+footer .oxi-tag{color:var(--oxi)}
+
+/* Error state */
+.err{color:var(--red);font-family:'JetBrains Mono',monospace;font-size:11px}
+
+/* Animate bars on load */
+@keyframes grow{from{width:0}to{width:var(--w)}}
+.duel-fill,.res-fill{animation:grow 0.8s cubic-bezier(0.16,1,0.3,1) forwards;width:0}
+
+@media(max-width:768px){
+  .score-strip{grid-template-columns:1fr;gap:16px;padding:24px}
+  .score-vs{flex-direction:row;padding:8px 0}
+  .score-vs::before,.score-vs::after{width:32px;height:1px}
+  .row{grid-template-columns:1fr;gap:8px}
+  .res-grid{grid-template-columns:1fr}
+  header .title{font-size:28px}
+  .score-num{font-size:48px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>benchmark report</h1>
+  <div class="title">OxiDB vs MongoDB</div>
+  <div class="meta">
+    <span>100K documents</span>
+    <span>2026-03-06 02:45</span>
+    <span>22 tests</span>
+    <span>MsgPack wire protocol</span>
+  </div>
+</header>
+
+<div class="methodology">
+  <p>A Go test binary (<strong>go test</strong>) drives both databases through their official client libraries.
+  <span class="hl-oxi">OxiDB</span> and <span class="hl-mongo">MongoDB 7</span> each run in isolated
+  Docker containers with <strong>tmpfs</strong> storage (pure RAM — no disk I/O variance).
+  The test program connects to both over <strong>localhost TCP</strong>, inserts <strong>100K identical documents</strong>
+  into each, then runs the same queries sequentially — first OxiDB, then MongoDB — measuring wall-clock time for each.
+  OxiDB uses the <strong>MsgPack</strong> binary wire protocol; MongoDB uses its native BSON/Wire protocol.
+  Indexes are created after insertion and timed separately. Each test is a single cold run (no warm-up iterations).</p>
+</div>
+
+<div class="env-panel">
+  <div class="env-title">Test Environment</div>
+  <div class="env-grid">
+    <div class="env-item"><div class="env-label">CPU</div><div class="env-value">Apple M4</div></div>
+    <div class="env-item"><div class="env-label">Cores</div><div class="env-value">10</div></div>
+    <div class="env-item"><div class="env-label">Memory</div><div class="env-value">24 GB</div></div>
+    <div class="env-item"><div class="env-label">OS / Arch</div><div class="env-value">darwin/arm64</div></div>
+    <div class="env-item"><div class="env-label">Go</div><div class="env-value">go1.23.4</div></div>
+    <div class="env-item"><div class="env-label">Docker</div><div class="env-value">27.4.0</div></div>
+    <div class="env-item"><div class="env-label">MongoDB</div><div class="env-value"></div></div>
+    <div class="env-item"><div class="env-label">Storage</div><div class="env-value">tmpfs (RAM-backed)</div></div>
+  </div>
+</div>
+
+<div class="score-strip">
+  <div class="score-side">
+    <div class="db-label oxi">OxiDB</div>
+    <div class="score-num oxi">18</div>
+    <div class="score-sub">wins</div>
+  </div>
+  <div class="score-vs">VS</div>
+  <div class="score-side">
+    <div class="db-label mongo">MongoDB</div>
+    <div class="score-num mongo">2</div>
+    <div class="score-sub">wins</div>
+  </div>
+</div>
+<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">&#9654;</div>
+  <div class="cat-name">Bulk Insert</div>
+  <div class="cat-count">1 tests</div>
+</div>
+<div class="row">
+  <div class="row-label">Insert 100000 docs (batch 1000)<span class="row-detail">91162 docs/s vs 104374 docs/s</span> <span class="row-counts">100000 / 100000 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">1.097s</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo winner" style="--w:87%;width:0"></div></div>
+      <div class="duel-time">958.1ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-mongo">MongoDB</span><span class="speedup">1.1x faster</span></div>
+</div>
+</div>
+<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">&#128269;</div>
+  <div class="cat-name">Queries</div>
+  <div class="cat-count">8 tests</div>
+</div>
+<div class="row">
+  <div class="row-label">Exact match (department=Engineering) <span class="row-counts">20142 / 20142 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:41%;width:0"></div></div>
+      <div class="duel-time">64.5ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">158.8ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">2.5x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Range query (age >= 50) <span class="row-counts">46719 / 46719 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:25%;width:0"></div></div>
+      <div class="duel-time">71.2ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">285.6ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.0x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Compound (dept=Sales AND status=active) <span class="row-counts">4930 / 4930 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:28%;width:0"></div></div>
+      <div class="duel-time">18.8ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">66.2ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">3.5x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">$or query (city=Tokyo OR city=Paris) <span class="row-counts">19849 / 19849 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:24%;width:0"></div></div>
+      <div class="duel-time">34.7ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">144.6ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.2x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">$in query (country in [US, UK, JP]) <span class="row-counts">30001 / 30001 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:23%;width:0"></div></div>
+      <div class="duel-time">46.9ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">201.7ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.3x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Range (salary 50000-100000) <span class="row-counts">29331 / 29331 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:20%;width:0"></div></div>
+      <div class="duel-time">45.8ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">227.8ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">5.0x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Boolean (verified=true) <span class="row-counts">50060 / 50060 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:28%;width:0"></div></div>
+      <div class="duel-time">97.6ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">348.5ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">3.6x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Nested field (address.zip starts with 0) <span class="row-counts">10050 / 10050 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:52%;width:0"></div></div>
+      <div class="duel-time">47.4ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">91.3ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">1.9x faster</span></div>
+</div>
+</div>
+<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">&#9679;</div>
+  <div class="cat-name">Indexes</div>
+  <div class="cat-count">1 tests</div>
+</div>
+<div class="row">
+  <div class="row-label">Create 4 indexes on 100K docs <span class="row-counts">4 / 4 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">664.2ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo winner" style="--w:85%;width:0"></div></div>
+      <div class="duel-time">564.4ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-mongo">MongoDB</span><span class="speedup">1.2x faster</span></div>
+</div>
+</div>
+<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">&#9889;</div>
+  <div class="cat-name">Indexed Queries</div>
+  <div class="cat-count">4 tests</div>
+</div>
+<div class="row">
+  <div class="row-label">Indexed: department=Engineering <span class="row-counts">20142 / 20142 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:32%;width:0"></div></div>
+      <div class="duel-time">39.8ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">125.6ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">3.2x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Indexed: age >= 60 <span class="row-counts">29959 / 29959 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:15%;width:0"></div></div>
+      <div class="duel-time">35.8ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">235.5ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">6.6x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Indexed: city=Tokyo <span class="row-counts">10011 / 10011 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:19%;width:0"></div></div>
+      <div class="duel-time">14.4ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">75.7ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">5.3x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Indexed: salary 80000-120000 <span class="row-counts">23311 / 23311 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:20%;width:0"></div></div>
+      <div class="duel-time">33.9ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">169.9ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">5.0x faster</span></div>
+</div>
+</div>
+<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">&#9679;</div>
+  <div class="cat-name">Count</div>
+  <div class="cat-count">3 tests</div>
+</div>
+<div class="row">
+  <div class="row-label">Count all <span class="row-counts">100000 / 100000 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:0%;width:0"></div></div>
+      <div class="duel-time">42µs</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">29.1ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">688.1x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Count dept=Engineering <span class="row-counts">20142 / 20142 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:4%;width:0"></div></div>
+      <div class="duel-time">84µs</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">2.4ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">28.2x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Count age >= 50 <span class="row-counts">46719 / 46719 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:1%;width:0"></div></div>
+      <div class="duel-time">61µs</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">7.8ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">129.2x faster</span></div>
+</div>
+</div>
+<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">&#8721;</div>
+  <div class="cat-name">Aggregation</div>
+  <div class="cat-count">3 tests</div>
+</div>
+<div class="row">
+  <div class="row-label">Group by department, avg salary <span class="row-counts">5 / 5 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:76%;width:0"></div></div>
+      <div class="duel-time">38.6ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">50.5ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">1.3x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Top 5 cities by count <span class="row-counts">5 / 5 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:1%;width:0"></div></div>
+      <div class="duel-time">114µs</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">21.2ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">185.2x faster</span></div>
+</div>
+<div class="row">
+  <div class="row-label">Match + Group (active engineers) <span class="row-counts">1 / 1 docs</span></div>
+  <div class="duel">
+    <div class="duel-row">
+      <div class="duel-label oxi">OxiDB</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:88%;width:0"></div></div>
+      <div class="duel-time">9.3ms</div>
+    </div>
+    <div class="duel-row">
+      <div class="duel-label mongo">Mongo</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">10.5ms</div>
+    </div>
+  </div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">1.1x faster</span></div>
+</div>
+</div>
+<div class="cat">
+<div class="cat-head">
+  <div class="cat-icon">&#9881;</div>
+  <div class="cat-name">Resources</div>
+</div>
+<div class="res-grid">
+<div class="res-card disk">
+  <div class="res-title">Disk usage (100K docs)</div>
+  <div class="res-bars">
+    <div class="res-row">
+      <div class="res-db oxi">OxiDB</div>
+      <div class="res-track"><div class="res-fill oxi" style="--w:0%;width:0"><span class="res-val">0	/data</span></div></div>
+    </div>
+    <div class="res-row">
+      <div class="res-db mongo">Mongo</div>
+      <div class="res-track"><div class="res-fill mongo" style="--w:100%;width:0"><span class="res-val">301M	/data/db</span></div></div>
+    </div>
+  </div>
+</div>
+<div class="res-card mem">
+  <div class="res-title">Memory usage (100K docs)</div>
+  <div class="res-bars">
+    <div class="res-row">
+      <div class="res-db oxi">OxiDB</div>
+      <div class="res-track"><div class="res-fill oxi" style="--w:9%;width:0"><span class="res-val">36.01MiB / 8.231GiB</span></div></div>
+    </div>
+    <div class="res-row">
+      <div class="res-db mongo">Mongo</div>
+      <div class="res-track"><div class="res-fill mongo" style="--w:100%;width:0"><span class="res-val">380.1MiB / 8.231GiB</span></div></div>
+    </div>
+  </div>
+</div>
+</div>
+</div>
+
+<footer>
+  <span><span class="oxi-tag">OxiDB</span> benchmark suite</span>
+  <span>22 tests &middot; 7 categories</span>
+</footer>
+
+</div>
+</body>
+</html>

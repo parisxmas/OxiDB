@@ -825,6 +825,100 @@ pub unsafe extern "C" fn oxidb_vector_search(
     unsafe { send_request(conn, &req) }
 }
 
+/// Send raw bytes (e.g. OxiWire-encoded) and receive raw response bytes.
+/// Handles TCP length-prefix framing. The caller provides the payload
+/// (without the 4-byte length prefix), and gets back the response payload.
+///
+/// Returns a pointer to a `RawResponse` struct with `data` and `len`.
+/// Caller must free with `oxidb_free_raw`.
+///
+/// # Safety
+/// `conn` must be a valid connection. `data` must be valid for `data_len` bytes.
+#[repr(C)]
+pub struct RawResponse {
+    pub data: *mut u8,
+    pub len: u32,
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_send_raw(
+    conn: *mut OxiDbConn,
+    data: *const u8,
+    data_len: u32,
+) -> *mut RawResponse {
+    if conn.is_null() || data.is_null() {
+        return ptr::null_mut();
+    }
+    let conn = unsafe { &mut *(conn as *mut OxiDbConnection) };
+    let payload = unsafe { std::slice::from_raw_parts(data, data_len as usize) };
+
+    match conn.request(payload) {
+        Ok(resp) => {
+            let mut resp_buf = resp.into_boxed_slice();
+            let raw = Box::new(RawResponse {
+                len: resp_buf.len() as u32,
+                data: resp_buf.as_mut_ptr(),
+            });
+            std::mem::forget(resp_buf); // ownership transferred to RawResponse
+            Box::into_raw(raw)
+        }
+        Err(e) => {
+            conn.set_last_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Free a RawResponse returned by `oxidb_send_raw`.
+///
+/// # Safety
+/// `ptr` must be a pointer returned by `oxidb_send_raw`, or NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_free_raw(ptr: *mut RawResponse) {
+    if !ptr.is_null() {
+        let raw = unsafe { Box::from_raw(ptr) };
+        if !raw.data.is_null() && raw.len > 0 {
+            // Reconstruct the Vec to free the data buffer
+            let _ = unsafe { Vec::from_raw_parts(raw.data, raw.len as usize, raw.len as usize) };
+        }
+    }
+}
+
+/// Execute a raw JSON command string and return the JSON response.
+/// This is the most flexible entry point — any valid OxiDB command JSON works.
+///
+/// # Safety
+/// `conn` must be a valid connection from `oxidb_connect`. `cmd_json` must be a valid
+/// null-terminated C string containing JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxidb_execute(
+    conn: *mut OxiDbConn,
+    cmd_json: *const c_char,
+) -> *mut c_char {
+    if conn.is_null() {
+        return ptr::null_mut();
+    }
+    let conn = unsafe { &mut *(conn as *mut OxiDbConnection) };
+    let cmd_str = match unsafe { cstr_to_str(cmd_json) } {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+
+    match conn.request(cmd_str.as_bytes()) {
+        Ok(resp) => match CString::new(resp) {
+            Ok(cs) => cs.into_raw(),
+            Err(e) => {
+                conn.set_last_error(format!("response contains null byte: {e}"));
+                ptr::null_mut()
+            }
+        },
+        Err(e) => {
+            conn.set_last_error(e.to_string());
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Free a string returned by any `oxidb_*` function.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxidb_free_string(ptr: *mut c_char) {

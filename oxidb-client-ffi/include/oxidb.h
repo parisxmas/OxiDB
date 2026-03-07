@@ -75,6 +75,28 @@ char* oxidb_begin_tx(OxiDbConn* conn);
 char* oxidb_commit_tx(OxiDbConn* conn);
 char* oxidb_rollback_tx(OxiDbConn* conn);
 
+/* SQL */
+char* oxidb_sql(OxiDbConn* conn, const char* query);
+
+/* Cron scheduler */
+char* oxidb_create_schedule(OxiDbConn* conn, const char* schedule_json);
+char* oxidb_list_schedules(OxiDbConn* conn);
+char* oxidb_get_schedule(OxiDbConn* conn, const char* name);
+char* oxidb_delete_schedule(OxiDbConn* conn, const char* name);
+char* oxidb_enable_schedule(OxiDbConn* conn, const char* name);
+char* oxidb_disable_schedule(OxiDbConn* conn, const char* name);
+
+/* Vector index */
+char* oxidb_create_vector_index(OxiDbConn* conn, const char* collection,
+                                const char* field, int32_t dimension,
+                                const char* metric);
+char* oxidb_vector_search(OxiDbConn* conn, const char* collection,
+                          const char* field, const char* vector_json,
+                          int32_t limit);
+
+/* Generic: execute any JSON command, returns JSON response. */
+char* oxidb_execute(OxiDbConn* conn, const char* cmd_json);
+
 /* Free a string returned by any oxidb_* function. */
 void oxidb_free_string(char* ptr);
 

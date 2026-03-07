@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oxidb-embedded"
+version = "0.18.0"
+description = "Embedded OxiDB for Python — run the database in-process via FFI (no server required)"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [{name = "OxiDB"}]
+keywords = ["database", "document", "nosql", "oxidb", "embedded", "ffi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+]
+
+[project.urls]
+Homepage = "https://oxidb.baltavista.com"
+Documentation = "https://oxidb.baltavista.com/python-examples.html"
+Downloads = "https://oxidb.baltavista.com/downloads.html"
+
+[tool.setuptools.packages.find]
+include = ["oxidb_embedded*"]

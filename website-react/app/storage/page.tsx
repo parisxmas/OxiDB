@@ -1,0 +1,27 @@
+import type { Metadata } from "next"
+
+export const metadata: Metadata = {
+  title: "Storage Engine",
+}
+
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<section id="storage" class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg> Storage Engine</h2>
+
+    <h3>Architecture</h3>
+    <ul>
+      <li><strong>Append-only file</strong> -- Documents stored as <code>[status:u8][length:u32 LE][payload]</code>. Soft-delete flips the status byte in place.</li>
+      <li><strong>Write-Ahead Log (WAL)</strong> -- CRC32 checksums per entry. Transaction ID tagging. 3-fsync protocol: WAL &rarr; data &rarr; checkpoint.</li>
+      <li><strong>Zstd compression</strong> -- Level 3 by default. Transparent per-document. Thread-local compressor/decompressor reuse.</li>
+      <li><strong>AES-256-GCM encryption</strong> -- Optional. Random 12-byte nonce per document. Applied after compression.</li>
+      <li><strong>LRU document cache</strong> -- Per-collection in-memory cache. JSON deserialized once, then Arc-refcounted. Configurable capacity.</li>
+      <li><strong>Lock-free reads</strong> -- Separate read-only file handle uses <code>pread</code>. Writes are serialized via Mutex.</li>
+      <li><strong>Lazy sync mode</strong> -- Background thread batches fsyncs at a configurable interval. Reduces write latency at the cost of durability window.</li>
+    </ul>
+
+    <h3>Collection Isolation</h3>
+    <p>Each collection has its own storage file, WAL, indexes, and cache. Per-collection <code>RwLock</code> enables concurrent reads across different collections and concurrent reads within the same collection.</p>
+  </div>
+</section>` }} />
+}

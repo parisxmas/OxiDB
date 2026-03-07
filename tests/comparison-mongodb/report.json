@@ -1,0 +1,233 @@
+{
+  "mongo_wins": 2,
+  "oxi_wins": 18,
+  "timings": [
+    {
+      "category": "Bulk Insert",
+      "name": "Insert 100000 docs (batch 1000)",
+      "oxi_ms": 1096.951,
+      "mongo_ms": 958.092,
+      "speedup": "1.1x",
+      "oxi_count": 100000,
+      "mongo_count": 100000,
+      "winner": "mongodb",
+      "oxi_detail": "91162 docs/s",
+      "mongo_detail": "104374 docs/s"
+    },
+    {
+      "category": "Queries",
+      "name": "Exact match (department=Engineering)",
+      "oxi_ms": 64.497,
+      "mongo_ms": 158.821,
+      "speedup": "2.5x",
+      "oxi_count": 20142,
+      "mongo_count": 20142,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Queries",
+      "name": "Range query (age \u003e= 50)",
+      "oxi_ms": 71.154,
+      "mongo_ms": 285.557,
+      "speedup": "4.0x",
+      "oxi_count": 46719,
+      "mongo_count": 46719,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Queries",
+      "name": "Compound (dept=Sales AND status=active)",
+      "oxi_ms": 18.832,
+      "mongo_ms": 66.158,
+      "speedup": "3.5x",
+      "oxi_count": 4930,
+      "mongo_count": 4930,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Queries",
+      "name": "$or query (city=Tokyo OR city=Paris)",
+      "oxi_ms": 34.71,
+      "mongo_ms": 144.581,
+      "speedup": "4.2x",
+      "oxi_count": 19849,
+      "mongo_count": 19849,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Queries",
+      "name": "$in query (country in [US, UK, JP])",
+      "oxi_ms": 46.876,
+      "mongo_ms": 201.749,
+      "speedup": "4.3x",
+      "oxi_count": 30001,
+      "mongo_count": 30001,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Queries",
+      "name": "Range (salary 50000-100000)",
+      "oxi_ms": 45.792,
+      "mongo_ms": 227.846,
+      "speedup": "5.0x",
+      "oxi_count": 29331,
+      "mongo_count": 29331,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Queries",
+      "name": "Boolean (verified=true)",
+      "oxi_ms": 97.574,
+      "mongo_ms": 348.497,
+      "speedup": "3.6x",
+      "oxi_count": 50060,
+      "mongo_count": 50060,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Queries",
+      "name": "Nested field (address.zip starts with 0)",
+      "oxi_ms": 47.38,
+      "mongo_ms": 91.338,
+      "speedup": "1.9x",
+      "oxi_count": 10050,
+      "mongo_count": 10050,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Indexes",
+      "name": "Create 4 indexes on 100K docs",
+      "oxi_ms": 664.221,
+      "mongo_ms": 564.355,
+      "speedup": "1.2x",
+      "oxi_count": 4,
+      "mongo_count": 4,
+      "winner": "mongodb"
+    },
+    {
+      "category": "Indexed Queries",
+      "name": "Indexed: department=Engineering",
+      "oxi_ms": 39.849,
+      "mongo_ms": 125.589,
+      "speedup": "3.2x",
+      "oxi_count": 20142,
+      "mongo_count": 20142,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Indexed Queries",
+      "name": "Indexed: age \u003e= 60",
+      "oxi_ms": 35.803,
+      "mongo_ms": 235.477,
+      "speedup": "6.6x",
+      "oxi_count": 29959,
+      "mongo_count": 29959,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Indexed Queries",
+      "name": "Indexed: city=Tokyo",
+      "oxi_ms": 14.412,
+      "mongo_ms": 75.744,
+      "speedup": "5.3x",
+      "oxi_count": 10011,
+      "mongo_count": 10011,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Indexed Queries",
+      "name": "Indexed: salary 80000-120000",
+      "oxi_ms": 33.864,
+      "mongo_ms": 169.918,
+      "speedup": "5.0x",
+      "oxi_count": 23311,
+      "mongo_count": 23311,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Count",
+      "name": "Count all",
+      "oxi_ms": 0.042,
+      "mongo_ms": 29.099,
+      "speedup": "688.1x",
+      "oxi_count": 100000,
+      "mongo_count": 100000,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Count",
+      "name": "Count dept=Engineering",
+      "oxi_ms": 0.084,
+      "mongo_ms": 2.37,
+      "speedup": "28.2x",
+      "oxi_count": 20142,
+      "mongo_count": 20142,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Count",
+      "name": "Count age \u003e= 50",
+      "oxi_ms": 0.06,
+      "mongo_ms": 7.813,
+      "speedup": "129.2x",
+      "oxi_count": 46719,
+      "mongo_count": 46719,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Aggregation",
+      "name": "Group by department, avg salary",
+      "oxi_ms": 38.556,
+      "mongo_ms": 50.526,
+      "speedup": "1.3x",
+      "oxi_count": 5,
+      "mongo_count": 5,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Aggregation",
+      "name": "Top 5 cities by count",
+      "oxi_ms": 0.114,
+      "mongo_ms": 21.18,
+      "speedup": "185.2x",
+      "oxi_count": 5,
+      "mongo_count": 5,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Aggregation",
+      "name": "Match + Group (active engineers)",
+      "oxi_ms": 9.277,
+      "mongo_ms": 10.5,
+      "speedup": "1.1x",
+      "oxi_count": 1,
+      "mongo_count": 1,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Resources",
+      "name": "Disk usage (100K docs)",
+      "oxi_ms": 0,
+      "mongo_ms": 0,
+      "speedup": "n/a",
+      "oxi_count": 0,
+      "mongo_count": 0,
+      "winner": "n/a",
+      "oxi_detail": "0\t/data",
+      "mongo_detail": "301M\t/data/db"
+    },
+    {
+      "category": "Resources",
+      "name": "Memory usage (100K docs)",
+      "oxi_ms": 0,
+      "mongo_ms": 0,
+      "speedup": "n/a",
+      "oxi_count": 0,
+      "mongo_count": 0,
+      "winner": "n/a",
+      "oxi_detail": "36.01MiB / 8.231GiB",
+      "mongo_detail": "380.1MiB / 8.231GiB"
+    }
+  ],
+  "total": 22
+}

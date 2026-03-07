@@ -79,6 +79,7 @@ pub enum QueryOp {
     Lt(IndexValue),
     Lte(IndexValue),
     In(Vec<IndexValue>),
+    Nin(Vec<IndexValue>),
     Exists(bool),
     Regex(regex::Regex),
 }
@@ -182,6 +183,12 @@ fn parse_op(
                 .ok_or_else(|| Error::InvalidQuery("$in must be an array".into()))?;
             Ok(QueryOp::In(arr.iter().map(IndexValue::from_json).collect()))
         }
+        "$nin" => {
+            let arr = op_val
+                .as_array()
+                .ok_or_else(|| Error::InvalidQuery("$nin must be an array".into()))?;
+            Ok(QueryOp::Nin(arr.iter().map(IndexValue::from_json).collect()))
+        }
         "$exists" => {
             let b = op_val
                 .as_bool()
@@ -275,7 +282,7 @@ fn execute_field_op(
         QueryOp::Lt(v) => idx.find_range(Bound::Unbounded, Bound::Excluded(v)),
         QueryOp::Lte(v) => idx.find_range(Bound::Unbounded, Bound::Included(v)),
         QueryOp::In(vals) => idx.find_in(vals),
-        QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
+        QueryOp::Nin(_) | QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
     })
 }
 
@@ -413,7 +420,7 @@ pub fn execute_indexed_lazy(
                     });
                     cont
                 }
-                QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
+                QueryOp::Nin(_) | QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
             })
         }
         Query::And(subs) => {
@@ -501,6 +508,7 @@ pub fn matches_doc(query: &Query, doc: &Document) -> bool {
                         QueryOp::Lt(v) => iv < *v,
                         QueryOp::Lte(v) => iv <= *v,
                         QueryOp::In(vals) => vals.contains(&iv),
+                        QueryOp::Nin(vals) => !vals.contains(&iv),
                         QueryOp::Exists(_) | QueryOp::Regex(_) => unreachable!(),
                     }
                 }
@@ -530,8 +538,8 @@ pub fn is_fully_indexed(
     match query {
         Query::All => true,
         Query::Field { field, op } => {
-            // $exists and $regex can't be resolved by index
-            if matches!(op, QueryOp::Exists(_) | QueryOp::Regex(_)) {
+            // $exists, $regex, $nin can't be resolved by index
+            if matches!(op, QueryOp::Exists(_) | QueryOp::Regex(_) | QueryOp::Nin(_)) {
                 return false;
             }
             field_indexes.contains_key(field.as_str())
@@ -559,7 +567,7 @@ pub fn count_indexed(
                 QueryOp::Lt(v) => idx.count_range(Bound::Unbounded, Bound::Excluded(v)),
                 QueryOp::Lte(v) => idx.count_range(Bound::Unbounded, Bound::Included(v)),
                 QueryOp::In(vals) => idx.count_in(vals),
-                QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
+                QueryOp::Nin(_) | QueryOp::Exists(_) | QueryOp::Regex(_) => return None,
             })
         }
         Query::And(subs) => {
@@ -705,6 +713,7 @@ pub fn matches_value(query: &Query, data: &JsonValue) -> bool {
                         QueryOp::Lt(v) => iv < *v,
                         QueryOp::Lte(v) => iv <= *v,
                         QueryOp::In(vals) => vals.contains(&iv),
+                        QueryOp::Nin(vals) => !vals.contains(&iv),
                         QueryOp::Exists(_) | QueryOp::Regex(_) => unreachable!(),
                     }
                 }
@@ -760,6 +769,7 @@ fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
                         QueryOp::Lt(v) => iv < *v,
                         QueryOp::Lte(v) => iv <= *v,
                         QueryOp::In(vals) => vals.contains(&iv),
+                        QueryOp::Nin(vals) => !vals.contains(&iv),
                         QueryOp::Exists(_) | QueryOp::Regex(_) => unreachable!(),
                     })
                 }
@@ -927,6 +937,26 @@ mod tests {
         assert!(matches_doc(&q, &doc_red));
         assert!(!matches_doc(&q, &doc_green));
         assert!(matches_doc(&q, &doc_blue));
+    }
+
+    #[test]
+    fn nin_operator() {
+        let q = parse_query(&json!({"color": {"$nin": ["red", "blue"]}})).unwrap();
+        let doc_red = Document::new(1, json!({"color": "red"})).unwrap();
+        let doc_green = Document::new(2, json!({"color": "green"})).unwrap();
+        let doc_blue = Document::new(3, json!({"color": "blue"})).unwrap();
+        let doc_yellow = Document::new(4, json!({"color": "yellow"})).unwrap();
+        assert!(!matches_doc(&q, &doc_red));
+        assert!(matches_doc(&q, &doc_green));
+        assert!(!matches_doc(&q, &doc_blue));
+        assert!(matches_doc(&q, &doc_yellow));
+    }
+
+    #[test]
+    fn nin_missing_field() {
+        let q = parse_query(&json!({"color": {"$nin": ["red", "blue"]}})).unwrap();
+        let doc_no_field = Document::new(1, json!({"name": "test"})).unwrap();
+        assert!(!matches_doc(&q, &doc_no_field)); // missing field → false
     }
 
     #[test]
