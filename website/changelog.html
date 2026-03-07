@@ -45,12 +45,56 @@
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.19.3 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.19.3</h3>
+        <span class="version-date">2026-03-08</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>OxiMem native in-memory store</strong> -- Renamed from Redis handler. Pure in-memory data structures (HashMap, VecDeque, HashSet, BTreeSet) with no SQL overhead. Pipeline performance exceeds 3M ops/s via lock coalescing and deferred flush.
+          </li>
+          <li>
+            <strong>Sorted sets</strong> -- Full sorted set implementation with dual data structure (BTreeSet + HashMap). Commands: ZADD, ZREM, ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZCARD, ZCOUNT, ZINCRBY, ZPOPMIN, ZPOPMAX.
+          </li>
+          <li>
+            <strong>Pub/Sub</strong> -- Channel-based publish/subscribe with mpsc channels. Commands: SUBSCRIBE, UNSUBSCRIBE, PUBLISH. Subscribers receive messages from both RESP and MQTT clients.
+          </li>
+          <li>
+            <strong>MQTT v3.1.1 protocol</strong> -- Full MQTT broker support on configurable port (<code>OXIDB_MQTT_PORT</code>). Handles CONNECT, PUBLISH, SUBSCRIBE, UNSUBSCRIBE, PINGREQ, DISCONNECT. QoS 0 and QoS 1 (PUBACK). Shares pub/sub namespace with OxiMem RESP layer.
+          </li>
+          <li>
+            <strong>MQTT-only mode</strong> -- <code>OXIDB_MODE=mqtt</code> runs OxiDB purely as an MQTT message broker, skipping the main TCP listener.
+          </li>
+          <li>
+            <strong>Command logging</strong> -- <code>OXIDB_LOG_COMMANDS=true</code> logs all OxiMem and MQTT commands with their responses to stderr.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Changed</h4>
+        <ul>
+          <li>
+            <strong>Pipeline optimization</strong> -- Lock coalescing acquires a single lock per batch of same-type commands. Deferred flush reduces syscalls by only flushing when the reader buffer is empty. Single-command fast path skips Vec allocation overhead.
+          </li>
+          <li>
+            <strong>OxiMem environment variables</strong> -- <code>OXIDB_REDIS_PORT</code> renamed to <code>OXIDB_OXIMEM_PORT</code>. New: <code>OXIDB_MQTT_PORT</code> (default 1883), <code>OXIDB_OXIMEM_SQL</code> (default false), <code>OXIDB_LOG_COMMANDS</code>.
+          </li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.19.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.19.0</h3>
         <span class="version-date">2026-03-07</span>
-        <span class="version-badge latest">latest</span>
       </div>
 
       <div class="change-group">
