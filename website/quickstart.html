@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OxiDB - Quick Start</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="container nav-inner">
+    <a href="index.html" class="logo">Oxi<span>DB</span></a>
+    <div class="nav-links">
+      <a href="downloads.html">Downloads</a>
+      <a href="features.html">Features</a>
+      <a href="quickstart.html" class="active">Quick Start</a>
+      <a href="docs.html">Docs</a>
+      <a href="queries.html">Queries</a>
+      <a href="updates.html">Updates</a>
+      <a href="aggregation.html">Aggregation</a>
+      <a href="indexes.html">Indexes</a>
+      <a href="transactions.html">Transactions</a>
+      <a href="sql.html">SQL</a>
+      <a href="search.html">Search</a>
+      <a href="vectors.html">Vectors</a>
+      <a href="blobs.html">Blobs</a>
+      <a href="streams.html">Streams</a>
+      <a href="server.html">Server</a>
+      <a href="clients.html">Clients</a>
+      <a href="go-examples.html">Go Examples</a>
+      <a href="python-examples.html">Python Examples</a>
+      <a href="storage.html">Storage</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="changelog.html">Changelog</a>
+    </div>
+    <button class="nav-toggle" onclick="document.querySelector('.nav').classList.toggle('open')" aria-label="Menu">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5"/></svg>
+    </button>
+  </div>
+</nav>
+
+<section id="quickstart" class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> Quick Start</h2>
+
+    <h3>Embedded (Rust)</h3>
+    <pre><code class="lang-rust"><span class="kw">use</span> oxidb::OxiDb;
+<span class="kw">use</span> serde_json::json;
+
+<span class="kw">fn</span> <span class="fn">main</span>() {
+    <span class="kw">let</span> db = OxiDb::open(<span class="str">"./my_data"</span>).unwrap();
+
+    <span class="co">// Insert a document</span>
+    db.insert(<span class="str">"users"</span>, json!({
+        <span class="str">"name"</span>: <span class="str">"Alice"</span>,
+        <span class="str">"age"</span>: <span class="num">30</span>,
+        <span class="str">"department"</span>: <span class="str">"Engineering"</span>
+    })).unwrap();
+
+    <span class="co">// Query</span>
+    <span class="kw">let</span> results = db.find(<span class="str">"users"</span>, json!({<span class="str">"age"</span>: {<span class="str">"$gte"</span>: <span class="num">25</span>}}), <span class="kw">None</span>).unwrap();
+
+    <span class="co">// Update</span>
+    db.update(<span class="str">"users"</span>, json!({<span class="str">"name"</span>: <span class="str">"Alice"</span>}), json!({
+        <span class="str">"$set"</span>: {<span class="str">"age"</span>: <span class="num">31</span>}
+    })).unwrap();
+}</code></pre>
+
+    <h3>Server Mode</h3>
+    <pre><code class="lang-bash"><span class="co"># Start the server</span>
+OXIDB_ADDR=127.0.0.1:4444 OXIDB_DATA=./data oxidb-server
+
+<span class="co"># Environment variables:</span>
+<span class="co">#   OXIDB_ADDR       - Bind address (default: 127.0.0.1:4444)</span>
+<span class="co">#   OXIDB_DATA       - Data directory (default: ./oxidb_data)</span>
+<span class="co">#   OXIDB_POOL_SIZE  - Worker threads (default: 4)</span>
+<span class="co">#   OXIDB_IDLE_TIMEOUT - Connection timeout in seconds (default: 30)</span></code></pre>
+
+    <h3>Python</h3>
+    <pre><code class="lang-python"><span class="kw">from</span> oxidb <span class="kw">import</span> OxiDbClient
+
+<span class="kw">with</span> OxiDbClient(<span class="str">"127.0.0.1"</span>, <span class="num">4444</span>) <span class="kw">as</span> db:
+    db.insert(<span class="str">"users"</span>, {<span class="str">"name"</span>: <span class="str">"Alice"</span>, <span class="str">"age"</span>: <span class="num">30</span>})
+    docs = db.find(<span class="str">"users"</span>, {<span class="str">"age"</span>: {<span class="str">"$gte"</span>: <span class="num">25</span>}})
+    db.update(<span class="str">"users"</span>, {<span class="str">"name"</span>: <span class="str">"Alice"</span>}, {<span class="str">"$inc"</span>: {<span class="str">"age"</span>: <span class="num">1</span>}})</code></pre>
+
+    <h3>Go</h3>
+    <pre><code class="lang-go">client, _ := oxidb.ConnectDefault()
+<span class="kw">defer</span> client.Close()
+
+client.UseOxiWire() <span class="co">// enable binary protocol (fastest)</span>
+
+client.Insert(<span class="str">"users"</span>, <span class="kw">map</span>[<span class="ty">string</span>]<span class="kw">any</span>{
+    <span class="str">"name"</span>: <span class="str">"Alice"</span>, <span class="str">"age"</span>: <span class="num">30</span>,
+})
+
+docs, _ := client.Find(<span class="str">"users"</span>, <span class="kw">map</span>[<span class="ty">string</span>]<span class="kw">any</span>{
+    <span class="str">"age"</span>: <span class="kw">map</span>[<span class="ty">string</span>]<span class="kw">any</span>{<span class="str">"$gte"</span>: <span class="num">25</span>},
+}, <span class="kw">nil</span>)</code></pre>
+
+    <h3>.NET (EF Core)</h3>
+    <pre><code class="lang-csharp"><span class="co">// Configure in Program.cs</span>
+builder.Services.AddOxiDb(options => {
+    options.UseTcp(<span class="str">"127.0.0.1"</span>, <span class="num">4444</span>);
+    <span class="co">// or: options.UseEmbedded("./data");</span>
+});
+
+<span class="co">// Use with EF Core</span>
+<span class="kw">var</span> users = <span class="kw">await</span> db.Users
+    .Where(u => u.Age >= <span class="num">25</span>)
+    .OrderBy(u => u.Name)
+    .ToListAsync();</code></pre>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container">
+    <div class="footer-inner">
+      <div class="footer-brand">
+        <span class="logo">Oxi<span>DB</span></span>
+        <p>Fast, embeddable document database. Written in Rust.</p>
+      </div>
+      <div class="footer-links">
+        <div>
+          <h4>Resources</h4>
+          <a href="https://crates.io/crates/oxidb">crates.io</a>
+        </div>
+        <div>
+          <h4>Docs</h4>
+          <a href="quickstart.html">Quick Start</a>
+          <a href="queries.html">Query API</a>
+          <a href="server.html">Server</a>
+          <a href="clients.html">Client Libraries</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <p>OxiDB v0.18.0 -- Built with Rust</p>
+    </div>
+  </div>
+</footer>
+
+<script>
+document.querySelectorAll('a[href^="#"]').forEach(a => {
+  a.addEventListener('click', e => {
+    e.preventDefault();
+    const target = document.querySelector(a.getAttribute('href'));
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.querySelector('.nav').classList.remove('open');
+  });
+});
+</script>
+</body>
+</html>

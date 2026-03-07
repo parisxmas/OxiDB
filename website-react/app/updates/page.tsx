@@ -1,0 +1,46 @@
+import type { Metadata } from "next"
+
+export const metadata: Metadata = {
+  title: "Update Operators",
+}
+
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<section id="updates" class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg> Update Operators</h2>
+
+    <h3>Field Operators</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Operator</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>$set</code></td><td>Set field value</td><td><code>{"$set": {"name": "Bob", "address.city": "NYC"}}</code></td></tr>
+          <tr><td><code>$unset</code></td><td>Remove field</td><td><code>{"$unset": {"temp_field": ""}}</code></td></tr>
+          <tr><td><code>$inc</code></td><td>Increment number</td><td><code>{"$inc": {"age": 1, "score": -5}}</code></td></tr>
+          <tr><td><code>$mul</code></td><td>Multiply number</td><td><code>{"$mul": {"price": 1.1}}</code></td></tr>
+          <tr><td><code>$min</code></td><td>Set to min of current and given</td><td><code>{"$min": {"low_score": 50}}</code></td></tr>
+          <tr><td><code>$max</code></td><td>Set to max of current and given</td><td><code>{"$max": {"high_score": 99}}</code></td></tr>
+          <tr><td><code>$rename</code></td><td>Rename field</td><td><code>{"$rename": {"old_name": "new_name"}}</code></td></tr>
+          <tr><td><code>$currentDate</code></td><td>Set to current timestamp</td><td><code>{"$currentDate": {"updated_at": true}}</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Array Operators</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Operator</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>$push</code></td><td>Append to array</td><td><code>{"$push": {"tags": "new-tag"}}</code></td></tr>
+          <tr><td><code>$pull</code></td><td>Remove from array</td><td><code>{"$pull": {"tags": "old-tag"}}</code></td></tr>
+          <tr><td><code>$addToSet</code></td><td>Add if not present</td><td><code>{"$addToSet": {"tags": "unique-tag"}}</code></td></tr>
+          <tr><td><code>$pop</code></td><td>Remove first (-1) or last (1)</td><td><code>{"$pop": {"queue": -1}}</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>Multiple operators can be combined in a single update:</p>
+    <pre><code class="lang-json">{<span class="str">"$set"</span>: {<span class="str">"status"</span>: <span class="str">"active"</span>}, <span class="str">"$inc"</span>: {<span class="str">"login_count"</span>: <span class="num">1</span>}, <span class="str">"$currentDate"</span>: {<span class="str">"last_login"</span>: <span class="kw">true</span>}}</code></pre>
+  </div>
+</section>` }} />
+}

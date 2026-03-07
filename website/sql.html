@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OxiDB - SQL Support</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="container nav-inner">
+    <a href="index.html" class="logo">Oxi<span>DB</span></a>
+    <div class="nav-links">
+      <a href="downloads.html">Downloads</a>
+      <a href="features.html">Features</a>
+      <a href="quickstart.html">Quick Start</a>
+      <a href="docs.html">Docs</a>
+      <a href="queries.html">Queries</a>
+      <a href="updates.html">Updates</a>
+      <a href="aggregation.html">Aggregation</a>
+      <a href="indexes.html">Indexes</a>
+      <a href="transactions.html">Transactions</a>
+      <a href="sql.html" class="active">SQL</a>
+      <a href="search.html">Search</a>
+      <a href="vectors.html">Vectors</a>
+      <a href="blobs.html">Blobs</a>
+      <a href="streams.html">Streams</a>
+      <a href="server.html">Server</a>
+      <a href="clients.html">Clients</a>
+      <a href="go-examples.html">Go Examples</a>
+      <a href="python-examples.html">Python Examples</a>
+      <a href="storage.html">Storage</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="changelog.html">Changelog</a>
+    </div>
+    <button class="nav-toggle" onclick="document.querySelector('.nav').classList.toggle('open')" aria-label="Menu">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5"/></svg>
+    </button>
+  </div>
+</nav>
+
+<section id="sql" class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg> SQL Support</h2>
+    <p class="section-desc">Standard SQL alongside JSON queries. Collections are tables.</p>
+
+    <pre><code class="lang-sql"><span class="kw">SELECT</span> name, age, department
+<span class="kw">FROM</span> users
+<span class="kw">WHERE</span> age >= <span class="num">25</span> <span class="kw">AND</span> department = <span class="str">'Engineering'</span>
+<span class="kw">ORDER BY</span> age <span class="kw">DESC</span>
+<span class="kw">LIMIT</span> <span class="num">10</span>;
+
+<span class="kw">INSERT INTO</span> users (name, age) <span class="kw">VALUES</span> (<span class="str">'Alice'</span>, <span class="num">30</span>);
+
+<span class="kw">UPDATE</span> users <span class="kw">SET</span> age = <span class="num">31</span> <span class="kw">WHERE</span> name = <span class="str">'Alice'</span>;
+
+<span class="kw">DELETE FROM</span> users <span class="kw">WHERE</span> status = <span class="str">'inactive'</span>;
+
+<span class="co">-- Aggregation</span>
+<span class="kw">SELECT</span> department, <span class="fn">COUNT</span>(*), <span class="fn">AVG</span>(salary)
+<span class="kw">FROM</span> users
+<span class="kw">GROUP BY</span> department;
+
+<span class="co">-- Joins</span>
+<span class="kw">SELECT</span> u.name, o.total
+<span class="kw">FROM</span> users u
+<span class="kw">JOIN</span> orders o <span class="kw">ON</span> u._id = o.user_id;
+
+<span class="co">-- Index management</span>
+<span class="kw">CREATE INDEX</span> idx_email <span class="kw">ON</span> users(email);
+<span class="kw">DROP INDEX</span> idx_email <span class="kw">ON</span> users;
+
+<span class="co">-- Database management</span>
+<span class="kw">CREATE DATABASE</span> myapp;
+<span class="kw">USE</span> myapp;
+<span class="kw">SHOW DATABASES</span>;</code></pre>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container">
+    <div class="footer-inner">
+      <div class="footer-brand">
+        <span class="logo">Oxi<span>DB</span></span>
+        <p>Fast, embeddable document database. Written in Rust.</p>
+      </div>
+      <div class="footer-links">
+        <div>
+          <h4>Resources</h4>
+          <a href="https://crates.io/crates/oxidb">crates.io</a>
+        </div>
+        <div>
+          <h4>Docs</h4>
+          <a href="quickstart.html">Quick Start</a>
+          <a href="queries.html">Query API</a>
+          <a href="server.html">Server</a>
+          <a href="clients.html">Client Libraries</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <p>OxiDB v0.18.0 -- Built with Rust</p>
+    </div>
+  </div>
+</footer>
+
+<script>
+document.querySelectorAll('a[href^="#"]').forEach(a => {
+  a.addEventListener('click', e => {
+    e.preventDefault();
+    const target = document.querySelector(a.getAttribute('href'));
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.querySelector('.nav').classList.remove('open');
+  });
+});
+</script>
+</body>
+</html>

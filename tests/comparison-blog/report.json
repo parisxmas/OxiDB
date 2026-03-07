@@ -1,0 +1,153 @@
+{
+  "oxi_wins": 10,
+  "pg_wins": 4,
+  "timings": [
+    {
+      "category": "Seed",
+      "name": "Insert 60 blog posts",
+      "oxi_ms": 28.108,
+      "pg_ms": 22.015,
+      "speedup": "1.3x",
+      "oxi_count": 60,
+      "pg_count": 60,
+      "winner": "postgresql"
+    },
+    {
+      "category": "Seed",
+      "name": "Create indexes",
+      "oxi_ms": 17.934,
+      "pg_ms": 14.139,
+      "speedup": "1.3x",
+      "oxi_count": 9,
+      "pg_count": 10,
+      "winner": "postgresql"
+    },
+    {
+      "category": "Single Query",
+      "name": "Get post by slug",
+      "oxi_ms": 0.534,
+      "pg_ms": 1.05,
+      "speedup": "2.0x",
+      "oxi_count": 1,
+      "pg_count": 1,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Single Query",
+      "name": "Homepage: published, sort by date DESC, limit 10",
+      "oxi_ms": 0.659,
+      "pg_ms": 1.102,
+      "speedup": "1.7x",
+      "oxi_count": 10,
+      "pg_count": 10,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Single Query",
+      "name": "Posts by category: Engineering",
+      "oxi_ms": 0.837,
+      "pg_ms": 1.322,
+      "speedup": "1.6x",
+      "oxi_count": 10,
+      "pg_count": 7,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Single Query",
+      "name": "Posts by tag: rust",
+      "oxi_ms": 0.398,
+      "pg_ms": 0.538,
+      "speedup": "1.4x",
+      "oxi_count": 1,
+      "pg_count": 1,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Single Query",
+      "name": "Featured posts",
+      "oxi_ms": 0.545,
+      "pg_ms": 1.129,
+      "speedup": "2.1x",
+      "oxi_count": 10,
+      "pg_count": 10,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Single Query",
+      "name": "Recent posts (last 30 days from latest)",
+      "oxi_ms": 1.074,
+      "pg_ms": 1.05,
+      "speedup": "1.0x",
+      "oxi_count": 20,
+      "pg_count": 10,
+      "winner": "postgresql"
+    },
+    {
+      "category": "Single Query",
+      "name": "Top posts by views (limit 10)",
+      "oxi_ms": 0.541,
+      "pg_ms": 1.851,
+      "speedup": "3.4x",
+      "oxi_count": 10,
+      "pg_count": 10,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Single Query",
+      "name": "Text search: database",
+      "oxi_ms": 1.779,
+      "pg_ms": 1.676,
+      "speedup": "1.1x",
+      "oxi_count": 20,
+      "pg_count": 20,
+      "winner": "postgresql"
+    },
+    {
+      "category": "Single Query",
+      "name": "Aggregation: count by category",
+      "oxi_ms": 0.343,
+      "pg_ms": 0.725,
+      "speedup": "2.1x",
+      "oxi_count": 10,
+      "pg_count": 10,
+      "winner": "oxidb"
+    },
+    {
+      "category": "Concurrent Reads",
+      "name": "1000 readers",
+      "oxi_ms": 1393.618,
+      "pg_ms": 1515.917,
+      "speedup": "1.1x",
+      "oxi_count": 7471,
+      "pg_count": 7471,
+      "winner": "oxidb",
+      "oxi_detail": "1000 conns | 5.4k ops/s | avg=79.5ms p50=1.7ms p95=558.9ms p99=1.289s n=7471",
+      "pg_detail": "1000 conns | 4.9k ops/s | avg=89.8ms p50=83.8ms p95=180.1ms p99=274ms n=7471"
+    },
+    {
+      "category": "Concurrent Mixed",
+      "name": "1000 mixed (800R+100V+100C)",
+      "oxi_ms": 568.493,
+      "pg_ms": 1148.364,
+      "speedup": "2.0x",
+      "oxi_count": 6000,
+      "pg_count": 6000,
+      "winner": "oxidb",
+      "oxi_detail": "1000 conns | 10.6k ops/s | R: avg=47.3ms p50=1.4ms p95=350.8ms p99=406.6ms n=4000 | W: avg=26.3ms p50=957µs p95=238.6ms p99=411.1ms n=2000 | err: 0/0",
+      "pg_detail": "1000 conns | 5.2k ops/s | R: avg=37.8ms p50=33.3ms p95=88.9ms p99=150.4ms n=4000 | W: avg=48.7ms p50=34.1ms p95=141.9ms p99=219.7ms n=2000 | err: 0/0"
+    },
+    {
+      "category": "Connection Storm",
+      "name": "1000 connect+query+close",
+      "oxi_ms": 163.994,
+      "pg_ms": 592.305,
+      "speedup": "3.6x",
+      "oxi_count": 1000,
+      "pg_count": 1000,
+      "winner": "oxidb",
+      "oxi_detail": "6.1k ops/s | avg=75.1ms p50=73.1ms p95=137.8ms p99=158.2ms n=1000 | 0 err",
+      "pg_detail": "1.7k ops/s | avg=322.3ms p50=325.2ms p95=575ms p99=587.3ms n=1000 | 0 err"
+    }
+  ],
+  "total": 14
+}

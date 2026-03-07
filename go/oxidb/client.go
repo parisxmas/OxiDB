@@ -46,6 +46,11 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// SetDeadline sets the read/write deadline on the underlying connection.
+func (c *Client) SetDeadline(t time.Time) error {
+	return c.conn.SetDeadline(t)
+}
+
 // UseOxiWire enables OxiDB's custom binary wire protocol (fastest).
 func (c *Client) UseOxiWire() {
 	c.oxiwire = true

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OxiDB - Query Operators</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="container nav-inner">
+    <a href="index.html" class="logo">Oxi<span>DB</span></a>
+    <div class="nav-links">
+      <a href="downloads.html">Downloads</a>
+      <a href="features.html">Features</a>
+      <a href="quickstart.html">Quick Start</a>
+      <a href="docs.html">Docs</a>
+      <a href="queries.html" class="active">Queries</a>
+      <a href="updates.html">Updates</a>
+      <a href="aggregation.html">Aggregation</a>
+      <a href="indexes.html">Indexes</a>
+      <a href="transactions.html">Transactions</a>
+      <a href="sql.html">SQL</a>
+      <a href="search.html">Search</a>
+      <a href="vectors.html">Vectors</a>
+      <a href="blobs.html">Blobs</a>
+      <a href="streams.html">Streams</a>
+      <a href="server.html">Server</a>
+      <a href="clients.html">Clients</a>
+      <a href="go-examples.html">Go Examples</a>
+      <a href="python-examples.html">Python Examples</a>
+      <a href="storage.html">Storage</a>
+      <a href="benchmarks.html">Benchmarks</a>
+      <a href="changelog.html">Changelog</a>
+    </div>
+    <button class="nav-toggle" onclick="document.querySelector('.nav').classList.toggle('open')" aria-label="Menu">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5"/></svg>
+    </button>
+  </div>
+</nav>
+
+<section id="queries" class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Query Operators</h2>
+    <p class="section-desc">MongoDB-compatible query language with JSON syntax. Dot notation for nested fields.</p>
+
+    <h3>Comparison</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Operator</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>$eq</code></td><td>Equals</td><td><code>{"age": {"$eq": 30}}</code> or just <code>{"age": 30}</code></td></tr>
+          <tr><td><code>$ne</code></td><td>Not equal</td><td><code>{"status": {"$ne": "inactive"}}</code></td></tr>
+          <tr><td><code>$gt</code></td><td>Greater than</td><td><code>{"age": {"$gt": 25}}</code></td></tr>
+          <tr><td><code>$gte</code></td><td>Greater than or equal</td><td><code>{"age": {"$gte": 25}}</code></td></tr>
+          <tr><td><code>$lt</code></td><td>Less than</td><td><code>{"salary": {"$lt": 100000}}</code></td></tr>
+          <tr><td><code>$lte</code></td><td>Less than or equal</td><td><code>{"salary": {"$lte": 100000}}</code></td></tr>
+          <tr><td><code>$in</code></td><td>Match any in array</td><td><code>{"country": {"$in": ["US", "UK", "JP"]}}</code></td></tr>
+          <tr><td><code>$exists</code></td><td>Field exists</td><td><code>{"email": {"$exists": true}}</code></td></tr>
+          <tr><td><code>$regex</code></td><td>Regular expression</td><td><code>{"name": {"$regex": "^A", "$options": "i"}}</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Logical</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Operator</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>$and</code></td><td>All conditions match</td><td><code>{"$and": [{"age": {"$gte": 25}}, {"status": "active"}]}</code></td></tr>
+          <tr><td><code>$or</code></td><td>Any condition matches</td><td><code>{"$or": [{"city": "Tokyo"}, {"city": "Paris"}]}</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Find Options</h3>
+    <pre><code class="lang-json">{
+  <span class="str">"sort"</span>: {<span class="str">"age"</span>: <span class="num">-1</span>, <span class="str">"name"</span>: <span class="num">1</span>},
+  <span class="str">"skip"</span>: <span class="num">20</span>,
+  <span class="str">"limit"</span>: <span class="num">10</span>
+}</code></pre>
+    <p>Sort values: <code>1</code> ascending, <code>-1</code> descending. When an index covers the sort field, sort is O(limit) instead of O(n log n).</p>
+
+    <h3>Nested Fields</h3>
+    <pre><code class="lang-json"><span class="co">// Dot notation for nested access</span>
+{<span class="str">"address.city"</span>: <span class="str">"Tokyo"</span>}
+{<span class="str">"address.zip"</span>: {<span class="str">"$regex"</span>: <span class="str">"^0"</span>}}</code></pre>
+
+    <h3>Type Ordering</h3>
+    <p>Cross-type comparisons follow a consistent ordering:</p>
+    <p><code>Null &lt; Bool &lt; Number &lt; DateTime &lt; String</code></p>
+    <p>Date strings (ISO 8601, RFC 3339, YYYY-MM-DD) are auto-detected and stored as epoch milliseconds.</p>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container">
+    <div class="footer-inner">
+      <div class="footer-brand">
+        <span class="logo">Oxi<span>DB</span></span>
+        <p>Fast, embeddable document database. Written in Rust.</p>
+      </div>
+      <div class="footer-links">
+        <div>
+          <h4>Resources</h4>
+          <a href="https://crates.io/crates/oxidb">crates.io</a>
+        </div>
+        <div>
+          <h4>Docs</h4>
+          <a href="quickstart.html">Quick Start</a>
+          <a href="queries.html">Query API</a>
+          <a href="server.html">Server</a>
+          <a href="clients.html">Client Libraries</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <p>OxiDB v0.18.0 -- Built with Rust</p>
+    </div>
+  </div>
+</footer>
+
+<script>
+document.querySelectorAll('a[href^="#"]').forEach(a => {
+  a.addEventListener('click', e => {
+    e.preventDefault();
+    const target = document.querySelector(a.getAttribute('href'));
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    document.querySelector('.nav').classList.remove('open');
+  });
+});
+</script>
+</body>
+</html>

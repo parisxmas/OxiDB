@@ -1,0 +1,197 @@
+import type { Metadata } from "next"
+
+export const metadata: Metadata = {
+  title: "Changelog",
+  description: `All notable changes to OxiDB, organized by version.`,
+}
+
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<section class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
+    <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
+
+    <!-- v0.18.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.18.0</h3>
+        <span class="version-date">2026-03-05</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>OxiWire binary protocol</strong> -- Custom wire format with 1-byte type tags, 4-byte LE lengths, 8-byte LE numbers. Magic byte <code>0xDB</code>. Replaces MsgPack for all request/response paths.
+            <span class="commit-ref">Encoder + decoder in Rust and Go</span>
+          </li>
+          <li>
+            <strong>.NET EF Core provider</strong> -- Full Entity Framework Core support with LINQ queries, transactions, and both TCP and embedded modes.
+            <span class="commit-ref">d7d5a05</span>
+          </li>
+          <li>
+            <strong>.NET NuGet packages</strong> -- <code>OxiDb.Client.Tcp</code>, <code>OxiDb.Client.Embedded</code>, <code>OxiDb.EntityFrameworkCore</code>.
+            <span class="commit-ref">d7d5a05</span>
+          </li>
+          <li>
+            <strong>Composite index tests</strong> -- 9 subtests covering exact match, prefix match, count, sort, update, delete, aggregate, drop, and triple-field composite indexes in Go.
+          </li>
+          <li>
+            <strong>Parallel OxiWire serialization</strong> -- Result sets >= 5,000 docs are serialized across up to 8 CPU cores. Chunk-based, zero per-doc allocation.
+          </li>
+          <li>
+            <strong>OxiDB vs MongoDB benchmark suite</strong> -- 22 tests across 7 categories. Score: OxiDB 19 -- MongoDB 1.
+          </li>
+          <li>
+            <strong>OxiDB vs PostgreSQL benchmark suite</strong> -- 20 tests comparing document workloads. Score: OxiDB 10 -- PostgreSQL 10.
+            <span class="commit-ref">d7d5a05</span>
+          </li>
+          <li>
+            <strong>OxiDB vs SQLite benchmark</strong> -- 100K document embedded benchmark.
+            <span class="commit-ref">ce8db5f</span>
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Changed</h4>
+        <ul>
+          <li>
+            <strong>Aggregation indexed-path threshold</strong> -- Changed from 10% to 50% selectivity. Indexed aggregation path now preferred when candidate set is less than 50% of collection size.
+          </li>
+          <li>
+            <strong>Go client rewritten for OxiWire</strong> -- All requests/responses use OxiWire binary format. MsgPack dependency removed entirely.
+          </li>
+          <li>
+            <strong>Pipeline handler updated</strong> -- Sub-responses decoded from OxiWire and re-encoded for composite pipeline responses.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type removed">Removed</h4>
+        <ul>
+          <li>
+            <strong>MsgPack support</strong> -- Removed from server (Rust), Go client, and all benchmark tests. OxiWire is the sole binary protocol.
+          </li>
+          <li>
+            <strong><code>github.com/vmihailenco/msgpack/v5</code></strong> -- Removed from Go module dependencies.
+          </li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- v0.17.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.17.0</h3>
+        <span class="version-date">2026-02-23</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>LRU document cache</strong> -- Per-collection in-memory cache with configurable capacity. JSON deserialized once, then <code>Arc</code>-refcounted.
+            <span class="commit-ref">0997d8e</span>
+          </li>
+          <li>
+            <strong>Streaming scan for non-indexed finds</strong> -- Avoids loading all documents into memory for large unindexed queries.
+            <span class="commit-ref">39cd803</span>
+          </li>
+          <li>
+            <strong>Lock-free pread</strong> -- Separate read-only file handle uses <code>pread</code> for concurrent reads without locking the write path.
+            <span class="commit-ref">63093a3</span>
+          </li>
+          <li>
+            <strong>Sorted-offset batch reads</strong> -- Indexed finds sort offsets before reading to minimize disk seeks.
+            <span class="commit-ref">63093a3</span>
+          </li>
+          <li>
+            <strong>Zero-decode aggregation</strong> -- Extract only needed fields from raw JSONB, skip full document deserialization.
+            <span class="commit-ref">4a6f696</span>
+          </li>
+          <li>
+            <strong>Batch pread for indexed $match aggregations</strong> -- Combine pread with zero-decode for indexed aggregation paths.
+            <span class="commit-ref">4b610ea</span>
+          </li>
+          <li>
+            <strong>Zero-decode index creation</strong> -- Extract only <code>_id</code> and the indexed field from raw JSONB during index build.
+            <span class="commit-ref">beb3f49</span>
+          </li>
+          <li>
+            <strong>DocIdSet optimization</strong> -- Inline storage for single-document index entries saves ~80 bytes per entry.
+            <span class="commit-ref">4897f86</span>
+          </li>
+          <li>
+            <strong>Zero-decode filter for unindexed scans</strong> -- JSONB keypath extraction avoids full JSON parse on scan.
+            <span class="commit-ref">7b9c639</span>
+          </li>
+          <li>
+            <strong>Parallel segmented scan</strong> -- Large unindexed queries split across CPU cores for parallel processing.
+            <span class="commit-ref">b339e5a</span>
+          </li>
+          <li>
+            <strong>Index-only count for aggregations</strong> -- <code>$group</code> with <code>$sum: 1</code> on indexed fields returns set size without touching documents.
+            <span class="commit-ref">b339e5a</span>
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Changed</h4>
+        <ul>
+          <li>
+            <strong>Memory consumption reduced</strong> -- Skip bulk cache during insert, drop unused <code>Value</code> clones, use <code>DocIdSet</code> instead of <code>BTreeSet</code> for single-entry indexes.
+            <span class="commit-ref">4897f86</span>
+          </li>
+          <li>
+            <strong>Streaming I/O throughout</strong> -- Replaced collect-then-process patterns with streaming iterators for finds, aggregations, and index creation.
+          </li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- v0.16.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.16.0</h3>
+        <span class="version-date">2026-02-23</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li><strong>Core document database engine</strong> -- Append-only storage, WAL with CRC32 checksums, per-collection locking.</li>
+          <li><strong>JSON query language</strong> -- $eq, $ne, $gt, $gte, $lt, $lte, $in, $exists, $regex, $and, $or. Dot notation for nested fields.</li>
+          <li><strong>Update operators</strong> -- $set, $unset, $inc, $mul, $min, $max, $rename, $currentDate, $push, $pull, $addToSet, $pop.</li>
+          <li><strong>Aggregation pipeline</strong> -- $match, $group, $sort, $project, $limit, $skip, $unwind, $addFields, $lookup, $count. Accumulators: $sum, $avg, $min, $max, $count, $first, $last, $push.</li>
+          <li><strong>Single-field, unique, and composite indexes</strong> -- BTreeMap-backed with index-only count and index-backed sort.</li>
+          <li><strong>Full-text search</strong> -- TF-IDF ranking with HTML, XML, JSON, PDF, DOCX, XLSX, and OCR support.</li>
+          <li><strong>Vector search</strong> -- HNSW index with cosine, euclidean, and dot product distance metrics.</li>
+          <li><strong>ACID transactions</strong> -- OCC with 3-phase commit, per-document versioning, deadlock-free sorted locking.</li>
+          <li><strong>SQL support</strong> -- SELECT, INSERT, UPDATE, DELETE, CREATE/DROP INDEX, CREATE/DROP TABLE, JOINs, GROUP BY, aggregate functions.</li>
+          <li><strong>Blob storage</strong> -- S3-style bucket/object API with metadata, ETags, content types.</li>
+          <li><strong>Encryption at rest</strong> -- AES-256-GCM with random 12-byte nonce per document.</li>
+          <li><strong>Zstd compression</strong> -- Level 3, transparent per-document, thread-local context reuse.</li>
+          <li><strong>Change streams</strong> -- Watch collections for insert/update/delete events. Resumable with 4096-event replay buffer.</li>
+          <li><strong>Stored procedures</strong> -- Named multi-step operations with parameter substitution.</li>
+          <li><strong>Scheduled tasks</strong> -- Background job scheduling with enable/disable control.</li>
+          <li><strong>Multi-database support</strong> -- Isolated databases within a single server instance.</li>
+          <li><strong>Backup & restore</strong> -- Compressed full backups with all data, indexes, and metadata.</li>
+          <li><strong>TCP server</strong> -- Length-prefixed JSON over TCP (max 16 MiB). Tokio-based async runtime.</li>
+          <li><strong>SCRAM-SHA-256 authentication</strong> -- Salted challenge-response, no plaintext passwords on wire.</li>
+          <li><strong>RBAC</strong> -- Admin, ReadWrite, Read roles with per-command authorization.</li>
+          <li><strong>TLS/SSL</strong> -- Certificate-based encryption for all traffic.</li>
+          <li><strong>Audit logging</strong> -- GELF format for centralized logging.</li>
+          <li><strong>Raft clustering</strong> -- Multi-node replication via openraft (optional <code>cluster</code> feature flag).</li>
+          <li><strong>Client libraries</strong> -- Python, Go, Julia, .NET (TCP + Embedded), Swift (C FFI), Java/Spring Boot.</li>
+          <li><strong>C FFI</strong> -- <code>oxidb-client-ffi</code> (cdylib) and <code>oxidb-embedded-ffi</code> (staticlib + cdylib) for language bindings.</li>
+        </ul>
+      </div>
+    </div>
+
+  </div>
+</section>` }} />
+}
