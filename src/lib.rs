@@ -19,6 +19,7 @@ pub mod sql;
 pub mod transaction;
 pub mod tx_log;
 pub mod update;
+pub mod in_memory;
 pub mod storage;
 pub mod value;
 pub mod vector;

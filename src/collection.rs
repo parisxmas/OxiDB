@@ -10,6 +10,7 @@ use crate::document::DocumentId;
 use crate::engine::LogCallback;
 use crate::error::{Error, Result};
 use crate::fts::CollectionTextIndex;
+use crate::in_memory::{InMemStorage, StorageBackend, WalBackend};
 use crate::index::{CompositeIndex, FieldIndex};
 use crate::index_persist;
 use crate::vector::{DistanceMetric, VectorIndex};
@@ -69,8 +70,8 @@ pub struct PreparedMutation {
 pub struct Collection {
     name: String,
     data_dir: PathBuf,
-    storage: Storage,
-    wal: Wal,
+    storage: StorageBackend,
+    wal: WalBackend,
     primary_index: HashMap<DocumentId, DocLocation>,
     doc_cache: DocCache,
     field_indexes: HashMap<String, FieldIndex>,
@@ -86,6 +87,10 @@ pub struct Collection {
     /// A background thread periodically calls `sync_writes()` to flush to disk.
     /// This matches MongoDB's default durability (journal flushed every ~10ms).
     lazy_sync: bool,
+    /// When true, this collection is in-memory only (no disk I/O).
+    in_memory: bool,
+    /// TTL index: maps expiry timestamp (ms since epoch) to document IDs.
+    ttl_index: std::collections::BTreeMap<u64, Vec<DocumentId>>,
 }
 
 impl Collection {
@@ -112,6 +117,9 @@ fn load_index_metadata(path: &Path) -> Result<Vec<IndexInfo>> {
 impl Collection {
     /// Persist current index definitions to a .idx file alongside the .dat file.
     fn save_index_metadata(&self) -> Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
         let indexes = self.list_indexes();
         let meta = IndexMetadata {
             version: 1,
@@ -126,6 +134,9 @@ impl Collection {
     /// Persist current index data (BTreeMap contents) to binary cache files.
     /// Called after create_index, create_unique_index, create_composite_index, and compact.
     pub fn save_index_data(&self) {
+        if self.in_memory {
+            return;
+        }
         let doc_count = self.primary_index.len() as u64;
         let next_id = self.next_id;
 
@@ -183,8 +194,8 @@ impl Collection {
 
         let data_path = data_dir.join(format!("{}.dat", name));
         let wal_path = data_dir.join(format!("{}.wal", name));
-        let storage = Storage::open_with_encryption(&data_path, encryption.clone())?;
-        let wal = Wal::open_with_encryption(&wal_path, encryption.clone())?;
+        let storage = StorageBackend::File(Storage::open_with_encryption(&data_path, encryption.clone())?);
+        let wal = WalBackend::File(Wal::open_with_encryption(&wal_path, encryption.clone())?);
 
         if verbose {
             let file_size = storage.file_size();
@@ -446,6 +457,8 @@ impl Collection {
             verbose,
             log_callback,
             lazy_sync: false,
+            in_memory: false,
+            ttl_index: std::collections::BTreeMap::new(),
         };
 
         // Save index cache after rebuild so next restart loads from cache
@@ -454,6 +467,30 @@ impl Collection {
         }
 
         Ok(collection)
+    }
+
+    /// Create a new in-memory collection (no disk I/O).
+    pub fn open_in_memory(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            data_dir: PathBuf::new(),
+            storage: StorageBackend::Memory(InMemStorage::new()),
+            wal: WalBackend::Memory,
+            primary_index: HashMap::new(),
+            doc_cache: DocCache::new(doc_cache::DEFAULT_CAPACITY),
+            field_indexes: HashMap::new(),
+            composite_indexes: Vec::new(),
+            text_index: None,
+            vector_indexes: HashMap::new(),
+            version_index: HashMap::new(),
+            next_id: 1,
+            encryption: None,
+            verbose: false,
+            log_callback: None,
+            lazy_sync: false,
+            in_memory: true,
+            ttl_index: std::collections::BTreeMap::new(),
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -1090,6 +1127,9 @@ impl Collection {
         for idx in self.vector_indexes.values_mut() {
             let _ = idx.insert(id, &data_arc);
         }
+
+        // TTL: if the document has a _ttl field (seconds), register expiry
+        self.register_ttl(id, &data_arc);
 
         self.doc_cache.put(id, data_arc);
 
@@ -2451,7 +2491,57 @@ impl Collection {
 
         let old_size = self.storage.file_size();
 
-        // Create temp storage (with same encryption key if present)
+        // In-memory mode: compact by rebuilding the Vec<u8> buffer
+        if self.in_memory {
+            let active_records = self.storage.iter_active()?;
+            let new_mem = InMemStorage::new();
+            let mut new_primary_index = HashMap::new();
+            let mut next_id: DocumentId = 1;
+
+            for (_old_loc, bytes) in &active_records {
+                let doc: Value = crate::codec::decode_doc(bytes)?;
+                let id = doc.get("_id").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    Error::InvalidQuery("document missing _id during compaction".into())
+                })?;
+                let new_bytes = crate::codec::encode_doc(&doc)?;
+                let loc = new_mem.append(&new_bytes)?;
+                new_primary_index.insert(id, loc);
+                if id >= next_id {
+                    next_id = id + 1;
+                }
+            }
+
+            let docs_kept = new_primary_index.len();
+            let new_size = new_mem.file_size();
+
+            self.storage = StorageBackend::Memory(new_mem);
+            self.primary_index = new_primary_index;
+            self.next_id = next_id;
+
+            // Fall through to index rebuild below
+            self.version_index.clear();
+            self.doc_cache.clear();
+            for idx in self.field_indexes.values_mut() { idx.clear(); }
+            for idx in &mut self.composite_indexes { idx.clear(); }
+            if let Some(ref mut text_idx) = self.text_index { text_idx.clear(); }
+            for idx in self.vector_indexes.values_mut() { idx.clear(); }
+            for (&id, &loc) in &self.primary_index.clone() {
+                let bytes = self.storage.read(loc)?;
+                let data: Value = crate::codec::decode_doc(&bytes)?;
+                let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.version_index.insert(id, ver);
+                let data_arc = Arc::new(data);
+                for idx in self.field_indexes.values_mut() { idx.insert_value(id, &data_arc); }
+                for idx in &mut self.composite_indexes { idx.insert_value(id, &data_arc); }
+                if let Some(ref mut text_idx) = self.text_index { text_idx.index_doc(id, &data_arc); }
+                for idx in self.vector_indexes.values_mut() { let _ = idx.insert(id, &data_arc); }
+                self.doc_cache.put(id, data_arc);
+            }
+
+            return Ok(CompactStats { old_size, new_size, docs_kept });
+        }
+
+        // File mode: create temp storage, copy, rename
         let tmp_path = self.data_dir.join(format!("{}.dat.tmp", self.name));
         let new_storage = Storage::open_with_encryption(&tmp_path, self.encryption.clone())?;
 
@@ -2484,7 +2574,7 @@ impl Collection {
         std::fs::rename(&tmp_path, &dat_path)?;
 
         // Replace storage with new instance pointing to the renamed file
-        self.storage = Storage::open_with_encryption(&dat_path, self.encryption.clone())?;
+        self.storage = StorageBackend::File(Storage::open_with_encryption(&dat_path, self.encryption.clone())?);
         self.primary_index = new_primary_index;
         self.next_id = next_id;
 
@@ -2532,6 +2622,107 @@ impl Collection {
             new_size,
             docs_kept,
         })
+    }
+
+    // -----------------------------------------------------------------------
+    // TTL (time-to-live) support
+    // -----------------------------------------------------------------------
+
+    /// If the document has a `_ttl` field (seconds), compute the expiry time
+    /// and register it in the TTL index.
+    fn register_ttl(&mut self, doc_id: DocumentId, data: &Value) {
+        let ttl_secs = data
+            .get("_ttl")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)));
+        if let Some(secs) = ttl_secs {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let expires_at = now_ms + secs * 1000;
+            self.ttl_index
+                .entry(expires_at)
+                .or_insert_with(Vec::new)
+                .push(doc_id);
+        }
+    }
+
+    /// Remove a document from the TTL index (called on update/delete).
+    #[allow(dead_code)]
+    fn unregister_ttl(&mut self, doc_id: DocumentId) {
+        self.ttl_index.retain(|_, ids| {
+            ids.retain(|&id| id != doc_id);
+            !ids.is_empty()
+        });
+    }
+
+    /// Evict all expired documents. Returns the number of evicted documents.
+    pub fn evict_expired(&mut self) -> usize {
+        if self.ttl_index.is_empty() {
+            return 0;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Collect expired doc IDs
+        let expired_keys: Vec<u64> = self
+            .ttl_index
+            .range(..=now_ms)
+            .map(|(k, _)| *k)
+            .collect();
+
+        if expired_keys.is_empty() {
+            return 0;
+        }
+
+        let mut expired_ids: Vec<DocumentId> = Vec::new();
+        for key in &expired_keys {
+            if let Some(ids) = self.ttl_index.get(key) {
+                expired_ids.extend(ids);
+            }
+        }
+
+        let count = expired_ids.len();
+
+        // Delete each expired document
+        for doc_id in &expired_ids {
+            if let Some(loc) = self.primary_index.remove(doc_id) {
+                let _ = self.storage.mark_deleted_no_sync(loc);
+
+                // Remove from indexes
+                if let Ok(bytes) = self.storage.read(loc) {
+                    if let Ok(doc) = crate::codec::decode_doc(&bytes) {
+                        for idx in self.field_indexes.values_mut() {
+                            idx.remove_value(*doc_id, &doc);
+                        }
+                        for idx in &mut self.composite_indexes {
+                            idx.remove_value(*doc_id, &doc);
+                        }
+                    }
+                }
+            }
+            self.version_index.remove(doc_id);
+            self.doc_cache.remove(*doc_id);
+        }
+
+        // Remove expired TTL entries
+        for key in expired_keys {
+            self.ttl_index.remove(&key);
+        }
+
+        if count > 0 {
+            let _ = self.storage.sync();
+        }
+
+        count
+    }
+
+    /// Returns true if this collection is in-memory only.
+    pub fn is_in_memory(&self) -> bool {
+        self.in_memory
     }
 
     // -----------------------------------------------------------------------

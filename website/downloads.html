@@ -200,6 +200,116 @@ cargo build --release -p oxidb-cli</code></pre>
       </div>
     </div>
 
+    <!-- .NET NuGet Packages -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">.NET NuGet Packages v0.18.1</h3>
+        <span class="version-date">2026-03-05</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <p class="release-notes">Pure managed TCP client, embedded FFI client with native runtimes, and Entity Framework Core provider for OxiDB.</p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Package</th><th>Description</th><th>File</th><th>Size</th><th>Type</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>OxiDb.Client.Tcp</td>
+              <td>Pure managed TCP client</td>
+              <td><code>OxiDb.Client.Tcp.0.18.1.nupkg</code></td>
+              <td>16 KB</td>
+              <td>nupkg</td>
+              <td><a href="/releases/v0.18.0/OxiDb.Client.Tcp.0.18.1.nupkg" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>OxiDb.Client.Embedded</td>
+              <td>Embedded FFI client + native runtimes</td>
+              <td><code>OxiDb.Client.Embedded.0.18.1.nupkg</code></td>
+              <td>2.3 MB</td>
+              <td>nupkg</td>
+              <td><a href="/releases/v0.18.0/OxiDb.Client.Embedded.0.18.1.nupkg" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>OxiDb.EntityFrameworkCore</td>
+              <td>EF Core provider (TCP + Embedded)</td>
+              <td><code>OxiDb.EntityFrameworkCore.0.18.1.nupkg</code></td>
+              <td>23 KB</td>
+              <td>nupkg</td>
+              <td><a href="/releases/v0.18.0/OxiDb.EntityFrameworkCore.0.18.1.nupkg" class="dl-btn">Download</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="install-hint">
+        <h4>Install via dotnet CLI</h4>
+        <pre><code><span class="co"># TCP client</span>
+dotnet add package OxiDb.Client.Tcp --version 0.18.1
+
+<span class="co"># Embedded client (includes native library)</span>
+dotnet add package OxiDb.Client.Embedded --version 0.18.1
+
+<span class="co"># EF Core provider</span>
+dotnet add package OxiDb.EntityFrameworkCore --version 0.18.1
+
+<span class="co"># Or install from downloaded .nupkg</span>
+dotnet nuget add source ./local-packages
+cp OxiDb.Client.Tcp.0.18.1.nupkg ./local-packages/
+dotnet add package OxiDb.Client.Tcp --version 0.18.1</code></pre>
+      </div>
+    </div>
+
+    <!-- JDBC Driver -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">JDBC Driver v0.1.0</h3>
+        <span class="version-date">2026-03-07</span>
+        <span class="version-badge latest">new</span>
+      </div>
+      <p class="release-notes">Pure Java JDBC driver for OxiDB using the OxiWire binary protocol. Zero dependencies, Java 17+. Works with DBeaver, IntelliJ, and any JDBC-compatible tool.</p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Platform</th><th>Architecture</th><th>File</th><th>Size</th><th>Type</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>All (Java)</td>
+              <td>Platform-independent</td>
+              <td><code>oxidb-jdbc-0.1.0.jar</code></td>
+              <td>38 KB</td>
+              <td>jar</td>
+              <td><a href="/releases/v0.18.0/oxidb-jdbc-0.1.0.jar" class="dl-btn">Download</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="install-hint">
+        <h4>JDBC Connection</h4>
+        <pre><code><span class="co">// Driver class</span>
+com.oxidb.jdbc.OxiDbDriver
+
+<span class="co">// URL format</span>
+jdbc:oxidb://host:port
+
+<span class="co">// Java usage</span>
+Connection conn = DriverManager.getConnection("jdbc:oxidb://127.0.0.1:4444");
+Statement stmt = conn.createStatement();
+ResultSet rs = stmt.executeQuery("SELECT * FROM users");
+
+<span class="co">// Maven</span>
+&lt;dependency&gt;
+  &lt;groupId&gt;com.oxidb&lt;/groupId&gt;
+  &lt;artifactId&gt;oxidb-jdbc&lt;/artifactId&gt;
+  &lt;version&gt;0.1.0&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+      </div>
+    </div>
+
     <div class="other-install">
       <h3>Other Installation Methods</h3>
       <div class="table-wrap">
@@ -210,6 +320,7 @@ cargo build --release -p oxidb-cli</code></pre>
             <tr><td>Python client</td><td><code>pip install oxidb</code> or copy <code>oxidb.py</code></td></tr>
             <tr><td>Python Embedded (FFI)</td><td><code>pip install oxidb-embedded</code></td></tr>
             <tr><td>Go client</td><td><code>go get oxidb</code></td></tr>
+            <tr><td>Java JDBC</td><td>Download <a href="/releases/v0.18.0/oxidb-jdbc-0.1.0.jar"><code>oxidb-jdbc-0.1.0.jar</code></a></td></tr>
             <tr><td>.NET TCP client</td><td><code>dotnet add package OxiDb.Client.Tcp</code></td></tr>
             <tr><td>.NET Embedded</td><td><code>dotnet add package OxiDb.Client.Embedded</code></td></tr>
             <tr><td>.NET EF Core</td><td><code>dotnet add package OxiDb.EntityFrameworkCore</code></td></tr>
@@ -245,7 +356,7 @@ cargo build --release -p oxidb-cli</code></pre>
       </div>
     </div>
     <div class="footer-bottom">
-      <p>OxiDB v0.18.0 -- Built with Rust</p>
+      <p>OxiDB v0.19.0 -- Built with Rust</p>
     </div>
   </div>
 </footer>

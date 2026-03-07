@@ -76,6 +76,10 @@ pub struct OxiDb {
     sync_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
     /// Per-collection LRU document cache capacity.
     cache_capacity: AtomicUsize,
+    /// When true, all collections are in-memory only (no disk I/O).
+    in_memory: bool,
+    /// Shutdown signal for the TTL eviction thread.
+    ttl_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 
 impl OxiDb {
@@ -102,6 +106,94 @@ impl OxiDb {
         log_callback: LogCallback,
     ) -> Result<Self> {
         Self::open_internal(data_dir, encryption, verbose, Some(log_callback))
+    }
+
+    /// Create a pure in-memory database (no disk I/O at all).
+    ///
+    /// All data lives only in RAM. Collections are auto-created on first use.
+    /// TTL support is available via the `_ttl` document field (seconds).
+    /// Existing OxiDB clients, SQL, indexes, transactions, and aggregations
+    /// all work unchanged.
+    pub fn open_in_memory() -> Result<Self> {
+        // Use a temp dir for subsystems that still need a path (blob, fts, txlog).
+        // These are effectively unused in pure in-memory mode but keep the
+        // type system happy.
+        let tmp = std::env::temp_dir().join(format!("oxidb_mem_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp)?;
+
+        let blob_store = BlobStore::open_with_encryption(&tmp, None)?;
+        let fts_index = Arc::new(RwLock::new(FtsIndex::open(&tmp)?));
+        let tx_log = TxCommitLog::open(&tmp)?;
+
+        let (fts_tx, fts_rx) = mpsc::sync_channel::<FtsJob>(256);
+        let fts_worker = Arc::clone(&fts_index);
+        std::thread::spawn(move || {
+            while let Ok(job) = fts_rx.recv() {
+                match job {
+                    FtsJob::Index { data, content_type, bucket, key } => {
+                        if let Some(text) = fts::extract_text(&data, &content_type) {
+                            let _ = fts_worker.write().unwrap().index_document(&bucket, &key, &text);
+                        }
+                    }
+                    FtsJob::Remove { bucket, key } => {
+                        let _ = fts_worker.write().unwrap().remove_document(&bucket, &key);
+                    }
+                }
+            }
+        });
+
+        Ok(Self {
+            data_dir: tmp,
+            collections: RwLock::new(HashMap::new()),
+            blob_store,
+            fts_index,
+            fts_tx,
+            tx_log,
+            next_tx_id: AtomicU64::new(1),
+            active_transactions: RwLock::new(HashMap::new()),
+            encryption: None,
+            verbose: false,
+            log_callback: None,
+            change_broker: ChangeStreamBroker::new(),
+            scheduler_shutdown: Mutex::new(None),
+            lazy_sync: AtomicBool::new(false),
+            sync_shutdown: Mutex::new(None),
+            cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
+            in_memory: true,
+            ttl_shutdown: Mutex::new(None),
+        })
+    }
+
+    /// Returns true if this database is running in pure in-memory mode.
+    pub fn is_in_memory(&self) -> bool {
+        self.in_memory
+    }
+
+    /// Start the background TTL eviction thread.
+    /// Runs every `interval` and evicts expired documents from all collections.
+    pub fn start_ttl_thread(self: &Arc<Self>, interval: std::time::Duration) {
+        let (tx, rx) = mpsc::sync_channel::<()>(0);
+        let db = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("oxidb-ttl".into())
+            .spawn(move || {
+                loop {
+                    match rx.recv_timeout(interval) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // Time to check for expired documents
+                            let cols = db.collections.read().unwrap();
+                            for col_arc in cols.values() {
+                                if let Ok(mut col) = col_arc.try_write() {
+                                    col.evict_expired();
+                                }
+                            }
+                        }
+                        _ => break, // Shutdown signal or channel closed
+                    }
+                }
+            })
+            .expect("failed to spawn TTL thread");
+        *self.ttl_shutdown.lock().unwrap() = Some(tx);
     }
 
     fn open_internal(
@@ -188,6 +280,8 @@ impl OxiDb {
             lazy_sync: AtomicBool::new(false),
             sync_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
+            in_memory: false,
+            ttl_shutdown: Mutex::new(None),
         })
     }
 
@@ -202,14 +296,18 @@ impl OxiDb {
         }
         // Slow path: load the collection OUTSIDE the write lock so that other
         // collections remain accessible while a large collection is loading.
-        let mut col = Collection::open_with_options(
-            name,
-            &self.data_dir,
-            &std::collections::HashSet::new(),
-            self.encryption.clone(),
-            self.verbose,
-            self.log_callback.clone(),
-        )?;
+        let mut col = if self.in_memory {
+            Collection::open_in_memory(name)
+        } else {
+            Collection::open_with_options(
+                name,
+                &self.data_dir,
+                &std::collections::HashSet::new(),
+                self.encryption.clone(),
+                self.verbose,
+                self.log_callback.clone(),
+            )?
+        };
         if self.lazy_sync.load(Ordering::Acquire) {
             col.set_lazy_sync(true);
         }
@@ -231,14 +329,18 @@ impl OxiDb {
         if cols.contains_key(name) {
             return Err(Error::CollectionAlreadyExists(name.to_string()));
         }
-        let mut col = Collection::open_with_options(
-            name,
-            &self.data_dir,
-            &std::collections::HashSet::new(),
-            self.encryption.clone(),
-            self.verbose,
-            self.log_callback.clone(),
-        )?;
+        let mut col = if self.in_memory {
+            Collection::open_in_memory(name)
+        } else {
+            Collection::open_with_options(
+                name,
+                &self.data_dir,
+                &std::collections::HashSet::new(),
+                self.encryption.clone(),
+                self.verbose,
+                self.log_callback.clone(),
+            )?
+        };
         if self.lazy_sync.load(Ordering::Acquire) {
             col.set_lazy_sync(true);
         }
@@ -254,9 +356,11 @@ impl OxiDb {
             cols.keys().cloned().collect()
         };
         // Also include collections on disk that haven't been loaded yet
-        if let Ok(disk_names) = Self::discover_collection_names_on_disk(&self.data_dir) {
-            for name in disk_names {
-                names.insert(name);
+        if !self.in_memory {
+            if let Ok(disk_names) = Self::discover_collection_names_on_disk(&self.data_dir) {
+                for name in disk_names {
+                    names.insert(name);
+                }
             }
         }
         let mut result: Vec<String> = names.into_iter().collect();
@@ -349,10 +453,12 @@ impl OxiDb {
     pub fn drop_collection(&self, name: &str) -> Result<()> {
         let mut cols = self.collections.write().unwrap();
         cols.remove(name);
-        for ext in &["dat", "wal", "idx", "fidx", "cidx", "vidx"] {
-            let path = self.data_dir.join(format!("{}.{}", name, ext));
-            if path.exists() {
-                std::fs::remove_file(path)?;
+        if !self.in_memory {
+            for ext in &["dat", "wal", "idx", "fidx", "cidx", "vidx"] {
+                let path = self.data_dir.join(format!("{}.{}", name, ext));
+                if path.exists() {
+                    std::fs::remove_file(path)?;
+                }
             }
         }
         Ok(())
@@ -2020,5 +2126,146 @@ mod tests {
         println!("\nCharlie: {}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["discount"], 5);
         assert_eq!(r["reason"], "standard_low_balance");
+    }
+
+    // -----------------------------------------------------------------------
+    // In-memory engine tests
+    // -----------------------------------------------------------------------
+
+    fn mem_db() -> OxiDb {
+        OxiDb::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn in_memory_insert_find() {
+        let db = mem_db();
+        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
+        db.insert("users", json!({"name": "Bob", "age": 25})).unwrap();
+
+        let docs = db.find("users", &json!({})).unwrap();
+        assert_eq!(docs.len(), 2);
+
+        let alice = db.find("users", &json!({"name": "Alice"})).unwrap();
+        assert_eq!(alice.len(), 1);
+        assert_eq!(alice[0]["age"], 30);
+    }
+
+    #[test]
+    fn in_memory_update_delete() {
+        let db = mem_db();
+        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
+
+        db.update("users", &json!({"name": "Alice"}), &json!({"$set": {"age": 31}})).unwrap();
+        let docs = db.find("users", &json!({"name": "Alice"})).unwrap();
+        assert_eq!(docs[0]["age"], 31);
+
+        db.delete("users", &json!({"name": "Alice"})).unwrap();
+        let docs = db.find("users", &json!({})).unwrap();
+        assert_eq!(docs.len(), 0);
+    }
+
+    #[test]
+    fn in_memory_collections() {
+        let db = mem_db();
+        db.insert("users", json!({"name": "Alice"})).unwrap();
+        db.insert("orders", json!({"item": "Widget"})).unwrap();
+
+        let cols = db.list_collections();
+        assert!(cols.contains(&"users".to_string()));
+        assert!(cols.contains(&"orders".to_string()));
+
+        db.drop_collection("orders").unwrap();
+        let cols = db.list_collections();
+        assert!(!cols.contains(&"orders".to_string()));
+    }
+
+    #[test]
+    fn in_memory_indexes() {
+        let db = mem_db();
+        db.create_index("users", "email").unwrap();
+        db.insert("users", json!({"name": "Alice", "email": "alice@test.com"})).unwrap();
+        db.insert("users", json!({"name": "Bob", "email": "bob@test.com"})).unwrap();
+
+        let docs = db.find("users", &json!({"email": "alice@test.com"})).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["name"], "Alice");
+    }
+
+    #[test]
+    fn in_memory_transactions() {
+        let db = mem_db();
+        let tx = db.begin_transaction();
+        db.tx_insert(tx, "users", json!({"name": "Alice"})).unwrap();
+        db.tx_insert(tx, "users", json!({"name": "Bob"})).unwrap();
+        db.commit_transaction(tx).unwrap();
+
+        let docs = db.find("users", &json!({})).unwrap();
+        assert_eq!(docs.len(), 2);
+    }
+
+    #[test]
+    fn in_memory_transaction_rollback() {
+        let db = mem_db();
+        db.insert("users", json!({"name": "Existing"})).unwrap();
+
+        let tx = db.begin_transaction();
+        db.tx_insert(tx, "users", json!({"name": "Temporary"})).unwrap();
+        db.rollback_transaction(tx).unwrap();
+
+        let docs = db.find("users", &json!({})).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["name"], "Existing");
+    }
+
+    #[test]
+    fn in_memory_is_in_memory() {
+        let db = mem_db();
+        assert!(db.is_in_memory());
+
+        let disk_db = temp_db();
+        assert!(!disk_db.is_in_memory());
+    }
+
+    #[test]
+    fn in_memory_ttl_eviction() {
+        let db = mem_db();
+        // Insert a doc with 0-second TTL (expires immediately)
+        db.insert("cache", json!({"key": "session", "_ttl": 0})).unwrap();
+        // Insert a doc without TTL
+        db.insert("cache", json!({"key": "permanent"})).unwrap();
+
+        // Before eviction, both docs exist
+        let docs = db.find("cache", &json!({})).unwrap();
+        assert_eq!(docs.len(), 2);
+
+        // Wait briefly then evict
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        {
+            let col = db.get_or_create_collection("cache").unwrap();
+            let mut col = col.write().unwrap();
+            let evicted = col.evict_expired();
+            assert_eq!(evicted, 1);
+        }
+
+        let docs = db.find("cache", &json!({})).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["key"], "permanent");
+    }
+
+    #[test]
+    fn in_memory_sql() {
+        let db = Arc::new(mem_db());
+        db.insert("products", json!({"name": "Widget", "price": 9.99})).unwrap();
+        db.insert("products", json!({"name": "Gadget", "price": 19.99})).unwrap();
+
+        let result = crate::sql::execute_sql(&db, "SELECT * FROM products WHERE price > 10");
+        assert!(result.is_ok());
+        match result.unwrap() {
+            crate::sql::SqlResult::Select(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0]["name"], "Gadget");
+            }
+            _ => panic!("expected Select"),
+        }
     }
 }

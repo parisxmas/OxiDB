@@ -788,6 +788,41 @@ fn handle_client(stream: TcpStream, state: &Arc<ServerState>, idle_timeout: Dura
     server_log!(state, GelfLevel::Informational, format!("client disconnected: {peer}"), extra: "peer" => &peer);
 }
 
+/// Handle a single Redis RESP client connection.
+fn handle_redis_client(stream: TcpStream, db: &Arc<OxiDb>) {
+    use oxidb_server::resp;
+    use oxidb_server::redis_handler;
+
+    let mut reader = BufReader::new(&stream);
+    let mut writer = BufWriter::new(&stream);
+
+    loop {
+        let value = match resp::read_value(&mut reader) {
+            Ok(v) => v,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        };
+
+        let args = match value {
+            resp::RespValue::Array(ref items) => items.as_slice(),
+            _ => {
+                let _ = resp::write_value(&mut writer, &resp::err("expected array"));
+                let _ = writer.flush();
+                continue;
+            }
+        };
+
+        let response = redis_handler::execute(db, args);
+        if resp::write_value(&mut writer, &response).is_err() {
+            break;
+        }
+        if writer.flush().is_err() {
+            break;
+        }
+    }
+}
+
 fn main() {
     // If OXIDB_NODE_ID is set and cluster feature is enabled, run in cluster mode.
     #[cfg(feature = "cluster")]
@@ -854,13 +889,28 @@ fn main() {
     } else {
         None
     };
-    let db_manager = DatabaseManager::open(
-        Path::new(&data_dir),
-        encryption_key,
-        verbose,
-        log_callback,
-    )
-    .expect("failed to open database manager");
+    // In-memory mode: OXIDB_MODE=memory runs everything in RAM (no disk I/O).
+    // All OxiDB features (SQL, indexes, transactions, aggregation, TTL) work unchanged.
+    let in_memory_mode = env::var("OXIDB_MODE")
+        .map(|v| v == "memory" || v == "in-memory")
+        .unwrap_or(false);
+
+    let db_manager = if in_memory_mode {
+        eprintln!("mode: in-memory (all data in RAM, no persistence)");
+        if let Some(g) = &gelf {
+            g.send(GelfLevel::Informational, "mode: in-memory", &[]);
+        }
+        DatabaseManager::open_in_memory()
+            .expect("failed to open in-memory database manager")
+    } else {
+        DatabaseManager::open(
+            Path::new(&data_dir),
+            encryption_key,
+            verbose,
+            log_callback,
+        )
+        .expect("failed to open database manager")
+    };
     let db = db_manager
         .get_default_database()
         .expect("failed to open default database");
@@ -879,7 +929,7 @@ fn main() {
     let lazy_sync = env::var("OXIDB_LAZY_SYNC")
         .map(|v| v != "false" && v != "0")
         .unwrap_or(true);
-    if lazy_sync {
+    if lazy_sync && !in_memory_mode {
         let sync_interval_ms: u64 = env::var("OXIDB_SYNC_INTERVAL_MS")
             .unwrap_or_else(|_| "10".to_string())
             .parse()
@@ -887,6 +937,16 @@ fn main() {
         db.enable_lazy_sync(Duration::from_millis(sync_interval_ms));
         eprintln!("lazy sync: enabled (interval={}ms)", sync_interval_ms);
     }
+
+    // TTL eviction thread: automatically remove expired documents.
+    // Runs every 100ms in memory mode, every 1s in file mode.
+    let ttl_interval = if in_memory_mode {
+        Duration::from_millis(100)
+    } else {
+        Duration::from_secs(1)
+    };
+    db.start_ttl_thread(ttl_interval);
+    eprintln!("TTL eviction: enabled (interval={}ms)", ttl_interval.as_millis());
 
     // Document cache capacity per collection (default: 100,000).
     if let Ok(cap_str) = env::var("OXIDB_CACHE_SIZE") {
@@ -991,6 +1051,49 @@ fn main() {
                     }
                     Err(e) => {
                         server_log!(state_pg, GelfLevel::Error, format!("[pg_wire] accept error: {e}"));
+                    }
+                }
+            }
+        });
+    }
+
+    // Redis-compatible RESP listener (optional, enabled via OXIDB_REDIS_PORT)
+    let redis_port: u16 = env::var("OXIDB_REDIS_PORT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("OXIDB_REDIS_PORT must be a valid u16");
+
+    if redis_port > 0 {
+        let redis_addr = format!("0.0.0.0:{redis_port}");
+        let redis_listener =
+            TcpListener::bind(&redis_addr).expect("failed to bind Redis RESP listener");
+        server_log!(state, GelfLevel::Notice, format!("Redis-compatible RESP listening on {redis_addr}"));
+
+        let state_redis = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for stream in redis_listener.incoming() {
+                match stream {
+                    Ok(s) => {
+                        let _ = s.set_nodelay(true);
+                        let db = Arc::clone(&state_redis.db);
+                        std::thread::spawn(move || {
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                handle_redis_client(s, &db);
+                            }));
+                            if let Err(e) = result {
+                                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = e.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                eprintln!("[redis] connection handler panicked: {msg}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        server_log!(state_redis, GelfLevel::Error, format!("[redis] accept error: {e}"));
                     }
                 }
             }
