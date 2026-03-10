@@ -1,0 +1,2 @@
+-keep class com.oxidb.embedded.OxiDb { *; }
+-keepclassmembers class com.oxidb.embedded.OxiDb { native <methods>; }

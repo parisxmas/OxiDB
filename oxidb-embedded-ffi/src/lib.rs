@@ -734,3 +734,104 @@ pub unsafe extern "C" fn oxidb_free_string(ptr: *mut c_char) {
         let _ = unsafe { CString::from_raw(ptr) };
     }
 }
+
+// ---------------------------------------------------------------------------
+// Android JNI bridge (enabled with `--features android`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "android")]
+mod android_jni {
+    use super::*;
+    use jni::JNIEnv;
+    use jni::objects::{JClass, JString};
+    use jni::sys::jlong;
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_oxidb_embedded_OxiDb_nativeOpen(
+        mut env: JNIEnv,
+        _class: JClass,
+        jpath: JString,
+    ) -> jlong {
+        let path: String = match env.get_string(&jpath) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let c_path = match CString::new(path) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        unsafe { oxidb_open(c_path.as_ptr()) as jlong }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_oxidb_embedded_OxiDb_nativeOpenEncrypted(
+        mut env: JNIEnv,
+        _class: JClass,
+        jpath: JString,
+        jkey_path: JString,
+    ) -> jlong {
+        let path: String = match env.get_string(&jpath) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let key_path: String = match env.get_string(&jkey_path) {
+            Ok(s) => s.into(),
+            Err(_) => return 0,
+        };
+        let c_path = match CString::new(path) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let c_key = match CString::new(key_path) {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        unsafe { oxidb_open_encrypted(c_path.as_ptr(), c_key.as_ptr()) as jlong }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_oxidb_embedded_OxiDb_nativeClose(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) {
+        if handle != 0 {
+            unsafe { oxidb_close(handle as *mut Handle) };
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_com_oxidb_embedded_OxiDb_nativeExecute<'local>(
+        mut env: JNIEnv<'local>,
+        _class: JClass<'local>,
+        handle: jlong,
+        jcmd: JString<'local>,
+    ) -> JString<'local> {
+        let cmd: String = match env.get_string(&jcmd) {
+            Ok(s) => s.into(),
+            Err(_) => {
+                return env.new_string("{\"ok\":false,\"error\":\"invalid command string\"}")
+                    .unwrap_or_else(|_| JString::default());
+            }
+        };
+        let c_cmd = match CString::new(cmd) {
+            Ok(c) => c,
+            Err(_) => {
+                return env.new_string("{\"ok\":false,\"error\":\"null byte in command\"}")
+                    .unwrap_or_else(|_| JString::default());
+            }
+        };
+
+        let result_ptr = unsafe { oxidb_execute(handle as *mut Handle, c_cmd.as_ptr()) };
+        let result_str = if result_ptr.is_null() {
+            "{\"ok\":false,\"error\":\"null response\"}".to_string()
+        } else {
+            let s = unsafe { CStr::from_ptr(result_ptr) }.to_string_lossy().into_owned();
+            unsafe { oxidb_free_string(result_ptr) };
+            s
+        };
+
+        env.new_string(&result_str)
+            .unwrap_or_else(|_| JString::default())
+    }
+}
