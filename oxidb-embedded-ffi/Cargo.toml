@@ -7,7 +7,12 @@ description = "C-compatible FFI for embedded (in-process) OxiDB — no server re
 [lib]
 crate-type = ["staticlib", "cdylib"]
 
+[features]
+default = []
+android = ["jni"]
+
 [dependencies]
 oxidb = { path = ".." }
 serde_json = "1"
 base64 = "0.22"
+jni = { version = "0.21", optional = true }
