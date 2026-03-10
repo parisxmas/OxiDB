@@ -1564,7 +1564,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "aes-gcm",
  "chrono",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-cli"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "base64",
  "clap",
@@ -1601,14 +1601,14 @@ dependencies = [
 
 [[package]]
 name = "oxidb-client-ffi"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "oxidb-embedded-ffi"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "base64",
  "jni",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "argon2",
  "base64",
