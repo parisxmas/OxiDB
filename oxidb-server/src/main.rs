@@ -1370,6 +1370,23 @@ fn main() {
         });
     }
 
+    // S3-compatible HTTP API (optional, enabled via OXIDB_S3_PORT)
+    #[cfg(feature = "s3")]
+    {
+        let s3_port: u16 = env::var("OXIDB_S3_PORT")
+            .unwrap_or_else(|_| "0".to_string())
+            .parse()
+            .expect("OXIDB_S3_PORT must be a valid u16");
+
+        if s3_port > 0 {
+            let s3_addr = format!("0.0.0.0:{s3_port}");
+            let s3_db = Arc::clone(&state.db);
+            oxidb_server::s3::start_s3_listener(&s3_addr, s3_db);
+            server_log!(state, GelfLevel::Notice,
+                format!("S3-compatible API listening on {s3_addr}"));
+        }
+    }
+
     // MQTT-only mode: skip the main OxiDB TCP listener
     if mqtt_only_mode {
         server_log!(state, GelfLevel::Notice, "MQTT-only mode — OxiDB TCP listener disabled".to_string());

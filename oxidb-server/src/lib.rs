@@ -13,6 +13,9 @@ pub mod scram;
 pub mod session;
 pub mod tls;
 
+#[cfg(feature = "s3")]
+pub mod s3;
+
 #[cfg(feature = "cluster")]
 pub mod async_protocol;
 #[cfg(feature = "cluster")]
