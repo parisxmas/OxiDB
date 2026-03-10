@@ -1,12 +1,13 @@
 [package]
 name = "oxidb-server"
-version = "0.19.3"
+version = "0.20.0"
 edition = "2024"
 description = "TCP server for OxiDB document database"
 
 [features]
 default = []
 ocr = ["oxidb/ocr"]
+s3 = []
 cluster = ["openraft", "tokio", "tokio-rustls"]
 
 [dependencies]
