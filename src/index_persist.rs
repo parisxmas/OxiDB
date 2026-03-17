@@ -1,9 +1,11 @@
 use std::fs;
 use std::io::{self, Cursor, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use crc32fast::Hasher;
 
+use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::index::{CompositeIndex, FieldIndex};
 use crate::vector::VectorIndex;
@@ -25,21 +27,20 @@ pub fn save_field_indexes(
     indexes: &[&FieldIndex],
     doc_count: u64,
     next_id: DocumentId,
+    encryption: Option<&Arc<EncryptionKey>>,
 ) -> io::Result<()> {
     if indexes.is_empty() {
-        // No field indexes — remove stale cache file if it exists
         let _ = fs::remove_file(path);
         return Ok(());
     }
 
-    // Serialize body
     let mut body = Vec::new();
     body.write_all(&(indexes.len() as u32).to_le_bytes())?;
     for idx in indexes {
         idx.write_to(&mut body)?;
     }
 
-    write_cache_file(path, &body, doc_count, next_id)
+    write_cache_file(path, &body, doc_count, next_id, encryption)
 }
 
 /// Load field indexes from a `.fidx` file.
@@ -48,9 +49,10 @@ pub fn load_field_indexes(
     path: &Path,
     expected_doc_count: u64,
     expected_next_id: DocumentId,
+    encryption: Option<&Arc<EncryptionKey>>,
 ) -> Option<Vec<FieldIndex>> {
     let data = fs::read(path).ok()?;
-    let body = validate_cache_file(&data, expected_doc_count, expected_next_id)?;
+    let body = validate_cache_file(&data, expected_doc_count, expected_next_id, encryption)?;
 
     let mut cursor = Cursor::new(body);
     let mut len_buf = [0u8; 4];
@@ -74,6 +76,7 @@ pub fn save_composite_indexes(
     indexes: &[&CompositeIndex],
     doc_count: u64,
     next_id: DocumentId,
+    encryption: Option<&Arc<EncryptionKey>>,
 ) -> io::Result<()> {
     if indexes.is_empty() {
         let _ = fs::remove_file(path);
@@ -86,7 +89,7 @@ pub fn save_composite_indexes(
         idx.write_to(&mut body)?;
     }
 
-    write_cache_file(path, &body, doc_count, next_id)
+    write_cache_file(path, &body, doc_count, next_id, encryption)
 }
 
 /// Load composite indexes from a `.cidx` file.
@@ -94,9 +97,10 @@ pub fn load_composite_indexes(
     path: &Path,
     expected_doc_count: u64,
     expected_next_id: DocumentId,
+    encryption: Option<&Arc<EncryptionKey>>,
 ) -> Option<Vec<CompositeIndex>> {
     let data = fs::read(path).ok()?;
-    let body = validate_cache_file(&data, expected_doc_count, expected_next_id)?;
+    let body = validate_cache_file(&data, expected_doc_count, expected_next_id, encryption)?;
 
     let mut cursor = Cursor::new(body);
     let mut len_buf = [0u8; 4];
@@ -120,6 +124,7 @@ pub fn save_vector_indexes(
     indexes: &[&VectorIndex],
     doc_count: u64,
     next_id: DocumentId,
+    encryption: Option<&Arc<EncryptionKey>>,
 ) -> io::Result<()> {
     if indexes.is_empty() {
         let _ = fs::remove_file(path);
@@ -132,7 +137,7 @@ pub fn save_vector_indexes(
         idx.write_to(&mut body)?;
     }
 
-    write_cache_file(path, &body, doc_count, next_id)
+    write_cache_file(path, &body, doc_count, next_id, encryption)
 }
 
 /// Load vector indexes from a `.vidx` file.
@@ -141,9 +146,10 @@ pub fn load_vector_indexes(
     path: &Path,
     expected_doc_count: u64,
     expected_next_id: DocumentId,
+    encryption: Option<&Arc<EncryptionKey>>,
 ) -> Option<Vec<VectorIndex>> {
     let data = fs::read(path).ok()?;
-    let body = validate_cache_file(&data, expected_doc_count, expected_next_id)?;
+    let body = validate_cache_file(&data, expected_doc_count, expected_next_id, encryption)?;
 
     let mut cursor = Cursor::new(body);
     let mut len_buf = [0u8; 4];
@@ -162,15 +168,23 @@ pub fn load_vector_indexes(
 // ---------------------------------------------------------------------------
 
 /// Write a cache file atomically: write to `.tmp`, then rename.
+/// If encryption is provided, the body is encrypted before writing.
 fn write_cache_file(
     path: &Path,
     body: &[u8],
     doc_count: u64,
     next_id: DocumentId,
+    encryption: Option<&Arc<EncryptionKey>>,
 ) -> io::Result<()> {
+    // Encrypt body if key is available
+    let final_body = match encryption {
+        Some(key) => key.encrypt(body).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?,
+        None => body.to_vec(),
+    };
+
     let body_crc = {
         let mut h = Hasher::new();
-        h.update(body);
+        h.update(&final_body);
         h.finalize()
     };
 
@@ -180,12 +194,12 @@ fn write_cache_file(
     header.write_all(&doc_count.to_le_bytes())?;
     header.write_all(&next_id.to_le_bytes())?;
     header.write_all(&body_crc.to_le_bytes())?;
-    header.write_all(&(body.len() as u64).to_le_bytes())?;
+    header.write_all(&(final_body.len() as u64).to_le_bytes())?;
 
     let tmp_path = path.with_extension("tmp");
     let mut file = fs::File::create(&tmp_path)?;
     file.write_all(&header)?;
-    file.write_all(body)?;
+    file.write_all(&final_body)?;
     file.sync_data()?;
     drop(file);
 
@@ -193,58 +207,44 @@ fn write_cache_file(
     Ok(())
 }
 
-/// Validate a cache file's header and CRC. Returns the body slice on success.
+/// Validate a cache file's header, CRC, and optionally decrypt. Returns the body on success.
 fn validate_cache_file(
     data: &[u8],
     expected_doc_count: u64,
     expected_next_id: DocumentId,
-) -> Option<&[u8]> {
+    encryption: Option<&Arc<EncryptionKey>>,
+) -> Option<Vec<u8>> {
     if data.len() < HEADER_SIZE {
         return None;
     }
 
-    // Magic
-    if &data[0..4] != MAGIC {
-        return None;
-    }
+    if &data[0..4] != MAGIC { return None; }
 
-    // Version
     let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
-    if version != VERSION {
-        return None;
-    }
+    if version != VERSION { return None; }
 
-    // Doc count
     let doc_count = u64::from_le_bytes(data[8..16].try_into().ok()?);
-    if doc_count != expected_doc_count {
-        return None;
-    }
+    if doc_count != expected_doc_count { return None; }
 
-    // Next ID
     let next_id = u64::from_le_bytes(data[16..24].try_into().ok()?);
-    if next_id != expected_next_id {
-        return None;
-    }
+    if next_id != expected_next_id { return None; }
 
-    // Body CRC
     let stored_crc = u32::from_le_bytes(data[24..28].try_into().ok()?);
-
-    // Body length
     let body_len = u64::from_le_bytes(data[28..36].try_into().ok()?) as usize;
-    if data.len() < HEADER_SIZE + body_len {
-        return None;
-    }
+    if data.len() < HEADER_SIZE + body_len { return None; }
 
     let body = &data[HEADER_SIZE..HEADER_SIZE + body_len];
 
-    // Verify CRC
+    // Verify CRC (on encrypted body — CRC was computed on encrypted data)
     let mut h = Hasher::new();
     h.update(body);
-    if h.finalize() != stored_crc {
-        return None;
-    }
+    if h.finalize() != stored_crc { return None; }
 
-    Some(body)
+    // Decrypt if encryption key is present
+    match encryption {
+        Some(key) => key.decrypt(body).ok(),
+        None => Some(body.to_vec()),
+    }
 }
 
 #[cfg(test)]
@@ -272,9 +272,9 @@ mod tests {
         idx2.insert(&make_doc(1, json!({"email": "a@b.c"})));
         idx2.insert(&make_doc(2, json!({"email": "d@e.f"})));
 
-        save_field_indexes(&path, &[&idx1, &idx2], 3, 4).unwrap();
+        save_field_indexes(&path, &[&idx1, &idx2], 3, 4, None).unwrap();
 
-        let loaded = load_field_indexes(&path, 3, 4).unwrap();
+        let loaded = load_field_indexes(&path, 3, 4, None).unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].field, "status");
         assert!(!loaded[0].unique);
@@ -290,14 +290,14 @@ mod tests {
         let path = dir.path().join("test.fidx");
 
         let idx = FieldIndex::new("x".into());
-        save_field_indexes(&path, &[&idx], 10, 11).unwrap();
+        save_field_indexes(&path, &[&idx], 10, 11, None).unwrap();
 
         // Wrong doc_count
-        assert!(load_field_indexes(&path, 9, 11).is_none());
+        assert!(load_field_indexes(&path, 9, 11, None).is_none());
         // Wrong next_id
-        assert!(load_field_indexes(&path, 10, 12).is_none());
+        assert!(load_field_indexes(&path, 10, 12, None).is_none());
         // Correct
-        assert!(load_field_indexes(&path, 10, 11).is_some());
+        assert!(load_field_indexes(&path, 10, 11, None).is_some());
     }
 
     #[test]
@@ -310,9 +310,9 @@ mod tests {
         idx.insert(&make_doc(2, json!({"status": "active", "priority": 5})));
         idx.insert(&make_doc(3, json!({"status": "closed", "priority": 1})));
 
-        save_composite_indexes(&path, &[&idx], 3, 4).unwrap();
+        save_composite_indexes(&path, &[&idx], 3, 4, None).unwrap();
 
-        let loaded = load_composite_indexes(&path, 3, 4).unwrap();
+        let loaded = load_composite_indexes(&path, 3, 4, None).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].fields, vec!["status", "priority"]);
 
@@ -327,7 +327,7 @@ mod tests {
         let path = dir.path().join("corrupt.fidx");
 
         let idx = FieldIndex::new("x".into());
-        save_field_indexes(&path, &[&idx], 0, 1).unwrap();
+        save_field_indexes(&path, &[&idx], 0, 1, None).unwrap();
 
         // Corrupt a byte in the body
         let mut data = fs::read(&path).unwrap();
@@ -336,14 +336,14 @@ mod tests {
         }
         fs::write(&path, &data).unwrap();
 
-        assert!(load_field_indexes(&path, 0, 1).is_none());
+        assert!(load_field_indexes(&path, 0, 1, None).is_none());
     }
 
     #[test]
     fn missing_file_returns_none() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nonexistent.fidx");
-        assert!(load_field_indexes(&path, 0, 1).is_none());
+        assert!(load_field_indexes(&path, 0, 1, None).is_none());
     }
 
     #[test]
@@ -353,11 +353,11 @@ mod tests {
 
         // Create a file first
         let idx = FieldIndex::new("x".into());
-        save_field_indexes(&path, &[&idx], 0, 1).unwrap();
+        save_field_indexes(&path, &[&idx], 0, 1, None).unwrap();
         assert!(path.exists());
 
         // Save with empty list should remove the file
-        save_field_indexes(&path, &[], 0, 1).unwrap();
+        save_field_indexes(&path, &[], 0, 1, None).unwrap();
         assert!(!path.exists());
     }
 }

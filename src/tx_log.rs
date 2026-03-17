@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use crate::error::Result;
 
@@ -39,7 +39,7 @@ impl TxCommitLog {
     /// Mark a transaction as committed by appending its tx_id and fsyncing.
     /// This is THE COMMIT POINT for the transaction.
     pub fn mark_committed(&self, tx_id: TransactionId) -> Result<()> {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         file.write_all(&tx_id.to_le_bytes())?;
         file.sync_data()?;
@@ -48,7 +48,7 @@ impl TxCommitLog {
 
     /// Read all committed transaction IDs from the log.
     pub fn read_committed(&self) -> Result<HashSet<TransactionId>> {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::Start(0))?;
         let file_len = file.metadata()?.len();
         let mut set = HashSet::new();
@@ -68,7 +68,7 @@ impl TxCommitLog {
 
     /// Remove a specific tx_id from the commit log by rewriting without it.
     pub fn remove_committed(&self, tx_id: TransactionId) -> Result<()> {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::Start(0))?;
         let file_len = file.metadata()?.len();
 
@@ -98,7 +98,7 @@ impl TxCommitLog {
 
     /// Clear the commit log (truncate to 0). Called after full recovery.
     pub fn clear(&self) -> Result<()> {
-        let file = self.inner.lock().unwrap();
+        let file = self.inner.lock();
         file.set_len(0)?;
         file.sync_data()?;
         Ok(())

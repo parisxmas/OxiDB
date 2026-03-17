@@ -270,7 +270,7 @@ footer .oxi-tag{color:var(--oxi)}
   <div class="title">OxiDB vs MongoDB</div>
   <div class="meta">
     <span>100K documents</span>
-    <span>2026-03-06 02:45</span>
+    <span>2026-03-17 21:23</span>
     <span>22 tests</span>
     <span>MsgPack wire protocol</span>
   </div>
@@ -303,13 +303,13 @@ footer .oxi-tag{color:var(--oxi)}
 <div class="score-strip">
   <div class="score-side">
     <div class="db-label oxi">OxiDB</div>
-    <div class="score-num oxi">18</div>
+    <div class="score-num oxi">19</div>
     <div class="score-sub">wins</div>
   </div>
   <div class="score-vs">VS</div>
   <div class="score-side">
     <div class="db-label mongo">MongoDB</div>
-    <div class="score-num mongo">2</div>
+    <div class="score-num mongo">1</div>
     <div class="score-sub">wins</div>
   </div>
 </div>
@@ -320,20 +320,20 @@ footer .oxi-tag{color:var(--oxi)}
   <div class="cat-count">1 tests</div>
 </div>
 <div class="row">
-  <div class="row-label">Insert 100000 docs (batch 1000)<span class="row-detail">91162 docs/s vs 104374 docs/s</span> <span class="row-counts">100000 / 100000 docs</span></div>
+  <div class="row-label">Insert 100000 docs (batch 1000)<span class="row-detail">126806 docs/s vs 103701 docs/s</span> <span class="row-counts">100000 / 100000 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">1.097s</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:82%;width:0"></div></div>
+      <div class="duel-time">788.6ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
-      <div class="duel-track"><div class="duel-fill mongo winner" style="--w:87%;width:0"></div></div>
-      <div class="duel-time">958.1ms</div>
+      <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
+      <div class="duel-time">964.3ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-mongo">MongoDB</span><span class="speedup">1.1x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">1.2x faster</span></div>
 </div>
 </div>
 <div class="cat">
@@ -347,128 +347,128 @@ footer .oxi-tag{color:var(--oxi)}
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:41%;width:0"></div></div>
-      <div class="duel-time">64.5ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:26%;width:0"></div></div>
+      <div class="duel-time">37.5ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">158.8ms</div>
+      <div class="duel-time">143.1ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">2.5x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">3.8x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Range query (age >= 50) <span class="row-counts">46719 / 46719 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:25%;width:0"></div></div>
-      <div class="duel-time">71.2ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:21%;width:0"></div></div>
+      <div class="duel-time">61ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">285.6ms</div>
+      <div class="duel-time">293.7ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.0x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.8x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Compound (dept=Sales AND status=active) <span class="row-counts">4930 / 4930 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:28%;width:0"></div></div>
-      <div class="duel-time">18.8ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:25%;width:0"></div></div>
+      <div class="duel-time">18.2ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">66.2ms</div>
+      <div class="duel-time">72.8ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">3.5x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.0x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">$or query (city=Tokyo OR city=Paris) <span class="row-counts">19849 / 19849 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:24%;width:0"></div></div>
-      <div class="duel-time">34.7ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:23%;width:0"></div></div>
+      <div class="duel-time">33.5ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">144.6ms</div>
+      <div class="duel-time">143.1ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.2x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.3x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">$in query (country in [US, UK, JP]) <span class="row-counts">30001 / 30001 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:23%;width:0"></div></div>
-      <div class="duel-time">46.9ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:21%;width:0"></div></div>
+      <div class="duel-time">43.3ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">201.7ms</div>
+      <div class="duel-time">207.7ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.3x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.8x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Range (salary 50000-100000) <span class="row-counts">29331 / 29331 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:20%;width:0"></div></div>
-      <div class="duel-time">45.8ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:24%;width:0"></div></div>
+      <div class="duel-time">49.7ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">227.8ms</div>
+      <div class="duel-time">209.4ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">5.0x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.2x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Boolean (verified=true) <span class="row-counts">50060 / 50060 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:28%;width:0"></div></div>
-      <div class="duel-time">97.6ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:21%;width:0"></div></div>
+      <div class="duel-time">65.7ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">348.5ms</div>
+      <div class="duel-time">309.8ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">3.6x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">4.7x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Nested field (address.zip starts with 0) <span class="row-counts">10050 / 10050 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:52%;width:0"></div></div>
-      <div class="duel-time">47.4ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:26%;width:0"></div></div>
+      <div class="duel-time">25.5ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">91.3ms</div>
+      <div class="duel-time">99.3ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">1.9x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">3.9x faster</span></div>
 </div>
 </div>
 <div class="cat">
@@ -483,15 +483,15 @@ footer .oxi-tag{color:var(--oxi)}
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
       <div class="duel-track"><div class="duel-fill oxi" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">664.2ms</div>
+      <div class="duel-time">620.2ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
-      <div class="duel-track"><div class="duel-fill mongo winner" style="--w:85%;width:0"></div></div>
-      <div class="duel-time">564.4ms</div>
+      <div class="duel-track"><div class="duel-fill mongo winner" style="--w:58%;width:0"></div></div>
+      <div class="duel-time">357.7ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-mongo">MongoDB</span><span class="speedup">1.2x faster</span></div>
+  <div class="result"><span class="badge badge-mongo">MongoDB</span><span class="speedup">1.7x faster</span></div>
 </div>
 </div>
 <div class="cat">
@@ -505,64 +505,64 @@ footer .oxi-tag{color:var(--oxi)}
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:32%;width:0"></div></div>
-      <div class="duel-time">39.8ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:28%;width:0"></div></div>
+      <div class="duel-time">32.2ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">125.6ms</div>
+      <div class="duel-time">116.3ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">3.2x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">3.6x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Indexed: age >= 60 <span class="row-counts">29959 / 29959 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:15%;width:0"></div></div>
-      <div class="duel-time">35.8ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:19%;width:0"></div></div>
+      <div class="duel-time">35.1ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">235.5ms</div>
+      <div class="duel-time">180.9ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">6.6x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">5.1x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Indexed: city=Tokyo <span class="row-counts">10011 / 10011 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:19%;width:0"></div></div>
-      <div class="duel-time">14.4ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:17%;width:0"></div></div>
+      <div class="duel-time">11.7ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">75.7ms</div>
+      <div class="duel-time">70.3ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">5.3x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">6.0x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Indexed: salary 80000-120000 <span class="row-counts">23311 / 23311 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:20%;width:0"></div></div>
-      <div class="duel-time">33.9ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:17%;width:0"></div></div>
+      <div class="duel-time">27.7ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">169.9ms</div>
+      <div class="duel-time">166.9ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">5.0x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">6.0x faster</span></div>
 </div>
 </div>
 <div class="cat">
@@ -577,31 +577,31 @@ footer .oxi-tag{color:var(--oxi)}
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
       <div class="duel-track"><div class="duel-fill oxi winner" style="--w:0%;width:0"></div></div>
-      <div class="duel-time">42µs</div>
+      <div class="duel-time">70µs</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">29.1ms</div>
+      <div class="duel-time">32.6ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">688.1x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">468.0x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Count dept=Engineering <span class="row-counts">20142 / 20142 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:4%;width:0"></div></div>
-      <div class="duel-time">84µs</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:3%;width:0"></div></div>
+      <div class="duel-time">128µs</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">2.4ms</div>
+      <div class="duel-time">3.9ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">28.2x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">30.5x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Count age >= 50 <span class="row-counts">46719 / 46719 docs</span></div>
@@ -609,15 +609,15 @@ footer .oxi-tag{color:var(--oxi)}
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
       <div class="duel-track"><div class="duel-fill oxi winner" style="--w:1%;width:0"></div></div>
-      <div class="duel-time">61µs</div>
+      <div class="duel-time">80µs</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">7.8ms</div>
+      <div class="duel-time">5.8ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">129.2x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">72.4x faster</span></div>
 </div>
 </div>
 <div class="cat">
@@ -631,16 +631,16 @@ footer .oxi-tag{color:var(--oxi)}
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:76%;width:0"></div></div>
-      <div class="duel-time">38.6ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:59%;width:0"></div></div>
+      <div class="duel-time">31.8ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">50.5ms</div>
+      <div class="duel-time">54ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">1.3x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">1.7x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Top 5 cities by count <span class="row-counts">5 / 5 docs</span></div>
@@ -648,28 +648,28 @@ footer .oxi-tag{color:var(--oxi)}
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
       <div class="duel-track"><div class="duel-fill oxi winner" style="--w:1%;width:0"></div></div>
-      <div class="duel-time">114µs</div>
+      <div class="duel-time">156µs</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">21.2ms</div>
+      <div class="duel-time">23.4ms</div>
     </div>
   </div>
-  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">185.2x faster</span></div>
+  <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">149.9x faster</span></div>
 </div>
 <div class="row">
   <div class="row-label">Match + Group (active engineers) <span class="row-counts">1 / 1 docs</span></div>
   <div class="duel">
     <div class="duel-row">
       <div class="duel-label oxi">OxiDB</div>
-      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:88%;width:0"></div></div>
-      <div class="duel-time">9.3ms</div>
+      <div class="duel-track"><div class="duel-fill oxi winner" style="--w:92%;width:0"></div></div>
+      <div class="duel-time">9.4ms</div>
     </div>
     <div class="duel-row">
       <div class="duel-label mongo">Mongo</div>
       <div class="duel-track"><div class="duel-fill mongo" style="--w:100%;width:0"></div></div>
-      <div class="duel-time">10.5ms</div>
+      <div class="duel-time">10.3ms</div>
     </div>
   </div>
   <div class="result"><span class="badge badge-oxi">OxiDB</span><span class="speedup">1.1x faster</span></div>
@@ -686,11 +686,11 @@ footer .oxi-tag{color:var(--oxi)}
   <div class="res-bars">
     <div class="res-row">
       <div class="res-db oxi">OxiDB</div>
-      <div class="res-track"><div class="res-fill oxi" style="--w:0%;width:0"><span class="res-val">0	/data</span></div></div>
+      <div class="res-track"><div class="res-fill oxi" style="--w:10%;width:0"><span class="res-val">N/A</span></div></div>
     </div>
     <div class="res-row">
       <div class="res-db mongo">Mongo</div>
-      <div class="res-track"><div class="res-fill mongo" style="--w:100%;width:0"><span class="res-val">301M	/data/db</span></div></div>
+      <div class="res-track"><div class="res-fill mongo" style="--w:10%;width:0"><span class="res-val">N/A</span></div></div>
     </div>
   </div>
 </div>
@@ -699,11 +699,11 @@ footer .oxi-tag{color:var(--oxi)}
   <div class="res-bars">
     <div class="res-row">
       <div class="res-db oxi">OxiDB</div>
-      <div class="res-track"><div class="res-fill oxi" style="--w:9%;width:0"><span class="res-val">36.01MiB / 8.231GiB</span></div></div>
+      <div class="res-track"><div class="res-fill oxi" style="--w:10%;width:0"><span class="res-val">N/A</span></div></div>
     </div>
     <div class="res-row">
       <div class="res-db mongo">Mongo</div>
-      <div class="res-track"><div class="res-fill mongo" style="--w:100%;width:0"><span class="res-val">380.1MiB / 8.231GiB</span></div></div>
+      <div class="res-track"><div class="res-fill mongo" style="--w:10%;width:0"><span class="res-val">N/A</span></div></div>
     </div>
   </div>
 </div>

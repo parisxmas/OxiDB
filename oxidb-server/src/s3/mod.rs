@@ -17,6 +17,7 @@
 mod auth;
 mod batch;
 mod bucket;
+mod encryption;
 mod helpers;
 mod http;
 mod multipart;
@@ -24,18 +25,34 @@ mod object;
 mod tagging;
 
 use std::collections::HashMap;
+use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Thread pool size for S3 connections.
+const POOL_SIZE: usize = 256;
+/// Maximum queued connections before rejecting.
+const MAX_QUEUED: usize = 1024;
 
 use oxidb::OxiDb;
 
 use auth::{S3Auth, verify_auth};
+use encryption::S3Encryption;
 use helpers::{url_decode, parse_query};
-use http::{HttpRequest, HttpResponse, error_response, parse_request};
+use http::{HttpRequest, HttpResponse, error_response, parse_request_from_reader};
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+/// Maximum parts per multipart upload.
+const MAX_MULTIPART_PARTS: u32 = 10_000;
+/// Maximum total size for all parts in a single multipart upload (5 GiB).
+const MAX_MULTIPART_TOTAL: usize = 5 * 1024 * 1024 * 1024;
+/// Abandoned uploads are cleaned up after this duration.
+const UPLOAD_TTL_SECS: u64 = 86400; // 24 hours
 
 /// In-progress multipart upload.
 struct MultipartUpload {
@@ -44,13 +61,33 @@ struct MultipartUpload {
     content_type: String,
     metadata: HashMap<String, String>,
     parts: HashMap<u32, Vec<u8>>,
+    total_bytes: usize,
+    created_at: std::time::Instant,
+    /// SSE marker: None, "AES256" (SSE-S3), or "SSE-C:<base64-key>" (SSE-C).
+    sse_marker: Option<String>,
+}
+
+impl MultipartUpload {
+    /// Zeroize SSE-C key material from memory.
+    fn zeroize_key(&mut self) {
+        if let Some(ref mut marker) = self.sse_marker {
+            if marker.starts_with("SSE-C:") {
+                let bytes = unsafe { marker.as_bytes_mut() };
+                for b in bytes.iter_mut() {
+                    unsafe { std::ptr::write_volatile(b, 0); }
+                }
+            }
+        }
+    }
 }
 
 /// Shared state for all S3 connections.
 struct S3State {
     db: Arc<OxiDb>,
     auth: Option<Arc<S3Auth>>,
+    encryption: Option<Arc<S3Encryption>>,
     uploads: Mutex<HashMap<String, MultipartUpload>>,
+    active_connections: AtomicUsize,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,16 +97,39 @@ struct S3State {
 pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<()> {
     let listener = TcpListener::bind(addr).expect("failed to bind S3 HTTP listener");
 
-    let auth = match (
-        std::env::var("OXIDB_S3_ACCESS_KEY"),
-        std::env::var("OXIDB_S3_SECRET_KEY"),
-    ) {
-        (Ok(ak), Ok(sk)) if !ak.is_empty() && !sk.is_empty() => {
-            eprintln!("[s3] authentication enabled (access_key={}...)", &ak[..ak.len().min(4)]);
-            Some(Arc::new(S3Auth { access_key: ak, secret_key: sk }))
+    let auth = match S3Auth::from_env() {
+        Some(a) => {
+            eprintln!("[s3] authentication enabled ({} credential(s))", a.credentials.len());
+            Some(Arc::new(a))
+        }
+        None => {
+            eprintln!("[s3] WARNING: authentication DISABLED — S3 API is open to anyone!");
+            eprintln!("[s3] Set OXIDB_S3_ACCESS_KEY/OXIDB_S3_SECRET_KEY or OXIDB_S3_CREDENTIALS to enable auth.");
+            None
+        }
+    };
+
+    let default_enc = std::env::var("OXIDB_S3_DEFAULT_ENCRYPTION")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let encryption = match std::env::var("OXIDB_S3_ENCRYPTION_KEY") {
+        Ok(hex_key) if !hex_key.is_empty() => {
+            match S3Encryption::from_hex_key(&hex_key, default_enc) {
+                Some(enc) => {
+                    eprintln!("[s3] server-side encryption enabled (SSE-S3){}", if default_enc { " [default for all objects]" } else { "" });
+                    Some(enc)
+                }
+                None => {
+                    eprintln!("[s3] WARNING: invalid OXIDB_S3_ENCRYPTION_KEY, encryption disabled");
+                    None
+                }
+            }
         }
         _ => {
-            eprintln!("[s3] authentication disabled (set OXIDB_S3_ACCESS_KEY and OXIDB_S3_SECRET_KEY to enable)");
+            if default_enc {
+                eprintln!("[s3] WARNING: OXIDB_S3_DEFAULT_ENCRYPTION=true but no OXIDB_S3_ENCRYPTION_KEY set");
+            }
             None
         }
     };
@@ -77,30 +137,71 @@ pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<
     let state = Arc::new(S3State {
         db,
         auth,
+        encryption,
         uploads: Mutex::new(HashMap::new()),
+        active_connections: AtomicUsize::new(0),
     });
+
+    // Background cleanup of abandoned multipart uploads
+    {
+        let state_cleanup = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("s3-upload-gc".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(3600)); // check every hour
+                let mut uploads = state_cleanup.uploads.lock().unwrap();
+                let before = uploads.len();
+                uploads.retain(|_, u| u.created_at.elapsed().as_secs() < UPLOAD_TTL_SECS);
+                let removed = before - uploads.len();
+                if removed > 0 {
+                    eprintln!("[s3] cleaned up {removed} abandoned multipart uploads");
+                }
+            })
+            .expect("failed to spawn s3-upload-gc");
+    }
+
+    // Thread pool: fixed workers with bounded queue
+    let (conn_tx, conn_rx) = std::sync::mpsc::sync_channel::<TcpStream>(MAX_QUEUED);
+    let conn_rx = Arc::new(Mutex::new(conn_rx));
+
+    for i in 0..POOL_SIZE {
+        let rx = Arc::clone(&conn_rx);
+        let state = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name(format!("s3-worker-{i}"))
+            .spawn(move || loop {
+                let stream = match rx.lock().unwrap().recv() {
+                    Ok(s) => s,
+                    Err(_) => return, // channel closed
+                };
+                state.active_connections.fetch_add(1, Ordering::Relaxed);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_connection(stream, &state);
+                }));
+                state.active_connections.fetch_sub(1, Ordering::Relaxed);
+                if let Err(e) = result {
+                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    eprintln!("[s3] connection handler panicked: {msg}");
+                }
+            })
+            .expect("failed to spawn s3 worker");
+    }
+    eprintln!("[s3] thread pool: {POOL_SIZE} workers, queue depth {MAX_QUEUED}");
 
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => {
                     let _ = s.set_nodelay(true);
-                    let state = Arc::clone(&state);
-                    std::thread::spawn(move || {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            handle_connection(s, &state);
-                        }));
-                        if let Err(e) = result {
-                            let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                                s.to_string()
-                            } else if let Some(s) = e.downcast_ref::<String>() {
-                                s.clone()
-                            } else {
-                                "unknown panic".to_string()
-                            };
-                            eprintln!("[s3] connection handler panicked: {msg}");
-                        }
-                    });
+                    if conn_tx.try_send(s).is_err() {
+                        eprintln!("[s3] connection rejected: queue full");
+                    }
                 }
                 Err(e) => eprintln!("[s3] accept error: {e}"),
             }
@@ -113,33 +214,48 @@ pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<
 // ---------------------------------------------------------------------------
 
 fn handle_connection(mut stream: TcpStream, state: &S3State) {
-    let req = match parse_request(&stream) {
-        Some(r) => r,
-        None => return,
-    };
+    // Keep-alive timeout: close idle connections after 30s
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let read_stream = stream.try_clone().expect("failed to clone stream");
+    let mut reader = BufReader::new(read_stream);
 
-    // CORS preflight
-    if req.method == "OPTIONS" {
-        HttpResponse::no_content().with_cors().write_to(&mut stream);
-        return;
-    }
+    loop {
+        let req = match parse_request_from_reader(&mut reader, &stream) {
+            Some(r) => r,
+            None => return, // connection closed or timeout
+        };
 
-    // Authenticate
-    if let Some(auth) = &state.auth {
-        if !verify_auth(&req, auth) {
-            error_response(403, "AccessDenied", "Access Denied", &req.path)
-                .with_cors()
-                .write_to(&mut stream);
-            return;
+        let wants_close = req.headers.get("connection")
+            .map(|v| v.eq_ignore_ascii_case("close"))
+            .unwrap_or(false);
+
+        // CORS preflight
+        if req.method == "OPTIONS" {
+            HttpResponse::no_content().with_cors().write_to_keepalive(&mut stream, !wants_close);
+            if wants_close { return; }
+            continue;
         }
+
+        // Authenticate
+        if let Some(auth) = &state.auth {
+            if !verify_auth(&req, auth) {
+                error_response(403, "AccessDenied", "Access Denied", &req.path)
+                    .with_cors()
+                    .write_to_keepalive(&mut stream, !wants_close);
+                if wants_close { return; }
+                continue;
+            }
+        }
+
+        let path = url_decode(&req.path);
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let params = parse_query(&req.query);
+
+        let resp = route_request(&req, &segments, &params, state);
+        resp.with_cors().write_to_keepalive(&mut stream, !wants_close);
+
+        if wants_close { return; }
     }
-
-    let path = url_decode(&req.path);
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let params = parse_query(&req.query);
-
-    let resp = route_request(&req, &segments, &params, state);
-    resp.with_cors().write_to(&mut stream);
 }
 
 fn route_request(
@@ -207,25 +323,25 @@ fn route_request(
         // Copy object: PUT with x-amz-copy-source header
         ("PUT", n) if n >= 2 && req.headers.contains_key("x-amz-copy-source") => {
             let key = segments[1..].join("/");
-            object::handle_copy_object(db, segments[0], &key, req)
+            object::handle_copy_object(state, segments[0], &key, req)
         }
 
         // Regular PUT object
         ("PUT", n) if n >= 2 => {
             let key = segments[1..].join("/");
-            object::handle_put_object(db, segments[0], &key, req)
+            object::handle_put_object(state, segments[0], &key, req)
         }
 
         // GET object
         ("GET", n) if n >= 2 => {
             let key = segments[1..].join("/");
-            object::handle_get_object(db, segments[0], &key, req)
+            object::handle_get_object(state, segments[0], &key, req)
         }
 
         // HEAD object
         ("HEAD", n) if n >= 2 => {
             let key = segments[1..].join("/");
-            object::handle_head_object(db, segments[0], &key)
+            object::handle_head_object(state, segments[0], &key)
         }
 
         // DELETE object
