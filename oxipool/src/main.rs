@@ -8,6 +8,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::timeout;
 
+mod scatter;
+mod shard;
+
 // ─── Config ──────────────────────────────────────────────────────────
 
 struct Config {
@@ -16,6 +19,7 @@ struct Config {
     replicas: Vec<String>,
     master_pool_size: usize,
     replica_pool_size: usize,
+    shard_pool_size: usize,
     max_clients: usize,
     connect_timeout: Duration,
     stats_interval: Duration,
@@ -49,6 +53,10 @@ impl Config {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(10),
+            shard_pool_size: env::var("OXIPOOL_SHARD_POOL_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
             max_clients: env::var("OXIPOOL_MAX_CLIENTS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -75,6 +83,8 @@ struct Stats {
     total_requests: AtomicU64,
     master_requests: AtomicU64,
     replica_requests: AtomicU64,
+    shard_requests: AtomicU64,
+    scatter_requests: AtomicU64,
     active_clients: AtomicI64,
     active_transactions: AtomicI64,
     pool_hits: AtomicU64,
@@ -88,6 +98,8 @@ impl Stats {
             total_requests: AtomicU64::new(0),
             master_requests: AtomicU64::new(0),
             replica_requests: AtomicU64::new(0),
+            shard_requests: AtomicU64::new(0),
+            scatter_requests: AtomicU64::new(0),
             active_clients: AtomicI64::new(0),
             active_transactions: AtomicI64::new(0),
             pool_hits: AtomicU64::new(0),
@@ -99,7 +111,7 @@ impl Stats {
 
 // ─── Connection Pool ─────────────────────────────────────────────────
 
-struct Pool {
+pub(crate) struct Pool {
     conns: Mutex<Vec<TcpStream>>,
     sem: Semaphore,
     addr: String,
@@ -134,7 +146,7 @@ impl Pool {
         Ok(pool)
     }
 
-    async fn get(&self) -> Result<TcpStream, String> {
+    pub(crate) async fn get(&self) -> Result<TcpStream, String> {
         let permit = self
             .sem
             .acquire()
@@ -153,12 +165,12 @@ impl Pool {
         }
     }
 
-    async fn put(&self, conn: TcpStream) {
+    pub(crate) async fn put(&self, conn: TcpStream) {
         self.conns.lock().await.push(conn);
         self.sem.add_permits(1);
     }
 
-    fn spawn_replace(pool: Arc<Pool>) {
+    pub(crate) fn spawn_replace(pool: Arc<Pool>) {
         let label = pool.label.clone();
         tokio::spawn(async move {
             let mut delay = Duration::from_millis(500);
@@ -242,7 +254,7 @@ async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), std::
     stream.flush().await
 }
 
-// ─── Command Classification ─────────────────────────────────────────
+// ─── Command Classification (non-sharded fallback) ──────────────────
 
 #[derive(PartialEq)]
 enum CmdRoute {
@@ -311,25 +323,17 @@ fn classify_command(payload: &[u8]) -> CmdRoute {
         return classify_sql(s);
     }
 
-    // Everything else is a read → replica
-    // find, find_one, count, aggregate, list_collections, list_indexes,
-    // text_search, vector_search, search, ping, list_buckets, list_objects,
-    // get_object, head_object, list_databases, list_users, list_schedules,
-    // get_schedule, auth_simple
     CmdRoute::Read
 }
 
 fn classify_sql(s: &str) -> CmdRoute {
-    // Extract the SQL query string and check if it's a read or write
-    // Look for "query" field value
     if let Some(pos) = s.find("\"query\"") {
         let after = &s[pos..];
-        // Find the query value after the colon and opening quote
         if let Some(colon) = after.find(':') {
             let value_part = after[colon + 1..].trim_start();
             let upper = value_part.to_uppercase();
             if upper.starts_with('"') {
-                let inner = &upper[1..]; // skip opening quote
+                let inner = &upper[1..];
                 let trimmed = inner.trim_start();
                 if trimmed.starts_with("SELECT")
                     || trimmed.starts_with("SHOW")
@@ -341,7 +345,7 @@ fn classify_sql(s: &str) -> CmdRoute {
             }
         }
     }
-    CmdRoute::Write // INSERT, UPDATE, DELETE, CREATE, DROP → master
+    CmdRoute::Write
 }
 
 // ─── Request Forwarding ─────────────────────────────────────────────
@@ -356,7 +360,7 @@ async fn forward(
     write_frame(client, &response).await
 }
 
-// ─── Client Handler ─────────────────────────────────────────────────
+// ─── Client Handler (non-sharded — original behavior) ───────────────
 
 async fn handle_client(
     mut client: TcpStream,
@@ -380,7 +384,6 @@ async fn handle_client(
 
         let result = match route {
             CmdRoute::TxBegin => {
-                // Transactions always go to master, pin the connection
                 stats.master_requests.fetch_add(1, Ordering::Relaxed);
                 match master.get().await {
                     Ok(mut backend) => match forward(&mut backend, &mut client, &payload).await {
@@ -420,7 +423,6 @@ async fn handle_client(
             CmdRoute::Write => {
                 stats.master_requests.fetch_add(1, Ordering::Relaxed);
                 if let Some(ref mut backend) = pinned {
-                    // Inside transaction → use pinned master connection
                     match forward(backend, &mut client, &payload).await {
                         Ok(()) => Ok(()),
                         Err(e) => {
@@ -437,7 +439,6 @@ async fn handle_client(
 
             CmdRoute::Read => {
                 if let Some(ref mut backend) = pinned {
-                    // Inside transaction → reads also go to pinned master
                     stats.master_requests.fetch_add(1, Ordering::Relaxed);
                     match forward(backend, &mut client, &payload).await {
                         Ok(()) => Ok(()),
@@ -449,12 +450,10 @@ async fn handle_client(
                         }
                     }
                 } else if let Some(ref router) = replicas {
-                    // Route to a replica
                     stats.replica_requests.fetch_add(1, Ordering::Relaxed);
                     let pool = router.get_pool();
                     forward_to_pool(pool, &mut client, &payload, &stats).await
                 } else {
-                    // No replicas configured — fall back to master
                     stats.master_requests.fetch_add(1, Ordering::Relaxed);
                     forward_to_pool(&master, &mut client, &payload, &stats).await
                 }
@@ -492,6 +491,219 @@ async fn handle_client(
     }
 }
 
+// ─── Sharded Client Handler ─────────────────────────────────────────
+
+async fn handle_client_sharded(
+    mut client: TcpStream,
+    shard_pools: Arc<Vec<Arc<Pool>>>,
+    router: Arc<shard::ShardRouter>,
+    stats: Arc<Stats>,
+) {
+    let addr = client.peer_addr().ok();
+    stats.active_clients.fetch_add(1, Ordering::Relaxed);
+
+    // Transaction pinning: (shard_id, connection)
+    let mut pinned: Option<(u32, TcpStream)> = None;
+
+    loop {
+        let payload = match read_frame(&mut client).await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+
+        stats.total_requests.fetch_add(1, Ordering::Relaxed);
+
+        // Parse command and determine routing
+        let parsed = match shard::parse_and_route(&router, &payload).await {
+            Ok(p) => p,
+            Err(e) => {
+                let resp = format!(
+                    "{{\"ok\":false,\"error\":\"{}\"}}",
+                    e.replace('\\', "\\\\").replace('"', "\\\"")
+                );
+                if write_frame(&mut client, resp.as_bytes()).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        let result: Result<(), std::io::Error> = match parsed.routing {
+            shard::CommandRouting::Transaction => {
+                if parsed.cmd == "begin_tx" {
+                    // Pin to shard 0 for transactions (single-shard only)
+                    stats.master_requests.fetch_add(1, Ordering::Relaxed);
+                    let pool = &shard_pools[0];
+                    match pool.get().await {
+                        Ok(mut backend) => {
+                            match forward(&mut backend, &mut client, &payload).await {
+                                Ok(()) => {
+                                    stats
+                                        .active_transactions
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    pinned = Some((0, backend));
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    Pool::spawn_replace(Arc::clone(pool));
+                                    Err(e)
+                                }
+                            }
+                        }
+                        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                    }
+                } else {
+                    // commit_tx / rollback_tx
+                    stats.master_requests.fetch_add(1, Ordering::Relaxed);
+                    if let Some((shard_id, mut backend)) = pinned.take() {
+                        stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
+                        match forward(&mut backend, &mut client, &payload).await {
+                            Ok(()) => {
+                                shard_pools[shard_id as usize].put(backend).await;
+                                Ok(())
+                            }
+                            Err(e) => {
+                                Pool::spawn_replace(Arc::clone(
+                                    &shard_pools[shard_id as usize],
+                                ));
+                                Err(e)
+                            }
+                        }
+                    } else {
+                        // Not in a transaction — send to shard 0
+                        forward_to_pool(
+                            &shard_pools[0],
+                            &mut client,
+                            &payload,
+                            &stats,
+                        )
+                        .await
+                    }
+                }
+            }
+
+            shard::CommandRouting::Targeted(shard_id) => {
+                if let Some((pinned_shard, ref mut backend)) = pinned {
+                    // Inside transaction — must use pinned connection
+                    if pinned_shard != shard_id {
+                        // Cross-shard transaction — reject
+                        let resp = b"{\"ok\":false,\"error\":\"cross-shard transactions not supported; use the same shard key within a transaction\"}";
+                        write_frame(&mut client, resp)
+                            .await
+                            .map_err(|e| e)
+                    } else {
+                        stats.shard_requests.fetch_add(1, Ordering::Relaxed);
+                        match forward(backend, &mut client, &payload).await {
+                            Ok(()) => Ok(()),
+                            Err(e) => {
+                                let s = pinned.take().unwrap().0;
+                                stats
+                                    .active_transactions
+                                    .fetch_sub(1, Ordering::Relaxed);
+                                Pool::spawn_replace(Arc::clone(&shard_pools[s as usize]));
+                                Err(e)
+                            }
+                        }
+                    }
+                } else {
+                    stats.shard_requests.fetch_add(1, Ordering::Relaxed);
+                    let pool = &shard_pools[shard_id as usize];
+                    forward_to_pool(pool, &mut client, &payload, &stats).await
+                }
+            }
+
+            shard::CommandRouting::ScatterGather => {
+                if let Some((_, ref mut backend)) = pinned {
+                    // Inside transaction — scatter-gather not allowed, send to pinned shard
+                    stats.master_requests.fetch_add(1, Ordering::Relaxed);
+                    match forward(backend, &mut client, &payload).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            let s = pinned.take().unwrap().0;
+                            stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
+                            Pool::spawn_replace(Arc::clone(&shard_pools[s as usize]));
+                            Err(e)
+                        }
+                    }
+                } else {
+                    stats.scatter_requests.fetch_add(1, Ordering::Relaxed);
+
+                    // Special case: insert_many needs doc splitting
+                    let response = if parsed.cmd == "insert_many" {
+                        scatter::scatter_insert_many(&shard_pools, &payload, &router).await
+                    } else {
+                        let strategy = scatter::MergeStrategy::for_command(&parsed.cmd);
+                        scatter::scatter_gather(&shard_pools, &payload, strategy).await
+                    };
+
+                    write_frame(&mut client, &response).await.map_err(|e| e)
+                }
+            }
+
+            shard::CommandRouting::Broadcast => {
+                if pinned.is_some() {
+                    // Inside transaction — DDL not allowed
+                    let resp = b"{\"ok\":false,\"error\":\"DDL commands not allowed inside transactions\"}";
+                    write_frame(&mut client, resp).await.map_err(|e| e)
+                } else {
+                    stats.scatter_requests.fetch_add(1, Ordering::Relaxed);
+                    let response = scatter::broadcast(&shard_pools, &payload).await;
+                    write_frame(&mut client, &response).await.map_err(|e| e)
+                }
+            }
+
+            shard::CommandRouting::Primary => {
+                if let Some((_, ref mut backend)) = pinned {
+                    stats.master_requests.fetch_add(1, Ordering::Relaxed);
+                    match forward(backend, &mut client, &payload).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            let s = pinned.take().unwrap().0;
+                            stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
+                            Pool::spawn_replace(Arc::clone(&shard_pools[s as usize]));
+                            Err(e)
+                        }
+                    }
+                } else {
+                    stats.master_requests.fetch_add(1, Ordering::Relaxed);
+                    forward_to_pool(&shard_pools[0], &mut client, &payload, &stats).await
+                }
+            }
+        };
+
+        if let Err(e) = result {
+            stats.backend_errors.fetch_add(1, Ordering::Relaxed);
+            let msg = format!("oxipool: {}", e);
+            let resp = format!(
+                "{{\"ok\":false,\"error\":\"{}\"}}",
+                msg.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+            if write_frame(&mut client, resp.as_bytes()).await.is_err() {
+                break;
+            }
+        }
+    }
+
+    // Client disconnected — cleanup orphaned transaction
+    if let Some((shard_id, mut backend)) = pinned {
+        stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
+        let rollback = b"{\"cmd\":\"rollback_tx\"}";
+        if write_frame(&mut backend, rollback).await.is_ok() {
+            let _ = read_frame(&mut backend).await;
+            shard_pools[shard_id as usize].put(backend).await;
+        } else {
+            Pool::spawn_replace(Arc::clone(&shard_pools[shard_id as usize]));
+        }
+    }
+
+    stats.active_clients.fetch_sub(1, Ordering::Relaxed);
+    if let Some(addr) = addr {
+        eprintln!("[oxipool] client disconnected: {}", addr);
+    }
+}
+
+// ─── Pool Forwarding ────────────────────────────────────────────────
+
 async fn forward_to_pool(
     pool: &Arc<Pool>,
     client: &mut TcpStream,
@@ -526,61 +738,40 @@ async fn forward_to_pool(
 #[tokio::main]
 async fn main() {
     let config = Config::from_env();
+    let shard_config = shard::ShardConfig::from_env();
     let has_replicas = !config.replicas.is_empty();
+    let is_sharded = shard_config.is_some();
 
-    eprintln!("OxiPool v0.2.0 — connection pooler for OxiDB");
+    eprintln!("OxiPool v0.3.0 — connection pooler for OxiDB");
     eprintln!("  listen:       {}", config.listen);
-    eprintln!("  master:       {}", config.master);
-    if has_replicas {
-        for (i, r) in config.replicas.iter().enumerate() {
-            eprintln!("  replica[{}]:   {}", i, r);
-        }
-        eprintln!("  routing:      writes → master, reads → replicas (round-robin)");
-    } else {
-        eprintln!("  replicas:     none (all traffic → master)");
-    }
-    eprintln!("  master_pool:  {}", config.master_pool_size);
-    if has_replicas {
-        eprintln!(
-            "  replica_pool: {} per replica ({} total)",
-            config.replica_pool_size,
-            config.replica_pool_size * config.replicas.len()
-        );
-    }
-    eprintln!("  max_clients:  {}", config.max_clients);
 
-    // Create master pool
-    let master = match Pool::new(
-        &config.master,
-        config.master_pool_size,
-        config.connect_timeout,
-        "master",
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("FATAL: {}", e);
-            std::process::exit(1);
+    if is_sharded {
+        // ─── Sharded mode ───────────────────────────────────────────
+        let shard_cfg = shard_config.unwrap();
+        let num_shards = shard_cfg.num_shards();
+        eprintln!("  mode:         SHARDED ({} shards, {} chunks)", num_shards, shard_cfg.num_chunks);
+        for (i, addr) in shard_cfg.shards.iter().enumerate() {
+            eprintln!("  shard[{}]:     {}", i, addr);
         }
-    };
-    eprintln!(
-        "  master pool:  {} connections to {}",
-        config.master_pool_size, config.master
-    );
+        if !shard_cfg.collection_keys.is_empty() {
+            for (coll, key) in &shard_cfg.collection_keys {
+                eprintln!("  shard_key:    {} → {}", coll, key.field);
+            }
+        }
+        eprintln!("  shard_pool:   {} per shard ({} total)", config.shard_pool_size, config.shard_pool_size * num_shards);
+        eprintln!("  max_clients:  {}", config.max_clients);
 
-    // Create replica pools
-    let replicas = if has_replicas {
-        let mut pools = Vec::new();
-        for (i, addr) in config.replicas.iter().enumerate() {
-            let label = format!("replica[{}]", i);
-            match Pool::new(addr, config.replica_pool_size, config.connect_timeout, &label).await {
+        // Create per-shard pools
+        let mut shard_pools = Vec::with_capacity(num_shards);
+        for (i, addr) in shard_cfg.shards.iter().enumerate() {
+            let label = format!("shard[{}]", i);
+            match Pool::new(addr, config.shard_pool_size, config.connect_timeout, &label).await {
                 Ok(p) => {
                     eprintln!(
-                        "  replica[{}]:   {} connections to {}",
-                        i, config.replica_pool_size, addr
+                        "  shard[{}]:     {} connections to {}",
+                        i, config.shard_pool_size, addr
                     );
-                    pools.push(p);
+                    shard_pools.push(p);
                 }
                 Err(e) => {
                     eprintln!("FATAL: {}", e);
@@ -588,88 +779,226 @@ async fn main() {
                 }
             }
         }
-        Some(Arc::new(ReplicaRouter {
-            pools,
-            next: AtomicU64::new(0),
-        }))
+        let shard_pools = Arc::new(shard_pools);
+        let router = shard::ShardRouter::new(shard_cfg);
+
+        let stats = Arc::new(Stats::new());
+
+        // Periodic stats
+        if config.stats_interval > Duration::ZERO {
+            let s = Arc::clone(&stats);
+            let sp = Arc::clone(&shard_pools);
+            let interval = config.stats_interval;
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                let mut last_total = 0u64;
+                loop {
+                    ticker.tick().await;
+                    let total = s.total_requests.load(Ordering::Relaxed);
+                    let rps = (total - last_total) as f64 / interval.as_secs_f64();
+                    last_total = total;
+                    let shard_avail: usize = sp.iter().map(|p| p.available()).sum();
+                    let shard_total: usize = sp.iter().map(|p| p.size).sum();
+                    eprintln!(
+                        "[stats] reqs={} rps={:.0} targeted={} scatter={} primary={} clients={} tx={} shard_pool={}/{} errs={}",
+                        total,
+                        rps,
+                        s.shard_requests.load(Ordering::Relaxed),
+                        s.scatter_requests.load(Ordering::Relaxed),
+                        s.master_requests.load(Ordering::Relaxed),
+                        s.active_clients.load(Ordering::Relaxed),
+                        s.active_transactions.load(Ordering::Relaxed),
+                        shard_avail,
+                        shard_total,
+                        s.backend_errors.load(Ordering::Relaxed),
+                    );
+                }
+            });
+        }
+
+        let client_limit = Arc::new(Semaphore::new(config.max_clients));
+
+        let listener = TcpListener::bind(&config.listen)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("FATAL: bind {}: {}", config.listen, e);
+                std::process::exit(1);
+            });
+        eprintln!("OxiPool listening on {} (sharded)", config.listen);
+
+        loop {
+            let (client, addr) = match listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[oxipool] accept error: {}", e);
+                    continue;
+                }
+            };
+            let _ = client.set_nodelay(true);
+
+            let permit = match client_limit.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("[oxipool] max clients reached, rejecting {}", addr);
+                    drop(client);
+                    continue;
+                }
+            };
+
+            let shard_pools = Arc::clone(&shard_pools);
+            let router = Arc::clone(&router);
+            let stats = Arc::clone(&stats);
+
+            tokio::spawn(async move {
+                handle_client_sharded(client, shard_pools, router, stats).await;
+                drop(permit);
+            });
+        }
     } else {
-        None
-    };
-
-    let stats = Arc::new(Stats::new());
-
-    // Periodic stats
-    if config.stats_interval > Duration::ZERO {
-        let s = Arc::clone(&stats);
-        let m = Arc::clone(&master);
-        let r = replicas.clone();
-        let interval = config.stats_interval;
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            let mut last_total = 0u64;
-            loop {
-                ticker.tick().await;
-                let total = s.total_requests.load(Ordering::Relaxed);
-                let rps = (total - last_total) as f64 / interval.as_secs_f64();
-                last_total = total;
-                let (r_avail, r_size) = match &r {
-                    Some(router) => (router.total_available(), router.total_size()),
-                    None => (0, 0),
-                };
-                eprintln!(
-                    "[stats] reqs={} rps={:.0} master={} replica={} clients={} tx={} master_pool={}/{} replica_pool={}/{} errs={}",
-                    total,
-                    rps,
-                    s.master_requests.load(Ordering::Relaxed),
-                    s.replica_requests.load(Ordering::Relaxed),
-                    s.active_clients.load(Ordering::Relaxed),
-                    s.active_transactions.load(Ordering::Relaxed),
-                    m.available(),
-                    m.size,
-                    r_avail,
-                    r_size,
-                    s.backend_errors.load(Ordering::Relaxed),
-                );
+        // ─── Non-sharded mode (original behavior) ──────────────────
+        eprintln!("  mode:         SINGLE (non-sharded)");
+        eprintln!("  master:       {}", config.master);
+        if has_replicas {
+            for (i, r) in config.replicas.iter().enumerate() {
+                eprintln!("  replica[{}]:   {}", i, r);
             }
-        });
-    }
+            eprintln!("  routing:      writes → master, reads → replicas (round-robin)");
+        } else {
+            eprintln!("  replicas:     none (all traffic → master)");
+        }
+        eprintln!("  master_pool:  {}", config.master_pool_size);
+        if has_replicas {
+            eprintln!(
+                "  replica_pool: {} per replica ({} total)",
+                config.replica_pool_size,
+                config.replica_pool_size * config.replicas.len()
+            );
+        }
+        eprintln!("  max_clients:  {}", config.max_clients);
 
-    let client_limit = Arc::new(Semaphore::new(config.max_clients));
-
-    let listener = TcpListener::bind(&config.listen)
+        // Create master pool
+        let master = match Pool::new(
+            &config.master,
+            config.master_pool_size,
+            config.connect_timeout,
+            "master",
+        )
         .await
-        .unwrap_or_else(|e| {
-            eprintln!("FATAL: bind {}: {}", config.listen, e);
-            std::process::exit(1);
-        });
-    eprintln!("OxiPool listening on {}", config.listen);
-
-    loop {
-        let (client, addr) = match listener.accept().await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("[oxipool] accept error: {}", e);
-                continue;
-            }
-        };
-        let _ = client.set_nodelay(true);
-
-        let permit = match client_limit.clone().try_acquire_owned() {
+        {
             Ok(p) => p,
-            Err(_) => {
-                eprintln!("[oxipool] max clients reached, rejecting {}", addr);
-                drop(client);
-                continue;
+            Err(e) => {
+                eprintln!("FATAL: {}", e);
+                std::process::exit(1);
             }
         };
+        eprintln!(
+            "  master pool:  {} connections to {}",
+            config.master_pool_size, config.master
+        );
 
-        let master = Arc::clone(&master);
-        let replicas = replicas.clone();
-        let stats = Arc::clone(&stats);
+        // Create replica pools
+        let replicas = if has_replicas {
+            let mut pools = Vec::new();
+            for (i, addr) in config.replicas.iter().enumerate() {
+                let label = format!("replica[{}]", i);
+                match Pool::new(addr, config.replica_pool_size, config.connect_timeout, &label).await
+                {
+                    Ok(p) => {
+                        eprintln!(
+                            "  replica[{}]:   {} connections to {}",
+                            i, config.replica_pool_size, addr
+                        );
+                        pools.push(p);
+                    }
+                    Err(e) => {
+                        eprintln!("FATAL: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            Some(Arc::new(ReplicaRouter {
+                pools,
+                next: AtomicU64::new(0),
+            }))
+        } else {
+            None
+        };
 
-        tokio::spawn(async move {
-            handle_client(client, master, replicas, stats).await;
-            drop(permit);
-        });
+        let stats = Arc::new(Stats::new());
+
+        // Periodic stats
+        if config.stats_interval > Duration::ZERO {
+            let s = Arc::clone(&stats);
+            let m = Arc::clone(&master);
+            let r = replicas.clone();
+            let interval = config.stats_interval;
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                let mut last_total = 0u64;
+                loop {
+                    ticker.tick().await;
+                    let total = s.total_requests.load(Ordering::Relaxed);
+                    let rps = (total - last_total) as f64 / interval.as_secs_f64();
+                    last_total = total;
+                    let (r_avail, r_size) = match &r {
+                        Some(router) => (router.total_available(), router.total_size()),
+                        None => (0, 0),
+                    };
+                    eprintln!(
+                        "[stats] reqs={} rps={:.0} master={} replica={} clients={} tx={} master_pool={}/{} replica_pool={}/{} errs={}",
+                        total,
+                        rps,
+                        s.master_requests.load(Ordering::Relaxed),
+                        s.replica_requests.load(Ordering::Relaxed),
+                        s.active_clients.load(Ordering::Relaxed),
+                        s.active_transactions.load(Ordering::Relaxed),
+                        m.available(),
+                        m.size,
+                        r_avail,
+                        r_size,
+                        s.backend_errors.load(Ordering::Relaxed),
+                    );
+                }
+            });
+        }
+
+        let client_limit = Arc::new(Semaphore::new(config.max_clients));
+
+        let listener = TcpListener::bind(&config.listen)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("FATAL: bind {}: {}", config.listen, e);
+                std::process::exit(1);
+            });
+        eprintln!("OxiPool listening on {}", config.listen);
+
+        loop {
+            let (client, addr) = match listener.accept().await {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("[oxipool] accept error: {}", e);
+                    continue;
+                }
+            };
+            let _ = client.set_nodelay(true);
+
+            let permit = match client_limit.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    eprintln!("[oxipool] max clients reached, rejecting {}", addr);
+                    drop(client);
+                    continue;
+                }
+            };
+
+            let master = Arc::clone(&master);
+            let replicas = replicas.clone();
+            let stats = Arc::clone(&stats);
+
+            tokio::spawn(async move {
+                handle_client(client, master, replicas, stats).await;
+                drop(permit);
+            });
+        }
     }
 }

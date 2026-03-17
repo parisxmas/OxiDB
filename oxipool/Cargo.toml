@@ -1,8 +1,11 @@
 [package]
 name = "oxipool"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
-description = "Connection pooler for OxiDB — like PgBouncer for OxiDB"
+description = "Connection pooler for OxiDB — like PgBouncer for OxiDB. Supports sharded routing."
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crc32fast = "1"

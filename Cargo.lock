@@ -1629,7 +1629,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.20.2"
+version = "0.20.3"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1656,8 +1656,11 @@ dependencies = [
 
 [[package]]
 name = "oxipool"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
+ "crc32fast",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
