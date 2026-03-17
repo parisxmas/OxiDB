@@ -259,7 +259,8 @@ impl Collection {
         let mut primary_index = HashMap::new();
         let doc_cache = DocCache::new(doc_cache::DEFAULT_CAPACITY);
         let mut version_index = HashMap::new();
-        let mut next_id: DocumentId = 1;
+        let shard_id_offset = Self::shard_id_offset();
+        let mut next_id: DocumentId = 1 + shard_id_offset;
 
         let load_start = std::time::Instant::now();
         let mut doc_count: u64 = 0;
@@ -488,7 +489,7 @@ impl Collection {
             text_index: None,
             vector_indexes: HashMap::new(),
             version_index: HashMap::new(),
-            next_id: 1,
+            next_id: 1 + Self::shard_id_offset(),
             encryption: None,
             verbose: false,
             log_callback: None,
@@ -500,6 +501,19 @@ impl Collection {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Returns the ID offset for this shard based on the `OXIDB_SHARD_ID` env var.
+    /// Each shard gets a 2^48 range within u64, allowing up to 65535 shards.
+    /// Shard 0 (or unset): offset 0, Shard 1: offset 2^48, Shard 2: offset 2*2^48, etc.
+    fn shard_id_offset() -> DocumentId {
+        match std::env::var("OXIDB_SHARD_ID") {
+            Ok(val) => {
+                let shard_id: u64 = val.parse().unwrap_or(0);
+                shard_id * (1u64 << 48)
+            }
+            Err(_) => 0,
+        }
     }
 
     /// Enable or disable lazy sync mode.

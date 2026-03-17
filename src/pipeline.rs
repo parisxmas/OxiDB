@@ -42,6 +42,28 @@ pub(crate) enum Expression {
     Subtract(Box<Expression>, Box<Expression>),
     Multiply(Vec<Expression>),
     Divide(Box<Expression>, Box<Expression>),
+    // Conditional
+    Cond(Box<Expression>, Box<Expression>, Box<Expression>), // condition, then, else
+    IfNull(Box<Expression>, Box<Expression>),                // expr, replacement
+    // String
+    Concat(Vec<Expression>),
+    ToLower(Box<Expression>),
+    ToUpper(Box<Expression>),
+    Substr(Box<Expression>, Box<Expression>, Box<Expression>), // string, start, length
+    Trim(Box<Expression>),
+    Split(Box<Expression>, Box<Expression>), // string, delimiter
+    // Date
+    Year(Box<Expression>),
+    Month(Box<Expression>),
+    DayOfMonth(Box<Expression>),
+    Hour(Box<Expression>),
+    Minute(Box<Expression>),
+    Second(Box<Expression>),
+    DayOfWeek(Box<Expression>),
+    // Modulo
+    Mod(Box<Expression>, Box<Expression>),
+    // Array
+    Size(Box<Expression>),
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +91,7 @@ pub(crate) enum Accumulator {
     First(Expression),
     Last(Expression),
     Push(Expression),
+    AddToSet(Expression),
 }
 
 enum AccumulatorState {
@@ -80,6 +103,7 @@ enum AccumulatorState {
     First(Option<Value>),
     Last(Option<Value>),
     Push(Vec<Value>),
+    AddToSet(Vec<Value>),
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +146,7 @@ enum Stage {
         /// Additional field pairs for composite join conditions.
         extra_pairs: Vec<(String, String)>,
     },
+    Out(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -172,6 +197,72 @@ pub(crate) fn set_field(doc: &mut Value, path: &str, value: Value) {
 
 fn to_f64(v: &Value) -> Option<f64> {
     v.as_f64()
+}
+
+/// Convert a Value to a string representation for string operators.
+fn value_to_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Null => None,
+        _ => Some(v.to_string()),
+    }
+}
+
+/// Check if a value is "truthy" for $cond evaluation (MongoDB semantics).
+fn is_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().map_or(false, |f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+/// Parse an ISO 8601 / RFC 3339 date string into (year, month, day, hour, min, sec, weekday).
+/// weekday: 1=Sunday .. 7=Saturday (MongoDB convention).
+fn parse_date_parts(v: &Value) -> Option<(i32, u32, u32, u32, u32, u32, u32)> {
+    let s = v.as_str()?;
+    let b = s.as_bytes();
+    if b.len() < 10 {
+        return None;
+    }
+    // YYYY-MM-DD
+    let year: i32 = s[0..4].parse().ok()?;
+    let month: u32 = s[5..7].parse().ok()?;
+    let day: u32 = s[8..10].parse().ok()?;
+
+    let (hour, minute, second) = if b.len() >= 19 && b[10] == b'T' {
+        (
+            s[11..13].parse::<u32>().unwrap_or(0),
+            s[14..16].parse::<u32>().unwrap_or(0),
+            s[17..19].parse::<u32>().unwrap_or(0),
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    // Zeller's formula for day of week
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 12)
+    } else {
+        (year, month)
+    };
+    let q = day as i32;
+    let k = y % 100;
+    let j = y / 100;
+    let h = (q + (13 * (m as i32 + 1)) / 5 + k + k / 4 + j / 4 - 2 * j).rem_euclid(7);
+    // h: 0=Saturday, 1=Sunday, 2=Monday, ..., 6=Friday
+    // MongoDB: 1=Sunday, 2=Monday, ..., 7=Saturday
+    let dow = match h {
+        0 => 7, // Saturday
+        1 => 1, // Sunday
+        n => n as u32,
+    };
+
+    Some((year, month, day, hour, minute, second, dow))
 }
 
 fn number_to_value(n: f64) -> Value {
@@ -236,6 +327,124 @@ fn parse_expression(val: &Value) -> Result<Expression> {
                         Box::new(parse_expression(&arr[1])?),
                     ))
                 }
+                // Conditional
+                "$cond" => {
+                    match arg {
+                        Value::Array(arr) if arr.len() == 3 => Ok(Expression::Cond(
+                            Box::new(parse_expression(&arr[0])?),
+                            Box::new(parse_expression(&arr[1])?),
+                            Box::new(parse_expression(&arr[2])?),
+                        )),
+                        Value::Object(obj) => {
+                            let if_expr = obj.get("if").ok_or_else(|| {
+                                Error::InvalidPipeline("$cond requires 'if' field".into())
+                            })?;
+                            let then_expr = obj.get("then").ok_or_else(|| {
+                                Error::InvalidPipeline("$cond requires 'then' field".into())
+                            })?;
+                            let else_expr = obj.get("else").ok_or_else(|| {
+                                Error::InvalidPipeline("$cond requires 'else' field".into())
+                            })?;
+                            Ok(Expression::Cond(
+                                Box::new(parse_expression(if_expr)?),
+                                Box::new(parse_expression(then_expr)?),
+                                Box::new(parse_expression(else_expr)?),
+                            ))
+                        }
+                        _ => Err(Error::InvalidPipeline(
+                            "$cond requires array [if,then,else] or object {if,then,else}".into(),
+                        )),
+                    }
+                }
+                "$ifNull" => {
+                    let arr = arg.as_array().ok_or_else(|| {
+                        Error::InvalidPipeline("$ifNull requires an array".into())
+                    })?;
+                    if arr.len() != 2 {
+                        return Err(Error::InvalidPipeline(
+                            "$ifNull requires exactly 2 arguments".into(),
+                        ));
+                    }
+                    Ok(Expression::IfNull(
+                        Box::new(parse_expression(&arr[0])?),
+                        Box::new(parse_expression(&arr[1])?),
+                    ))
+                }
+                // String
+                "$concat" => {
+                    let arr = arg.as_array().ok_or_else(|| {
+                        Error::InvalidPipeline("$concat requires an array".into())
+                    })?;
+                    let exprs: Result<Vec<_>> = arr.iter().map(parse_expression).collect();
+                    Ok(Expression::Concat(exprs?))
+                }
+                "$toLower" => Ok(Expression::ToLower(Box::new(parse_expression(arg)?))),
+                "$toUpper" => Ok(Expression::ToUpper(Box::new(parse_expression(arg)?))),
+                "$substr" => {
+                    let arr = arg.as_array().ok_or_else(|| {
+                        Error::InvalidPipeline("$substr requires an array".into())
+                    })?;
+                    if arr.len() != 3 {
+                        return Err(Error::InvalidPipeline(
+                            "$substr requires exactly 3 arguments".into(),
+                        ));
+                    }
+                    Ok(Expression::Substr(
+                        Box::new(parse_expression(&arr[0])?),
+                        Box::new(parse_expression(&arr[1])?),
+                        Box::new(parse_expression(&arr[2])?),
+                    ))
+                }
+                "$trim" => {
+                    match arg {
+                        Value::Object(obj) => {
+                            let input = obj.get("input").ok_or_else(|| {
+                                Error::InvalidPipeline("$trim requires 'input' field".into())
+                            })?;
+                            Ok(Expression::Trim(Box::new(parse_expression(input)?)))
+                        }
+                        _ => Ok(Expression::Trim(Box::new(parse_expression(arg)?))),
+                    }
+                }
+                "$split" => {
+                    let arr = arg.as_array().ok_or_else(|| {
+                        Error::InvalidPipeline("$split requires an array".into())
+                    })?;
+                    if arr.len() != 2 {
+                        return Err(Error::InvalidPipeline(
+                            "$split requires exactly 2 arguments".into(),
+                        ));
+                    }
+                    Ok(Expression::Split(
+                        Box::new(parse_expression(&arr[0])?),
+                        Box::new(parse_expression(&arr[1])?),
+                    ))
+                }
+                // Date
+                "$year" => Ok(Expression::Year(Box::new(parse_expression(arg)?))),
+                "$month" => Ok(Expression::Month(Box::new(parse_expression(arg)?))),
+                "$dayOfMonth" => Ok(Expression::DayOfMonth(Box::new(parse_expression(arg)?))),
+                "$hour" => Ok(Expression::Hour(Box::new(parse_expression(arg)?))),
+                "$minute" => Ok(Expression::Minute(Box::new(parse_expression(arg)?))),
+                "$second" => Ok(Expression::Second(Box::new(parse_expression(arg)?))),
+                "$dayOfWeek" => Ok(Expression::DayOfWeek(Box::new(parse_expression(arg)?))),
+                // Math
+                "$mod" => {
+                    let arr = arg.as_array().ok_or_else(|| {
+                        Error::InvalidPipeline("$mod requires an array".into())
+                    })?;
+                    if arr.len() != 2 {
+                        return Err(Error::InvalidPipeline(
+                            "$mod requires exactly 2 arguments".into(),
+                        ));
+                    }
+                    Ok(Expression::Mod(
+                        Box::new(parse_expression(&arr[0])?),
+                        Box::new(parse_expression(&arr[1])?),
+                    ))
+                }
+                // Array
+                "$size" => Ok(Expression::Size(Box::new(parse_expression(arg)?))),
                 _ => Ok(Expression::Literal(Value::Object(map.clone()))),
             }
         }
@@ -328,6 +537,133 @@ impl Expression {
                     _ => Value::Null,
                 }
             }
+            Expression::Mod(a, b) => {
+                match (to_f64(&a.eval(doc)), to_f64(&b.eval(doc))) {
+                    (Some(a), Some(b)) if b != 0.0 => number_to_value(a % b),
+                    _ => Value::Null,
+                }
+            }
+            // Conditional
+            Expression::Cond(cond, then_expr, else_expr) => {
+                if is_truthy(&cond.eval(doc)) {
+                    then_expr.eval(doc)
+                } else {
+                    else_expr.eval(doc)
+                }
+            }
+            Expression::IfNull(expr, replacement) => {
+                let val = expr.eval(doc);
+                if val.is_null() {
+                    replacement.eval(doc)
+                } else {
+                    val
+                }
+            }
+            // String
+            Expression::Concat(exprs) => {
+                let mut result = String::new();
+                for e in exprs {
+                    match value_to_string(&e.eval(doc)) {
+                        Some(s) => result.push_str(&s),
+                        None => return Value::Null,
+                    }
+                }
+                Value::String(result)
+            }
+            Expression::ToLower(expr) => {
+                match value_to_string(&expr.eval(doc)) {
+                    Some(s) => Value::String(s.to_lowercase()),
+                    None => Value::Null,
+                }
+            }
+            Expression::ToUpper(expr) => {
+                match value_to_string(&expr.eval(doc)) {
+                    Some(s) => Value::String(s.to_uppercase()),
+                    None => Value::Null,
+                }
+            }
+            Expression::Substr(string_expr, start_expr, len_expr) => {
+                let s = match value_to_string(&string_expr.eval(doc)) {
+                    Some(s) => s,
+                    None => return Value::Null,
+                };
+                let start = to_f64(&start_expr.eval(doc)).unwrap_or(0.0) as usize;
+                let len = to_f64(&len_expr.eval(doc)).unwrap_or(0.0) as usize;
+                if start >= s.len() {
+                    Value::String(String::new())
+                } else {
+                    let end = (start + len).min(s.len());
+                    Value::String(s[start..end].to_string())
+                }
+            }
+            Expression::Trim(expr) => {
+                match value_to_string(&expr.eval(doc)) {
+                    Some(s) => Value::String(s.trim().to_string()),
+                    None => Value::Null,
+                }
+            }
+            Expression::Split(string_expr, delim_expr) => {
+                let s = match value_to_string(&string_expr.eval(doc)) {
+                    Some(s) => s,
+                    None => return Value::Null,
+                };
+                let delim = match value_to_string(&delim_expr.eval(doc)) {
+                    Some(d) => d,
+                    None => return Value::Null,
+                };
+                let parts: Vec<Value> = s.split(&delim).map(|p| Value::String(p.to_string())).collect();
+                Value::Array(parts)
+            }
+            // Date
+            Expression::Year(expr) => {
+                match parse_date_parts(&expr.eval(doc)) {
+                    Some((year, _, _, _, _, _, _)) => json!(year),
+                    None => Value::Null,
+                }
+            }
+            Expression::Month(expr) => {
+                match parse_date_parts(&expr.eval(doc)) {
+                    Some((_, month, _, _, _, _, _)) => json!(month),
+                    None => Value::Null,
+                }
+            }
+            Expression::DayOfMonth(expr) => {
+                match parse_date_parts(&expr.eval(doc)) {
+                    Some((_, _, day, _, _, _, _)) => json!(day),
+                    None => Value::Null,
+                }
+            }
+            Expression::Hour(expr) => {
+                match parse_date_parts(&expr.eval(doc)) {
+                    Some((_, _, _, hour, _, _, _)) => json!(hour),
+                    None => Value::Null,
+                }
+            }
+            Expression::Minute(expr) => {
+                match parse_date_parts(&expr.eval(doc)) {
+                    Some((_, _, _, _, minute, _, _)) => json!(minute),
+                    None => Value::Null,
+                }
+            }
+            Expression::Second(expr) => {
+                match parse_date_parts(&expr.eval(doc)) {
+                    Some((_, _, _, _, _, second, _)) => json!(second),
+                    None => Value::Null,
+                }
+            }
+            Expression::DayOfWeek(expr) => {
+                match parse_date_parts(&expr.eval(doc)) {
+                    Some((_, _, _, _, _, _, dow)) => json!(dow),
+                    None => Value::Null,
+                }
+            }
+            // Array
+            Expression::Size(expr) => {
+                match expr.eval(doc) {
+                    Value::Array(arr) => json!(arr.len()),
+                    _ => Value::Null,
+                }
+            }
         }
     }
 }
@@ -355,6 +691,7 @@ fn parse_accumulator(val: &Value) -> Result<Accumulator> {
         "$first" => Ok(Accumulator::First(parse_expression(arg)?)),
         "$last" => Ok(Accumulator::Last(parse_expression(arg)?)),
         "$push" => Ok(Accumulator::Push(parse_expression(arg)?)),
+        "$addToSet" => Ok(Accumulator::AddToSet(parse_expression(arg)?)),
         _ => Err(Error::InvalidPipeline(format!(
             "unknown accumulator: {}",
             op
@@ -617,6 +954,12 @@ fn update_accumulator(state: &mut AccumulatorState, acc: &Accumulator, doc: &Val
         (Accumulator::Push(expr), AccumulatorState::Push(vec)) => {
             vec.push(expr.eval_ref(doc).into_owned());
         }
+        (Accumulator::AddToSet(expr), AccumulatorState::AddToSet(vec)) => {
+            let val = expr.eval_ref(doc).into_owned();
+            if !vec.contains(&val) {
+                vec.push(val);
+            }
+        }
         _ => {}
     }
 }
@@ -680,6 +1023,14 @@ fn update_accumulator_raw(state: &mut AccumulatorState, acc: &Accumulator, raw: 
         (Accumulator::Push(expr), AccumulatorState::Push(vec)) => {
             if let Some(owned) = eval_expr_raw_owned(expr, raw) {
                 vec.push(raw_owned_to_value(&owned));
+            }
+        }
+        (Accumulator::AddToSet(expr), AccumulatorState::AddToSet(vec)) => {
+            if let Some(owned) = eval_expr_raw_owned(expr, raw) {
+                let val = raw_owned_to_value(&owned);
+                if !vec.contains(&val) {
+                    vec.push(val);
+                }
             }
         }
         _ => {}
@@ -776,6 +1127,7 @@ fn exec_group<D: DocRef>(
                 Accumulator::First(_) => AccumulatorState::First(None),
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+                Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
             })
             .collect();
         for (i, (_, acc)) in accumulators.iter().enumerate() {
@@ -807,6 +1159,7 @@ fn exec_group<D: DocRef>(
                 AccumulatorState::First(v) => v.unwrap_or(Value::Null),
                 AccumulatorState::Last(v) => v.unwrap_or(Value::Null),
                 AccumulatorState::Push(v) => Value::Array(v),
+                AccumulatorState::AddToSet(v) => Value::Array(v),
             };
             doc.insert(name.clone(), val);
         }
@@ -1220,6 +1573,7 @@ fn try_index_group(
                 Accumulator::First(_) => AccumulatorState::First(None),
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+                Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
             })
             .collect();
 
@@ -1255,6 +1609,7 @@ fn try_index_group(
                 Accumulator::First(_) => AccumulatorState::First(None),
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+                Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
             })
             .collect();
 
@@ -1365,6 +1720,7 @@ fn finalize_accumulator(state: AccumulatorState) -> Value {
         AccumulatorState::First(v) => v.unwrap_or(Value::Null),
         AccumulatorState::Last(v) => v.unwrap_or(Value::Null),
         AccumulatorState::Push(v) => Value::Array(v),
+        AccumulatorState::AddToSet(v) => Value::Array(v),
     }
 }
 
@@ -1412,6 +1768,13 @@ fn merge_accumulator_state(self_state: &mut AccumulatorState, other: Accumulator
         }
         (AccumulatorState::Push(vec), AccumulatorState::Push(mut other_vec)) => {
             vec.append(&mut other_vec);
+        }
+        (AccumulatorState::AddToSet(vec), AccumulatorState::AddToSet(other_vec)) => {
+            for val in other_vec {
+                if !vec.contains(&val) {
+                    vec.push(val);
+                }
+            }
         }
         _ => {}
     }
@@ -1534,7 +1897,8 @@ pub(crate) fn is_raw_eligible(key: &GroupKey, accumulators: &[(String, Accumulat
         | Accumulator::Max(e)
         | Accumulator::First(e)
         | Accumulator::Last(e)
-        | Accumulator::Push(e) => matches!(e, Expression::FieldRef(_) | Expression::Literal(_)),
+        | Accumulator::Push(e)
+        | Accumulator::AddToSet(e) => matches!(e, Expression::FieldRef(_) | Expression::Literal(_)),
     })
 }
 
@@ -1610,6 +1974,7 @@ impl StreamingGroup {
                 Accumulator::First(_) => AccumulatorState::First(None),
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+                Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
             })
             .collect();
         for (i, (_, acc)) in self.accumulators.iter().enumerate() {
@@ -1737,6 +2102,7 @@ impl StreamingGroup {
                 Accumulator::First(_) => AccumulatorState::First(None),
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+                Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
             })
             .collect();
         for (i, (_, acc)) in self.accumulators.iter().enumerate() {
@@ -1892,6 +2258,12 @@ impl Pipeline {
                         as_field: as_field.to_string(),
                         extra_pairs,
                     }
+                }
+                "$out" => {
+                    let coll = stage_body.as_str().ok_or_else(|| {
+                        Error::InvalidPipeline("$out must be a collection name string".into())
+                    })?;
+                    Stage::Out(coll.to_string())
                 }
                 _ => {
                     return Err(Error::InvalidPipeline(format!(
@@ -2049,9 +2421,22 @@ impl Pipeline {
                     as_field,
                     extra_pairs,
                 } => exec_lookup(current, from, local_field, foreign_field, as_field, extra_pairs, lookup_fn)?,
+                Stage::Out(_) => {
+                    // $out is handled at the engine level after pipeline execution.
+                    // The pipeline returns the docs; the engine writes them to the target collection.
+                    current
+                }
             };
         }
         Ok(current)
+    }
+
+    /// If the last stage is $out, return the target collection name.
+    pub fn out_collection(&self) -> Option<&str> {
+        match self.stages.last() {
+            Some(Stage::Out(coll)) => Some(coll),
+            _ => None,
+        }
     }
 }
 
@@ -2872,6 +3257,311 @@ mod tests {
                 "NYC" => assert!((avg - 32.5).abs() < 0.01, "NYC avg was {avg}"),
                 "LA" => assert!((avg - 25.0).abs() < 0.01, "LA avg was {avg}"),
                 other => panic!("unexpected city: {other}"),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // $addToSet accumulator
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn group_add_to_set() {
+        let docs = vec![
+            json!({"dept": "eng", "lang": "Rust"}),
+            json!({"dept": "eng", "lang": "Go"}),
+            json!({"dept": "eng", "lang": "Rust"}), // duplicate
+            json!({"dept": "sales", "lang": "Python"}),
+        ];
+        let pipeline = Pipeline::parse(&json!([
+            {"$group": {"_id": "$dept", "languages": {"$addToSet": "$lang"}}}
+        ])).unwrap();
+        let results = pipeline.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(results.len(), 2);
+        for doc in &results {
+            let langs = doc["languages"].as_array().unwrap();
+            if doc["_id"] == "eng" {
+                assert_eq!(langs.len(), 2); // Rust and Go, no duplicates
+                assert!(langs.contains(&json!("Rust")));
+                assert!(langs.contains(&json!("Go")));
+            } else {
+                assert_eq!(langs.len(), 1);
+                assert!(langs.contains(&json!("Python")));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // $cond and $ifNull
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expr_cond_array_form() {
+        let doc = json!({"score": 85});
+        let expr = parse_expression(&json!({"$cond": ["$score", "pass", "fail"]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("pass"));
+    }
+
+    #[test]
+    fn expr_cond_object_form() {
+        let doc = json!({"active": false});
+        let expr = parse_expression(&json!({
+            "$cond": {"if": "$active", "then": "yes", "else": "no"}
+        })).unwrap();
+        assert_eq!(expr.eval(&doc), json!("no"));
+    }
+
+    #[test]
+    fn expr_cond_null_is_falsy() {
+        let doc = json!({"val": null});
+        let expr = parse_expression(&json!({"$cond": ["$val", "has", "empty"]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("empty"));
+    }
+
+    #[test]
+    fn expr_ifnull_returns_value_when_present() {
+        let doc = json!({"name": "Alice"});
+        let expr = parse_expression(&json!({"$ifNull": ["$name", "Unknown"]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("Alice"));
+    }
+
+    #[test]
+    fn expr_ifnull_returns_replacement_when_null() {
+        let doc = json!({"name": null});
+        let expr = parse_expression(&json!({"$ifNull": ["$name", "Unknown"]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("Unknown"));
+    }
+
+    #[test]
+    fn expr_ifnull_returns_replacement_when_missing() {
+        let doc = json!({"age": 30});
+        let expr = parse_expression(&json!({"$ifNull": ["$name", "N/A"]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("N/A"));
+    }
+
+    // -----------------------------------------------------------------------
+    // String operators
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expr_concat() {
+        let doc = json!({"first": "John", "last": "Doe"});
+        let expr = parse_expression(&json!({"$concat": ["$first", " ", "$last"]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("John Doe"));
+    }
+
+    #[test]
+    fn expr_concat_null_returns_null() {
+        let doc = json!({"first": "John"});
+        let expr = parse_expression(&json!({"$concat": ["$first", " ", "$missing"]})).unwrap();
+        assert_eq!(expr.eval(&doc), Value::Null);
+    }
+
+    #[test]
+    fn expr_to_lower() {
+        let doc = json!({"name": "ALICE"});
+        let expr = parse_expression(&json!({"$toLower": "$name"})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("alice"));
+    }
+
+    #[test]
+    fn expr_to_upper() {
+        let doc = json!({"name": "alice"});
+        let expr = parse_expression(&json!({"$toUpper": "$name"})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("ALICE"));
+    }
+
+    #[test]
+    fn expr_substr() {
+        let doc = json!({"s": "hello world"});
+        let expr = parse_expression(&json!({"$substr": ["$s", 0, 5]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("hello"));
+    }
+
+    #[test]
+    fn expr_trim() {
+        let doc = json!({"s": "  hello  "});
+        let expr = parse_expression(&json!({"$trim": {"input": "$s"}})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("hello"));
+    }
+
+    #[test]
+    fn expr_split() {
+        let doc = json!({"s": "a,b,c"});
+        let expr = parse_expression(&json!({"$split": ["$s", ","]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!(["a", "b", "c"]));
+    }
+
+    // -----------------------------------------------------------------------
+    // Date operators
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expr_year() {
+        let doc = json!({"d": "2024-03-15T10:30:45Z"});
+        let expr = parse_expression(&json!({"$year": "$d"})).unwrap();
+        assert_eq!(expr.eval(&doc), json!(2024));
+    }
+
+    #[test]
+    fn expr_month() {
+        let doc = json!({"d": "2024-03-15T10:30:45Z"});
+        let expr = parse_expression(&json!({"$month": "$d"})).unwrap();
+        assert_eq!(expr.eval(&doc), json!(3));
+    }
+
+    #[test]
+    fn expr_day_of_month() {
+        let doc = json!({"d": "2024-03-15"});
+        let expr = parse_expression(&json!({"$dayOfMonth": "$d"})).unwrap();
+        assert_eq!(expr.eval(&doc), json!(15));
+    }
+
+    #[test]
+    fn expr_hour_minute_second() {
+        let doc = json!({"d": "2024-03-15T10:30:45Z"});
+        let h = parse_expression(&json!({"$hour": "$d"})).unwrap();
+        let m = parse_expression(&json!({"$minute": "$d"})).unwrap();
+        let s = parse_expression(&json!({"$second": "$d"})).unwrap();
+        assert_eq!(h.eval(&doc), json!(10));
+        assert_eq!(m.eval(&doc), json!(30));
+        assert_eq!(s.eval(&doc), json!(45));
+    }
+
+    #[test]
+    fn expr_day_of_week() {
+        // 2024-03-15 is a Friday → MongoDB: 6
+        let doc = json!({"d": "2024-03-15"});
+        let expr = parse_expression(&json!({"$dayOfWeek": "$d"})).unwrap();
+        assert_eq!(expr.eval(&doc), json!(6));
+    }
+
+    #[test]
+    fn expr_date_only_string() {
+        let doc = json!({"d": "2024-01-01"});
+        let y = parse_expression(&json!({"$year": "$d"})).unwrap();
+        let m = parse_expression(&json!({"$month": "$d"})).unwrap();
+        let d = parse_expression(&json!({"$dayOfMonth": "$d"})).unwrap();
+        assert_eq!(y.eval(&doc), json!(2024));
+        assert_eq!(m.eval(&doc), json!(1));
+        assert_eq!(d.eval(&doc), json!(1));
+    }
+
+    #[test]
+    fn expr_date_null_returns_null() {
+        let doc = json!({"d": "not-a-date"});
+        let expr = parse_expression(&json!({"$year": "$d"})).unwrap();
+        assert_eq!(expr.eval(&doc), Value::Null);
+    }
+
+    // -----------------------------------------------------------------------
+    // $mod and $size
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expr_mod() {
+        let doc = json!({"a": 10});
+        let expr = parse_expression(&json!({"$mod": ["$a", 3]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!(1));
+    }
+
+    #[test]
+    fn expr_size() {
+        let doc = json!({"tags": ["a", "b", "c"]});
+        let expr = parse_expression(&json!({"$size": "$tags"})).unwrap();
+        assert_eq!(expr.eval(&doc), json!(3));
+    }
+
+    #[test]
+    fn expr_size_non_array_returns_null() {
+        let doc = json!({"val": "string"});
+        let expr = parse_expression(&json!({"$size": "$val"})).unwrap();
+        assert_eq!(expr.eval(&doc), Value::Null);
+    }
+
+    // -----------------------------------------------------------------------
+    // $out stage
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn out_collection_parsed() {
+        let pipeline = Pipeline::parse(&json!([
+            {"$match": {"status": "active"}},
+            {"$out": "results"}
+        ])).unwrap();
+        assert_eq!(pipeline.out_collection(), Some("results"));
+    }
+
+    #[test]
+    fn pipeline_without_out() {
+        let pipeline = Pipeline::parse(&json!([
+            {"$match": {"status": "active"}}
+        ])).unwrap();
+        assert_eq!(pipeline.out_collection(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Combined: expressions in $project and $addFields
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn project_with_cond_and_concat() {
+        let docs = vec![
+            json!({"name": "Alice", "score": 90}),
+            json!({"name": "Bob", "score": 40}),
+        ];
+        let pipeline = Pipeline::parse(&json!([
+            {"$project": {
+                "name": 1,
+                "grade": {"$cond": [{"$subtract": ["$score", 50]}, "pass", "fail"]},
+                "label": {"$concat": ["$name", ": ", {"$cond": [{"$subtract": ["$score", 50]}, "P", "F"]}]}
+            }}
+        ])).unwrap();
+        let results = pipeline.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(results[0]["grade"], json!("pass"));  // 90-50=40 → truthy
+        assert_eq!(results[0]["label"], json!("Alice: P"));
+        assert_eq!(results[1]["grade"], json!("pass"));  // 40-50=-10 → truthy (non-zero)
+        assert_eq!(results[1]["label"], json!("Bob: P"));
+    }
+
+    #[test]
+    fn addfields_with_date_and_string() {
+        let docs = vec![
+            json!({"created": "2024-06-15T08:30:00Z", "name": "test"}),
+        ];
+        let pipeline = Pipeline::parse(&json!([
+            {"$addFields": {
+                "year": {"$year": "$created"},
+                "month": {"$month": "$created"},
+                "upper_name": {"$toUpper": "$name"}
+            }}
+        ])).unwrap();
+        let results = pipeline.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(results[0]["year"], json!(2024));
+        assert_eq!(results[0]["month"], json!(6));
+        assert_eq!(results[0]["upper_name"], json!("TEST"));
+    }
+
+    #[test]
+    fn group_with_date_key() {
+        let docs = vec![
+            json!({"date": "2024-01-15", "amount": 100}),
+            json!({"date": "2024-01-20", "amount": 200}),
+            json!({"date": "2024-02-10", "amount": 150}),
+        ];
+        let pipeline = Pipeline::parse(&json!([
+            {"$group": {
+                "_id": {"$month": "$date"},
+                "total": {"$sum": "$amount"}
+            }}
+        ])).unwrap();
+        let results = pipeline.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(results.len(), 2);
+        for doc in &results {
+            match doc["_id"].as_u64().unwrap() {
+                1 => assert_eq!(doc["total"], json!(300)),
+                2 => assert_eq!(doc["total"], json!(150)),
+                other => panic!("unexpected month: {other}"),
             }
         }
     }
