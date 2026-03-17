@@ -3,7 +3,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use crc32fast::Hasher;
 
@@ -90,7 +91,7 @@ impl Wal {
         let payload = self.serialize_entry(entry)?;
         let crc = Self::compute_crc(&payload);
 
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         file.write_all(&crc.to_le_bytes())?;
         file.write_all(&(payload.len() as u32).to_le_bytes())?;
@@ -105,7 +106,7 @@ impl Wal {
         let payload = self.serialize_entry(entry)?;
         let crc = Self::compute_crc(&payload);
 
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         file.write_all(&crc.to_le_bytes())?;
         file.write_all(&(payload.len() as u32).to_le_bytes())?;
@@ -116,7 +117,7 @@ impl Wal {
 
     /// Write multiple WAL entries with a single fsync.
     pub fn log_batch(&self, entries: &[WalEntry]) -> Result<()> {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         for entry in entries {
             let payload = self.serialize_entry(entry)?;
@@ -131,7 +132,7 @@ impl Wal {
 
     /// Write multiple WAL entries without fsync.
     pub fn log_batch_no_sync(&self, entries: &[WalEntry]) -> Result<()> {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         for entry in entries {
             let payload = self.serialize_entry(entry)?;
@@ -145,7 +146,7 @@ impl Wal {
 
     /// Write multiple insert entries without fsync, avoiding doc_bytes clones.
     pub fn log_batch_inserts_no_sync(&self, entries: &[(u64, &[u8])]) -> Result<()> {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         for &(doc_id, doc_bytes) in entries {
             let encrypted = self.maybe_encrypt(doc_bytes)?;
@@ -188,7 +189,7 @@ impl Wal {
             buf.extend_from_slice(&payload);
         }
 
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         file.write_all(&buf)?;
         Ok(())
@@ -196,7 +197,7 @@ impl Wal {
 
     /// Truncate the WAL to 0 (checkpoint), then fsync.
     pub fn checkpoint(&self) -> Result<()> {
-        let file = self.inner.lock().unwrap();
+        let file = self.inner.lock();
         file.set_len(0)?;
         file.sync_data()?;
         Ok(())
@@ -204,7 +205,7 @@ impl Wal {
 
     /// Truncate the WAL to 0 without fsync.
     pub fn checkpoint_no_sync(&self) -> Result<()> {
-        let file = self.inner.lock().unwrap();
+        let file = self.inner.lock();
         file.set_len(0)?;
         Ok(())
     }
@@ -409,7 +410,7 @@ impl Wal {
     }
 
     fn read_entries(&self) -> Result<Vec<WalEntry>> {
-        let mut file = self.inner.lock().unwrap();
+        let mut file = self.inner.lock();
         file.seek(SeekFrom::Start(0))?;
         let file_len = file.metadata()?.len();
         let mut entries = Vec::new();
@@ -419,7 +420,10 @@ impl Wal {
             // Read header: crc32 (4) + payload_len (4)
             let mut header = [0u8; 8];
             if file.read_exact(&mut header).is_err() {
-                break; // Truncated header, stop
+                if pos > 0 {
+                    eprintln!("[wal] truncated header at offset {pos}, stopping replay ({} entries recovered)", entries.len());
+                }
+                break;
             }
 
             let stored_crc = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
@@ -427,7 +431,8 @@ impl Wal {
                 u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
 
             if pos + 8 + payload_len as u64 > file_len {
-                break; // Truncated payload, stop
+                eprintln!("[wal] truncated payload at offset {pos} (need {} bytes, file has {}), stopping replay", payload_len, file_len - pos - 8);
+                break;
             }
 
             let mut payload = vec![0u8; payload_len];
@@ -438,7 +443,8 @@ impl Wal {
             // Verify CRC
             let computed_crc = Self::compute_crc(&payload);
             if stored_crc != computed_crc {
-                break; // Corrupt entry, stop replay
+                eprintln!("[wal] CRC mismatch at offset {pos}: stored={stored_crc:#010x} computed={computed_crc:#010x}, stopping replay ({} entries recovered)", entries.len());
+                break;
             }
 
             // Parse payload

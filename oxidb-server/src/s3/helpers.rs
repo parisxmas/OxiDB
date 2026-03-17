@@ -79,6 +79,34 @@ pub fn extract_xml_tag_pairs(xml: &str) -> Vec<(String, String)> {
     keys.into_iter().zip(values.into_iter()).collect()
 }
 
+/// Convert ISO 8601 timestamp (e.g. "2026-03-17T17:03:25Z") to HTTP-date (RFC 7231).
+/// Returns "Mon, 17 Mar 2026 17:03:25 GMT" format required by S3 `Last-Modified` header.
+pub fn iso_to_httpdate(iso: &str) -> String {
+    // Parse "YYYY-MM-DDTHH:MM:SSZ" (or with fractional seconds)
+    let iso = iso.trim();
+    if iso.len() < 19 {
+        return iso.to_string();
+    }
+    let year: i32 = iso[0..4].parse().unwrap_or(0);
+    let month: u32 = iso[5..7].parse().unwrap_or(1);
+    let day: u32 = iso[8..10].parse().unwrap_or(1);
+    let time_part = &iso[11..19]; // "HH:MM:SS"
+
+    let month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    let day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+
+    // Zeller-like day-of-week (Tomohiko Sakamoto's algorithm)
+    let t = [0i32, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let mut y = year;
+    if month < 3 { y -= 1; }
+    let dow = ((y + y/4 - y/100 + y/400 + t[(month - 1) as usize] + day as i32) % 7) as usize;
+    // dow: 0=Sun, 1=Mon, ..., 6=Sat → remap to our day_names (Mon=0)
+    let dow_idx = if dow == 0 { 6 } else { dow - 1 };
+
+    let m_idx = (month - 1).min(11) as usize;
+    format!("{}, {:02} {} {} {} GMT", day_names[dow_idx], day, month_names[m_idx], year, time_part)
+}
+
 pub fn parse_range(header: &str, total: u64) -> Option<(u64, u64)> {
     let s = header.strip_prefix("bytes=")?;
     let (start_s, end_s) = s.split_once('-')?;
@@ -120,6 +148,13 @@ mod tests {
         let xml = "<Delete><Object><Key>file1.txt</Key></Object><Object><Key>file2.txt</Key></Object></Delete>";
         let keys = extract_xml_values(xml, "Key");
         assert_eq!(keys, vec!["file1.txt", "file2.txt"]);
+    }
+
+    #[test]
+    fn test_iso_to_httpdate() {
+        assert_eq!(iso_to_httpdate("2026-03-17T17:03:25Z"), "Tue, 17 Mar 2026 17:03:25 GMT");
+        assert_eq!(iso_to_httpdate("2024-01-01T00:00:00Z"), "Mon, 01 Jan 2024 00:00:00 GMT");
+        assert_eq!(iso_to_httpdate("2025-12-25T12:30:00Z"), "Thu, 25 Dec 2025 12:30:00 GMT");
     }
 
     #[test]

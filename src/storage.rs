@@ -2,7 +2,8 @@ use std::borrow::Cow;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use crate::crypto::EncryptionKey;
 use crate::error::Result;
@@ -141,7 +142,7 @@ impl Storage {
     /// Append a document to the data file, returns its location.
     pub fn append(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
         let payload = self.prepare_payload(doc_bytes)?;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let offset = inner.current_offset;
         let length = payload.len() as u32;
 
@@ -158,7 +159,7 @@ impl Storage {
 
     /// Read a document's bytes from the data file.
     pub fn read(&self, loc: DocLocation) -> Result<Vec<u8>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.file.seek(SeekFrom::Start(loc.offset + 5))?;
         let mut buf = vec![0u8; loc.length as usize];
         inner.file.read_exact(&mut buf)?;
@@ -207,7 +208,7 @@ impl Storage {
         &self,
         locs: &mut [(usize, DocLocation)],
     ) -> Result<Vec<(usize, Vec<u8>)>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         locs.sort_unstable_by_key(|&(_, loc)| loc.offset);
         let mut results = Vec::with_capacity(locs.len());
         for &(idx, loc) in locs.iter() {
@@ -225,7 +226,7 @@ impl Storage {
 
     /// Soft-delete a record by flipping its status byte.
     pub fn mark_deleted(&self, loc: DocLocation) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.file.seek(SeekFrom::Start(loc.offset))?;
         inner.file.write_all(&[RECORD_DELETED])?;
         inner.file.sync_data()?;
@@ -235,7 +236,7 @@ impl Storage {
     /// Append a document without fsync (caller must call `sync()` after batch).
     pub fn append_no_sync(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
         let payload = self.prepare_payload(doc_bytes)?;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let offset = inner.current_offset;
         let length = payload.len() as u32;
 
@@ -258,7 +259,7 @@ impl Storage {
             .map(|doc_bytes| self.prepare_payload(doc_bytes))
             .collect::<Result<Vec<_>>>()?;
 
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.file.seek(SeekFrom::End(0))?;
 
         let mut locations = Vec::with_capacity(payloads.len());
@@ -360,7 +361,7 @@ impl Storage {
         }
 
         // Single lock acquisition, single write
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         let base_offset = inner.current_offset;
         inner.file.seek(SeekFrom::End(0))?;
         inner.file.write_all(&buf)?;
@@ -376,7 +377,7 @@ impl Storage {
 
     /// Soft-delete without fsync (caller must call `sync()` after batch).
     pub fn mark_deleted_no_sync(&self, loc: DocLocation) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.file.seek(SeekFrom::Start(loc.offset))?;
         inner.file.write_all(&[RECORD_DELETED])?;
         Ok(())
@@ -384,14 +385,14 @@ impl Storage {
 
     /// Flush and fsync the data file.
     pub fn sync(&self) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.file.sync_data()?;
         Ok(())
     }
 
     /// Returns the total file size in bytes.
     pub fn file_size(&self) -> u64 {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock();
         inner.current_offset
     }
 
@@ -404,7 +405,7 @@ impl Storage {
     /// The DocLocation contains the correct on-disk payload length (which may
     /// differ from plaintext length when encryption is enabled).
     pub fn iter_active(&self) -> Result<Vec<(DocLocation, Vec<u8>)>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.file.seek(SeekFrom::Start(0))?;
         let file_len = inner.file.metadata()?.len();
         let mut results = Vec::new();
@@ -438,7 +439,7 @@ impl Storage {
     where
         F: FnMut(DocLocation, Vec<u8>) -> Result<()>,
     {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock();
         inner.file.seek(SeekFrom::Start(0))?;
         let file_len = inner.file.metadata()?.len();
         let mut pos = 0u64;
@@ -457,7 +458,7 @@ impl Storage {
                 // Drop inner lock before callback (callback may need to read storage)
                 drop(inner);
                 f(DocLocation { offset: pos, length }, plaintext)?;
-                inner = self.inner.lock().unwrap();
+                inner = self.inner.lock();
                 // Re-seek to continue after this record
                 inner.file.seek(SeekFrom::Start(pos + 5 + length as u64))?;
             } else {

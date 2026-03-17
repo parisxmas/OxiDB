@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 
 use lru::LruCache;
 use serde_json::Value;
@@ -31,39 +32,39 @@ impl DocCache {
     /// Look up a document by ID, promoting it to most-recently-used.
     /// Returns `None` on cache miss.
     pub fn get(&self, id: DocumentId) -> Option<Arc<Value>> {
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = self.inner.lock();
         cache.get(&id).map(Arc::clone)
     }
 
     /// Look up without promoting (peek). Useful during iteration
     /// when we don't want to disturb eviction order.
     pub fn peek(&self, id: DocumentId) -> Option<Arc<Value>> {
-        let cache = self.inner.lock().unwrap();
+        let cache = self.inner.lock();
         cache.peek(&id).map(Arc::clone)
     }
 
     /// Insert or update a document in the cache. May evict the
     /// least-recently-used entry if the cache is full.
     pub fn put(&self, id: DocumentId, doc: Arc<Value>) {
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = self.inner.lock();
         cache.put(id, doc);
     }
 
     /// Remove a document from the cache.
     pub fn remove(&self, id: DocumentId) {
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = self.inner.lock();
         cache.pop(&id);
     }
 
     /// Remove all entries.
     pub fn clear(&self) {
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = self.inner.lock();
         cache.clear();
     }
 
     /// Number of entries currently in the cache.
     pub fn len(&self) -> usize {
-        let cache = self.inner.lock().unwrap();
+        let cache = self.inner.lock();
         cache.len()
     }
 
@@ -71,13 +72,13 @@ impl DocCache {
     /// are evicted immediately (LRU order).
     pub fn resize(&self, capacity: usize) {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = self.inner.lock();
         cache.resize(cap);
     }
 
     /// Current maximum capacity.
     pub fn capacity(&self) -> usize {
-        let cache = self.inner.lock().unwrap();
+        let cache = self.inner.lock();
         cache.cap().get()
     }
 
@@ -85,7 +86,7 @@ impl DocCache {
     /// Returns a Vec with Some(arc) for hits and None for misses,
     /// in the same order as the input.
     pub fn get_many(&self, ids: &[DocumentId]) -> Vec<Option<Arc<Value>>> {
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = self.inner.lock();
         ids.iter()
             .map(|&id| cache.get(&id).map(Arc::clone))
             .collect()
@@ -93,7 +94,7 @@ impl DocCache {
 
     /// Insert multiple entries in a single lock acquisition.
     pub fn put_many(&self, entries: impl IntoIterator<Item = (DocumentId, Arc<Value>)>) {
-        let mut cache = self.inner.lock().unwrap();
+        let mut cache = self.inner.lock();
         for (id, doc) in entries {
             cache.put(id, doc);
         }
