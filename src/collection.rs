@@ -141,23 +141,24 @@ impl Collection {
         let next_id = self.next_id;
 
         // Save field indexes (.fidx)
+        let enc = self.encryption.as_ref();
         let fidx_path = self.data_dir.join(format!("{}.fidx", self.name));
         let field_refs: Vec<&FieldIndex> = self.field_indexes.values().collect();
-        if let Err(e) = index_persist::save_field_indexes(&fidx_path, &field_refs, doc_count, next_id) {
+        if let Err(e) = index_persist::save_field_indexes(&fidx_path, &field_refs, doc_count, next_id, enc) {
             eprintln!("[warn] {}: failed to save field index cache: {}", self.name, e);
         }
 
         // Save composite indexes (.cidx)
         let cidx_path = self.data_dir.join(format!("{}.cidx", self.name));
         let comp_refs: Vec<&CompositeIndex> = self.composite_indexes.iter().collect();
-        if let Err(e) = index_persist::save_composite_indexes(&cidx_path, &comp_refs, doc_count, next_id) {
+        if let Err(e) = index_persist::save_composite_indexes(&cidx_path, &comp_refs, doc_count, next_id, enc) {
             eprintln!("[warn] {}: failed to save composite index cache: {}", self.name, e);
         }
 
         // Save vector indexes (.vidx)
         let vidx_path = self.data_dir.join(format!("{}.vidx", self.name));
         let vec_refs: Vec<&VectorIndex> = self.vector_indexes.values().collect();
-        if let Err(e) = index_persist::save_vector_indexes(&vidx_path, &vec_refs, doc_count, next_id) {
+        if let Err(e) = index_persist::save_vector_indexes(&vidx_path, &vec_refs, doc_count, next_id, enc) {
             eprintln!("[warn] {}: failed to save vector index cache: {}", self.name, e);
         }
     }
@@ -318,20 +319,24 @@ impl Collection {
             let cidx_path = data_dir.join(format!("{}.cidx", name));
             let vidx_path = data_dir.join(format!("{}.vidx", name));
 
+            let enc = encryption.as_ref();
             let cached_field = index_persist::load_field_indexes(
                 &fidx_path,
                 doc_count,
                 next_id,
+                enc,
             );
             let cached_composite = index_persist::load_composite_indexes(
                 &cidx_path,
                 doc_count,
                 next_id,
+                enc,
             );
             let cached_vector = index_persist::load_vector_indexes(
                 &vidx_path,
                 doc_count,
                 next_id,
+                enc,
             );
 
             // Both must succeed for the cache to be valid

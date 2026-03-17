@@ -6,8 +6,49 @@ use super::http::HttpRequest;
 use super::helpers::parse_query;
 
 pub struct S3Auth {
-    pub access_key: String,
-    pub secret_key: String,
+    /// Multiple credentials: access_key → secret_key.
+    pub credentials: HashMap<String, String>,
+}
+
+impl S3Auth {
+    /// Parse credentials from env vars.
+    /// Supports single pair (OXIDB_S3_ACCESS_KEY + OXIDB_S3_SECRET_KEY)
+    /// and multi-user (OXIDB_S3_CREDENTIALS="ak1:sk1,ak2:sk2").
+    pub fn from_env() -> Option<Self> {
+        let mut creds = HashMap::new();
+
+        // Multi-user: OXIDB_S3_CREDENTIALS=ak1:sk1,ak2:sk2
+        if let Ok(multi) = std::env::var("OXIDB_S3_CREDENTIALS") {
+            for pair in multi.split(',') {
+                let pair = pair.trim();
+                if let Some((ak, sk)) = pair.split_once(':') {
+                    if !ak.is_empty() && !sk.is_empty() {
+                        creds.insert(ak.to_string(), sk.to_string());
+                    }
+                }
+            }
+        }
+
+        // Single pair (backwards compatible)
+        if let (Ok(ak), Ok(sk)) = (
+            std::env::var("OXIDB_S3_ACCESS_KEY"),
+            std::env::var("OXIDB_S3_SECRET_KEY"),
+        ) {
+            if !ak.is_empty() && !sk.is_empty() {
+                creds.insert(ak, sk);
+            }
+        }
+
+        if creds.is_empty() {
+            None
+        } else {
+            Some(Self { credentials: creds })
+        }
+    }
+
+    fn get_secret(&self, access_key: &str) -> Option<&str> {
+        self.credentials.get(access_key).map(|s| s.as_str())
+    }
 }
 
 pub fn verify_auth(req: &HttpRequest, auth: &S3Auth) -> bool {
@@ -32,9 +73,10 @@ pub fn verify_auth(req: &HttpRequest, auth: &S3Auth) -> bool {
     let cred_end = auth_header[cred_start..].find('/').unwrap_or(0) + cred_start;
     let access_key = &auth_header[cred_start..cred_end];
 
-    if access_key != auth.access_key {
-        return false;
-    }
+    let secret_key = match auth.get_secret(access_key) {
+        Some(sk) => sk,
+        None => return false,
+    };
 
     let sig_start = match auth_header.find("Signature=") {
         Some(i) => i + 10,
@@ -80,7 +122,7 @@ pub fn verify_auth(req: &HttpRequest, auth: &S3Auth) -> bool {
         amz_date, credential_scope, sha256_hex(canonical_request.as_bytes())
     );
 
-    let signing_key = derive_signing_key(&auth.secret_key, date_stamp, credential_scope);
+    let signing_key = derive_signing_key(secret_key, date_stamp, credential_scope);
     let computed_sig = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
 
     constant_time_eq(signature.as_bytes(), computed_sig.as_bytes())
@@ -100,9 +142,10 @@ fn verify_presigned(req: &HttpRequest, auth: &S3Auth, params: &HashMap<String, S
     let access_key = parts[0];
     let credential_scope = parts[1];
 
-    if access_key != auth.access_key {
-        return false;
-    }
+    let secret_key = match auth.get_secret(access_key) {
+        Some(sk) => sk,
+        None => return false,
+    };
 
     let date_stamp = credential_scope.split('/').next().unwrap_or("");
     let amz_date = params.get("X-Amz-Date").map(|s| s.as_str()).unwrap_or("");
@@ -158,7 +201,7 @@ fn verify_presigned(req: &HttpRequest, auth: &S3Auth, params: &HashMap<String, S
         amz_date, credential_scope, sha256_hex(canonical_request.as_bytes())
     );
 
-    let signing_key = derive_signing_key(&auth.secret_key, date_stamp, credential_scope);
+    let signing_key = derive_signing_key(secret_key, date_stamp, credential_scope);
     let computed_sig = hmac_sha256_hex(&signing_key, string_to_sign.as_bytes());
 
     constant_time_eq(signature.as_bytes(), computed_sig.as_bytes())
