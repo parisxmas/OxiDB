@@ -811,6 +811,7 @@ impl OxiDb {
     pub fn aggregate(&self, collection: &str, pipeline_json: &Value) -> Result<Vec<Value>> {
         let pipeline = Pipeline::parse(pipeline_json)?;
         let (leading_match, start_idx) = pipeline.take_leading_match();
+        let out_collection = pipeline.out_collection().map(|s| s.to_string());
 
         let lookup_fn = |foreign: &str, query: &Value| -> Result<Vec<Value>> {
             self.find(foreign, query)
@@ -819,7 +820,7 @@ impl OxiDb {
         // Streaming fast path: when pipeline is [$match?] -> $group -> [rest],
         // stream docs through storage sequentially instead of materializing
         // the full Vec<Arc<Value>>. This is 5-10x faster for large collections.
-        if let Some((group_key, accumulators, next_idx)) =
+        let result = if let Some((group_key, accumulators, next_idx)) =
             pipeline.try_streaming_group(start_idx)
         {
             let col = self.get_or_create_collection(collection)?;
@@ -834,28 +835,45 @@ impl OxiDb {
                 col_guard.count(),
                 leading_match,
             ) {
-                return pipeline.execute_from(next_idx, index_result, &lookup_fn);
+                pipeline.execute_from(next_idx, index_result, &lookup_fn)?
+            } else {
+                let group_result =
+                    col_guard.aggregate_streaming(leading_match, group_key, accumulators)?;
+                // Continue with remaining pipeline stages on the small group result
+                pipeline.execute_from(next_idx, group_result, &lookup_fn)?
             }
+        } else {
+            let query = match leading_match {
+                Some(q) => q.clone(),
+                None => json!({}),
+            };
 
-            let group_result =
-                col_guard.aggregate_streaming(leading_match, group_key, accumulators)?;
-            // Continue with remaining pipeline stages on the small group result
-            return pipeline.execute_from(next_idx, group_result, &lookup_fn);
-        }
-
-        let query = match leading_match {
-            Some(q) => q.clone(),
-            None => json!({}),
+            // Standard path: use Arc-based pipeline to avoid cloning all initial docs.
+            // This is critical for aggregation over large datasets (200K+ docs).
+            let col = self.get_or_create_collection(collection)?;
+            let col_guard = col.read();
+            let arcs = col_guard.find_arcs(&query)?;
+            let field_indexes = col_guard.field_indexes();
+            let doc_lookup = |id: DocumentId| col_guard.load_doc_arc(id);
+            pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(field_indexes), Some(&doc_lookup))?
         };
 
-        // Standard path: use Arc-based pipeline to avoid cloning all initial docs.
-        // This is critical for aggregation over large datasets (200K+ docs).
-        let col = self.get_or_create_collection(collection)?;
-        let col_guard = col.read();
-        let arcs = col_guard.find_arcs(&query)?;
-        let field_indexes = col_guard.field_indexes();
-        let doc_lookup = |id: DocumentId| col_guard.load_doc_arc(id);
-        pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(field_indexes), Some(&doc_lookup))
+        // Handle $out: write results to the target collection
+        if let Some(target) = out_collection {
+            let target_col = self.get_or_create_collection(&target)?;
+            let mut target_guard = target_col.write();
+            for doc in &result {
+                // Strip _id and _version so the target collection assigns new ones
+                let mut clean = doc.clone();
+                if let Some(obj) = clean.as_object_mut() {
+                    obj.remove("_id");
+                    obj.remove("_version");
+                }
+                target_guard.insert(clean)?;
+            }
+        }
+
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
