@@ -739,13 +739,38 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         // -------------------------------------------------------------------
 
         "create_procedure" => {
-            let name = match request.get("name").and_then(|v| v.as_str()) {
-                Some(n) => n.to_string(),
-                None => return err_bytes("missing 'name'"),
+            // Check if this is an OxiScript source (has "script" field)
+            if let Some(script) = request.get("script").and_then(|v| v.as_str()) {
+                match oxidb::oxiscript::compile(script) {
+                    Ok(compiled) => {
+                        let name = compiled["name"].as_str().unwrap_or("").to_string();
+                        match db.create_procedure(&name, compiled) {
+                            Ok(()) => ok_bytes(json!("procedure created")),
+                            Err(e) => err_bytes(&e.to_string()),
+                        }
+                    }
+                    Err(e) => err_bytes(&format!("oxiscript compile error: {}", e)),
+                }
+            } else {
+                let name = match request.get("name").and_then(|v| v.as_str()) {
+                    Some(n) => n.to_string(),
+                    None => return err_bytes("missing 'name'"),
+                };
+                match db.create_procedure(&name, request) {
+                    Ok(()) => ok_bytes(json!("procedure created")),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
+            }
+        }
+
+        "compile_oxiscript" => {
+            let script = match request.get("script").and_then(|v| v.as_str()) {
+                Some(s) => s,
+                None => return err_bytes("missing 'script'"),
             };
-            match db.create_procedure(&name, request) {
-                Ok(()) => ok_bytes(json!("procedure created")),
-                Err(e) => err_bytes(&e.to_string()),
+            match oxidb::oxiscript::compile(script) {
+                Ok(compiled) => ok_bytes(compiled),
+                Err(e) => err_bytes(&format!("oxiscript compile error: {}", e)),
             }
         }
 
