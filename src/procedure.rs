@@ -72,13 +72,62 @@ fn resolve_vars(value: &Value, ctx: &ProcedureContext) -> Value {
         Value::String(s) => resolve_string_var(s, ctx),
         Value::Array(arr) => Value::Array(arr.iter().map(|v| resolve_vars(v, ctx)).collect()),
         Value::Object(obj) => {
+            // First resolve all values
             let mut map = serde_json::Map::new();
             for (k, v) in obj {
                 map.insert(k.clone(), resolve_vars(v, ctx));
             }
-            Value::Object(map)
+            // Then try to evaluate simple arithmetic expressions
+            let result = Value::Object(map);
+            try_eval_expr(&result).unwrap_or(result)
         }
         other => other.clone(),
+    }
+}
+
+/// Try to evaluate simple arithmetic expressions produced by the OxiScript compiler.
+/// Handles: $multiply, $add, $subtract, $divide, $mod
+fn try_eval_expr(value: &Value) -> Option<Value> {
+    let obj = value.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    let (op, args) = obj.iter().next()?;
+    let arr = args.as_array()?;
+    if arr.len() != 2 {
+        return None;
+    }
+    let a = as_f64(&arr[0])?;
+    let b = as_f64(&arr[1])?;
+    let result = match op.as_str() {
+        "$multiply" => a * b,
+        "$add" => a + b,
+        "$subtract" => a - b,
+        "$divide" => {
+            if b == 0.0 {
+                return None;
+            }
+            a / b
+        }
+        "$mod" => {
+            if b == 0.0 {
+                return None;
+            }
+            a % b
+        }
+        _ => return None,
+    };
+    if result == (result as i64) as f64 && result.is_finite() {
+        Some(json!(result as i64))
+    } else {
+        Some(json!(result))
+    }
+}
+
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64(),
+        _ => None,
     }
 }
 
@@ -260,6 +309,7 @@ fn execute_step(
         "aggregate" => step_aggregate(step, ctx, db),
         "set" => step_set(step, ctx),
         "if" => step_if(step, ctx, db, tx_id),
+        "call_procedure" => step_call_procedure(step, ctx, db),
         "abort" => step_abort(step, ctx),
         "return" => step_return(step, ctx),
         _ => Err(Error::ProcedureError(format!("unknown step type: {step_type}"))),
@@ -451,6 +501,27 @@ fn step_return(step: &Value, ctx: &ProcedureContext) -> Result<StepResult> {
         .map(|v| resolve_vars(v, ctx))
         .unwrap_or_else(|| json!({"ok": true}));
     Ok(StepResult::Return(value))
+}
+
+fn step_call_procedure(
+    step: &Value,
+    ctx: &mut ProcedureContext,
+    db: &OxiDb,
+) -> Result<StepResult> {
+    let resolved = resolve_vars(step, ctx);
+    let name = resolved
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::ProcedureError("call_procedure missing 'name'".into()))?;
+    let params = resolved.get("params").cloned().unwrap_or(json!({}));
+
+    let result = db.call_procedure(name, params)?;
+
+    if let Some(alias) = step.get("as").and_then(|v| v.as_str()) {
+        ctx.vars.insert(alias.to_string(), result);
+    }
+
+    Ok(StepResult::Continue)
 }
 
 // ---------------------------------------------------------------------------

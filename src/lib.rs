@@ -12,6 +12,7 @@ pub mod fts;
 pub mod index;
 pub mod index_persist;
 pub mod pipeline;
+pub mod oxiscript;
 pub mod procedure;
 pub mod query;
 pub mod scheduler;
