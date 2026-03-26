@@ -2,7 +2,7 @@
   <img src="logo.png" alt="OxiDB" width="500">
 </p>
 
-<p align="center">A fast, embeddable document database written in Rust. SQL and JSON-based queries, single binary, zero configuration, Raft replication, AES-256 encryption, SCRAM-SHA-256 auth, crash-safe WAL, and sub-second failover.</p>
+<p align="center">A fast, embeddable document database written in Rust. SQL and JSON queries, S3-compatible API, Redis-compatible in-memory store, MQTT messaging, hash sharding, Raft replication, AES-256 encryption, crash-safe WAL, single binary, zero configuration.</p>
 
 **Client libraries:** [Python](python/) | [Go](go/) | [Java/Spring Boot](oxidb-spring-boot-starter/) | [Julia](julia/) | [.NET](dotnet/) | [Swift/iOS](swift/) | [C FFI](oxidb-client-ffi/)
 
@@ -14,9 +14,9 @@ Download the latest release for your platform from [GitHub Releases](https://git
 
 | Platform | Download |
 |----------|----------|
-| macOS Apple Silicon (M1/M2/M3/M4) | [`oxidb-server-macos-arm64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/download/v0.15.0/oxidb-server-macos-arm64.tar.gz) |
-| macOS Intel | [`oxidb-server-macos-x86_64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/download/v0.15.0/oxidb-server-macos-x86_64.tar.gz) |
-| Linux x86_64 | [`oxidb-server-linux-x86_64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/download/v0.15.0/oxidb-server-linux-x86_64.tar.gz) |
+| macOS Apple Silicon (M1/M2/M3/M4) | [`oxidb-server-macos-arm64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/download/v0.20.4/oxidb-server-macos-arm64.tar.gz) |
+| macOS Intel | [`oxidb-server-macos-x86_64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/download/v0.20.4/oxidb-server-macos-x86_64.tar.gz) |
+| Linux x86_64 | [`oxidb-server-linux-x86_64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/download/v0.20.4/oxidb-server-linux-x86_64.tar.gz) |
 
 ```bash
 tar xzf oxidb-server-*.tar.gz
@@ -61,19 +61,33 @@ docker compose up -d
 | `OXIDB_NODE_ID` | — | Numeric node ID to enable Raft cluster mode |
 | `OXIDB_RAFT_ADDR` | `127.0.0.1:4445` | Raft inter-node communication address |
 | `OXIDB_RAFT_PEERS` | — | Comma-separated peer list: `"1=host1:4445,2=host2:4445,3=host3:4445"` |
+| `OXIDB_OXIMEM_PORT` | — | Enable OxiMem (Redis-compatible) RESP listener on this port |
+| `OXIDB_OXIMEM_SQL` | `false` | Mirror OxiMem data to OxiDB collections for SQL querying |
+| `OXIDB_MQTT_PORT` | — | Enable MQTT v3.1.1 listener on this port |
+| `OXIDB_S3_PORT` | — | Enable S3-compatible HTTP API on this port |
+| `OXIDB_S3_ACCESS_KEY` | — | S3 access key for AWS SigV4 authentication |
+| `OXIDB_S3_SECRET_KEY` | — | S3 secret key for AWS SigV4 authentication |
+| `OXIDB_S3_CREDENTIALS` | — | Path to S3 credentials file |
+| `OXIDB_S3_ENCRYPTION_KEY` | — | Hex-encoded 32-byte AES-256 key for S3 SSE |
+| `OXIDB_S3_DEFAULT_ENCRYPTION` | `false` | Encrypt all S3 objects by default |
+| `OXIDB_LOG_COMMANDS` | `false` | Log OxiMem/MQTT commands |
 
 ## Features
 
 - **SQL query language** — `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE INDEX`, `SHOW TABLES` with `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, `JOIN`, `LIMIT`, `OFFSET`
 - **Document database** — JSON documents, no schema required, collections auto-created on insert
-- **JSON-based queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$exists`, `$regex`, `$and`, `$or`
+- **JSON-based queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$regex`, `$and`, `$or`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
-- **Aggregation pipeline** — 10 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`; index-accelerated `$group` for count, sum, min, max, avg
+- **Aggregation pipeline** — 11 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`, `$out`; index-accelerated `$group` for count, sum, min, max, avg
 - **Indexes** — field, unique, composite, full-text, and vector indexes with automatic backfill; list and drop support
 - **Vector search** — k-nearest-neighbor similarity search with cosine, Euclidean, and dot product metrics; flat (exact) for small collections, HNSW (approximate) for large; zero external dependencies
 - **Persistent index cache** — index data (BTreeMap contents) persisted to binary `.fidx`/`.cidx`/`.vidx` files; on restart, indexes load from cache in seconds instead of rebuilding from documents (16M docs: ~3s vs ~30min)
 - **Zero-copy reads** — `find_one`, `update`, and `delete` use Arc-based document iteration, cloning only matching documents instead of every visited document
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
+- **S3-compatible API** — full HTTP REST API with path-style requests, multipart upload, range reads, object tagging, copy, conditional requests, SSE-S3/SSE-C encryption; compatible with AWS CLI and boto3
+- **OxiMem (Redis-compatible)** — in-memory key-value store with RESP wire protocol; 50+ commands (strings, hashes, lists, sets, sorted sets, pub/sub); optional SQL mirroring to OxiDB collections
+- **MQTT v3.1.1** — publish/subscribe messaging with cross-protocol bridging to OxiMem pub/sub channels
+- **Hash sharding** — OxiPool proxy with CRC32 hash routing, scatter-gather queries, per-collection shard keys, and cross-shard transaction detection
 - **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
 - **Full-text search** — automatic text extraction from 10+ formats (HTML, XML, PDF, DOCX, XLSX, images via OCR), TF-IDF ranked search
 - **Raft replication** — multi-node cluster via OpenRaft with automatic leader election, HAProxy-compatible health checks, and sub-second failover
@@ -166,6 +180,7 @@ let result = try client.sql(query: "SELECT name, age FROM users WHERE age > 21")
 | `$lt`      | `{"age": {"$lt": 65}}`                   | Less than                  |
 | `$lte`     | `{"age": {"$lte": 100}}`                | Less than or equal         |
 | `$in`      | `{"cat": {"$in": ["a", "b"]}}`           | Value in array             |
+| `$nin`     | `{"cat": {"$nin": ["a", "b"]}}`          | Value not in array         |
 | `$exists`  | `{"email": {"$exists": true}}`           | Field exists / does not    |
 | `$regex`   | `{"name": {"$regex": "^A", "$options": "i"}}` | Regular expression match   |
 | `$and`     | `{"$and": [{"a": 1}, {"b": 2}]}`        | Logical AND (explicit)     |
@@ -215,14 +230,23 @@ All operators support dot-notation for nested fields.
 | `$unwind`     | Expand array fields into one document per element  |
 | `$addFields`  | Add computed fields while preserving existing ones |
 | `$lookup`     | Left outer join with another collection            |
+| `$out`        | Write pipeline results to a target collection      |
 
 ### Accumulators (for `$group`)
 
-`$sum`, `$avg`, `$min`, `$max`, `$count`, `$first`, `$last`, `$push`
+`$sum`, `$avg`, `$min`, `$max`, `$count`, `$first`, `$last`, `$push`, `$addToSet`
 
 ### Expressions
 
-Field references (`"$fieldName"`), literals, and arithmetic operators (`$add`, `$subtract`, `$multiply`, `$divide`). Dot-notation supported for nested fields.
+Field references (`"$fieldName"`), literals, and operators:
+
+- **Arithmetic:** `$add`, `$subtract`, `$multiply`, `$divide`, `$mod`
+- **String:** `$concat`, `$toLower`, `$toUpper`, `$substr`, `$trim`, `$split`
+- **Date:** `$year`, `$month`, `$dayOfMonth`, `$hour`, `$minute`, `$second`, `$dayOfWeek`
+- **Conditional:** `$cond`, `$ifNull`
+- **Array:** `$size`
+
+Dot-notation supported for nested fields.
 
 ## TCP Protocol
 
@@ -449,6 +473,110 @@ If the client falls behind, an overflow notification is sent:
 Send `{"cmd": "unwatch"}` to stop receiving events and return to normal request mode.
 
 > **Note:** Watch requires Admin role when authentication is enabled. Not available over TLS connections in standalone mode.
+
+## OxiMem (Redis-Compatible In-Memory Store)
+
+OxiMem is a built-in in-memory key-value store with full RESP wire protocol compatibility. Connect with `redis-cli`, any Redis client library, or the Redis SDK.
+
+```bash
+# Enable OxiMem on port 6379
+OXIDB_OXIMEM_PORT=6379 ./oxidb-server
+
+# Connect with redis-cli
+redis-cli -p 6379
+> SET user:1 '{"name":"Alice"}'
+> GET user:1
+```
+
+### Supported Commands
+
+| Category | Commands |
+|----------|----------|
+| **String** | `SET`, `GET`, `GETSET`, `SETNX`, `SETEX`, `PSETEX`, `MSET`, `MGET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `INCRBYFLOAT`, `APPEND`, `STRLEN`, `GETRANGE` |
+| **Key** | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PERSIST`, `TTL`, `PTTL`, `TYPE`, `KEYS`, `RENAME`, `RANDOMKEY`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `SCAN` |
+| **Hash** | `HSET`, `HMSET`, `HGET`, `HMGET`, `HDEL`, `HEXISTS`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HINCRBY`, `HSETNX` |
+| **List** | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX` |
+| **Set** | `SADD`, `SREM`, `SMEMBERS`, `SISMEMBER`, `SCARD` |
+| **Sorted Set** | `ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZREVRANK`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZCARD`, `ZCOUNT`, `ZINCRBY`, `ZPOPMIN`, `ZPOPMAX` |
+| **Pub/Sub** | `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE` |
+| **Server** | `PING`, `ECHO`, `QUIT`, `SELECT`, `COMMAND`, `CLIENT`, `AUTH`, `INFO`, `CONFIG` |
+
+Set `OXIDB_OXIMEM_SQL=true` to mirror all OxiMem data to OxiDB collections (`_kv`, `_hash`, `_list`, `_set`), making it queryable via SQL.
+
+## MQTT v3.1.1
+
+Built-in MQTT message broker with cross-protocol bridging to OxiMem pub/sub channels.
+
+```bash
+# Enable MQTT on port 1883
+OXIDB_MQTT_PORT=1883 ./oxidb-server
+
+# Publish from MQTT, receive in redis-cli (or vice versa)
+mosquitto_pub -t "sensors/temp" -m '{"value": 22.5}'
+```
+
+Supports CONNECT, PUBLISH (QoS 0-1), SUBSCRIBE, UNSUBSCRIBE, PINGREQ/PINGRESP, and DISCONNECT. MQTT and OxiMem RESP share the same pub/sub infrastructure — a message published via MQTT is delivered to OxiMem SUBSCRIBE listeners and vice versa.
+
+## S3-Compatible API
+
+Full S3-compatible HTTP REST API. Works with AWS CLI, boto3, and any S3-compatible client.
+
+```bash
+# Enable S3 API on port 9000 with authentication
+OXIDB_S3_PORT=9000 OXIDB_S3_ACCESS_KEY=mykey OXIDB_S3_SECRET_KEY=mysecret ./oxidb-server
+
+# Use with AWS CLI
+aws --endpoint-url http://localhost:9000 s3 mb s3://mybucket
+aws --endpoint-url http://localhost:9000 s3 cp file.txt s3://mybucket/file.txt
+aws --endpoint-url http://localhost:9000 s3 ls s3://mybucket
+```
+
+### S3 Features
+
+- **Bucket operations** — create, delete, list
+- **Object operations** — put, get, head, delete, list (with prefix filtering)
+- **Multipart upload** — initiate, upload parts, complete, abort, list parts
+- **Object copy** — server-side copy via `x-amz-copy-source` header
+- **Range requests** — partial reads with `Range` header
+- **Conditional requests** — `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since`
+- **Object tagging** — put, get, delete tags
+- **Batch delete** — delete multiple objects in a single request
+- **Authentication** — AWS Signature V4
+- **Server-side encryption** — SSE-S3 (server-managed key) and SSE-C (customer-provided key), both AES-256-GCM
+
+## Sharding (OxiPool)
+
+Hash-based sharding proxy that distributes data across multiple OxiDB nodes.
+
+```bash
+# Start shards
+OXIDB_ADDR=0.0.0.0:4444 OXIDB_SHARD_ID=0 OXIDB_DATA=./shard0 ./oxidb-server &
+OXIDB_ADDR=0.0.0.0:4445 OXIDB_SHARD_ID=1 OXIDB_DATA=./shard1 ./oxidb-server &
+
+# Start OxiPool proxy
+OXIPOOL_SHARDS=localhost:4444,localhost:4445 \
+  OXIPOOL_SHARD_KEYS=orders:customer_id,users:region \
+  ./oxipool
+```
+
+### Sharding Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OXIPOOL_SHARDS` | — | Comma-separated shard endpoints |
+| `OXIPOOL_SHARD_CONFIG` | — | JSON config file path (overrides `OXIPOOL_SHARDS`) |
+| `OXIPOOL_NUM_CHUNKS` | `256` | Virtual chunk count (must be power of 2) |
+| `OXIPOOL_SHARD_KEYS` | — | Per-collection shard keys (e.g. `orders:customer_id,users:region`) |
+| `OXIDB_SHARD_ID` | — | Shard numeric ID for ID range prefixing |
+
+### Routing
+
+- **Targeted** — operations with shard key in query/document route to a single shard
+- **Scatter-gather** — queries without shard key fan out to all shards and merge results
+- **Broadcast** — DDL operations (create/drop collection, index management)
+- **Primary-only** — admin commands (`list_collections`, etc.)
+
+Cross-shard transactions are detected and rejected.
 
 ## Benchmark
 
