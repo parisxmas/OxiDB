@@ -4,12 +4,13 @@
 //! this module persists them to a `.pidx` file and memory-maps it.
 //! The OS manages which pages stay in RAM (hot) vs disk (cold).
 //!
-//! File format:
+//! File format (v2):
 //! ```text
 //! [MAGIC: "OXPI" 4 bytes]
 //! [VERSION: u32 LE]
 //! [ENTRY_COUNT: u64 LE]
 //! [NEXT_ID: u64 LE]
+//! [DAT_FILE_SIZE: u64 LE]   -- .dat file size when .pidx was persisted
 //! [entries: sorted array of (doc_id: u64, offset: u64, length: u32, version: u64) ]
 //! ```
 //!
@@ -19,6 +20,7 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::Mmap;
 
@@ -26,20 +28,32 @@ use crate::document::DocumentId;
 use crate::storage::DocLocation;
 
 const MAGIC: &[u8; 4] = b"OXPI";
-const VERSION: u32 = 1;
-const HEADER_SIZE: usize = 4 + 4 + 8 + 8; // magic + version + count + next_id
+const FORMAT_VERSION: u32 = 2;
+const HEADER_SIZE: usize = 4 + 4 + 8 + 8 + 8; // magic + version + count + next_id + dat_file_size
 const ENTRY_SIZE: usize = 28; // doc_id(8) + offset(8) + length(4) + version(8)
 
-/// A memory-mapped primary index. Zero startup cost — the OS pages in data on demand.
-pub struct MmapPrimaryIndex {
+/// The immutable base layer: a memory-mapped sorted array of entries.
+struct MmapBase {
     mmap: Option<Mmap>,
-    path: PathBuf,
     entry_count: u64,
     next_id: u64,
+}
+
+/// A memory-mapped primary index. Zero startup cost -- the OS pages in data on demand.
+///
+/// All state is behind interior-mutable locks so the index can be used through `&self`.
+pub struct MmapPrimaryIndex {
+    /// The mmap base layer (replaced atomically on persist).
+    base: parking_lot::RwLock<MmapBase>,
+    path: PathBuf,
     /// In-memory overlay for new writes since last persist.
     overlay: parking_lot::RwLock<HashMap<DocumentId, (DocLocation, u64)>>,
     /// Deleted doc_ids since last persist (tombstones).
     deleted: parking_lot::RwLock<std::collections::HashSet<DocumentId>>,
+    /// Whether this is an in-memory-only index (no .pidx file).
+    in_memory: bool,
+    /// The .dat file size that was recorded when .pidx was last persisted.
+    dat_file_size: AtomicU64,
 }
 
 impl MmapPrimaryIndex {
@@ -54,43 +68,88 @@ impl MmapPrimaryIndex {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "bad pidx magic"));
             }
             let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
-            if version != VERSION {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unsupported pidx version: {}", version),
-                ));
+            if version != FORMAT_VERSION {
+                // Old or unknown version -- treat as if .pidx doesn't exist
+                return Ok(Self {
+                    base: parking_lot::RwLock::new(MmapBase {
+                        mmap: None,
+                        entry_count: 0,
+                        next_id: 1,
+                    }),
+                    path: path.to_path_buf(),
+                    overlay: parking_lot::RwLock::new(HashMap::new()),
+                    deleted: parking_lot::RwLock::new(std::collections::HashSet::new()),
+                    in_memory: false,
+                    dat_file_size: AtomicU64::new(0),
+                });
             }
             let entry_count = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
             let next_id = u64::from_le_bytes(mmap[16..24].try_into().unwrap());
+            let dat_file_size = u64::from_le_bytes(mmap[24..32].try_into().unwrap());
 
             Ok(Self {
-                mmap: Some(mmap),
+                base: parking_lot::RwLock::new(MmapBase {
+                    mmap: Some(mmap),
+                    entry_count,
+                    next_id,
+                }),
                 path: path.to_path_buf(),
-                entry_count,
-                next_id,
                 overlay: parking_lot::RwLock::new(HashMap::new()),
                 deleted: parking_lot::RwLock::new(std::collections::HashSet::new()),
+                in_memory: false,
+                dat_file_size: AtomicU64::new(dat_file_size),
             })
         } else {
             Ok(Self {
-                mmap: None,
+                base: parking_lot::RwLock::new(MmapBase {
+                    mmap: None,
+                    entry_count: 0,
+                    next_id: 1,
+                }),
                 path: path.to_path_buf(),
-                entry_count: 0,
-                next_id: 1,
                 overlay: parking_lot::RwLock::new(HashMap::new()),
                 deleted: parking_lot::RwLock::new(std::collections::HashSet::new()),
+                in_memory: false,
+                dat_file_size: AtomicU64::new(0),
             })
         }
     }
 
-    /// Get the next document ID.
+    /// Check if this index has an mmap base (was loaded from a .pidx file).
+    pub fn has_mmap(&self) -> bool {
+        self.base.read().mmap.is_some()
+    }
+
+    /// Get the .dat file size recorded when this .pidx was last persisted.
+    pub fn dat_file_size(&self) -> u64 {
+        self.dat_file_size.load(Ordering::Acquire)
+    }
+
+    /// Create a purely in-memory primary index (no .pidx file).
+    pub fn new_in_memory() -> Self {
+        Self {
+            base: parking_lot::RwLock::new(MmapBase {
+                mmap: None,
+                entry_count: 0,
+                next_id: 1,
+            }),
+            path: PathBuf::new(),
+            overlay: parking_lot::RwLock::new(HashMap::new()),
+            deleted: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            in_memory: true,
+            dat_file_size: AtomicU64::new(0),
+        }
+    }
+
+    /// Get the next document ID (max of mmap next_id and overlay max+1).
     pub fn next_id(&self) -> u64 {
+        let base = self.base.read();
         let overlay = self.overlay.read();
         if overlay.is_empty() {
-            self.next_id
+            base.next_id
         } else {
             let max_overlay = overlay.keys().max().copied().unwrap_or(0);
-            self.next_id.max(max_overlay + 1)
+            base.next_id.max(max_overlay + 1)
         }
     }
 
@@ -139,7 +198,7 @@ impl MmapPrimaryIndex {
 
     /// Update version for a document.
     pub fn update_version(&self, doc_id: DocumentId, new_version: u64) {
-        if let Some(mut entry) = self.overlay.write().get_mut(&doc_id) {
+        if let Some(entry) = self.overlay.write().get_mut(&doc_id) {
             entry.1 = new_version;
         } else if let Some((loc, _)) = self.mmap_lookup(doc_id) {
             self.overlay.write().insert(doc_id, (loc, new_version));
@@ -153,30 +212,32 @@ impl MmapPrimaryIndex {
 
     /// Total number of documents (mmap + overlay - deleted).
     pub fn len(&self) -> usize {
+        let base = self.base.read();
         let overlay = self.overlay.read();
         let deleted = self.deleted.read();
-        let mmap_count = self.entry_count as usize;
+        let mmap_count = base.entry_count as usize;
         let overlay_new = overlay
             .keys()
-            .filter(|id| !self.mmap_contains(**id))
+            .filter(|id| !Self::mmap_contains_base(&base, **id))
             .count();
         let mmap_deleted = deleted
             .iter()
-            .filter(|id| self.mmap_contains(**id))
+            .filter(|id| Self::mmap_contains_base(&base, **id))
             .count();
         mmap_count + overlay_new - mmap_deleted
     }
 
     /// Iterate over all document IDs and locations.
     pub fn iter(&self) -> Vec<(DocumentId, DocLocation)> {
+        let base = self.base.read();
         let overlay = self.overlay.read();
         let deleted = self.deleted.read();
         let mut result = Vec::with_capacity(self.len());
 
         // Mmap entries (excluding deleted and overridden)
-        if let Some(ref mmap) = self.mmap {
-            for i in 0..self.entry_count as usize {
-                let entry = self.read_entry(mmap, i);
+        if let Some(ref mmap) = base.mmap {
+            for i in 0..base.entry_count as usize {
+                let entry = Self::read_entry_from(mmap, i);
                 if !deleted.contains(&entry.0) && !overlay.contains_key(&entry.0) {
                     result.push((entry.0, DocLocation {
                         offset: entry.1,
@@ -196,11 +257,74 @@ impl MmapPrimaryIndex {
         result
     }
 
+    /// Iterate over all document IDs (no locations needed).
+    pub fn iter_ids(&self) -> Vec<DocumentId> {
+        let base = self.base.read();
+        let overlay = self.overlay.read();
+        let deleted = self.deleted.read();
+        let mut result = Vec::with_capacity(self.len());
+
+        if let Some(ref mmap) = base.mmap {
+            for i in 0..base.entry_count as usize {
+                let (id, _, _, _) = Self::read_entry_from(mmap, i);
+                if !deleted.contains(&id) && !overlay.contains_key(&id) {
+                    result.push(id);
+                }
+            }
+        }
+
+        for &doc_id in overlay.keys() {
+            if !deleted.contains(&doc_id) {
+                result.push(doc_id);
+            }
+        }
+
+        result
+    }
+
+    /// Collect all entries as (doc_id, offset) for segment computation.
+    pub fn iter_offsets(&self) -> Vec<u64> {
+        let base = self.base.read();
+        let overlay = self.overlay.read();
+        let deleted = self.deleted.read();
+        let mut offsets = Vec::with_capacity(self.len());
+
+        if let Some(ref mmap) = base.mmap {
+            for i in 0..base.entry_count as usize {
+                let (id, offset, _, _) = Self::read_entry_from(mmap, i);
+                if !deleted.contains(&id) && !overlay.contains_key(&id) {
+                    offsets.push(offset);
+                }
+            }
+        }
+
+        for (&doc_id, &(loc, _)) in overlay.iter() {
+            if !deleted.contains(&doc_id) {
+                offsets.push(loc.offset);
+            }
+        }
+
+        offsets
+    }
+
     /// Persist the current state (mmap + overlay - deleted) to disk.
-    /// After this, overlay is cleared and a new mmap is created.
-    pub fn persist(&self) -> io::Result<()> {
+    /// `current_dat_size` is the current .dat file size, stored in the header
+    /// so that on reopen we can detect if the .dat changed since last persist.
+    /// After this, overlay is cleared and a new mmap is loaded.
+    pub fn persist_with_dat_size(&self, current_dat_size: u64) -> io::Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
+
         let all_entries = self.collect_all_entries();
         if all_entries.is_empty() {
+            self.overlay.write().clear();
+            self.deleted.write().clear();
+            let mut base = self.base.write();
+            base.mmap = None;
+            base.entry_count = 0;
+            // Remove stale .pidx file
+            let _ = fs::remove_file(&self.path);
             return Ok(());
         }
 
@@ -213,9 +337,10 @@ impl MmapPrimaryIndex {
             let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
             writer.write_all(MAGIC)?;
-            writer.write_all(&VERSION.to_le_bytes())?;
+            writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
             writer.write_all(&(all_entries.len() as u64).to_le_bytes())?;
             writer.write_all(&next_id.to_le_bytes())?;
+            writer.write_all(&current_dat_size.to_le_bytes())?;
 
             for (doc_id, offset, length, version) in &all_entries {
                 writer.write_all(&doc_id.to_le_bytes())?;
@@ -227,7 +352,27 @@ impl MmapPrimaryIndex {
         }
         fs::rename(&tmp_path, &self.path)?;
 
+        // Re-mmap the new file and clear overlay
+        let file = File::open(&self.path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let entry_count = all_entries.len() as u64;
+
+        {
+            let mut base = self.base.write();
+            base.mmap = Some(mmap);
+            base.entry_count = entry_count;
+            base.next_id = next_id;
+        }
+        self.overlay.write().clear();
+        self.deleted.write().clear();
+        self.dat_file_size.store(current_dat_size, Ordering::Release);
+
         Ok(())
+    }
+
+    /// Convenience: persist without updating dat_file_size (uses 0).
+    pub fn persist(&self) -> io::Result<()> {
+        self.persist_with_dat_size(0)
     }
 
     /// Rebuild from in-memory HashMap (used during migration from old format).
@@ -236,6 +381,7 @@ impl MmapPrimaryIndex {
         primary: &HashMap<DocumentId, DocLocation>,
         versions: &HashMap<DocumentId, u64>,
         next_id: u64,
+        dat_file_size: u64,
     ) -> io::Result<Self> {
         let mut entries: Vec<(u64, u64, u32, u64)> = primary
             .iter()
@@ -252,9 +398,10 @@ impl MmapPrimaryIndex {
             let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
             writer.write_all(MAGIC)?;
-            writer.write_all(&VERSION.to_le_bytes())?;
+            writer.write_all(&FORMAT_VERSION.to_le_bytes())?;
             writer.write_all(&(entries.len() as u64).to_le_bytes())?;
             writer.write_all(&next_id.to_le_bytes())?;
+            writer.write_all(&dat_file_size.to_le_bytes())?;
 
             for (doc_id, offset, length, version) in &entries {
                 writer.write_all(&doc_id.to_le_bytes())?;
@@ -269,11 +416,41 @@ impl MmapPrimaryIndex {
         Self::open(path)
     }
 
+    /// Reset the index with new data (used after compaction).
+    /// Loads data directly into the overlay from the given maps.
+    pub fn reset_from_maps(
+        &self,
+        primary: &HashMap<DocumentId, DocLocation>,
+        versions: &HashMap<DocumentId, u64>,
+    ) {
+        // Clear everything
+        {
+            let mut base = self.base.write();
+            base.mmap = None;
+            base.entry_count = 0;
+            base.next_id = 1;
+        }
+        self.deleted.write().clear();
+
+        // Load into overlay
+        let mut overlay = self.overlay.write();
+        overlay.clear();
+        for (&id, &loc) in primary {
+            let ver = versions.get(&id).copied().unwrap_or(1);
+            overlay.insert(id, (loc, ver));
+        }
+    }
+
     // ─── Internal ──────────────────────────────────────────────────
 
     fn mmap_lookup(&self, doc_id: DocumentId) -> Option<(DocLocation, u64)> {
-        let mmap = self.mmap.as_ref()?;
-        let count = self.entry_count as usize;
+        let base = self.base.read();
+        Self::mmap_lookup_base(&base, doc_id)
+    }
+
+    fn mmap_lookup_base(base: &MmapBase, doc_id: DocumentId) -> Option<(DocLocation, u64)> {
+        let mmap = base.mmap.as_ref()?;
+        let count = base.entry_count as usize;
         if count == 0 {
             return None;
         }
@@ -283,7 +460,7 @@ impl MmapPrimaryIndex {
         let mut hi = count;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let (id, offset, length, version) = self.read_entry(mmap, mid);
+            let (id, offset, length, version) = Self::read_entry_from(mmap, mid);
             match id.cmp(&doc_id) {
                 std::cmp::Ordering::Equal => {
                     return Some((DocLocation { offset, length }, version));
@@ -295,12 +472,12 @@ impl MmapPrimaryIndex {
         None
     }
 
-    fn mmap_contains(&self, doc_id: DocumentId) -> bool {
-        self.mmap_lookup(doc_id).is_some()
+    fn mmap_contains_base(base: &MmapBase, doc_id: DocumentId) -> bool {
+        Self::mmap_lookup_base(base, doc_id).is_some()
     }
 
     #[inline]
-    fn read_entry(&self, mmap: &Mmap, index: usize) -> (u64, u64, u32, u64) {
+    fn read_entry_from(mmap: &Mmap, index: usize) -> (u64, u64, u32, u64) {
         let base = HEADER_SIZE + index * ENTRY_SIZE;
         let doc_id = u64::from_le_bytes(mmap[base..base + 8].try_into().unwrap());
         let offset = u64::from_le_bytes(mmap[base + 8..base + 16].try_into().unwrap());
@@ -310,14 +487,15 @@ impl MmapPrimaryIndex {
     }
 
     fn collect_all_entries(&self) -> Vec<(u64, u64, u32, u64)> {
+        let base = self.base.read();
         let overlay = self.overlay.read();
         let deleted = self.deleted.read();
         let mut entries: Vec<(u64, u64, u32, u64)> = Vec::with_capacity(self.len());
 
         // Mmap entries
-        if let Some(ref mmap) = self.mmap {
-            for i in 0..self.entry_count as usize {
-                let (id, offset, length, version) = self.read_entry(mmap, i);
+        if let Some(ref mmap) = base.mmap {
+            for i in 0..base.entry_count as usize {
+                let (id, offset, length, version) = Self::read_entry_from(mmap, i);
                 if !deleted.contains(&id) {
                     if let Some(&(loc, ver)) = overlay.get(&id) {
                         entries.push((id, loc.offset, loc.length, ver));
@@ -330,7 +508,7 @@ impl MmapPrimaryIndex {
 
         // New overlay entries (not in mmap)
         for (&id, &(loc, ver)) in overlay.iter() {
-            if !deleted.contains(&id) && !self.mmap_contains(id) {
+            if !deleted.contains(&id) && !Self::mmap_contains_base(&base, id) {
                 entries.push((id, loc.offset, loc.length, ver));
             }
         }
@@ -413,7 +591,7 @@ mod tests {
             versions.insert(i, 1u64);
         }
 
-        let idx = MmapPrimaryIndex::rebuild_from_maps(&path, &primary, &versions, 10000)?;
+        let idx = MmapPrimaryIndex::rebuild_from_maps(&path, &primary, &versions, 10000, 0)?;
         assert_eq!(idx.len(), 10000);
 
         // Check random lookups
@@ -424,6 +602,51 @@ mod tests {
 
         let loc = idx.get_location(7777).unwrap();
         assert_eq!(loc.offset, 7777 * 100);
+
+        Ok(())
+    }
+
+    #[test]
+    fn in_memory_mode() {
+        let idx = MmapPrimaryIndex::new_in_memory();
+        assert_eq!(idx.len(), 0);
+
+        idx.insert(1, DocLocation { offset: 0, length: 100 }, 1);
+        idx.insert(2, DocLocation { offset: 100, length: 200 }, 1);
+        assert_eq!(idx.len(), 2);
+        assert!(idx.contains(1));
+
+        idx.remove(1);
+        assert_eq!(idx.len(), 1);
+        assert!(!idx.contains(1));
+
+        // persist should be a no-op for in-memory
+        idx.persist().unwrap();
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn persist_clears_overlay() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("test.pidx");
+
+        let idx = MmapPrimaryIndex::open(&path)?;
+        idx.insert(1, DocLocation { offset: 0, length: 100 }, 1);
+        idx.insert(2, DocLocation { offset: 100, length: 200 }, 1);
+        idx.persist()?;
+
+        // Overlay should be empty after persist
+        assert_eq!(idx.len(), 2);
+        assert!(idx.contains(1));
+        assert!(idx.contains(2));
+
+        // Add more
+        idx.insert(3, DocLocation { offset: 200, length: 50 }, 1);
+        assert_eq!(idx.len(), 3);
+        idx.persist()?;
+
+        assert_eq!(idx.len(), 3);
+        assert!(idx.contains(3));
 
         Ok(())
     }

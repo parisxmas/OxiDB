@@ -29,7 +29,7 @@ thread_local! {
 }
 
 /// Location of a document in the data file.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DocLocation {
     pub offset: u64,
     pub length: u32,
