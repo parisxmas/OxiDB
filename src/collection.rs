@@ -16,6 +16,7 @@ use crate::in_memory::{InMemStorage, StorageBackend, WalBackend};
 use crate::index::{CompositeIndex, FieldIndex};
 use crate::index_bundle::IndexBundle;
 use crate::index_persist;
+use crate::mmap_index::MmapPrimaryIndex;
 use crate::stripe::{Stripe, NUM_STRIPES};
 use crate::vector::{DistanceMetric, VectorIndex};
 use crate::query::{self, FindOptions, Query, SortOrder};
@@ -82,6 +83,9 @@ pub struct Collection {
     storage: std::cell::UnsafeCell<StorageBackend>,
     wal: WalBackend,
     stripes: Vec<RwLock<Stripe>>,
+    /// Mmap-backed primary index: doc_id -> (offset, length, version).
+    /// One per collection — replaces per-stripe primary_index and version_index.
+    pidx: MmapPrimaryIndex,
     indexes: RwLock<IndexBundle>,
     next_id: AtomicU64,
     encryption: Option<Arc<EncryptionKey>>,
@@ -130,33 +134,7 @@ fn load_index_metadata(path: &Path) -> Result<Vec<IndexInfo>> {
     Ok(meta.indexes)
 }
 
-// -----------------------------------------------------------------------
-// Helper: distribute a flat HashMap into stripes
-// -----------------------------------------------------------------------
-
-fn distribute_primary_index(
-    flat: HashMap<DocumentId, DocLocation>,
-) -> Vec<HashMap<DocumentId, DocLocation>> {
-    let mut per_stripe: Vec<HashMap<DocumentId, DocLocation>> = (0..NUM_STRIPES)
-        .map(|_| HashMap::new())
-        .collect();
-    for (id, loc) in flat {
-        per_stripe[Stripe::stripe_for(id)].insert(id, loc);
-    }
-    per_stripe
-}
-
-fn distribute_version_index(
-    flat: HashMap<DocumentId, u64>,
-) -> Vec<HashMap<DocumentId, u64>> {
-    let mut per_stripe: Vec<HashMap<DocumentId, u64>> = (0..NUM_STRIPES)
-        .map(|_| HashMap::new())
-        .collect();
-    for (id, ver) in flat {
-        per_stripe[Stripe::stripe_for(id)].insert(id, ver);
-    }
-    per_stripe
-}
+// (distribute helpers removed — primary/version indexes are now in MmapPrimaryIndex)
 
 impl Collection {
     /// Persist current index definitions to a .idx file alongside the .dat file.
@@ -182,6 +160,12 @@ impl Collection {
         }
         let doc_count = self.count() as u64;
         let next_id = self.next_id.load(Ordering::Acquire);
+
+        // Persist the mmap primary index (overlay -> .pidx) with current .dat size
+        let current_dat_size = self.storage().file_size();
+        if let Err(e) = self.pidx.persist_with_dat_size(current_dat_size) {
+            eprintln!("[warn] {}: failed to persist primary index: {}", self.name, e);
+        }
 
         let idx = self.indexes.read();
         let enc = self.encryption.as_ref();
@@ -295,56 +279,120 @@ impl Collection {
             ));
         }
 
-        let mut primary_index = HashMap::new();
-        let mut version_index = HashMap::new();
         let shard_id_offset = Self::shard_id_offset();
-        let mut next_id: DocumentId = 1 + shard_id_offset;
-
         let load_start = std::time::Instant::now();
-        let mut doc_count: u64 = 0;
 
-        let inner_cb = log_callback.clone();
+        // Phase 1: Open or build MmapPrimaryIndex.
+        let pidx_path = data_dir.join(format!("{}.pidx", name));
+        let pidx: MmapPrimaryIndex;
+        let doc_count: u64;
+        let current_dat_size = storage.file_size();
 
-        // Phase 1: Scan .dat for primary_index, version_index, next_id.
-        storage.for_each_active(|loc, bytes| {
-            let doc: Value = crate::codec::decode_doc(&bytes)?;
-            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                primary_index.insert(id, loc);
-                let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                version_index.insert(id, ver);
-                if id >= next_id {
-                    next_id = id + 1;
-                }
-
-                if let Some(ref mut ti) = text_index {
-                    let doc_arc = Arc::new(doc);
-                    ti.index_doc(id, &doc_arc);
-                }
+        // Try to open .pidx and validate it against the current .dat file size.
+        let pidx_valid = if pidx_path.exists() {
+            match MmapPrimaryIndex::open(&pidx_path) {
+                Ok(p) if p.has_mmap() && p.dat_file_size() == current_dat_size => Some(p),
+                _ => None,
             }
-            doc_count += 1;
-            if verbose && doc_count % 500_000 == 0 {
-                let msg = format!(
-                    "[verbose] {}: loaded {} documents... ({:.1}s)",
+        } else {
+            None
+        };
+
+        if let Some(valid_pidx) = pidx_valid {
+            // .pidx is valid — zero startup cost
+            pidx = valid_pidx;
+            doc_count = pidx.len() as u64;
+
+            if verbose {
+                vlog(&format!(
+                    "[verbose] {}: opened .pidx with {} entries in {:.3}s (zero-scan)",
                     name,
                     doc_count,
-                    load_start.elapsed().as_secs_f64()
-                );
-                eprintln!("{msg}");
-                if let Some(cb) = &inner_cb {
-                    cb(&msg);
-                }
+                    load_start.elapsed().as_secs_f64(),
+                ));
             }
-            Ok(())
-        })?;
 
-        if verbose {
-            vlog(&format!(
-                "[verbose] {}: {} documents loaded in {:.2}s (primary scan)",
-                name,
-                doc_count,
-                load_start.elapsed().as_secs_f64(),
-            ));
+            // Index text from .pidx entries if text index is needed
+            if text_index.is_some() {
+                let inner_cb = log_callback.clone();
+                let mut count = 0u64;
+                storage.for_each_active(|_loc, bytes| {
+                    let doc: Value = crate::codec::decode_doc(&bytes)?;
+                    if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                        if let Some(ref mut ti) = text_index {
+                            let doc_arc = Arc::new(doc);
+                            ti.index_doc(id, &doc_arc);
+                        }
+                    }
+                    count += 1;
+                    if verbose && count % 500_000 == 0 {
+                        let msg = format!(
+                            "[verbose] {}: text index scan {} docs... ({:.1}s)",
+                            name, count, load_start.elapsed().as_secs_f64()
+                        );
+                        eprintln!("{msg}");
+                        if let Some(cb) = &inner_cb { cb(&msg); }
+                    }
+                    Ok(())
+                })?;
+            }
+        } else {
+            // No .pidx — scan .dat to build primary index, then create .pidx
+            let mut primary_index = HashMap::new();
+            let mut version_index = HashMap::new();
+            let mut next_id: DocumentId = 1 + shard_id_offset;
+            let mut scan_count: u64 = 0;
+            let inner_cb = log_callback.clone();
+
+            storage.for_each_active(|loc, bytes| {
+                let doc: Value = crate::codec::decode_doc(&bytes)?;
+                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    primary_index.insert(id, loc);
+                    let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                    version_index.insert(id, ver);
+                    if id >= next_id {
+                        next_id = id + 1;
+                    }
+
+                    if let Some(ref mut ti) = text_index {
+                        let doc_arc = Arc::new(doc);
+                        ti.index_doc(id, &doc_arc);
+                    }
+                }
+                scan_count += 1;
+                if verbose && scan_count % 500_000 == 0 {
+                    let msg = format!(
+                        "[verbose] {}: loaded {} documents... ({:.1}s)",
+                        name, scan_count, load_start.elapsed().as_secs_f64()
+                    );
+                    eprintln!("{msg}");
+                    if let Some(cb) = &inner_cb { cb(&msg); }
+                }
+                Ok(())
+            })?;
+
+            if verbose {
+                vlog(&format!(
+                    "[verbose] {}: {} documents loaded in {:.2}s (primary scan)",
+                    name, scan_count, load_start.elapsed().as_secs_f64(),
+                ));
+            }
+
+            doc_count = scan_count;
+
+            // Build .pidx from the scanned data
+            pidx = MmapPrimaryIndex::rebuild_from_maps(&pidx_path, &primary_index, &version_index, next_id, current_dat_size)
+                .map_err(|e| Error::Io(e))?;
+
+            if verbose {
+                vlog(&format!(
+                    "[verbose] {}: built .pidx ({} entries) in {:.2}s",
+                    name, primary_index.len(), load_start.elapsed().as_secs_f64(),
+                ));
+            }
         }
+
+        let mut next_id = pidx.next_id().max(1 + shard_id_offset);
 
         // Phase 2: Try loading cached index data (.fidx / .cidx / .vidx)
         let mut indexes_from_cache = false;
@@ -458,41 +506,68 @@ impl Collection {
             }
         }
 
-        // Phase 3: WAL recovery (updates indexes and LRU cache too)
-        // We use a temporary DocCache for WAL recovery
-        let doc_cache = DocCache::new(doc_cache::DEFAULT_CAPACITY);
-        wal.recover(
-            &storage,
-            &mut primary_index,
-            &doc_cache,
-            &mut next_id,
-            committed_tx_ids,
-            &mut version_index,
-            &mut field_indexes,
-            &mut composite_indexes,
-            verbose,
-            &log_callback,
-        )?;
+        // Phase 3: WAL recovery
+        // WAL recover uses temporary HashMaps; we then apply the delta to pidx.
+        {
+            let mut wal_primary: HashMap<DocumentId, DocLocation> = HashMap::new();
+            let mut wal_versions: HashMap<DocumentId, u64> = HashMap::new();
+            let doc_cache_tmp = DocCache::new(doc_cache::DEFAULT_CAPACITY);
+
+            // Pre-seed wal_primary from pidx so recover can check existing entries.
+            // This is only needed for WAL recovery (typically small).
+            for (id, loc) in pidx.iter() {
+                wal_primary.insert(id, loc);
+            }
+            // Pre-seed versions too
+            for (&id, _) in &wal_primary {
+                wal_versions.insert(id, pidx.get_version(id));
+            }
+
+            let before_count = wal_primary.len();
+
+            wal.recover(
+                &storage,
+                &mut wal_primary,
+                &doc_cache_tmp,
+                &mut next_id,
+                committed_tx_ids,
+                &mut wal_versions,
+                &mut field_indexes,
+                &mut composite_indexes,
+                verbose,
+                &log_callback,
+            )?;
+
+            // Apply WAL changes back to pidx if anything changed
+            let after_count = wal_primary.len();
+            if before_count != after_count || after_count > 0 {
+                // Find new/updated entries
+                for (&id, &loc) in &wal_primary {
+                    let ver = wal_versions.get(&id).copied().unwrap_or(1);
+                    if pidx.get_location(id) != Some(loc) || pidx.get_version(id) != ver {
+                        pidx.insert(id, loc, ver);
+                    }
+                }
+                // Find deleted entries (were in pidx but not in wal_primary after recovery)
+                for (id, _loc) in pidx.iter() {
+                    if !wal_primary.contains_key(&id) {
+                        pidx.remove(id);
+                    }
+                }
+                // Update next_id
+                if next_id > pidx.next_id() {
+                    // next_id was advanced by WAL recovery; pidx.next_id tracks overlay max
+                }
+            }
+        }
 
         if verbose {
             vlog(&format!("[verbose] {}: collection ready", name));
         }
 
-        // Distribute flat maps into stripes
-        let per_stripe_primary = distribute_primary_index(primary_index);
-        let per_stripe_version = distribute_version_index(version_index);
-
         let cache_per_stripe = doc_cache::DEFAULT_CAPACITY / NUM_STRIPES;
-        let stripes: Vec<RwLock<Stripe>> = per_stripe_primary
-            .into_iter()
-            .zip(per_stripe_version.into_iter())
-            .map(|(pi, vi)| {
-                RwLock::new(Stripe {
-                    primary_index: pi,
-                    version_index: vi,
-                    doc_cache: DocCache::new(cache_per_stripe.max(1)),
-                })
-            })
+        let stripes: Vec<RwLock<Stripe>> = (0..NUM_STRIPES)
+            .map(|_| RwLock::new(Stripe::new(cache_per_stripe.max(1))))
             .collect();
 
         let indexes = RwLock::new(IndexBundle {
@@ -509,6 +584,7 @@ impl Collection {
             storage: std::cell::UnsafeCell::new(storage),
             wal,
             stripes,
+            pidx,
             indexes,
             next_id: AtomicU64::new(next_id),
             encryption,
@@ -539,6 +615,7 @@ impl Collection {
             storage: std::cell::UnsafeCell::new(StorageBackend::Memory(InMemStorage::new())),
             wal: WalBackend::Memory,
             stripes,
+            pidx: MmapPrimaryIndex::new_in_memory(),
             indexes: RwLock::new(IndexBundle::new()),
             next_id: AtomicU64::new(1 + Self::shard_id_offset()),
             encryption: None,
@@ -616,9 +693,9 @@ impl Collection {
             return Some(arc);
         }
 
-        // Slow path: read from storage
-        let loc = stripe.primary_index.get(&id)?;
-        let bytes = self.storage().read_lockfree(*loc).ok()?;
+        // Slow path: read from storage using pidx
+        let loc = self.pidx.get_location(id)?;
+        let bytes = self.storage().read_lockfree(loc).ok()?;
         let doc = crate::codec::decode_doc(&bytes).ok()?;
         let arc = Arc::new(doc);
         stripe.doc_cache.put(id, Arc::clone(&arc));
@@ -635,16 +712,12 @@ impl Collection {
 
     /// Check if a document exists in the primary index.
     fn primary_contains(&self, id: DocumentId) -> bool {
-        let stripe_idx = Stripe::stripe_for(id);
-        let stripe = self.stripes[stripe_idx].read();
-        stripe.primary_index.contains_key(&id)
+        self.pidx.contains(id)
     }
 
     /// Get a document location from the primary index.
     fn primary_get(&self, id: DocumentId) -> Option<DocLocation> {
-        let stripe_idx = Stripe::stripe_for(id);
-        let stripe = self.stripes[stripe_idx].read();
-        stripe.primary_index.get(&id).copied()
+        self.pidx.get_location(id)
     }
 
     /// Iterate all documents, calling `f` for each one.
@@ -652,14 +725,7 @@ impl Collection {
     where
         F: FnMut(DocumentId, Value) -> Result<()>,
     {
-        // Collect all (id, loc) pairs from all stripes
-        let mut all_entries: Vec<(DocumentId, DocLocation)> = Vec::new();
-        for stripe_lock in &self.stripes {
-            let stripe = stripe_lock.read();
-            for (&id, &loc) in &stripe.primary_index {
-                all_entries.push((id, loc));
-            }
-        }
+        let all_entries = self.pidx.iter();
         for (id, loc) in all_entries {
             let bytes = self.storage().read(loc)?;
             let doc = crate::codec::decode_doc(&bytes)?;
@@ -672,13 +738,7 @@ impl Collection {
     where
         F: FnMut(DocumentId, &Arc<Value>) -> Result<bool>,
     {
-        let mut all_entries: Vec<(DocumentId, DocLocation)> = Vec::new();
-        for stripe_lock in &self.stripes {
-            let stripe = stripe_lock.read();
-            for (&id, &loc) in &stripe.primary_index {
-                all_entries.push((id, loc));
-            }
-        }
+        let all_entries = self.pidx.iter();
         for (id, loc) in all_entries {
             let bytes = self.storage().read(loc)?;
             let doc = crate::codec::decode_doc(&bytes)?;
@@ -1224,13 +1284,8 @@ impl Collection {
             self.wal.checkpoint_no_sync()?;
         }
 
-        // Update stripe
-        let stripe_idx = Stripe::stripe_for(id);
-        {
-            let mut stripe = self.stripes[stripe_idx].write();
-            stripe.primary_index.insert(id, loc);
-            stripe.version_index.insert(id, 1);
-        }
+        // Update primary index
+        self.pidx.insert(id, loc, 1);
 
         let data_arc = Arc::new(data);
 
@@ -1253,6 +1308,7 @@ impl Collection {
             Self::register_ttl_inner(&mut indexes.ttl_index, id, &data_arc);
         }
 
+        let stripe_idx = Stripe::stripe_for(id);
         self.stripes[stripe_idx].read().doc_cache.put(id, data_arc);
 
         Ok(id)
@@ -1332,7 +1388,7 @@ impl Collection {
             self.wal.checkpoint_no_sync()?;
         }
 
-        // Phase 4: update stripes and indexes
+        // Phase 4: update primary index and indexes
         let skip_cache = prepared.len() > 1000;
         let has_indexes = {
             let idx = self.indexes.read();
@@ -1344,50 +1400,36 @@ impl Collection {
 
         let mut ids = Vec::with_capacity(prepared.len());
 
-        // Group by stripe for efficient locking
-        let mut per_stripe: Vec<Vec<(DocumentId, Value, DocLocation)>> = (0..NUM_STRIPES)
-            .map(|_| Vec::new())
-            .collect();
+        // Collect all docs with their locations
+        let mut all_docs: Vec<(DocumentId, Value, DocLocation)> = Vec::with_capacity(prepared.len());
         for ((id, data, _bytes), loc) in prepared.into_iter().zip(batch_locs) {
-            let s = Stripe::stripe_for(id);
-            per_stripe[s].push((id, data, loc));
+            self.pidx.insert(id, loc, 1);
+            all_docs.push((id, data, loc));
             ids.push(id);
-        }
-
-        // Lock stripes in order (deadlock prevention)
-        for (s, entries) in per_stripe.iter().enumerate() {
-            if entries.is_empty() { continue; }
-            let mut stripe = self.stripes[s].write();
-            for (id, _, loc) in entries {
-                stripe.primary_index.insert(*id, *loc);
-                stripe.version_index.insert(*id, 1);
-            }
         }
 
         // Update indexes
         if has_indexes || !skip_cache {
             let mut indexes = self.indexes.write();
-            for entries in &per_stripe {
-                for (id, data, _loc) in entries {
-                    if has_indexes || !skip_cache {
-                        let data_arc = Arc::new(data.clone());
-                        for idx in indexes.field_indexes.values_mut() {
-                            idx.insert_value(*id, &data_arc);
-                        }
-                        for idx in &mut indexes.composite_indexes {
-                            idx.insert_value(*id, &data_arc);
-                        }
-                        if let Some(ref mut text_idx) = indexes.text_index {
-                            text_idx.index_doc(*id, &data_arc);
-                        }
-                        for idx in indexes.vector_indexes.values_mut() {
-                            let _ = idx.insert(*id, &data_arc);
-                        }
-                        if !skip_cache {
-                            let s = Stripe::stripe_for(*id);
-                            self.stripes[s].read().doc_cache.put(*id, data_arc);
-                        }
+            for (id, data, _loc) in &all_docs {
+                let data_arc = Arc::new(data.clone());
+                if has_indexes {
+                    for idx in indexes.field_indexes.values_mut() {
+                        idx.insert_value(*id, &data_arc);
                     }
+                    for idx in &mut indexes.composite_indexes {
+                        idx.insert_value(*id, &data_arc);
+                    }
+                    if let Some(ref mut text_idx) = indexes.text_index {
+                        text_idx.index_doc(*id, &data_arc);
+                    }
+                    for idx in indexes.vector_indexes.values_mut() {
+                        let _ = idx.insert(*id, &data_arc);
+                    }
+                }
+                if !skip_cache {
+                    let s = Stripe::stripe_for(*id);
+                    self.stripes[s].read().doc_cache.put(*id, data_arc);
                 }
             }
         }
@@ -1428,47 +1470,33 @@ impl Collection {
 
         let mut ids = Vec::with_capacity(prepared.len());
 
-        // Group by stripe
-        let mut per_stripe: Vec<Vec<(DocumentId, Value, DocLocation)>> = (0..NUM_STRIPES)
-            .map(|_| Vec::new())
-            .collect();
+        // Update primary index and collect docs
+        let mut all_docs: Vec<(DocumentId, Value)> = Vec::with_capacity(prepared.len());
         for ((id, data, _bytes), loc) in prepared.into_iter().zip(batch_locs) {
-            let s = Stripe::stripe_for(id);
-            per_stripe[s].push((id, data, loc));
+            self.pidx.insert(id, loc, 1);
+            all_docs.push((id, data));
             ids.push(id);
-        }
-
-        // Update stripes in order
-        for (s, entries) in per_stripe.iter().enumerate() {
-            if entries.is_empty() { continue; }
-            let mut stripe = self.stripes[s].write();
-            for (id, _, loc) in entries {
-                stripe.primary_index.insert(*id, *loc);
-                stripe.version_index.insert(*id, 1);
-            }
         }
 
         // Update indexes
         {
             let mut indexes = self.indexes.write();
-            for entries in &per_stripe {
-                for (id, data, _) in entries {
-                    let data_arc = Arc::new(data.clone());
-                    for idx in indexes.field_indexes.values_mut() {
-                        idx.insert_value(*id, &data_arc);
-                    }
-                    for idx in &mut indexes.composite_indexes {
-                        idx.insert_value(*id, &data_arc);
-                    }
-                    if let Some(ref mut text_idx) = indexes.text_index {
-                        text_idx.index_doc(*id, &data_arc);
-                    }
-                    for idx in indexes.vector_indexes.values_mut() {
-                        let _ = idx.insert(*id, &data_arc);
-                    }
-                    let s = Stripe::stripe_for(*id);
-                    self.stripes[s].read().doc_cache.put(*id, data_arc);
+            for (id, data) in &all_docs {
+                let data_arc = Arc::new(data.clone());
+                for idx in indexes.field_indexes.values_mut() {
+                    idx.insert_value(*id, &data_arc);
                 }
+                for idx in &mut indexes.composite_indexes {
+                    idx.insert_value(*id, &data_arc);
+                }
+                if let Some(ref mut text_idx) = indexes.text_index {
+                    text_idx.index_doc(*id, &data_arc);
+                }
+                for idx in indexes.vector_indexes.values_mut() {
+                    let _ = idx.insert(*id, &data_arc);
+                }
+                let s = Stripe::stripe_for(*id);
+                self.stripes[s].read().doc_cache.put(*id, data_arc);
             }
         }
 
@@ -1742,14 +1770,7 @@ impl Collection {
             // No index — iterate all documents
             drop(idx_guard); // Release index lock before full scan
 
-            let ids: Vec<DocumentId> = {
-                let mut all_ids = Vec::new();
-                for stripe_lock in &self.stripes {
-                    let stripe = stripe_lock.read();
-                    all_ids.extend(stripe.primary_index.keys().copied());
-                }
-                all_ids
-            };
+            let ids: Vec<DocumentId> = self.pidx.iter_ids();
 
             // Batch cache probe
             let mut cached: Vec<Option<Arc<Value>>> = Vec::with_capacity(ids.len());
@@ -1938,11 +1959,7 @@ impl Collection {
         if file_size == 0 || num_threads <= 1 {
             return vec![(0, file_size)];
         }
-        let mut offsets: Vec<u64> = Vec::new();
-        for stripe_lock in &self.stripes {
-            let stripe = stripe_lock.read();
-            offsets.extend(stripe.primary_index.values().map(|loc| loc.offset));
-        }
+        let mut offsets = self.pidx.iter_offsets();
         offsets.sort_unstable();
         let n = offsets.len();
         if n == 0 {
@@ -2386,19 +2403,14 @@ impl Collection {
             self.wal.checkpoint_no_sync()?;
         }
 
-        // Phase 5: update stripes and indexes
+        // Phase 5: update primary index and indexes
         let mut updated_ids = Vec::with_capacity(ops.len());
         {
             let mut indexes = self.indexes.write();
             for (op, new_loc) in ops.into_iter().zip(new_locs) {
                 updated_ids.push(op.id);
-                let stripe_idx = Stripe::stripe_for(op.id);
-                {
-                    let mut stripe = self.stripes[stripe_idx].write();
-                    stripe.primary_index.insert(op.id, new_loc);
-                    let new_version = op.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
-                    stripe.version_index.insert(op.id, new_version);
-                }
+                let new_version = op.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
+                self.pidx.update_location(op.id, new_loc, new_version);
                 for idx in indexes.field_indexes.values_mut() {
                     idx.remove_value(op.id, &op.old_data);
                     idx.insert_value(op.id, &op.new_data);
@@ -2520,19 +2532,15 @@ impl Collection {
             self.wal.checkpoint_no_sync()?;
         }
 
-        // Phase 4: update stripes and indexes
+        // Phase 4: update primary index and indexes
         let mut deleted_ids = Vec::with_capacity(ops.len());
         {
             let mut indexes = self.indexes.write();
             for op in ops {
                 deleted_ids.push(op.id);
+                self.pidx.remove(op.id);
                 let stripe_idx = Stripe::stripe_for(op.id);
-                {
-                    let mut stripe = self.stripes[stripe_idx].write();
-                    stripe.primary_index.remove(&op.id);
-                    stripe.version_index.remove(&op.id);
-                    stripe.doc_cache.remove(op.id);
-                }
+                self.stripes[stripe_idx].read().doc_cache.remove(op.id);
                 for idx in indexes.field_indexes.values_mut() {
                     idx.remove_value(op.id, &op.data);
                 }
@@ -2556,7 +2564,7 @@ impl Collection {
     // -----------------------------------------------------------------------
 
     pub fn count(&self) -> usize {
-        self.stripes.iter().map(|s| s.read().primary_index.len()).sum()
+        self.pidx.len()
     }
 
     pub fn count_matching(&self, query_json: &Value) -> Result<usize> {
@@ -2633,6 +2641,7 @@ impl Collection {
             let active_records = self.storage().iter_active()?;
             let new_mem = InMemStorage::new();
             let mut new_primary_index = HashMap::new();
+            let mut new_version_index = HashMap::new();
             let mut next_id: DocumentId = 1;
 
             for (_old_loc, bytes) in &active_records {
@@ -2640,9 +2649,11 @@ impl Collection {
                 let id = doc.get("_id").and_then(|v| v.as_u64()).ok_or_else(|| {
                     Error::InvalidQuery("document missing _id during compaction".into())
                 })?;
+                let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                 let new_bytes = crate::codec::encode_doc(&doc)?;
                 let loc = new_mem.append(&new_bytes)?;
                 new_primary_index.insert(id, loc);
+                new_version_index.insert(id, ver);
                 if id >= next_id {
                     next_id = id + 1;
                 }
@@ -2651,17 +2662,14 @@ impl Collection {
             let docs_kept = new_primary_index.len();
             let new_size = new_mem.file_size();
 
-            // We need to update storage - this requires unsafe mutation since we have &self
-            // For the in-memory case, we use the same pattern as set_lazy_sync
             unsafe { *self.storage.get() = StorageBackend::Memory(new_mem); }
 
-            // Distribute into stripes
-            let per_stripe = distribute_primary_index(new_primary_index);
-            for (s, pi) in per_stripe.into_iter().enumerate() {
-                let mut stripe = self.stripes[s].write();
-                stripe.primary_index = pi;
-                stripe.version_index.clear();
-                stripe.doc_cache.clear();
+            // Reset pidx with new data
+            self.pidx.reset_from_maps(&new_primary_index, &new_version_index);
+
+            // Clear all stripe caches
+            for stripe_lock in &self.stripes {
+                stripe_lock.read().doc_cache.clear();
             }
 
             self.next_id.store(next_id, Ordering::SeqCst);
@@ -2674,28 +2682,16 @@ impl Collection {
                 if let Some(ref mut text_idx) = indexes.text_index { text_idx.clear(); }
                 for idx in indexes.vector_indexes.values_mut() { idx.clear(); }
 
-                // Re-scan for version + indexes
-                let mut all_entries: Vec<(DocumentId, DocLocation)> = Vec::new();
-                for stripe_lock in &self.stripes {
-                    let stripe = stripe_lock.read();
-                    for (&id, &loc) in &stripe.primary_index {
-                        all_entries.push((id, loc));
-                    }
-                }
+                let all_entries = self.pidx.iter();
                 for (id, loc) in all_entries {
                     let bytes = self.storage().read(loc)?;
                     let data: Value = crate::codec::decode_doc(&bytes)?;
-                    let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let s = Stripe::stripe_for(id);
-                    {
-                        let mut stripe = self.stripes[s].write();
-                        stripe.version_index.insert(id, ver);
-                    }
                     let data_arc = Arc::new(data);
                     for idx in indexes.field_indexes.values_mut() { idx.insert_value(id, &data_arc); }
                     for idx in &mut indexes.composite_indexes { idx.insert_value(id, &data_arc); }
                     if let Some(ref mut text_idx) = indexes.text_index { text_idx.index_doc(id, &data_arc); }
                     for idx in indexes.vector_indexes.values_mut() { let _ = idx.insert(id, &data_arc); }
+                    let s = Stripe::stripe_for(id);
                     self.stripes[s].read().doc_cache.put(id, data_arc);
                 }
             }
@@ -2709,6 +2705,7 @@ impl Collection {
 
         let active_records = self.storage().iter_active()?;
         let mut new_primary_index = HashMap::new();
+        let mut new_version_index = HashMap::new();
         let mut next_id: DocumentId = 1;
 
         for (_old_loc, bytes) in &active_records {
@@ -2716,9 +2713,11 @@ impl Collection {
             let id = doc.get("_id").and_then(|v| v.as_u64()).ok_or_else(|| {
                 Error::InvalidQuery("document missing _id during compaction".into())
             })?;
+            let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             let new_bytes = crate::codec::encode_doc(&doc)?;
             let loc = new_storage.append_no_sync(&new_bytes)?;
             new_primary_index.insert(id, loc);
+            new_version_index.insert(id, ver);
             if id >= next_id {
                 next_id = id + 1;
             }
@@ -2735,13 +2734,12 @@ impl Collection {
         // Replace storage
         unsafe { *self.storage.get() = StorageBackend::File(Storage::open_with_encryption(&dat_path, self.encryption.clone())?); }
 
-        // Distribute into stripes
-        let per_stripe = distribute_primary_index(new_primary_index);
-        for (s, pi) in per_stripe.into_iter().enumerate() {
-            let mut stripe = self.stripes[s].write();
-            stripe.primary_index = pi;
-            stripe.version_index.clear();
-            stripe.doc_cache.clear();
+        // Reset pidx with new data and persist to .pidx file
+        self.pidx.reset_from_maps(&new_primary_index, &new_version_index);
+
+        // Clear all stripe caches
+        for stripe_lock in &self.stripes {
+            stripe_lock.read().doc_cache.clear();
         }
         self.next_id.store(next_id, Ordering::SeqCst);
 
@@ -2753,27 +2751,16 @@ impl Collection {
             if let Some(ref mut text_idx) = indexes.text_index { text_idx.clear(); }
             for idx in indexes.vector_indexes.values_mut() { idx.clear(); }
 
-            let mut all_entries: Vec<(DocumentId, DocLocation)> = Vec::new();
-            for stripe_lock in &self.stripes {
-                let stripe = stripe_lock.read();
-                for (&id, &loc) in &stripe.primary_index {
-                    all_entries.push((id, loc));
-                }
-            }
+            let all_entries = self.pidx.iter();
             for (id, loc) in all_entries {
                 let bytes = self.storage().read(loc)?;
                 let data: Value = crate::codec::decode_doc(&bytes)?;
-                let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                let s = Stripe::stripe_for(id);
-                {
-                    let mut stripe = self.stripes[s].write();
-                    stripe.version_index.insert(id, ver);
-                }
                 let data_arc = Arc::new(data);
                 for idx in indexes.field_indexes.values_mut() { idx.insert_value(id, &data_arc); }
                 for idx in &mut indexes.composite_indexes { idx.insert_value(id, &data_arc); }
                 if let Some(ref mut text_idx) = indexes.text_index { text_idx.index_doc(id, &data_arc); }
                 for idx in indexes.vector_indexes.values_mut() { let _ = idx.insert(id, &data_arc); }
+                let s = Stripe::stripe_for(id);
                 self.stripes[s].read().doc_cache.put(id, data_arc);
             }
         }
@@ -2839,9 +2826,7 @@ impl Collection {
         let count = expired_ids.len();
 
         for doc_id in &expired_ids {
-            let stripe_idx = Stripe::stripe_for(*doc_id);
-            let mut stripe = self.stripes[stripe_idx].write();
-            if let Some(loc) = stripe.primary_index.remove(doc_id) {
+            if let Some(loc) = self.pidx.get_location(*doc_id) {
                 let _ = self.storage().mark_deleted_no_sync(loc);
 
                 if let Ok(bytes) = self.storage().read(loc) {
@@ -2855,8 +2840,9 @@ impl Collection {
                     }
                 }
             }
-            stripe.version_index.remove(doc_id);
-            stripe.doc_cache.remove(*doc_id);
+            self.pidx.remove(*doc_id);
+            let stripe_idx = Stripe::stripe_for(*doc_id);
+            self.stripes[stripe_idx].read().doc_cache.remove(*doc_id);
         }
 
         for key in expired_keys {
@@ -2879,9 +2865,7 @@ impl Collection {
     // -----------------------------------------------------------------------
 
     pub fn get_version(&self, doc_id: DocumentId) -> u64 {
-        let stripe_idx = Stripe::stripe_for(doc_id);
-        let stripe = self.stripes[stripe_idx].read();
-        stripe.version_index.get(&doc_id).copied().unwrap_or(0)
+        self.pidx.get_version(doc_id)
     }
 
     pub fn log_wal_batch(&self, entries: &[WalEntry]) -> Result<()> {
@@ -3081,17 +3065,13 @@ impl Collection {
         }
         self.storage().sync()?;
 
-        // Update stripes and indexes
+        // Update primary index (pidx) and indexes
         let mut indexes = self.indexes.write();
         for (i, m) in mutations.iter().enumerate() {
             let stripe_idx = Stripe::stripe_for(m.doc_id);
             if m.is_delete {
-                {
-                    let mut stripe = self.stripes[stripe_idx].write();
-                    stripe.primary_index.remove(&m.doc_id);
-                    stripe.version_index.remove(&m.doc_id);
-                    stripe.doc_cache.remove(m.doc_id);
-                }
+                self.pidx.remove(m.doc_id);
+                self.stripes[stripe_idx].read().doc_cache.remove(m.doc_id);
                 if let Some(ref old_data) = m.old_data {
                     for idx in indexes.field_indexes.values_mut() {
                         idx.remove_value(m.doc_id, old_data);
@@ -3107,12 +3087,8 @@ impl Collection {
                     idx.remove(m.doc_id);
                 }
             } else if let Some(loc) = new_locs[i] {
-                {
-                    let mut stripe = self.stripes[stripe_idx].write();
-                    stripe.primary_index.insert(m.doc_id, loc);
-                    let ver = m.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
-                    stripe.version_index.insert(m.doc_id, ver);
-                }
+                let ver = m.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
+                self.pidx.insert(m.doc_id, loc, ver);
                 if let Some(ref old_data) = m.old_data {
                     for idx in indexes.field_indexes.values_mut() {
                         idx.remove_value(m.doc_id, old_data);
