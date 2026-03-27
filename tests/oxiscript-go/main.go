@@ -107,6 +107,18 @@ func main() {
 	if orderCount == 0 {
 		fmt.Println("Seeding data...")
 		seed(c, addr)
+		c.c.Close()
+
+		// Restart server to ensure all data is properly loaded from WAL
+		fmt.Print("  Restarting server...")
+		cmd.Process.Signal(syscall.SIGTERM)
+		cmd.Wait()
+		cmd = exec.Command(serverBin)
+		cmd.Env = append(os.Environ(), "OXIDB_ADDR="+addr, "OXIDB_DATA="+dataDir, "OXIDB_IDLE_TIMEOUT=0")
+		cmd.Start()
+		c = connect(addr)
+		fmt.Println(" ready")
+
 		// Re-count
 		r = c.must(map[string]any{"cmd": "count", "collection": "orders"})
 		orderCount = f(m(d(r))["count"])
@@ -114,7 +126,7 @@ func main() {
 		custCount = f(m(d(r))["count"])
 		r = c.must(map[string]any{"cmd": "count", "collection": "products"})
 		prodCount = f(m(d(r))["count"])
-		fmt.Printf("Seeded: %.0f orders, %.0f customers, %.0f products\n\n", orderCount, custCount, prodCount)
+		fmt.Printf("  Data: %.0f orders, %.0f customers, %.0f products\n\n", orderCount, custCount, prodCount)
 	}
 
 	// Recreate procedures
@@ -194,12 +206,12 @@ func main() {
 	// ─── 0. Quick sanity check ─────────────────────────────────────
 	fmt.Println("─── 0. Sanity check ───")
 	{
-		r, _ := c.do(map[string]any{"cmd": "find_one", "collection": "customers", "query": map[string]any{"customer_id": "C0001"}})
+		r, _ := c.do(map[string]any{"cmd": "find_one", "collection": "customers", "query": map[string]any{"customer_id": "C00001"}})
 		fmt.Printf("  find_one C0001: ok=%v data_nil=%v\n", r["ok"], r["data"] == nil)
 		if r["data"] != nil {
 			fmt.Printf("  data: %v\n", m(d(r))["customer_id"])
 		}
-		r2, _ := c.do(map[string]any{"cmd": "call_procedure", "name": "get_balance", "params": map[string]any{"customer_id": "C0001"}})
+		r2, _ := c.do(map[string]any{"cmd": "call_procedure", "name": "get_balance", "params": map[string]any{"customer_id": "C00001"}})
 		fmt.Printf("  get_balance C0001: %v\n", r2)
 	}
 	fmt.Println()
@@ -530,8 +542,8 @@ func seed(c *conn, addr string) {
 	}
 	fmt.Printf(" %.1fs\n", time.Since(t0).Seconds())
 
-	// Wait for lazy sync to flush all data to disk before creating indexes
-	time.Sleep(100 * time.Millisecond)
+	// Wait for lazy sync to flush buffers (10ms interval, 1s is plenty)
+	time.Sleep(1 * time.Second)
 
 	fmt.Print("  Creating indexes...")
 	t0 = time.Now()

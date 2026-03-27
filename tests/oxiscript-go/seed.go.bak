@@ -1,0 +1,711 @@
+package main
+
+import (
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+// ─── Wire client (one per goroutine) ───────────────────────────────
+
+type client struct {
+	conn net.Conn
+}
+
+func dial(addr string) (*client, error) {
+	for i := 0; i < 40; i++ {
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			c := &client{conn: conn}
+			r, err := c.send(map[string]any{"cmd": "ping"})
+			if err == nil && r != nil {
+				return c, nil
+			}
+			conn.Close()
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("cannot connect to %s", addr)
+}
+
+func (c *client) send(payload map[string]any) (map[string]any, error) {
+	data, _ := json.Marshal(payload)
+	lenBuf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(lenBuf, uint32(len(data)))
+	c.conn.Write(lenBuf)
+	c.conn.Write(data)
+
+	if _, err := io.ReadFull(c.conn, lenBuf); err != nil {
+		return nil, err
+	}
+	length := binary.LittleEndian.Uint32(lenBuf)
+	resp := make([]byte, length)
+	if _, err := io.ReadFull(c.conn, resp); err != nil {
+		return nil, err
+	}
+	var result map[string]any
+	json.Unmarshal(resp, &result)
+	return result, nil
+}
+
+func (c *client) mustSend(payload map[string]any) map[string]any {
+	resp, err := c.send(payload)
+	if err != nil {
+		panic(fmt.Sprintf("send failed: %v", err))
+	}
+	if ok, _ := resp["ok"].(bool); !ok {
+		errMsg, _ := resp["error"].(string)
+		panic(fmt.Sprintf("command failed: %s | payload: %v", errMsg, payload))
+	}
+	return resp
+}
+
+func (c *client) close() { c.conn.Close() }
+
+func isOk(resp map[string]any) bool {
+	ok, _ := resp["ok"].(bool)
+	return ok
+}
+
+func getError(resp map[string]any) string {
+	e, _ := resp["error"].(string)
+	return e
+}
+
+func getData(resp map[string]any) any { return resp["data"] }
+
+func getMap(v any) map[string]any {
+	if m, ok := v.(map[string]any); ok {
+		return m
+	}
+	return nil
+}
+
+func getFloat(v any) float64 {
+	if n, ok := v.(float64); ok {
+		return n
+	}
+	return 0
+}
+
+// ─── Main ──────────────────────────────────────────────────────────
+
+const (
+	NUM_CUSTOMERS    = 10000
+	NUM_PRODUCTS     = 1000
+	NUM_ORDERS       = 1000000
+	CONCURRENCY      = 20
+	OPS_PER_WORKER   = 100
+	STARTING_BALANCE = 100000.0
+)
+
+func main() {
+	port := "14999"
+	addr := "127.0.0.1:" + port
+
+	// Check if --reuse flag is passed (skip seed, connect to existing server)
+	reuse := false
+	for _, arg := range os.Args[1:] {
+		if arg == "--reuse" || arg == "-r" {
+			reuse = true
+		}
+	}
+
+	dataDir := filepath.Join("..", "..", "test_data", "oxiscript_bench")
+	serverBin := filepath.Join("..", "..", "target", "release", "oxidb-server")
+	if _, err := os.Stat(serverBin); err != nil {
+		fmt.Println("FATAL: oxidb-server not found. Run `cargo build --release`.")
+		os.Exit(1)
+	}
+
+	// Start server with persistent data dir
+	os.MkdirAll(dataDir, 0755)
+	cmd := exec.Command(serverBin)
+	cmd.Env = append(os.Environ(), "OXIDB_ADDR="+addr, "OXIDB_DATA="+dataDir, "OXIDB_IDLE_TIMEOUT=0")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.Start()
+	defer func() {
+		cmd.Process.Signal(syscall.SIGTERM)
+		cmd.Wait()
+	}()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cmd.Process.Signal(syscall.SIGTERM)
+		cmd.Wait()
+		os.Exit(1)
+	}()
+
+	admin, err := dial(addr)
+	if err != nil {
+		fmt.Printf("FATAL: %v\n", err)
+		os.Exit(1)
+	}
+	defer admin.close()
+	fmt.Println("Server ready.")
+
+	// ════════════════════════════════════════════════════════════════
+	// Phase 1: Seed realistic data (skip if --reuse and data exists)
+	// ════════════════════════════════════════════════════════════════
+
+	// Check if data already exists
+	needSeed := true
+	if reuse {
+		r := admin.mustSend(map[string]any{"cmd": "count", "collection": "orders"})
+		cnt := getFloat(getMap(getData(r))["count"])
+		if cnt >= float64(NUM_ORDERS) {
+			fmt.Printf("═══ Phase 1: Reusing existing data (%.0f orders found) ═══\n\n", cnt)
+			needSeed = false
+		}
+	}
+
+	regions := []string{"US-EAST", "US-WEST", "EU-WEST", "EU-EAST", "APAC"}
+	tiers := []string{"free", "basic", "premium", "enterprise"}
+	categories := []string{"electronics", "clothing", "food", "books", "toys", "sports"}
+	var t0 time.Time
+
+	if needSeed {
+	fmt.Println("═══ Phase 1: Seed data ═══")
+
+	for _, col := range []string{"customers", "products", "orders", "transactions", "alerts"} {
+		admin.mustSend(map[string]any{"cmd": "drop_collection", "collection": col})
+	}
+
+	// Customers — each starts with known balance
+	fmt.Printf("  Inserting %d customers (balance=%.0f each)...", NUM_CUSTOMERS, STARTING_BALANCE)
+	t0 = time.Now()
+	batch := make([]map[string]any, 0, 5000)
+	for i := 0; i < NUM_CUSTOMERS; i++ {
+		batch = append(batch, map[string]any{
+			"customer_id": fmt.Sprintf("C%04d", i),
+			"name":        fmt.Sprintf("Customer %d", i),
+			"region":      regions[i%len(regions)],
+			"tier":        tiers[i%len(tiers)],
+			"balance":     STARTING_BALANCE,
+			"total_spent": 0.0,
+			"order_count": 0,
+		})
+		if len(batch) == 5000 {
+			admin.mustSend(map[string]any{"cmd": "insert_many", "collection": "customers", "docs": batch})
+			batch = batch[:0]
+		}
+	}
+	if len(batch) > 0 {
+		admin.mustSend(map[string]any{"cmd": "insert_many", "collection": "customers", "docs": batch})
+	}
+	fmt.Printf(" %.1fs\n", time.Since(t0).Seconds())
+
+	// Products — known stock
+	fmt.Printf("  Inserting %d products (stock=10000 each)...", NUM_PRODUCTS)
+	t0 = time.Now()
+	batch = batch[:0]
+	for i := 0; i < NUM_PRODUCTS; i++ {
+		batch = append(batch, map[string]any{
+			"sku":      fmt.Sprintf("P%03d", i),
+			"name":     fmt.Sprintf("Product %d", i),
+			"category": categories[i%len(categories)],
+			"price":    float64(10 + (i*7)%990),
+			"stock":    10000,
+			"sold":     0,
+		})
+	}
+	admin.mustSend(map[string]any{"cmd": "insert_many", "collection": "products", "docs": batch})
+	fmt.Printf(" %.1fs\n", time.Since(t0).Seconds())
+
+	// Historical orders
+	fmt.Printf("  Inserting %d historical orders...", NUM_ORDERS)
+	t0 = time.Now()
+	batch = batch[:0]
+	for i := 0; i < NUM_ORDERS; i++ {
+		batch = append(batch, map[string]any{
+			"order_id":    fmt.Sprintf("H%06d", i),
+			"customer_id": fmt.Sprintf("C%04d", rand.Intn(NUM_CUSTOMERS)),
+			"sku":         fmt.Sprintf("P%03d", rand.Intn(NUM_PRODUCTS)),
+			"qty":         1 + rand.Intn(5),
+			"total":       float64(10 + rand.Intn(5000)),
+			"status":      "completed",
+			"region":      regions[rand.Intn(len(regions))],
+		})
+		if len(batch) == 5000 {
+			admin.mustSend(map[string]any{"cmd": "insert_many", "collection": "orders", "docs": batch})
+			batch = batch[:0]
+		}
+	}
+	fmt.Printf(" %.1fs\n", time.Since(t0).Seconds())
+
+	// Indexes
+	fmt.Print("  Creating indexes...")
+	t0 = time.Now()
+	for _, idx := range [][2]string{
+		{"customers", "customer_id"},
+		{"customers", "region"},
+		{"products", "sku"},
+		{"orders", "customer_id"},
+		{"orders", "order_id"},
+		{"orders", "sku"},
+		{"orders", "status"},
+		{"orders", "region"},
+		{"transactions", "customer_id"},
+	} {
+		admin.mustSend(map[string]any{"cmd": "create_index", "collection": idx[0], "field": idx[1]})
+	}
+	fmt.Printf(" %.1fs\n\n", time.Since(t0).Seconds())
+
+	} // end if needSeed
+
+	// ════════════════════════════════════════════════════════════════
+	// Phase 2: Create stored procedures (always recreate)
+	// ════════════════════════════════════════════════════════════════
+
+	fmt.Println("═══ Phase 2: Create stored procedures ═══")
+
+	scripts := map[string]string{
+		"get_balance": `
+			proc get_balance(customer_id) {
+				let cust = find_one("customers", {customer_id: customer_id})
+				if cust == null { abort "customer not found" }
+				return cust.balance
+			}
+		`,
+		"get_customer_profile": `
+			proc get_customer_profile(customer_id) {
+				let cust = find_one("customers", {customer_id: customer_id})
+				if cust == null { abort "customer not found" }
+				let order_count = count("orders", {customer_id: customer_id})
+				let recent = find("orders", {customer_id: customer_id}, {_id: -1}, 5)
+				return {
+					customer_id: cust.customer_id,
+					name: cust.name,
+					region: cust.region,
+					tier: cust.tier,
+					balance: cust.balance,
+					total_orders: order_count,
+					recent_orders: recent
+				}
+			}
+		`,
+		"check_stock": `
+			proc check_stock(sku) {
+				let p = find_one("products", {sku: sku})
+				if p == null { abort "product not found" }
+				return {sku: p.sku, stock: p.stock, price: p.price}
+			}
+		`,
+		"place_order": `
+			proc place_order(customer_id, sku, qty, total) {
+				let stock = check_stock({sku: sku})
+				if stock.stock < qty { abort "out of stock" }
+				let cust = find_one("customers", {customer_id: customer_id})
+				if cust == null { abort "customer not found" }
+				if cust.balance < total { abort "insufficient funds" }
+				update("products", {sku: sku}, {$inc: {stock: -qty, sold: qty}})
+				update("customers", {customer_id: customer_id}, {
+					$inc: {balance: -total, total_spent: total, order_count: 1}
+				})
+				insert("orders", {
+					customer_id: customer_id,
+					sku: sku,
+					qty: qty,
+					total: total,
+					status: "completed",
+					region: cust.region
+				})
+				return {status: "placed", total: total}
+			}
+		`,
+		"process_refund": `
+			proc process_refund(order_id) {
+				let order = find_one("orders", {order_id: order_id})
+				if order == null { abort "order not found" }
+				if order.status != "completed" { abort "not refundable" }
+				update("orders", {order_id: order_id}, {$set: {status: "refunded"}})
+				update("customers", {customer_id: order.customer_id}, {
+					$inc: {balance: order.total}
+				})
+				insert("transactions", {
+					type: "refund",
+					order_id: order_id,
+					customer_id: order.customer_id,
+					amount: order.total
+				})
+				return {refunded: order.total}
+			}
+		`,
+		"regional_report": `
+			proc regional_report(region) {
+				let summary = aggregate("orders", [
+					{$match: {region: region, status: "completed"}},
+					{$group: {_id: "$sku", revenue: {$sum: "$total"}, count: {$sum: 1}}},
+					{$sort: {revenue: -1}},
+					{$limit: 10}
+				])
+				let totals = aggregate("orders", [
+					{$match: {region: region, status: "completed"}},
+					{$group: {_id: null, total_revenue: {$sum: "$total"}, total_orders: {$sum: 1}}}
+				])
+				return {region: region, top_products: summary, totals: totals}
+			}
+		`,
+	}
+
+	for name, script := range scripts {
+		t0 = time.Now()
+		admin.mustSend(map[string]any{"cmd": "create_procedure", "script": script})
+		fmt.Printf("  Created %-25s (%.1fms)\n", name, float64(time.Since(t0).Microseconds())/1000)
+	}
+	fmt.Println()
+
+	// ════════════════════════════════════════════════════════════════
+	// Phase 3: Record pre-test state
+	// ════════════════════════════════════════════════════════════════
+
+	fmt.Println("═══ Phase 3: Record starting state ═══")
+
+	// Sum all balances via aggregation
+	r := admin.mustSend(map[string]any{
+		"cmd": "aggregate", "collection": "customers",
+		"pipeline": []any{
+			map[string]any{"$group": map[string]any{
+				"_id": nil, "total_balance": map[string]any{"$sum": "$balance"},
+			}},
+		},
+	})
+	var totalBalanceBefore float64
+	if arr, ok := getData(r).([]any); ok && len(arr) > 0 {
+		if m := getMap(arr[0]); m != nil {
+			totalBalanceBefore = getFloat(m["total_balance"])
+		}
+	}
+
+	r = admin.mustSend(map[string]any{"cmd": "count", "collection": "orders"})
+	ordersBefore := getFloat(getMap(getData(r))["count"])
+
+	fmt.Printf("  Total balance across %d customers: %.0f\n", NUM_CUSTOMERS, totalBalanceBefore)
+	fmt.Printf("  Total orders: %.0f\n", ordersBefore)
+	fmt.Println()
+
+	// ════════════════════════════════════════════════════════════════
+	// Phase 4: Concurrent workload
+	// ════════════════════════════════════════════════════════════════
+
+	fmt.Printf("═══ Phase 4: Concurrent workload (%d workers x %d ops) ═══\n\n", CONCURRENCY, OPS_PER_WORKER)
+
+	var (
+		placeOk       atomic.Int64
+		placeFail     atomic.Int64
+		placeConflict atomic.Int64
+		refundOk      atomic.Int64
+		refundFail    atomic.Int64
+		profileOk     atomic.Int64
+		reportOk      atomic.Int64
+		totalPlaceMs  atomic.Int64
+		totalRefundMs atomic.Int64
+		totalProfMs   atomic.Int64
+		totalReportMs atomic.Int64
+		totalSpentAll atomic.Int64 // track money spent (in cents to avoid float atomics)
+		totalRefundedAll atomic.Int64
+	)
+
+	var wg sync.WaitGroup
+	t0 = time.Now()
+
+	for w := 0; w < CONCURRENCY; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			conn, err := dial(addr)
+			if err != nil {
+				fmt.Printf("  Worker %d: CONNECT FAILED: %v\n", workerID, err)
+				return
+			}
+			defer conn.close()
+
+			rng := rand.New(rand.NewSource(int64(workerID * 1000 + time.Now().Nanosecond())))
+
+			for op := 0; op < OPS_PER_WORKER; op++ {
+				roll := rng.Intn(100)
+
+				switch {
+				case roll < 40:
+					// 40% — Place order (write-heavy, contention on customer+product)
+					custID := fmt.Sprintf("C%04d", rng.Intn(NUM_CUSTOMERS))
+					sku := fmt.Sprintf("P%03d", rng.Intn(NUM_PRODUCTS))
+					qty := 1 + rng.Intn(3)
+					price := float64(10 + rng.Intn(200))
+					orderTotal := price * float64(qty)
+
+					start := time.Now()
+					resp, err := conn.send(map[string]any{
+						"cmd": "call_procedure", "name": "place_order",
+						"params": map[string]any{
+							"customer_id": custID, "sku": sku,
+							"qty": qty, "total": orderTotal,
+						},
+					})
+					elapsed := time.Since(start)
+					totalPlaceMs.Add(elapsed.Milliseconds())
+
+					if err != nil || !isOk(resp) {
+						errMsg := ""
+						if resp != nil {
+							errMsg = getError(resp)
+						}
+						if strings.Contains(errMsg, "conflict") || strings.Contains(errMsg, "version") {
+							placeConflict.Add(1)
+						} else {
+							placeFail.Add(1)
+						}
+					} else {
+						placeOk.Add(1)
+						totalSpentAll.Add(int64(orderTotal * 100))
+					}
+
+				case roll < 55:
+					// 15% — Process refund (write-heavy, contention on order+customer)
+					orderIdx := rng.Intn(NUM_ORDERS)
+					orderID := fmt.Sprintf("H%06d", orderIdx)
+
+					start := time.Now()
+					resp, err := conn.send(map[string]any{
+						"cmd": "call_procedure", "name": "process_refund",
+						"params": map[string]any{"order_id": orderID},
+					})
+					elapsed := time.Since(start)
+					totalRefundMs.Add(elapsed.Milliseconds())
+
+					if err != nil || !isOk(resp) {
+						refundFail.Add(1)
+					} else {
+						refundOk.Add(1)
+						d := getMap(getData(resp))
+						if d != nil {
+							totalRefundedAll.Add(int64(getFloat(d["refunded"]) * 100))
+						}
+					}
+
+				case roll < 85:
+					// 30% — Get customer profile (read-heavy)
+					custID := fmt.Sprintf("C%04d", rng.Intn(NUM_CUSTOMERS))
+
+					start := time.Now()
+					resp, err := conn.send(map[string]any{
+						"cmd": "call_procedure", "name": "get_customer_profile",
+						"params": map[string]any{"customer_id": custID},
+					})
+					elapsed := time.Since(start)
+					totalProfMs.Add(elapsed.Milliseconds())
+
+					if err == nil && isOk(resp) {
+						profileOk.Add(1)
+					}
+
+				default:
+					// 15% — Regional report (aggregation, read-only)
+					region := regions[rng.Intn(len(regions))]
+
+					start := time.Now()
+					resp, err := conn.send(map[string]any{
+						"cmd": "call_procedure", "name": "regional_report",
+						"params": map[string]any{"region": region},
+					})
+					elapsed := time.Since(start)
+					totalReportMs.Add(elapsed.Milliseconds())
+
+					if err == nil && isOk(resp) {
+						reportOk.Add(1)
+					}
+				}
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	wallTime := time.Since(t0)
+	totalOps := int64(CONCURRENCY * OPS_PER_WORKER)
+
+	fmt.Printf("  Wall time: %s\n", wallTime.Round(time.Millisecond))
+	fmt.Printf("  Total ops: %d  (%.0f ops/sec)\n\n", totalOps, float64(totalOps)/wallTime.Seconds())
+
+	pOk := placeOk.Load()
+	pFail := placeFail.Load()
+	pConflict := placeConflict.Load()
+	rOk := refundOk.Load()
+	rFail := refundFail.Load()
+	prOk := profileOk.Load()
+	rpOk := reportOk.Load()
+
+	pTotal := pOk + pFail + pConflict
+	rTotal := rOk + rFail
+
+	fmt.Println("  ┌─────────────────────────────────────────────────────────┐")
+	fmt.Println("  │ Operation         │ OK     │ Fail   │ Conflict │ Avg   │")
+	fmt.Println("  ├─────────────────────────────────────────────────────────┤")
+	if pTotal > 0 {
+		fmt.Printf("  │ place_order       │ %6d │ %6d │ %8d │ %4dms│\n",
+			pOk, pFail, pConflict, totalPlaceMs.Load()/pTotal)
+	}
+	if rTotal > 0 {
+		fmt.Printf("  │ process_refund    │ %6d │ %6d │        - │ %4dms│\n",
+			rOk, rFail, totalRefundMs.Load()/rTotal)
+	}
+	if prOk > 0 {
+		fmt.Printf("  │ get_cust_profile  │ %6d │      - │        - │ %4dms│\n",
+			prOk, totalProfMs.Load()/prOk)
+	}
+	if rpOk > 0 {
+		fmt.Printf("  │ regional_report   │ %6d │      - │        - │ %4dms│\n",
+			rpOk, totalReportMs.Load()/rpOk)
+	}
+	fmt.Println("  └─────────────────────────────────────────────────────────┘")
+	fmt.Println()
+
+	// ════════════════════════════════════════════════════════════════
+	// Phase 5: Verify data integrity
+	// ════════════════════════════════════════════════════════════════
+
+	fmt.Println("═══ Phase 5: Verify data integrity ═══")
+
+	passed := 0
+	failed := 0
+	check := func(name string, ok bool, detail string) {
+		if ok {
+			fmt.Printf("  PASS: %s\n", name)
+			passed++
+		} else {
+			fmt.Printf("  FAIL: %s — %s\n", name, detail)
+			failed++
+		}
+	}
+
+	// 5a. Sum all customer balances via aggregation
+	r = admin.mustSend(map[string]any{
+		"cmd": "aggregate", "collection": "customers",
+		"pipeline": []any{
+			map[string]any{"$group": map[string]any{
+				"_id": nil, "total_balance": map[string]any{"$sum": "$balance"},
+			}},
+		},
+	})
+	balAgg := getData(r)
+	var totalBalanceAfter float64
+	if arr, ok := balAgg.([]any); ok && len(arr) > 0 {
+		if m := getMap(arr[0]); m != nil {
+			totalBalanceAfter = getFloat(m["total_balance"])
+		}
+	}
+
+	// Money conservation: before + refunded - spent = after
+	moneySpent := float64(totalSpentAll.Load()) / 100.0
+	moneyRefunded := float64(totalRefundedAll.Load()) / 100.0
+	expectedBalance := totalBalanceBefore - moneySpent + moneyRefunded
+	diff := totalBalanceAfter - expectedBalance
+
+	fmt.Printf("\n  Balance before:  %.2f\n", totalBalanceBefore)
+	fmt.Printf("  Money spent:     %.2f (%d orders placed)\n", moneySpent, pOk)
+	fmt.Printf("  Money refunded:  %.2f (%d refunds)\n", moneyRefunded, rOk)
+	fmt.Printf("  Expected after:  %.2f\n", expectedBalance)
+	fmt.Printf("  Actual after:    %.2f\n", totalBalanceAfter)
+	fmt.Printf("  Difference:      %.2f\n\n", diff)
+
+	check("Money conservation (balance tracking)",
+		diff >= -0.01 && diff <= 0.01,
+		fmt.Sprintf("difference=%.2f", diff))
+
+	// 5b. No negative balances
+	r = admin.mustSend(map[string]any{
+		"cmd": "count", "collection": "customers",
+		"query": map[string]any{"balance": map[string]any{"$lt": 0}},
+	})
+	negativeCount := int(getFloat(getMap(getData(r))["count"]))
+	check("No negative customer balances",
+		negativeCount == 0,
+		fmt.Sprintf("%d customers have negative balance", negativeCount))
+
+	// 5c. No negative stock
+	r = admin.mustSend(map[string]any{
+		"cmd": "count", "collection": "products",
+		"query": map[string]any{"stock": map[string]any{"$lt": 0}},
+	})
+	negStock := int(getFloat(getMap(getData(r))["count"]))
+	check("No negative product stock",
+		negStock == 0,
+		fmt.Sprintf("%d products have negative stock", negStock))
+
+	// 5d. Order count increased by exactly place_order success count
+	r = admin.mustSend(map[string]any{"cmd": "count", "collection": "orders"})
+	ordersAfter := getFloat(getMap(getData(r))["count"])
+	newOrders := ordersAfter - ordersBefore
+	check("Order count matches successful place_order calls",
+		int64(newOrders) == pOk,
+		fmt.Sprintf("new_orders=%.0f, place_ok=%d", newOrders, pOk))
+
+	// 5e. Transaction log count matches successful refunds
+	r = admin.mustSend(map[string]any{"cmd": "count", "collection": "transactions"})
+	txCount := getFloat(getMap(getData(r))["count"])
+	check("Transaction log count matches refund count",
+		int64(txCount) == rOk,
+		fmt.Sprintf("tx_log=%.0f, refund_ok=%d", txCount, rOk))
+
+	// 5f. No completed orders that were refunded still show "completed"
+	// (spot check 100 random refunded orders)
+	spotChecked := 0
+	badStatus := 0
+	for i := 0; i < 100; i++ {
+		orderID := fmt.Sprintf("H%06d", rand.Intn(NUM_ORDERS))
+		r, err := admin.send(map[string]any{
+			"cmd": "find_one", "collection": "orders", "query": map[string]any{"order_id": orderID},
+		})
+		if err != nil || !isOk(r) {
+			continue
+		}
+		d := getMap(getData(r))
+		if d == nil {
+			continue
+		}
+		spotChecked++
+		// If it has a refund in transactions, status should be "refunded"
+		tr, _ := admin.send(map[string]any{
+			"cmd": "count", "collection": "transactions",
+			"query": map[string]any{"order_id": orderID},
+		})
+		if isOk(tr) {
+			cnt := getFloat(getMap(getData(tr))["count"])
+			if cnt > 0 && d["status"] == "completed" {
+				badStatus++
+			}
+		}
+	}
+	check(fmt.Sprintf("Refunded orders have correct status (checked %d)", spotChecked),
+		badStatus == 0,
+		fmt.Sprintf("%d refunded orders still show 'completed'", badStatus))
+
+	// ════════════════════════════════════════════════════════════════
+	// Summary
+	// ════════════════════════════════════════════════════════════════
+
+	fmt.Println()
+	fmt.Println(strings.Repeat("═", 60))
+	fmt.Printf("  %d passed, %d failed\n", passed, failed)
+	fmt.Printf("  %d total ops in %s (%.0f ops/sec, %d concurrent)\n",
+		totalOps, wallTime.Round(time.Millisecond), float64(totalOps)/wallTime.Seconds(), CONCURRENCY)
+	fmt.Println(strings.Repeat("═", 60))
+
+	if failed > 0 {
+		os.Exit(1)
+	}
+}

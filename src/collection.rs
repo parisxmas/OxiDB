@@ -712,6 +712,9 @@ impl Collection {
     fn parallel_build_index(&self, field: &str, unique: bool) -> Result<FieldIndex> {
         use rayon::prelude::*;
 
+        // Flush any buffered writes to disk before scanning
+        let _ = self.storage().sync();
+
         let storage = self.storage();
         let file_size = storage.file_size();
 
