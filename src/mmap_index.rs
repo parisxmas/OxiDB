@@ -54,6 +54,8 @@ pub struct MmapPrimaryIndex {
     in_memory: bool,
     /// The .dat file size that was recorded when .pidx was last persisted.
     dat_file_size: AtomicU64,
+    /// Tracked document count — avoids O(n) recount on every len() call.
+    doc_count: AtomicU64,
 }
 
 impl MmapPrimaryIndex {
@@ -81,6 +83,7 @@ impl MmapPrimaryIndex {
                     deleted: parking_lot::RwLock::new(std::collections::HashSet::new()),
                     in_memory: false,
                     dat_file_size: AtomicU64::new(0),
+                    doc_count: AtomicU64::new(0),
                 });
             }
             let entry_count = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
@@ -98,6 +101,7 @@ impl MmapPrimaryIndex {
                 deleted: parking_lot::RwLock::new(std::collections::HashSet::new()),
                 in_memory: false,
                 dat_file_size: AtomicU64::new(dat_file_size),
+                doc_count: AtomicU64::new(entry_count),
             })
         } else {
             Ok(Self {
@@ -111,6 +115,7 @@ impl MmapPrimaryIndex {
                 deleted: parking_lot::RwLock::new(std::collections::HashSet::new()),
                 in_memory: false,
                 dat_file_size: AtomicU64::new(0),
+                doc_count: AtomicU64::new(0),
             })
         }
     }
@@ -138,6 +143,7 @@ impl MmapPrimaryIndex {
             deleted: parking_lot::RwLock::new(std::collections::HashSet::new()),
             in_memory: true,
             dat_file_size: AtomicU64::new(0),
+            doc_count: AtomicU64::new(0),
         }
     }
 
@@ -186,14 +192,33 @@ impl MmapPrimaryIndex {
 
     /// Insert or update an entry in the overlay.
     pub fn insert(&self, doc_id: DocumentId, loc: DocLocation, version: u64) {
-        self.deleted.write().remove(&doc_id);
-        self.overlay.write().insert(doc_id, (loc, version));
+        let was_deleted = self.deleted.write().remove(&doc_id);
+        let mut overlay = self.overlay.write();
+        let was_in_overlay = overlay.contains_key(&doc_id);
+        let was_in_mmap = if !was_in_overlay {
+            Self::mmap_contains_base(&self.base.read(), doc_id)
+        } else {
+            false
+        };
+        overlay.insert(doc_id, (loc, version));
+        // Increment only if the doc_id is truly new (not already tracked)
+        let already_existed = was_in_overlay || (was_in_mmap && !was_deleted);
+        if !already_existed {
+            self.doc_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Mark a document as deleted.
     pub fn remove(&self, doc_id: DocumentId) {
-        self.overlay.write().remove(&doc_id);
+        let was_in_overlay = self.overlay.write().remove(&doc_id).is_some();
+        let was_in_mmap = Self::mmap_contains_base(&self.base.read(), doc_id);
+        let already_deleted = self.deleted.read().contains(&doc_id);
         self.deleted.write().insert(doc_id);
+        // Decrement only if the doc_id actually existed before this call
+        let existed = was_in_overlay || (was_in_mmap && !already_deleted);
+        if existed {
+            self.doc_count.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Update version for a document.
@@ -212,19 +237,7 @@ impl MmapPrimaryIndex {
 
     /// Total number of documents (mmap + overlay - deleted).
     pub fn len(&self) -> usize {
-        let base = self.base.read();
-        let overlay = self.overlay.read();
-        let deleted = self.deleted.read();
-        let mmap_count = base.entry_count as usize;
-        let overlay_new = overlay
-            .keys()
-            .filter(|id| !Self::mmap_contains_base(&base, **id))
-            .count();
-        let mmap_deleted = deleted
-            .iter()
-            .filter(|id| Self::mmap_contains_base(&base, **id))
-            .count();
-        mmap_count + overlay_new - mmap_deleted
+        self.doc_count.load(Ordering::Relaxed) as usize
     }
 
     /// Iterate over all document IDs and locations.
@@ -323,6 +336,7 @@ impl MmapPrimaryIndex {
             let mut base = self.base.write();
             base.mmap = None;
             base.entry_count = 0;
+            self.doc_count.store(0, Ordering::Relaxed);
             // Remove stale .pidx file
             let _ = fs::remove_file(&self.path);
             return Ok(());
@@ -366,6 +380,7 @@ impl MmapPrimaryIndex {
         self.overlay.write().clear();
         self.deleted.write().clear();
         self.dat_file_size.store(current_dat_size, Ordering::Release);
+        self.doc_count.store(entry_count, Ordering::Relaxed);
 
         Ok(())
     }
@@ -439,6 +454,7 @@ impl MmapPrimaryIndex {
             let ver = versions.get(&id).copied().unwrap_or(1);
             overlay.insert(id, (loc, ver));
         }
+        self.doc_count.store(primary.len() as u64, Ordering::Relaxed);
     }
 
     // ─── Internal ──────────────────────────────────────────────────
