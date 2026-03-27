@@ -1,0 +1,8 @@
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY tests/benchmark-1m/oxidb-server-linux /usr/local/bin/oxidb-server
+RUN mkdir -p /data
+ENV OXIDB_ADDR=0.0.0.0:4444
+ENV OXIDB_DATA=/data
+EXPOSE 4444
+CMD ["oxidb-server"]

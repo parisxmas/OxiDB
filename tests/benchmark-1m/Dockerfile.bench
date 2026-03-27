@@ -1,0 +1,4 @@
+FROM debian:bookworm-slim
+COPY tests/benchmark-1m/bench-linux /bench
+RUN chmod +x /bench
+CMD ["/bench"]
