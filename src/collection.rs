@@ -823,6 +823,32 @@ impl Collection {
         })
     }
 
+    /// Streaming scan with raw JSONB pre-filter. Only deserializes docs that match.
+    fn for_each_matching_streaming<F>(&self, query: &query::Query, mut f: F) -> Result<()>
+    where
+        F: FnMut(Value) -> Result<bool>,
+    {
+        self.storage.scan_readonly_while(|bytes| {
+            // Try raw JSONB match first — skip non-matching without deserialize
+            match query::matches_raw_jsonb(query, bytes) {
+                Some(false) => return Ok(true), // skip, no deserialize
+                Some(true) => {
+                    let doc = crate::codec::decode_doc(bytes)?;
+                    f(doc)
+                }
+                None => {
+                    // Legacy JSON — must deserialize
+                    let doc = crate::codec::decode_doc(bytes)?;
+                    if query::matches_value(query, &doc) {
+                        f(doc)
+                    } else {
+                        Ok(true)
+                    }
+                }
+            }
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Index management
     // -----------------------------------------------------------------------
@@ -1770,10 +1796,16 @@ impl Collection {
                     // Phase 3: batch pread sorted by offset
                     let batch = self.storage.read_batch_lockfree(&mut miss_locs)?;
 
-                    // Phase 4: decode and batch-populate cache
+                    // Phase 4: decode, raw-match filter, and batch-populate cache
                     let mut cache_entries: Vec<(u64, Arc<Value>)> =
                         Vec::with_capacity(batch.len());
                     for (i, bytes) in batch {
+                        // Skip non-matching docs early via raw JSONB match
+                        if !skip_post_filter {
+                            if let Some(false) = query::matches_raw_jsonb(&query, &bytes) {
+                                continue;
+                            }
+                        }
                         let doc = crate::codec::decode_doc(&bytes)?;
                         let arc = Arc::new(doc);
                         cache_entries.push((ids[i], Arc::clone(&arc)));
@@ -1888,15 +1920,30 @@ impl Collection {
                         Vec::with_capacity(batch.len());
 
                     for (i, bytes) in batch {
-                        let doc = crate::codec::decode_doc(&bytes)?;
-                        let arc = Arc::new(doc);
-                        cache_entries.push((ids[i], Arc::clone(&arc)));
-                        if query::matches_value(&query, &arc) {
+                        // Try raw JSONB match first (no deserialize)
+                        let matched = match query::matches_raw_jsonb(&query, &bytes) {
+                            Some(m) => m,
+                            None => {
+                                // Legacy JSON — must deserialize
+                                let doc = crate::codec::decode_doc(&bytes)?;
+                                let arc = Arc::new(doc);
+                                cache_entries.push((ids[i], Arc::clone(&arc)));
+                                if query::matches_value(&query, &arc) {
+                                    results.push(arc);
+                                }
+                                if let Some(limit) = early_limit {
+                                    if results.len() >= limit { break; }
+                                }
+                                continue;
+                            }
+                        };
+                        if matched {
+                            let doc = crate::codec::decode_doc(&bytes)?;
+                            let arc = Arc::new(doc);
+                            cache_entries.push((ids[i], Arc::clone(&arc)));
                             results.push(arc);
                             if let Some(limit) = early_limit {
-                                if results.len() >= limit {
-                                    break;
-                                }
+                                if results.len() >= limit { break; }
                             }
                         }
                     }

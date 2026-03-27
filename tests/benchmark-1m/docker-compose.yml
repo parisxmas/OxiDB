@@ -1,0 +1,47 @@
+services:
+  oxidb:
+    build:
+      context: ../..
+      dockerfile: tests/benchmark-1m/Dockerfile.oxidb
+    ports:
+      - "4444:4444"
+    tmpfs:
+      - /data
+    environment:
+      - OXIDB_ADDR=0.0.0.0:4444
+      - OXIDB_DATA=/data
+      - OXIDB_POOL_SIZE=8
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/4444' || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  mongodb:
+    image: mongo:8
+    ports:
+      - "27017:27017"
+    tmpfs:
+      - /data/db
+    command: ["mongod", "--storageEngine", "wiredTiger", "--wiredTigerCacheSizeGB", "1"]
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  bench:
+    build:
+      context: ../..
+      dockerfile: tests/benchmark-1m/Dockerfile.bench
+    depends_on:
+      oxidb:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    environment:
+      - OXIDB_HOST=oxidb
+      - OXIDB_PORT=4444
+      - MONGO_URI=mongodb://mongodb:27017
+      - DOC_COUNT=1000000
+      - BATCH_SIZE=5000
