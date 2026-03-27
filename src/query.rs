@@ -550,6 +550,71 @@ pub fn is_fully_indexed(
     }
 }
 
+/// Check if all query conditions can be checked per-doc via index containment.
+/// More restrictive than `is_fully_indexed` — only returns true for $eq/$in
+/// ops that `matches_doc_id_indexed` can handle.
+pub fn is_lazy_index_checkable(
+    query: &Query,
+    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
+) -> bool {
+    match query {
+        Query::All => true,
+        Query::Field { field, op } => {
+            if !field_indexes.contains_key(field.as_str()) {
+                return false;
+            }
+            matches!(op, QueryOp::Eq(_) | QueryOp::In(_))
+        }
+        Query::And(subs) => subs.iter().all(|s| is_lazy_index_checkable(s, field_indexes)),
+        Query::Or(subs) => subs.iter().all(|s| is_lazy_index_checkable(s, field_indexes)),
+    }
+}
+
+/// Check if a single doc_id matches a fully-indexed query using only index
+/// lookups (no doc loading). Returns `Some(true/false)` if the query can be
+/// resolved by indexes alone, or `None` if it cannot.
+/// This is O(log n) per field condition vs O(n) for materializing the full set.
+pub fn matches_doc_id_indexed(
+    query: &Query,
+    doc_id: DocumentId,
+    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
+) -> Option<bool> {
+    match query {
+        Query::All => Some(true),
+        Query::Field { field, op } => {
+            let idx = field_indexes.get(field.as_str())?;
+            match op {
+                QueryOp::Eq(val) => Some(idx.contains_doc_id(val, doc_id)),
+                QueryOp::In(vals) => {
+                    Some(vals.iter().any(|v| idx.contains_doc_id(v, doc_id)))
+                }
+                // For other ops we can't do a cheap single-doc check
+                _ => None,
+            }
+        }
+        Query::And(subs) => {
+            for sub in subs {
+                match matches_doc_id_indexed(sub, doc_id, field_indexes) {
+                    Some(true) => continue,
+                    Some(false) => return Some(false),
+                    None => return None,
+                }
+            }
+            Some(true)
+        }
+        Query::Or(subs) => {
+            for sub in subs {
+                match matches_doc_id_indexed(sub, doc_id, field_indexes) {
+                    Some(true) => return Some(true),
+                    Some(false) => continue,
+                    None => return None,
+                }
+            }
+            Some(false)
+        }
+    }
+}
+
 /// Count matching documents using only indexes (no BTreeSet allocation).
 /// Returns None if the query can't be counted by index alone.
 pub fn count_indexed(
