@@ -401,6 +401,7 @@ impl OxiDb {
         std::thread::Builder::new()
             .name("oxidb-sync".into())
             .spawn(move || {
+                let mut flush_counter = 0u64;
                 loop {
                     match rx.recv_timeout(interval) {
                         Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -411,17 +412,26 @@ impl OxiDb {
                                     let _ = col.sync_writes();
                                 }
                             }
+                            drop(cols);
+
+                            // Persist indexes every ~10s (1000 * 10ms interval)
+                            flush_counter += 1;
+                            if flush_counter % 1000 == 0 {
+                                db.flush_indexes();
+                            }
                         }
                         _ => break, // Shutdown signal or sender dropped
                     }
                 }
-                // Final flush on shutdown
+                // Final flush on shutdown: sync writes + persist indexes
                 let cols = db.collections.read();
                 for col_arc in cols.values() {
                     { let col = col_arc.read();
                         let _ = col.sync_writes();
                     }
                 }
+                drop(cols);
+                db.flush_indexes();
             })
             .expect("failed to spawn sync thread");
 

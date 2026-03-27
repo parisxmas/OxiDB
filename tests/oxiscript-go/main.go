@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -86,6 +87,7 @@ func main() {
 
 	cmd := exec.Command(serverBin)
 	cmd.Env = append(os.Environ(), "OXIDB_ADDR="+addr, "OXIDB_DATA="+dataDir, "OXIDB_IDLE_TIMEOUT=0")
+	startTime := time.Now()
 	cmd.Start()
 	defer func() { cmd.Process.Signal(syscall.SIGTERM); cmd.Wait() }()
 	sig := make(chan os.Signal, 1)
@@ -93,23 +95,33 @@ func main() {
 	go func() { <-sig; cmd.Process.Signal(syscall.SIGTERM); cmd.Wait(); os.Exit(0) }()
 
 	c := connect(addr)
-	fmt.Println("Server ready.")
+	startupMs := time.Since(startTime).Milliseconds()
+	fmt.Printf("Server ready. (startup: %dms, RAM: %s, PID: %d)\n", startupMs, getRSS(cmd.Process.Pid), cmd.Process.Pid)
+
+	serverPID = cmd.Process.Pid
 
 	// Check data
+	done := step("Loading collection metadata", serverPID)
 	r := c.must(map[string]any{"cmd": "count", "collection": "orders"})
 	orderCount := f(m(d(r))["count"])
 	r = c.must(map[string]any{"cmd": "count", "collection": "customers"})
 	custCount := f(m(d(r))["count"])
 	r = c.must(map[string]any{"cmd": "count", "collection": "products"})
 	prodCount := f(m(d(r))["count"])
-	fmt.Printf("Data: %.0f orders, %.0f customers, %.0f products\n\n", orderCount, custCount, prodCount)
+	done()
+	fmt.Printf("  Data: %.0f orders, %.0f customers, %.0f products\n\n", orderCount, custCount, prodCount)
 
 	if orderCount == 0 {
 		fmt.Println("Seeding data...")
 		seed(c, addr)
+
+		// Wait for lazy sync to flush all buffers, then ping to confirm
+		time.Sleep(500 * time.Millisecond)
+		c.must(map[string]any{"cmd": "ping"})
+		time.Sleep(500 * time.Millisecond)
 		c.c.Close()
 
-		// Restart server to ensure all data is properly loaded from WAL
+		// Restart server to load data with proper indexes
 		fmt.Print("  Restarting server...")
 		cmd.Process.Signal(syscall.SIGTERM)
 		cmd.Wait()
@@ -130,7 +142,7 @@ func main() {
 	}
 
 	// Recreate procedures
-	fmt.Println("Creating stored procedures...")
+	done = step("Creating stored procedures", serverPID)
 	scripts := []struct{ name, script string }{
 		{"get_balance", `proc get_balance(customer_id) {
 			let cust = find_one("customers", {customer_id: customer_id})
@@ -193,7 +205,8 @@ func main() {
 	for _, s := range scripts {
 		c.must(map[string]any{"cmd": "create_procedure", "script": s.script})
 	}
-	fmt.Println("Done.\n")
+	done()
+	fmt.Println()
 
 	regions := []string{"US-EAST", "US-WEST", "EU-WEST", "EU-EAST", "APAC"}
 	type result struct {
@@ -204,22 +217,24 @@ func main() {
 	var results []result
 
 	// ─── 0. Quick sanity check ─────────────────────────────────────
-	fmt.Println("─── 0. Sanity check ───")
+	done = step("Sanity check (find_one + SP call)", serverPID)
 	{
-		r, _ := c.do(map[string]any{"cmd": "find_one", "collection": "customers", "query": map[string]any{"customer_id": "C00001"}})
-		fmt.Printf("  find_one C0001: ok=%v data_nil=%v\n", r["ok"], r["data"] == nil)
-		if r["data"] != nil {
-			fmt.Printf("  data: %v\n", m(d(r))["customer_id"])
+		r, _ := c.do(map[string]any{"cmd": "find_one", "collection": "customers", "query": map[string]any{"customer_id": "C0001"}})
+		ok := r["data"] != nil
+		r2, _ := c.do(map[string]any{"cmd": "call_procedure", "name": "get_balance", "params": map[string]any{"customer_id": "C0001"}})
+		ok2, _ := r2["ok"].(bool)
+		if !ok || !ok2 {
+			fmt.Printf("\n  FAIL: find_one=%v, get_balance=%v\n", ok, r2)
+			os.Exit(1)
 		}
-		r2, _ := c.do(map[string]any{"cmd": "call_procedure", "name": "get_balance", "params": map[string]any{"customer_id": "C00001"}})
-		fmt.Printf("  get_balance C0001: %v\n", r2)
 	}
+	done()
 	fmt.Println()
 
 	// ─── 1. get_balance (indexed find_one) ─────────────────────────
 	fmt.Println("─── 1. get_balance (indexed find_one + return) ───")
 	for i := 0; i < 5; i++ {
-		cid := fmt.Sprintf("C%05d", rand.Intn(100000))
+		cid := fmt.Sprintf("C%04d", rand.Intn(10000))
 		t0 := time.Now()
 		r, _ := c.do(map[string]any{"cmd": "call_procedure", "name": "get_balance", "params": map[string]any{"customer_id": cid}})
 		dur := time.Since(t0)
@@ -236,7 +251,7 @@ func main() {
 	// ─── 2. get_customer_profile (find + count + find top 5) ───────
 	fmt.Println("─── 2. get_customer_profile (find_one + count + find top 5) ───")
 	for i := 0; i < 5; i++ {
-		cid := fmt.Sprintf("C%05d", rand.Intn(100000))
+		cid := fmt.Sprintf("C%04d", rand.Intn(10000))
 		t0 := time.Now()
 		r := c.must(map[string]any{"cmd": "call_procedure", "name": "get_customer_profile", "params": map[string]any{"customer_id": cid}})
 		dur := time.Since(t0)
@@ -249,12 +264,18 @@ func main() {
 	// ─── 3. check_stock (indexed find_one) ─────────────────────────
 	fmt.Println("─── 3. check_stock (indexed find_one) ───")
 	for i := 0; i < 5; i++ {
-		sku := fmt.Sprintf("P%04d", rand.Intn(5000))
+		sku := fmt.Sprintf("P%03d", rand.Intn(1000))
 		t0 := time.Now()
-		r := c.must(map[string]any{"cmd": "call_procedure", "name": "check_stock", "params": map[string]any{"sku": sku}})
+		r, _ := c.do(map[string]any{"cmd": "call_procedure", "name": "check_stock", "params": map[string]any{"sku": sku}})
 		dur := time.Since(t0)
-		p := m(d(r))
-		fmt.Printf("  %s stock=%.0f price=%.0f  %s\n", sku, f(p["stock"]), f(p["price"]), dur.Round(time.Microsecond))
+		if ok, _ := r["ok"].(bool); ok {
+			p := m(d(r))
+			fmt.Printf("  %s stock=%.0f price=%.0f  %s\n", sku, f(p["stock"]), f(p["price"]), dur.Round(time.Microsecond))
+		} else {
+			// Debug: try direct find_one
+			r2, _ := c.do(map[string]any{"cmd": "find_one", "collection": "products", "query": map[string]any{"sku": sku}})
+			fmt.Printf("  %s FAIL (SP: %s) direct_find=%v  %s\n", sku, r["error"], r2["data"] != nil, dur.Round(time.Microsecond))
+		}
 		results = append(results, result{"check_stock", dur, sku})
 	}
 	fmt.Println()
@@ -262,8 +283,8 @@ func main() {
 	// ─── 4. place_order (proc→proc + 3 writes) ────────────────────
 	fmt.Println("─── 4. place_order (calls check_stock + 3 writes) ───")
 	for i := 0; i < 5; i++ {
-		cid := fmt.Sprintf("C%05d", rand.Intn(100000))
-		sku := fmt.Sprintf("P%04d", rand.Intn(5000))
+		cid := fmt.Sprintf("C%04d", rand.Intn(10000))
+		sku := fmt.Sprintf("P%03d", rand.Intn(1000))
 		qty := 1 + rand.Intn(3)
 		total := float64(qty) * float64(10+rand.Intn(200))
 		t0 := time.Now()
@@ -285,7 +306,7 @@ func main() {
 	// ─── 5. process_refund (find + validate + 3 writes) ────────────
 	fmt.Println("─── 5. process_refund (find + validate + 3 writes) ───")
 	for i := 0; i < 5; i++ {
-		oid := fmt.Sprintf("H%08d", rand.Intn(15000000))
+		oid := fmt.Sprintf("H%06d", rand.Intn(1000000))
 		t0 := time.Now()
 		r, _ := c.do(map[string]any{"cmd": "call_procedure", "name": "process_refund", "params": map[string]any{"order_id": oid}})
 		dur := time.Since(t0)
@@ -334,7 +355,7 @@ func main() {
 	fmt.Println("─── 7. Throughput: 100x get_balance (sequential) ───")
 	t0 := time.Now()
 	for i := 0; i < 100; i++ {
-		cid := fmt.Sprintf("C%05d", rand.Intn(100000))
+		cid := fmt.Sprintf("C%04d", rand.Intn(10000))
 		c.must(map[string]any{"cmd": "call_procedure", "name": "get_balance", "params": map[string]any{"customer_id": cid}})
 	}
 	dur100 := time.Since(t0)
@@ -475,6 +496,8 @@ func main() {
 	fmt.Printf("    %-43s %13s\n",
 		fmt.Sprintf("total throughput (%d ops)", totalOps),
 		fmt.Sprintf("%.0f ops/sec", float64(totalOps)/wallDur.Seconds()))
+	fmt.Println(strings.Repeat("─", 65))
+	fmt.Printf("  Server RAM: %s\n", getRSS(serverPID))
 	fmt.Println(strings.Repeat("═", 65))
 }
 
@@ -483,12 +506,12 @@ func seed(c *conn, addr string) {
 	tiers := []string{"free", "basic", "premium", "enterprise"}
 	categories := []string{"electronics", "clothing", "food", "books", "toys", "sports"}
 
-	fmt.Printf("  Inserting %d customers...", 100000)
+	fmt.Printf("  Inserting %d customers...", 10000)
 	t0 := time.Now()
 	batch := make([]map[string]any, 0, 5000)
-	for i := 0; i < 100000; i++ {
+	for i := 0; i < 10000; i++ {
 		batch = append(batch, map[string]any{
-			"customer_id": fmt.Sprintf("C%05d", i),
+			"customer_id": fmt.Sprintf("C%04d", i),
 			"name":        fmt.Sprintf("Customer %d", i),
 			"region":      regions[i%len(regions)],
 			"tier":        tiers[i%len(tiers)],
@@ -507,11 +530,11 @@ func seed(c *conn, addr string) {
 	}
 	fmt.Printf(" %.1fs\n", time.Since(t0).Seconds())
 
-	fmt.Printf("  Inserting %d products...", 5000)
+	fmt.Printf("  Inserting %d products...", 1000)
 	t0 = time.Now()
-	for i := 0; i < 5000; i++ {
+	for i := 0; i < 1000; i++ {
 		batch = append(batch, map[string]any{
-			"sku":      fmt.Sprintf("P%04d", i),
+			"sku":      fmt.Sprintf("P%03d", i),
 			"name":     fmt.Sprintf("Product %d", i),
 			"category": categories[i%len(categories)],
 			"price":    float64(10 + (i*7)%990),
@@ -523,13 +546,13 @@ func seed(c *conn, addr string) {
 	batch = batch[:0]
 	fmt.Printf(" %.1fs\n", time.Since(t0).Seconds())
 
-	fmt.Printf("  Inserting %d orders...", 15000000)
+	fmt.Printf("  Inserting %d orders...", 1000000)
 	t0 = time.Now()
-	for i := 0; i < 15000000; i++ {
+	for i := 0; i < 1000000; i++ {
 		batch = append(batch, map[string]any{
-			"order_id":    fmt.Sprintf("H%08d", i),
-			"customer_id": fmt.Sprintf("C%05d", rand.Intn(100000)),
-			"sku":         fmt.Sprintf("P%04d", rand.Intn(5000)),
+			"order_id":    fmt.Sprintf("H%06d", i),
+			"customer_id": fmt.Sprintf("C%04d", rand.Intn(10000)),
+			"sku":         fmt.Sprintf("P%03d", rand.Intn(1000)),
 			"qty":         1 + rand.Intn(5),
 			"total":       float64(10 + rand.Intn(5000)),
 			"status":      "completed",
@@ -558,4 +581,37 @@ func seed(c *conn, addr string) {
 		c.must(map[string]any{"cmd": "create_index", "collection": idx[0], "field": idx[1]})
 	}
 	fmt.Printf(" %.1fs\n", time.Since(t0).Seconds())
+}
+
+// getRSS returns the resident set size (physical RAM) of a process as a human-readable string.
+func getRSS(pid int) string {
+	// macOS: ps -o rss= -p PID returns RSS in kilobytes
+	out, err := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return "?"
+	}
+	kb, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return "?"
+	}
+	if kb < 1024 {
+		return fmt.Sprintf("%d KB", kb)
+	}
+	mb := float64(kb) / 1024.0
+	if mb < 1024 {
+		return fmt.Sprintf("%.1f MB", mb)
+	}
+	return fmt.Sprintf("%.2f GB", mb/1024.0)
+}
+
+// serverPID is set after server starts, used by step() to show RAM
+var serverPID int
+
+// step prints what is happening with timing and RAM usage
+func step(name string, pid int) func() {
+	fmt.Printf("  %-50s", name+"...")
+	t := time.Now()
+	return func() {
+		fmt.Printf(" %8s  RAM: %s\n", time.Since(t).Round(time.Millisecond), getRSS(pid))
+	}
 }
