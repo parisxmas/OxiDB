@@ -74,13 +74,12 @@ pub struct Collection {
     data_dir: PathBuf,
     storage: StorageBackend,
     wal: WalBackend,
-    primary_index: HashMap<DocumentId, DocLocation>,
+    pidx: MmapPrimaryIndex,
     doc_cache: DocCache,
     field_indexes: HashMap<String, MmapFieldIndex>,
     composite_indexes: Vec<CompositeIndex>,
     text_index: Option<CollectionTextIndex>,
     vector_indexes: HashMap<String, VectorIndex>,
-    version_index: HashMap<DocumentId, u64>,
     next_id: DocumentId,
     encryption: Option<Arc<EncryptionKey>>,
     verbose: bool,
@@ -139,8 +138,13 @@ impl Collection {
         if self.in_memory {
             return;
         }
-        let doc_count = self.primary_index.len() as u64;
+        let doc_count = self.pidx.len() as u64;
         let next_id = self.next_id;
+
+        // Persist primary index (.pidx)
+        if let Err(e) = self.pidx.persist_with_dat_size(self.storage.file_size()) {
+            eprintln!("[warn] {}: failed to persist .pidx: {}", self.name, e);
+        }
 
         // Save field indexes (.fidx v2 — mmap-based)
         for idx in self.field_indexes.values_mut() {
@@ -269,9 +273,7 @@ impl Collection {
             ));
         }
 
-        let mut primary_index = HashMap::new();
         let doc_cache = DocCache::new(doc_cache::DEFAULT_CAPACITY);
-        let mut version_index = HashMap::new();
         let shard_id_offset = Self::shard_id_offset();
         let mut next_id: DocumentId = 1 + shard_id_offset;
 
@@ -279,31 +281,22 @@ impl Collection {
         let mut doc_count: u64 = 0;
         let mut loaded_from_pidx = false;
 
-        // Fast path: try loading primary_index + version_index from .pidx file.
+        // Fast path: try opening .pidx file directly as the MmapPrimaryIndex.
         // This avoids scanning and deserializing every record in the .dat file.
         let pidx_path = data_dir.join(format!("{}.pidx", name));
         let current_dat_size = storage.file_size();
+        let mut pidx: Option<MmapPrimaryIndex> = None;
 
         if pidx_path.exists() && text_index.is_none() {
             match MmapPrimaryIndex::open(&pidx_path) {
-                Ok(pidx) if pidx.has_mmap() && pidx.dat_file_size() <= current_dat_size => {
-                    // .pidx is valid and matches .dat — populate HashMaps from it
+                Ok(p) if p.has_mmap() && p.dat_file_size() <= current_dat_size => {
                     let pidx_start = std::time::Instant::now();
-                    let entries = pidx.iter_with_versions();
-                    primary_index.reserve(entries.len());
-                    version_index.reserve(entries.len());
-                    for (id, loc, version) in entries {
-                        primary_index.insert(id, loc);
-                        version_index.insert(id, version);
-                        if id >= next_id {
-                            next_id = id + 1;
-                        }
-                    }
-                    doc_count = primary_index.len() as u64;
+                    next_id = p.next_id().max(next_id);
+                    doc_count = p.len() as u64;
                     loaded_from_pidx = true;
 
                     // Scan new records appended after .pidx was saved
-                    let pidx_dat_size = pidx.dat_file_size();
+                    let pidx_dat_size = p.dat_file_size();
                     if pidx_dat_size < current_dat_size {
                         storage.scan_segment_readonly_while(pidx_dat_size, current_dat_size, |bytes| {
                             let doc: Value = crate::codec::decode_doc(bytes)?;
@@ -313,8 +306,7 @@ impl Collection {
                                     length: bytes.len() as u32,
                                 };
                                 let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
-                                primary_index.insert(id, loc);
-                                version_index.insert(id, ver);
+                                p.insert(id, loc, ver);
                                 if id >= next_id { next_id = id + 1; }
                                 doc_count += 1;
                             }
@@ -330,6 +322,7 @@ impl Collection {
                             pidx_start.elapsed().as_secs_f64(),
                         ));
                     }
+                    pidx = Some(p);
                 }
                 _ => {
                     // .pidx invalid or dat size mismatch — fall through to .dat scan
@@ -343,21 +336,24 @@ impl Collection {
             }
         }
 
-        // Phase 1 (slow path): Scan .dat for primary_index, version_index, next_id.
+        // Phase 1 (slow path): Scan .dat into temp HashMaps, then build pidx.
         // Only needed when .pidx was not available or invalid.
+        // We need temp HashMaps because we later pass them to WAL recovery.
+        let mut primary_index_tmp = HashMap::new();
+        let mut version_index_tmp = HashMap::new();
         if !loaded_from_pidx {
             // Clone callback for use inside the closure
             let inner_cb = log_callback.clone();
 
-            // Also rebuild text index (always from docs — not cached).
+            // Also rebuild text index (always from docs -- not cached).
             // Field/composite indexes are NOT rebuilt here; we try the cache first.
-            // Documents are NOT cached — the LRU cache is populated on demand.
+            // Documents are NOT cached -- the LRU cache is populated on demand.
             storage.for_each_active(|loc, bytes| {
                 let doc: Value = crate::codec::decode_doc(&bytes)?;
                 if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                    primary_index.insert(id, loc);
+                    primary_index_tmp.insert(id, loc);
                     let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                    version_index.insert(id, ver);
+                    version_index_tmp.insert(id, ver);
                     if id >= next_id {
                         next_id = id + 1;
                     }
@@ -569,19 +565,74 @@ impl Collection {
             }
         }
 
-        // Phase 3: WAL recovery (updates indexes and LRU cache too)
+        // Phase 3: WAL recovery (updates indexes and LRU cache too).
+        // WAL recover expects &mut HashMap references, so if we loaded from pidx,
+        // we dump its entries into temp maps, run recovery, then merge back.
+        if loaded_from_pidx {
+            // Dump current pidx state into temp maps for WAL recovery
+            let p = pidx.as_ref().unwrap();
+            for (id, loc, ver) in p.iter_with_versions() {
+                primary_index_tmp.insert(id, loc);
+                version_index_tmp.insert(id, ver);
+            }
+        }
+
         wal.recover(
             &storage,
-            &mut primary_index,
+            &mut primary_index_tmp,
             &doc_cache,
             &mut next_id,
             committed_tx_ids,
-            &mut version_index,
+            &mut version_index_tmp,
             &mut field_indexes,
             &mut composite_indexes,
             verbose,
             &log_callback,
         )?;
+
+        // Build the final pidx from recovery results
+        if loaded_from_pidx {
+            // WAL recovery may have added/removed entries — reset pidx from maps
+            let p = pidx.as_ref().unwrap();
+            p.reset_from_maps(&primary_index_tmp, &version_index_tmp);
+        } else if !primary_index_tmp.is_empty() {
+            // Slow path: build pidx from scanned HashMaps
+            let dat_size = storage.file_size();
+            match MmapPrimaryIndex::rebuild_from_maps(
+                &pidx_path,
+                &primary_index_tmp,
+                &version_index_tmp,
+                next_id,
+                dat_size,
+            ) {
+                Ok(p) => {
+                    if verbose {
+                        let msg = format!(
+                            "[verbose] {}: persisted .pidx ({} entries) for fast restart",
+                            name,
+                            primary_index_tmp.len(),
+                        );
+                        vlog(&msg);
+                    }
+                    pidx = Some(p);
+                }
+                Err(e) => {
+                    eprintln!("[warn] {}: failed to persist .pidx: {}", name, e);
+                    // Fall back to in-memory pidx populated from maps
+                    let p = MmapPrimaryIndex::new_in_memory();
+                    for (&id, &loc) in &primary_index_tmp {
+                        let ver = version_index_tmp.get(&id).copied().unwrap_or(1);
+                        p.insert(id, loc, ver);
+                    }
+                    pidx = Some(p);
+                }
+            }
+        }
+
+        // Ensure we have a pidx (may be empty if collection is empty)
+        let final_pidx = pidx.unwrap_or_else(|| {
+            MmapPrimaryIndex::open(&pidx_path).unwrap_or_else(|_| MmapPrimaryIndex::new_in_memory())
+        });
 
         if verbose {
             vlog(&format!("[verbose] {}: collection ready", name));
@@ -592,13 +643,12 @@ impl Collection {
             data_dir: data_dir.to_path_buf(),
             storage,
             wal,
-            primary_index,
+            pidx: final_pidx,
             doc_cache,
             field_indexes,
             composite_indexes,
             text_index,
             vector_indexes,
-            version_index,
             next_id,
             encryption,
             verbose,
@@ -613,28 +663,6 @@ impl Collection {
             collection.save_index_data();
         }
 
-        // Persist .pidx so next startup can skip the .dat scan.
-        // Only needed when we did the slow .dat scan this time.
-        if !loaded_from_pidx && !collection.primary_index.is_empty() {
-            let dat_size = collection.storage.file_size();
-            if let Err(e) = MmapPrimaryIndex::rebuild_from_maps(
-                &pidx_path,
-                &collection.primary_index,
-                &collection.version_index,
-                collection.next_id,
-                dat_size,
-            ) {
-                eprintln!("[warn] {}: failed to persist .pidx: {}", name, e);
-            } else if verbose {
-                let msg = format!(
-                    "[verbose] {}: persisted .pidx ({} entries) for fast restart",
-                    name,
-                    collection.primary_index.len(),
-                );
-                collection.vlog(&msg);
-            }
-        }
-
         Ok(collection)
     }
 
@@ -645,13 +673,12 @@ impl Collection {
             data_dir: PathBuf::new(),
             storage: StorageBackend::Memory(InMemStorage::new()),
             wal: WalBackend::Memory,
-            primary_index: HashMap::new(),
+            pidx: MmapPrimaryIndex::new_in_memory(),
             doc_cache: DocCache::new(doc_cache::DEFAULT_CAPACITY),
             field_indexes: HashMap::new(),
             composite_indexes: Vec::new(),
             text_index: None,
             vector_indexes: HashMap::new(),
-            version_index: HashMap::new(),
             next_id: 1 + Self::shard_id_offset(),
             encryption: None,
             verbose: false,
@@ -730,8 +757,8 @@ impl Collection {
             return Some(arc);
         }
         // Slow path: lockfree pread from storage, decode, populate cache
-        let loc = self.primary_index.get(&id)?;
-        let bytes = self.storage.read_lockfree(*loc).ok()?;
+        let loc = self.pidx.get_location(id)?;
+        let bytes = self.storage.read_lockfree(loc).ok()?;
         let doc = crate::codec::decode_doc(&bytes).ok()?;
         let arc = Arc::new(doc);
         self.doc_cache.put(id, Arc::clone(&arc));
@@ -754,7 +781,7 @@ impl Collection {
     where
         F: FnMut(DocumentId, Value) -> Result<()>,
     {
-        for (&id, &loc) in &self.primary_index {
+        for (id, loc) in self.pidx.iter() {
             let bytes = self.storage.read(loc)?;
             let doc = crate::codec::decode_doc(&bytes)?;
             f(id, doc)?;
@@ -769,7 +796,7 @@ impl Collection {
     where
         F: FnMut(DocumentId, &Arc<Value>) -> Result<bool>,
     {
-        for (&id, &loc) in &self.primary_index {
+        for (id, loc) in self.pidx.iter() {
             let bytes = self.storage.read(loc)?;
             let doc = crate::codec::decode_doc(&bytes)?;
             let arc = Arc::new(doc);
@@ -808,7 +835,7 @@ impl Collection {
             return Ok(());
         }
 
-        let total = self.primary_index.len();
+        let total = self.pidx.len();
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: creating index on '{}' ({} docs to scan)",
@@ -874,7 +901,7 @@ impl Collection {
             return Ok(());
         }
 
-        let total = self.primary_index.len();
+        let total = self.pidx.len();
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: creating unique index on '{}' ({} docs to scan)",
@@ -960,7 +987,7 @@ impl Collection {
             return Ok(name);
         }
 
-        let total = self.primary_index.len();
+        let total = self.pidx.len();
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: creating composite index '{}' ({} docs to scan)",
@@ -1011,7 +1038,7 @@ impl Collection {
             return Ok(());
         }
 
-        let total = self.primary_index.len();
+        let total = self.pidx.len();
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: creating text index on {:?} ({} docs to scan)",
@@ -1155,7 +1182,7 @@ impl Collection {
             return Ok(());
         }
 
-        let total = self.primary_index.len();
+        let total = self.pidx.len();
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: creating vector index on '{}' (dim={}, metric={}, {} docs to scan)",
@@ -1295,8 +1322,7 @@ impl Collection {
             self.wal.checkpoint_no_sync()?;
         }
 
-        self.primary_index.insert(id, loc);
-        self.version_index.insert(id, 1);
+        self.pidx.insert(id, loc, 1);
 
         let data_arc = Arc::new(data);
 
@@ -1408,8 +1434,7 @@ impl Collection {
             || !self.vector_indexes.is_empty();
 
         for ((id, data, _bytes), (_, loc)) in prepared.into_iter().zip(locs.iter()) {
-            self.primary_index.insert(id, *loc);
-            self.version_index.insert(id, 1);
+            self.pidx.insert(id, *loc, 1);
             if has_indexes || !skip_cache {
                 let data_arc = Arc::new(data);
                 for idx in self.field_indexes.values_mut() {
@@ -1472,8 +1497,7 @@ impl Collection {
         // Update in-memory indexes
         let mut ids = Vec::with_capacity(prepared.len());
         for ((id, data, _bytes), loc) in prepared.into_iter().zip(batch_locs) {
-            self.primary_index.insert(id, loc);
-            self.version_index.insert(id, 1);
+            self.pidx.insert(id, loc, 1);
             let data_arc = Arc::new(data);
             for idx in self.field_indexes.values_mut() {
                 idx.insert_value(id, &data_arc);
@@ -1736,7 +1760,7 @@ impl Collection {
                 let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = Vec::new();
                 for (i, opt) in all_docs.iter().enumerate() {
                     if opt.is_none() {
-                        if let Some(&loc) = self.primary_index.get(&ids[i]) {
+                        if let Some(loc) = self.pidx.get_location(ids[i]) {
                             miss_locs.push((i, loc));
                         }
                     }
@@ -1785,7 +1809,7 @@ impl Collection {
             // No index — iterate all documents via parallel cache-first path.
             // Probes LRU cache first (zero-cost for warm cache), falls
             // back to disk + decompress only for cache misses.
-            let ids: Vec<DocumentId> = self.primary_index.keys().copied().collect();
+            let ids: Vec<DocumentId> = self.pidx.iter_ids();
             let cached = self.doc_cache.get_many(&ids);
 
             let num_threads = std::thread::available_parallelism()
@@ -1854,7 +1878,7 @@ impl Collection {
                 let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = miss_indices
                     .iter()
                     .filter_map(|&i| {
-                        self.primary_index.get(&ids[i]).map(|&loc| (i, loc))
+                        self.pidx.get_location(ids[i]).map(|loc| (i, loc))
                     })
                     .collect();
 
@@ -1958,7 +1982,7 @@ impl Collection {
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
-                if self.primary_index.contains_key(&id) {
+                if self.pidx.contains(id) {
                     if let Some(data) = self.read_doc(id)? {
                         if skip_post_filter || query::matches_value(&query, &data) {
                             return Ok(Some(data));
@@ -1990,7 +2014,7 @@ impl Collection {
         if file_size == 0 || num_threads <= 1 {
             return vec![(0, file_size)];
         }
-        let mut offsets: Vec<u64> = self.primary_index.values().map(|loc| loc.offset).collect();
+        let mut offsets: Vec<u64> = self.pidx.iter_offsets();
         offsets.sort_unstable();
         let n = offsets.len();
         let mut boundaries = Vec::with_capacity(num_threads + 1);
@@ -2020,7 +2044,7 @@ impl Collection {
         accumulators: &[(String, crate::pipeline::Accumulator)],
     ) -> Result<Vec<Value>> {
         let use_raw = crate::pipeline::is_raw_eligible(group_key, accumulators);
-        let doc_count = self.primary_index.len();
+        let doc_count = self.pidx.len();
 
         // ── Parallel path: large collection + raw-eligible ───────────────
         // Decide whether to use parallel full scan even for $match queries
@@ -2165,7 +2189,7 @@ impl Collection {
                             Vec::new();
                         for (i, opt) in cached.iter().enumerate() {
                             if opt.is_none() {
-                                if let Some(&loc) = self.primary_index.get(&id_vec[i]) {
+                                if let Some(loc) = self.pidx.get_location(id_vec[i]) {
                                     miss_locs.push((i, loc));
                                 }
                             }
@@ -2256,7 +2280,7 @@ impl Collection {
         let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = Vec::new();
         for (i, opt) in cached.iter().enumerate() {
             if opt.is_none() {
-                if let Some(&loc) = self.primary_index.get(&id_vec[i]) {
+                if let Some(loc) = self.pidx.get_location(id_vec[i]) {
                     miss_locs.push((i, loc));
                 }
             }
@@ -2299,7 +2323,7 @@ impl Collection {
 
     /// Get a document by its _id directly.
     pub fn get(&self, id: DocumentId) -> Result<Option<Value>> {
-        if self.primary_index.contains_key(&id) {
+        if self.pidx.contains(id) {
             self.read_doc(id)
         } else {
             Ok(None)
@@ -2328,7 +2352,7 @@ impl Collection {
         // Try lazy index path first for limited updates
         let mut lazy_handled = false;
         if limit.is_some() {
-            let primary_index = &self.primary_index;
+            let pidx = &self.pidx;
             let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
             let lim = limit.unwrap();
             let lazy_result = query::execute_indexed_lazy(
@@ -2337,7 +2361,7 @@ impl Collection {
                 &mut |id| {
                     if let Some(arc) = self.load_doc_arc(id) {
                         if skip_post_filter || query::matches_value(&query, &arc) {
-                            if let Some(&old_loc) = primary_index.get(&id) {
+                            if let Some(old_loc) = pidx.get_location(id) {
                                 matches.push((id, (*arc).clone(), old_loc));
                                 if matches.len() >= lim {
                                     return false;
@@ -2362,7 +2386,7 @@ impl Collection {
 
             if let Some(ref indexed_ids) = candidate_ids {
                 for &id in indexed_ids {
-                    if let Some(&old_loc) = self.primary_index.get(&id) {
+                    if let Some(old_loc) = self.pidx.get_location(id) {
                         if let Some(data) = self.read_doc(id)? {
                             if query::matches_value(&query, &data) {
                                 matches.push((id, data, old_loc));
@@ -2375,7 +2399,7 @@ impl Collection {
                 // No index — iterate doc store (zero-copy: clone only matches)
                 self.for_each_doc_arc_while(|id, arc| {
                     if query::matches_value(&query, arc) {
-                        if let Some(&old_loc) = self.primary_index.get(&id) {
+                        if let Some(old_loc) = self.pidx.get_location(id) {
                             matches.push((id, (**arc).clone(), old_loc));
                             if limit.is_some_and(|l| matches.len() >= l) { return Ok(false); }
                         }
@@ -2452,9 +2476,8 @@ impl Collection {
         let mut updated_ids = Vec::with_capacity(ops.len());
         for (op, new_loc) in ops.into_iter().zip(new_locs) {
             updated_ids.push(op.id);
-            self.primary_index.insert(op.id, new_loc);
             let new_version = op.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
-            self.version_index.insert(op.id, new_version);
+            self.pidx.update_location(op.id, new_loc, new_version);
             for idx in self.field_indexes.values_mut() {
                 idx.remove_value(op.id, &op.old_data);
                 idx.insert_value(op.id, &op.new_data);
@@ -2492,7 +2515,7 @@ impl Collection {
         // Try lazy index path first for limited deletes
         let mut lazy_handled = false;
         if limit.is_some() {
-            let primary_index = &self.primary_index;
+            let pidx = &self.pidx;
             let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
             let lim = limit.unwrap();
             let lazy_result = query::execute_indexed_lazy(
@@ -2501,7 +2524,7 @@ impl Collection {
                 &mut |id| {
                     if let Some(arc) = self.load_doc_arc(id) {
                         if skip_post_filter || query::matches_value(&query, &arc) {
-                            if let Some(&loc) = primary_index.get(&id) {
+                            if let Some(loc) = pidx.get_location(id) {
                                 ops.push(DeleteOp { id, loc, data: (*arc).clone() });
                                 if ops.len() >= lim {
                                     return false;
@@ -2526,7 +2549,7 @@ impl Collection {
 
             if let Some(ref indexed_ids) = candidate_ids {
                 for &id in indexed_ids {
-                    if let Some(&loc) = self.primary_index.get(&id) {
+                    if let Some(loc) = self.pidx.get_location(id) {
                         if let Some(data) = self.read_doc(id)? {
                             if query::matches_value(&query, &data) {
                                 ops.push(DeleteOp { id, loc, data });
@@ -2539,7 +2562,7 @@ impl Collection {
                 // No index — iterate doc store (zero-copy: clone only matches)
                 self.for_each_doc_arc_while(|id, arc| {
                     if query::matches_value(&query, arc) {
-                        if let Some(&loc) = self.primary_index.get(&id) {
+                        if let Some(loc) = self.pidx.get_location(id) {
                             ops.push(DeleteOp { id, loc, data: (**arc).clone() });
                             if limit.is_some_and(|l| ops.len() >= l) { return Ok(false); }
                         }
@@ -2576,8 +2599,7 @@ impl Collection {
         let mut deleted_ids = Vec::with_capacity(ops.len());
         for op in ops {
             deleted_ids.push(op.id);
-            self.primary_index.remove(&op.id);
-            self.version_index.remove(&op.id);
+            self.pidx.remove(op.id);
             self.doc_cache.remove(op.id);
             for idx in self.field_indexes.values_mut() {
                 idx.remove_value(op.id, &op.data);
@@ -2598,7 +2620,7 @@ impl Collection {
 
     /// Returns the number of documents in the collection.
     pub fn count(&self) -> usize {
-        self.primary_index.len()
+        self.pidx.len()
     }
 
     /// Count documents matching a query without building a Vec<Value>.
@@ -2627,7 +2649,7 @@ impl Collection {
             // For large candidate sets (>50% of collection), use sequential scan
             // with BufReader (one file handle, no mutex contention) + raw JSONB
             // field extraction when records are in JSONB binary format.
-            if indexed_ids.len() > self.primary_index.len() / 2 {
+            if indexed_ids.len() > self.pidx.len() / 2 {
                 return self.count_with_scan(&query);
             }
             // Small candidate set — random access via LRU cache + storage fallback
@@ -2681,7 +2703,8 @@ impl Collection {
         if self.in_memory {
             let active_records = self.storage.iter_active()?;
             let new_mem = InMemStorage::new();
-            let mut new_primary_index = HashMap::new();
+            let mut new_primary = HashMap::new();
+            let mut new_versions = HashMap::new();
             let mut next_id: DocumentId = 1;
 
             for (_old_loc, bytes) in &active_records {
@@ -2689,33 +2712,32 @@ impl Collection {
                 let id = doc.get("_id").and_then(|v| v.as_u64()).ok_or_else(|| {
                     Error::InvalidQuery("document missing _id during compaction".into())
                 })?;
+                let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                 let new_bytes = crate::codec::encode_doc(&doc)?;
                 let loc = new_mem.append(&new_bytes)?;
-                new_primary_index.insert(id, loc);
+                new_primary.insert(id, loc);
+                new_versions.insert(id, ver);
                 if id >= next_id {
                     next_id = id + 1;
                 }
             }
 
-            let docs_kept = new_primary_index.len();
+            let docs_kept = new_primary.len();
             let new_size = new_mem.file_size();
 
             self.storage = StorageBackend::Memory(new_mem);
-            self.primary_index = new_primary_index;
+            self.pidx.reset_from_maps(&new_primary, &new_versions);
             self.next_id = next_id;
 
-            // Fall through to index rebuild below
-            self.version_index.clear();
+            // Rebuild field/composite/text/vector indexes; clear LRU cache
             self.doc_cache.clear();
             for idx in self.field_indexes.values_mut() { idx.clear(); }
             for idx in &mut self.composite_indexes { idx.clear(); }
             if let Some(ref mut text_idx) = self.text_index { text_idx.clear(); }
             for idx in self.vector_indexes.values_mut() { idx.clear(); }
-            for (&id, &loc) in &self.primary_index.clone() {
+            for (id, loc) in self.pidx.iter() {
                 let bytes = self.storage.read(loc)?;
                 let data: Value = crate::codec::decode_doc(&bytes)?;
-                let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                self.version_index.insert(id, ver);
                 let data_arc = Arc::new(data);
                 for idx in self.field_indexes.values_mut() { idx.insert_value(id, &data_arc); }
                 for idx in &mut self.composite_indexes { idx.insert_value(id, &data_arc); }
@@ -2733,7 +2755,8 @@ impl Collection {
 
         // Copy active records to new file
         let active_records = self.storage.iter_active()?;
-        let mut new_primary_index = HashMap::new();
+        let mut new_primary = HashMap::new();
+        let mut new_versions = HashMap::new();
         let mut next_id: DocumentId = 1;
 
         for (_old_loc, bytes) in &active_records {
@@ -2741,31 +2764,32 @@ impl Collection {
             let id = doc.get("_id").and_then(|v| v.as_u64()).ok_or_else(|| {
                 Error::InvalidQuery("document missing _id during compaction".into())
             })?;
+            let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
 
             // Re-encode as JSONB (converts legacy JSON records on compact)
             let new_bytes = crate::codec::encode_doc(&doc)?;
             let loc = new_storage.append_no_sync(&new_bytes)?;
-            new_primary_index.insert(id, loc);
+            new_primary.insert(id, loc);
+            new_versions.insert(id, ver);
             if id >= next_id {
                 next_id = id + 1;
             }
         }
         new_storage.sync()?;
 
-        let docs_kept = new_primary_index.len();
+        let docs_kept = new_primary.len();
         let new_size = new_storage.file_size();
 
-        // Atomic swap: rename tmp → original
+        // Atomic swap: rename tmp -> original
         let dat_path = self.data_dir.join(format!("{}.dat", self.name));
         std::fs::rename(&tmp_path, &dat_path)?;
 
         // Replace storage with new instance pointing to the renamed file
         self.storage = StorageBackend::File(Storage::open_with_encryption(&dat_path, self.encryption.clone())?);
-        self.primary_index = new_primary_index;
+        self.pidx.reset_from_maps(&new_primary, &new_versions);
         self.next_id = next_id;
 
-        // Rebuild all indexes and version_index; clear LRU cache
-        self.version_index.clear();
+        // Rebuild all indexes; clear LRU cache
         self.doc_cache.clear();
         for idx in self.field_indexes.values_mut() {
             idx.clear();
@@ -2779,11 +2803,9 @@ impl Collection {
         for idx in self.vector_indexes.values_mut() {
             idx.clear();
         }
-        for (&id, &loc) in &self.primary_index.clone() {
+        for (id, loc) in self.pidx.iter() {
             let bytes = self.storage.read(loc)?;
             let data: Value = crate::codec::decode_doc(&bytes)?;
-            let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-            self.version_index.insert(id, ver);
             let data_arc = Arc::new(data);
             for idx in self.field_indexes.values_mut() {
                 idx.insert_value(id, &data_arc);
@@ -2875,7 +2897,8 @@ impl Collection {
 
         // Delete each expired document
         for doc_id in &expired_ids {
-            if let Some(loc) = self.primary_index.remove(doc_id) {
+            if let Some(loc) = self.pidx.get_location(*doc_id) {
+                self.pidx.remove(*doc_id);
                 let _ = self.storage.mark_deleted_no_sync(loc);
 
                 // Remove from indexes
@@ -2890,7 +2913,6 @@ impl Collection {
                     }
                 }
             }
-            self.version_index.remove(doc_id);
             self.doc_cache.remove(*doc_id);
         }
 
@@ -2917,7 +2939,7 @@ impl Collection {
 
     /// Get the current version of a document (0 if not found).
     pub fn get_version(&self, doc_id: DocumentId) -> u64 {
-        self.version_index.get(&doc_id).copied().unwrap_or(0)
+        self.pidx.get_version(doc_id)
     }
 
     /// Log a batch of WAL entries (used by the engine during transactional commit).
@@ -3021,7 +3043,7 @@ impl Collection {
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
-                if let Some(&old_loc) = self.primary_index.get(&id) {
+                if let Some(old_loc) = self.pidx.get_location(id) {
                     if let Some(data) = self.read_doc(id)? {
                         process_candidate(id, &data, old_loc)?;
                     }
@@ -3031,7 +3053,7 @@ impl Collection {
             // Collect snapshot from doc store then process
             let mut snapshot: Vec<(DocumentId, Value, DocLocation)> = Vec::new();
             self.for_each_doc(|id, data| {
-                if let Some(&loc) = self.primary_index.get(&id) {
+                if let Some(loc) = self.pidx.get_location(id) {
                     snapshot.push((id, data, loc));
                 }
                 Ok(())
@@ -3078,7 +3100,7 @@ impl Collection {
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
-                if let Some(&loc) = self.primary_index.get(&id) {
+                if let Some(loc) = self.pidx.get_location(id) {
                     if let Some(data) = self.read_doc(id)? {
                         process_candidate(id, &data, loc)?;
                     }
@@ -3088,7 +3110,7 @@ impl Collection {
             // Collect snapshot from doc store then process
             let mut snapshot: Vec<(DocumentId, Value, DocLocation)> = Vec::new();
             self.for_each_doc(|id, data| {
-                if let Some(&loc) = self.primary_index.get(&id) {
+                if let Some(loc) = self.pidx.get_location(id) {
                     snapshot.push((id, data, loc));
                 }
                 Ok(())
@@ -3131,8 +3153,7 @@ impl Collection {
         // Update in-memory indexes, doc_cache, and doc store
         for (i, m) in mutations.iter().enumerate() {
             if m.is_delete {
-                self.primary_index.remove(&m.doc_id);
-                self.version_index.remove(&m.doc_id);
+                self.pidx.remove(m.doc_id);
                 self.doc_cache.remove(m.doc_id);
                 if let Some(ref old_data) = m.old_data {
                     for idx in self.field_indexes.values_mut() {
@@ -3149,9 +3170,8 @@ impl Collection {
                     idx.remove(m.doc_id);
                 }
             } else if let Some(loc) = new_locs[i] {
-                self.primary_index.insert(m.doc_id, loc);
                 let ver = m.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
-                self.version_index.insert(m.doc_id, ver);
+                self.pidx.insert(m.doc_id, loc, ver);
                 if let Some(ref old_data) = m.old_data {
                     for idx in self.field_indexes.values_mut() {
                         idx.remove_value(m.doc_id, old_data);
