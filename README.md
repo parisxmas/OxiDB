@@ -81,7 +81,7 @@ docker compose up -d
 - **Aggregation pipeline** — 11 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`, `$out`; index-accelerated `$group` for count, sum, min, max, avg
 - **Indexes** — field, unique, composite, full-text, and vector indexes with automatic backfill; list and drop support
 - **Vector search** — k-nearest-neighbor similarity search with cosine, Euclidean, and dot product metrics; flat (exact) for small collections, HNSW (approximate) for large; zero external dependencies
-- **Persistent index cache** — index data (BTreeMap contents) persisted to binary `.fidx`/`.cidx`/`.vidx` files; on restart, indexes load from cache in seconds instead of rebuilding from documents (16M docs: ~3s vs ~30min)
+- **Memory-mapped indexes** — primary index (`.pidx`) and field indexes (`.fidx2`) use mmap for zero-startup-cost loading; OS pages in data on demand, no RAM preloading; 1M docs startup in <1s with 6 MB RAM
 - **Zero-copy reads** — `find_one`, `update`, and `delete` use Arc-based document iteration, cloning only matching documents instead of every visited document
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
 - **S3-compatible API** — full HTTP REST API with path-style requests, multipart upload, range reads, object tagging, copy, conditional requests, SSE-S3/SSE-C encryption; compatible with AWS CLI and boto3
@@ -96,11 +96,12 @@ docker compose up -d
 - **Crash-safe** — write-ahead log with CRC32 checksums, verified by SIGKILL recovery tests
 - **Encryption at rest** — AES-256-GCM with per-record nonces
 - **Security** — TLS transport, SCRAM-SHA-256 authentication, role-based access control (Admin/ReadWrite/Read), audit logging
-- **Stored procedures** — JSON-defined multi-step procedures with control flow (`if`/`else`, `abort`, `return`), variable binding, and automatic transaction wrapping
+- **OxiScript** — lightweight stored procedure language; `proc transfer(from, to, amount) { ... }` compiles to JSON steps; supports if/else, variable binding, field access, all DB operations, and procedure-calling-procedure
+- **Stored procedures** — JSON-defined or OxiScript multi-step procedures with control flow (`if`/`else`, `abort`, `return`), variable binding, and automatic transaction wrapping
 - **Cron scheduler** — built-in background scheduler that runs stored procedures on cron expressions (`"0 3 * * *"`) or fixed intervals (`"30s"`, `"5m"`, `"2h"`), with run history tracking
 - **GELF logging** — centralized UDP logging to Graylog/Loki via `OXIDB_GELF_ADDR`
 - **Compaction** — reclaim space from deleted documents with atomic file swap
-- **Thread-safe** — `RwLock` per collection, concurrent readers never block
+- **Stripe-level locking** — 16 internal stripes per collection; concurrent writes to different documents don't contend; parallel index building with rayon uses all CPU cores
 - **CLI tool** — interactive shell with JSON-based syntax, embedded and client modes
 - **Multi-language clients** — Python, Go, Java/Spring Boot, Julia, .NET, Swift/iOS — all zero or minimal dependencies
 

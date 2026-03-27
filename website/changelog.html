@@ -45,12 +45,63 @@
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.21.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.21.0</h3>
+        <span class="version-date">2026-03-27</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>OxiScript stored procedure language</strong> -- Lightweight scripting language that compiles to JSON steps. Supports <code>proc</code> declarations, <code>let</code> variable binding, <code>if</code>/<code>else</code>, <code>return</code>, <code>abort</code>, field access with dot notation, all DB operations (<code>find</code>, <code>insert</code>, <code>update</code>, <code>delete</code>, <code>count</code>, <code>aggregate</code>), MongoDB operators (<code>$set</code>, <code>$inc</code>, etc.), and procedure-calling-procedure as regular function calls. Create via <code>{"cmd": "create_procedure", "script": "proc foo() { ... }"}</code> or compile without saving via <code>compile_oxiscript</code>.
+          </li>
+          <li>
+            <strong>Memory-mapped indexes</strong> -- Primary index (<code>.pidx</code>) and field indexes (<code>.fidx2</code>) use <code>mmap</code> for zero-startup-cost loading. OS pages in data on demand. 1M documents: startup &lt;1s, 6 MB RAM. New writes go to in-memory overlay, periodically persisted.
+          </li>
+          <li>
+            <strong>Stripe-level locking</strong> -- Collections use 16 internal stripes instead of a single RwLock. Concurrent writes to different documents no longer contend on the same lock. Enables true parallel write throughput.
+          </li>
+          <li>
+            <strong>Parallel index building</strong> -- <code>create_index</code> uses rayon to scan storage segments in parallel across all CPU cores. Each thread builds a local index, results are merged. Falls back to single-threaded for small collections.
+          </li>
+          <li>
+            <strong>Graceful shutdown index persistence</strong> -- Server sync thread now persists <code>.pidx</code> and <code>.fidx2</code> files on shutdown and every ~10 seconds, preventing data loss on restart.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Changed</h4>
+        <ul>
+          <li>
+            <strong>Procedure engine arithmetic evaluation</strong> -- Variable resolution now evaluates simple arithmetic expressions (<code>$multiply</code>, <code>$add</code>, <code>$subtract</code>, <code>$divide</code>) at runtime, enabling <code>-amount</code> in <code>$inc</code> updates within stored procedures.
+          </li>
+          <li>
+            <strong>Collection struct refactor</strong> -- Replaced in-memory <code>HashMap&lt;DocumentId, DocLocation&gt;</code> and <code>HashMap&lt;DocumentId, u64&gt;</code> with <code>MmapPrimaryIndex</code>. No RAM preloading of document offsets or version data at startup.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type performance">Performance</h4>
+        <ul>
+          <li>Startup time: near-zero for any database size (mmap, no full scan)</li>
+          <li>RAM usage: 6 MB for 1M documents (was ~110 MB with HashMap indexes)</li>
+          <li>Stored procedure throughput: 56 calls/sec sequential, 27 ops/sec concurrent (10 workers, 1M docs)</li>
+          <li><code>get_balance</code> SP: 16ms | <code>place_order</code> (proc-calling-proc + 3 writes): 65ms</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.19.3 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.19.3</h3>
         <span class="version-date">2026-03-08</span>
-        <span class="version-badge latest">latest</span>
       </div>
 
       <div class="change-group">
