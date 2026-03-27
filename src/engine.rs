@@ -60,7 +60,7 @@ enum FtsJob {
 /// and reads on the *same* collection can proceed concurrently.
 pub struct OxiDb {
     data_dir: PathBuf,
-    collections: RwLock<HashMap<String, Arc<RwLock<Collection>>>>,
+    collections: RwLock<HashMap<String, Arc<Collection>>>,
     blob_store: BlobStore,
     fts_index: Arc<RwLock<FtsIndex>>,
     fts_tx: mpsc::SyncSender<FtsJob>,
@@ -184,9 +184,7 @@ impl OxiDb {
                             // Time to check for expired documents
                             let cols = db.collections.read();
                             for col_arc in cols.values() {
-                                if let Some(mut col) = col_arc.try_write() {
-                                    col.evict_expired();
-                                }
+                                col_arc.evict_expired();
                             }
                         }
                         _ => break, // Shutdown signal or channel closed
@@ -286,8 +284,8 @@ impl OxiDb {
         })
     }
 
-    /// Return an Arc to a collection's RwLock, auto-creating if needed.
-    fn get_or_create_collection(&self, name: &str) -> Result<Arc<RwLock<Collection>>> {
+    /// Return an Arc to a collection, auto-creating if needed.
+    fn get_or_create_collection(&self, name: &str) -> Result<Arc<Collection>> {
         // Fast path: read lock only
         {
             let cols = self.collections.read();
@@ -297,7 +295,7 @@ impl OxiDb {
         }
         // Slow path: load the collection OUTSIDE the write lock so that other
         // collections remain accessible while a large collection is loading.
-        let mut col = if self.in_memory {
+        let col = if self.in_memory {
             Collection::open_in_memory(name)
         } else {
             Collection::open_with_options(
@@ -313,7 +311,7 @@ impl OxiDb {
             col.set_lazy_sync(true);
         }
         col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
-        let arc = Arc::new(RwLock::new(col));
+        let arc = Arc::new(col);
         // Briefly acquire write lock to insert
         let mut cols = self.collections.write();
         // Double-check: another thread may have loaded the same collection
@@ -330,7 +328,7 @@ impl OxiDb {
         if cols.contains_key(name) {
             return Err(Error::CollectionAlreadyExists(name.to_string()));
         }
-        let mut col = if self.in_memory {
+        let col = if self.in_memory {
             Collection::open_in_memory(name)
         } else {
             Collection::open_with_options(
@@ -346,7 +344,7 @@ impl OxiDb {
             col.set_lazy_sync(true);
         }
         col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
-        cols.insert(name.to_string(), Arc::new(RwLock::new(col)));
+        cols.insert(name.to_string(), Arc::new(col));
         Ok(())
     }
 
@@ -373,9 +371,7 @@ impl OxiDb {
     pub fn flush_indexes(&self) {
         let cols = self.collections.read();
         for (_name, col_arc) in cols.iter() {
-            { let col = col_arc.read();
-                col.save_index_data();
-            }
+            col_arc.save_index_data();
         }
     }
 
@@ -389,9 +385,7 @@ impl OxiDb {
         {
             let cols = self.collections.read();
             for col_arc in cols.values() {
-                { let mut col = col_arc.write();
-                    col.set_lazy_sync(true);
-                }
+                col_arc.set_lazy_sync(true);
             }
         }
 
@@ -407,9 +401,7 @@ impl OxiDb {
                             // Periodic flush
                             let cols = db.collections.read();
                             for col_arc in cols.values() {
-                                { let col = col_arc.read();
-                                    let _ = col.sync_writes();
-                                }
+                                let _ = col_arc.sync_writes();
                             }
                         }
                         _ => break, // Shutdown signal or sender dropped
@@ -418,9 +410,7 @@ impl OxiDb {
                 // Final flush on shutdown
                 let cols = db.collections.read();
                 for col_arc in cols.values() {
-                    { let col = col_arc.read();
-                        let _ = col.sync_writes();
-                    }
+                    let _ = col_arc.sync_writes();
                 }
             })
             .expect("failed to spawn sync thread");
@@ -439,9 +429,7 @@ impl OxiDb {
         self.cache_capacity.store(capacity, Ordering::Release);
         let cols = self.collections.read();
         for col_arc in cols.values() {
-            { let col = col_arc.read();
-                col.set_cache_capacity(capacity);
-            }
+            col_arc.set_cache_capacity(capacity);
         }
     }
 
@@ -496,7 +484,7 @@ impl OxiDb {
         let col = self.get_or_create_collection(collection)?;
         let emit = self.change_broker.has_subscribers();
         let doc_clone = if emit { Some(doc.clone()) } else { None };
-        let id = col.write().insert(doc)?;
+        let id = col.insert(doc)?;
         if let Some(mut d) = doc_clone {
             if let Some(obj) = d.as_object_mut() {
                 obj.insert("_id".to_string(), Value::Number(id.into()));
@@ -522,51 +510,45 @@ impl OxiDb {
         let col = self.get_or_create_collection(collection)?;
         let emit = self.change_broker.has_subscribers();
 
-        // Phase 1: Brief write lock — reserve IDs and check unique constraints
-        let (first_id, has_unique_indexes, unique_fields, need_values) = {
-            let mut col_w = col.write();
-            let count = docs.len() as u64;
+        // Phase 1: Reserve IDs and check unique constraints
+        let count = docs.len() as u64;
 
-            // Quick check: any unique indexes?
-            let unique_fields: Vec<String> = col_w
-                .field_indexes()
+        // Quick check: any unique indexes?
+        let (unique_fields, need_values) = {
+            let idx_guard = col.field_indexes();
+            let unique_fields: Vec<String> = idx_guard
+                .field_indexes
                 .values()
                 .filter(|idx| idx.unique)
                 .map(|idx| idx.field.clone())
                 .collect();
+            let need_values = !idx_guard.field_indexes.is_empty()
+                || !idx_guard.composite_indexes.is_empty()
+                || idx_guard.text_index.is_some()
+                || !idx_guard.vector_indexes.is_empty();
+            (unique_fields, need_values)
+        };
+        let has_unique_indexes = !unique_fields.is_empty();
 
-            // Check if any indexes exist that will need the decoded Value
-            let need_values = !col_w.field_indexes().is_empty()
-                || !col_w.composite_indexes().is_empty()
-                || col_w.has_text_index()
-                || !col_w.vector_indexes().is_empty();
+        let first_id = col.reserve_ids(count);
 
-            let first_id = col_w.reserve_ids(count);
-
-            // Check existing unique constraints only when unique indexes exist
-            if !unique_fields.is_empty() {
-                for (i, doc) in docs.iter().enumerate() {
-                    let id = first_id + i as u64;
-                    let mut check_doc = doc.clone();
-                    if let Some(obj) = check_doc.as_object_mut() {
-                        obj.insert("_id".to_string(), Value::Number(id.into()));
-                    }
-                    col_w.check_unique_constraints(&check_doc, None)?;
+        // Check existing unique constraints only when unique indexes exist
+        if has_unique_indexes {
+            for (i, doc) in docs.iter().enumerate() {
+                let id = first_id + i as u64;
+                let mut check_doc = doc.clone();
+                if let Some(obj) = check_doc.as_object_mut() {
+                    obj.insert("_id".to_string(), Value::Number(id.into()));
                 }
+                col.check_unique_constraints(&check_doc, None)?;
             }
+        }
 
-            (first_id, !unique_fields.is_empty(), unique_fields, need_values)
-        }; // write lock released
-
-        // Phase 2: Pre-serialize all documents (no lock held — other threads can work)
+        // Phase 2: Pre-serialize all documents
         let mut prepared = Vec::with_capacity(docs.len());
 
-        // Track intra-batch uniqueness
         let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
 
-        // When no indexes need the Value and batch is large, drop it after
-        // encoding to reduce allocator churn (otherwise jemalloc retains
-        // the freed pages, inflating RSS).
         let keep_values = need_values || emit || docs.len() <= 1000;
 
         for (i, mut data) in docs.into_iter().enumerate() {
@@ -578,7 +560,6 @@ impl OxiDb {
             obj.insert("_id".to_string(), Value::Number(id.into()));
             obj.insert("_version".to_string(), Value::Number(1.into()));
 
-            // Intra-batch uniqueness check
             if has_unique_indexes {
                 for field in &unique_fields {
                     if let Some(value) = resolve_field_in_value(&data, field) {
@@ -599,13 +580,12 @@ impl OxiDb {
             if keep_values {
                 prepared.push((id, data, bytes));
             } else {
-                // Drop Value to free memory — only bytes are needed
                 prepared.push((id, Value::Null, bytes));
             }
         }
 
-        // Phase 3: Write lock — insert pre-serialized docs (fast: no serialization)
-        let ids = col.write().insert_many_prepared(prepared)?;
+        // Phase 3: Insert pre-serialized docs (collection handles internal locking)
+        let ids = col.insert_many_prepared(prepared)?;
 
         // Emit change events if needed
         if emit {
@@ -626,7 +606,7 @@ impl OxiDb {
 
     pub fn find(&self, collection: &str, query: &Value) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
-        col.read().find(query)
+        col.find(query)
     }
 
     pub fn find_with_options(
@@ -636,7 +616,7 @@ impl OxiDb {
         opts: &FindOptions,
     ) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
-        col.read().find_with_options(query, opts)
+        col.find_with_options(query, opts)
     }
 
     pub fn find_with_options_arcs(
@@ -646,17 +626,17 @@ impl OxiDb {
         opts: &FindOptions,
     ) -> Result<Vec<Arc<Value>>> {
         let col = self.get_or_create_collection(collection)?;
-        col.read().find_with_options_arcs(query, opts)
+        col.find_with_options_arcs(query, opts)
     }
 
     pub fn find_one(&self, collection: &str, query: &Value) -> Result<Option<Value>> {
         let col = self.get_or_create_collection(collection)?;
-        col.read().find_one(query)
+        col.find_one(query)
     }
 
     pub fn update(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        let ids = col.write().update(query, update, None)?;
+        let ids = col.update(query, update, None)?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
@@ -674,7 +654,7 @@ impl OxiDb {
 
     pub fn update_one(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        let ids = col.write().update(query, update, Some(1))?;
+        let ids = col.update(query, update, Some(1))?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
@@ -692,7 +672,7 @@ impl OxiDb {
 
     pub fn delete(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        let ids = col.write().delete(query, None)?;
+        let ids = col.delete(query, None)?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
@@ -710,7 +690,7 @@ impl OxiDb {
 
     pub fn delete_one(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        let ids = col.write().delete(query, Some(1))?;
+        let ids = col.delete(query, Some(1))?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
@@ -728,12 +708,12 @@ impl OxiDb {
 
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_index(field)
+        col.create_index(field)
     }
 
     pub fn create_unique_index(&self, collection: &str, field: &str) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_unique_index(field)
+        col.create_unique_index(field)
     }
 
     pub fn create_composite_index(
@@ -742,22 +722,21 @@ impl OxiDb {
         fields: Vec<String>,
     ) -> Result<String> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_composite_index(fields)
+        col.create_composite_index(fields)
     }
 
     pub fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>> {
         let col = self.get_or_create_collection(collection)?;
-        Ok(col.read().list_indexes())
+        Ok(col.list_indexes())
     }
 
     pub fn drop_index(&self, collection: &str, index_name: &str) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().drop_index(index_name)
+        col.drop_index(index_name)
     }
 
     pub fn count(&self, collection: &str, query: &Value) -> Result<usize> {
         let col = self.get_or_create_collection(collection)?;
-        let col = col.read();
         if query.as_object().is_some_and(|m| m.is_empty()) {
             Ok(col.count())
         } else {
@@ -767,12 +746,12 @@ impl OxiDb {
 
     pub fn compact(&self, collection: &str) -> Result<CompactStats> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().compact()
+        col.compact()
     }
 
     pub fn create_text_index(&self, collection: &str, fields: Vec<String>) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_text_index(fields)
+        col.create_text_index(fields)
     }
 
     pub fn text_search(
@@ -782,7 +761,7 @@ impl OxiDb {
         limit: usize,
     ) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
-        col.read().text_search(query, limit)
+        col.text_search(query, limit)
     }
 
     pub fn create_vector_index(
@@ -793,7 +772,7 @@ impl OxiDb {
         metric: crate::vector::DistanceMetric,
     ) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_vector_index(field, dimension, metric)
+        col.create_vector_index(field, dimension, metric)
     }
 
     pub fn vector_search(
@@ -805,7 +784,7 @@ impl OxiDb {
         ef_search: Option<usize>,
     ) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
-        col.read().vector_search(field, query_vector, limit, ef_search)
+        col.vector_search(field, query_vector, limit, ef_search)
     }
 
     pub fn aggregate(&self, collection: &str, pipeline_json: &Value) -> Result<Vec<Value>> {
@@ -824,21 +803,23 @@ impl OxiDb {
             pipeline.try_streaming_group(start_idx)
         {
             let col = self.get_or_create_collection(collection)?;
-            let col_guard = col.read();
 
             // Index-only count: if group key has an index and all accumulators
             // are count-only, read counts directly from the index (zero I/O).
+            let idx_guard = col.field_indexes();
             if let Some(index_result) = crate::pipeline::try_index_only_count(
                 group_key,
                 accumulators,
-                col_guard.field_indexes(),
-                col_guard.count(),
+                &idx_guard.field_indexes,
+                col.count(),
                 leading_match,
             ) {
+                drop(idx_guard);
                 pipeline.execute_from(next_idx, index_result, &lookup_fn)?
             } else {
+                drop(idx_guard);
                 let group_result =
-                    col_guard.aggregate_streaming(leading_match, group_key, accumulators)?;
+                    col.aggregate_streaming(leading_match, group_key, accumulators)?;
                 // Continue with remaining pipeline stages on the small group result
                 pipeline.execute_from(next_idx, group_result, &lookup_fn)?
             }
@@ -851,25 +832,22 @@ impl OxiDb {
             // Standard path: use Arc-based pipeline to avoid cloning all initial docs.
             // This is critical for aggregation over large datasets (200K+ docs).
             let col = self.get_or_create_collection(collection)?;
-            let col_guard = col.read();
-            let arcs = col_guard.find_arcs(&query)?;
-            let field_indexes = col_guard.field_indexes();
-            let doc_lookup = |id: DocumentId| col_guard.load_doc_arc(id);
-            pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(field_indexes), Some(&doc_lookup))?
+            let arcs = col.find_arcs(&query)?;
+            let idx_guard = col.field_indexes();
+            let doc_lookup = |id: DocumentId| col.load_doc_arc(id);
+            pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(&idx_guard.field_indexes), Some(&doc_lookup))?
         };
 
         // Handle $out: write results to the target collection
         if let Some(target) = out_collection {
             let target_col = self.get_or_create_collection(&target)?;
-            let mut target_guard = target_col.write();
             for doc in &result {
-                // Strip _id and _version so the target collection assigns new ones
                 let mut clean = doc.clone();
                 if let Some(obj) = clean.as_object_mut() {
                     obj.remove("_id");
                     obj.remove("_version");
                 }
-                target_guard.insert(clean)?;
+                target_col.insert(clean)?;
             }
         }
 
@@ -904,8 +882,7 @@ impl OxiDb {
     /// Execute a read within a transaction, recording versions for OCC.
     pub fn tx_find(&self, tx_id: TransactionId, collection: &str, query: &Value) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
-        let col_guard = col.read();
-        let results = col_guard.find(query)?;
+        let results = col.find(query)?;
 
         // Record read versions
         let txs = self.active_transactions.read();
@@ -915,7 +892,7 @@ impl OxiDb {
 
         for doc in &results {
             if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                let version = col_guard.get_version(doc_id);
+                let version = col.get_version(doc_id);
                 tx.read_set.push(ReadRecord {
                     collection: collection.to_string(),
                     doc_id,
@@ -937,8 +914,7 @@ impl OxiDb {
     ) -> Result<()> {
         // Read to find matching docs and record their versions
         let col = self.get_or_create_collection(collection)?;
-        let col_guard = col.read();
-        let matching = col_guard.find(query)?;
+        let matching = col.find(query)?;
 
         let txs = self.active_transactions.read();
         let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
@@ -947,7 +923,7 @@ impl OxiDb {
 
         for doc in &matching {
             if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                let version = col_guard.get_version(doc_id);
+                let version = col.get_version(doc_id);
                 tx.read_set.push(ReadRecord {
                     collection: collection.to_string(),
                     doc_id,
@@ -972,8 +948,7 @@ impl OxiDb {
         query: &Value,
     ) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        let col_guard = col.read();
-        let matching = col_guard.find(query)?;
+        let matching = col.find(query)?;
 
         let txs = self.active_transactions.read();
         let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
@@ -982,7 +957,7 @@ impl OxiDb {
 
         for doc in &matching {
             if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                let version = col_guard.get_version(doc_id);
+                let version = col.get_version(doc_id);
                 tx.read_set.push(ReadRecord {
                     collection: collection.to_string(),
                     doc_id,
@@ -1008,22 +983,16 @@ impl OxiDb {
         };
         let tx = tx.into_inner();
 
-        // 2. Acquire write locks on all involved collections in BTreeSet order (deadlock-free)
-        let mut locked_collections: Vec<(String, Arc<RwLock<Collection>>)> = Vec::new();
+        // 2. Get all involved collections (sorted for deadlock-free access)
+        let mut locked_collections: Vec<(String, Arc<Collection>)> = Vec::new();
         for col_name in &tx.collections_involved {
             let col = self.get_or_create_collection(col_name)?;
             locked_collections.push((col_name.clone(), col));
         }
 
-        // Acquire write guards -- we hold them for the duration of commit
-        let mut write_guards: HashMap<String, parking_lot::RwLockWriteGuard<Collection>> = HashMap::new();
-        for (name, col_arc) in &locked_collections {
-            write_guards.insert(name.clone(), col_arc.write());
-        }
-
         // 3. OCC validation: verify all recorded versions match current versions
         for record in &tx.read_set {
-            if let Some(col) = write_guards.get(&record.collection) {
+            if let Some((_, col)) = locked_collections.iter().find(|(n, _)| n == &record.collection) {
                 let current_version = col.get_version(record.doc_id);
                 if current_version != record.version {
                     return Err(Error::TransactionConflict {
@@ -1036,24 +1005,23 @@ impl OxiDb {
             }
         }
 
-        // 4. Prepare: execute each WriteOp against the locked collection
-        //    Collect WAL entries and mutations per collection
+        // 4. Prepare: execute each WriteOp against the collection
         let mut all_mutations: HashMap<String, Vec<crate::collection::PreparedMutation>> = HashMap::new();
 
         for op in tx.write_ops {
             match op {
                 WriteOp::Insert { collection, data } => {
-                    let col = write_guards.get_mut(&collection).unwrap();
+                    let col = &locked_collections.iter().find(|(n, _)| n == &collection).unwrap().1;
                     let mutation = col.prepare_tx_insert(data, tx_id)?;
                     all_mutations.entry(collection).or_default().push(mutation);
                 }
                 WriteOp::Update { collection, query, update } => {
-                    let col = write_guards.get_mut(&collection).unwrap();
+                    let col = &locked_collections.iter().find(|(n, _)| n == &collection).unwrap().1;
                     let mutations = col.prepare_tx_update(&query, &update, tx_id)?;
                     all_mutations.entry(collection).or_default().extend(mutations);
                 }
                 WriteOp::Delete { collection, query } => {
-                    let col = write_guards.get_mut(&collection).unwrap();
+                    let col = &locked_collections.iter().find(|(n, _)| n == &collection).unwrap().1;
                     let mutations = col.prepare_tx_delete(&query, tx_id)?;
                     all_mutations.entry(collection).or_default().extend(mutations);
                 }
@@ -1062,7 +1030,7 @@ impl OxiDb {
 
         // 5. WAL log: for each collection, log WAL entries with single fsync each
         for (col_name, mutations) in &all_mutations {
-            let col = write_guards.get(col_name).unwrap();
+            let col = &locked_collections.iter().find(|(n, _)| n == col_name).unwrap().1;
             let entries: Vec<crate::wal::WalEntry> = mutations
                 .iter()
                 .map(|m| match &m.wal_entry {
@@ -1138,13 +1106,12 @@ impl OxiDb {
 
         // 8. Apply: for each collection, apply mutations to storage
         for (col_name, mut mutations) in all_mutations {
-            let col = write_guards.get_mut(&col_name).unwrap();
+            let col = &locked_collections.iter().find(|(n, _)| n == &col_name).unwrap().1;
             col.apply_prepared(&mut mutations)?;
         }
 
         // 9. Checkpoint: for each collection, checkpoint WAL
-        for (col_name, _) in &locked_collections {
-            let col = write_guards.get(col_name).unwrap();
+        for (_col_name, col) in &locked_collections {
             col.checkpoint_wal()?;
         }
 
@@ -1156,7 +1123,6 @@ impl OxiDb {
             self.change_broker.emit(event);
         }
 
-        // 12. Write locks drop automatically when write_guards goes out of scope
         Ok(())
     }
 
@@ -1268,24 +1234,17 @@ impl OxiDb {
 
     /// Create or replace a stored procedure.
     pub fn create_procedure(&self, name: &str, body: Value) -> Result<()> {
-        // Validate the procedure definition
         crate::procedure::parse_procedure(&body)?;
 
         let col = self.get_or_create_collection("_procedures")?;
-        let mut col_guard = col.write();
+        let _ = col.create_unique_index("name");
+        let _ = col.delete(&json!({"name": name}), None);
 
-        // Ensure unique index on name
-        let _ = col_guard.create_unique_index("name");
-
-        // Delete existing procedure with same name (upsert semantics)
-        let _ = col_guard.delete(&json!({"name": name}), None);
-
-        // Store the full definition with the name
         let mut doc = body;
         if let Some(obj) = doc.as_object_mut() {
             obj.insert("name".to_string(), Value::String(name.to_string()));
         }
-        col_guard.insert(doc)?;
+        col.insert(doc)?;
         Ok(())
     }
 
@@ -1293,9 +1252,7 @@ impl OxiDb {
     pub fn call_procedure(&self, name: &str, params: Value) -> Result<Value> {
         let proc_def = {
             let col = self.get_or_create_collection("_procedures")?;
-            let col_guard = col.read();
-            col_guard
-                .find_one(&json!({"name": name}))?
+            col.find_one(&json!({"name": name}))?
                 .ok_or_else(|| Error::ProcedureNotFound(name.to_string()))?
         };
         crate::procedure::execute_procedure(self, &proc_def, &params)
@@ -1304,8 +1261,7 @@ impl OxiDb {
     /// List all stored procedure names.
     pub fn list_procedures(&self) -> Result<Vec<String>> {
         let col = self.get_or_create_collection("_procedures")?;
-        let col_guard = col.read();
-        let docs = col_guard.find(&json!({}))?;
+        let docs = col.find(&json!({}))?;
         Ok(docs
             .iter()
             .filter_map(|d| d.get("name").and_then(|v| v.as_str()).map(String::from))
@@ -1315,17 +1271,14 @@ impl OxiDb {
     /// Get a stored procedure definition by name.
     pub fn get_procedure(&self, name: &str) -> Result<Value> {
         let col = self.get_or_create_collection("_procedures")?;
-        let col_guard = col.read();
-        col_guard
-            .find_one(&json!({"name": name}))?
+        col.find_one(&json!({"name": name}))?
             .ok_or_else(|| Error::ProcedureNotFound(name.to_string()))
     }
 
     /// Delete a stored procedure by name.
     pub fn delete_procedure(&self, name: &str) -> Result<()> {
         let col = self.get_or_create_collection("_procedures")?;
-        let mut col_guard = col.write();
-        let deleted = col_guard.delete(&json!({"name": name}), None)?;
+        let deleted = col.delete(&json!({"name": name}), None)?;
         if deleted.is_empty() {
             return Err(Error::ProcedureNotFound(name.to_string()));
         }
@@ -1398,35 +1351,29 @@ impl OxiDb {
         }
 
         let col = self.get_or_create_collection("_schedules")?;
-        let mut col_guard = col.write();
-        let _ = col_guard.create_unique_index("name");
-        // Upsert: delete existing, then insert
-        let _ = col_guard.delete(&json!({"name": name}), None);
-        col_guard.insert(def)?;
+        let _ = col.create_unique_index("name");
+        let _ = col.delete(&json!({"name": name}), None);
+        col.insert(def)?;
         Ok(())
     }
 
     /// List all schedules.
     pub fn list_schedules(&self) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection("_schedules")?;
-        let col_guard = col.read();
-        col_guard.find(&json!({}))
+        col.find(&json!({}))
     }
 
     /// Get a schedule by name.
     pub fn get_schedule(&self, name: &str) -> Result<Value> {
         let col = self.get_or_create_collection("_schedules")?;
-        let col_guard = col.read();
-        col_guard
-            .find_one(&json!({"name": name}))?
+        col.find_one(&json!({"name": name}))?
             .ok_or_else(|| Error::ScheduleError(format!("schedule not found: {name}")))
     }
 
     /// Delete a schedule by name.
     pub fn delete_schedule(&self, name: &str) -> Result<()> {
         let col = self.get_or_create_collection("_schedules")?;
-        let mut col_guard = col.write();
-        let deleted = col_guard.delete(&json!({"name": name}), None)?;
+        let deleted = col.delete(&json!({"name": name}), None)?;
         if deleted.is_empty() {
             return Err(Error::ScheduleError(format!("schedule not found: {name}")));
         }
@@ -1493,17 +1440,13 @@ impl OxiDb {
         {
             let cols = self.collections.read();
             for col_arc in cols.values() {
-                let col = col_arc.write();
-                col.save_index_data();
-                let _ = col.checkpoint_wal();
+                col_arc.save_index_data();
+                let _ = col_arc.checkpoint_wal();
             }
         }
 
-        // 5. Acquire read locks on all collections for consistent snapshot
-        let cols = self.collections.read();
-        let _read_guards: Vec<_> = cols.values()
-            .map(|c| c.read())
-            .collect();
+        // 5. Collections use internal locking — no external read guards needed
+        let _cols = self.collections.read();
 
         // 6. Create tar.gz archive
         let file = std::fs::File::create(output_path)?;
@@ -1624,9 +1567,7 @@ impl Drop for OxiDb {
         {
             let cols = self.collections.read();
             for col_arc in cols.values() {
-                { let col = col_arc.read();
-                    let _ = col.sync_writes();
-                }
+                let _ = col_arc.sync_writes();
             }
         }
         self.flush_indexes();
@@ -2265,7 +2206,6 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         {
             let col = db.get_or_create_collection("cache").unwrap();
-            let mut col = col.write();
             let evicted = col.evict_expired();
             assert_eq!(evicted, 1);
         }
