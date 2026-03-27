@@ -29,7 +29,7 @@ thread_local! {
 }
 
 /// Location of a document in the data file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct DocLocation {
     pub offset: u64,
     pub length: u32,
@@ -380,6 +380,20 @@ impl Storage {
         let mut inner = self.inner.lock();
         inner.file.seek(SeekFrom::Start(loc.offset))?;
         inner.file.write_all(&[RECORD_DELETED])?;
+        Ok(())
+    }
+
+    /// Soft-delete multiple records in a single lock acquisition.
+    /// Caller must call `sync()` after.
+    pub fn mark_deleted_batch_no_sync(&self, locs: &[DocLocation]) -> Result<()> {
+        if locs.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock();
+        for loc in locs {
+            inner.file.seek(SeekFrom::Start(loc.offset))?;
+            inner.file.write_all(&[RECORD_DELETED])?;
+        }
         Ok(())
     }
 
