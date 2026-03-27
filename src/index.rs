@@ -221,6 +221,16 @@ impl FieldIndex {
         self.tree.entry(key).or_default().insert(id);
     }
 
+    /// Merge another FieldIndex into this one. Used for parallel index building.
+    pub fn merge(&mut self, other: FieldIndex) {
+        for (key, ids) in other.tree {
+            let entry = self.tree.entry(key).or_default();
+            for id in ids.iter() {
+                entry.insert(*id);
+            }
+        }
+    }
+
     pub fn remove(&mut self, doc: &Document) {
         if let Some(value) = doc.get_field(&self.field) {
             let key = IndexValue::from_json(value);
