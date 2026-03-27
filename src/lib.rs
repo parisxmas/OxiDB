@@ -12,6 +12,7 @@ pub mod fts;
 pub mod index;
 pub mod index_bundle;
 pub mod index_persist;
+pub mod mmap_index;
 pub mod oxiscript;
 pub mod pipeline;
 pub mod procedure;
