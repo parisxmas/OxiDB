@@ -286,7 +286,7 @@ impl Collection {
 
         if pidx_path.exists() && text_index.is_none() {
             match MmapPrimaryIndex::open(&pidx_path) {
-                Ok(pidx) if pidx.has_mmap() && pidx.dat_file_size() == current_dat_size => {
+                Ok(pidx) if pidx.has_mmap() && pidx.dat_file_size() <= current_dat_size => {
                     // .pidx is valid and matches .dat — populate HashMaps from it
                     let pidx_start = std::time::Instant::now();
                     let entries = pidx.iter_with_versions();
@@ -301,6 +301,27 @@ impl Collection {
                     }
                     doc_count = primary_index.len() as u64;
                     loaded_from_pidx = true;
+
+                    // Scan new records appended after .pidx was saved
+                    let pidx_dat_size = pidx.dat_file_size();
+                    if pidx_dat_size < current_dat_size {
+                        storage.scan_segment_readonly_while(pidx_dat_size, current_dat_size, |bytes| {
+                            let doc: Value = crate::codec::decode_doc(bytes)?;
+                            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                                let loc = crate::storage::DocLocation {
+                                    offset: 0, // approximate — will be corrected by WAL
+                                    length: bytes.len() as u32,
+                                };
+                                let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
+                                primary_index.insert(id, loc);
+                                version_index.insert(id, ver);
+                                if id >= next_id { next_id = id + 1; }
+                                doc_count += 1;
+                            }
+                            Ok(true)
+                        }).ok();
+                    }
+
                     if verbose {
                         vlog(&format!(
                             "[verbose] {}: {} documents loaded from .pidx in {:.3}s (skipped .dat scan)",
