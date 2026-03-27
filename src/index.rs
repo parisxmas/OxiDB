@@ -73,6 +73,14 @@ impl DocIdSet {
         }
     }
 
+    pub fn contains(&self, id: &DocumentId) -> bool {
+        match self {
+            DocIdSet::Empty => false,
+            DocIdSet::One(existing) => existing == id,
+            DocIdSet::Set(set) => set.contains(id),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         matches!(self, DocIdSet::Empty)
     }

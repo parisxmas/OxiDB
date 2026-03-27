@@ -538,6 +538,21 @@ impl MmapFieldIndex {
         result
     }
 
+    /// Check if a doc_id exists for a given value without materializing a BTreeSet.
+    /// O(log n) in mmap layer + O(log n) in overlay.
+    pub fn contains_doc_id(&self, value: &IndexValue, doc_id: DocumentId) -> bool {
+        // Check mmap layer
+        let mmap_set = self.mmap_get(value);
+        if mmap_set.contains(&doc_id) {
+            return true;
+        }
+        // Check overlay
+        if let Some(ids) = self.overlay.get(value) {
+            return ids.contains(&doc_id);
+        }
+        false
+    }
+
     /// Count matching docs for exact value.
     pub fn count_eq(&self, value: &IndexValue) -> usize {
         let mmap_count = self.mmap_get(value).len();
