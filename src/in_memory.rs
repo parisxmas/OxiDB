@@ -132,6 +132,17 @@ impl InMemStorage {
         self.mark_deleted(loc)
     }
 
+    pub fn mark_deleted_batch_no_sync(&self, locs: &[DocLocation]) -> Result<()> {
+        if locs.is_empty() {
+            return Ok(());
+        }
+        let mut data = self.data.lock().unwrap();
+        for loc in locs {
+            data[loc.offset as usize] = RECORD_DELETED;
+        }
+        Ok(())
+    }
+
     pub fn sync(&self) -> Result<()> {
         Ok(()) // no-op
     }
@@ -380,6 +391,13 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.mark_deleted_no_sync(loc),
             Self::Memory(m) => m.mark_deleted_no_sync(loc),
+        }
+    }
+
+    pub fn mark_deleted_batch_no_sync(&self, locs: &[DocLocation]) -> Result<()> {
+        match self {
+            Self::File(s) => s.mark_deleted_batch_no_sync(locs),
+            Self::Memory(m) => m.mark_deleted_batch_no_sync(locs),
         }
     }
 

@@ -955,6 +955,19 @@ impl MmapFieldIndex {
         Self::open(path)
     }
 
+    /// Create a MmapFieldIndex from an in-memory FieldIndex (overlay-only, no disk file).
+    pub fn from_field_index(old: &FieldIndex) -> Self {
+        let mut idx = if old.unique {
+            Self::new_unique(old.field.clone())
+        } else {
+            Self::new(old.field.clone())
+        };
+        for (val, ids) in old.iter_asc() {
+            idx.overlay.insert(val.clone(), ids.clone());
+        }
+        idx
+    }
+
     /// Convert this MmapFieldIndex to an in-memory FieldIndex (for persistence/compatibility).
     pub fn to_field_index(&self) -> FieldIndex {
         let mut fi = if self.unique {

@@ -132,16 +132,23 @@ impl Wal {
     }
 
     /// Write multiple WAL entries without fsync.
+    /// Uses a single buffer + single write_all to reduce syscalls from 3*N to 1.
     pub fn log_batch_no_sync(&self, entries: &[WalEntry]) -> Result<()> {
-        let mut file = self.inner.lock();
-        file.seek(SeekFrom::End(0))?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        // Pre-serialize all entries into a single buffer to minimize syscalls
+        let mut buf = Vec::with_capacity(entries.len() * 64);
         for entry in entries {
             let payload = self.serialize_entry(entry)?;
             let crc = Self::compute_crc(&payload);
-            file.write_all(&crc.to_le_bytes())?;
-            file.write_all(&(payload.len() as u32).to_le_bytes())?;
-            file.write_all(&payload)?;
+            buf.extend_from_slice(&crc.to_le_bytes());
+            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&payload);
         }
+        let mut file = self.inner.lock();
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&buf)?;
         Ok(())
     }
 
