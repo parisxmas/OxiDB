@@ -703,6 +703,100 @@ impl Collection {
     }
 
     // -----------------------------------------------------------------------
+    // Parallel index building
+    // -----------------------------------------------------------------------
+
+    /// Build a field index using all available CPU cores.
+    /// Splits the storage file into segments, scans each in parallel with rayon,
+    /// then merges the per-thread indexes into one.
+    fn parallel_build_index(&self, field: &str, unique: bool) -> Result<FieldIndex> {
+        use rayon::prelude::*;
+
+        let storage = self.storage();
+        let file_size = storage.file_size();
+
+        // For small files or in-memory, fall back to single-threaded
+        if file_size < 1_000_000 || self.in_memory {
+            return self.sequential_build_index(field, unique);
+        }
+
+        let num_threads = rayon::current_num_threads().max(2);
+
+        // Compute segment boundaries aligned to record boundaries
+        let segments = self.compute_scan_segments(num_threads);
+
+        let field_owned = field.to_string();
+        let results: Vec<Result<FieldIndex>> = segments
+            .par_iter()
+            .map(|&(start, end)| {
+                let mut idx = if unique {
+                    FieldIndex::new_unique(field_owned.clone())
+                } else {
+                    FieldIndex::new(field_owned.clone())
+                };
+                self.storage().scan_segment_readonly_while(start, end, |bytes| {
+                    if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
+                        let raw = jsonb::RawJsonb::new(bytes);
+                        if let Some(id) = extract_raw_u64(&raw, "_id") {
+                            if let Some(iv) = extract_raw_index_value(&raw, &field_owned) {
+                                idx.insert_raw(id, iv);
+                            }
+                        }
+                    } else {
+                        let doc: Value = crate::codec::decode_doc(bytes)?;
+                        if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                            let arc = Arc::new(doc);
+                            idx.insert_value(id, &arc);
+                        }
+                    }
+                    Ok(true)
+                })?;
+                Ok(idx)
+            })
+            .collect();
+
+        // Merge all per-thread indexes
+        let mut final_idx = if unique {
+            FieldIndex::new_unique(field.to_string())
+        } else {
+            FieldIndex::new(field.to_string())
+        };
+        for result in results {
+            final_idx.merge(result?);
+        }
+
+        Ok(final_idx)
+    }
+
+    /// Single-threaded index build fallback for small collections or in-memory mode.
+    fn sequential_build_index(&self, field: &str, unique: bool) -> Result<FieldIndex> {
+        let mut idx = if unique {
+            FieldIndex::new_unique(field.to_string())
+        } else {
+            FieldIndex::new(field.to_string())
+        };
+        let field_owned = field.to_string();
+        self.storage().scan_readonly_while(|bytes| {
+            if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
+                let raw = jsonb::RawJsonb::new(bytes);
+                if let Some(id) = extract_raw_u64(&raw, "_id") {
+                    if let Some(iv) = extract_raw_index_value(&raw, &field_owned) {
+                        idx.insert_raw(id, iv);
+                    }
+                }
+            } else {
+                let doc: Value = crate::codec::decode_doc(bytes)?;
+                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    let arc = Arc::new(doc);
+                    idx.insert_value(id, &arc);
+                }
+            }
+            Ok(true)
+        })?;
+        Ok(idx)
+    }
+
+    // -----------------------------------------------------------------------
     // Index management
     // -----------------------------------------------------------------------
 
@@ -715,49 +809,21 @@ impl Collection {
         }
 
         let total = self.count();
+        let start = std::time::Instant::now();
+
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: creating index on '{}' ({} docs to scan)",
                 self.name, field, total
             ));
         }
-        let start = std::time::Instant::now();
-        let mut count = 0u64;
-        let mut idx = FieldIndex::new(field.to_string());
-        let name = self.name.clone();
-        let verbose = self.verbose;
 
-        let field_owned = field.to_string();
-        self.storage().scan_readonly_while(|bytes| {
-            if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
-                let raw = jsonb::RawJsonb::new(bytes);
-                if let Some(id) = extract_raw_u64(&raw, "_id") {
-                    if let Some(iv) = extract_raw_index_value(&raw, &field_owned) {
-                        idx.insert_raw(id, iv);
-                    }
-                    count += 1;
-                }
-            } else {
-                let doc: Value = crate::codec::decode_doc(bytes)?;
-                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                    let arc = Arc::new(doc);
-                    idx.insert_value(id, &arc);
-                    count += 1;
-                }
-            }
-            if verbose && count % 500_000 == 0 {
-                eprintln!(
-                    "[verbose] {}: index '{}' scanned {} / {} docs ({:.1}s)",
-                    name, field, count, total, start.elapsed().as_secs_f64()
-                );
-            }
-            Ok(true)
-        })?;
+        let idx = self.parallel_build_index(field, false)?;
 
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: index '{}' ready ({} docs in {:.2}s)",
-                self.name, field, count, start.elapsed().as_secs_f64()
+                self.name, field, total, start.elapsed().as_secs_f64()
             ));
         }
         {
@@ -778,69 +844,21 @@ impl Collection {
         }
 
         let total = self.count();
+        let start = std::time::Instant::now();
+
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: creating unique index on '{}' ({} docs to scan)",
                 self.name, field, total
             ));
         }
-        let start = std::time::Instant::now();
-        let mut count = 0u64;
-        let mut idx = FieldIndex::new_unique(field.to_string());
-        let field_owned = field.to_string();
-        let name = self.name.clone();
-        let verbose = self.verbose;
-        let mut unique_err: Option<Error> = None;
 
-        self.storage().scan_readonly_while(|bytes| {
-            if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
-                let raw = jsonb::RawJsonb::new(bytes);
-                if let Some(id) = extract_raw_u64(&raw, "_id") {
-                    if let Some(iv) = extract_raw_index_value(&raw, &field_owned) {
-                        if idx.check_unique(&iv, None) {
-                            unique_err = Some(Error::UniqueViolation {
-                                field: field_owned.clone(),
-                            });
-                            return Ok(false);
-                        }
-                        idx.insert_raw(id, iv);
-                    }
-                    count += 1;
-                }
-            } else {
-                let doc: Value = crate::codec::decode_doc(bytes)?;
-                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                    let arc = Arc::new(doc);
-                    if let Some(value) = resolve_field_in_value(&arc, &field_owned) {
-                        let iv = IndexValue::from_json(value);
-                        if idx.check_unique(&iv, None) {
-                            unique_err = Some(Error::UniqueViolation {
-                                field: field_owned.clone(),
-                            });
-                            return Ok(false);
-                        }
-                    }
-                    idx.insert_value(id, &arc);
-                    count += 1;
-                }
-            }
-            if verbose && count % 500_000 == 0 {
-                eprintln!(
-                    "[verbose] {}: unique index '{}' scanned {} / {} docs ({:.1}s)",
-                    name, field_owned, count, total, start.elapsed().as_secs_f64()
-                );
-            }
-            Ok(true)
-        })?;
-
-        if let Some(err) = unique_err {
-            return Err(err);
-        }
+        let idx = self.parallel_build_index(field, true)?;
 
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: unique index '{}' ready ({} docs in {:.2}s)",
-                self.name, field, count, start.elapsed().as_secs_f64()
+                self.name, field, total, start.elapsed().as_secs_f64()
             ));
         }
         {

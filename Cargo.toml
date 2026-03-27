@@ -32,6 +32,7 @@ flate2 = "1"
 regex = "1"
 sqlparser = "0.59"
 zstd = "0.13"
+rayon = "1"
 
 [dev-dependencies]
 tempfile = "3"
