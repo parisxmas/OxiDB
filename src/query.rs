@@ -5,7 +5,8 @@ use serde_json::Value as JsonValue;
 
 use crate::document::{Document, DocumentId};
 use crate::error::{Error, Result};
-use crate::index::{CompositeIndex, FieldIndex};
+use crate::index::CompositeIndex;
+use crate::mmap_field_index::MmapFieldIndex;
 use crate::value::IndexValue;
 
 // ---------------------------------------------------------------------------
@@ -224,7 +225,7 @@ fn parse_op(
 /// Execute a query using available indexes. Returns matching document IDs.
 pub fn execute_indexed(
     query: &Query,
-    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
     composite_indexes: &[CompositeIndex],
 ) -> Option<BTreeSet<DocumentId>> {
     match query {
@@ -269,7 +270,7 @@ pub fn execute_indexed(
 fn execute_field_op(
     field: &str,
     op: &QueryOp,
-    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
     _composite_indexes: &[CompositeIndex],
 ) -> Option<BTreeSet<DocumentId>> {
     let idx = field_indexes.get(field)?;
@@ -294,9 +295,9 @@ fn execute_field_op(
 /// range. Returns the merged (start, end) bounds and the field index, or None.
 fn try_merge_range_and<'a>(
     subs: &'a [Query],
-    field_indexes: &'a std::collections::HashMap<String, FieldIndex>,
+    field_indexes: &'a std::collections::HashMap<String, MmapFieldIndex>,
 ) -> Option<(
-    &'a FieldIndex,
+    &'a MmapFieldIndex,
     Bound<&'a IndexValue>,
     Bound<&'a IndexValue>,
 )> {
@@ -356,7 +357,7 @@ fn try_merge_range_and<'a>(
 /// `Some(false)` if stopped early by callback, `None` if indexes couldn't handle it.
 pub fn execute_indexed_lazy(
     query: &Query,
-    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
     callback: &mut dyn FnMut(DocumentId) -> bool,
 ) -> Option<bool> {
     match query {
@@ -533,7 +534,7 @@ fn resolve_field_ref<'a>(data: &'a JsonValue, path: &str) -> Option<&'a JsonValu
 /// post-filtering with `matches_value` is needed.
 pub fn is_fully_indexed(
     query: &Query,
-    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
 ) -> bool {
     match query {
         Query::All => true,
@@ -553,7 +554,7 @@ pub fn is_fully_indexed(
 /// Returns None if the query can't be counted by index alone.
 pub fn count_indexed(
     query: &Query,
-    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
 ) -> Option<usize> {
     match query {
         Query::All => None, // caller should use primary_index.len()
@@ -582,7 +583,7 @@ pub fn count_indexed(
 /// Handle AND of range conditions on the same field — count without BTreeSet.
 fn count_single_field_and(
     subs: &[Query],
-    field_indexes: &std::collections::HashMap<String, FieldIndex>,
+    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
 ) -> Option<usize> {
     let mut field_name: Option<&str> = None;
     let mut gte_bound: Option<&IndexValue> = None;
@@ -1088,7 +1089,7 @@ mod tests {
 
     #[test]
     fn execute_indexed_eq() {
-        let mut idx = FieldIndex::new("status".into());
+        let mut idx = MmapFieldIndex::new("status".into());
         idx.insert_value(1, &json!({"status": "active"}));
         idx.insert_value(2, &json!({"status": "inactive"}));
         idx.insert_value(3, &json!({"status": "active"}));
@@ -1111,7 +1112,7 @@ mod tests {
 
     #[test]
     fn count_indexed_eq() {
-        let mut idx = FieldIndex::new("x".into());
+        let mut idx = MmapFieldIndex::new("x".into());
         idx.insert_value(1, &json!({"x": 10}));
         idx.insert_value(2, &json!({"x": 10}));
         idx.insert_value(3, &json!({"x": 20}));
@@ -1125,7 +1126,7 @@ mod tests {
 
     #[test]
     fn is_fully_indexed_check() {
-        let mut idx = FieldIndex::new("a".into());
+        let mut idx = MmapFieldIndex::new("a".into());
         idx.insert_value(1, &json!({"a": 1}));
 
         let mut field_indexes = std::collections::HashMap::new();
