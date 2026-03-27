@@ -1870,28 +1870,7 @@ impl Collection {
         let idx_guard = self.indexes.read();
         let skip_post_filter = query::is_fully_indexed(&query, &idx_guard.field_indexes);
 
-        // Try lazy index path first
-        if !matches!(query, Query::All) {
-            let mut found: Option<Value> = None;
-            let lazy_result = query::execute_indexed_lazy(
-                &query,
-                &idx_guard.field_indexes,
-                &mut |id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            found = Some((*arc).clone());
-                            return false;
-                        }
-                    }
-                    true
-                },
-            );
-            if lazy_result.is_some() {
-                return Ok(found);
-            }
-        }
-
-        // Fallback: full materialization path
+        // Use materialization path (safe with stripe locking)
         let candidate_ids = if !matches!(query, Query::All) {
             query::execute_indexed(
                 &query,
