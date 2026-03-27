@@ -1838,75 +1838,68 @@ impl Collection {
                 }
             }
         } else {
-            // No index — iterate all documents via parallel cache-first path.
-            // Probes LRU cache first (zero-cost for warm cache), falls
-            // back to disk + decompress only for cache misses.
-            let ids: Vec<DocumentId> = self.pidx.iter_ids();
-            let cached = self.doc_cache.get_many(&ids);
+            // No index — parallel storage scan with raw JSONB pre-filter.
+            // Each thread scans a segment of the .dat file independently.
+            let num_threads = rayon::current_num_threads().max(2);
+            let segments = self.compute_scan_segments(num_threads);
 
-            let num_threads = std::thread::available_parallelism()
-                .map(|n| n.get().min(8))
-                .unwrap_or(4);
-
-            // Phase 1: parallel query matching on cached documents
-            let mut miss_indices: Vec<usize> = Vec::new();
-            if cached.len() >= 10_000 && num_threads > 1 && early_limit.is_none() {
-                let chunk_size = (cached.len() + num_threads - 1) / num_threads;
-                let (par_results, par_misses) = std::thread::scope(|s| {
-                    let handles: Vec<_> = (0..num_threads)
-                        .map(|t| {
-                            let start = t * chunk_size;
-                            let end = ((t + 1) * chunk_size).min(cached.len());
-                            let slice = &cached[start..end];
-                            let q = &query;
-                            s.spawn(move || {
-                                let mut local_hits: Vec<Arc<Value>> = Vec::new();
-                                let mut local_miss: Vec<usize> = Vec::new();
-                                for (j, opt) in slice.iter().enumerate() {
-                                    if let Some(arc) = opt {
-                                        if query::matches_value(q, arc) {
-                                            local_hits.push(Arc::clone(arc));
-                                        }
-                                    } else {
-                                        local_miss.push(start + j);
+            if segments.len() > 1 && early_limit.is_none() {
+                use rayon::prelude::*;
+                let q = &query;
+                let par_results: Vec<Vec<Arc<Value>>> = segments
+                    .par_iter()
+                    .map(|&(start, end)| {
+                        let mut local: Vec<Arc<Value>> = Vec::new();
+                        let _ = self.storage.scan_segment_readonly_while(start, end, |bytes| {
+                            // Raw JSONB pre-filter: skip without deserialize
+                            match query::matches_raw_jsonb(q, bytes) {
+                                Some(false) => return Ok(true),
+                                Some(true) => {
+                                    let doc = crate::codec::decode_doc(bytes)?;
+                                    local.push(Arc::new(doc));
+                                }
+                                None => {
+                                    let doc = crate::codec::decode_doc(bytes)?;
+                                    if query::matches_value(q, &doc) {
+                                        local.push(Arc::new(doc));
                                     }
                                 }
-                                (local_hits, local_miss)
-                            })
-                        })
-                        .collect();
-                    let mut all_results: Vec<Arc<Value>> = Vec::new();
-                    let mut all_misses: Vec<usize> = Vec::new();
-                    for h in handles {
-                        let (r, m) = h.join().unwrap();
-                        all_results.extend(r);
-                        all_misses.extend(m);
-                    }
-                    (all_results, all_misses)
-                });
-                results.extend(par_results);
-                miss_indices = par_misses;
+                            }
+                            Ok(true)
+                        });
+                        local
+                    })
+                    .collect();
+                for batch in par_results {
+                    results.extend(batch);
+                }
             } else {
-                // Sequential path: small collections or queries with limit
-                for (i, opt) in cached.into_iter().enumerate() {
-                    if let Some(arc) = opt {
-                        if query::matches_value(&query, &arc) {
-                            results.push(arc);
-                            if let Some(limit) = early_limit {
-                                if results.len() >= limit {
-                                    break;
-                                }
+                // Sequential: small collection or limit query
+                self.storage.scan_readonly_while(|bytes| {
+                    match query::matches_raw_jsonb(&query, bytes) {
+                        Some(false) => return Ok(true),
+                        Some(true) => {
+                            let doc = crate::codec::decode_doc(bytes)?;
+                            results.push(Arc::new(doc));
+                        }
+                        None => {
+                            let doc = crate::codec::decode_doc(bytes)?;
+                            if query::matches_value(&query, &doc) {
+                                results.push(Arc::new(doc));
                             }
                         }
-                    } else {
-                        miss_indices.push(i);
                     }
-                }
+                    if let Some(limit) = early_limit {
+                        if results.len() >= limit { return Ok(false); }
+                    }
+                    Ok(true)
+                })?;
             }
 
-            // Phase 2: batch-read cache misses from disk (if any and not already at limit)
-            let at_limit = early_limit.map_or(false, |l| results.len() >= l);
-            if !miss_indices.is_empty() && !at_limit {
+            // Legacy batch-read path removed — parallel scan handles everything
+            if false {
+                let ids: Vec<DocumentId> = Vec::new();
+                let miss_indices: Vec<usize> = Vec::new();
                 let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = miss_indices
                     .iter()
                     .filter_map(|&i| {
