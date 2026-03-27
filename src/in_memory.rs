@@ -12,7 +12,8 @@ use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
 use crate::engine::LogCallback;
 use crate::error::Result;
-use crate::index::{CompositeIndex, FieldIndex};
+use crate::index::CompositeIndex;
+use crate::mmap_field_index::MmapFieldIndex;
 use crate::storage::{DocLocation, Storage};
 use crate::wal::{Wal, WalEntry};
 
@@ -521,7 +522,7 @@ impl WalBackend {
         next_id: &mut DocumentId,
         committed_tx_ids: &HashSet<u64>,
         version_index: &mut HashMap<DocumentId, u64>,
-        field_indexes: &mut HashMap<String, FieldIndex>,
+        field_indexes: &mut HashMap<String, MmapFieldIndex>,
         composite_indexes: &mut Vec<CompositeIndex>,
         verbose: bool,
         log_callback: &Option<LogCallback>,

@@ -6,7 +6,7 @@ use serde_json::{json, Map, Value};
 
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
-use crate::index::FieldIndex;
+use crate::mmap_field_index::MmapFieldIndex;
 use crate::query::{self, SortOrder};
 use crate::value::IndexValue;
 
@@ -1346,7 +1346,7 @@ where
 // ---------------------------------------------------------------------------
 
 /// Pure index-only count aggregation: when the group key is a single FieldRef
-/// with a FieldIndex and all accumulators are Count or Sum(Literal), we can
+/// with a MmapFieldIndex and all accumulators are Count or Sum(Literal), we can
 /// read counts directly from the index without touching any documents.
 ///
 /// `total_docs` is the total number of documents in the collection. When
@@ -1357,7 +1357,7 @@ where
 pub(crate) fn try_index_only_count(
     key: &GroupKey,
     accumulators: &[(String, Accumulator)],
-    field_indexes: &HashMap<String, FieldIndex>,
+    field_indexes: &HashMap<String, MmapFieldIndex>,
     total_docs: usize,
     match_query: Option<&Value>,
 ) -> Option<Vec<Value>> {
@@ -1447,10 +1447,10 @@ pub(crate) fn try_index_only_count(
 ///
 /// **Count-only fast path** (Opt 4): When the group key is a single FieldRef and
 /// all accumulators are Count or Sum(Literal(1)), we can read counts directly
-/// from `FieldIndex::iter_asc()` without touching any documents at all.
+/// from `MmapFieldIndex::iter_asc()` without touching any documents at all.
 ///
 /// **Index-partitioned fast path** (Opt 5): When the group key is a single FieldRef
-/// with a FieldIndex, iterate index entries to get pre-partitioned groups. For each
+/// with a MmapFieldIndex, iterate index entries to get pre-partitioned groups. For each
 /// group, look up docs from doc_cache and feed accumulators. Avoids HashMap overhead.
 ///
 /// Returns `Some(results)` if an index path was used, `None` otherwise.
@@ -1458,7 +1458,7 @@ fn try_index_group(
     key: &GroupKey,
     accumulators: &[(String, Accumulator)],
     docs: &[Arc<Value>],
-    field_indexes: Option<&HashMap<String, FieldIndex>>,
+    field_indexes: Option<&HashMap<String, MmapFieldIndex>>,
     doc_lookup: Option<&dyn Fn(DocumentId) -> Option<Arc<Value>>>,
 ) -> Result<Option<Vec<Value>>> {
     // Only optimize single-field group key
@@ -1577,7 +1577,7 @@ fn try_index_group(
             })
             .collect();
 
-        for &doc_id in doc_ids {
+        for &doc_id in &doc_ids {
             if let Some(doc_arc) = dl(doc_id) {
                 let doc = doc_arc.as_ref();
                 for (i, (_, acc)) in accumulators.iter().enumerate() {
@@ -1617,7 +1617,7 @@ fn try_index_group(
         // Build a HashSet of all indexed doc IDs for fast lookup.
         let mut indexed_ids = std::collections::HashSet::with_capacity(total_indexed);
         for (_, ids) in fi.iter_asc() {
-            for &id in ids {
+            for &id in &ids {
                 indexed_ids.insert(id);
             }
         }
@@ -2317,7 +2317,7 @@ impl Pipeline {
         start: usize,
         mut docs: Vec<Arc<Value>>,
         lookup_fn: &F,
-        field_indexes: Option<&HashMap<String, FieldIndex>>,
+        field_indexes: Option<&HashMap<String, MmapFieldIndex>>,
         doc_lookup: Option<&dyn Fn(DocumentId) -> Option<Arc<Value>>>,
     ) -> Result<Vec<Value>>
     where
