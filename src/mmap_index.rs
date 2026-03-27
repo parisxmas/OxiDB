@@ -270,6 +270,34 @@ impl MmapPrimaryIndex {
         result
     }
 
+    /// Iterate over all entries returning (doc_id, DocLocation, version).
+    /// Used to populate primary_index and version_index HashMaps at startup.
+    pub fn iter_with_versions(&self) -> Vec<(DocumentId, DocLocation, u64)> {
+        let base = self.base.read();
+        let overlay = self.overlay.read();
+        let deleted = self.deleted.read();
+        let mut result = Vec::with_capacity(self.len());
+
+        // Mmap entries (excluding deleted and overridden)
+        if let Some(ref mmap) = base.mmap {
+            for i in 0..base.entry_count as usize {
+                let (id, offset, length, version) = Self::read_entry_from(mmap, i);
+                if !deleted.contains(&id) && !overlay.contains_key(&id) {
+                    result.push((id, DocLocation { offset, length }, version));
+                }
+            }
+        }
+
+        // Overlay entries
+        for (&doc_id, &(loc, version)) in overlay.iter() {
+            if !deleted.contains(&doc_id) {
+                result.push((doc_id, loc, version));
+            }
+        }
+
+        result
+    }
+
     /// Iterate over all document IDs (no locations needed).
     pub fn iter_ids(&self) -> Vec<DocumentId> {
         let base = self.base.read();

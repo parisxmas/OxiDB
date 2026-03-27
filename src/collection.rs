@@ -18,6 +18,7 @@ use crate::vector::{DistanceMetric, VectorIndex};
 use crate::query::{self, FindOptions, Query, SortOrder};
 use crate::storage::{DocLocation, Storage};
 use crate::value::IndexValue;
+use crate::mmap_index::MmapPrimaryIndex;
 use crate::wal::{Wal, WalEntry};
 
 /// Resolve a field path (with dot notation) directly on a &Value.
@@ -276,53 +277,100 @@ impl Collection {
 
         let load_start = std::time::Instant::now();
         let mut doc_count: u64 = 0;
+        let mut loaded_from_pidx = false;
 
-        // Clone callback for use inside the closure
-        let inner_cb = log_callback.clone();
+        // Fast path: try loading primary_index + version_index from .pidx file.
+        // This avoids scanning and deserializing every record in the .dat file.
+        let pidx_path = data_dir.join(format!("{}.pidx", name));
+        let current_dat_size = storage.file_size();
 
-        // Phase 1: Scan .dat for primary_index, version_index, next_id.
-        // Also rebuild text index (always from docs — not cached).
-        // Field/composite indexes are NOT rebuilt here; we try the cache first.
-        // Documents are NOT cached — the LRU cache is populated on demand.
-        storage.for_each_active(|loc, bytes| {
-            let doc: Value = crate::codec::decode_doc(&bytes)?;
-            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                primary_index.insert(id, loc);
-                let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                version_index.insert(id, ver);
-                if id >= next_id {
-                    next_id = id + 1;
+        if pidx_path.exists() && text_index.is_none() {
+            match MmapPrimaryIndex::open(&pidx_path) {
+                Ok(pidx) if pidx.has_mmap() && pidx.dat_file_size() == current_dat_size => {
+                    // .pidx is valid and matches .dat — populate HashMaps from it
+                    let pidx_start = std::time::Instant::now();
+                    let entries = pidx.iter_with_versions();
+                    primary_index.reserve(entries.len());
+                    version_index.reserve(entries.len());
+                    for (id, loc, version) in entries {
+                        primary_index.insert(id, loc);
+                        version_index.insert(id, version);
+                        if id >= next_id {
+                            next_id = id + 1;
+                        }
+                    }
+                    doc_count = primary_index.len() as u64;
+                    loaded_from_pidx = true;
+                    if verbose {
+                        vlog(&format!(
+                            "[verbose] {}: {} documents loaded from .pidx in {:.3}s (skipped .dat scan)",
+                            name,
+                            doc_count,
+                            pidx_start.elapsed().as_secs_f64(),
+                        ));
+                    }
                 }
-
-                // Text index is always rebuilt from docs (not cached)
-                if let Some(ref mut ti) = text_index {
-                    let doc_arc = Arc::new(doc);
-                    ti.index_doc(id, &doc_arc);
+                _ => {
+                    // .pidx invalid or dat size mismatch — fall through to .dat scan
+                    if verbose {
+                        vlog(&format!(
+                            "[verbose] {}: .pidx invalid or stale, will scan .dat",
+                            name,
+                        ));
+                    }
                 }
             }
-            doc_count += 1;
-            if verbose && doc_count % 500_000 == 0 {
-                let msg = format!(
-                    "[verbose] {}: loaded {} documents... ({:.1}s)",
+        }
+
+        // Phase 1 (slow path): Scan .dat for primary_index, version_index, next_id.
+        // Only needed when .pidx was not available or invalid.
+        if !loaded_from_pidx {
+            // Clone callback for use inside the closure
+            let inner_cb = log_callback.clone();
+
+            // Also rebuild text index (always from docs — not cached).
+            // Field/composite indexes are NOT rebuilt here; we try the cache first.
+            // Documents are NOT cached — the LRU cache is populated on demand.
+            storage.for_each_active(|loc, bytes| {
+                let doc: Value = crate::codec::decode_doc(&bytes)?;
+                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    primary_index.insert(id, loc);
+                    let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                    version_index.insert(id, ver);
+                    if id >= next_id {
+                        next_id = id + 1;
+                    }
+
+                    // Text index is always rebuilt from docs (not cached)
+                    if let Some(ref mut ti) = text_index {
+                        let doc_arc = Arc::new(doc);
+                        ti.index_doc(id, &doc_arc);
+                    }
+                }
+                doc_count += 1;
+                if verbose && doc_count % 500_000 == 0 {
+                    let msg = format!(
+                        "[verbose] {}: loaded {} documents... ({:.1}s)",
+                        name,
+                        doc_count,
+                        load_start.elapsed().as_secs_f64()
+                    );
+                    eprintln!("{msg}");
+                    if let Some(cb) = &inner_cb {
+                        cb(&msg);
+                    }
+                }
+                Ok(())
+            })?;
+
+            if verbose {
+                vlog(&format!(
+                    "[verbose] {}: {} documents loaded in {:.2}s (primary scan)",
                     name,
                     doc_count,
-                    load_start.elapsed().as_secs_f64()
-                );
-                eprintln!("{msg}");
-                if let Some(cb) = &inner_cb {
-                    cb(&msg);
-                }
+                    load_start.elapsed().as_secs_f64(),
+                ));
             }
-            Ok(())
-        })?;
-
-        if verbose {
-            vlog(&format!(
-                "[verbose] {}: {} documents loaded in {:.2}s (primary scan)",
-                name,
-                doc_count,
-                load_start.elapsed().as_secs_f64(),
-            ));
         }
 
         // Phase 2: Try loading cached index data (.fidx2 / .fidx / .cidx / .vidx)
@@ -542,6 +590,28 @@ impl Collection {
         // Save index cache after rebuild so next restart loads from cache
         if has_persisted_indexes && !indexes_from_cache {
             collection.save_index_data();
+        }
+
+        // Persist .pidx so next startup can skip the .dat scan.
+        // Only needed when we did the slow .dat scan this time.
+        if !loaded_from_pidx && !collection.primary_index.is_empty() {
+            let dat_size = collection.storage.file_size();
+            if let Err(e) = MmapPrimaryIndex::rebuild_from_maps(
+                &pidx_path,
+                &collection.primary_index,
+                &collection.version_index,
+                collection.next_id,
+                dat_size,
+            ) {
+                eprintln!("[warn] {}: failed to persist .pidx: {}", name, e);
+            } else if verbose {
+                let msg = format!(
+                    "[verbose] {}: persisted .pidx ({} entries) for fast restart",
+                    name,
+                    collection.primary_index.len(),
+                );
+                collection.vlog(&msg);
+            }
         }
 
         Ok(collection)
