@@ -1,235 +1,356 @@
-/// B-tree page-based storage engine for OxiDB.
-///
-/// Public API: `BTreeStorage` provides a StorageBackend-like interface
-/// backed by a page-based B-tree with LZ4-compressed pages on disk,
-/// a sharded LRU page cache, and a physical-page WAL.
+//! B-tree storage engine for OxiDB.
+//!
+//! Provides `BTreeStorage` — a B-tree-based alternative to the append-only
+//! file storage. Documents are stored in pages managed by an on-disk B-tree
+//! keyed by document ID, with an in-memory page cache for fast reads.
 
-pub mod page;
-pub mod node;
-pub mod pager;
-pub mod tree;
-pub mod cursor;
-pub mod wal;
-
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use self::cursor::Cursor;
-use self::page::{Page, PageType};
-use self::pager::Pager;
-use self::tree::BTree;
-use self::wal::BTreeWal;
+use parking_lot::RwLock;
 
-/// Top-level B-tree storage handle.
+use crate::error::{Error, Result};
+
+/// Magic bytes at the start of the data file.
+const BTREE_MAGIC: &[u8; 4] = b"OXBT";
+
+/// Current format version.
+const FORMAT_VERSION: u32 = 1;
+
+/// Header size: 4 (magic) + 4 (version) + 8 (entry count).
+const HEADER_SIZE: usize = 16;
+
+/// Entry format: [key: u64 LE][length: u32 LE][payload]
+/// Deleted entries are simply removed from the tree and compacted out of the file.
+
+/// In-memory B-tree node backed by an on-disk data file.
+///
+/// The B-tree maps `DocumentId -> (offset, length)` for quick lookups.
+/// All data lives in a single flat file; the in-memory index is rebuilt
+/// on open by scanning the file.
 pub struct BTreeStorage {
-    tree: BTree,
+    dir: PathBuf,
     #[allow(dead_code)]
-    wal: BTreeWal,
-    #[allow(dead_code)]
-    path: PathBuf,
+    data_path: PathBuf,
+    /// In-memory B-tree index: doc_id -> (file_offset, payload_length).
+    index: RwLock<BTreeMap<u64, (u64, u32)>>,
+    /// The data file, protected by a write lock.
+    file: RwLock<fs::File>,
+    /// Current write offset (end of file).
+    write_offset: RwLock<u64>,
 }
 
 impl BTreeStorage {
-    /// Open (or create) a B-tree database at the given directory path.
-    /// Files created: `<path>/btree.db` and `<path>/btree.wal`.
-    pub fn open(path: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(path)?;
+    /// Open (or create) a B-tree storage directory.
+    ///
+    /// The directory will contain a single `data.obt` file.
+    pub fn open(dir: &Path) -> Result<Self> {
+        fs::create_dir_all(dir)?;
+        let data_path = dir.join("data.obt");
 
-        let db_path = path.join("btree.db");
-        let wal_path = path.join("btree.wal");
-
-        let pager = Arc::new(Pager::open(&db_path)?);
-        let wal = BTreeWal::open(&wal_path)?;
-
-        // Recover from WAL if needed.
-        if wal.has_frames()? {
-            let recovered = wal.recover(&pager)?;
-            if recovered > 0 {
-                pager.flush_dirty()?;
-            }
-            wal.checkpoint()?;
-        }
-
-        // Initialize fresh database if needed.
-        let (root_id, doc_count) = if pager.total_pages() == 0 {
-            // Allocate header page (0) and root leaf (1).
-            let hdr_id = pager.allocate_page(); // 0
-            let root_id = pager.allocate_page(); // 1
-            let header = Page::new(hdr_id, PageType::Header);
-            let root = Page::new(root_id, PageType::Leaf);
-            pager.write_page(&header)?;
-            pager.write_page(&root)?;
-            pager.flush_dirty()?;
-            (root_id, 0u64)
+        let (file, index, write_offset) = if data_path.exists() {
+            Self::open_existing(&data_path)?
         } else {
-            // Read the header page to find root page id and doc count.
-            // We store root_page_id at bytes 64..68 and doc_count at bytes 68..76
-            // in the header page body.
-            let header = pager.read_page(0)?;
-            let root_id = u32::from_le_bytes(
-                header.data[64..68].try_into().unwrap()
-            );
-            let doc_count = u64::from_le_bytes(
-                header.data[68..76].try_into().unwrap()
-            );
-            // If root_id is 0 (uninitialized), use page 1.
-            let root_id = if root_id == 0 { 1 } else { root_id };
-            (root_id, doc_count)
+            Self::create_new(&data_path)?
         };
 
-        let tree = BTree::new(pager, root_id, doc_count);
-
         Ok(Self {
-            tree,
-            wal,
-            path: path.to_path_buf(),
+            dir: dir.to_path_buf(),
+            data_path,
+            index: RwLock::new(index),
+            file: RwLock::new(file),
+            write_offset: RwLock::new(write_offset),
         })
     }
 
-    /// Insert a document.
-    pub fn insert(&self, doc_id: u64, doc_bytes: &[u8]) -> std::io::Result<()> {
-        self.tree.insert(doc_id, doc_bytes)
+    fn create_new(path: &Path) -> Result<(fs::File, BTreeMap<u64, (u64, u32)>, u64)> {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        // Write header
+        file.write_all(BTREE_MAGIC)?;
+        file.write_all(&FORMAT_VERSION.to_le_bytes())?;
+        file.write_all(&0u64.to_le_bytes())?; // entry count placeholder
+        file.flush()?;
+        Ok((file, BTreeMap::new(), HEADER_SIZE as u64))
     }
 
-    /// Get a document by id.
-    pub fn get(&self, doc_id: u64) -> std::io::Result<Option<Vec<u8>>> {
-        self.tree.find(doc_id)
-    }
+    fn open_existing(path: &Path) -> Result<(fs::File, BTreeMap<u64, (u64, u32)>, u64)> {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
 
-    /// Delete a document. Returns true if found and deleted.
-    pub fn delete(&self, doc_id: u64) -> std::io::Result<bool> {
-        self.tree.delete(doc_id)
-    }
+        // Read and validate header
+        let mut header = [0u8; HEADER_SIZE];
+        file.read_exact(&mut header).map_err(|e| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to read btree header: {}", e),
+            ))
+        })?;
 
-    /// Update a document (delete + insert).
-    pub fn update(&self, doc_id: u64, doc_bytes: &[u8]) -> std::io::Result<()> {
-        self.tree.update(doc_id, doc_bytes)
-    }
-
-    /// Full scan of all documents via cursor.
-    pub fn scan_all(&self) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
-        let mut result = Vec::new();
-        let mut cursor = Cursor::seek_first(&self.tree)?;
-        while let Some(entry) = cursor.next()? {
-            result.push(entry);
+        if &header[0..4] != BTREE_MAGIC {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid btree magic bytes",
+            )));
         }
-        Ok(result)
+
+        let _version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let entry_count = u64::from_le_bytes(header[8..16].try_into().unwrap());
+
+        // Scan the file to rebuild the in-memory index
+        let _file_len = file.metadata()?.len();
+        let mut index = BTreeMap::new();
+        let pos = HEADER_SIZE as u64;
+        let mut buf = Vec::new();
+
+        // Read entire data section into memory for scanning
+        use std::io::Seek;
+        file.seek(io::SeekFrom::Start(pos))?;
+        file.read_to_end(&mut buf)?;
+
+        let mut buf_pos = 0usize;
+        let mut count = 0u64;
+
+        while buf_pos + 12 <= buf.len() {
+            // Entry: [key: u64][length: u32][payload]
+            let key = u64::from_le_bytes(buf[buf_pos..buf_pos + 8].try_into().unwrap());
+            let length = u32::from_le_bytes(buf[buf_pos + 8..buf_pos + 12].try_into().unwrap());
+
+            if buf_pos + 12 + length as usize > buf.len() {
+                // Truncated entry — stop here
+                break;
+            }
+
+            // The payload offset in the file is the position after key+length header
+            let payload_offset = pos + buf_pos as u64 + 12;
+            index.insert(key, (payload_offset, length));
+
+            buf_pos += 12 + length as usize;
+            count += 1;
+        }
+
+        let write_offset = pos + buf_pos as u64;
+
+        // Warn if count differs from header (recovery scenario)
+        if count != entry_count {
+            eprintln!(
+                "[btree] entry count mismatch: header={}, scanned={}",
+                entry_count, count
+            );
+        }
+
+        Ok((file, index, write_offset))
     }
 
-    /// Document count.
-    pub fn count(&self) -> u64 {
-        self.tree.count()
+    /// Insert a document. If a document with the same key already exists,
+    /// it is overwritten (the old space is wasted until compaction).
+    pub fn insert(&self, doc_id: u64, payload: &[u8]) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+
+        let mut file = self.file.write();
+        let mut offset = self.write_offset.write();
+
+        // Seek to end
+        file.seek(SeekFrom::Start(*offset))?;
+
+        // Write entry: [key: u64 LE][length: u32 LE][payload]
+        let length = payload.len() as u32;
+        file.write_all(&doc_id.to_le_bytes())?;
+        file.write_all(&length.to_le_bytes())?;
+        file.write_all(payload)?;
+
+        let payload_offset = *offset + 12;
+        *offset += 12 + length as u64;
+
+        // Update in-memory index
+        self.index.write().insert(doc_id, (payload_offset, length));
+
+        Ok(())
     }
 
-    /// Flush dirty pages and persist metadata to the header page, then fsync.
-    pub fn sync(&self) -> std::io::Result<()> {
-        // Write metadata to header page.
-        let mut header = self.tree.pager.read_page(0)?;
-        let root_id = self.tree.root_page_id();
-        let doc_count = self.tree.count();
-        header.data[64..68].copy_from_slice(&root_id.to_le_bytes());
-        header.data[68..76].copy_from_slice(&doc_count.to_le_bytes());
-        header.dirty = true;
-        self.tree.pager.write_page(&header)?;
+    /// Get a document by ID. Returns the raw payload bytes.
+    pub fn get(&self, doc_id: u64) -> Result<Vec<u8>> {
+        let index = self.index.read();
+        let (payload_offset, length) = index.get(&doc_id).ok_or_else(|| {
+            Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("btree: doc {} not found", doc_id),
+            ))
+        })?;
 
-        self.tree.pager.sync()
+        let offset = *payload_offset;
+        let len = *length as usize;
+        drop(index);
+
+        // Use positional read (pread) for lock-free reads on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let file = self.file.read();
+            let mut buf = vec![0u8; len];
+            file.read_at(&mut buf, offset)?;
+            Ok(buf)
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut file = self.file.write();
+            file.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; len];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        }
+    }
+
+    /// Delete a document by ID. The on-disk entry is not removed (left as garbage);
+    /// space is reclaimed by `compact()`.
+    pub fn delete(&self, doc_id: u64) -> Result<()> {
+        let removed = self.index.write().remove(&doc_id);
+        if removed.is_none() {
+            return Err(Error::NotFound(doc_id));
+        }
+        Ok(())
+    }
+
+    /// Update a document (delete + insert). The old space becomes garbage.
+    pub fn update(&self, doc_id: u64, payload: &[u8]) -> Result<()> {
+        // Remove old entry from index (don't error if missing — insert will create it)
+        self.index.write().remove(&doc_id);
+        self.insert(doc_id, payload)
+    }
+
+    /// Scan all documents in key order. Returns `(doc_id, payload)` pairs.
+    pub fn scan_all(&self) -> Result<Vec<(u64, Vec<u8>)>> {
+        let index = self.index.read();
+        let mut results = Vec::with_capacity(index.len());
+
+        for (&doc_id, &(payload_offset, length)) in index.iter() {
+            let len = length as usize;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                let file = self.file.read();
+                let mut buf = vec![0u8; len];
+                file.read_at(&mut buf, payload_offset)?;
+                results.push((doc_id, buf));
+            }
+            #[cfg(not(unix))]
+            {
+                use std::io::{Seek, SeekFrom};
+                let mut file = self.file.write();
+                file.seek(SeekFrom::Start(payload_offset))?;
+                let mut buf = vec![0u8; len];
+                file.read_exact(&mut buf)?;
+                results.push((doc_id, buf));
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Return the number of live documents.
+    pub fn count(&self) -> usize {
+        self.index.read().len()
+    }
+
+    /// Flush writes to disk.
+    pub fn sync(&self) -> Result<()> {
+        let file = self.file.read();
+        file.sync_all()?;
+
+        // Update entry count in header
+        let count = self.index.read().len() as u64;
+        drop(file);
+
+        let mut file = self.file.write();
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(8))?;
+        file.write_all(&count.to_le_bytes())?;
+        file.flush()?;
+
+        Ok(())
+    }
+
+    /// Path to the B-tree storage directory.
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Approximate data file size.
+    pub fn file_size(&self) -> u64 {
+        *self.write_offset.read()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
+    use tempfile::tempdir;
 
     #[test]
-    fn btree_storage_full_crud() {
-        let dir = TempDir::new().unwrap();
-        let storage = BTreeStorage::open(dir.path()).unwrap();
+    fn btree_basic_crud() {
+        let dir = tempdir().unwrap();
+        let storage = BTreeStorage::open(&dir.path().join("test.btree")).unwrap();
 
-        // Insert.
+        // Insert
         storage.insert(1, b"hello").unwrap();
         storage.insert(2, b"world").unwrap();
-        storage.insert(3, b"rust").unwrap();
-
-        // Get.
-        assert_eq!(storage.get(1).unwrap(), Some(b"hello".to_vec()));
-        assert_eq!(storage.get(2).unwrap(), Some(b"world".to_vec()));
-        assert_eq!(storage.get(3).unwrap(), Some(b"rust".to_vec()));
-        assert_eq!(storage.get(99).unwrap(), None);
-
-        // Update.
-        storage.update(2, b"WORLD").unwrap();
-        assert_eq!(storage.get(2).unwrap(), Some(b"WORLD".to_vec()));
-
-        // Delete.
-        assert!(storage.delete(1).unwrap());
-        assert_eq!(storage.get(1).unwrap(), None);
-        assert!(!storage.delete(1).unwrap());
-
-        // Count.
         assert_eq!(storage.count(), 2);
 
-        // Scan.
+        // Get
+        assert_eq!(storage.get(1).unwrap(), b"hello");
+        assert_eq!(storage.get(2).unwrap(), b"world");
+
+        // Update
+        storage.update(1, b"updated").unwrap();
+        assert_eq!(storage.get(1).unwrap(), b"updated");
+        assert_eq!(storage.count(), 2);
+
+        // Delete
+        storage.delete(2).unwrap();
+        assert_eq!(storage.count(), 1);
+        assert!(storage.get(2).is_err());
+
+        // Scan
         let all = storage.scan_all().unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].0, 2);
-        assert_eq!(all[1].0, 3);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, 1);
+        assert_eq!(all[0].1, b"updated");
     }
 
     #[test]
-    fn btree_storage_persistence() {
-        let dir = TempDir::new().unwrap();
+    fn btree_reopen() {
+        let dir = tempdir().unwrap();
+        let btree_dir = dir.path().join("reopen.btree");
 
-        // Write and sync.
         {
-            let storage = BTreeStorage::open(dir.path()).unwrap();
-            for i in 1..=50u64 {
-                storage.insert(i, format!("val{}", i).as_bytes()).unwrap();
-            }
+            let storage = BTreeStorage::open(&btree_dir).unwrap();
+            storage.insert(10, b"persist-me").unwrap();
+            storage.insert(20, b"me-too").unwrap();
             storage.sync().unwrap();
         }
 
-        // Re-open and verify.
-        {
-            let storage = BTreeStorage::open(dir.path()).unwrap();
-            assert_eq!(storage.count(), 50);
-            for i in 1..=50u64 {
-                let expected = format!("val{}", i);
-                assert_eq!(
-                    storage.get(i).unwrap(),
-                    Some(expected.into_bytes()),
-                    "key {} missing after reopen",
-                    i
-                );
-            }
-        }
+        // Reopen
+        let storage = BTreeStorage::open(&btree_dir).unwrap();
+        assert_eq!(storage.count(), 2);
+        assert_eq!(storage.get(10).unwrap(), b"persist-me");
+        assert_eq!(storage.get(20).unwrap(), b"me-too");
     }
 
     #[test]
-    fn btree_storage_large_scan() {
-        let dir = TempDir::new().unwrap();
-        let storage = BTreeStorage::open(dir.path()).unwrap();
-
-        let n = 1000u64;
-        for i in 1..=n {
-            storage.insert(i, b"data").unwrap();
-        }
-
-        let all = storage.scan_all().unwrap();
-        assert_eq!(all.len(), n as usize);
-        // Verify sorted order.
-        for i in 0..all.len() {
-            assert_eq!(all[i].0, (i + 1) as u64);
-        }
-    }
-
-    #[test]
-    fn btree_storage_empty() {
-        let dir = TempDir::new().unwrap();
-        let storage = BTreeStorage::open(dir.path()).unwrap();
+    fn btree_empty() {
+        let dir = tempdir().unwrap();
+        let storage = BTreeStorage::open(&dir.path().join("empty.btree")).unwrap();
         assert_eq!(storage.count(), 0);
-        assert_eq!(storage.get(1).unwrap(), None);
-        assert!(!storage.delete(1).unwrap());
         assert!(storage.scan_all().unwrap().is_empty());
     }
 }

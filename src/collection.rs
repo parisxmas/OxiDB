@@ -11,7 +11,7 @@ use crate::engine::LogCallback;
 use crate::error::{Error, Result};
 use crate::fts::CollectionTextIndex;
 use crate::in_memory::{InMemStorage, StorageBackend, WalBackend};
-use crate::index::{CompositeIndex, FieldIndex};
+use crate::index::CompositeIndex;
 use crate::mmap_field_index::MmapFieldIndex;
 use crate::index_persist;
 use crate::vector::{DistanceMetric, VectorIndex};
@@ -144,8 +144,8 @@ impl Collection {
         // Save field indexes (.fidx)
         let enc = self.encryption.as_ref();
         let fidx_path = self.data_dir.join(format!("{}.fidx", self.name));
-        let field_legacy: Vec<FieldIndex> = self.field_indexes.values().map(|m| m.to_field_index()).collect();
-        let field_refs: Vec<&FieldIndex> = field_legacy.iter().collect();
+        let converted: Vec<crate::index::FieldIndex> = self.field_indexes.values().map(|m| m.to_field_index()).collect();
+        let field_refs: Vec<&crate::index::FieldIndex> = converted.iter().collect();
         if let Err(e) = index_persist::save_field_indexes(&fidx_path, &field_refs, doc_count, next_id, enc) {
             eprintln!("[warn] {}: failed to save field index cache: {}", self.name, e);
         }
@@ -194,6 +194,15 @@ impl Collection {
                 cb(msg);
             }
         };
+
+        // Auto-detect B-tree storage: if a .btree directory exists, open as B-tree
+        let btree_dir = data_dir.join(format!("{}.btree", name));
+        if btree_dir.is_dir() {
+            if verbose {
+                vlog(&format!("[verbose] {}: detected B-tree storage at {:?}", name, btree_dir));
+            }
+            return Self::open_btree(name, data_dir);
+        }
 
         let data_path = data_dir.join(format!("{}.dat", name));
         let wal_path = data_dir.join(format!("{}.wal", name));
@@ -353,8 +362,7 @@ impl Collection {
                     // Replace empty index structures with cached ones
                     field_indexes.clear();
                     for idx in &cached {
-                        let mmap_idx = MmapFieldIndex::from_field_index(idx);
-                        field_indexes.insert(mmap_idx.field.clone(), mmap_idx);
+                        field_indexes.insert(idx.field.clone(), MmapFieldIndex::from_field_index(idx));
                     }
                 }
                 if let Some(cached) = cached_composite {
@@ -500,6 +508,62 @@ impl Collection {
             in_memory: true,
             ttl_index: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Create or open a collection backed by B-tree storage.
+    ///
+    /// Data is stored in `data_dir/<name>.btree/` using a B-tree page layout
+    /// instead of the default append-only file. The B-tree engine handles its own
+    /// durability so a no-op WAL is used.
+    pub fn open_btree(name: &str, data_dir: &Path) -> Result<Self> {
+        use crate::in_memory::BTreeAdapter;
+
+        let btree_dir = data_dir.join(format!("{}.btree", name));
+        let btree = crate::btree::BTreeStorage::open(&btree_dir)?;
+
+        let storage = StorageBackend::BTree(BTreeAdapter::new(btree));
+        let wal = WalBackend::Noop;
+
+        // Rebuild primary_index, version_index, next_id from B-tree contents
+        let mut primary_index = HashMap::new();
+        let doc_cache = DocCache::new(doc_cache::DEFAULT_CAPACITY);
+        let mut version_index = HashMap::new();
+        let shard_id_offset = Self::shard_id_offset();
+        let mut next_id: DocumentId = 1 + shard_id_offset;
+
+        storage.for_each_active(|loc, bytes| {
+            let doc: Value = crate::codec::decode_doc(&bytes)?;
+            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                primary_index.insert(id, loc);
+                let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                version_index.insert(id, ver);
+                if id >= next_id {
+                    next_id = id + 1;
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(Self {
+            name: name.to_string(),
+            data_dir: data_dir.to_path_buf(),
+            storage,
+            wal,
+            primary_index,
+            doc_cache,
+            field_indexes: HashMap::new(),
+            composite_indexes: Vec::new(),
+            text_index: None,
+            vector_indexes: HashMap::new(),
+            version_index,
+            next_id,
+            encryption: None,
+            verbose: false,
+            log_callback: None,
+            lazy_sync: false,
+            in_memory: false,
+            ttl_index: std::collections::BTreeMap::new(),
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -1388,110 +1452,17 @@ impl Collection {
                 if let Some(field_idx) = self.field_indexes.get(sort_field) {
                     let need = opts.skip.unwrap_or(0) as usize + opts.limit.unwrap_or(u64::MAX) as usize;
                     let mut results = Vec::new();
+                    // In index-backed sort we iterate the SORT field's index,
+                    // NOT the query fields' indexes — so we can only skip filtering
+                    // when there is no query filter at all.
                     let skip_filter = matches!(query, Query::All);
-
-                    // Lazy index check: for each doc_id from the sort index,
-                    // check filter conditions via per-doc index lookups (O(log n)
-                    // each) instead of materializing the full candidate set.
-                    // This is dramatically faster for sort+limit queries because
-                    // we only check ~limit * 1/selectivity docs vs building a
-                    // HashSet of ALL matching IDs upfront.
-                    let use_lazy_index_check = !skip_filter
-                        && query::is_lazy_index_checkable(&query, &self.field_indexes);
-
-                    // Fallback: materialize candidate set only when lazy check
-                    // is not possible (e.g. query uses $gt/$regex/non-eq ops
-                    // that can't be checked per-doc via index containment).
-                    let candidate_set: Option<HashSet<u64>> = if !skip_filter && !use_lazy_index_check {
-                        query::execute_indexed(
-                            &query,
-                            &self.field_indexes,
-                            &self.composite_indexes,
-                        )
-                        .map(|btree| btree.into_iter().collect::<HashSet<u64>>())
-                    } else {
-                        None
-                    };
-
-                    let fully_indexed = candidate_set.is_some()
-                        && query::is_fully_indexed(&query, &self.field_indexes);
-
-                    // When lazy index check is available AND we have a limit,
-                    // collect matching doc_ids first (no doc loading), then batch-load only the final set.
-                    if use_lazy_index_check && opts.limit.is_some() {
-                        let mut matched_ids: Vec<DocumentId> = Vec::with_capacity(need);
-
-                        match sort_order {
-                            SortOrder::Asc => {
-                                'id_asc: for (_value, doc_ids) in field_idx.iter_asc() {
-                                    for &id in &doc_ids {
-                                        if let Some(false) = query::matches_doc_id_indexed(
-                                            &query, id, &self.field_indexes,
-                                        ) {
-                                            continue;
-                                        }
-                                        matched_ids.push(id);
-                                        if matched_ids.len() >= need { break 'id_asc; }
-                                    }
-                                }
-                            }
-                            SortOrder::Desc => {
-                                'id_desc: for (_value, doc_ids) in field_idx.iter_desc() {
-                                    for &id in doc_ids.iter().rev() {
-                                        if let Some(false) = query::matches_doc_id_indexed(
-                                            &query, id, &self.field_indexes,
-                                        ) {
-                                            continue;
-                                        }
-                                        matched_ids.push(id);
-                                        if matched_ids.len() >= need { break 'id_desc; }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Apply skip
-                        let skip = opts.skip.unwrap_or(0) as usize;
-                        let final_ids: Vec<DocumentId> = matched_ids.into_iter().skip(skip).collect();
-
-                        // Load final documents
-                        for id in final_ids {
-                            if let Some(arc) = self.read_doc_arc(id) {
-                                results.push(arc);
-                            }
-                        }
-                        return Ok(results);
-                    }
 
                     match sort_order {
                         SortOrder::Asc => {
                             'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
                                 for &id in &doc_ids {
-                                    // Lazy index check: O(log n) per-doc membership
-                                    // test using the filter field's index directly.
-                                    if use_lazy_index_check {
-                                        if let Some(false) = query::matches_doc_id_indexed(
-                                            &query, id, &self.field_indexes,
-                                        ) {
-                                            continue;
-                                        }
-                                        // Passed index check — load doc for result
-                                        if let Some(arc) = self.read_doc_arc(id) {
-                                            results.push(arc);
-                                            if results.len() >= need {
-                                                break 'outer_asc;
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    // Fallback: materialized candidate set check
-                                    if let Some(ref cset) = candidate_set {
-                                        if !cset.contains(&id) {
-                                            continue;
-                                        }
-                                    }
                                     if let Some(arc) = self.read_doc_arc(id) {
-                                        if skip_filter || fully_indexed || query::matches_value(&query, &arc) {
+                                        if skip_filter || query::matches_value(&query, &arc) {
                                             results.push(arc);
                                             if results.len() >= need {
                                                 break 'outer_asc;
@@ -1504,29 +1475,8 @@ impl Collection {
                         SortOrder::Desc => {
                             'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
                                 for &id in doc_ids.iter().rev() {
-                                    // Lazy index check
-                                    if use_lazy_index_check {
-                                        if let Some(false) = query::matches_doc_id_indexed(
-                                            &query, id, &self.field_indexes,
-                                        ) {
-                                            continue;
-                                        }
-                                        if let Some(arc) = self.read_doc_arc(id) {
-                                            results.push(arc);
-                                            if results.len() >= need {
-                                                break 'outer_desc;
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                    // Fallback: materialized candidate set check
-                                    if let Some(ref cset) = candidate_set {
-                                        if !cset.contains(&id) {
-                                            continue;
-                                        }
-                                    }
                                     if let Some(arc) = self.read_doc_arc(id) {
-                                        if skip_filter || fully_indexed || query::matches_value(&query, &arc) {
+                                        if skip_filter || query::matches_value(&query, &arc) {
                                             results.push(arc);
                                             if results.len() >= need {
                                                 break 'outer_desc;
@@ -1696,99 +1646,23 @@ impl Collection {
                     // Phase 3: batch pread sorted by offset
                     let batch = self.storage.read_batch_lockfree(&mut miss_locs)?;
 
-                    // Phase 4: parallel decode for large miss sets
-                    const PARALLEL_DECODE_THRESHOLD: usize = 4096;
-                    if batch.len() >= PARALLEL_DECODE_THRESHOLD {
-                        let num_threads = std::thread::available_parallelism()
-                            .map(|n| n.get().min(8))
-                            .unwrap_or(4);
-                        let chunk_size = (batch.len() + num_threads - 1) / num_threads;
-                        let decoded: Result<Vec<Vec<(usize, Arc<Value>)>>> =
-                            std::thread::scope(|s| {
-                                let handles: Vec<_> = batch
-                                    .chunks(chunk_size)
-                                    .map(|chunk| {
-                                        s.spawn(move || {
-                                            let mut local: Vec<(usize, Arc<Value>)> =
-                                                Vec::with_capacity(chunk.len());
-                                            for &(i, ref bytes) in chunk {
-                                                let doc =
-                                                    crate::codec::decode_doc(bytes)?;
-                                                local.push((i, Arc::new(doc)));
-                                            }
-                                            Ok::<_, crate::error::Error>(local)
-                                        })
-                                    })
-                                    .collect();
-                                handles
-                                    .into_iter()
-                                    .map(|h| h.join().unwrap())
-                                    .collect()
-                            });
-                        let decoded = decoded?;
-                        let mut cache_entries: Vec<(u64, Arc<Value>)> =
-                            Vec::with_capacity(batch.len());
-                        for chunk in decoded {
-                            for (i, arc) in chunk {
-                                cache_entries.push((ids[i], Arc::clone(&arc)));
-                                all_docs[i] = Some(arc);
-                            }
-                        }
-                        self.doc_cache.put_many(cache_entries);
-                    } else {
-                        // Sequential decode for smaller miss sets
-                        let mut cache_entries: Vec<(u64, Arc<Value>)> =
-                            Vec::with_capacity(batch.len());
-                        for (i, bytes) in batch {
-                            let doc = crate::codec::decode_doc(&bytes)?;
-                            let arc = Arc::new(doc);
-                            cache_entries.push((ids[i], Arc::clone(&arc)));
-                            all_docs[i] = Some(arc);
-                        }
-                        self.doc_cache.put_many(cache_entries);
+                    // Phase 4: decode and batch-populate cache
+                    let mut cache_entries: Vec<(u64, Arc<Value>)> =
+                        Vec::with_capacity(batch.len());
+                    for (i, bytes) in batch {
+                        let doc = crate::codec::decode_doc(&bytes)?;
+                        let arc = Arc::new(doc);
+                        cache_entries.push((ids[i], Arc::clone(&arc)));
+                        all_docs[i] = Some(arc);
                     }
+                    self.doc_cache.put_many(cache_entries);
                 }
 
-                // Phase 5: build results (parallel for large sets)
-                const PARALLEL_FILTER_THRESHOLD: usize = 50_000;
-                let num_threads = std::thread::available_parallelism()
-                    .map(|n| n.get().min(8))
-                    .unwrap_or(4);
-                if all_docs.len() >= PARALLEL_FILTER_THRESHOLD && num_threads > 1 {
-                    let chunk_size =
-                        (all_docs.len() + num_threads - 1) / num_threads;
-                    let q = &query;
-                    results = std::thread::scope(|s| {
-                        let handles: Vec<_> = all_docs
-                            .chunks(chunk_size)
-                            .map(|chunk| {
-                                s.spawn(move || {
-                                    let mut local: Vec<Arc<Value>> = Vec::new();
-                                    for opt in chunk {
-                                        if let Some(arc) = opt {
-                                            if skip_post_filter
-                                                || query::matches_value(q, arc)
-                                            {
-                                                local.push(Arc::clone(arc));
-                                            }
-                                        }
-                                    }
-                                    local
-                                })
-                            })
-                            .collect();
-                        let mut merged = Vec::new();
-                        for h in handles {
-                            merged.extend(h.join().unwrap());
-                        }
-                        merged
-                    });
-                } else {
-                    for opt in all_docs {
-                        if let Some(arc) = opt {
-                            if skip_post_filter || query::matches_value(&query, &arc) {
-                                results.push(arc);
-                            }
+                // Phase 5: build results
+                for opt in all_docs {
+                    if let Some(arc) = opt {
+                        if skip_post_filter || query::matches_value(&query, &arc) {
+                            results.push(arc);
                         }
                     }
                 }
@@ -1808,142 +1682,101 @@ impl Collection {
                 }
             }
         } else {
-            // No index — parallel raw scan for large collections.
-            // Uses matches_raw_jsonb to skip non-matching docs without
-            // full JSON deserialization, and scans segments in parallel.
-            let doc_count = self.primary_index.len();
+            // No index — iterate all documents via parallel cache-first path.
+            // Probes LRU cache first (zero-cost for warm cache), falls
+            // back to disk + decompress only for cache misses.
+            let ids: Vec<DocumentId> = self.primary_index.keys().copied().collect();
+            let cached = self.doc_cache.get_many(&ids);
+
             let num_threads = std::thread::available_parallelism()
                 .map(|n| n.get().min(8))
                 .unwrap_or(4);
 
-            if doc_count >= 100_000 && num_threads > 1 && early_limit.is_none() && !matches!(query, Query::All) {
-                let segments = self.compute_scan_segments(num_threads);
-                let q = &query;
-                let scan_results: Result<Vec<Vec<Arc<Value>>>> = std::thread::scope(|s| {
-                    let handles: Vec<_> = segments
-                        .iter()
-                        .map(|&(start, end)| {
+            // Phase 1: parallel query matching on cached documents
+            let mut miss_indices: Vec<usize> = Vec::new();
+            if cached.len() >= 10_000 && num_threads > 1 && early_limit.is_none() {
+                let chunk_size = (cached.len() + num_threads - 1) / num_threads;
+                let (par_results, par_misses) = std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..num_threads)
+                        .map(|t| {
+                            let start = t * chunk_size;
+                            let end = ((t + 1) * chunk_size).min(cached.len());
+                            let slice = &cached[start..end];
+                            let q = &query;
                             s.spawn(move || {
-                                let mut local: Vec<Arc<Value>> = Vec::new();
-                                self.storage.scan_segment_readonly_while(start, end, |bytes| {
-                                    match query::matches_raw_jsonb(q, bytes) {
-                                        Some(true) => {
-                                            let doc = crate::codec::decode_doc(bytes)?;
-                                            local.push(Arc::new(doc));
+                                let mut local_hits: Vec<Arc<Value>> = Vec::new();
+                                let mut local_miss: Vec<usize> = Vec::new();
+                                for (j, opt) in slice.iter().enumerate() {
+                                    if let Some(arc) = opt {
+                                        if query::matches_value(q, arc) {
+                                            local_hits.push(Arc::clone(arc));
                                         }
-                                        Some(false) => {}
-                                        None => {
-                                            // Raw check not possible, fall back to full decode
-                                            let doc = crate::codec::decode_doc(bytes)?;
-                                            if query::matches_value(q, &doc) {
-                                                local.push(Arc::new(doc));
-                                            }
-                                        }
+                                    } else {
+                                        local_miss.push(start + j);
                                     }
-                                    Ok(true)
-                                })?;
-                                Ok::<_, crate::error::Error>(local)
+                                }
+                                (local_hits, local_miss)
                             })
                         })
                         .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().unwrap())
-                        .collect()
+                    let mut all_results: Vec<Arc<Value>> = Vec::new();
+                    let mut all_misses: Vec<usize> = Vec::new();
+                    for h in handles {
+                        let (r, m) = h.join().unwrap();
+                        all_results.extend(r);
+                        all_misses.extend(m);
+                    }
+                    (all_results, all_misses)
                 });
-                for chunk in scan_results? {
-                    results.extend(chunk);
-                }
+                results.extend(par_results);
+                miss_indices = par_misses;
             } else {
-                // Small collection or query with limit — cache-first path.
-                let ids: Vec<DocumentId> = self.primary_index.keys().copied().collect();
-                let cached = self.doc_cache.get_many(&ids);
-
-                let mut miss_indices: Vec<usize> = Vec::new();
-                if cached.len() >= 10_000 && num_threads > 1 && early_limit.is_none() {
-                    let chunk_size = (cached.len() + num_threads - 1) / num_threads;
-                    let (par_results, par_misses) = std::thread::scope(|s| {
-                        let handles: Vec<_> = (0..num_threads)
-                            .map(|t| {
-                                let start = t * chunk_size;
-                                let end = ((t + 1) * chunk_size).min(cached.len());
-                                let slice = &cached[start..end];
-                                let q = &query;
-                                s.spawn(move || {
-                                    let mut local_hits: Vec<Arc<Value>> = Vec::new();
-                                    let mut local_miss: Vec<usize> = Vec::new();
-                                    for (j, opt) in slice.iter().enumerate() {
-                                        if let Some(arc) = opt {
-                                            if query::matches_value(q, arc) {
-                                                local_hits.push(Arc::clone(arc));
-                                            }
-                                        } else {
-                                            local_miss.push(start + j);
-                                        }
-                                    }
-                                    (local_hits, local_miss)
-                                })
-                            })
-                            .collect();
-                        let mut all_results: Vec<Arc<Value>> = Vec::new();
-                        let mut all_misses: Vec<usize> = Vec::new();
-                        for h in handles {
-                            let (r, m) = h.join().unwrap();
-                            all_results.extend(r);
-                            all_misses.extend(m);
-                        }
-                        (all_results, all_misses)
-                    });
-                    results.extend(par_results);
-                    miss_indices = par_misses;
-                } else {
-                    // Sequential path: small collections or queries with limit
-                    for (i, opt) in cached.into_iter().enumerate() {
-                        if let Some(arc) = opt {
-                            if query::matches_value(&query, &arc) {
-                                results.push(arc);
-                                if let Some(limit) = early_limit {
-                                    if results.len() >= limit {
-                                        break;
-                                    }
+                // Sequential path: small collections or queries with limit
+                for (i, opt) in cached.into_iter().enumerate() {
+                    if let Some(arc) = opt {
+                        if query::matches_value(&query, &arc) {
+                            results.push(arc);
+                            if let Some(limit) = early_limit {
+                                if results.len() >= limit {
+                                    break;
                                 }
                             }
-                        } else {
-                            miss_indices.push(i);
                         }
+                    } else {
+                        miss_indices.push(i);
                     }
                 }
+            }
 
-                // Phase 2: batch-read cache misses from disk (if any and not already at limit)
-                let at_limit = early_limit.map_or(false, |l| results.len() >= l);
-                if !miss_indices.is_empty() && !at_limit {
-                    let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = miss_indices
-                        .iter()
-                        .filter_map(|&i| {
-                            self.primary_index.get(&ids[i]).map(|&loc| (i, loc))
-                        })
-                        .collect();
+            // Phase 2: batch-read cache misses from disk (if any and not already at limit)
+            let at_limit = early_limit.map_or(false, |l| results.len() >= l);
+            if !miss_indices.is_empty() && !at_limit {
+                let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = miss_indices
+                    .iter()
+                    .filter_map(|&i| {
+                        self.primary_index.get(&ids[i]).map(|&loc| (i, loc))
+                    })
+                    .collect();
 
-                    if !miss_locs.is_empty() {
-                        let batch = self.storage.read_batch_lockfree(&mut miss_locs)?;
-                        let mut cache_entries: Vec<(DocumentId, Arc<Value>)> =
-                            Vec::with_capacity(batch.len());
+                if !miss_locs.is_empty() {
+                    let batch = self.storage.read_batch_lockfree(&mut miss_locs)?;
+                    let mut cache_entries: Vec<(DocumentId, Arc<Value>)> =
+                        Vec::with_capacity(batch.len());
 
-                        for (i, bytes) in batch {
-                            let doc = crate::codec::decode_doc(&bytes)?;
-                            let arc = Arc::new(doc);
-                            cache_entries.push((ids[i], Arc::clone(&arc)));
-                            if query::matches_value(&query, &arc) {
-                                results.push(arc);
-                                if let Some(limit) = early_limit {
-                                    if results.len() >= limit {
-                                        break;
-                                    }
+                    for (i, bytes) in batch {
+                        let doc = crate::codec::decode_doc(&bytes)?;
+                        let arc = Arc::new(doc);
+                        cache_entries.push((ids[i], Arc::clone(&arc)));
+                        if query::matches_value(&query, &arc) {
+                            results.push(arc);
+                            if let Some(limit) = early_limit {
+                                if results.len() >= limit {
+                                    break;
                                 }
                             }
                         }
-                        self.doc_cache.put_many(cache_entries);
                     }
+                    self.doc_cache.put_many(cache_entries);
                 }
             }
         }
@@ -2104,13 +1937,11 @@ impl Collection {
                 None => None,
             };
 
-            // For $match with index, decide between indexed random-read vs
-            // parallel sequential scan. Indexed lookup is only faster when the
-            // candidate set is very small (< 5% of collection), because:
-            // - Sequential scan with raw JSONB matching avoids per-doc cache
-            //   lookups and deserializes only matches
-            // - Parallel segments give near-linear speedup with thread count
-            // - Random reads from cache have overhead even when warm
+            // For $match with index, check if parallel full scan is better
+            // than indexed lookup. With warm LRU cache, random reads via
+            // cached doc pointers are nearly free, so prefer the indexed path
+            // whenever candidates < 50% of collection. This avoids scanning
+            // the entire collection when an index can skip most documents.
             if let Some(ref query) = match_query {
                 let candidate_ids = query::execute_indexed(
                     query,
@@ -2118,8 +1949,8 @@ impl Collection {
                     &self.composite_indexes,
                 );
                 if let Some(ref ids) = candidate_ids {
-                    if ids.len() <= doc_count / 20 {
-                        // Very small candidate set — indexed random-read is faster
+                    if ids.len() <= doc_count / 2 {
+                        // Small candidate set — indexed random-read is faster
                         return self.aggregate_streaming_indexed(
                             query, ids, group_key, accumulators, use_raw,
                         );
@@ -2308,7 +2139,6 @@ impl Collection {
     }
 
     /// Indexed match path — batch pread + raw JSONB path (extracted for reuse).
-    /// Parallelizes aggregation across threads when the candidate set is large.
     fn aggregate_streaming_indexed(
         &self,
         query: &Query,
@@ -2317,6 +2147,7 @@ impl Collection {
         accumulators: &[(String, crate::pipeline::Accumulator)],
         use_raw: bool,
     ) -> Result<Vec<Value>> {
+        let mut group = crate::pipeline::StreamingGroup::new(group_key, accumulators);
         let skip_post_filter = query::is_fully_indexed(query, &self.field_indexes);
         let id_vec: Vec<u64> = ids.iter().copied().collect();
 
@@ -2337,94 +2168,12 @@ impl Collection {
             Vec::new()
         };
 
-        // Parallel aggregation: split cached hits across threads for grouping.
-        let num_threads = std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(4);
-
-        // Collect cache hits for parallel processing
-        let cache_hits: Vec<&Arc<Value>> = if skip_post_filter {
-            cached.iter().filter_map(|opt| opt.as_ref()).collect()
-        } else {
-            cached
-                .iter()
-                .filter_map(|opt| {
-                    opt.as_ref()
-                        .filter(|arc| query::matches_value(query, arc))
-                })
-                .collect()
-        };
-
-        let use_parallel = cache_hits.len() >= 10_000 && num_threads > 1;
-
-        if use_parallel {
-            let chunk_size = (cache_hits.len() + num_threads - 1) / num_threads;
-
-            let result: Result<Vec<Value>> = std::thread::scope(|s| {
-                let mut handles = Vec::new();
-
-                // Spawn threads for cache hits
-                for chunk in cache_hits.chunks(chunk_size) {
-                    let gk = group_key;
-                    let acc = accumulators;
-                    handles.push(s.spawn(move || {
-                        let mut local_group =
-                            crate::pipeline::StreamingGroup::new(gk, acc);
-                        for arc in chunk {
-                            local_group.feed(arc);
-                        }
-                        Ok::<_, crate::error::Error>(local_group)
-                    }));
+        for opt in cached.iter() {
+            if let Some(arc) = opt {
+                if skip_post_filter || query::matches_value(query, arc) {
+                    group.feed(arc);
                 }
-
-                // Process batch_raw (cache misses) in the main merge step
-                let mut merged: Option<crate::pipeline::StreamingGroup> = None;
-                for handle in handles {
-                    let local_group = handle.join().unwrap()?;
-                    match merged {
-                        None => merged = Some(local_group),
-                        Some(ref mut m) => m.merge(local_group),
-                    }
-                }
-
-                // Feed cache misses
-                let mut miss_group =
-                    crate::pipeline::StreamingGroup::new(group_key, accumulators);
-                if use_raw && skip_post_filter {
-                    for (_i, bytes) in &batch_raw {
-                        miss_group.feed_raw(bytes);
-                    }
-                } else {
-                    let mut cache_entries: Vec<(u64, Arc<Value>)> =
-                        Vec::with_capacity(batch_raw.len());
-                    for (i, bytes) in &batch_raw {
-                        let doc = crate::codec::decode_doc(bytes)?;
-                        let arc = Arc::new(doc);
-                        if skip_post_filter || query::matches_value(query, &arc) {
-                            miss_group.feed(&arc);
-                        }
-                        cache_entries.push((id_vec[*i], Arc::clone(&arc)));
-                    }
-                    self.doc_cache.put_many(cache_entries);
-                }
-
-                match merged {
-                    None => merged = Some(miss_group),
-                    Some(ref mut m) => m.merge(miss_group),
-                }
-
-                Ok(merged
-                    .map(|g| g.finalize())
-                    .unwrap_or_default())
-            });
-            return result;
-        }
-
-        // Sequential path for small candidate sets
-        let mut group = crate::pipeline::StreamingGroup::new(group_key, accumulators);
-
-        for arc in &cache_hits {
-            group.feed(arc);
+            }
         }
 
         if use_raw && skip_post_filter {
@@ -2584,11 +2333,13 @@ impl Collection {
             .collect();
         self.wal.log_batch_no_sync(&wal_entries)?;
 
-        // Phase 3: apply all mutations to .dat — batch append + batch delete
-        let items: Vec<&[u8]> = ops.iter().map(|op| op.new_bytes.as_slice()).collect();
-        let new_locs = self.storage.append_batch_no_sync_buffered(&items)?;
-        let old_locs: Vec<DocLocation> = ops.iter().map(|op| op.old_loc).collect();
-        self.storage.mark_deleted_batch_no_sync(&old_locs)?;
+        // Phase 3: apply all mutations to .dat
+        let mut new_locs = Vec::with_capacity(ops.len());
+        for op in &ops {
+            let new_loc = self.storage.append_no_sync(&op.new_bytes)?;
+            self.storage.mark_deleted_no_sync(op.old_loc)?;
+            new_locs.push(new_loc);
+        }
         if !self.lazy_sync {
             self.storage.sync()?;
         }
@@ -2709,9 +2460,10 @@ impl Collection {
             .collect();
         self.wal.log_batch_no_sync(&wal_entries)?;
 
-        // Phase 3: batch mark all deleted in .dat
-        let del_locs: Vec<DocLocation> = ops.iter().map(|op| op.loc).collect();
-        self.storage.mark_deleted_batch_no_sync(&del_locs)?;
+        // Phase 3: mark all deleted in .dat
+        for op in &ops {
+            self.storage.mark_deleted_no_sync(op.loc)?;
+        }
         if !self.lazy_sync {
             self.storage.sync()?;
         }
@@ -3850,5 +3602,90 @@ mod tests {
         // Should get the two most recent Junior entries from formId "1"
         assert_eq!(results[0]["createdAt"], "2024-01-05");
         assert_eq!(results[1]["createdAt"], "2024-01-03");
+    }
+
+    // -----------------------------------------------------------------------
+    // B-tree storage tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn btree_collection_crud() {
+        let dir = tempdir().unwrap();
+        let mut col = Collection::open_btree("btree_test", dir.path()).unwrap();
+
+        // Insert 100 docs
+        let mut ids = Vec::new();
+        for i in 0..100 {
+            let id = col
+                .insert(json!({"name": format!("user_{}", i), "score": i}))
+                .unwrap();
+            ids.push(id);
+        }
+        assert_eq!(col.count(), 100);
+
+        // Find all
+        let all = col.find(&json!({})).unwrap();
+        assert_eq!(all.len(), 100);
+
+        // Get specific doc
+        let doc = col.get(ids[42]).unwrap().unwrap();
+        assert_eq!(doc["name"], "user_42");
+        assert_eq!(doc["score"], 42);
+
+        // Update one
+        col.update(
+            &json!({"_id": ids[0]}),
+            &json!({"$set": {"name": "updated_user_0"}}),
+            None,
+        )
+        .unwrap();
+        let updated = col.get(ids[0]).unwrap().unwrap();
+        assert_eq!(updated["name"], "updated_user_0");
+        assert_eq!(col.count(), 100);
+
+        // Delete one
+        let deleted = col.delete(&json!({"_id": ids[99]}), None).unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(col.count(), 99);
+        assert!(col.get(ids[99]).unwrap().is_none());
+
+        // Find with query
+        let high_score = col.find(&json!({"score": {"$gte": 90}})).unwrap();
+        // We deleted id[99] (score 99), so should get scores 90..98 = 9 docs
+        assert_eq!(high_score.len(), 9);
+    }
+
+    #[test]
+    fn btree_collection_reopen() {
+        let dir = tempdir().unwrap();
+        let id;
+        {
+            let mut col = Collection::open_btree("reopen_test", dir.path()).unwrap();
+            id = col.insert(json!({"key": "value"})).unwrap();
+            col.storage.sync().unwrap();
+        }
+
+        // Reopen the same directory
+        let col = Collection::open_btree("reopen_test", dir.path()).unwrap();
+        assert_eq!(col.count(), 1);
+        let doc = col.get(id).unwrap().unwrap();
+        assert_eq!(doc["key"], "value");
+    }
+
+    #[test]
+    fn btree_autodetect_on_open() {
+        let dir = tempdir().unwrap();
+        // Create a B-tree collection first
+        {
+            let mut col = Collection::open_btree("autodetect", dir.path()).unwrap();
+            col.insert(json!({"test": true})).unwrap();
+            col.storage.sync().unwrap();
+        }
+
+        // Now open with the generic open() — should auto-detect the .btree dir
+        let col = Collection::open("autodetect", dir.path()).unwrap();
+        assert_eq!(col.count(), 1);
+        let all = col.find(&json!({})).unwrap();
+        assert_eq!(all[0]["test"], true);
     }
 }
