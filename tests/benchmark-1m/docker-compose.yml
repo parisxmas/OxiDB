@@ -43,5 +43,5 @@ services:
       - OXIDB_HOST=oxidb
       - OXIDB_PORT=4444
       - MONGO_URI=mongodb://mongodb:27017
-      - DOC_COUNT=1000000
+      - DOC_COUNT=100000
       - BATCH_SIZE=5000
