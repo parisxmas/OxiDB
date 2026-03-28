@@ -11,18 +11,21 @@ use crate::error::Result;
 const RECORD_ACTIVE: u8 = 0;
 const RECORD_DELETED: u8 = 1;
 
-/// First 4 bytes of a zstd frame — used to detect compressed payloads.
+/// First 4 bytes of a zstd frame — used to detect legacy zstd-compressed payloads.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 
-/// Default zstd compression level.
+/// LZ4 frame magic — used to detect lz4-compressed payloads.
+const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
+
+/// Default zstd compression level (kept for reading legacy data).
 const ZSTD_LEVEL: i32 = 3;
 
 thread_local! {
-    /// Per-thread reusable zstd compressor — avoids context creation overhead per document.
+    /// Per-thread reusable zstd compressor (legacy — kept for backward compat reads).
     static ZSTD_COMPRESSOR: std::cell::RefCell<zstd::bulk::Compressor<'static>> = std::cell::RefCell::new(
         zstd::bulk::Compressor::new(ZSTD_LEVEL).expect("failed to create zstd compressor")
     );
-    /// Per-thread reusable zstd decompressor.
+    /// Per-thread reusable zstd decompressor (legacy reads).
     static ZSTD_DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> = std::cell::RefCell::new(
         zstd::bulk::Decompressor::new().expect("failed to create zstd decompressor")
     );
@@ -114,25 +117,41 @@ impl Storage {
         })
     }
 
-    /// Decompress if the payload starts with the zstd magic number.
+    /// Decompress if the payload starts with zstd or lz4 magic bytes.
     fn maybe_decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() >= 4 && data[..4] == ZSTD_MAGIC {
-            // Use the frame content size header if available, otherwise estimate.
+        if data.len() < 4 {
+            return Ok(data.to_vec());
+        }
+
+        // zstd frame
+        if data[..4] == ZSTD_MAGIC {
             let exact = zstd::zstd_safe::get_frame_content_size(data);
             let capacity = match exact {
                 Ok(Some(size)) => size as usize,
                 _ => std::cmp::max(data.len() * 16, 65536),
             };
-            ZSTD_DECOMPRESSOR.with(|d| {
+            return ZSTD_DECOMPRESSOR.with(|d| {
                 d.borrow_mut()
                     .decompress(data, capacity)
                     .map_err(|e| crate::error::Error::Io(
                         std::io::Error::new(std::io::ErrorKind::InvalidData, e),
                     ))
-            })
-        } else {
-            Ok(data.to_vec())
+            });
         }
+
+        // LZ4 frame (backward compat if data was written with lz4)
+        if data[..4] == LZ4_MAGIC {
+            use std::io::Read as _;
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
+            let mut result = Vec::with_capacity(data.len() * 4);
+            decoder.read_to_end(&mut result).map_err(|e| {
+                crate::error::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            return Ok(result);
+        }
+
+        // Uncompressed
+        Ok(data.to_vec())
     }
 
     /// Prepare payload for writing: compress → encrypt.
