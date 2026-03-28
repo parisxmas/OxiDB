@@ -10,9 +10,13 @@ use flate2::write::GzEncoder;
 use serde_json::{json, Value};
 
 use crate::blob::BlobStore;
+use crate::btree_collection::BTreeCollection;
 use crate::change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
 use crate::collection::{Collection, CompactStats, IndexInfo, resolve_field_in_value};
+use crate::index::CompositeIndex;
+use crate::mmap_field_index::MmapFieldIndex;
 use crate::value::IndexValue;
+use crate::vector::VectorIndex;
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
@@ -24,6 +28,267 @@ use crate::tx_log::{TransactionId, TxCommitLog};
 
 /// Callback type for forwarding engine log messages to an external sink.
 pub type LogCallback = Arc<dyn Fn(&str) + Send + Sync>;
+
+// ---------------------------------------------------------------------------
+// AnyCollection — enum wrapper for Collection vs BTreeCollection
+// ---------------------------------------------------------------------------
+
+/// Wraps either a standard `Collection` or a B-tree-native `BTreeCollection`.
+///
+/// Every method the engine calls on a collection is delegated through this
+/// enum via straightforward match arms.
+pub enum AnyCollection {
+    Standard(Collection),
+    BTree(BTreeCollection),
+}
+
+// Macro to reduce boilerplate for simple delegation patterns.
+macro_rules! delegate {
+    // &self methods
+    (ref $self:ident . $method:ident ( $($arg:ident),* )) => {
+        match $self {
+            AnyCollection::Standard(c) => c.$method($($arg),*),
+            AnyCollection::BTree(c) => c.$method($($arg),*),
+        }
+    };
+    // &mut self methods
+    (mut $self:ident . $method:ident ( $($arg:ident),* )) => {
+        match $self {
+            AnyCollection::Standard(c) => c.$method($($arg),*),
+            AnyCollection::BTree(c) => c.$method($($arg),*),
+        }
+    };
+}
+
+impl AnyCollection {
+    // -- Configuration -------------------------------------------------------
+
+    pub fn set_lazy_sync(&mut self, enabled: bool) {
+        delegate!(mut self.set_lazy_sync(enabled));
+    }
+
+    pub fn set_cache_capacity(&self, capacity: usize) {
+        delegate!(ref self.set_cache_capacity(capacity));
+    }
+
+    pub fn sync_writes(&self) -> Result<()> {
+        delegate!(ref self.sync_writes())
+    }
+
+    pub fn save_index_data(&self) {
+        delegate!(ref self.save_index_data());
+    }
+
+    // -- Accessor methods ----------------------------------------------------
+
+    pub fn field_indexes(&self) -> &HashMap<String, MmapFieldIndex> {
+        delegate!(ref self.field_indexes())
+    }
+
+    pub fn composite_indexes(&self) -> &[CompositeIndex] {
+        delegate!(ref self.composite_indexes())
+    }
+
+    pub fn has_text_index(&self) -> bool {
+        delegate!(ref self.has_text_index())
+    }
+
+    pub fn vector_indexes(&self) -> &HashMap<String, VectorIndex> {
+        delegate!(ref self.vector_indexes())
+    }
+
+    // -- Document access -----------------------------------------------------
+
+    pub fn load_doc_arc(&self, id: DocumentId) -> Option<Arc<Value>> {
+        delegate!(ref self.load_doc_arc(id))
+    }
+
+    pub fn get_version(&self, doc_id: DocumentId) -> u64 {
+        delegate!(ref self.get_version(doc_id))
+    }
+
+    pub fn check_unique_constraints(&self, data: &Value, exclude_id: Option<DocumentId>) -> Result<()> {
+        delegate!(ref self.check_unique_constraints(data, exclude_id))
+    }
+
+    // -- CRUD ----------------------------------------------------------------
+
+    pub fn insert(&mut self, doc: Value) -> Result<DocumentId> {
+        delegate!(mut self.insert(doc))
+    }
+
+    pub fn reserve_ids(&mut self, count: u64) -> DocumentId {
+        delegate!(mut self.reserve_ids(count))
+    }
+
+    pub fn insert_many_prepared(
+        &mut self,
+        prepared: Vec<(DocumentId, Value, Vec<u8>)>,
+    ) -> Result<Vec<DocumentId>> {
+        delegate!(mut self.insert_many_prepared(prepared))
+    }
+
+    pub fn find(&self, query: &Value) -> Result<Vec<Value>> {
+        delegate!(ref self.find(query))
+    }
+
+    pub fn find_arcs(&self, query_json: &Value) -> Result<Vec<Arc<Value>>> {
+        delegate!(ref self.find_arcs(query_json))
+    }
+
+    pub fn find_with_options(&self, query: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
+        delegate!(ref self.find_with_options(query, opts))
+    }
+
+    pub fn find_with_options_arcs(&self, query: &Value, opts: &FindOptions) -> Result<Vec<Arc<Value>>> {
+        delegate!(ref self.find_with_options_arcs(query, opts))
+    }
+
+    pub fn find_one(&self, query: &Value) -> Result<Option<Value>> {
+        delegate!(ref self.find_one(query))
+    }
+
+    pub fn update(
+        &mut self,
+        query: &Value,
+        update: &Value,
+        limit: Option<usize>,
+    ) -> Result<Vec<DocumentId>> {
+        delegate!(mut self.update(query, update, limit))
+    }
+
+    pub fn delete(
+        &mut self,
+        query: &Value,
+        limit: Option<usize>,
+    ) -> Result<Vec<DocumentId>> {
+        delegate!(mut self.delete(query, limit))
+    }
+
+    pub fn count(&self) -> usize {
+        delegate!(ref self.count())
+    }
+
+    pub fn count_matching(&self, query: &Value) -> Result<usize> {
+        delegate!(ref self.count_matching(query))
+    }
+
+    pub fn compact(&mut self) -> Result<CompactStats> {
+        delegate!(mut self.compact())
+    }
+
+    // -- Indexes -------------------------------------------------------------
+
+    pub fn create_index(&mut self, field: &str) -> Result<()> {
+        delegate!(mut self.create_index(field))
+    }
+
+    pub fn create_unique_index(&mut self, field: &str) -> Result<()> {
+        delegate!(mut self.create_unique_index(field))
+    }
+
+    pub fn create_composite_index(&mut self, fields: Vec<String>) -> Result<String> {
+        delegate!(mut self.create_composite_index(fields))
+    }
+
+    pub fn list_indexes(&self) -> Vec<IndexInfo> {
+        delegate!(ref self.list_indexes())
+    }
+
+    pub fn drop_index(&mut self, name: &str) -> Result<()> {
+        delegate!(mut self.drop_index(name))
+    }
+
+    // -- Text search ---------------------------------------------------------
+
+    pub fn create_text_index(&mut self, fields: Vec<String>) -> Result<()> {
+        delegate!(mut self.create_text_index(fields))
+    }
+
+    pub fn text_search(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
+        delegate!(ref self.text_search(query, limit))
+    }
+
+    // -- Vector search -------------------------------------------------------
+
+    pub fn create_vector_index(
+        &mut self,
+        field: &str,
+        dimension: usize,
+        metric: crate::vector::DistanceMetric,
+    ) -> Result<()> {
+        delegate!(mut self.create_vector_index(field, dimension, metric))
+    }
+
+    pub fn vector_search(
+        &self,
+        field: &str,
+        query_vector: &[f32],
+        limit: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<Value>> {
+        delegate!(ref self.vector_search(field, query_vector, limit, ef_search))
+    }
+
+    // -- Aggregation ---------------------------------------------------------
+
+    pub(crate) fn aggregate_streaming(
+        &self,
+        match_query_json: Option<&Value>,
+        group_key: &crate::pipeline::GroupKey,
+        accumulators: &[(String, crate::pipeline::Accumulator)],
+    ) -> Result<Vec<Value>> {
+        delegate!(ref self.aggregate_streaming(match_query_json, group_key, accumulators))
+    }
+
+    // -- Transaction support -------------------------------------------------
+
+    pub fn log_wal_batch(&self, entries: &[crate::wal::WalEntry]) -> Result<()> {
+        delegate!(ref self.log_wal_batch(entries))
+    }
+
+    pub fn checkpoint_wal(&self) -> Result<()> {
+        delegate!(ref self.checkpoint_wal())
+    }
+
+    pub fn prepare_tx_insert(
+        &mut self,
+        data: Value,
+        tx_id: u64,
+    ) -> Result<crate::collection::PreparedMutation> {
+        delegate!(mut self.prepare_tx_insert(data, tx_id))
+    }
+
+    pub fn prepare_tx_update(
+        &mut self,
+        query_json: &Value,
+        update_json: &Value,
+        tx_id: u64,
+    ) -> Result<Vec<crate::collection::PreparedMutation>> {
+        delegate!(mut self.prepare_tx_update(query_json, update_json, tx_id))
+    }
+
+    pub fn prepare_tx_delete(
+        &mut self,
+        query_json: &Value,
+        tx_id: u64,
+    ) -> Result<Vec<crate::collection::PreparedMutation>> {
+        delegate!(mut self.prepare_tx_delete(query_json, tx_id))
+    }
+
+    pub fn apply_prepared(
+        &mut self,
+        mutations: &mut Vec<crate::collection::PreparedMutation>,
+    ) -> Result<()> {
+        delegate!(mut self.apply_prepared(mutations))
+    }
+
+    // -- TTL -----------------------------------------------------------------
+
+    pub fn evict_expired(&mut self) -> usize {
+        delegate!(mut self.evict_expired())
+    }
+}
 
 /// Information about a completed backup operation.
 #[derive(Debug)]
@@ -60,7 +325,7 @@ enum FtsJob {
 /// and reads on the *same* collection can proceed concurrently.
 pub struct OxiDb {
     data_dir: PathBuf,
-    collections: RwLock<HashMap<String, Arc<RwLock<Collection>>>>,
+    collections: RwLock<HashMap<String, Arc<RwLock<AnyCollection>>>>,
     blob_store: BlobStore,
     fts_index: Arc<RwLock<FtsIndex>>,
     fts_tx: mpsc::SyncSender<FtsJob>,
@@ -291,7 +556,7 @@ impl OxiDb {
     }
 
     /// Return an Arc to a collection's RwLock, auto-creating if needed.
-    fn get_or_create_collection(&self, name: &str) -> Result<Arc<RwLock<Collection>>> {
+    fn get_or_create_collection(&self, name: &str) -> Result<Arc<RwLock<AnyCollection>>> {
         // Fast path: read lock only
         {
             let cols = self.collections.read();
@@ -301,19 +566,23 @@ impl OxiDb {
         }
         // Slow path: load the collection OUTSIDE the write lock so that other
         // collections remain accessible while a large collection is loading.
-        let mut col = if self.in_memory {
-            Collection::open_in_memory(name)
-        } else if self.use_btree || self.data_dir.join(format!("{}.btree", name)).exists() {
-            Collection::open_btree(name, &self.data_dir)?
+        let mut col: AnyCollection = if self.use_btree || self.data_dir.join(format!("{}.btree", name)).exists() {
+            if self.in_memory {
+                AnyCollection::BTree(BTreeCollection::open_in_memory(name))
+            } else {
+                AnyCollection::BTree(BTreeCollection::open(name, &self.data_dir)?)
+            }
+        } else if self.in_memory {
+            AnyCollection::Standard(Collection::open_in_memory(name))
         } else {
-            Collection::open_with_options(
+            AnyCollection::Standard(Collection::open_with_options(
                 name,
                 &self.data_dir,
                 &std::collections::HashSet::new(),
                 self.encryption.clone(),
                 self.verbose,
                 self.log_callback.clone(),
-            )?
+            )?)
         };
         if self.lazy_sync.load(Ordering::Acquire) {
             col.set_lazy_sync(true);
@@ -336,19 +605,23 @@ impl OxiDb {
         if cols.contains_key(name) {
             return Err(Error::CollectionAlreadyExists(name.to_string()));
         }
-        let mut col = if self.in_memory {
-            Collection::open_in_memory(name)
-        } else if self.use_btree {
-            Collection::open_btree(name, &self.data_dir)?
+        let mut col: AnyCollection = if self.use_btree {
+            if self.in_memory {
+                AnyCollection::BTree(BTreeCollection::open_in_memory(name))
+            } else {
+                AnyCollection::BTree(BTreeCollection::open(name, &self.data_dir)?)
+            }
+        } else if self.in_memory {
+            AnyCollection::Standard(Collection::open_in_memory(name))
         } else {
-            Collection::open_with_options(
+            AnyCollection::Standard(Collection::open_with_options(
                 name,
                 &self.data_dir,
                 &std::collections::HashSet::new(),
                 self.encryption.clone(),
                 self.verbose,
                 self.log_callback.clone(),
-            )?
+            )?)
         };
         if self.lazy_sync.load(Ordering::Acquire) {
             col.set_lazy_sync(true);
@@ -478,6 +751,11 @@ impl OxiDb {
                 if path.exists() {
                     std::fs::remove_file(path)?;
                 }
+            }
+            // Also remove B-tree directory if present
+            let btree_dir = self.data_dir.join(format!("{}.btree", name));
+            if btree_dir.exists() {
+                std::fs::remove_dir_all(btree_dir)?;
             }
         }
         Ok(())
@@ -1027,14 +1305,14 @@ impl OxiDb {
         let tx = tx.into_inner();
 
         // 2. Acquire write locks on all involved collections in BTreeSet order (deadlock-free)
-        let mut locked_collections: Vec<(String, Arc<RwLock<Collection>>)> = Vec::new();
+        let mut locked_collections: Vec<(String, Arc<RwLock<AnyCollection>>)> = Vec::new();
         for col_name in &tx.collections_involved {
             let col = self.get_or_create_collection(col_name)?;
             locked_collections.push((col_name.clone(), col));
         }
 
         // Acquire write guards -- we hold them for the duration of commit
-        let mut write_guards: HashMap<String, parking_lot::RwLockWriteGuard<Collection>> = HashMap::new();
+        let mut write_guards: HashMap<String, parking_lot::RwLockWriteGuard<AnyCollection>> = HashMap::new();
         for (name, col_arc) in &locked_collections {
             write_guards.insert(name.clone(), col_arc.write());
         }
@@ -1585,7 +1863,7 @@ impl OxiDb {
         })
     }
 
-    /// Scan a directory for `*.dat` files and return collection names.
+    /// Scan a directory for `*.dat` files and `*.btree` directories and return collection names.
     fn discover_collection_names_on_disk(dir: &Path) -> Result<Vec<String>> {
         let mut names = Vec::new();
         if !dir.exists() {
@@ -1595,6 +1873,10 @@ impl OxiDb {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("dat") {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_string());
+                }
+            } else if path.extension().and_then(|e| e.to_str()) == Some("btree") && path.is_dir() {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     names.push(stem.to_string());
                 }
