@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "indexes": [
+    {
+      "name": "customer_id",
+      "index_type": "field",
+      "fields": [
+        "customer_id"
+      ],
+      "unique": false
+    },
+    {
+      "name": "region",
+      "index_type": "field",
+      "fields": [
+        "region"
+      ],
+      "unique": false
+    }
+  ]
+}

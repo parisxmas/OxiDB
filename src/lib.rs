@@ -1,5 +1,7 @@
 pub mod blob;
 pub mod btree;
+pub mod btree_collection;
+pub mod btree_storage;
 pub mod change_stream;
 pub mod codec;
 pub mod collection;
@@ -32,6 +34,7 @@ pub mod vector;
 pub mod wal;
 
 pub use change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
+pub use btree_collection::BTreeCollection;
 pub use collection::{Collection, CompactStats, IndexInfo};
 pub use crypto::EncryptionKey;
 pub use database_manager::DatabaseManager;

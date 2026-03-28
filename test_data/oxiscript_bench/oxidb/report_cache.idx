@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "indexes": [
+    {
+      "name": "region",
+      "index_type": "field",
+      "fields": [
+        "region"
+      ],
+      "unique": false
+    }
+  ]
+}
