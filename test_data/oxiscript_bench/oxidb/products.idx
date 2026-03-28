@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "indexes": [
+    {
+      "name": "sku",
+      "index_type": "field",
+      "fields": [
+        "sku"
+      ],
+      "unique": false
+    }
+  ]
+}

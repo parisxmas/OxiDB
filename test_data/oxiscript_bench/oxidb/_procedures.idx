@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "indexes": [
+    {
+      "name": "name",
+      "index_type": "unique",
+      "fields": [
+        "name"
+      ],
+      "unique": true
+    }
+  ]
+}
