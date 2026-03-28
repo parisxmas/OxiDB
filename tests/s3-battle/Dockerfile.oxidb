@@ -1,0 +1,16 @@
+FROM rust:1.87-slim AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p oxidb-server --features s3
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/oxidb-server /usr/local/bin/oxidb-server
+ENV OXIDB_ADDR=0.0.0.0:4444 \
+    OXIDB_DATA=/data \
+    OXIDB_S3_PORT=9000 \
+    OXIDB_S3_ACCESS_KEY=benchkey \
+    OXIDB_S3_SECRET_KEY=benchsecret123 \
+    OXIDB_S3_ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+EXPOSE 4444 9000
+CMD ["oxidb-server"]

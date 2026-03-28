@@ -1,0 +1,59 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "oxiwire-dotnet", "oxiwire-dotnet\oxiwire-dotnet.csproj", "{E2165D93-9721-8A83-B2DF-A52C49EB02D1}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "efcore-tcp-test", "efcore-tcp-test", "{A5C2D787-0700-E8BE-9E95-524FCAAFF9D4}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "efcore-embedded-test", "efcore-embedded-test", "{5DFD1D48-5F24-8D2B-25C8-508B1560B0E1}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "comparison-efcore", "comparison-efcore", "{994627AC-2BBE-81FB-BE18-32F6CE66CC46}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "acid-dotnet", "acid-dotnet\acid-dotnet.csproj", "{E784F266-EBDA-CB5E-D5B5-A4F4886BAC6A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "EfCoreTcpTest", "efcore-tcp-test\EfCoreTcpTest.csproj", "{69BB2262-65A4-B7C7-E233-BD6E93D9262A}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "EfCoreEmbeddedTest", "efcore-embedded-test\EfCoreEmbeddedTest.csproj", "{DB504B80-8D1A-B6D7-CA5B-D8A9938CA374}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OxiDb.Tests.EFCore", "comparison-efcore\OxiDb.Tests.EFCore.csproj", "{77ACFF41-FC12-BC05-83A3-2BF0C710677F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{E2165D93-9721-8A83-B2DF-A52C49EB02D1}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E2165D93-9721-8A83-B2DF-A52C49EB02D1}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E2165D93-9721-8A83-B2DF-A52C49EB02D1}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E2165D93-9721-8A83-B2DF-A52C49EB02D1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{E784F266-EBDA-CB5E-D5B5-A4F4886BAC6A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E784F266-EBDA-CB5E-D5B5-A4F4886BAC6A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E784F266-EBDA-CB5E-D5B5-A4F4886BAC6A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E784F266-EBDA-CB5E-D5B5-A4F4886BAC6A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{69BB2262-65A4-B7C7-E233-BD6E93D9262A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{69BB2262-65A4-B7C7-E233-BD6E93D9262A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{69BB2262-65A4-B7C7-E233-BD6E93D9262A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{69BB2262-65A4-B7C7-E233-BD6E93D9262A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DB504B80-8D1A-B6D7-CA5B-D8A9938CA374}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DB504B80-8D1A-B6D7-CA5B-D8A9938CA374}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DB504B80-8D1A-B6D7-CA5B-D8A9938CA374}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DB504B80-8D1A-B6D7-CA5B-D8A9938CA374}.Release|Any CPU.Build.0 = Release|Any CPU
+		{77ACFF41-FC12-BC05-83A3-2BF0C710677F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{77ACFF41-FC12-BC05-83A3-2BF0C710677F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{77ACFF41-FC12-BC05-83A3-2BF0C710677F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{77ACFF41-FC12-BC05-83A3-2BF0C710677F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{69BB2262-65A4-B7C7-E233-BD6E93D9262A} = {A5C2D787-0700-E8BE-9E95-524FCAAFF9D4}
+		{DB504B80-8D1A-B6D7-CA5B-D8A9938CA374} = {5DFD1D48-5F24-8D2B-25C8-508B1560B0E1}
+		{77ACFF41-FC12-BC05-83A3-2BF0C710677F} = {994627AC-2BBE-81FB-BE18-32F6CE66CC46}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {34E9BCDA-71BE-4932-A931-9834950AF9B9}
+	EndGlobalSection
+EndGlobal

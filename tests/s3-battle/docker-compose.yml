@@ -1,0 +1,44 @@
+services:
+  oxidb:
+    build:
+      context: ../..
+      dockerfile: tests/s3-battle/Dockerfile.oxidb
+    ports:
+      - "9100:9000"
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/127.0.0.1/9000 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9200:9000"
+    environment:
+      MINIO_ROOT_USER: benchkey
+      MINIO_ROOT_PASSWORD: benchsecret123
+      MINIO_KMS_SECRET_KEY: "oxidb-bench-key:MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+    tmpfs:
+      - /data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  bench:
+    image: python:3.12-slim
+    depends_on:
+      oxidb:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./benchmark.py:/bench/benchmark.py:ro
+    working_dir: /bench
+    command: >
+      bash -c "pip install -q boto3 && python benchmark.py"
