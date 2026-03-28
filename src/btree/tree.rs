@@ -331,6 +331,89 @@ impl BTree {
         }
     }
 
+    /// Find multiple documents in a single traversal.
+    ///
+    /// Sorts `doc_ids`, then walks the tree once collecting results from
+    /// each leaf page visited.  Co-located doc_ids on the same leaf page
+    /// are served from a single page read, exploiting spatial locality.
+    pub fn find_batch(&self, doc_ids: &[u64]) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
+        if doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut sorted_ids = doc_ids.to_vec();
+        sorted_ids.sort_unstable();
+        sorted_ids.dedup();
+
+        let mut results = Vec::with_capacity(sorted_ids.len());
+        let mut id_idx = 0;
+
+        // Find the leftmost leaf that could contain sorted_ids[0]
+        let mut page_id = self.root_page.load(Ordering::Acquire);
+        // Navigate to the leaf for the first doc_id
+        loop {
+            let page = self.pager.read_page(page_id)?;
+            match page.page_type() {
+                PageType::Leaf => break,
+                PageType::Internal => {
+                    page_id = internal_find_child(&page, sorted_ids[0]);
+                }
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unexpected page type during find_batch",
+                    ));
+                }
+            }
+        }
+
+        // Now scan leaves left-to-right via next_page links, collecting
+        // all matching doc_ids.
+        loop {
+            if id_idx >= sorted_ids.len() {
+                break;
+            }
+
+            let page = self.pager.read_page(page_id)?;
+            let entries = leaf_entries(&page);
+
+            // For each remaining doc_id that could be on this page, check.
+            // Leaf entries are sorted, so we can merge-scan.
+            let mut entry_idx = 0;
+            while id_idx < sorted_ids.len() && entry_idx < entries.len() {
+                let target = sorted_ids[id_idx];
+                let (entry_id, ref payload) = entries[entry_idx];
+
+                if target < entry_id {
+                    // target is not on this page (would be before entry_idx)
+                    // Check if target could be on this page at all by looking
+                    // at the first entry. If target < first entry's id,
+                    // the doc doesn't exist (tree is sorted), skip it.
+                    id_idx += 1;
+                } else if target == entry_id {
+                    results.push((target, payload.clone()));
+                    id_idx += 1;
+                    entry_idx += 1;
+                } else {
+                    // target > entry_id, advance entry_idx
+                    entry_idx += 1;
+                }
+            }
+
+            // If remaining targets are > all entries on this leaf, they might
+            // be on the next leaf. But first skip any targets smaller than
+            // what the next page would start with (they don't exist).
+            let next = page.next_page();
+            if next == 0 {
+                // No more leaves — remaining ids don't exist
+                break;
+            }
+            page_id = next;
+        }
+
+        Ok(results)
+    }
+
     /// Return the rightmost leaf page id.
     pub fn rightmost_leaf(&self) -> std::io::Result<PageId> {
         let mut page_id = self.root_page.load(Ordering::Acquire);
@@ -480,5 +563,81 @@ mod tests {
         for i in 1..=500u64 {
             assert!(tree.find(i).unwrap().is_some());
         }
+    }
+
+    #[test]
+    fn btree_tree_find_batch_basic() {
+        let (_pager, tree) = setup();
+        for i in 1..=100u64 {
+            let payload = format!("val-{}", i);
+            tree.insert(i, payload.as_bytes()).unwrap();
+        }
+
+        // Batch find a subset (out of order, with gaps)
+        let results = tree.find_batch(&[50, 10, 90, 30, 70]).unwrap();
+        let map: std::collections::HashMap<u64, Vec<u8>> = results.into_iter().collect();
+        assert_eq!(map.len(), 5);
+        assert_eq!(map[&10], b"val-10");
+        assert_eq!(map[&30], b"val-30");
+        assert_eq!(map[&50], b"val-50");
+        assert_eq!(map[&70], b"val-70");
+        assert_eq!(map[&90], b"val-90");
+    }
+
+    #[test]
+    fn btree_tree_find_batch_with_missing() {
+        let (_pager, tree) = setup();
+        tree.insert(1, b"one").unwrap();
+        tree.insert(3, b"three").unwrap();
+        tree.insert(5, b"five").unwrap();
+
+        let results = tree.find_batch(&[1, 2, 3, 4, 5, 6]).unwrap();
+        let map: std::collections::HashMap<u64, Vec<u8>> = results.into_iter().collect();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map[&1], b"one");
+        assert_eq!(map[&3], b"three");
+        assert_eq!(map[&5], b"five");
+    }
+
+    #[test]
+    fn btree_tree_find_batch_empty() {
+        let (_pager, tree) = setup();
+        tree.insert(1, b"one").unwrap();
+
+        let results = tree.find_batch(&[]).unwrap();
+        assert!(results.is_empty());
+
+        let results = tree.find_batch(&[99, 100]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn btree_tree_find_batch_after_splits() {
+        let (_pager, tree) = setup();
+        // Insert enough to force multiple leaf splits
+        let payload = vec![0xABu8; 200];
+        for i in 1..=500u64 {
+            tree.insert(i, &payload).unwrap();
+        }
+
+        // Batch find across multiple leaf pages
+        let ids: Vec<u64> = (1..=500).step_by(7).collect();
+        let results = tree.find_batch(&ids).unwrap();
+        assert_eq!(results.len(), ids.len());
+        for (doc_id, data) in &results {
+            assert!(ids.contains(doc_id));
+            assert_eq!(data, &payload);
+        }
+    }
+
+    #[test]
+    fn btree_tree_find_batch_duplicates() {
+        let (_pager, tree) = setup();
+        tree.insert(1, b"one").unwrap();
+        tree.insert(2, b"two").unwrap();
+
+        // Duplicate IDs in request should be deduped
+        let results = tree.find_batch(&[1, 1, 2, 2, 1]).unwrap();
+        assert_eq!(results.len(), 2);
     }
 }

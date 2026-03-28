@@ -285,6 +285,62 @@ impl BTreeStorage {
         &self.dir
     }
 
+    /// Batch-read multiple documents by ID.
+    ///
+    /// Groups reads by file offset so that nearby documents (which share
+    /// similar insert-time locality) are read with sequential I/O rather
+    /// than random seeks.  Returns `(doc_id, payload)` pairs for every
+    /// doc_id that exists in the index.
+    pub fn get_batch(&self, doc_ids: &[u64]) -> Result<Vec<(u64, Vec<u8>)>> {
+        if doc_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 1: look up all (doc_id, offset, length) under a single read lock
+        let index = self.index.read();
+        let mut lookups: Vec<(u64, u64, u32)> = Vec::with_capacity(doc_ids.len());
+        for &id in doc_ids {
+            if let Some(&(payload_offset, length)) = index.get(&id) {
+                lookups.push((id, payload_offset, length));
+            }
+        }
+        drop(index);
+
+        if lookups.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: sort by file offset for sequential I/O
+        lookups.sort_unstable_by_key(|&(_, offset, _)| offset);
+
+        // Phase 3: batch pread all payloads
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let file = self.file.read();
+            let mut results = Vec::with_capacity(lookups.len());
+            for (id, offset, length) in lookups {
+                let mut buf = vec![0u8; length as usize];
+                file.read_at(&mut buf, offset)?;
+                results.push((id, buf));
+            }
+            Ok(results)
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut file = self.file.write();
+            let mut results = Vec::with_capacity(lookups.len());
+            for (id, offset, length) in lookups {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; length as usize];
+                file.read_exact(&mut buf)?;
+                results.push((id, buf));
+            }
+            Ok(results)
+        }
+    }
+
     /// Approximate data file size.
     pub fn file_size(&self) -> u64 {
         *self.write_offset.read()
@@ -352,5 +408,59 @@ mod tests {
         let storage = BTreeStorage::open(&dir.path().join("empty.btree")).unwrap();
         assert_eq!(storage.count(), 0);
         assert!(storage.scan_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn btree_get_batch_basic() {
+        let dir = tempdir().unwrap();
+        let storage = BTreeStorage::open(&dir.path().join("batch.btree")).unwrap();
+
+        storage.insert(1, b"one").unwrap();
+        storage.insert(2, b"two").unwrap();
+        storage.insert(3, b"three").unwrap();
+        storage.insert(4, b"four").unwrap();
+        storage.insert(5, b"five").unwrap();
+
+        // Batch read a subset (out of order)
+        let results = storage.get_batch(&[5, 2, 4]).unwrap();
+        assert_eq!(results.len(), 3);
+
+        // Results are sorted by file offset, so check by converting to a map
+        let map: std::collections::HashMap<u64, Vec<u8>> = results.into_iter().collect();
+        assert_eq!(map[&2], b"two");
+        assert_eq!(map[&4], b"four");
+        assert_eq!(map[&5], b"five");
+    }
+
+    #[test]
+    fn btree_get_batch_with_missing() {
+        let dir = tempdir().unwrap();
+        let storage = BTreeStorage::open(&dir.path().join("batch_miss.btree")).unwrap();
+
+        storage.insert(10, b"ten").unwrap();
+        storage.insert(20, b"twenty").unwrap();
+
+        // Request includes non-existent IDs
+        let results = storage.get_batch(&[10, 99, 20, 100]).unwrap();
+        assert_eq!(results.len(), 2);
+        let map: std::collections::HashMap<u64, Vec<u8>> = results.into_iter().collect();
+        assert_eq!(map[&10], b"ten");
+        assert_eq!(map[&20], b"twenty");
+    }
+
+    #[test]
+    fn btree_get_batch_empty() {
+        let dir = tempdir().unwrap();
+        let storage = BTreeStorage::open(&dir.path().join("batch_empty.btree")).unwrap();
+
+        storage.insert(1, b"one").unwrap();
+
+        // Empty request
+        let results = storage.get_batch(&[]).unwrap();
+        assert!(results.is_empty());
+
+        // All missing
+        let results = storage.get_batch(&[99, 100]).unwrap();
+        assert!(results.is_empty());
     }
 }
