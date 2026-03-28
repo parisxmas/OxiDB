@@ -2240,9 +2240,9 @@ impl Collection {
 
             let old_version = mutable_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             let new_version = old_version + 1;
-            mutable_data.as_object_mut()
-                .unwrap()
-                .insert("_version".to_string(), Value::Number(new_version.into()));
+            if let Some(obj) = mutable_data.as_object_mut() {
+                obj.insert("_version".to_string(), Value::Number(new_version.into()));
+            }
 
             self.check_unique_constraints(&mutable_data, Some(id))?;
 
