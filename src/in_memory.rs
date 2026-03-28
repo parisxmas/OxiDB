@@ -419,10 +419,21 @@ impl StorageBackend {
             Self::File(s) => s.read_batch_lockfree(locs),
             Self::Memory(m) => m.read_batch_lockfree(locs),
             Self::BTree(b) => {
+                // Use batch read for I/O locality — groups reads by file
+                // offset so nearby documents are read sequentially.
+                let doc_ids: Vec<u64> = locs.iter().map(|&(_, loc)| loc.offset).collect();
+                let batch = b.inner.get_batch(&doc_ids)?;
+
+                // Build a lookup map from doc_id -> payload for joining back
+                // to the original index positions.
+                let mut by_id: std::collections::HashMap<u64, Vec<u8>> =
+                    batch.into_iter().collect();
+
                 let mut results = Vec::with_capacity(locs.len());
                 for &(idx, loc) in locs.iter() {
-                    let data = b.inner.get(loc.offset)?;
-                    results.push((idx, data));
+                    if let Some(data) = by_id.remove(&loc.offset) {
+                        results.push((idx, data));
+                    }
                 }
                 Ok(results)
             }
