@@ -79,6 +79,8 @@ pub struct OxiDb {
     cache_capacity: AtomicUsize,
     /// When true, all collections are in-memory only (no disk I/O).
     in_memory: bool,
+    /// When true, new collections use B-tree storage engine.
+    use_btree: bool,
     /// Shutdown signal for the TTL eviction thread.
     ttl_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
 }
@@ -161,6 +163,7 @@ impl OxiDb {
             sync_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: true,
+            use_btree: false,
             ttl_shutdown: Mutex::new(None),
         })
     }
@@ -282,6 +285,7 @@ impl OxiDb {
             sync_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: false,
+            use_btree: std::env::var("OXIDB_BTREE").map(|v| v == "true" || v == "1").unwrap_or(false),
             ttl_shutdown: Mutex::new(None),
         })
     }
@@ -299,6 +303,8 @@ impl OxiDb {
         // collections remain accessible while a large collection is loading.
         let mut col = if self.in_memory {
             Collection::open_in_memory(name)
+        } else if self.use_btree || self.data_dir.join(format!("{}.btree", name)).exists() {
+            Collection::open_btree(name, &self.data_dir)?
         } else {
             Collection::open_with_options(
                 name,
@@ -332,6 +338,8 @@ impl OxiDb {
         }
         let mut col = if self.in_memory {
             Collection::open_in_memory(name)
+        } else if self.use_btree {
+            Collection::open_btree(name, &self.data_dir)?
         } else {
             Collection::open_with_options(
                 name,
