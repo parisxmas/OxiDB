@@ -808,9 +808,9 @@ impl BTreeCollection {
                 &query,
                 &self.field_indexes,
                 &mut |id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            if storage.contains_key(id) {
+                    if storage.contains_key(id) {
+                        if let Some(arc) = self.load_doc_arc(id) {
+                            if skip_post_filter || query::matches_value(&query, &arc) {
                                 matches.push((id, (*arc).clone()));
                                 if matches.len() >= lim {
                                     return false;
@@ -871,29 +871,38 @@ impl BTreeCollection {
             new_data: Value,
             new_bytes: Vec<u8>,
         }
+        let has_unique = self.field_indexes.values().any(|idx| idx.unique);
         let mut ops = Vec::with_capacity(matches.len());
 
-        for (id, data) in matches {
-            let mut mutable_data = data.clone();
-            crate::update::apply_update(&mut mutable_data, update_json)?;
+        for (id, mut data) in matches {
+            crate::update::apply_update(&mut data, update_json)?;
 
-            let old_version = mutable_data
+            let old_version = data
                 .get("_version")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             let new_version = old_version + 1;
-            mutable_data
-                .as_object_mut()
+            data.as_object_mut()
                 .unwrap()
                 .insert("_version".to_string(), Value::Number(new_version.into()));
 
-            self.check_unique_constraints(&mutable_data, Some(id))?;
+            if has_unique {
+                self.check_unique_constraints(&data, Some(id))?;
+            }
 
-            let new_bytes = codec::encode_doc(&mutable_data)?;
+            let new_bytes = codec::encode_doc(&data)?;
+
+            // Read old data for index removal only if we have field indexes
+            let old_data = if !self.field_indexes.is_empty() || !self.composite_indexes.is_empty() {
+                self.load_doc_arc(id).map(|a| (*a).clone()).unwrap_or(data.clone())
+            } else {
+                Value::Null
+            };
+
             ops.push(UpdateOp {
                 id,
-                old_data: data,
-                new_data: mutable_data,
+                old_data,
+                new_data: data,
                 new_bytes,
             });
         }
