@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::fts::CollectionTextIndex;
 use crate::in_memory::{InMemStorage, StorageBackend, WalBackend};
 use crate::index::CompositeIndex;
-use crate::mmap_field_index::MmapFieldIndex;
+use crate::paged_field_index::PagedFieldIndex;
 use crate::index_persist;
 use crate::vector::{DistanceMetric, VectorIndex};
 use crate::query::{self, FindOptions, Query, SortOrder};
@@ -75,7 +75,7 @@ pub struct Collection {
     wal: WalBackend,
     primary_index: HashMap<DocumentId, DocLocation>,
     doc_cache: DocCache,
-    field_indexes: HashMap<String, MmapFieldIndex>,
+    field_indexes: HashMap<String, PagedFieldIndex>,
     composite_indexes: Vec<CompositeIndex>,
     text_index: Option<CollectionTextIndex>,
     vector_indexes: HashMap<String, VectorIndex>,
@@ -144,8 +144,7 @@ impl Collection {
         // Save field indexes (.fidx)
         let enc = self.encryption.as_ref();
         let fidx_path = self.data_dir.join(format!("{}.fidx", self.name));
-        let converted: Vec<crate::index::FieldIndex> = self.field_indexes.values().map(|m| m.to_field_index()).collect();
-        let field_refs: Vec<&crate::index::FieldIndex> = converted.iter().collect();
+        let field_refs: Vec<&PagedFieldIndex> = self.field_indexes.values().collect();
         if let Err(e) = index_persist::save_field_indexes(&fidx_path, &field_refs, doc_count, next_id, enc) {
             eprintln!("[warn] {}: failed to save field index cache: {}", self.name, e);
         }
@@ -195,15 +194,6 @@ impl Collection {
             }
         };
 
-        // Auto-detect B-tree storage: if a .btree directory exists, open as B-tree
-        let btree_dir = data_dir.join(format!("{}.btree", name));
-        if btree_dir.is_dir() {
-            if verbose {
-                vlog(&format!("[verbose] {}: detected B-tree storage at {:?}", name, btree_dir));
-            }
-            return Self::open_btree(name, data_dir);
-        }
-
         let data_path = data_dir.join(format!("{}.dat", name));
         let wal_path = data_dir.join(format!("{}.wal", name));
         let storage = StorageBackend::File(Storage::open_with_encryption(&data_path, encryption.clone())?);
@@ -220,7 +210,7 @@ impl Collection {
         let has_persisted_indexes = !persisted_indexes.is_empty();
 
         // Pre-create empty index structures from metadata
-        let mut field_indexes: HashMap<String, MmapFieldIndex> = HashMap::new();
+        let mut field_indexes: HashMap<String, PagedFieldIndex> = HashMap::new();
         let mut composite_indexes: Vec<CompositeIndex> = Vec::new();
         let mut text_index: Option<CollectionTextIndex> = None;
         let mut vector_indexes: HashMap<String, VectorIndex> = HashMap::new();
@@ -230,13 +220,13 @@ impl Collection {
                 "field" => {
                     field_indexes.insert(
                         info.name.clone(),
-                        MmapFieldIndex::new(info.name.clone()),
+                        PagedFieldIndex::new(info.name.clone()),
                     );
                 }
                 "unique" => {
                     field_indexes.insert(
                         info.name.clone(),
-                        MmapFieldIndex::new_unique(info.name.clone()),
+                        PagedFieldIndex::new_unique(info.name.clone()),
                     );
                 }
                 "composite" => {
@@ -361,8 +351,8 @@ impl Collection {
                 if let Some(cached) = cached_field {
                     // Replace empty index structures with cached ones
                     field_indexes.clear();
-                    for idx in &cached {
-                        field_indexes.insert(idx.field.clone(), MmapFieldIndex::from_field_index(idx));
+                    for idx in cached {
+                        field_indexes.insert(idx.field.clone(), idx);
                     }
                 }
                 if let Some(cached) = cached_composite {
@@ -510,62 +500,6 @@ impl Collection {
         }
     }
 
-    /// Create or open a collection backed by B-tree storage.
-    ///
-    /// Data is stored in `data_dir/<name>.btree/` using a B-tree page layout
-    /// instead of the default append-only file. The B-tree engine handles its own
-    /// durability so a no-op WAL is used.
-    pub fn open_btree(name: &str, data_dir: &Path) -> Result<Self> {
-        use crate::in_memory::BTreeAdapter;
-
-        let btree_dir = data_dir.join(format!("{}.btree", name));
-        let btree = crate::btree::BTreeStorage::open(&btree_dir)?;
-
-        let storage = StorageBackend::BTree(BTreeAdapter::new(btree));
-        let wal = WalBackend::Noop;
-
-        // Rebuild primary_index, version_index, next_id from B-tree contents
-        let mut primary_index = HashMap::new();
-        let doc_cache = DocCache::new(doc_cache::DEFAULT_CAPACITY);
-        let mut version_index = HashMap::new();
-        let shard_id_offset = Self::shard_id_offset();
-        let mut next_id: DocumentId = 1 + shard_id_offset;
-
-        storage.for_each_active(|loc, bytes| {
-            let doc: Value = crate::codec::decode_doc(&bytes)?;
-            if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                primary_index.insert(id, loc);
-                let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                version_index.insert(id, ver);
-                if id >= next_id {
-                    next_id = id + 1;
-                }
-            }
-            Ok(())
-        })?;
-
-        Ok(Self {
-            name: name.to_string(),
-            data_dir: data_dir.to_path_buf(),
-            storage,
-            wal,
-            primary_index,
-            doc_cache,
-            field_indexes: HashMap::new(),
-            composite_indexes: Vec::new(),
-            text_index: None,
-            vector_indexes: HashMap::new(),
-            version_index,
-            next_id,
-            encryption: None,
-            verbose: false,
-            log_callback: None,
-            lazy_sync: false,
-            in_memory: false,
-            ttl_index: std::collections::BTreeMap::new(),
-        })
-    }
-
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -608,7 +542,7 @@ impl Collection {
     }
 
     /// Access the field indexes for index-accelerated aggregation.
-    pub fn field_indexes(&self) -> &HashMap<String, MmapFieldIndex> {
+    pub fn field_indexes(&self) -> &HashMap<String, PagedFieldIndex> {
         &self.field_indexes
     }
 
@@ -721,7 +655,7 @@ impl Collection {
         }
         let start = std::time::Instant::now();
         let mut count = 0u64;
-        let mut idx = MmapFieldIndex::new(field.to_string());
+        let mut idx = PagedFieldIndex::new(field.to_string());
         let name = self.name.clone();
         let verbose = self.verbose;
 
@@ -785,7 +719,7 @@ impl Collection {
         }
         let start = std::time::Instant::now();
         let mut count = 0u64;
-        let mut idx = MmapFieldIndex::new_unique(field.to_string());
+        let mut idx = PagedFieldIndex::new_unique(field.to_string());
         let field_owned = field.to_string();
         let name = self.name.clone();
         let verbose = self.verbose;
@@ -1460,7 +1394,7 @@ impl Collection {
                     match sort_order {
                         SortOrder::Asc => {
                             'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
-                                for &id in &doc_ids {
+                                for &id in doc_ids {
                                     if let Some(arc) = self.read_doc_arc(id) {
                                         if skip_filter || query::matches_value(&query, &arc) {
                                             results.push(arc);
@@ -3602,90 +3536,5 @@ mod tests {
         // Should get the two most recent Junior entries from formId "1"
         assert_eq!(results[0]["createdAt"], "2024-01-05");
         assert_eq!(results[1]["createdAt"], "2024-01-03");
-    }
-
-    // -----------------------------------------------------------------------
-    // B-tree storage tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn btree_collection_crud() {
-        let dir = tempdir().unwrap();
-        let mut col = Collection::open_btree("btree_test", dir.path()).unwrap();
-
-        // Insert 100 docs
-        let mut ids = Vec::new();
-        for i in 0..100 {
-            let id = col
-                .insert(json!({"name": format!("user_{}", i), "score": i}))
-                .unwrap();
-            ids.push(id);
-        }
-        assert_eq!(col.count(), 100);
-
-        // Find all
-        let all = col.find(&json!({})).unwrap();
-        assert_eq!(all.len(), 100);
-
-        // Get specific doc
-        let doc = col.get(ids[42]).unwrap().unwrap();
-        assert_eq!(doc["name"], "user_42");
-        assert_eq!(doc["score"], 42);
-
-        // Update one
-        col.update(
-            &json!({"_id": ids[0]}),
-            &json!({"$set": {"name": "updated_user_0"}}),
-            None,
-        )
-        .unwrap();
-        let updated = col.get(ids[0]).unwrap().unwrap();
-        assert_eq!(updated["name"], "updated_user_0");
-        assert_eq!(col.count(), 100);
-
-        // Delete one
-        let deleted = col.delete(&json!({"_id": ids[99]}), None).unwrap();
-        assert_eq!(deleted.len(), 1);
-        assert_eq!(col.count(), 99);
-        assert!(col.get(ids[99]).unwrap().is_none());
-
-        // Find with query
-        let high_score = col.find(&json!({"score": {"$gte": 90}})).unwrap();
-        // We deleted id[99] (score 99), so should get scores 90..98 = 9 docs
-        assert_eq!(high_score.len(), 9);
-    }
-
-    #[test]
-    fn btree_collection_reopen() {
-        let dir = tempdir().unwrap();
-        let id;
-        {
-            let mut col = Collection::open_btree("reopen_test", dir.path()).unwrap();
-            id = col.insert(json!({"key": "value"})).unwrap();
-            col.storage.sync().unwrap();
-        }
-
-        // Reopen the same directory
-        let col = Collection::open_btree("reopen_test", dir.path()).unwrap();
-        assert_eq!(col.count(), 1);
-        let doc = col.get(id).unwrap().unwrap();
-        assert_eq!(doc["key"], "value");
-    }
-
-    #[test]
-    fn btree_autodetect_on_open() {
-        let dir = tempdir().unwrap();
-        // Create a B-tree collection first
-        {
-            let mut col = Collection::open_btree("autodetect", dir.path()).unwrap();
-            col.insert(json!({"test": true})).unwrap();
-            col.storage.sync().unwrap();
-        }
-
-        // Now open with the generic open() — should auto-detect the .btree dir
-        let col = Collection::open("autodetect", dir.path()).unwrap();
-        assert_eq!(col.count(), 1);
-        let all = col.find(&json!({})).unwrap();
-        assert_eq!(all[0]["test"], true);
     }
 }
