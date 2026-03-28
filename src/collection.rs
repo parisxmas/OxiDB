@@ -1416,6 +1416,53 @@ impl Collection {
                     let fully_indexed = candidate_set.is_some()
                         && query::is_fully_indexed(&query, &self.field_indexes);
 
+                    // When lazy index check is available AND we have a limit,
+                    // collect matching doc_ids first (no doc loading), then batch-load only the final set.
+                    if use_lazy_index_check && opts.limit.is_some() {
+                        let mut matched_ids: Vec<DocumentId> = Vec::with_capacity(need);
+
+                        match sort_order {
+                            SortOrder::Asc => {
+                                'id_asc: for (_value, doc_ids) in field_idx.iter_asc() {
+                                    for &id in &doc_ids {
+                                        if let Some(false) = query::matches_doc_id_indexed(
+                                            &query, id, &self.field_indexes,
+                                        ) {
+                                            continue;
+                                        }
+                                        matched_ids.push(id);
+                                        if matched_ids.len() >= need { break 'id_asc; }
+                                    }
+                                }
+                            }
+                            SortOrder::Desc => {
+                                'id_desc: for (_value, doc_ids) in field_idx.iter_desc() {
+                                    for &id in doc_ids.iter().rev() {
+                                        if let Some(false) = query::matches_doc_id_indexed(
+                                            &query, id, &self.field_indexes,
+                                        ) {
+                                            continue;
+                                        }
+                                        matched_ids.push(id);
+                                        if matched_ids.len() >= need { break 'id_desc; }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Apply skip
+                        let skip = opts.skip.unwrap_or(0) as usize;
+                        let final_ids: Vec<DocumentId> = matched_ids.into_iter().skip(skip).collect();
+
+                        // Batch-load only the final documents
+                        for id in final_ids {
+                            if let Some(arc) = self.read_doc_arc(id) {
+                                results.push(arc);
+                            }
+                        }
+                        return Ok(results);
+                    }
+
                     match sort_order {
                         SortOrder::Asc => {
                             'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
