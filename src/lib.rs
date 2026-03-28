@@ -1,4 +1,5 @@
 pub mod blob;
+pub mod btree;
 pub mod change_stream;
 pub mod codec;
 pub mod collection;
