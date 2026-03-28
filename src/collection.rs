@@ -1454,7 +1454,7 @@ impl Collection {
                         let skip = opts.skip.unwrap_or(0) as usize;
                         let final_ids: Vec<DocumentId> = matched_ids.into_iter().skip(skip).collect();
 
-                        // Batch-load only the final documents
+                        // Load final documents
                         for id in final_ids {
                             if let Some(arc) = self.read_doc_arc(id) {
                                 results.push(arc);
