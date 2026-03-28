@@ -257,6 +257,53 @@ impl BTreeStorage {
         Ok(results)
     }
 
+    /// Streaming scan: call the callback for each document's raw bytes.
+    /// Reads documents in doc_id order. Returns early if callback returns false.
+    /// Uses sorted iteration — sequential file reads for I/O locality.
+    pub fn scan_while<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> Result<bool>,
+    {
+        let index = self.index.read();
+
+        // Collect (doc_id, offset, length) sorted by offset for sequential I/O
+        let mut entries: Vec<(u64, u32)> = index.values().copied().collect();
+        entries.sort_unstable_by_key(|&(offset, _)| offset);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let file = self.file.read();
+            for (offset, length) in entries {
+                let mut buf = vec![0u8; length as usize];
+                file.read_at(&mut buf, offset)?;
+                if !f(&buf)? {
+                    break;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut file = self.file.write();
+            for (offset, length) in entries {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut buf = vec![0u8; length as usize];
+                file.read_exact(&mut buf)?;
+                if !f(&buf)? {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Snapshot of the in-memory index (cloned) for iteration.
+    pub fn index_snapshot(&self) -> BTreeMap<u64, (u64, u32)> {
+        self.index.read().clone()
+    }
+
     /// Return the number of live documents.
     pub fn count(&self) -> usize {
         self.index.read().len()

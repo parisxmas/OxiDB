@@ -538,10 +538,15 @@ impl StorageBackend {
             Self::File(s) => s.for_each_active(f),
             Self::Memory(m) => m.for_each_active(f),
             Self::BTree(b) => {
-                for (id, bytes) in b.inner.scan_all()? {
-                    f(DocLocation { offset: id, length: 0 }, bytes)?;
-                }
-                Ok(())
+                b.inner.scan_while(|bytes| {
+                    // Extract doc_id from the JSONB payload
+                    if let Ok(doc) = crate::codec::decode_doc(bytes) {
+                        if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                            f(DocLocation { offset: id, length: 0 }, bytes.to_vec())?;
+                        }
+                    }
+                    Ok(true)
+                })
             }
         }
     }
@@ -553,14 +558,7 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.scan_readonly_while(f),
             Self::Memory(m) => m.scan_readonly_while(f),
-            Self::BTree(b) => {
-                for (_id, bytes) in b.inner.scan_all()? {
-                    if !f(&bytes)? {
-                        break;
-                    }
-                }
-                Ok(())
-            }
+            Self::BTree(b) => b.inner.scan_while(f)
         }
     }
 
