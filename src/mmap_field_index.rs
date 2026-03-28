@@ -336,6 +336,32 @@ impl MmapFieldIndex {
         }
     }
 
+    /// Check if a doc_id exists in a mmap entry's docid list using binary search.
+    /// O(log n) — does NOT load all doc_ids into memory.
+    fn mmap_entry_contains_docid(&self, idx: usize, doc_id: DocumentId) -> bool {
+        let Some(mmap) = self.mmap.as_ref() else { return false };
+        let Some(layout) = self.layout.as_ref() else { return false };
+        let buf = &mmap[..];
+        let eoff = layout.entry_table_offset + idx * ENTRY_HEADER_SIZE;
+        if eoff + ENTRY_HEADER_SIZE > buf.len() { return false }
+        let docid_offset = read_u64(buf, eoff + 13) as usize;
+        let docid_count = read_u32(buf, eoff + 21) as usize;
+        if docid_count == 0 { return false }
+        let abs_offset = layout.docid_section_offset + docid_offset;
+        if abs_offset + docid_count * 8 > buf.len() { return false }
+
+        // Binary search on sorted u64 array in mmap
+        let mut lo = 0usize;
+        let mut hi = docid_count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let v = read_u64(buf, abs_offset + mid * 8);
+            if v == doc_id { return true }
+            if v < doc_id { lo = mid + 1 } else { hi = mid }
+        }
+        false
+    }
+
     /// Binary-search the mmap entry table for an exact IndexValue match.
     /// Returns the entry index if found.
     fn mmap_find_entry(&self, target: &IndexValue) -> Option<usize> {
@@ -541,14 +567,21 @@ impl MmapFieldIndex {
     /// Check if a doc_id exists for a given value without materializing a BTreeSet.
     /// O(log n) in mmap layer + O(log n) in overlay.
     pub fn contains_doc_id(&self, value: &IndexValue, doc_id: DocumentId) -> bool {
-        // Check mmap layer
-        let mmap_set = self.mmap_get(value);
-        if mmap_set.contains(&doc_id) {
-            return true;
-        }
-        // Check overlay
+        // Check overlay first (recent writes)
         if let Some(ids) = self.overlay.get(value) {
-            return ids.contains(&doc_id);
+            if ids.contains(&doc_id) {
+                return true;
+            }
+        }
+        // Check tombstones
+        if let Some(removed_vals) = self.removed.get(&doc_id) {
+            if removed_vals.iter().any(|v| v == value) {
+                return false;
+            }
+        }
+        // Check mmap via binary search — O(log n), no allocation
+        if let Some(idx) = self.mmap_find_entry(value) {
+            return self.mmap_entry_contains_docid(idx, doc_id);
         }
         false
     }
