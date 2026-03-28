@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::btree_storage::BTreeStorage;
@@ -46,7 +47,6 @@ pub struct BTreeCollection {
     vector_indexes: HashMap<String, VectorIndex>,
     doc_cache: DocCache,
     next_id: AtomicU64,
-    version_index: HashMap<DocumentId, u64>,
     #[allow(dead_code)]
     in_memory: bool,
     ttl_index: std::collections::BTreeMap<u64, Vec<DocumentId>>,
@@ -60,15 +60,9 @@ impl BTreeCollection {
 
         // Determine next_id by scanning the tree for the max key
         let mut max_id: u64 = 0;
-        let mut version_index = HashMap::new();
-        storage.scan_all_while(|key, bytes| {
+        storage.scan_all_while(|key, _bytes| {
             if key > max_id {
                 max_id = key;
-            }
-            // Populate version_index from stored docs
-            if let Ok(doc) = codec::decode_doc(bytes) {
-                let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
-                version_index.insert(key, ver);
             }
             Ok(true)
         })?;
@@ -83,7 +77,6 @@ impl BTreeCollection {
             vector_indexes: HashMap::new(),
             doc_cache: DocCache::new(crate::doc_cache::DEFAULT_CAPACITY),
             next_id: AtomicU64::new(max_id + 1),
-            version_index,
             in_memory: false,
             ttl_index: std::collections::BTreeMap::new(),
         })
@@ -101,7 +94,6 @@ impl BTreeCollection {
             vector_indexes: HashMap::new(),
             doc_cache: DocCache::new(crate::doc_cache::DEFAULT_CAPACITY),
             next_id: AtomicU64::new(1),
-            version_index: HashMap::new(),
             in_memory: true,
             ttl_index: std::collections::BTreeMap::new(),
         }
@@ -256,8 +248,6 @@ impl BTreeCollection {
         // Insert directly into B-tree (the B-tree IS the storage)
         self.storage.insert(id, bytes);
 
-        self.version_index.insert(id, 1);
-
         let data_arc = Arc::new(data);
 
         // Update field indexes
@@ -288,11 +278,26 @@ impl BTreeCollection {
             return Ok(vec![]);
         }
 
-        // Phase 1: assign IDs, serialize, validate constraints
-        let mut prepared = Vec::with_capacity(docs.len());
-        let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
+        let has_unique = self.field_indexes.values().any(|idx| idx.unique);
+        let has_indexes = !self.field_indexes.is_empty()
+            || !self.composite_indexes.is_empty()
+            || self.text_index.is_some()
+            || !self.vector_indexes.is_empty();
 
+        // Phase 1: assign IDs, serialize, validate constraints
         let first_id = self.next_id.load(Ordering::SeqCst);
+        let doc_count = docs.len();
+
+        // Collect (id, data, bytes) — we need data only if indexes or cache need it
+        let mut btree_entries: Vec<(u64, Vec<u8>)> = Vec::with_capacity(doc_count);
+        // Keep data values only when indexes/cache need them
+        let mut data_values: Vec<(u64, Value)> = if has_indexes || doc_count <= 1000 {
+            Vec::with_capacity(doc_count)
+        } else {
+            Vec::new()
+        };
+        let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> =
+            if has_unique { HashMap::new() } else { HashMap::new() };
 
         for (i, mut data) in docs.into_iter().enumerate() {
             if !data.is_object() {
@@ -303,43 +308,45 @@ impl BTreeCollection {
             obj.insert("_id".to_string(), Value::Number(id.into()));
             obj.insert("_version".to_string(), Value::Number(1.into()));
 
-            // Check against existing indexes
-            self.check_unique_constraints(&data, None)?;
+            // Only check unique constraints when unique indexes exist
+            if has_unique {
+                self.check_unique_constraints(&data, None)?;
 
-            // Check intra-batch uniqueness
-            for idx in self.field_indexes.values() {
-                if !idx.unique {
-                    continue;
-                }
-                if let Some(value) = resolve_field_in_value(&data, &idx.field) {
-                    let iv = IndexValue::from_json(value);
-                    let field_map = pending_unique.entry(idx.field.clone()).or_default();
-                    if field_map.contains_key(&iv) {
-                        return Err(Error::UniqueViolation {
-                            field: idx.field.clone(),
-                        });
+                // Check intra-batch uniqueness
+                for idx in self.field_indexes.values() {
+                    if !idx.unique {
+                        continue;
                     }
-                    field_map.insert(iv, id);
+                    if let Some(value) = resolve_field_in_value(&data, &idx.field) {
+                        let iv = IndexValue::from_json(value);
+                        let field_map = pending_unique.entry(idx.field.clone()).or_default();
+                        if field_map.contains_key(&iv) {
+                            return Err(Error::UniqueViolation {
+                                field: idx.field.clone(),
+                            });
+                        }
+                        field_map.insert(iv, id);
+                    }
                 }
             }
 
             let bytes = codec::encode_doc(&data)?;
-            prepared.push((id, data, bytes));
+            btree_entries.push((id, bytes));
+
+            if has_indexes || doc_count <= 1000 {
+                data_values.push((id, data));
+            }
         }
 
-        // Phase 2: insert all into B-tree
-        let mut ids = Vec::with_capacity(prepared.len());
-        let skip_cache = prepared.len() > 1000;
-        let has_indexes = !self.field_indexes.is_empty()
-            || !self.composite_indexes.is_empty()
-            || self.text_index.is_some()
-            || !self.vector_indexes.is_empty();
+        // Phase 2: bulk insert into B-tree using extend()
+        let ids: Vec<DocumentId> = btree_entries.iter().map(|(id, _)| *id).collect();
+        self.storage.insert_batch(btree_entries);
 
-        for (id, data, bytes) in prepared {
-            self.storage.insert(id, bytes);
-            self.version_index.insert(id, 1);
+        // Phase 3: update indexes and cache
+        let skip_cache = doc_count > 1000;
 
-            if has_indexes || !skip_cache {
+        if has_indexes || !skip_cache {
+            for (id, data) in data_values {
                 let data_arc = Arc::new(data);
                 for idx in self.field_indexes.values_mut() {
                     idx.insert_value(id, &data_arc);
@@ -357,11 +364,9 @@ impl BTreeCollection {
                     self.doc_cache.put(id, data_arc);
                 }
             }
-
-            ids.push(id);
         }
 
-        self.next_id.store(first_id + ids.len() as u64, Ordering::SeqCst);
+        self.next_id.store(first_id + doc_count as u64, Ordering::SeqCst);
 
         Ok(ids)
     }
@@ -383,7 +388,6 @@ impl BTreeCollection {
         let mut ids = Vec::with_capacity(prepared.len());
         for (id, data, bytes) in prepared {
             self.storage.insert(id, bytes);
-            self.version_index.insert(id, 1);
 
             let data_arc = Arc::new(data);
             for idx in self.field_indexes.values_mut() {
@@ -637,18 +641,36 @@ impl BTreeCollection {
                 }
             }
         } else {
-            // No index — B-tree cursor scan (KEY ADVANTAGE: sequential page access)
-            self.for_each_doc_arc_while(|_id, arc| {
-                if query::matches_value(&query, arc) {
-                    results.push(Arc::clone(arc));
-                    if let Some(limit) = early_limit {
-                        if results.len() >= limit {
-                            return Ok(false);
+            // No index — parallel B-tree scan using rayon
+            if early_limit.is_some() {
+                // With early limit (no sort + limit) — keep sequential for early termination
+                self.for_each_doc_arc_while(|_id, arc| {
+                    if query::matches_value(&query, arc) {
+                        results.push(Arc::clone(arc));
+                        if let Some(limit) = early_limit {
+                            if results.len() >= limit {
+                                return Ok(false);
+                            }
                         }
                     }
-                }
-                Ok(true)
-            })?;
+                    Ok(true)
+                })?;
+            } else {
+                // Full scan — parallel decode + filter with rayon
+                let all_bytes = self.storage.values_as_slices();
+                let matched: Vec<Arc<Value>> = all_bytes
+                    .par_iter()
+                    .filter_map(|bytes| {
+                        let doc = codec::decode_doc(bytes).ok()?;
+                        if query::matches_value(&query, &doc) {
+                            Some(Arc::new(doc))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                results = matched;
+            }
         }
 
         // Apply sort -> skip -> limit
@@ -886,12 +908,6 @@ impl BTreeCollection {
             // Update B-tree in-place (replace value)
             self.storage.insert(op.id, op.new_bytes);
 
-            let new_version = op.new_data
-                .get("_version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1);
-            self.version_index.insert(op.id, new_version);
-
             // Update field indexes
             for idx in self.field_indexes.values_mut() {
                 idx.remove_value(op.id, &op.old_data);
@@ -1011,7 +1027,6 @@ impl BTreeCollection {
         for op in ops {
             // Remove from B-tree (no soft-delete — immediate reclaim)
             self.storage.remove(op.id);
-            self.version_index.remove(&op.id);
             self.doc_cache.remove(op.id);
 
             for idx in self.field_indexes.values_mut() {
@@ -1072,14 +1087,18 @@ impl BTreeCollection {
                 }
             }
         } else {
-            // B-tree cursor scan
-            self.storage.scan_bytes_while(|bytes| {
-                let doc = codec::decode_doc(bytes)?;
-                if query::matches_value(&query, &doc) {
-                    count += 1;
-                }
-                Ok(true)
-            })?;
+            // Parallel B-tree scan with rayon
+            let all_bytes = self.storage.values_as_slices();
+            count = all_bytes
+                .par_iter()
+                .filter(|bytes| {
+                    if let Ok(doc) = codec::decode_doc(bytes) {
+                        query::matches_value(&query, &doc)
+                    } else {
+                        false
+                    }
+                })
+                .count();
         }
 
         Ok(count)
@@ -1112,7 +1131,16 @@ impl BTreeCollection {
     // -----------------------------------------------------------------------
 
     pub fn get_version(&self, doc_id: DocumentId) -> u64 {
-        self.version_index.get(&doc_id).copied().unwrap_or(0)
+        // Read version from the document payload in the B-tree (no separate HashMap)
+        if let Some(arc) = self.doc_cache.get(doc_id) {
+            return arc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+        }
+        if let Some(bytes) = self.storage.get(doc_id) {
+            if let Ok(doc) = codec::decode_doc(bytes) {
+                return doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+            }
+        }
+        0
     }
 
     // -----------------------------------------------------------------------
@@ -1657,7 +1685,6 @@ impl BTreeCollection {
             if m.is_delete {
                 // Remove from B-tree
                 self.storage.remove(m.doc_id);
-                self.version_index.remove(&m.doc_id);
                 self.doc_cache.remove(m.doc_id);
                 if let Some(ref old_data) = m.old_data {
                     for idx in self.field_indexes.values_mut() {
@@ -1676,11 +1703,6 @@ impl BTreeCollection {
             } else {
                 // Insert or update in B-tree
                 self.storage.insert(m.doc_id, m.new_bytes.clone());
-                let ver = m.new_data
-                    .get("_version")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1);
-                self.version_index.insert(m.doc_id, ver);
 
                 if let Some(ref old_data) = m.old_data {
                     for idx in self.field_indexes.values_mut() {
@@ -1757,7 +1779,6 @@ impl BTreeCollection {
                     if let Some(bytes) = self.storage.get(id).map(|b| b.clone()) {
                         if let Ok(data) = codec::decode_doc(&bytes) {
                             self.storage.remove(id);
-                            self.version_index.remove(&id);
                             self.doc_cache.remove(id);
                             for idx in self.field_indexes.values_mut() {
                                 idx.remove_value(id, &data);
