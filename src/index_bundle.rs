@@ -7,12 +7,13 @@ use std::collections::HashMap;
 
 use crate::document::DocumentId;
 use crate::fts::CollectionTextIndex;
-use crate::index::{CompositeIndex, FieldIndex};
+use crate::index::CompositeIndex;
+use crate::mmap_field_index::MmapFieldIndex;
 use crate::vector::VectorIndex;
 
 /// All secondary indexes for a collection.
 pub struct IndexBundle {
-    pub field_indexes: HashMap<String, FieldIndex>,
+    pub field_indexes: HashMap<String, MmapFieldIndex>,
     pub composite_indexes: Vec<CompositeIndex>,
     pub text_index: Option<CollectionTextIndex>,
     pub vector_indexes: HashMap<String, VectorIndex>,
