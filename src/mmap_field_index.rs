@@ -1241,20 +1241,19 @@ impl<'a> Iterator for MmapFieldIndexIter<'a> {
 
 /// Descending iterator over merged (mmap + overlay) entries.
 pub struct MmapFieldIndexIterDesc<'a> {
-    entries: Vec<(IndexValue, DocIdSet)>,
-    pos: usize,
-    _marker: std::marker::PhantomData<&'a ()>,
+    index: &'a MmapFieldIndex,
+    mmap_pos: usize,
+    overlay_rev: Vec<(IndexValue, DocIdSet)>,
+    overlay_pos: usize,
 }
 
 impl<'a> MmapFieldIndexIterDesc<'a> {
     fn new(index: &'a MmapFieldIndex) -> Self {
-        let entries = index.merged_all();
-        let len = entries.len();
-        Self {
-            entries,
-            pos: len,
-            _marker: std::marker::PhantomData,
-        }
+        let mmap_count = index.layout.as_ref().map_or(0, |l| l.entry_count as usize);
+        // Overlay is typically small (recent writes only) — safe to clone + reverse
+        let overlay_rev: Vec<(IndexValue, DocIdSet)> = index.overlay.clone().into_iter().collect();
+        let overlay_pos = overlay_rev.len();
+        Self { index, mmap_pos: mmap_count, overlay_rev, overlay_pos }
     }
 }
 
@@ -1262,15 +1261,40 @@ impl<'a> Iterator for MmapFieldIndexIterDesc<'a> {
     type Item = (IndexValue, DocIdSet);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos > 0 {
-            self.pos -= 1;
-            let entry = std::mem::replace(
-                &mut self.entries[self.pos],
-                (IndexValue::Null, DocIdSet::Empty),
-            );
-            Some(entry)
+        let mm_val = if self.mmap_pos > 0 {
+            self.index.mmap_entry_value(self.mmap_pos - 1)
         } else {
             None
+        };
+        let ov_val = if self.overlay_pos > 0 {
+            Some(&self.overlay_rev[self.overlay_pos - 1].0)
+        } else {
+            None
+        };
+
+        match (mm_val, ov_val) {
+            (Some(mv), Some(ov)) => {
+                if ov >= &mv {
+                    self.overlay_pos -= 1;
+                    let (v, ids) = self.overlay_rev[self.overlay_pos].clone();
+                    if ov == &mv { self.mmap_pos -= 1; } // skip dup
+                    Some((v, ids))
+                } else {
+                    self.mmap_pos -= 1;
+                    let ids = self.index.mmap_entry_docids(self.mmap_pos);
+                    Some((mv, ids))
+                }
+            }
+            (Some(mv), None) => {
+                self.mmap_pos -= 1;
+                let ids = self.index.mmap_entry_docids(self.mmap_pos);
+                Some((mv, ids))
+            }
+            (None, Some(_)) => {
+                self.overlay_pos -= 1;
+                Some(self.overlay_rev[self.overlay_pos].clone())
+            }
+            (None, None) => None,
         }
     }
 }
