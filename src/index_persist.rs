@@ -7,7 +7,8 @@ use crc32fast::Hasher;
 
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
-use crate::index::{CompositeIndex, FieldIndex};
+use crate::index::CompositeIndex;
+use crate::paged_field_index::PagedFieldIndex;
 use crate::vector::VectorIndex;
 
 /// Magic bytes identifying an OxiDB index cache file.
@@ -24,7 +25,7 @@ const HEADER_SIZE: usize = 36;
 /// Save field indexes to a `.fidx` file atomically (write tmp + rename).
 pub fn save_field_indexes(
     path: &Path,
-    indexes: &[&FieldIndex],
+    indexes: &[&PagedFieldIndex],
     doc_count: u64,
     next_id: DocumentId,
     encryption: Option<&Arc<EncryptionKey>>,
@@ -50,7 +51,7 @@ pub fn load_field_indexes(
     expected_doc_count: u64,
     expected_next_id: DocumentId,
     encryption: Option<&Arc<EncryptionKey>>,
-) -> Option<Vec<FieldIndex>> {
+) -> Option<Vec<PagedFieldIndex>> {
     let data = fs::read(path).ok()?;
     let body = validate_cache_file(&data, expected_doc_count, expected_next_id, encryption)?;
 
@@ -61,7 +62,7 @@ pub fn load_field_indexes(
 
     let mut indexes = Vec::with_capacity(count);
     for _ in 0..count {
-        indexes.push(FieldIndex::read_from(&mut cursor).ok()?);
+        indexes.push(PagedFieldIndex::read_from(&mut cursor).ok()?);
     }
     Some(indexes)
 }
@@ -263,14 +264,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.fidx");
 
-        let mut idx1 = FieldIndex::new("status".into());
-        idx1.insert(&make_doc(1, json!({"status": "active"})));
-        idx1.insert(&make_doc(2, json!({"status": "inactive"})));
-        idx1.insert(&make_doc(3, json!({"status": "active"})));
+        let mut idx1 = PagedFieldIndex::new("status".into());
+        idx1.insert_value(1, &json!({"status": "active"}));
+        idx1.insert_value(2, &json!({"status": "inactive"}));
+        idx1.insert_value(3, &json!({"status": "active"}));
 
-        let mut idx2 = FieldIndex::new_unique("email".into());
-        idx2.insert(&make_doc(1, json!({"email": "a@b.c"})));
-        idx2.insert(&make_doc(2, json!({"email": "d@e.f"})));
+        let mut idx2 = PagedFieldIndex::new_unique("email".into());
+        idx2.insert_value(1, &json!({"email": "a@b.c"}));
+        idx2.insert_value(2, &json!({"email": "d@e.f"}));
 
         save_field_indexes(&path, &[&idx1, &idx2], 3, 4, None).unwrap();
 
@@ -289,7 +290,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.fidx");
 
-        let idx = FieldIndex::new("x".into());
+        let idx = PagedFieldIndex::new("x".into());
         save_field_indexes(&path, &[&idx], 10, 11, None).unwrap();
 
         // Wrong doc_count
@@ -326,7 +327,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("corrupt.fidx");
 
-        let idx = FieldIndex::new("x".into());
+        let idx = PagedFieldIndex::new("x".into());
         save_field_indexes(&path, &[&idx], 0, 1, None).unwrap();
 
         // Corrupt a byte in the body
@@ -352,7 +353,7 @@ mod tests {
         let path = dir.path().join("test.fidx");
 
         // Create a file first
-        let idx = FieldIndex::new("x".into());
+        let idx = PagedFieldIndex::new("x".into());
         save_field_indexes(&path, &[&idx], 0, 1, None).unwrap();
         assert!(path.exists());
 

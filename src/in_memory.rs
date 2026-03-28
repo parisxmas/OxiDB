@@ -6,7 +6,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use crate::doc_cache::DocCache;
@@ -14,7 +13,7 @@ use crate::document::DocumentId;
 use crate::engine::LogCallback;
 use crate::error::Result;
 use crate::index::CompositeIndex;
-use crate::mmap_field_index::MmapFieldIndex;
+use crate::paged_field_index::PagedFieldIndex;
 use crate::storage::{DocLocation, Storage};
 use crate::wal::{Wal, WalEntry};
 
@@ -311,87 +310,17 @@ impl InMemStorage {
 // StorageBackend
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// BTreeAdapter
-// ---------------------------------------------------------------------------
-
-/// Adapter that wraps `BTreeStorage` and tracks a per-doc generation counter
-/// so that `mark_deleted` after an `append` (which is logically an update) does
-/// not accidentally remove the freshly-written entry.
-///
-/// The generation is encoded in `DocLocation.length` — a field unused by B-tree
-/// (which uses `offset` for the doc_id).  On every `append`, the global
-/// generation counter is bumped and stored in the returned `DocLocation.length`.
-/// `mark_deleted` only removes the entry when the provided generation matches
-/// the latest generation for that doc_id, preventing the
-/// append-then-mark_deleted update pattern from deleting the new data.
-pub struct BTreeAdapter {
-    pub inner: crate::btree::BTreeStorage,
-    generation: AtomicU32,
-    /// doc_id -> latest generation written by `append`.
-    gen_map: Mutex<HashMap<u64, u32>>,
-}
-
-impl BTreeAdapter {
-    pub fn new(inner: crate::btree::BTreeStorage) -> Self {
-        Self {
-            inner,
-            generation: AtomicU32::new(1),
-            gen_map: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-/// Unified storage backend: file-based, in-memory, or B-tree.
+/// Unified storage backend: either file-based or in-memory.
 pub enum StorageBackend {
     File(Storage),
     Memory(InMemStorage),
-    BTree(BTreeAdapter),
-}
-
-/// Extract `_id` from JSONB-encoded document bytes.
-fn extract_id_from_bytes(bytes: &[u8]) -> Option<u64> {
-    let doc = crate::codec::decode_doc(bytes).ok()?;
-    doc.get("_id")?.as_u64()
 }
 
 impl StorageBackend {
-    /// B-tree helper: insert a doc and return a DocLocation tagged with a
-    /// generation counter so that a subsequent `mark_deleted` for the *old*
-    /// location is correctly treated as a no-op.
-    fn btree_append(&self, b: &BTreeAdapter, doc_bytes: &[u8]) -> Result<DocLocation> {
-        let id = extract_id_from_bytes(doc_bytes).ok_or_else(|| {
-            crate::error::Error::Codec("btree append: missing _id".into())
-        })?;
-        let generation = b.generation.fetch_add(1, Ordering::Relaxed);
-        b.inner.insert(id, doc_bytes)?;
-        b.gen_map.lock().unwrap().insert(id, generation);
-        Ok(DocLocation { offset: id, length: generation })
-    }
-
-    /// B-tree helper: delete a doc only if its generation matches the one
-    /// recorded in the DocLocation.  When the generation is stale (i.e. a
-    /// newer `append` for the same doc_id has already been issued), the
-    /// delete is silently skipped.
-    fn btree_mark_deleted(b: &BTreeAdapter, loc: DocLocation) -> Result<()> {
-        let doc_id = loc.offset;
-        let loc_gen = loc.length;
-        let gen_map = b.gen_map.lock().unwrap();
-        if let Some(&current_gen) = gen_map.get(&doc_id) {
-            if current_gen != loc_gen {
-                // A newer version was written — skip the delete.
-                return Ok(());
-            }
-        }
-        drop(gen_map);
-        b.inner.delete(doc_id).or(Ok(()))
-    }
-
     pub fn append(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
         match self {
             Self::File(s) => s.append(doc_bytes),
             Self::Memory(m) => m.append(doc_bytes),
-            Self::BTree(b) => self.btree_append(b, doc_bytes),
         }
     }
 
@@ -399,7 +328,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.read(loc),
             Self::Memory(m) => m.read(loc),
-            Self::BTree(b) => b.inner.get(loc.offset),
         }
     }
 
@@ -407,7 +335,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.read_lockfree(loc),
             Self::Memory(m) => m.read_lockfree(loc),
-            Self::BTree(b) => b.inner.get(loc.offset),
         }
     }
 
@@ -418,25 +345,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.read_batch_lockfree(locs),
             Self::Memory(m) => m.read_batch_lockfree(locs),
-            Self::BTree(b) => {
-                // Use batch read for I/O locality — groups reads by file
-                // offset so nearby documents are read sequentially.
-                let doc_ids: Vec<u64> = locs.iter().map(|&(_, loc)| loc.offset).collect();
-                let batch = b.inner.get_batch(&doc_ids)?;
-
-                // Build a lookup map from doc_id -> payload for joining back
-                // to the original index positions.
-                let mut by_id: std::collections::HashMap<u64, Vec<u8>> =
-                    batch.into_iter().collect();
-
-                let mut results = Vec::with_capacity(locs.len());
-                for &(idx, loc) in locs.iter() {
-                    if let Some(data) = by_id.remove(&loc.offset) {
-                        results.push((idx, data));
-                    }
-                }
-                Ok(results)
-            }
         }
     }
 
@@ -444,7 +352,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.mark_deleted(loc),
             Self::Memory(m) => m.mark_deleted(loc),
-            Self::BTree(b) => Self::btree_mark_deleted(b, loc),
         }
     }
 
@@ -452,7 +359,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.append_no_sync(doc_bytes),
             Self::Memory(m) => m.append_no_sync(doc_bytes),
-            Self::BTree(b) => self.btree_append(b, doc_bytes),
         }
     }
 
@@ -460,13 +366,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.append_batch_no_sync(items),
             Self::Memory(m) => m.append_batch_no_sync(items),
-            Self::BTree(b) => {
-                let mut locations = Vec::with_capacity(items.len());
-                for &item in items {
-                    locations.push(self.btree_append(b, item)?);
-                }
-                Ok(locations)
-            }
         }
     }
 
@@ -474,13 +373,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.append_batch_no_sync_buffered(items),
             Self::Memory(m) => m.append_batch_no_sync_buffered(items),
-            Self::BTree(b) => {
-                let mut locations = Vec::with_capacity(items.len());
-                for &item in items {
-                    locations.push(self.btree_append(b, item)?);
-                }
-                Ok(locations)
-            }
         }
     }
 
@@ -488,7 +380,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.mark_deleted_no_sync(loc),
             Self::Memory(m) => m.mark_deleted_no_sync(loc),
-            Self::BTree(b) => Self::btree_mark_deleted(b, loc),
         }
     }
 
@@ -496,7 +387,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.sync(),
             Self::Memory(m) => m.sync(),
-            Self::BTree(b) => b.inner.sync(),
         }
     }
 
@@ -504,7 +394,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.file_size(),
             Self::Memory(m) => m.file_size(),
-            Self::BTree(b) => b.inner.file_size(),
         }
     }
 
@@ -512,7 +401,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.path(),
             Self::Memory(m) => m.path(),
-            Self::BTree(b) => b.inner.path(),
         }
     }
 
@@ -520,45 +408,26 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.iter_active(),
             Self::Memory(m) => m.iter_active(),
-            Self::BTree(b) => {
-                let entries = b.inner.scan_all()?;
-                Ok(entries
-                    .into_iter()
-                    .map(|(id, bytes)| (DocLocation { offset: id, length: 0 }, bytes))
-                    .collect())
-            }
         }
     }
 
-    pub fn for_each_active<F>(&self, mut f: F) -> Result<()>
+    pub fn for_each_active<F>(&self, f: F) -> Result<()>
     where
         F: FnMut(DocLocation, Vec<u8>) -> Result<()>,
     {
         match self {
             Self::File(s) => s.for_each_active(f),
             Self::Memory(m) => m.for_each_active(f),
-            Self::BTree(b) => {
-                b.inner.scan_while(|bytes| {
-                    // Extract doc_id from the JSONB payload
-                    if let Ok(doc) = crate::codec::decode_doc(bytes) {
-                        if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                            f(DocLocation { offset: id, length: 0 }, bytes.to_vec())?;
-                        }
-                    }
-                    Ok(true)
-                })
-            }
         }
     }
 
-    pub fn scan_readonly_while<F>(&self, mut f: F) -> Result<()>
+    pub fn scan_readonly_while<F>(&self, f: F) -> Result<()>
     where
         F: FnMut(&[u8]) -> Result<bool>,
     {
         match self {
             Self::File(s) => s.scan_readonly_while(f),
             Self::Memory(m) => m.scan_readonly_while(f),
-            Self::BTree(b) => b.inner.scan_while(f)
         }
     }
 
@@ -574,11 +443,6 @@ impl StorageBackend {
         match self {
             Self::File(s) => s.scan_segment_readonly_while(start_offset, end_offset, f),
             Self::Memory(m) => m.scan_segment_readonly_while(start_offset, end_offset, f),
-            Self::BTree(_b) => {
-                // B-tree has no linear offset concept; for segment scans we do a
-                // full scan (callers rarely use this path for B-tree).
-                self.scan_readonly_while(f)
-            }
         }
     }
 }
@@ -587,68 +451,66 @@ impl StorageBackend {
 // WalBackend
 // ---------------------------------------------------------------------------
 
-/// Unified WAL backend: file-based, no-op (in-memory mode), or noop
-/// (B-tree mode — the B-tree engine handles its own durability).
+/// Unified WAL backend: either file-based or no-op (in-memory mode).
 pub enum WalBackend {
     File(Wal),
-    Memory, // all operations are no-ops (in-memory collections)
-    Noop,   // all operations are no-ops (B-tree mode — B-tree handles its own WAL)
+    Memory, // all operations are no-ops
 }
 
 impl WalBackend {
     pub fn log(&self, entry: &WalEntry) -> Result<()> {
         match self {
             Self::File(w) => w.log(entry),
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 
     pub fn log_no_sync(&self, entry: &WalEntry) -> Result<()> {
         match self {
             Self::File(w) => w.log_no_sync(entry),
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 
     pub fn log_batch(&self, entries: &[WalEntry]) -> Result<()> {
         match self {
             Self::File(w) => w.log_batch(entries),
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 
     pub fn log_batch_no_sync(&self, entries: &[WalEntry]) -> Result<()> {
         match self {
             Self::File(w) => w.log_batch_no_sync(entries),
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 
     pub fn log_batch_inserts_no_sync(&self, entries: &[(u64, &[u8])]) -> Result<()> {
         match self {
             Self::File(w) => w.log_batch_inserts_no_sync(entries),
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 
     pub fn log_batch_inserts_no_sync_buffered(&self, entries: &[(u64, &[u8])]) -> Result<()> {
         match self {
             Self::File(w) => w.log_batch_inserts_no_sync_buffered(entries),
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 
     pub fn checkpoint(&self) -> Result<()> {
         match self {
             Self::File(w) => w.checkpoint(),
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 
     pub fn checkpoint_no_sync(&self) -> Result<()> {
         match self {
             Self::File(w) => w.checkpoint_no_sync(),
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 
@@ -660,7 +522,7 @@ impl WalBackend {
         next_id: &mut DocumentId,
         committed_tx_ids: &HashSet<u64>,
         version_index: &mut HashMap<DocumentId, u64>,
-        field_indexes: &mut HashMap<String, MmapFieldIndex>,
+        field_indexes: &mut HashMap<String, PagedFieldIndex>,
         composite_indexes: &mut Vec<CompositeIndex>,
         verbose: bool,
         log_callback: &Option<LogCallback>,
@@ -681,14 +543,14 @@ impl WalBackend {
                 ),
                 _ => Ok(()),
             },
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 
     pub fn remove_file(&self) -> Result<()> {
         match self {
             Self::File(w) => w.remove_file(),
-            Self::Memory | Self::Noop => Ok(()),
+            Self::Memory => Ok(()),
         }
     }
 }

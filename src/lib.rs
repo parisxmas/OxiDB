@@ -18,6 +18,7 @@ pub mod index_persist;
 pub mod mmap_field_index;
 pub mod mmap_index;
 pub mod oxiscript;
+pub mod paged_field_index;
 pub mod pipeline;
 pub mod procedure;
 pub mod query;
@@ -34,7 +35,6 @@ pub mod vector;
 pub mod wal;
 
 pub use change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
-pub use btree_collection::BTreeCollection;
 pub use collection::{Collection, CompactStats, IndexInfo};
 pub use crypto::EncryptionKey;
 pub use database_manager::DatabaseManager;

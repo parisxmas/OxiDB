@@ -6,7 +6,7 @@ use serde_json::Value as JsonValue;
 use crate::document::{Document, DocumentId};
 use crate::error::{Error, Result};
 use crate::index::CompositeIndex;
-use crate::mmap_field_index::MmapFieldIndex;
+use crate::paged_field_index::PagedFieldIndex;
 use crate::value::IndexValue;
 
 // ---------------------------------------------------------------------------
@@ -225,7 +225,7 @@ fn parse_op(
 /// Execute a query using available indexes. Returns matching document IDs.
 pub fn execute_indexed(
     query: &Query,
-    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
+    field_indexes: &std::collections::HashMap<String, PagedFieldIndex>,
     composite_indexes: &[CompositeIndex],
 ) -> Option<BTreeSet<DocumentId>> {
     match query {
@@ -270,7 +270,7 @@ pub fn execute_indexed(
 fn execute_field_op(
     field: &str,
     op: &QueryOp,
-    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
+    field_indexes: &std::collections::HashMap<String, PagedFieldIndex>,
     _composite_indexes: &[CompositeIndex],
 ) -> Option<BTreeSet<DocumentId>> {
     let idx = field_indexes.get(field)?;
@@ -295,9 +295,9 @@ fn execute_field_op(
 /// range. Returns the merged (start, end) bounds and the field index, or None.
 fn try_merge_range_and<'a>(
     subs: &'a [Query],
-    field_indexes: &'a std::collections::HashMap<String, MmapFieldIndex>,
+    field_indexes: &'a std::collections::HashMap<String, PagedFieldIndex>,
 ) -> Option<(
-    &'a MmapFieldIndex,
+    &'a PagedFieldIndex,
     Bound<&'a IndexValue>,
     Bound<&'a IndexValue>,
 )> {
@@ -357,7 +357,7 @@ fn try_merge_range_and<'a>(
 /// `Some(false)` if stopped early by callback, `None` if indexes couldn't handle it.
 pub fn execute_indexed_lazy(
     query: &Query,
-    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
+    field_indexes: &std::collections::HashMap<String, PagedFieldIndex>,
     callback: &mut dyn FnMut(DocumentId) -> bool,
 ) -> Option<bool> {
     match query {
@@ -534,7 +534,7 @@ fn resolve_field_ref<'a>(data: &'a JsonValue, path: &str) -> Option<&'a JsonValu
 /// post-filtering with `matches_value` is needed.
 pub fn is_fully_indexed(
     query: &Query,
-    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
+    field_indexes: &std::collections::HashMap<String, PagedFieldIndex>,
 ) -> bool {
     match query {
         Query::All => true,
@@ -550,76 +550,11 @@ pub fn is_fully_indexed(
     }
 }
 
-/// Check if all query conditions can be checked per-doc via index containment.
-/// More restrictive than `is_fully_indexed` — only returns true for $eq/$in
-/// ops that `matches_doc_id_indexed` can handle.
-pub fn is_lazy_index_checkable(
-    query: &Query,
-    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
-) -> bool {
-    match query {
-        Query::All => true,
-        Query::Field { field, op } => {
-            if !field_indexes.contains_key(field.as_str()) {
-                return false;
-            }
-            matches!(op, QueryOp::Eq(_) | QueryOp::In(_))
-        }
-        Query::And(subs) => subs.iter().all(|s| is_lazy_index_checkable(s, field_indexes)),
-        Query::Or(subs) => subs.iter().all(|s| is_lazy_index_checkable(s, field_indexes)),
-    }
-}
-
-/// Check if a single doc_id matches a fully-indexed query using only index
-/// lookups (no doc loading). Returns `Some(true/false)` if the query can be
-/// resolved by indexes alone, or `None` if it cannot.
-/// This is O(log n) per field condition vs O(n) for materializing the full set.
-pub fn matches_doc_id_indexed(
-    query: &Query,
-    doc_id: DocumentId,
-    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
-) -> Option<bool> {
-    match query {
-        Query::All => Some(true),
-        Query::Field { field, op } => {
-            let idx = field_indexes.get(field.as_str())?;
-            match op {
-                QueryOp::Eq(val) => Some(idx.contains_doc_id(val, doc_id)),
-                QueryOp::In(vals) => {
-                    Some(vals.iter().any(|v| idx.contains_doc_id(v, doc_id)))
-                }
-                // For other ops we can't do a cheap single-doc check
-                _ => None,
-            }
-        }
-        Query::And(subs) => {
-            for sub in subs {
-                match matches_doc_id_indexed(sub, doc_id, field_indexes) {
-                    Some(true) => continue,
-                    Some(false) => return Some(false),
-                    None => return None,
-                }
-            }
-            Some(true)
-        }
-        Query::Or(subs) => {
-            for sub in subs {
-                match matches_doc_id_indexed(sub, doc_id, field_indexes) {
-                    Some(true) => return Some(true),
-                    Some(false) => continue,
-                    None => return None,
-                }
-            }
-            Some(false)
-        }
-    }
-}
-
 /// Count matching documents using only indexes (no BTreeSet allocation).
 /// Returns None if the query can't be counted by index alone.
 pub fn count_indexed(
     query: &Query,
-    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
+    field_indexes: &std::collections::HashMap<String, PagedFieldIndex>,
 ) -> Option<usize> {
     match query {
         Query::All => None, // caller should use primary_index.len()
@@ -648,7 +583,7 @@ pub fn count_indexed(
 /// Handle AND of range conditions on the same field — count without BTreeSet.
 fn count_single_field_and(
     subs: &[Query],
-    field_indexes: &std::collections::HashMap<String, MmapFieldIndex>,
+    field_indexes: &std::collections::HashMap<String, PagedFieldIndex>,
 ) -> Option<usize> {
     let mut field_name: Option<&str> = None;
     let mut gte_bound: Option<&IndexValue> = None;
@@ -1154,7 +1089,7 @@ mod tests {
 
     #[test]
     fn execute_indexed_eq() {
-        let mut idx = MmapFieldIndex::new("status".into());
+        let mut idx = PagedFieldIndex::new("status".into());
         idx.insert_value(1, &json!({"status": "active"}));
         idx.insert_value(2, &json!({"status": "inactive"}));
         idx.insert_value(3, &json!({"status": "active"}));
@@ -1177,7 +1112,7 @@ mod tests {
 
     #[test]
     fn count_indexed_eq() {
-        let mut idx = MmapFieldIndex::new("x".into());
+        let mut idx = PagedFieldIndex::new("x".into());
         idx.insert_value(1, &json!({"x": 10}));
         idx.insert_value(2, &json!({"x": 10}));
         idx.insert_value(3, &json!({"x": 20}));
@@ -1191,7 +1126,7 @@ mod tests {
 
     #[test]
     fn is_fully_indexed_check() {
-        let mut idx = MmapFieldIndex::new("a".into());
+        let mut idx = PagedFieldIndex::new("a".into());
         idx.insert_value(1, &json!({"a": 1}));
 
         let mut field_indexes = std::collections::HashMap::new();

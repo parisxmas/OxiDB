@@ -14,7 +14,7 @@ use crate::btree_collection::BTreeCollection;
 use crate::change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
 use crate::collection::{Collection, CompactStats, IndexInfo, resolve_field_in_value};
 use crate::index::CompositeIndex;
-use crate::mmap_field_index::MmapFieldIndex;
+use crate::paged_field_index::PagedFieldIndex;
 use crate::value::IndexValue;
 use crate::vector::VectorIndex;
 use crate::crypto::EncryptionKey;
@@ -81,7 +81,7 @@ impl AnyCollection {
 
     // -- Accessor methods ----------------------------------------------------
 
-    pub fn field_indexes(&self) -> &HashMap<String, MmapFieldIndex> {
+    pub fn field_indexes(&self) -> &HashMap<String, PagedFieldIndex> {
         delegate!(ref self.field_indexes())
     }
 

@@ -26,7 +26,7 @@ use crate::document::DocumentId;
 use crate::error::{Error, Result};
 use crate::fts::CollectionTextIndex;
 use crate::index::CompositeIndex;
-use crate::mmap_field_index::MmapFieldIndex;
+use crate::paged_field_index::PagedFieldIndex;
 use crate::query::{self, FindOptions, Query, SortOrder};
 use crate::value::IndexValue;
 use crate::vector::{DistanceMetric, VectorIndex};
@@ -41,7 +41,7 @@ pub struct BTreeCollection {
     #[allow(dead_code)]
     data_dir: PathBuf,
     storage: BTreeStorage,
-    field_indexes: HashMap<String, MmapFieldIndex>,
+    field_indexes: HashMap<String, PagedFieldIndex>,
     composite_indexes: Vec<CompositeIndex>,
     text_index: Option<CollectionTextIndex>,
     vector_indexes: HashMap<String, VectorIndex>,
@@ -119,7 +119,7 @@ impl BTreeCollection {
     // Accessor methods (matching Collection API)
     // -----------------------------------------------------------------------
 
-    pub fn field_indexes(&self) -> &HashMap<String, MmapFieldIndex> {
+    pub fn field_indexes(&self) -> &HashMap<String, PagedFieldIndex> {
         &self.field_indexes
     }
 
@@ -477,7 +477,7 @@ impl BTreeCollection {
                     match sort_order {
                         SortOrder::Asc => {
                             'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
-                                for &id in &doc_ids {
+                                for &id in doc_ids {
                                     if let Some(arc) = self.read_doc_arc(id) {
                                         if skip_filter || query::matches_value(&query, &arc) {
                                             results.push(arc);
@@ -1162,7 +1162,7 @@ impl BTreeCollection {
             return Ok(());
         }
 
-        let mut idx = MmapFieldIndex::new(field.to_string());
+        let mut idx = PagedFieldIndex::new(field.to_string());
 
         // Backfill using B-tree cursor scan (sequential page access)
         self.storage.scan_bytes_while(|bytes| {
@@ -1195,7 +1195,7 @@ impl BTreeCollection {
             return Ok(());
         }
 
-        let mut idx = MmapFieldIndex::new_unique(field.to_string());
+        let mut idx = PagedFieldIndex::new_unique(field.to_string());
 
         self.storage.scan_bytes_while(|bytes| {
             if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
