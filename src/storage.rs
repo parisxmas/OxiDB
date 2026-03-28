@@ -53,6 +53,11 @@ pub struct Storage {
     inner: Mutex<StorageInner>,
     read_file: File,
     encryption: Option<Arc<EncryptionKey>>,
+    /// Memory-mapped view of the data file for zero-syscall reads.
+    /// Re-mapped when the file grows significantly.
+    read_mmap: parking_lot::RwLock<Option<memmap2::Mmap>>,
+    /// Size of the file when mmap was last created.
+    mmap_len: std::sync::atomic::AtomicU64,
 }
 
 impl Storage {
@@ -77,6 +82,14 @@ impl Storage {
         // Separate read-only handle for lockfree pread operations.
         let read_file = File::open(path)?;
 
+        // Create initial mmap for reads (if file is non-empty)
+        let mmap = if current_offset > 0 {
+            unsafe { memmap2::Mmap::map(&read_file).ok() }
+        } else {
+            None
+        };
+        let mmap_len = mmap.as_ref().map_or(0, |m| m.len() as u64);
+
         Ok(Self {
             _path: path.to_path_buf(),
             inner: Mutex::new(StorageInner {
@@ -85,6 +98,8 @@ impl Storage {
             }),
             read_file,
             encryption,
+            read_mmap: parking_lot::RwLock::new(mmap),
+            mmap_len: std::sync::atomic::AtomicU64::new(mmap_len),
         })
     }
 
@@ -168,43 +183,83 @@ impl Storage {
     }
 
     /// Read a document without acquiring the Mutex.
-    /// Uses `pread` (positional read) on Unix — a single atomic syscall
-    /// that neither seeks nor shares the file position with writers.
-    #[cfg(unix)]
+    /// Uses mmap when available (zero syscall), falls back to pread.
     pub fn read_lockfree(&self, loc: DocLocation) -> Result<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
-        let mut buf = vec![0u8; loc.length as usize];
-        self.read_file.read_at(&mut buf, loc.offset + 5)?;
-        self.decode_payload(&buf)
-    }
+        let data_start = (loc.offset + 5) as usize;
+        let data_end = data_start + loc.length as usize;
 
-    #[cfg(not(unix))]
-    pub fn read_lockfree(&self, loc: DocLocation) -> Result<Vec<u8>> {
-        self.read(loc)
+        // Fast path: read from mmap (no syscall)
+        {
+            let guard = self.read_mmap.read();
+            if let Some(ref mmap) = *guard {
+                if data_end <= mmap.len() {
+                    return self.decode_payload(&mmap[data_start..data_end]);
+                }
+            }
+        }
+
+        // Slow path: pread for data beyond mmap range (recent writes)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let mut buf = vec![0u8; loc.length as usize];
+            self.read_file.read_at(&mut buf, loc.offset + 5)?;
+            self.decode_payload(&buf)
+        }
+        #[cfg(not(unix))]
+        {
+            self.read(loc)
+        }
     }
 
     /// Batch-read multiple documents without the Mutex.
-    /// Locations are sorted by offset internally for I/O locality.
-    /// Returns (index, bytes) pairs in sorted-offset order.
-    #[cfg(unix)]
+    /// Uses mmap when possible, falls back to pread for recent data.
     pub fn read_batch_lockfree(
         &self,
         locs: &mut [(usize, DocLocation)],
     ) -> Result<Vec<(usize, Vec<u8>)>> {
-        use std::os::unix::fs::FileExt;
         locs.sort_unstable_by_key(|&(_, loc)| loc.offset);
+        let guard = self.read_mmap.read();
+        let mmap_ref = guard.as_ref();
+        let mmap_len = mmap_ref.map_or(0, |m| m.len());
+
         let mut results = Vec::with_capacity(locs.len());
         for &(idx, loc) in locs.iter() {
-            let mut buf = vec![0u8; loc.length as usize];
-            self.read_file.read_at(&mut buf, loc.offset + 5)?;
-            let decoded = self.decode_payload(&buf)?;
+            let data_start = (loc.offset + 5) as usize;
+            let data_end = data_start + loc.length as usize;
+
+            let decoded = if let Some(ref mmap) = mmap_ref {
+                if data_end <= mmap_len {
+                    // Zero-syscall mmap read
+                    self.decode_payload(&mmap[data_start..data_end])?
+                } else {
+                    self.pread_decode(loc)?
+                }
+            } else {
+                self.pread_decode(loc)?
+            };
             results.push((idx, decoded));
         }
         Ok(results)
     }
 
-    #[cfg(not(unix))]
-    pub fn read_batch_lockfree(
+    /// Fallback pread + decode for data beyond mmap range.
+    fn pread_decode(&self, loc: DocLocation) -> Result<Vec<u8>> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let mut buf = vec![0u8; loc.length as usize];
+            self.read_file.read_at(&mut buf, loc.offset + 5)?;
+            self.decode_payload(&buf)
+        }
+        #[cfg(not(unix))]
+        {
+            self.read(loc)
+        }
+    }
+
+    #[allow(dead_code)]
+    fn read_batch_lockfree_legacy(
         &self,
         locs: &mut [(usize, DocLocation)],
     ) -> Result<Vec<(usize, Vec<u8>)>> {
@@ -401,7 +456,22 @@ impl Storage {
     pub fn sync(&self) -> Result<()> {
         let inner = self.inner.lock();
         inner.file.sync_data()?;
+        let current_size = inner.current_offset;
+        drop(inner);
+        self.remap_if_grown(current_size);
         Ok(())
+    }
+
+    /// Re-create mmap if the file has grown beyond the current mmap range.
+    fn remap_if_grown(&self, current_size: u64) {
+        let old_len = self.mmap_len.load(std::sync::atomic::Ordering::Relaxed);
+        if current_size > old_len && current_size > 0 {
+            if let Ok(new_mmap) = unsafe { memmap2::Mmap::map(&self.read_file) } {
+                let new_len = new_mmap.len() as u64;
+                *self.read_mmap.write() = Some(new_mmap);
+                self.mmap_len.store(new_len, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// Returns the total file size in bytes.
