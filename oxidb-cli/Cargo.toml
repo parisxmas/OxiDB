@@ -1,6 +1,6 @@
 [package]
 name = "oxidb-cli"
-version = "0.20.1"
+version = "0.22.0"
 edition = "2024"
 description = "Interactive CLI and REPL for OxiDB with MongoDB-style syntax"
 
