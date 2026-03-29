@@ -479,12 +479,36 @@ impl BTreeCollection {
                     let mut results = Vec::new();
                     let skip_filter = matches!(query, Query::All);
 
+                    // Extract eq conditions for index-level containment check
+                    let eq_checks: Vec<(String, IndexValue)> = if !skip_filter {
+                        query::extract_eq_conditions(&query)
+                            .map(|m| m.into_iter()
+                                .filter(|(f, _)| self.field_indexes.contains_key(f) && f != sort_field)
+                                .collect())
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let use_index_check = !eq_checks.is_empty();
+
+                    let check_id = |id: DocumentId| -> bool {
+                        for (field, value) in &eq_checks {
+                            if let Some(idx) = self.field_indexes.get(field.as_str()) {
+                                if !idx.contains_doc_id(value, id) {
+                                    return false;
+                                }
+                            }
+                        }
+                        true
+                    };
+
                     match sort_order {
                         SortOrder::Asc => {
                             'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
                                 for &id in doc_ids {
+                                    if use_index_check && !check_id(id) { continue; }
                                     if let Some(arc) = self.read_doc_arc(id) {
-                                        if skip_filter || query::matches_value(&query, &arc) {
+                                        if skip_filter || use_index_check || query::matches_value(&query, &arc) {
                                             results.push(arc);
                                             if results.len() >= need {
                                                 break 'outer_asc;
@@ -497,8 +521,9 @@ impl BTreeCollection {
                         SortOrder::Desc => {
                             'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
                                 for &id in doc_ids.iter().rev() {
+                                    if use_index_check && !check_id(id) { continue; }
                                     if let Some(arc) = self.read_doc_arc(id) {
-                                        if skip_filter || query::matches_value(&query, &arc) {
+                                        if skip_filter || use_index_check || query::matches_value(&query, &arc) {
                                             results.push(arc);
                                             if results.len() >= need {
                                                 break 'outer_desc;
@@ -924,10 +949,14 @@ impl BTreeCollection {
             // Update B-tree in-place (replace value)
             self.storage.insert(op.id, op.new_bytes);
 
-            // Update field indexes
+            // Update field indexes — only for fields whose value changed
             for idx in self.field_indexes.values_mut() {
-                idx.remove_value(op.id, &op.old_data);
-                idx.insert_value(op.id, &op.new_data);
+                let old_val = crate::collection::resolve_field_in_value(&op.old_data, &idx.field);
+                let new_val = crate::collection::resolve_field_in_value(&op.new_data, &idx.field);
+                if old_val != new_val {
+                    idx.remove_value(op.id, &op.old_data);
+                    idx.insert_value(op.id, &op.new_data);
+                }
             }
             for idx in &mut self.composite_indexes {
                 idx.remove_value(op.id, &op.old_data);
