@@ -77,3 +77,6 @@ dist/
 OxiDMS/oxidms-server
 OxiDMS/frontend/node_modules/
 OxiDMS/frontend/dist/
+
+tests/go-complex-tests/bench-complex
+tests/go-complex-tests/report.json
