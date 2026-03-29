@@ -21,7 +21,8 @@ use serde_json::Value;
 
 use crate::btree_storage::BTreeStorage;
 use crate::codec;
-use crate::collection::{CompactStats, IndexInfo, resolve_field_in_value};
+use crate::collection::{CompactStats, IndexInfo, IndexMetadata, load_index_metadata, resolve_field_in_value};
+use crate::index_persist;
 use crate::in_memory::WalBackend;
 use crate::wal::{Wal, WalEntry};
 use crate::doc_cache::DocCache;
@@ -84,12 +85,68 @@ impl BTreeCollection {
             Ok(true)
         })?;
 
+        // Load persisted index definitions
+        let idx_path = data_dir.join(format!("{}.idx", name));
+        let persisted_indexes = load_index_metadata(&idx_path).unwrap_or_default();
+
+        // Try loading cached index data
+        let doc_count = storage.count() as u64;
+        let fidx_path = data_dir.join(format!("{}.fidx", name));
+        let loaded_field_indexes = if !persisted_indexes.is_empty() {
+            index_persist::load_field_indexes(&fidx_path, doc_count, max_id + 1, None)
+        } else {
+            None
+        };
+
+        let field_indexes = if let Some(loaded) = loaded_field_indexes {
+            // Loaded from cache — build HashMap from the loaded vec
+            let mut map = HashMap::new();
+            for idx in loaded {
+                map.insert(idx.field.clone(), idx);
+            }
+            map
+        } else if !persisted_indexes.is_empty() {
+            // Metadata exists but cache stale — rebuild from B-tree
+            let mut map = HashMap::new();
+            for info in &persisted_indexes {
+                if info.index_type == "field" || info.index_type == "unique" {
+                    let field = &info.fields[0];
+                    let mut idx = PagedFieldIndex::new(field.clone());
+                    if info.unique { idx.unique = true; }
+                    // Build index by scanning all docs
+                    let mut pairs: Vec<(IndexValue, DocumentId)> = Vec::new();
+                    storage.scan_all_while(|id, bytes| {
+                        if let Ok(doc) = crate::codec::decode_doc(bytes) {
+                            if let Some(val) = resolve_field_in_value(&doc, field) {
+                                pairs.push((IndexValue::from_json(val), id));
+                            }
+                        }
+                        Ok(true)
+                    })?;
+                    pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+                    idx.build_from_sorted(pairs);
+                    map.insert(field.clone(), idx);
+                }
+            }
+            map
+        } else {
+            HashMap::new()
+        };
+
+        let cidx_path = data_dir.join(format!("{}.cidx", name));
+        let composite_indexes = if !persisted_indexes.is_empty() {
+            let loaded = index_persist::load_composite_indexes(&cidx_path, doc_count, max_id + 1, None);
+            loaded.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             name: name.to_string(),
             data_dir: data_dir.to_path_buf(),
             storage,
-            field_indexes: RwLock::new(HashMap::new()),
-            composite_indexes: RwLock::new(Vec::new()),
+            field_indexes: RwLock::new(field_indexes),
+            composite_indexes: RwLock::new(composite_indexes),
             text_index: RwLock::new(None),
             vector_indexes: RwLock::new(HashMap::new()),
             doc_cache: DocCache::new(crate::doc_cache::DEFAULT_CAPACITY),
@@ -182,8 +239,46 @@ impl BTreeCollection {
     }
 
     pub fn save_index_data(&self) {
-        // B-tree collection doesn't use .fidx/.cidx files — indexes are
-        // rebuilt from the B-tree on load if needed.
+        if self.in_memory || self.data_dir.as_os_str().is_empty() {
+            return;
+        }
+        let doc_count = self.storage.count() as u64;
+        let next_id = self.next_id.load(Ordering::Acquire);
+
+        // Flush write buffers and save field indexes
+        {
+            let mut fi = self.field_indexes.write();
+            for idx in fi.values_mut() {
+                idx.flush_write_buffer();
+            }
+            let fidx_path = self.data_dir.join(format!("{}.fidx", self.name));
+            let field_refs: Vec<&PagedFieldIndex> = fi.values().collect();
+            let _ = index_persist::save_field_indexes(&fidx_path, &field_refs, doc_count, next_id, None);
+        }
+
+        // Save composite indexes
+        {
+            let ci = self.composite_indexes.read();
+            if !ci.is_empty() {
+                let cidx_path = self.data_dir.join(format!("{}.cidx", self.name));
+                let comp_refs: Vec<&CompositeIndex> = ci.iter().collect();
+                let _ = index_persist::save_composite_indexes(&cidx_path, &comp_refs, doc_count, next_id, None);
+            }
+        }
+    }
+
+    fn save_index_metadata(&self) -> Result<()> {
+        if self.in_memory || self.data_dir.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let meta = IndexMetadata {
+            version: 1,
+            indexes: self.list_indexes(),
+        };
+        let bytes = serde_json::to_vec(&meta)?;
+        let path = self.data_dir.join(format!("{}.idx", self.name));
+        std::fs::write(&path, &bytes)?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1413,6 +1508,8 @@ impl BTreeCollection {
 
         let mut fi = self.field_indexes.write();
         fi.insert(field.to_string(), idx);
+        drop(fi);
+        let _ = self.save_index_metadata();
         Ok(())
     }
 
@@ -1460,6 +1557,8 @@ impl BTreeCollection {
 
         let mut fi = self.field_indexes.write();
         fi.insert(field.to_string(), idx);
+        drop(fi);
+        let _ = self.save_index_metadata();
         Ok(())
     }
 
@@ -1486,6 +1585,8 @@ impl BTreeCollection {
 
         let mut ci = self.composite_indexes.write();
         ci.push(idx);
+        drop(ci);
+        let _ = self.save_index_metadata();
         Ok(name)
     }
 
@@ -1548,6 +1649,8 @@ impl BTreeCollection {
         {
             let mut fi = self.field_indexes.write();
             if fi.remove(name).is_some() {
+                drop(fi);
+                let _ = self.save_index_metadata();
                 return Ok(());
             }
         }
@@ -1555,6 +1658,8 @@ impl BTreeCollection {
             let mut ci = self.composite_indexes.write();
             if let Some(pos) = ci.iter().position(|i| i.name() == name) {
                 ci.remove(pos);
+                drop(ci);
+                let _ = self.save_index_metadata();
                 return Ok(());
             }
         }
@@ -1562,12 +1667,14 @@ impl BTreeCollection {
             let mut ti = self.text_index.write();
             if ti.is_some() {
                 *ti = None;
+                let _ = self.save_index_metadata();
                 return Ok(());
             }
         }
         if let Some(field) = name.strip_prefix("_vec_") {
             let mut vi = self.vector_indexes.write();
             if vi.remove(field).is_some() {
+                let _ = self.save_index_metadata();
                 return Ok(());
             }
         }
