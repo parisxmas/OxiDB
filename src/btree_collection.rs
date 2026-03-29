@@ -379,7 +379,7 @@ impl BTreeCollection {
         }
 
         // Parallel JSONB encode
-        let btree_entries: Vec<(u64, Vec<u8>)> = if doc_count > 1000 {
+        let btree_entries: Vec<(u64, Vec<u8>)> = if doc_count > 500 {
             docs_with_ids.par_iter()
                 .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
                 .collect()

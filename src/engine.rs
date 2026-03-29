@@ -890,16 +890,13 @@ impl OxiDb {
         }; // write lock released
 
         // Phase 2: Pre-serialize all documents (no lock held — other threads can work)
-        let mut prepared = Vec::with_capacity(docs.len());
-
-        // Track intra-batch uniqueness
-        let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
 
         // When no indexes need the Value and batch is large, drop it after
-        // encoding to reduce allocator churn (otherwise jemalloc retains
-        // the freed pages, inflating RSS).
+        // encoding to reduce allocator churn.
         let keep_values = need_values || emit || docs.len() <= 1000;
 
+        // Assign IDs and prepare docs
+        let mut docs_with_ids: Vec<(u64, Value)> = Vec::with_capacity(docs.len());
         for (i, mut data) in docs.into_iter().enumerate() {
             if !data.is_object() {
                 return Err(Error::NotAnObject);
@@ -911,6 +908,7 @@ impl OxiDb {
 
             // Intra-batch uniqueness check
             if has_unique_indexes {
+                let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
                 for field in &unique_fields {
                     if let Some(value) = resolve_field_in_value(&data, field) {
                         let iv = IndexValue::from_json(value);
@@ -924,16 +922,28 @@ impl OxiDb {
                     }
                 }
             }
-
-            let bytes = crate::codec::encode_doc(&data)?;
-
-            if keep_values {
-                prepared.push((id, data, bytes));
-            } else {
-                // Drop Value to free memory — only bytes are needed
-                prepared.push((id, Value::Null, bytes));
-            }
+            docs_with_ids.push((id, data));
         }
+
+        // Parallel JSONB encode for large batches
+        let prepared: Vec<(DocumentId, Value, Vec<u8>)> = if docs_with_ids.len() > 500 && !has_unique_indexes {
+            use rayon::prelude::*;
+            docs_with_ids.into_par_iter().map(|(id, data)| {
+                let bytes = crate::codec::encode_doc(&data).unwrap_or_default();
+                if keep_values { (id, data, bytes) } else { (id, Value::Null, bytes) }
+            }).collect()
+        } else {
+            let mut prepared = Vec::with_capacity(docs_with_ids.len());
+            for (id, data) in docs_with_ids {
+                let bytes = crate::codec::encode_doc(&data)?;
+                if keep_values {
+                    prepared.push((id, data, bytes));
+                } else {
+                    prepared.push((id, Value::Null, bytes));
+                }
+            }
+            prepared
+        };
 
         // Phase 3: Write lock — insert pre-serialized docs (fast: no serialization)
         let ids = col_write!(col, insert_many_prepared(prepared))?;

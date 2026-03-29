@@ -329,8 +329,16 @@ impl BTreeStorage {
     /// use the regular `insert()` loop instead.
     pub fn insert_batch(&self, entries: Vec<(u64, Vec<u8>)>) {
         let total_new: u64 = entries.iter().map(|(_, v)| v.len() as u64).sum();
-        for (key, value) in entries {
-            self.tree.insert(key, value);
+        if entries.len() > 1000 {
+            // Parallel insert — DashMap shards allow concurrent writes
+            use rayon::prelude::*;
+            entries.into_par_iter().for_each(|(key, value)| {
+                self.tree.insert(key, value);
+            });
+        } else {
+            for (key, value) in entries {
+                self.tree.insert(key, value);
+            }
         }
         self.total_bytes.fetch_add(total_new, Ordering::AcqRel);
     }
