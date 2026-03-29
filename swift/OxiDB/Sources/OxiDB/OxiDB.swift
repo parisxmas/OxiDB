@@ -484,6 +484,56 @@ public final class OxiDBClient: OxiDBMutationObservable {
         return try call { oxidb_disable_schedule($0, name) }
     }
 
+    // MARK: - Stored Procedures (OxiScript)
+
+    /// Create a stored procedure from OxiScript source.
+    /// Example: `try client.createProcedure(script: "proc greet(name) { return {hello: name} }")`
+    @discardableResult
+    public func createProcedure(script: String) throws -> [String: Any] {
+        let cmd: [String: Any] = ["cmd": "create_procedure", "script": script]
+        return try execute(cmd)
+    }
+
+    /// Create a stored procedure from JSON definition.
+    @discardableResult
+    public func createProcedure(name: String, params: [String], steps: [[String: Any]]) throws -> [String: Any] {
+        let cmd: [String: Any] = ["cmd": "create_procedure", "name": name, "params": params, "steps": steps]
+        return try execute(cmd)
+    }
+
+    /// Call a stored procedure by name.
+    public func callProcedure(name: String, params: [String: Any] = [:]) throws -> [String: Any] {
+        let cmd: [String: Any] = ["cmd": "call_procedure", "name": name, "params": params]
+        return try execute(cmd)
+    }
+
+    /// List all stored procedures.
+    public func listProcedures() throws -> [String: Any] {
+        return try execute(["cmd": "list_procedures"])
+    }
+
+    /// Get a stored procedure definition.
+    public func getProcedure(name: String) throws -> [String: Any] {
+        return try execute(["cmd": "get_procedure", "name": name])
+    }
+
+    /// Delete a stored procedure.
+    @discardableResult
+    public func deleteProcedure(name: String) throws -> [String: Any] {
+        return try execute(["cmd": "delete_procedure", "name": name])
+    }
+
+    /// Compile OxiScript without saving — returns compiled JSON steps.
+    public func compileOxiScript(script: String) throws -> [String: Any] {
+        return try execute(["cmd": "compile_oxiscript", "script": script])
+    }
+
+    /// Send a raw JSON command to the server.
+    public func execute(_ command: [String: Any]) throws -> [String: Any] {
+        let json = try jsonString(command)
+        return try call { oxidb_execute($0, json) }
+    }
+
     // MARK: - Private Helpers
 
     private func call(_ fn: (UnsafeMutableRawPointer) -> UnsafeMutablePointer<CChar>?) throws -> [String: Any] {
@@ -894,6 +944,46 @@ public final class OxiDBDatabase: OxiDBMutationObservable {
     @discardableResult
     public func disableSchedule(name: String) throws -> [String: Any] {
         return try execute(["cmd": "disable_schedule", "name": name])
+    }
+
+    // MARK: - Stored Procedures (OxiScript)
+
+    /// Create a stored procedure from OxiScript source.
+    @discardableResult
+    public func createProcedure(script: String) throws -> [String: Any] {
+        return try execute(["cmd": "create_procedure", "script": script])
+    }
+
+    /// Create a stored procedure from JSON definition.
+    @discardableResult
+    public func createProcedure(name: String, params: [String], steps: [[String: Any]]) throws -> [String: Any] {
+        return try execute(["cmd": "create_procedure", "name": name, "params": params, "steps": steps])
+    }
+
+    /// Call a stored procedure by name.
+    public func callProcedure(name: String, params: [String: Any] = [:]) throws -> [String: Any] {
+        return try execute(["cmd": "call_procedure", "name": name, "params": params])
+    }
+
+    /// List all stored procedures.
+    public func listProcedures() throws -> [String: Any] {
+        return try execute(["cmd": "list_procedures"])
+    }
+
+    /// Get a stored procedure definition.
+    public func getProcedure(name: String) throws -> [String: Any] {
+        return try execute(["cmd": "get_procedure", "name": name])
+    }
+
+    /// Delete a stored procedure.
+    @discardableResult
+    public func deleteProcedure(name: String) throws -> [String: Any] {
+        return try execute(["cmd": "delete_procedure", "name": name])
+    }
+
+    /// Compile OxiScript without saving.
+    public func compileOxiScript(script: String) throws -> [String: Any] {
+        return try execute(["cmd": "compile_oxiscript", "script": script])
     }
 
     // MARK: - Raw Execute
