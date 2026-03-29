@@ -2,9 +2,7 @@ import Foundation
 #if canImport(COxiDB)
 import COxiDB
 #endif
-#if canImport(COxiDBEmbedded)
 import COxiDBEmbedded
-#endif
 
 // MARK: - Error Types
 

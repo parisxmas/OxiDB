@@ -24,6 +24,9 @@ __pycache__/
 swift/**/.build/
 *.xcuserstate
 xcuserdata/
+.build-rust*/
+release/OxiDBEmbedded.xcframework/
+release/OxiDBEmbedded.xcframework.zip
 
 # Julia
 julia/**/Manifest.toml
