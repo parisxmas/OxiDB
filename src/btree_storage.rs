@@ -369,6 +369,17 @@ impl BTreeStorage {
         values
     }
 
+    /// Collect all keys (lightweight — no value cloning).
+    pub fn scan_keys<F>(&self, mut f: F)
+    where
+        F: FnMut(u64),
+    {
+        self.tree.iter_sync(|key, _| {
+            f(*key);
+            true
+        });
+    }
+
     /// Iterate all entries in arbitrary order (no key sort). Faster for full scans
     /// like aggregation where key order doesn't matter.
     pub fn for_each_value<F>(&self, mut f: F) -> Result<()>

@@ -903,14 +903,18 @@ impl BTreeCollection {
                     Ok(true)
                 })?;
             } else {
-                // Full scan — parallel decode + filter with rayon
-                let all_bytes = self.storage.values_as_slices();
-                let matched: Vec<Arc<Value>> = all_bytes
+                // Full scan — collect doc_ids then parallel filter
+                let doc_ids: Vec<u64> = {
+                    let mut ids = Vec::new();
+                    self.storage.scan_keys(|k| { ids.push(k); });
+                    ids
+                };
+                let matched: Vec<Arc<Value>> = doc_ids
                     .par_iter()
-                    .filter_map(|bytes| {
-                        let doc = codec::decode_doc(bytes).ok()?;
-                        if query::matches_value(&query, &doc) {
-                            Some(Arc::new(doc))
+                    .filter_map(|&id| {
+                        let arc = self.load_doc_arc(id)?;
+                        if query::matches_value(&query, &arc) {
+                            Some(arc)
                         } else {
                             None
                         }
@@ -1410,13 +1414,17 @@ impl BTreeCollection {
             // Drop fi before full scan
             drop(fi);
 
-            // Parallel B-tree scan with rayon
-            let all_bytes = self.storage.values_as_slices();
-            count = all_bytes
+            // Parallel scan using doc_cache (avoids cloning raw bytes)
+            let doc_ids: Vec<u64> = {
+                let mut ids = Vec::new();
+                self.storage.scan_keys(|k| { ids.push(k); });
+                ids
+            };
+            count = doc_ids
                 .par_iter()
-                .filter(|bytes| {
-                    if let Ok(doc) = codec::decode_doc(bytes) {
-                        query::matches_value(&query, &doc)
+                .filter(|&&id| {
+                    if let Some(arc) = self.load_doc_arc(id) {
+                        query::matches_value(&query, &arc)
                     } else {
                         false
                     }
