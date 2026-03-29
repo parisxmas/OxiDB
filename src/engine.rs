@@ -1235,6 +1235,15 @@ impl OxiDb {
         tx_id
     }
 
+    /// Extract buffered write ops from a transaction (for Raft replication).
+    /// Removes the transaction from the active set.
+    pub fn extract_transaction_writes(&self, tx_id: TransactionId) -> Result<Vec<WriteOp>> {
+        let mut txs = self.active_transactions.write();
+        let tx_mutex = txs.remove(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
+        let tx = tx_mutex.into_inner();
+        Ok(tx.write_ops)
+    }
+
     /// Buffer an insert within a transaction.
     pub fn tx_insert(&self, tx_id: TransactionId, collection: &str, doc: Value) -> Result<()> {
         let txs = self.active_transactions.read();

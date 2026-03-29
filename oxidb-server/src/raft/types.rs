@@ -92,6 +92,18 @@ pub enum OxiDbRequest {
         bucket: String,
         key: String,
     },
+    /// Atomic transaction commit — all buffered writes applied as one Raft entry.
+    CommitTransaction {
+        write_ops: Vec<TransactionWriteOp>,
+    },
+}
+
+/// A single write operation from a committed transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TransactionWriteOp {
+    Insert { collection: String, document: Value },
+    Update { collection: String, query: Value, update: Value },
+    Delete { collection: String, query: Value },
 }
 
 /// Response from applying a write request through the state machine.
