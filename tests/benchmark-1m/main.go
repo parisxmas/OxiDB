@@ -116,9 +116,19 @@ func record(cat, name string, oxiDur, monDur time.Duration, oxiN, monN int, oxiE
 	}
 	fmt.Printf("  %-35s OxiDB: %8s  MongoDB: %8s%s\n",
 		name,
-		oxiDur.Round(time.Millisecond),
-		monDur.Round(time.Millisecond),
+		formatDur(oxiDur),
+		formatDur(monDur),
 		ratio)
+}
+
+func formatDur(d time.Duration) string {
+	if d < time.Millisecond {
+		return fmt.Sprintf("%dµs", d.Microseconds())
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	return d.Round(time.Millisecond).String()
 }
 
 // ─── Data generators ───────────────────────────────────────────────
@@ -622,8 +632,8 @@ func main() {
 		}
 		fmt.Printf("%-12s %-35s %10s %10s %8s\n",
 			r.Category, r.Name,
-			r.OxiDB.Round(time.Millisecond),
-			r.MongoDB.Round(time.Millisecond),
+			formatDur(r.OxiDB),
+			formatDur(r.MongoDB),
 			ratio)
 	}
 	fmt.Println(strings.Repeat("─", 75))
