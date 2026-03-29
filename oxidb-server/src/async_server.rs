@@ -215,6 +215,56 @@ async fn dispatch_request(
     }
 
     // ---------------------------------------------------------------
+    // Transaction commit through Raft (cluster mode)
+    // ---------------------------------------------------------------
+    if let Some(raft) = &state.raft {
+        if cmd == "commit_tx" {
+            if let Some(tx_id) = active_tx.take() {
+                // Extract buffered writes from the transaction and send as one Raft entry
+                match state.db.extract_transaction_writes(tx_id) {
+                    Ok(write_ops) => {
+                        // Convert core WriteOp to Raft TransactionWriteOp
+                        let raft_ops: Vec<crate::raft::types::TransactionWriteOp> = write_ops
+                            .into_iter()
+                            .map(|op| match op {
+                                oxidb::transaction::WriteOp::Insert { collection, data } => {
+                                    crate::raft::types::TransactionWriteOp::Insert { collection, document: data }
+                                }
+                                oxidb::transaction::WriteOp::Update { collection, query, update } => {
+                                    crate::raft::types::TransactionWriteOp::Update { collection, query, update }
+                                }
+                                oxidb::transaction::WriteOp::Delete { collection, query } => {
+                                    crate::raft::types::TransactionWriteOp::Delete { collection, query }
+                                }
+                            })
+                            .collect();
+                        let raft_req = crate::raft::types::OxiDbRequest::CommitTransaction {
+                            write_ops: raft_ops,
+                        };
+                        let result = raft.client_write(raft_req).await;
+                        log_audit(state, session, &cmd, None, "ok", "");
+                        return match result {
+                            Ok(resp) => {
+                                let raft_resp: crate::raft::types::OxiDbResponse = resp.data;
+                                match raft_resp {
+                                    crate::raft::types::OxiDbResponse::Ok { data } => handler::ok_bytes(data),
+                                    crate::raft::types::OxiDbResponse::Error { message } => handler::err_bytes(&message),
+                                }
+                            }
+                            Err(e) => handler::err_bytes(&format!("raft error: {e}")),
+                        };
+                    }
+                    Err(e) => {
+                        return handler::err_bytes(&format!("transaction error: {e}"));
+                    }
+                }
+            } else {
+                return handler::err_bytes("no active transaction");
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Write routing through Raft (cluster mode)
     // ---------------------------------------------------------------
     if let Some(raft) = &state.raft {

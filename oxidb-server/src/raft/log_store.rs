@@ -9,7 +9,7 @@ use serde_json::json;
 
 use oxidb::OxiDb;
 
-use super::types::{OxiDbRequest, OxiDbResponse, TypeConfig};
+use super::types::{OxiDbRequest, OxiDbResponse, TransactionWriteOp, TypeConfig};
 
 /// Snapshot metadata stored alongside the state machine.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -160,6 +160,31 @@ fn apply_request(db: &OxiDb, req: OxiDbRequest) -> OxiDbResponse {
         OxiDbRequest::DeleteObject { bucket, key } => match db.delete_object(&bucket, &key) {
             Ok(()) => OxiDbResponse::Ok { data: json!("object deleted") },
             Err(e) => OxiDbResponse::Error { message: e.to_string() },
+        },
+        OxiDbRequest::CommitTransaction { write_ops } => {
+            // Apply all buffered transaction writes atomically
+            let mut errors = Vec::new();
+            for op in write_ops {
+                let result = match op {
+                    TransactionWriteOp::Insert { collection, document } => {
+                        db.insert(&collection, document).map(|_| ())
+                    }
+                    TransactionWriteOp::Update { collection, query, update } => {
+                        db.update(&collection, &query, &update).map(|_| ())
+                    }
+                    TransactionWriteOp::Delete { collection, query } => {
+                        db.delete(&collection, &query).map(|_| ())
+                    }
+                };
+                if let Err(e) = result {
+                    errors.push(e.to_string());
+                }
+            }
+            if errors.is_empty() {
+                OxiDbResponse::Ok { data: json!("transaction committed") }
+            } else {
+                OxiDbResponse::Error { message: format!("partial commit errors: {}", errors.join("; ")) }
+            }
         },
     }
 }
