@@ -144,7 +144,7 @@ func main() {
 	// ─── Test 2: Multi-thread UDP burst ──────────────────────────
 	fmt.Println("═══ Test 2: Multi-thread UDP burst (8 workers × 10K) ═══")
 	tcpClient.DropCollection("_udp_logs")
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(2 * time.Second) // wait for pending UDP inserts to drain
 	{
 		workers := 8
 		perWorker := 10000
@@ -190,7 +190,7 @@ func main() {
 	// ─── Test 3: Sustained throughput (5 seconds) ────────────────
 	fmt.Println("═══ Test 3: Sustained throughput (8 workers, 5 seconds) ═══")
 	tcpClient.DropCollection("_udp_logs")
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(2 * time.Second)
 	{
 		workers := 8
 		duration := 5 * time.Second
