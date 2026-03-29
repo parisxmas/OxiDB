@@ -550,7 +550,7 @@ impl OxiDb {
             sync_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: false,
-            use_btree: std::env::var("OXIDB_BTREE").map(|v| v == "true" || v == "1").unwrap_or(false),
+            use_btree: !std::env::var("OXIDB_BTREE").map(|v| v == "false" || v == "0").unwrap_or(false),
             ttl_shutdown: Mutex::new(None),
         })
     }
@@ -2061,6 +2061,7 @@ mod tests {
 
     #[test]
     fn backup_creates_archive() {
+        unsafe { std::env::set_var("OXIDB_BTREE", "false"); }
         let dir = tempdir().unwrap();
         let db = OxiDb::open(dir.path()).unwrap();
         db.insert("users", json!({"name": "Alice"})).unwrap();
@@ -2090,6 +2091,7 @@ mod tests {
 
     #[test]
     fn restore_from_backup() {
+        unsafe { std::env::set_var("OXIDB_BTREE", "false"); }
         let dir = tempdir().unwrap();
         let db = OxiDb::open(dir.path()).unwrap();
         db.insert("users", json!({"name": "Alice"})).unwrap();
