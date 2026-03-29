@@ -410,7 +410,7 @@ impl Wal {
         hasher.finalize()
     }
 
-    fn read_entries(&self) -> Result<Vec<WalEntry>> {
+    pub fn read_entries(&self) -> Result<Vec<WalEntry>> {
         let mut file = self.inner.lock();
         file.seek(SeekFrom::Start(0))?;
         let file_len = file.metadata()?.len();

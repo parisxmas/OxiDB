@@ -22,6 +22,8 @@ use serde_json::Value;
 use crate::btree_storage::BTreeStorage;
 use crate::codec;
 use crate::collection::{CompactStats, IndexInfo, resolve_field_in_value};
+use crate::in_memory::WalBackend;
+use crate::wal::{Wal, WalEntry};
 use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
@@ -55,6 +57,7 @@ pub struct BTreeCollection {
     ttl_index: Mutex<std::collections::BTreeMap<u64, Vec<DocumentId>>>,
     /// Dirty flag: set on write, cleared after persist.
     dirty: AtomicBool,
+    wal: WalBackend,
 }
 
 impl BTreeCollection {
@@ -62,6 +65,15 @@ impl BTreeCollection {
     pub fn open(name: &str, data_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let storage = BTreeStorage::open(name, data_dir)?;
+
+        let wal_path = data_dir.join(format!("{}.wal", name));
+        let wal = Wal::open(&wal_path)?;
+        let replayed = Self::replay_wal(&wal, &storage)?;
+        let wal_backend = WalBackend::File(wal);
+        if replayed > 0 {
+            storage.persist()?;
+            if let WalBackend::File(ref w) = wal_backend { w.checkpoint_no_sync()?; }
+        }
 
         // Determine next_id by scanning the tree for the max key
         let mut max_id: u64 = 0;
@@ -85,6 +97,7 @@ impl BTreeCollection {
             in_memory: false,
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             dirty: AtomicBool::new(false),
+            wal: wal_backend,
         })
     }
 
@@ -103,7 +116,28 @@ impl BTreeCollection {
             in_memory: true,
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             dirty: AtomicBool::new(false),
+            wal: WalBackend::Memory,
         }
+    }
+
+    fn replay_wal(wal: &Wal, storage: &BTreeStorage) -> Result<usize> {
+        let entries = wal.read_entries()?;
+        if entries.is_empty() { return Ok(0); }
+        let mut count = 0usize;
+        for entry in &entries {
+            match entry {
+                WalEntry::Insert { doc_id, doc_bytes, .. }
+                | WalEntry::Update { doc_id, doc_bytes, .. } => {
+                    storage.insert(*doc_id, doc_bytes.clone());
+                    count += 1;
+                }
+                WalEntry::Delete { doc_id, .. } => {
+                    storage.remove(*doc_id);
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
     }
 
     // -----------------------------------------------------------------------
@@ -122,7 +156,9 @@ impl BTreeCollection {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(()); // nothing changed since last persist
         }
-        self.storage.persist()
+        self.storage.persist()?;
+        self.wal.checkpoint_no_sync()?;
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -284,6 +320,9 @@ impl BTreeCollection {
 
         let bytes = codec::encode_doc(&data)?;
 
+        // WAL log before mutation
+        self.wal.log_no_sync(&WalEntry::Insert { doc_id: id, doc_bytes: bytes.clone(), tx_id: 0 })?;
+
         // Insert directly into B-tree (the B-tree IS the storage)
         self.storage.insert(id, bytes);
 
@@ -395,6 +434,10 @@ impl BTreeCollection {
             self.storage.reserve(doc_count);
         }
         let ids: Vec<DocumentId> = btree_entries.iter().map(|(id, _)| *id).collect();
+        {
+            let wal_refs: Vec<(u64, &[u8])> = btree_entries.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+            self.wal.log_batch_inserts_no_sync_buffered(&wal_refs)?;
+        }
         self.storage.insert_batch(btree_entries);
 
         // Phase 3: update indexes and cache
@@ -454,6 +497,10 @@ impl BTreeCollection {
         let mut vi = self.vector_indexes.write();
 
         let mut ids = Vec::with_capacity(prepared.len());
+        {
+            let wal_refs: Vec<(u64, &[u8])> = prepared.iter().map(|(id, _, b)| (*id, b.as_slice())).collect();
+            self.wal.log_batch_inserts_no_sync_buffered(&wal_refs)?;
+        }
         for (id, data, bytes) in prepared {
             self.storage.insert(id, bytes);
 
@@ -1046,6 +1093,11 @@ impl BTreeCollection {
             }
         }
 
+        {
+            let wal_entries: Vec<WalEntry> = ops.iter().map(|op| WalEntry::Update { doc_id: op.id, doc_bytes: op.new_bytes.clone(), tx_id: 0 }).collect();
+            self.wal.log_batch_no_sync(&wal_entries)?;
+        }
+
         let mut updated_ids = Vec::with_capacity(ops.len());
         for op in ops {
             // Update B-tree in-place (replace value)
@@ -1179,6 +1231,11 @@ impl BTreeCollection {
         }
 
         // Phase 2: Remove from B-tree and update indexes (write locks)
+        {
+            let wal_entries: Vec<WalEntry> = ops.iter().map(|op| WalEntry::Delete { doc_id: op.id, tx_id: 0 }).collect();
+            self.wal.log_batch_no_sync(&wal_entries)?;
+        }
+
         let mut fi = self.field_indexes.write();
         let mut ci = self.composite_indexes.write();
         let mut ti = self.text_index.write();
@@ -2442,6 +2499,87 @@ mod tests {
 
             let doc = col.find_one(&json!({"seq": 50})).unwrap().unwrap();
             assert_eq!(doc.get("name").unwrap().as_str().unwrap(), "doc_50");
+        }
+    }
+
+    #[test]
+    fn wal_recovery_after_crash() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Insert docs WITHOUT calling sync_writes (simulates crash)
+        {
+            let col = BTreeCollection::open("wal_test", dir.path()).unwrap();
+            for i in 0..50 {
+                col.insert(json!({"seq": i, "data": format!("val_{}", i)})).unwrap();
+            }
+            // NO sync_writes — WAL has entries but .btree file is empty
+        }
+
+        // Reopen — WAL replay should recover all 50 docs
+        {
+            let col = BTreeCollection::open("wal_test", dir.path()).unwrap();
+            assert_eq!(col.count(), 50);
+            let doc = col.find_one(&json!({"seq": 25})).unwrap().unwrap();
+            assert_eq!(doc.get("data").unwrap().as_str().unwrap(), "val_25");
+        }
+    }
+
+    #[test]
+    fn wal_recovery_update_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Phase 1: insert + persist
+        {
+            let col = BTreeCollection::open("wal_ud", dir.path()).unwrap();
+            for i in 0..10 {
+                col.insert(json!({"key": i, "value": 0})).unwrap();
+            }
+            col.sync_writes().unwrap(); // persist + checkpoint
+        }
+
+        // Phase 2: update + delete WITHOUT persist (crash)
+        {
+            let col = BTreeCollection::open("wal_ud", dir.path()).unwrap();
+            assert_eq!(col.count(), 10);
+            // Update key=5 → value=999
+            col.update(&json!({"key": 5}), &json!({"$set": {"value": 999}}), None).unwrap();
+            // Delete key=0
+            col.delete(&json!({"key": 0}), None).unwrap();
+            // NO sync_writes — crash
+        }
+
+        // Phase 3: recover — should have 9 docs, key=5 value=999
+        {
+            let col = BTreeCollection::open("wal_ud", dir.path()).unwrap();
+            assert_eq!(col.count(), 9);
+            let doc = col.find_one(&json!({"key": 5})).unwrap().unwrap();
+            let val = doc.get("value").unwrap().as_i64().unwrap();
+            assert_eq!(val, 999);
+            assert!(col.find_one(&json!({"key": 0})).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn wal_checkpoint_clears_wal() {
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let col = BTreeCollection::open("wal_cp", dir.path()).unwrap();
+            for i in 0..20 {
+                col.insert(json!({"seq": i})).unwrap();
+            }
+            col.sync_writes().unwrap(); // persist + checkpoint WAL
+        }
+
+        // WAL file should be empty after checkpoint
+        let wal_path = dir.path().join("wal_cp.wal");
+        let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_size, 0, "WAL should be empty after checkpoint");
+
+        // Reopen — no replay needed, all data from .btree file
+        {
+            let col = BTreeCollection::open("wal_cp", dir.path()).unwrap();
+            assert_eq!(col.count(), 20);
         }
     }
 }
