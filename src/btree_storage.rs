@@ -303,8 +303,10 @@ impl BTreeStorage {
     /// Batch insert multiple entries using BTreeMap::extend for bulk efficiency.
     /// IMPORTANT: Only use for new keys (no replacements). If keys might exist,
     /// use the regular insert() loop instead.
-    pub fn insert_batch(&mut self, entries: Vec<(u64, Vec<u8>)>) {
+    pub fn insert_batch(&mut self, mut entries: Vec<(u64, Vec<u8>)>) {
         let total_new: u64 = entries.iter().map(|(_, v)| v.len() as u64).sum();
+        // Sort by key for optimal BTreeMap::extend performance
+        entries.sort_unstable_by_key(|(k, _)| *k);
         self.tree.extend(entries);
         self.total_bytes.fetch_add(total_new, Ordering::AcqRel);
     }

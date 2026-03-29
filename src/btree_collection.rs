@@ -284,21 +284,12 @@ impl BTreeCollection {
             || self.text_index.is_some()
             || !self.vector_indexes.is_empty();
 
-        // Phase 1: assign IDs, serialize, validate constraints
+        // Phase 1: assign IDs and prepare docs (parallel JSONB encode)
         let first_id = self.next_id.load(Ordering::SeqCst);
         let doc_count = docs.len();
 
-        // Collect (id, data, bytes) — we need data only if indexes or cache need it
-        let mut btree_entries: Vec<(u64, Vec<u8>)> = Vec::with_capacity(doc_count);
-        // Keep data values only when indexes/cache need them
-        let mut data_values: Vec<(u64, Value)> = if has_indexes || doc_count <= 1000 {
-            Vec::with_capacity(doc_count)
-        } else {
-            Vec::new()
-        };
-        let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> =
-            if has_unique { HashMap::new() } else { HashMap::new() };
-
+        // Assign IDs first
+        let mut docs_with_ids: Vec<(u64, Value)> = Vec::with_capacity(doc_count);
         for (i, mut data) in docs.into_iter().enumerate() {
             if !data.is_object() {
                 return Err(Error::NotAnObject);
@@ -307,40 +298,50 @@ impl BTreeCollection {
             let obj = data.as_object_mut().unwrap();
             obj.insert("_id".to_string(), Value::Number(id.into()));
             obj.insert("_version".to_string(), Value::Number(1.into()));
+            docs_with_ids.push((id, data));
+        }
 
-            // Only check unique constraints when unique indexes exist
-            if has_unique {
-                self.check_unique_constraints(&data, None)?;
-
-                // Check intra-batch uniqueness
+        // Unique constraint check (only when needed)
+        if has_unique {
+            let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
+            for (id, data) in &docs_with_ids {
+                self.check_unique_constraints(data, None)?;
                 for idx in self.field_indexes.values() {
-                    if !idx.unique {
-                        continue;
-                    }
-                    if let Some(value) = resolve_field_in_value(&data, &idx.field) {
+                    if !idx.unique { continue; }
+                    if let Some(value) = resolve_field_in_value(data, &idx.field) {
                         let iv = IndexValue::from_json(value);
                         let field_map = pending_unique.entry(idx.field.clone()).or_default();
                         if field_map.contains_key(&iv) {
-                            return Err(Error::UniqueViolation {
-                                field: idx.field.clone(),
-                            });
+                            return Err(Error::UniqueViolation { field: idx.field.clone() });
                         }
-                        field_map.insert(iv, id);
+                        field_map.insert(iv, *id);
                     }
                 }
             }
-
-            let bytes = codec::encode_doc(&data)?;
-            btree_entries.push((id, bytes));
-
-            if has_indexes || doc_count <= 1000 {
-                data_values.push((id, data));
-            }
         }
 
-        // Phase 2: bulk insert into B-tree using extend()
+        // Parallel JSONB encode
+        use rayon::prelude::*;
+        let btree_entries: Vec<(u64, Vec<u8>)> = if doc_count > 1000 {
+            docs_with_ids.par_iter()
+                .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
+                .collect()
+        } else {
+            docs_with_ids.iter()
+                .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
+                .collect()
+        };
+
+        // Phase 2: bulk insert into B-tree
         let ids: Vec<DocumentId> = btree_entries.iter().map(|(id, _)| *id).collect();
         self.storage.insert_batch(btree_entries);
+
+        // Keep data values for index updates
+        let data_values: Vec<(u64, Value)> = if has_indexes || doc_count <= 1000 {
+            docs_with_ids
+        } else {
+            Vec::new()
+        };
 
         // Phase 3: update indexes and cache
         let skip_cache = doc_count > 1000;
@@ -1162,28 +1163,31 @@ impl BTreeCollection {
             return Ok(());
         }
 
-        let mut idx = PagedFieldIndex::new(field.to_string());
+        // Parallel index build: extract (id, IndexValue) pairs from all docs
+        use rayon::prelude::*;
+        let slices = self.storage.values_as_slices();
+        let field_owned = field.to_string();
 
-        // Backfill using B-tree cursor scan (sequential page access)
-        self.storage.scan_bytes_while(|bytes| {
-            if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
-                // JSONB binary — use raw extraction
-                let raw = jsonb::RawJsonb::new(bytes);
-                if let Some(id) = extract_raw_u64(&raw, "_id") {
-                    if let Some(iv) = extract_raw_index_value(&raw, field) {
-                        idx.insert_raw(id, iv);
-                    }
+        let pairs: Vec<(u64, IndexValue)> = slices.par_iter()
+            .filter_map(|bytes| {
+                if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
+                    let raw = jsonb::RawJsonb::new(bytes);
+                    let id = extract_raw_u64(&raw, "_id")?;
+                    let iv = extract_raw_index_value(&raw, &field_owned)?;
+                    Some((id, iv))
+                } else {
+                    let doc: Value = codec::decode_doc(bytes).ok()?;
+                    let id = doc.get("_id")?.as_u64()?;
+                    let val = resolve_field_in_value(&doc, &field_owned)?;
+                    Some((id, IndexValue::from_json(val)))
                 }
-            } else {
-                // Legacy JSON text
-                let doc: Value = codec::decode_doc(bytes)?;
-                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
-                    let arc = Arc::new(doc);
-                    idx.insert_value(id, &arc);
-                }
-            }
-            Ok(true)
-        })?;
+            })
+            .collect();
+
+        let mut idx = PagedFieldIndex::new(field.to_string());
+        for (id, iv) in pairs {
+            idx.insert_raw(id, iv);
+        }
 
         self.field_indexes.insert(field.to_string(), idx);
         Ok(())

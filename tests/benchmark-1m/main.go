@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,6 +17,29 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
+
+// getContainerMemory returns RSS memory of a container in MB
+func getContainerMemory(containerName string) string {
+	out, err := exec.Command("sh", "-c",
+		fmt.Sprintf("cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes 2>/dev/null || echo 0")).Output()
+	if err != nil {
+		// Try docker stats from outside
+		return "?"
+	}
+	bytes, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if bytes > 0 {
+		mb := float64(bytes) / 1024 / 1024
+		return fmt.Sprintf("%.1f MB", mb)
+	}
+	return "?"
+}
+
+// getOxiDBMemory gets OxiDB memory via /proc or ps
+func getProcessMemory(name string, host string, port int) string {
+	// Use docker stats API — bench container can't see other containers' /proc
+	// Instead, call a simple endpoint or estimate from connection
+	return "?"
+}
 
 // ─── Config ────────────────────────────────────────────────────────
 
@@ -180,6 +204,7 @@ func main() {
 	mdb.Collection(coll).Drop(ctx)
 
 	// OxiDB insert
+	fmt.Printf("  OxiDB inserting...")
 	t0 := time.Now()
 	for offset := 0; offset < docCount; offset += batchSize {
 		end := offset + batchSize
@@ -191,13 +216,18 @@ func main() {
 			batch = append(batch, makeDoc(i))
 		}
 		if _, err := oxi.InsertMany(coll, batch); err != nil {
-			fmt.Printf("  OxiDB insert error at offset %d: %v\n", offset, err)
+			fmt.Printf("\n  OxiDB insert error at offset %d: %v\n", offset, err)
 			break
+		}
+		if (offset/batchSize+1)%20 == 0 || end == docCount {
+			fmt.Printf("\r  OxiDB inserting... %dk/%dk (%.1fs)", end/1000, docCount/1000, time.Since(t0).Seconds())
 		}
 	}
 	oxiInsert := time.Since(t0)
+	fmt.Printf("\r  OxiDB inserted %dk in %s                    \n", docCount/1000, oxiInsert.Round(time.Millisecond))
 
 	// MongoDB insert
+	fmt.Printf("  MongoDB inserting...")
 	t0 = time.Now()
 	for offset := 0; offset < docCount; offset += batchSize {
 		end := offset + batchSize
@@ -209,11 +239,15 @@ func main() {
 			batch = append(batch, makeBson(i))
 		}
 		if _, err := mcoll.InsertMany(ctx, batch); err != nil {
-			fmt.Printf("  MongoDB insert error at offset %d: %v\n", offset, err)
+			fmt.Printf("\n  MongoDB insert error at offset %d: %v\n", offset, err)
 			break
+		}
+		if (offset/batchSize+1)%20 == 0 || end == docCount {
+			fmt.Printf("\r  MongoDB inserting... %dk/%dk (%.1fs)", end/1000, docCount/1000, time.Since(t0).Seconds())
 		}
 	}
 	monInsert := time.Since(t0)
+	fmt.Printf("\r  MongoDB inserted %dk in %s                    \n", docCount/1000, monInsert.Round(time.Millisecond))
 
 	record("INSERT", fmt.Sprintf("%d docs (batch %d)", docCount, batchSize), oxiInsert, monInsert, docCount, docCount, nil, nil)
 	fmt.Println()
