@@ -43,7 +43,7 @@ pub struct BTreeCollection {
     name: String,
     #[allow(dead_code)]
     data_dir: PathBuf,
-    storage: BTreeStorage,                                     // Already thread-safe (DashMap)
+    storage: BTreeStorage,                                     // Already thread-safe (scc::HashMap)
     field_indexes: RwLock<HashMap<String, PagedFieldIndex>>,
     composite_indexes: RwLock<Vec<CompositeIndex>>,
     text_index: RwLock<Option<CollectionTextIndex>>,
@@ -398,7 +398,8 @@ impl BTreeCollection {
         self.storage.insert_batch(btree_entries);
 
         // Phase 3: update indexes and cache
-        let skip_cache = doc_count > 50_000;
+        // Skip cache population during bulk insert when no indexes need it
+        let skip_cache = doc_count > 5_000 || !has_indexes;
 
         // Keep data values for index updates and caching
         let data_values: Vec<(u64, Value)> = if has_indexes || !skip_cache {
