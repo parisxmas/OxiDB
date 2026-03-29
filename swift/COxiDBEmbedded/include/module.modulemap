@@ -1,0 +1,5 @@
+module COxiDBEmbedded {
+    header "oxidb_embedded.h"
+    link "oxidb_embedded_ffi"
+    export *
+}
