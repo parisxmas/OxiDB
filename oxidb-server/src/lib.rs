@@ -12,6 +12,7 @@ pub mod resp;
 pub mod scram;
 pub mod session;
 pub mod tls;
+pub mod udp_ingest;
 
 #[cfg(feature = "s3")]
 pub mod s3;
