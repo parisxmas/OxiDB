@@ -8,6 +8,7 @@ COPY oxidb-server/ oxidb-server/
 COPY oxidb-client-ffi/ oxidb-client-ffi/
 COPY oxidb-embedded-ffi/ oxidb-embedded-ffi/
 COPY oxidb-cli/ oxidb-cli/
+COPY oxipool/ oxipool/
 
 # Create stubs for workspace members not needed for server build
 RUN mkdir -p oxidb-app/src-tauri/src && \
@@ -17,7 +18,7 @@ RUN mkdir -p oxidb-app/src-tauri/src && \
     echo '[package]\nname = "oxidb-wasm"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxidb-wasm/Cargo.toml && \
     echo '' > oxidb-wasm/src/lib.rs
 
-RUN cargo build --release --package oxidb-server
+RUN cargo build --release --package oxidb-server --features cluster
 
 FROM debian:bookworm-slim
 
