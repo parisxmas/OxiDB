@@ -18,13 +18,13 @@
 //!   [child_page: u32 LE][key: u64 LE]
 //!   ... last child_page follows after last entry
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
-/// In-memory B-tree storage using a `BTreeMap<u64, Vec<u8>>`.
+/// In-memory B-tree storage using a `HashMap<u64, Vec<u8>>`.
 ///
 /// This is the first implementation: a clean Rust BTreeMap that provides the
 /// correct cursor-based API. It can later be replaced with a page-cache-backed
@@ -37,7 +37,7 @@ use crate::error::{Error, Result};
 /// - No soft-delete / compaction needed — updates are in-place
 pub struct BTreeStorage {
     /// The B-tree: doc_id → JSONB-encoded document bytes.
-    tree: BTreeMap<u64, Vec<u8>>,
+    tree: HashMap<u64, Vec<u8>>,
     /// Total bytes stored (for stats).
     total_bytes: AtomicU64,
     /// Data directory for persistence (empty for in-memory).
@@ -54,21 +54,24 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    /// Create a cursor positioned at the first entry.
-    pub fn seek_first(tree: &BTreeMap<u64, Vec<u8>>) -> Result<Self> {
-        let entries: Vec<(u64, Vec<u8>)> = tree
+    /// Create a cursor positioned at the first entry (sorted by key).
+    pub fn seek_first(tree: &HashMap<u64, Vec<u8>>) -> Result<Self> {
+        let mut entries: Vec<(u64, Vec<u8>)> = tree
             .iter()
             .map(|(&k, v)| (k, v.clone()))
             .collect();
+        entries.sort_unstable_by_key(|(k, _)| *k);
         Ok(Self { entries, pos: 0 })
     }
 
     /// Create a cursor positioned at a specific key (or the next key >= it).
-    pub fn seek(tree: &BTreeMap<u64, Vec<u8>>, key: u64) -> Result<Self> {
-        let entries: Vec<(u64, Vec<u8>)> = tree
-            .range(key..)
+    pub fn seek(tree: &HashMap<u64, Vec<u8>>, key: u64) -> Result<Self> {
+        let mut entries: Vec<(u64, Vec<u8>)> = tree
+            .iter()
+            .filter(|(k, _)| **k >= key)
             .map(|(&k, v)| (k, v.clone()))
             .collect();
+        entries.sort_unstable_by_key(|(k, _)| *k);
         Ok(Self { entries, pos: 0 })
     }
 
@@ -100,13 +103,13 @@ pub struct ReverseCursor {
 }
 
 impl ReverseCursor {
-    /// Create a cursor positioned at the last entry.
-    pub fn seek_last(tree: &BTreeMap<u64, Vec<u8>>) -> Result<Self> {
-        let entries: Vec<(u64, Vec<u8>)> = tree
+    /// Create a cursor positioned at the last entry (descending key order).
+    pub fn seek_last(tree: &HashMap<u64, Vec<u8>>) -> Result<Self> {
+        let mut entries: Vec<(u64, Vec<u8>)> = tree
             .iter()
-            .rev()
             .map(|(&k, v)| (k, v.clone()))
             .collect();
+        entries.sort_unstable_by(|(a, _), (b, _)| b.cmp(a)); // descending
         Ok(Self { entries, pos: 0 })
     }
 
@@ -125,7 +128,7 @@ impl BTreeStorage {
     /// Create a new in-memory B-tree storage.
     pub fn new(name: &str, data_dir: &Path) -> Self {
         Self {
-            tree: BTreeMap::new(),
+            tree: HashMap::new(),
             total_bytes: AtomicU64::new(0),
             data_dir: data_dir.to_path_buf(),
             name: name.to_string(),
@@ -135,7 +138,7 @@ impl BTreeStorage {
     /// Create a new in-memory B-tree storage (no persistence).
     pub fn new_in_memory(name: &str) -> Self {
         Self {
-            tree: BTreeMap::new(),
+            tree: HashMap::new(),
             total_bytes: AtomicU64::new(0),
             data_dir: PathBuf::new(),
             name: name.to_string(),
@@ -268,29 +271,37 @@ impl BTreeStorage {
     where
         F: FnMut(u64, &[u8]) -> Result<bool>,
     {
-        for (&key, value) in &self.tree {
-            if !f(key, value)? {
-                break;
+        let mut keys: Vec<u64> = self.tree.keys().copied().collect();
+        keys.sort_unstable();
+        for key in keys {
+            if let Some(value) = self.tree.get(&key) {
+                if !f(key, value)? {
+                    break;
+                }
             }
         }
         Ok(())
     }
 
-    /// Iterate all entries calling `f` for each (bytes only, no key).
+    /// Iterate all entries calling `f` for each (bytes only, sorted by key).
     pub fn scan_bytes_while<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(&[u8]) -> Result<bool>,
     {
-        for value in self.tree.values() {
-            if !f(value)? {
-                break;
+        let mut keys: Vec<u64> = self.tree.keys().copied().collect();
+        keys.sort_unstable();
+        for key in keys {
+            if let Some(value) = self.tree.get(&key) {
+                if !f(value)? {
+                    break;
+                }
             }
         }
         Ok(())
     }
 
     /// Get a reference to the underlying BTreeMap (for direct iteration).
-    pub fn tree(&self) -> &BTreeMap<u64, Vec<u8>> {
+    pub fn tree(&self) -> &HashMap<u64, Vec<u8>> {
         &self.tree
     }
 
@@ -303,10 +314,9 @@ impl BTreeStorage {
     /// Batch insert multiple entries using BTreeMap::extend for bulk efficiency.
     /// IMPORTANT: Only use for new keys (no replacements). If keys might exist,
     /// use the regular insert() loop instead.
-    pub fn insert_batch(&mut self, mut entries: Vec<(u64, Vec<u8>)>) {
+    pub fn insert_batch(&mut self, entries: Vec<(u64, Vec<u8>)>) {
         let total_new: u64 = entries.iter().map(|(_, v)| v.len() as u64).sum();
-        // Sort by key for optimal BTreeMap::extend performance
-        entries.sort_unstable_by_key(|(k, _)| *k);
+        self.tree.reserve(entries.len());
         self.tree.extend(entries);
         self.total_bytes.fetch_add(total_new, Ordering::AcqRel);
     }
