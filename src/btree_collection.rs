@@ -199,7 +199,12 @@ impl BTreeCollection {
     where
         F: FnMut(&Value) -> Result<bool>,
     {
-        self.storage.scan_bytes_while(|bytes| {
+        // Use unsorted iteration (faster — no key collection + sort)
+        // and hit doc_cache when available to avoid re-decoding.
+        self.storage.for_each_value(|key, bytes| {
+            if let Some(arc) = self.doc_cache.get(key) {
+                return f(&arc);
+            }
             let doc = codec::decode_doc(bytes)?;
             f(&doc)
         })
