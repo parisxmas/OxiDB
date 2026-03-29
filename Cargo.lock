@@ -648,20 +648,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dashmap"
-version = "6.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
-dependencies = [
- "cfg-if",
- "crossbeam-utils",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core",
-]
-
-[[package]]
 name = "deflate64"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1653,7 +1639,6 @@ dependencies = [
  "aes-gcm",
  "chrono",
  "crc32fast",
- "dashmap",
  "flate2",
  "jsonb",
  "leptess",
@@ -1666,6 +1651,7 @@ dependencies = [
  "rayon",
  "regex",
  "rusqlite",
+ "scc",
  "serde",
  "serde_json",
  "sha2",
@@ -1708,7 +1694,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.22.1"
+version = "0.22.3"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2375,12 +2361,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "saa"
+version = "5.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16c7f49c9d5caa3bf4b3106900484b447b9253fe99670ceb81cb6cb5027855e1"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scc"
+version = "3.6.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f448f7d881535036452f0cac656a41463807f095eda504890764ca7d11e2a2ea"
+dependencies = [
+ "saa",
+ "sdd",
 ]
 
 [[package]]
@@ -2400,6 +2402,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "sdd"
+version = "4.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6ca0e33fc1ae39e36b2d1fdfc8ee470b26397b642ff87572a59a36ff4f2340b"
 
 [[package]]
 name = "seahash"

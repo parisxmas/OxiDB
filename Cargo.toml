@@ -35,7 +35,7 @@ zstd = "0.13"
 lz4_flex = "0.11"
 memmap2 = "0.9"
 rayon = "1.10"
-dashmap = "6"
+scc = "3"
 
 [dev-dependencies]
 tempfile = "3"
