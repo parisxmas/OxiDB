@@ -51,13 +51,28 @@ macro_rules! delegate {
             AnyCollection::BTree(c) => c.$method($($arg),*),
         }
     };
-    // &mut self methods
+    // &mut self methods (Standard needs &mut, BTree uses interior mutability so &self works)
     (mut $self:ident . $method:ident ( $($arg:ident),* )) => {
         match $self {
             AnyCollection::Standard(c) => c.$method($($arg),*),
             AnyCollection::BTree(c) => c.$method($($arg),*),
         }
     };
+}
+
+/// Execute a write operation on a collection.
+/// For BTree: uses read() lock (interior mutability handles writes).
+/// For Standard: uses write() lock (needs &mut self).
+macro_rules! col_write {
+    ($col:expr, $method:ident ( $($arg:expr),* )) => {{
+        let guard = $col.read();
+        if let AnyCollection::BTree(ref b) = *guard {
+            b.$method($($arg),*)
+        } else {
+            drop(guard);
+            $col.write().$method($($arg),*)
+        }
+    }};
 }
 
 impl AnyCollection {
@@ -81,20 +96,52 @@ impl AnyCollection {
 
     // -- Accessor methods ----------------------------------------------------
 
-    pub fn field_indexes(&self) -> &HashMap<String, PagedFieldIndex> {
-        delegate!(ref self.field_indexes())
-    }
-
-    pub fn composite_indexes(&self) -> &[CompositeIndex] {
-        delegate!(ref self.composite_indexes())
+    /// Check unique indexes info. Returns (unique_fields, need_values, has_text_index).
+    pub fn index_metadata(&self) -> (Vec<String>, bool, bool) {
+        match self {
+            AnyCollection::Standard(c) => {
+                let unique_fields: Vec<String> = c.field_indexes().values()
+                    .filter(|idx| idx.unique).map(|idx| idx.field.clone()).collect();
+                let need = !c.field_indexes().is_empty() || !c.composite_indexes().is_empty()
+                    || c.has_text_index() || !c.vector_indexes().is_empty();
+                (unique_fields, need, c.has_text_index())
+            }
+            AnyCollection::BTree(c) => {
+                let fi = c.field_indexes();
+                let ci = c.composite_indexes();
+                let vi = c.vector_indexes();
+                let unique_fields: Vec<String> = fi.values()
+                    .filter(|idx| idx.unique).map(|idx| idx.field.clone()).collect();
+                let need = !fi.is_empty() || !ci.is_empty()
+                    || c.has_text_index() || !vi.is_empty();
+                (unique_fields, need, c.has_text_index())
+            }
+        }
     }
 
     pub fn has_text_index(&self) -> bool {
         delegate!(ref self.has_text_index())
     }
 
-    pub fn vector_indexes(&self) -> &HashMap<String, VectorIndex> {
-        delegate!(ref self.vector_indexes())
+    /// Try index-only aggregate count (delegates into variant to handle lock guards).
+    pub fn try_index_only_aggregate(
+        &self,
+        group_key: &crate::pipeline::GroupKey,
+        accumulators: &[(String, crate::pipeline::Accumulator)],
+        total_docs: usize,
+        match_query: Option<&Value>,
+    ) -> Option<Vec<Value>> {
+        match self {
+            AnyCollection::Standard(c) => crate::pipeline::try_index_only_count(
+                group_key, accumulators, c.field_indexes(), total_docs, match_query,
+            ),
+            AnyCollection::BTree(c) => {
+                let fi = c.field_indexes();
+                crate::pipeline::try_index_only_count(
+                    group_key, accumulators, &fi, total_docs, match_query,
+                )
+            }
+        }
     }
 
     // -- Document access -----------------------------------------------------
@@ -792,7 +839,7 @@ impl OxiDb {
         let col = self.get_or_create_collection(collection)?;
         let emit = self.change_broker.has_subscribers();
         let doc_clone = if emit { Some(doc.clone()) } else { None };
-        let id = col.write().insert(doc)?;
+        let id = col_write!(col, insert(doc))?;
         if let Some(mut d) = doc_clone {
             if let Some(obj) = d.as_object_mut() {
                 obj.insert("_id".to_string(), Value::Number(id.into()));
@@ -823,19 +870,7 @@ impl OxiDb {
             let mut col_w = col.write();
             let count = docs.len() as u64;
 
-            // Quick check: any unique indexes?
-            let unique_fields: Vec<String> = col_w
-                .field_indexes()
-                .values()
-                .filter(|idx| idx.unique)
-                .map(|idx| idx.field.clone())
-                .collect();
-
-            // Check if any indexes exist that will need the decoded Value
-            let need_values = !col_w.field_indexes().is_empty()
-                || !col_w.composite_indexes().is_empty()
-                || col_w.has_text_index()
-                || !col_w.vector_indexes().is_empty();
+            let (unique_fields, need_values, _) = col_w.index_metadata();
 
             let first_id = col_w.reserve_ids(count);
 
@@ -901,7 +936,7 @@ impl OxiDb {
         }
 
         // Phase 3: Write lock — insert pre-serialized docs (fast: no serialization)
-        let ids = col.write().insert_many_prepared(prepared)?;
+        let ids = col_write!(col, insert_many_prepared(prepared))?;
 
         // Emit change events if needed
         if emit {
@@ -952,7 +987,7 @@ impl OxiDb {
 
     pub fn update(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        let ids = col.write().update(query, update, None)?;
+        let ids = col_write!(col, update(query, update, None))?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
@@ -970,7 +1005,7 @@ impl OxiDb {
 
     pub fn update_one(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        let ids = col.write().update(query, update, Some(1))?;
+        let ids = col_write!(col, update(query, update, Some(1)))?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
@@ -988,7 +1023,7 @@ impl OxiDb {
 
     pub fn delete(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        let ids = col.write().delete(query, None)?;
+        let ids = col_write!(col, delete(query, None))?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
@@ -1006,7 +1041,7 @@ impl OxiDb {
 
     pub fn delete_one(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
-        let ids = col.write().delete(query, Some(1))?;
+        let ids = col_write!(col, delete(query, Some(1)))?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
@@ -1024,12 +1059,12 @@ impl OxiDb {
 
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_index(field)
+        col_write!(col, create_index(field))
     }
 
     pub fn create_unique_index(&self, collection: &str, field: &str) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_unique_index(field)
+        col_write!(col, create_unique_index(field))
     }
 
     pub fn create_composite_index(
@@ -1038,7 +1073,7 @@ impl OxiDb {
         fields: Vec<String>,
     ) -> Result<String> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_composite_index(fields)
+        col_write!(col, create_composite_index(fields))
     }
 
     pub fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>> {
@@ -1048,7 +1083,7 @@ impl OxiDb {
 
     pub fn drop_index(&self, collection: &str, index_name: &str) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().drop_index(index_name)
+        col_write!(col, drop_index(index_name))
     }
 
     pub fn count(&self, collection: &str, query: &Value) -> Result<usize> {
@@ -1063,12 +1098,12 @@ impl OxiDb {
 
     pub fn compact(&self, collection: &str) -> Result<CompactStats> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().compact()
+        col_write!(col, compact())
     }
 
     pub fn create_text_index(&self, collection: &str, fields: Vec<String>) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_text_index(fields)
+        col_write!(col, create_text_index(fields))
     }
 
     pub fn text_search(
@@ -1089,7 +1124,7 @@ impl OxiDb {
         metric: crate::vector::DistanceMetric,
     ) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
-        col.write().create_vector_index(field, dimension, metric)
+        col_write!(col, create_vector_index(field, dimension, metric))
     }
 
     pub fn vector_search(
@@ -1124,10 +1159,9 @@ impl OxiDb {
 
             // Index-only count: if group key has an index and all accumulators
             // are count-only, read counts directly from the index (zero I/O).
-            if let Some(index_result) = crate::pipeline::try_index_only_count(
+            if let Some(index_result) = col_guard.try_index_only_aggregate(
                 group_key,
                 accumulators,
-                col_guard.field_indexes(),
                 col_guard.count(),
                 leading_match,
             ) {
@@ -1149,9 +1183,16 @@ impl OxiDb {
             let col = self.get_or_create_collection(collection)?;
             let col_guard = col.read();
             let arcs = col_guard.find_arcs(&query)?;
-            let field_indexes = col_guard.field_indexes();
             let doc_lookup = |id: DocumentId| col_guard.load_doc_arc(id);
-            pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(field_indexes), Some(&doc_lookup))?
+            match &*col_guard {
+                AnyCollection::Standard(c) => {
+                    pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(c.field_indexes()), Some(&doc_lookup))?
+                }
+                AnyCollection::BTree(c) => {
+                    let fi = c.field_indexes();
+                    pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(&fi), Some(&doc_lookup))?
+                }
+            }
         };
 
         // Handle $out: write results to the target collection

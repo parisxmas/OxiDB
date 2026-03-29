@@ -647,6 +647,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5041cc499144891f3790297212f32a74fb938e5136a14943f338ef9e0ae276cf"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "deflate64"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1610,11 +1624,12 @@ dependencies = [
 
 [[package]]
 name = "oxidb"
-version = "0.20.1"
+version = "0.22.0"
 dependencies = [
  "aes-gcm",
  "chrono",
  "crc32fast",
+ "dashmap",
  "flate2",
  "jsonb",
  "leptess",
@@ -1640,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-cli"
-version = "0.20.1"
+version = "0.22.0"
 dependencies = [
  "base64",
  "clap",
@@ -1652,14 +1667,14 @@ dependencies = [
 
 [[package]]
 name = "oxidb-client-ffi"
-version = "0.20.1"
+version = "0.22.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "oxidb-embedded-ffi"
-version = "0.20.1"
+version = "0.22.0"
 dependencies = [
  "base64",
  "jni",
@@ -1669,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.21.1"
+version = "0.22.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1696,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "oxipool"
-version = "0.3.0"
+version = "0.22.0"
 dependencies = [
  "crc32fast",
  "serde",
