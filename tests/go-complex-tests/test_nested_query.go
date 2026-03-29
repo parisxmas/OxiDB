@@ -6,6 +6,7 @@ import (
 
 	"github.com/parisxmas/OxiDB/go/oxidb"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
@@ -15,6 +16,15 @@ func testNestedQuery() {
 	env := setup(coll)
 	seedData(env, coll, docCount)
 	ctx := env.Ctx
+
+	// Create indexes on nested fields (dot-notation)
+	fmt.Println("  Creating nested field indexes...")
+	nestedFields := []string{"address.city", "address.country", "address.zip"}
+	for _, f := range nestedFields {
+		env.Oxi.CreateIndex(coll, f)
+		env.Mcoll.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: f, Value: 1}}})
+	}
+	fmt.Println("  Done.\n")
 
 	fmt.Println("  Testing dot-notation queries on nested fields\n")
 
