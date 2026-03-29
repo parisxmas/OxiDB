@@ -30,8 +30,31 @@ julia/**/Manifest.toml
 
 # OxiDB data
 oxidb_data/
+test_data/
 *.dat
 *.wal
+*.fidx
+*.fidx2
+*.pidx
+*.cidx
+*.vidx
+*.idx
+
+# Build artifacts & binaries
+.build/
+.claude/worktrees/
+target-local/
+examples/go_pg_bench/bench
+tests/benchmark-1m/bench
+tests/benchmark-1m/bench-linux
+tests/benchmark-1m/bench-local
+tests/benchmark-1m/oxidb-server-linux
+tests/s3-benchmark-go/s3-benchmark
+tests/oxiscript-go/oxiscript-bench
+tests/acid-go/acid-test
+tests/stress-go/stress-test
+tests/failover-go/failover-test
+tests/leak-go/leak-test
 
 # Node
 node_modules/
