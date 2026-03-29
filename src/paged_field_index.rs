@@ -494,6 +494,15 @@ impl PagedFieldIndex {
 
     // -- Unique constraint check ---------------------------------------------
 
+    /// Check if a doc_id exists under a given index value. O(log n) binary search.
+    pub fn contains_doc_id(&self, value: &IndexValue, doc_id: DocumentId) -> bool {
+        let idx = self.entries.partition_point(|(k, _)| k < value);
+        if idx < self.entries.len() && &self.entries[idx].0 == value {
+            return self.entries[idx].1.contains(&doc_id);
+        }
+        false
+    }
+
     pub fn check_unique(&self, value: &IndexValue, exclude_id: Option<DocumentId>) -> bool {
         if !self.write_buffer.is_empty() {
             let ids = self.find_eq(value);
