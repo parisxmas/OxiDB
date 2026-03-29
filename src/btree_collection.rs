@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use serde_json::Value;
 
@@ -35,21 +36,23 @@ use crate::vector::{DistanceMetric, VectorIndex};
 ///
 /// Unlike `Collection` which uses append-only storage + primary index HashMap,
 /// this struct uses the B-tree as both storage AND primary index.
+///
+/// All fields with interior mutability — callers use `&self` for everything.
 pub struct BTreeCollection {
     #[allow(dead_code)]
     name: String,
     #[allow(dead_code)]
     data_dir: PathBuf,
-    storage: BTreeStorage,
-    field_indexes: HashMap<String, PagedFieldIndex>,
-    composite_indexes: Vec<CompositeIndex>,
-    text_index: Option<CollectionTextIndex>,
-    vector_indexes: HashMap<String, VectorIndex>,
-    doc_cache: DocCache,
-    next_id: AtomicU64,
+    storage: BTreeStorage,                                     // Already thread-safe (DashMap)
+    field_indexes: RwLock<HashMap<String, PagedFieldIndex>>,
+    composite_indexes: RwLock<Vec<CompositeIndex>>,
+    text_index: RwLock<Option<CollectionTextIndex>>,
+    vector_indexes: RwLock<HashMap<String, VectorIndex>>,
+    doc_cache: DocCache,                                       // Already thread-safe
+    next_id: AtomicU64,                                        // Already atomic
     #[allow(dead_code)]
     in_memory: bool,
-    ttl_index: std::collections::BTreeMap<u64, Vec<DocumentId>>,
+    ttl_index: Mutex<std::collections::BTreeMap<u64, Vec<DocumentId>>>,
     /// Dirty flag: set on write, cleared after persist.
     dirty: AtomicBool,
 }
@@ -73,14 +76,14 @@ impl BTreeCollection {
             name: name.to_string(),
             data_dir: data_dir.to_path_buf(),
             storage,
-            field_indexes: HashMap::new(),
-            composite_indexes: Vec::new(),
-            text_index: None,
-            vector_indexes: HashMap::new(),
+            field_indexes: RwLock::new(HashMap::new()),
+            composite_indexes: RwLock::new(Vec::new()),
+            text_index: RwLock::new(None),
+            vector_indexes: RwLock::new(HashMap::new()),
             doc_cache: DocCache::new(crate::doc_cache::DEFAULT_CAPACITY),
             next_id: AtomicU64::new(max_id + 1),
             in_memory: false,
-            ttl_index: std::collections::BTreeMap::new(),
+            ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             dirty: AtomicBool::new(false),
         })
     }
@@ -91,14 +94,14 @@ impl BTreeCollection {
             name: name.to_string(),
             data_dir: PathBuf::new(),
             storage: BTreeStorage::new_in_memory(name),
-            field_indexes: HashMap::new(),
-            composite_indexes: Vec::new(),
-            text_index: None,
-            vector_indexes: HashMap::new(),
+            field_indexes: RwLock::new(HashMap::new()),
+            composite_indexes: RwLock::new(Vec::new()),
+            text_index: RwLock::new(None),
+            vector_indexes: RwLock::new(HashMap::new()),
             doc_cache: DocCache::new(crate::doc_cache::DEFAULT_CAPACITY),
             next_id: AtomicU64::new(1),
             in_memory: true,
-            ttl_index: std::collections::BTreeMap::new(),
+            ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             dirty: AtomicBool::new(false),
         }
     }
@@ -107,7 +110,7 @@ impl BTreeCollection {
     // Configuration (matching Collection API)
     // -----------------------------------------------------------------------
 
-    pub fn set_lazy_sync(&mut self, _enabled: bool) {
+    pub fn set_lazy_sync(&self, _enabled: bool) {
         // B-tree handles its own durability; this is a no-op.
     }
 
@@ -126,20 +129,20 @@ impl BTreeCollection {
     // Accessor methods (matching Collection API)
     // -----------------------------------------------------------------------
 
-    pub fn field_indexes(&self) -> &HashMap<String, PagedFieldIndex> {
-        &self.field_indexes
+    pub fn field_indexes(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<String, PagedFieldIndex>> {
+        self.field_indexes.read()
     }
 
-    pub fn composite_indexes(&self) -> &[CompositeIndex] {
-        &self.composite_indexes
+    pub fn composite_indexes(&self) -> parking_lot::RwLockReadGuard<'_, Vec<CompositeIndex>> {
+        self.composite_indexes.read()
     }
 
     pub fn has_text_index(&self) -> bool {
-        self.text_index.is_some()
+        self.text_index.read().is_some()
     }
 
-    pub fn vector_indexes(&self) -> &HashMap<String, VectorIndex> {
-        &self.vector_indexes
+    pub fn vector_indexes(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<String, VectorIndex>> {
+        self.vector_indexes.read()
     }
 
     pub fn save_index_data(&self) {
@@ -159,7 +162,7 @@ impl BTreeCollection {
         }
         // Slow path: B-tree lookup + decode
         let bytes = self.storage.get(id)?;
-        let doc = codec::decode_doc(bytes).ok()?;
+        let doc = codec::decode_doc(&bytes).ok()?;
         let arc = Arc::new(doc);
         self.doc_cache.put(id, Arc::clone(&arc));
         Some(arc)
@@ -199,8 +202,21 @@ impl BTreeCollection {
     where
         F: FnMut(&Value) -> Result<bool>,
     {
-        // Use unsorted iteration (faster — no key collection + sort)
-        // and hit doc_cache when available to avoid re-decoding.
+        // Sorted iteration (preserves key order for find queries)
+        self.storage.scan_all_while(|key, bytes| {
+            if let Some(arc) = self.doc_cache.get(key) {
+                return f(&arc);
+            }
+            let doc = codec::decode_doc(bytes)?;
+            f(&doc)
+        })
+    }
+
+    /// Unsorted doc iteration — faster for aggregation where order doesn't matter.
+    fn for_each_doc_unordered<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(&Value) -> Result<bool>,
+    {
         self.storage.for_each_value(|key, bytes| {
             if let Some(arc) = self.doc_cache.get(key) {
                 return f(&arc);
@@ -214,12 +230,13 @@ impl BTreeCollection {
     // Unique constraint checking
     // -----------------------------------------------------------------------
 
-    pub fn check_unique_constraints(
-        &self,
+    /// Check unique constraints. Caller must hold (or pass) a read guard on field_indexes.
+    fn check_unique_constraints_with(
+        fi: &HashMap<String, PagedFieldIndex>,
         data: &Value,
         exclude_id: Option<DocumentId>,
     ) -> Result<()> {
-        for idx in self.field_indexes.values() {
+        for idx in fi.values() {
             if !idx.unique {
                 continue;
             }
@@ -235,12 +252,21 @@ impl BTreeCollection {
         Ok(())
     }
 
+    pub fn check_unique_constraints(
+        &self,
+        data: &Value,
+        exclude_id: Option<DocumentId>,
+    ) -> Result<()> {
+        let fi = self.field_indexes.read();
+        Self::check_unique_constraints_with(&fi, data, exclude_id)
+    }
+
     // -----------------------------------------------------------------------
     // CRUD operations
     // -----------------------------------------------------------------------
 
     /// Insert a document. Returns the assigned _id.
-    pub fn insert(&mut self, mut data: Value) -> Result<DocumentId> {
+    pub fn insert(&self, mut data: Value) -> Result<DocumentId> {
         if !data.is_object() {
             return Err(Error::NotAnObject);
         }
@@ -253,7 +279,8 @@ impl BTreeCollection {
         obj.insert("_version".to_string(), Value::Number(1.into()));
 
         // Check unique constraints BEFORE any mutation
-        self.check_unique_constraints(&data, None)?;
+        let mut fi = self.field_indexes.write();
+        Self::check_unique_constraints_with(&fi, &data, None)?;
 
         let bytes = codec::encode_doc(&data)?;
 
@@ -263,17 +290,26 @@ impl BTreeCollection {
         let data_arc = Arc::new(data);
 
         // Update field indexes
-        for idx in self.field_indexes.values_mut() {
+        for idx in fi.values_mut() {
             idx.insert_value(id, &data_arc);
         }
-        for idx in &mut self.composite_indexes {
-            idx.insert_value(id, &data_arc);
+        {
+            let mut ci = self.composite_indexes.write();
+            for idx in ci.iter_mut() {
+                idx.insert_value(id, &data_arc);
+            }
         }
-        if let Some(ref mut text_idx) = self.text_index {
-            text_idx.index_doc(id, &data_arc);
+        {
+            let mut ti = self.text_index.write();
+            if let Some(ref mut text_idx) = *ti {
+                text_idx.index_doc(id, &data_arc);
+            }
         }
-        for idx in self.vector_indexes.values_mut() {
-            let _ = idx.insert(id, &data_arc);
+        {
+            let mut vi = self.vector_indexes.write();
+            for idx in vi.values_mut() {
+                let _ = idx.insert(id, &data_arc);
+            }
         }
 
         // TTL
@@ -286,16 +322,25 @@ impl BTreeCollection {
     }
 
     /// Insert multiple documents atomically.
-    pub fn insert_many(&mut self, docs: Vec<Value>) -> Result<Vec<DocumentId>> {
+    pub fn insert_many(&self, docs: Vec<Value>) -> Result<Vec<DocumentId>> {
         if docs.is_empty() {
             return Ok(vec![]);
         }
 
-        let has_unique = self.field_indexes.values().any(|idx| idx.unique);
-        let has_indexes = !self.field_indexes.is_empty()
-            || !self.composite_indexes.is_empty()
-            || self.text_index.is_some()
-            || !self.vector_indexes.is_empty();
+        let mut fi = self.field_indexes.write();
+        let has_unique = fi.values().any(|idx| idx.unique);
+        let has_field_indexes = !fi.is_empty();
+
+        let mut ci = self.composite_indexes.write();
+        let has_composite = !ci.is_empty();
+
+        let mut ti = self.text_index.write();
+        let has_text = ti.is_some();
+
+        let mut vi = self.vector_indexes.write();
+        let has_vector = !vi.is_empty();
+
+        let has_indexes = has_field_indexes || has_composite || has_text || has_vector;
 
         // Phase 1: assign IDs and prepare docs (parallel JSONB encode)
         let first_id = self.next_id.load(Ordering::SeqCst);
@@ -318,8 +363,8 @@ impl BTreeCollection {
         if has_unique {
             let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
             for (id, data) in &docs_with_ids {
-                self.check_unique_constraints(data, None)?;
-                for idx in self.field_indexes.values() {
+                Self::check_unique_constraints_with(&fi, data, None)?;
+                for idx in fi.values() {
                     if !idx.unique { continue; }
                     if let Some(value) = resolve_field_in_value(data, &idx.field) {
                         let iv = IndexValue::from_json(value);
@@ -334,7 +379,6 @@ impl BTreeCollection {
         }
 
         // Parallel JSONB encode
-        use rayon::prelude::*;
         let btree_entries: Vec<(u64, Vec<u8>)> = if doc_count > 1000 {
             docs_with_ids.par_iter()
                 .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
@@ -366,16 +410,16 @@ impl BTreeCollection {
         if has_indexes || !skip_cache {
             for (id, data) in data_values {
                 let data_arc = Arc::new(data);
-                for idx in self.field_indexes.values_mut() {
+                for idx in fi.values_mut() {
                     idx.insert_value(id, &data_arc);
                 }
-                for idx in &mut self.composite_indexes {
+                for idx in ci.iter_mut() {
                     idx.insert_value(id, &data_arc);
                 }
-                if let Some(ref mut text_idx) = self.text_index {
+                if let Some(ref mut text_idx) = *ti {
                     text_idx.index_doc(id, &data_arc);
                 }
-                for idx in self.vector_indexes.values_mut() {
+                for idx in vi.values_mut() {
                     let _ = idx.insert(id, &data_arc);
                 }
                 if !skip_cache {
@@ -390,34 +434,39 @@ impl BTreeCollection {
     }
 
     /// Reserve a contiguous block of document IDs.
-    pub fn reserve_ids(&mut self, count: u64) -> DocumentId {
+    pub fn reserve_ids(&self, count: u64) -> DocumentId {
         self.next_id.fetch_add(count, Ordering::SeqCst)
     }
 
     /// Insert pre-serialized documents (used by engine's insert_many path).
     pub fn insert_many_prepared(
-        &mut self,
+        &self,
         prepared: Vec<(DocumentId, Value, Vec<u8>)>,
     ) -> Result<Vec<DocumentId>> {
         if prepared.is_empty() {
             return Ok(vec![]);
         }
 
+        let mut fi = self.field_indexes.write();
+        let mut ci = self.composite_indexes.write();
+        let mut ti = self.text_index.write();
+        let mut vi = self.vector_indexes.write();
+
         let mut ids = Vec::with_capacity(prepared.len());
         for (id, data, bytes) in prepared {
             self.storage.insert(id, bytes);
 
             let data_arc = Arc::new(data);
-            for idx in self.field_indexes.values_mut() {
+            for idx in fi.values_mut() {
                 idx.insert_value(id, &data_arc);
             }
-            for idx in &mut self.composite_indexes {
+            for idx in ci.iter_mut() {
                 idx.insert_value(id, &data_arc);
             }
-            if let Some(ref mut text_idx) = self.text_index {
+            if let Some(ref mut text_idx) = *ti {
                 text_idx.index_doc(id, &data_arc);
             }
-            for idx in self.vector_indexes.values_mut() {
+            for idx in vi.values_mut() {
                 let _ = idx.insert(id, &data_arc);
             }
             self.doc_cache.put(id, data_arc);
@@ -485,11 +534,14 @@ impl BTreeCollection {
             return Ok(results);
         }
 
+        // Acquire read lock on field_indexes for the duration of index-accelerated paths
+        let fi = self.field_indexes.read();
+
         // Fast path: index-backed sort with early termination
         if let Some(sort_fields) = &opts.sort {
             if sort_fields.len() == 1 {
                 let (sort_field, sort_order) = &sort_fields[0];
-                if let Some(field_idx) = self.field_indexes.get(sort_field) {
+                if let Some(field_idx) = fi.get(sort_field) {
                     let need = opts.skip.unwrap_or(0) as usize
                         + opts.limit.unwrap_or(u64::MAX) as usize;
                     let mut results = Vec::new();
@@ -499,7 +551,7 @@ impl BTreeCollection {
                     let eq_checks: Vec<(String, IndexValue)> = if !skip_filter {
                         query::extract_eq_conditions(&query)
                             .map(|m| m.into_iter()
-                                .filter(|(f, _)| self.field_indexes.contains_key(f) && f != sort_field)
+                                .filter(|(f, _)| fi.contains_key(f) && f != sort_field)
                                 .collect())
                             .unwrap_or_default()
                     } else {
@@ -509,7 +561,7 @@ impl BTreeCollection {
 
                     let check_id = |id: DocumentId| -> bool {
                         for (field, value) in &eq_checks {
-                            if let Some(idx) = self.field_indexes.get(field.as_str()) {
+                            if let Some(idx) = fi.get(field.as_str()) {
                                 if !idx.contains_doc_id(value, id) {
                                     return false;
                                 }
@@ -576,7 +628,8 @@ impl BTreeCollection {
             if sort_fields.len() == 1 {
                 let (sort_field, sort_order) = &sort_fields[0];
                 if let Some(eq_conds) = query::extract_eq_conditions(&query) {
-                    for comp_idx in &self.composite_indexes {
+                    let ci = self.composite_indexes.read();
+                    for comp_idx in ci.iter() {
                         let fields = &comp_idx.fields;
                         let n = fields.len();
                         if n >= 2
@@ -635,7 +688,7 @@ impl BTreeCollection {
         }
 
         // Standard path: index-accelerated or full B-tree cursor scan
-        let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
+        let skip_post_filter = query::is_fully_indexed(&query, &fi);
 
         let early_limit: Option<usize> = if opts.sort.is_none() && opts.skip.is_none() {
             opts.limit.map(|l| l as usize)
@@ -649,7 +702,7 @@ impl BTreeCollection {
         if let Some(limit) = early_limit {
             let lazy_result = query::execute_indexed_lazy(
                 &query,
-                &self.field_indexes,
+                &fi,
                 &mut |id| {
                     if let Some(arc) = self.load_doc_arc(id) {
                         if skip_post_filter || query::matches_value(&query, &arc) {
@@ -667,11 +720,13 @@ impl BTreeCollection {
             }
         }
 
+        let ci = self.composite_indexes.read();
         let candidate_ids = query::execute_indexed(
             &query,
-            &self.field_indexes,
-            &self.composite_indexes,
+            &fi,
+            &ci,
         );
+        drop(ci);
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
@@ -687,6 +742,9 @@ impl BTreeCollection {
                 }
             }
         } else {
+            // Drop the field_indexes read lock before full scan
+            drop(fi);
+
             // No index — parallel B-tree scan using rayon
             if early_limit.is_some() {
                 // With early limit (no sort + limit) — keep sequential for early termination
@@ -717,6 +775,9 @@ impl BTreeCollection {
                     .collect();
                 results = matched;
             }
+
+            // Re-acquire for the sort phase below (but only if we need sort and don't have fi)
+            // Actually, sort doesn't use field_indexes, so no need to re-acquire.
         }
 
         // Apply sort -> skip -> limit
@@ -760,14 +821,15 @@ impl BTreeCollection {
     pub fn find_one(&self, query_json: &Value) -> Result<Option<Value>> {
         let query = query::parse_query(query_json)?;
 
-        let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
+        let fi = self.field_indexes.read();
+        let skip_post_filter = query::is_fully_indexed(&query, &fi);
 
         // Try lazy index path first
         if !matches!(query, Query::All) {
             let mut found: Option<Value> = None;
             let lazy_result = query::execute_indexed_lazy(
                 &query,
-                &self.field_indexes,
+                &fi,
                 &mut |id| {
                     if let Some(arc) = self.load_doc_arc(id) {
                         if skip_post_filter || query::matches_value(&query, &arc) {
@@ -785,14 +847,18 @@ impl BTreeCollection {
 
         // Fallback: index or cursor scan
         let candidate_ids = if !matches!(query, Query::All) {
+            let ci = self.composite_indexes.read();
             query::execute_indexed(
                 &query,
-                &self.field_indexes,
-                &self.composite_indexes,
+                &fi,
+                &ci,
             )
         } else {
             None
         };
+
+        // Drop read locks before potential full scan
+        drop(fi);
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
@@ -826,7 +892,7 @@ impl BTreeCollection {
 
     /// Update documents matching a query. Returns IDs of updated documents.
     pub fn update(
-        &mut self,
+        &self,
         query_json: &Value,
         update_json: &Value,
         limit: Option<usize>,
@@ -842,85 +908,95 @@ impl BTreeCollection {
 
         let query = query::parse_query(query_json)?;
 
-        // Phase 1: Find matching docs
+        // Phase 1: Find matching docs (read lock on indexes)
         let mut matches: Vec<(DocumentId, Value)> = Vec::new();
-
-        let mut lazy_handled = false;
-        if limit.is_some() {
-            let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
-            let lim = limit.unwrap();
-            let storage = &self.storage;
-            let lazy_result = query::execute_indexed_lazy(
-                &query,
-                &self.field_indexes,
-                &mut |id| {
-                    if storage.contains_key(id) {
-                        if let Some(arc) = self.load_doc_arc(id) {
-                            if skip_post_filter || query::matches_value(&query, &arc) {
-                                matches.push((id, (*arc).clone()));
-                                if matches.len() >= lim {
-                                    return false;
+        {
+            let fi = self.field_indexes.read();
+            let mut lazy_handled = false;
+            if limit.is_some() {
+                let skip_post_filter = query::is_fully_indexed(&query, &fi);
+                let lim = limit.unwrap();
+                let lazy_result = query::execute_indexed_lazy(
+                    &query,
+                    &fi,
+                    &mut |id| {
+                        if self.storage.contains_key(id) {
+                            if let Some(arc) = self.load_doc_arc(id) {
+                                if skip_post_filter || query::matches_value(&query, &arc) {
+                                    matches.push((id, (*arc).clone()));
+                                    if matches.len() >= lim {
+                                        return false;
+                                    }
                                 }
                             }
                         }
-                    }
-                    true
-                },
-            );
-            if lazy_result.is_some() {
-                lazy_handled = true;
-            }
-        }
-
-        if !lazy_handled {
-            let candidate_ids = query::execute_indexed(
-                &query,
-                &self.field_indexes,
-                &self.composite_indexes,
-            );
-
-            if let Some(ref indexed_ids) = candidate_ids {
-                for &id in indexed_ids {
-                    if self.storage.contains_key(id) {
-                        if let Some(data) = self.read_doc(id)? {
-                            if query::matches_value(&query, &data) {
-                                matches.push((id, data));
-                                if limit.is_some_and(|l| matches.len() >= l) {
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                        true
+                    },
+                );
+                if lazy_result.is_some() {
+                    lazy_handled = true;
                 }
-            } else {
-                // B-tree cursor scan
-                self.for_each_doc_arc_while(|id, arc| {
-                    if query::matches_value(&query, arc) {
-                        matches.push((id, (**arc).clone()));
-                        if limit.is_some_and(|l| matches.len() >= l) {
-                            return Ok(false);
+            }
+
+            if !lazy_handled {
+                let ci = self.composite_indexes.read();
+                let candidate_ids = query::execute_indexed(
+                    &query,
+                    &fi,
+                    &ci,
+                );
+                drop(ci);
+
+                if let Some(ref indexed_ids) = candidate_ids {
+                    for &id in indexed_ids {
+                        if self.storage.contains_key(id) {
+                            if let Some(data) = self.read_doc(id)? {
+                                if query::matches_value(&query, &data) {
+                                    matches.push((id, data));
+                                    if limit.is_some_and(|l| matches.len() >= l) {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
-                    Ok(true)
-                })?;
+                } else {
+                    // Drop fi before full scan to avoid holding lock during I/O
+                    drop(fi);
+                    // B-tree cursor scan
+                    self.for_each_doc_arc_while(|id, arc| {
+                        if query::matches_value(&query, arc) {
+                            matches.push((id, (**arc).clone()));
+                            if limit.is_some_and(|l| matches.len() >= l) {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    })?;
+                }
             }
-        }
+        } // fi read lock released (if not already dropped)
 
         if matches.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Phase 2: Prepare and validate updates
+        // Phase 2: Prepare and validate updates (no lock needed)
         struct UpdateOp {
             id: DocumentId,
             old_data: Value,
             new_data: Value,
             new_bytes: Vec<u8>,
         }
-        let has_unique = self.field_indexes.values().any(|idx| idx.unique);
+
         let mut ops = Vec::with_capacity(matches.len());
 
-        let need_old_data = !self.field_indexes.is_empty() || !self.composite_indexes.is_empty();
+        // We need to check if we have indexes for old_data tracking — peek under a brief read lock
+        let need_old_data = {
+            let fi = self.field_indexes.read();
+            let ci = self.composite_indexes.read();
+            !fi.is_empty() || !ci.is_empty()
+        };
 
         for (id, mut data) in matches {
             // Save old data BEFORE mutation for index removal (avoids a second load_doc_arc call)
@@ -941,10 +1017,6 @@ impl BTreeCollection {
                 obj.insert("_version".to_string(), Value::Number(new_version.into()));
             }
 
-            if has_unique {
-                self.check_unique_constraints(&data, Some(id))?;
-            }
-
             let new_bytes = codec::encode_doc(&data)?;
 
             ops.push(UpdateOp {
@@ -959,14 +1031,27 @@ impl BTreeCollection {
             return Ok(Vec::new());
         }
 
-        // Phase 3: Apply to B-tree and update indexes
+        // Phase 3: Apply to B-tree and update indexes (write locks)
+        let mut fi = self.field_indexes.write();
+        let mut ci = self.composite_indexes.write();
+        let mut ti = self.text_index.write();
+        let mut vi = self.vector_indexes.write();
+
+        // Unique constraint check under write lock
+        let has_unique = fi.values().any(|idx| idx.unique);
+        if has_unique {
+            for op in &ops {
+                Self::check_unique_constraints_with(&fi, &op.new_data, Some(op.id))?;
+            }
+        }
+
         let mut updated_ids = Vec::with_capacity(ops.len());
         for op in ops {
             // Update B-tree in-place (replace value)
             self.storage.insert(op.id, op.new_bytes);
 
             // Update field indexes — only for fields whose value changed
-            for idx in self.field_indexes.values_mut() {
+            for idx in fi.values_mut() {
                 let old_val = crate::collection::resolve_field_in_value(&op.old_data, &idx.field);
                 let new_val = crate::collection::resolve_field_in_value(&op.new_data, &idx.field);
                 if old_val != new_val {
@@ -974,14 +1059,14 @@ impl BTreeCollection {
                     idx.insert_value(op.id, &op.new_data);
                 }
             }
-            for idx in &mut self.composite_indexes {
+            for idx in ci.iter_mut() {
                 idx.remove_value(op.id, &op.old_data);
                 idx.insert_value(op.id, &op.new_data);
             }
-            if let Some(ref mut text_idx) = self.text_index {
+            if let Some(ref mut text_idx) = *ti {
                 text_idx.index_doc(op.id, &op.new_data);
             }
-            for idx in self.vector_indexes.values_mut() {
+            for idx in vi.values_mut() {
                 idx.remove(op.id);
                 let _ = idx.insert(op.id, &op.new_data);
             }
@@ -1002,7 +1087,7 @@ impl BTreeCollection {
 
     /// Delete documents matching a query. Returns IDs of deleted documents.
     pub fn delete(
-        &mut self,
+        &self,
         query_json: &Value,
         limit: Option<usize>,
     ) -> Result<Vec<DocumentId>> {
@@ -1015,94 +1100,105 @@ impl BTreeCollection {
         }
         let mut ops = Vec::new();
 
-        let mut lazy_handled = false;
-        if limit.is_some() {
-            let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
-            let lim = limit.unwrap();
-            let storage = &self.storage;
-            let lazy_result = query::execute_indexed_lazy(
-                &query,
-                &self.field_indexes,
-                &mut |id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            if storage.contains_key(id) {
-                                ops.push(DeleteOp {
-                                    id,
-                                    data: (*arc).clone(),
-                                });
-                                if ops.len() >= lim {
-                                    return false;
+        {
+            let fi = self.field_indexes.read();
+            let mut lazy_handled = false;
+            if limit.is_some() {
+                let skip_post_filter = query::is_fully_indexed(&query, &fi);
+                let lim = limit.unwrap();
+                let lazy_result = query::execute_indexed_lazy(
+                    &query,
+                    &fi,
+                    &mut |id| {
+                        if let Some(arc) = self.load_doc_arc(id) {
+                            if skip_post_filter || query::matches_value(&query, &arc) {
+                                if self.storage.contains_key(id) {
+                                    ops.push(DeleteOp {
+                                        id,
+                                        data: (*arc).clone(),
+                                    });
+                                    if ops.len() >= lim {
+                                        return false;
+                                    }
                                 }
                             }
                         }
-                    }
-                    true
-                },
-            );
-            if lazy_result.is_some() {
-                lazy_handled = true;
-            }
-        }
-
-        if !lazy_handled {
-            let candidate_ids = query::execute_indexed(
-                &query,
-                &self.field_indexes,
-                &self.composite_indexes,
-            );
-
-            if let Some(ref indexed_ids) = candidate_ids {
-                for &id in indexed_ids {
-                    if self.storage.contains_key(id) {
-                        if let Some(data) = self.read_doc(id)? {
-                            if query::matches_value(&query, &data) {
-                                ops.push(DeleteOp { id, data });
-                                if limit.is_some_and(|l| ops.len() >= l) {
-                                    break;
-                                }
-                            }
-                        }
-                    }
+                        true
+                    },
+                );
+                if lazy_result.is_some() {
+                    lazy_handled = true;
                 }
-            } else {
-                // B-tree cursor scan
-                self.for_each_doc_arc_while(|id, arc| {
-                    if query::matches_value(&query, arc) {
-                        ops.push(DeleteOp {
-                            id,
-                            data: (**arc).clone(),
-                        });
-                        if limit.is_some_and(|l| ops.len() >= l) {
-                            return Ok(false);
+            }
+
+            if !lazy_handled {
+                let ci = self.composite_indexes.read();
+                let candidate_ids = query::execute_indexed(
+                    &query,
+                    &fi,
+                    &ci,
+                );
+                drop(ci);
+
+                if let Some(ref indexed_ids) = candidate_ids {
+                    for &id in indexed_ids {
+                        if self.storage.contains_key(id) {
+                            if let Some(data) = self.read_doc(id)? {
+                                if query::matches_value(&query, &data) {
+                                    ops.push(DeleteOp { id, data });
+                                    if limit.is_some_and(|l| ops.len() >= l) {
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
-                    Ok(true)
-                })?;
+                } else {
+                    // Drop fi before full scan
+                    drop(fi);
+                    // B-tree cursor scan
+                    self.for_each_doc_arc_while(|id, arc| {
+                        if query::matches_value(&query, arc) {
+                            ops.push(DeleteOp {
+                                id,
+                                data: (**arc).clone(),
+                            });
+                            if limit.is_some_and(|l| ops.len() >= l) {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    })?;
+                }
             }
-        }
+        } // fi read lock released (if not already dropped)
 
         if ops.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Phase 2: Remove from B-tree and update indexes
+        // Phase 2: Remove from B-tree and update indexes (write locks)
+        let mut fi = self.field_indexes.write();
+        let mut ci = self.composite_indexes.write();
+        let mut ti = self.text_index.write();
+        let mut vi = self.vector_indexes.write();
+
         let mut deleted_ids = Vec::with_capacity(ops.len());
         for op in ops {
             // Remove from B-tree (no soft-delete — immediate reclaim)
             self.storage.remove(op.id);
             self.doc_cache.remove(op.id);
 
-            for idx in self.field_indexes.values_mut() {
+            for idx in fi.values_mut() {
                 idx.remove_value(op.id, &op.data);
             }
-            for idx in &mut self.composite_indexes {
+            for idx in ci.iter_mut() {
                 idx.remove_value(op.id, &op.data);
             }
-            if let Some(ref mut text_idx) = self.text_index {
+            if let Some(ref mut text_idx) = *ti {
                 text_idx.remove_doc(op.id);
             }
-            for idx in self.vector_indexes.values_mut() {
+            for idx in vi.values_mut() {
                 idx.remove(op.id);
             }
 
@@ -1128,18 +1224,22 @@ impl BTreeCollection {
     pub fn count_matching(&self, query_json: &Value) -> Result<usize> {
         let query = query::parse_query(query_json)?;
 
+        let fi = self.field_indexes.read();
+
         // Fast path: count from index
-        if let Some(count) = query::count_indexed(&query, &self.field_indexes) {
+        if let Some(count) = query::count_indexed(&query, &fi) {
             return Ok(count);
         }
 
+        let ci = self.composite_indexes.read();
         let candidate_ids = query::execute_indexed(
             &query,
-            &self.field_indexes,
-            &self.composite_indexes,
+            &fi,
+            &ci,
         );
+        drop(ci);
 
-        let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
+        let skip_post_filter = query::is_fully_indexed(&query, &fi);
 
         let mut count = 0;
         if let Some(ref indexed_ids) = candidate_ids {
@@ -1154,6 +1254,9 @@ impl BTreeCollection {
                 }
             }
         } else {
+            // Drop fi before full scan
+            drop(fi);
+
             // Parallel B-tree scan with rayon
             let all_bytes = self.storage.values_as_slices();
             count = all_bytes
@@ -1177,7 +1280,7 @@ impl BTreeCollection {
 
     /// Compact the B-tree storage.
     /// Since B-tree has no soft-deletes, this is mainly a rebuild/persistence operation.
-    pub fn compact(&mut self) -> Result<CompactStats> {
+    pub fn compact(&self) -> Result<CompactStats> {
         let old_size = self.storage.total_bytes();
 
         // Persist current state to disk
@@ -1203,7 +1306,7 @@ impl BTreeCollection {
             return arc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
         }
         if let Some(bytes) = self.storage.get(doc_id) {
-            if let Ok(doc) = codec::decode_doc(bytes) {
+            if let Ok(doc) = codec::decode_doc(&bytes) {
                 return doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             }
         }
@@ -1215,13 +1318,15 @@ impl BTreeCollection {
     // -----------------------------------------------------------------------
 
     /// Create a single-field index. Rebuilds from B-tree cursor scan.
-    pub fn create_index(&mut self, field: &str) -> Result<()> {
-        if self.field_indexes.contains_key(field) {
-            return Ok(());
+    pub fn create_index(&self, field: &str) -> Result<()> {
+        {
+            let fi = self.field_indexes.read();
+            if fi.contains_key(field) {
+                return Ok(());
+            }
         }
 
         // Parallel index build: extract (id, IndexValue) pairs from all docs
-        use rayon::prelude::*;
         let slices = self.storage.values_as_slices();
         let field_owned = field.to_string();
 
@@ -1248,14 +1353,18 @@ impl BTreeCollection {
         let sorted_pairs: Vec<(IndexValue, u64)> = pairs;
         idx.build_from_sorted(sorted_pairs.into_iter().map(|(iv, id)| (iv, id)).collect());
 
-        self.field_indexes.insert(field.to_string(), idx);
+        let mut fi = self.field_indexes.write();
+        fi.insert(field.to_string(), idx);
         Ok(())
     }
 
     /// Create a unique single-field index.
-    pub fn create_unique_index(&mut self, field: &str) -> Result<()> {
-        if self.field_indexes.contains_key(field) {
-            return Ok(());
+    pub fn create_unique_index(&self, field: &str) -> Result<()> {
+        {
+            let fi = self.field_indexes.read();
+            if fi.contains_key(field) {
+                return Ok(());
+            }
         }
 
         let mut idx = PagedFieldIndex::new_unique(field.to_string());
@@ -1291,15 +1400,19 @@ impl BTreeCollection {
             Ok(true)
         })?;
 
-        self.field_indexes.insert(field.to_string(), idx);
+        let mut fi = self.field_indexes.write();
+        fi.insert(field.to_string(), idx);
         Ok(())
     }
 
     /// Create a composite (multi-field) index.
-    pub fn create_composite_index(&mut self, fields: Vec<String>) -> Result<String> {
+    pub fn create_composite_index(&self, fields: Vec<String>) -> Result<String> {
         let name = fields.join("_");
-        if self.composite_indexes.iter().any(|i| i.name() == name) {
-            return Ok(name);
+        {
+            let ci = self.composite_indexes.read();
+            if ci.iter().any(|i| i.name() == name) {
+                return Ok(name);
+            }
         }
 
         let mut idx = CompositeIndex::new(fields);
@@ -1313,14 +1426,16 @@ impl BTreeCollection {
             Ok(true)
         })?;
 
-        self.composite_indexes.push(idx);
+        let mut ci = self.composite_indexes.write();
+        ci.push(idx);
         Ok(name)
     }
 
     /// List all indexes.
     pub fn list_indexes(&self) -> Vec<IndexInfo> {
         let mut indexes = Vec::new();
-        for idx in self.field_indexes.values() {
+        let fi = self.field_indexes.read();
+        for idx in fi.values() {
             indexes.push(IndexInfo {
                 name: idx.field.clone(),
                 index_type: if idx.unique {
@@ -1334,7 +1449,8 @@ impl BTreeCollection {
                 metric: None,
             });
         }
-        for idx in &self.composite_indexes {
+        let ci = self.composite_indexes.read();
+        for idx in ci.iter() {
             indexes.push(IndexInfo {
                 name: idx.name(),
                 index_type: "composite".to_string(),
@@ -1344,7 +1460,8 @@ impl BTreeCollection {
                 metric: None,
             });
         }
-        if let Some(ref text_idx) = self.text_index {
+        let ti = self.text_index.read();
+        if let Some(ref text_idx) = *ti {
             indexes.push(IndexInfo {
                 name: "_text".to_string(),
                 index_type: "text".to_string(),
@@ -1354,7 +1471,8 @@ impl BTreeCollection {
                 metric: None,
             });
         }
-        for idx in self.vector_indexes.values() {
+        let vi = self.vector_indexes.read();
+        for idx in vi.values() {
             indexes.push(IndexInfo {
                 name: format!("_vec_{}", idx.field),
                 index_type: "vector".to_string(),
@@ -1368,20 +1486,30 @@ impl BTreeCollection {
     }
 
     /// Drop an index by name.
-    pub fn drop_index(&mut self, name: &str) -> Result<()> {
-        if self.field_indexes.remove(name).is_some() {
-            return Ok(());
+    pub fn drop_index(&self, name: &str) -> Result<()> {
+        {
+            let mut fi = self.field_indexes.write();
+            if fi.remove(name).is_some() {
+                return Ok(());
+            }
         }
-        if let Some(pos) = self.composite_indexes.iter().position(|i| i.name() == name) {
-            self.composite_indexes.remove(pos);
-            return Ok(());
+        {
+            let mut ci = self.composite_indexes.write();
+            if let Some(pos) = ci.iter().position(|i| i.name() == name) {
+                ci.remove(pos);
+                return Ok(());
+            }
         }
-        if name == "_text" && self.text_index.is_some() {
-            self.text_index = None;
-            return Ok(());
+        if name == "_text" {
+            let mut ti = self.text_index.write();
+            if ti.is_some() {
+                *ti = None;
+                return Ok(());
+            }
         }
         if let Some(field) = name.strip_prefix("_vec_") {
-            if self.vector_indexes.remove(field).is_some() {
+            let mut vi = self.vector_indexes.write();
+            if vi.remove(field).is_some() {
                 return Ok(());
             }
         }
@@ -1392,9 +1520,12 @@ impl BTreeCollection {
     // Text search
     // -----------------------------------------------------------------------
 
-    pub fn create_text_index(&mut self, fields: Vec<String>) -> Result<()> {
-        if self.text_index.is_some() {
-            return Ok(());
+    pub fn create_text_index(&self, fields: Vec<String>) -> Result<()> {
+        {
+            let ti = self.text_index.read();
+            if ti.is_some() {
+                return Ok(());
+            }
         }
 
         let mut idx = CollectionTextIndex::new(fields);
@@ -1408,12 +1539,14 @@ impl BTreeCollection {
             Ok(true)
         })?;
 
-        self.text_index = Some(idx);
+        let mut ti = self.text_index.write();
+        *ti = Some(idx);
         Ok(())
     }
 
     pub fn text_search(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
-        let idx = self.text_index.as_ref().ok_or_else(|| {
+        let ti = self.text_index.read();
+        let idx = ti.as_ref().ok_or_else(|| {
             Error::InvalidQuery(
                 "no text index on this collection; create one with create_text_index".into(),
             )
@@ -1440,13 +1573,16 @@ impl BTreeCollection {
     // -----------------------------------------------------------------------
 
     pub fn create_vector_index(
-        &mut self,
+        &self,
         field: &str,
         dimension: usize,
         metric: DistanceMetric,
     ) -> Result<()> {
-        if self.vector_indexes.contains_key(field) {
-            return Ok(());
+        {
+            let vi = self.vector_indexes.read();
+            if vi.contains_key(field) {
+                return Ok(());
+            }
         }
 
         let mut idx = VectorIndex::new(field.to_string(), dimension, metric);
@@ -1460,7 +1596,8 @@ impl BTreeCollection {
             Ok(true)
         })?;
 
-        self.vector_indexes.insert(field.to_string(), idx);
+        let mut vi = self.vector_indexes.write();
+        vi.insert(field.to_string(), idx);
         Ok(())
     }
 
@@ -1471,7 +1608,8 @@ impl BTreeCollection {
         limit: usize,
         ef_search: Option<usize>,
     ) -> Result<Vec<Value>> {
-        let idx = self.vector_indexes.get(field).ok_or_else(|| {
+        let vi = self.vector_indexes.read();
+        let idx = vi.get(field).ok_or_else(|| {
             Error::InvalidQuery(format!(
                 "no vector index on field '{}'; create one with create_vector_index",
                 field
@@ -1518,7 +1656,7 @@ impl BTreeCollection {
 
         match match_query_json {
             None => {
-                self.for_each_doc_streaming(|doc| {
+                self.for_each_doc_unordered(|doc| {
                     group.feed(doc);
                     Ok(true)
                 })?;
@@ -1526,19 +1664,22 @@ impl BTreeCollection {
             Some(match_val) => {
                 let query = query::parse_query(match_val)?;
                 if matches!(query, Query::All) {
-                    self.for_each_doc_streaming(|doc| {
+                    self.for_each_doc_unordered(|doc| {
                         group.feed(doc);
                         Ok(true)
                     })?;
                 } else {
                     // Try index-accelerated path
+                    let fi = self.field_indexes.read();
+                    let ci = self.composite_indexes.read();
                     let candidate_ids = query::execute_indexed(
                         &query,
-                        &self.field_indexes,
-                        &self.composite_indexes,
+                        &fi,
+                        &ci,
                     );
                     let skip_post_filter =
-                        query::is_fully_indexed(&query, &self.field_indexes);
+                        query::is_fully_indexed(&query, &fi);
+                    drop(ci);
 
                     if let Some(ref ids) = candidate_ids {
                         for &id in ids {
@@ -1549,8 +1690,9 @@ impl BTreeCollection {
                             }
                         }
                     } else {
-                        // Full B-tree cursor scan with filter
-                        self.for_each_doc_streaming(|doc| {
+                        drop(fi);
+                        // Full scan with filter (order doesn't matter for aggregation)
+                        self.for_each_doc_unordered(|doc| {
                             if query::matches_value(&query, doc) {
                                 group.feed(doc);
                             }
@@ -1580,7 +1722,7 @@ impl BTreeCollection {
     }
 
     pub fn prepare_tx_insert(
-        &mut self,
+        &self,
         mut data: Value,
         tx_id: u64,
     ) -> Result<crate::collection::PreparedMutation> {
@@ -1613,7 +1755,7 @@ impl BTreeCollection {
     }
 
     pub fn prepare_tx_update(
-        &mut self,
+        &self,
         query_json: &Value,
         update_json: &Value,
         tx_id: u64,
@@ -1628,10 +1770,12 @@ impl BTreeCollection {
         }
 
         let query = query::parse_query(query_json)?;
+        let fi = self.field_indexes.read();
+        let ci = self.composite_indexes.read();
         let candidate_ids = query::execute_indexed(
             &query,
-            &self.field_indexes,
-            &self.composite_indexes,
+            &fi,
+            &ci,
         );
 
         let mut mutations = Vec::new();
@@ -1655,7 +1799,7 @@ impl BTreeCollection {
                     .unwrap()
                     .insert("_version".to_string(), Value::Number(new_version.into()));
 
-                self.check_unique_constraints(&data, Some(id))?;
+                Self::check_unique_constraints_with(&fi, &data, Some(id))?;
 
                 let new_bytes = codec::encode_doc(&data)?;
                 mutations.push(crate::collection::PreparedMutation {
@@ -1681,13 +1825,55 @@ impl BTreeCollection {
                 }
             }
         } else {
+            drop(ci);
+            drop(fi);
             let mut snapshot: Vec<(DocumentId, Value)> = Vec::new();
             self.for_each_doc_arc_while(|id, arc| {
                 snapshot.push((id, (**arc).clone()));
                 Ok(true)
             })?;
+            // Re-acquire for unique checks in process_candidate
+            let fi = self.field_indexes.read();
+            let _ci = self.composite_indexes.read();
+            let process_candidate_reborrowed =
+                |id: DocumentId,
+                 cached: &Value,
+                 mutations: &mut Vec<crate::collection::PreparedMutation>|
+                 -> Result<()> {
+                    if !query::matches_value(&query, cached) {
+                        return Ok(());
+                    }
+                    let old_data = cached.clone();
+                    let mut data = cached.clone();
+
+                    crate::update::apply_update(&mut data, update_json)?;
+
+                    let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let new_version = old_version + 1;
+                    data.as_object_mut()
+                        .unwrap()
+                        .insert("_version".to_string(), Value::Number(new_version.into()));
+
+                    Self::check_unique_constraints_with(&fi, &data, Some(id))?;
+
+                    let new_bytes = codec::encode_doc(&data)?;
+                    mutations.push(crate::collection::PreparedMutation {
+                        wal_entry: crate::wal::WalEntry::Update {
+                            doc_id: id,
+                            doc_bytes: new_bytes.clone(),
+                            tx_id,
+                        },
+                        doc_id: id,
+                        new_bytes,
+                        old_loc: None,
+                        old_data: Some(old_data),
+                        new_data: data,
+                        is_delete: false,
+                    });
+                    Ok(())
+                };
             for (id, data) in &snapshot {
-                process_candidate(*id, data, &mut mutations)?;
+                process_candidate_reborrowed(*id, data, &mut mutations)?;
             }
         }
 
@@ -1695,16 +1881,20 @@ impl BTreeCollection {
     }
 
     pub fn prepare_tx_delete(
-        &mut self,
+        &self,
         query_json: &Value,
         tx_id: u64,
     ) -> Result<Vec<crate::collection::PreparedMutation>> {
         let query = query::parse_query(query_json)?;
+        let fi = self.field_indexes.read();
+        let ci = self.composite_indexes.read();
         let candidate_ids = query::execute_indexed(
             &query,
-            &self.field_indexes,
-            &self.composite_indexes,
+            &fi,
+            &ci,
         );
+        drop(ci);
+        drop(fi);
 
         let mut mutations = Vec::new();
 
@@ -1750,26 +1940,31 @@ impl BTreeCollection {
 
     /// Apply prepared mutations to the B-tree and update indexes.
     pub fn apply_prepared(
-        &mut self,
+        &self,
         mutations: &mut Vec<crate::collection::PreparedMutation>,
     ) -> Result<()> {
+        let mut fi = self.field_indexes.write();
+        let mut ci = self.composite_indexes.write();
+        let mut ti = self.text_index.write();
+        let mut vi = self.vector_indexes.write();
+
         for m in mutations.iter() {
             if m.is_delete {
                 // Remove from B-tree
                 self.storage.remove(m.doc_id);
                 self.doc_cache.remove(m.doc_id);
                 if let Some(ref old_data) = m.old_data {
-                    for idx in self.field_indexes.values_mut() {
+                    for idx in fi.values_mut() {
                         idx.remove_value(m.doc_id, old_data);
                     }
-                    for idx in &mut self.composite_indexes {
+                    for idx in ci.iter_mut() {
                         idx.remove_value(m.doc_id, old_data);
                     }
                 }
-                if let Some(ref mut text_idx) = self.text_index {
+                if let Some(ref mut text_idx) = *ti {
                     text_idx.remove_doc(m.doc_id);
                 }
-                for idx in self.vector_indexes.values_mut() {
+                for idx in vi.values_mut() {
                     idx.remove(m.doc_id);
                 }
             } else {
@@ -1777,23 +1972,23 @@ impl BTreeCollection {
                 self.storage.insert(m.doc_id, m.new_bytes.clone());
 
                 if let Some(ref old_data) = m.old_data {
-                    for idx in self.field_indexes.values_mut() {
+                    for idx in fi.values_mut() {
                         idx.remove_value(m.doc_id, old_data);
                     }
-                    for idx in &mut self.composite_indexes {
+                    for idx in ci.iter_mut() {
                         idx.remove_value(m.doc_id, old_data);
                     }
                 }
-                for idx in self.field_indexes.values_mut() {
+                for idx in fi.values_mut() {
                     idx.insert_value(m.doc_id, &m.new_data);
                 }
-                for idx in &mut self.composite_indexes {
+                for idx in ci.iter_mut() {
                     idx.insert_value(m.doc_id, &m.new_data);
                 }
-                if let Some(ref mut text_idx) = self.text_index {
+                if let Some(ref mut text_idx) = *ti {
                     text_idx.index_doc(m.doc_id, &m.new_data);
                 }
-                for idx in self.vector_indexes.values_mut() {
+                for idx in vi.values_mut() {
                     idx.remove(m.doc_id);
                     let _ = idx.insert(m.doc_id, &m.new_data);
                 }
@@ -1811,7 +2006,7 @@ impl BTreeCollection {
     // TTL support
     // -----------------------------------------------------------------------
 
-    fn register_ttl(&mut self, doc_id: DocumentId, data: &Value) {
+    fn register_ttl(&self, doc_id: DocumentId, data: &Value) {
         let ttl_secs = data
             .get("_ttl")
             .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)));
@@ -1821,47 +2016,55 @@ impl BTreeCollection {
                 .unwrap_or_default()
                 .as_millis() as u64;
             let expires_at = now_ms + secs * 1000;
-            self.ttl_index
-                .entry(expires_at)
+            let mut ttl = self.ttl_index.lock();
+            ttl.entry(expires_at)
                 .or_insert_with(Vec::new)
                 .push(doc_id);
         }
     }
 
     /// Evict expired documents. Returns the number evicted.
-    pub fn evict_expired(&mut self) -> usize {
-        if self.ttl_index.is_empty() {
-            return 0;
-        }
-
+    pub fn evict_expired(&self) -> usize {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
 
-        // Collect expired entries
-        let expired: Vec<(u64, Vec<DocumentId>)> = self
-            .ttl_index
-            .range(..=now_ms)
-            .map(|(&k, v)| (k, v.clone()))
-            .collect();
+        // Collect expired entries under the ttl lock
+        let expired: Vec<(u64, Vec<DocumentId>)> = {
+            let ttl = self.ttl_index.lock();
+            if ttl.is_empty() {
+                return 0;
+            }
+            ttl.range(..=now_ms)
+                .map(|(&k, v)| (k, v.clone()))
+                .collect()
+        };
+
+        if expired.is_empty() {
+            return 0;
+        }
+
+        // Acquire write locks for index cleanup
+        let mut fi = self.field_indexes.write();
+        let mut ci = self.composite_indexes.write();
+        let mut ti = self.text_index.write();
 
         let mut evicted = 0;
-        for (ts, ids) in &expired {
+        for (_ts, ids) in &expired {
             for &id in ids {
                 if self.storage.contains_key(id) {
-                    // Load doc data for index cleanup
-                    if let Some(bytes) = self.storage.get(id).map(|b| b.clone()) {
+                    if let Some(bytes) = self.storage.get(id) {
                         if let Ok(data) = codec::decode_doc(&bytes) {
                             self.storage.remove(id);
                             self.doc_cache.remove(id);
-                            for idx in self.field_indexes.values_mut() {
+                            for idx in fi.values_mut() {
                                 idx.remove_value(id, &data);
                             }
-                            for idx in &mut self.composite_indexes {
+                            for idx in ci.iter_mut() {
                                 idx.remove_value(id, &data);
                             }
-                            if let Some(ref mut text_idx) = self.text_index {
+                            if let Some(ref mut text_idx) = *ti {
                                 text_idx.remove_doc(id);
                             }
                             evicted += 1;
@@ -1869,7 +2072,14 @@ impl BTreeCollection {
                     }
                 }
             }
-            self.ttl_index.remove(ts);
+        }
+
+        // Remove expired entries from ttl_index
+        {
+            let mut ttl = self.ttl_index.lock();
+            for (ts, _) in &expired {
+                ttl.remove(ts);
+            }
         }
 
         evicted
@@ -1917,7 +2127,7 @@ mod tests {
 
     #[test]
     fn insert_and_find() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         let id1 = col.insert(json!({"name": "Alice", "age": 30})).unwrap();
         let id2 = col.insert(json!({"name": "Bob", "age": 25})).unwrap();
@@ -1948,7 +2158,7 @@ mod tests {
 
     #[test]
     fn insert_many_and_count() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         let docs: Vec<Value> = (0..1000)
             .map(|i| json!({"seq": i, "value": format!("doc_{}", i)}))
@@ -1968,7 +2178,7 @@ mod tests {
 
     #[test]
     fn create_index_and_find() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         // Insert docs
         for i in 0..100 {
@@ -1990,7 +2200,7 @@ mod tests {
 
     #[test]
     fn find_with_sort_and_limit() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         for i in 0..50 {
             col.insert(json!({"score": 50 - i, "name": format!("player_{}", i)}))
@@ -2023,7 +2233,7 @@ mod tests {
 
     #[test]
     fn update_documents() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         col.insert(json!({"name": "Alice", "age": 30})).unwrap();
         col.insert(json!({"name": "Bob", "age": 25})).unwrap();
@@ -2053,7 +2263,7 @@ mod tests {
 
     #[test]
     fn delete_documents() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         for i in 0..10 {
             col.insert(json!({"group": i % 3, "value": i})).unwrap();
@@ -2074,7 +2284,7 @@ mod tests {
 
     #[test]
     fn unique_index_enforcement() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         col.insert(json!({"email": "alice@test.com"})).unwrap();
         col.create_unique_index("email").unwrap();
@@ -2089,7 +2299,7 @@ mod tests {
 
     #[test]
     fn version_tracking() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         let id = col.insert(json!({"name": "test"})).unwrap();
         assert_eq!(col.get_version(id), 1);
@@ -2105,7 +2315,7 @@ mod tests {
 
     #[test]
     fn compact_operation() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         for i in 0..100 {
             col.insert(json!({"value": i})).unwrap();
@@ -2120,7 +2330,7 @@ mod tests {
 
     #[test]
     fn btree_cursor_scan_order() {
-        let mut col = new_btree_collection("test");
+        let col = new_btree_collection("test");
 
         // Insert in random order
         for &i in &[5, 3, 1, 4, 2] {
@@ -2142,7 +2352,7 @@ mod tests {
 
     #[test]
     fn insert_1000_create_index_find_sort_count_update_delete() {
-        let mut col = new_btree_collection("stress_test");
+        let col = new_btree_collection("stress_test");
 
         // Insert 1000 docs
         let docs: Vec<Value> = (0..1000)
@@ -2216,7 +2426,7 @@ mod tests {
 
         // Create and populate
         {
-            let mut col = BTreeCollection::open("persist_test", dir.path()).unwrap();
+            let col = BTreeCollection::open("persist_test", dir.path()).unwrap();
             for i in 0..100 {
                 col.insert(json!({"seq": i, "name": format!("doc_{}", i)}))
                     .unwrap();
