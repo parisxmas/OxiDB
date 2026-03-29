@@ -11,21 +11,16 @@ let package = Package(
         .library(name: "OxiDB", targets: ["OxiDB"]),
     ],
     targets: [
-        .systemLibrary(
-            name: "COxiDB",
-            path: "Sources/OxiDB/include",
-            pkgConfig: nil,
-            providers: nil
+        .binaryTarget(
+            name: "COxiDBEmbedded",
+            url: "https://github.com/parisxmas/OxiDB/releases/download/v0.22.0/OxiDBEmbedded.xcframework.zip",
+            checksum: "6979e8314d7c928d11a287a72d93ec8b3250d0ed6ab8d248745e18cf2c9c4c6c"
         ),
         .target(
             name: "OxiDB",
-            dependencies: ["COxiDB"],
+            dependencies: ["COxiDBEmbedded"],
             path: "Sources/OxiDB",
-            exclude: ["include"],
-            linkerSettings: [
-                .linkedLibrary("oxidb_client_ffi"),
-                .linkedLibrary("oxidb_embedded_ffi"),
-            ]
+            exclude: ["include"]
         ),
     ]
 )
