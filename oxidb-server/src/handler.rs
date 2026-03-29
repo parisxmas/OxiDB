@@ -257,9 +257,16 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 Some(u) => u,
                 None => return err_bytes("missing 'update'"),
             };
-            match db.update_one(col, query, update) {
-                Ok(count) => ok_bytes(json!({ "modified": count })),
-                Err(e) => err_bytes(&e.to_string()),
+            if let Some(tx_id) = *active_tx {
+                match db.tx_update(tx_id, col, query, update) {
+                    Ok(()) => ok_bytes(json!("buffered")),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
+            } else {
+                match db.update_one(col, query, update) {
+                    Ok(count) => ok_bytes(json!({ "modified": count })),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
             }
         }
 
@@ -294,9 +301,16 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 Some(q) => q,
                 None => return err_bytes("missing 'query'"),
             };
-            match db.delete_one(col, query) {
-                Ok(count) => ok_bytes(json!({ "deleted": count })),
-                Err(e) => err_bytes(&e.to_string()),
+            if let Some(tx_id) = *active_tx {
+                match db.tx_delete(tx_id, col, query) {
+                    Ok(()) => ok_bytes(json!("buffered")),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
+            } else {
+                match db.delete_one(col, query) {
+                    Ok(count) => ok_bytes(json!({ "deleted": count })),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
             }
         }
 
