@@ -27,6 +27,8 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 rmp = "0.8"
 rmp-serde = "1"
+socket2 = "0.5"
+libc = "0.2"
 openraft = { version = "0.9", features = ["serde"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "time", "macros", "sync"], optional = true }
 tokio-rustls = { version = "0.26", optional = true }
