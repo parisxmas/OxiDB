@@ -1387,6 +1387,22 @@ fn main() {
         }
     }
 
+    // UDP log ingestion listener (optional, enabled via OXIDB_UDP_PORT)
+    let udp_port: u16 = env::var("OXIDB_UDP_PORT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("OXIDB_UDP_PORT must be a valid u16");
+
+    if udp_port > 0 {
+        let udp_addr = format!("0.0.0.0:{udp_port}");
+        let udp_collection = env::var("OXIDB_UDP_COLLECTION")
+            .unwrap_or_else(|_| "_udp_logs".to_string());
+        let udp_db = Arc::clone(&state.db);
+        oxidb_server::udp_ingest::start_udp_listener(&udp_addr, udp_db, udp_collection.clone());
+        server_log!(state, GelfLevel::Notice,
+            format!("UDP log ingestion listening on {udp_addr} → collection '{udp_collection}'"));
+    }
+
     // MQTT-only mode: skip the main OxiDB TCP listener
     if mqtt_only_mode {
         server_log!(state, GelfLevel::Notice, "MQTT-only mode — OxiDB TCP listener disabled".to_string());
