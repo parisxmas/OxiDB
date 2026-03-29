@@ -44,9 +44,9 @@ pub struct IndexInfo {
 
 /// Persisted index metadata (written to .idx files).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct IndexMetadata {
-    version: u32,
-    indexes: Vec<IndexInfo>,
+pub(crate) struct IndexMetadata {
+    pub version: u32,
+    pub indexes: Vec<IndexInfo>,
 }
 
 /// Statistics returned after a compaction run.
@@ -105,7 +105,7 @@ impl Collection {
 }
 
 /// Load persisted index definitions from a .idx file.
-fn load_index_metadata(path: &Path) -> Result<Vec<IndexInfo>> {
+pub(crate) fn load_index_metadata(path: &Path) -> Result<Vec<IndexInfo>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
