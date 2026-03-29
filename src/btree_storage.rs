@@ -331,6 +331,20 @@ impl BTreeStorage {
     pub fn values_as_slices(&self) -> Vec<&[u8]> {
         self.tree.values().map(|v| v.as_slice()).collect()
     }
+
+    /// Iterate all entries in arbitrary order (no key sort). Faster for full scans
+    /// like aggregation where key order doesn't matter.
+    pub fn for_each_value<F>(&self, mut f: F) -> Result<()>
+    where
+        F: FnMut(u64, &[u8]) -> Result<bool>,
+    {
+        for (&key, value) in &self.tree {
+            if !f(key, value)? {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
