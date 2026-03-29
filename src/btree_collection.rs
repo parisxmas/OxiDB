@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rayon::prelude::*;
 use serde_json::Value;
@@ -50,6 +50,8 @@ pub struct BTreeCollection {
     #[allow(dead_code)]
     in_memory: bool,
     ttl_index: std::collections::BTreeMap<u64, Vec<DocumentId>>,
+    /// Dirty flag: set on write, cleared after persist.
+    dirty: AtomicBool,
 }
 
 impl BTreeCollection {
@@ -79,6 +81,7 @@ impl BTreeCollection {
             next_id: AtomicU64::new(max_id + 1),
             in_memory: false,
             ttl_index: std::collections::BTreeMap::new(),
+            dirty: AtomicBool::new(false),
         })
     }
 
@@ -96,6 +99,7 @@ impl BTreeCollection {
             next_id: AtomicU64::new(1),
             in_memory: true,
             ttl_index: std::collections::BTreeMap::new(),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -112,6 +116,9 @@ impl BTreeCollection {
     }
 
     pub fn sync_writes(&self) -> Result<()> {
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(()); // nothing changed since last persist
+        }
         self.storage.persist()
     }
 
@@ -268,6 +275,7 @@ impl BTreeCollection {
         self.register_ttl(id, &data_arc);
 
         self.doc_cache.put(id, data_arc);
+        self.dirty.store(true, Ordering::Release);
 
         Ok(id)
     }
@@ -409,6 +417,9 @@ impl BTreeCollection {
             }
             self.doc_cache.put(id, data_arc);
             ids.push(id);
+        }
+        if !ids.is_empty() {
+            self.dirty.store(true, Ordering::Release);
         }
 
         Ok(ids)
@@ -973,6 +984,9 @@ impl BTreeCollection {
             self.doc_cache.put(op.id, Arc::new(op.new_data));
             updated_ids.push(op.id);
         }
+        if !updated_ids.is_empty() {
+            self.dirty.store(true, Ordering::Release);
+        }
 
         Ok(updated_ids)
     }
@@ -1088,6 +1102,9 @@ impl BTreeCollection {
             }
 
             deleted_ids.push(op.id);
+        }
+        if !deleted_ids.is_empty() {
+            self.dirty.store(true, Ordering::Release);
         }
 
         Ok(deleted_ids)
@@ -1777,6 +1794,9 @@ impl BTreeCollection {
                 }
                 self.doc_cache.put(m.doc_id, Arc::new(m.new_data.clone()));
             }
+        }
+        if !mutations.is_empty() {
+            self.dirty.store(true, Ordering::Release);
         }
 
         Ok(())
