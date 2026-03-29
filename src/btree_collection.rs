@@ -896,9 +896,9 @@ impl BTreeCollection {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             let new_version = old_version + 1;
-            data.as_object_mut()
-                .unwrap()
-                .insert("_version".to_string(), Value::Number(new_version.into()));
+            if let Some(obj) = data.as_object_mut() {
+                obj.insert("_version".to_string(), Value::Number(new_version.into()));
+            }
 
             if has_unique {
                 self.check_unique_constraints(&data, Some(id))?;
