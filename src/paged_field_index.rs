@@ -528,6 +528,31 @@ impl PagedFieldIndex {
         self.entries.is_empty() && self.write_buffer.is_empty()
     }
 
+    /// Build the index from pre-sorted (IndexValue, DocumentId) pairs.
+    /// Much faster than per-item `insert_raw` for bulk index building because
+    /// it avoids O(n) Vec::insert shifts — pairs are already in order so we
+    /// just append or extend the last entry.
+    ///
+    /// IMPORTANT: `pairs` MUST be sorted by IndexValue (ascending).
+    pub fn build_from_sorted(&mut self, pairs: Vec<(IndexValue, DocumentId)>) {
+        self.entries.clear();
+        self.write_buffer.clear();
+        if pairs.is_empty() {
+            return;
+        }
+        // Pre-allocate: at most pairs.len() unique values
+        self.entries.reserve(pairs.len() / 2);
+        for (val, id) in pairs {
+            if let Some(last) = self.entries.last_mut() {
+                if last.0 == val {
+                    last.1.insert(id);
+                    continue;
+                }
+            }
+            self.entries.push((val, DocIdSet::One(id)));
+        }
+    }
+
     /// Merge another PagedFieldIndex into this one.
     /// Used for parallel index building.
     pub fn merge(&mut self, mut other: Self) {

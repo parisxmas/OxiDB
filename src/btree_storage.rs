@@ -311,6 +311,12 @@ impl BTreeStorage {
         self.total_bytes.store(0, Ordering::Release);
     }
 
+    /// Pre-allocate capacity in the underlying HashMap.
+    /// Call this before a series of `insert_batch` calls to avoid incremental reallocation.
+    pub fn reserve(&mut self, additional: usize) {
+        self.tree.reserve(additional);
+    }
+
     /// Batch insert multiple entries using BTreeMap::extend for bulk efficiency.
     /// IMPORTANT: Only use for new keys (no replacements). If keys might exist,
     /// use the regular insert() loop instead.

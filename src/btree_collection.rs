@@ -333,18 +333,22 @@ impl BTreeCollection {
         };
 
         // Phase 2: bulk insert into B-tree
+        // Pre-reserve full capacity to avoid incremental reallocation across batches
+        if self.storage.count() == 0 {
+            self.storage.reserve(doc_count);
+        }
         let ids: Vec<DocumentId> = btree_entries.iter().map(|(id, _)| *id).collect();
         self.storage.insert_batch(btree_entries);
 
-        // Keep data values for index updates
-        let data_values: Vec<(u64, Value)> = if has_indexes || doc_count <= 1000 {
+        // Phase 3: update indexes and cache
+        let skip_cache = doc_count > 50_000;
+
+        // Keep data values for index updates and caching
+        let data_values: Vec<(u64, Value)> = if has_indexes || !skip_cache {
             docs_with_ids
         } else {
             Vec::new()
         };
-
-        // Phase 3: update indexes and cache
-        let skip_cache = doc_count > 1000;
 
         if has_indexes || !skip_cache {
             for (id, data) in data_values {
@@ -875,7 +879,16 @@ impl BTreeCollection {
         let has_unique = self.field_indexes.values().any(|idx| idx.unique);
         let mut ops = Vec::with_capacity(matches.len());
 
+        let need_old_data = !self.field_indexes.is_empty() || !self.composite_indexes.is_empty();
+
         for (id, mut data) in matches {
+            // Save old data BEFORE mutation for index removal (avoids a second load_doc_arc call)
+            let old_data = if need_old_data {
+                data.clone()
+            } else {
+                Value::Null
+            };
+
             crate::update::apply_update(&mut data, update_json)?;
 
             let old_version = data
@@ -892,13 +905,6 @@ impl BTreeCollection {
             }
 
             let new_bytes = codec::encode_doc(&data)?;
-
-            // Read old data for index removal only if we have field indexes
-            let old_data = if !self.field_indexes.is_empty() || !self.composite_indexes.is_empty() {
-                self.load_doc_arc(id).map(|a| (*a).clone()).unwrap_or(data.clone())
-            } else {
-                Value::Null
-            };
 
             ops.push(UpdateOp {
                 id,
@@ -1168,26 +1174,28 @@ impl BTreeCollection {
         let slices = self.storage.values_as_slices();
         let field_owned = field.to_string();
 
-        let pairs: Vec<(u64, IndexValue)> = slices.par_iter()
+        let mut pairs: Vec<(IndexValue, u64)> = slices.par_iter()
             .filter_map(|bytes| {
                 if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
                     let raw = jsonb::RawJsonb::new(bytes);
                     let id = extract_raw_u64(&raw, "_id")?;
                     let iv = extract_raw_index_value(&raw, &field_owned)?;
-                    Some((id, iv))
+                    Some((iv, id))
                 } else {
                     let doc: Value = codec::decode_doc(bytes).ok()?;
                     let id = doc.get("_id")?.as_u64()?;
                     let val = resolve_field_in_value(&doc, &field_owned)?;
-                    Some((id, IndexValue::from_json(val)))
+                    Some((IndexValue::from_json(val), id))
                 }
             })
             .collect();
 
+        // Sort by IndexValue so build_from_sorted can append in order (no O(n) shifts)
+        pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+
         let mut idx = PagedFieldIndex::new(field.to_string());
-        for (id, iv) in pairs {
-            idx.insert_raw(id, iv);
-        }
+        let sorted_pairs: Vec<(IndexValue, u64)> = pairs;
+        idx.build_from_sorted(sorted_pairs.into_iter().map(|(iv, id)| (iv, id)).collect());
 
         self.field_indexes.insert(field.to_string(), idx);
         Ok(())
