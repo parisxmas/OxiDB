@@ -132,7 +132,9 @@ impl PagedFieldIndex {
         if self.write_buffer.is_empty() {
             if let Ok(pos) = self.entries.binary_search_by(|e| e.0.cmp(&key)) {
                 let removed = self.entries[pos].1.remove(&id);
-                if removed && self.entries[pos].1.is_empty() {
+                // Remove empty entries only for small indexes (< 10K entries)
+                // Large indexes defer cleanup to compact_entries() to avoid O(n) shifts
+                if removed && self.entries[pos].1.is_empty() && self.entries.len() < 10_000 {
                     self.entries.remove(pos);
                 }
             }
@@ -143,6 +145,11 @@ impl PagedFieldIndex {
         if self.write_buffer.len() >= self.write_buffer_limit {
             self.flush_write_buffer();
         }
+    }
+
+    /// Remove empty entries from the sorted Vec. Call after bulk deletions.
+    pub fn compact_entries(&mut self) {
+        self.entries.retain(|(_, ids)| !ids.is_empty());
     }
 
     /// Flush the write buffer, merging all pending operations into the sorted entries.
