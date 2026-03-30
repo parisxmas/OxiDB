@@ -32,7 +32,6 @@ fn encryption_at_rest_roundtrip() {
 
 /// Test that data files are not readable as plain JSON when encrypted.
 #[test]
-#[ignore = "B-tree engine encryption-at-rest not yet implemented"]
 fn encrypted_data_not_plain_text() {
     let dir = tempfile::tempdir().unwrap();
     let key_path = dir.path().join("test.key");
