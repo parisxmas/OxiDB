@@ -83,3 +83,5 @@ tests/go-complex-tests/report.json
 acid-test
 repl-test
 udp-bench
+scale-test
+telco-test
