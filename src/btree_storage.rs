@@ -19,6 +19,7 @@
 //!   ... last child_page follows after last entry
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use scc::HashMap as SccMap;
@@ -46,6 +47,8 @@ pub struct BTreeStorage {
     data_dir: PathBuf,
     /// Collection name (for file naming).
     name: String,
+    /// Optional encryption key for at-rest encryption of the .btree file.
+    encryption: Option<Arc<crate::EncryptionKey>>,
 }
 
 /// A cursor for iterating through the storage in ascending key order.
@@ -132,12 +135,13 @@ impl ReverseCursor {
 
 impl BTreeStorage {
     /// Create a new in-memory B-tree storage.
-    pub fn new(name: &str, data_dir: &Path) -> Self {
+    pub fn new(name: &str, data_dir: &Path, encryption: Option<Arc<crate::EncryptionKey>>) -> Self {
         Self {
             tree: SccMap::new(),
             total_bytes: AtomicU64::new(0),
             data_dir: data_dir.to_path_buf(),
             name: name.to_string(),
+            encryption,
         }
     }
 
@@ -148,16 +152,21 @@ impl BTreeStorage {
             total_bytes: AtomicU64::new(0),
             data_dir: PathBuf::new(),
             name: name.to_string(),
+            encryption: None,
         }
     }
 
     /// Open or load a B-tree from disk. Falls back to empty if no file exists.
-    pub fn open(name: &str, data_dir: &Path) -> Result<Self> {
+    pub fn open(name: &str, data_dir: &Path, encryption: Option<Arc<crate::EncryptionKey>>) -> Result<Self> {
         let path = data_dir.join(format!("{}.btree", name));
-        let storage = Self::new(name, data_dir);
+        let storage = Self::new(name, data_dir, encryption);
 
         if path.exists() {
-            let data = std::fs::read(&path)?;
+            let mut data = std::fs::read(&path)?;
+            // Decrypt if encryption key is set
+            if let Some(ref key) = storage.encryption {
+                data = key.decrypt(&data)?;
+            }
             storage.load_from_bytes(&data)?;
         }
 
@@ -200,7 +209,13 @@ impl BTreeStorage {
             buf.extend_from_slice(value);
             true
         });
-        std::fs::write(&path, &buf)?;
+        // Encrypt if key is set
+        let write_buf = if let Some(ref key) = self.encryption {
+            key.encrypt(&buf)?
+        } else {
+            buf
+        };
+        std::fs::write(&path, &write_buf)?;
         Ok(())
     }
 
@@ -490,14 +505,14 @@ mod tests {
     fn persistence_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let storage = BTreeStorage::new("test_persist", dir.path());
+            let storage = BTreeStorage::new("test_persist", dir.path(), None);
             storage.insert(1, b"alpha".to_vec());
             storage.insert(2, b"beta".to_vec());
             storage.insert(3, b"gamma".to_vec());
             storage.persist().unwrap();
         }
         {
-            let storage = BTreeStorage::open("test_persist", dir.path()).unwrap();
+            let storage = BTreeStorage::open("test_persist", dir.path(), None).unwrap();
             assert_eq!(storage.count(), 3);
             assert_eq!(storage.get(1).unwrap().as_slice(), b"alpha");
             assert_eq!(storage.get(2).unwrap().as_slice(), b"beta");

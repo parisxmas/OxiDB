@@ -312,7 +312,7 @@ impl OxiDb {
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
-            BTreeCollection::open(name, &self.data_dir)?
+            BTreeCollection::open(name, &self.data_dir, self.encryption.clone())?
         };
         if self.lazy_sync.load(Ordering::Acquire) {
             col.set_lazy_sync(true);
@@ -338,7 +338,7 @@ impl OxiDb {
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
-            BTreeCollection::open(name, &self.data_dir)?
+            BTreeCollection::open(name, &self.data_dir, self.encryption.clone())?
         };
         if self.lazy_sync.load(Ordering::Acquire) {
             col.set_lazy_sync(true);

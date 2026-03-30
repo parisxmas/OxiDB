@@ -63,9 +63,9 @@ pub struct BTreeCollection {
 
 impl BTreeCollection {
     /// Create a new B-tree-backed collection (file mode).
-    pub fn open(name: &str, data_dir: &Path) -> Result<Self> {
+    pub fn open(name: &str, data_dir: &Path, encryption: Option<std::sync::Arc<crate::EncryptionKey>>) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
-        let storage = BTreeStorage::open(name, data_dir)?;
+        let storage = BTreeStorage::open(name, data_dir, encryption)?;
 
         let wal_path = data_dir.join(format!("{}.wal", name));
         let wal = Wal::open(&wal_path)?;
@@ -2641,7 +2641,7 @@ mod tests {
 
         // Create and populate
         {
-            let col = BTreeCollection::open("persist_test", dir.path()).unwrap();
+            let col = BTreeCollection::open("persist_test", dir.path(), None).unwrap();
             for i in 0..100 {
                 col.insert(json!({"seq": i, "name": format!("doc_{}", i)}))
                     .unwrap();
@@ -2651,7 +2651,7 @@ mod tests {
 
         // Reopen and verify
         {
-            let col = BTreeCollection::open("persist_test", dir.path()).unwrap();
+            let col = BTreeCollection::open("persist_test", dir.path(), None).unwrap();
             assert_eq!(col.count(), 100);
 
             let doc = col.find_one(&json!({"seq": 50})).unwrap().unwrap();
@@ -2665,7 +2665,7 @@ mod tests {
 
         // Insert docs WITHOUT calling sync_writes (simulates crash)
         {
-            let col = BTreeCollection::open("wal_test", dir.path()).unwrap();
+            let col = BTreeCollection::open("wal_test", dir.path(), None).unwrap();
             for i in 0..50 {
                 col.insert(json!({"seq": i, "data": format!("val_{}", i)})).unwrap();
             }
@@ -2674,7 +2674,7 @@ mod tests {
 
         // Reopen — WAL replay should recover all 50 docs
         {
-            let col = BTreeCollection::open("wal_test", dir.path()).unwrap();
+            let col = BTreeCollection::open("wal_test", dir.path(), None).unwrap();
             assert_eq!(col.count(), 50);
             let doc = col.find_one(&json!({"seq": 25})).unwrap().unwrap();
             assert_eq!(doc.get("data").unwrap().as_str().unwrap(), "val_25");
@@ -2687,7 +2687,7 @@ mod tests {
 
         // Phase 1: insert + persist
         {
-            let col = BTreeCollection::open("wal_ud", dir.path()).unwrap();
+            let col = BTreeCollection::open("wal_ud", dir.path(), None).unwrap();
             for i in 0..10 {
                 col.insert(json!({"key": i, "value": 0})).unwrap();
             }
@@ -2696,7 +2696,7 @@ mod tests {
 
         // Phase 2: update + delete WITHOUT persist (crash)
         {
-            let col = BTreeCollection::open("wal_ud", dir.path()).unwrap();
+            let col = BTreeCollection::open("wal_ud", dir.path(), None).unwrap();
             assert_eq!(col.count(), 10);
             // Update key=5 → value=999
             col.update(&json!({"key": 5}), &json!({"$set": {"value": 999}}), None).unwrap();
@@ -2707,7 +2707,7 @@ mod tests {
 
         // Phase 3: recover — should have 9 docs, key=5 value=999
         {
-            let col = BTreeCollection::open("wal_ud", dir.path()).unwrap();
+            let col = BTreeCollection::open("wal_ud", dir.path(), None).unwrap();
             assert_eq!(col.count(), 9);
             let doc = col.find_one(&json!({"key": 5})).unwrap().unwrap();
             let val = doc.get("value").unwrap().as_i64().unwrap();
@@ -2721,7 +2721,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let col = BTreeCollection::open("wal_cp", dir.path()).unwrap();
+            let col = BTreeCollection::open("wal_cp", dir.path(), None).unwrap();
             for i in 0..20 {
                 col.insert(json!({"seq": i})).unwrap();
             }
@@ -2735,7 +2735,7 @@ mod tests {
 
         // Reopen — no replay needed, all data from .btree file
         {
-            let col = BTreeCollection::open("wal_cp", dir.path()).unwrap();
+            let col = BTreeCollection::open("wal_cp", dir.path(), None).unwrap();
             assert_eq!(col.count(), 20);
         }
     }
