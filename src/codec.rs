@@ -9,6 +9,56 @@ pub fn encode_doc(value: &Value) -> Result<Vec<u8>> {
     Ok(owned.to_vec())
 }
 
+/// Extract a single top-level field from JSONB bytes without full decode.
+/// Returns None if the field doesn't exist or bytes are not JSONB.
+/// Much faster than decode_doc() for large nested documents.
+pub fn extract_field(bytes: &[u8], field: &str) -> Option<Value> {
+    if bytes.is_empty() {
+        return None;
+    }
+    match bytes[0] {
+        b'{' | b'[' => {
+            // Legacy JSON — must full decode (no partial extraction)
+            let doc: Value = serde_json::from_slice(bytes).ok()?;
+            doc.get(field).cloned()
+        }
+        _ => {
+            // JSONB binary — partial extraction via get_by_name
+            let raw = jsonb::RawJsonb::new(bytes);
+            let owned = raw.get_by_name(field, false).ok()??;
+            jsonb::from_raw_jsonb(&owned.as_raw()).ok()
+        }
+    }
+}
+
+/// Extract multiple top-level fields from JSONB bytes without full decode.
+pub fn extract_fields(bytes: &[u8], fields: &[&str]) -> Vec<(String, Value)> {
+    if bytes.is_empty() || fields.is_empty() {
+        return Vec::new();
+    }
+    match bytes[0] {
+        b'{' | b'[' => {
+            if let Ok(doc) = serde_json::from_slice::<Value>(bytes) {
+                fields.iter()
+                    .filter_map(|f| doc.get(*f).map(|v| (f.to_string(), v.clone())))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => {
+            let raw = jsonb::RawJsonb::new(bytes);
+            fields.iter()
+                .filter_map(|f| {
+                    let owned = raw.get_by_name(f, false).ok()??;
+                    let val = jsonb::from_raw_jsonb(&owned.as_raw()).ok()?;
+                    Some((f.to_string(), val))
+                })
+                .collect()
+        }
+    }
+}
+
 /// Decode bytes into a `serde_json::Value`.
 ///
 /// Auto-detects the format: if the first byte is `{` (0x7B) or `[` (0x5B),
