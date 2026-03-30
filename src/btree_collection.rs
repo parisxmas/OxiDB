@@ -1842,12 +1842,13 @@ impl BTreeCollection {
 
         match match_query_json {
             None => {
-                // Sequential streaming — iterates scc::HashMap by reference (no clone)
+                // Sequential streaming — use feed_raw for JSONB partial extraction
+                // (extracts only group key + accumulator fields, skips nested arrays)
                 self.storage.for_each_value(|key, bytes| {
                     if let Some(arc) = self.doc_cache.get(key) {
                         group.feed(&arc);
-                    } else if let Ok(doc) = codec::decode_doc(bytes) {
-                        group.feed(&doc);
+                    } else {
+                        group.feed_raw(bytes);
                     }
                     Ok(true)
                 })?;
@@ -1858,8 +1859,8 @@ impl BTreeCollection {
                     self.storage.for_each_value(|key, bytes| {
                         if let Some(arc) = self.doc_cache.get(key) {
                             group.feed(&arc);
-                        } else if let Ok(doc) = codec::decode_doc(bytes) {
-                            group.feed(&doc);
+                        } else {
+                            group.feed_raw(bytes);
                         }
                         Ok(true)
                     })?;
@@ -1886,7 +1887,7 @@ impl BTreeCollection {
                         }
                     } else {
                         drop(fi);
-                        // Full scan with filter
+                        // Full scan with filter — must decode for match check
                         self.storage.for_each_value(|key, bytes| {
                             if let Some(arc) = self.doc_cache.get(key) {
                                 if query::matches_value(&query, &arc) {
