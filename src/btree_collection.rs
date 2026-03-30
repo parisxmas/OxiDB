@@ -329,6 +329,13 @@ impl BTreeCollection {
 
     /// Stream all documents sequentially via B-tree cursor.
     /// Does NOT populate the LRU cache (avoids thrashing for large scans).
+    /// Collect all doc IDs from storage (lightweight, no value cloning).
+    fn collect_doc_ids(&self) -> Vec<u64> {
+        let mut ids = Vec::new();
+        self.storage.scan_keys(|k| ids.push(k));
+        ids
+    }
+
     fn for_each_doc_streaming<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(&Value) -> Result<bool>,
@@ -596,23 +603,29 @@ impl BTreeCollection {
             let wal_refs: Vec<(u64, &[u8])> = prepared.iter().map(|(id, _, b)| (*id, b.as_slice())).collect();
             self.wal.log_batch_inserts_no_sync_buffered(&wal_refs)?;
         }
+        let has_indexes = !fi.is_empty() || !ci.is_empty() || ti.is_some() || !vi.is_empty();
+        let skip_cache = prepared.len() > 1000;
         for (id, data, bytes) in prepared {
             self.storage.insert(id, bytes);
 
-            let data_arc = Arc::new(data);
-            for idx in fi.values_mut() {
-                idx.insert_value(id, &data_arc);
+            if has_indexes || !skip_cache {
+                let data_arc = Arc::new(data);
+                for idx in fi.values_mut() {
+                    idx.insert_value(id, &data_arc);
+                }
+                for idx in ci.iter_mut() {
+                    idx.insert_value(id, &data_arc);
+                }
+                if let Some(ref mut text_idx) = *ti {
+                    text_idx.index_doc(id, &data_arc);
+                }
+                for idx in vi.values_mut() {
+                    let _ = idx.insert(id, &data_arc);
+                }
+                if !skip_cache {
+                    self.doc_cache.put(id, data_arc);
+                }
             }
-            for idx in ci.iter_mut() {
-                idx.insert_value(id, &data_arc);
-            }
-            if let Some(ref mut text_idx) = *ti {
-                text_idx.index_doc(id, &data_arc);
-            }
-            for idx in vi.values_mut() {
-                let _ = idx.insert(id, &data_arc);
-            }
-            self.doc_cache.put(id, data_arc);
             ids.push(id);
         }
         if !ids.is_empty() {
@@ -1829,16 +1842,25 @@ impl BTreeCollection {
 
         match match_query_json {
             None => {
-                self.for_each_doc_unordered(|doc| {
-                    group.feed(doc);
+                // Sequential streaming — iterates scc::HashMap by reference (no clone)
+                self.storage.for_each_value(|key, bytes| {
+                    if let Some(arc) = self.doc_cache.get(key) {
+                        group.feed(&arc);
+                    } else if let Ok(doc) = codec::decode_doc(bytes) {
+                        group.feed(&doc);
+                    }
                     Ok(true)
                 })?;
             }
             Some(match_val) => {
                 let query = query::parse_query(match_val)?;
                 if matches!(query, Query::All) {
-                    self.for_each_doc_unordered(|doc| {
-                        group.feed(doc);
+                    self.storage.for_each_value(|key, bytes| {
+                        if let Some(arc) = self.doc_cache.get(key) {
+                            group.feed(&arc);
+                        } else if let Ok(doc) = codec::decode_doc(bytes) {
+                            group.feed(&doc);
+                        }
                         Ok(true)
                     })?;
                 } else {
@@ -1864,10 +1886,16 @@ impl BTreeCollection {
                         }
                     } else {
                         drop(fi);
-                        // Full scan with filter (order doesn't matter for aggregation)
-                        self.for_each_doc_unordered(|doc| {
-                            if query::matches_value(&query, doc) {
-                                group.feed(doc);
+                        // Full scan with filter
+                        self.storage.for_each_value(|key, bytes| {
+                            if let Some(arc) = self.doc_cache.get(key) {
+                                if query::matches_value(&query, &arc) {
+                                    group.feed(&arc);
+                                }
+                            } else if let Ok(doc) = codec::decode_doc(bytes) {
+                                if query::matches_value(&query, &doc) {
+                                    group.feed(&doc);
+                                }
                             }
                             Ok(true)
                         })?;
