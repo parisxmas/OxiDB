@@ -1879,8 +1879,15 @@ impl BTreeCollection {
 
                     if let Some(ref ids) = candidate_ids {
                         for &id in ids {
-                            if let Some(arc) = self.load_doc_arc(id) {
-                                if skip_post_filter || query::matches_value(&query, &arc) {
+                            if skip_post_filter {
+                                // Index guarantees match — use feed_raw (no full decode)
+                                if let Some(arc) = self.doc_cache.get(id) {
+                                    group.feed(&arc);
+                                } else if let Some(bytes) = self.storage.get(id) {
+                                    group.feed_raw(&bytes);
+                                }
+                            } else if let Some(arc) = self.load_doc_arc(id) {
+                                if query::matches_value(&query, &arc) {
                                     group.feed(&arc);
                                 }
                             }
