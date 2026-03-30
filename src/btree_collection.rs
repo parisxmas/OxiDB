@@ -1375,6 +1375,12 @@ impl BTreeCollection {
             deleted_ids.push(op.id);
         }
         if !deleted_ids.is_empty() {
+            // Compact empty entries from field indexes in one pass (avoids O(n) shift per delete)
+            if deleted_ids.len() > 100 {
+                for idx in fi.values_mut() {
+                    idx.compact_entries();
+                }
+            }
             self.dirty.store(true, Ordering::Release);
         }
 
