@@ -1412,28 +1412,17 @@ fn main() {
         }
     }
 
-    let (tx, rx) = mpsc::channel::<TcpStream>();
-    let rx = Arc::new(Mutex::new(rx));
-
-    for _ in 0..pool_size {
-        let rx = Arc::clone(&rx);
-        let state = Arc::clone(&state);
-        let tls_config = tls_config.clone();
-        std::thread::spawn(move || loop {
-            let stream = rx.lock().unwrap().recv();
-            match stream {
-                Ok(stream) => handle_client(stream, &state, idle_timeout, tls_config.as_ref()),
-                Err(_) => break,
-            }
-        });
-    }
-
+    // Accept loop — spawn a thread per connection.
+    // No fixed pool_size limit: concurrent connections scale with OS thread capacity.
+    listener.set_nonblocking(false).expect("failed to set blocking");
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                if let Err(e) = tx.send(s) {
-                    server_log!(state, GelfLevel::Error, format!("failed to dispatch connection: {e}"));
-                }
+                let state = Arc::clone(&state);
+                let tls_config = tls_config.clone();
+                std::thread::spawn(move || {
+                    handle_client(s, &state, idle_timeout, tls_config.as_ref());
+                });
             }
             Err(e) => {
                 server_log!(state, GelfLevel::Error, format!("accept error: {e}"));
