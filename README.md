@@ -70,7 +70,8 @@ docker compose up -d
 | `OXIDB_S3_CREDENTIALS` | — | Path to S3 credentials file |
 | `OXIDB_S3_ENCRYPTION_KEY` | — | Hex-encoded 32-byte AES-256 key for S3 SSE |
 | `OXIDB_S3_DEFAULT_ENCRYPTION` | `false` | Encrypt all S3 objects by default |
-| `OXIDB_BTREE` | `true` | Use B-tree storage engine (set `false` for legacy append-only) |
+| `OXIDB_UDP_PORT` | — | Enable UDP GELF/JSON log ingestion on this port |
+| `OXIDB_UDP_COLLECTION` | `_udp_logs` | Collection name for UDP log ingestion |
 | `OXIDB_LOG_COMMANDS` | `false` | Log OxiMem/MQTT commands |
 
 ## Features
@@ -82,8 +83,7 @@ docker compose up -d
 - **Aggregation pipeline** — 11 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`, `$out`; index-accelerated `$group` for count, sum, min, max, avg
 - **Indexes** — field, unique, composite, full-text, and vector indexes with automatic backfill; list and drop support
 - **Vector search** — k-nearest-neighbor similarity search with cosine, Euclidean, and dot product metrics; flat (exact) for small collections, HNSW (approximate) for large; zero external dependencies
-- **B-tree storage engine** (default) — DashMap-based concurrent document storage with interior mutability; reads never block reads, writes to different documents proceed in parallel; PagedFieldIndex (sorted Vec with binary search) for cache-friendly index access
-- **Memory-mapped indexes** — primary index (`.pidx`) and field indexes (`.fidx2`) use mmap for zero-startup-cost loading; OS pages in data on demand, no RAM preloading (append-only engine)
+- **B-tree storage engine** — `scc::HashMap` concurrent document storage with interior mutability; reads never block reads, writes to different documents proceed in parallel; WAL for crash safety; persisted field indexes for instant startup
 - **Zero-copy reads** — `find_one`, `update`, and `delete` use Arc-based document iteration, cloning only matching documents instead of every visited document
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
 - **S3-compatible API** — full HTTP REST API with path-style requests, multipart upload, range reads, object tagging, copy, conditional requests, SSE-S3/SSE-C encryption; compatible with AWS CLI and boto3
@@ -103,8 +103,10 @@ docker compose up -d
 - **Cron scheduler** — built-in background scheduler that runs stored procedures on cron expressions (`"0 3 * * *"`) or fixed intervals (`"30s"`, `"5m"`, `"2h"`), with run history tracking
 - **GELF logging** — centralized UDP logging to Graylog/Loki via `OXIDB_GELF_ADDR`
 - **Compaction** — reclaim space from deleted documents with atomic file swap
-- **Concurrent access** — DashMap storage + RwLock-per-index interior mutability allows lock-free document reads and fine-grained write concurrency; 72K mixed ops/sec with 10 concurrent workers
-- **Stripe-level locking** — 16 internal stripes per collection in append-only engine; parallel index building with rayon uses all CPU cores
+- **Concurrent access** — `scc::HashMap` storage + RwLock-per-index interior mutability; lock-free document reads, fine-grained write concurrency; 32K mixed ops/sec with 10 concurrent workers
+- **Query optimizer** — selectivity-based index selection; picks the most selective condition in AND queries using index cardinality estimates
+- **JSONB partial extraction** — aggregation extracts only needed fields from binary docs, skipping nested arrays; 1M × 3KB docs aggregated in 300-700ms
+- **UDP log ingestion** — high-throughput fire-and-forget GELF/JSON receiver; 197K msg/sec with SO_REUSEPORT multi-thread listeners
 - **VS Code extension** — collection browser, MongoDB-style query editor, OxiScript syntax highlighting
 - **CLI tool** — interactive shell with JSON-based syntax, embedded and client modes
 - **Multi-language clients** — Python, Go, Java/Spring Boot, Julia, .NET, Swift/iOS — all zero or minimal dependencies
@@ -585,66 +587,74 @@ Cross-shard transactions are detected and rejected.
 
 ## Benchmark: OxiDB vs MongoDB 8
 
-100K documents, 14 fields each, 8 indexed fields. Native Apple Silicon, B-tree engine. OxiDB wins 17/18 tests.
+100K documents, 12 fields each, 8 indexed fields. Native Apple Silicon. **OxiDB wins 18/18 tests.**
 
-| Category | Operation | OxiDB | MongoDB | Winner |
-|----------|-----------|-------|---------|--------|
-| **INSERT** | 100K docs (batch 5000) | 2.3s | 2.9s | OxiDB 1.2x |
-| **INDEX** | 8 indexes | 101ms | 2.7s | OxiDB 27x |
-| **QUERY** | Exact match (indexed) | 240µs | 1ms | OxiDB 7x |
-| | Equality (indexed) | 1ms | 54ms | OxiDB 31x |
-| | Range (indexed) | 4ms | 120ms | OxiDB 28x |
-| | Range + equality | 17ms | 45ms | OxiDB 2.6x |
-| | Multi-condition AND | 4ms | 25ms | OxiDB 6x |
-| | Unindexed scan | 60ms | 59ms | Tied |
-| | find_one (indexed) | 156µs | 331µs | OxiDB 2x |
-| | Count (indexed) | 70µs | 1ms | OxiDB 16x |
-| | Sort + limit 10 (indexed) | 140µs | 496µs | OxiDB 3.5x |
-| **UPDATE** | UpdateOne (indexed) | 84µs | 333µs | OxiDB 4x |
-| | UpdateMany (bulk) | 1ms | 31ms | OxiDB 20x |
-| **AGGREGATE** | Group by dept + avg salary | 19ms | 26ms | OxiDB 1.4x |
-| | Match region + group dept | 17ms | 18ms | OxiDB 1.1x |
-| | Group by city + full stats | 20ms | 33ms | OxiDB 1.6x |
-| **CONCURRENT** | find_one (10 workers) | 11ms | 14ms | OxiDB 1.4x |
-| **DELETE** | DeleteMany | 4ms | 970ms | OxiDB 215x |
+| Category | Operation | OxiDB | MongoDB | Ratio |
+|----------|-----------|-------|---------|-------|
+| **INSERT** | 100K docs (batch 5000) | 786ms | 2.73s | **3.5x** |
+| **INDEX** | 8 indexes | 317ms | 2.66s | **8.4x** |
+| **QUERY** | Exact match (indexed) | 151µs | 1ms | **8x** |
+| | Equality (indexed) | 1ms | 50ms | **40x** |
+| | Range (indexed) | 4ms | 122ms | **30x** |
+| | Range + equality | 7ms | 43ms | **5.4x** |
+| | Multi-condition AND | 2ms | 100ms | **37x** |
+| | Unindexed scan | 5ms | 59ms | **11x** |
+| | find_one (indexed) | 119µs | 277µs | **2.3x** |
+| | Count (indexed) | 83µs | 1ms | **13x** |
+| | Sort + limit 10 | 99µs | 376µs | **3.8x** |
+| **UPDATE** | UpdateOne (indexed) | 129µs | 187µs | **1.4x** |
+| | UpdateMany (bulk) | 1ms | 38ms | **25x** |
+| **AGGREGATE** | Group by dept + avg | 20ms | 27ms | **1.3x** |
+| | Match region + group | 3ms | 9ms | **2.9x** |
+| | Group by city + stats | 13ms | 30ms | **2.3x** |
+| **CONCURRENT** | find_one (10 workers) | 14ms | 55ms | **3.8x** |
+| **DELETE** | DeleteMany | 3ms | 479ms | **126x** |
 
-**Concurrent mixed workload** (10 workers, 70% read / 20% update / 10% insert): OxiDB 72K ops/sec vs MongoDB 43K ops/sec.
+**Concurrent mixed workload** (10 workers, 70% read / 20% update / 10% insert): OxiDB 32K ops/sec vs MongoDB 19K ops/sec.
 
-Benchmark source: [`tests/benchmark-1m/`](tests/benchmark-1m/)
+### 1M Telco CRM Scenario (nested documents, ~3KB each)
+
+| Operation | Time |
+|-----------|------|
+| Insert 1M customers | 2m7s (8K/sec) |
+| Create 10 indexes | 40s |
+| Customer lookup (indexed) | 177-343µs |
+| Count (indexed) | 25-93µs |
+| Aggregation (group by region) | 430ms |
+| Aggregation (match + group) | 114-317ms |
+| Campaign update (125K docs) | 14s |
+
+Benchmark sources: [`tests/benchmark-1m/`](tests/benchmark-1m/) | [`tests/go-complex-tests/`](tests/go-complex-tests/) | [`tests/telco-15m-go/`](tests/telco-15m-go/)
 
 ## Architecture
 
-### Storage Engines
+### Storage Engine
 
-OxiDB provides two storage engines, selected via `OXIDB_BTREE` (default: `true`):
-
-**B-tree engine** (default) — `DashMap<doc_id, JSONB bytes>` with concurrent access. Documents are stored in a sharded hash map that allows lock-free reads and parallel writes. Indexes use `PagedFieldIndex` (sorted `Vec` with binary search) wrapped in per-index `RwLock` for fine-grained concurrency. Persistence via periodic serialization to `.btree` files.
-
-**Append-only engine** — each collection is a `.dat` file: `[status: u8][length: u32 LE][JSONB bytes]`. Deletes flip the status byte in place. Uses memory-mapped primary index (`.pidx`) and field indexes (`.fidx2`) for zero-startup-cost loading. Write-ahead log with CRC32 checksums and 3-fsync protocol for crash safety. 16-stripe locking for write concurrency.
+`scc::HashMap<doc_id, JSONB bytes>` with interior mutability. Documents stored in a lock-free concurrent hash map. Indexes use `PagedFieldIndex` (sorted `Vec` with binary search) wrapped in per-index `RwLock`. Persistence via WAL + periodic `.btree` file serialization. Persisted field indexes (`.fidx`) for instant startup.
 
 ### Concurrency Model
 
-The B-tree engine uses **interior mutability** — each component handles its own locking:
-- **Storage** — `DashMap` (sharded concurrent hash map): reads and writes to different documents proceed in parallel
-- **Indexes** — `RwLock` per index group: queries (read lock) never block other queries; writes (write lock) only block during index mutation
-- **Document cache** — 16-shard LRU with per-shard `Mutex`: near-zero contention for cached reads
-- **ID generation** — `AtomicU64`: lock-free sequential ID allocation
+Interior mutability — no collection-level lock:
+- **Storage** — `scc::HashMap`: lock-free reads, parallel writes to different documents
+- **Indexes** — `RwLock` per index group: queries never block other queries
+- **Document cache** — 16-shard LRU with per-shard `Mutex`
+- **ID generation** — `AtomicU64`
 
-This eliminates the collection-level write lock that previously serialized all operations.
+### Write-Ahead Log
 
-### Write-Ahead Log (.wal files)
-
-Every mutation in the append-only engine is logged before touching the data file. Batch operations use a 3-fsync protocol: WAL write + fsync, data mutations + fsync, WAL checkpoint + fsync. On startup the WAL is replayed idempotently and then truncated.
+Every insert/update/delete is logged to a `.wal` file before mutating storage. On crash recovery, WAL entries are replayed to restore un-persisted writes. WAL is checkpointed (truncated) after each successful `.btree` file persist (~every 10ms when dirty).
 
 ### Performance Optimizations
 
-- **Concurrent document access** — DashMap storage allows parallel reads/writes without collection-level locking
-- **Index-level sort+limit** — sort queries with limit use index iteration with cross-index membership checks, avoiding full document loading
-- **Dirty-flag persistence** — background sync only writes to disk when data has changed, eliminating redundant I/O
-- **Cache-accelerated aggregation** — streaming aggregation checks the doc cache before decoding JSONB bytes; unordered iteration for grouping avoids unnecessary key sorting
-- **Parallel JSONB encoding** — `insert_many` encodes documents in parallel using rayon before acquiring any locks
-- **Zero-copy iteration** — `find_one`, `update`, and `delete` use `Arc<Value>` references, cloning only matching documents
-- **Index-accelerated aggregation** — `$group` with count/sum accumulators reads group counts directly from the index without touching documents
+- **`scc::HashMap`** — write-optimized concurrent hash map with finer-grained bucket locks than DashMap
+- **Selectivity-based query optimizer** — AND queries pick the most selective index condition first using `count_eq`/`count_range` cardinality estimates
+- **JSONB partial extraction** — aggregation uses `feed_raw()` to extract only group key + accumulator fields from binary docs, skipping nested arrays (17-50x faster on large nested documents)
+- **Parallel cache-based scan** — unindexed queries use rayon parallel filter with doc_cache hits (11x faster than MongoDB)
+- **Index-level sort+limit** — sort queries with limit use index iteration with cross-index membership checks
+- **Deferred index compaction** — bulk delete skips per-entry Vec shifts, compacts once at end (34x faster DeleteMany)
+- **Dirty-flag persistence** — background sync only writes to disk when data has changed
+- **Parallel JSONB encoding** — `insert_many` encodes documents in parallel using rayon
+- **Index persistence** — field/composite indexes saved to `.fidx`/`.cidx` files; loaded on startup if doc_count matches
 
 ### IndexValue Type Ordering
 
