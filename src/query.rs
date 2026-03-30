@@ -3,11 +3,52 @@ use std::ops::Bound;
 
 use serde_json::Value as JsonValue;
 
+use std::collections::HashMap;
+
 use crate::document::{Document, DocumentId};
 use crate::error::{Error, Result};
 use crate::index::CompositeIndex;
 use crate::paged_field_index::PagedFieldIndex;
 use crate::value::IndexValue;
+
+// ---------------------------------------------------------------------------
+// Query cost estimation (selectivity-based index selection)
+// ---------------------------------------------------------------------------
+
+/// Estimate how many documents a query condition would match using index metadata.
+/// Returns None if the condition can't be estimated (no index, regex, exists, etc.).
+pub fn estimate_rows(query: &Query, field_indexes: &HashMap<String, PagedFieldIndex>) -> Option<usize> {
+    match query {
+        Query::All => None,
+        Query::Field { field, op } => {
+            let idx = field_indexes.get(field.as_str())?;
+            match op {
+                QueryOp::Eq(v) => Some(idx.count_eq(v)),
+                QueryOp::Ne(v) => Some(idx.count_all().saturating_sub(idx.count_eq(v))),
+                QueryOp::Gt(v) => Some(idx.count_range(Bound::Excluded(v), Bound::Unbounded)),
+                QueryOp::Gte(v) => Some(idx.count_range(Bound::Included(v), Bound::Unbounded)),
+                QueryOp::Lt(v) => Some(idx.count_range(Bound::Unbounded, Bound::Excluded(v))),
+                QueryOp::Lte(v) => Some(idx.count_range(Bound::Unbounded, Bound::Included(v))),
+                QueryOp::In(vals) => Some(idx.count_in(vals)),
+                QueryOp::Nin(_) | QueryOp::Exists(_) | QueryOp::Regex(_) => None,
+            }
+        }
+        Query::And(subs) => {
+            // Min of all estimable sub-queries (intersection can't exceed smallest)
+            let estimates: Vec<usize> = subs.iter()
+                .filter_map(|s| estimate_rows(s, field_indexes))
+                .collect();
+            if estimates.is_empty() { None } else { Some(*estimates.iter().min().unwrap()) }
+        }
+        Query::Or(subs) => {
+            // Sum of all (upper bound)
+            let estimates: Vec<usize> = subs.iter()
+                .filter_map(|s| estimate_rows(s, field_indexes))
+                .collect();
+            if estimates.is_empty() { None } else { Some(estimates.iter().sum()) }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Find options: sort / skip / limit
@@ -434,21 +475,21 @@ pub fn execute_indexed_lazy(
                 });
                 return Some(cont);
             }
-            // For AND with multiple indexed conditions, find the most selective
-            // sub-query (smallest estimated result set), iterate it lazily,
-            // and post-filter the rest.
-            let mut indexable_idx: Option<usize> = None;
+            // For AND with multiple indexed conditions, pick the most selective
+            // sub-query (smallest estimated result set) and iterate it lazily.
+            let mut best_idx: Option<(usize, usize)> = None; // (index, estimated_rows)
             let mut all_indexable = true;
             for (i, sub) in subs.iter().enumerate() {
                 if execute_indexed(sub, field_indexes, &[]).is_some() {
-                    if indexable_idx.is_none() {
-                        indexable_idx = Some(i);
+                    let est = estimate_rows(sub, field_indexes).unwrap_or(usize::MAX);
+                    if best_idx.is_none() || est < best_idx.unwrap().1 {
+                        best_idx = Some((i, est));
                     }
                 } else {
                     all_indexable = false;
                 }
             }
-            if let Some(idx) = indexable_idx {
+            if let Some((idx, _)) = best_idx {
                 let sub = &subs[idx];
 
                 // If there are other indexed subs, materialize them for intersection
