@@ -37,6 +37,7 @@ use oxidb::OxiDb;
 use oxidb::query::FindOptions;
 use serde_json::{json, Value};
 
+use crate::jwt;
 use crate::s3::http::{parse_request_from_reader, HttpRequest, HttpResponse};
 
 const POOL_SIZE: usize = 64;
@@ -45,18 +46,27 @@ const MAX_QUEUED: usize = 512;
 struct RestState {
     db: Arc<OxiDb>,
     active: AtomicUsize,
+    /// JWT secret. When `Some`, auth is enforced on all non-public endpoints.
+    jwt_secret: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn start_rest_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<()> {
+pub fn start_rest_listener(addr: &str, db: Arc<OxiDb>, jwt_secret: Option<String>) -> std::thread::JoinHandle<()> {
     let listener = TcpListener::bind(addr).expect("failed to bind REST HTTP listener");
+
+    if jwt_secret.is_some() {
+        eprintln!("[rest] JWT authentication enabled");
+    } else {
+        eprintln!("[rest] WARNING: no OXIDB_JWT_SECRET — REST API is open (no auth)");
+    }
 
     let state = Arc::new(RestState {
         db,
         active: AtomicUsize::new(0),
+        jwt_secret,
     });
 
     let (conn_tx, conn_rx) = std::sync::mpsc::sync_channel::<TcpStream>(MAX_QUEUED);
@@ -149,8 +159,34 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         return with_rest_cors(json_response(204, "No Content", json!(null)));
     }
 
+    // ── Auth endpoints (always public) ──────────────────────────────────
     let result = match (req.method.as_str(), segments.as_slice()) {
-        // Health
+        ("POST", ["api", "auth", "signup"]) => return with_rest_cors(handle_auth_signup(req, state)),
+        ("POST", ["api", "auth", "login"]) => return with_rest_cors(handle_auth_login(req, state)),
+        ("GET", ["api", "auth", "verify"]) => return with_rest_cors(handle_auth_verify(req, state)),
+        ("GET", ["api", "ping"]) => return with_rest_cors(json_response(200, "OK", json!({"status": "ok", "data": "pong"}))),
+        _ => None::<Value>,
+    };
+    if let Some(_) = result {
+        // handled above via early return
+    }
+
+    // ── JWT enforcement ──────────────────────────────────────────────
+    if let Some(ref secret) = state.jwt_secret {
+        let auth_header = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
+        if let Some(token) = jwt::extract_bearer(auth_header) {
+            match jwt::verify(token, secret) {
+                Ok(_claims) => {} // authenticated — proceed
+                Err(e) => return with_rest_cors(json_response(401, "Unauthorized", json!({"error": e}))),
+            }
+        } else {
+            return with_rest_cors(json_response(401, "Unauthorized", json!({"error": "missing Authorization: Bearer <token>"})));
+        }
+    }
+
+    // ── Protected endpoints ──────────────────────────────────────────
+    let result = match (req.method.as_str(), segments.as_slice()) {
+        // Health (also available above without auth, but keep for pattern match)
         ("GET", ["api", "ping"]) => Ok(json!({"status": "ok", "data": "pong"})),
 
         // Collections
@@ -399,6 +435,86 @@ fn handle_call_procedure(name: &str, req: &HttpRequest, state: &RestState) -> Re
 fn handle_delete_procedure(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
     state.db.delete_procedure(name).map_err(db_err)?;
     Ok(json!({"deleted": name}))
+}
+
+// ---------------------------------------------------------------------------
+// Auth handlers
+// ---------------------------------------------------------------------------
+
+fn handle_auth_signup(req: &HttpRequest, state: &RestState) -> HttpResponse {
+    let secret = match &state.jwt_secret {
+        Some(s) => s,
+        None => return json_response(400, "Bad Request", json!({"error": "auth not enabled (set OXIDB_JWT_SECRET)"})),
+    };
+    let body = match serde_json::from_slice::<Value>(&req.body) {
+        Ok(v) => v,
+        Err(_) => return json_response(400, "Bad Request", json!({"error": "invalid JSON"})),
+    };
+    let username = match body["username"].as_str() {
+        Some(u) => u,
+        None => return json_response(400, "Bad Request", json!({"error": "missing 'username'"})),
+    };
+    let password = match body["password"].as_str() {
+        Some(p) => p,
+        None => return json_response(400, "Bad Request", json!({"error": "missing 'password'"})),
+    };
+    let role = body["role"].as_str().unwrap_or("readwrite");
+
+    match jwt::signup(&state.db, username, password, role) {
+        Ok(user) => {
+            // Auto-login: return a token immediately
+            match jwt::login(&state.db, username, password, secret) {
+                Ok(token) => json_response(201, "Created", json!({"user": user, "token": token})),
+                Err(e) => json_response(500, "Internal Server Error", json!({"error": e})),
+            }
+        }
+        Err(e) => json_response(409, "Conflict", json!({"error": e})),
+    }
+}
+
+fn handle_auth_login(req: &HttpRequest, state: &RestState) -> HttpResponse {
+    let secret = match &state.jwt_secret {
+        Some(s) => s,
+        None => return json_response(400, "Bad Request", json!({"error": "auth not enabled (set OXIDB_JWT_SECRET)"})),
+    };
+    let body = match serde_json::from_slice::<Value>(&req.body) {
+        Ok(v) => v,
+        Err(_) => return json_response(400, "Bad Request", json!({"error": "invalid JSON"})),
+    };
+    let username = match body["username"].as_str() {
+        Some(u) => u,
+        None => return json_response(400, "Bad Request", json!({"error": "missing 'username'"})),
+    };
+    let password = match body["password"].as_str() {
+        Some(p) => p,
+        None => return json_response(400, "Bad Request", json!({"error": "missing 'password'"})),
+    };
+
+    match jwt::login(&state.db, username, password, secret) {
+        Ok(token) => json_response(200, "OK", json!({"token": token})),
+        Err(e) => json_response(401, "Unauthorized", json!({"error": e})),
+    }
+}
+
+fn handle_auth_verify(req: &HttpRequest, state: &RestState) -> HttpResponse {
+    let secret = match &state.jwt_secret {
+        Some(s) => s,
+        None => return json_response(400, "Bad Request", json!({"error": "auth not enabled"})),
+    };
+    let auth_header = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
+    let token = match jwt::extract_bearer(auth_header) {
+        Some(t) => t,
+        None => return json_response(401, "Unauthorized", json!({"error": "missing Bearer token"})),
+    };
+    match jwt::verify(token, secret) {
+        Ok(claims) => json_response(200, "OK", json!({
+            "valid": true,
+            "username": claims.sub,
+            "role": claims.role,
+            "exp": claims.exp,
+        })),
+        Err(e) => json_response(401, "Unauthorized", json!({"error": e})),
+    }
 }
 
 // ---------------------------------------------------------------------------
