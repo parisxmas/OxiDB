@@ -14,6 +14,7 @@ pub mod session;
 pub mod tls;
 pub mod udp_ingest;
 
+pub mod jwt;
 pub mod rest;
 pub mod ws;
 

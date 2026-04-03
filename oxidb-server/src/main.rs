@@ -1387,6 +1387,9 @@ fn main() {
         }
     }
 
+    // JWT secret for REST/WS auth (optional)
+    let jwt_secret = env::var("OXIDB_JWT_SECRET").ok().filter(|s| !s.is_empty());
+
     // REST HTTP API (optional, enabled via OXIDB_HTTP_PORT)
     let http_port: u16 = env::var("OXIDB_HTTP_PORT")
         .unwrap_or_else(|_| "0".to_string())
@@ -1396,7 +1399,7 @@ fn main() {
     if http_port > 0 {
         let http_addr = format!("0.0.0.0:{http_port}");
         let http_db = Arc::clone(&state.db);
-        oxidb_server::rest::start_rest_listener(&http_addr, http_db);
+        oxidb_server::rest::start_rest_listener(&http_addr, http_db, jwt_secret.clone());
         server_log!(state, GelfLevel::Notice,
             format!("REST HTTP API listening on {http_addr}"));
     }
@@ -1410,7 +1413,7 @@ fn main() {
     if ws_port > 0 {
         let ws_addr = format!("0.0.0.0:{ws_port}");
         let ws_db = Arc::clone(&state.db);
-        oxidb_server::ws::start_ws_listener(&ws_addr, ws_db);
+        oxidb_server::ws::start_ws_listener(&ws_addr, ws_db, jwt_secret.clone());
         server_log!(state, GelfLevel::Notice,
             format!("WebSocket API listening on {ws_addr}"));
     }

@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 
 use oxidb::OxiDb;
 use oxidb::change_stream::{WatchFilter, WatchHandle, SubscriberId};
+use crate::jwt;
 
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
@@ -43,18 +44,24 @@ const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-5AB5DC11D685";
 struct WsState {
     db: Arc<OxiDb>,
     active: AtomicUsize,
+    jwt_secret: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn start_ws_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<()> {
+pub fn start_ws_listener(addr: &str, db: Arc<OxiDb>, jwt_secret: Option<String>) -> std::thread::JoinHandle<()> {
     let listener = TcpListener::bind(addr).expect("failed to bind WebSocket listener");
+
+    if jwt_secret.is_some() {
+        eprintln!("[ws] JWT authentication enabled (send {{\"cmd\":\"auth\",\"token\":\"...\"}} first)");
+    }
 
     let state = Arc::new(WsState {
         db,
         active: AtomicUsize::new(0),
+        jwt_secret,
     });
 
     let (conn_tx, conn_rx) = std::sync::mpsc::sync_channel::<TcpStream>(MAX_QUEUED);
@@ -267,6 +274,42 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
 
     if !do_handshake(&mut stream) {
         return;
+    }
+
+    // JWT auth: if enabled, require {"cmd": "auth", "token": "..."} as first message
+    let mut authenticated = state.jwt_secret.is_none(); // open if no secret
+    if !authenticated {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+        match read_frame(&mut stream) {
+            Some((0x01, payload)) => {
+                if let Ok(text) = std::str::from_utf8(&payload) {
+                    if let Ok(cmd) = serde_json::from_str::<Value>(text) {
+                        if cmd["cmd"].as_str() == Some("auth") {
+                            if let Some(token) = cmd["token"].as_str() {
+                                if let Some(ref secret) = state.jwt_secret {
+                                    match jwt::verify(token, secret) {
+                                        Ok(_claims) => {
+                                            authenticated = true;
+                                            let _ = send_json(&mut stream, &json!({"ok": true, "data": "authenticated"}));
+                                        }
+                                        Err(e) => {
+                                            let _ = send_json(&mut stream, &json!({"ok": false, "error": e}));
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if !authenticated {
+            let _ = send_json(&mut stream, &json!({"ok": false, "error": "auth required: send {\"cmd\":\"auth\",\"token\":\"...\"}"}));
+            return;
+        }
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
     }
 
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
