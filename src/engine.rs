@@ -199,6 +199,7 @@ impl OxiDb {
                             let cols = db.collections.read();
                             for col_arc in cols.values() {
                                 col_arc.evict_expired();
+                                col_arc.evict_ttl_indexed();
                             }
                         }
                         _ => break, // Shutdown signal or channel closed
@@ -743,6 +744,16 @@ impl OxiDb {
     ) -> Result<String> {
         let col = self.get_or_create_collection(collection)?;
         col.create_composite_index(fields)
+    }
+
+    pub fn create_ttl_index(
+        &self,
+        collection: &str,
+        field: &str,
+        expire_after_seconds: u64,
+    ) -> Result<()> {
+        let col = self.get_or_create_collection(collection)?;
+        col.create_ttl_index(field, expire_after_seconds)
     }
 
     pub fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>> {
@@ -2259,6 +2270,164 @@ mod tests {
         let docs = db.find("cache", &json!({})).unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0]["key"], "permanent");
+    }
+
+    #[test]
+    fn ttl_index_create_and_list() {
+        let db = mem_db();
+        db.create_ttl_index("sessions", "created_at", 3600).unwrap();
+
+        let indexes = db.list_indexes("sessions").unwrap();
+        // Should have both a field index on "created_at" and a TTL index
+        let ttl_idx = indexes.iter().find(|i| i.index_type == "ttl").unwrap();
+        assert_eq!(ttl_idx.name, "created_at_ttl");
+        assert_eq!(ttl_idx.fields, vec!["created_at".to_string()]);
+        assert_eq!(ttl_idx.expire_after_seconds, Some(3600));
+
+        let field_idx = indexes.iter().find(|i| i.index_type == "field").unwrap();
+        assert_eq!(field_idx.name, "created_at");
+    }
+
+    #[test]
+    fn ttl_index_evicts_expired_docs() {
+        let db = mem_db();
+        // TTL of 1 second
+        db.create_ttl_index("sessions", "created_at", 1).unwrap();
+
+        // Insert a doc with a timestamp 5 seconds in the past (should be expired)
+        let past = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let past_str = past.to_rfc3339();
+        db.insert("sessions", json!({"user": "expired", "created_at": past_str})).unwrap();
+
+        // Insert a doc with current timestamp (should survive)
+        let now_str = chrono::Utc::now().to_rfc3339();
+        db.insert("sessions", json!({"user": "active", "created_at": now_str})).unwrap();
+
+        // Both exist before eviction
+        let docs = db.find("sessions", &json!({})).unwrap();
+        assert_eq!(docs.len(), 2);
+
+        // Run eviction
+        {
+            let col = db.get_or_create_collection("sessions").unwrap();
+            let evicted = col.evict_ttl_indexed();
+            assert_eq!(evicted, 1);
+        }
+
+        // Only the active doc remains
+        let docs = db.find("sessions", &json!({})).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["user"], "active");
+    }
+
+    #[test]
+    fn ttl_index_no_eviction_before_expiry() {
+        let db = mem_db();
+        // TTL of 1 hour
+        db.create_ttl_index("cache", "ts", 3600).unwrap();
+
+        // Insert a doc with current timestamp — should NOT be evicted
+        let now_str = chrono::Utc::now().to_rfc3339();
+        db.insert("cache", json!({"key": "fresh", "ts": now_str})).unwrap();
+
+        {
+            let col = db.get_or_create_collection("cache").unwrap();
+            let evicted = col.evict_ttl_indexed();
+            assert_eq!(evicted, 0);
+        }
+
+        let docs = db.find("cache", &json!({})).unwrap();
+        assert_eq!(docs.len(), 1);
+    }
+
+    #[test]
+    fn ttl_index_idempotent_create() {
+        let db = mem_db();
+        db.create_ttl_index("logs", "timestamp", 86400).unwrap();
+        db.create_ttl_index("logs", "timestamp", 86400).unwrap(); // should not error
+
+        let indexes = db.list_indexes("logs").unwrap();
+        let ttl_count = indexes.iter().filter(|i| i.index_type == "ttl").count();
+        assert_eq!(ttl_count, 1);
+    }
+
+    #[test]
+    fn ttl_index_drop() {
+        let db = mem_db();
+        db.create_ttl_index("sessions", "created_at", 3600).unwrap();
+
+        // Verify it exists
+        let indexes = db.list_indexes("sessions").unwrap();
+        assert!(indexes.iter().any(|i| i.name == "created_at_ttl"));
+
+        // Drop it
+        db.drop_index("sessions", "created_at_ttl").unwrap();
+
+        // Verify it's gone
+        let indexes = db.list_indexes("sessions").unwrap();
+        assert!(!indexes.iter().any(|i| i.name == "created_at_ttl"));
+    }
+
+    #[test]
+    fn ttl_index_persists_across_restart() {
+        let dir = tempdir().unwrap();
+
+        // Phase 1: create TTL index and insert docs
+        {
+            let db = OxiDb::open(dir.path()).unwrap();
+            db.create_ttl_index("sessions", "created_at", 2).unwrap();
+
+            // Insert an already-expired doc (5s ago, TTL=2s)
+            let past = chrono::Utc::now() - chrono::Duration::seconds(5);
+            db.insert("sessions", json!({"user": "old", "created_at": past.to_rfc3339()})).unwrap();
+
+            // Insert a fresh doc
+            db.insert("sessions", json!({"user": "new", "created_at": chrono::Utc::now().to_rfc3339()})).unwrap();
+
+            // Flush to disk
+            let col = db.get_or_create_collection("sessions").unwrap();
+            let _ = col.sync_writes();
+        }
+        // db dropped — simulates shutdown
+
+        // Phase 2: reopen and verify TTL index was restored
+        {
+            let db = OxiDb::open(dir.path()).unwrap();
+
+            // TTL index should be in list_indexes
+            let indexes = db.list_indexes("sessions").unwrap();
+            let ttl_idx = indexes.iter().find(|i| i.index_type == "ttl");
+            assert!(ttl_idx.is_some(), "TTL index not restored after restart");
+            let ttl_idx = ttl_idx.unwrap();
+            assert_eq!(ttl_idx.name, "created_at_ttl");
+            assert_eq!(ttl_idx.expire_after_seconds, Some(2));
+
+            // Evict — the old doc should be removed
+            let col = db.get_or_create_collection("sessions").unwrap();
+            let evicted = col.evict_ttl_indexed();
+            assert_eq!(evicted, 1);
+
+            // Only the fresh doc remains
+            let docs = db.find("sessions", &json!({})).unwrap();
+            assert_eq!(docs.len(), 1);
+            assert_eq!(docs[0]["user"], "new");
+        }
+    }
+
+    #[test]
+    fn ttl_index_evicts_on_create() {
+        let db = mem_db();
+        // Insert already-expired docs BEFORE creating the TTL index
+        let past = chrono::Utc::now() - chrono::Duration::seconds(10);
+        db.insert("events", json!({"type": "old", "at": past.to_rfc3339()})).unwrap();
+        db.insert("events", json!({"type": "current", "at": chrono::Utc::now().to_rfc3339()})).unwrap();
+
+        // Creating the TTL index should immediately evict the old doc
+        db.create_ttl_index("events", "at", 5).unwrap();
+
+        let docs = db.find("events", &json!({})).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["type"], "current");
     }
 
     #[test]

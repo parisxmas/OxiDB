@@ -1,0 +1,483 @@
+//! REST API — JSON-over-HTTP interface for OxiDB document operations.
+//!
+//! Enabled via `OXIDB_HTTP_PORT`. Provides CRUD, aggregation, indexes, SQL,
+//! and stored procedures over standard HTTP with JSON request/response bodies.
+//!
+//! # Endpoints
+//!
+//! | Method | Path | Description |
+//! |--------|------|-------------|
+//! | GET    | /api/ping | Health check |
+//! | GET    | /api/collections | List collections |
+//! | POST   | /api/collections | Create collection |
+//! | DELETE | /api/collections/{name} | Drop collection |
+//! | POST   | /api/{collection}/documents | Insert (doc or docs) |
+//! | GET    | /api/{collection}/documents | Find (query in ?q=) |
+//! | PATCH  | /api/{collection}/documents | Update |
+//! | DELETE | /api/{collection}/documents | Delete |
+//! | GET    | /api/{collection}/count | Count (?q=) |
+//! | POST   | /api/{collection}/aggregate | Aggregation pipeline |
+//! | GET    | /api/{collection}/indexes | List indexes |
+//! | POST   | /api/{collection}/indexes | Create index |
+//! | DELETE | /api/{collection}/indexes/{name} | Drop index |
+//! | POST   | /api/sql | SQL query |
+//! | POST   | /api/procedures | Create procedure |
+//! | GET    | /api/procedures | List procedures |
+//! | POST   | /api/procedures/{name}/call | Call procedure |
+//! | DELETE | /api/procedures/{name} | Delete procedure |
+
+use std::collections::HashMap;
+use std::io::BufReader;
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use oxidb::OxiDb;
+use oxidb::query::FindOptions;
+use serde_json::{json, Value};
+
+use crate::s3::http::{parse_request_from_reader, HttpRequest, HttpResponse};
+
+const POOL_SIZE: usize = 64;
+const MAX_QUEUED: usize = 512;
+
+struct RestState {
+    db: Arc<OxiDb>,
+    active: AtomicUsize,
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+pub fn start_rest_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<()> {
+    let listener = TcpListener::bind(addr).expect("failed to bind REST HTTP listener");
+
+    let state = Arc::new(RestState {
+        db,
+        active: AtomicUsize::new(0),
+    });
+
+    let (conn_tx, conn_rx) = std::sync::mpsc::sync_channel::<TcpStream>(MAX_QUEUED);
+    let conn_rx = Arc::new(Mutex::new(conn_rx));
+
+    for i in 0..POOL_SIZE {
+        let rx = Arc::clone(&conn_rx);
+        let state = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name(format!("rest-worker-{i}"))
+            .spawn(move || loop {
+                let stream = match rx.lock().unwrap().recv() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                state.active.fetch_add(1, Ordering::Relaxed);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_connection(stream, &state);
+                }));
+                state.active.fetch_sub(1, Ordering::Relaxed);
+                if let Err(e) = result {
+                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = e.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    eprintln!("[rest] handler panicked: {msg}");
+                }
+            })
+            .expect("failed to spawn rest worker");
+    }
+    eprintln!("[rest] thread pool: {POOL_SIZE} workers, queue depth {MAX_QUEUED}");
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    if conn_tx.try_send(s).is_err() {
+                        eprintln!("[rest] connection rejected: queue full");
+                    }
+                }
+                Err(e) => eprintln!("[rest] accept error: {e}"),
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Connection handling
+// ---------------------------------------------------------------------------
+
+fn handle_connection(mut stream: TcpStream, state: &RestState) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    let read_stream = stream.try_clone().expect("failed to clone stream");
+    let mut reader = BufReader::new(read_stream);
+
+    loop {
+        let req = match parse_request_from_reader(&mut reader, &stream) {
+            Some(r) => r,
+            None => return,
+        };
+
+        let wants_close = req
+            .headers
+            .get("connection")
+            .is_some_and(|v| v.eq_ignore_ascii_case("close"));
+
+        let resp = route_request(&req, state);
+        resp.write_to_keepalive(&mut stream, !wants_close);
+
+        if wants_close {
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
+    let path = req.path.trim_end_matches('/');
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    // CORS preflight
+    if req.method == "OPTIONS" {
+        return with_rest_cors(json_response(204, "No Content", json!(null)));
+    }
+
+    let result = match (req.method.as_str(), segments.as_slice()) {
+        // Health
+        ("GET", ["api", "ping"]) => Ok(json!({"status": "ok", "data": "pong"})),
+
+        // Collections
+        ("GET", ["api", "collections"]) => handle_list_collections(state),
+        ("POST", ["api", "collections"]) => handle_create_collection(req, state),
+        ("DELETE", ["api", "collections", name]) => handle_drop_collection(name, state),
+
+        // Documents
+        ("POST", ["api", col, "documents"]) => handle_insert(col, req, state),
+        ("GET", ["api", col, "documents"]) => handle_find(col, req, state),
+        ("PATCH", ["api", col, "documents"]) => handle_update(col, req, state),
+        ("DELETE", ["api", col, "documents"]) => handle_delete(col, req, state),
+
+        // Count
+        ("GET", ["api", col, "count"]) => handle_count(col, req, state),
+
+        // Aggregation
+        ("POST", ["api", col, "aggregate"]) => handle_aggregate(col, req, state),
+
+        // Indexes
+        ("GET", ["api", col, "indexes"]) => handle_list_indexes(col, state),
+        ("POST", ["api", col, "indexes"]) => handle_create_index(col, req, state),
+        ("DELETE", ["api", col, "indexes", name]) => handle_drop_index(col, name, state),
+
+        // SQL
+        ("POST", ["api", "sql"]) => handle_sql(req, state),
+
+        // Procedures
+        ("GET", ["api", "procedures"]) => handle_list_procedures(state),
+        ("POST", ["api", "procedures"]) => handle_create_procedure(req, state),
+        ("POST", ["api", "procedures", name, "call"]) => handle_call_procedure(name, req, state),
+        ("DELETE", ["api", "procedures", name]) => handle_delete_procedure(name, state),
+
+        _ => Err((404, "not found")),
+    };
+
+    match result {
+        Ok(data) => with_rest_cors(json_response(200, "OK", data)),
+        Err((status, msg)) => {
+            let status_text = match status {
+                400 => "Bad Request",
+                404 => "Not Found",
+                405 => "Method Not Allowed",
+                409 => "Conflict",
+                _ => "Internal Server Error",
+            };
+            with_rest_cors(json_response(status, status_text, json!({"error": msg})))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+fn handle_list_collections(state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let cols = state.db.list_collections();
+    Ok(json!({"collections": cols}))
+}
+
+fn handle_create_collection(req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let name = body["name"].as_str().ok_or((400, "missing 'name'"))?;
+    state.db.create_collection(name).map_err(|_| (409, "collection already exists"))?;
+    Ok(json!({"created": name}))
+}
+
+fn handle_drop_collection(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    state.db.drop_collection(name).map_err(|_| (404, "collection not found"))?;
+    Ok(json!({"dropped": name}))
+}
+
+fn handle_insert(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    if let Some(doc) = body.get("doc") {
+        let id = state.db.insert(col, doc.clone()).map_err(db_err)?;
+        Ok(json!({"id": id}))
+    } else if let Some(docs) = body.get("docs").and_then(|v| v.as_array()) {
+        let ids = state.db.insert_many(col, docs.clone()).map_err(db_err)?;
+        Ok(json!({"ids": ids}))
+    } else {
+        Err((400, "missing 'doc' or 'docs'"))
+    }
+}
+
+fn handle_find(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let query = query_param_json(&req.query, "q").unwrap_or(json!({}));
+    let skip = query_param_u64(&req.query, "skip");
+    let limit = query_param_u64(&req.query, "limit");
+
+    // Build sort from ?sort={"field":1} query param
+    let sort_parsed = query_param_json(&req.query, "sort").and_then(|v| {
+        v.as_object().map(|obj| {
+            obj.iter()
+                .map(|(k, v)| {
+                    let order = if v.as_i64().unwrap_or(1) < 0 {
+                        oxidb::query::SortOrder::Desc
+                    } else {
+                        oxidb::query::SortOrder::Asc
+                    };
+                    (k.clone(), order)
+                })
+                .collect::<Vec<_>>()
+        })
+    });
+
+    let opts = FindOptions {
+        sort: sort_parsed,
+        skip,
+        limit,
+    };
+
+    let docs = state.db.find_with_options(col, &query, &opts).map_err(db_err)?;
+    Ok(json!(docs))
+}
+
+fn handle_update(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let query = body.get("query").ok_or((400, "missing 'query'"))?;
+    let update = body.get("update").ok_or((400, "missing 'update'"))?;
+    let one = body.get("one").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if one {
+        let n = state.db.update_one(col, query, update).map_err(db_err)?;
+        Ok(json!({"modified": n}))
+    } else {
+        let n = state.db.update(col, query, update).map_err(db_err)?;
+        Ok(json!({"modified": n}))
+    }
+}
+
+fn handle_delete(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = if req.body.is_empty() {
+        let q = query_param_json(&req.query, "q").unwrap_or(json!({}));
+        json!({"query": q})
+    } else {
+        parse_json_body(req)?
+    };
+    let query = body.get("query").ok_or((400, "missing 'query'"))?;
+    let n = state.db.delete(col, query).map_err(db_err)?;
+    Ok(json!({"deleted": n}))
+}
+
+fn handle_count(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let query = query_param_json(&req.query, "q").unwrap_or(json!({}));
+    let n = state.db.count(col, &query).map_err(db_err)?;
+    Ok(json!({"count": n}))
+}
+
+fn handle_aggregate(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let pipeline = body.get("pipeline").ok_or((400, "missing 'pipeline'"))?;
+    let results = state.db.aggregate(col, pipeline).map_err(db_err)?;
+    Ok(json!(results))
+}
+
+fn handle_list_indexes(col: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let indexes = state.db.list_indexes(col).map_err(db_err)?;
+    Ok(json!(indexes))
+}
+
+fn handle_create_index(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let idx_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("field");
+
+    match idx_type {
+        "unique" => {
+            let field = body["field"].as_str().ok_or((400, "missing 'field'"))?;
+            state.db.create_unique_index(col, field).map_err(db_err)?;
+            Ok(json!({"created": field, "type": "unique"}))
+        }
+        "composite" => {
+            let fields: Vec<String> = body["fields"]
+                .as_array()
+                .ok_or((400, "missing 'fields' array"))?
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            let name = state.db.create_composite_index(col, fields).map_err(db_err)?;
+            Ok(json!({"created": name, "type": "composite"}))
+        }
+        "ttl" => {
+            let field = body["field"].as_str().ok_or((400, "missing 'field'"))?;
+            let expire = body["expireAfterSeconds"].as_u64().ok_or((400, "missing 'expireAfterSeconds'"))?;
+            state.db.create_ttl_index(col, field, expire).map_err(db_err)?;
+            Ok(json!({"created": format!("{field}_ttl"), "type": "ttl"}))
+        }
+        _ => {
+            let field = body["field"].as_str().ok_or((400, "missing 'field'"))?;
+            state.db.create_index(col, field).map_err(db_err)?;
+            Ok(json!({"created": field, "type": "field"}))
+        }
+    }
+}
+
+fn handle_drop_index(col: &str, name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    state.db.drop_index(col, name).map_err(db_err)?;
+    Ok(json!({"dropped": name}))
+}
+
+fn handle_sql(req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let query = body["query"].as_str().ok_or((400, "missing 'query'"))?;
+    let result = oxidb::sql::execute_sql(&state.db, query).map_err(db_err)?;
+    match result {
+        oxidb::sql::SqlResult::Select(rows) => Ok(json!(rows)),
+        oxidb::sql::SqlResult::Insert(ids) => Ok(json!({"inserted": ids})),
+        oxidb::sql::SqlResult::Update(n) => Ok(json!({"modified": n})),
+        oxidb::sql::SqlResult::Delete(n) => Ok(json!({"deleted": n})),
+        oxidb::sql::SqlResult::Ddl(msg) => Ok(json!({"result": msg})),
+        oxidb::sql::SqlResult::UseDatabase(name) => Ok(json!({"database": name})),
+        oxidb::sql::SqlResult::ShowDatabases(names) => Ok(json!({"databases": names})),
+    }
+}
+
+fn handle_list_procedures(state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let procs = state.db.list_procedures().map_err(db_err)?;
+    Ok(json!(procs))
+}
+
+fn handle_create_procedure(req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    if let Some(script) = body.get("script").and_then(|v| v.as_str()) {
+        let compiled = oxidb::oxiscript::compile(script)
+            .map_err(|e| (400, Box::leak(e.into_boxed_str()) as &'static str))?;
+        let name = compiled["name"].as_str().unwrap_or("unknown").to_string();
+        state.db.create_procedure(&name, compiled).map_err(db_err)?;
+        Ok(json!({"created": name}))
+    } else {
+        let name = body["name"].as_str().ok_or((400, "missing 'name' or 'script'"))?;
+        state.db.create_procedure(name, body.clone()).map_err(db_err)?;
+        Ok(json!({"created": name}))
+    }
+}
+
+fn handle_call_procedure(name: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let params = if req.body.is_empty() {
+        json!({})
+    } else {
+        parse_json_body(req)?
+    };
+    let result = state.db.call_procedure(name, params).map_err(db_err)?;
+    Ok(result)
+}
+
+fn handle_delete_procedure(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    state.db.delete_procedure(name).map_err(db_err)?;
+    Ok(json!({"deleted": name}))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn parse_json_body(req: &HttpRequest) -> Result<Value, (u16, &'static str)> {
+    if req.body.is_empty() {
+        return Err((400, "empty request body"));
+    }
+    serde_json::from_slice(&req.body).map_err(|_| (400, "invalid JSON"))
+}
+
+fn query_param_json(query: &str, key: &str) -> Option<Value> {
+    parse_query_string(query)
+        .get(key)
+        .and_then(|v| {
+            // Try URL-decoded JSON parse
+            let decoded = url_decode(v);
+            serde_json::from_str(&decoded).ok()
+        })
+}
+
+fn query_param_u64(query: &str, key: &str) -> Option<u64> {
+    parse_query_string(query).get(key).and_then(|v| v.parse().ok())
+}
+
+fn parse_query_string(query: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if query.is_empty() {
+        return map;
+    }
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            map.insert(k.to_string(), v.to_string());
+        }
+    }
+    map
+}
+
+fn url_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next().unwrap_or(b'0');
+            let h2 = chars.next().unwrap_or(b'0');
+            let hex = [h1, h2];
+            if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&hex).unwrap_or("00"), 16) {
+                result.push(byte as char);
+            }
+        } else if b == b'+' {
+            result.push(' ');
+        } else {
+            result.push(b as char);
+        }
+    }
+    result
+}
+
+fn db_err(_e: oxidb::Error) -> (u16, &'static str) {
+    (500, "database error")
+}
+
+fn json_response(status: u16, status_text: &'static str, body: Value) -> HttpResponse {
+    let bytes = serde_json::to_vec(&body).unwrap_or_default();
+    HttpResponse {
+        status,
+        status_text,
+        content_type: "application/json".to_string(),
+        headers: Vec::new(),
+        body: bytes,
+        content_length_override: None,
+    }
+}
+
+fn with_rest_cors(resp: HttpResponse) -> HttpResponse {
+    resp.with_header("Access-Control-Allow-Origin", "*")
+        .with_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+        .with_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        .with_header("Access-Control-Max-Age", "3600")
+}

@@ -1668,4 +1668,252 @@ mod tests {
         assert_eq!(step["params"]["_arg1"], "acc2");
         assert_eq!(step["params"]["_arg2"], 100);
     }
+
+    // -----------------------------------------------------------------------
+    // Lexer — additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lex_nested_object_with_dollar_operators() {
+        let mut lexer = Lexer::new("{$set: {balance: 100}, $inc: {count: 1}}");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::LBrace);
+        assert_eq!(tokens[1], Token::DollarIdent("$set".into()));
+        assert_eq!(tokens[2], Token::Colon);
+        assert_eq!(tokens[3], Token::LBrace);
+        assert!(tokens.iter().any(|t| *t == Token::DollarIdent("$inc".into())));
+    }
+
+    #[test]
+    fn lex_multiline_string_with_escapes() {
+        let mut lexer = Lexer::new(r#""line1\nline2\ttab""#);
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Str("line1\nline2\ttab".into()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Parser — additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_for_in_loop() {
+        let src = r#"
+            proc process(data) {
+                for item in data {
+                    insert("results", {val: item})
+                }
+            }
+        "#;
+        let mut lexer = Lexer::new(src);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let proc = parser.parse_procedure().unwrap();
+        assert_eq!(proc.body.len(), 1);
+        match &proc.body[0] {
+            Stmt::For(var, _, body) => {
+                assert_eq!(var, "item");
+                assert_eq!(body.len(), 1);
+            }
+            _ => panic!("expected For statement"),
+        }
+    }
+
+    #[test]
+    fn parse_nested_if_else_if() {
+        let src = r#"
+            proc classify(score) {
+                if score > 90 {
+                    return "A"
+                } else if score > 70 {
+                    return "B"
+                } else {
+                    return "C"
+                }
+            }
+        "#;
+        let mut lexer = Lexer::new(src);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let proc = parser.parse_procedure().unwrap();
+        assert_eq!(proc.body.len(), 1);
+        match &proc.body[0] {
+            Stmt::If(_, then_body, Some(else_body)) => {
+                assert_eq!(then_body.len(), 1);
+                // else branch is another If
+                assert_eq!(else_body.len(), 1);
+                match &else_body[0] {
+                    Stmt::If(_, _, Some(inner_else)) => {
+                        assert_eq!(inner_else.len(), 1);
+                    }
+                    _ => panic!("expected nested if"),
+                }
+            }
+            _ => panic!("expected If statement"),
+        }
+    }
+
+    #[test]
+    fn parse_array_index_access() {
+        let src = r#"
+            proc first_name(data) {
+                let name = data[0].name
+                return name
+            }
+        "#;
+        let mut lexer = Lexer::new(src);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let proc = parser.parse_procedure().unwrap();
+        match &proc.body[0] {
+            Stmt::Let(name, expr) => {
+                assert_eq!(name, "name");
+                // data[0].name should be Field(Index(Ident(data), 0), "name")
+                match expr {
+                    Expr::Field(_, field) => assert_eq!(field, "name"),
+                    _ => panic!("expected field access, got {:?}", expr),
+                }
+            }
+            _ => panic!("expected Let"),
+        }
+    }
+
+    #[test]
+    fn parse_complex_object_literal() {
+        let src = r#"
+            proc create(name) {
+                insert("users", {
+                    name: name,
+                    tags: ["new", "verified"],
+                    metadata: {source: "api", version: 2}
+                })
+            }
+        "#;
+        let mut lexer = Lexer::new(src);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let proc = parser.parse_procedure().unwrap();
+        assert_eq!(proc.body.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Compiler — additional tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compile_for_loop_to_json() {
+        let src = r#"
+            proc batch(items) {
+                for x in items {
+                    insert("results", {val: x})
+                }
+            }
+        "#;
+        let result = compile(src).unwrap();
+        let step = &result["steps"][0];
+        assert_eq!(step["step"], "for");
+        assert_eq!(step["var"], "x");
+        assert!(step["body"].is_array());
+        assert_eq!(step["body"][0]["step"], "insert");
+    }
+
+    #[test]
+    fn compile_arithmetic_expressions() {
+        let src = r#"
+            proc calc(a, b) {
+                return {sum: a + b, product: a * b}
+            }
+        "#;
+        let result = compile(src).unwrap();
+        let ret = &result["steps"][0]["value"];
+        // a + b → {"$expr": {"$add": [...]}}
+        assert!(ret["sum"].is_object());
+        assert!(ret["product"].is_object());
+    }
+
+    #[test]
+    fn compile_comparison_chain() {
+        let src = r#"
+            proc validate(age, score) {
+                if age > 0 && score < 100 {
+                    return "valid"
+                }
+                return "invalid"
+            }
+        "#;
+        let result = compile(src).unwrap();
+        let cond = &result["steps"][0]["condition"];
+        // && compiles to $and
+        assert!(cond["$and"].is_array());
+    }
+
+    #[test]
+    fn compile_update_one() {
+        let src = r#"
+            proc set_name(id, name) {
+                update_one("users", {_id: id}, {$set: {name: name}})
+            }
+        "#;
+        let result = compile(src).unwrap();
+        let step = &result["steps"][0];
+        assert_eq!(step["step"], "update_one");
+        assert_eq!(step["collection"], "users");
+        assert!(step["update"]["$set"].is_object());
+    }
+
+    #[test]
+    fn compile_delete_one() {
+        let src = r#"
+            proc remove(id) {
+                delete_one("users", {_id: id})
+            }
+        "#;
+        let result = compile(src).unwrap();
+        let step = &result["steps"][0];
+        assert_eq!(step["step"], "delete_one");
+        assert_eq!(step["collection"], "users");
+    }
+
+    #[test]
+    fn compile_nested_procedure_calls() {
+        let src = r#"
+            proc inner(x) {
+                return x
+            }
+            proc middle(x) {
+                let r = inner(x)
+                return r
+            }
+            proc outer() {
+                let r = middle(42)
+                return r
+            }
+        "#;
+        let results = compile_all(src).unwrap();
+        assert_eq!(results.len(), 3);
+        // outer calls middle
+        let outer = &results[2];
+        assert_eq!(outer["steps"][0]["step"], "call_procedure");
+        assert_eq!(outer["steps"][0]["name"], "middle");
+        // middle calls inner
+        let middle = &results[1];
+        assert_eq!(middle["steps"][0]["step"], "call_procedure");
+        assert_eq!(middle["steps"][0]["name"], "inner");
+    }
+
+    #[test]
+    fn compile_multiple_positional_params() {
+        let src = r#"
+            proc test() {
+                let r = process("a", 1, true, null)
+                return r
+            }
+        "#;
+        let result = compile(src).unwrap();
+        let step = &result["steps"][0];
+        assert_eq!(step["step"], "call_procedure");
+        assert_eq!(step["params"]["_arg0"], "a");
+        assert_eq!(step["params"]["_arg1"], 1);
+        assert_eq!(step["params"]["_arg2"], true);
+        assert!(step["params"]["_arg3"].is_null());
+    }
 }

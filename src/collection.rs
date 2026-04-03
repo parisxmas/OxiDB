@@ -40,6 +40,8 @@ pub struct IndexInfo {
     pub dimension: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metric: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expire_after_seconds: Option<u64>,
 }
 
 /// Persisted index metadata (written to .idx files).
@@ -897,6 +899,7 @@ impl Collection {
                 unique: idx.unique,
                 dimension: None,
                 metric: None,
+                expire_after_seconds: None,
             });
         }
         for idx in &self.composite_indexes {
@@ -907,6 +910,7 @@ impl Collection {
                 unique: false,
                 dimension: None,
                 metric: None,
+                expire_after_seconds: None,
             });
         }
         if let Some(ref text_idx) = self.text_index {
@@ -917,6 +921,7 @@ impl Collection {
                 unique: false,
                 dimension: None,
                 metric: None,
+                expire_after_seconds: None,
             });
         }
         for idx in self.vector_indexes.values() {
@@ -927,6 +932,7 @@ impl Collection {
                 unique: false,
                 dimension: Some(idx.dimension),
                 metric: Some(idx.metric_str().to_string()),
+                expire_after_seconds: None,
             });
         }
         indexes

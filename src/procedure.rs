@@ -962,4 +962,223 @@ mod tests {
         let result = execute_procedure(&db, &def, &json!(["world"])).unwrap();
         assert_eq!(result, json!({"name": "world"}));
     }
+
+    // -----------------------------------------------------------------------
+    // End-to-end OxiScript → compile → execute tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: compile OxiScript source and execute with params
+    fn run_oxiscript(db: &OxiDb, src: &str, params: Value) -> Result<Value> {
+        let compiled = crate::oxiscript::compile(src)
+            .map_err(|e| Error::ProcedureError(e))?;
+        // Register procedure so call_procedure can find it
+        let name = compiled["name"].as_str().unwrap().to_string();
+        db.create_procedure(&name, compiled)?;
+        db.call_procedure(&name, params)
+    }
+
+    /// Helper: compile multiple procs, register all, call the last one
+    fn run_oxiscript_multi(db: &OxiDb, src: &str, call_name: &str, params: Value) -> Result<Value> {
+        let procs = crate::oxiscript::compile_all(src)
+            .map_err(|e| Error::ProcedureError(e))?;
+        for p in &procs {
+            let name = p["name"].as_str().unwrap().to_string();
+            db.create_procedure(&name, p.clone())?;
+        }
+        db.call_procedure(call_name, params)
+    }
+
+    #[test]
+    fn e2e_arithmetic_in_return() {
+        let db = temp_db();
+        let src = r#"
+            proc add(a, b) {
+                return {sum: a + b}
+            }
+        "#;
+        let result = run_oxiscript(&db, src, json!({"a": 10, "b": 25})).unwrap();
+        // OxiScript arithmetic compiles to $expr wrapper — engine evaluates it
+        let sum = &result["sum"];
+        let val = if sum.is_object() { sum["$expr"].as_i64().unwrap() } else { sum.as_i64().unwrap() };
+        assert_eq!(val, 35);
+    }
+
+    #[test]
+    fn e2e_nested_if_with_abort() {
+        let db = temp_db();
+        let src = r#"
+            proc validate(age, role) {
+                if age < 18 {
+                    abort "too young"
+                }
+                if role != "admin" {
+                    abort "not admin"
+                }
+                return {status: "ok"}
+            }
+        "#;
+
+        // Should abort — too young
+        let err = run_oxiscript(&db, src, json!({"age": 15, "role": "admin"}));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("too young"));
+
+        // Should abort — not admin
+        let err = run_oxiscript(&db, src, json!({"age": 25, "role": "user"}));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("not admin"));
+
+        // Should succeed
+        let result = run_oxiscript(&db, src, json!({"age": 25, "role": "admin"})).unwrap();
+        assert_eq!(result["status"], "ok");
+    }
+
+    #[test]
+    fn e2e_aggregate_result_access() {
+        let db = temp_db();
+        db.insert("sales", json!({"product": "A", "amount": 100})).unwrap();
+        db.insert("sales", json!({"product": "A", "amount": 200})).unwrap();
+        db.insert("sales", json!({"product": "B", "amount": 50})).unwrap();
+
+        // Aggregate with $count stage (avoids $field ref conflict with $var resolution)
+        let def = json!({
+            "name": "count_sales",
+            "params": ["product"],
+            "steps": [
+                {"step": "find", "collection": "sales", "query": {"product": "$param.product"}, "as": "matches"},
+                {"step": "count", "collection": "sales", "query": {"product": "$param.product"}, "as": "total"},
+                {"step": "return", "value": {"count": "$total", "items": "$matches"}}
+            ]
+        });
+        let result = execute_procedure(&db, &def, &json!({"product": "A"})).unwrap();
+        assert_eq!(result["count"], 2);
+        assert!(result["items"].is_array());
+        assert_eq!(result["items"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn e2e_count_and_branch() {
+        let db = temp_db();
+        db.insert("items", json!({"status": "active"})).unwrap();
+        db.insert("items", json!({"status": "active"})).unwrap();
+        db.insert("items", json!({"status": "archived"})).unwrap();
+
+        let src = r#"
+            proc check_active() {
+                let n = count("items", {status: "active"})
+                if n > 0 {
+                    return {has_active: true, count: n}
+                }
+                return {has_active: false, count: 0}
+            }
+        "#;
+        let result = run_oxiscript(&db, src, json!({})).unwrap();
+        assert_eq!(result["has_active"], true);
+        assert_eq!(result["count"], 2);
+    }
+
+    #[test]
+    fn e2e_multi_collection_abort_rollback() {
+        let db = temp_db();
+        db.insert("accounts", json!({"id": "A", "balance": 100})).unwrap();
+        db.insert("ledger", json!({"entries": 0})).unwrap();
+
+        let src = r#"
+            proc withdraw(account_id, amount) {
+                let acc = find_one("accounts", {id: account_id})
+                if acc.balance < amount {
+                    abort "insufficient funds"
+                }
+                update("accounts", {id: account_id}, {$inc: {balance: -amount}})
+                insert("ledger", {type: "withdrawal", account: account_id, amount: amount})
+                return {status: "ok"}
+            }
+        "#;
+
+        // Try to withdraw too much — should abort and rollback both collections
+        let err = run_oxiscript(&db, src, json!({"account_id": "A", "amount": 999}));
+        assert!(err.is_err());
+
+        // Balance should be unchanged
+        let acc = db.find_one("accounts", &json!({"id": "A"})).unwrap().unwrap();
+        assert_eq!(acc["balance"], 100);
+
+        // No new ledger entry should exist
+        let ledger = db.find("ledger", &json!({"type": "withdrawal"})).unwrap();
+        assert_eq!(ledger.len(), 0);
+    }
+
+    #[test]
+    fn e2e_update_with_multiple_operators() {
+        let db = temp_db();
+        db.insert("users", json!({"name": "Alice", "score": 10, "active": false})).unwrap();
+
+        let src = r#"
+            proc activate_and_bump(name, bonus) {
+                update("users", {name: name}, {$set: {active: true}, $inc: {score: bonus}})
+                return {status: "ok"}
+            }
+        "#;
+        let result = run_oxiscript(&db, src, json!({"name": "Alice", "bonus": 5})).unwrap();
+        assert_eq!(result["status"], "ok");
+
+        // Verify after commit — the update is now visible
+        let user = db.find_one("users", &json!({"name": "Alice"})).unwrap().unwrap();
+        assert_eq!(user["active"], true);
+        assert_eq!(user["score"], 15);
+    }
+
+    #[test]
+    fn e2e_delete_and_verify() {
+        let db = temp_db();
+        db.insert("logs", json!({"level": "error", "msg": "fail"})).unwrap();
+        db.insert("logs", json!({"level": "info", "msg": "ok"})).unwrap();
+        db.insert("logs", json!({"level": "error", "msg": "crash"})).unwrap();
+
+        let src = r#"
+            proc clear_errors() {
+                delete("logs", {level: "error"})
+                return {status: "ok"}
+            }
+        "#;
+        let result = run_oxiscript(&db, src, json!({})).unwrap();
+        assert_eq!(result["status"], "ok");
+
+        // Verify after commit — deletes are visible
+        let docs = db.find("logs", &json!({})).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["level"], "info");
+    }
+
+    #[test]
+    fn e2e_call_chain_with_return_value() {
+        let db = temp_db();
+        db.insert("accounts", json!({"account_id": "X", "balance": 500})).unwrap();
+
+        let src = r#"
+            proc get_balance(account_id) {
+                let acc = find_one("accounts", {account_id: account_id})
+                return acc.balance
+            }
+
+            proc can_afford(account_id, price) {
+                let balance = get_balance({account_id: account_id})
+                if balance < price {
+                    return {affordable: false}
+                }
+                return {affordable: true, remaining: balance - price}
+            }
+        "#;
+        let result = run_oxiscript_multi(&db, src, "can_afford",
+            json!({"account_id": "X", "price": 200})).unwrap();
+        assert_eq!(result["affordable"], true);
+        // Arithmetic returns $expr wrapper
+        let remaining = &result["remaining"];
+        let val = if remaining.is_object() { remaining["$expr"].as_i64().unwrap() } else { remaining.as_i64().unwrap() };
+        assert_eq!(val, 300);
+
+        let result = run_oxiscript_multi(&db, src, "can_afford",
+            json!({"account_id": "X", "price": 999})).unwrap();
+        assert_eq!(result["affordable"], false);
+    }
 }

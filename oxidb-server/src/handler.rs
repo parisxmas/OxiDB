@@ -342,6 +342,25 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        "create_ttl_index" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let field = match request.get("field").and_then(|v| v.as_str()) {
+                Some(f) => f,
+                None => return err_bytes("missing 'field'"),
+            };
+            let expire_after = match request.get("expireAfterSeconds").and_then(|v| v.as_u64()) {
+                Some(s) => s,
+                None => return err_bytes("missing 'expireAfterSeconds'"),
+            };
+            match db.create_ttl_index(col, field, expire_after) {
+                Ok(()) => ok_bytes(json!("ttl index created")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         "create_unique_index" => {
             let col = match collection.as_deref() {
                 Some(c) => c,

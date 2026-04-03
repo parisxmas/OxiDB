@@ -41,6 +41,13 @@ use crate::vector::{DistanceMetric, VectorIndex};
 /// this struct uses the B-tree as both storage AND primary index.
 ///
 /// All fields with interior mutability — callers use `&self` for everything.
+/// Configuration for a TTL index on a datetime field.
+#[derive(Debug, Clone)]
+pub struct TtlIndexConfig {
+    pub field: String,
+    pub expire_after_seconds: u64,
+}
+
 pub struct BTreeCollection {
     #[allow(dead_code)]
     name: String,
@@ -56,6 +63,7 @@ pub struct BTreeCollection {
     #[allow(dead_code)]
     in_memory: bool,
     ttl_index: Mutex<std::collections::BTreeMap<u64, Vec<DocumentId>>>,
+    ttl_configs: RwLock<Vec<TtlIndexConfig>>,
     /// Dirty flag: set on write, cleared after persist.
     dirty: AtomicBool,
     wal: WalBackend,
@@ -141,6 +149,18 @@ impl BTreeCollection {
             Vec::new()
         };
 
+        // Restore TTL index configs from persisted metadata
+        let ttl_configs: Vec<TtlIndexConfig> = persisted_indexes
+            .iter()
+            .filter(|info| info.index_type == "ttl")
+            .filter_map(|info| {
+                info.expire_after_seconds.map(|expire| TtlIndexConfig {
+                    field: info.fields[0].clone(),
+                    expire_after_seconds: expire,
+                })
+            })
+            .collect();
+
         Ok(Self {
             name: name.to_string(),
             data_dir: data_dir.to_path_buf(),
@@ -153,6 +173,7 @@ impl BTreeCollection {
             next_id: AtomicU64::new(max_id + 1),
             in_memory: false,
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
+            ttl_configs: RwLock::new(ttl_configs),
             dirty: AtomicBool::new(false),
             wal: wal_backend,
         })
@@ -172,6 +193,7 @@ impl BTreeCollection {
             next_id: AtomicU64::new(1),
             in_memory: true,
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
+            ttl_configs: RwLock::new(Vec::new()),
             dirty: AtomicBool::new(false),
             wal: WalBackend::Memory,
         }
@@ -1633,6 +1655,7 @@ impl BTreeCollection {
                 unique: idx.unique,
                 dimension: None,
                 metric: None,
+                expire_after_seconds: None,
             });
         }
         let ci = self.composite_indexes.read();
@@ -1644,6 +1667,7 @@ impl BTreeCollection {
                 unique: false,
                 dimension: None,
                 metric: None,
+                expire_after_seconds: None,
             });
         }
         let ti = self.text_index.read();
@@ -1655,6 +1679,7 @@ impl BTreeCollection {
                 unique: false,
                 dimension: None,
                 metric: None,
+                expire_after_seconds: None,
             });
         }
         let vi = self.vector_indexes.read();
@@ -1666,6 +1691,19 @@ impl BTreeCollection {
                 unique: false,
                 dimension: Some(idx.dimension),
                 metric: Some(idx.metric_str().to_string()),
+                expire_after_seconds: None,
+            });
+        }
+        let ttl_cfgs = self.ttl_configs.read();
+        for cfg in ttl_cfgs.iter() {
+            indexes.push(IndexInfo {
+                name: format!("{}_ttl", cfg.field),
+                index_type: "ttl".to_string(),
+                fields: vec![cfg.field.clone()],
+                unique: false,
+                dimension: None,
+                metric: None,
+                expire_after_seconds: Some(cfg.expire_after_seconds),
             });
         }
         indexes
@@ -1701,6 +1739,15 @@ impl BTreeCollection {
         if let Some(field) = name.strip_prefix("_vec_") {
             let mut vi = self.vector_indexes.write();
             if vi.remove(field).is_some() {
+                let _ = self.save_index_metadata();
+                return Ok(());
+            }
+        }
+        if let Some(field) = name.strip_suffix("_ttl") {
+            let mut cfgs = self.ttl_configs.write();
+            if let Some(pos) = cfgs.iter().position(|c| c.field == field) {
+                cfgs.remove(pos);
+                drop(cfgs);
                 let _ = self.save_index_metadata();
                 return Ok(());
             }
@@ -2220,6 +2267,108 @@ impl BTreeCollection {
     // -----------------------------------------------------------------------
     // TTL support
     // -----------------------------------------------------------------------
+
+    /// Create a TTL index on a datetime field. Documents are automatically
+    /// deleted when `field_value + expire_after_seconds` has passed.
+    pub fn create_ttl_index(&self, field: &str, expire_after_seconds: u64) -> Result<()> {
+        // Check if a TTL index already exists on this field
+        {
+            let cfgs = self.ttl_configs.read();
+            if cfgs.iter().any(|c| c.field == field) {
+                return Ok(()); // idempotent
+            }
+        }
+
+        // Ensure a field index exists on the date field for efficient range scan
+        self.create_index(field)?;
+
+        // Store the TTL config
+        {
+            let mut cfgs = self.ttl_configs.write();
+            cfgs.push(TtlIndexConfig {
+                field: field.to_string(),
+                expire_after_seconds,
+            });
+        }
+
+        let _ = self.save_index_metadata();
+
+        // Immediately evict any already-expired docs
+        self.evict_ttl_indexed();
+
+        Ok(())
+    }
+
+    /// Evict documents that have expired according to TTL index configs.
+    /// For each TTL index, finds documents where `field_value + expireAfterSeconds <= now`
+    /// using the field index for efficient range scan.
+    pub fn evict_ttl_indexed(&self) -> usize {
+        let cfgs = self.ttl_configs.read();
+        if cfgs.is_empty() {
+            return 0;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let mut to_delete: Vec<DocumentId> = Vec::new();
+
+        for cfg in cfgs.iter() {
+            // cutoff = now - expire_after_seconds (documents with datetime <= cutoff are expired)
+            let cutoff_ms = now_ms.saturating_sub(cfg.expire_after_seconds * 1000);
+            let cutoff_val = IndexValue::DateTime(cutoff_ms as i64);
+
+            // Use the field index for an efficient range scan
+            let fi = self.field_indexes.read();
+            if let Some(idx) = fi.get(&cfg.field) {
+                let expired_ids = idx.find_range(
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Included(&cutoff_val),
+                );
+                to_delete.extend(expired_ids);
+            }
+        }
+        drop(cfgs);
+
+        if to_delete.is_empty() {
+            return 0;
+        }
+
+        // Delete expired docs — acquire write locks for index cleanup
+        let mut fi = self.field_indexes.write();
+        let mut ci = self.composite_indexes.write();
+        let mut ti = self.text_index.write();
+
+        let mut evicted = 0;
+        for id in to_delete {
+            if self.storage.contains_key(id) {
+                if let Some(bytes) = self.storage.get(id) {
+                    if let Ok(data) = codec::decode_doc(&bytes) {
+                        self.storage.remove(id);
+                        self.doc_cache.remove(id);
+                        for idx in fi.values_mut() {
+                            idx.remove_value(id, &data);
+                        }
+                        for idx in ci.iter_mut() {
+                            idx.remove_value(id, &data);
+                        }
+                        if let Some(ref mut text_idx) = *ti {
+                            text_idx.remove_doc(id);
+                        }
+                        evicted += 1;
+                    }
+                }
+            }
+        }
+
+        if evicted > 0 {
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+
+        evicted
+    }
 
     fn register_ttl(&self, doc_id: DocumentId, data: &Value) {
         let ttl_secs = data
