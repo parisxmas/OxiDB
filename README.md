@@ -17,6 +17,8 @@ Download the latest release for your platform from [GitHub Releases](https://git
 | macOS Apple Silicon (M1/M2/M3/M4) | [`oxidb-server-macos-arm64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/latest/download/oxidb-server-macos-arm64.tar.gz) |
 | macOS Intel | [`oxidb-server-macos-x86_64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/latest/download/oxidb-server-macos-x86_64.tar.gz) |
 | Linux x86_64 | [`oxidb-server-linux-x86_64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/latest/download/oxidb-server-linux-x86_64.tar.gz) |
+| Linux ARM64 | [`oxidb-server-linux-arm64.tar.gz`](https://github.com/parisxmas/OxiDB/releases/latest/download/oxidb-server-linux-arm64.tar.gz) |
+| Windows x86_64 | [`oxidb-server-windows-x86_64.zip`](https://github.com/parisxmas/OxiDB/releases/latest/download/oxidb-server-windows-x86_64.zip) |
 
 ```bash
 tar xzf oxidb-server-*.tar.gz
@@ -96,14 +98,14 @@ docker compose up -d
 - **Change streams** — real-time `watch`/`unwatch` with collection filtering, backpressure handling, and token-based resume
 - **JSONB binary storage** — compact binary format for faster serialization; backward-compatible with existing JSON data files
 - **Crash-safe** — write-ahead log with CRC32 checksums, verified by SIGKILL recovery tests
-- **Encryption at rest** — AES-256-GCM with per-record nonces
+- **Encryption at rest** — AES-256-GCM on storage records and B-tree persistence files; per-record nonces
 - **Security** — TLS transport, SCRAM-SHA-256 authentication, role-based access control (Admin/ReadWrite/Read), audit logging
 - **OxiScript** — lightweight stored procedure language; `proc transfer(from, to, amount) { ... }` compiles to JSON steps; supports if/else, variable binding, field access, all DB operations, and procedure-calling-procedure
 - **Stored procedures** — JSON-defined or OxiScript multi-step procedures with control flow (`if`/`else`, `abort`, `return`), variable binding, and automatic transaction wrapping
 - **Cron scheduler** — built-in background scheduler that runs stored procedures on cron expressions (`"0 3 * * *"`) or fixed intervals (`"30s"`, `"5m"`, `"2h"`), with run history tracking
 - **GELF logging** — centralized UDP logging to Graylog/Loki via `OXIDB_GELF_ADDR`
 - **Compaction** — reclaim space from deleted documents with atomic file swap
-- **Concurrent access** — `scc::HashMap` storage + RwLock-per-index interior mutability; lock-free document reads, fine-grained write concurrency; 32K mixed ops/sec with 10 concurrent workers
+- **Concurrent access** — `scc::HashMap` storage + RwLock-per-index interior mutability; lock-free document reads, fine-grained write concurrency; thread-per-connection model with unbounded concurrency; 32K mixed ops/sec with 10 concurrent workers
 - **Query optimizer** — selectivity-based index selection; picks the most selective condition in AND queries using index cardinality estimates
 - **JSONB partial extraction** — aggregation extracts only needed fields from binary docs, skipping nested arrays; 1M × 3KB docs aggregated in 300-700ms
 - **UDP log ingestion** — high-throughput fire-and-forget GELF/JSON receiver; 197K msg/sec with SO_REUSEPORT multi-thread listeners
