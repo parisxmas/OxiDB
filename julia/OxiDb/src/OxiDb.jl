@@ -32,7 +32,7 @@ export OxiDbClient, OxiDbError, TransactionConflictError,
        count_docs,
        # Indexes
        create_index, create_unique_index, create_composite_index,
-       create_text_index, list_indexes, drop_index,
+       create_text_index, create_ttl_index, list_indexes, drop_index,
        # FTS (documents)
        text_search,
        # Vector search
@@ -49,7 +49,12 @@ export OxiDbClient, OxiDbError, TransactionConflictError,
        # FTS (blobs)
        search,
        # SQL
-       sql
+       sql,
+       # Stored procedures & OxiScript
+       compile_oxiscript, create_procedure, call_procedure,
+       list_procedures, get_procedure, delete_procedure,
+       # Change streams
+       watch, unwatch
 
 # ------------------------------------------------------------------
 # Exceptions
@@ -317,6 +322,17 @@ List all indexes on a collection. Returns a list of index descriptors.
 """
 list_indexes(client::OxiDbClient, collection::AbstractString) =
     _checked(client, Dict("cmd" => "list_indexes", "collection" => collection))
+
+"""
+    create_ttl_index(client, collection, field, expire_after_seconds)
+
+Create a TTL index on a datetime field. Documents are automatically deleted
+when `field_value + expire_after_seconds` has passed.
+"""
+create_ttl_index(client::OxiDbClient, collection::AbstractString, field::AbstractString,
+                 expire_after_seconds::Integer) =
+    _checked(client, Dict("cmd" => "create_ttl_index", "collection" => collection,
+                           "field" => field, "expireAfterSeconds" => expire_after_seconds))
 
 """
     drop_index(client, collection, index_name)
@@ -623,5 +639,96 @@ Disable (pause) a schedule.
 """
 disable_schedule(client::OxiDbClient, name::AbstractString) =
     _checked(client, Dict("cmd" => "disable_schedule", "name" => name))
+
+# ------------------------------------------------------------------
+# Stored procedures & OxiScript
+# ------------------------------------------------------------------
+
+"""
+    compile_oxiscript(client, script) -> Dict
+
+Compile an OxiScript source string into a JSON procedure definition.
+Does not register the procedure — use `create_procedure` for that.
+"""
+compile_oxiscript(client::OxiDbClient, script::AbstractString) =
+    _checked(client, Dict("cmd" => "compile_oxiscript", "script" => script))
+
+"""
+    create_procedure(client, name, params, steps)
+
+Create a stored procedure from a JSON definition.
+"""
+function create_procedure(client::OxiDbClient, name::AbstractString, params::Vector, steps::Vector)
+    _checked(client, Dict("cmd" => "create_procedure", "name" => name,
+                           "params" => params, "steps" => steps))
+end
+
+"""
+    create_procedure(client; script)
+
+Create a stored procedure from an OxiScript source string.
+The procedure name is derived from the `proc name(...)` declaration.
+"""
+function create_procedure(client::OxiDbClient; script::AbstractString)
+    _checked(client, Dict("cmd" => "create_procedure", "script" => script))
+end
+
+"""
+    call_procedure(client, name; params=Dict())
+
+Call a stored procedure by name with the given parameters.
+"""
+function call_procedure(client::OxiDbClient, name::AbstractString; params=Dict())
+    _checked(client, Dict("cmd" => "call_procedure", "name" => name, "params" => params))
+end
+
+"""
+    list_procedures(client)
+
+List all registered stored procedure names.
+"""
+list_procedures(client::OxiDbClient) =
+    _checked(client, Dict("cmd" => "list_procedures"))
+
+"""
+    get_procedure(client, name)
+
+Get a stored procedure definition by name.
+"""
+get_procedure(client::OxiDbClient, name::AbstractString) =
+    _checked(client, Dict("cmd" => "get_procedure", "name" => name))
+
+"""
+    delete_procedure(client, name)
+
+Delete a stored procedure by name.
+"""
+delete_procedure(client::OxiDbClient, name::AbstractString) =
+    _checked(client, Dict("cmd" => "delete_procedure", "name" => name))
+
+# ------------------------------------------------------------------
+# Change streams
+# ------------------------------------------------------------------
+
+"""
+    watch(client; collection=nothing, resume_after=nothing)
+
+Subscribe to real-time change events (insert, update, delete).
+After calling watch, subsequent reads on the connection will receive change events.
+"""
+function watch(client::OxiDbClient; collection::Union{AbstractString,Nothing}=nothing,
+               resume_after::Union{Integer,Nothing}=nothing)
+    payload = Dict{String,Any}("cmd" => "watch")
+    collection !== nothing && (payload["collection"] = collection)
+    resume_after !== nothing && (payload["resume_after"] = resume_after)
+    _checked(client, payload)
+end
+
+"""
+    unwatch(client)
+
+Stop receiving change stream events and return to normal request mode.
+"""
+unwatch(client::OxiDbClient) = _checked(client, Dict("cmd" => "unwatch"))
 
 end # module

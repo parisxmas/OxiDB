@@ -19,7 +19,7 @@ mod batch;
 mod bucket;
 mod encryption;
 mod helpers;
-mod http;
+pub mod http;
 mod multipart;
 mod object;
 mod tagging;

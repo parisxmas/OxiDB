@@ -35,7 +35,7 @@ export OxiDatabase, OxiDbError, TransactionConflictError,
        count_docs,
        # Indexes
        create_index, create_unique_index, create_composite_index,
-       create_text_index, list_indexes, drop_index,
+       create_text_index, create_ttl_index, list_indexes, drop_index,
        # FTS (documents)
        text_search,
        # Aggregation
@@ -48,7 +48,12 @@ export OxiDatabase, OxiDbError, TransactionConflictError,
        create_bucket, list_buckets, delete_bucket,
        put_object, get_object, head_object, delete_object, list_objects,
        # FTS (blobs)
-       search
+       search,
+       # SQL
+       sql,
+       # Stored procedures & OxiScript
+       compile_oxiscript, create_procedure, call_procedure,
+       list_procedures, get_procedure, delete_procedure
 
 # ------------------------------------------------------------------
 # Exceptions
@@ -361,6 +366,17 @@ list_indexes(db::OxiDatabase, collection::AbstractString) =
     _checked(db, Dict("cmd" => "list_indexes", "collection" => collection))
 
 """
+    create_ttl_index(db, collection, field, expire_after_seconds)
+
+Create a TTL index on a datetime field. Documents are automatically deleted
+when `field_value + expire_after_seconds` has passed.
+"""
+create_ttl_index(db::OxiDatabase, collection::AbstractString, field::AbstractString,
+                 expire_after_seconds::Integer) =
+    _checked(db, Dict("cmd" => "create_ttl_index", "collection" => collection,
+                       "field" => field, "expireAfterSeconds" => expire_after_seconds))
+
+"""
     drop_index(db, collection, index_name)
 
 Drop an index by name from a collection.
@@ -559,5 +575,81 @@ function search(db::OxiDatabase, query::AbstractString;
     bucket !== nothing && (payload["bucket"] = bucket)
     _checked(db, payload)
 end
+
+# ------------------------------------------------------------------
+# SQL
+# ------------------------------------------------------------------
+
+"""
+    sql(db, query)
+
+Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES.
+"""
+sql(db::OxiDatabase, query::AbstractString) =
+    _checked(db, Dict("cmd" => "sql", "query" => query))
+
+# ------------------------------------------------------------------
+# Stored procedures & OxiScript
+# ------------------------------------------------------------------
+
+"""
+    compile_oxiscript(db, script) -> Dict
+
+Compile an OxiScript source string into a JSON procedure definition.
+"""
+compile_oxiscript(db::OxiDatabase, script::AbstractString) =
+    _checked(db, Dict("cmd" => "compile_oxiscript", "script" => script))
+
+"""
+    create_procedure(db, name, params, steps)
+
+Create a stored procedure from a JSON definition.
+"""
+function create_procedure(db::OxiDatabase, name::AbstractString, params::Vector, steps::Vector)
+    _checked(db, Dict("cmd" => "create_procedure", "name" => name,
+                       "params" => params, "steps" => steps))
+end
+
+"""
+    create_procedure(db; script)
+
+Create a stored procedure from an OxiScript source string.
+"""
+function create_procedure(db::OxiDatabase; script::AbstractString)
+    _checked(db, Dict("cmd" => "create_procedure", "script" => script))
+end
+
+"""
+    call_procedure(db, name; params=Dict())
+
+Call a stored procedure by name with the given parameters.
+"""
+function call_procedure(db::OxiDatabase, name::AbstractString; params=Dict())
+    _checked(db, Dict("cmd" => "call_procedure", "name" => name, "params" => params))
+end
+
+"""
+    list_procedures(db)
+
+List all registered stored procedure names.
+"""
+list_procedures(db::OxiDatabase) =
+    _checked(db, Dict("cmd" => "list_procedures"))
+
+"""
+    get_procedure(db, name)
+
+Get a stored procedure definition by name.
+"""
+get_procedure(db::OxiDatabase, name::AbstractString) =
+    _checked(db, Dict("cmd" => "get_procedure", "name" => name))
+
+"""
+    delete_procedure(db, name)
+
+Delete a stored procedure by name.
+"""
+delete_procedure(db::OxiDatabase, name::AbstractString) =
+    _checked(db, Dict("cmd" => "delete_procedure", "name" => name))
 
 end # module

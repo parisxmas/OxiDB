@@ -72,6 +72,7 @@ docker compose up -d
 | `OXIDB_S3_CREDENTIALS` | — | Path to S3 credentials file |
 | `OXIDB_S3_ENCRYPTION_KEY` | — | Hex-encoded 32-byte AES-256 key for S3 SSE |
 | `OXIDB_S3_DEFAULT_ENCRYPTION` | `false` | Encrypt all S3 objects by default |
+| `OXIDB_HTTP_PORT` | — | Enable REST HTTP API on this port |
 | `OXIDB_UDP_PORT` | — | Enable UDP GELF/JSON log ingestion on this port |
 | `OXIDB_UDP_COLLECTION` | `_udp_logs` | Collection name for UDP log ingestion |
 | `OXIDB_LOG_COMMANDS` | `false` | Log OxiMem/MQTT commands |
@@ -83,11 +84,13 @@ docker compose up -d
 - **JSON-based queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$regex`, `$and`, `$or`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
 - **Aggregation pipeline** — 11 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`, `$out`; index-accelerated `$group` for count, sum, min, max, avg
-- **Indexes** — field, unique, composite, full-text, and vector indexes with automatic backfill; list and drop support
+- **Indexes** — field, unique, composite, full-text, vector, and TTL indexes with automatic backfill; list and drop support
+- **TTL indexes** — automatic document expiration on any datetime field; `create_ttl_index` with configurable `expireAfterSeconds`; index-accelerated eviction via background thread
 - **Vector search** — k-nearest-neighbor similarity search with cosine, Euclidean, and dot product metrics; flat (exact) for small collections, HNSW (approximate) for large; zero external dependencies
 - **B-tree storage engine** — `scc::HashMap` concurrent document storage with interior mutability; reads never block reads, writes to different documents proceed in parallel; WAL for crash safety; persisted field indexes for instant startup
 - **Zero-copy reads** — `find_one`, `update`, and `delete` use Arc-based document iteration, cloning only matching documents instead of every visited document
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
+- **REST HTTP API** — JSON-over-HTTP interface for all document operations (CRUD, aggregation, indexes, SQL, procedures); works with `curl`, Postman, or any HTTP client; CORS enabled
 - **S3-compatible API** — full HTTP REST API with path-style requests, multipart upload, range reads, object tagging, copy, conditional requests, SSE-S3/SSE-C encryption; compatible with AWS CLI and boto3
 - **OxiMem (Redis-compatible)** — in-memory key-value store with RESP wire protocol; 50+ commands (strings, hashes, lists, sets, sorted sets, pub/sub); optional SQL mirroring to OxiDB collections
 - **MQTT v3.1.1** — publish/subscribe messaging with cross-protocol bridging to OxiMem pub/sub channels
@@ -287,6 +290,7 @@ Max message size is 16 MiB.
 | `create_unique_index`    | `collection`, `field`                              |
 | `create_composite_index` | `collection`, `fields`                             |
 | `create_text_index`      | `collection`, `fields`                             |
+| `create_ttl_index`       | `collection`, `field`, `expireAfterSeconds`        |
 | `list_indexes`           | `collection`                                       |
 | `drop_index`             | `collection`, `index`                              |
 | `text_search`            | `collection`, `query`, `limit?`                    |
@@ -552,6 +556,53 @@ aws --endpoint-url http://localhost:9000 s3 ls s3://mybucket
 - **Batch delete** — delete multiple objects in a single request
 - **Authentication** — AWS Signature V4
 - **Server-side encryption** — SSE-S3 (server-managed key) and SSE-C (customer-provided key), both AES-256-GCM
+
+## REST HTTP API
+
+JSON-over-HTTP interface for all document operations. No client library needed — works with `curl`, Postman, browser JavaScript, or any HTTP client.
+
+```bash
+# Enable REST API on port 8080
+OXIDB_HTTP_PORT=8080 ./oxidb-server
+
+# Insert
+curl -X POST http://localhost:8080/api/users/documents \
+  -H "Content-Type: application/json" \
+  -d '{"doc": {"name": "Alice", "age": 30}}'
+
+# Find
+curl 'http://localhost:8080/api/users/documents?q={"age":{"$gt":21}}&sort={"age":-1}&limit=10'
+
+# SQL
+curl -X POST http://localhost:8080/api/sql \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT * FROM users WHERE age > 21"}'
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/api/ping` | Health check |
+| `GET` | `/api/collections` | List collections |
+| `POST` | `/api/collections` | Create collection (`{"name": "..."}`) |
+| `DELETE` | `/api/collections/{name}` | Drop collection |
+| `POST` | `/api/{collection}/documents` | Insert (`{"doc": {...}}` or `{"docs": [...]}`) |
+| `GET` | `/api/{collection}/documents` | Find (`?q={}&sort={}&skip=N&limit=N`) |
+| `PATCH` | `/api/{collection}/documents` | Update (`{"query": {}, "update": {}}`) |
+| `DELETE` | `/api/{collection}/documents` | Delete (`{"query": {}}`) |
+| `GET` | `/api/{collection}/count` | Count (`?q={}`) |
+| `POST` | `/api/{collection}/aggregate` | Aggregation (`{"pipeline": [...]}`) |
+| `POST` | `/api/{collection}/indexes` | Create index (`{"field": "...", "type": "field\|unique\|ttl"}`) |
+| `GET` | `/api/{collection}/indexes` | List indexes |
+| `DELETE` | `/api/{collection}/indexes/{name}` | Drop index |
+| `POST` | `/api/sql` | SQL query (`{"query": "SELECT ..."}`) |
+| `POST` | `/api/procedures` | Create procedure (`{"script": "proc ..."}`) |
+| `POST` | `/api/procedures/{name}/call` | Call procedure |
+| `GET` | `/api/procedures` | List procedures |
+| `DELETE` | `/api/procedures/{name}` | Delete procedure |
+
+CORS enabled. JSON request and response bodies. HTTP keep-alive supported.
 
 ## Sharding (OxiPool)
 

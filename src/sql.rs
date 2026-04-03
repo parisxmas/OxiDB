@@ -72,6 +72,11 @@ pub fn execute_sql_with_dialect(db: &OxiDb, sql: &str, dialect: SqlDialect) -> R
         return Ok(result);
     }
 
+    // Pre-parse TTL INDEX commands (sqlparser doesn't understand CREATE TTL INDEX).
+    if let Some(result) = try_ttl_index_command(db, sql)? {
+        return Ok(result);
+    }
+
     let parser_dialect = dialect.to_parser_dialect();
     let statements = Parser::parse_sql(parser_dialect.as_ref(), sql)
         .map_err(|e| Error::InvalidQuery(format!("SQL parse error: {e}")))?;
@@ -102,6 +107,11 @@ pub fn execute_sql_with_db_manager(
         return Ok(result);
     }
 
+    // Pre-parse TTL INDEX commands.
+    if let Some(result) = try_ttl_index_command(db, sql)? {
+        return Ok(result);
+    }
+
     // Fall through to standard SQL execution.
     let parser_dialect = dialect.to_parser_dialect();
     let statements = Parser::parse_sql(parser_dialect.as_ref(), sql)
@@ -118,6 +128,58 @@ pub fn execute_sql_with_db_manager(
 
     let stmt = statements.into_iter().next().unwrap();
     execute_statement(db, stmt)
+}
+
+/// Try to parse `CREATE TTL INDEX ... ON table(field) EXPIRE AFTER N` before sqlparser.
+/// Syntax: `CREATE TTL INDEX [name] ON table (field) EXPIRE AFTER <seconds>`
+fn try_ttl_index_command(db: &OxiDb, sql: &str) -> Result<Option<SqlResult>> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_uppercase();
+
+    if !upper.starts_with("CREATE TTL INDEX") {
+        return Ok(None);
+    }
+
+    // Parse: CREATE TTL INDEX [name] ON table (field) EXPIRE AFTER <seconds>
+    // Find ON, extract table and field, then EXPIRE AFTER <n>
+    let on_pos = upper.find(" ON ").ok_or_else(|| {
+        Error::InvalidQuery("CREATE TTL INDEX requires ON clause".into())
+    })?;
+    let after_on = &trimmed[on_pos + 4..];
+
+    // Extract table name — everything before '('
+    let paren_pos = after_on.find('(').ok_or_else(|| {
+        Error::InvalidQuery("CREATE TTL INDEX requires (field)".into())
+    })?;
+    let table = after_on[..paren_pos].trim()
+        .trim_matches('"').trim_matches('`').trim_matches('\'');
+
+    // Extract field — between '(' and ')'
+    let close_paren = after_on.find(')').ok_or_else(|| {
+        Error::InvalidQuery("missing closing parenthesis".into())
+    })?;
+    let field = after_on[paren_pos + 1..close_paren].trim()
+        .trim_matches('"').trim_matches('`').trim_matches('\'');
+
+    // Extract EXPIRE AFTER <seconds>
+    let remainder = after_on[close_paren + 1..].trim();
+    let remainder_upper = remainder.to_uppercase();
+    if !remainder_upper.starts_with("EXPIRE AFTER") {
+        return Err(Error::InvalidQuery(
+            "CREATE TTL INDEX requires EXPIRE AFTER <seconds>".into(),
+        ));
+    }
+    let seconds_str = remainder[12..].trim(); // skip "EXPIRE AFTER"
+    let seconds: u64 = seconds_str.parse().map_err(|_| {
+        Error::InvalidQuery(format!(
+            "EXPIRE AFTER value must be a positive integer, got '{seconds_str}'"
+        ))
+    })?;
+
+    db.create_ttl_index(table, field, seconds)?;
+    Ok(Some(SqlResult::Ddl(format!(
+        "ttl index on '{field}' created (expireAfterSeconds={seconds})"
+    ))))
 }
 
 /// Try to handle database-level SQL commands before sqlparser.
@@ -1667,5 +1729,47 @@ mod tests {
         assert_eq!(like_to_regex("test%"), "^test.*$");
         assert_eq!(like_to_regex("%test"), "^.*test$");
         assert_eq!(like_to_regex("exact"), "^exact$");
+    }
+
+    #[test]
+    fn create_ttl_index_via_sql() {
+        let dir = tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+
+        let result = execute_sql(
+            &db,
+            "CREATE TTL INDEX idx_session_ttl ON sessions (created_at) EXPIRE AFTER 3600",
+        )
+        .unwrap();
+        assert!(matches!(result, SqlResult::Ddl(_)));
+
+        let indexes = db.list_indexes("sessions").unwrap();
+        let ttl = indexes.iter().find(|i| i.index_type == "ttl").unwrap();
+        assert_eq!(ttl.name, "created_at_ttl");
+        assert_eq!(ttl.expire_after_seconds, Some(3600));
+    }
+
+    #[test]
+    fn create_ttl_index_via_sql_evicts() {
+        let db = OxiDb::open_in_memory().unwrap();
+
+        // Insert an expired doc
+        let past = chrono::Utc::now() - chrono::Duration::seconds(10);
+        db.insert("logs", json!({"msg": "old", "ts": past.to_rfc3339()})).unwrap();
+        db.insert("logs", json!({"msg": "new", "ts": chrono::Utc::now().to_rfc3339()})).unwrap();
+
+        // Create TTL index via SQL — should immediately evict old doc
+        execute_sql(&db, "CREATE TTL INDEX ON logs (ts) EXPIRE AFTER 5").unwrap();
+
+        let docs = db.find("logs", &json!({})).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0]["msg"], "new");
+    }
+
+    #[test]
+    fn create_ttl_index_sql_error_missing_expire() {
+        let db = OxiDb::open_in_memory().unwrap();
+        let result = execute_sql(&db, "CREATE TTL INDEX ON t (f)");
+        assert!(result.is_err());
     }
 }

@@ -59,7 +59,9 @@ def timed(sock, payload):
 
 
 def main():
-    server_bin = os.path.join(os.path.dirname(__file__), "..", "target", "release", "oxidb-server")
+    server_bin = os.path.join(os.path.dirname(__file__), "..", "target-local", "release", "oxidb-server")
+    if not os.path.exists(server_bin):
+        server_bin = os.path.join(os.path.dirname(__file__), "..", "target", "release", "oxidb-server")
     if not os.path.exists(server_bin):
         print("FATAL: oxidb-server not found. Run `cargo build --release`.")
         sys.exit(1)
@@ -438,6 +440,246 @@ def main():
         check("50 transfer calls completed", True)
         timings.append(("50x transfer (7-step)", batch_ms))
         timings.append(("avg per transfer call", batch_ms / 50))
+
+        # ════════════════════════════════════════════════════════════
+        # Test 10: TTL index via protocol
+        # ════════════════════════════════════════════════════════════
+
+        print("\nTEST 10: TTL index create and list")
+        send_recv(s, {"cmd": "drop_collection", "collection": "sessions"})
+        resp = send_recv(s, {"cmd": "create_ttl_index", "collection": "sessions", "field": "created_at", "expireAfterSeconds": 3600})
+        check("create_ttl_index ok", resp.get("ok"), str(resp))
+
+        resp = send_recv(s, {"cmd": "list_indexes", "collection": "sessions"})
+        check("list_indexes ok", resp.get("ok"))
+        indexes = get_data(resp)
+        ttl_idx = [i for i in indexes if i.get("index_type") == "ttl"]
+        check("ttl index in list", len(ttl_idx) == 1, str(indexes))
+        check("ttl expireAfterSeconds=3600", ttl_idx[0].get("expire_after_seconds") == 3600, str(ttl_idx))
+
+        # ════════════════════════════════════════════════════════════
+        # Test 11: If-else-if chain
+        # ════════════════════════════════════════════════════════════
+
+        print("\nTEST 11: If-else-if chain")
+        script = '''
+            proc classify(score) {
+                if score >= 90 {
+                    return {grade: "A"}
+                } else if score >= 70 {
+                    return {grade: "B"}
+                } else if score >= 50 {
+                    return {grade: "C"}
+                } else {
+                    return {grade: "F"}
+                }
+            }
+        '''
+        resp = send_recv(s, {"cmd": "create_procedure", "script": script})
+        check("create classify ok", resp.get("ok"), str(resp))
+
+        for score, expected in [(95, "A"), (80, "B"), (60, "C"), (30, "F")]:
+            resp = send_recv(s, {"cmd": "call_procedure", "name": "classify", "params": {"score": score}})
+            check(f"score {score} → grade {expected}", get_data(resp).get("grade") == expected, str(get_data(resp)))
+
+        # ════════════════════════════════════════════════════════════
+        # Test 12: Multi-collection transaction rollback
+        # ════════════════════════════════════════════════════════════
+
+        print("\nTEST 12: Multi-collection rollback on abort")
+        send_recv(s, {"cmd": "drop_collection", "collection": "inventory"})
+        send_recv(s, {"cmd": "drop_collection", "collection": "shipments"})
+        send_recv(s, {"cmd": "insert", "collection": "inventory", "doc": {"item": "Widget", "qty": 5}})
+        send_recv(s, {"cmd": "create_index", "collection": "inventory", "field": "item"})
+
+        script = '''
+            proc ship(item, qty) {
+                let inv = find_one("inventory", {item: item})
+                if inv == null { abort "item not found" }
+                if inv.qty < qty { abort "not enough stock" }
+                update("inventory", {item: item}, {$inc: {qty: -qty}})
+                insert("shipments", {item: item, qty: qty, status: "shipped"})
+                return {status: "shipped"}
+            }
+        '''
+        send_recv(s, {"cmd": "create_procedure", "script": script})
+
+        # Should fail — not enough stock
+        resp = send_recv(s, {"cmd": "call_procedure", "name": "ship", "params": {"item": "Widget", "qty": 100}})
+        check("ship fails for overship", not resp.get("ok"))
+
+        # Verify inventory unchanged
+        r = send_recv(s, {"cmd": "find_one", "collection": "inventory", "query": {"item": "Widget"}})
+        check("inventory unchanged (5)", get_data(r).get("qty") == 5, str(get_data(r)))
+
+        # No shipment created
+        r = send_recv(s, {"cmd": "count", "collection": "shipments"})
+        check("no shipments created", get_data(r).get("count") == 0, str(get_data(r)))
+
+        # Now succeed
+        resp = send_recv(s, {"cmd": "call_procedure", "name": "ship", "params": {"item": "Widget", "qty": 3}})
+        check("ship 3 ok", resp.get("ok"), str(resp))
+        r = send_recv(s, {"cmd": "find_one", "collection": "inventory", "query": {"item": "Widget"}})
+        check("inventory now 2", get_data(r).get("qty") == 2, str(get_data(r)))
+
+        # ════════════════════════════════════════════════════════════
+        # Test 13: Update with $set + $inc combined
+        # ════════════════════════════════════════════════════════════
+
+        print("\nTEST 13: Update with $set + $inc combined")
+        send_recv(s, {"cmd": "drop_collection", "collection": "players"})
+        send_recv(s, {"cmd": "insert", "collection": "players", "doc": {"name": "Zara", "level": 1, "xp": 0, "title": "novice"}})
+        send_recv(s, {"cmd": "create_index", "collection": "players", "field": "name"})
+
+        script = '''
+            proc level_up(name, xp_gained) {
+                update("players", {name: name}, {
+                    $inc: {level: 1, xp: xp_gained},
+                    $set: {title: "veteran"}
+                })
+                return {status: "leveled up"}
+            }
+        '''
+        send_recv(s, {"cmd": "create_procedure", "script": script})
+        resp = send_recv(s, {"cmd": "call_procedure", "name": "level_up", "params": {"name": "Zara", "xp_gained": 500}})
+        check("level_up ok", resp.get("ok"), str(resp))
+
+        r = send_recv(s, {"cmd": "find_one", "collection": "players", "query": {"name": "Zara"}})
+        p = get_data(r)
+        check("level is 2", p.get("level") == 2, str(p))
+        check("xp is 500", p.get("xp") == 500, str(p))
+        check("title is veteran", p.get("title") == "veteran", str(p))
+
+        # ════════════════════════════════════════════════════════════
+        # Test 14: Delete in procedure + count verification
+        # ════════════════════════════════════════════════════════════
+
+        print("\nTEST 14: Delete in procedure + count verification")
+        send_recv(s, {"cmd": "drop_collection", "collection": "events"})
+        for i in range(10):
+            level = "error" if i < 3 else "info"
+            send_recv(s, {"cmd": "insert", "collection": "events", "doc": {"level": level, "idx": i}})
+
+        script = '''
+            proc purge_errors() {
+                delete("events", {level: "error"})
+                return {status: "purged"}
+            }
+        '''
+        send_recv(s, {"cmd": "create_procedure", "script": script})
+        resp, ms = timed(s, {"cmd": "call_procedure", "name": "purge_errors", "params": {}})
+        check("purge_errors ok", resp.get("ok"), str(resp))
+        timings.append(("purge_errors (delete+return)", ms))
+
+        r = send_recv(s, {"cmd": "count", "collection": "events"})
+        check("7 events remain", get_data(r).get("count") == 7, str(get_data(r)))
+
+        r = send_recv(s, {"cmd": "count", "collection": "events", "query": {"level": "error"}})
+        check("0 errors remain", get_data(r).get("count") == 0, str(get_data(r)))
+
+        # ════════════════════════════════════════════════════════════
+        # Test 15: Procedure with find (multi-doc result)
+        # ════════════════════════════════════════════════════════════
+
+        print("\nTEST 15: Procedure with find (multi-doc)")
+        script = '''
+            proc find_by_level(level) {
+                let docs = find("events", {level: level})
+                let n = count("events", {level: level})
+                return {count: n, docs: docs}
+            }
+        '''
+        send_recv(s, {"cmd": "create_procedure", "script": script})
+        resp = send_recv(s, {"cmd": "call_procedure", "name": "find_by_level", "params": {"level": "info"}})
+        check("find_by_level ok", resp.get("ok"), str(resp))
+        data = get_data(resp)
+        check("count is 7", data.get("count") == 7, str(data))
+        check("docs is array of 7", isinstance(data.get("docs"), list) and len(data.get("docs", [])) == 7, str(data))
+
+        # ════════════════════════════════════════════════════════════
+        # Test 16: Chained procedure calls (3-deep)
+        # ════════════════════════════════════════════════════════════
+
+        print("\nTEST 16: Three-level procedure call chain")
+        script = '''
+            proc get_name(account_id) {
+                let acc = find_one("accounts", {account_id: account_id})
+                if acc == null { abort "not found" }
+                return acc.name
+            }
+        '''
+        send_recv(s, {"cmd": "create_procedure", "script": script})
+
+        script = '''
+            proc get_greeting(account_id) {
+                let name = get_name({account_id: account_id})
+                return {greeting: "Hello", name: name}
+            }
+        '''
+        send_recv(s, {"cmd": "create_procedure", "script": script})
+
+        script = '''
+            proc send_welcome(account_id) {
+                let msg = get_greeting({account_id: account_id})
+                insert("alerts", {
+                    to: account_id,
+                    message: msg.greeting,
+                    recipient: msg.name,
+                    type: "welcome"
+                })
+                return {sent: true}
+            }
+        '''
+        send_recv(s, {"cmd": "create_procedure", "script": script})
+
+        resp = send_recv(s, {"cmd": "call_procedure", "name": "send_welcome", "params": {"account_id": "bob"}})
+        check("send_welcome ok", resp.get("ok"), str(resp))
+        check("sent is true", get_data(resp).get("sent") == True, str(get_data(resp)))
+
+        r = send_recv(s, {"cmd": "find_one", "collection": "alerts", "query": {"to": "bob", "type": "welcome"}})
+        check("alert created", get_data(r) is not None, str(get_data(r)))
+        check("recipient is Bob", get_data(r).get("recipient") == "Bob", str(get_data(r)))
+
+        # ════════════════════════════════════════════════════════════
+        # Test 17: SQL via procedure (count + find_one)
+        # ════════════════════════════════════════════════════════════
+
+        print("\nTEST 17: Procedure with validation + insert + update")
+        script = '''
+            proc register(username, email) {
+                let existing = find_one("users", {username: username})
+                if existing != null {
+                    abort "username taken"
+                }
+                insert("users", {username: username, email: email, status: "active", login_count: 0})
+                return {registered: true, username: username}
+            }
+        '''
+        send_recv(s, {"cmd": "drop_collection", "collection": "users"})
+        send_recv(s, {"cmd": "create_procedure", "script": script})
+
+        resp = send_recv(s, {"cmd": "call_procedure", "name": "register", "params": {"username": "alice99", "email": "a@test.com"}})
+        check("register ok", resp.get("ok"), str(resp))
+        check("username alice99", get_data(resp).get("username") == "alice99")
+
+        # Duplicate should fail
+        resp = send_recv(s, {"cmd": "call_procedure", "name": "register", "params": {"username": "alice99", "email": "a@test.com"}})
+        check("duplicate fails", not resp.get("ok"))
+        check("error is username taken", "username taken" in resp.get("error", ""))
+
+        # ════════════════════════════════════════════════════════════
+        # Test 18: Batch — many different procedures
+        # ════════════════════════════════════════════════════════════
+
+        print("\nTEST 18: Batch — mixed procedure calls")
+        t0 = time.perf_counter()
+        for i in range(20):
+            send_recv(s, {"cmd": "call_procedure", "name": "classify", "params": {"score": i * 5}})
+            send_recv(s, {"cmd": "call_procedure", "name": "get_balance", "params": {"account_id": "bob"}})
+        batch_ms = (time.perf_counter() - t0) * 1000
+        check("40 mixed calls completed", True)
+        timings.append(("40x mixed (classify+get_balance)", batch_ms))
+        timings.append(("avg per mixed call", batch_ms / 40))
 
         # ════════════════════════════════════════════════════════════
         # Summary

@@ -1387,6 +1387,20 @@ fn main() {
         }
     }
 
+    // REST HTTP API (optional, enabled via OXIDB_HTTP_PORT)
+    let http_port: u16 = env::var("OXIDB_HTTP_PORT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("OXIDB_HTTP_PORT must be a valid u16");
+
+    if http_port > 0 {
+        let http_addr = format!("0.0.0.0:{http_port}");
+        let http_db = Arc::clone(&state.db);
+        oxidb_server::rest::start_rest_listener(&http_addr, http_db);
+        server_log!(state, GelfLevel::Notice,
+            format!("REST HTTP API listening on {http_addr}"));
+    }
+
     // UDP log ingestion listener (optional, enabled via OXIDB_UDP_PORT)
     let udp_port: u16 = env::var("OXIDB_UDP_PORT")
         .unwrap_or_else(|_| "0".to_string())
