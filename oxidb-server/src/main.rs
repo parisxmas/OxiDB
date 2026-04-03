@@ -1401,6 +1401,20 @@ fn main() {
             format!("REST HTTP API listening on {http_addr}"));
     }
 
+    // WebSocket listener (optional, enabled via OXIDB_WS_PORT)
+    let ws_port: u16 = env::var("OXIDB_WS_PORT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("OXIDB_WS_PORT must be a valid u16");
+
+    if ws_port > 0 {
+        let ws_addr = format!("0.0.0.0:{ws_port}");
+        let ws_db = Arc::clone(&state.db);
+        oxidb_server::ws::start_ws_listener(&ws_addr, ws_db);
+        server_log!(state, GelfLevel::Notice,
+            format!("WebSocket API listening on {ws_addr}"));
+    }
+
     // UDP log ingestion listener (optional, enabled via OXIDB_UDP_PORT)
     let udp_port: u16 = env::var("OXIDB_UDP_PORT")
         .unwrap_or_else(|_| "0".to_string())
