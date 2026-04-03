@@ -15,6 +15,7 @@ pub mod tls;
 pub mod udp_ingest;
 
 pub mod rest;
+pub mod ws;
 
 #[cfg(feature = "s3")]
 pub mod s3;
