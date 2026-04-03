@@ -38,6 +38,7 @@ use oxidb::query::FindOptions;
 use serde_json::{json, Value};
 
 use crate::jwt;
+use crate::rules::{self, AuthContext, Operation};
 use crate::s3::http::{parse_request_from_reader, HttpRequest, HttpResponse};
 
 const POOL_SIZE: usize = 64;
@@ -171,18 +172,20 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         // handled above via early return
     }
 
-    // ── JWT enforcement ──────────────────────────────────────────────
-    if let Some(ref secret) = state.jwt_secret {
+    // ── JWT enforcement + extract auth context ─────────────────────
+    let auth_ctx = if let Some(ref secret) = state.jwt_secret {
         let auth_header = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
         if let Some(token) = jwt::extract_bearer(auth_header) {
             match jwt::verify(token, secret) {
-                Ok(_claims) => {} // authenticated — proceed
+                Ok(claims) => AuthContext::from_claims(&claims.sub, &claims.role),
                 Err(e) => return with_rest_cors(json_response(401, "Unauthorized", json!({"error": e}))),
             }
         } else {
             return with_rest_cors(json_response(401, "Unauthorized", json!({"error": "missing Authorization: Bearer <token>"})));
         }
-    }
+    } else {
+        AuthContext::anonymous()
+    };
 
     // ── Protected endpoints ──────────────────────────────────────────
     let result = match (req.method.as_str(), segments.as_slice()) {
@@ -194,11 +197,11 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         ("POST", ["api", "collections"]) => handle_create_collection(req, state),
         ("DELETE", ["api", "collections", name]) => handle_drop_collection(name, state),
 
-        // Documents
-        ("POST", ["api", col, "documents"]) => handle_insert(col, req, state),
-        ("GET", ["api", col, "documents"]) => handle_find(col, req, state),
-        ("PATCH", ["api", col, "documents"]) => handle_update(col, req, state),
-        ("DELETE", ["api", col, "documents"]) => handle_delete(col, req, state),
+        // Documents (with security rules enforcement)
+        ("POST", ["api", col, "documents"]) => handle_insert_with_rules(col, req, state, &auth_ctx),
+        ("GET", ["api", col, "documents"]) => handle_find_with_rules(col, req, state, &auth_ctx),
+        ("PATCH", ["api", col, "documents"]) => handle_update_with_rules(col, req, state, &auth_ctx),
+        ("DELETE", ["api", col, "documents"]) => handle_delete_with_rules(col, req, state, &auth_ctx),
 
         // Count
         ("GET", ["api", col, "count"]) => handle_count(col, req, state),
@@ -219,6 +222,11 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         ("POST", ["api", "procedures"]) => handle_create_procedure(req, state),
         ("POST", ["api", "procedures", name, "call"]) => handle_call_procedure(name, req, state),
         ("DELETE", ["api", "procedures", name]) => handle_delete_procedure(name, state),
+
+        // Security rules
+        ("POST", ["api", "rules", col]) => handle_set_rules(col, req, state),
+        ("GET", ["api", "rules", col]) => handle_get_rules(col, state),
+        ("DELETE", ["api", "rules", col]) => handle_delete_rules(col, state),
 
         _ => Err((404, "not found")),
     };
@@ -435,6 +443,107 @@ fn handle_call_procedure(name: &str, req: &HttpRequest, state: &RestState) -> Re
 fn handle_delete_procedure(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
     state.db.delete_procedure(name).map_err(db_err)?;
     Ok(json!({"deleted": name}))
+}
+
+// ---------------------------------------------------------------------------
+// CRUD with security rules
+// ---------------------------------------------------------------------------
+
+fn handle_insert_with_rules(col: &str, req: &HttpRequest, state: &RestState, auth: &AuthContext) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    if let Some(doc) = body.get("doc") {
+        rules::check_access(&state.db, col, Operation::Create, auth, None, Some(doc))
+            .map_err(|_| (403, "access denied"))?;
+        let id = state.db.insert(col, doc.clone()).map_err(db_err)?;
+        Ok(json!({"id": id}))
+    } else if let Some(docs) = body.get("docs").and_then(|v| v.as_array()) {
+        // Check rules on first doc as representative (batch check)
+        if let Some(first) = docs.first() {
+            rules::check_access(&state.db, col, Operation::Create, auth, None, Some(first))
+                .map_err(|_| (403, "access denied"))?;
+        }
+        let ids = state.db.insert_many(col, docs.clone()).map_err(db_err)?;
+        Ok(json!({"ids": ids}))
+    } else {
+        Err((400, "missing 'doc' or 'docs'"))
+    }
+}
+
+fn handle_find_with_rules(col: &str, req: &HttpRequest, state: &RestState, auth: &AuthContext) -> Result<Value, (u16, &'static str)> {
+    // Check read access (without specific doc — collection-level check)
+    rules::check_access(&state.db, col, Operation::Read, auth, None, None)
+        .map_err(|_| (403, "access denied"))?;
+    handle_find(col, req, state)
+}
+
+fn handle_update_with_rules(col: &str, req: &HttpRequest, state: &RestState, auth: &AuthContext) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let query = body.get("query").ok_or((400, "missing 'query'"))?;
+    let update = body.get("update").ok_or((400, "missing 'update'"))?;
+
+    // Check rules against matching documents
+    let docs = state.db.find(col, query).map_err(db_err)?;
+    for doc in &docs {
+        rules::check_access(&state.db, col, Operation::Update, auth, Some(doc), None)
+            .map_err(|_| (403, "access denied"))?;
+    }
+
+    let one = body.get("one").and_then(|v| v.as_bool()).unwrap_or(false);
+    if one {
+        let n = state.db.update_one(col, query, update).map_err(db_err)?;
+        Ok(json!({"modified": n}))
+    } else {
+        let n = state.db.update(col, query, update).map_err(db_err)?;
+        Ok(json!({"modified": n}))
+    }
+}
+
+fn handle_delete_with_rules(col: &str, req: &HttpRequest, state: &RestState, auth: &AuthContext) -> Result<Value, (u16, &'static str)> {
+    let body = if req.body.is_empty() {
+        let q = query_param_json(&req.query, "q").unwrap_or(json!({}));
+        json!({"query": q})
+    } else {
+        parse_json_body(req)?
+    };
+    let query = body.get("query").ok_or((400, "missing 'query'"))?;
+
+    // Check rules against matching documents
+    let docs = state.db.find(col, query).map_err(db_err)?;
+    for doc in &docs {
+        rules::check_access(&state.db, col, Operation::Delete, auth, Some(doc), None)
+            .map_err(|_| (403, "access denied"))?;
+    }
+
+    let n = state.db.delete(col, query).map_err(db_err)?;
+    Ok(json!({"deleted": n}))
+}
+
+// ---------------------------------------------------------------------------
+// Rules management handlers
+// ---------------------------------------------------------------------------
+
+fn handle_set_rules(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    rules::set_rules(&state.db, col, &body).map_err(|_| (500, "failed to set rules"))?;
+    Ok(json!({"collection": col, "rules": "set"}))
+}
+
+fn handle_get_rules(col: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    match rules::get_rules(&state.db, col) {
+        Some(r) => Ok(json!({
+            "collection": col,
+            "read": r.read,
+            "create": r.create,
+            "update": r.update,
+            "delete": r.delete,
+        })),
+        None => Err((404, "no rules defined for this collection")),
+    }
+}
+
+fn handle_delete_rules(col: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    rules::delete_rules(&state.db, col).map_err(|_| (500, "failed to delete rules"))?;
+    Ok(json!({"collection": col, "rules": "deleted"}))
 }
 
 // ---------------------------------------------------------------------------

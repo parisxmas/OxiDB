@@ -16,6 +16,7 @@ pub mod udp_ingest;
 
 pub mod jwt;
 pub mod rest;
+pub mod rules;
 pub mod ws;
 
 #[cfg(feature = "s3")]
