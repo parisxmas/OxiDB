@@ -157,12 +157,7 @@ fn do_handshake(stream: &mut TcpStream) -> bool {
     let hash = hasher.finalize();
     let accept = base64::engine::general_purpose::STANDARD.encode(hash);
 
-    let response = format!(
-        "HTTP/1.1 101 Switching Protocols\r\n\
-         Upgrade: websocket\r\n\
-         Connection: Upgrade\r\n\
-         Sec-WebSocket-Accept: {accept}\r\n\r\n"
-    );
+    let response = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
     stream.write_all(response.as_bytes()).is_ok()
 }
 
