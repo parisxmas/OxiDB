@@ -1,0 +1,30 @@
+{
+  "name": "oxidb",
+  "version": "0.23.2",
+  "description": "OxiDB client for JavaScript/TypeScript — REST API, WebSocket real-time subscriptions, authentication",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "oxidb",
+    "database",
+    "document-database",
+    "nosql",
+    "realtime",
+    "websocket",
+    "rest-api",
+    "firebase-alternative"
+  ],
+  "author": "OxiDB",
+  "license": "MIT",
+  "homepage": "https://github.com/parisxmas/OxiDB",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/parisxmas/OxiDB.git",
+    "directory": "oxidb-js"
+  }
+}
