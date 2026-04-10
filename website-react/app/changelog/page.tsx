@@ -11,12 +11,56 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.24.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.24.0</h3>
+        <span class="version-date">2026-04-10</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>WebAssembly support</strong> -- New <code>oxidb-wasm</code> crate compiles OxiDB to <code>wasm32</code> and runs entirely in the browser.
+          </li>
+          <li>
+            <strong>In-memory browser mode</strong> -- No server needed. JSON queries, SQL, and aggregation all work client-side in the browser.
+          </li>
+          <li>
+            <strong>wasm-bindgen API</strong> -- Full JavaScript API surface: <code>init</code>, <code>insert</code>, <code>find</code>, <code>update</code>, <code>delete</code>, <code>count</code>, <code>sql</code>, <code>aggregate</code>.
+          </li>
+          <li>
+            <strong>~1.5 MB gzipped WASM binary</strong> -- Compact binary size suitable for production web applications.
+          </li>
+          <li>
+            <strong>TypeScript types included</strong> -- Full type definitions shipped with the WASM package for editor autocompletion and type safety.
+          </li>
+          <li>
+            <strong>Cross-platform lock shim (<code>src/locks.rs</code>)</strong> -- Uses <code>parking_lot</code> on native targets, spin locks on <code>wasm32</code>.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Changed</h4>
+        <ul>
+          <li>
+            <strong>Native-only dependencies made target-specific</strong> -- <code>rayon</code>, <code>memmap2</code>, <code>zstd</code>, and other native-only crates moved to target-specific dependencies to enable WASM compilation.
+          </li>
+          <li>
+            <strong><code>#[cfg(not(target_arch = "wasm32"))]</code> guards throughout core engine</strong> -- Platform-incompatible code paths conditionally compiled out for the WASM target.
+          </li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.18.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.18.0</h3>
         <span class="version-date">2026-03-05</span>
-        <span class="version-badge latest">latest</span>
       </div>
 
       <div class="change-group">

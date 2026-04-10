@@ -89,6 +89,11 @@ export default function Page() {
         <h3>Scheduled Tasks</h3>
         <p>Background job scheduling with enable/disable control and configurable intervals.</p>
       </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><path d="M7 10h2l1-3 2 6 1-3h2"/></svg></div>
+        <h3>WebAssembly</h3>
+        <p>Run OxiDB entirely in the browser via WASM. No server needed — in-memory mode with full query, SQL, and aggregation support. ~1.5 MB gzipped.</p>
+      </div>
     </div>
   </div>
 </section>` }} />
