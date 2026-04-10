@@ -13,12 +13,17 @@ use crate::fts::CollectionTextIndex;
 use crate::in_memory::{InMemStorage, StorageBackend, WalBackend};
 use crate::index::CompositeIndex;
 use crate::paged_field_index::PagedFieldIndex;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::index_persist;
 use crate::vector::{DistanceMetric, VectorIndex};
 use crate::query::{self, FindOptions, Query, SortOrder};
-use crate::storage::{DocLocation, Storage};
+use crate::storage::DocLocation;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::storage::Storage;
 use crate::value::IndexValue;
-use crate::wal::{Wal, WalEntry};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::wal::Wal;
+use crate::wal::WalEntry;
 
 /// Resolve a field path (with dot notation) directly on a &Value.
 pub fn resolve_field_in_value<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
@@ -136,6 +141,7 @@ impl Collection {
 
     /// Persist current index data (BTreeMap contents) to binary cache files.
     /// Called after create_index, create_unique_index, create_composite_index, and compact.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save_index_data(&self) {
         if self.in_memory {
             return;
@@ -166,12 +172,19 @@ impl Collection {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn save_index_data(&self) {
+        // No-op on wasm32 (no filesystem persistence)
+    }
+
     /// Create or open a collection backed by a data file.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(name: &str, data_dir: &Path) -> Result<Self> {
         Self::open_with_options(name, data_dir, &HashSet::new(), None, false, None)
     }
 
     /// Create or open a collection, filtering WAL recovery by committed tx_ids.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_with_committed_txs(
         name: &str,
         data_dir: &Path,
@@ -181,6 +194,7 @@ impl Collection {
     }
 
     /// Create or open a collection with optional encryption and tx recovery.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_with_options(
         name: &str,
         data_dir: &Path,
@@ -2568,6 +2582,8 @@ impl Collection {
         }
 
         // File mode: create temp storage, copy, rename
+        #[cfg(not(target_arch = "wasm32"))]
+        {
         let tmp_path = self.data_dir.join(format!("{}.dat.tmp", self.name));
         let new_storage = Storage::open_with_encryption(&tmp_path, self.encryption.clone())?;
 
@@ -2648,6 +2664,13 @@ impl Collection {
             new_size,
             docs_kept,
         })
+        } // end #[cfg(not(target_arch = "wasm32"))]
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            // On wasm32, compact is only meaningful for in-memory mode (handled above).
+            Err(Error::InvalidQuery("compact: not supported on wasm32 for file-backed storage".into()))
+        }
     }
 
     // -----------------------------------------------------------------------

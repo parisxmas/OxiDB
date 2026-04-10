@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use parking_lot::RwLock;
+use crate::locks::RwLock;
 
 use crate::error::{Error, Result};
 

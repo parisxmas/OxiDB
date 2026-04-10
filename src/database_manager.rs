@@ -106,23 +106,29 @@ impl DatabaseManager {
             return Err(Error::DatabaseNotFound(name.to_string()));
         }
 
-        // Check that the database directory exists
-        let db_dir = self.data_dir.join(name);
-        if !db_dir.exists() {
-            return Err(Error::DatabaseNotFound(name.to_string()));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Check that the database directory exists
+            let db_dir = self.data_dir.join(name);
+            if !db_dir.exists() {
+                return Err(Error::DatabaseNotFound(name.to_string()));
+            }
+
+            // Slow path: open the database
+            let db = self.open_db_instance(&db_dir)?;
+            let arc = Arc::new(db);
+
+            // Insert with write lock (double-check)
+            let mut dbs = self.databases.write().unwrap();
+            if let Some(existing) = dbs.get(name) {
+                return Ok(Arc::clone(existing));
+            }
+            dbs.insert(name.to_string(), Arc::clone(&arc));
+            Ok(arc)
         }
 
-        // Slow path: open the database
-        let db = self.open_db_instance(&db_dir)?;
-        let arc = Arc::new(db);
-
-        // Insert with write lock (double-check)
-        let mut dbs = self.databases.write().unwrap();
-        if let Some(existing) = dbs.get(name) {
-            return Ok(Arc::clone(existing));
-        }
-        dbs.insert(name.to_string(), Arc::clone(&arc));
-        Ok(arc)
+        #[cfg(target_arch = "wasm32")]
+        Err(Error::DatabaseNotFound(name.to_string()))
     }
 
     /// Get the default database.
@@ -141,6 +147,7 @@ impl DatabaseManager {
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         let db = if self.in_memory {
             OxiDb::open_in_memory()?
         } else {
@@ -151,6 +158,8 @@ impl DatabaseManager {
             std::fs::create_dir_all(&db_dir)?;
             self.open_db_instance(&db_dir)?
         };
+        #[cfg(target_arch = "wasm32")]
+        let db = OxiDb::open_in_memory()?;
 
         let mut dbs = self.databases.write().unwrap();
         dbs.insert(name.to_string(), Arc::new(db));
@@ -216,6 +225,7 @@ impl DatabaseManager {
     }
 
     /// Start the scheduler on the default database.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn start_scheduler(&self) -> Result<()> {
         let db = self.get_default_database()?;
         db.start_scheduler();
@@ -231,6 +241,7 @@ impl DatabaseManager {
     // Internal
     // -----------------------------------------------------------------------
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_db_instance(&self, db_dir: &Path) -> Result<OxiDb> {
         if let Some(ref cb) = self.log_callback {
             OxiDb::open_with_log(

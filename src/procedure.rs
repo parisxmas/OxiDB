@@ -4,7 +4,10 @@ use serde_json::{json, Value};
 
 use crate::engine::OxiDb;
 use crate::error::{Error, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::tx_log::TransactionId;
+#[cfg(target_arch = "wasm32")]
+type TransactionId = u64;
 
 /// Parsed procedure definition.
 pub struct Procedure {

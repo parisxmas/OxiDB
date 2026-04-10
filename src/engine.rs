@@ -1,14 +1,23 @@
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
+#[cfg(target_arch = "wasm32")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
-use parking_lot::{Mutex, RwLock};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::mpsc;
+use std::sync::Arc;
+use crate::locks::{Mutex, RwLock};
 
+#[cfg(not(target_arch = "wasm32"))]
 use flate2::Compression;
+#[cfg(not(target_arch = "wasm32"))]
 use flate2::read::GzDecoder;
+#[cfg(not(target_arch = "wasm32"))]
 use flate2::write::GzEncoder;
 use serde_json::{json, Value};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::blob::BlobStore;
 use crate::btree_collection::BTreeCollection;
 use crate::change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
@@ -17,11 +26,15 @@ use crate::value::IndexValue;
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::fts::{self, FtsIndex};
 use crate::pipeline::Pipeline;
 use crate::query::FindOptions;
 use crate::transaction::{ReadRecord, Transaction, WriteOp};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::tx_log::{TransactionId, TxCommitLog};
+#[cfg(target_arch = "wasm32")]
+type TransactionId = u64;
 
 /// Callback type for forwarding engine log messages to an external sink.
 pub type LogCallback = Arc<dyn Fn(&str) + Send + Sync>;
@@ -54,6 +67,7 @@ pub struct RestoreInfo {
     pub collections: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 enum FtsJob {
     Index {
         data: Vec<u8>,
@@ -68,16 +82,16 @@ enum FtsJob {
 }
 
 /// The main OxiDB engine. Manages multiple collections.
-///
-/// Thread-safe: uses a `RwLock` on the collections map. Each
-/// `BTreeCollection` uses interior mutability (internal `RwLock`s)
-/// so reads on the same collection can proceed concurrently.
 pub struct OxiDb {
     data_dir: PathBuf,
     collections: RwLock<HashMap<String, Arc<BTreeCollection>>>,
+    #[cfg(not(target_arch = "wasm32"))]
     blob_store: BlobStore,
+    #[cfg(not(target_arch = "wasm32"))]
     fts_index: Arc<RwLock<FtsIndex>>,
+    #[cfg(not(target_arch = "wasm32"))]
     fts_tx: mpsc::SyncSender<FtsJob>,
+    #[cfg(not(target_arch = "wasm32"))]
     tx_log: TxCommitLog,
     next_tx_id: AtomicU64,
     active_transactions: RwLock<HashMap<TransactionId, Mutex<Transaction>>>,
@@ -85,35 +99,35 @@ pub struct OxiDb {
     verbose: bool,
     log_callback: Option<LogCallback>,
     change_broker: ChangeStreamBroker,
+    #[cfg(not(target_arch = "wasm32"))]
     scheduler_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
-    /// When true, collections skip per-write fsync; a background thread flushes.
     lazy_sync: AtomicBool,
+    #[cfg(not(target_arch = "wasm32"))]
     sync_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
-    /// Per-collection LRU document cache capacity.
     cache_capacity: AtomicUsize,
-    /// When true, all collections are in-memory only (no disk I/O).
     in_memory: bool,
-    /// Shutdown signal for the TTL eviction thread.
+    #[cfg(not(target_arch = "wasm32"))]
     ttl_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 
 impl OxiDb {
     /// Open or create a database at the given directory.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(data_dir: &Path) -> Result<Self> {
         Self::open_internal(data_dir, None, false, None)
     }
 
-    /// Open or create a database with optional encryption key.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_with_options(data_dir: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
         Self::open_internal(data_dir, encryption, false, None)
     }
 
-    /// Open or create a database with verbose logging enabled.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_verbose(data_dir: &Path, encryption: Option<Arc<EncryptionKey>>, verbose: bool) -> Result<Self> {
         Self::open_internal(data_dir, encryption, verbose, None)
     }
 
-    /// Open with verbose logging and an external log callback (e.g. GELF).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_with_log(
         data_dir: &Path,
         encryption: Option<Arc<EncryptionKey>>,
@@ -124,15 +138,8 @@ impl OxiDb {
     }
 
     /// Create a pure in-memory database (no disk I/O at all).
-    ///
-    /// All data lives only in RAM. Collections are auto-created on first use.
-    /// TTL support is available via the `_ttl` document field (seconds).
-    /// Existing OxiDB clients, SQL, indexes, transactions, and aggregations
-    /// all work unchanged.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open_in_memory() -> Result<Self> {
-        // Use a temp dir for subsystems that still need a path (blob, fts, txlog).
-        // These are effectively unused in pure in-memory mode but keep the
-        // type system happy.
         let tmp = std::env::temp_dir().join(format!("oxidb_mem_{}", std::process::id()));
         std::fs::create_dir_all(&tmp)?;
 
@@ -179,11 +186,31 @@ impl OxiDb {
         })
     }
 
+    /// Create a pure in-memory database for WebAssembly.
+    /// No filesystem, no threads, no blob/FTS subsystems.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open_in_memory() -> Result<Self> {
+        Ok(Self {
+            data_dir: PathBuf::new(),
+            collections: RwLock::new(HashMap::new()),
+            next_tx_id: AtomicU64::new(1),
+            active_transactions: RwLock::new(HashMap::new()),
+            encryption: None,
+            verbose: false,
+            log_callback: None,
+            change_broker: ChangeStreamBroker::new(),
+            lazy_sync: AtomicBool::new(false),
+            cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
+            in_memory: true,
+        })
+    }
+
     /// Returns true if this database is running in pure in-memory mode.
     pub fn is_in_memory(&self) -> bool {
         self.in_memory
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// Start the background TTL eviction thread.
     /// Runs every `interval` and evicts expired documents from all collections.
     pub fn start_ttl_thread(self: &Arc<Self>, interval: std::time::Duration) {
@@ -210,6 +237,7 @@ impl OxiDb {
         *self.ttl_shutdown.lock() = Some(tx);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_internal(
         data_dir: &Path,
         encryption: Option<Arc<EncryptionKey>>,
@@ -301,28 +329,26 @@ impl OxiDb {
 
     /// Return an Arc to a collection, auto-creating if needed.
     fn get_or_create_collection(&self, name: &str) -> Result<Arc<BTreeCollection>> {
-        // Fast path: read lock only
         {
             let cols = self.collections.read();
             if let Some(col) = cols.get(name) {
                 return Ok(Arc::clone(col));
             }
         }
-        // Slow path: load the collection OUTSIDE the write lock so that other
-        // collections remain accessible while a large collection is loading.
+        #[cfg(not(target_arch = "wasm32"))]
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
             BTreeCollection::open(name, &self.data_dir, self.encryption.clone())?
         };
+        #[cfg(target_arch = "wasm32")]
+        let col = BTreeCollection::open_in_memory(name);
         if self.lazy_sync.load(Ordering::Acquire) {
             col.set_lazy_sync(true);
         }
         col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
         let arc = Arc::new(col);
-        // Briefly acquire write lock to insert
         let mut cols = self.collections.write();
-        // Double-check: another thread may have loaded the same collection
         if let Some(existing) = cols.get(name) {
             return Ok(Arc::clone(existing));
         }
@@ -336,11 +362,14 @@ impl OxiDb {
         if cols.contains_key(name) {
             return Err(Error::CollectionAlreadyExists(name.to_string()));
         }
+        #[cfg(not(target_arch = "wasm32"))]
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
             BTreeCollection::open(name, &self.data_dir, self.encryption.clone())?
         };
+        #[cfg(target_arch = "wasm32")]
+        let col = BTreeCollection::open_in_memory(name);
         if self.lazy_sync.load(Ordering::Acquire) {
             col.set_lazy_sync(true);
         }
@@ -355,7 +384,7 @@ impl OxiDb {
             let cols = self.collections.read();
             cols.keys().cloned().collect()
         };
-        // Also include collections on disk that haven't been loaded yet
+        #[cfg(not(target_arch = "wasm32"))]
         if !self.in_memory {
             if let Ok(disk_names) = Self::discover_collection_names_on_disk(&self.data_dir) {
                 for name in disk_names {
@@ -376,6 +405,7 @@ impl OxiDb {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     /// Enable lazy sync mode: write operations skip per-operation fsync,
     /// and a background thread flushes all collections every `interval`.
     /// This matches MongoDB's default durability (journal flushed periodically).
@@ -453,6 +483,7 @@ impl OxiDb {
     pub fn drop_collection(&self, name: &str) -> Result<()> {
         let mut cols = self.collections.write();
         cols.remove(name);
+        #[cfg(not(target_arch = "wasm32"))]
         if !self.in_memory {
             for ext in &["dat", "wal", "idx", "fidx", "cidx", "vidx"] {
                 let path = self.data_dir.join(format!("{}.{}", name, ext));
@@ -460,7 +491,6 @@ impl OxiDb {
                     std::fs::remove_file(path)?;
                 }
             }
-            // Also remove B-tree directory if present
             let btree_dir = self.data_dir.join(format!("{}.btree", name));
             if btree_dir.exists() {
                 std::fs::remove_dir_all(btree_dir)?;
@@ -586,6 +616,7 @@ impl OxiDb {
         }
 
         // Parallel JSONB encode for large batches
+        #[cfg(not(target_arch = "wasm32"))]
         let prepared: Vec<(DocumentId, Value, Vec<u8>)> = if docs_with_ids.len() > 500 && !has_unique_indexes {
             use rayon::prelude::*;
             docs_with_ids.into_par_iter().map(|(id, data)| {
@@ -593,6 +624,19 @@ impl OxiDb {
                 if keep_values { (id, data, bytes) } else { (id, Value::Null, bytes) }
             }).collect()
         } else {
+            let mut prepared = Vec::with_capacity(docs_with_ids.len());
+            for (id, data) in docs_with_ids {
+                let bytes = crate::codec::encode_doc(&data)?;
+                if keep_values {
+                    prepared.push((id, data, bytes));
+                } else {
+                    prepared.push((id, Value::Null, bytes));
+                }
+            }
+            prepared
+        };
+        #[cfg(target_arch = "wasm32")]
+        let prepared: Vec<(DocumentId, Value, Vec<u8>)> = {
             let mut prepared = Vec::with_capacity(docs_with_ids.len());
             for (id, data) in docs_with_ids {
                 let bytes = crate::codec::encode_doc(&data)?;
@@ -1106,6 +1150,7 @@ impl OxiDb {
         }
 
         // 6. COMMIT POINT: mark transaction as committed in the global log
+        #[cfg(not(target_arch = "wasm32"))]
         self.tx_log.mark_committed(tx_id)?;
 
         // 7. Collect event data before consuming mutations
@@ -1163,6 +1208,7 @@ impl OxiDb {
         }
 
         // 10. Cleanup: remove tx_id from commit log
+        #[cfg(not(target_arch = "wasm32"))]
         self.tx_log.remove_committed(tx_id)?;
 
         // 11. Emit change events after successful commit
@@ -1182,21 +1228,25 @@ impl OxiDb {
     }
 
     // -----------------------------------------------------------------------
-    // Blob storage methods
+    // Blob storage methods (native only)
     // -----------------------------------------------------------------------
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn create_bucket(&self, name: &str) -> Result<()> {
         self.blob_store.create_bucket(name)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn list_buckets(&self) -> Vec<String> {
         self.blob_store.list_buckets()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn delete_bucket(&self, name: &str) -> Result<()> {
         self.blob_store.delete_bucket(name)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn put_object(
         &self,
         bucket: &str,
@@ -1221,16 +1271,19 @@ impl OxiDb {
         Ok(serde_json::to_value(&meta)?)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn get_object(&self, bucket: &str, key: &str) -> Result<(Vec<u8>, Value)> {
         let (data, meta) = self.blob_store.get_object(bucket, key)?;
         Ok((data, serde_json::to_value(&meta)?))
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn head_object(&self, bucket: &str, key: &str) -> Result<Value> {
         let meta = self.blob_store.head_object(bucket, key)?;
         Ok(serde_json::to_value(&meta)?)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn delete_object(&self, bucket: &str, key: &str) -> Result<()> {
         self.blob_store.delete_object(bucket, key)?;
 
@@ -1244,6 +1297,7 @@ impl OxiDb {
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn list_objects(
         &self,
         bucket: &str,
@@ -1257,6 +1311,7 @@ impl OxiDb {
             .collect()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn search(
         &self,
         bucket: Option<&str>,
@@ -1343,7 +1398,7 @@ impl OxiDb {
     // Cron Scheduler
     // -----------------------------------------------------------------------
 
-    /// Spawn the scheduler background thread that periodically runs due schedules.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn start_scheduler(self: &Arc<Self>) {
         let (tx, rx) = mpsc::sync_channel::<()>(0);
         let db = Arc::clone(self);
@@ -1467,6 +1522,7 @@ impl OxiDb {
     ///
     /// The backup flushes all indexes and WAL checkpoints before archiving,
     /// then holds read locks on all collections to ensure a consistent snapshot.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn backup(&self, output_path: &Path) -> Result<BackupInfo> {
         // 1. Validate output path doesn't already exist
         if output_path.exists() {
@@ -1527,6 +1583,7 @@ impl OxiDb {
     ///
     /// This is a static method — the caller should open a new `OxiDb` instance
     /// on the target directory after restoration.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn restore(archive_path: &Path, target_dir: &Path) -> Result<RestoreInfo> {
         // 1. Validate archive exists
         if !archive_path.exists() {
@@ -1567,6 +1624,7 @@ impl OxiDb {
     }
 
     /// Scan a directory for `*.dat` files and `*.btree` files/directories and return collection names.
+    #[cfg(not(target_arch = "wasm32"))]
     fn discover_collection_names_on_disk(dir: &Path) -> Result<Vec<String>> {
         let mut names = Vec::new();
         if !dir.exists() {
@@ -1586,10 +1644,11 @@ impl OxiDb {
     }
 
     /// Recursively add directory contents to a tar archive, skipping `.tmp` files.
+    #[cfg(not(target_arch = "wasm32"))]
     fn add_dir_to_tar<W: std::io::Write>(
         archive: &mut tar::Builder<W>,
-        dir: &Path,
-        base: &Path,
+        dir: &std::path::Path,
+        base: &std::path::Path,
     ) -> Result<()> {
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
@@ -1614,13 +1673,11 @@ impl OxiDb {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for OxiDb {
     fn drop(&mut self) {
-        // Shut down the scheduler thread (dropping the sender causes it to exit)
         let _ = self.scheduler_shutdown.lock().take();
-        // Shut down the background sync thread and do a final flush
         let _ = self.sync_shutdown.lock().take();
-        // Final sync of all collections (in case lazy_sync was enabled)
         {
             let cols = self.collections.read();
             for col_arc in cols.values() {

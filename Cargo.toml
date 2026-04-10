@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli", "oxipool"]
+members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli", "oxipool", "oxidb-wasm"]
 resolver = "3"
 
 [package]
 name = "oxidb"
-version = "0.22.0"
+version = "0.24.0"
 edition = "2024"
 description = "A fast document database engine with optimized date indexing"
 
@@ -21,21 +21,30 @@ crc32fast = "1"
 sha2 = "0.10"
 aes-gcm = "0.10"
 rand = "0.9"
-zip = "2"
-pdf-extract = "0.7"
 leptess = { version = "0.14", optional = true }
 jsonb = "0.5"
 lru = "0.12"
-parking_lot = "0.12"
-tar = "0.4"
-flate2 = "1"
 regex = "1"
 sqlparser = "0.59"
-zstd = "0.13"
-lz4_flex = "0.11"
+scc = "3"
+
+# Native-only dependencies (filesystem, threads, memory-mapped I/O)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+parking_lot = "0.12"
 memmap2 = "0.9"
 rayon = "1.10"
-scc = "3"
+pdf-extract = "0.7"
+zip = "2"
+tar = "0.4"
+flate2 = "1"
+zstd = "0.13"
+lz4_flex = "0.11"
+
+# WASM-specific dependencies
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+spin = "0.9"
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,20 +1,36 @@
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use parking_lot::Mutex;
+use crate::document::DocumentId;
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::borrow::Cow;
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs::{self, File, OpenOptions};
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::locks::Mutex;
+
+#[cfg(not(target_arch = "wasm32"))]
 use crc32fast::Hasher;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::crypto::EncryptionKey;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::doc_cache::DocCache;
-use crate::document::DocumentId;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::engine::LogCallback;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::error::Result;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::index::CompositeIndex;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::paged_field_index::PagedFieldIndex;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::storage::{DocLocation, Storage};
 
 const OP_INSERT: u8 = 1;
@@ -53,15 +69,14 @@ impl WalEntry {
     }
 }
 
-/// Write-ahead log for crash-safe mutations.
-///
-/// Thread-safe: all file operations are serialized via an internal Mutex.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Wal {
     inner: Mutex<File>,
     path: PathBuf,
     encryption: Option<Arc<EncryptionKey>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Wal {
     /// Open or create a WAL file.
     pub fn open(path: &Path) -> Result<Self> {
@@ -488,7 +503,7 @@ impl Wal {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

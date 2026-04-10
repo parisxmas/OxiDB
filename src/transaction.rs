@@ -3,7 +3,10 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 use crate::document::DocumentId;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::tx_log::TransactionId;
+#[cfg(target_arch = "wasm32")]
+type TransactionId = u64;
 
 /// A record of a document read during a transaction, used for OCC validation.
 pub struct ReadRecord {

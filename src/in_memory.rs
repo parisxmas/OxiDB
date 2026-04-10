@@ -4,18 +4,31 @@
 //! and backend enums (`StorageBackend`, `WalBackend`) that allow `Collection` to
 //! operate transparently in either file or memory mode.
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::doc_cache::DocCache;
-use crate::document::DocumentId;
-use crate::engine::LogCallback;
 use crate::error::Result;
+use crate::storage::DocLocation;
+use crate::wal::WalEntry;
+
+use std::path::{Path, PathBuf};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::{HashMap, HashSet};
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::doc_cache::DocCache;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::document::DocumentId;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::engine::LogCallback;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::index::CompositeIndex;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::paged_field_index::PagedFieldIndex;
-use crate::storage::{DocLocation, Storage};
-use crate::wal::{Wal, WalEntry};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::storage::Storage;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::wal::Wal;
 
 const RECORD_ACTIVE: u8 = 0;
 const RECORD_DELETED: u8 = 1;
@@ -312,6 +325,7 @@ impl InMemStorage {
 
 /// Unified storage backend: either file-based or in-memory.
 pub enum StorageBackend {
+    #[cfg(not(target_arch = "wasm32"))]
     File(Storage),
     Memory(InMemStorage),
 }
@@ -319,6 +333,7 @@ pub enum StorageBackend {
 impl StorageBackend {
     pub fn append(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.append(doc_bytes),
             Self::Memory(m) => m.append(doc_bytes),
         }
@@ -326,6 +341,7 @@ impl StorageBackend {
 
     pub fn read(&self, loc: DocLocation) -> Result<Vec<u8>> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.read(loc),
             Self::Memory(m) => m.read(loc),
         }
@@ -333,6 +349,7 @@ impl StorageBackend {
 
     pub fn read_lockfree(&self, loc: DocLocation) -> Result<Vec<u8>> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.read_lockfree(loc),
             Self::Memory(m) => m.read_lockfree(loc),
         }
@@ -343,6 +360,7 @@ impl StorageBackend {
         locs: &mut [(usize, DocLocation)],
     ) -> Result<Vec<(usize, Vec<u8>)>> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.read_batch_lockfree(locs),
             Self::Memory(m) => m.read_batch_lockfree(locs),
         }
@@ -350,6 +368,7 @@ impl StorageBackend {
 
     pub fn mark_deleted(&self, loc: DocLocation) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.mark_deleted(loc),
             Self::Memory(m) => m.mark_deleted(loc),
         }
@@ -357,6 +376,7 @@ impl StorageBackend {
 
     pub fn append_no_sync(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.append_no_sync(doc_bytes),
             Self::Memory(m) => m.append_no_sync(doc_bytes),
         }
@@ -364,6 +384,7 @@ impl StorageBackend {
 
     pub fn append_batch_no_sync(&self, items: &[&[u8]]) -> Result<Vec<DocLocation>> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.append_batch_no_sync(items),
             Self::Memory(m) => m.append_batch_no_sync(items),
         }
@@ -371,6 +392,7 @@ impl StorageBackend {
 
     pub fn append_batch_no_sync_buffered(&self, items: &[&[u8]]) -> Result<Vec<DocLocation>> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.append_batch_no_sync_buffered(items),
             Self::Memory(m) => m.append_batch_no_sync_buffered(items),
         }
@@ -378,6 +400,7 @@ impl StorageBackend {
 
     pub fn mark_deleted_no_sync(&self, loc: DocLocation) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.mark_deleted_no_sync(loc),
             Self::Memory(m) => m.mark_deleted_no_sync(loc),
         }
@@ -385,6 +408,7 @@ impl StorageBackend {
 
     pub fn sync(&self) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.sync(),
             Self::Memory(m) => m.sync(),
         }
@@ -392,11 +416,13 @@ impl StorageBackend {
 
     pub fn file_size(&self) -> u64 {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.file_size(),
             Self::Memory(m) => m.file_size(),
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn path(&self) -> &Path {
         match self {
             Self::File(s) => s.path(),
@@ -406,6 +432,7 @@ impl StorageBackend {
 
     pub fn iter_active(&self) -> Result<Vec<(DocLocation, Vec<u8>)>> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.iter_active(),
             Self::Memory(m) => m.iter_active(),
         }
@@ -416,6 +443,7 @@ impl StorageBackend {
         F: FnMut(DocLocation, Vec<u8>) -> Result<()>,
     {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.for_each_active(f),
             Self::Memory(m) => m.for_each_active(f),
         }
@@ -426,6 +454,7 @@ impl StorageBackend {
         F: FnMut(&[u8]) -> Result<bool>,
     {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.scan_readonly_while(f),
             Self::Memory(m) => m.scan_readonly_while(f),
         }
@@ -441,6 +470,7 @@ impl StorageBackend {
         F: FnMut(&[u8]) -> Result<bool>,
     {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(s) => s.scan_segment_readonly_while(start_offset, end_offset, f),
             Self::Memory(m) => m.scan_segment_readonly_while(start_offset, end_offset, f),
         }
@@ -453,6 +483,7 @@ impl StorageBackend {
 
 /// Unified WAL backend: either file-based or no-op (in-memory mode).
 pub enum WalBackend {
+    #[cfg(not(target_arch = "wasm32"))]
     File(Wal),
     Memory, // all operations are no-ops
 }
@@ -460,6 +491,7 @@ pub enum WalBackend {
 impl WalBackend {
     pub fn log(&self, entry: &WalEntry) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(w) => w.log(entry),
             Self::Memory => Ok(()),
         }
@@ -467,6 +499,7 @@ impl WalBackend {
 
     pub fn log_no_sync(&self, entry: &WalEntry) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(w) => w.log_no_sync(entry),
             Self::Memory => Ok(()),
         }
@@ -474,6 +507,7 @@ impl WalBackend {
 
     pub fn log_batch(&self, entries: &[WalEntry]) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(w) => w.log_batch(entries),
             Self::Memory => Ok(()),
         }
@@ -481,6 +515,7 @@ impl WalBackend {
 
     pub fn log_batch_no_sync(&self, entries: &[WalEntry]) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(w) => w.log_batch_no_sync(entries),
             Self::Memory => Ok(()),
         }
@@ -488,6 +523,7 @@ impl WalBackend {
 
     pub fn log_batch_inserts_no_sync(&self, entries: &[(u64, &[u8])]) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(w) => w.log_batch_inserts_no_sync(entries),
             Self::Memory => Ok(()),
         }
@@ -495,6 +531,7 @@ impl WalBackend {
 
     pub fn log_batch_inserts_no_sync_buffered(&self, entries: &[(u64, &[u8])]) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(w) => w.log_batch_inserts_no_sync_buffered(entries),
             Self::Memory => Ok(()),
         }
@@ -502,6 +539,7 @@ impl WalBackend {
 
     pub fn checkpoint(&self) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(w) => w.checkpoint(),
             Self::Memory => Ok(()),
         }
@@ -509,11 +547,13 @@ impl WalBackend {
 
     pub fn checkpoint_no_sync(&self) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(w) => w.checkpoint_no_sync(),
             Self::Memory => Ok(()),
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn recover(
         &self,
         storage: &StorageBackend,
@@ -549,6 +589,7 @@ impl WalBackend {
 
     pub fn remove_file(&self) -> Result<()> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Self::File(w) => w.remove_file(),
             Self::Memory => Ok(()),
         }

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use crate::document::DocumentId;
 use crate::fts::CollectionTextIndex;
 use crate::index::CompositeIndex;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::mmap_field_index::MmapFieldIndex;
 use crate::vector::VectorIndex;
 

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use lru::LruCache;
-use parking_lot::Mutex;
+use crate::locks::Mutex;
 
 use super::page::{Page, PageId, PAGE_SIZE};
 
