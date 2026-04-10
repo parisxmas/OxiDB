@@ -82,6 +82,15 @@ client = connect("127.0.0.1", 4444)</code></pre>
         <p>iOS/macOS support via C FFI to the embedded Rust library.</p>
         <pre><code>let db = OxiDB(path: "./data")</code></pre>
       </div>
+
+      <div class="client-card">
+        <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><path d="M7 10h2l1-3 2 6 1-3h2"/></svg></div>
+        <h3>WebAssembly (Browser)</h3>
+        <p>Full OxiDB engine compiled to WASM. In-memory, no server. See <a href="/wasm">/wasm</a> for docs.</p>
+        <pre><code>import init, * as oxidb from './wasm/oxidb_wasm.js';
+await init();
+oxidb.init();</code></pre>
+      </div>
     </div>
   </div>
 </section>` }} />
