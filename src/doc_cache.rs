@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use parking_lot::Mutex;
+use crate::locks::Mutex;
 
 use lru::LruCache;
 use serde_json::Value;

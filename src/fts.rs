@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Serialize, Deserialize, Clone)]
 struct Posting {
     doc_id: String,
@@ -12,6 +16,7 @@ struct Posting {
     positions: Vec<u32>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Serialize, Deserialize, Clone)]
 struct DocInfo {
     bucket: String,
@@ -19,17 +24,20 @@ struct DocInfo {
     total_terms: u32,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Serialize, Deserialize, Default)]
 struct IndexData {
     postings: HashMap<String, Vec<Posting>>,
     docs: HashMap<String, DocInfo>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct FtsIndex {
     index_path: PathBuf,
     data: IndexData,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub struct SearchResult {
     pub bucket: String,
     pub key: String,
@@ -42,6 +50,7 @@ const STOP_WORDS: &[&str] = &[
     "she", "so", "that", "the", "this", "to", "was", "we", "with", "you",
 ];
 
+#[cfg(not(target_arch = "wasm32"))]
 fn make_doc_id(bucket: &str, key: &str) -> String {
     format!("{}\t{}", bucket, key)
 }
@@ -55,6 +64,7 @@ pub(crate) fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl FtsIndex {
     pub fn open(data_dir: &Path) -> Result<Self> {
         let fts_dir = data_dir.join("_fts");
@@ -360,6 +370,7 @@ fn resolve_field<'a>(data: &'a serde_json::Value, path: &str) -> Option<&'a serd
     Some(current)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
     let ct = content_type.to_lowercase();
 
@@ -401,6 +412,7 @@ pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_pdf(data: &[u8]) -> Option<String> {
     pdf_extract::extract_text_from_mem(data).ok().and_then(|s| {
         let trimmed = s.trim().to_string();
@@ -408,6 +420,7 @@ fn extract_pdf(data: &[u8]) -> Option<String> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_docx(data: &[u8]) -> Option<String> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
@@ -430,6 +443,7 @@ fn extract_image_ocr(data: &[u8]) -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed) }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_xlsx(data: &[u8]) -> Option<String> {
     let cursor = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(cursor).ok()?;
@@ -454,6 +468,7 @@ fn extract_xlsx(data: &[u8]) -> Option<String> {
     if parts.is_empty() { None } else { Some(parts.join(" ")) }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn strip_html_tags(html: &str) -> String {
     let mut result = String::with_capacity(html.len());
     let mut in_tag = false;
@@ -471,6 +486,7 @@ fn strip_html_tags(html: &str) -> String {
     result
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn extract_json_strings(val: &serde_json::Value, out: &mut Vec<String>) {
     match val {
         serde_json::Value::String(s) => out.push(s.clone()),
@@ -488,7 +504,7 @@ fn extract_json_strings(val: &serde_json::Value, out: &mut Vec<String>) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

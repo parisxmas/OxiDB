@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use parking_lot::Mutex;
+use crate::locks::Mutex;
 
 use super::page::{PageId, PAGE_SIZE};
 use super::pager::Pager;

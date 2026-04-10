@@ -134,7 +134,7 @@ impl ReverseCursor {
 }
 
 impl BTreeStorage {
-    /// Create a new in-memory B-tree storage.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(name: &str, data_dir: &Path, encryption: Option<Arc<crate::EncryptionKey>>) -> Self {
         Self {
             tree: SccMap::new(),
@@ -157,6 +157,7 @@ impl BTreeStorage {
     }
 
     /// Open or load a B-tree from disk. Falls back to empty if no file exists.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(name: &str, data_dir: &Path, encryption: Option<Arc<crate::EncryptionKey>>) -> Result<Self> {
         let path = data_dir.join(format!("{}.btree", name));
         let storage = Self::new(name, data_dir, encryption);
@@ -197,6 +198,7 @@ impl BTreeStorage {
     }
 
     /// Persist the B-tree to disk.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn persist(&self) -> Result<()> {
         if self.data_dir.as_os_str().is_empty() {
             return Ok(()); // in-memory mode
@@ -359,8 +361,8 @@ impl BTreeStorage {
     /// use the regular `insert()` loop instead.
     pub fn insert_batch(&self, entries: Vec<(u64, Vec<u8>)>) {
         let total_new: u64 = entries.iter().map(|(_, v)| v.len() as u64).sum();
+        #[cfg(not(target_arch = "wasm32"))]
         if entries.len() > 1000 {
-            // Parallel insert — scc buckets allow concurrent writes
             use rayon::prelude::*;
             entries.into_par_iter().for_each(|(key, value)| {
                 let _ = self.tree.insert_sync(key, value);
@@ -369,6 +371,10 @@ impl BTreeStorage {
             for (key, value) in entries {
                 let _ = self.tree.insert_sync(key, value);
             }
+        }
+        #[cfg(target_arch = "wasm32")]
+        for (key, value) in entries {
+            let _ = self.tree.insert_sync(key, value);
         }
         self.total_bytes.fetch_add(total_new, Ordering::AcqRel);
     }

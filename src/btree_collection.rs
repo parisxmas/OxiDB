@@ -15,16 +15,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use parking_lot::{Mutex, RwLock};
+use crate::locks::{Mutex, RwLock};
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 use serde_json::Value;
 
 use crate::btree_storage::BTreeStorage;
 use crate::codec;
-use crate::collection::{CompactStats, IndexInfo, IndexMetadata, load_index_metadata, resolve_field_in_value};
+use crate::collection::{CompactStats, IndexInfo, IndexMetadata, resolve_field_in_value};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::collection::load_index_metadata;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::index_persist;
 use crate::in_memory::WalBackend;
-use crate::wal::{Wal, WalEntry};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::wal::Wal;
+use crate::wal::WalEntry;
 use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
@@ -70,7 +76,7 @@ pub struct BTreeCollection {
 }
 
 impl BTreeCollection {
-    /// Create a new B-tree-backed collection (file mode).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open(name: &str, data_dir: &Path, encryption: Option<std::sync::Arc<crate::EncryptionKey>>) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let storage = BTreeStorage::open(name, data_dir, encryption)?;
@@ -199,6 +205,7 @@ impl BTreeCollection {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn replay_wal(wal: &Wal, storage: &BTreeStorage) -> Result<usize> {
         let entries = wal.read_entries()?;
         if entries.is_empty() { return Ok(0); }
@@ -235,6 +242,7 @@ impl BTreeCollection {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(()); // nothing changed since last persist
         }
+        #[cfg(not(target_arch = "wasm32"))]
         self.storage.persist()?;
         self.wal.checkpoint_no_sync()?;
         Ok(())
@@ -244,11 +252,11 @@ impl BTreeCollection {
     // Accessor methods (matching Collection API)
     // -----------------------------------------------------------------------
 
-    pub fn field_indexes(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<String, PagedFieldIndex>> {
+    pub fn field_indexes(&self) -> crate::locks::RwLockReadGuard<'_, HashMap<String, PagedFieldIndex>> {
         self.field_indexes.read()
     }
 
-    pub fn composite_indexes(&self) -> parking_lot::RwLockReadGuard<'_, Vec<CompositeIndex>> {
+    pub fn composite_indexes(&self) -> crate::locks::RwLockReadGuard<'_, Vec<CompositeIndex>> {
         self.composite_indexes.read()
     }
 
@@ -256,10 +264,11 @@ impl BTreeCollection {
         self.text_index.read().is_some()
     }
 
-    pub fn vector_indexes(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<String, VectorIndex>> {
+    pub fn vector_indexes(&self) -> crate::locks::RwLockReadGuard<'_, HashMap<String, VectorIndex>> {
         self.vector_indexes.read()
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn save_index_data(&self) {
         if self.in_memory || self.data_dir.as_os_str().is_empty() {
             return;
@@ -289,17 +298,25 @@ impl BTreeCollection {
         }
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn save_index_data(&self) {
+        // No-op on wasm32 (no filesystem persistence)
+    }
+
     fn save_index_metadata(&self) -> Result<()> {
         if self.in_memory || self.data_dir.as_os_str().is_empty() {
             return Ok(());
         }
-        let meta = IndexMetadata {
-            version: 1,
-            indexes: self.list_indexes(),
-        };
-        let bytes = serde_json::to_vec(&meta)?;
-        let path = self.data_dir.join(format!("{}.idx", self.name));
-        std::fs::write(&path, &bytes)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let meta = IndexMetadata {
+                version: 1,
+                indexes: self.list_indexes(),
+            };
+            let bytes = serde_json::to_vec(&meta)?;
+            let path = self.data_dir.join(format!("{}.idx", self.name));
+            std::fs::write(&path, &bytes)?;
+        }
         Ok(())
     }
 
@@ -541,7 +558,8 @@ impl BTreeCollection {
             }
         }
 
-        // Parallel JSONB encode
+        // Parallel JSONB encode (sequential on wasm32)
+        #[cfg(not(target_arch = "wasm32"))]
         let btree_entries: Vec<(u64, Vec<u8>)> = if doc_count > 500 {
             docs_with_ids.par_iter()
                 .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
@@ -551,6 +569,10 @@ impl BTreeCollection {
                 .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
                 .collect()
         };
+        #[cfg(target_arch = "wasm32")]
+        let btree_entries: Vec<(u64, Vec<u8>)> = docs_with_ids.iter()
+            .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
+            .collect();
 
         // Phase 2: bulk insert into B-tree
         // Pre-reserve full capacity to avoid incremental reallocation across batches
@@ -944,8 +966,17 @@ impl BTreeCollection {
                     self.storage.scan_keys(|k| { ids.push(k); });
                     ids
                 };
+                #[cfg(not(target_arch = "wasm32"))]
                 let matched: Vec<Arc<Value>> = doc_ids
                     .par_iter()
+                    .filter_map(|&id| {
+                        let arc = self.load_doc_arc(id)?;
+                        if query::matches_value(&query, &arc) { Some(arc) } else { None }
+                    })
+                    .collect();
+                #[cfg(target_arch = "wasm32")]
+                let matched: Vec<Arc<Value>> = doc_ids
+                    .iter()
                     .filter_map(|&id| {
                         let arc = self.load_doc_arc(id)?;
                         if query::matches_value(&query, &arc) {
@@ -1461,16 +1492,24 @@ impl BTreeCollection {
                 self.storage.scan_keys(|k| { ids.push(k); });
                 ids
             };
-            count = doc_ids
+            #[cfg(not(target_arch = "wasm32"))]
+            { count = doc_ids
                 .par_iter()
                 .filter(|&&id| {
                     if let Some(arc) = self.load_doc_arc(id) {
                         query::matches_value(&query, &arc)
-                    } else {
-                        false
-                    }
+                    } else { false }
                 })
-                .count();
+                .count(); }
+            #[cfg(target_arch = "wasm32")]
+            { count = doc_ids
+                .iter()
+                .filter(|&&id| {
+                    if let Some(arc) = self.load_doc_arc(id) {
+                        query::matches_value(&query, &arc)
+                    } else { false }
+                })
+                .count(); }
         }
 
         Ok(count)
@@ -1486,6 +1525,7 @@ impl BTreeCollection {
         let old_size = self.storage.total_bytes();
 
         // Persist current state to disk
+        #[cfg(not(target_arch = "wasm32"))]
         self.storage.persist()?;
 
         let new_size = self.storage.total_bytes();
@@ -1532,21 +1572,23 @@ impl BTreeCollection {
         let slices = self.storage.values_as_slices();
         let field_owned = field.to_string();
 
-        let mut pairs: Vec<(IndexValue, u64)> = slices.par_iter()
-            .filter_map(|bytes| {
-                if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
-                    let raw = jsonb::RawJsonb::new(bytes);
-                    let id = extract_raw_u64(&raw, "_id")?;
-                    let iv = extract_raw_index_value(&raw, &field_owned)?;
-                    Some((iv, id))
-                } else {
-                    let doc: Value = codec::decode_doc(bytes).ok()?;
-                    let id = doc.get("_id")?.as_u64()?;
-                    let val = resolve_field_in_value(&doc, &field_owned)?;
-                    Some((IndexValue::from_json(val), id))
-                }
-            })
-            .collect();
+        let iter_fn = |bytes: &Vec<u8>| -> Option<(IndexValue, u64)> {
+            if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
+                let raw = jsonb::RawJsonb::new(bytes);
+                let id = extract_raw_u64(&raw, "_id")?;
+                let iv = extract_raw_index_value(&raw, &field_owned)?;
+                Some((iv, id))
+            } else {
+                let doc: Value = codec::decode_doc(bytes).ok()?;
+                let id = doc.get("_id")?.as_u64()?;
+                let val = resolve_field_in_value(&doc, &field_owned)?;
+                Some((IndexValue::from_json(val), id))
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut pairs: Vec<(IndexValue, u64)> = slices.par_iter().filter_map(iter_fn).collect();
+        #[cfg(target_arch = "wasm32")]
+        let mut pairs: Vec<(IndexValue, u64)> = slices.iter().filter_map(iter_fn).collect();
 
         // Sort by IndexValue so build_from_sorted can append in order (no O(n) shifts)
         pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
@@ -1980,7 +2022,9 @@ impl BTreeCollection {
 
     pub fn checkpoint_wal(&self) -> Result<()> {
         // No WAL to checkpoint — persist the B-tree instead.
-        self.storage.persist()
+        #[cfg(not(target_arch = "wasm32"))]
+        self.storage.persist()?;
+        Ok(())
     }
 
     pub fn prepare_tx_insert(

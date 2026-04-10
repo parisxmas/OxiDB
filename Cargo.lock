@@ -971,8 +971,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1634,12 +1636,14 @@ dependencies = [
 
 [[package]]
 name = "oxidb"
-version = "0.22.0"
+version = "0.24.0"
 dependencies = [
  "aes-gcm",
  "chrono",
  "crc32fast",
  "flate2",
+ "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "jsonb",
  "leptess",
  "lru",
@@ -1655,6 +1659,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "spin",
  "sqlparser",
  "tar",
  "tempfile",
@@ -1694,13 +1699,14 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.22.3"
+version = "0.24.0"
 dependencies = [
  "aes-gcm",
  "argon2",
  "base64",
  "chrono",
  "hmac",
+ "libc",
  "md-5",
  "openraft",
  "oxidb",
@@ -1712,11 +1718,24 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha1",
  "sha2",
+ "socket2 0.5.10",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "oxidb-wasm"
+version = "0.1.0"
+dependencies = [
+ "oxidb",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -2432,6 +2451,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2529,12 +2559,31 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spin"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+dependencies = [
+ "lock_api",
 ]
 
 [[package]]
@@ -2764,7 +2813,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.3",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]

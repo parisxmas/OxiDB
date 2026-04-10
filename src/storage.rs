@@ -1,36 +1,3 @@
-use std::borrow::Cow;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use parking_lot::Mutex;
-
-use crate::crypto::EncryptionKey;
-use crate::error::Result;
-
-const RECORD_ACTIVE: u8 = 0;
-const RECORD_DELETED: u8 = 1;
-
-/// First 4 bytes of a zstd frame — used to detect legacy zstd-compressed payloads.
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
-
-/// LZ4 frame magic — used to detect lz4-compressed payloads.
-const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
-
-/// Default zstd compression level (kept for reading legacy data).
-const ZSTD_LEVEL: i32 = 3;
-
-thread_local! {
-    /// Per-thread reusable zstd compressor (legacy — kept for backward compat reads).
-    static ZSTD_COMPRESSOR: std::cell::RefCell<zstd::bulk::Compressor<'static>> = std::cell::RefCell::new(
-        zstd::bulk::Compressor::new(ZSTD_LEVEL).expect("failed to create zstd compressor")
-    );
-    /// Per-thread reusable zstd decompressor (legacy reads).
-    static ZSTD_DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> = std::cell::RefCell::new(
-        zstd::bulk::Decompressor::new().expect("failed to create zstd decompressor")
-    );
-}
-
 /// Location of a document in the data file.
 #[derive(Debug, Clone, Copy)]
 pub struct DocLocation {
@@ -38,19 +5,54 @@ pub struct DocLocation {
     pub length: u32,
 }
 
+// Everything below is native-only (filesystem, compression, mmap).
+#[cfg(not(target_arch = "wasm32"))]
+use std::borrow::Cow;
+#[cfg(not(target_arch = "wasm32"))]
+use std::fs::{self, File, OpenOptions};
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::locks::Mutex;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::crypto::EncryptionKey;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::error::Result;
+
+#[cfg(not(target_arch = "wasm32"))]
+const RECORD_ACTIVE: u8 = 0;
+#[cfg(not(target_arch = "wasm32"))]
+const RECORD_DELETED: u8 = 1;
+
+#[cfg(not(target_arch = "wasm32"))]
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+#[cfg(not(target_arch = "wasm32"))]
+const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
+#[cfg(not(target_arch = "wasm32"))]
+const ZSTD_LEVEL: i32 = 3;
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    static ZSTD_COMPRESSOR: std::cell::RefCell<zstd::bulk::Compressor<'static>> = std::cell::RefCell::new(
+        zstd::bulk::Compressor::new(ZSTD_LEVEL).expect("failed to create zstd compressor")
+    );
+    static ZSTD_DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> = std::cell::RefCell::new(
+        zstd::bulk::Decompressor::new().expect("failed to create zstd decompressor")
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 struct StorageInner {
     file: File,
     current_offset: u64,
 }
 
-/// Append-only file storage for documents.
-///
-/// Record format: [status: u8][length: u32 LE][payload]
-/// - status 0 = active, 1 = deleted (soft delete)
-/// - payload is either raw json_bytes or encrypted bytes
-///
-/// Thread-safe: all file operations are serialized via an internal Mutex.
-/// Reads can bypass the Mutex via `read_lockfree()` which uses `pread`.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Storage {
     _path: PathBuf,
     inner: Mutex<StorageInner>,
@@ -63,6 +65,7 @@ pub struct Storage {
     mmap_len: std::sync::atomic::AtomicU64,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Storage {
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_encryption(path, None)
@@ -662,7 +665,7 @@ impl Storage {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
