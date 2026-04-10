@@ -21,6 +21,7 @@ const navItems = [
   { href: '/streams', label: 'Streams' },
   { href: '/server', label: 'Server' },
   { href: '/clients', label: 'Clients' },
+  { href: '/wasm', label: 'WebAssembly' },
   { href: '/go-examples', label: 'Go Examples' },
   { href: '/python-examples', label: 'Python Examples' },
   { href: '/storage', label: 'Storage' },
