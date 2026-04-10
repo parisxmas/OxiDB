@@ -4,13 +4,34 @@ Run OxiDB document database entirely in the browser. No server needed — all da
 
 ## Quick Start
 
-### Option 1: Use Pre-built Release
+### Option 1: Download and Use
 
-Download from GitHub releases:
+```bash
+# Download from GitHub releases
+curl -L -o oxidb-wasm.tar.gz \
+  https://github.com/parisxmas/OxiDB/releases/download/v0.24.0/oxidb-wasm-v0.24.0.tar.gz
+
+# Extract into your project
+mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/
+```
+
+Your project structure:
+
+```
+your-project/
+  wasm/
+    oxidb_wasm.js
+    oxidb_wasm.d.ts
+    oxidb_wasm_bg.wasm
+    oxidb_wasm_bg.wasm.d.ts
+  index.html
+```
+
+Use in HTML:
 
 ```html
 <script type="module">
-  import init, * as oxidb from 'https://github.com/parisxmas/oxidb/releases/latest/download/oxidb-wasm/oxidb_wasm.js';
+  import init, * as oxidb from './wasm/oxidb_wasm.js';
 
   await init();
   oxidb.init();
@@ -24,31 +45,8 @@ Download from GitHub releases:
 </script>
 ```
 
-### Option 2: Self-host
-
-1. Download and extract `oxidb-wasm.tar.gz` from [releases](https://github.com/parisxmas/oxidb/releases)
-2. Place the files in your project (e.g. `/wasm/`)
-3. Import from local path:
-
-```
-your-project/
-  wasm/
-    oxidb_wasm.js
-    oxidb_wasm.d.ts
-    oxidb_wasm_bg.wasm
-    oxidb_wasm_bg.wasm.d.ts
-  index.html
-```
-
-```html
-<script type="module">
-  import init, * as oxidb from './wasm/oxidb_wasm.js';
-
-  await init();
-  oxidb.init();
-  // ready to use
-</script>
-```
+> **Note:** The WASM files must be served from your own web server (same origin).
+> Direct import from GitHub URLs will not work due to CORS and content-type restrictions.
 
 ### Option 3: Build from Source
 
