@@ -1154,6 +1154,14 @@ fn main() {
     db.start_ttl_thread(ttl_interval);
     eprintln!("TTL eviction: enabled (interval={}ms)", ttl_interval.as_millis());
 
+    // Alert evaluator thread (evaluates alert rules periodically)
+    let alert_interval_secs: u64 = env::var("OXIDB_ALERT_INTERVAL")
+        .unwrap_or_else(|_| "15".to_string())
+        .parse()
+        .expect("OXIDB_ALERT_INTERVAL must be a valid u64 (seconds)");
+    db.start_alert_evaluator(Duration::from_secs(alert_interval_secs));
+    eprintln!("alert evaluator: enabled (interval={alert_interval_secs}s)");
+
     // Document cache capacity per collection (default: 100,000).
     if let Ok(cap_str) = env::var("OXIDB_CACHE_SIZE") {
         let cap: usize = cap_str.parse().expect("OXIDB_CACHE_SIZE must be a valid usize");
@@ -1432,6 +1440,22 @@ fn main() {
         oxidb_server::udp_ingest::start_udp_listener(&udp_addr, udp_db, udp_collection.clone());
         server_log!(state, GelfLevel::Notice,
             format!("UDP log ingestion listening on {udp_addr} → collection '{udp_collection}'"));
+    }
+
+    // GELF UDP ingestion listener (optional, enabled via OXIDB_GELF_PORT)
+    let gelf_port: u16 = env::var("OXIDB_GELF_PORT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("OXIDB_GELF_PORT must be a valid u16");
+
+    if gelf_port > 0 {
+        let gelf_addr = format!("0.0.0.0:{gelf_port}");
+        let gelf_collection = env::var("OXIDB_GELF_COLLECTION")
+            .unwrap_or_else(|_| "_gelf_logs".to_string());
+        let gelf_db = Arc::clone(&state.db);
+        oxidb_server::gelf_ingest::start_gelf_listener(&gelf_addr, gelf_db, gelf_collection.clone());
+        server_log!(state, GelfLevel::Notice,
+            format!("GELF ingestion listening on {gelf_addr} → collection '{gelf_collection}'"));
     }
 
     // MQTT-only mode: skip the main OxiDB TCP listener

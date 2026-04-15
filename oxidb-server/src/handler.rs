@@ -911,6 +911,117 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         }
 
         // -------------------------------------------------------------------
+        // Retention policies
+        // -------------------------------------------------------------------
+
+        "set_retention" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let days = match request.get("days").and_then(|v| v.as_u64()) {
+                Some(d) => d,
+                None => return err_bytes("missing 'days'"),
+            };
+            match db.set_retention(col, days) {
+                Ok(()) => ok_bytes(json!(format!("retention set: {col} ({days} days)"))),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "get_retention" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            match db.get_retention(col) {
+                Ok(policy) => ok_bytes(policy),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "delete_retention" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            match db.delete_retention(col) {
+                Ok(()) => ok_bytes(json!(format!("retention deleted: {col}"))),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "list_retentions" => {
+            match db.list_retentions() {
+                Ok(policies) => ok_bytes(json!(policies)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // Alerting
+        // -------------------------------------------------------------------
+
+        "create_alert" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            let mut def = request.clone();
+            match db.create_alert(name, def) {
+                Ok(()) => ok_bytes(json!(format!("alert created: {name}"))),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "delete_alert" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.delete_alert(name) {
+                Ok(()) => ok_bytes(json!(format!("alert deleted: {name}"))),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "list_alerts" => {
+            match db.list_alerts() {
+                Ok(alerts) => ok_bytes(json!(alerts)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "get_alert" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.get_alert(name) {
+                Ok(alert) => ok_bytes(alert),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "test_alert" => {
+            let name = match request.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return err_bytes("missing 'name'"),
+            };
+            match db.test_alert(name) {
+                Ok(result) => ok_bytes(result),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "list_alert_history" => {
+            match db.list_alert_history() {
+                Ok(history) => ok_bytes(json!(history)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        // -------------------------------------------------------------------
         // Vector index commands
         // -------------------------------------------------------------------
 

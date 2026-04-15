@@ -27,6 +27,7 @@ pub mod mmap_field_index;
 pub mod mmap_index;
 pub mod oxiscript;
 pub mod paged_field_index;
+pub mod alerting;
 pub mod pipeline;
 pub mod procedure;
 pub mod query;

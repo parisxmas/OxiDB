@@ -108,6 +108,8 @@ pub struct OxiDb {
     in_memory: bool,
     #[cfg(not(target_arch = "wasm32"))]
     ttl_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    alert_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 
 impl OxiDb {
@@ -183,7 +185,8 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: true,
             ttl_shutdown: Mutex::new(None),
-        })
+            alert_shutdown: Mutex::new(None),
+})
     }
 
     /// Create a pure in-memory database for WebAssembly.
@@ -324,7 +327,8 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: false,
             ttl_shutdown: Mutex::new(None),
-        })
+            alert_shutdown: Mutex::new(None),
+})
     }
 
     /// Return an Arc to a collection, auto-creating if needed.
@@ -1515,6 +1519,197 @@ impl OxiDb {
     }
 
     // -----------------------------------------------------------------------
+    // Retention Policies
+    // -----------------------------------------------------------------------
+
+    /// Set a retention policy on a collection.
+    /// Documents older than `retain_days` (based on `_ts` field) are automatically deleted.
+    /// Internally creates a TTL index on `_ts` — the existing TTL eviction thread handles cleanup.
+    pub fn set_retention(&self, collection: &str, retain_days: u64) -> Result<()> {
+        if retain_days == 0 {
+            return Err(Error::InvalidQuery("retain_days must be > 0".to_string()));
+        }
+        let expire_after_seconds = retain_days * 86400;
+
+        // Create TTL index on _ts (idempotent — skips if already exists)
+        self.create_ttl_index(collection, "_ts", expire_after_seconds)?;
+
+        // Upsert policy record in _retention_policies
+        let policy_col = self.get_or_create_collection("_retention_policies")?;
+        let _ = policy_col.create_index("collection");
+        let _ = policy_col.delete(&json!({"collection": collection}), None);
+        policy_col.insert(json!({
+            "collection": collection,
+            "retain_days": retain_days,
+            "expire_after_seconds": expire_after_seconds,
+            "_ts": chrono::Utc::now().to_rfc3339(),
+        }))?;
+
+        Ok(())
+    }
+
+    /// Get the retention policy for a collection.
+    pub fn get_retention(&self, collection: &str) -> Result<Value> {
+        let policy_col = self.get_or_create_collection("_retention_policies")?;
+        policy_col
+            .find_one(&json!({"collection": collection}))?
+            .ok_or_else(|| Error::InvalidQuery(format!("no retention policy for '{collection}'")))
+    }
+
+    /// Delete the retention policy for a collection.
+    /// Removes the TTL config so documents are no longer auto-evicted.
+    pub fn delete_retention(&self, collection: &str) -> Result<()> {
+        // Remove TTL config from the target collection
+        let col = self.get_or_create_collection(collection)?;
+        col.remove_ttl_config("_ts");
+
+        // Remove the policy record
+        let policy_col = self.get_or_create_collection("_retention_policies")?;
+        let deleted = policy_col.delete(&json!({"collection": collection}), None)?;
+        if deleted.is_empty() {
+            return Err(Error::InvalidQuery(format!("no retention policy for '{collection}'")));
+        }
+        Ok(())
+    }
+
+    /// List all retention policies.
+    pub fn list_retentions(&self) -> Result<Vec<Value>> {
+        let policy_col = self.get_or_create_collection("_retention_policies")?;
+        policy_col.find(&json!({}))
+    }
+
+    // -----------------------------------------------------------------------
+    // Alerting
+    // -----------------------------------------------------------------------
+
+    /// Start the background alert evaluator thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn start_alert_evaluator(self: &Arc<Self>, interval: std::time::Duration) {
+        let (tx, rx) = mpsc::sync_channel::<()>(0);
+        let db = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("oxidb-alerts".into())
+            .spawn(move || {
+                crate::alerting::alert_loop(db, rx, interval);
+            })
+            .expect("failed to spawn alert evaluator thread");
+        *self.alert_shutdown.lock() = Some(tx);
+    }
+
+    /// Create a new alert rule.
+    pub fn create_alert(&self, name: &str, mut def: Value) -> Result<()> {
+        // Validate required fields
+        let obj = def.as_object_mut().ok_or_else(|| {
+            Error::InvalidQuery("alert definition must be a JSON object".to_string())
+        })?;
+
+        if !obj.contains_key("collection") {
+            return Err(Error::InvalidQuery("missing 'collection'".to_string()));
+        }
+        if !obj.contains_key("condition") {
+            return Err(Error::InvalidQuery("missing 'condition'".to_string()));
+        }
+        if !obj.contains_key("actions") {
+            return Err(Error::InvalidQuery("missing 'actions'".to_string()));
+        }
+
+        // Validate condition has required fields
+        if let Some(cond) = obj.get("condition").and_then(|v| v.as_object()) {
+            if !cond.contains_key("type") {
+                return Err(Error::InvalidQuery("condition missing 'type'".to_string()));
+            }
+            if !cond.contains_key("threshold") {
+                return Err(Error::InvalidQuery("condition missing 'threshold'".to_string()));
+            }
+        }
+
+        // Set defaults
+        obj.entry("name").or_insert(json!(name));
+        obj.entry("enabled").or_insert(json!(true));
+        obj.entry("cooldown_seconds").or_insert(json!(300));
+        obj.entry("last_fired").or_insert(json!(null));
+        obj.entry("last_fired_epoch").or_insert(json!(0));
+        obj.entry("fire_count").or_insert(json!(0));
+        obj.entry("_ts").or_insert(json!(chrono::Utc::now().to_rfc3339()));
+
+        // Check for duplicate
+        let alert_col = self.get_or_create_collection("_alerts")?;
+        let _ = alert_col.create_index("name");
+        if alert_col.find_one(&json!({"name": name}))?.is_some() {
+            // Update existing alert
+            let _ = alert_col.delete(&json!({"name": name}), None);
+        }
+
+        alert_col.insert(Value::Object(obj.clone()))?;
+        Ok(())
+    }
+
+    /// Delete an alert by name.
+    pub fn delete_alert(&self, name: &str) -> Result<()> {
+        let alert_col = self.get_or_create_collection("_alerts")?;
+        let deleted = alert_col.delete(&json!({"name": name}), None)?;
+        if deleted.is_empty() {
+            return Err(Error::InvalidQuery(format!("alert not found: {name}")));
+        }
+        Ok(())
+    }
+
+    /// List all alerts.
+    pub fn list_alerts(&self) -> Result<Vec<Value>> {
+        let alert_col = self.get_or_create_collection("_alerts")?;
+        alert_col.find(&json!({}))
+    }
+
+    /// Get a single alert by name.
+    pub fn get_alert(&self, name: &str) -> Result<Value> {
+        let alert_col = self.get_or_create_collection("_alerts")?;
+        alert_col
+            .find_one(&json!({"name": name}))?
+            .ok_or_else(|| Error::InvalidQuery(format!("alert not found: {name}")))
+    }
+
+    /// Test an alert by evaluating its condition immediately (without cooldown or actions).
+    pub fn test_alert(&self, name: &str) -> Result<Value> {
+        let alert = self.get_alert(name)?;
+        let now = crate::scheduler::epoch_now();
+
+        let collection = alert.get("collection").and_then(|v| v.as_str())
+            .ok_or_else(|| Error::InvalidQuery("alert missing 'collection'".to_string()))?;
+        let condition = alert.get("condition")
+            .ok_or_else(|| Error::InvalidQuery("alert missing 'condition'".to_string()))?;
+        let cond_type = condition.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        let result = match cond_type {
+            "count_threshold" => {
+                let query = crate::alerting::build_windowed_query_pub(condition, now);
+                let count = match query {
+                    Some(q) => self.count(collection, &q)? as i64,
+                    None => 0,
+                };
+                let threshold = condition.get("threshold").and_then(|v| v.as_i64()).unwrap_or(0);
+                let operator = condition.get("operator").and_then(|v| v.as_str()).unwrap_or("gte");
+                json!({
+                    "alert": name,
+                    "type": "count_threshold",
+                    "current_value": count,
+                    "threshold": threshold,
+                    "operator": operator,
+                    "would_fire": crate::alerting::compare_pub(count, threshold, operator),
+                })
+            }
+            _ => json!({"alert": name, "error": format!("unsupported condition type: {cond_type}")}),
+        };
+
+        Ok(result)
+    }
+
+    /// List alert history.
+    pub fn list_alert_history(&self) -> Result<Vec<Value>> {
+        let hist_col = self.get_or_create_collection("_alert_history")?;
+        hist_col.find(&json!({}))
+    }
+
+    // -----------------------------------------------------------------------
     // Backup & Restore
     // -----------------------------------------------------------------------
 
@@ -1678,6 +1873,7 @@ impl Drop for OxiDb {
     fn drop(&mut self) {
         let _ = self.scheduler_shutdown.lock().take();
         let _ = self.sync_shutdown.lock().take();
+        let _ = self.alert_shutdown.lock().take();
         {
             let cols = self.collections.read();
             for col_arc in cols.values() {
