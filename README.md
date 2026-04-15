@@ -2,9 +2,9 @@
   <img src="logo.png" alt="OxiDB" width="500">
 </p>
 
-<p align="center">A fast, embeddable document database written in Rust. SQL and JSON queries, S3-compatible API, Redis-compatible in-memory store, MQTT messaging, hash sharding, Raft replication, AES-256 encryption, crash-safe WAL, single binary, zero configuration.</p>
+<p align="center">A fast, embeddable document database written in Rust. SQL and JSON queries, S3-compatible API, Redis-compatible in-memory store, MQTT messaging, GELF log ingestion with auto-indexing, alerting, retention policies, GPU-accelerated vector search, hash sharding, Raft replication, AES-256 encryption, crash-safe WAL, single binary, zero configuration.</p>
 
-**Client libraries:** [Python](python/) | [Go](go/) | [Java/Spring Boot](oxidb-spring-boot-starter/) | [Julia](julia/) | [.NET](dotnet/) | [Swift/iOS](swift/) | [C FFI](oxidb-client-ffi/) | [VS Code Extension](oxidb-vscode/)
+**Client libraries:** [Python](python/) | [Go](go/) | [Java/Spring Boot](oxidb-spring-boot-starter/) | [Julia](julia/) | [.NET](dotnet/) | [Swift/iOS](swift/) | [JavaScript/TypeScript](oxidb-js/) | [C FFI](oxidb-client-ffi/) | [VS Code Extension](oxidb-vscode/)
 
 ## Installation
 
@@ -75,6 +75,9 @@ docker compose up -d
 | `OXIDB_HTTP_PORT` | — | Enable REST HTTP API on this port |
 | `OXIDB_UDP_PORT` | — | Enable UDP GELF/JSON log ingestion on this port |
 | `OXIDB_UDP_COLLECTION` | `_udp_logs` | Collection name for UDP log ingestion |
+| `OXIDB_GELF_PORT` | — | Enable GELF UDP ingestion with auto-indexing (e.g. `12201`) |
+| `OXIDB_GELF_COLLECTION` | `_gelf_logs` | Collection name for GELF log ingestion |
+| `OXIDB_ALERT_INTERVAL` | `15` | Alert evaluator check interval in seconds |
 | `OXIDB_LOG_COMMANDS` | `false` | Log OxiMem/MQTT commands |
 
 ## Features
@@ -86,7 +89,7 @@ docker compose up -d
 - **Aggregation pipeline** — 11 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`, `$out`; index-accelerated `$group` for count, sum, min, max, avg
 - **Indexes** — field, unique, composite, full-text, vector, and TTL indexes with automatic backfill; list and drop support
 - **TTL indexes** — automatic document expiration on any datetime field; `create_ttl_index` with configurable `expireAfterSeconds`; index-accelerated eviction via background thread
-- **Vector search** — k-nearest-neighbor similarity search with cosine, Euclidean, and dot product metrics; flat (exact) for small collections, HNSW (approximate) for large; zero external dependencies
+- **Vector search** — k-nearest-neighbor similarity search with cosine, Euclidean, and dot product metrics; flat (exact) for small collections, HNSW (approximate) for large; optional GPU acceleration via wgpu compute shaders (Metal/Vulkan/DX12, `--features gpu`)
 - **B-tree storage engine** — `scc::HashMap` concurrent document storage with interior mutability; reads never block reads, writes to different documents proceed in parallel; WAL for crash safety; persisted field indexes for instant startup
 - **Zero-copy reads** — `find_one`, `update`, and `delete` use Arc-based document iteration, cloning only matching documents instead of every visited document
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
@@ -96,7 +99,7 @@ docker compose up -d
 - **MQTT v3.1.1** — publish/subscribe messaging with cross-protocol bridging to OxiMem pub/sub channels
 - **Hash sharding** — OxiPool proxy with CRC32 hash routing, scatter-gather queries, per-collection shard keys, and cross-shard transaction detection
 - **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
-- **Full-text search** — automatic text extraction from 10+ formats (HTML, XML, PDF, DOCX, XLSX, images via OCR), TF-IDF ranked search
+- **Full-text search** — automatic text extraction from 10+ formats (HTML, XML, PDF, DOCX, XLSX, images via OCR), TF-IDF ranked search with Porter2 stemming, Turkish/English stop words, and Unicode accent normalization
 - **Raft replication** — multi-node cluster via OpenRaft with automatic leader election, HAProxy-compatible health checks, and sub-second failover
 - **Change streams** — real-time `watch`/`unwatch` with collection filtering, backpressure handling, and token-based resume
 - **JSONB binary storage** — compact binary format for faster serialization; backward-compatible with existing JSON data files
@@ -107,11 +110,14 @@ docker compose up -d
 - **Stored procedures** — JSON-defined or OxiScript multi-step procedures with control flow (`if`/`else`, `abort`, `return`), variable binding, and automatic transaction wrapping
 - **Cron scheduler** — built-in background scheduler that runs stored procedures on cron expressions (`"0 3 * * *"`) or fixed intervals (`"30s"`, `"5m"`, `"2h"`), with run history tracking
 - **GELF logging** — centralized UDP logging to Graylog/Loki via `OXIDB_GELF_ADDR`
+- **GELF ingestion** — receive GELF v1.1 structured logs via UDP, auto-index every field (Elasticsearch-style dynamic mapping), chunked message reassembly, simd-json parsing, crossbeam lock-free channels, batch insert; 138K msg/sec sustained throughput
+- **Retention policies** — collection-level `set_retention` with automatic TTL-based cleanup; `{"cmd": "set_retention", "collection": "_gelf_logs", "days": 30}`
+- **Alerting** — background alert evaluator with count/aggregation thresholds, webhook actions, cooldown, and `_alert_history` logging; `{"cmd": "create_alert", "name": "high_errors", "collection": "_gelf_logs", "condition": {...}, "actions": [...]}`
 - **Compaction** — reclaim space from deleted documents with atomic file swap
 - **Concurrent access** — `scc::HashMap` storage + RwLock-per-index interior mutability; lock-free document reads, fine-grained write concurrency; thread-per-connection model with unbounded concurrency; 32K mixed ops/sec with 10 concurrent workers
 - **Query optimizer** — selectivity-based index selection; picks the most selective condition in AND queries using index cardinality estimates
 - **JSONB partial extraction** — aggregation extracts only needed fields from binary docs, skipping nested arrays; 1M × 3KB docs aggregated in 300-700ms
-- **UDP log ingestion** — high-throughput fire-and-forget GELF/JSON receiver; 197K msg/sec with SO_REUSEPORT multi-thread listeners
+- **UDP log ingestion** — high-throughput fire-and-forget GELF/JSON receiver; SO_REUSEPORT multi-thread listeners
 - **VS Code extension** — collection browser, MongoDB-style query editor, OxiScript syntax highlighting
 - **CLI tool** — interactive shell with JSON-based syntax, embedded and client modes
 - **Multi-language clients** — Python, Go, Java/Spring Boot, Julia, .NET, Swift/iOS — all zero or minimal dependencies
@@ -320,6 +326,16 @@ Max message size is 16 MiB.
 | `delete_schedule`        | `name`                                             |
 | `enable_schedule`        | `name`                                             |
 | `disable_schedule`       | `name`                                             |
+| `set_retention`          | `collection`, `days`                               |
+| `get_retention`          | `collection`                                       |
+| `delete_retention`       | `collection`                                       |
+| `list_retentions`        | —                                                  |
+| `create_alert`           | `name`, `collection`, `condition`, `actions`, `cooldown_seconds?` |
+| `delete_alert`           | `name`                                              |
+| `list_alerts`            | —                                                  |
+| `get_alert`              | `name`                                              |
+| `test_alert`             | `name`                                              |
+| `list_alert_history`     | —                                                  |
 | `watch`                  | `collection?`, `resume_after?`                     |
 | `unwatch`                | —                                                  |
 | `begin_tx`               | —                                                  |
