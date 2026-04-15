@@ -44,23 +44,68 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-const STOP_WORDS: &[&str] = &[
+/// English stop words.
+const STOP_WORDS_EN: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "but", "by", "for", "from", "had", "has", "have",
     "he", "her", "his", "if", "in", "into", "is", "it", "its", "no", "not", "of", "on", "or",
     "she", "so", "that", "the", "this", "to", "was", "we", "with", "you",
 ];
+
+/// Turkish stop words.
+const STOP_WORDS_TR: &[&str] = &[
+    "bir", "ve", "bu", "da", "de", "ile", "mi", "mu", "ne", "o", "ya", "ben", "sen",
+    "biz", "siz", "ama", "her", "ki", "en", "var", "yok", "olan", "gibi", "daha",
+    "icin", "kadar", "sonra", "once", "ise", "hem", "veya", "sadece",
+];
+
+/// Check if a word is a stop word (English or Turkish).
+fn is_stop_word(word: &str) -> bool {
+    STOP_WORDS_EN.contains(&word) || STOP_WORDS_TR.contains(&word)
+}
+
+/// Apply Porter2 stemming to a word.
+fn stem(word: &str) -> String {
+    use rust_stemmers::{Algorithm, Stemmer};
+    let stemmer = Stemmer::create(Algorithm::English);
+    stemmer.stem(word).to_string()
+}
+
+/// Strip Unicode accents/diacritics: é→e, ü→u, ç→c, etc.
+fn strip_accents(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' => 'a',
+            'è' | 'é' | 'ê' | 'ë' => 'e',
+            'ì' | 'í' | 'î' | 'ï' => 'i',
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' => 'o',
+            'ù' | 'ú' | 'û' | 'ü' => 'u',
+            'ç' => 'c',
+            'ñ' => 'n',
+            'ş' => 's',
+            'ğ' => 'g',
+            'ı' => 'i',
+            _ => c,
+        })
+        .collect()
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 fn make_doc_id(bucket: &str, key: &str) -> String {
     format!("{}\t{}", bucket, key)
 }
 
+/// Tokenize text: lowercase → strip accents → split → stop words → stem.
+///
+/// Produces stemmed tokens for both indexing and querying, ensuring
+/// that "running" and "runs" both match "run".
 pub(crate) fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
+    let lower = text.to_lowercase();
+    let normalized = strip_accents(&lower);
+    normalized
         .split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.len() > 1)
-        .filter(|w| !STOP_WORDS.contains(w))
-        .map(String::from)
+        .filter(|w| !is_stop_word(w))
+        .map(|w| stem(w))
         .collect()
 }
 
@@ -871,5 +916,67 @@ startxref
         }
         let results = idx.search("databases", 3);
         assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn stemming_matches_variants() {
+        // "running" and "runs" both stem to "run"
+        let t1 = tokenize("running");
+        let t2 = tokenize("runs");
+        assert_eq!(t1[0], t2[0]);
+        assert_eq!(t1[0], "run");
+
+        // "databases" and "database" both stem to "databas"
+        let t3 = tokenize("databases");
+        let t4 = tokenize("database");
+        assert_eq!(t3[0], t4[0]);
+
+        // "connected" and "connecting" stem to same root
+        let t5 = tokenize("connected");
+        let t6 = tokenize("connecting");
+        assert_eq!(t5[0], t6[0]);
+    }
+
+    #[test]
+    fn stemming_search_finds_variants() {
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        idx.index_doc(1, &serde_json::json!({"text": "the server is running smoothly"}));
+        idx.index_doc(2, &serde_json::json!({"text": "database connections are stable"}));
+
+        // Searching for "runs" should find doc containing "running" (both stem to "run")
+        let results = idx.search("runs", 10);
+        assert_eq!(results.len(), 1);
+
+        // Searching for "connecting" should find "connections"
+        let results = idx.search("connecting", 10);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn accent_stripping() {
+        let t1 = tokenize("café résumé naïve");
+        assert!(t1.contains(&stem("cafe")));
+        assert!(t1.contains(&stem("resume")));
+        assert!(t1.contains(&stem("naive")));
+    }
+
+    #[test]
+    fn turkish_stop_words_filtered() {
+        let tokens = tokenize("bu bir test ve deneme");
+        // "bu", "bir", "ve" are Turkish stop words
+        assert!(!tokens.iter().any(|t| t == "bu"));
+        assert!(!tokens.iter().any(|t| t == "bir"));
+        assert!(!tokens.iter().any(|t| t == "ve"));
+        // "test" and "deneme" should remain (possibly stemmed)
+        assert!(tokens.len() >= 2);
+    }
+
+    #[test]
+    fn turkish_characters_normalized() {
+        let tokens = tokenize("güneş çiçek şehir");
+        // ğ→g, ş→s, ç→c, ü→u
+        assert!(tokens.iter().any(|t| t.contains("gune")));
+        assert!(tokens.iter().any(|t| t.contains("cicek")));
+        assert!(tokens.iter().any(|t| t.contains("sehir")));
     }
 }

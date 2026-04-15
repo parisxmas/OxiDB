@@ -27,6 +27,7 @@ lru = "0.12"
 regex = "1"
 sqlparser = "0.59"
 scc = "3"
+rust-stemmers = "1"
 
 # Native-only dependencies (filesystem, threads, memory-mapped I/O)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
