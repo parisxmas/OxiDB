@@ -13,27 +13,58 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, Cell};
 use ratatui::Terminal;
 use serde_json::{json, Value};
 
 #[derive(Parser)]
-#[command(name = "oxidb-tail", about = "Interactive TUI log viewer for OxiDB")]
+#[command(
+    name = "oxidb-tail",
+    about = "Interactive TUI log viewer for OxiDB",
+    long_about = "Real-time interactive log viewer for OxiDB with colored output.\n\n\
+        Connects to an OxiDB server via TCP and streams log entries from a\n\
+        GELF collection in a columnar table layout with automatic field detection.\n\n\
+        Features:\n\
+        - Color-coded log levels (ERR=red, WRN=yellow, INF=green, DBG=gray)\n\
+        - Automatic column detection from structured GELF fields\n\
+        - Full-text search across all fields with / key\n\
+        - Level filtering (cycle with l key)\n\
+        - Scrollable log history with keyboard navigation\n\
+        - Detail panel for inspecting individual log entries (Enter key)\n\
+        - Stats sidebar with host distribution (Tab key)\n\
+        - Live/paused mode toggle\n\n\
+        Example:\n\
+          oxidb-tail --host 127.0.0.1 --port 4444\n\
+          oxidb-tail --host db.example.com --port 4444 --collection app_logs\n\
+          oxidb-tail --host 192.0.2.6 --port 4444 --interval 1000\n\n\
+        Keyboard shortcuts:\n\
+          q         Quit\n\
+          /         Search/filter logs\n\
+          l         Cycle level filter (ALL → ERR → WRN → INF → DBG)\n\
+          ↑↓ / jk   Scroll through logs (pauses live mode)\n\
+          PgUp/PgDn Fast scroll\n\
+          Enter     Toggle detail panel for selected log\n\
+          Tab       Toggle stats sidebar\n\
+          f         Resume live mode (follow new logs)\n\
+          Esc       Clear filter or resume live mode"
+)]
 struct Cli {
-    /// Server host
-    #[arg(long, default_value = "127.0.0.1")]
+    /// OxiDB server hostname or IP address
+    #[arg(long, help = "OxiDB server hostname or IP address (e.g. 127.0.0.1, db.example.com)")]
     host: String,
 
-    /// Server port
-    #[arg(long, default_value_t = 4444)]
+    /// OxiDB server TCP port
+    #[arg(long, help = "OxiDB server TCP port number (e.g. 4444)")]
     port: u16,
 
-    /// Collection to tail
-    #[arg(long, short, default_value = "_gelf_logs")]
+    /// Name of the collection to stream logs from
+    #[arg(long, short, default_value = "_gelf_logs",
+          help = "Collection to tail [default: _gelf_logs]")]
     collection: String,
 
-    /// Poll interval in milliseconds
-    #[arg(long, default_value_t = 500)]
+    /// How often to poll the server for new logs, in milliseconds
+    #[arg(long, default_value_t = 500,
+          help = "Poll interval in milliseconds [default: 500]")]
     interval: u64,
 }
 
@@ -132,6 +163,8 @@ struct App {
     filter_text: String,
     filter_active: bool,
     level_filter: Option<u8>,
+    extra_columns: Vec<String>,
+    columns_locked: bool,
     total_count: u64,
     error_count: u64,
     warn_count: u64,
@@ -141,6 +174,7 @@ struct App {
     last_fetch: Instant,
     last_count: usize,
     show_detail: bool,
+    show_stats: bool,
     selected: usize,
 }
 
@@ -153,6 +187,8 @@ impl App {
             filter_text: String::new(),
             filter_active: false,
             level_filter: None,
+            extra_columns: Vec::new(),
+            columns_locked: false,
             total_count: 0,
             error_count: 0,
             warn_count: 0,
@@ -162,6 +198,7 @@ impl App {
             last_fetch: Instant::now(),
             last_count: 0,
             show_detail: false,
+            show_stats: false,
             selected: 0,
         }
     }
@@ -291,68 +328,102 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
                 .split(main_chunks[1])
         };
 
-        let body_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Min(60),       // logs
-                Constraint::Length(30),     // stats sidebar
-            ])
-            .split(body_with_detail[0]);
+        let body_chunks = if app.show_stats {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Min(60),
+                    Constraint::Length(30),
+                ])
+                .split(body_with_detail[0])
+        } else {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(100),
+                    Constraint::Length(0),
+                ])
+                .split(body_with_detail[0])
+        };
 
-        // Log list (newest first — reversed)
+        // Log table (newest first — reversed, columnar layout)
         let filtered = app.filtered_logs();
         let log_area = body_chunks[0];
-        let visible_height = log_area.height.saturating_sub(2) as usize;
+        let visible_height = log_area.height.saturating_sub(3) as usize; // header + borders
 
         let scroll = if app.auto_scroll {
-            0 // newest at top, no scroll needed in live mode
+            0
         } else {
             app.scroll_offset.min(filtered.len().saturating_sub(visible_height))
         };
 
-        let items: Vec<ListItem> = filtered.iter().rev().skip(scroll).take(visible_height).enumerate().map(|(i, log)| {
+        // Use locked columns
+        let common_extra_keys = app.extra_columns.clone();
+
+        let rows: Vec<Row> = filtered.iter().rev().skip(scroll).take(visible_height).enumerate().map(|(i, log)| {
             let idx = scroll + i;
-            let level_style = Style::default().fg(log.level_color());
+            let level_style = Style::default().fg(log.level_color()).add_modifier(Modifier::BOLD);
             let is_selected = !app.auto_scroll && idx == app.selected;
 
-            let mut spans = vec![
-                Span::styled(format!("{} ", log.timestamp), Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{} ", log.level_label()), level_style.add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{:16} ", log.host), Style::default().fg(Color::Blue)),
-                Span::raw(&log.message),
+            let mut cells = vec![
+                Cell::from(log.timestamp.clone()).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(log.level_label()).style(level_style),
+                Cell::from(log.host.clone()).style(Style::default().fg(Color::Blue)),
+                Cell::from(truncate_str(&log.message, 50)).style(Style::default().fg(Color::White)),
             ];
 
-            // Show a few extra fields inline
-            let max_extras = 3;
-            for (j, (k, v)) in log.extra.iter().take(max_extras).enumerate() {
-                if j == 0 {
-                    spans.push(Span::styled("  ", Style::default()));
-                }
-                spans.push(Span::styled(k, Style::default().fg(Color::DarkGray)));
-                spans.push(Span::styled("=", Style::default().fg(Color::DarkGray)));
-                let truncated = if v.len() > 20 { format!("{}…", &v[..19]) } else { v.clone() };
-                spans.push(Span::styled(truncated, Style::default().fg(Color::White)));
-                spans.push(Span::raw(" "));
-            }
-            if log.extra.len() > max_extras {
-                spans.push(Span::styled(format!("+{}", log.extra.len() - max_extras), Style::default().fg(Color::DarkGray)));
+            // Dynamic extra columns
+            for key in &common_extra_keys {
+                let val = log.extra.iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| truncate_str(v, 18))
+                    .unwrap_or_default();
+                cells.push(Cell::from(val).style(Style::default().fg(Color::Cyan)));
             }
 
-            let style = if is_selected {
-                Style::default().bg(Color::DarkGray)
+            let row = Row::new(cells);
+            if is_selected {
+                row.style(Style::default().bg(Color::DarkGray))
             } else {
-                Style::default()
-            };
-
-            ListItem::new(Line::from(spans)).style(style)
+                row
+            }
         }).collect();
+
+        // Build header
+        let mut header_cells = vec![
+            Cell::from("Time").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Cell::from("Lvl").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Cell::from("Host").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Cell::from("Message").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ];
+        for key in &common_extra_keys {
+            header_cells.push(Cell::from(key.as_str()).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        }
+        let header = Row::new(header_cells)
+            .style(Style::default().bg(Color::Rgb(30, 30, 30)))
+            .height(1);
+
+        // Column widths
+        let mut widths = vec![
+            Constraint::Length(12),  // Time
+            Constraint::Length(3),   // Lvl
+            Constraint::Length(18),  // Host
+            Constraint::Min(30),     // Message (flexible)
+        ];
+        for _ in &common_extra_keys {
+            widths.push(Constraint::Length(19));
+        }
 
         let log_block = Block::default()
             .title(format!(" Logs ({}) ", filtered.len()))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray));
-        let log_list = List::new(items).block(log_block);
-        frame.render_widget(log_list, log_area);
+
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(log_block)
+            .row_highlight_style(Style::default().bg(Color::DarkGray));
+        frame.render_widget(table, log_area);
 
         // Scrollbar
         if filtered.len() > visible_height {
@@ -366,39 +437,41 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
             );
         }
 
-        // Stats sidebar
-        let mut stats_lines: Vec<Line> = Vec::new();
-        stats_lines.push(Line::from(vec![
-            Span::styled("Hosts", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]));
-
-        let mut sorted_hosts: Vec<(&String, &u64)> = app.host_counts.iter().collect();
-        sorted_hosts.sort_by(|a, b| b.1.cmp(a.1));
-        for (host, count) in sorted_hosts.iter().take(8) {
+        // Stats sidebar (toggle with Tab)
+        if app.show_stats {
+            let mut stats_lines: Vec<Line> = Vec::new();
             stats_lines.push(Line::from(vec![
-                Span::styled(format!("{:>6} ", count), Style::default().fg(Color::White)),
-                Span::styled(if host.len() > 18 { &host[..18] } else { host }, Style::default().fg(Color::Cyan)),
+                Span::styled("Hosts", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             ]));
+
+            let mut sorted_hosts: Vec<(&String, &u64)> = app.host_counts.iter().collect();
+            sorted_hosts.sort_by(|a, b| b.1.cmp(a.1));
+            for (host, count) in sorted_hosts.iter().take(8) {
+                stats_lines.push(Line::from(vec![
+                    Span::styled(format!("{:>6} ", count), Style::default().fg(Color::White)),
+                    Span::styled(if host.len() > 18 { &host[..18] } else { host }, Style::default().fg(Color::Cyan)),
+                ]));
+            }
+
+            stats_lines.push(Line::raw(""));
+            stats_lines.push(Line::from(vec![
+                Span::styled("Level Filter: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(app.level_filter_label(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            ]));
+
+            if app.auto_scroll {
+                stats_lines.push(Line::from(Span::styled("● LIVE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
+            } else {
+                stats_lines.push(Line::from(Span::styled("○ PAUSED", Style::default().fg(Color::Yellow))));
+            }
+
+            let stats_block = Block::default()
+                .title(" Stats ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray));
+            let stats = Paragraph::new(stats_lines).block(stats_block);
+            frame.render_widget(stats, body_chunks[1]);
         }
-
-        stats_lines.push(Line::raw(""));
-        stats_lines.push(Line::from(vec![
-            Span::styled("Level Filter: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(app.level_filter_label(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]));
-
-        if app.auto_scroll {
-            stats_lines.push(Line::from(Span::styled("● LIVE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
-        } else {
-            stats_lines.push(Line::from(Span::styled("○ PAUSED", Style::default().fg(Color::Yellow))));
-        }
-
-        let stats_block = Block::default()
-            .title(" Stats ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
-        let stats = Paragraph::new(stats_lines).block(stats_block);
-        frame.render_widget(stats, body_chunks[1]);
 
         // Detail panel (full width, below logs)
         if app.show_detail && app.selected < filtered.len() {
@@ -476,6 +549,8 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
             Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
             Span::styled("↵", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Tab", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" stats  ", Style::default().fg(Color::DarkGray)),
             Span::styled("f", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(" follow  ", Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
@@ -485,6 +560,29 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
             .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
         frame.render_widget(footer, main_chunks[2]);
     });
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    }
+}
+
+/// Find the N most common extra field keys across filtered logs.
+fn find_common_extra_keys(logs: &[&LogEntry], n: usize) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for log in logs.iter().take(200) {
+        for (k, _) in &log.extra {
+            *counts.entry(k.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.into_iter().take(n).map(|(k, _)| k).collect()
 }
 
 // ─── Data fetcher ───────────────────────────────────────────
@@ -546,6 +644,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app.add_log(entry);
             }
             app.update_rate();
+            // Lock columns after first batch of logs
+            if !app.columns_locked && app.logs.len() >= 10 {
+                let filtered = app.filtered_logs();
+                app.extra_columns = find_common_extra_keys(&filtered, 4);
+                app.columns_locked = true;
+            }
             last_poll = Instant::now();
         }
 
@@ -626,6 +730,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if !app.auto_scroll {
                                 app.show_detail = !app.show_detail;
                             }
+                        }
+                        KeyCode::Tab => {
+                            app.show_stats = !app.show_stats;
                         }
                         KeyCode::End => {
                             app.auto_scroll = true;
