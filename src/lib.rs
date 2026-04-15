@@ -12,6 +12,9 @@ pub mod collection;
 pub mod doc_cache;
 pub mod crypto;
 pub mod database_manager;
+
+#[cfg(feature = "gpu")]
+pub mod gpu;
 pub mod document;
 pub mod engine;
 pub mod error;

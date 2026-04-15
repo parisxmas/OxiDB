@@ -9,6 +9,7 @@ default = ["s3"]
 ocr = ["oxidb/ocr"]
 s3 = []
 cluster = ["openraft", "tokio", "tokio-rustls"]
+gpu = ["oxidb/gpu"]
 
 [dependencies]
 oxidb = { path = ".." }

@@ -466,6 +466,36 @@ fn extract_vector(data: &Value, field: &str) -> Option<Vec<f32>> {
     Some(vec)
 }
 
+/// Contiguous vector storage for GPU dispatch.
+/// Uses interior mutability (Mutex) so it can be rebuilt during `&self` search calls.
+struct FlatVectorCache {
+    inner: std::sync::Mutex<FlatVectorCacheInner>,
+}
+
+struct FlatVectorCacheInner {
+    data: Vec<f32>,
+    doc_ids: Vec<DocumentId>,
+    dirty: bool,
+}
+
+impl FlatVectorCache {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(FlatVectorCacheInner {
+                data: Vec::new(),
+                doc_ids: Vec::new(),
+                dirty: true,
+            }),
+        }
+    }
+
+    fn mark_dirty(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.dirty = true;
+        }
+    }
+}
+
 /// A vector index on a collection field.
 pub struct VectorIndex {
     pub field: String,
@@ -475,6 +505,9 @@ pub struct VectorIndex {
     hnsw: Option<HnswGraph>,
     flat_threshold: usize,
     hnsw_config: HnswConfig,
+    flat_cache: FlatVectorCache,
+    #[cfg(feature = "gpu")]
+    gpu: Option<std::sync::Arc<crate::gpu::GpuCompute>>,
 }
 
 impl VectorIndex {
@@ -488,7 +521,16 @@ impl VectorIndex {
             hnsw: None,
             flat_threshold: 1000,
             hnsw_config: HnswConfig::default(),
+            flat_cache: FlatVectorCache::new(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
         }
+    }
+
+    /// Set the GPU compute backend for accelerated search.
+    #[cfg(feature = "gpu")]
+    pub fn set_gpu(&mut self, gpu: std::sync::Arc<crate::gpu::GpuCompute>) {
+        self.gpu = Some(gpu);
     }
 
     /// Parse metric from string, defaulting to Cosine.
@@ -527,6 +569,7 @@ impl VectorIndex {
         }
 
         self.vectors.insert(doc_id, vec);
+        self.flat_cache.mark_dirty();
 
         // Build/update HNSW if above threshold
         if self.vectors.len() >= self.flat_threshold {
@@ -543,6 +586,7 @@ impl VectorIndex {
     /// Remove a document from the index.
     pub fn remove(&mut self, doc_id: DocumentId) {
         self.vectors.remove(&doc_id);
+        self.flat_cache.mark_dirty();
         if let Some(ref mut hnsw) = self.hnsw {
             hnsw.remove(doc_id);
             if hnsw.needs_rebuild() {
@@ -560,6 +604,7 @@ impl VectorIndex {
     pub fn clear(&mut self) {
         self.vectors.clear();
         self.hnsw = None;
+        self.flat_cache.mark_dirty();
     }
 
     /// Search for the k nearest neighbors to the query vector.
@@ -577,7 +622,18 @@ impl VectorIndex {
         }
 
         let results = if self.vectors.len() < self.flat_threshold || self.hnsw.is_none() {
-            self.flat_search(query, k)
+            #[cfg(feature = "gpu")]
+            {
+                if self.gpu.is_some() && self.vectors.len() >= 256 {
+                    self.gpu_flat_search(query, k)
+                } else {
+                    self.flat_search(query, k)
+                }
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                self.flat_search(query, k)
+            }
         } else {
             let ef = ef_search.unwrap_or(50).max(k);
             self.hnsw_search(query, k, ef)
@@ -601,6 +657,68 @@ impl VectorIndex {
         }
 
         let mut results: Vec<VectorSearchResult> = heap.into_sorted_vec()
+            .into_iter()
+            .map(|OrdF32Id(dist, doc_id)| VectorSearchResult {
+                doc_id,
+                distance: dist,
+                similarity: self.metric.to_similarity(dist),
+            })
+            .collect();
+        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+        results
+    }
+
+    /// GPU-accelerated brute-force KNN search.
+    /// Dispatches distance computation to the GPU, then picks top-K on CPU.
+    #[cfg(feature = "gpu")]
+    fn gpu_flat_search(&self, query: &[f32], k: usize) -> Vec<VectorSearchResult> {
+        let gpu = match &self.gpu {
+            Some(g) => g.clone(),
+            None => return self.flat_search(query, k),
+        };
+
+        // Rebuild flat cache if dirty (interior mutability via Mutex)
+        let mut cache = self.flat_cache.inner.lock().unwrap();
+        if cache.dirty {
+            cache.data.clear();
+            cache.doc_ids.clear();
+            cache.data.reserve(self.vectors.len() * self.dimension);
+            cache.doc_ids.reserve(self.vectors.len());
+            for (&doc_id, vec) in &self.vectors {
+                cache.doc_ids.push(doc_id);
+                cache.data.extend_from_slice(vec);
+            }
+            cache.dirty = false;
+        }
+
+        let count = cache.doc_ids.len() as u32;
+        if count == 0 {
+            return Vec::new();
+        }
+
+        // Dispatch to GPU
+        let distances = gpu.compute_distances(
+            query,
+            &cache.data,
+            count,
+            self.dimension as u32,
+            self.metric,
+        );
+
+        // Pick top-K using a max-heap on CPU
+        let mut heap: BinaryHeap<OrdF32Id> = BinaryHeap::new();
+        for (i, &dist) in distances.iter().enumerate() {
+            let doc_id = cache.doc_ids[i];
+            if heap.len() < k {
+                heap.push(OrdF32Id(dist, doc_id));
+            } else if heap.peek().is_some_and(|top| dist < top.0) {
+                heap.pop();
+                heap.push(OrdF32Id(dist, doc_id));
+            }
+        }
+
+        let mut results: Vec<VectorSearchResult> = heap
+            .into_sorted_vec()
             .into_iter()
             .map(|OrdF32Id(dist, doc_id)| VectorSearchResult {
                 doc_id,
@@ -722,6 +840,9 @@ impl VectorIndex {
             hnsw: None,
             flat_threshold,
             hnsw_config,
+            flat_cache: FlatVectorCache::new(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
         };
 
         // Rebuild HNSW if above threshold

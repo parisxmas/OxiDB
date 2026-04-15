@@ -1162,6 +1162,20 @@ fn main() {
     db.start_alert_evaluator(Duration::from_secs(alert_interval_secs));
     eprintln!("alert evaluator: enabled (interval={alert_interval_secs}s)");
 
+    // GPU compute for vector search (optional, enabled with --features gpu)
+    #[cfg(feature = "gpu")]
+    {
+        match oxidb::gpu::GpuCompute::init() {
+            Some(gpu) => {
+                eprintln!("GPU compute: enabled ({})", gpu.backend());
+                db.set_gpu(gpu);
+            }
+            None => {
+                eprintln!("GPU compute: no suitable adapter found, using CPU");
+            }
+        }
+    }
+
     // Document cache capacity per collection (default: 100,000).
     if let Ok(cap_str) = env::var("OXIDB_CACHE_SIZE") {
         let cap: usize = cap_str.parse().expect("OXIDB_CACHE_SIZE must be a valid usize");
