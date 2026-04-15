@@ -15,7 +15,7 @@
 //!
 //! Enable with `OXIDB_GELF_PORT=12201`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::UdpSocket;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,11 +30,68 @@ const MAX_GELF_SIZE: usize = 65535;
 /// GELF chunked message magic bytes.
 const GELF_CHUNKED_MAGIC: [u8; 2] = [0x1e, 0x0f];
 
+/// GELF chunked header size: 2 (magic) + 8 (message_id) + 1 (seq_num) + 1 (seq_count) = 12
+const CHUNK_HEADER_SIZE: usize = 12;
+
+/// Maximum age for incomplete chunk sets before they are discarded.
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often to sweep expired chunk buffers (every N packets).
+const CHUNK_SWEEP_INTERVAL: u64 = 1000;
+
 /// Maximum batch size before flushing to the database.
 const BATCH_SIZE: usize = 2000;
 
 /// Maximum time to wait before flushing a partial batch.
 const BATCH_TIMEOUT: Duration = Duration::from_millis(5);
+
+/// Buffer for reassembling a chunked GELF message.
+struct ChunkBuffer {
+    /// Chunks indexed by sequence number. `None` = not yet received.
+    chunks: Vec<Option<Vec<u8>>>,
+    /// Number of chunks received so far.
+    received: u8,
+    /// Total number of chunks expected.
+    total: u8,
+    /// When the first chunk arrived (for timeout).
+    created_at: Instant,
+}
+
+impl ChunkBuffer {
+    fn new(total: u8) -> Self {
+        Self {
+            chunks: vec![None; total as usize],
+            received: 0,
+            total,
+            created_at: Instant::now(),
+        }
+    }
+
+    /// Insert a chunk. Returns true if the message is now complete.
+    fn insert(&mut self, seq: u8, data: Vec<u8>) -> bool {
+        if (seq as usize) < self.chunks.len() && self.chunks[seq as usize].is_none() {
+            self.chunks[seq as usize] = Some(data);
+            self.received += 1;
+        }
+        self.received == self.total
+    }
+
+    /// Reassemble all chunks into a single byte buffer.
+    fn reassemble(&self) -> Vec<u8> {
+        let total_len: usize = self.chunks.iter().filter_map(|c| c.as_ref()).map(|c| c.len()).sum();
+        let mut buf = Vec::with_capacity(total_len);
+        for chunk in &self.chunks {
+            if let Some(data) = chunk {
+                buf.extend_from_slice(data);
+            }
+        }
+        buf
+    }
+
+    fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > CHUNK_TIMEOUT
+    }
+}
 
 /// Standard GELF fields that are always present and always indexed.
 const STANDARD_FIELDS: &[&str] = &[
@@ -98,6 +155,8 @@ pub fn start_gelf_listener(
             .spawn(move || {
                 let socket = bind_reuseport(&addr);
                 let mut buf = [0u8; MAX_GELF_SIZE];
+                let mut chunk_buffers: HashMap<u64, ChunkBuffer> = HashMap::new();
+                let mut packet_count: u64 = 0;
 
                 loop {
                     match socket.recv_from(&mut buf) {
@@ -105,14 +164,50 @@ pub fn start_gelf_listener(
                             if len == 0 {
                                 continue;
                             }
-                            if len >= 2
+
+                            packet_count += 1;
+
+                            // Periodic sweep of expired chunk buffers
+                            if packet_count % CHUNK_SWEEP_INTERVAL == 0 {
+                                chunk_buffers.retain(|_, cb| !cb.is_expired());
+                            }
+
+                            if len >= CHUNK_HEADER_SIZE
                                 && buf[0] == GELF_CHUNKED_MAGIC[0]
                                 && buf[1] == GELF_CHUNKED_MAGIC[1]
                             {
-                                continue;
-                            }
-                            if let Some(doc) = parse_gelf_message_simd(&mut buf[..len]) {
-                                let _ = tx.try_send(doc);
+                                // Chunked GELF message
+                                let message_id = u64::from_be_bytes([
+                                    buf[2], buf[3], buf[4], buf[5],
+                                    buf[6], buf[7], buf[8], buf[9],
+                                ]);
+                                let seq_num = buf[10];
+                                let seq_count = buf[11];
+
+                                if seq_count == 0 || seq_num >= seq_count {
+                                    continue; // invalid
+                                }
+
+                                let chunk_data = buf[CHUNK_HEADER_SIZE..len].to_vec();
+
+                                let cb = chunk_buffers
+                                    .entry(message_id)
+                                    .or_insert_with(|| ChunkBuffer::new(seq_count));
+
+                                if cb.insert(seq_num, chunk_data) {
+                                    // All chunks received — reassemble and parse
+                                    let mut full_msg = cb.reassemble();
+                                    chunk_buffers.remove(&message_id);
+
+                                    if let Some(doc) = parse_gelf_message_simd(&mut full_msg) {
+                                        let _ = tx.try_send(doc);
+                                    }
+                                }
+                            } else {
+                                // Regular (non-chunked) GELF message
+                                if let Some(doc) = parse_gelf_message_simd(&mut buf[..len]) {
+                                    let _ = tx.try_send(doc);
+                                }
                             }
                         }
                         Err(_) => {}
@@ -514,5 +609,68 @@ mod tests {
         assert_eq!(new_fields.len(), 2);
         assert!(new_fields.contains(&&"Username".to_string()));
         assert!(new_fields.contains(&&"ClientIp".to_string()));
+    }
+
+    #[test]
+    fn chunk_buffer_reassembly() {
+        let mut cb = ChunkBuffer::new(3);
+        assert!(!cb.insert(0, b"hello ".to_vec()));
+        assert!(!cb.insert(2, b"world".to_vec()));
+        assert!(cb.insert(1, b"beautiful ".to_vec())); // now complete
+
+        let result = cb.reassemble();
+        assert_eq!(result, b"hello beautiful world");
+    }
+
+    #[test]
+    fn chunk_buffer_duplicate_ignored() {
+        let mut cb = ChunkBuffer::new(2);
+        assert!(!cb.insert(0, b"first".to_vec()));
+        assert!(!cb.insert(0, b"duplicate".to_vec())); // duplicate seq, ignored
+        assert!(cb.insert(1, b"second".to_vec()));
+
+        let result = cb.reassemble();
+        assert_eq!(result, b"firstsecond"); // original kept, not duplicate
+    }
+
+    #[test]
+    fn chunk_buffer_expired() {
+        let mut cb = ChunkBuffer::new(2);
+        cb.created_at = Instant::now() - Duration::from_secs(10);
+        assert!(cb.is_expired());
+    }
+
+    #[test]
+    fn chunk_buffer_not_expired() {
+        let cb = ChunkBuffer::new(2);
+        assert!(!cb.is_expired());
+    }
+
+    #[test]
+    fn chunk_header_parsing() {
+        // Build a chunked GELF packet
+        let message_id: u64 = 0xDEADBEEF12345678;
+        let seq_num: u8 = 0;
+        let seq_count: u8 = 1;
+        let payload = br#"{"version":"1.1","host":"test","short_message":"chunked!"}"#;
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&GELF_CHUNKED_MAGIC);
+        packet.extend_from_slice(&message_id.to_be_bytes());
+        packet.push(seq_num);
+        packet.push(seq_count);
+        packet.extend_from_slice(payload);
+
+        // Verify header parsing
+        assert_eq!(packet[0], 0x1e);
+        assert_eq!(packet[1], 0x0f);
+        let parsed_id = u64::from_be_bytes([
+            packet[2], packet[3], packet[4], packet[5],
+            packet[6], packet[7], packet[8], packet[9],
+        ]);
+        assert_eq!(parsed_id, message_id);
+        assert_eq!(packet[10], seq_num);
+        assert_eq!(packet[11], seq_count);
+        assert_eq!(&packet[CHUNK_HEADER_SIZE..], payload.as_slice());
     }
 }
