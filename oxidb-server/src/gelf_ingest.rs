@@ -487,22 +487,22 @@ mod tests {
             "short_message": "Login user: johndoe",
             "timestamp": 1713198420.123,
             "level": 6,
-            "facility": "KarteX.API",
+            "facility": "Example.API",
             "_Username": "johndoe",
             "_ClientIp": "192.0.2.42",
-            "_SourceContext": "KarteX.API.Endpoints.User.LoginEndpoint"
+            "_SourceContext": "Example.API.Endpoints.User.LoginEndpoint"
         }"#;
 
         let doc = parse_gelf_message(data).unwrap();
         assert_eq!(doc.get("host").unwrap(), "web01");
         assert_eq!(doc.get("short_message").unwrap(), "Login user: johndoe");
         assert_eq!(doc.get("level").unwrap(), 6);
-        assert_eq!(doc.get("facility").unwrap(), "KarteX.API");
+        assert_eq!(doc.get("facility").unwrap(), "Example.API");
         assert_eq!(doc.get("Username").unwrap(), "johndoe");
         assert_eq!(doc.get("ClientIp").unwrap(), "192.0.2.42");
         assert_eq!(
             doc.get("SourceContext").unwrap(),
-            "KarteX.API.Endpoints.User.LoginEndpoint"
+            "Example.API.Endpoints.User.LoginEndpoint"
         );
         assert!(doc.get("version").is_none());
         assert!(doc.get("_ts").is_some());

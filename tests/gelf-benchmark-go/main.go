@@ -37,27 +37,27 @@ func envInt(key string, def int) int {
 	return def
 }
 
-// Realistic GELF message pools — modeled after KarteX .NET Serilog output
+// Realistic GELF message pools — modeled after Example .NET Serilog output
 var (
 	hosts = []string{
-		"kartex-api-01", "kartex-api-02", "kartex-api-03",
-		"kartex-worker-01", "kartex-worker-02",
-		"kartex-web-01", "kartex-web-02",
-		"kartex-scheduler-01",
+		"example-api-01", "example-api-02", "example-api-03",
+		"example-worker-01", "example-worker-02",
+		"example-web-01", "example-web-02",
+		"example-scheduler-01",
 	}
-	applications = []string{"KarteX.API", "KarteX.Worker", "KarteX.Web", "KarteX.Scheduler"}
+	applications = []string{"Example.API", "Example.Worker", "Example.Web", "Example.Scheduler"}
 	environments = []string{"Docker", "Kubernetes", "Staging"}
 	sourceContexts = []string{
-		"KarteX.API.Endpoints.User.LoginEndpoint",
-		"KarteX.API.Endpoints.User.RegisterEndpoint",
-		"KarteX.API.Endpoints.IpLogPreProcessor",
-		"KarteX.API.Endpoints.Order.CreateOrderEndpoint",
-		"KarteX.API.Endpoints.Order.GetOrderEndpoint",
-		"KarteX.API.Middleware.AuthenticationMiddleware",
-		"KarteX.API.Middleware.RateLimitMiddleware",
-		"KarteX.Worker.Jobs.SendEmailJob",
-		"KarteX.Worker.Jobs.ProcessPaymentJob",
-		"KarteX.Web.Controllers.DashboardController",
+		"Example.API.Endpoints.User.LoginEndpoint",
+		"Example.API.Endpoints.User.RegisterEndpoint",
+		"Example.API.Endpoints.IpLogPreProcessor",
+		"Example.API.Endpoints.Order.CreateOrderEndpoint",
+		"Example.API.Endpoints.Order.GetOrderEndpoint",
+		"Example.API.Middleware.AuthenticationMiddleware",
+		"Example.API.Middleware.RateLimitMiddleware",
+		"Example.Worker.Jobs.SendEmailJob",
+		"Example.Worker.Jobs.ProcessPaymentJob",
+		"Example.Web.Controllers.DashboardController",
 	}
 	usernames = []string{
 		"johndoe", "janedoe", "admin", "baris", "mehmet",
@@ -73,11 +73,11 @@ var (
 	mobileClients  = []string{"iOS", "Android", "-"}
 	mobileVersions = []string{"2.1.0", "2.0.5", "1.9.3", "2.2.0-beta"}
 	userAgents     = []string{
-		"KarteX/2.1.0 (iPhone; iOS 18.3)",
-		"KarteX/2.0.5 (Samsung Galaxy S24; Android 15)",
+		"Example/2.1.0 (iPhone; iOS 18.3)",
+		"Example/2.0.5 (Samsung Galaxy S24; Android 15)",
 		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0",
 		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1",
-		"KarteX/2.2.0-beta (Pixel 9; Android 15)",
+		"Example/2.2.0-beta (Pixel 9; Android 15)",
 	}
 	messages = []string{
 		"Login user: %s %s",
@@ -339,7 +339,7 @@ func main() {
 
 		// Query by SourceContext (auto-indexed)
 		t0 = time.Now()
-		docs, _ = tcpClient.Find(collection, map[string]any{"SourceContext": "KarteX.API.Endpoints.User.LoginEndpoint"},
+		docs, _ = tcpClient.Find(collection, map[string]any{"SourceContext": "Example.API.Endpoints.User.LoginEndpoint"},
 			&oxidb.FindOptions{Limit: intPtr(10)})
 		dur = time.Since(t0)
 		fmt.Printf("  SourceContext=LoginEndpoint (limit 10): %d found in %v\n", len(docs), dur.Round(time.Microsecond))
