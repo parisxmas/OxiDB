@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod auth;
 pub mod gelf;
+pub mod gelf_ingest;
 pub mod handler;
 pub mod mqtt;
 pub mod oxiwire;

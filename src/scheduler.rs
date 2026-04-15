@@ -305,7 +305,7 @@ pub fn scheduler_loop(db: Arc<OxiDb>, rx: mpsc::Receiver<()>) {
 // Time helpers (no chrono dependency — uses std SystemTime)
 // ---------------------------------------------------------------------------
 
-fn epoch_now() -> i64 {
+pub fn epoch_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -341,7 +341,7 @@ fn epoch_to_parts(epoch: i64) -> (u8, u8, u8, u8, u8) {
 }
 
 /// Convert epoch seconds to an ISO 8601 UTC string.
-fn epoch_to_iso(epoch: i64) -> String {
+pub fn epoch_to_iso(epoch: i64) -> String {
     let (minute, hour, dom, month, dow) = epoch_to_parts(epoch);
     let _ = dow; // unused here
 

@@ -2343,6 +2343,15 @@ impl BTreeCollection {
         Ok(())
     }
 
+    /// Remove a TTL config for the given field (used by retention policy deletion).
+    /// The underlying field index is kept — only the TTL eviction config is removed.
+    pub fn remove_ttl_config(&self, field: &str) {
+        let mut cfgs = self.ttl_configs.write();
+        cfgs.retain(|c| c.field != field);
+        drop(cfgs);
+        let _ = self.save_index_metadata();
+    }
+
     /// Evict documents that have expired according to TTL index configs.
     /// For each TTL index, finds documents where `field_value + expireAfterSeconds <= now`
     /// using the field index for efficient range scan.

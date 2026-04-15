@@ -228,6 +228,20 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         ("GET", ["api", "rules", col]) => handle_get_rules(col, state),
         ("DELETE", ["api", "rules", col]) => handle_delete_rules(col, state),
 
+        // Retention policies
+        ("POST", ["api", "retention", col]) => handle_set_retention(col, req, state),
+        ("GET", ["api", "retention", col]) => handle_get_retention(col, state),
+        ("DELETE", ["api", "retention", col]) => handle_delete_retention(col, state),
+        ("GET", ["api", "retention"]) => handle_list_retentions(state),
+
+        // Alerts
+        ("POST", ["api", "alerts"]) => handle_create_alert(req, state),
+        ("GET", ["api", "alerts"]) => handle_list_alerts(state),
+        ("GET", ["api", "alerts", name]) => handle_get_alert(name, state),
+        ("DELETE", ["api", "alerts", name]) => handle_delete_alert(name, state),
+        ("POST", ["api", "alerts", name, "test"]) => handle_test_alert(name, state),
+        ("GET", ["api", "alert-history"]) => handle_alert_history(state),
+
         _ => Err((404, "not found")),
     };
 
@@ -544,6 +558,65 @@ fn handle_get_rules(col: &str, state: &RestState) -> Result<Value, (u16, &'stati
 fn handle_delete_rules(col: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
     rules::delete_rules(&state.db, col).map_err(|_| (500, "failed to delete rules"))?;
     Ok(json!({"collection": col, "rules": "deleted"}))
+}
+
+// ---------------------------------------------------------------------------
+// Retention policy handlers
+// ---------------------------------------------------------------------------
+
+fn handle_set_retention(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let days = body.get("days").and_then(|v| v.as_u64()).ok_or((400, "missing 'days'"))?;
+    state.db.set_retention(col, days).map_err(|_| (500, "failed to set retention"))?;
+    Ok(json!({"collection": col, "retain_days": days}))
+}
+
+fn handle_get_retention(col: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    state.db.get_retention(col).map_err(|_| (404, "no retention policy for this collection"))
+}
+
+fn handle_delete_retention(col: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    state.db.delete_retention(col).map_err(|_| (404, "no retention policy for this collection"))?;
+    Ok(json!({"collection": col, "retention": "deleted"}))
+}
+
+fn handle_list_retentions(state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let policies = state.db.list_retentions().map_err(|_| (500, "failed to list retentions"))?;
+    Ok(json!(policies))
+}
+
+// ---------------------------------------------------------------------------
+// Alert handlers
+// ---------------------------------------------------------------------------
+
+fn handle_create_alert(req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let body = parse_json_body(req)?;
+    let name = body.get("name").and_then(|v| v.as_str()).ok_or((400, "missing 'name'"))?;
+    state.db.create_alert(name, body.clone()).map_err(|_| (400, "failed to create alert"))?;
+    Ok(json!({"alert": name, "status": "created"}))
+}
+
+fn handle_list_alerts(state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let alerts = state.db.list_alerts().map_err(|_| (500, "failed to list alerts"))?;
+    Ok(json!(alerts))
+}
+
+fn handle_get_alert(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    state.db.get_alert(name).map_err(|_| (404, "alert not found"))
+}
+
+fn handle_delete_alert(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    state.db.delete_alert(name).map_err(|_| (404, "alert not found"))?;
+    Ok(json!({"alert": name, "status": "deleted"}))
+}
+
+fn handle_test_alert(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+    state.db.test_alert(name).map_err(|_| (404, "alert not found"))
+}
+
+fn handle_alert_history(state: &RestState) -> Result<Value, (u16, &'static str)> {
+    let history = state.db.list_alert_history().map_err(|_| (500, "failed to list alert history"))?;
+    Ok(json!(history))
 }
 
 // ---------------------------------------------------------------------------
