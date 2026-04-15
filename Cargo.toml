@@ -11,6 +11,7 @@ description = "A fast document database engine with optimized date indexing"
 [features]
 default = []
 ocr = ["leptess"]
+gpu = ["wgpu", "pollster", "bytemuck"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +29,9 @@ regex = "1"
 sqlparser = "0.59"
 scc = "3"
 rust-stemmers = "1"
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
 
 # Native-only dependencies (filesystem, threads, memory-mapped I/O)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

@@ -110,6 +110,8 @@ pub struct OxiDb {
     ttl_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
     #[cfg(not(target_arch = "wasm32"))]
     alert_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
+    #[cfg(feature = "gpu")]
+    gpu: Mutex<Option<Arc<crate::gpu::GpuCompute>>>,
 }
 
 impl OxiDb {
@@ -186,6 +188,8 @@ impl OxiDb {
             in_memory: true,
             ttl_shutdown: Mutex::new(None),
             alert_shutdown: Mutex::new(None),
+            #[cfg(feature = "gpu")]
+            gpu: Mutex::new(None),
 })
     }
 
@@ -328,6 +332,8 @@ impl OxiDb {
             in_memory: false,
             ttl_shutdown: Mutex::new(None),
             alert_shutdown: Mutex::new(None),
+            #[cfg(feature = "gpu")]
+            gpu: Mutex::new(None),
 })
     }
 
@@ -841,6 +847,12 @@ impl OxiDb {
     ) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
         col.text_search(query, limit)
+    }
+
+    /// Set the GPU compute backend for accelerated vector search.
+    #[cfg(feature = "gpu")]
+    pub fn set_gpu(&self, gpu: Arc<crate::gpu::GpuCompute>) {
+        *self.gpu.lock() = Some(gpu);
     }
 
     pub fn create_vector_index(
