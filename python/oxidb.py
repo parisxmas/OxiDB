@@ -450,3 +450,95 @@ class OxiDbClient:
             "cmd": "revoke_db_role", "username": username,
             "database": database,
         })
+
+    # ------------------------------------------------------------------
+    # TTL indexes
+    # ------------------------------------------------------------------
+
+    def create_ttl_index(self, collection: str, field: str, expire_after_seconds: int):
+        """Create a TTL index that automatically expires documents after a duration.
+
+        Args:
+            collection: Collection name.
+            field: Datetime field to check for expiration.
+            expire_after_seconds: Seconds after the field value before the document is deleted.
+        """
+        return self._checked({
+            "cmd": "create_ttl_index", "collection": collection,
+            "field": field, "expireAfterSeconds": expire_after_seconds,
+        })
+
+    # ------------------------------------------------------------------
+    # Retention policies
+    # ------------------------------------------------------------------
+
+    def set_retention(self, collection: str, days: int):
+        """Set a retention policy — documents older than `days` are automatically deleted.
+
+        Creates a TTL index on the `_ts` field. The background TTL thread handles eviction.
+
+        Args:
+            collection: Collection name (e.g. '_gelf_logs').
+            days: Number of days to retain documents.
+        """
+        return self._checked({
+            "cmd": "set_retention", "collection": collection, "days": days,
+        })
+
+    def get_retention(self, collection: str) -> dict:
+        """Get the retention policy for a collection."""
+        return self._checked({"cmd": "get_retention", "collection": collection})
+
+    def delete_retention(self, collection: str):
+        """Delete the retention policy for a collection."""
+        return self._checked({"cmd": "delete_retention", "collection": collection})
+
+    def list_retentions(self) -> list:
+        """List all retention policies."""
+        return self._checked({"cmd": "list_retentions"})
+
+    # ------------------------------------------------------------------
+    # Alerting
+    # ------------------------------------------------------------------
+
+    def create_alert(self, name: str, collection: str, condition: dict,
+                     actions: list, cooldown_seconds: int = 300):
+        """Create an alert rule that fires when a condition is met.
+
+        Args:
+            name: Unique alert name.
+            collection: Collection to monitor.
+            condition: Condition definition, e.g.
+                {"type": "count_threshold", "query": {"level": {"$lte": 3}},
+                 "window": "5m", "threshold": 100, "operator": "gte"}
+            actions: List of actions, e.g. [{"type": "webhook", "url": "..."}, {"type": "stderr"}]
+            cooldown_seconds: Minimum seconds between firings (default 300).
+        """
+        return self._checked({
+            "cmd": "create_alert", "name": name, "collection": collection,
+            "condition": condition, "actions": actions,
+            "cooldown_seconds": cooldown_seconds,
+        })
+
+    def get_alert(self, name: str) -> dict:
+        """Get an alert by name."""
+        return self._checked({"cmd": "get_alert", "name": name})
+
+    def delete_alert(self, name: str):
+        """Delete an alert by name."""
+        return self._checked({"cmd": "delete_alert", "name": name})
+
+    def list_alerts(self) -> list:
+        """List all alert rules."""
+        return self._checked({"cmd": "list_alerts"})
+
+    def test_alert(self, name: str) -> dict:
+        """Evaluate an alert's condition immediately without firing actions.
+
+        Returns the current value, threshold, and whether it would fire.
+        """
+        return self._checked({"cmd": "test_alert", "name": name})
+
+    def list_alert_history(self) -> list:
+        """List all fired alert events from _alert_history."""
+        return self._checked({"cmd": "list_alert_history"})
