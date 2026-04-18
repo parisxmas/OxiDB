@@ -84,7 +84,7 @@ docker compose up -d
 
 - **SQL query language** — `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE INDEX`, `SHOW TABLES` with `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, `JOIN`, `LIMIT`, `OFFSET`
 - **Document database** — JSON documents, no schema required, collections auto-created on insert
-- **JSON-based queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$regex`, `$and`, `$or`
+- **JSON-based queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$regex`, `$elemMatch`, `$all`, `$size`, `$not`, `$type`, `$mod`, `$and`, `$or`, `$nor`, `$expr`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
 - **Aggregation pipeline** — 11 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`, `$out`; index-accelerated `$group` for count, sum, min, max, avg
 - **Indexes** — field, unique, composite, full-text, vector, and TTL indexes with automatic backfill; list and drop support
@@ -189,6 +189,8 @@ let result = try client.sql(query: "SELECT name, age FROM users WHERE age > 21")
 
 ## Query Operators
 
+### Comparison
+
 | Operator   | Example                                  | Description                |
 |------------|------------------------------------------|----------------------------|
 | `$eq`      | `{"status": "active"}`                   | Equality (implicit)        |
@@ -199,10 +201,38 @@ let result = try client.sql(query: "SELECT name, age FROM users WHERE age > 21")
 | `$lte`     | `{"age": {"$lte": 100}}`                | Less than or equal         |
 | `$in`      | `{"cat": {"$in": ["a", "b"]}}`           | Value in array             |
 | `$nin`     | `{"cat": {"$nin": ["a", "b"]}}`          | Value not in array         |
+
+### Logical
+
+| Operator   | Example                                  | Description                |
+|------------|------------------------------------------|----------------------------|
+| `$and`     | `{"$and": [{"a": 1}, {"b": 2}]}`        | All conditions must match  |
+| `$or`      | `{"$or": [{"a": 1}, {"b": 2}]}`         | Any condition matches      |
+| `$nor`     | `{"$nor": [{"status": "deleted"}, {"banned": true}]}` | None of the conditions match |
+| `$not`     | `{"age": {"$not": {"$gt": 30}}}`         | Negate an operator expression |
+
+### Element
+
+| Operator   | Example                                  | Description                |
+|------------|------------------------------------------|----------------------------|
 | `$exists`  | `{"email": {"$exists": true}}`           | Field exists / does not    |
+| `$type`    | `{"age": {"$type": "number"}}`           | Field is a specific JSON type (`string`, `number`, `bool`, `array`, `object`, `null`, `int`) |
+
+### Evaluation
+
+| Operator   | Example                                  | Description                |
+|------------|------------------------------------------|----------------------------|
 | `$regex`   | `{"name": {"$regex": "^A", "$options": "i"}}` | Regular expression match   |
-| `$and`     | `{"$and": [{"a": 1}, {"b": 2}]}`        | Logical AND (explicit)     |
-| `$or`      | `{"$or": [{"a": 1}, {"b": 2}]}`         | Logical OR                 |
+| `$mod`     | `{"qty": {"$mod": [4, 0]}}`             | Modulo: `field % divisor == remainder` |
+| `$expr`    | `{"$expr": {"$gt": ["$sold", "$stock"]}}` | Cross-field comparison using `$field` references |
+
+### Array
+
+| Operator     | Example                                          | Description                |
+|--------------|--------------------------------------------------|----------------------------|
+| `$elemMatch` | `{"items": {"$elemMatch": {"price": {"$gt": 100}}}}` | At least one array element matches all conditions |
+| `$all`       | `{"tags": {"$all": ["rust", "fast"]}}`           | Array contains all specified values |
+| `$size`      | `{"tags": {"$size": 3}}`                        | Array has exact length     |
 
 Multiple conditions on different fields are implicitly ANDed.
 
