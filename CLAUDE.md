@@ -58,7 +58,7 @@ Each collection owns:
 - **Version map** — per-document version counters for OCC
 
 ### Query Engine (`src/query.rs`, `src/pipeline.rs`)
-Query AST with field conditions and logical operators ($and, $or). Operators: $eq, $ne, $gt/$gte/$lt/$lte, $in, $exists. Key optimizations:
+Query AST with field conditions and logical operators ($and, $or, $nor). Operators: $eq, $ne, $gt/$gte/$lt/$lte, $in, $nin, $exists, $regex, $elemMatch, $not, $all, $size, $type, $mod. Top-level $expr for cross-field comparisons. Key optimizations:
 - Index-backed sort: BTreeMap iteration is O(limit) instead of O(n log n)
 - Index-only count: returns set size without touching documents
 - Early termination: `update_one`/`delete_one` stop after first match

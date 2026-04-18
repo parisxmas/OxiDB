@@ -860,6 +860,249 @@ func (c *Client) PipelineInsertMany(collection string, batches [][]map[string]an
 }
 
 // ------------------------------------------------------------------
+// Stored procedures
+// ------------------------------------------------------------------
+
+// CreateProcedure creates a stored procedure from a JSON definition.
+// The definition should include "name", "body" (JavaScript), and optionally "params".
+func (c *Client) CreateProcedure(name string, definition map[string]any) error {
+	payload := map[string]any{"cmd": "create_procedure", "name": name}
+	for k, v := range definition {
+		payload[k] = v
+	}
+	_, err := c.checked(payload)
+	return err
+}
+
+// CreateProcedureFromScript creates a stored procedure from OxiScript source.
+func (c *Client) CreateProcedureFromScript(script string) error {
+	_, err := c.checked(map[string]any{"cmd": "create_procedure", "script": script})
+	return err
+}
+
+// CallProcedure executes a stored procedure by name with optional parameters.
+func (c *Client) CallProcedure(name string, params map[string]any) (any, error) {
+	payload := map[string]any{"cmd": "call_procedure", "name": name}
+	if params != nil {
+		payload["params"] = params
+	}
+	return c.checked(payload)
+}
+
+// ListProcedures returns a list of stored procedure names.
+func (c *Client) ListProcedures() ([]string, error) {
+	data, err := c.checked(map[string]any{"cmd": "list_procedures"})
+	if err != nil {
+		return nil, err
+	}
+	arr, _ := data.([]any)
+	result := make([]string, len(arr))
+	for i, v := range arr {
+		result[i], _ = v.(string)
+	}
+	return result, nil
+}
+
+// GetProcedure returns the definition of a stored procedure.
+func (c *Client) GetProcedure(name string) (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "get_procedure", "name": name})
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// DeleteProcedure deletes a stored procedure by name.
+func (c *Client) DeleteProcedure(name string) error {
+	_, err := c.checked(map[string]any{"cmd": "delete_procedure", "name": name})
+	return err
+}
+
+// CompileOxiScript compiles OxiScript source and returns the compiled definition.
+func (c *Client) CompileOxiScript(script string) (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "compile_oxiscript", "script": script})
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// ------------------------------------------------------------------
+// TTL indexes
+// ------------------------------------------------------------------
+
+// CreateTTLIndex creates a TTL index that automatically expires documents.
+// The field should be a datetime field; documents are deleted expireAfterSeconds
+// after the field value.
+func (c *Client) CreateTTLIndex(collection, field string, expireAfterSeconds int) error {
+	_, err := c.checked(map[string]any{
+		"cmd": "create_ttl_index", "collection": collection,
+		"field": field, "expireAfterSeconds": expireAfterSeconds,
+	})
+	return err
+}
+
+// ------------------------------------------------------------------
+// Retention policies
+// ------------------------------------------------------------------
+
+// SetRetention sets a retention policy — documents older than days are auto-deleted.
+// Creates a TTL index on the _ts field.
+func (c *Client) SetRetention(collection string, days int) error {
+	_, err := c.checked(map[string]any{
+		"cmd": "set_retention", "collection": collection, "days": days,
+	})
+	return err
+}
+
+// GetRetention returns the retention policy for a collection.
+func (c *Client) GetRetention(collection string) (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "get_retention", "collection": collection})
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// DeleteRetention removes the retention policy for a collection.
+func (c *Client) DeleteRetention(collection string) error {
+	_, err := c.checked(map[string]any{"cmd": "delete_retention", "collection": collection})
+	return err
+}
+
+// ListRetentions returns all retention policies.
+func (c *Client) ListRetentions() ([]map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "list_retentions"})
+	if err != nil {
+		return nil, err
+	}
+	return toMapSlice(data), nil
+}
+
+// ------------------------------------------------------------------
+// Alerting
+// ------------------------------------------------------------------
+
+// CreateAlert creates an alert rule that fires when a condition is met.
+// Condition example: {"type": "count_threshold", "query": {"level": {"$lte": 3}},
+//
+//	"window": "5m", "threshold": 100, "operator": "gte"}
+//
+// Actions example: [{"type": "webhook", "url": "..."}, {"type": "stderr"}]
+func (c *Client) CreateAlert(name, collection string, condition map[string]any, actions []map[string]any, cooldownSeconds int) error {
+	if cooldownSeconds <= 0 {
+		cooldownSeconds = 300
+	}
+	_, err := c.checked(map[string]any{
+		"cmd": "create_alert", "name": name, "collection": collection,
+		"condition": condition, "actions": actions,
+		"cooldown_seconds": cooldownSeconds,
+	})
+	return err
+}
+
+// GetAlert returns an alert rule by name.
+func (c *Client) GetAlert(name string) (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "get_alert", "name": name})
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// DeleteAlert deletes an alert rule by name.
+func (c *Client) DeleteAlert(name string) error {
+	_, err := c.checked(map[string]any{"cmd": "delete_alert", "name": name})
+	return err
+}
+
+// ListAlerts returns all alert rules.
+func (c *Client) ListAlerts() ([]map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "list_alerts"})
+	if err != nil {
+		return nil, err
+	}
+	return toMapSlice(data), nil
+}
+
+// TestAlert evaluates an alert's condition immediately without firing actions.
+// Returns the current value, threshold, and whether it would fire.
+func (c *Client) TestAlert(name string) (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "test_alert", "name": name})
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// ListAlertHistory returns all fired alert events from _alert_history.
+func (c *Client) ListAlertHistory() ([]map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "list_alert_history"})
+	if err != nil {
+		return nil, err
+	}
+	return toMapSlice(data), nil
+}
+
+// ------------------------------------------------------------------
+// Text extraction
+// ------------------------------------------------------------------
+
+// ExtractText extracts text from a blob object using OxiDB's built-in
+// extractors (PDF, DOCX, HTML, etc.).
+func (c *Client) ExtractText(bucket, key string) (string, error) {
+	data, err := c.checked(map[string]any{"cmd": "extract_text", "bucket": bucket, "key": key})
+	if err != nil {
+		return "", err
+	}
+	m, _ := data.(map[string]any)
+	text, _ := m["text"].(string)
+	return text, nil
+}
+
+// ------------------------------------------------------------------
+// Backup & Restore
+// ------------------------------------------------------------------
+
+// Backup creates a full database backup at the given path.
+// Returns backup info with path, size_bytes, and collections.
+func (c *Client) Backup(path string) (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "backup", "path": path})
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// Restore restores a database from a backup archive to a target directory.
+// Returns restore info with path, collections, and a message.
+func (c *Client) Restore(archive, target string) (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "restore", "archive": archive, "target": target})
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// ------------------------------------------------------------------
+// SQL dialect
+// ------------------------------------------------------------------
+
+// SetDialect sets the SQL dialect for this session.
+// Valid dialects: "mysql", "postgresql", "mssql", "generic".
+func (c *Client) SetDialect(dialect string) error {
+	_, err := c.checked(map[string]any{"cmd": "set_dialect", "dialect": dialect})
+	return err
+}
+
+// ------------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------------
 
