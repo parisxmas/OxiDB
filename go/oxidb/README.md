@@ -159,6 +159,93 @@ bucket := "files"
 results, _ = client.Search("hello world", &bucket, 10)
 ```
 
+### Stored Procedures
+
+```go
+// Create from JSON definition
+client.CreateProcedure("greet", map[string]any{
+    "body": "return 'Hello, ' + params.name;",
+})
+
+// Create from OxiScript
+client.CreateProcedureFromScript("proc greet(name) { return 'Hello, ' + name; }")
+
+// Call a procedure
+result, _ := client.CallProcedure("greet", map[string]any{"name": "Alice"})
+
+// List, get, delete
+names, _ := client.ListProcedures()
+def, _ := client.GetProcedure("greet")
+client.DeleteProcedure("greet")
+
+// Compile OxiScript without creating
+compiled, _ := client.CompileOxiScript("proc test() { return 1; }")
+```
+
+### TTL Indexes
+
+```go
+// Auto-expire documents 3600 seconds after the "created_at" field value
+client.CreateTTLIndex("sessions", "created_at", 3600)
+```
+
+### Retention Policies
+
+```go
+// Keep logs for 30 days (auto-deletes older documents)
+client.SetRetention("_gelf_logs", 30)
+
+policy, _ := client.GetRetention("_gelf_logs")
+all, _ := client.ListRetentions()
+client.DeleteRetention("_gelf_logs")
+```
+
+### Alerting
+
+```go
+// Create an alert that fires when error count exceeds threshold
+client.CreateAlert("high-errors", "logs",
+    map[string]any{
+        "type": "count_threshold", "query": map[string]any{"level": map[string]any{"$lte": 3}},
+        "window": "5m", "threshold": 100, "operator": "gte",
+    },
+    []map[string]any{
+        {"type": "webhook", "url": "https://hooks.example.com/alert"},
+        {"type": "stderr"},
+    },
+    300, // cooldown seconds
+)
+
+alert, _ := client.GetAlert("high-errors")
+alerts, _ := client.ListAlerts()
+result, _ := client.TestAlert("high-errors") // dry-run
+history, _ := client.ListAlertHistory()
+client.DeleteAlert("high-errors")
+```
+
+### Text Extraction
+
+```go
+// Extract text from a blob (PDF, DOCX, HTML, etc.)
+text, _ := client.ExtractText("files", "report.pdf")
+```
+
+### Backup & Restore
+
+```go
+info, _ := client.Backup("/tmp/oxidb-backup")
+// info["path"], info["size_bytes"], info["collections"]
+
+info, _ = client.Restore("/tmp/oxidb-backup", "/tmp/oxidb-restored")
+```
+
+### SQL Dialect
+
+```go
+// Set SQL dialect for the session
+client.SetDialect("postgresql") // mysql, postgresql, mssql, generic
+```
+
 ### Compaction
 
 ```go
