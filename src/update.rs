@@ -289,11 +289,26 @@ fn remove_field(doc: &mut Value, path: &str) {
                 Some(v) => current = v,
                 None => return,
             },
+            Value::Array(arr) => match part.parse::<usize>() {
+                Ok(idx) if idx < arr.len() => current = &mut arr[idx],
+                _ => return,
+            },
             _ => return,
         }
     }
-    if let Value::Object(map) = current {
-        map.remove(parts[parts.len() - 1]);
+    let last = parts[parts.len() - 1];
+    match current {
+        Value::Object(map) => {
+            map.remove(last);
+        }
+        Value::Array(arr) => {
+            if let Ok(idx) = last.parse::<usize>() {
+                if idx < arr.len() {
+                    arr.remove(idx);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -647,5 +662,109 @@ mod tests {
         let mut doc = json!({"name": "Alice"});
         let result = apply_update(&mut doc, &json!({"$inc": {"name": 1}}));
         assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Array dot-notation (variants.0.stock bug fix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn set_array_element_by_index() {
+        let mut doc = json!({"variants": [{"size": "M", "stock": 10}, {"size": "L", "stock": 5}]});
+        apply_update(&mut doc, &json!({"$set": {"variants.0.stock": 8}})).unwrap();
+        assert_eq!(doc["variants"][0]["stock"], 8);
+        assert_eq!(doc["variants"][0]["size"], "M"); // preserved
+        assert_eq!(doc["variants"][1]["stock"], 5);  // untouched
+        assert!(doc["variants"].is_array());         // still an array
+    }
+
+    #[test]
+    fn set_array_second_element() {
+        let mut doc = json!({"items": [{"name": "A", "qty": 1}, {"name": "B", "qty": 2}]});
+        apply_update(&mut doc, &json!({"$set": {"items.1.qty": 99}})).unwrap();
+        assert_eq!(doc["items"][1]["qty"], 99);
+        assert_eq!(doc["items"][0]["qty"], 1); // untouched
+        assert!(doc["items"].is_array());
+    }
+
+    #[test]
+    fn set_array_element_top_level_value() {
+        let mut doc = json!({"scores": [10, 20, 30]});
+        apply_update(&mut doc, &json!({"$set": {"scores.1": 99}})).unwrap();
+        assert_eq!(doc["scores"], json!([10, 99, 30]));
+    }
+
+    #[test]
+    fn inc_array_element_field() {
+        let mut doc = json!({"variants": [{"size": "M", "stock": 10}, {"size": "L", "stock": 5}]});
+        apply_update(&mut doc, &json!({"$inc": {"variants.0.stock": -3}})).unwrap();
+        assert_eq!(doc["variants"][0]["stock"], 7);
+        assert!(doc["variants"].is_array());
+    }
+
+    #[test]
+    fn set_deeply_nested_array() {
+        let mut doc = json!({"a": [{"b": [{"c": 1}, {"c": 2}]}]});
+        apply_update(&mut doc, &json!({"$set": {"a.0.b.1.c": 99}})).unwrap();
+        assert_eq!(doc["a"][0]["b"][1]["c"], 99);
+        assert_eq!(doc["a"][0]["b"][0]["c"], 1); // untouched
+    }
+
+    #[test]
+    fn set_array_out_of_bounds_noop() {
+        let mut doc = json!({"arr": [1, 2]});
+        apply_update(&mut doc, &json!({"$set": {"arr.5": 99}})).unwrap();
+        assert_eq!(doc["arr"], json!([1, 2])); // unchanged
+    }
+
+    #[test]
+    fn unset_array_element_field() {
+        let mut doc = json!({"items": [{"name": "A", "temp": true}, {"name": "B"}]});
+        apply_update(&mut doc, &json!({"$unset": {"items.0.temp": ""}})).unwrap();
+        assert!(doc["items"][0].get("temp").is_none());
+        assert_eq!(doc["items"][0]["name"], "A");
+    }
+
+    #[test]
+    fn unset_array_element_removes_from_array() {
+        let mut doc = json!({"tags": ["a", "b", "c"]});
+        apply_update(&mut doc, &json!({"$unset": {"tags.1": ""}})).unwrap();
+        assert_eq!(doc["tags"], json!(["a", "c"]));
+    }
+
+    #[test]
+    fn push_to_nested_array_element() {
+        let mut doc = json!({"users": [{"name": "A", "roles": ["read"]}, {"name": "B", "roles": ["admin"]}]});
+        apply_update(&mut doc, &json!({"$push": {"users.0.roles": "write"}})).unwrap();
+        assert_eq!(doc["users"][0]["roles"], json!(["read", "write"]));
+        assert_eq!(doc["users"][1]["roles"], json!(["admin"])); // untouched
+    }
+
+    // The exact scenario from the bug report: e-commerce variant stock update
+    #[test]
+    fn scenario_ecommerce_variant_stock_update() {
+        let mut doc = json!({
+            "name": "T-Shirt",
+            "variants": [
+                {"size": "S", "color": "red", "stock": 50, "price": 29.99},
+                {"size": "M", "color": "red", "stock": 30, "price": 29.99},
+                {"size": "L", "color": "blue", "stock": 10, "price": 34.99}
+            ]
+        });
+
+        // Customer buys 1x Medium Red → decrement stock
+        apply_update(&mut doc, &json!({"$inc": {"variants.1.stock": -1}})).unwrap();
+        assert_eq!(doc["variants"][1]["stock"], 29);
+
+        // Set Large Blue to out of stock
+        apply_update(&mut doc, &json!({"$set": {"variants.2.stock": 0}})).unwrap();
+        assert_eq!(doc["variants"][2]["stock"], 0);
+
+        // Verify array integrity
+        assert!(doc["variants"].is_array());
+        assert_eq!(doc["variants"].as_array().unwrap().len(), 3);
+        assert_eq!(doc["variants"][0]["stock"], 50); // untouched
+        assert_eq!(doc["variants"][1]["size"], "M"); // fields preserved
+        assert_eq!(doc["variants"][2]["color"], "blue"); // fields preserved
     }
 }

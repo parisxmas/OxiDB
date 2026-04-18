@@ -162,10 +162,19 @@ pub struct Pipeline {
 // ---------------------------------------------------------------------------
 
 /// Resolve a field path by reference — zero allocations.
+/// Supports numeric segments as array indexes: `"items.0.name"` resolves
+/// `items[0].name` when `items` is an array.
 fn resolve_field_ref<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
     let mut current = doc;
     for part in path.split('.') {
-        current = current.as_object()?.get(part)?;
+        match current {
+            Value::Object(map) => current = map.get(part)?,
+            Value::Array(arr) => {
+                let idx: usize = part.parse().ok()?;
+                current = arr.get(idx)?;
+            }
+            _ => return None,
+        }
     }
     Some(current)
 }
@@ -174,23 +183,62 @@ pub(crate) fn resolve_field(doc: &Value, path: &str) -> Value {
     resolve_field_ref(doc, path).cloned().unwrap_or(Value::Null)
 }
 
+/// Set a value at a dot-notation path, creating intermediate objects as needed.
+/// Supports numeric segments as array indexes: `"items.0.stock"` sets
+/// `items[0].stock` when `items` is an array.
 pub(crate) fn set_field(doc: &mut Value, path: &str, value: Value) {
     let parts: Vec<&str> = path.split('.').collect();
     let mut current = doc;
     for (i, part) in parts.iter().enumerate() {
         if i == parts.len() - 1 {
-            if let Value::Object(map) = current {
-                map.insert(part.to_string(), value);
+            // Last segment: write the value
+            match current {
+                Value::Object(map) => {
+                    map.insert(part.to_string(), value);
+                }
+                Value::Array(arr) => {
+                    if let Ok(idx) = part.parse::<usize>() {
+                        if idx < arr.len() {
+                            arr[idx] = value;
+                        }
+                    }
+                }
+                _ => {}
             }
             return;
         }
-        if let Value::Object(map) = current {
-            if !map.contains_key(*part) || !map[*part].is_object() {
-                map.insert(part.to_string(), json!({}));
+        // Intermediate segment: navigate deeper
+        match current {
+            Value::Object(map) => {
+                if let Some(idx) = part.parse::<usize>().ok().filter(|_| {
+                    map.get(*part).map_or(false, |v| v.is_array() || v.is_object())
+                        == false
+                        && !map.contains_key(*part)
+                }) {
+                    // Numeric key but no existing entry — can't create array out of thin air
+                    let _ = idx;
+                    map.insert(part.to_string(), json!({}));
+                } else if !map.contains_key(*part) {
+                    map.insert(part.to_string(), json!({}));
+                } else if let Some(v) = map.get(*part) {
+                    if !v.is_object() && !v.is_array() {
+                        map.insert(part.to_string(), json!({}));
+                    }
+                }
+                current = map.get_mut(*part).unwrap();
             }
-            current = map.get_mut(*part).unwrap();
-        } else {
-            return;
+            Value::Array(arr) => {
+                if let Ok(idx) = part.parse::<usize>() {
+                    if idx < arr.len() {
+                        current = &mut arr[idx];
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
+            _ => return,
         }
     }
 }
