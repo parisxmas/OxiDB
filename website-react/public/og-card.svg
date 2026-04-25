@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <!-- Background gradient: dark slate with rust glow top-left -->
+    <radialGradient id="rustBloom" cx="20%" cy="0%" r="70%">
+      <stop offset="0%"  stop-color="#e2784a" stop-opacity="0.30"/>
+      <stop offset="50%" stop-color="#e2784a" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#e2784a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="steelBloom" cx="100%" cy="100%" r="60%">
+      <stop offset="0%"  stop-color="#7c9eb4" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#7c9eb4" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="title" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#ffffff"/>
+      <stop offset="55%"  stop-color="#e7e9ed"/>
+      <stop offset="100%" stop-color="#e2784a"/>
+    </linearGradient>
+    <linearGradient id="hexGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#e2784a"/>
+      <stop offset="100%" stop-color="#a8451f"/>
+    </linearGradient>
+    <pattern id="grid" x="0" y="0" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M 48 0 L 0 0 0 48" fill="none" stroke="#ffffff" stroke-opacity="0.025" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <!-- Layered backgrounds -->
+  <rect width="1200" height="630" fill="#0a0c10"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <rect width="1200" height="630" fill="url(#rustBloom)"/>
+  <rect width="1200" height="630" fill="url(#steelBloom)"/>
+
+  <!-- Top accent rule -->
+  <line x1="0" y1="0" x2="1200" y2="0" stroke="#e2784a" stroke-width="3"/>
+
+  <!-- Brand mark (hex) -->
+  <g transform="translate(80, 80)">
+    <polygon points="36,0 72,18 72,54 36,72 0,54 0,18"
+             fill="url(#hexGrad)" stroke="#a8451f" stroke-width="1"/>
+    <text x="100" y="48"
+          font-family="'Geist', system-ui, sans-serif"
+          font-size="22"
+          font-weight="500"
+          letter-spacing="0.02em"
+          fill="#e7e9ed">Oxi<tspan fill="#e2784a">DB</tspan></text>
+    <text x="220" y="48"
+          font-family="'Geist Mono', ui-monospace, monospace"
+          font-size="13"
+          letter-spacing="0.18em"
+          fill="#6c7585">DOCUMENT&#160;DATABASE</text>
+  </g>
+
+  <!-- Version chip (top right) -->
+  <g transform="translate(960, 70)">
+    <rect x="0" y="0" width="160" height="36" rx="18"
+          fill="rgba(226,120,74,0.12)"
+          stroke="#a8451f" stroke-width="1"/>
+    <circle cx="20" cy="18" r="4" fill="#e2784a"/>
+    <text x="36" y="23"
+          font-family="'Geist Mono', ui-monospace, monospace"
+          font-size="13"
+          font-weight="500"
+          letter-spacing="0.18em"
+          fill="#e2784a">V0.25.3 · LATEST</text>
+  </g>
+
+  <!-- Hero title -->
+  <text x="80" y="320"
+        font-family="'Geist', system-ui, sans-serif"
+        font-size="148"
+        font-weight="500"
+        letter-spacing="-0.045em"
+        fill="url(#title)">OxiDB</text>
+
+  <!-- Tagline -->
+  <text x="80" y="380"
+        font-family="'Geist', system-ui, sans-serif"
+        font-size="32"
+        font-weight="400"
+        letter-spacing="-0.01em"
+        fill="#e7e9ed">A fast, versatile document database.</text>
+
+  <!-- Feature pills row -->
+  <g transform="translate(80, 430)" font-family="'Geist Mono', ui-monospace, monospace" font-size="14" letter-spacing="0.06em">
+    <!-- Pill 1: JSON & SQL -->
+    <g>
+      <rect x="0" y="0" width="148" height="36" rx="18" fill="#181d26" stroke="#262d39"/>
+      <text x="74" y="23" text-anchor="middle" fill="#e7e9ed">JSON · SQL</text>
+    </g>
+    <!-- Pill 2: ACID -->
+    <g transform="translate(160, 0)">
+      <rect x="0" y="0" width="120" height="36" rx="18" fill="#181d26" stroke="#262d39"/>
+      <text x="60" y="23" text-anchor="middle" fill="#e7e9ed">ACID TX</text>
+    </g>
+    <!-- Pill 3: Sharding -->
+    <g transform="translate(292, 0)">
+      <rect x="0" y="0" width="148" height="36" rx="18" fill="rgba(226,120,74,0.12)" stroke="#a8451f"/>
+      <text x="74" y="23" text-anchor="middle" fill="#e2784a">SHARDED</text>
+    </g>
+    <!-- Pill 4: Raft -->
+    <g transform="translate(452, 0)">
+      <rect x="0" y="0" width="180" height="36" rx="18" fill="rgba(226,120,74,0.12)" stroke="#a8451f"/>
+      <text x="90" y="23" text-anchor="middle" fill="#e2784a">RAFT REPLICATED</text>
+    </g>
+    <!-- Pill 5: Persistent -->
+    <g transform="translate(644, 0)">
+      <rect x="0" y="0" width="160" height="36" rx="18" fill="rgba(226,120,74,0.12)" stroke="#a8451f"/>
+      <text x="80" y="23" text-anchor="middle" fill="#e2784a">PERSISTENT</text>
+    </g>
+  </g>
+
+  <!-- Stat strip (bottom) -->
+  <g transform="translate(80, 510)"
+     font-family="'Geist Mono', ui-monospace, monospace">
+    <!-- Stat 1 -->
+    <text x="0" y="0" font-size="11" letter-spacing="0.20em" fill="#6c7585">VERIFIED AT</text>
+    <text x="0" y="32" font-size="34" font-weight="500" fill="#e7e9ed">1,000,000</text>
+    <text x="0" y="56" font-size="12" fill="#a4adba">records under failover</text>
+
+    <!-- Stat 2 -->
+    <g transform="translate(280, 0)">
+      <text x="0" y="0" font-size="11" letter-spacing="0.20em" fill="#6c7585">THROUGHPUT</text>
+      <text x="0" y="32" font-size="34" font-weight="500" fill="#e7e9ed">44K rec/s</text>
+      <text x="0" y="56" font-size="12" fill="#a4adba">avg with mid-stream failover</text>
+    </g>
+
+    <!-- Stat 3 -->
+    <g transform="translate(560, 0)">
+      <text x="0" y="0" font-size="11" letter-spacing="0.20em" fill="#6c7585">RAFT CATCH-UP</text>
+      <text x="0" y="32" font-size="34" font-weight="500" fill="#e7e9ed">1.0 s</text>
+      <text x="0" y="56" font-size="12" fill="#a4adba">on follower restart</text>
+    </g>
+
+    <!-- Stat 4 -->
+    <g transform="translate(820, 0)">
+      <text x="0" y="0" font-size="11" letter-spacing="0.20em" fill="#6c7585">DATA LOSS</text>
+      <text x="0" y="32" font-size="34" font-weight="500" fill="#82a98a">0</text>
+      <text x="0" y="56" font-size="12" fill="#a4adba">across the test suite</text>
+    </g>
+  </g>
+
+  <!-- Bottom-right URL -->
+  <text x="1120" y="600" text-anchor="end"
+        font-family="'Geist Mono', ui-monospace, monospace"
+        font-size="12"
+        letter-spacing="0.08em"
+        fill="#6c7585">oxidb.baltavista.com</text>
+</svg>

@@ -32,7 +32,7 @@ export default function Page() {
               <td><code>oxidb-server-v0.25.3-linux-amd64.tar.gz</code></td>
               <td>5.4 MB</td>
               <td>musl static</td>
-              <td><a href="releases/v0.25.3/oxidb-server-v0.25.3-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-server-v0.25.3-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>Linux</td>
@@ -40,7 +40,7 @@ export default function Page() {
               <td><code>oxidb-server-v0.25.3-linux-arm64.tar.gz</code></td>
               <td>4.8 MB</td>
               <td>musl static</td>
-              <td><a href="releases/v0.25.3/oxidb-server-v0.25.3-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-server-v0.25.3-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>macOS</td>
@@ -48,7 +48,7 @@ export default function Page() {
               <td><code>oxidb-server-v0.25.3-darwin-arm64.tar.gz</code></td>
               <td>4.6 MB</td>
               <td>tar.gz</td>
-              <td><a href="releases/v0.25.3/oxidb-server-v0.25.3-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-server-v0.25.3-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>macOS</td>
@@ -56,7 +56,7 @@ export default function Page() {
               <td><code>oxidb-server-v0.25.3-darwin-amd64.tar.gz</code></td>
               <td>5.1 MB</td>
               <td>tar.gz</td>
-              <td><a href="releases/v0.25.3/oxidb-server-v0.25.3-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-server-v0.25.3-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>Windows</td>
@@ -64,13 +64,13 @@ export default function Page() {
               <td><code>oxidb-server-v0.25.3-windows-amd64.zip</code></td>
               <td>5.0 MB</td>
               <td>zip</td>
-              <td><a href="releases/v0.25.3/oxidb-server-v0.25.3-windows-amd64.zip" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-server-v0.25.3-windows-amd64.zip" class="dl-btn">Download</a></td>
             </tr>
             <tr class="checksum-row">
               <td colspan="3"><strong>SHA256 Checksums</strong></td>
               <td></td>
               <td>txt</td>
-              <td><a href="releases/v0.25.3/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
+              <td><a href="/releases/v0.25.3/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
             </tr>
           </tbody>
         </table>
@@ -109,7 +109,7 @@ cargo add oxidb</code></pre>
               <td><code>oxidb-cli-v0.25.3-linux-amd64.tar.gz</code></td>
               <td>3.9 MB</td>
               <td>musl static</td>
-              <td><a href="releases/v0.25.3/oxidb-cli-v0.25.3-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-cli-v0.25.3-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>Linux</td>
@@ -117,7 +117,7 @@ cargo add oxidb</code></pre>
               <td><code>oxidb-cli-v0.25.3-linux-arm64.tar.gz</code></td>
               <td>3.6 MB</td>
               <td>musl static</td>
-              <td><a href="releases/v0.25.3/oxidb-cli-v0.25.3-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-cli-v0.25.3-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>macOS</td>
@@ -125,7 +125,7 @@ cargo add oxidb</code></pre>
               <td><code>oxidb-cli-v0.25.3-darwin-arm64.tar.gz</code></td>
               <td>3.3 MB</td>
               <td>tar.gz</td>
-              <td><a href="releases/v0.25.3/oxidb-cli-v0.25.3-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-cli-v0.25.3-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>macOS</td>
@@ -133,7 +133,7 @@ cargo add oxidb</code></pre>
               <td><code>oxidb-cli-v0.25.3-darwin-amd64.tar.gz</code></td>
               <td>3.7 MB</td>
               <td>tar.gz</td>
-              <td><a href="releases/v0.25.3/oxidb-cli-v0.25.3-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-cli-v0.25.3-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>Windows</td>
@@ -141,13 +141,13 @@ cargo add oxidb</code></pre>
               <td><code>oxidb-cli-v0.25.3-windows-amd64.zip</code></td>
               <td>3.8 MB</td>
               <td>zip</td>
-              <td><a href="releases/v0.25.3/oxidb-cli-v0.25.3-windows-amd64.zip" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.25.3/oxidb-cli-v0.25.3-windows-amd64.zip" class="dl-btn">Download</a></td>
             </tr>
             <tr class="checksum-row">
               <td colspan="3"><strong>SHA256 Checksums</strong></td>
               <td></td>
               <td>txt</td>
-              <td><a href="releases/v0.25.3/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
+              <td><a href="/releases/v0.25.3/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
             </tr>
           </tbody>
         </table>
@@ -226,7 +226,7 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-server-v0.18.0-linux-amd64.tar.gz</code></td>
               <td>5.4 MB</td>
               <td>musl static</td>
-              <td><a href="releases/v0.18.0/oxidb-server-v0.18.0-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>Linux</td>
@@ -234,7 +234,7 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-server-v0.18.0-linux-arm64.tar.gz</code></td>
               <td>4.8 MB</td>
               <td>musl static</td>
-              <td><a href="releases/v0.18.0/oxidb-server-v0.18.0-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>macOS</td>
@@ -242,7 +242,7 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-server-v0.18.0-darwin-arm64.tar.gz</code></td>
               <td>4.6 MB</td>
               <td>tar.gz</td>
-              <td><a href="releases/v0.18.0/oxidb-server-v0.18.0-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>macOS</td>
@@ -250,7 +250,7 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-server-v0.18.0-darwin-amd64.tar.gz</code></td>
               <td>5.1 MB</td>
               <td>tar.gz</td>
-              <td><a href="releases/v0.18.0/oxidb-server-v0.18.0-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>Windows</td>
@@ -258,13 +258,13 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-server-v0.18.0-windows-amd64.zip</code></td>
               <td>5.0 MB</td>
               <td>zip</td>
-              <td><a href="releases/v0.18.0/oxidb-server-v0.18.0-windows-amd64.zip" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-server-v0.18.0-windows-amd64.zip" class="dl-btn">Download</a></td>
             </tr>
             <tr class="checksum-row">
               <td colspan="3"><strong>SHA256 Checksums</strong></td>
               <td></td>
               <td>txt</td>
-              <td><a href="releases/v0.18.0/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
+              <td><a href="/releases/v0.18.0/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
             </tr>
           </tbody>
         </table>
@@ -291,7 +291,7 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-cli-v0.18.0-linux-amd64.tar.gz</code></td>
               <td>3.9 MB</td>
               <td>musl static</td>
-              <td><a href="releases/v0.18.0/oxidb-cli-v0.18.0-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-linux-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>Linux</td>
@@ -299,7 +299,7 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-cli-v0.18.0-linux-arm64.tar.gz</code></td>
               <td>3.6 MB</td>
               <td>musl static</td>
-              <td><a href="releases/v0.18.0/oxidb-cli-v0.18.0-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-linux-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>macOS</td>
@@ -307,7 +307,7 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-cli-v0.18.0-darwin-arm64.tar.gz</code></td>
               <td>3.3 MB</td>
               <td>tar.gz</td>
-              <td><a href="releases/v0.18.0/oxidb-cli-v0.18.0-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-darwin-arm64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>macOS</td>
@@ -315,7 +315,7 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-cli-v0.18.0-darwin-amd64.tar.gz</code></td>
               <td>3.7 MB</td>
               <td>tar.gz</td>
-              <td><a href="releases/v0.18.0/oxidb-cli-v0.18.0-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-darwin-amd64.tar.gz" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>Windows</td>
@@ -323,13 +323,13 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
               <td><code>oxidb-cli-v0.18.0-windows-amd64.zip</code></td>
               <td>3.8 MB</td>
               <td>zip</td>
-              <td><a href="releases/v0.18.0/oxidb-cli-v0.18.0-windows-amd64.zip" class="dl-btn">Download</a></td>
+              <td><a href="/releases/v0.18.0/oxidb-cli-v0.18.0-windows-amd64.zip" class="dl-btn">Download</a></td>
             </tr>
             <tr class="checksum-row">
               <td colspan="3"><strong>SHA256 Checksums</strong></td>
               <td></td>
               <td>txt</td>
-              <td><a href="releases/v0.18.0/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
+              <td><a href="/releases/v0.18.0/SHA256SUMS.txt" class="dl-btn dl-btn-secondary">Verify</a></td>
             </tr>
           </tbody>
         </table>

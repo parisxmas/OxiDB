@@ -202,11 +202,12 @@ pub async fn scatter_insert_many(
             Ok(Ok((data, _))) => {
                 if let Ok(resp) = serde_json::from_slice::<Value>(&data) {
                     if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                        if let Some(n) = resp.get("inserted").and_then(|v| v.as_u64()) {
-                            total_inserted += n;
-                        }
-                        if let Some(ids) = resp.get("ids").and_then(|v| v.as_array()) {
-                            all_ids.extend(ids.iter().cloned());
+                        // OxiDB returns {"ok": true, "data": [ids]} for insert_many
+                        if let Some(data) = resp.get("data") {
+                            if let Some(ids) = data.as_array() {
+                                total_inserted += ids.len() as u64;
+                                all_ids.extend(ids.iter().cloned());
+                            }
                         }
                     } else if let Some(e) = resp.get("error").and_then(|v| v.as_str()) {
                         last_error = Some(e.to_string());
@@ -219,15 +220,11 @@ pub async fn scatter_insert_many(
     }
 
     if total_inserted > 0 {
-        let mut resp = json!({"ok": true, "inserted": total_inserted});
-        if !all_ids.is_empty() {
-            resp["ids"] = Value::Array(all_ids);
-        }
-        serde_json::to_vec(&resp).unwrap()
+        serde_json::to_vec(&json!({"ok": true, "data": all_ids})).unwrap()
     } else if let Some(err) = last_error {
         serde_json::to_vec(&json!({"ok": false, "error": err})).unwrap()
     } else {
-        serde_json::to_vec(&json!({"ok": true, "inserted": 0})).unwrap()
+        serde_json::to_vec(&json!({"ok": true, "data": []})).unwrap()
     }
 }
 
@@ -243,70 +240,109 @@ fn merge_responses(responses: Vec<Vec<u8>>, strategy: MergeStrategy) -> Vec<u8> 
     }
 }
 
-/// Merge "find" responses: concatenate the "docs" arrays.
-fn merge_doc_arrays(responses: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut all_docs: Vec<Value> = Vec::new();
+/// If any shard returned `ok:false` (or a malformed response), return the
+/// first such error message. Used by the merge strategies that aggregate
+/// across shards (`SumCounts`, `ConcatDocs`, `SumModified`) so that a partial
+/// failure surfaces as a real error to the client instead of being silently
+/// excluded from the aggregate.
+fn first_partial_error(responses: &[Vec<u8>]) -> Option<String> {
+    for resp_bytes in responses {
+        match serde_json::from_slice::<Value>(resp_bytes) {
+            Ok(resp) => {
+                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let msg = resp
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("shard returned ok:false without an error message");
+                    return Some(msg.to_string());
+                }
+            }
+            Err(e) => return Some(format!("shard returned malformed response: {}", e)),
+        }
+    }
+    None
+}
 
+/// Merge "find" responses: concatenate the "docs" arrays. Fails fast if any
+/// shard errored — silently dropping a shard's docs would produce a
+/// truthy-but-incomplete result set, which is worse than a clear error.
+fn merge_doc_arrays(responses: Vec<Vec<u8>>) -> Vec<u8> {
+    if let Some(err) = first_partial_error(&responses) {
+        return serde_json::to_vec(&json!({
+            "ok": false,
+            "error": format!("scatter-gather find failed on one or more shards: {}", err),
+        })).unwrap();
+    }
+
+    let mut all_docs: Vec<Value> = Vec::new();
     for resp_bytes in &responses {
         if let Ok(resp) = serde_json::from_slice::<Value>(resp_bytes) {
-            if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                if let Some(docs) = resp.get("docs").and_then(|v| v.as_array()) {
-                    all_docs.extend(docs.iter().cloned());
-                }
-                // Also handle "results" key (text_search, vector_search)
-                if let Some(results) = resp.get("results").and_then(|v| v.as_array()) {
-                    all_docs.extend(results.iter().cloned());
-                }
+            if let Some(data) = resp.get("data").and_then(|v| v.as_array()) {
+                all_docs.extend(data.iter().cloned());
             }
         }
     }
 
-    serde_json::to_vec(&json!({"ok": true, "docs": all_docs})).unwrap()
+    serde_json::to_vec(&json!({"ok": true, "data": all_docs})).unwrap()
 }
 
-/// Merge "count" responses: sum all counts.
+/// Merge "count" responses: sum all counts. Fails fast if any shard errored
+/// (otherwise a stale/down shard would silently undercount the total).
 fn merge_counts(responses: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut total: u64 = 0;
+    if let Some(err) = first_partial_error(&responses) {
+        return serde_json::to_vec(&json!({
+            "ok": false,
+            "error": format!("scatter-gather count failed on one or more shards: {}", err),
+        })).unwrap();
+    }
 
+    let mut total: u64 = 0;
     for resp_bytes in &responses {
         if let Ok(resp) = serde_json::from_slice::<Value>(resp_bytes) {
-            if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                if let Some(n) = resp.get("count").and_then(|v| v.as_u64()) {
+            if let Some(data) = resp.get("data") {
+                if let Some(n) = data.get("count").and_then(|v| v.as_u64()) {
                     total += n;
                 }
             }
         }
     }
 
-    serde_json::to_vec(&json!({"ok": true, "count": total})).unwrap()
+    serde_json::to_vec(&json!({"ok": true, "data": {"count": total}})).unwrap()
 }
 
-/// Merge update/delete responses: sum modified/deleted counts.
+/// Merge update/delete responses: sum modified/deleted counts. Fails fast
+/// on any shard error — partial application would leave the client with no
+/// way to detect that some shards didn't apply the update.
 fn merge_modified(responses: Vec<Vec<u8>>) -> Vec<u8> {
+    if let Some(err) = first_partial_error(&responses) {
+        return serde_json::to_vec(&json!({
+            "ok": false,
+            "error": format!("scatter-gather update/delete failed on one or more shards: {}", err),
+        })).unwrap();
+    }
+
     let mut total_modified: u64 = 0;
     let mut total_matched: u64 = 0;
-
     for resp_bytes in &responses {
         if let Ok(resp) = serde_json::from_slice::<Value>(resp_bytes) {
-            if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                if let Some(n) = resp.get("modified").and_then(|v| v.as_u64()) {
-                    total_modified += n;
-                }
-                if let Some(n) = resp.get("deleted").and_then(|v| v.as_u64()) {
-                    total_modified += n;
-                }
-                if let Some(n) = resp.get("matched").and_then(|v| v.as_u64()) {
-                    total_matched += n;
-                }
+            let src = resp.get("data").unwrap_or(&resp);
+            if let Some(n) = src.get("modified").and_then(|v| v.as_u64()) {
+                total_modified += n;
+            }
+            if let Some(n) = src.get("deleted").and_then(|v| v.as_u64()) {
+                total_modified += n;
+            }
+            if let Some(n) = src.get("matched").and_then(|v| v.as_u64()) {
+                total_matched += n;
             }
         }
     }
 
-    let mut resp = json!({"ok": true, "modified": total_modified});
+    let mut data = json!({"modified": total_modified});
     if total_matched > 0 {
-        resp["matched"] = json!(total_matched);
+        data["matched"] = json!(total_matched);
     }
-    serde_json::to_vec(&resp).unwrap()
+    serde_json::to_vec(&json!({"ok": true, "data": data})).unwrap()
 }
 
 /// For find_one/update_one/delete_one: return the first successful match.
@@ -314,16 +350,26 @@ fn merge_first_match(responses: Vec<Vec<u8>>) -> Vec<u8> {
     for resp_bytes in &responses {
         if let Ok(resp) = serde_json::from_slice::<Value>(resp_bytes) {
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                // find_one: has "doc" field
-                if resp.get("doc").is_some() && !resp["doc"].is_null() {
-                    return resp_bytes.clone();
-                }
-                // update_one/delete_one: modified > 0
-                if resp.get("modified").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
-                    return resp_bytes.clone();
-                }
-                if resp.get("deleted").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
-                    return resp_bytes.clone();
+                // OxiDB returns {"ok": true, "data": <doc|result>}
+                if let Some(data) = resp.get("data") {
+                    if !data.is_null() {
+                        // find_one: data is a document (object)
+                        if data.is_object() {
+                            // update_one/delete_one with 0 modifications — skip
+                            if let Some(m) = data.get("modified").and_then(|v| v.as_u64()) {
+                                if m > 0 { return resp_bytes.clone(); }
+                            } else if let Some(d) = data.get("deleted").and_then(|v| v.as_u64()) {
+                                if d > 0 { return resp_bytes.clone(); }
+                            } else {
+                                // Regular document (find_one)
+                                return resp_bytes.clone();
+                            }
+                        }
+                        // data is array or other non-null — return it
+                        if data.is_array() {
+                            return resp_bytes.clone();
+                        }
+                    }
                 }
             }
         }

@@ -2,6 +2,13 @@
 
 ## v0.25.3
 
+### `oxipool/src/scatter.rs` — partial-shard errors no longer silent
+
+- New `first_partial_error` helper — checks every shard response before merging.
+- `merge_counts`, `merge_doc_arrays`, `merge_modified` now fail fast with `ok:false` and the failing shard's error message instead of silently summing/concatenating only the responding shards.
+- Surfaced by the 100K load test: a stale-pool conn to a freshly-restarted follower returned an error → router silently dropped that shard → `count` returned ~2/3 of the actual rows. With the fix the client sees a real error and can retry, instead of getting an under-count.
+- `oxipool` crate version bumped: 0.25.0 → 0.25.3.
+
 ### Cluster mode — Raft persistence: O(1) per mutation
 
 - Rewrite `oxidb-server/src/raft/log_store.rs` persistence layer to scale
