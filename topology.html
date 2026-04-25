@@ -1,0 +1,1500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ShopEdge // OxiDB Cluster Topology</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg:        #0a0c10;
+    --bg-2:      #0d1016;
+    --bg-3:      #11151c;
+    --surface:   #14181f;
+    --surface-2: #181d26;
+    --surface-3: #1d232d;
+    --line:      #1c2129;
+    --line-2:    #262d39;
+    --line-3:    #323a48;
+    --text:      #e7e9ed;
+    --text-2:    #a4adba;
+    --text-3:    #6c7585;
+    --text-4:    #424a59;
+    --rust:      #e2784a;
+    --rust-2:    #d4642f;
+    --rust-3:    #b04a1a;
+    --rust-glow: rgba(226,120,74,0.32);
+    --rust-soft: rgba(226,120,74,0.08);
+    --steel:     #7c9eb4;
+    --steel-2:   #5a7d92;
+    --steel-3:   #3e5a6c;
+    --steel-glow: rgba(124,158,180,0.22);
+    --steel-soft: rgba(124,158,180,0.06);
+    --good:      #82a98a;
+    --serif: 'Instrument Serif', 'Iowan Old Style', 'Times New Roman', serif;
+    --sans: 'Geist', -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif;
+    --mono: 'Geist Mono', 'SF Mono', 'JetBrains Mono', ui-monospace, monospace;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { background: var(--bg); }
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    font-weight: 400;
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background:
+      radial-gradient(ellipse 1200px 600px at 30% -10%, rgba(226,120,74,0.08), transparent 70%),
+      radial-gradient(ellipse 900px 500px at 80% 5%, rgba(124,158,180,0.05), transparent 70%),
+      var(--bg);
+    overflow-x: hidden;
+  }
+  body::before {
+    /* Page-wide noise grain */
+    content: "";
+    position: fixed;
+    inset: 0;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.9  0 0 0 0 0.9  0 0 0 0 0.9  0 0 0 0.06 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+    opacity: 0.5;
+    mix-blend-mode: overlay;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* ---- Header bar ---- */
+  .top-bar {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 22px 56px;
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(255,255,255,0.012), transparent);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+    letter-spacing: 0.06em;
+    color: var(--text-2);
+  }
+  .brand-mark {
+    width: 18px;
+    height: 18px;
+    display: inline-block;
+    background: linear-gradient(135deg, var(--rust) 0%, var(--rust-3) 80%);
+    clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+    box-shadow: 0 0 12px var(--rust-glow);
+  }
+  .brand strong {
+    color: var(--text);
+    font-weight: 500;
+    letter-spacing: 0;
+  }
+  .brand-divider {
+    width: 1px;
+    height: 14px;
+    background: var(--line-2);
+    display: inline-block;
+    margin: 0 4px;
+  }
+  .top-meta {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-3);
+    letter-spacing: 0.02em;
+  }
+  .top-meta span.dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--good);
+    display: inline-block;
+    box-shadow: 0 0 8px rgba(130,169,138,0.6);
+    margin-right: 6px;
+    transform: translateY(-1px);
+  }
+
+  /* ---- Hero ---- */
+  .hero {
+    position: relative;
+    z-index: 2;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 80px 56px 50px;
+  }
+  .kicker {
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 36px;
+  }
+  .kicker::before {
+    content: "";
+    width: 28px;
+    height: 1px;
+    background: var(--rust);
+  }
+  .kicker .pulse {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--rust);
+    box-shadow: 0 0 10px var(--rust-glow);
+    animation: kicker-pulse 2.6s ease-in-out infinite;
+  }
+  @keyframes kicker-pulse {
+    0%, 100% { opacity: 0.55; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.3); }
+  }
+  h1.title {
+    font-family: var(--sans);
+    font-weight: 500;
+    font-size: clamp(64px, 9vw, 132px);
+    line-height: 0.92;
+    letter-spacing: -0.045em;
+    margin: 0 0 22px;
+    color: var(--text);
+  }
+  h1.title em {
+    font-family: var(--serif);
+    font-style: italic;
+    font-weight: 400;
+    color: var(--rust);
+    letter-spacing: -0.02em;
+  }
+  h1.title .slash {
+    font-family: var(--mono);
+    font-weight: 400;
+    color: var(--text-3);
+    font-size: 0.36em;
+    letter-spacing: 0.04em;
+    vertical-align: middle;
+    margin-left: 18px;
+    text-transform: lowercase;
+  }
+  .lede {
+    font-size: 19px;
+    line-height: 1.55;
+    color: var(--text-2);
+    max-width: 720px;
+    margin: 0;
+    font-weight: 400;
+  }
+  .lede b {
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  /* ---- Spec strip ---- */
+  .spec-strip {
+    position: relative;
+    z-index: 2;
+    max-width: 1400px;
+    margin: 60px auto 0;
+    padding: 0 56px;
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+  }
+  .spec-strip > div {
+    padding: 22px 18px 22px 0;
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .spec-strip > div:nth-child(6) { border-right: none; }
+  .spec-strip > div:nth-child(n+2) { padding-left: 22px; }
+  .spec-strip dt {
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    margin: 0;
+  }
+  .spec-strip dd {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 22px;
+    color: var(--text);
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+  .spec-strip dd .sub {
+    color: var(--text-3);
+    font-weight: 400;
+    font-size: 16px;
+    margin-left: 4px;
+  }
+  .spec-strip dd .accent { color: var(--rust); }
+
+  /* ---- Section header (figure caption) ---- */
+  .figure-head {
+    position: relative;
+    z-index: 2;
+    max-width: 1400px;
+    margin: 80px auto 22px;
+    padding: 0 56px;
+    display: grid;
+    grid-template-columns: 80px 1fr auto;
+    gap: 26px;
+    align-items: end;
+  }
+  .figure-num {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--rust);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--rust-3);
+  }
+  .figure-title {
+    font-size: 22px;
+    font-weight: 500;
+    color: var(--text);
+    letter-spacing: -0.015em;
+  }
+  .figure-axes {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-3);
+    letter-spacing: 0.02em;
+  }
+
+  /* ---- Topology stage ---- */
+  .stage-wrap {
+    position: relative;
+    z-index: 2;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 0 56px 0;
+    overflow-x: auto;
+  }
+  .stage {
+    position: relative;
+    border: 1px solid var(--line);
+    background:
+      linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px) 0 0 / 40px 40px,
+      linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px) 0 0 / 40px 40px,
+      radial-gradient(ellipse 700px 400px at 50% -5%, rgba(226,120,74,0.07), transparent 65%),
+      radial-gradient(ellipse 800px 500px at 50% 110%, rgba(124,158,180,0.04), transparent 65%),
+      var(--bg-2);
+    border-radius: 4px;
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.02) inset,
+      0 0 0 1px rgba(0,0,0,0.4),
+      0 50px 80px -30px rgba(0,0,0,0.6);
+    padding: 30px 30px 30px;
+    min-width: 1280px;
+  }
+  .stage::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(ellipse 60% 80% at 50% 50%, transparent 50%, rgba(0,0,0,0.45));
+    pointer-events: none;
+    border-radius: 4px;
+  }
+  .stage-corner {
+    position: absolute;
+    width: 16px;
+    height: 16px;
+    border-color: var(--rust-3);
+    border-style: solid;
+    border-width: 0;
+    pointer-events: none;
+    z-index: 5;
+  }
+  .stage-corner.tl { top: -1px; left: -1px; border-top-width: 1px; border-left-width: 1px; }
+  .stage-corner.tr { top: -1px; right: -1px; border-top-width: 1px; border-right-width: 1px; }
+  .stage-corner.bl { bottom: -1px; left: -1px; border-bottom-width: 1px; border-left-width: 1px; }
+  .stage-corner.br { bottom: -1px; right: -1px; border-bottom-width: 1px; border-right-width: 1px; }
+
+  .topology {
+    position: relative;
+    width: 1240px;
+    height: 920px;
+    margin: 0 auto;
+  }
+  .topology-svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 1;
+    overflow: visible;
+  }
+
+  /* SVG line styles */
+  .topology-svg .line {
+    fill: none;
+    stroke-width: 1.2;
+  }
+  .topology-svg .line-route {
+    stroke: var(--rust-2);
+    stroke-opacity: 0.85;
+    filter: drop-shadow(0 0 4px rgba(212,100,47,0.4));
+  }
+  .topology-svg .line-wal {
+    stroke: var(--steel-2);
+    stroke-opacity: 0.85;
+    stroke-dasharray: 5 5;
+    animation: wal-flow 2s linear infinite;
+  }
+  @keyframes wal-flow {
+    to { stroke-dashoffset: -20; }
+  }
+  .topology-svg .line-label {
+    font-family: 'Geist Mono', monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.06em;
+    fill: var(--text-3);
+  }
+  .topology-svg .line-label-rust { fill: var(--rust); letter-spacing: 0.08em; text-transform: uppercase; font-size: 9.5px; }
+  .topology-svg .line-label-steel { fill: var(--steel); letter-spacing: 0.08em; text-transform: uppercase; font-size: 9.5px; }
+  .topology-svg .line-label-tiny { font-family: 'Geist Mono', monospace; font-size: 9px; fill: var(--text-4); letter-spacing: 0.05em; }
+  .topology-svg .stripe {
+    stroke: var(--line-3);
+    stroke-width: 0.5;
+    stroke-dasharray: 2 4;
+    fill: none;
+    opacity: 0.6;
+  }
+
+  /* ---- Cards (positioned absolutely) ---- */
+  .card {
+    position: absolute;
+    z-index: 2;
+    background: var(--surface);
+    border: 1px solid var(--line-2);
+    border-radius: 6px;
+    color: var(--text);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.025) inset,
+      0 8px 24px -10px rgba(0,0,0,0.6);
+    transition: transform 200ms ease, border-color 200ms ease, box-shadow 200ms ease;
+  }
+  .card:hover {
+    border-color: var(--line-3);
+    transform: translateY(-1px);
+  }
+
+  /* --- API tier --- */
+  .card-api {
+    display: grid;
+    grid-template-rows: 1fr auto;
+    padding: 12px 16px;
+  }
+  .card-api .row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .card-api .api-mark {
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+    background: linear-gradient(180deg, var(--surface-3), var(--surface));
+    border: 1px solid var(--line-2);
+    display: grid;
+    place-items: center;
+    color: var(--text-2);
+  }
+  .card-api .title {
+    font-size: 14.5px;
+    font-weight: 500;
+    color: var(--text);
+    letter-spacing: -0.005em;
+  }
+  .card-api .sub {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-3);
+    letter-spacing: 0.02em;
+    margin-top: 2px;
+  }
+  .card-api .foot {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-4);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-align: right;
+  }
+
+  /* --- Router --- */
+  .card-router {
+    background:
+      linear-gradient(180deg, rgba(226,120,74,0.04), transparent 60%),
+      var(--surface);
+    border-color: var(--line-3);
+    box-shadow:
+      0 1px 0 rgba(255,255,255,0.03) inset,
+      0 0 0 1px rgba(226,120,74,0.06),
+      0 24px 60px -20px rgba(0,0,0,0.7);
+    padding: 18px 24px;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: 14px;
+  }
+  .card-router .head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 12px;
+  }
+  .router-id {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .router-id .name {
+    font-size: 18px;
+    font-weight: 500;
+    letter-spacing: -0.015em;
+  }
+  .router-id .port {
+    font-family: var(--mono);
+    color: var(--rust);
+    font-size: 14px;
+  }
+  .tier-badge {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    padding: 4px 10px;
+    border: 1px solid var(--line-2);
+    border-radius: 99px;
+    background: rgba(255,255,255,0.015);
+  }
+  .tier-badge.rust { color: var(--rust); border-color: var(--rust-3); background: var(--rust-soft); }
+  .router-tags {
+    display: flex;
+    gap: 8px;
+  }
+  .card-router .body {
+    display: grid;
+    grid-template-columns: 1.05fr 1.1fr 0.85fr;
+    gap: 16px;
+    align-items: stretch;
+  }
+  .env {
+    border-left: 1px solid var(--line);
+    padding-left: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .env:first-child { border-left: none; padding-left: 0; }
+  .env-key {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--text-3);
+  }
+  .env-val {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text);
+    line-height: 1.55;
+    word-break: break-word;
+  }
+  .env-val .accent { color: var(--rust); }
+  .env-val .muted { color: var(--text-3); }
+
+  /* --- Shard pool cards --- */
+  .card-pool {
+    padding: 16px 18px 14px;
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: 12px;
+  }
+  .card-pool .head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 10px;
+  }
+  .pool-id {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .pool-id .port {
+    font-family: var(--mono);
+    color: var(--rust);
+    font-size: 12px;
+  }
+  .shard-tag {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--rust);
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    padding: 4px 8px;
+    background: var(--rust-soft);
+    border: 1px solid var(--rust-3);
+    border-radius: 4px;
+  }
+  .pool-info {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .pool-info li {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .pool-info .env-key { min-width: 78px; }
+  .pool-info .rule {
+    margin-top: 6px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--line-2);
+    color: var(--text-2);
+    flex-wrap: wrap;
+    font-size: 10.5px;
+  }
+  .chip {
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    padding: 2px 6px;
+    border-radius: 3px;
+    border: 1px solid;
+  }
+  .chip.rust { color: var(--rust); border-color: var(--rust-3); background: var(--rust-soft); }
+  .chip.steel { color: var(--steel); border-color: var(--steel-3); background: var(--steel-soft); }
+
+  /* --- Node cards --- */
+  .card-node {
+    padding: 12px 14px;
+    display: grid;
+    grid-template-rows: 1fr auto;
+    gap: 6px;
+  }
+  .card-node .top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .card-node .ico {
+    width: 24px;
+    height: 24px;
+    display: grid;
+    place-items: center;
+    border-radius: 4px;
+    border: 1px solid;
+    flex-shrink: 0;
+  }
+  .card-node .name {
+    font-family: var(--mono);
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text);
+    letter-spacing: -0.01em;
+  }
+  .card-node .port {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-3);
+    margin-left: 0;
+  }
+  .card-node .spacer { flex: 1; }
+  .card-node .status {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    position: relative;
+    flex-shrink: 0;
+  }
+  .card-node .bottom {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .role-badge {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    border-radius: 3px;
+    border: 1px solid;
+    font-weight: 500;
+  }
+  .node-fn {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-3);
+    letter-spacing: 0.04em;
+  }
+
+  /* Master variant */
+  .card-master {
+    background:
+      linear-gradient(180deg, rgba(226,120,74,0.06), transparent 70%),
+      var(--surface-2);
+    border-color: rgba(226,120,74,0.4);
+    box-shadow:
+      0 0 0 1px rgba(226,120,74,0.06),
+      0 1px 0 rgba(255,255,255,0.03) inset,
+      0 12px 30px -12px rgba(0,0,0,0.7),
+      0 0 24px -8px var(--rust-glow);
+  }
+  .card-master .ico { color: var(--rust); border-color: var(--rust-3); background: var(--rust-soft); }
+  .card-master .status {
+    background: var(--rust);
+    box-shadow: 0 0 8px var(--rust);
+  }
+  .card-master .status::after {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border-radius: 50%;
+    background: var(--rust);
+    opacity: 0.6;
+    animation: master-ring 2.4s ease-out infinite;
+  }
+  @keyframes master-ring {
+    0%   { transform: scale(0.8); opacity: 0.55; }
+    70%  { transform: scale(2.2); opacity: 0; }
+    100% { transform: scale(2.4); opacity: 0; }
+  }
+  .card-master .role-badge {
+    color: var(--rust);
+    border-color: var(--rust-3);
+    background: var(--rust-soft);
+  }
+
+  /* Replica variant */
+  .card-replica {
+    background: var(--surface);
+    border-color: rgba(124,158,180,0.22);
+  }
+  .card-replica .ico { color: var(--steel); border-color: var(--steel-3); background: var(--steel-soft); }
+  .card-replica .status {
+    background: var(--steel);
+    box-shadow: 0 0 6px rgba(124,158,180,0.7);
+  }
+  .card-replica .role-badge {
+    color: var(--steel);
+    border-color: var(--steel-3);
+    background: var(--steel-soft);
+  }
+
+  /* Stagger entry animation */
+  @keyframes fade-up {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .anim { animation: fade-up 0.7s cubic-bezier(.2,.7,.2,1) backwards; }
+  .anim-delay-0 { animation-delay: 0.05s; }
+  .anim-delay-1 { animation-delay: 0.18s; }
+  .anim-delay-2 { animation-delay: 0.32s; }
+  .anim-delay-3 { animation-delay: 0.46s; }
+  .anim-delay-4 { animation-delay: 0.6s; }
+
+  /* SVG line draw-in */
+  .topology-svg .line {
+    stroke-dasharray: var(--len, 1000);
+    stroke-dashoffset: var(--len, 1000);
+    animation: draw 1s ease-out 0.05s forwards;
+  }
+  .topology-svg .line-wal {
+    /* WAL keeps its own animation — overwritten below */
+    animation: draw 1s ease-out 0.6s forwards, wal-flow 2s linear 1.7s infinite;
+    stroke-dasharray: 5 5;
+    stroke-dashoffset: 0;
+  }
+  @keyframes draw {
+    to { stroke-dashoffset: 0; }
+  }
+
+  /* ---- Legend ---- */
+  .legend-row {
+    position: relative;
+    z-index: 2;
+    max-width: 1400px;
+    margin: 22px auto 0;
+    padding: 0 56px;
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+    align-items: center;
+    border-top: 1px solid var(--line);
+    padding-top: 22px;
+    margin-top: 30px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-2);
+    letter-spacing: 0.02em;
+  }
+  .legend-item .swatch {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    border: 1px solid;
+    display: grid;
+    place-items: center;
+  }
+  .legend-item .swatch.master { background: var(--rust-soft); border-color: var(--rust-3); color: var(--rust); }
+  .legend-item .swatch.replica { background: var(--steel-soft); border-color: var(--steel-3); color: var(--steel); }
+  .legend-item .ln {
+    width: 36px; height: 0;
+    border-top: 1.4px solid;
+    position: relative;
+  }
+  .legend-item .ln.route { border-color: var(--rust); }
+  .legend-item .ln.wal { border-style: dashed; border-color: var(--steel); }
+
+  /* ---- Data layout section ---- */
+  section.layout {
+    position: relative;
+    z-index: 2;
+    max-width: 1400px;
+    margin: 100px auto 0;
+    padding: 0 56px;
+  }
+  .section-head {
+    display: grid;
+    grid-template-columns: 80px 1fr;
+    gap: 26px;
+    align-items: end;
+    margin-bottom: 30px;
+  }
+  .section-head .num {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--rust);
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--rust-3);
+  }
+  .section-head h2 {
+    margin: 0;
+    font-size: 36px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: var(--text);
+  }
+  .section-head h2 em {
+    font-family: var(--serif);
+    font-style: italic;
+    color: var(--rust);
+    font-weight: 400;
+  }
+
+  table.layout-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  table.layout-table thead th {
+    text-align: left;
+    padding: 12px 16px;
+    font-size: 10px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--text-3);
+    font-weight: 500;
+    border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line);
+    background: rgba(255,255,255,0.012);
+  }
+  table.layout-table tbody td {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--line);
+    color: var(--text-2);
+    vertical-align: top;
+  }
+  table.layout-table tbody tr {
+    transition: background 200ms ease;
+  }
+  table.layout-table tbody tr:hover {
+    background: rgba(226,120,74,0.025);
+  }
+  table.layout-table tbody td.coll {
+    color: var(--text);
+    font-weight: 500;
+  }
+  table.layout-table tbody td.coll::before {
+    content: "▸ ";
+    color: var(--rust);
+    margin-right: 2px;
+  }
+  table.layout-table tbody td.shard-by .accent { color: var(--rust); }
+  table.layout-table tbody td .muted { color: var(--text-3); }
+  table.layout-table tbody td .em { color: var(--text); }
+  table.layout-table tbody tr.unsharded td.coll::before { color: var(--steel); }
+  table.layout-table tbody tr.unsharded td.shard-by { color: var(--steel); }
+
+  .table-foot {
+    margin-top: 12px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--text-4);
+    letter-spacing: 0.05em;
+  }
+
+  /* ---- Key flows ---- */
+  section.flows {
+    position: relative;
+    z-index: 2;
+    max-width: 1400px;
+    margin: 100px auto 0;
+    padding: 0 56px;
+  }
+  .flow-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 18px;
+    margin-top: 8px;
+  }
+  .flow-card {
+    border: 1px solid var(--line);
+    background: linear-gradient(180deg, rgba(255,255,255,0.012), transparent 50%), var(--bg-2);
+    border-radius: 4px;
+    padding: 22px 24px 20px;
+    transition: border-color 200ms ease, transform 200ms ease;
+    position: relative;
+    overflow: hidden;
+  }
+  .flow-card:hover {
+    border-color: var(--line-3);
+    transform: translateY(-1px);
+  }
+  .flow-card::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0;
+    width: 3px;
+    height: 100%;
+    background: linear-gradient(180deg, var(--rust), transparent);
+    opacity: 0.7;
+  }
+  .flow-num {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--rust);
+    letter-spacing: 0.18em;
+    margin-bottom: 6px;
+  }
+  .flow-title {
+    font-size: 17px;
+    font-weight: 500;
+    color: var(--text);
+    margin-bottom: 8px;
+    letter-spacing: -0.005em;
+  }
+  .flow-path {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-2);
+    line-height: 1.55;
+    margin-bottom: 14px;
+    padding: 8px 12px;
+    background: rgba(255,255,255,0.018);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    word-break: break-word;
+  }
+  .flow-path .arrow { color: var(--rust); margin: 0 5px; }
+  .flow-path .node { color: var(--text); }
+  .flow-path .replica { color: var(--steel); }
+  .flow-desc {
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--text-2);
+  }
+  .flow-desc code {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    background: rgba(255,255,255,0.025);
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--line);
+  }
+
+  /* Footer */
+  footer {
+    position: relative;
+    z-index: 2;
+    max-width: 1400px;
+    margin: 120px auto 0;
+    padding: 30px 56px 60px;
+    border-top: 1px solid var(--line);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-3);
+    letter-spacing: 0.04em;
+  }
+  footer .links { display: flex; gap: 18px; }
+  footer .links a {
+    color: var(--text-3);
+    text-decoration: none;
+    border-bottom: 1px dashed var(--line-2);
+    padding-bottom: 1px;
+  }
+  footer .links a:hover { color: var(--rust); border-color: var(--rust-3); }
+
+  /* Responsive — keep diagram horizontally scrollable on narrow screens */
+  @media (max-width: 1280px) {
+    .top-bar, .hero, .spec-strip, .figure-head, .stage-wrap, .legend-row, section.layout, section.flows, footer {
+      padding-left: 28px;
+      padding-right: 28px;
+    }
+  }
+  @media (max-width: 920px) {
+    .spec-strip { grid-template-columns: repeat(3, 1fr); }
+    .spec-strip > div:nth-child(3) { border-right: none; }
+    .flow-grid { grid-template-columns: 1fr; }
+    h1.title .slash { display: block; margin-left: 0; margin-top: 12px; font-size: 0.22em; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ─── Header bar ─── -->
+<div class="top-bar">
+  <div class="brand">
+    <span class="brand-mark"></span>
+    <strong>OxiDB</strong>
+    <span class="brand-divider"></span>
+    <span>architecture · case study</span>
+  </div>
+  <div class="top-meta">
+    <span><span class="dot"></span>v0.25.1</span>
+    <span>oxipool · TX-pinned routing</span>
+    <span>2026-04-25</span>
+  </div>
+</div>
+
+<!-- ─── Hero ─── -->
+<div class="hero">
+  <div class="kicker"><span class="pulse"></span>case study · e-commerce · production deployment</div>
+  <h1 class="title">ShopEdge<span class="slash">// cluster topology</span></h1>
+  <p class="lede">A real-world OxiDB deployment for a mid-size e-commerce platform. <b>Three shards, nine nodes, single ingress</b> — write-heavy checkout served by per-shard masters, read-heavy browsing fanned out across replicas, time-series events pruned by TTL, hot-path counters in OxiMem.</p>
+</div>
+
+<!-- ─── Spec strip ─── -->
+<dl class="spec-strip">
+  <div><dt>shards</dt><dd>03</dd></div>
+  <div><dt>nodes</dt><dd>09</dd></div>
+  <div><dt>replicas / shard</dt><dd>02</dd></div>
+  <div><dt>virtual chunks</dt><dd>256</dd></div>
+  <div><dt>routing</dt><dd><span class="accent">CRC32</span><span class="sub">customer_id</span></dd></div>
+  <div><dt>ingress</dt><dd>:4445<span class="sub">oxipool-router</span></dd></div>
+</dl>
+
+<!-- ─── Figure caption ─── -->
+<div class="figure-head">
+  <div class="figure-num">FIG. 01</div>
+  <div class="figure-title">Two-tier oxipool — shard router fronts per-shard pools, each fronting a master + 2 replicas.</div>
+  <div class="figure-axes">↳ vertical: ingress → routing → pool → primary → replicas</div>
+</div>
+
+<!-- ─── Topology stage ─── -->
+<div class="stage-wrap">
+  <div class="stage">
+    <span class="stage-corner tl"></span>
+    <span class="stage-corner tr"></span>
+    <span class="stage-corner bl"></span>
+    <span class="stage-corner br"></span>
+
+    <div class="topology">
+      <!-- ─── Connector overlay ─── -->
+      <svg class="topology-svg" viewBox="0 0 1240 920" preserveAspectRatio="xMidYMid meet">
+        <defs>
+          <marker id="arrow-rust" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#d4642f"/>
+          </marker>
+          <marker id="arrow-steel" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="#7c9eb4"/>
+          </marker>
+        </defs>
+
+        <!-- API → Router -->
+        <path class="line line-route" d="M620 100 L620 180" marker-end="url(#arrow-rust)" style="--len: 80;"/>
+        <text x="630" y="146" class="line-label">length-prefixed JSON</text>
+
+        <!-- Router → Shard pools (3 ways) -->
+        <path class="line line-route" d="M620 340 C620 384 200 384 200 420" marker-end="url(#arrow-rust)" style="--len: 480;"/>
+        <path class="line line-route" d="M620 340 L620 420" marker-end="url(#arrow-rust)" style="--len: 80;"/>
+        <path class="line line-route" d="M620 340 C620 384 1040 384 1040 420" marker-end="url(#arrow-rust)" style="--len: 480;"/>
+
+        <!-- Routing-band label -->
+        <text x="620" y="375" text-anchor="middle" class="line-label line-label-rust">CRC32(customer_id) · 256 virtual chunks</text>
+        <line class="stripe" x1="80" y1="384" x2="540" y2="384"/>
+        <line class="stripe" x1="700" y1="384" x2="1160" y2="384"/>
+
+        <!-- Pool → Master (3 lines) -->
+        <path class="line line-route" d="M200 560 L200 600" marker-end="url(#arrow-rust)" style="--len: 40;"/>
+        <path class="line line-route" d="M620 560 L620 600" marker-end="url(#arrow-rust)" style="--len: 40;"/>
+        <path class="line line-route" d="M1040 560 L1040 600" marker-end="url(#arrow-rust)" style="--len: 40;"/>
+
+        <!-- Master → Replica1 (3 short WAL arrows) -->
+        <path class="line line-wal" d="M200 672 L200 712" marker-end="url(#arrow-steel)"/>
+        <path class="line line-wal" d="M620 672 L620 712" marker-end="url(#arrow-steel)"/>
+        <path class="line line-wal" d="M1040 672 L1040 712" marker-end="url(#arrow-steel)"/>
+
+        <!-- Master → Replica2 (3 curved bypass WAL arrows) -->
+        <path class="line line-wal" d="M320 628 C390 628 390 848 320 848" marker-end="url(#arrow-steel)"/>
+        <path class="line line-wal" d="M740 628 C810 628 810 848 740 848" marker-end="url(#arrow-steel)"/>
+        <path class="line line-wal" d="M1160 628 C1220 628 1220 848 1160 848" marker-end="url(#arrow-steel)"/>
+
+        <!-- WAL labels (one per shard, on the bypass curve) -->
+        <text x="395" y="734" text-anchor="middle" class="line-label-steel" transform="rotate(0 395 734)">WAL ship</text>
+        <text x="395" y="748" text-anchor="middle" class="line-label-tiny">async · eventual</text>
+        <text x="815" y="734" text-anchor="middle" class="line-label-steel">WAL ship</text>
+        <text x="815" y="748" text-anchor="middle" class="line-label-tiny">async · eventual</text>
+        <text x="1225" y="734" text-anchor="end" class="line-label-steel">WAL ship</text>
+        <text x="1225" y="748" text-anchor="end" class="line-label-tiny">async · eventual</text>
+      </svg>
+
+      <!-- ─── Layer 1: API tier ─── -->
+      <div class="card card-api anim anim-delay-0" style="left:480px; top:20px; width:280px; height:80px;">
+        <div class="row">
+          <div class="api-mark">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+              <path d="M3 6h18M3 12h18M3 18h18"/>
+            </svg>
+          </div>
+          <div>
+            <div class="title">API tier</div>
+            <div class="sub">Next.js · Go · WebSocket</div>
+          </div>
+        </div>
+        <div class="foot">↓ length-prefixed JSON / TCP</div>
+      </div>
+
+      <!-- ─── Layer 2: Router ─── -->
+      <div class="card card-router anim anim-delay-1" style="left:200px; top:180px; width:840px; height:160px;">
+        <div class="head">
+          <div class="router-id">
+            <span class="name">oxipool-router</span>
+            <span class="port">:4445</span>
+          </div>
+          <div class="router-tags">
+            <span class="tier-badge">tier · 1</span>
+            <span class="tier-badge rust">shard router</span>
+          </div>
+        </div>
+        <div class="body">
+          <div class="env">
+            <div class="env-key">OXIPOOL_SHARDS</div>
+            <div class="env-val">pool-shard-A:4446<br>pool-shard-B:4446<br>pool-shard-C:4446</div>
+          </div>
+          <div class="env">
+            <div class="env-key">OXIPOOL_SHARD_KEYS</div>
+            <div class="env-val">orders<span class="muted">:</span><span class="accent">customer_id</span><br>carts<span class="muted">:</span><span class="accent">customer_id</span><br>events<span class="muted">:</span><span class="accent">customer_id</span></div>
+          </div>
+          <div class="env">
+            <div class="env-key">unsharded → shard A</div>
+            <div class="env-val">products<br>categories<br>inventory · _blobs</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ─── Layer 3: Shard pools (3) ─── -->
+      <div class="card card-pool anim anim-delay-2" style="left:40px; top:420px; width:320px; height:140px;">
+        <div class="head">
+          <div class="pool-id"><span class="shard-tag">shard A</span><span class="port">:4446</span></div>
+          <span class="tier-badge">tier · 2</span>
+        </div>
+        <ul class="pool-info">
+          <li><span class="env-key">name</span><span>oxipool-shard-A</span></li>
+          <li><span class="env-key">master</span><span class="accent" style="color:var(--rust);">A0:4444</span></li>
+          <li><span class="env-key">replicas</span><span style="color:var(--steel);">A1:4444, A2:4444</span></li>
+          <li class="rule"><span class="chip rust">writes →</span> master <span class="muted">·</span> <span class="chip steel">reads →</span> replicas (RR)</li>
+        </ul>
+      </div>
+
+      <div class="card card-pool anim anim-delay-2" style="left:460px; top:420px; width:320px; height:140px;">
+        <div class="head">
+          <div class="pool-id"><span class="shard-tag">shard B</span><span class="port">:4446</span></div>
+          <span class="tier-badge">tier · 2</span>
+        </div>
+        <ul class="pool-info">
+          <li><span class="env-key">name</span><span>oxipool-shard-B</span></li>
+          <li><span class="env-key">master</span><span class="accent" style="color:var(--rust);">B0:4444</span></li>
+          <li><span class="env-key">replicas</span><span style="color:var(--steel);">B1:4444, B2:4444</span></li>
+          <li class="rule"><span class="chip rust">writes →</span> master <span class="muted">·</span> <span class="chip steel">reads →</span> replicas (RR)</li>
+        </ul>
+      </div>
+
+      <div class="card card-pool anim anim-delay-2" style="left:880px; top:420px; width:320px; height:140px;">
+        <div class="head">
+          <div class="pool-id"><span class="shard-tag">shard C</span><span class="port">:4446</span></div>
+          <span class="tier-badge">tier · 2</span>
+        </div>
+        <ul class="pool-info">
+          <li><span class="env-key">name</span><span>oxipool-shard-C</span></li>
+          <li><span class="env-key">master</span><span class="accent" style="color:var(--rust);">C0:4444</span></li>
+          <li><span class="env-key">replicas</span><span style="color:var(--steel);">C1:4444, C2:4444</span></li>
+          <li class="rule"><span class="chip rust">writes →</span> master <span class="muted">·</span> <span class="chip steel">reads →</span> replicas (RR)</li>
+        </ul>
+      </div>
+
+      <!-- ─── Layer 4: Nodes (9) ─── -->
+      <!-- Shard A rack -->
+      <div class="card card-node card-master anim anim-delay-3" style="left:80px; top:600px; width:240px; height:72px;">
+        <div class="top">
+          <div class="ico">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 L4 14 H11 L9 22 L20 9 H13 Z"/></svg>
+          </div>
+          <span class="name">A0</span>
+          <span class="port">:4444</span>
+          <span class="spacer"></span>
+          <span class="status"></span>
+        </div>
+        <div class="bottom">
+          <span class="role-badge">MASTER</span>
+          <span class="node-fn">writes · TX-pinned</span>
+        </div>
+      </div>
+      <div class="card card-node card-replica anim anim-delay-3" style="left:80px; top:712px; width:240px; height:64px;">
+        <div class="top">
+          <div class="ico">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H2zM22 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z"/></svg>
+          </div>
+          <span class="name">A1</span>
+          <span class="port">:4444</span>
+          <span class="spacer"></span>
+          <span class="status"></span>
+        </div>
+        <div class="bottom">
+          <span class="role-badge">REPLICA</span>
+          <span class="node-fn">reads · RR</span>
+        </div>
+      </div>
+      <div class="card card-node card-replica anim anim-delay-3" style="left:80px; top:816px; width:240px; height:64px;">
+        <div class="top">
+          <div class="ico">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H2zM22 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z"/></svg>
+          </div>
+          <span class="name">A2</span>
+          <span class="port">:4444</span>
+          <span class="spacer"></span>
+          <span class="status"></span>
+        </div>
+        <div class="bottom">
+          <span class="role-badge">REPLICA</span>
+          <span class="node-fn">reads · RR</span>
+        </div>
+      </div>
+
+      <!-- Shard B rack -->
+      <div class="card card-node card-master anim anim-delay-4" style="left:500px; top:600px; width:240px; height:72px;">
+        <div class="top">
+          <div class="ico">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 L4 14 H11 L9 22 L20 9 H13 Z"/></svg>
+          </div>
+          <span class="name">B0</span>
+          <span class="port">:4444</span>
+          <span class="spacer"></span>
+          <span class="status"></span>
+        </div>
+        <div class="bottom">
+          <span class="role-badge">MASTER</span>
+          <span class="node-fn">writes · TX-pinned</span>
+        </div>
+      </div>
+      <div class="card card-node card-replica anim anim-delay-4" style="left:500px; top:712px; width:240px; height:64px;">
+        <div class="top">
+          <div class="ico">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H2zM22 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z"/></svg>
+          </div>
+          <span class="name">B1</span>
+          <span class="port">:4444</span>
+          <span class="spacer"></span>
+          <span class="status"></span>
+        </div>
+        <div class="bottom">
+          <span class="role-badge">REPLICA</span>
+          <span class="node-fn">reads · RR</span>
+        </div>
+      </div>
+      <div class="card card-node card-replica anim anim-delay-4" style="left:500px; top:816px; width:240px; height:64px;">
+        <div class="top">
+          <div class="ico">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H2zM22 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z"/></svg>
+          </div>
+          <span class="name">B2</span>
+          <span class="port">:4444</span>
+          <span class="spacer"></span>
+          <span class="status"></span>
+        </div>
+        <div class="bottom">
+          <span class="role-badge">REPLICA</span>
+          <span class="node-fn">reads · RR</span>
+        </div>
+      </div>
+
+      <!-- Shard C rack -->
+      <div class="card card-node card-master anim anim-delay-4" style="left:920px; top:600px; width:240px; height:72px;">
+        <div class="top">
+          <div class="ico">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 L4 14 H11 L9 22 L20 9 H13 Z"/></svg>
+          </div>
+          <span class="name">C0</span>
+          <span class="port">:4444</span>
+          <span class="spacer"></span>
+          <span class="status"></span>
+        </div>
+        <div class="bottom">
+          <span class="role-badge">MASTER</span>
+          <span class="node-fn">writes · TX-pinned</span>
+        </div>
+      </div>
+      <div class="card card-node card-replica anim anim-delay-4" style="left:920px; top:712px; width:240px; height:64px;">
+        <div class="top">
+          <div class="ico">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H2zM22 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z"/></svg>
+          </div>
+          <span class="name">C1</span>
+          <span class="port">:4444</span>
+          <span class="spacer"></span>
+          <span class="status"></span>
+        </div>
+        <div class="bottom">
+          <span class="role-badge">REPLICA</span>
+          <span class="node-fn">reads · RR</span>
+        </div>
+      </div>
+      <div class="card card-node card-replica anim anim-delay-4" style="left:920px; top:816px; width:240px; height:64px;">
+        <div class="top">
+          <div class="ico">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H2zM22 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z"/></svg>
+          </div>
+          <span class="name">C2</span>
+          <span class="port">:4444</span>
+          <span class="spacer"></span>
+          <span class="status"></span>
+        </div>
+        <div class="bottom">
+          <span class="role-badge">REPLICA</span>
+          <span class="node-fn">reads · RR</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ─── Legend ─── -->
+<div class="legend-row">
+  <div class="legend-item">
+    <span class="swatch master">
+      <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2 L4 14 H11 L9 22 L20 9 H13 Z"/></svg>
+    </span>
+    master · writes · TX-pinned
+  </div>
+  <div class="legend-item">
+    <span class="swatch replica">
+      <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 4h7a3 3 0 0 1 3 3v13a2 2 0 0 0-2-2H2zM22 4h-7a3 3 0 0 0-3 3v13a2 2 0 0 1 2-2h8z"/></svg>
+    </span>
+    replica · reads · round-robin
+  </div>
+  <div class="legend-item">
+    <span class="ln route"></span>
+    routing path · CRC32(shard_key)
+  </div>
+  <div class="legend-item">
+    <span class="ln wal"></span>
+    WAL ship · async · eventual consistency
+  </div>
+</div>
+
+<!-- ─── Section 02: Data layout ─── -->
+<section class="layout">
+  <div class="section-head">
+    <div class="num">FIG. 02</div>
+    <h2>Data <em>layout</em></h2>
+  </div>
+  <table class="layout-table">
+    <thead>
+      <tr>
+        <th style="width: 22%;">collection</th>
+        <th style="width: 22%;">shard key</th>
+        <th style="width: 30%;">routing</th>
+        <th>notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="coll">customers</td>
+        <td class="shard-by"><span class="accent">_id</span></td>
+        <td>CRC32(_id) → 256 chunks → shard</td>
+        <td>natural per-customer partition</td>
+      </tr>
+      <tr>
+        <td class="coll">orders</td>
+        <td class="shard-by"><span class="accent">customer_id</span></td>
+        <td>CRC32(customer_id) → 256 chunks → shard</td>
+        <td>co-located with customer; order history is single-shard</td>
+      </tr>
+      <tr>
+        <td class="coll">carts</td>
+        <td class="shard-by"><span class="accent">customer_id</span></td>
+        <td>CRC32(customer_id) → 256 chunks → shard</td>
+        <td>checkout TX pinned to <span class="em">master only</span></td>
+      </tr>
+      <tr>
+        <td class="coll">events</td>
+        <td class="shard-by"><span class="accent">customer_id</span></td>
+        <td>CRC32(customer_id) → 256 chunks → shard</td>
+        <td>TTL 30d via <code style="color:var(--rust);">_ts</code> · auto retention · scatter-gather for cross-customer reports</td>
+      </tr>
+      <tr class="unsharded">
+        <td class="coll">products</td>
+        <td class="shard-by">—</td>
+        <td>unsharded → shard A (replicas)</td>
+        <td>catalog is small &amp; hot · cached · serves all browse traffic</td>
+      </tr>
+      <tr class="unsharded">
+        <td class="coll">categories</td>
+        <td class="shard-by">—</td>
+        <td>unsharded → shard A (replicas)</td>
+        <td>navigation / taxonomy</td>
+      </tr>
+      <tr class="unsharded">
+        <td class="coll">inventory</td>
+        <td class="shard-by">—</td>
+        <td>unsharded → shard A <span class="em">master only</span></td>
+        <td>stock counts need strong consistency · writes serialised</td>
+      </tr>
+      <tr class="unsharded">
+        <td class="coll">_blobs</td>
+        <td class="shard-by">—</td>
+        <td>shard 0 (A) only</td>
+        <td>S3-style object storage · not sharded today · order receipts &amp; product images</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="table-foot">unsharded collections route to shard A by convention — change with <span style="color:var(--rust);">OXIPOOL_PRIMARY=A</span> in router env</div>
+</section>
+
+<!-- ─── Section 03: Key flows ─── -->
+<section class="flows">
+  <div class="section-head">
+    <div class="num">FIG. 03</div>
+    <h2>Key <em>request flows</em></h2>
+  </div>
+  <div class="flow-grid">
+    <div class="flow-card">
+      <div class="flow-num">FLOW · 01</div>
+      <div class="flow-title">Browse catalog</div>
+      <div class="flow-path"><span class="node">API</span><span class="arrow">→</span>router<span class="arrow">→</span>shard-A pool<span class="arrow">→</span><span class="replica">A1</span> · <span class="replica">A2</span> <span style="color:var(--text-3)">(RR)</span></div>
+      <div class="flow-desc">Catalog is unsharded — request hits <code>products</code> on shard A. <code>SELECT</code> classifies as a read, never touches A0.</div>
+    </div>
+    <div class="flow-card">
+      <div class="flow-num">FLOW · 02</div>
+      <div class="flow-title">Add to cart</div>
+      <div class="flow-path"><span class="node">API</span><span class="arrow">→</span>router<span class="arrow">→</span>CRC32(customer_id)<span class="arrow">→</span>shard-B pool<span class="arrow">→</span><span class="node">B0</span> <span style="color:var(--rust)">(write)</span></div>
+      <div class="flow-desc">Hash of <code>customer_id</code> picks one shard. Single-shard write — no scatter, no fanout.</div>
+    </div>
+    <div class="flow-card">
+      <div class="flow-num">FLOW · 03</div>
+      <div class="flow-title">Checkout transaction</div>
+      <div class="flow-path"><span class="node">API</span><span class="arrow">→</span>router<span class="arrow">→</span>shard-X pool<span class="arrow">→</span><span class="node">X0</span> <em style="color:var(--rust)">[pinned]</em><span class="arrow">→</span>commit_tx</div>
+      <div class="flow-desc"><code>begin_tx</code> pins the connection to one master for the entire TX so SELECTs see uncommitted writes. Replicas not consulted.</div>
+    </div>
+    <div class="flow-card">
+      <div class="flow-num">FLOW · 04</div>
+      <div class="flow-title">Order history</div>
+      <div class="flow-path"><span class="node">API</span><span class="arrow">→</span>router<span class="arrow">→</span>find{customer_id:42}<span class="arrow">→</span>CRC32<span class="arrow">→</span><span class="replica">B2</span></div>
+      <div class="flow-desc">Query carries the shard key. Read goes to one shard, picks a replica via round-robin. Latency = single hop.</div>
+    </div>
+    <div class="flow-card">
+      <div class="flow-num">FLOW · 05</div>
+      <div class="flow-title">Cross-customer scatter-gather</div>
+      <div class="flow-path"><span class="node">API</span><span class="arrow">→</span>router<span class="arrow">→</span>fanout<span class="arrow">→</span><span class="replica">A?</span> · <span class="replica">B?</span> · <span class="replica">C?</span><span class="arrow">→</span>merge</div>
+      <div class="flow-desc">Query without <code>customer_id</code> (e.g. <code>find{status:"pending"}</code>) — fanned to all 3 shard pools, results merged at the router. Use sparingly.</div>
+    </div>
+    <div class="flow-card">
+      <div class="flow-num">FLOW · 06</div>
+      <div class="flow-title">Real-time dashboard</div>
+      <div class="flow-path"><span class="node">browser</span><span class="arrow">→</span>WebSocket<span class="arrow">→</span><span class="node">A0</span> · <span class="node">B0</span> · <span class="node">C0</span><span class="arrow">→</span>onSnapshot</div>
+      <div class="flow-desc">Dashboards subscribe per-shard to change events. API multiplexes the 3 streams. WAL-shipped writes propagate to replicas in the background.</div>
+    </div>
+    <div class="flow-card">
+      <div class="flow-num">FLOW · 07</div>
+      <div class="flow-title">Hot-path counters · OxiMem</div>
+      <div class="flow-path"><span class="node">API</span><span class="arrow">→</span>RESP<span class="arrow">→</span><span class="node">X0</span>:6379<span class="arrow">→</span>ZADD score=epoch_ms</div>
+      <div class="flow-desc">Cart-abandonment timers, rate limits, session counters live in OxiMem on each master. <code>ZRANGEBYSCORE</code> for time windows. Pub/Sub bridges to MQTT for IoT.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ─── Footer ─── -->
+<footer>
+  <div>© 2026 · OxiDB · ShopEdge cluster brief · v0.25.1</div>
+  <div class="links">
+    <a href="#">oxipool source</a>
+    <a href="#">deployment guide</a>
+    <a href="#">replication notes</a>
+  </div>
+</footer>
+
+<script>
+  // Tasteful interactivity: highlight the routing path on a node hover
+  (function () {
+    const nodes = document.querySelectorAll('.card-node, .card-pool, .card-router, .card-api');
+    const lines = document.querySelectorAll('.topology-svg .line');
+    nodes.forEach(n => {
+      n.addEventListener('mouseenter', () => {
+        lines.forEach(l => l.style.opacity = '0.35');
+      });
+      n.addEventListener('mouseleave', () => {
+        lines.forEach(l => l.style.opacity = '');
+      });
+    });
+  })();
+</script>
+
+</body>
+</html>

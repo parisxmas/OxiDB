@@ -1,0 +1,32 @@
+# When building the api image, BuildKit prefers this file over the context's
+# root .dockerignore — so we keep go/ available for COPY but still skip the
+# heavy stuff we don't need.
+
+target/
+oxidb_data/
+.git/
+dotnet/
+python/
+julia/
+ruby/
+php/
+android/
+swift/
+oxidb-spring-boot-starter/
+oxidb-app/
+oxidb-wasm/
+oxidb-tail/
+oxidb-vscode/
+oxidb-jdbc/
+website/
+website-react/
+wordpress/
+crypto-feeder/
+benchmarks/
+docs/
+test_data/
+releases/
+samples/
+examples/
+*.md
+LICENSE

@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.25.3
+
+### Cluster mode — Raft persistence: O(1) per mutation
+
+- Rewrite `oxidb-server/src/raft/log_store.rs` persistence layer to scale
+  - Split single `raft_state.json` into `raft_meta.json` (small, vote/committed/sm_data — rewritten on metadata changes) and `raft_log.jsonl` (append-only, one Entry per line)
+  - `append_to_log` is now O(1) per entry instead of O(n) — single line append
+  - `delete_conflict_logs_since` / `purge_logs_upto` rewrite the log file (rare events)
+  - On startup, `raft_meta.json` + `raft_log.jsonl` are loaded line-by-line into the in-memory BTreeMap
+  - Transparent migration from the v0.25.2 single-file format
+- Unblocked 1M-record load tests under failover: 22.4 s end-to-end, 44,701 rec/s avg, 0 records lost (previously stalled at ~52% complete due to 14 MB-per-mutation rewrites)
+
+## v0.25.2
+
+### Cluster mode — Raft state persistence
+
+- Add disk persistence for Raft storage in `oxidb-server/src/raft/log_store.rs`
+  - `OxiDbStore` was previously in-memory only; nodes that restarted came back as `Learner term=0` and lost cluster membership, breaking failover scenarios
+  - New `OxiDbStore::open(db, &data_dir)` constructor loads existing Raft state on startup
+  - Atomic write-through (write-then-rename) on every mutation: `save_vote`, `save_committed`, `append_to_log`, `delete_conflict_logs_since`, `purge_logs_upto`, `apply_to_state_machine`, `install_snapshot`
+  - Wired up from `oxidb-server/src/main.rs` cluster-mode startup
+- `OxiDbStore::new(db)` retained as in-memory variant (used by tests)
+
+### Tests
+
+- Add `ShardReplicaRealWorldTest/` — full sharded + replicated cluster harness
+  - 14-service `docker-compose.yml`: 9 oxidb-server nodes (3 Raft groups), 3 per-shard oxipool master/replica routers, 1 top-level shard-routing oxipool, 1 Go API tier, 1 cluster-init bootstrapper, 1 opt-in smoke harness
+  - `cluster-init/` — one-shot Go tool that runs `raft_init` + `raft_add_learner` + `raft_change_membership` on each shard's leader candidate
+  - `api/` — Go HTTP API with endpoints for browse, cart, checkout (TX-pinned), order history, scatter-gather queries, raft metrics
+  - `smoke/` — 5-assertion Go smoke test covering health, sharding, replication, TX pinning, scatter-gather
+  - `tests/test_cluster.py` — 8 Python integration tests (CRUD + sharding + aggregation)
+  - `tests/test_failover.py` — 5 Python failover scenarios (network partition, follower down, recovery catch-up, two followers down, leader down)
+  - `tests/test_load_failover.py` — load test with mid-stream failover (parameterized by `TOTAL`/`BATCH`/`FAILOVER_AT`)
+  - Validated against 10K, 100K, and 1M record loads
+
 ## v0.25.1
 
 ### Query Engine

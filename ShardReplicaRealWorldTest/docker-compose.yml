@@ -1,0 +1,326 @@
+# ShopEdge — sharded + replicated OxiDB topology
+# 3 shards × 3 Raft nodes per shard = 9 oxidb-server instances
+# 3 per-shard oxipool master/replica routers + 1 top-level shard-routing oxipool
+# Plus a Go API tier and a one-shot cluster bootstrapper.
+#
+# Build context for db/pool services is repo root (..) so they can reach src/.
+# Compose-file location: <repo>/ShardReplicaRealWorldTest/docker-compose.yml
+#
+# Quick start:
+#   cd ShardReplicaRealWorldTest
+#   docker compose up -d --build
+#   curl http://localhost:8080/api/health
+#
+# Bring it all down:
+#   docker compose down -v
+
+name: shopedge
+
+# ────────────────────────────────────────────────────────────────────────────
+# Reusable fragments
+# ────────────────────────────────────────────────────────────────────────────
+
+# Shared images are built by ONE owning service each (db-a0 builds the
+# oxidb-server image; pool-shard-a builds the oxipool image). Other services
+# reference the tag with `image:` only — this avoids BuildKit's parallel-tag
+# race when many services share the same image.
+
+x-oxidb: &oxidb
+  image: shopedge/oxidb-server:latest
+  restart: unless-stopped
+  environment: &oxidb-env
+    OXIDB_ADDR: "0.0.0.0:4444"
+    OXIDB_DATA: "/data"
+    OXIDB_RAFT_ADDR: "0.0.0.0:5000"
+    OXIDB_POOL_SIZE: "32"
+    OXIDB_IDLE_TIMEOUT: "60"
+  networks:
+    - shopedge
+
+x-oxipool: &oxipool
+  image: shopedge/oxipool:latest
+  restart: unless-stopped
+  networks:
+    - shopedge
+
+# ────────────────────────────────────────────────────────────────────────────
+# Storage tier — 9 oxidb-server nodes, 3 Raft groups
+# Each shard's nodes share identical OXIDB_RAFT_PEERS; node IDs reset per shard.
+# ────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Shard A ────────────────────────────────────────────────
+  # db-a0 owns the oxidb-server image build; the other 8 db-* services just
+  # reference shopedge/oxidb-server:latest after this build completes.
+  db-a0:
+    <<: *oxidb
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: shopedge-db-a0
+    hostname: db-a0
+    environment:
+      <<: *oxidb-env
+      OXIDB_NODE_ID: "1"
+      OXIDB_RAFT_PEERS: "1=db-a0:5000,2=db-a1:5000,3=db-a2:5000"
+    volumes:
+      - db-a0-data:/data
+
+  db-a1:
+    <<: *oxidb
+    container_name: shopedge-db-a1
+    hostname: db-a1
+    environment:
+      <<: *oxidb-env
+      OXIDB_NODE_ID: "2"
+      OXIDB_RAFT_PEERS: "1=db-a0:5000,2=db-a1:5000,3=db-a2:5000"
+    volumes:
+      - db-a1-data:/data
+
+  db-a2:
+    <<: *oxidb
+    container_name: shopedge-db-a2
+    hostname: db-a2
+    environment:
+      <<: *oxidb-env
+      OXIDB_NODE_ID: "3"
+      OXIDB_RAFT_PEERS: "1=db-a0:5000,2=db-a1:5000,3=db-a2:5000"
+    volumes:
+      - db-a2-data:/data
+
+  # ── Shard B ────────────────────────────────────────────────
+  db-b0:
+    <<: *oxidb
+    container_name: shopedge-db-b0
+    hostname: db-b0
+    environment:
+      <<: *oxidb-env
+      OXIDB_NODE_ID: "1"
+      OXIDB_RAFT_PEERS: "1=db-b0:5000,2=db-b1:5000,3=db-b2:5000"
+    volumes:
+      - db-b0-data:/data
+
+  db-b1:
+    <<: *oxidb
+    container_name: shopedge-db-b1
+    hostname: db-b1
+    environment:
+      <<: *oxidb-env
+      OXIDB_NODE_ID: "2"
+      OXIDB_RAFT_PEERS: "1=db-b0:5000,2=db-b1:5000,3=db-b2:5000"
+    volumes:
+      - db-b1-data:/data
+
+  db-b2:
+    <<: *oxidb
+    container_name: shopedge-db-b2
+    hostname: db-b2
+    environment:
+      <<: *oxidb-env
+      OXIDB_NODE_ID: "3"
+      OXIDB_RAFT_PEERS: "1=db-b0:5000,2=db-b1:5000,3=db-b2:5000"
+    volumes:
+      - db-b2-data:/data
+
+  # ── Shard C ────────────────────────────────────────────────
+  db-c0:
+    <<: *oxidb
+    container_name: shopedge-db-c0
+    hostname: db-c0
+    environment:
+      <<: *oxidb-env
+      OXIDB_NODE_ID: "1"
+      OXIDB_RAFT_PEERS: "1=db-c0:5000,2=db-c1:5000,3=db-c2:5000"
+    volumes:
+      - db-c0-data:/data
+
+  db-c1:
+    <<: *oxidb
+    container_name: shopedge-db-c1
+    hostname: db-c1
+    environment:
+      <<: *oxidb-env
+      OXIDB_NODE_ID: "2"
+      OXIDB_RAFT_PEERS: "1=db-c0:5000,2=db-c1:5000,3=db-c2:5000"
+    volumes:
+      - db-c1-data:/data
+
+  db-c2:
+    <<: *oxidb
+    container_name: shopedge-db-c2
+    hostname: db-c2
+    environment:
+      <<: *oxidb-env
+      OXIDB_NODE_ID: "3"
+      OXIDB_RAFT_PEERS: "1=db-c0:5000,2=db-c1:5000,3=db-c2:5000"
+    volumes:
+      - db-c2-data:/data
+
+  # ────────────────────────────────────────────────────────────
+  # Cluster bootstrap — one-shot, calls raft_init + add_learner +
+  # change_membership on db-a0, db-b0, db-c0. Exits when done.
+  # ────────────────────────────────────────────────────────────
+  cluster-init:
+    build:
+      context: ..
+      dockerfile: ShardReplicaRealWorldTest/cluster-init/Dockerfile
+    image: shopedge/cluster-init:latest
+    container_name: shopedge-cluster-init
+    restart: "no"
+    depends_on:
+      - db-a0
+      - db-a1
+      - db-a2
+      - db-b0
+      - db-b1
+      - db-b2
+      - db-c0
+      - db-c1
+      - db-c2
+    networks:
+      - shopedge
+    environment:
+      WAIT_SECONDS: "8"
+
+  # ────────────────────────────────────────────────────────────
+  # Pool tier 2 — per-shard master/replica routers
+  # Writes → MASTER, reads → REPLICAS (round-robin)
+  # ────────────────────────────────────────────────────────────
+  # pool-shard-a owns the oxipool image build; pool-shard-b, pool-shard-c, and
+  # pool-router just reference shopedge/oxipool:latest after this completes.
+  pool-shard-a:
+    <<: *oxipool
+    build:
+      context: ..
+      dockerfile: Dockerfile.oxipool
+    container_name: shopedge-pool-shard-a
+    hostname: pool-shard-a
+    depends_on:
+      - db-a0
+      - db-a1
+      - db-a2
+    environment:
+      OXIPOOL_LISTEN: "0.0.0.0:4446"
+      OXIPOOL_MASTER: "db-a0:4444"
+      OXIPOOL_REPLICAS: "db-a1:4444,db-a2:4444"
+      OXIPOOL_MASTER_SIZE: "10"
+      OXIPOOL_REPLICA_SIZE: "10"
+      OXIPOOL_MAX_CLIENTS: "500"
+
+  pool-shard-b:
+    <<: *oxipool
+    container_name: shopedge-pool-shard-b
+    hostname: pool-shard-b
+    depends_on:
+      - db-b0
+      - db-b1
+      - db-b2
+    environment:
+      OXIPOOL_LISTEN: "0.0.0.0:4446"
+      OXIPOOL_MASTER: "db-b0:4444"
+      OXIPOOL_REPLICAS: "db-b1:4444,db-b2:4444"
+      OXIPOOL_MASTER_SIZE: "10"
+      OXIPOOL_REPLICA_SIZE: "10"
+      OXIPOOL_MAX_CLIENTS: "500"
+
+  pool-shard-c:
+    <<: *oxipool
+    container_name: shopedge-pool-shard-c
+    hostname: pool-shard-c
+    depends_on:
+      - db-c0
+      - db-c1
+      - db-c2
+    environment:
+      OXIPOOL_LISTEN: "0.0.0.0:4446"
+      OXIPOOL_MASTER: "db-c0:4444"
+      OXIPOOL_REPLICAS: "db-c1:4444,db-c2:4444"
+      OXIPOOL_MASTER_SIZE: "10"
+      OXIPOOL_REPLICA_SIZE: "10"
+      OXIPOOL_MAX_CLIENTS: "500"
+
+  # ────────────────────────────────────────────────────────────
+  # Pool tier 1 — top-level shard router
+  # CRC32(shard_key) → 256 chunks → one of 3 shard pools
+  # ────────────────────────────────────────────────────────────
+  pool-router:
+    <<: *oxipool
+    container_name: shopedge-pool-router
+    hostname: pool-router
+    depends_on:
+      - pool-shard-a
+      - pool-shard-b
+      - pool-shard-c
+    ports:
+      - "4445:4445"
+    environment:
+      OXIPOOL_LISTEN: "0.0.0.0:4445"
+      OXIPOOL_SHARDS: "pool-shard-a:4446,pool-shard-b:4446,pool-shard-c:4446"
+      OXIPOOL_SHARD_KEYS: "orders:customer_id,carts:customer_id,events:customer_id"
+      OXIPOOL_NUM_CHUNKS: "256"
+      OXIPOOL_SHARD_POOL_SIZE: "16"
+      OXIPOOL_MAX_CLIENTS: "1000"
+
+  # ────────────────────────────────────────────────────────────
+  # API tier — Go HTTP server, hits pool-router for everything
+  # ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: ShardReplicaRealWorldTest/api/Dockerfile
+    image: shopedge/api:latest
+    container_name: shopedge-api
+    hostname: api
+    restart: unless-stopped
+    depends_on:
+      cluster-init:
+        condition: service_completed_successfully
+      pool-router:
+        condition: service_started
+    networks:
+      - shopedge
+    ports:
+      - "8080:8080"
+    environment:
+      API_LISTEN: "0.0.0.0:8080"
+      OXIDB_ROUTER_HOST: "pool-router"
+      OXIDB_ROUTER_PORT: "4445"
+      # For diagnostic endpoints that bypass routing
+      OXIDB_DIRECT_NODES: "db-a0:4444,db-a1:4444,db-a2:4444,db-b0:4444,db-b1:4444,db-b2:4444,db-c0:4444,db-c1:4444,db-c2:4444"
+
+  # ────────────────────────────────────────────────────────────
+  # Smoke test — opt-in (profile: smoke). Run with:
+  #   docker compose --profile smoke run --rm smoke
+  # ────────────────────────────────────────────────────────────
+  smoke:
+    build:
+      context: ..
+      dockerfile: ShardReplicaRealWorldTest/smoke/Dockerfile
+    image: shopedge/smoke:latest
+    container_name: shopedge-smoke
+    profiles: ["smoke"]
+    networks:
+      - shopedge
+    environment:
+      SMOKE_ROUTER: "pool-router:4445"
+      SMOKE_NODES_A: "db-a0:4444,db-a1:4444,db-a2:4444"
+      SMOKE_NODES_B: "db-b0:4444,db-b1:4444,db-b2:4444"
+      SMOKE_NODES_C: "db-c0:4444,db-c1:4444,db-c2:4444"
+      SMOKE_REPL_DELAY: "800"
+
+# ────────────────────────────────────────────────────────────────────────────
+networks:
+  shopedge:
+    driver: bridge
+
+volumes:
+  db-a0-data:
+  db-a1-data:
+  db-a2-data:
+  db-b0-data:
+  db-b1-data:
+  db-b2-data:
+  db-c0-data:
+  db-c1-data:
+  db-c2-data:
