@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use openraft::storage::{LogState, RaftLogReader, RaftSnapshotBuilder, RaftStorage, Snapshot};
@@ -36,15 +38,61 @@ struct Inner {
     current_snapshot: Option<StoredSnapshot>,
 }
 
+/// Persisted Raft metadata — the small, frequently-updated bits.
+/// Excludes the log (which lives in a separate append-only file) and the
+/// in-memory snapshot blob (which Raft can rebuild from the log).
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedMeta {
+    last_purged_log_id: Option<LogId<u64>>,
+    vote: Option<Vote<u64>>,
+    committed: Option<LogId<u64>>,
+    sm_data: StateMachineData,
+}
+
+impl Inner {
+    fn to_meta(&self) -> PersistedMeta {
+        PersistedMeta {
+            last_purged_log_id: self.last_purged_log_id,
+            vote: self.vote,
+            committed: self.committed,
+            sm_data: self.sm_data.clone(),
+        }
+    }
+}
+
+/// Persistence layout (under `<data_dir>/`):
+///   raft_meta.json   — small file: vote, committed, last_purged_log_id, sm_data.
+///                      Rewritten on metadata changes (write+rename, ~constant size).
+///   raft_log.jsonl   — append-only log: one Entry per line.
+///                      Truncated only on `delete_conflict_logs_since` /
+///                      `purge_logs_upto` (rare events).
+///
 /// Combined log store + state machine implementing the v1 `RaftStorage` trait.
 /// Wrapped by `Adaptor` for use with `Raft::new`.
 ///
 /// All mutable state lives behind `Arc<RwLock<Inner>>` so that the handles
 /// returned by `get_log_reader()` and `get_snapshot_builder()` share the
 /// same underlying data as the main store.
+///
+/// When `paths` is `Some(...)`, every mutation is mirrored to disk in O(1)
+/// per entry. On `OxiDbStore::open(data_dir)`, both files are loaded so the
+/// node rejoins its Raft cluster after a restart instead of coming back as
+/// a `Learner` with `term=0`.
 pub struct OxiDbStore {
     inner: Arc<RwLock<Inner>>,
     db: Arc<OxiDb>,
+    paths: Option<RaftPaths>,
+    /// Lock that serializes mutations to the on-disk log file.
+    /// (in-memory operations are already serialized by the RwLock on `inner`.)
+    log_writer: Arc<std::sync::Mutex<()>>,
+}
+
+#[derive(Clone)]
+struct RaftPaths {
+    meta:     PathBuf,
+    log:      PathBuf,
+    meta_tmp: PathBuf,
+    log_tmp:  PathBuf,
 }
 
 impl Clone for OxiDbStore {
@@ -52,11 +100,14 @@ impl Clone for OxiDbStore {
         Self {
             inner: Arc::clone(&self.inner),
             db: Arc::clone(&self.db),
+            paths: self.paths.clone(),
+            log_writer: Arc::clone(&self.log_writer),
         }
     }
 }
 
 impl OxiDbStore {
+    /// In-memory only — no persistence. Use `open` for production deployments.
     pub fn new(db: Arc<OxiDb>) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Inner {
@@ -68,6 +119,193 @@ impl OxiDbStore {
                 current_snapshot: None,
             })),
             db,
+            paths: None,
+            log_writer: Arc::new(std::sync::Mutex::new(())),
+        }
+    }
+
+    /// Persistent variant: loads existing Raft state from `<data_dir>/raft_meta.json`
+    /// + `<data_dir>/raft_log.jsonl`. Every subsequent mutation appends to the log
+    /// or rewrites the (small) meta file in O(1).
+    pub fn open(db: Arc<OxiDb>, data_dir: &std::path::Path) -> Self {
+        if let Err(e) = fs::create_dir_all(data_dir) {
+            eprintln!("raft: failed to create data dir {data_dir:?}: {e}");
+        }
+        let paths = RaftPaths {
+            meta:     data_dir.join("raft_meta.json"),
+            log:      data_dir.join("raft_log.jsonl"),
+            meta_tmp: data_dir.join("raft_meta.json.tmp"),
+            log_tmp:  data_dir.join("raft_log.jsonl.tmp"),
+        };
+
+        // Migrate old single-file format if present.
+        let legacy = data_dir.join("raft_state.json");
+        if legacy.exists() && !paths.meta.exists() {
+            eprintln!("raft: migrating legacy raft_state.json → split files");
+            if let Ok(bytes) = fs::read(&legacy) {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    let mut meta = PersistedMeta::default();
+                    meta.last_purged_log_id = v.get("last_purged_log_id")
+                        .and_then(|x| serde_json::from_value(x.clone()).ok());
+                    meta.vote = v.get("vote")
+                        .and_then(|x| serde_json::from_value(x.clone()).ok());
+                    meta.committed = v.get("committed")
+                        .and_then(|x| serde_json::from_value(x.clone()).ok());
+                    if let Some(sm) = v.get("sm_data") {
+                        if let Ok(s) = serde_json::from_value::<StateMachineData>(sm.clone()) {
+                            meta.sm_data = s;
+                        }
+                    }
+                    let _ = fs::write(&paths.meta, serde_json::to_vec(&meta).unwrap_or_default());
+                    if let Some(arr) = v.get("log").and_then(|x| x.as_object()) {
+                        let mut sorted: Vec<(u64, &serde_json::Value)> = arr.iter()
+                            .filter_map(|(k, v)| k.parse::<u64>().ok().map(|i| (i, v)))
+                            .collect();
+                        sorted.sort_by_key(|(i, _)| *i);
+                        let mut log_buf = String::new();
+                        for (_, entry) in sorted {
+                            log_buf.push_str(&entry.to_string());
+                            log_buf.push('\n');
+                        }
+                        let _ = fs::write(&paths.log, log_buf);
+                    }
+                    let _ = fs::remove_file(&legacy);
+                }
+            }
+        }
+
+        // Load metadata.
+        let meta = if paths.meta.exists() {
+            match fs::read(&paths.meta) {
+                Ok(b) => serde_json::from_slice::<PersistedMeta>(&b).unwrap_or_else(|e| {
+                    eprintln!("raft: corrupt {:?}: {e}; starting fresh", paths.meta);
+                    PersistedMeta::default()
+                }),
+                Err(e) => {
+                    eprintln!("raft: read {:?}: {e}", paths.meta);
+                    PersistedMeta::default()
+                }
+            }
+        } else {
+            PersistedMeta::default()
+        };
+
+        // Load log entries (line-by-line).
+        let mut log = BTreeMap::new();
+        if paths.log.exists() {
+            match fs::read_to_string(&paths.log) {
+                Ok(s) => {
+                    for line in s.lines() {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        match serde_json::from_str::<Entry<TypeConfig>>(line) {
+                            Ok(entry) => {
+                                log.insert(entry.log_id.index, entry);
+                            }
+                            Err(e) => {
+                                eprintln!("raft: skip corrupt log line: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => eprintln!("raft: read {:?}: {e}", paths.log),
+            }
+        }
+
+        eprintln!(
+            "raft: loaded state from {:?} ({} log entries, vote={:?}, committed={:?})",
+            data_dir,
+            log.len(),
+            meta.vote,
+            meta.committed
+        );
+
+        Self {
+            inner: Arc::new(RwLock::new(Inner {
+                log,
+                last_purged_log_id: meta.last_purged_log_id,
+                vote: meta.vote,
+                committed: meta.committed,
+                sm_data: meta.sm_data,
+                current_snapshot: None,
+            })),
+            db,
+            paths: Some(paths),
+            log_writer: Arc::new(std::sync::Mutex::new(())),
+        }
+    }
+
+    /// Rewrite the small metadata file (vote + committed + last_purged + sm_data).
+    /// O(1) — file is tiny regardless of cluster age.
+    fn persist_meta(&self) {
+        let paths = match &self.paths {
+            Some(p) => p,
+            None => return,
+        };
+        let meta = self.inner.read().unwrap().to_meta();
+        let bytes = match serde_json::to_vec(&meta) {
+            Ok(b) => b,
+            Err(e) => { eprintln!("raft persist_meta: serialize: {e}"); return; }
+        };
+        if let Err(e) = fs::write(&paths.meta_tmp, &bytes) {
+            eprintln!("raft persist_meta: write tmp: {e}"); return;
+        }
+        if let Err(e) = fs::rename(&paths.meta_tmp, &paths.meta) {
+            eprintln!("raft persist_meta: rename: {e}");
+        }
+    }
+
+    /// Append a single log entry to the on-disk log file. O(1) per entry.
+    fn append_log_entry(&self, entry: &Entry<TypeConfig>) {
+        let paths = match &self.paths {
+            Some(p) => p,
+            None => return,
+        };
+        let line = match serde_json::to_string(entry) {
+            Ok(s) => s,
+            Err(e) => { eprintln!("raft append_log: serialize: {e}"); return; }
+        };
+        let _guard = self.log_writer.lock().unwrap();
+        let res = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&paths.log)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(line.as_bytes())?;
+                f.write_all(b"\n")
+            });
+        if let Err(e) = res {
+            eprintln!("raft append_log: write: {e}");
+        }
+    }
+
+    /// Rewrite the log file from current in-memory state. Called from
+    /// `delete_conflict_logs_since` and `purge_logs_upto` — rare in steady state.
+    fn rewrite_log(&self) {
+        let paths = match &self.paths {
+            Some(p) => p,
+            None => return,
+        };
+        let buf = {
+            let inner = self.inner.read().unwrap();
+            let mut s = String::with_capacity(inner.log.len() * 64);
+            for entry in inner.log.values() {
+                if let Ok(line) = serde_json::to_string(entry) {
+                    s.push_str(&line);
+                    s.push('\n');
+                }
+            }
+            s
+        };
+        let _guard = self.log_writer.lock().unwrap();
+        if let Err(e) = fs::write(&paths.log_tmp, buf.as_bytes()) {
+            eprintln!("raft rewrite_log: write tmp: {e}"); return;
+        }
+        if let Err(e) = fs::rename(&paths.log_tmp, &paths.log) {
+            eprintln!("raft rewrite_log: rename: {e}");
         }
     }
 }
@@ -236,6 +474,7 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         self.inner.write().unwrap().vote = Some(*vote);
+        self.persist_meta();
         Ok(())
     }
 
@@ -245,6 +484,7 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
 
     async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
         self.inner.write().unwrap().committed = committed;
+        self.persist_meta();
         Ok(())
     }
 
@@ -269,29 +509,47 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
     {
-        let mut inner = self.inner.write().unwrap();
-        for entry in entries {
-            inner.log.insert(entry.log_id.index, entry);
+        // Collect the entries first so we can both insert them in-memory AND
+        // append them to disk without holding the write lock during file I/O.
+        let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
+        {
+            let mut inner = self.inner.write().unwrap();
+            for entry in &entries {
+                inner.log.insert(entry.log_id.index, entry.clone());
+            }
+        }
+        // O(1) per entry: append-only write to raft_log.jsonl
+        for entry in &entries {
+            self.append_log_entry(entry);
         }
         Ok(())
     }
 
     async fn delete_conflict_logs_since(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let mut inner = self.inner.write().unwrap();
-        let keys: Vec<u64> = inner.log.range(log_id.index..).map(|(k, _)| *k).collect();
-        for k in keys {
-            inner.log.remove(&k);
+        {
+            let mut inner = self.inner.write().unwrap();
+            let keys: Vec<u64> = inner.log.range(log_id.index..).map(|(k, _)| *k).collect();
+            for k in keys {
+                inner.log.remove(&k);
+            }
         }
+        // Rare event: rewrite the log file from current in-memory state.
+        self.rewrite_log();
         Ok(())
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let mut inner = self.inner.write().unwrap();
-        inner.last_purged_log_id = Some(log_id);
-        let keys: Vec<u64> = inner.log.range(..=log_id.index).map(|(k, _)| *k).collect();
-        for k in keys {
-            inner.log.remove(&k);
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.last_purged_log_id = Some(log_id);
+            let keys: Vec<u64> = inner.log.range(..=log_id.index).map(|(k, _)| *k).collect();
+            for k in keys {
+                inner.log.remove(&k);
+            }
         }
+        // last_purged_log_id changed → meta needs persisting; log was truncated.
+        self.persist_meta();
+        self.rewrite_log();
         Ok(())
     }
 
@@ -306,28 +564,30 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
         &mut self,
         entries: &[Entry<TypeConfig>],
     ) -> Result<Vec<OxiDbResponse>, StorageError<u64>> {
-        let mut inner = self.inner.write().unwrap();
-        let mut results = Vec::new();
-
-        for entry in entries {
-            inner.sm_data.last_applied_log = Some(entry.log_id);
-
-            match &entry.payload {
-                openraft::EntryPayload::Blank => {
-                    results.push(OxiDbResponse::Ok { data: json!(null) });
-                }
-                openraft::EntryPayload::Normal(req) => {
-                    let resp = apply_request(&self.db, req.clone());
-                    results.push(resp);
-                }
-                openraft::EntryPayload::Membership(mem) => {
-                    inner.sm_data.last_membership =
-                        StoredMembership::new(Some(entry.log_id), mem.clone());
-                    results.push(OxiDbResponse::Ok { data: json!("membership updated") });
+        let results = {
+            let mut inner = self.inner.write().unwrap();
+            let mut out = Vec::new();
+            for entry in entries {
+                inner.sm_data.last_applied_log = Some(entry.log_id);
+                match &entry.payload {
+                    openraft::EntryPayload::Blank => {
+                        out.push(OxiDbResponse::Ok { data: json!(null) });
+                    }
+                    openraft::EntryPayload::Normal(req) => {
+                        let resp = apply_request(&self.db, req.clone());
+                        out.push(resp);
+                    }
+                    openraft::EntryPayload::Membership(mem) => {
+                        inner.sm_data.last_membership =
+                            StoredMembership::new(Some(entry.log_id), mem.clone());
+                        out.push(OxiDbResponse::Ok { data: json!("membership updated") });
+                    }
                 }
             }
-        }
-
+            out
+        };
+        // sm_data (last_applied + membership) changed → small file rewrite.
+        self.persist_meta();
         Ok(results)
     }
 
@@ -344,15 +604,16 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
         meta: &SnapshotMeta<u64, openraft::BasicNode>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
-        let mut inner = self.inner.write().unwrap();
-        inner.sm_data.last_applied_log = meta.last_log_id;
-        inner.sm_data.last_membership = meta.last_membership.clone();
-
-        inner.current_snapshot = Some(StoredSnapshot {
-            meta: meta.clone(),
-            data: snapshot.into_inner(),
-        });
-
+        {
+            let mut inner = self.inner.write().unwrap();
+            inner.sm_data.last_applied_log = meta.last_log_id;
+            inner.sm_data.last_membership = meta.last_membership.clone();
+            inner.current_snapshot = Some(StoredSnapshot {
+                meta: meta.clone(),
+                data: snapshot.into_inner(),
+            });
+        }
+        self.persist_meta();
         Ok(())
     }
 

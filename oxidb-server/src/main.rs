@@ -1644,7 +1644,7 @@ fn run_cluster_mode() {
         let raft_addr = raft_config.raft_addr.clone();
         let openraft_config = RaftConfig::openraft_config();
 
-        let store = OxiDbStore::new(Arc::clone(&db));
+        let store = OxiDbStore::open(Arc::clone(&db), Path::new(&data_dir));
         let (log_store, sm) = Adaptor::new(store);
 
         let raft = openraft::Raft::new(
