@@ -36,6 +36,32 @@ export default function Page() {
         <tbody>
           <tr><td><code>$and</code></td><td>All conditions match</td><td><code>{"$and": [{"age": {"$gte": 25}}, {"status": "active"}]}</code></td></tr>
           <tr><td><code>$or</code></td><td>Any condition matches</td><td><code>{"$or": [{"city": "Tokyo"}, {"city": "Paris"}]}</code></td></tr>
+          <tr><td><code>$nor</code></td><td>None of the conditions match <span class="version-badge latest">v0.25.1</span></td><td><code>{"$nor": [{"status": "banned"}, {"deleted": true}]}</code></td></tr>
+          <tr><td><code>$not</code></td><td>Negate a field condition (missing fields → true) <span class="version-badge latest">v0.25.1</span></td><td><code>{"age": {"$not": {"$lt": 18}}}</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Array <span class="version-badge latest">v0.25.1</span></h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Operator</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>$elemMatch</code></td><td>Match an array element against a sub-query (AND across conditions)</td><td><code>{"items": {"$elemMatch": {"qty": {"$gte": 3}, "in_stock": true}}}</code></td></tr>
+          <tr><td><code>$all</code></td><td>Array contains all listed values</td><td><code>{"tags": {"$all": ["sale", "new"]}}</code></td></tr>
+          <tr><td><code>$size</code></td><td>Array has exactly this length</td><td><code>{"tags": {"$size": 3}}</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Element &amp; evaluation <span class="version-badge latest">v0.25.1</span></h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Operator</th><th>Description</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td><code>$type</code></td><td>JSON type match: <code>string</code>, <code>number</code>, <code>int</code>, <code>bool</code>, <code>array</code>, <code>object</code>, <code>null</code></td><td><code>{"phone": {"$type": "string"}}</code></td></tr>
+          <tr><td><code>$mod</code></td><td>Modulo arithmetic <code>[divisor, remainder]</code></td><td><code>{"age": {"$mod": [10, 0]}}</code> (multiples of 10)</td></tr>
+          <tr><td><code>$expr</code></td><td>Top-level cross-field comparisons</td><td><code>{"$expr": {"$gt": ["$sold", "$stock"]}}</code></td></tr>
         </tbody>
       </table>
     </div>

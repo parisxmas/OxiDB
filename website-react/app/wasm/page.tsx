@@ -16,7 +16,7 @@ export default function Page() {
       <h3>Installation</h3>
       <p>Download the pre-built WASM package from GitHub releases and extract into your project:</p>
       <pre><code>curl -L -o oxidb-wasm.tar.gz \\
-  https://github.com/parisxmas/OxiDB/releases/download/v0.24.0/oxidb-wasm-v0.24.0.tar.gz
+  https://github.com/parisxmas/OxiDB/releases/download/v0.25.3/oxidb-wasm-v0.25.3.tar.gz
 
 mkdir wasm &amp;&amp; tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
       <p>Your project structure:</p>

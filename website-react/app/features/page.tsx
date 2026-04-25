@@ -94,6 +94,16 @@ export default function Page() {
         <h3>WebAssembly</h3>
         <p>Run OxiDB entirely in the browser via WASM. No server needed — in-memory mode with full query, SQL, and aggregation support. ~1.5 MB gzipped.</p>
       </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><line x1="7" y1="7" x2="10" y2="10"/><line x1="14" y1="10" x2="17" y2="7"/><line x1="7" y1="17" x2="10" y2="14"/><line x1="14" y1="14" x2="17" y2="17"/></svg></div>
+        <h3>Raft Replication <span class="version-badge latest">v0.25.3</span></h3>
+        <p>Multi-node replication via openraft consensus. Persistent state (<code>raft_meta.json</code> + append-only <code>raft_log.jsonl</code>) survives container restarts. Quorum-based commits, automatic catch-up on rejoin, verified at 1M records under mid-stream failover.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg></div>
+        <h3>Sharding (oxipool) <span class="version-badge latest">v0.25.x</span></h3>
+        <p>Two-tier <code>oxipool</code> router: top-level CRC32 hash on configurable shard keys (e.g. <code>customer_id</code>) → 256 virtual chunks → N shards. Per-shard pool fronts master + replicas with read/write split + TX pinning. Scatter-gather for cross-shard queries. Reference deployment: <code>ShardReplicaRealWorldTest/</code>.</p>
+      </div>
     </div>
   </div>
 </section>` }} />

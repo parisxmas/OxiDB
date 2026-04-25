@@ -30,11 +30,24 @@ db = OxiDbClient("127.0.0.1", 4444)</code></pre>
 
       <div class="client-card">
         <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
-        <h3>Go</h3>
-        <p>Native Go client with OxiWire binary protocol support.</p>
+        <h3>Go <span class="version-badge latest">v0.25.1</span></h3>
+        <p>Native Go client with OxiWire binary protocol. v0.25.1 added stored procedures, TTL indexes, retention policies, alerting, blob text extraction, backup/restore, and SQL dialect switching.</p>
         <pre><code>import "oxidb"
 client, _ := oxidb.ConnectDefault()
-client.UseOxiWire()</code></pre>
+client.UseOxiWire()
+
+<span class="co">// Stored procedures</span>
+client.CreateProcedure(<span class="str">"name"</span>, oxiScript)
+client.CallProcedure(<span class="str">"name"</span>, args)
+
+<span class="co">// TTL + retention</span>
+client.CreateTTLIndex(<span class="str">"sessions"</span>, <span class="str">"created_at"</span>, <span class="num">3600</span>)
+client.SetRetention(<span class="str">"events"</span>, <span class="num">30</span>)
+
+<span class="co">// Alerting · Backup · Dialect</span>
+client.CreateAlert(rule)
+client.Backup(path)
+client.SetDialect(<span class="str">"postgresql"</span>)</code></pre>
       </div>
 
       <div class="client-card">

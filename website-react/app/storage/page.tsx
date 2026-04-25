@@ -22,6 +22,14 @@ export default function Page() {
 
     <h3>Collection Isolation</h3>
     <p>Each collection has its own storage file, WAL, indexes, and cache. Per-collection <code>RwLock</code> enables concurrent reads across different collections and concurrent reads within the same collection.</p>
+
+    <h3>Cluster mode persistence <span class="version-badge latest">v0.25.3</span></h3>
+    <p>When <code>--features cluster</code> is enabled and <code>OXIDB_NODE_ID</code> is set, each node also writes its Raft state inside <code>OXIDB_DATA</code>:</p>
+    <ul>
+      <li><strong><code>raft_meta.json</code></strong> -- small file (~400 B): vote, last committed log id, last purged log id, last applied log id, current membership. Rewritten on metadata changes.</li>
+      <li><strong><code>raft_log.jsonl</code></strong> -- append-only log: one openraft Entry per line. <code>append_to_log</code> is O(1) per entry; only conflict-resolution and snapshot purges rewrite the file.</li>
+    </ul>
+    <p>This is what allows a node to come back as a <code>Follower</code> after a restart instead of a fresh <code>Learner term=0</code>. Verified end-to-end at 1M records under mid-stream failover; see <code>oxidb-server/src/raft/log_store.rs</code> for the implementation.</p>
   </div>
 </section>` }} />
 }
