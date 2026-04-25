@@ -11,12 +11,129 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.25.3 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.25.3</h3>
+        <span class="version-date">2026-04-25</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Changed</h4>
+        <ul>
+          <li>
+            <strong>Raft persistence: O(1) per mutation</strong> &mdash; rewrote <code>oxidb-server/src/raft/log_store.rs</code> to split state into a small <code>raft_meta.json</code> (vote / committed / sm_data) and an append-only <code>raft_log.jsonl</code> (one entry per line).
+          </li>
+          <li>
+            <strong>Append-only log writes</strong> &mdash; <code>append_to_log</code> is now a single line append per entry instead of rewriting the entire log; <code>delete_conflict_logs_since</code> and <code>purge_logs_upto</code> rewrite only on those rare events.
+          </li>
+          <li>
+            <strong>Transparent migration</strong> from the v0.25.2 single-file <code>raft_state.json</code> on first boot.
+          </li>
+          <li>
+            <strong>Unblocked 1M-record load tests</strong> under failover &mdash; 22.4 s end-to-end, 44,701 rec/s avg, zero records lost. The previous single-file snapshot stalled the cluster at ~52% complete due to 14 MB-per-mutation rewrites.
+          </li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- v0.25.2 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.25.2</h3>
+        <span class="version-date">2026-04-25</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>Persistent Raft state for cluster mode</strong> &mdash; <code>OxiDbStore</code> in <code>oxidb-server/src/raft/log_store.rs</code> was previously in-memory only; nodes that restarted came back as <code>Learner term=0</code> and lost cluster membership, breaking failover scenarios.
+          </li>
+          <li>
+            <strong>New <code>OxiDbStore::open(db, &amp;data_dir)</code> constructor</strong> &mdash; loads existing Raft state on startup; <code>OxiDbStore::new(db)</code> retained as in-memory variant for tests.
+          </li>
+          <li>
+            <strong>Atomic write-through</strong> on every mutation &mdash; <code>save_vote</code>, <code>save_committed</code>, <code>append_to_log</code>, <code>delete_conflict_logs_since</code>, <code>purge_logs_upto</code>, <code>apply_to_state_machine</code>, <code>install_snapshot</code>.
+          </li>
+          <li>
+            <strong>ShardReplicaRealWorldTest harness</strong> &mdash; 14-service docker-compose: 9 oxidb-server nodes (3 Raft groups), 3 per-shard oxipool master/replica routers, 1 top-tier shard-routing oxipool, Go API tier, one-shot cluster-init bootstrapper.
+          </li>
+          <li>
+            <strong>End-to-end test suites</strong> &mdash; Go smoke harness (5 assertions), Python integration tests (8 cases: CRUD + sharding + aggregation), Python failover scenarios (5: network partition, follower down, recovery catch-up, two followers down, leader down), parameterized load test with mid-stream failover (validated against 10K, 100K, 1M record loads).
+          </li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- v0.25.1 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.25.1</h3>
+        <span class="version-date">2026-04-18</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>Eight new query operators</strong> &mdash; <code>$not</code>, <code>$nor</code>, <code>$all</code>, <code>$size</code>, <code>$type</code>, <code>$mod</code>, <code>$expr</code>, <code>$elemMatch</code>.
+          </li>
+          <li>
+            <strong><code>$not</code> field operator</strong> &mdash; negate any field condition; missing fields evaluate to true (MongoDB-compatible).
+          </li>
+          <li>
+            <strong><code>$nor</code> top-level operator</strong> &mdash; match documents where none of the listed conditions are true.
+          </li>
+          <li>
+            <strong><code>$all</code> array operator</strong> &mdash; array must contain all specified values.
+          </li>
+          <li>
+            <strong><code>$size</code> operator</strong> &mdash; match arrays with an exact length.
+          </li>
+          <li>
+            <strong><code>$type</code> operator</strong> &mdash; match by JSON type (<code>string</code>, <code>number</code>, <code>bool</code>, <code>array</code>, <code>object</code>, <code>null</code>, <code>int</code>).
+          </li>
+          <li>
+            <strong><code>$mod</code> operator</strong> &mdash; modulo arithmetic on numeric fields (<code>[divisor, remainder]</code>).
+          </li>
+          <li>
+            <strong><code>$expr</code> top-level operator</strong> &mdash; cross-field comparisons, e.g. <code>{"$expr": {"$gt": ["$sold", "$stock"]}}</code>.
+          </li>
+          <li>
+            <strong><code>$elemMatch</code> operator</strong> &mdash; match array elements against sub-queries with AND semantics.
+          </li>
+          <li>
+            <strong>Go client additions</strong> &mdash; stored procedures (<code>CreateProcedure</code>, <code>CallProcedure</code>, <code>ListProcedures</code>...), <code>CreateTTLIndex</code>, retention policies, alerting methods, <code>ExtractText</code>, <code>Backup</code>/<code>Restore</code>, <code>SetDialect</code>.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed</h4>
+        <ul>
+          <li>
+            <strong>Array dot-notation in <code>$set</code> / <code>$inc</code> / <code>$unset</code></strong> &mdash; <code>variants.0.stock</code> no longer corrupts arrays.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Changed</h4>
+        <ul>
+          <li>
+            <strong>Refactored <code>matches_doc</code> and <code>matches_value</code></strong> into a shared <code>eval_field_op</code> helper.
+          </li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.24.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.24.0</h3>
         <span class="version-date">2026-04-10</span>
-        <span class="version-badge latest">latest</span>
       </div>
 
       <div class="change-group">

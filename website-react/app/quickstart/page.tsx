@@ -76,6 +76,22 @@ builder.Services.AddOxiDb(options => {
     .Where(u => u.Age >= <span class="num">25</span>)
     .OrderBy(u => u.Name)
     .ToListAsync();</code></pre>
+
+    <h3>Run a 3-node Raft cluster <span class="version-badge latest">v0.25.3</span></h3>
+    <p>Each node sets a unique <code>OXIDB_NODE_ID</code> and the same <code>OXIDB_RAFT_PEERS</code> list. After all 3 are up, bootstrap once via the leader candidate.</p>
+    <pre><code class="lang-bash"><span class="co"># node 1 — initial leader candidate</span>
+OXIDB_NODE_ID=1 OXIDB_RAFT_ADDR=0.0.0.0:5000 \\
+  OXIDB_RAFT_PEERS=<span class="str">"1=db-a0:5000,2=db-a1:5000,3=db-a2:5000"</span> \\
+  oxidb-server &amp;
+
+<span class="co"># node 2 + node 3 — same OXIDB_RAFT_PEERS, different NODE_ID and host</span>
+
+<span class="co"># one-shot bootstrap on db-a0</span>
+oxidb-cli raft_init
+oxidb-cli raft_add_learner --id=2 --addr=db-a1:5000
+oxidb-cli raft_add_learner --id=3 --addr=db-a2:5000
+oxidb-cli raft_change_membership --members=1,2,3</code></pre>
+    <p>For a full reference deployment (3 shards × 3 Raft nodes, oxipool routing, Go API, Python failover + 1M-record load tests) see <a href="https://github.com/parisxmas/OxiDB/tree/master/ShardReplicaRealWorldTest"><code>ShardReplicaRealWorldTest/</code></a> in the repo.</p>
   </div>
 </section>` }} />
 }

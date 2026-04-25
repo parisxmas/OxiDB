@@ -36,7 +36,7 @@ db.commit_transaction(tx)  <span class="co"># atomic commit or rollback on confl
         <tbody>
           <tr><td><code>begin_transaction()</code></td><td>Start a new transaction, returns transaction ID</td></tr>
           <tr><td><code>tx_insert(tx, col, doc)</code></td><td>Buffered insert</td></tr>
-          <tr><td><code>tx_find(tx, col, query)</code></td><td>Read with snapshot isolation</td></tr>
+          <tr><td><code>tx_find(tx, col, query)</code></td><td>Read from committed state (does NOT see same-tx buffered writes — OCC semantics)</td></tr>
           <tr><td><code>tx_update(tx, col, query, update)</code></td><td>Buffered update</td></tr>
           <tr><td><code>tx_delete(tx, col, query)</code></td><td>Buffered delete</td></tr>
           <tr><td><code>commit_transaction(tx)</code></td><td>Validate and commit atomically</td></tr>
@@ -44,6 +44,16 @@ db.commit_transaction(tx)  <span class="co"># atomic commit or rollback on confl
         </tbody>
       </table>
     </div>
+
+    <h3>Transactions in cluster mode <span class="version-badge latest">v0.25.x</span></h3>
+    <p>When the server runs with <code>--features cluster</code> behind <a href="/server/">oxipool</a>, transactions are <strong>pinned to a single shard</strong> for their entire lifetime:</p>
+    <ul>
+      <li><code>begin_tx</code> grabs a backend connection from the targeted shard's master pool and locks it to that client until <code>commit_tx</code> or <code>rollback_tx</code>.</li>
+      <li>Every operation inside the transaction must route to the same shard. Cross-shard writes inside a tx are rejected with <code>cross-shard transactions not supported; use the same shard key within a transaction</code>.</li>
+      <li>On commit, the buffered writes are applied as a single Raft log entry (<code>OxiDbRequest::CommitTransaction</code>), replicated to all followers in the shard's Raft group, and ack'd to the client.</li>
+      <li>OCC's version-conflict detection still applies <strong>within</strong> the shard — concurrent transactions touching the same documents in that shard will conflict normally.</li>
+    </ul>
+    <p>Practical consequence: pick a shard key your tx data shares (e.g. <code>customer_id</code> for a checkout flow), and the cluster gives you the same atomicity story as standalone mode.</p>
   </div>
 </section>` }} />
 }

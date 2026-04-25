@@ -30,17 +30,23 @@ export default function Page() {
     <p>Clients can also use plain JSON over the same TCP connection.</p>
 
     <h3>Clustering (Raft)</h3>
-    <p>Multi-node replication via Raft consensus. State machine replication with persistent log. Enable with the <code>cluster</code> feature flag.</p>
+    <p>Multi-node replication via Raft consensus (openraft). Each node runs its own state machine and persistent log; writes commit on quorum (2/3 for a 3-node group). Enable with the <code>cluster</code> feature flag in <code>oxidb-server</code>.</p>
+    <p><strong>Persistent state <span class="version-badge latest">v0.25.3</span></strong> — Raft state is written to <code>raft_meta.json</code> + <code>raft_log.jsonl</code> on every mutation. Nodes survive container restarts and rejoin their Raft group automatically (previously the node would come back as a fresh <code>Learner</code> and the cluster would diverge).</p>
+    <p>To bootstrap a 3-node cluster, send <code>raft_init</code> on node 1, then <code>raft_add_learner</code> for nodes 2 and 3, then <code>raft_change_membership: [1, 2, 3]</code>. The full reference deployment lives at <a href="https://github.com/parisxmas/OxiDB/tree/master/ShardReplicaRealWorldTest"><code>ShardReplicaRealWorldTest/</code></a> — 3 shards × 3 Raft nodes, fronted by oxipool, validated under 1M-record load with mid-stream failover.</p>
 
     <h3>Configuration</h3>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Environment Variable</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td><code>OXIDB_ADDR</code></td><td><code>127.0.0.1:4444</code></td><td>Bind address</td></tr>
-          <tr><td><code>OXIDB_DATA</code></td><td><code>./oxidb_data</code></td><td>Data directory</td></tr>
+          <tr><td><code>OXIDB_ADDR</code></td><td><code>127.0.0.1:4444</code></td><td>Client bind address</td></tr>
+          <tr><td><code>OXIDB_DATA</code></td><td><code>./oxidb_data</code></td><td>Data directory (also holds <code>raft_meta.json</code> + <code>raft_log.jsonl</code>)</td></tr>
           <tr><td><code>OXIDB_POOL_SIZE</code></td><td><code>4</code></td><td>Worker thread count</td></tr>
           <tr><td><code>OXIDB_IDLE_TIMEOUT</code></td><td><code>30</code></td><td>Connection timeout (seconds, 0 = never)</td></tr>
+          <tr><td colspan="3" style="padding-top:10px;color:var(--text-mute);font-family:var(--font-mono);font-size:11px;letter-spacing:0.16em;text-transform:uppercase">Cluster mode (--features cluster)</td></tr>
+          <tr><td><code>OXIDB_NODE_ID</code></td><td>—</td><td>Required to enable cluster mode. Unique <code>u64</code> per node within a Raft group.</td></tr>
+          <tr><td><code>OXIDB_RAFT_ADDR</code></td><td><code>127.0.0.1:4445</code></td><td>Bind address for Raft RPC (separate from client port)</td></tr>
+          <tr><td><code>OXIDB_RAFT_PEERS</code></td><td>—</td><td><code>1=node1:5000,2=node2:5000,3=node3:5000</code></td></tr>
         </tbody>
       </table>
     </div>

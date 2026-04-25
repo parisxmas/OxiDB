@@ -41,6 +41,17 @@ export default function Page() {
 
     <p>Multiple operators can be combined in a single update:</p>
     <pre><code class="lang-json">{<span class="str">"$set"</span>: {<span class="str">"status"</span>: <span class="str">"active"</span>}, <span class="str">"$inc"</span>: {<span class="str">"login_count"</span>: <span class="num">1</span>}, <span class="str">"$currentDate"</span>: {<span class="str">"last_login"</span>: <span class="kw">true</span>}}</code></pre>
+
+    <h3>Array dot-notation <span class="version-badge latest">v0.25.1 fixed</span></h3>
+    <p>Path components that are integers index into arrays, not object keys. Pre-v0.25.1 this could corrupt the array; that's resolved.</p>
+    <pre><code class="lang-json"><span class="co">// Set the stock of the first variant</span>
+{<span class="str">"$set"</span>: {<span class="str">"variants.0.stock"</span>: <span class="num">42</span>}}
+
+<span class="co">// Decrement a counter on a deeply nested array element</span>
+{<span class="str">"$inc"</span>: {<span class="str">"shipments.2.units_remaining"</span>: <span class="num">-1</span>}}
+
+<span class="co">// Remove a transient field from a specific array element</span>
+{<span class="str">"$unset"</span>: {<span class="str">"items.0._tmp"</span>: <span class="str">""</span>}}</code></pre>
   </div>
 </section>` }} />
 }
