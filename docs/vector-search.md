@@ -168,25 +168,6 @@ for _, doc := range results {
 }
 ```
 
-### Java
-
-```java
-OxiDbClient db = new OxiDbClient("127.0.0.1", 4444, 5000);
-
-// Create a vector index
-db.createVectorIndex("articles", "embedding", 384, "cosine");
-
-// Insert documents with embeddings
-db.insert("articles", Map.of(
-    "title", "Introduction to Rust",
-    "embedding", new double[]{0.12, -0.34, 0.56}  // 384-dim vector
-));
-
-// Search for similar documents
-JsonNode results = db.vectorSearch("articles", "embedding",
-    new double[]{0.15, -0.30, 0.50}, 5);
-```
-
 ### Julia
 
 ```julia

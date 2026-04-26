@@ -252,18 +252,6 @@ pipeline := []map[string]any{
 results, _ := client.Aggregate("orders", pipeline)
 ```
 
-### Java
-
-```java
-List<Map<String, Object>> pipeline = List.of(
-    Map.of("$match", Map.of("status", "completed")),
-    Map.of("$group", Map.of("_id", "$category", "total", Map.of("$sum", "$amount"))),
-    Map.of("$sort", Map.of("total", -1)),
-    Map.of("$limit", 10)
-);
-JsonNode results = db.aggregate("orders", pipeline);
-```
-
 ### Julia
 
 ```julia

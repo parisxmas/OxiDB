@@ -203,28 +203,6 @@ client.EnableSchedule("nightly_cleanup")
 client.DeleteSchedule("nightly_cleanup")
 ```
 
-### Java
-
-```java
-// Create with cron
-db.createSchedule("nightly_cleanup", "cleanup_expired", "0 2 * * *",
-    Map.of("days_old", 30), true);
-
-// Create with interval
-db.createScheduleInterval("health_check", "check_system_health", "5m");
-
-// List / get
-JsonNode schedules = db.listSchedules();
-JsonNode schedule = db.getSchedule("nightly_cleanup");
-
-// Disable / enable
-db.disableSchedule("nightly_cleanup");
-db.enableSchedule("nightly_cleanup");
-
-// Delete
-db.deleteSchedule("nightly_cleanup");
-```
-
 ### Julia
 
 ```julia

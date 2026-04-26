@@ -245,15 +245,6 @@ client.SQL("INSERT INTO users (name, age) VALUES ('Alice', 30)")
 client.SQL("UPDATE users SET status = 'inactive' WHERE last_login < '2024-01-01'")
 ```
 
-### Java
-
-```java
-JsonNode users = db.sql("SELECT * FROM users WHERE age >= 18 ORDER BY name LIMIT 10");
-db.sql("INSERT INTO users (name, age) VALUES ('Alice', 30)");
-db.sql("UPDATE users SET status = 'inactive' WHERE last_login < '2024-01-01'");
-db.sql("CREATE INDEX ON users (email)");
-```
-
 ### Julia
 
 ```julia

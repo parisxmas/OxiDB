@@ -212,29 +212,6 @@ objects, _ := client.ListObjects("documents", strPtr("2025/"), intPtr(50))
 results, _ := client.Search("quarterly report", strPtr("documents"), 5)
 ```
 
-### Java
-
-```java
-// Bucket operations
-db.createBucket("documents");
-JsonNode buckets = db.listBuckets();
-
-// Put object
-byte[] data = Files.readAllBytes(Path.of("report.pdf"));
-db.putObject("documents", "report.pdf", data, "application/pdf",
-    Map.of("department", "finance"));
-
-// Get object (content is base64 in response)
-JsonNode obj = db.getObject("documents", "report.pdf");
-byte[] content = db.decodeObjectContent(obj);
-
-// List objects
-JsonNode objects = db.listObjects("documents", "2025/", 50);
-
-// Full-text search
-JsonNode results = db.search("quarterly report", "documents", 5);
-```
-
 ### Julia
 
 ```julia

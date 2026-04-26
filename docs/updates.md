@@ -134,26 +134,6 @@ client.UpdateOne("users", map[string]any{"email": "bob@example.com"}, map[string
 })
 ```
 
-### Java
-
-```java
-// Field operators
-db.update("users", Map.of("name", "Alice"), Map.of(
-    "$set", Map.of("status", "active"),
-    "$inc", Map.of("login_count", 1),
-    "$currentDate", Map.of("last_login", true)
-));
-
-// Array operators
-db.update("posts", Map.of("_id", 1), Map.of("$push", Map.of("tags", "rust")));
-
-// update_one
-db.updateOne("users",
-    Map.of("email", "bob@example.com"),
-    Map.of("$set", Map.of("verified", true))
-);
-```
-
 ### Julia
 
 ```julia

@@ -257,13 +257,6 @@ result, _ := client.Send(map[string]any{
 })
 ```
 
-### Java
-
-```java
-// Call procedure via raw command or protocol
-JsonNode result = db.sql(""); // Use protocol-level call
-```
-
 ### Julia
 
 ```julia

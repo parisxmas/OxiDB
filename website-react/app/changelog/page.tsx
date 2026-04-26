@@ -347,7 +347,7 @@ export default function Page() {
           <li><strong>TLS/SSL</strong> -- Certificate-based encryption for all traffic.</li>
           <li><strong>Audit logging</strong> -- GELF format for centralized logging.</li>
           <li><strong>Raft clustering</strong> -- Multi-node replication via openraft (optional <code>cluster</code> feature flag).</li>
-          <li><strong>Client libraries</strong> -- Python, Go, Julia, .NET (TCP + Embedded), Swift (C FFI), Java/Spring Boot.</li>
+          <li><strong>Client libraries</strong> -- Python, Go, Julia, .NET (TCP + Embedded), Swift (C FFI).</li>
           <li><strong>C FFI</strong> -- <code>oxidb-client-ffi</code> (cdylib) and <code>oxidb-embedded-ffi</code> (staticlib + cdylib) for language bindings.</li>
         </ul>
       </div>

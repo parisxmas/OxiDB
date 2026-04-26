@@ -181,29 +181,6 @@ indexes, _ := client.ListIndexes("users")
 client.DropIndex("users", "email")
 ```
 
-### Java
-
-```java
-// Field index
-db.createIndex("users", "email");
-
-// Unique index
-db.createUniqueIndex("users", "username");
-
-// Composite index
-db.createCompositeIndex("orders", List.of("customer_id", "status"));
-
-// Text index
-db.createTextIndex("articles", List.of("title", "body"));
-
-// Text search
-JsonNode results = db.textSearch("articles", "rust database", 5);
-
-// List and drop
-JsonNode indexes = db.listIndexes("users");
-db.dropIndex("users", "email");
-```
-
 ### Julia
 
 ```julia

@@ -192,22 +192,6 @@ user, _ := client.FindOne("users", map[string]any{"email": "alice@example.com"})
 n, _ := client.Count("users", map[string]any{"status": "active"})
 ```
 
-### Java
-
-```java
-// Basic find
-JsonNode users = db.find("users", Map.of("status", "active"));
-
-// With sort, skip, limit
-JsonNode page = db.find("users", Map.of(), Map.of("name", 1), 0, 10);
-
-// find_one
-JsonNode user = db.findOne("users", Map.of("email", "alice@example.com"));
-
-// count
-int n = db.count("users", Map.of("status", "active"));
-```
-
 ### Julia
 
 ```julia

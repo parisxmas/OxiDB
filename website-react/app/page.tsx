@@ -21,6 +21,61 @@ export default function Page() {
   </div>
 </header>
 
+<section class="section section-alt">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Install OxiDB in 60 seconds</h2>
+    <p class="section-desc">From zero to a running server. Single static binary, no dependencies, no installer.</p>
+
+    <h3>1. Download the server</h3>
+    <pre><code class="lang-bash"><span class="co"># Linux (x86_64)</span>
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.25.3/oxidb-server-v0.25.3-linux-amd64.tar.gz
+tar xzf oxidb-server-v0.25.3-linux-amd64.tar.gz
+
+<span class="co"># macOS (Apple Silicon)</span>
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.25.3/oxidb-server-v0.25.3-darwin-arm64.tar.gz
+tar xzf oxidb-server-v0.25.3-darwin-arm64.tar.gz
+
+<span class="co"># Windows: download oxidb-server-v0.25.3-windows-amd64.zip from /downloads/</span></code></pre>
+
+    <h3>2. Start the server</h3>
+    <pre><code class="lang-bash"><span class="co"># Listens on 127.0.0.1:4444 by default; data goes to ./oxidb_data</span>
+./oxidb-server
+
+<span class="co"># Or override with env vars:</span>
+OXIDB_ADDR=0.0.0.0:4444 OXIDB_DATA=/var/lib/oxidb ./oxidb-server</code></pre>
+
+    <h3>3. Connect and run your first query</h3>
+    <pre><code class="lang-bash"><span class="co"># Download the CLI</span>
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.25.3/oxidb-cli-v0.25.3-linux-amd64.tar.gz
+tar xzf oxidb-cli-v0.25.3-linux-amd64.tar.gz
+
+<span class="co"># Open the REPL against the running server</span>
+./oxidb --host 127.0.0.1 --port 4444
+
+oxidb&gt; insert users {<span class="str">"name"</span>: <span class="str">"Alice"</span>, <span class="str">"age"</span>: <span class="num">30</span>}
+oxidb&gt; find users {<span class="str">"age"</span>: {<span class="str">"$gte"</span>: <span class="num">18</span>}}
+oxidb&gt; update users {<span class="str">"name"</span>: <span class="str">"Alice"</span>} {<span class="str">"$inc"</span>: {<span class="str">"age"</span>: <span class="num">1</span>}}</code></pre>
+
+    <div class="install-hint">
+      <h4>Prefer to embed instead of running a server?</h4>
+      <pre><code class="lang-bash"><span class="co"># Rust</span>
+cargo add oxidb
+
+<span class="co"># Python (TCP client / embedded)</span>
+pip install oxidb
+pip install oxidb-embedded
+
+<span class="co"># Go</span>
+go get oxidb
+
+<span class="co"># .NET</span>
+dotnet add package OxiDb.Client.Tcp</code></pre>
+    </div>
+
+    <p style="margin-top: 24px;">Need a different platform, source build, or the WebAssembly bundle? See <a href="/downloads/">Downloads</a> &middot; <a href="/quickstart/">Full Quick Start</a> &middot; <a href="/clients/">All clients</a>.</p>
+  </div>
+</section>
+
 <section class="section">
   <div class="container">
     <h2>Why OxiDB</h2>
@@ -68,7 +123,7 @@ export default function Page() {
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
         <h3>Multi-Language</h3>
-        <p>Official clients for Rust, Python, Go, .NET (TCP + Embedded + EF Core), Java/Spring Boot, Julia, and Swift.</p>
+        <p>Official clients for Rust, Python, Go, .NET (TCP + Embedded + EF Core), Julia, and Swift.</p>
       </div>
     </div>
   </div>
@@ -80,11 +135,11 @@ export default function Page() {
     <div class="glance-grid">
       <a href="/features/" class="glance-item">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 11-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-        <span>16 features</span>
+        <span>19 features</span>
       </a>
       <a href="/queries/" class="glance-item">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-        <span>9 query operators</span>
+        <span>20 query operators</span>
       </a>
       <a href="/updates/" class="glance-item">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
@@ -100,7 +155,7 @@ export default function Page() {
       </a>
       <a href="/clients/" class="glance-item">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-        <span>9 client libraries</span>
+        <span>10 client libraries</span>
       </a>
       <a href="/sql/" class="glance-item">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>

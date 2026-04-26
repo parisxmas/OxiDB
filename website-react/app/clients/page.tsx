@@ -17,7 +17,7 @@ export default function Page() {
         <h3>Rust (Embedded)</h3>
         <p>Use OxiDB as a library. Zero network overhead. Add to Cargo.toml:</p>
         <pre><code>[dependencies]
-oxidb = "0.18"</code></pre>
+oxidb = "0.25"</code></pre>
       </div>
 
       <div class="client-card">
@@ -71,40 +71,6 @@ client.SetDialect(<span class="str">"postgresql"</span>)</code></pre>
         <pre><code>dotnet add package OxiDb.EntityFrameworkCore</code></pre>
       </div>
 
-      <div class="client-card">
-        <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 3a3 3 0 00-3 3v12a3 3 0 003 3 3 3 0 003-3 3 3 0 00-3-3H6a3 3 0 00-3 3 3 3 0 003 3 3 3 0 003-3V6a3 3 0 00-3-3 3 3 0 00-3 3 3 3 0 003 3h12a3 3 0 003-3 3 3 0 00-3-3z"/></svg></div>
-        <h3>Java / Spring Boot</h3>
-        <p>Spring Boot starter with auto-configuration.</p>
-        <pre><code>&lt;dependency&gt;
-  &lt;groupId&gt;com.oxidb&lt;/groupId&gt;
-  &lt;artifactId&gt;oxidb-spring-boot-starter&lt;/artifactId&gt;
-&lt;/dependency&gt;</code></pre>
       </div>
-
-      <div class="client-card">
-        <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="4"/><line x1="4.93" y1="4.93" x2="9.17" y2="9.17"/><line x1="14.83" y1="14.83" x2="19.07" y2="19.07"/><line x1="14.83" y1="9.17" x2="19.07" y2="4.93"/><line x1="4.93" y1="19.07" x2="9.17" y2="14.83"/></svg></div>
-        <h3>Julia</h3>
-        <p>Julia language bindings with full API coverage.</p>
-        <pre><code>using OxiDB
-client = connect("127.0.0.1", 4444)</code></pre>
-      </div>
-
-      <div class="client-card">
-        <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></div>
-        <h3>Swift</h3>
-        <p>iOS/macOS support via C FFI to the embedded Rust library.</p>
-        <pre><code>let db = OxiDB(path: "./data")</code></pre>
-      </div>
-
-      <div class="client-card">
-        <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><path d="M7 10h2l1-3 2 6 1-3h2"/></svg></div>
-        <h3>WebAssembly (Browser)</h3>
-        <p>Full OxiDB engine compiled to WASM. In-memory, no server. See <a href="/wasm">/wasm</a> for docs.</p>
-        <pre><code>import init, * as oxidb from './wasm/oxidb_wasm.js';
-await init();
-oxidb.init();</code></pre>
-      </div>
-    </div>
-  </div>
 </section>` }} />
 }

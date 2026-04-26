@@ -4,7 +4,7 @@
 
 <p align="center">A fast, embeddable document database written in Rust. SQL and JSON queries, S3-compatible API, Redis-compatible in-memory store, MQTT messaging, GELF log ingestion with auto-indexing, alerting, retention policies, GPU-accelerated vector search, hash sharding, Raft replication, AES-256 encryption, crash-safe WAL, single binary, zero configuration.</p>
 
-**Client libraries:** [Python](python/) | [Go](go/) | [Java/Spring Boot](oxidb-spring-boot-starter/) | [Julia](julia/) | [.NET](dotnet/) | [Swift/iOS](swift/) | [JavaScript/TypeScript](oxidb-js/) | [C FFI](oxidb-client-ffi/) | [VS Code Extension](oxidb-vscode/)
+**Client libraries:** [Python](python/) | [Go](go/) | [Julia](julia/) | [.NET](dotnet/) | [Swift/iOS](swift/) | [JavaScript/TypeScript](oxidb-js/) | [C FFI](oxidb-client-ffi/) | [VS Code Extension](oxidb-vscode/)
 
 ## Installation
 
@@ -120,7 +120,7 @@ docker compose up -d
 - **UDP log ingestion** — high-throughput fire-and-forget GELF/JSON receiver; SO_REUSEPORT multi-thread listeners
 - **VS Code extension** — collection browser, MongoDB-style query editor, OxiScript syntax highlighting
 - **CLI tool** — interactive shell with JSON-based syntax, embedded and client modes
-- **Multi-language clients** — Python, Go, Java/Spring Boot, Julia, .NET, Swift/iOS — all zero or minimal dependencies
+- **Multi-language clients** — Python, Go, Julia, .NET, Swift/iOS — all zero or minimal dependencies
 
 ## SQL Query Language
 
@@ -165,11 +165,6 @@ result = client.sql("SELECT name, age FROM users WHERE age > 21")
 ```go
 // Go
 result, err := client.SQL("SELECT name, age FROM users WHERE age > 21")
-```
-
-```java
-// Java
-JsonNode result = client.sql("SELECT name, age FROM users WHERE age > 21");
 ```
 
 ```julia

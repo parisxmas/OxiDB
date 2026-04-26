@@ -160,19 +160,6 @@ func main() {
 }
 ```
 
-### Java (Spring Boot)
-
-```java
-@Autowired
-private OxiDbClient db;
-
-public void example() {
-    db.insert("users", Map.of("name", "Alice", "age", 30));
-    JsonNode users = db.find("users", Map.of("name", "Alice"));
-    System.out.println(users);
-}
-```
-
 ### Julia
 
 ```julia

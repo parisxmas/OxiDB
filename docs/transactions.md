@@ -135,39 +135,6 @@ if errors.As(err, &conflict) {
 }
 ```
 
-### Java
-
-```java
-// Callback helper (recommended)
-db.withTransaction(() -> {
-    db.insert("ledger", Map.of("action", "debit", "amount", 100));
-    db.insert("ledger", Map.of("action", "credit", "amount", 100));
-});
-
-// Manual
-db.beginTx();
-try {
-    db.insert("ledger", Map.of("action", "debit", "amount", 100));
-    db.insert("ledger", Map.of("action", "credit", "amount", 100));
-    db.commitTx();
-} catch (Exception e) {
-    db.rollbackTx();
-    throw e;
-}
-```
-
-Error handling:
-
-```java
-try {
-    db.commitTx();
-} catch (TransactionConflictException e) {
-    // OCC conflict -- retry
-} catch (OxiDbException e) {
-    // Other error
-}
-```
-
 ### Julia
 
 ```julia
