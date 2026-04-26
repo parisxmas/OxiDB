@@ -1,734 +1,165 @@
 """
-OxiDB Julia client library.
+    OxiDb
 
-Communicates with oxidb-server over TCP using the length-prefixed JSON protocol.
+Minimal Julia client for `oxidb-server`. JSON over TCP, length-prefixed
+(`[u32 LE length][JSON]`). Thread-safe.
 
-# Usage
+## Usage
 
 ```julia
 using OxiDb
 
-client = connect_oxidb("127.0.0.1", 4444)
-insert(client, "users", Dict("name" => "Alice", "age" => 30))
-docs = find(client, "users", Dict("name" => "Alice"))
-close(client)
+OxiDb.connect("127.0.0.1", 4444) do db
+    insert(db, "users", Dict("name" => "Alice", "age" => 30))
+    docs = find(db, "users"; query = Dict("age" => Dict("\$gte" => 18)))
+    @show docs
+end
+```
+
+For any command not covered by the convenience helpers below, use the
+generic `exec` — every server command is reachable that way:
+
+```julia
+exec(db, "create_ttl_index";
+     collection = "sessions", field = "created_at", expireAfterSeconds = 3600)
+
+exec(db, "create_procedure"; name = "hi",
+     script = "proc hi(n) { return {hi: n} }")
 ```
 """
 module OxiDb
 
-using Base64
 using JSON3
 using Sockets
 
-export OxiDbClient, OxiDbError, TransactionConflictError,
-       connect_oxidb,
-       # Utility
-       ping,
-       # Collections
-       create_collection, list_collections, drop_collection,
-       # CRUD
+export OxiDbClient, OxiDbError, exec, ping,
        insert, insert_many, find, find_one,
        update, update_one, delete, delete_one,
-       count_docs,
-       # Indexes
-       create_index, create_unique_index, create_composite_index,
-       create_text_index, create_ttl_index, list_indexes, drop_index,
-       # FTS (documents)
-       text_search,
-       # Vector search
-       create_vector_index, vector_search,
-       # Aggregation
-       aggregate,
-       # Compaction
-       compact,
-       # Transactions
-       begin_tx, commit_tx, rollback_tx, transaction,
-       # Blob storage
-       create_bucket, list_buckets, delete_bucket,
-       put_object, get_object, head_object, delete_object, list_objects,
-       # FTS (blobs)
-       search,
-       # SQL
-       sql,
-       # Stored procedures & OxiScript
-       compile_oxiscript, create_procedure, call_procedure,
-       list_procedures, get_procedure, delete_procedure,
-       # Change streams
-       watch, unwatch
+       count_docs, aggregate, sql
 
-# ------------------------------------------------------------------
-# Exceptions
-# ------------------------------------------------------------------
+# ─── Errors ────────────────────────────────────────────────────────────────
 
 struct OxiDbError <: Exception
     msg::String
 end
-
 Base.showerror(io::IO, e::OxiDbError) = print(io, "OxiDbError: ", e.msg)
 
-struct TransactionConflictError <: Exception
-    msg::String
-end
+# ─── Client ────────────────────────────────────────────────────────────────
 
-Base.showerror(io::IO, e::TransactionConflictError) = print(io, "TransactionConflictError: ", e.msg)
-
-# ------------------------------------------------------------------
-# Client
-# ------------------------------------------------------------------
-
-"""
-    OxiDbClient
-
-TCP client for oxidb-server. Thread-safe via ReentrantLock.
-Protocol: each message is [4-byte little-endian length][JSON payload].
-"""
 mutable struct OxiDbClient
     sock::TCPSocket
     lock::ReentrantLock
-
-    function OxiDbClient(sock::TCPSocket)
-        new(sock, ReentrantLock())
-    end
 end
+
+OxiDbClient(sock::TCPSocket) = OxiDbClient(sock, ReentrantLock())
+
+Base.show(io::IO, c::OxiDbClient) =
+    print(io, "OxiDbClient(", isopen(c.sock) ? "open" : "closed", ")")
 
 """
-    connect_oxidb(host="127.0.0.1", port=4444) -> OxiDbClient
+    connect(host="127.0.0.1", port=4444) -> OxiDbClient
+    connect(f::Function, host="127.0.0.1", port=4444)
 
-Connect to an oxidb-server instance.
+Open a TCP connection. The two-argument `do`-block form auto-closes
+the connection when the block exits, even on error.
 """
-function connect_oxidb(host::AbstractString="127.0.0.1", port::Integer=4444)
-    sock = Sockets.connect(host, port)
-    OxiDbClient(sock)
+connect(host::AbstractString = "127.0.0.1", port::Integer = 4444) =
+    OxiDbClient(Sockets.connect(host, port))
+
+function connect(f::Function, host::AbstractString = "127.0.0.1", port::Integer = 4444)
+    c = connect(host, port)
+    try f(c) finally close(c) end
 end
 
-function Base.close(client::OxiDbClient)
-    close(client.sock)
-end
+Base.close(c::OxiDbClient) = close(c.sock)
+Base.isopen(c::OxiDbClient) = isopen(c.sock)
 
-# ------------------------------------------------------------------
-# Low-level protocol
-# ------------------------------------------------------------------
+# ─── Wire protocol (length-prefixed JSON) ──────────────────────────────────
 
-function _send_raw(client::OxiDbClient, data::Vector{UInt8})
-    len = UInt32(length(data))
-    len_bytes = reinterpret(UInt8, [htol(len)])
-    write(client.sock, len_bytes)
-    write(client.sock, data)
-end
-
-function _recv_raw(client::OxiDbClient)
-    len_bytes = read(client.sock, 4)
-    length(len_bytes) == 4 || throw(OxiDbError("connection closed by server"))
-    len = ltoh(reinterpret(UInt32, len_bytes)[1])
-    payload = read(client.sock, len)
-    UInt32(length(payload)) == len || throw(OxiDbError("connection closed by server"))
-    payload
-end
-
-function _request(client::OxiDbClient, payload::Dict)
-    lock(client.lock) do
-        json_bytes = Vector{UInt8}(JSON3.write(payload))
-        _send_raw(client, json_bytes)
-        resp_bytes = _recv_raw(client)
-        JSON3.read(String(resp_bytes), Dict{String,Any})
+function _request(c::OxiDbClient, payload::AbstractDict)
+    body = Vector{UInt8}(JSON3.write(payload))
+    lock(c.lock) do
+        write(c.sock, htol(UInt32(length(body))))
+        write(c.sock, body)
+        n = ltoh(read(c.sock, UInt32))
+        n == 0 && return Dict{String,Any}()
+        JSON3.read(String(read(c.sock, Int(n))), Dict{String,Any})
     end
 end
 
-function _checked(client::OxiDbClient, payload::Dict)
-    resp = _request(client, payload)
-    if !get(resp, "ok", false)
-        error_msg = get(resp, "error", "unknown error")
-        if occursin("conflict", lowercase(error_msg))
-            throw(TransactionConflictError(error_msg))
-        end
-        throw(OxiDbError(error_msg))
+# ─── Generic command — the escape hatch for anything not below ─────────────
+
+"""
+    exec(client, cmd::AbstractString; kwargs...)
+
+Send any command to the server. Returns the `data` field of the response,
+or throws `OxiDbError` on failure. Pass command-specific fields as keyword
+arguments — they're merged into the wire payload as-is.
+"""
+function exec(c::OxiDbClient, cmd::AbstractString; kwargs...)
+    payload = Dict{String,Any}("cmd" => cmd)
+    for (k, v) in kwargs
+        payload[String(k)] = v
     end
+    resp = _request(c, payload)
+    get(resp, "ok", false) || throw(OxiDbError(get(resp, "error", "unknown error")))
     get(resp, "data", nothing)
 end
 
-# ------------------------------------------------------------------
-# Utility
-# ------------------------------------------------------------------
+# ─── Convenience: the everyday ops ─────────────────────────────────────────
 
-"""
-    ping(client) -> String
+ping(c::OxiDbClient) = exec(c, "ping")
 
-Ping the server. Returns "pong".
-"""
-ping(client::OxiDbClient) = _checked(client, Dict("cmd" => "ping"))
+insert(c::OxiDbClient, collection::AbstractString, doc::AbstractDict) =
+    exec(c, "insert"; collection, doc)
 
-# ------------------------------------------------------------------
-# Collection management
-# ------------------------------------------------------------------
+insert_many(c::OxiDbClient, collection::AbstractString, docs::AbstractVector) =
+    exec(c, "insert_many"; collection, docs)
 
-"""
-    create_collection(client, name)
-
-Explicitly create a collection. Collections are also auto-created on insert.
-"""
-create_collection(client::OxiDbClient, name::AbstractString) =
-    _checked(client, Dict("cmd" => "create_collection", "collection" => name))
-
-"""
-    list_collections(client)
-
-Return a list of collection names.
-"""
-list_collections(client::OxiDbClient) =
-    _checked(client, Dict("cmd" => "list_collections"))
-
-"""
-    drop_collection(client, name)
-
-Drop a collection and its data.
-"""
-drop_collection(client::OxiDbClient, name::AbstractString) =
-    _checked(client, Dict("cmd" => "drop_collection", "collection" => name))
-
-# ------------------------------------------------------------------
-# CRUD
-# ------------------------------------------------------------------
-
-"""
-    insert(client, collection, doc::Dict)
-
-Insert a single document. Returns Dict("id" => ...) outside tx, "buffered" inside tx.
-"""
-function insert(client::OxiDbClient, collection::AbstractString, doc::Dict)
-    _checked(client, Dict("cmd" => "insert", "collection" => collection, "doc" => doc))
-end
-
-"""
-    insert_many(client, collection, docs::Vector)
-
-Insert multiple documents.
-"""
-function insert_many(client::OxiDbClient, collection::AbstractString, docs::Vector)
-    _checked(client, Dict("cmd" => "insert_many", "collection" => collection, "docs" => docs))
-end
-
-"""
-    find(client, collection, query=Dict(); sort=nothing, skip=nothing, limit=nothing)
-
-Find documents matching a query.
-"""
-function find(client::OxiDbClient, collection::AbstractString, query::Dict=Dict();
-              sort=nothing, skip::Union{Integer,Nothing}=nothing,
-              limit::Union{Integer,Nothing}=nothing)
+function find(c::OxiDbClient, collection::AbstractString;
+              query::AbstractDict = Dict{String,Any}(),
+              sort = nothing, skip = nothing, limit = nothing)
     payload = Dict{String,Any}("cmd" => "find", "collection" => collection, "query" => query)
-    sort !== nothing && (payload["sort"] = sort)
-    skip !== nothing && (payload["skip"] = skip)
-    limit !== nothing && (payload["limit"] = limit)
-    _checked(client, payload)
+    sort  === nothing || (payload["sort"]  = sort)
+    skip  === nothing || (payload["skip"]  = skip)
+    limit === nothing || (payload["limit"] = limit)
+    resp = _request(c, payload)
+    get(resp, "ok", false) || throw(OxiDbError(get(resp, "error", "unknown error")))
+    get(resp, "data", Any[])
 end
 
-"""
-    find_one(client, collection, query=Dict())
+find_one(c::OxiDbClient, collection::AbstractString,
+         query::AbstractDict = Dict{String,Any}()) =
+    exec(c, "find_one"; collection, query)
 
-Find a single document. Returns the document or nothing.
-"""
-function find_one(client::OxiDbClient, collection::AbstractString, query::Dict=Dict())
-    _checked(client, Dict("cmd" => "find_one", "collection" => collection, "query" => query))
-end
+update(c::OxiDbClient, collection::AbstractString,
+       query::AbstractDict, update_doc::AbstractDict) =
+    exec(c, "update"; collection, query, update = update_doc)
 
-"""
-    update(client, collection, query::Dict, update_doc::Dict)
+update_one(c::OxiDbClient, collection::AbstractString,
+           query::AbstractDict, update_doc::AbstractDict) =
+    exec(c, "update_one"; collection, query, update = update_doc)
 
-Update all documents matching a query.
-"""
-function update(client::OxiDbClient, collection::AbstractString, query::Dict, update_doc::Dict)
-    _checked(client, Dict("cmd" => "update", "collection" => collection,
-                           "query" => query, "update" => update_doc))
-end
+delete(c::OxiDbClient, collection::AbstractString, query::AbstractDict) =
+    exec(c, "delete"; collection, query)
 
-"""
-    update_one(client, collection, query::Dict, update_doc::Dict)
-
-Update the first document matching a query.
-"""
-function update_one(client::OxiDbClient, collection::AbstractString, query::Dict, update_doc::Dict)
-    _checked(client, Dict("cmd" => "update_one", "collection" => collection,
-                           "query" => query, "update" => update_doc))
-end
-
-"""
-    delete(client, collection, query::Dict)
-
-Delete all documents matching a query.
-"""
-function delete(client::OxiDbClient, collection::AbstractString, query::Dict)
-    _checked(client, Dict("cmd" => "delete", "collection" => collection, "query" => query))
-end
-
-"""
-    delete_one(client, collection, query::Dict)
-
-Delete the first document matching a query.
-"""
-function delete_one(client::OxiDbClient, collection::AbstractString, query::Dict)
-    _checked(client, Dict("cmd" => "delete_one", "collection" => collection, "query" => query))
-end
+delete_one(c::OxiDbClient, collection::AbstractString, query::AbstractDict) =
+    exec(c, "delete_one"; collection, query)
 
 """
     count_docs(client, collection, query=Dict()) -> Int
 
-Count documents matching a query.
+`count_docs` rather than `count` so it doesn't collide with `Base.count`.
 """
-function count_docs(client::OxiDbClient, collection::AbstractString, query::Dict=Dict())
-    result = _checked(client, Dict("cmd" => "count", "collection" => collection, "query" => query))
-    result["count"]
+function count_docs(c::OxiDbClient, collection::AbstractString,
+                    query::AbstractDict = Dict{String,Any}())
+    r = exec(c, "count"; collection, query)
+    r isa AbstractDict ? Int(r["count"]) : Int(r)
 end
 
-# ------------------------------------------------------------------
-# Indexes
-# ------------------------------------------------------------------
+aggregate(c::OxiDbClient, collection::AbstractString, pipeline::AbstractVector) =
+    exec(c, "aggregate"; collection, pipeline)
 
-"""
-    create_index(client, collection, field)
-
-Create a non-unique index on a field.
-"""
-create_index(client::OxiDbClient, collection::AbstractString, field::AbstractString) =
-    _checked(client, Dict("cmd" => "create_index", "collection" => collection, "field" => field))
-
-"""
-    create_unique_index(client, collection, field)
-
-Create a unique index on a field.
-"""
-create_unique_index(client::OxiDbClient, collection::AbstractString, field::AbstractString) =
-    _checked(client, Dict("cmd" => "create_unique_index", "collection" => collection, "field" => field))
-
-"""
-    create_composite_index(client, collection, fields)
-
-Create a composite index on multiple fields.
-"""
-create_composite_index(client::OxiDbClient, collection::AbstractString, fields::Vector{<:AbstractString}) =
-    _checked(client, Dict("cmd" => "create_composite_index", "collection" => collection, "fields" => fields))
-
-"""
-    create_text_index(client, collection, fields)
-
-Create a full-text search index on the specified string fields.
-"""
-create_text_index(client::OxiDbClient, collection::AbstractString, fields::Vector{<:AbstractString}) =
-    _checked(client, Dict("cmd" => "create_text_index", "collection" => collection, "fields" => fields))
-
-"""
-    list_indexes(client, collection)
-
-List all indexes on a collection. Returns a list of index descriptors.
-"""
-list_indexes(client::OxiDbClient, collection::AbstractString) =
-    _checked(client, Dict("cmd" => "list_indexes", "collection" => collection))
-
-"""
-    create_ttl_index(client, collection, field, expire_after_seconds)
-
-Create a TTL index on a datetime field. Documents are automatically deleted
-when `field_value + expire_after_seconds` has passed.
-"""
-create_ttl_index(client::OxiDbClient, collection::AbstractString, field::AbstractString,
-                 expire_after_seconds::Integer) =
-    _checked(client, Dict("cmd" => "create_ttl_index", "collection" => collection,
-                           "field" => field, "expireAfterSeconds" => expire_after_seconds))
-
-"""
-    drop_index(client, collection, index_name)
-
-Drop an index by name from a collection.
-"""
-drop_index(client::OxiDbClient, collection::AbstractString, index_name::AbstractString) =
-    _checked(client, Dict("cmd" => "drop_index", "collection" => collection, "index" => index_name))
-
-# ------------------------------------------------------------------
-# Document full-text search
-# ------------------------------------------------------------------
-
-"""
-    text_search(client, collection, query; limit=10)
-
-Full-text search on collection documents. Returns matching documents with `_score` field.
-Requires a text index created with `create_text_index`.
-"""
-function text_search(client::OxiDbClient, collection::AbstractString, query::AbstractString; limit::Integer=10)
-    _checked(client, Dict("cmd" => "text_search", "collection" => collection, "query" => query, "limit" => limit))
-end
-
-# ------------------------------------------------------------------
-# Vector search
-# ------------------------------------------------------------------
-
-"""
-    create_vector_index(client, collection, field, dimension; metric="cosine")
-
-Create a vector similarity search index on a field.
-Metric can be "cosine", "euclidean", or "dot_product".
-"""
-function create_vector_index(client::OxiDbClient, collection::AbstractString, field::AbstractString,
-                             dimension::Integer; metric::AbstractString="cosine")
-    _checked(client, Dict("cmd" => "create_vector_index", "collection" => collection,
-                           "field" => field, "dimension" => dimension, "metric" => metric))
-end
-
-"""
-    vector_search(client, collection, field, vector; limit=10)
-
-Find the k nearest neighbors by vector similarity.
-Returns documents with `_similarity` and `_distance` fields.
-"""
-function vector_search(client::OxiDbClient, collection::AbstractString, field::AbstractString,
-                       vector::Vector{<:Real}; limit::Integer=10)
-    _checked(client, Dict("cmd" => "vector_search", "collection" => collection,
-                           "field" => field, "vector" => vector, "limit" => limit))
-end
-
-# ------------------------------------------------------------------
-# Aggregation
-# ------------------------------------------------------------------
-
-"""
-    aggregate(client, collection, pipeline::Vector)
-
-Run an aggregation pipeline. Returns list of result documents.
-"""
-aggregate(client::OxiDbClient, collection::AbstractString, pipeline::Vector) =
-    _checked(client, Dict("cmd" => "aggregate", "collection" => collection, "pipeline" => pipeline))
-
-# ------------------------------------------------------------------
-# Compaction
-# ------------------------------------------------------------------
-
-"""
-    compact(client, collection)
-
-Compact a collection. Returns Dict with old_size, new_size, docs_kept.
-"""
-compact(client::OxiDbClient, collection::AbstractString) =
-    _checked(client, Dict("cmd" => "compact", "collection" => collection))
-
-# ------------------------------------------------------------------
-# Transactions
-# ------------------------------------------------------------------
-
-"""
-    begin_tx(client)
-
-Begin a transaction on this connection. Returns Dict("tx_id" => ...).
-"""
-begin_tx(client::OxiDbClient) = _checked(client, Dict("cmd" => "begin_tx"))
-
-"""
-    commit_tx(client)
-
-Commit the active transaction. Throws TransactionConflictError on OCC conflict.
-"""
-commit_tx(client::OxiDbClient) = _checked(client, Dict("cmd" => "commit_tx"))
-
-"""
-    rollback_tx(client)
-
-Rollback the active transaction.
-"""
-rollback_tx(client::OxiDbClient) = _checked(client, Dict("cmd" => "rollback_tx"))
-
-"""
-    transaction(f, client)
-
-Execute `f` within a transaction. Auto-commits on success, auto-rolls back on exception.
-
-# Example
-```julia
-transaction(client) do
-    insert(client, "col", Dict("x" => 1))
-    update(client, "col", Dict("x" => 1), Dict("\\\$set" => Dict("x" => 2)))
-end
-```
-"""
-function transaction(f, client::OxiDbClient)
-    begin_tx(client)
-    try
-        f()
-        commit_tx(client)
-    catch e
-        try
-            rollback_tx(client)
-        catch _
-            # rollback may fail if commit already failed
-        end
-        rethrow()
-    end
-end
-
-# ------------------------------------------------------------------
-# Blob storage
-# ------------------------------------------------------------------
-
-"""
-    create_bucket(client, bucket)
-
-Create a blob storage bucket.
-"""
-create_bucket(client::OxiDbClient, bucket::AbstractString) =
-    _checked(client, Dict("cmd" => "create_bucket", "bucket" => bucket))
-
-"""
-    list_buckets(client)
-
-List all blob storage buckets.
-"""
-list_buckets(client::OxiDbClient) = _checked(client, Dict("cmd" => "list_buckets"))
-
-"""
-    delete_bucket(client, bucket)
-
-Delete a blob storage bucket.
-"""
-delete_bucket(client::OxiDbClient, bucket::AbstractString) =
-    _checked(client, Dict("cmd" => "delete_bucket", "bucket" => bucket))
-
-"""
-    put_object(client, bucket, key, data::Vector{UInt8}; content_type="application/octet-stream", metadata=nothing)
-
-Upload a blob object. Data is base64-encoded automatically.
-"""
-function put_object(client::OxiDbClient, bucket::AbstractString, key::AbstractString,
-                    data::Vector{UInt8};
-                    content_type::AbstractString="application/octet-stream",
-                    metadata::Union{Dict,Nothing}=nothing)
-    payload = Dict{String,Any}(
-        "cmd" => "put_object",
-        "bucket" => bucket,
-        "key" => key,
-        "data" => base64encode(data),
-        "content_type" => content_type
-    )
-    metadata !== nothing && (payload["metadata"] = metadata)
-    _checked(client, payload)
-end
-
-"""
-    get_object(client, bucket, key) -> (data::Vector{UInt8}, metadata::Dict)
-
-Download a blob object. Returns (bytes, metadata).
-"""
-function get_object(client::OxiDbClient, bucket::AbstractString, key::AbstractString)
-    result = _checked(client, Dict("cmd" => "get_object", "bucket" => bucket, "key" => key))
-    data = base64decode(result["content"])
-    (data, result["metadata"])
-end
-
-"""
-    head_object(client, bucket, key)
-
-Get blob object metadata without downloading the content.
-"""
-head_object(client::OxiDbClient, bucket::AbstractString, key::AbstractString) =
-    _checked(client, Dict("cmd" => "head_object", "bucket" => bucket, "key" => key))
-
-"""
-    delete_object(client, bucket, key)
-
-Delete a blob object.
-"""
-delete_object(client::OxiDbClient, bucket::AbstractString, key::AbstractString) =
-    _checked(client, Dict("cmd" => "delete_object", "bucket" => bucket, "key" => key))
-
-"""
-    list_objects(client, bucket; prefix=nothing, limit=nothing)
-
-List objects in a bucket.
-"""
-function list_objects(client::OxiDbClient, bucket::AbstractString;
-                      prefix::Union{AbstractString,Nothing}=nothing,
-                      limit::Union{Integer,Nothing}=nothing)
-    payload = Dict{String,Any}("cmd" => "list_objects", "bucket" => bucket)
-    prefix !== nothing && (payload["prefix"] = prefix)
-    limit !== nothing && (payload["limit"] = limit)
-    _checked(client, payload)
-end
-
-# ------------------------------------------------------------------
-# Full-text search
-# ------------------------------------------------------------------
-
-"""
-    search(client, query; bucket=nothing, limit=10)
-
-Full-text search across blobs. Returns list of Dict with bucket, key, score.
-"""
-function search(client::OxiDbClient, query::AbstractString;
-                bucket::Union{AbstractString,Nothing}=nothing,
-                limit::Integer=10)
-    payload = Dict{String,Any}("cmd" => "search", "query" => query, "limit" => limit)
-    bucket !== nothing && (payload["bucket"] = bucket)
-    _checked(client, payload)
-end
-
-# ------------------------------------------------------------------
-# SQL
-# ------------------------------------------------------------------
-
-"""
-    sql(client, query::AbstractString)
-
-Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES.
-"""
-sql(client::OxiDbClient, query::AbstractString) =
-    _checked(client, Dict("cmd" => "sql", "query" => query))
-
-# ------------------------------------------------------------------
-# Cron schedules
-# ------------------------------------------------------------------
-
-"""
-    create_schedule(client, name, procedure; cron=nothing, every=nothing, params=nothing, enabled=true)
-
-Create or replace a named schedule. Specify either `cron` or `every`.
-"""
-function create_schedule(client::OxiDbClient, name::AbstractString, procedure::AbstractString;
-                         cron::Union{AbstractString,Nothing}=nothing,
-                         every::Union{AbstractString,Nothing}=nothing,
-                         params::Union{Dict,Nothing}=nothing,
-                         enabled::Bool=true)
-    payload = Dict{String,Any}("cmd" => "create_schedule", "name" => name,
-                               "procedure" => procedure, "enabled" => enabled)
-    cron !== nothing && (payload["cron"] = cron)
-    every !== nothing && (payload["every"] = every)
-    params !== nothing && (payload["params"] = params)
-    _checked(client, payload)
-end
-
-"""
-    list_schedules(client)
-
-List all schedules with status.
-"""
-list_schedules(client::OxiDbClient) =
-    _checked(client, Dict("cmd" => "list_schedules"))
-
-"""
-    get_schedule(client, name)
-
-Get a schedule by name.
-"""
-get_schedule(client::OxiDbClient, name::AbstractString) =
-    _checked(client, Dict("cmd" => "get_schedule", "name" => name))
-
-"""
-    delete_schedule(client, name)
-
-Delete a schedule.
-"""
-delete_schedule(client::OxiDbClient, name::AbstractString) =
-    _checked(client, Dict("cmd" => "delete_schedule", "name" => name))
-
-"""
-    enable_schedule(client, name)
-
-Enable a paused schedule.
-"""
-enable_schedule(client::OxiDbClient, name::AbstractString) =
-    _checked(client, Dict("cmd" => "enable_schedule", "name" => name))
-
-"""
-    disable_schedule(client, name)
-
-Disable (pause) a schedule.
-"""
-disable_schedule(client::OxiDbClient, name::AbstractString) =
-    _checked(client, Dict("cmd" => "disable_schedule", "name" => name))
-
-# ------------------------------------------------------------------
-# Stored procedures & OxiScript
-# ------------------------------------------------------------------
-
-"""
-    compile_oxiscript(client, script) -> Dict
-
-Compile an OxiScript source string into a JSON procedure definition.
-Does not register the procedure — use `create_procedure` for that.
-"""
-compile_oxiscript(client::OxiDbClient, script::AbstractString) =
-    _checked(client, Dict("cmd" => "compile_oxiscript", "script" => script))
-
-"""
-    create_procedure(client, name, params, steps)
-
-Create a stored procedure from a JSON definition.
-"""
-function create_procedure(client::OxiDbClient, name::AbstractString, params::Vector, steps::Vector)
-    _checked(client, Dict("cmd" => "create_procedure", "name" => name,
-                           "params" => params, "steps" => steps))
-end
-
-"""
-    create_procedure(client; script)
-
-Create a stored procedure from an OxiScript source string.
-The procedure name is derived from the `proc name(...)` declaration.
-"""
-function create_procedure(client::OxiDbClient; script::AbstractString)
-    _checked(client, Dict("cmd" => "create_procedure", "script" => script))
-end
-
-"""
-    call_procedure(client, name; params=Dict())
-
-Call a stored procedure by name with the given parameters.
-"""
-function call_procedure(client::OxiDbClient, name::AbstractString; params=Dict())
-    _checked(client, Dict("cmd" => "call_procedure", "name" => name, "params" => params))
-end
-
-"""
-    list_procedures(client)
-
-List all registered stored procedure names.
-"""
-list_procedures(client::OxiDbClient) =
-    _checked(client, Dict("cmd" => "list_procedures"))
-
-"""
-    get_procedure(client, name)
-
-Get a stored procedure definition by name.
-"""
-get_procedure(client::OxiDbClient, name::AbstractString) =
-    _checked(client, Dict("cmd" => "get_procedure", "name" => name))
-
-"""
-    delete_procedure(client, name)
-
-Delete a stored procedure by name.
-"""
-delete_procedure(client::OxiDbClient, name::AbstractString) =
-    _checked(client, Dict("cmd" => "delete_procedure", "name" => name))
-
-# ------------------------------------------------------------------
-# Change streams
-# ------------------------------------------------------------------
-
-"""
-    watch(client; collection=nothing, resume_after=nothing)
-
-Subscribe to real-time change events (insert, update, delete).
-After calling watch, subsequent reads on the connection will receive change events.
-"""
-function watch(client::OxiDbClient; collection::Union{AbstractString,Nothing}=nothing,
-               resume_after::Union{Integer,Nothing}=nothing)
-    payload = Dict{String,Any}("cmd" => "watch")
-    collection !== nothing && (payload["collection"] = collection)
-    resume_after !== nothing && (payload["resume_after"] = resume_after)
-    _checked(client, payload)
-end
-
-"""
-    unwatch(client)
-
-Stop receiving change stream events and return to normal request mode.
-"""
-unwatch(client::OxiDbClient) = _checked(client, Dict("cmd" => "unwatch"))
+sql(c::OxiDbClient, query::AbstractString) = exec(c, "sql"; query)
 
 end # module
