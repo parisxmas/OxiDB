@@ -25,5 +25,5 @@ OxiDb.connect("127.0.0.1", 4444) do db
                                    query      = "julia ml",
                                    limit      = 5)
     println("TF-IDF results for 'julia ml':")
-    foreach(h -> println("  ", round(h["score"], digits=3), "  ", h["doc"]["title"]), hits)
+    foreach(h -> println("  ", round(h["_score"], digits=3), "  ", h["title"]), hits)
 end

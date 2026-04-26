@@ -25,7 +25,7 @@ OxiDb.connect("127.0.0.1", 4444) do db
 
     exec(db, "create_vector_index"; collection = "kb",
                                     field      = "vec",
-                                    dimension  => 8,
+                                    dimension  = 8,
                                     metric     = "cosine")
 
     query_vec = embed("what makes julia unique")
@@ -34,5 +34,5 @@ OxiDb.connect("127.0.0.1", 4444) do db
                                      vector     = query_vec,
                                      limit      = 3)
     println("Top-3 matches:")
-    foreach(h -> println("  ", round(h["score"], digits=3), "  ", h["doc"]["text"]), hits)
+    foreach(h -> println("  ", round(h["_similarity"], digits=3), "  ", h["text"]), hits)
 end
