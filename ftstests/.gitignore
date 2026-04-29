@@ -3,3 +3,4 @@ server.log
 oxidb_data/
 __pycache__/
 *.pyc
+SUPPORT_REQUEST.md
