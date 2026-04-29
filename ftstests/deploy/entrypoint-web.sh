@@ -19,21 +19,20 @@ done
 
 # Marker file — created after the first successful seed. Re-runs skip
 # the upload, so restarts are cheap and data survives across restarts.
+# The image no longer ships a corpus; opt in by setting
+# OXIDB_FTS_DEMO_AUTOSEED=1 to fetch + chunk the Project Gutenberg
+# books at first boot.
 SEED_MARKER=/data/.seeded
-if [ ! -f "$SEED_MARKER" ]; then
-    if ls /app/ftstests/data/*.docx >/dev/null 2>&1; then
-        echo "[entrypoint] seeding bundled corpus"
-        if python3 /app/ftstests/02_upload.py; then
-            mkdir -p /data && touch "$SEED_MARKER"
-            echo "[entrypoint] seed complete"
-        else
-            echo "[entrypoint] seed failed — continuing anyway" >&2
-        fi
+if [ ! -f "$SEED_MARKER" ] && [ "${OXIDB_FTS_DEMO_AUTOSEED:-0}" = "1" ]; then
+    echo "[entrypoint] OXIDB_FTS_DEMO_AUTOSEED=1 — fetching demo corpus"
+    if python3 /app/ftstests/01_generate.py && python3 /app/ftstests/02_upload.py; then
+        mkdir -p /data && touch "$SEED_MARKER"
+        echo "[entrypoint] seed complete"
     else
-        echo "[entrypoint] no bundled corpus, skipping seed"
+        echo "[entrypoint] seed failed — continuing without corpus" >&2
     fi
 else
-    echo "[entrypoint] seed marker present, skipping"
+    echo "[entrypoint] seed skipped (set OXIDB_FTS_DEMO_AUTOSEED=1 to enable)"
 fi
 
 echo "[entrypoint] starting web server on :$WEB_PORT"

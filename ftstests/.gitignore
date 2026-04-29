@@ -4,3 +4,6 @@ oxidb_data/
 __pycache__/
 *.pyc
 SUPPORT_REQUEST.md
+# Demo corpus is generated locally on demand by 01_generate.py
+# (Project Gutenberg fetch + zipfile DOCX synth) — not shipped.
+data/
