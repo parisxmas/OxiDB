@@ -64,6 +64,77 @@ pub(crate) enum Expression {
     Mod(Box<Expression>, Box<Expression>),
     // Array
     Size(Box<Expression>),
+    // Date bucketing for $dateHistogram. Floors a date to the start
+    // of its enclosing interval and returns an ISO 8601 string.
+    DateBucket(Box<Expression>, DateInterval),
+}
+
+/// Bucket size for $dateHistogram. Fixed-width intervals are stored
+/// as a number of seconds; Month and Year are handled specially
+/// because their length varies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DateInterval {
+    Seconds(u64),
+    Month,
+    Year,
+}
+
+impl DateInterval {
+    /// Parse interval strings like "1m", "5m", "1h", "1d", "1w", "1M",
+    /// "1y", or the long forms "minute", "hour", "day", "week",
+    /// "month", "year".
+    fn parse(raw: &str) -> Option<Self> {
+        let s = raw.trim();
+        match s {
+            "minute" | "minutes" => return Some(DateInterval::Seconds(60)),
+            "hour" | "hours" => return Some(DateInterval::Seconds(3600)),
+            "day" | "days" => return Some(DateInterval::Seconds(86_400)),
+            "week" | "weeks" => return Some(DateInterval::Seconds(604_800)),
+            "month" | "months" => return Some(DateInterval::Month),
+            "year" | "years" => return Some(DateInterval::Year),
+            "second" | "seconds" => return Some(DateInterval::Seconds(1)),
+            _ => {}
+        }
+        // Compound form: "<n><unit>". Note: we treat lowercase 'm' as minute
+        // and uppercase 'M' as month, matching ES.
+        if let Some((num_part, unit)) = split_interval_token(s) {
+            let n: u64 = num_part.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            return match unit {
+                "s" => Some(DateInterval::Seconds(n)),
+                "m" => Some(DateInterval::Seconds(n.checked_mul(60)?)),
+                "h" => Some(DateInterval::Seconds(n.checked_mul(3600)?)),
+                "d" => Some(DateInterval::Seconds(n.checked_mul(86_400)?)),
+                "w" => Some(DateInterval::Seconds(n.checked_mul(604_800)?)),
+                "M" => {
+                    if n == 1 {
+                        Some(DateInterval::Month)
+                    } else {
+                        None // multi-month buckets not supported
+                    }
+                }
+                "y" | "Y" => {
+                    if n == 1 {
+                        Some(DateInterval::Year)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+        }
+        None
+    }
+}
+
+fn split_interval_token(s: &str) -> Option<(&str, &str)> {
+    let split_at = s.find(|c: char| !c.is_ascii_digit())?;
+    if split_at == 0 {
+        return None;
+    }
+    Some((&s[..split_at], &s[split_at..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +163,10 @@ pub(crate) enum Accumulator {
     Last(Expression),
     Push(Expression),
     AddToSet(Expression),
+    /// Exact percentile aggregation. Collects all numeric values for
+    /// the input expression and, on finalize, returns one value per
+    /// requested percentile (e.g. p=[0.5, 0.95, 0.99]).
+    Percentile(Expression, Vec<f64>),
 }
 
 enum AccumulatorState {
@@ -104,6 +179,7 @@ enum AccumulatorState {
     Last(Option<Value>),
     Push(Vec<Value>),
     AddToSet(Vec<Value>),
+    Percentile { percentiles: Vec<f64>, values: Vec<f64> },
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +223,17 @@ enum Stage {
         extra_pairs: Vec<(String, String)>,
     },
     Out(String),
+    /// Synthetic post-processing stage emitted by `$dateHistogram` when
+    /// the user requests `min_doc_count: 0`. Walks the bucket list
+    /// output by the preceding `$group`, parses each `_id` as a date,
+    /// and inserts missing buckets between the observed min and max
+    /// with `count_field: 0`. Other accumulator fields are absent on
+    /// synthesized buckets.
+    DateBucketFill {
+        interval: DateInterval,
+        count_field: String,
+        id_field: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -712,6 +799,164 @@ impl Expression {
                     _ => Value::Null,
                 }
             }
+            Expression::DateBucket(expr, interval) => {
+                let inner = expr.eval(doc);
+                match value_to_epoch_millis(&inner) {
+                    Some(ms) => match bucket_date_label(ms, *interval) {
+                        Some(label) => Value::String(label),
+                        None => Value::Null,
+                    },
+                    None => Value::Null,
+                }
+            }
+        }
+    }
+}
+
+/// Convert a JSON value to epoch milliseconds. Accepts:
+///   - i64/u64 (already epoch ms)
+///   - f64 (truncated to i64)
+///   - ISO 8601 / RFC 3339 strings (via IndexValue's date parser)
+fn value_to_epoch_millis(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Some(i)
+            } else {
+                n.as_f64().map(|f| f as i64)
+            }
+        }
+        Value::String(_) => match IndexValue::from_json(v) {
+            IndexValue::DateTime(ms) => Some(ms),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Step from one bucket's epoch_ms to the start of the next bucket
+/// (one `interval` later). For Seconds intervals this is straight
+/// addition; Month and Year add by calendar.
+fn next_bucket_ms(epoch_ms: i64, interval: DateInterval) -> Option<i64> {
+    match interval {
+        DateInterval::Seconds(n) => epoch_ms.checked_add((n as i64).checked_mul(1000)?),
+        DateInterval::Month => {
+            use chrono::Datelike;
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(epoch_ms)?;
+            let (y, m) = if dt.month() == 12 {
+                (dt.year() + 1, 1)
+            } else {
+                (dt.year(), dt.month() + 1)
+            };
+            let nd = chrono::NaiveDate::from_ymd_opt(y, m, 1)?;
+            Some(nd.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis())
+        }
+        DateInterval::Year => {
+            use chrono::Datelike;
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(epoch_ms)?;
+            let nd = chrono::NaiveDate::from_ymd_opt(dt.year() + 1, 1, 1)?;
+            Some(nd.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis())
+        }
+    }
+}
+
+/// Fill empty date buckets between the observed min and max with a
+/// zero count. Used by `$dateHistogram { min_doc_count: 0 }`.
+fn exec_date_bucket_fill(
+    docs: Vec<Value>,
+    interval: DateInterval,
+    count_field: &str,
+    id_field: &str,
+) -> Vec<Value> {
+    if docs.is_empty() {
+        return docs;
+    }
+
+    // Index existing buckets by their parsed epoch_ms, and find min/max.
+    let mut existing: std::collections::HashMap<i64, Value> =
+        std::collections::HashMap::with_capacity(docs.len());
+    let mut min_ms: Option<i64> = None;
+    let mut max_ms: Option<i64> = None;
+    let mut without_id: Vec<Value> = Vec::new();
+    for doc in docs {
+        let label = doc.get(id_field).and_then(|v| v.as_str());
+        let ms = label.and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .ok()
+                .map(|dt| dt.timestamp_millis())
+        });
+        match ms {
+            Some(ms) => {
+                min_ms = Some(min_ms.map_or(ms, |m| m.min(ms)));
+                max_ms = Some(max_ms.map_or(ms, |m| m.max(ms)));
+                existing.insert(ms, doc);
+            }
+            None => {
+                // Bucket without parseable _id (e.g. null date input). Pass through.
+                without_id.push(doc);
+            }
+        }
+    }
+
+    let (Some(min_ms), Some(max_ms)) = (min_ms, max_ms) else {
+        return without_id;
+    };
+
+    // Walk from min to max stepping by interval, emitting either the
+    // existing bucket or a synthesized empty one.
+    let mut out: Vec<Value> = Vec::new();
+    let mut cur = min_ms;
+    let mut iters = 0;
+    // Hard cap: prevent runaway loops if interval is mis-parsed.
+    let max_iters = 1_000_000;
+    while cur <= max_ms && iters < max_iters {
+        if let Some(existing_doc) = existing.remove(&cur) {
+            out.push(existing_doc);
+        } else if let Some(label) = bucket_date_label(cur, interval) {
+            out.push(json!({
+                id_field: label,
+                count_field: 0,
+            }));
+        }
+        let next = match next_bucket_ms(cur, interval) {
+            Some(n) if n > cur => n,
+            _ => break,
+        };
+        cur = next;
+        iters += 1;
+    }
+    // Append any docs we couldn't place (existing buckets whose ms
+    // didn't land on the canonical boundary, plus null-id docs).
+    out.extend(existing.into_values());
+    out.extend(without_id);
+    out
+}
+
+/// Floor an epoch_ms value to the start of its bucket and render the
+/// bucket as an ISO 8601 / RFC 3339 string in UTC.
+fn bucket_date_label(epoch_ms: i64, interval: DateInterval) -> Option<String> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(epoch_ms)?;
+    match interval {
+        DateInterval::Seconds(n) => {
+            let total_secs = dt.timestamp();
+            let n_i64 = n as i64;
+            // Use Euclidean-style floor so negative timestamps still bucket
+            // toward -infinity rather than truncating toward zero.
+            let floored = total_secs.div_euclid(n_i64) * n_i64;
+            let bucket = chrono::DateTime::<chrono::Utc>::from_timestamp(floored, 0)?;
+            Some(bucket.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        }
+        DateInterval::Month => {
+            use chrono::{Datelike, NaiveDate};
+            let nd = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)?;
+            let bucket = nd.and_hms_opt(0, 0, 0)?.and_utc();
+            Some(bucket.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        }
+        DateInterval::Year => {
+            use chrono::{Datelike, NaiveDate};
+            let nd = NaiveDate::from_ymd_opt(dt.year(), 1, 1)?;
+            let bucket = nd.and_hms_opt(0, 0, 0)?.and_utc();
+            Some(bucket.format("%Y-%m-%dT%H:%M:%SZ").to_string())
         }
     }
 }
@@ -719,6 +964,94 @@ impl Expression {
 // ---------------------------------------------------------------------------
 // Stage parsing helpers
 // ---------------------------------------------------------------------------
+
+/// Parse a `$dateHistogram` stage into a `Stage::Group` (and an
+/// optional `Stage::DateBucketFill` follow-up) whose `_id` is a
+/// date-bucket expression. Each bucket implicitly counts documents
+/// (named `count` by default), and any user-provided accumulators are
+/// merged in.
+///
+/// Body shape:
+///   { "$dateHistogram": {
+///       "field": "timestamp",
+///       "interval": "1h",                 // or "minute"/"day"/"month" etc.
+///       "count_field": "count",            // optional, default "count"
+///       "min_doc_count": 0,                // optional. 0 = fill empty buckets.
+///       "accumulators": {                  // optional
+///           "total": {"$sum": "$amount"}
+///       }
+///   }}
+fn parse_date_histogram_stage(val: &Value) -> Result<(Stage, Option<Stage>)> {
+    let obj = val
+        .as_object()
+        .ok_or_else(|| Error::InvalidPipeline("$dateHistogram must be an object".into()))?;
+
+    let field = obj
+        .get("field")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::InvalidPipeline("$dateHistogram requires 'field' string".into())
+        })?
+        .to_string();
+
+    let interval_raw = obj
+        .get("interval")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::InvalidPipeline("$dateHistogram requires 'interval' string".into())
+        })?;
+    let interval = DateInterval::parse(interval_raw).ok_or_else(|| {
+        Error::InvalidPipeline(format!(
+            "$dateHistogram: unsupported interval '{interval_raw}' \
+             (try '1m', '5m', '1h', '1d', '1w', '1M', '1y', or 'minute'/'hour'/...)"
+        ))
+    })?;
+
+    let count_field = obj
+        .get("count_field")
+        .and_then(|v| v.as_str())
+        .unwrap_or("count")
+        .to_string();
+
+    // min_doc_count defaults to 1 (omit empty buckets — the existing
+    // behavior). 0 means: emit a synthetic bucket with count=0 for
+    // every gap between observed min and max.
+    let min_doc_count = obj
+        .get("min_doc_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+
+    let key = GroupKey::Single(Expression::DateBucket(
+        Box::new(Expression::FieldRef(field)),
+        interval,
+    ));
+
+    let mut accumulators: Vec<(String, Accumulator)> =
+        vec![(count_field.clone(), Accumulator::Count)];
+
+    if let Some(extra) = obj.get("accumulators") {
+        let extra_obj = extra.as_object().ok_or_else(|| {
+            Error::InvalidPipeline(
+                "$dateHistogram 'accumulators' must be an object".into(),
+            )
+        })?;
+        for (name, acc_val) in extra_obj {
+            accumulators.push((name.clone(), parse_accumulator(acc_val)?));
+        }
+    }
+
+    let group = Stage::Group { key, accumulators };
+    let fill = if min_doc_count == 0 {
+        Some(Stage::DateBucketFill {
+            interval,
+            count_field,
+            id_field: "_id".to_string(),
+        })
+    } else {
+        None
+    };
+    Ok((group, fill))
+}
 
 fn parse_accumulator(val: &Value) -> Result<Accumulator> {
     let obj = val
@@ -740,11 +1073,50 @@ fn parse_accumulator(val: &Value) -> Result<Accumulator> {
         "$last" => Ok(Accumulator::Last(parse_expression(arg)?)),
         "$push" => Ok(Accumulator::Push(parse_expression(arg)?)),
         "$addToSet" => Ok(Accumulator::AddToSet(parse_expression(arg)?)),
+        "$percentile" => parse_percentile_accumulator(arg),
         _ => Err(Error::InvalidPipeline(format!(
             "unknown accumulator: {}",
             op
         ))),
     }
+}
+
+/// Parse `{ "input": "$score", "p": [0.5, 0.95, 0.99] }` into a
+/// `Percentile` accumulator. `p` values must be in [0, 1].
+fn parse_percentile_accumulator(arg: &Value) -> Result<Accumulator> {
+    let obj = arg.as_object().ok_or_else(|| {
+        Error::InvalidPipeline(
+            "$percentile must be an object: { input, p: [...] }".into(),
+        )
+    })?;
+    let input = obj
+        .get("input")
+        .ok_or_else(|| Error::InvalidPipeline("$percentile requires 'input'".into()))?;
+    let expr = parse_expression(input)?;
+    let p_arr = obj
+        .get("p")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            Error::InvalidPipeline("$percentile requires 'p' as an array of numbers".into())
+        })?;
+    if p_arr.is_empty() {
+        return Err(Error::InvalidPipeline(
+            "$percentile 'p' array must not be empty".into(),
+        ));
+    }
+    let mut percentiles = Vec::with_capacity(p_arr.len());
+    for v in p_arr {
+        let f = v.as_f64().ok_or_else(|| {
+            Error::InvalidPipeline("$percentile 'p' values must be numbers".into())
+        })?;
+        if !(0.0..=1.0).contains(&f) {
+            return Err(Error::InvalidPipeline(format!(
+                "$percentile 'p' values must be in [0, 1], got {f}"
+            )));
+        }
+        percentiles.push(f);
+    }
+    Ok(Accumulator::Percentile(expr, percentiles))
 }
 
 fn parse_group_stage(val: &Value) -> Result<Stage> {
@@ -947,6 +1319,33 @@ fn compute_fast_key_multi<'a>(vals: impl Iterator<Item = &'a Value>, len: usize)
 }
 
 #[inline(always)]
+/// Compute one value per requested percentile from a collected sample.
+/// Uses linear interpolation between the two nearest ranks; this matches
+/// the most common "exact" / "tdigest" output for tractable sample sizes.
+fn finalize_percentile(percentiles: Vec<f64>, mut values: Vec<f64>) -> Value {
+    if values.is_empty() {
+        return Value::Array(percentiles.iter().map(|_| Value::Null).collect());
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = values.len();
+    let out: Vec<Value> = percentiles
+        .iter()
+        .map(|p| {
+            let p = p.clamp(0.0, 1.0);
+            if n == 1 {
+                return number_to_value(values[0]);
+            }
+            let pos = p * (n - 1) as f64;
+            let lower_idx = pos.floor() as usize;
+            let upper_idx = (lower_idx + 1).min(n - 1);
+            let frac = pos - lower_idx as f64;
+            let v = values[lower_idx] + (values[upper_idx] - values[lower_idx]) * frac;
+            number_to_value(v)
+        })
+        .collect();
+    Value::Array(out)
+}
+
 fn update_accumulator(state: &mut AccumulatorState, acc: &Accumulator, doc: &Value) {
     match (acc, state) {
         (Accumulator::Sum(expr), AccumulatorState::Sum(s)) => {
@@ -1006,6 +1405,13 @@ fn update_accumulator(state: &mut AccumulatorState, acc: &Accumulator, doc: &Val
             let val = expr.eval_ref(doc).into_owned();
             if !vec.contains(&val) {
                 vec.push(val);
+            }
+        }
+        (Accumulator::Percentile(expr, _), AccumulatorState::Percentile { values, .. }) => {
+            if let Some(n) = expr.eval_num(doc) {
+                if n.is_finite() {
+                    values.push(n);
+                }
             }
         }
         _ => {}
@@ -1176,6 +1582,10 @@ fn exec_group<D: DocRef>(
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
                 Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
+                Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
+                    percentiles: percentiles.clone(),
+                    values: Vec::new(),
+                },
             })
             .collect();
         for (i, (_, acc)) in accumulators.iter().enumerate() {
@@ -1208,6 +1618,9 @@ fn exec_group<D: DocRef>(
                 AccumulatorState::Last(v) => v.unwrap_or(Value::Null),
                 AccumulatorState::Push(v) => Value::Array(v),
                 AccumulatorState::AddToSet(v) => Value::Array(v),
+                AccumulatorState::Percentile { percentiles, values } => {
+                    finalize_percentile(percentiles, values)
+                }
             };
             doc.insert(name.clone(), val);
         }
@@ -1622,6 +2035,10 @@ fn try_index_group(
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
                 Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
+                Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
+                    percentiles: percentiles.clone(),
+                    values: Vec::new(),
+                },
             })
             .collect();
 
@@ -1658,6 +2075,10 @@ fn try_index_group(
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
                 Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
+                Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
+                    percentiles: percentiles.clone(),
+                    values: Vec::new(),
+                },
             })
             .collect();
 
@@ -1769,6 +2190,9 @@ fn finalize_accumulator(state: AccumulatorState) -> Value {
         AccumulatorState::Last(v) => v.unwrap_or(Value::Null),
         AccumulatorState::Push(v) => Value::Array(v),
         AccumulatorState::AddToSet(v) => Value::Array(v),
+        AccumulatorState::Percentile { percentiles, values } => {
+            finalize_percentile(percentiles, values)
+        }
     }
 }
 
@@ -1947,6 +2371,12 @@ pub(crate) fn is_raw_eligible(key: &GroupKey, accumulators: &[(String, Accumulat
         | Accumulator::Last(e)
         | Accumulator::Push(e)
         | Accumulator::AddToSet(e) => matches!(e, Expression::FieldRef(_) | Expression::Literal(_)),
+        // Percentile collects all values — it's compatible with the
+        // optimized streaming path as long as the input expression
+        // is index-friendly.
+        Accumulator::Percentile(e, _) => {
+            matches!(e, Expression::FieldRef(_) | Expression::Literal(_))
+        }
     })
 }
 
@@ -2023,6 +2453,10 @@ impl StreamingGroup {
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
                 Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
+                Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
+                    percentiles: percentiles.clone(),
+                    values: Vec::new(),
+                },
             })
             .collect();
         for (i, (_, acc)) in self.accumulators.iter().enumerate() {
@@ -2151,6 +2585,10 @@ impl StreamingGroup {
                 Accumulator::Last(_) => AccumulatorState::Last(None),
                 Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
                 Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
+                Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
+                    percentiles: percentiles.clone(),
+                    values: Vec::new(),
+                },
             })
             .collect();
         for (i, (_, acc)) in self.accumulators.iter().enumerate() {
@@ -2220,6 +2658,14 @@ impl Pipeline {
             let stage = match stage_name.as_str() {
                 "$match" => Stage::Match(stage_body.clone()),
                 "$group" => parse_group_stage(stage_body)?,
+                "$dateHistogram" => {
+                    let (group_stage, maybe_fill) = parse_date_histogram_stage(stage_body)?;
+                    stages.push(group_stage);
+                    if let Some(fill) = maybe_fill {
+                        stages.push(fill);
+                    }
+                    continue;
+                }
                 "$sort" => Stage::Sort(parse_sort(stage_body)?),
                 "$skip" => {
                     let n = stage_body.as_u64().ok_or_else(|| {
@@ -2474,6 +2920,11 @@ impl Pipeline {
                     // The pipeline returns the docs; the engine writes them to the target collection.
                     current
                 }
+                Stage::DateBucketFill {
+                    interval,
+                    count_field,
+                    id_field,
+                } => exec_date_bucket_fill(current, *interval, count_field, id_field),
             };
         }
         Ok(current)
@@ -2793,6 +3244,322 @@ mod tests {
             let a = result.iter().find(|d| d["_id"] == "A").unwrap();
             assert_eq!(a["count"], json!(2));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // $percentile tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn percentile_basic() {
+        let docs: Vec<Value> = (1..=100)
+            .map(|i| json!({"category": "A", "value": i}))
+            .collect();
+        let stage = parse_group_stage(&json!({
+            "_id": "$category",
+            "p": {"$percentile": {"input": "$value", "p": [0.5, 0.95, 0.99]}}
+        }))
+        .unwrap();
+        if let Stage::Group { key, accumulators } = &stage {
+            let result = exec_group(&docs, key, accumulators).unwrap();
+            assert_eq!(result.len(), 1);
+            let arr = result[0]["p"].as_array().unwrap();
+            assert_eq!(arr.len(), 3);
+            // For values 1..=100 with linear interpolation:
+            //   p=0.5 → pos = 0.5*99 = 49.5 → 50.5
+            //   p=0.95 → pos = 0.95*99 = 94.05 → ~95.05
+            //   p=0.99 → pos = 0.99*99 = 98.01 → ~99.01
+            let p50 = arr[0].as_f64().unwrap();
+            let p95 = arr[1].as_f64().unwrap();
+            let p99 = arr[2].as_f64().unwrap();
+            assert!((p50 - 50.5).abs() < 0.01, "p50: {p50}");
+            assert!((p95 - 95.05).abs() < 0.01, "p95: {p95}");
+            assert!((p99 - 99.01).abs() < 0.01, "p99: {p99}");
+        }
+    }
+
+    #[test]
+    fn percentile_empty_input() {
+        let docs: Vec<Value> = vec![json!({"category": "A"})]; // no value field
+        let stage = parse_group_stage(&json!({
+            "_id": "$category",
+            "p": {"$percentile": {"input": "$value", "p": [0.5]}}
+        }))
+        .unwrap();
+        if let Stage::Group { key, accumulators } = &stage {
+            let result = exec_group(&docs, key, accumulators).unwrap();
+            let arr = result[0]["p"].as_array().unwrap();
+            assert_eq!(arr.len(), 1);
+            assert_eq!(arr[0], Value::Null);
+        }
+    }
+
+    #[test]
+    fn percentile_single_value() {
+        let docs = vec![json!({"category": "A", "value": 42})];
+        let stage = parse_group_stage(&json!({
+            "_id": "$category",
+            "p": {"$percentile": {"input": "$value", "p": [0.0, 0.5, 1.0]}}
+        }))
+        .unwrap();
+        if let Stage::Group { key, accumulators } = &stage {
+            let result = exec_group(&docs, key, accumulators).unwrap();
+            let arr = result[0]["p"].as_array().unwrap();
+            for v in arr {
+                assert_eq!(v.as_f64().unwrap(), 42.0);
+            }
+        }
+    }
+
+    #[test]
+    fn percentile_rejects_p_out_of_range() {
+        let r = parse_accumulator(&json!({
+            "$percentile": {"input": "$x", "p": [1.5]}
+        }));
+        assert!(r.is_err());
+        let r = parse_accumulator(&json!({
+            "$percentile": {"input": "$x", "p": [-0.1]}
+        }));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn percentile_rejects_empty_p() {
+        let r = parse_accumulator(&json!({
+            "$percentile": {"input": "$x", "p": []}
+        }));
+        assert!(r.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // $dateHistogram tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn date_interval_parses_long_forms() {
+        assert_eq!(DateInterval::parse("minute"), Some(DateInterval::Seconds(60)));
+        assert_eq!(DateInterval::parse("hour"), Some(DateInterval::Seconds(3600)));
+        assert_eq!(DateInterval::parse("day"), Some(DateInterval::Seconds(86_400)));
+        assert_eq!(DateInterval::parse("week"), Some(DateInterval::Seconds(604_800)));
+        assert_eq!(DateInterval::parse("month"), Some(DateInterval::Month));
+        assert_eq!(DateInterval::parse("year"), Some(DateInterval::Year));
+        assert_eq!(DateInterval::parse("seconds"), Some(DateInterval::Seconds(1)));
+    }
+
+    #[test]
+    fn date_interval_parses_short_forms() {
+        assert_eq!(DateInterval::parse("1m"), Some(DateInterval::Seconds(60)));
+        assert_eq!(DateInterval::parse("5m"), Some(DateInterval::Seconds(300)));
+        assert_eq!(DateInterval::parse("15m"), Some(DateInterval::Seconds(900)));
+        assert_eq!(DateInterval::parse("1h"), Some(DateInterval::Seconds(3600)));
+        assert_eq!(DateInterval::parse("6h"), Some(DateInterval::Seconds(21_600)));
+        assert_eq!(DateInterval::parse("1d"), Some(DateInterval::Seconds(86_400)));
+        assert_eq!(DateInterval::parse("1w"), Some(DateInterval::Seconds(604_800)));
+        assert_eq!(DateInterval::parse("1M"), Some(DateInterval::Month));
+        assert_eq!(DateInterval::parse("1y"), Some(DateInterval::Year));
+        // Lowercase 'm' is minute, uppercase 'M' is month — guard against confusion
+        assert_ne!(DateInterval::parse("1m"), DateInterval::parse("1M"));
+    }
+
+    #[test]
+    fn date_interval_rejects_invalid() {
+        assert_eq!(DateInterval::parse(""), None);
+        assert_eq!(DateInterval::parse("0h"), None);
+        assert_eq!(DateInterval::parse("xyz"), None);
+        // Multi-month/year buckets not supported
+        assert_eq!(DateInterval::parse("3M"), None);
+        assert_eq!(DateInterval::parse("2y"), None);
+    }
+
+    #[test]
+    fn bucket_label_floors_seconds() {
+        // 2026-04-29T15:47:32Z = 1777_823_252 seconds
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-04-29T15:47:32Z")
+            .unwrap()
+            .timestamp_millis();
+        // 1h bucket
+        assert_eq!(
+            bucket_date_label(dt, DateInterval::Seconds(3600)).unwrap(),
+            "2026-04-29T15:00:00Z"
+        );
+        // 5m bucket
+        assert_eq!(
+            bucket_date_label(dt, DateInterval::Seconds(300)).unwrap(),
+            "2026-04-29T15:45:00Z"
+        );
+        // 1d bucket
+        assert_eq!(
+            bucket_date_label(dt, DateInterval::Seconds(86_400)).unwrap(),
+            "2026-04-29T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn bucket_label_floors_month_and_year() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-04-29T15:47:32Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            bucket_date_label(dt, DateInterval::Month).unwrap(),
+            "2026-04-01T00:00:00Z"
+        );
+        assert_eq!(
+            bucket_date_label(dt, DateInterval::Year).unwrap(),
+            "2026-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn date_histogram_groups_by_hour() {
+        let docs = vec![
+            json!({"ts": "2026-04-29T10:15:00Z", "amount": 5}),
+            json!({"ts": "2026-04-29T10:45:00Z", "amount": 10}),
+            json!({"ts": "2026-04-29T11:05:00Z", "amount": 7}),
+        ];
+        let (stage, fill) = parse_date_histogram_stage(&json!({
+            "field": "ts",
+            "interval": "1h"
+        }))
+        .unwrap();
+        assert!(fill.is_none(), "default min_doc_count=1 should not emit fill");
+        if let Stage::Group { key, accumulators } = &stage {
+            let result = exec_group(&docs, key, accumulators).unwrap();
+            assert_eq!(result.len(), 2);
+            let h10 = result.iter().find(|d| d["_id"] == "2026-04-29T10:00:00Z").unwrap();
+            assert_eq!(h10["count"], json!(2));
+            let h11 = result.iter().find(|d| d["_id"] == "2026-04-29T11:00:00Z").unwrap();
+            assert_eq!(h11["count"], json!(1));
+        } else {
+            panic!("expected Group stage");
+        }
+    }
+
+    #[test]
+    fn date_histogram_with_extra_accumulators() {
+        let docs = vec![
+            json!({"ts": "2026-04-29T10:15:00Z", "amount": 5}),
+            json!({"ts": "2026-04-29T10:45:00Z", "amount": 10}),
+            json!({"ts": "2026-04-29T11:05:00Z", "amount": 7}),
+        ];
+        let (stage, _fill) = parse_date_histogram_stage(&json!({
+            "field": "ts",
+            "interval": "1h",
+            "accumulators": {
+                "total": {"$sum": "$amount"},
+                "max_amount": {"$max": "$amount"}
+            }
+        }))
+        .unwrap();
+        if let Stage::Group { key, accumulators } = &stage {
+            let result = exec_group(&docs, key, accumulators).unwrap();
+            let h10 = result.iter().find(|d| d["_id"] == "2026-04-29T10:00:00Z").unwrap();
+            assert_eq!(h10["count"], json!(2));
+            assert_eq!(h10["total"], json!(15));
+            assert_eq!(h10["max_amount"], json!(10));
+        } else {
+            panic!("expected Group stage");
+        }
+    }
+
+    #[test]
+    fn date_histogram_accepts_epoch_ms() {
+        // Numeric input — already epoch_ms.
+        let docs = vec![
+            json!({"ts": 1_777_823_400_000_i64}), // 2026-04-29T15:50:00Z
+            json!({"ts": 1_777_823_500_000_i64}), // 2026-04-29T15:51:40Z
+        ];
+        let (stage, _fill) = parse_date_histogram_stage(&json!({
+            "field": "ts",
+            "interval": "1h"
+        }))
+        .unwrap();
+        if let Stage::Group { key, accumulators } = &stage {
+            let result = exec_group(&docs, key, accumulators).unwrap();
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0]["count"], json!(2));
+        }
+    }
+
+    #[test]
+    fn date_histogram_min_doc_count_zero_fills_empty_buckets() {
+        // Two docs an hour apart with one missing hour in between.
+        let p = Pipeline::parse(&json!([
+            {"$dateHistogram": {
+                "field": "ts",
+                "interval": "1h",
+                "min_doc_count": 0
+            }},
+            {"$sort": {"_id": 1}}
+        ]))
+        .unwrap();
+
+        let docs = vec![
+            json!({"ts": "2026-04-29T10:15:00Z"}),
+            json!({"ts": "2026-04-29T10:45:00Z"}),
+            json!({"ts": "2026-04-29T12:05:00Z"}),
+        ];
+        let result = p.execute_from(0, docs, &no_lookup).unwrap();
+        // Expect 3 buckets: 10:00 (count 2), 11:00 (count 0), 12:00 (count 1)
+        assert_eq!(result.len(), 3, "got buckets: {result:?}");
+        assert_eq!(result[0]["_id"], "2026-04-29T10:00:00Z");
+        assert_eq!(result[0]["count"], json!(2));
+        assert_eq!(result[1]["_id"], "2026-04-29T11:00:00Z");
+        assert_eq!(result[1]["count"], json!(0));
+        assert_eq!(result[2]["_id"], "2026-04-29T12:00:00Z");
+        assert_eq!(result[2]["count"], json!(1));
+    }
+
+    #[test]
+    fn date_histogram_min_doc_count_zero_no_fill_with_single_bucket() {
+        let p = Pipeline::parse(&json!([
+            {"$dateHistogram": {
+                "field": "ts",
+                "interval": "1h",
+                "min_doc_count": 0
+            }}
+        ]))
+        .unwrap();
+        let docs = vec![json!({"ts": "2026-04-29T10:15:00Z"})];
+        let result = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["_id"], "2026-04-29T10:00:00Z");
+        assert_eq!(result[0]["count"], json!(1));
+    }
+
+    #[test]
+    fn date_histogram_min_doc_count_zero_emits_fill_stage() {
+        let (group, fill) = parse_date_histogram_stage(&json!({
+            "field": "ts",
+            "interval": "1h",
+            "min_doc_count": 0
+        }))
+        .unwrap();
+        assert!(matches!(group, Stage::Group { .. }));
+        assert!(matches!(fill, Some(Stage::DateBucketFill { .. })));
+    }
+
+    #[test]
+    fn date_histogram_via_pipeline_parser() {
+        // End-to-end: $dateHistogram registered as a stage parser.
+        let p = Pipeline::parse(&json!([
+            {"$dateHistogram": {"field": "ts", "interval": "1d"}}
+        ]));
+        assert!(p.is_ok(), "{:?}", p.err());
+    }
+
+    #[test]
+    fn date_histogram_invalid_interval_errors() {
+        let r = parse_date_histogram_stage(&json!({
+            "field": "ts",
+            "interval": "bogus"
+        }));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn date_histogram_missing_field_errors() {
+        let r = parse_date_histogram_stage(&json!({"interval": "1h"}));
+        assert!(r.is_err());
     }
 
     // -----------------------------------------------------------------------

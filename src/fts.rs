@@ -29,12 +29,133 @@ struct DocInfo {
 struct IndexData {
     postings: HashMap<String, Vec<Posting>>,
     docs: HashMap<String, DocInfo>,
+    #[serde(default)]
+    total_term_count: u64,
+}
+
+// BM25 scoring parameters. Defaults match Lucene/Elasticsearch.
+// k1 controls term-frequency saturation (higher = more linear).
+// b controls length normalization (0 = ignore length, 1 = full).
+// Both can be overridden at process start via env vars
+// (OXIDB_FTS_K1, OXIDB_FTS_B); resolved once and cached.
+const BM25_K1_DEFAULT: f64 = 1.2;
+const BM25_B_DEFAULT: f64 = 0.75;
+
+fn parse_k1(raw: Option<&str>) -> f64 {
+    raw.and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(BM25_K1_DEFAULT)
+}
+
+fn parse_b(raw: Option<&str>) -> f64 {
+    raw.and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        .unwrap_or(BM25_B_DEFAULT)
+}
+
+fn parse_lang(raw: Option<&str>) -> rust_stemmers::Algorithm {
+    use rust_stemmers::Algorithm;
+    match raw.map(|s| s.trim().to_lowercase()).as_deref() {
+        Some("turkish") | Some("tr") | Some("tur") => Algorithm::Turkish,
+        Some("german") | Some("de") | Some("ger") => Algorithm::German,
+        Some("french") | Some("fr") | Some("fra") => Algorithm::French,
+        Some("spanish") | Some("es") | Some("spa") => Algorithm::Spanish,
+        Some("italian") | Some("it") | Some("ita") => Algorithm::Italian,
+        Some("portuguese") | Some("pt") | Some("por") => Algorithm::Portuguese,
+        Some("russian") | Some("ru") | Some("rus") => Algorithm::Russian,
+        Some("dutch") | Some("nl") | Some("nld") => Algorithm::Dutch,
+        Some("danish") | Some("da") | Some("dan") => Algorithm::Danish,
+        Some("finnish") | Some("fi") | Some("fin") => Algorithm::Finnish,
+        Some("hungarian") | Some("hu") | Some("hun") => Algorithm::Hungarian,
+        Some("norwegian") | Some("no") | Some("nor") => Algorithm::Norwegian,
+        Some("romanian") | Some("ro") | Some("ron") => Algorithm::Romanian,
+        Some("greek") | Some("el") | Some("ell") => Algorithm::Greek,
+        Some("arabic") | Some("ar") | Some("ara") => Algorithm::Arabic,
+        Some("swedish") | Some("sv") | Some("swe") => Algorithm::Swedish,
+        Some("tamil") | Some("ta") | Some("tam") => Algorithm::Tamil,
+        _ => Algorithm::English,
+    }
+}
+
+fn fts_k1() -> f64 {
+    static CACHED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| parse_k1(std::env::var("OXIDB_FTS_K1").ok().as_deref()))
+}
+
+fn fts_b() -> f64 {
+    static CACHED: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| parse_b(std::env::var("OXIDB_FTS_B").ok().as_deref()))
+}
+
+fn fts_stemmer() -> &'static rust_stemmers::Stemmer {
+    static CACHED: std::sync::OnceLock<rust_stemmers::Stemmer> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        rust_stemmers::Stemmer::create(parse_lang(std::env::var("OXIDB_FTS_LANG").ok().as_deref()))
+    })
+}
+
+fn algorithm_label(a: rust_stemmers::Algorithm) -> &'static str {
+    use rust_stemmers::Algorithm;
+    match a {
+        Algorithm::Arabic => "arabic",
+        Algorithm::Danish => "danish",
+        Algorithm::Dutch => "dutch",
+        Algorithm::English => "english",
+        Algorithm::Finnish => "finnish",
+        Algorithm::French => "french",
+        Algorithm::German => "german",
+        Algorithm::Greek => "greek",
+        Algorithm::Hungarian => "hungarian",
+        Algorithm::Italian => "italian",
+        Algorithm::Norwegian => "norwegian",
+        Algorithm::Portuguese => "portuguese",
+        Algorithm::Romanian => "romanian",
+        Algorithm::Russian => "russian",
+        Algorithm::Spanish => "spanish",
+        Algorithm::Swedish => "swedish",
+        Algorithm::Tamil => "tamil",
+        Algorithm::Turkish => "turkish",
+    }
+}
+
+/// One-line summary of the current FTS configuration, suitable for
+/// startup logs. Reads (and caches) env vars on first call.
+pub fn fts_config_summary() -> String {
+    let lang = parse_lang(std::env::var("OXIDB_FTS_LANG").ok().as_deref());
+    format!(
+        "FTS: lang={} k1={} b={} (BM25)",
+        algorithm_label(lang),
+        fts_k1(),
+        fts_b()
+    )
+}
+
+#[inline]
+fn bm25_idf(total_docs: f64, docs_with_term: f64) -> f64 {
+    ((total_docs - docs_with_term + 0.5) / (docs_with_term + 0.5) + 1.0).ln()
+}
+
+#[inline]
+fn bm25_score(tf: f64, dl: f64, avgdl: f64, idf: f64) -> f64 {
+    let k1 = fts_k1();
+    let b = fts_b();
+    let norm = 1.0 - b + b * (dl / avgdl);
+    let comp = (tf * (k1 + 1.0)) / (tf + k1 * norm);
+    idf * comp
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub struct FtsIndex {
     index_path: PathBuf,
     data: IndexData,
+    /// When true, mutations only mark the index dirty; persistence
+    /// happens lazily via an external flusher calling `flush()`.
+    /// When false (default), every mutation writes the full index
+    /// file synchronously — convenient for tests and embedded use,
+    /// but not appropriate for high-volume ingestion.
+    batched: bool,
+    /// Set on every mutation, cleared by `persist`/`flush`.
+    dirty: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -63,11 +184,10 @@ fn is_stop_word(word: &str) -> bool {
     STOP_WORDS_EN.contains(&word) || STOP_WORDS_TR.contains(&word)
 }
 
-/// Apply Porter2 stemming to a word.
+/// Apply Snowball stemming to a word using the language configured
+/// via OXIDB_FTS_LANG (defaults to English).
 fn stem(word: &str) -> String {
-    use rust_stemmers::{Algorithm, Stemmer};
-    let stemmer = Stemmer::create(Algorithm::English);
-    stemmer.stem(word).to_string()
+    fts_stemmer().stem(word).to_string()
 }
 
 /// Strip Unicode accents/diacritics: é→e, ü→u, ç→c, etc.
@@ -116,14 +236,41 @@ impl FtsIndex {
         std::fs::create_dir_all(&fts_dir)?;
         let index_path = fts_dir.join("index.json");
 
-        let data = if index_path.exists() {
+        let mut data: IndexData = if index_path.exists() {
             let bytes = std::fs::read(&index_path)?;
             serde_json::from_slice(&bytes)?
         } else {
             IndexData::default()
         };
 
-        Ok(Self { index_path, data })
+        // Lazy migration: backfill total_term_count for indexes
+        // written before BM25 was added. New empty indexes also have
+        // total_term_count == 0 but docs is empty, so this is safe.
+        if data.total_term_count == 0 && !data.docs.is_empty() {
+            data.total_term_count = data.docs.values().map(|d| d.total_terms as u64).sum();
+        }
+
+        Ok(Self {
+            index_path,
+            data,
+            batched: false,
+            dirty: false,
+        })
+    }
+
+    /// Switch the index into batched mode (no per-mutation persist).
+    /// The caller is then responsible for invoking `flush()` periodically.
+    pub fn set_batched(&mut self, batched: bool) {
+        self.batched = batched;
+    }
+
+    /// Persist the index if it has unwritten changes. No-op otherwise.
+    pub fn flush(&mut self) -> Result<()> {
+        if self.dirty {
+            self.persist()?;
+            self.dirty = false;
+        }
+        Ok(())
     }
 
     pub fn index_document(&mut self, bucket: &str, key: &str, text: &str) -> Result<()> {
@@ -162,6 +309,16 @@ impl FtsIndex {
                 .push(posting);
         }
 
+        // Maintain total_term_count cache for BM25 avgdl: subtract old
+        // entry (if re-indexing) before inserting the new one.
+        if let Some(prev) = self.data.docs.get(&doc_id) {
+            self.data.total_term_count = self
+                .data
+                .total_term_count
+                .saturating_sub(prev.total_terms as u64);
+        }
+        self.data.total_term_count += total_terms as u64;
+
         // Store doc info
         self.data.docs.insert(
             doc_id,
@@ -172,15 +329,28 @@ impl FtsIndex {
             },
         );
 
-        self.persist()?;
+        self.dirty = true;
+        if !self.batched {
+            self.persist()?;
+            self.dirty = false;
+        }
         Ok(())
     }
 
     pub fn remove_document(&mut self, bucket: &str, key: &str) -> Result<()> {
         let doc_id = make_doc_id(bucket, key);
         self.remove_postings(&doc_id);
-        self.data.docs.remove(&doc_id);
-        self.persist()?;
+        if let Some(removed) = self.data.docs.remove(&doc_id) {
+            self.data.total_term_count = self
+                .data
+                .total_term_count
+                .saturating_sub(removed.total_terms as u64);
+        }
+        self.dirty = true;
+        if !self.batched {
+            self.persist()?;
+            self.dirty = false;
+        }
         Ok(())
     }
 
@@ -209,12 +379,13 @@ impl FtsIndex {
         }
 
         let total_docs = self.data.docs.len() as f64;
+        let avgdl = (self.data.total_term_count as f64 / total_docs).max(1.0);
         let mut scores: HashMap<String, f64> = HashMap::new();
 
         for term in &query_terms {
             if let Some(postings) = self.data.postings.get(term) {
                 let docs_with_term = postings.len() as f64;
-                let idf = (total_docs / docs_with_term).ln() + 1.0;
+                let idf = bm25_idf(total_docs, docs_with_term);
 
                 for posting in postings {
                     // Optionally filter by bucket
@@ -227,8 +398,10 @@ impl FtsIndex {
                     }
 
                     if let Some(doc_info) = self.data.docs.get(&posting.doc_id) {
-                        let tf = posting.frequency as f64 / doc_info.total_terms as f64;
-                        *scores.entry(posting.doc_id.clone()).or_insert(0.0) += tf * idf;
+                        let dl = doc_info.total_terms as f64;
+                        let f = posting.frequency as f64;
+                        *scores.entry(posting.doc_id.clone()).or_insert(0.0) +=
+                            bm25_score(f, dl, avgdl, idf);
                     }
                 }
             }
@@ -271,13 +444,15 @@ struct DocPosting {
 }
 
 /// In-memory inverted index for full-text search on collection documents.
-/// Indexes specified string fields using TF-IDF scoring.
+/// Indexes specified string fields using BM25 scoring.
 pub struct CollectionTextIndex {
     fields: Vec<String>,
     /// term → list of postings
     postings: HashMap<String, Vec<DocPosting>>,
     /// doc_id → total indexed terms count
     doc_term_counts: HashMap<DocumentId, u32>,
+    /// Sum of all per-doc term counts; cached for BM25 avgdl.
+    total_term_count: u64,
 }
 
 pub struct DocSearchResult {
@@ -291,6 +466,7 @@ impl CollectionTextIndex {
             fields,
             postings: HashMap::new(),
             doc_term_counts: HashMap::new(),
+            total_term_count: 0,
         }
     }
 
@@ -346,13 +522,16 @@ impl CollectionTextIndex {
         }
 
         self.doc_term_counts.insert(doc_id, total_terms);
+        self.total_term_count += total_terms as u64;
     }
 
     /// Remove a document from the index.
     pub fn remove_doc(&mut self, doc_id: DocumentId) {
-        if self.doc_term_counts.remove(&doc_id).is_none() {
-            return; // not indexed
-        }
+        let removed_terms = match self.doc_term_counts.remove(&doc_id) {
+            Some(n) => n,
+            None => return, // not indexed
+        };
+        self.total_term_count = self.total_term_count.saturating_sub(removed_terms as u64);
         let mut empty_terms = Vec::new();
         for (term, postings) in self.postings.iter_mut() {
             postings.retain(|p| p.doc_id != doc_id);
@@ -365,7 +544,7 @@ impl CollectionTextIndex {
         }
     }
 
-    /// Search the index. Returns doc_ids with TF-IDF scores, sorted by score descending.
+    /// Search the index. Returns doc_ids with BM25 scores, sorted by score descending.
     pub fn search(&self, query: &str, limit: usize) -> Vec<DocSearchResult> {
         let query_terms = tokenize(query);
         if query_terms.is_empty() || self.doc_term_counts.is_empty() {
@@ -373,17 +552,20 @@ impl CollectionTextIndex {
         }
 
         let total_docs = self.doc_term_counts.len() as f64;
+        let avgdl = (self.total_term_count as f64 / total_docs).max(1.0);
         let mut scores: HashMap<DocumentId, f64> = HashMap::new();
 
         for term in &query_terms {
             if let Some(postings) = self.postings.get(term) {
                 let docs_with_term = postings.len() as f64;
-                let idf = (total_docs / docs_with_term).ln() + 1.0;
+                let idf = bm25_idf(total_docs, docs_with_term);
 
                 for posting in postings {
                     if let Some(&total_terms) = self.doc_term_counts.get(&posting.doc_id) {
-                        let tf = posting.frequency as f64 / total_terms as f64;
-                        *scores.entry(posting.doc_id).or_insert(0.0) += tf * idf;
+                        let dl = total_terms as f64;
+                        let f = posting.frequency as f64;
+                        *scores.entry(posting.doc_id).or_insert(0.0) +=
+                            bm25_score(f, dl, avgdl, idf);
                     }
                 }
             }
@@ -403,7 +585,186 @@ impl CollectionTextIndex {
     pub fn clear(&mut self) {
         self.postings.clear();
         self.doc_term_counts.clear();
+        self.total_term_count = 0;
     }
+}
+
+/// Single highlighted snippet of source text. Words that match the
+/// query (after the same tokenization pipeline) are wrapped in
+/// `<open_tag>...</close_tag>`; surrounding text is preserved verbatim.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HighlightSnippet {
+    /// The snippet itself, with matched terms wrapped in the tags.
+    pub text: String,
+    /// Number of distinct query terms matched in this snippet.
+    pub matched_terms: usize,
+    /// Byte offset of the snippet within the original text.
+    pub offset: usize,
+}
+
+/// Generate highlighted snippets from `text` for terms in `query`.
+///
+/// The query and text are tokenized through the same pipeline used by
+/// the index (lowercase → strip accents → stop words → stem), so a
+/// query for "kitaplar" will highlight "kitap", "kitaplarda", etc. when
+/// the configured stemmer is Turkish.
+///
+/// Returns up to `max_snippets` snippets, each at most `snippet_chars`
+/// long, ordered by descending match density. Tags default to `<mark>`
+/// / `</mark>` when called via `highlight()`.
+pub fn highlight(text: &str, query: &str, snippet_chars: usize, max_snippets: usize) -> Vec<HighlightSnippet> {
+    highlight_with_tags(text, query, snippet_chars, max_snippets, "<mark>", "</mark>")
+}
+
+pub fn highlight_with_tags(
+    text: &str,
+    query: &str,
+    snippet_chars: usize,
+    max_snippets: usize,
+    open_tag: &str,
+    close_tag: &str,
+) -> Vec<HighlightSnippet> {
+    use std::collections::HashSet;
+
+    let query_stems: HashSet<String> = tokenize(query).into_iter().collect();
+    if query_stems.is_empty() || max_snippets == 0 || snippet_chars == 0 {
+        return Vec::new();
+    }
+
+    // Walk the original text, identify word spans (byte ranges), and
+    // mark each one as a hit if its stemmed form is in query_stems.
+    // We walk char-by-char to keep byte offsets correct for multibyte
+    // text (e.g. Turkish ş, ğ).
+    struct Span {
+        start: usize,
+        end: usize,
+        is_hit: bool,
+    }
+    let mut spans: Vec<Span> = Vec::new();
+    let mut cur_start: Option<usize> = None;
+    let mut bytes_seen = 0usize;
+    for (idx, ch) in text.char_indices() {
+        bytes_seen = idx + ch.len_utf8();
+        if ch.is_alphanumeric() {
+            if cur_start.is_none() {
+                cur_start = Some(idx);
+            }
+        } else if let Some(start) = cur_start.take() {
+            let end = idx;
+            let word = &text[start..end];
+            let is_hit = if word.chars().count() > 1 && !is_stop_word(&strip_accents(&word.to_lowercase())) {
+                let stemmed = stem(&strip_accents(&word.to_lowercase()));
+                query_stems.contains(&stemmed)
+            } else {
+                false
+            };
+            spans.push(Span { start, end, is_hit });
+        }
+    }
+    if let Some(start) = cur_start {
+        let end = bytes_seen;
+        let word = &text[start..end];
+        let is_hit = if word.chars().count() > 1 && !is_stop_word(&strip_accents(&word.to_lowercase())) {
+            let stemmed = stem(&strip_accents(&word.to_lowercase()));
+            query_stems.contains(&stemmed)
+        } else {
+            false
+        };
+        spans.push(Span { start, end, is_hit });
+    }
+
+    // Find hit positions; bail if no matches.
+    let hit_indices: Vec<usize> = spans
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_hit)
+        .map(|(i, _)| i)
+        .collect();
+    if hit_indices.is_empty() {
+        return Vec::new();
+    }
+
+    // Build snippets: anchor a window on each hit, expanding by chars
+    // before/after, deduping overlapping windows by greedy merge.
+    let half = snippet_chars / 2;
+    let mut windows: Vec<(usize, usize)> = Vec::new();
+    for &hi in &hit_indices {
+        let span = &spans[hi];
+        let win_start = span.start.saturating_sub(half);
+        // Snap to char boundary
+        let win_start = snap_left(text, win_start);
+        let win_end = (span.end + half).min(text.len());
+        let win_end = snap_right(text, win_end);
+        windows.push((win_start, win_end));
+    }
+    windows.sort_by_key(|w| w.0);
+
+    // Merge overlapping windows
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for w in windows {
+        match merged.last_mut() {
+            Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+            _ => merged.push(w),
+        }
+    }
+
+    // Render each window with hits wrapped in tags.
+    let mut snippets: Vec<HighlightSnippet> = Vec::new();
+    for (ws, we) in merged.iter() {
+        let mut out = String::with_capacity(we - ws + 16);
+        let mut cursor = *ws;
+        let mut matched: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for span in spans.iter() {
+            if span.end <= *ws || span.start >= *we {
+                continue;
+            }
+            // Push gap before this span
+            if span.start > cursor {
+                out.push_str(&text[cursor..span.start]);
+            }
+            let span_start = span.start.max(*ws);
+            let span_end = span.end.min(*we);
+            if span.is_hit {
+                out.push_str(open_tag);
+                out.push_str(&text[span_start..span_end]);
+                out.push_str(close_tag);
+                matched.insert(text[span_start..span_end].to_lowercase());
+            } else {
+                out.push_str(&text[span_start..span_end]);
+            }
+            cursor = span_end;
+        }
+        // Push tail gap inside window
+        if cursor < *we {
+            out.push_str(&text[cursor..*we]);
+        }
+        snippets.push(HighlightSnippet {
+            text: out,
+            matched_terms: matched.len(),
+            offset: *ws,
+        });
+    }
+
+    // Order by match density (more matches first), then by position.
+    snippets.sort_by(|a, b| {
+        b.matched_terms.cmp(&a.matched_terms).then(a.offset.cmp(&b.offset))
+    });
+    snippets.truncate(max_snippets);
+    snippets
+}
+
+fn snap_left(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn snap_right(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 /// Resolve a dotted field path in a JSON value.
@@ -978,5 +1339,273 @@ startxref
         assert!(tokens.iter().any(|t| t.contains("gune")));
         assert!(tokens.iter().any(|t| t.contains("cicek")));
         assert!(tokens.iter().any(|t| t.contains("sehir")));
+    }
+
+    // -----------------------------------------------------------------------
+    // BM25-specific behavior
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bm25_length_normalization_short_doc_wins() {
+        // Same TF (=1), different doc length → shorter doc ranks higher.
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        idx.index_doc(1, &serde_json::json!({"text": "rust language"}));
+        idx.index_doc(
+            2,
+            &serde_json::json!({
+                "text": "rust language one many programming languages used widely \
+                         across many domains applications including systems web \
+                         embedded performance reliability"
+            }),
+        );
+
+        let results = idx.search("rust", 10);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].doc_id, 1, "shorter doc should rank higher under BM25");
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[test]
+    fn bm25_tf_saturates() {
+        // Doubling TF must NOT double the score — BM25 saturates via k1.
+        // Both docs have the same length so length normalization is neutral.
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        idx.index_doc(
+            1,
+            &serde_json::json!({"text": "rust alpha beta gamma delta epsilon zeta eta theta"}),
+        );
+        idx.index_doc(
+            2,
+            &serde_json::json!({"text": "rust rust rust rust rust rust rust rust rust"}),
+        );
+        // corpus padding so IDF is non-trivial
+        for i in 3..=10 {
+            idx.index_doc(i, &serde_json::json!({"text": format!("filler{} content", i)}));
+        }
+
+        let r = idx.search("rust", 10);
+        let s1 = r.iter().find(|x| x.doc_id == 1).unwrap().score;
+        let s2 = r.iter().find(|x| x.doc_id == 2).unwrap().score;
+
+        assert!(s2 > s1, "more TF should still rank higher");
+        // 9× TF must yield clearly less than 9× score
+        assert!(
+            s2 < s1 * 9.0,
+            "BM25 should saturate, not scale linearly: s1={s1} s2={s2}"
+        );
+    }
+
+    #[test]
+    fn bm25_avgdl_maintained_across_index_remove_reindex() {
+        // Stress the total_term_count cache: index, remove, re-index,
+        // then verify search still works and ranks correctly.
+        let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
+        idx.index_doc(1, &serde_json::json!({"text": "rust language guide"}));
+        idx.index_doc(2, &serde_json::json!({"text": "go language guide"}));
+        idx.remove_doc(1);
+        idx.index_doc(1, &serde_json::json!({"text": "rust performance optimization manual"}));
+
+        // Cache must equal the sum of remaining doc lengths.
+        let expected: u64 = idx.doc_term_counts.values().map(|&n| n as u64).sum();
+        assert_eq!(idx.total_term_count, expected);
+
+        let r = idx.search("rust", 10);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].doc_id, 1);
+        assert!(r[0].score > 0.0);
+    }
+
+    #[test]
+    fn fts_config_parses_k1() {
+        assert_eq!(parse_k1(None), BM25_K1_DEFAULT);
+        assert_eq!(parse_k1(Some("1.5")), 1.5);
+        assert_eq!(parse_k1(Some("2.0")), 2.0);
+        // Invalid: non-numeric, zero, negative, infinity → falls back to default
+        assert_eq!(parse_k1(Some("nope")), BM25_K1_DEFAULT);
+        assert_eq!(parse_k1(Some("0")), BM25_K1_DEFAULT);
+        assert_eq!(parse_k1(Some("-1")), BM25_K1_DEFAULT);
+        assert_eq!(parse_k1(Some("inf")), BM25_K1_DEFAULT);
+    }
+
+    #[test]
+    fn fts_config_parses_b() {
+        assert_eq!(parse_b(None), BM25_B_DEFAULT);
+        assert_eq!(parse_b(Some("0.0")), 0.0);
+        assert_eq!(parse_b(Some("0.5")), 0.5);
+        assert_eq!(parse_b(Some("1.0")), 1.0);
+        // Out of [0, 1] range → falls back
+        assert_eq!(parse_b(Some("1.5")), BM25_B_DEFAULT);
+        assert_eq!(parse_b(Some("-0.1")), BM25_B_DEFAULT);
+        assert_eq!(parse_b(Some("nope")), BM25_B_DEFAULT);
+    }
+
+    #[test]
+    fn fts_config_parses_lang() {
+        use rust_stemmers::Algorithm;
+        // Default → English
+        assert!(matches!(parse_lang(None), Algorithm::English));
+        assert!(matches!(parse_lang(Some("")), Algorithm::English));
+        assert!(matches!(parse_lang(Some("nonsense")), Algorithm::English));
+        // Turkish aliases
+        assert!(matches!(parse_lang(Some("tr")), Algorithm::Turkish));
+        assert!(matches!(parse_lang(Some("TR")), Algorithm::Turkish));
+        assert!(matches!(parse_lang(Some("turkish")), Algorithm::Turkish));
+        assert!(matches!(parse_lang(Some("Turkish")), Algorithm::Turkish));
+        assert!(matches!(parse_lang(Some("  TUR  ")), Algorithm::Turkish));
+        // A few other languages
+        assert!(matches!(parse_lang(Some("de")), Algorithm::German));
+        assert!(matches!(parse_lang(Some("fr")), Algorithm::French));
+        assert!(matches!(parse_lang(Some("ar")), Algorithm::Arabic));
+    }
+
+    #[test]
+    fn turkish_stemmer_collapses_inflections() {
+        // Verify that the Turkish stemmer is wired up correctly. We bypass
+        // the global OnceLock-cached stemmer (which may already be set to
+        // English in this test process) and call the algorithm directly.
+        use rust_stemmers::{Algorithm, Stemmer};
+        let tr = Stemmer::create(Algorithm::Turkish);
+        // "kitap" (book) and its inflections should collapse to a common stem.
+        let s_kitap = tr.stem("kitap").to_string();
+        let s_kitaplar = tr.stem("kitaplar").to_string(); // books
+        let s_kitabi = tr.stem("kitabı").to_string(); // his/her book
+        let s_kitaplarda = tr.stem("kitaplarda").to_string(); // in the books
+        // At minimum, kitap and kitaplar should match.
+        assert_eq!(s_kitap, s_kitaplar);
+        // The "-da/-de" locative variant should also collapse.
+        assert_eq!(s_kitap, s_kitaplarda);
+        // Inflected genitive form starts from the root prefix.
+        assert!(
+            s_kitabi.starts_with("kit"),
+            "expected kitabı to stem near 'kit*', got {s_kitabi}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Highlighting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn highlight_basic_match() {
+        let text = "Rust is a systems programming language focused on safety";
+        let snippets = highlight(text, "programming", 60, 3);
+        assert_eq!(snippets.len(), 1);
+        assert!(snippets[0].text.contains("<mark>programming</mark>"));
+        assert_eq!(snippets[0].matched_terms, 1);
+    }
+
+    #[test]
+    fn highlight_no_match_returns_empty() {
+        let text = "Rust is a systems programming language";
+        let snippets = highlight(text, "javascript", 60, 3);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn highlight_uses_same_tokenization_as_index() {
+        // Searching for "running" must find "run" / "runs" via stemming.
+        let text = "the server runs every night";
+        let snippets = highlight(text, "running", 60, 3);
+        assert_eq!(snippets.len(), 1);
+        assert!(snippets[0].text.contains("<mark>runs</mark>"));
+    }
+
+    #[test]
+    fn highlight_multiple_distinct_terms() {
+        let text = "OxiDB supports rust programming and database engineering";
+        let snippets = highlight(text, "rust database", 80, 3);
+        assert_eq!(snippets.len(), 1);
+        assert!(snippets[0].text.contains("<mark>rust</mark>"));
+        assert!(snippets[0].text.contains("<mark>database</mark>"));
+        assert_eq!(snippets[0].matched_terms, 2);
+    }
+
+    #[test]
+    fn highlight_overlapping_windows_merge() {
+        // Two hits within the snippet window should produce one merged
+        // snippet, not two separate snippets that overlap.
+        let text = "alpha beta gamma rust delta epsilon zeta rust eta theta";
+        let snippets = highlight(text, "rust", 60, 5);
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0].text.matches("<mark>rust</mark>").count(), 2);
+    }
+
+    #[test]
+    fn highlight_custom_tags() {
+        let text = "Rust is fast";
+        let snippets = highlight_with_tags(text, "rust", 30, 1, "[", "]");
+        assert_eq!(snippets.len(), 1);
+        assert!(snippets[0].text.contains("[Rust]"));
+        assert!(!snippets[0].text.contains("<mark>"));
+    }
+
+    #[test]
+    fn highlight_preserves_original_casing() {
+        // Match comes via lowercase+stem tokenization, but the emitted
+        // snippet should keep the original characters intact.
+        let text = "The Rust Programming Language is great";
+        let snippets = highlight(text, "programming", 80, 3);
+        assert_eq!(snippets.len(), 1);
+        assert!(
+            snippets[0].text.contains("<mark>Programming</mark>"),
+            "expected original casing 'Programming' to be wrapped, got: {}",
+            snippets[0].text
+        );
+    }
+
+    #[test]
+    fn highlight_handles_multibyte_boundaries() {
+        // Make sure char-boundary snapping does not panic on Unicode text
+        // even when the snippet window edges fall mid-character.
+        let text = "Türkçe metin içinde rust kelimesi geçiyor ş ğ ç ü ö";
+        let snippets = highlight(text, "rust", 5, 1);
+        assert_eq!(snippets.len(), 1);
+        assert!(snippets[0].text.contains("<mark>rust</mark>"));
+    }
+
+    #[test]
+    fn highlight_empty_query_returns_empty() {
+        let snippets = highlight("any text", "", 60, 3);
+        assert!(snippets.is_empty());
+        let snippets = highlight("any text", "  ", 60, 3);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn highlight_zero_max_returns_empty() {
+        let snippets = highlight("rust is fast", "rust", 60, 0);
+        assert!(snippets.is_empty());
+    }
+
+    #[test]
+    fn bm25_persistence_backfills_total_term_count_on_load() {
+        // Simulate an old index file that predates the total_term_count
+        // field (serialized with 0 because of #[serde(default)]).
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut idx = FtsIndex::open(dir.path()).unwrap();
+            idx.index_document("docs", "a.txt", "rust performance database engine")
+                .unwrap();
+            idx.index_document("docs", "b.txt", "go programming language")
+                .unwrap();
+        }
+
+        // Manually clobber total_term_count in the persisted JSON to 0
+        // to simulate a pre-BM25 index.
+        let path = dir.path().join("_fts").join("index.json");
+        let bytes = std::fs::read(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["total_term_count"] = serde_json::json!(0u64);
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        // Reopening should rebuild the cache from existing doc info.
+        let idx = FtsIndex::open(dir.path()).unwrap();
+        assert!(
+            idx.data.total_term_count > 0,
+            "old index should be backfilled on open"
+        );
+        let r = idx.search(None, "rust", 10);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].score > 0.0);
     }
 }

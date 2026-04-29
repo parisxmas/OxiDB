@@ -1,0 +1,1050 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OxiDB FTS Demo · ftstests</title>
+  <style>
+    :root {
+      --bg: #fafaf7;
+      --panel: #ffffff;
+      --border: #e6e3da;
+      --ink: #1a1a18;
+      --ink-soft: #6b6b66;
+      --accent: #b25e00;
+      --mark: #fff2a8;
+      --score: #1f7a4d;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; }
+    body {
+      font: 15px/1.5 ui-sans-serif, -apple-system, "SF Pro Text", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      min-height: 100vh;
+    }
+    header {
+      padding: 24px 32px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    header h1 {
+      margin: 0;
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    header .sub {
+      color: var(--ink-soft);
+      font-size: 13px;
+      margin-top: 4px;
+    }
+    main {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 24px 24px 80px;
+    }
+    .search-row {
+      display: flex;
+      gap: 8px;
+      align-items: stretch;
+      margin-bottom: 12px;
+    }
+    .search-row input[type="text"] {
+      flex: 1;
+      min-width: 0;
+      padding: 12px 14px;
+      font: inherit;
+      font-size: 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--ink);
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+    .search-row input[type="text"]:focus {
+      border-color: var(--accent);
+    }
+    .search-row button {
+      padding: 0 18px;
+      font: inherit;
+      font-weight: 600;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: filter 0.15s ease;
+    }
+    .search-row button:hover { filter: brightness(1.1); }
+    .search-row button:disabled { opacity: 0.5; cursor: wait; }
+
+    .controls {
+      display: flex;
+      gap: 16px;
+      align-items: center;
+      flex-wrap: wrap;
+      color: var(--ink-soft);
+      font-size: 13px;
+      margin-bottom: 24px;
+    }
+    .controls label { display: inline-flex; align-items: center; gap: 6px; }
+    .controls select, .controls input[type="number"] {
+      font: inherit;
+      padding: 4px 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--ink);
+    }
+    .examples {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 20px;
+    }
+    .examples .chip {
+      font-size: 12px;
+      padding: 4px 10px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      cursor: pointer;
+      color: var(--ink-soft);
+    }
+    .examples .chip:hover { color: var(--accent); border-color: var(--accent); }
+
+    .meta {
+      font-size: 13px;
+      color: var(--ink-soft);
+      margin-bottom: 12px;
+    }
+
+    .result {
+      padding: 14px 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 10px;
+    }
+    .result h3 {
+      margin: 0 0 6px;
+      font-size: 14px;
+      font-weight: 600;
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+    }
+    .result .key { color: var(--ink); }
+    .result .score {
+      color: var(--score);
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .result .snippet {
+      font-size: 14px;
+      line-height: 1.55;
+      color: var(--ink);
+      margin: 6px 0 0;
+      padding-left: 8px;
+      border-left: 2px solid var(--border);
+    }
+    .result .snippet + .snippet { margin-top: 6px; }
+    mark { background: var(--mark); color: var(--ink); padding: 0 2px; border-radius: 2px; }
+
+    .empty, .error {
+      padding: 32px 16px;
+      text-align: center;
+      color: var(--ink-soft);
+      font-size: 14px;
+    }
+    .error { color: #a83232; }
+
+    /* Upload panel */
+    .upload {
+      margin: 0 0 24px;
+      padding: 14px 16px;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .upload.drag {
+      border-color: var(--accent);
+      background: #fff5e8;
+    }
+    .upload-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .upload-row label.pick {
+      padding: 8px 14px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .upload-row label.pick:hover { border-color: var(--accent); }
+    .upload-row .picked {
+      flex: 1;
+      min-width: 200px;
+      font-size: 13px;
+      color: var(--ink-soft);
+    }
+    .upload-row button {
+      padding: 8px 14px;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .upload-row button:disabled { opacity: 0.5; cursor: wait; }
+    .upload-status {
+      margin-top: 8px;
+      font-size: 13px;
+      color: var(--ink-soft);
+    }
+    .upload-status.ok { color: var(--score); }
+    .upload-status.err { color: #a83232; }
+    .upload-hint {
+      font-size: 11px;
+      color: var(--ink-soft);
+      margin-top: 4px;
+    }
+
+    /* Result cards become clickable */
+    .result {
+      cursor: pointer;
+      transition: border-color 0.12s ease, transform 0.12s ease;
+    }
+    .result:hover {
+      border-color: var(--accent);
+    }
+    .result:active {
+      transform: scale(0.998);
+    }
+
+    /* Modal viewer */
+    .viewer-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(20, 20, 18, 0.55);
+      display: none;
+      align-items: stretch;
+      justify-content: center;
+      z-index: 100;
+    }
+    .viewer-backdrop.open { display: flex; }
+    .viewer {
+      width: min(1100px, 92vw);
+      height: 92vh;
+      margin: 4vh auto;
+      background: var(--panel);
+      border-radius: 10px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .viewer-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .viewer-title {
+      font-size: 14px;
+      font-weight: 600;
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .viewer-head .meta {
+      font-size: 12px;
+      color: var(--ink-soft);
+      font-weight: 400;
+      margin-left: 8px;
+    }
+    .viewer-tabs {
+      display: flex;
+      gap: 4px;
+    }
+    .viewer-tabs button {
+      padding: 4px 10px;
+      font: inherit;
+      font-size: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--ink-soft);
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .viewer-tabs button.active {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: #fff5e8;
+    }
+    .viewer-close {
+      padding: 4px 10px;
+      font: inherit;
+      font-size: 14px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      border-radius: 6px;
+      cursor: pointer;
+      color: var(--ink-soft);
+    }
+    .viewer-close:hover { color: var(--accent); border-color: var(--accent); }
+    .viewer-body {
+      flex: 1;
+      overflow: auto;
+      background: #f3f1eb;
+    }
+    .viewer-body iframe {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #fff;
+    }
+    .viewer-body .docx,
+    .viewer-body .text-pre,
+    .viewer-body .xlsx {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 24px;
+      background: #fff;
+      min-height: 100%;
+      box-shadow: 0 0 0 1px var(--border);
+    }
+    .viewer-body .text-pre {
+      white-space: pre-wrap;
+      font: 13px/1.55 ui-monospace, "SF Mono", Menlo, monospace;
+    }
+    .viewer-body .xlsx table {
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    .viewer-body .xlsx td, .viewer-body .xlsx th {
+      border: 1px solid var(--border);
+      padding: 4px 8px;
+      vertical-align: top;
+    }
+    .viewer-body .docx p { margin: 0 0 0.6em; }
+    .viewer-body .docx h1, .viewer-body .docx h2, .viewer-body .docx h3 {
+      margin: 1.2em 0 0.4em;
+    }
+    .viewer-loading {
+      padding: 40px;
+      text-align: center;
+      color: var(--ink-soft);
+    }
+    .viewer-error {
+      padding: 40px;
+      text-align: center;
+      color: #a83232;
+    }
+
+    /* Find-in-doc toolbar */
+    .findbar {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      padding: 8px 16px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+    }
+    .findbar.hidden { display: none; }
+    .findbar input {
+      flex: 1;
+      max-width: 320px;
+      padding: 5px 10px;
+      font: inherit;
+      font-size: 13px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      outline: none;
+    }
+    .findbar input:focus { border-color: var(--accent); }
+    .findbar button {
+      padding: 4px 10px;
+      font: inherit;
+      font-size: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--ink);
+      border-radius: 6px;
+      cursor: pointer;
+      min-width: 28px;
+    }
+    .findbar button:hover { border-color: var(--accent); color: var(--accent); }
+    .findbar button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .findbar .count {
+      color: var(--ink-soft);
+      font-variant-numeric: tabular-nums;
+      min-width: 64px;
+      text-align: right;
+    }
+    .findbar a.dl {
+      margin-left: auto;
+      padding: 4px 10px;
+      font-size: 12px;
+      color: var(--ink-soft);
+      text-decoration: none;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .findbar a.dl:hover { color: var(--accent); border-color: var(--accent); }
+
+    /* Highlight markers inside the viewer body */
+    .viewer-body .vm {
+      background: #fff2a8;
+      border-radius: 2px;
+      padding: 0 1px;
+    }
+    .viewer-body .vm.current {
+      background: #ff9a3c;
+      color: #fff;
+      box-shadow: 0 0 0 2px rgba(255, 154, 60, 0.35);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OxiDB FTS Demo</h1>
+    <div class="sub">
+      <span id="docCount">…</span> documents indexed
+      <span style="color:var(--ink-soft)"> · Alice · Pride and Prejudice · Sherlock Holmes + your uploads · BM25 over a blob index.</span>
+    </div>
+  </header>
+
+  <main>
+    <form class="search-row" id="form">
+      <input id="q" type="text" placeholder="Search… (try Holmes, Darcy, rabbit)" autocomplete="off" autofocus />
+      <button id="go" type="submit">Search</button>
+    </form>
+
+    <div class="controls">
+      <label><input type="checkbox" id="hl" checked /> highlight</label>
+      <label>limit
+        <input type="number" id="limit" min="1" max="50" value="10" style="width: 64px" />
+      </label>
+      <span id="status" style="margin-left:auto"></span>
+    </div>
+
+    <div class="examples" id="examples">
+      <span class="chip" data-q="Holmes">Holmes</span>
+      <span class="chip" data-q="Watson">Watson</span>
+      <span class="chip" data-q="Baker Street">Baker Street</span>
+      <span class="chip" data-q="Darcy">Darcy</span>
+      <span class="chip" data-q="Bingley">Bingley</span>
+      <span class="chip" data-q="Elizabeth marriage">Elizabeth marriage</span>
+      <span class="chip" data-q="Cheshire">Cheshire</span>
+      <span class="chip" data-q="rabbit">rabbit</span>
+      <span class="chip" data-q="Queen Hearts">Queen Hearts</span>
+    </div>
+
+    <div class="upload" id="dropZone">
+      <div class="upload-row">
+        <label class="pick" for="files">Choose files…</label>
+        <input id="files" type="file" multiple accept=".pdf,.docx,.xlsx,.txt,.html,.htm,.xml,.json,.md,.csv" style="display:none" />
+        <span class="picked" id="picked">no files selected · drag &amp; drop here too</span>
+        <button id="upload" type="button" disabled>Upload</button>
+      </div>
+      <div class="upload-status" id="uploadStatus"></div>
+      <div class="upload-hint">PDF, DOCX, XLSX, TXT, HTML, XML, JSON, CSV, MD · max 5 MB / file · indexed asynchronously, searchable in ~1&nbsp;s</div>
+    </div>
+
+    <div id="results"></div>
+  </main>
+
+  <div class="viewer-backdrop" id="viewerBackdrop" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="viewer">
+      <div class="viewer-head">
+        <div class="viewer-title" id="viewerTitle">—</div>
+        <div class="viewer-tabs">
+          <button id="tabRendered" class="active" type="button">Rendered</button>
+          <button id="tabText" type="button">Extracted text</button>
+        </div>
+        <a class="viewer-close" id="downloadLink" download style="text-decoration:none">Download</a>
+        <button class="viewer-close" id="viewerClose" type="button" aria-label="Close">✕</button>
+      </div>
+      <div class="findbar hidden" id="findbar">
+        <input id="findInput" type="text" placeholder="Find in document… (⌘F)" />
+        <button id="findPrev" type="button" title="Previous match (Shift-Enter)">↑</button>
+        <button id="findNext" type="button" title="Next match (Enter)">↓</button>
+        <span class="count" id="findCount">0 / 0</span>
+        <span style="margin-left:auto;font-size:12px;color:var(--ink-soft)">match highlighting · Esc to close</span>
+      </div>
+      <div class="viewer-body" id="viewerBody"></div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById("form");
+    const qEl = document.getElementById("q");
+    const goBtn = document.getElementById("go");
+    const hlEl = document.getElementById("hl");
+    const limitEl = document.getElementById("limit");
+    const statusEl = document.getElementById("status");
+    const resultsEl = document.getElementById("results");
+
+    document.querySelectorAll(".chip").forEach((c) => {
+      c.addEventListener("click", () => {
+        qEl.value = c.dataset.q;
+        form.requestSubmit();
+      });
+    });
+
+    // -------------------------------------------------------------
+    // Header stats
+    // -------------------------------------------------------------
+    const docCountEl = document.getElementById("docCount");
+
+    async function refreshDocCount() {
+      try {
+        const r = await fetch("/api/stats", { cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const { count } = await r.json();
+        docCountEl.textContent = count.toLocaleString();
+      } catch (e) {
+        docCountEl.textContent = "?";
+      }
+    }
+    refreshDocCount();
+
+    // -------------------------------------------------------------
+    // Upload panel
+    // -------------------------------------------------------------
+    const filesEl = document.getElementById("files");
+    const pickedEl = document.getElementById("picked");
+    const uploadBtn = document.getElementById("upload");
+    const uploadStatus = document.getElementById("uploadStatus");
+    const dropZone = document.getElementById("dropZone");
+
+    let pendingFiles = [];
+
+    function setPending(fs) {
+      pendingFiles = Array.from(fs || []);
+      if (pendingFiles.length === 0) {
+        pickedEl.textContent = "no files selected · drag & drop here too";
+        uploadBtn.disabled = true;
+      } else {
+        const total = pendingFiles.reduce((n, f) => n + f.size, 0);
+        pickedEl.textContent = `${pendingFiles.length} file${pendingFiles.length === 1 ? "" : "s"} · ${humanSize(total)}`;
+        uploadBtn.disabled = false;
+      }
+    }
+
+    filesEl.addEventListener("change", () => setPending(filesEl.files));
+
+    // Drag & drop
+    ["dragenter", "dragover"].forEach((ev) => {
+      dropZone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        dropZone.classList.add("drag");
+      });
+    });
+    ["dragleave", "drop"].forEach((ev) => {
+      dropZone.addEventListener(ev, (e) => {
+        e.preventDefault();
+        dropZone.classList.remove("drag");
+      });
+    });
+    dropZone.addEventListener("drop", (e) => {
+      if (e.dataTransfer?.files?.length) setPending(e.dataTransfer.files);
+    });
+
+    uploadBtn.addEventListener("click", async () => {
+      if (!pendingFiles.length) return;
+      uploadBtn.disabled = true;
+      uploadStatus.classList.remove("ok", "err");
+
+      const total = pendingFiles.length;
+      let ok = 0, failed = 0;
+      const failures = [];
+      for (let i = 0; i < pendingFiles.length; i++) {
+        const f = pendingFiles[i];
+        uploadStatus.textContent = `Uploading ${i + 1}/${total} · ${f.name}`;
+        try {
+          const r = await fetch("/api/upload/" + encodeURIComponent(f.name), {
+            method: "PUT",
+            headers: { "Content-Type": f.type || "application/octet-stream" },
+            body: f,
+          });
+          if (!r.ok) {
+            const err = await r.json().catch(() => ({}));
+            throw new Error(err.error || `HTTP ${r.status}`);
+          }
+          ok++;
+        } catch (err) {
+          failed++;
+          failures.push(`${f.name}: ${err.message || err}`);
+        }
+      }
+
+      if (failed === 0) {
+        uploadStatus.classList.add("ok");
+        uploadStatus.textContent = `Uploaded ${ok}/${total} — indexing in background, searchable in ~1 s.`;
+      } else {
+        uploadStatus.classList.add("err");
+        uploadStatus.textContent = `${ok}/${total} succeeded · ${failed} failed: ${failures.slice(0, 3).join("; ")}`;
+      }
+      // Reset the picker so the user can drop another batch.
+      filesEl.value = "";
+      setPending([]);
+      // Refresh the header count so new uploads are visible immediately.
+      if (ok > 0) refreshDocCount();
+    });
+
+    function humanSize(n) {
+      if (n < 1024) return `${n} B`;
+      if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+      if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+      return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+    }
+
+    // -------------------------------------------------------------
+    // Document viewer
+    // -------------------------------------------------------------
+    const viewerBackdrop = document.getElementById("viewerBackdrop");
+    const viewerTitle = document.getElementById("viewerTitle");
+    const viewerBody = document.getElementById("viewerBody");
+    const viewerClose = document.getElementById("viewerClose");
+    const tabRendered = document.getElementById("tabRendered");
+    const tabText = document.getElementById("tabText");
+    const findbar = document.getElementById("findbar");
+    const findInput = document.getElementById("findInput");
+    const findPrev = document.getElementById("findPrev");
+    const findNext = document.getElementById("findNext");
+    const findCount = document.getElementById("findCount");
+    const downloadLink = document.getElementById("downloadLink");
+
+    let currentKey = null;
+    let currentMode = "rendered";
+    let matches = [];      // array of <span class="vm"> nodes
+    let matchCursor = -1;  // index into matches
+
+    viewerClose.addEventListener("click", closeViewer);
+    viewerBackdrop.addEventListener("click", (e) => {
+      if (e.target === viewerBackdrop) closeViewer();
+    });
+    document.addEventListener("keydown", (e) => {
+      const open = viewerBackdrop.classList.contains("open");
+      if (open && e.key === "Escape") return closeViewer();
+      if (open && (e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault();
+        findInput.focus();
+        findInput.select();
+      }
+    });
+    tabRendered.addEventListener("click", () => {
+      if (currentKey) renderViewerTab("rendered");
+    });
+    tabText.addEventListener("click", () => {
+      if (currentKey) renderViewerTab("text");
+    });
+
+    findInput.addEventListener("input", () => applyFind(findInput.value));
+    findInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        if (e.shiftKey) gotoMatch(matchCursor - 1);
+        else gotoMatch(matchCursor + 1);
+      }
+    });
+    findPrev.addEventListener("click", () => gotoMatch(matchCursor - 1));
+    findNext.addEventListener("click", () => gotoMatch(matchCursor + 1));
+
+    function openViewer(key) {
+      currentKey = key;
+      viewerTitle.textContent = key;
+      viewerBackdrop.classList.add("open");
+      viewerBackdrop.setAttribute("aria-hidden", "false");
+      downloadLink.href = `/api/blob/${encodeURIComponent(key)}`;
+      downloadLink.setAttribute("download", key);
+      // Pre-fill the find box with the current search query.
+      findInput.value = qEl.value.trim();
+      renderViewerTab("rendered");
+    }
+
+    function closeViewer() {
+      viewerBackdrop.classList.remove("open");
+      viewerBackdrop.setAttribute("aria-hidden", "true");
+      viewerBody.innerHTML = "";
+      currentKey = null;
+      matches = [];
+      matchCursor = -1;
+      updateFindCount();
+    }
+
+    function setTab(active) {
+      [tabRendered, tabText].forEach((b) => b.classList.remove("active"));
+      (active === "rendered" ? tabRendered : tabText).classList.add("active");
+    }
+
+    async function renderViewerTab(mode) {
+      currentMode = mode;
+      setTab(mode);
+      // Clear existing match state — about to re-render the body.
+      matches = [];
+      matchCursor = -1;
+      updateFindCount();
+      viewerBody.innerHTML = `<div class="viewer-loading">Loading ${escapeText(currentKey)}…</div>`;
+      try {
+        if (mode === "text") {
+          await renderExtractedText(currentKey);
+        } else {
+          await renderByExtension(currentKey);
+        }
+      } catch (e) {
+        viewerBody.innerHTML = `<div class="viewer-error">Failed to render: ${escapeText(e.message || String(e))}</div>`;
+        findbar.classList.add("hidden");
+        return;
+      }
+      // After render, decide whether find is even meaningful (PDF and
+      // sandboxed HTML iframes have their own search UIs).
+      const isIframe = viewerBody.querySelector("iframe");
+      if (isIframe) {
+        findbar.classList.add("hidden");
+      } else {
+        findbar.classList.remove("hidden");
+        applyFind(findInput.value);
+      }
+    }
+
+    async function renderExtractedText(key) {
+      const r = await fetch(`/api/text/${encodeURIComponent(key)}`);
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || `HTTP ${r.status}`);
+      }
+      const { text } = await r.json();
+      const pre = document.createElement("pre");
+      pre.className = "text-pre";
+      pre.textContent = text || "(empty)";
+      const wrap = document.createElement("div");
+      wrap.style.background = "#fff";
+      wrap.style.minHeight = "100%";
+      wrap.appendChild(pre);
+      viewerBody.replaceChildren(wrap);
+    }
+
+    async function renderByExtension(key) {
+      const ext = key.toLowerCase().split(".").pop();
+      const blobUrl = `/api/blob/${encodeURIComponent(key)}`;
+      const q = qEl.value.trim();
+
+      switch (ext) {
+        case "pdf": {
+          // Native browser PDF viewer. `#search=` triggers the built-in
+          // find UI (Chrome) and opens the search panel preloaded with
+          // the user's query. Other browsers fall back to no auto-find.
+          const frag = q ? `#search=${encodeURIComponent(q)}` : "#view=FitH";
+          viewerBody.innerHTML = `<iframe src="${blobUrl}${frag}" title="PDF: ${escapeText(key)}"></iframe>`;
+          return;
+        }
+
+        case "docx":
+          await renderDocx(blobUrl);
+          return;
+
+        case "xlsx":
+          await renderXlsx(blobUrl);
+          return;
+
+        case "html":
+        case "htm": {
+          const r = await fetch(blobUrl);
+          const html = await r.text();
+          // Sandboxed iframe so untrusted HTML cannot run scripts or
+          // read this origin's storage.
+          const iframe = document.createElement("iframe");
+          iframe.setAttribute("sandbox", "");
+          iframe.srcdoc = html;
+          viewerBody.replaceChildren(iframe);
+          return;
+        }
+
+        case "txt":
+        case "md":
+        case "json":
+        case "xml":
+        case "csv":
+        case "log": {
+          const r = await fetch(blobUrl);
+          const text = await r.text();
+          const pre = document.createElement("pre");
+          pre.className = "text-pre";
+          pre.textContent = text;
+          viewerBody.replaceChildren(pre);
+          return;
+        }
+
+        default:
+          // Unknown format → fall back to extracted text.
+          await renderExtractedText(key);
+      }
+    }
+
+    // CDN-loaded vendor libs, loaded once on first use.
+    const VENDOR = {
+      mammoth: "https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js",
+      xlsx: "https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js",
+    };
+    const _loaded = new Map();
+    function loadScript(url) {
+      if (_loaded.has(url)) return _loaded.get(url);
+      const p = new Promise((resolve, reject) => {
+        const s = document.createElement("script");
+        s.src = url;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error(`failed to load ${url}`));
+        document.head.appendChild(s);
+      });
+      _loaded.set(url, p);
+      return p;
+    }
+
+    async function renderDocx(blobUrl) {
+      await loadScript(VENDOR.mammoth);
+      const r = await fetch(blobUrl);
+      const buf = await r.arrayBuffer();
+      const result = await window.mammoth.convertToHtml({ arrayBuffer: buf });
+      const wrap = document.createElement("div");
+      wrap.className = "docx";
+      wrap.innerHTML = result.value || "<i>(empty)</i>";
+      viewerBody.replaceChildren(wrap);
+    }
+
+    async function renderXlsx(blobUrl) {
+      await loadScript(VENDOR.xlsx);
+      const r = await fetch(blobUrl);
+      const buf = await r.arrayBuffer();
+      const wb = window.XLSX.read(new Uint8Array(buf), { type: "array" });
+      const wrap = document.createElement("div");
+      wrap.className = "xlsx";
+      wb.SheetNames.forEach((name) => {
+        const sheet = wb.Sheets[name];
+        const heading = document.createElement("h3");
+        heading.textContent = name;
+        heading.style.cssText = "margin:1em 0 0.4em;font-size:14px;color:var(--ink-soft);";
+        const table = document.createElement("div");
+        table.innerHTML = window.XLSX.utils.sheet_to_html(sheet);
+        wrap.appendChild(heading);
+        wrap.appendChild(table);
+      });
+      viewerBody.replaceChildren(wrap);
+    }
+
+    // -------------------------------------------------------------
+    // In-document find / highlight
+    // -------------------------------------------------------------
+    function escapeRegex(s) {
+      return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+
+    // Walk text nodes inside `root`, ignoring SCRIPT/STYLE and any
+    // existing match wrappers.
+    function* walkTextNodes(root) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          const p = node.parentElement;
+          if (!p) return NodeFilter.FILTER_REJECT;
+          const tag = p.tagName;
+          if (tag === "SCRIPT" || tag === "STYLE") return NodeFilter.FILTER_REJECT;
+          if (p.classList && p.classList.contains("vm")) return NodeFilter.FILTER_REJECT;
+          if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      const list = [];
+      let n;
+      while ((n = walker.nextNode())) list.push(n);
+      yield* list;
+    }
+
+    function clearMatches() {
+      // Replace each <span class="vm"> with its text node, then merge
+      // adjacent text nodes via normalize().
+      viewerBody.querySelectorAll("span.vm").forEach((s) => {
+        s.replaceWith(document.createTextNode(s.textContent));
+      });
+      viewerBody.normalize();
+      matches = [];
+      matchCursor = -1;
+    }
+
+    function applyFind(query) {
+      clearMatches();
+      const q = (query || "").trim();
+      if (!q) {
+        updateFindCount();
+        return;
+      }
+      // Tokenize on whitespace; ignore single-letter tokens to keep
+      // results readable for queries like "Baker Street".
+      const terms = q.split(/\s+/).filter((t) => t.length > 1);
+      if (!terms.length) {
+        updateFindCount();
+        return;
+      }
+      const pattern = new RegExp(`(${terms.map(escapeRegex).join("|")})`, "gi");
+      for (const node of walkTextNodes(viewerBody)) {
+        const text = node.nodeValue;
+        pattern.lastIndex = 0;
+        if (!pattern.test(text)) continue;
+        pattern.lastIndex = 0;
+        const frag = document.createDocumentFragment();
+        let last = 0;
+        let m;
+        while ((m = pattern.exec(text))) {
+          if (m.index > last) frag.appendChild(document.createTextNode(text.slice(last, m.index)));
+          const span = document.createElement("span");
+          span.className = "vm";
+          span.textContent = m[0];
+          matches.push(span);
+          frag.appendChild(span);
+          last = m.index + m[0].length;
+        }
+        if (last < text.length) frag.appendChild(document.createTextNode(text.slice(last)));
+        node.parentNode.replaceChild(frag, node);
+      }
+      if (matches.length) gotoMatch(0, /*scroll*/ false);
+      updateFindCount();
+    }
+
+    function gotoMatch(idx, scroll = true) {
+      if (!matches.length) return;
+      // Wrap around at boundaries.
+      if (idx < 0) idx = matches.length - 1;
+      if (idx >= matches.length) idx = 0;
+      if (matchCursor >= 0 && matches[matchCursor]) {
+        matches[matchCursor].classList.remove("current");
+      }
+      matchCursor = idx;
+      const target = matches[matchCursor];
+      target.classList.add("current");
+      if (scroll) {
+        target.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+      updateFindCount();
+    }
+
+    function updateFindCount() {
+      const n = matches.length;
+      if (n === 0) {
+        findCount.textContent = "0 / 0";
+        findPrev.disabled = true;
+        findNext.disabled = true;
+      } else {
+        findCount.textContent = `${matchCursor + 1} / ${n}`;
+        findPrev.disabled = false;
+        findNext.disabled = false;
+      }
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const query = qEl.value.trim();
+      if (!query) return;
+      const highlight = hlEl.checked;
+      const limit = Math.max(1, Math.min(50, parseInt(limitEl.value || "10", 10)));
+
+      goBtn.disabled = true;
+      statusEl.textContent = "searching…";
+      const t0 = performance.now();
+      try {
+        const r = await fetch("/api/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, limit, highlight }),
+        });
+        const dt = Math.round(performance.now() - t0);
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          renderError(err.error || `HTTP ${r.status}`);
+          statusEl.textContent = `${dt} ms · error`;
+          return;
+        }
+        const { results } = await r.json();
+        statusEl.textContent = `${results.length} hit${results.length === 1 ? "" : "s"} · ${dt} ms`;
+        render(query, results);
+      } catch (err) {
+        renderError(err.message || String(err));
+        statusEl.textContent = "error";
+      } finally {
+        goBtn.disabled = false;
+      }
+    });
+
+    function escapeText(s) {
+      return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    // Server already returns snippets with literal "<mark>" tags. We
+    // escape everything else but reinstate <mark> after escaping.
+    function renderSnippet(snippet) {
+      return escapeText(snippet)
+        .replace(/&lt;mark&gt;/g, "<mark>")
+        .replace(/&lt;\/mark&gt;/g, "</mark>");
+    }
+
+    function bookOf(key) {
+      if (key.startsWith("alice_")) return "Alice in Wonderland";
+      if (key.startsWith("pride_")) return "Pride and Prejudice";
+      if (key.startsWith("sherlock_")) return "Sherlock Holmes";
+      return key;
+    }
+
+    function render(query, results) {
+      if (!results.length) {
+        resultsEl.innerHTML = `<div class="empty">No hits for <b>${escapeText(query)}</b>. Try a different word, or check the index has finished loading.</div>`;
+        return;
+      }
+      resultsEl.innerHTML = results
+        .map((r) => {
+          const score = (r.score ?? 0).toFixed(3);
+          const snippets = (r.highlights || []).map(
+            (s) => `<div class="snippet">…${renderSnippet(s)}…</div>`,
+          );
+          return `
+            <article class="result" data-key="${escapeText(r.key)}">
+              <h3>
+                <span class="key">${escapeText(r.key)} <span style="color:var(--ink-soft);font-weight:400">· ${escapeText(bookOf(r.key))}</span></span>
+                <span class="score">score ${score}</span>
+              </h3>
+              ${snippets.join("")}
+            </article>
+          `;
+        })
+        .join("");
+      // Click → open viewer
+      resultsEl.querySelectorAll(".result").forEach((el) => {
+        el.addEventListener("click", () => openViewer(el.dataset.key));
+      });
+    }
+
+    function renderError(msg) {
+      resultsEl.innerHTML = `<div class="error">${escapeText(msg)}</div>`;
+    }
+  </script>
+</body>
+</html>

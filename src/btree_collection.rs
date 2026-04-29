@@ -1849,6 +1849,67 @@ impl BTreeCollection {
         Ok(docs)
     }
 
+    /// Full-text search with `<mark>...</mark>` highlighted snippets.
+    /// See `Collection::text_search_highlighted` for the response shape.
+    pub fn text_search_highlighted(
+        &self,
+        query: &str,
+        limit: usize,
+        snippet_chars: usize,
+        max_snippets: usize,
+    ) -> Result<Vec<Value>> {
+        let ti = self.text_index.read();
+        let idx = ti.as_ref().ok_or_else(|| {
+            Error::InvalidQuery(
+                "no text index on this collection; create one with create_text_index".into(),
+            )
+        })?;
+
+        let indexed_fields: Vec<String> = idx.fields().to_vec();
+        let search_results = idx.search(query, limit);
+        let mut docs = Vec::with_capacity(search_results.len());
+        for result in search_results {
+            if let Some(mut doc) = self.read_doc(result.doc_id)? {
+                let mut highlights = serde_json::Map::new();
+                if max_snippets > 0 && snippet_chars > 0 {
+                    for field in &indexed_fields {
+                        for text in crate::collection::collect_field_strings(&doc, field) {
+                            let snippets = crate::fts::highlight(
+                                &text,
+                                query,
+                                snippet_chars,
+                                max_snippets,
+                            );
+                            if !snippets.is_empty() {
+                                let arr: Vec<Value> = snippets
+                                    .into_iter()
+                                    .map(|s| Value::String(s.text))
+                                    .collect();
+                                highlights
+                                    .entry(field.clone())
+                                    .or_insert_with(|| Value::Array(Vec::new()))
+                                    .as_array_mut()
+                                    .unwrap()
+                                    .extend(arr);
+                            }
+                        }
+                    }
+                }
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.insert("_score".to_string(), serde_json::json!(result.score));
+                    if !highlights.is_empty() {
+                        obj.insert(
+                            "_highlights".to_string(),
+                            Value::Object(highlights),
+                        );
+                    }
+                }
+                docs.push(doc);
+            }
+        }
+        Ok(docs)
+    }
+
     // -----------------------------------------------------------------------
     // Vector search
     // -----------------------------------------------------------------------
@@ -2940,5 +3001,68 @@ mod tests {
             let col = BTreeCollection::open("wal_cp", dir.path(), None).unwrap();
             assert_eq!(col.count(), 20);
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Full-text search (highlighted)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn text_search_highlighted_marks_matching_terms() {
+        let col = new_btree_collection("hl_test");
+        col.create_text_index(vec!["title".to_string(), "body".to_string()])
+            .unwrap();
+        col.insert(json!({
+            "title": "Rust Programming Guide",
+            "body": "An introduction to systems programming with rust and safety guarantees"
+        }))
+        .unwrap();
+        col.insert(json!({
+            "title": "Go in Action",
+            "body": "Concurrency primitives in the go programming language"
+        }))
+        .unwrap();
+
+        let results = col
+            .text_search_highlighted("rust", 10, 80, 3)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        let hl = results[0].get("_highlights").expect("missing _highlights");
+        let hl_obj = hl.as_object().unwrap();
+
+        // The match is in "title" and "body" — at least one should highlight.
+        let any_marked = hl_obj.values().any(|v| {
+            v.as_array()
+                .map(|arr| arr.iter().any(|s| s.as_str().unwrap_or("").contains("<mark>")))
+                .unwrap_or(false)
+        });
+        assert!(any_marked, "expected at least one snippet with <mark> tag, got: {hl:?}");
+
+        // The doc body still has its original fields.
+        assert_eq!(results[0]["title"], json!("Rust Programming Guide"));
+        assert!(results[0]["_score"].as_f64().unwrap() > 0.0);
+    }
+
+    #[test]
+    fn text_search_highlighted_omits_highlights_when_max_zero() {
+        let col = new_btree_collection("hl_zero");
+        col.create_text_index(vec!["body".to_string()]).unwrap();
+        col.insert(json!({"body": "rust is great"})).unwrap();
+
+        let results = col.text_search_highlighted("rust", 10, 80, 0).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].get("_highlights").is_none());
+        assert!(results[0].get("_score").is_some());
+    }
+
+    #[test]
+    fn text_search_highlighted_no_match_no_highlights_field() {
+        let col = new_btree_collection("hl_none");
+        col.create_text_index(vec!["body".to_string()]).unwrap();
+        col.insert(json!({"body": "rust is great"})).unwrap();
+
+        // The query stems to a different word, so no hits.
+        let results = col.text_search_highlighted("python", 10, 80, 3).unwrap();
+        assert_eq!(results.len(), 0);
     }
 }

@@ -459,7 +459,29 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10) as usize;
-            match db.text_search(col, query, limit) {
+
+            // Optional highlight: client passes
+            //   { "highlight": true } for defaults, or
+            //   { "highlight": { "snippet_chars": 80, "max_snippets": 3 } }
+            let highlight_cfg = request.get("highlight").and_then(|h| {
+                if h.as_bool() == Some(true) {
+                    Some((80usize, 3usize))
+                } else if let Some(obj) = h.as_object() {
+                    let snippet_chars =
+                        obj.get("snippet_chars").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
+                    let max_snippets =
+                        obj.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+                    Some((snippet_chars, max_snippets))
+                } else {
+                    None
+                }
+            });
+
+            let result = match highlight_cfg {
+                Some((sc, ms)) => db.text_search_highlighted(col, query, limit, sc, ms),
+                None => db.text_search(col, query, limit),
+            };
+            match result {
                 Ok(results) => ok_bytes(json!(results)),
                 Err(e) => err_bytes(&e.to_string()),
             }
@@ -690,7 +712,30 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10) as usize;
-            match db.search(bucket, query, limit) {
+
+            // Optional highlight: `{ "highlight": true }` for defaults, or
+            // `{ "highlight": { "snippet_chars": N, "max_snippets": M } }`.
+            // Note: extracting text from PDFs/DOCX is expensive, so the
+            // caller pays only when they ask for highlights.
+            let highlight_cfg = request.get("highlight").and_then(|h| {
+                if h.as_bool() == Some(true) {
+                    Some((80usize, 3usize))
+                } else if let Some(obj) = h.as_object() {
+                    let snippet_chars =
+                        obj.get("snippet_chars").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
+                    let max_snippets =
+                        obj.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+                    Some((snippet_chars, max_snippets))
+                } else {
+                    None
+                }
+            });
+
+            let result = match highlight_cfg {
+                Some((sc, ms)) => db.search_highlighted(bucket, query, limit, sc, ms),
+                None => db.search(bucket, query, limit),
+            };
+            match result {
                 Ok(results) => ok_bytes(json!(results)),
                 Err(e) => err_bytes(&e.to_string()),
             }

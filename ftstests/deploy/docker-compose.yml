@@ -1,0 +1,54 @@
+# Docker Compose for the oxidbftsdemo.baltavista.com deployment.
+# Images are built and shipped from the developer's machine via
+# `docker save`/`docker load` — this file just consumes them by name.
+
+name: oxidb-ftsdemo
+
+services:
+  oxidb:
+    image: oxidb-ftsdemo-oxidb:latest
+    restart: unless-stopped
+    environment:
+      OXIDB_ADDR: 0.0.0.0:14888
+      OXIDB_DATA: /data
+      OXIDB_POOL_SIZE: "8"
+      OXIDB_IDLE_TIMEOUT: "0"
+      # FTS pipeline tuning — multi-worker extract + batched persist.
+      OXIDB_FTS_WORKERS: "4"
+      OXIDB_FTS_FLUSH_INTERVAL_MS: "500"
+      # English default; change to "tr" later if Turkish content shows up.
+      OXIDB_FTS_LANG: "english"
+    volumes:
+      - ftsdemo-data:/data
+    networks:
+      - ftsdemo
+    expose:
+      - "14888"
+
+  web:
+    image: oxidb-ftsdemo-web:latest
+    restart: unless-stopped
+    depends_on:
+      - oxidb
+    environment:
+      OXIDB_HOST: oxidb
+      OXIDB_PORT: "14888"
+      WEB_PORT: "8765"
+      # Bind on all interfaces inside the container so the host's
+      # docker-proxy on 127.0.0.1:8765 can reach the listener.
+      WEB_BIND: "0.0.0.0"
+    volumes:
+      # Mount data so the seed marker (.seeded) persists across restarts.
+      - ftsdemo-data:/data
+    ports:
+      - "127.0.0.1:8765:8765"
+    networks:
+      - ftsdemo
+
+networks:
+  ftsdemo:
+    driver: bridge
+
+volumes:
+  ftsdemo-data:
+    name: oxidb-ftsdemo-data

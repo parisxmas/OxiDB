@@ -79,6 +79,11 @@ docker compose up -d
 | `OXIDB_GELF_COLLECTION` | `_gelf_logs` | Collection name for GELF log ingestion |
 | `OXIDB_ALERT_INTERVAL` | `15` | Alert evaluator check interval in seconds |
 | `OXIDB_LOG_COMMANDS` | `false` | Log OxiMem/MQTT commands |
+| `OXIDB_FTS_LANG` | `english` | Snowball stemmer language: `english`, `turkish`/`tr`, `german`, `french`, `spanish`, `italian`, `portuguese`, `russian`, `dutch`, `danish`, `finnish`, `hungarian`, `norwegian`, `romanian`, `greek`, `arabic`, `swedish`, `tamil` |
+| `OXIDB_FTS_K1` | `1.2` | BM25 term-frequency saturation (>0). Matches Lucene/Elasticsearch default |
+| `OXIDB_FTS_B` | `0.75` | BM25 length normalization (0–1). 0 = ignore document length, 1 = full normalization |
+| `OXIDB_FTS_WORKERS` | `1` | Number of FTS extract+index worker threads (one per core for heavy PDF/DOCX ingestion) |
+| `OXIDB_FTS_FLUSH_INTERVAL_MS` | `1000` | How often the FTS index file is fsynced; batches per-document writes to amortize disk I/O |
 
 ## Features
 
@@ -86,7 +91,7 @@ docker compose up -d
 - **Document database** — JSON documents, no schema required, collections auto-created on insert
 - **JSON-based queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$regex`, `$elemMatch`, `$all`, `$size`, `$not`, `$type`, `$mod`, `$and`, `$or`, `$nor`, `$expr`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
-- **Aggregation pipeline** — 11 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`, `$out`; index-accelerated `$group` for count, sum, min, max, avg
+- **Aggregation pipeline** — 12 stages: `$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`, `$out`, `$dateHistogram`; index-accelerated `$group` for count, sum, min, max, avg; accumulators include `$sum`, `$avg`, `$min`, `$max`, `$count`, `$first`, `$last`, `$push`, `$addToSet`, `$percentile`
 - **Indexes** — field, unique, composite, full-text, vector, and TTL indexes with automatic backfill; list and drop support
 - **TTL indexes** — automatic document expiration on any datetime field; `create_ttl_index` with configurable `expireAfterSeconds`; index-accelerated eviction via background thread
 - **Vector search** — k-nearest-neighbor similarity search with cosine, Euclidean, and dot product metrics; flat (exact) for small collections, HNSW (approximate) for large; optional GPU acceleration via wgpu compute shaders (Metal/Vulkan/DX12, `--features gpu`)
@@ -99,7 +104,7 @@ docker compose up -d
 - **MQTT v3.1.1** — publish/subscribe messaging with cross-protocol bridging to OxiMem pub/sub channels
 - **Hash sharding** — OxiPool proxy with CRC32 hash routing, scatter-gather queries, per-collection shard keys, and cross-shard transaction detection
 - **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
-- **Full-text search** — automatic text extraction from 10+ formats (HTML, XML, PDF, DOCX, XLSX, images via OCR), TF-IDF ranked search with Porter2 stemming, Turkish/English stop words, and Unicode accent normalization
+- **Full-text search** — automatic text extraction from 10+ formats (HTML, XML, PDF, DOCX, XLSX, images via OCR), **BM25 ranking** (Lucene/Elasticsearch-compatible, tunable `k1`/`b`), Snowball stemming for **18 languages** (English, Turkish, German, French, Spanish, Italian, Portuguese, Russian, Dutch, Danish, Finnish, Hungarian, Norwegian, Romanian, Greek, Arabic, Swedish, Tamil), Turkish/English stop words, Unicode accent normalization, **`<mark>` highlighted snippets** (per-field for collections, on-demand re-extract for blobs), **async multi-worker extract** (`OXIDB_FTS_WORKERS`) for high-volume PDF/DOCX ingestion, and **batched index persist** (`OXIDB_FTS_FLUSH_INTERVAL_MS`) to amortize disk writes
 - **Raft replication** — multi-node cluster via OpenRaft with automatic leader election, HAProxy-compatible health checks, and sub-second failover
 - **Change streams** — real-time `watch`/`unwatch` with collection filtering, backpressure handling, and token-based resume
 - **JSONB binary storage** — compact binary format for faster serialization; backward-compatible with existing JSON data files

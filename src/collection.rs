@@ -34,6 +34,27 @@ pub fn resolve_field_in_value<'a>(data: &'a Value, path: &str) -> Option<&'a Val
     Some(current)
 }
 
+/// Collect all string values at the given field path. Mirrors the
+/// extraction logic used by `CollectionTextIndex` so highlighting runs
+/// against exactly the same source text the index was built from.
+pub(crate) fn collect_field_strings(data: &Value, path: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(val) = resolve_field_in_value(data, path) {
+        match val {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(arr) => {
+                for item in arr {
+                    if let Value::String(s) = item {
+                        out.push(s.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Metadata about an index on a collection.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexInfo {
@@ -990,6 +1011,66 @@ impl Collection {
             if let Some(mut doc) = self.read_doc(result.doc_id)? {
                 if let Some(obj) = doc.as_object_mut() {
                     obj.insert("_score".to_string(), serde_json::json!(result.score));
+                }
+                docs.push(doc);
+            }
+        }
+        Ok(docs)
+    }
+
+    /// Full-text search with `<mark>...</mark>` highlighted snippets.
+    ///
+    /// Each result includes a `_highlights` map of `{ field: [snippet, ...] }`
+    /// covering only the indexed text fields where the query matched.
+    /// `snippet_chars` is the target window length and `max_snippets` caps
+    /// the snippet count per field. Pass 0 for `max_snippets` to disable
+    /// highlights (equivalent to `text_search`).
+    pub fn text_search_highlighted(
+        &self,
+        query: &str,
+        limit: usize,
+        snippet_chars: usize,
+        max_snippets: usize,
+    ) -> Result<Vec<Value>> {
+        let idx = self.text_index.as_ref().ok_or_else(|| {
+            Error::InvalidQuery("no text index on this collection; create one with create_text_index".into())
+        })?;
+
+        let indexed_fields: Vec<String> = idx.fields().to_vec();
+        let search_results = idx.search(query, limit);
+        let mut docs = Vec::with_capacity(search_results.len());
+        for result in search_results {
+            if let Some(mut doc) = self.read_doc(result.doc_id)? {
+                let mut highlights = serde_json::Map::new();
+                if max_snippets > 0 && snippet_chars > 0 {
+                    for field in &indexed_fields {
+                        for text in collect_field_strings(&doc, field) {
+                            let snippets = crate::fts::highlight(
+                                &text,
+                                query,
+                                snippet_chars,
+                                max_snippets,
+                            );
+                            if !snippets.is_empty() {
+                                let arr: Vec<Value> = snippets
+                                    .into_iter()
+                                    .map(|s| Value::String(s.text))
+                                    .collect();
+                                highlights
+                                    .entry(field.clone())
+                                    .or_insert_with(|| Value::Array(Vec::new()))
+                                    .as_array_mut()
+                                    .unwrap()
+                                    .extend(arr);
+                            }
+                        }
+                    }
+                }
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.insert("_score".to_string(), serde_json::json!(result.score));
+                    if !highlights.is_empty() {
+                        obj.insert("_highlights".to_string(), Value::Object(highlights));
+                    }
                 }
                 docs.push(doc);
             }

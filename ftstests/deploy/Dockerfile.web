@@ -1,0 +1,27 @@
+# Web client container: stdlib-only Python proxy in front of OxiDB.
+# Build context must be the repo root so we can pull in python/oxidb.py
+# and the ftstests/ assets in one go.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Stdlib-only — no pip install needed. Copy just the files we serve.
+COPY python/oxidb.py /app/python/oxidb.py
+COPY ftstests/web.py        /app/ftstests/web.py
+COPY ftstests/index.html    /app/ftstests/index.html
+COPY ftstests/01_generate.py /app/ftstests/01_generate.py
+COPY ftstests/02_upload.py   /app/ftstests/02_upload.py
+COPY ftstests/data           /app/ftstests/data
+COPY ftstests/deploy/entrypoint-web.sh /app/entrypoint-web.sh
+
+RUN chmod +x /app/entrypoint-web.sh
+
+# Web binds to 8765 inside the container; docker-compose maps it to
+# 127.0.0.1:8765 on the host so only nginx can reach it.
+EXPOSE 8765
+
+ENV OXIDB_HOST=oxidb \
+    OXIDB_PORT=14888 \
+    WEB_PORT=8765
+
+ENTRYPOINT ["/app/entrypoint-web.sh"]

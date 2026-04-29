@@ -81,6 +81,105 @@ enum FtsJob {
     },
 }
 
+/// Round-robin dispatcher that fans FTS jobs out to N worker threads.
+/// Each worker has its own bounded channel; when one is full the next
+/// send tries the next worker. This parallelizes CPU-bound extract_text
+/// across cores.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct FtsDispatcher {
+    senders: Vec<mpsc::SyncSender<FtsJob>>,
+    counter: AtomicUsize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FtsDispatcher {
+    fn new(senders: Vec<mpsc::SyncSender<FtsJob>>) -> Self {
+        Self {
+            senders,
+            counter: AtomicUsize::new(0),
+        }
+    }
+
+    fn send(&self, job: FtsJob) -> std::result::Result<(), mpsc::SendError<FtsJob>> {
+        let n = self.senders.len();
+        // Try the next worker round-robin. If its channel is full,
+        // fall back to a blocking send to even out load.
+        let start = self.counter.fetch_add(1, Ordering::Relaxed) % n;
+        let mut current_job = job;
+        for i in 0..n {
+            let idx = (start + i) % n;
+            match self.senders[idx].try_send(current_job) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(j)) => current_job = j,
+                Err(mpsc::TrySendError::Disconnected(j)) => current_job = j,
+            }
+        }
+        // All workers backed up — block on the round-robin pick.
+        self.senders[start].send(current_job)
+    }
+}
+
+/// Read OXIDB_FTS_WORKERS / OXIDB_FTS_FLUSH_INTERVAL_MS env vars and
+/// spin up the worker pool + periodic flusher thread. Switches the
+/// FTS index into batched-persist mode so high-volume ingestion does
+/// not rewrite the whole index file on every document.
+#[cfg(not(target_arch = "wasm32"))]
+fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> FtsDispatcher {
+    let n_workers = std::env::var("OXIDB_FTS_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let flush_interval_ms = std::env::var("OXIDB_FTS_FLUSH_INTERVAL_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1000);
+
+    // Switch into batched mode so individual index_document calls
+    // don't each rewrite the whole _fts/index.json file.
+    fts_index.write().set_batched(true);
+
+    let mut senders = Vec::with_capacity(n_workers);
+    for _ in 0..n_workers {
+        let (tx, rx) = mpsc::sync_channel::<FtsJob>(256);
+        let fts_worker = Arc::clone(fts_index);
+        std::thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                match job {
+                    FtsJob::Index {
+                        data,
+                        content_type,
+                        bucket,
+                        key,
+                    } => {
+                        // CPU-bound extraction happens BEFORE the lock so
+                        // workers parallelize across cores.
+                        if let Some(text) = fts::extract_text(&data, &content_type) {
+                            let _ = fts_worker.write().index_document(&bucket, &key, &text);
+                        }
+                    }
+                    FtsJob::Remove { bucket, key } => {
+                        let _ = fts_worker.write().remove_document(&bucket, &key);
+                    }
+                }
+            }
+        });
+        senders.push(tx);
+    }
+
+    // Periodic flusher: writes the FTS index file at most once every
+    // flush_interval_ms regardless of how many docs were indexed.
+    if flush_interval_ms > 0 {
+        let flush_target = Arc::clone(fts_index);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(flush_interval_ms));
+            let _ = flush_target.write().flush();
+        });
+    }
+
+    FtsDispatcher::new(senders)
+}
+
 /// The main OxiDB engine. Manages multiple collections.
 pub struct OxiDb {
     data_dir: PathBuf,
@@ -90,7 +189,7 @@ pub struct OxiDb {
     #[cfg(not(target_arch = "wasm32"))]
     fts_index: Arc<RwLock<FtsIndex>>,
     #[cfg(not(target_arch = "wasm32"))]
-    fts_tx: mpsc::SyncSender<FtsJob>,
+    fts_tx: FtsDispatcher,
     #[cfg(not(target_arch = "wasm32"))]
     tx_log: TxCommitLog,
     next_tx_id: AtomicU64,
@@ -151,22 +250,7 @@ impl OxiDb {
         let fts_index = Arc::new(RwLock::new(FtsIndex::open(&tmp)?));
         let tx_log = TxCommitLog::open(&tmp)?;
 
-        let (fts_tx, fts_rx) = mpsc::sync_channel::<FtsJob>(256);
-        let fts_worker = Arc::clone(&fts_index);
-        std::thread::spawn(move || {
-            while let Ok(job) = fts_rx.recv() {
-                match job {
-                    FtsJob::Index { data, content_type, bucket, key } => {
-                        if let Some(text) = fts::extract_text(&data, &content_type) {
-                            let _ = fts_worker.write().index_document(&bucket, &key, &text);
-                        }
-                    }
-                    FtsJob::Remove { bucket, key } => {
-                        let _ = fts_worker.write().remove_document(&bucket, &key);
-                    }
-                }
-            }
-        });
+        let fts_tx = setup_fts_workers(&fts_index);
 
         Ok(Self {
             data_dir: tmp,
@@ -286,25 +370,10 @@ impl OxiDb {
             ));
         }
 
-        let (fts_tx, fts_rx) = mpsc::sync_channel::<FtsJob>(256);
-        let fts_worker = Arc::clone(&fts_index);
-        std::thread::spawn(move || {
-            while let Ok(job) = fts_rx.recv() {
-                match job {
-                    FtsJob::Index { data, content_type, bucket, key } => {
-                        if let Some(text) = fts::extract_text(&data, &content_type) {
-                            let _ = fts_worker.write().index_document(&bucket, &key, &text);
-                        }
-                    }
-                    FtsJob::Remove { bucket, key } => {
-                        let _ = fts_worker.write().remove_document(&bucket, &key);
-                    }
-                }
-            }
-        });
+        let fts_tx = setup_fts_workers(&fts_index);
 
         if verbose {
-            vlog("[verbose] FTS worker thread started");
+            vlog("[verbose] FTS worker threads started");
         }
 
         // After recovery, clear the commit log (all committed txns are now applied)
@@ -849,6 +918,18 @@ impl OxiDb {
         col.text_search(query, limit)
     }
 
+    pub fn text_search_highlighted(
+        &self,
+        collection: &str,
+        query: &str,
+        limit: usize,
+        snippet_chars: usize,
+        max_snippets: usize,
+    ) -> Result<Vec<Value>> {
+        let col = self.get_or_create_collection(collection)?;
+        col.text_search_highlighted(query, limit, snippet_chars, max_snippets)
+    }
+
     /// Set the GPU compute backend for accelerated vector search.
     #[cfg(feature = "gpu")]
     pub fn set_gpu(&self, gpu: Arc<crate::gpu::GpuCompute>) {
@@ -1345,6 +1426,61 @@ impl OxiDb {
                 })
             })
             .collect())
+    }
+
+    /// Blob FTS search with `<mark>...</mark>` highlighted snippets.
+    ///
+    /// For each hit, fetches the blob, re-extracts text via
+    /// `fts::extract_text()`, and produces snippets through `fts::highlight()`.
+    /// This is more expensive than `search()` because it re-extracts
+    /// each matched document — pass it only when the caller actually
+    /// wants snippets, and keep `limit` modest.
+    ///
+    /// Output shape per hit:
+    ///   { "bucket": "...", "key": "...", "score": ...,
+    ///     "highlights": ["...<mark>term</mark>...", ...] }
+    /// `highlights` is omitted when extraction fails or there are no matches.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn search_highlighted(
+        &self,
+        bucket: Option<&str>,
+        query: &str,
+        limit: usize,
+        snippet_chars: usize,
+        max_snippets: usize,
+    ) -> Result<Vec<Value>> {
+        let results = self.fts_index.read().search(bucket, query, limit);
+        let mut out = Vec::with_capacity(results.len());
+        for r in results {
+            let mut entry = json!({
+                "bucket": r.bucket,
+                "key": r.key,
+                "score": r.score,
+            });
+            if max_snippets > 0 && snippet_chars > 0 {
+                if let Ok((data, meta)) = self.blob_store.get_object(&r.bucket, &r.key) {
+                    if let Some(text) = crate::fts::extract_text(&data, &meta.content_type) {
+                        let snippets = crate::fts::highlight(
+                            &text,
+                            query,
+                            snippet_chars,
+                            max_snippets,
+                        );
+                        if !snippets.is_empty() {
+                            let arr: Vec<Value> = snippets
+                                .into_iter()
+                                .map(|s| Value::String(s.text))
+                                .collect();
+                            if let Some(obj) = entry.as_object_mut() {
+                                obj.insert("highlights".to_string(), Value::Array(arr));
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(entry);
+        }
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------

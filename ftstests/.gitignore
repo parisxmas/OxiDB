@@ -1,0 +1,5 @@
+# Runtime artifacts — should never be committed.
+server.log
+oxidb_data/
+__pycache__/
+*.pyc

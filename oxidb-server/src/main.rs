@@ -1161,6 +1161,7 @@ fn main() {
         .expect("OXIDB_ALERT_INTERVAL must be a valid u64 (seconds)");
     db.start_alert_evaluator(Duration::from_secs(alert_interval_secs));
     eprintln!("alert evaluator: enabled (interval={alert_interval_secs}s)");
+    eprintln!("{}", oxidb::fts::fts_config_summary());
 
     // GPU compute for vector search (optional, enabled with --features gpu)
     #[cfg(feature = "gpu")]

@@ -3,6 +3,7 @@ oxidb_data/
 .git/
 dotnet/
 python/
+!python/oxidb.py
 julia/
 go/
 ruby/
