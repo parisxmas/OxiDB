@@ -16,7 +16,10 @@ RUN mkdir -p oxidb-app/src-tauri/src && \
     echo '' > oxidb-app/src-tauri/src/lib.rs && \
     mkdir -p oxidb-wasm/src && \
     echo '[package]\nname = "oxidb-wasm"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxidb-wasm/Cargo.toml && \
-    echo '' > oxidb-wasm/src/lib.rs
+    echo '' > oxidb-wasm/src/lib.rs && \
+    mkdir -p oxidb-tail/src && \
+    echo '[package]\nname = "oxidb-tail"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxidb-tail/Cargo.toml && \
+    echo 'fn main() {}' > oxidb-tail/src/main.rs
 
 RUN cargo build --release --package oxidb-server --features cluster
 
