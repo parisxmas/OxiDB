@@ -436,11 +436,21 @@ impl OxiDb {
     }
 
     /// Create a new collection.
+    ///
+    /// Opens the collection (disk I/O) without holding the global write lock,
+    /// then takes the lock only to insert. Mirrors `get_or_create_collection`'s
+    /// concurrency pattern so parallel `create_collection` calls don't serialize.
     pub fn create_collection(&self, name: &str) -> Result<()> {
-        let mut cols = self.collections.write();
-        if cols.contains_key(name) {
-            return Err(Error::CollectionAlreadyExists(name.to_string()));
+        // Fast path: already exists.
+        {
+            let cols = self.collections.read();
+            if cols.contains_key(name) {
+                return Err(Error::CollectionAlreadyExists(name.to_string()));
+            }
         }
+
+        // Open without holding the write lock — concurrent creates of distinct
+        // collections proceed in parallel here.
         #[cfg(not(target_arch = "wasm32"))]
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
@@ -453,6 +463,13 @@ impl OxiDb {
             col.set_lazy_sync(true);
         }
         col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
+
+        // Acquire the write lock only to insert. Re-check existence to
+        // handle the race with another writer that won.
+        let mut cols = self.collections.write();
+        if cols.contains_key(name) {
+            return Err(Error::CollectionAlreadyExists(name.to_string()));
+        }
         cols.insert(name.to_string(), Arc::new(col));
         Ok(())
     }
