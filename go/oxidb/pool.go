@@ -6,6 +6,13 @@ import (
 	"time"
 )
 
+// pingTimeout bounds the liveness check on a pooled connection. Without a
+// deadline, Ping on a server-reaped TCP conn that didn't get a clean FIN
+// can hang for the OS keepalive interval (~2h on macOS/Linux). 2s is more
+// than enough RTT for healthy local/LAN deployments and small enough that
+// stale conns don't visibly stall application requests.
+const pingTimeout = 2 * time.Second
+
 // Pool is a connection pool for oxidb-server.
 // Goroutines check out connections with Get() and return them with Put().
 type Pool struct {
@@ -49,17 +56,7 @@ func (p *Pool) Get() (*Client, error) {
 	if !ok {
 		return nil, fmt.Errorf("oxidb pool: closed")
 	}
-	// Verify the connection is alive
-	if _, err := c.Ping(); err != nil {
-		c.Close()
-		// Create a fresh connection
-		fresh, err := Connect(p.host, p.port, p.timeout)
-		if err != nil {
-			return nil, fmt.Errorf("oxidb pool: reconnect: %w", err)
-		}
-		return fresh, nil
-	}
-	return c, nil
+	return p.checkout(c)
 }
 
 // GetTimeout checks out a connection with a timeout.
@@ -70,18 +67,29 @@ func (p *Pool) GetTimeout(d time.Duration) (*Client, error) {
 		if !ok {
 			return nil, fmt.Errorf("oxidb pool: closed")
 		}
-		if _, err := c.Ping(); err != nil {
-			c.Close()
-			fresh, err := Connect(p.host, p.port, p.timeout)
-			if err != nil {
-				return nil, fmt.Errorf("oxidb pool: reconnect: %w", err)
-			}
-			return fresh, nil
-		}
-		return c, nil
+		return p.checkout(c)
 	case <-time.After(d):
 		return nil, fmt.Errorf("oxidb pool: timeout waiting for connection")
 	}
+}
+
+// checkout verifies the conn is alive (bounded by pingTimeout) and returns
+// it, or transparently dials a fresh replacement if the conn was reaped by
+// the server. The deadline is cleared on success so subsequent operations
+// run without an inherited timeout.
+func (p *Pool) checkout(c *Client) (*Client, error) {
+	_ = c.SetDeadline(time.Now().Add(pingTimeout))
+	_, err := c.Ping()
+	if err == nil {
+		_ = c.SetDeadline(time.Time{})
+		return c, nil
+	}
+	c.Close()
+	fresh, derr := Connect(p.host, p.port, p.timeout)
+	if derr != nil {
+		return nil, fmt.Errorf("oxidb pool: reconnect: %w", derr)
+	}
+	return fresh, nil
 }
 
 // Put returns a connection to the pool.
