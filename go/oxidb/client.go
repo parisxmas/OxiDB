@@ -159,6 +159,33 @@ func (c *Client) Ping() (string, error) {
 	return s, nil
 }
 
+// BucketFTSSize returns the bytes of indexed text attributable to a single
+// blob bucket. Useful for per-tenant FTS storage accounting (DMS quota).
+// Result is approximate for indexes written before the per-doc text_bytes
+// field existed (server-side falls back to total_terms × estimate).
+func (c *Client) BucketFTSSize(bucket string) (uint64, error) {
+	data, err := c.checked(map[string]any{
+		"cmd":    "bucket_fts_size",
+		"bucket": bucket,
+	})
+	if err != nil {
+		return 0, err
+	}
+	m, ok := data.(map[string]any)
+	if !ok {
+		return 0, fmt.Errorf("oxidb: bucket_fts_size: unexpected response shape: %T", data)
+	}
+	switch v := m["bytes"].(type) {
+	case float64:
+		return uint64(v), nil
+	case int64:
+		return uint64(v), nil
+	case int:
+		return uint64(v), nil
+	}
+	return 0, fmt.Errorf("oxidb: bucket_fts_size: missing 'bytes' field in %v", m)
+}
+
 // ------------------------------------------------------------------
 // Collection management
 // ------------------------------------------------------------------

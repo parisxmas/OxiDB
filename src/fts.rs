@@ -22,6 +22,13 @@ struct DocInfo {
     bucket: String,
     key: String,
     total_terms: u32,
+    /// Byte length of the extracted text that was passed to index_document.
+    /// Used to attribute FTS storage cost per-bucket for tenant quota
+    /// reporting. Optional/default-0 so indexes written before this field
+    /// existed deserialize cleanly — they fall back to a term-count-based
+    /// estimate via FtsIndex::bucket_text_size.
+    #[serde(default)]
+    text_bytes: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -326,6 +333,7 @@ impl FtsIndex {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 total_terms,
+                text_bytes: text.len() as u64,
             },
         );
 
@@ -335,6 +343,31 @@ impl FtsIndex {
             self.dirty = false;
         }
         Ok(())
+    }
+
+    /// Returns the total bytes of extracted text indexed under `bucket`.
+    /// Powers per-tenant FTS quota accounting in DMS — sum is taken across
+    /// all docs whose `bucket` field matches.
+    ///
+    /// For DocInfo entries written before `text_bytes` existed (default
+    /// value 0), falls back to estimating bytes from `total_terms` × 6
+    /// (rough average word length post-tokenization). New writes carry
+    /// the exact byte count, so the estimate phases out as docs are
+    /// re-indexed.
+    pub fn bucket_text_size(&self, bucket: &str) -> u64 {
+        const ESTIMATED_BYTES_PER_TERM: u64 = 6;
+        self.data
+            .docs
+            .values()
+            .filter(|d| d.bucket == bucket)
+            .map(|d| {
+                if d.text_bytes > 0 {
+                    d.text_bytes
+                } else {
+                    d.total_terms as u64 * ESTIMATED_BYTES_PER_TERM
+                }
+            })
+            .sum()
     }
 
     pub fn remove_document(&mut self, bucket: &str, key: &str) -> Result<()> {
@@ -842,11 +875,103 @@ fn extract_docx(data: &[u8]) -> Option<String> {
 
 #[cfg(feature = "ocr")]
 fn extract_image_ocr(data: &[u8]) -> Option<String> {
-    let mut lt = leptess::LepTess::new(None, "eng").ok()?;
-    lt.set_image_from_mem(data).ok()?;
+    // Tesseract accepts a "+"-joined list of language codes
+    // (e.g. "eng+tur"), each backed by a `*.traineddata` file the
+    // image must ship. Env-overridable so operators don't need a
+    // recompile to add a language.
+    let langs = std::env::var("OXIDB_OCR_LANGS").unwrap_or_else(|_| "eng".to_string());
+    // Decode → grayscale → 2× upscale → Otsu binarize is a textbook
+    // win for messy phone-camera shots. After this Tesseract sees a
+    // clean B&W bitmap, which is exactly what its default PSM
+    // (single uniform block) is tuned for — so we don't need to
+    // poke `tessedit_pageseg_mode` here. Disable via
+    // OXIDB_OCR_PREPROCESS=0 if the raw image happens to OCR
+    // better (rare in practice).
+    let preprocess = std::env::var("OXIDB_OCR_PREPROCESS")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    let cooked = if preprocess { preprocess_for_ocr(data) } else { None };
+    let to_feed: &[u8] = cooked.as_deref().unwrap_or(data);
+
+    let mut lt = leptess::LepTess::new(None, &langs).ok()?;
+    lt.set_image_from_mem(to_feed).ok()?;
     let text = lt.get_utf8_text().ok()?;
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() { None } else { Some(trimmed) }
+}
+
+/// Photo-friendly OCR pre-processing pipeline:
+///   decode → grayscale → 2× upscale (Lanczos3) → Otsu binarize → PNG
+/// Returns `None` on any decoder/encoder failure so the caller can
+/// fall back to feeding the raw bytes to Tesseract.
+#[cfg(feature = "ocr")]
+fn preprocess_for_ocr(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Cursor;
+    let img = image::load_from_memory(data).ok()?;
+    let gray = img.to_luma8();
+
+    // 2× upscale with Lanczos3. Phone-camera business cards often
+    // ship at ~600 px wide where text glyphs are 8-12 px tall — too
+    // small for Tesseract's LSTM. Upscale before threshold so the
+    // binarization operates on smoother input.
+    let (w, h) = (gray.width().saturating_mul(2), gray.height().saturating_mul(2));
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let upscaled = image::imageops::resize(&gray, w, h, image::imageops::FilterType::Lanczos3);
+
+    // Otsu's method picks the threshold that maximizes the
+    // between-class variance — great for bimodal histograms (dark
+    // text on light-ish background or vice versa).
+    let threshold = otsu_threshold(&upscaled);
+    let mut binary: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
+        image::ImageBuffer::new(w, h);
+    for (x, y, p) in upscaled.enumerate_pixels() {
+        let v = if p[0] >= threshold { 255 } else { 0 };
+        binary.put_pixel(x, y, image::Luma([v]));
+    }
+
+    let mut buf = Vec::new();
+    binary
+        .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+        .ok()?;
+    Some(buf)
+}
+
+#[cfg(feature = "ocr")]
+fn otsu_threshold(img: &image::ImageBuffer<image::Luma<u8>, Vec<u8>>) -> u8 {
+    let mut hist = [0u64; 256];
+    for p in img.pixels() {
+        hist[p[0] as usize] += 1;
+    }
+    let total: u64 = (img.width() as u64) * (img.height() as u64);
+    if total == 0 {
+        return 127;
+    }
+    let sum_total: u64 = (0..256).map(|i| (i as u64) * hist[i]).sum();
+    let mut best_t: u8 = 127;
+    let mut best_var: f64 = 0.0;
+    let mut w_b: u64 = 0;
+    let mut sum_b: u64 = 0;
+    for t in 0..256u32 {
+        w_b += hist[t as usize];
+        if w_b == 0 {
+            continue;
+        }
+        let w_f = total - w_b;
+        if w_f == 0 {
+            break;
+        }
+        sum_b += (t as u64) * hist[t as usize];
+        let mean_b = sum_b as f64 / w_b as f64;
+        let mean_f = (sum_total - sum_b) as f64 / w_f as f64;
+        let var = (w_b as f64) * (w_f as f64) * (mean_b - mean_f).powi(2);
+        if var > best_var {
+            best_var = var;
+            best_t = t as u8;
+        }
+    }
+    best_t
 }
 
 #[cfg(not(target_arch = "wasm32"))]

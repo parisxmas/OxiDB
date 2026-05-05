@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
+use std::collections::VecDeque;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 #[cfg(target_arch = "wasm32")]
 use std::path::PathBuf;
@@ -7,6 +9,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 use crate::locks::{Mutex, RwLock};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -89,19 +93,25 @@ enum FtsJob {
 pub(crate) struct FtsDispatcher {
     senders: Vec<mpsc::SyncSender<FtsJob>>,
     counter: AtomicUsize,
+    runtime: Arc<FtsRuntime>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl FtsDispatcher {
-    fn new(senders: Vec<mpsc::SyncSender<FtsJob>>) -> Self {
+    fn new(senders: Vec<mpsc::SyncSender<FtsJob>>, runtime: Arc<FtsRuntime>) -> Self {
         Self {
             senders,
             counter: AtomicUsize::new(0),
+            runtime,
         }
     }
 
     fn send(&self, job: FtsJob) -> std::result::Result<(), mpsc::SendError<FtsJob>> {
         let n = self.senders.len();
+        // Bump the queue depth before the actual handoff. Workers
+        // decrement on `recv` so the gauge reflects "jobs accepted but
+        // not yet picked up by a worker".
+        self.runtime.queue_depth.fetch_add(1, Ordering::Relaxed);
         // Try the next worker round-robin. If its channel is full,
         // fall back to a blocking send to even out load.
         let start = self.counter.fetch_add(1, Ordering::Relaxed) % n;
@@ -115,7 +125,166 @@ impl FtsDispatcher {
             }
         }
         // All workers backed up — block on the round-robin pick.
-        self.senders[start].send(current_job)
+        let res = self.senders[start].send(current_job);
+        if res.is_err() {
+            // No worker will pick this up — undo the optimistic
+            // queue_depth bump so the gauge stays honest.
+            self.runtime.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        }
+        res
+    }
+}
+
+/// Per-worker observability state for the FTS pipeline. Workers update
+/// their own slot before/after each job; readers (e.g. the `fts_status`
+/// wire command) take a brief snapshot. Designed so a subscriber-less
+/// hot path stays cheap: queue_depth is a single relaxed atomic and the
+/// per-worker mutex is only held by that worker plus the snapshot
+/// reader.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct FtsRuntime {
+    queue_depth: AtomicUsize,
+    in_flight: Vec<Mutex<Option<InFlightJob>>>,
+    recent: Mutex<VecDeque<RecentJob>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct InFlightJob {
+    bucket: String,
+    key: String,
+    started_at: Instant,
+    phase: FtsPhase,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy)]
+enum FtsPhase {
+    Extracting,
+    Indexing,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct RecentJob {
+    bucket: String,
+    key: String,
+    result: JobOutcome,
+    total_ms: u64,
+    finished_at: Instant,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum JobOutcome {
+    Indexed,
+    Skipped(&'static str),
+    Failed(String),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const FTS_RECENT_RING_CAP: usize = 50;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FtsRuntime {
+    fn new(n_workers: usize) -> Self {
+        let mut slots = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            slots.push(Mutex::new(None));
+        }
+        Self {
+            queue_depth: AtomicUsize::new(0),
+            in_flight: slots,
+            recent: Mutex::new(VecDeque::with_capacity(FTS_RECENT_RING_CAP)),
+        }
+    }
+
+    fn start(&self, worker_id: usize, bucket: &str, key: &str) {
+        // Worker has just received a job — it's no longer queued.
+        self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        let mut slot = self.in_flight[worker_id].lock();
+        *slot = Some(InFlightJob {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            started_at: Instant::now(),
+            phase: FtsPhase::Extracting,
+        });
+    }
+
+    fn advance_to_indexing(&self, worker_id: usize) {
+        let mut slot = self.in_flight[worker_id].lock();
+        if let Some(job) = slot.as_mut() {
+            job.phase = FtsPhase::Indexing;
+        }
+    }
+
+    fn finish(&self, worker_id: usize, outcome: JobOutcome) {
+        let mut slot = self.in_flight[worker_id].lock();
+        if let Some(job) = slot.take() {
+            let total_ms = job.started_at.elapsed().as_millis() as u64;
+            let mut ring = self.recent.lock();
+            if ring.len() >= FTS_RECENT_RING_CAP {
+                ring.pop_front();
+            }
+            ring.push_back(RecentJob {
+                bucket: job.bucket,
+                key: job.key,
+                result: outcome,
+                total_ms,
+                finished_at: Instant::now(),
+            });
+        }
+    }
+
+    fn snapshot(&self) -> Value {
+        let queue_depth = self.queue_depth.load(Ordering::Relaxed);
+        let workers: Vec<Value> = self
+            .in_flight
+            .iter()
+            .enumerate()
+            .map(|(id, slot)| {
+                let g = slot.lock();
+                let current = g.as_ref().map(|j| {
+                    let phase = match j.phase {
+                        FtsPhase::Extracting => "extracting",
+                        FtsPhase::Indexing => "indexing",
+                    };
+                    json!({
+                        "bucket": j.bucket,
+                        "key": j.key,
+                        "phase": phase,
+                        "ms_elapsed": j.started_at.elapsed().as_millis() as u64,
+                    })
+                });
+                json!({ "id": id, "current": current })
+            })
+            .collect();
+        let now = Instant::now();
+        let recent: Vec<Value> = self
+            .recent
+            .lock()
+            .iter()
+            .map(|r| {
+                let result = match &r.result {
+                    JobOutcome::Indexed => json!({ "kind": "indexed" }),
+                    JobOutcome::Skipped(reason) => {
+                        json!({ "kind": "skipped", "reason": reason })
+                    }
+                    JobOutcome::Failed(error) => {
+                        json!({ "kind": "failed", "error": error })
+                    }
+                };
+                json!({
+                    "bucket": r.bucket,
+                    "key": r.key,
+                    "result": result,
+                    "total_ms": r.total_ms,
+                    "ms_ago": now.duration_since(r.finished_at).as_millis() as u64,
+                })
+            })
+            .collect();
+        json!({
+            "queue_depth": queue_depth,
+            "workers": workers,
+            "recent": recent,
+        })
     }
 }
 
@@ -124,7 +293,7 @@ impl FtsDispatcher {
 /// FTS index into batched-persist mode so high-volume ingestion does
 /// not rewrite the whole index file on every document.
 #[cfg(not(target_arch = "wasm32"))]
-fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> FtsDispatcher {
+fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> (FtsDispatcher, Arc<FtsRuntime>) {
     let n_workers = std::env::var("OXIDB_FTS_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -139,10 +308,13 @@ fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> FtsDispatcher {
     // don't each rewrite the whole _fts/index.json file.
     fts_index.write().set_batched(true);
 
+    let runtime = Arc::new(FtsRuntime::new(n_workers));
+
     let mut senders = Vec::with_capacity(n_workers);
-    for _ in 0..n_workers {
+    for worker_id in 0..n_workers {
         let (tx, rx) = mpsc::sync_channel::<FtsJob>(256);
         let fts_worker = Arc::clone(fts_index);
+        let runtime_w = Arc::clone(&runtime);
         std::thread::spawn(move || {
             while let Ok(job) = rx.recv() {
                 match job {
@@ -152,14 +324,35 @@ fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> FtsDispatcher {
                         bucket,
                         key,
                     } => {
+                        runtime_w.start(worker_id, &bucket, &key);
                         // CPU-bound extraction happens BEFORE the lock so
                         // workers parallelize across cores.
-                        if let Some(text) = fts::extract_text(&data, &content_type) {
-                            let _ = fts_worker.write().index_document(&bucket, &key, &text);
+                        match fts::extract_text(&data, &content_type) {
+                            Some(text) => {
+                                runtime_w.advance_to_indexing(worker_id);
+                                match fts_worker.write().index_document(&bucket, &key, &text) {
+                                    Ok(()) => runtime_w.finish(worker_id, JobOutcome::Indexed),
+                                    Err(e) => runtime_w
+                                        .finish(worker_id, JobOutcome::Failed(e.to_string())),
+                                }
+                            }
+                            None => runtime_w.finish(
+                                worker_id,
+                                JobOutcome::Skipped("no extractor for content type"),
+                            ),
                         }
                     }
                     FtsJob::Remove { bucket, key } => {
-                        let _ = fts_worker.write().remove_document(&bucket, &key);
+                        // Removes are bookkeeping-only — surface them as
+                        // a brief in-flight + Indexed entry so the UI sees
+                        // something, but the operation is tiny.
+                        runtime_w.start(worker_id, &bucket, &key);
+                        runtime_w.advance_to_indexing(worker_id);
+                        match fts_worker.write().remove_document(&bucket, &key) {
+                            Ok(()) => runtime_w.finish(worker_id, JobOutcome::Indexed),
+                            Err(e) => runtime_w
+                                .finish(worker_id, JobOutcome::Failed(e.to_string())),
+                        }
                     }
                 }
             }
@@ -177,7 +370,7 @@ fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> FtsDispatcher {
         });
     }
 
-    FtsDispatcher::new(senders)
+    (FtsDispatcher::new(senders, Arc::clone(&runtime)), runtime)
 }
 
 /// The main OxiDB engine. Manages multiple collections.
@@ -190,6 +383,8 @@ pub struct OxiDb {
     fts_index: Arc<RwLock<FtsIndex>>,
     #[cfg(not(target_arch = "wasm32"))]
     fts_tx: FtsDispatcher,
+    #[cfg(not(target_arch = "wasm32"))]
+    fts_runtime: Arc<FtsRuntime>,
     #[cfg(not(target_arch = "wasm32"))]
     tx_log: TxCommitLog,
     next_tx_id: AtomicU64,
@@ -250,7 +445,7 @@ impl OxiDb {
         let fts_index = Arc::new(RwLock::new(FtsIndex::open(&tmp)?));
         let tx_log = TxCommitLog::open(&tmp)?;
 
-        let fts_tx = setup_fts_workers(&fts_index);
+        let (fts_tx, fts_runtime) = setup_fts_workers(&fts_index);
 
         Ok(Self {
             data_dir: tmp,
@@ -258,6 +453,7 @@ impl OxiDb {
             blob_store,
             fts_index,
             fts_tx,
+            fts_runtime,
             tx_log,
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
@@ -370,7 +566,7 @@ impl OxiDb {
             ));
         }
 
-        let fts_tx = setup_fts_workers(&fts_index);
+        let (fts_tx, fts_runtime) = setup_fts_workers(&fts_index);
 
         if verbose {
             vlog("[verbose] FTS worker threads started");
@@ -387,6 +583,7 @@ impl OxiDb {
             blob_store,
             fts_index,
             fts_tx,
+            fts_runtime,
             tx_log,
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
@@ -1358,6 +1555,23 @@ impl OxiDb {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn delete_bucket(&self, name: &str) -> Result<()> {
         self.blob_store.delete_bucket(name)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    /// Snapshot of the FTS pipeline: queue depth, per-worker in-flight
+    /// jobs, and a ring of recently completed/failed jobs. Cheap to call
+    /// — locks are held only while assembling the JSON value.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn fts_status(&self) -> Value {
+        self.fts_runtime.snapshot()
+    }
+
+    /// Bytes of indexed text attributable to a single blob bucket. Used
+    /// by per-tenant FTS quota accounting; the caller maps `bucket` to
+    /// a tenant id (e.g. DMS uses `t_<tid>`). Locks the index for read,
+    /// so it competes with search but never with writes.
+    pub fn bucket_fts_size(&self, bucket: &str) -> u64 {
+        self.fts_index.read().bucket_text_size(bucket)
     }
 
     #[cfg(not(target_arch = "wasm32"))]

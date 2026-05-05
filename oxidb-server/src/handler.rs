@@ -741,6 +741,18 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        "fts_status" => ok_bytes(db.fts_status()),
+
+        "bucket_fts_size" => {
+            let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
+                Some(b) => b,
+                None => return err_bytes("missing 'bucket'"),
+            };
+            ok_bytes(json!({ "bucket": bucket, "bytes": db.bucket_fts_size(bucket) }))
+        }
+
+        "proc_status" => ok_bytes(crate::proc_stats::PROC_STATS.snapshot()),
+
         // -------------------------------------------------------------------
         // Backup & Restore (admin-only via RBAC)
         // -------------------------------------------------------------------

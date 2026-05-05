@@ -345,6 +345,19 @@ class OxiDbClient:
             payload["bucket"] = bucket
         return self._checked(payload)
 
+    def fts_status(self) -> dict:
+        """Snapshot of the FTS pipeline: queue depth, per-worker in-flight,
+        and a ring of recently completed/failed/skipped jobs.
+        Returns: {queue_depth, workers: [{id, current}], recent: [...]}"""
+        return self._checked({"cmd": "fts_status"})
+
+    def proc_status(self) -> dict:
+        """Process self-metrics for the running oxidb-server.
+        Returns: {cpu_percent, mem_rss_mb, threads, uptime_s}.
+        cpu_percent is an average over the time since the previous call;
+        the first call always returns 0.0."""
+        return self._checked({"cmd": "proc_status"})
+
     # ------------------------------------------------------------------
     # Database management
     # ------------------------------------------------------------------
