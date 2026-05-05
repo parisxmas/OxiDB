@@ -18,6 +18,80 @@ pub struct ObjectMeta {
     pub etag: String,
     pub created_at: String,
     pub metadata: HashMap<String, String>,
+    /// Codec used to compress the on-disk `.data` payload, if any.
+    /// `None` (or the field's absence in older meta files) means the
+    /// payload is stored as-is. Only `"zstd"` is currently emitted.
+    /// Decompression on read is keyed off this field, so the format
+    /// is forward-compatible: old uncompressed blobs keep working
+    /// after the upgrade because their meta defaults this to None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_compression: Option<String>,
+    /// Bytes the `.data` file actually consumes on disk (post
+    /// compression / encryption). `None` for blobs written before
+    /// this field existed; readers should fall back to `size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_size: Option<u64>,
+}
+
+/// Returns true for content types that are already entropy-saturated
+/// (image/audio/video, PDF, ZIP-based Office docs, etc). Re-compressing
+/// these wastes CPU on every put + get for at most a few percent of
+/// savings, so the compressor short-circuits before invoking zstd.
+fn is_already_compressed(content_type: &str) -> bool {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.starts_with("image/") || ct.starts_with("video/") || ct.starts_with("audio/") {
+        return true;
+    }
+    if ct.starts_with("application/vnd.openxmlformats-officedocument.")
+        || ct.starts_with("application/vnd.oasis.opendocument.")
+    {
+        return true;
+    }
+    matches!(
+        ct.as_str(),
+        "application/pdf"
+            | "application/zip"
+            | "application/x-zip-compressed"
+            | "application/gzip"
+            | "application/x-gzip"
+            | "application/x-bzip2"
+            | "application/x-xz"
+            | "application/x-7z-compressed"
+            | "application/x-rar-compressed"
+            | "application/x-tar"
+            | "application/zstd"
+    )
+}
+
+/// Try to zstd-compress a payload. Keeps the compressed bytes only when
+/// they save at least 5% — otherwise the original is returned and the
+/// per-blob compression label stays None. Files under 256 bytes always
+/// pass through (zstd framing alone overshoots small payloads), and
+/// content types known to be pre-compressed short-circuit so we don't
+/// waste CPU re-encoding entropy.
+fn try_compress_zstd(data: &[u8], content_type: &str) -> (Vec<u8>, Option<&'static str>) {
+    const MIN_SIZE: usize = 256;
+    if data.len() < MIN_SIZE || is_already_compressed(content_type) {
+        return (data.to_vec(), None);
+    }
+    match zstd::stream::encode_all(data, 3) {
+        Ok(c) if c.len() * 100 < data.len() * 95 => (c, Some("zstd")),
+        _ => (data.to_vec(), None),
+    }
+}
+
+/// Decompress a payload according to the codec recorded on the meta.
+/// Unknown codecs surface as an error so silent corruption is
+/// impossible if a future version writes a new label.
+fn decompress(payload: Vec<u8>, codec: Option<&str>) -> Result<Vec<u8>> {
+    match codec {
+        None => Ok(payload),
+        Some("zstd") => zstd::stream::decode_all(payload.as_slice())
+            .map_err(|e| Error::Io(std::io::Error::other(format!("zstd decode: {e}")))),
+        Some(other) => Err(Error::Io(std::io::Error::other(format!(
+            "unknown storage_compression codec: {other}"
+        )))),
+    }
 }
 
 struct BucketState {
@@ -32,6 +106,11 @@ pub struct BlobStore {
     /// inner RwLock protects individual bucket state (object CRUD).
     buckets: RwLock<HashMap<String, Arc<RwLock<BucketState>>>>,
     encryption: Option<Arc<EncryptionKey>>,
+    /// Opt-in zstd compression for blob payloads. Read path always
+    /// honors `meta.storage_compression`, so disabling this after
+    /// blobs were written compressed still works — only new uploads
+    /// are affected. Toggled via `OXIDB_BLOB_COMPRESS=1` at startup.
+    compression: bool,
     delete_tx: mpsc::Sender<PathBuf>,
 }
 
@@ -83,10 +162,16 @@ impl BlobStore {
                 .expect("failed to spawn blob-sync thread");
         }
 
+        let compression = std::env::var("OXIDB_BLOB_COMPRESS")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+
         Ok(Self {
             base_dir,
             buckets: RwLock::new(buckets),
             encryption,
+            compression,
             delete_tx,
         })
     }
@@ -108,7 +193,19 @@ impl BlobStore {
                         Some(key) => key.decrypt(&raw_meta)?,
                         None => raw_meta,
                     };
-                    let meta: ObjectMeta = serde_json::from_slice(&meta_bytes)?;
+                    let mut meta: ObjectMeta = serde_json::from_slice(&meta_bytes)?;
+                    // Backfill `stored_size` for blobs written before
+                    // the field existed. We stat the matching .data
+                    // file rather than rewriting the on-disk meta.
+                    // The cached value is enough for head_object /
+                    // API consumers; persistence catches up the next
+                    // time the blob is rewritten.
+                    if meta.stored_size.is_none() {
+                        let data_path = bucket_path.join(format!("{id}.data"));
+                        if let Ok(md) = std::fs::metadata(&data_path) {
+                            meta.stored_size = Some(md.len());
+                        }
+                    }
                     keys.insert(meta.key.clone(), id);
                     metas.insert(id, meta);
                     valid_ids.insert(id);
@@ -238,6 +335,20 @@ impl BlobStore {
         let etag: String = hash.iter().take(16).map(|b| format!("{b:02x}")).collect();
         let created_at = now_rfc3339();
 
+        // Compression first (so encryption — if any — operates on the
+        // smaller payload; encrypted bytes have near-maximum entropy
+        // and won't compress at all).
+        let (compressed_data, codec) = if self.compression {
+            try_compress_zstd(data, content_type)
+        } else {
+            (data.to_vec(), None)
+        };
+
+        let data_to_write = match &self.encryption {
+            Some(key) => key.encrypt(&compressed_data)?,
+            None => compressed_data,
+        };
+
         let meta = ObjectMeta {
             key: key.to_string(),
             bucket: bucket.to_string(),
@@ -246,11 +357,8 @@ impl BlobStore {
             etag,
             created_at,
             metadata,
-        };
-
-        let data_to_write = match &self.encryption {
-            Some(key) => key.encrypt(data)?,
-            None => data.to_vec(),
+            storage_compression: codec.map(|s| s.to_string()),
+            stored_size: Some(data_to_write.len() as u64),
         };
         let meta_json = serde_json::to_vec(&meta)?;
         let meta_to_write = match &self.encryption {
@@ -310,7 +418,7 @@ impl BlobStore {
         }; // all locks released before disk I/O
 
         let raw_data = std::fs::read(self.data_path(bucket, id))?;
-        let data = match &self.encryption {
+        let decrypted = match &self.encryption {
             Some(key) => key.decrypt(&raw_data)?,
             None => raw_data,
         };
@@ -330,6 +438,11 @@ impl BlobStore {
             }
             m
         };
+
+        // Read path is never gated on `self.compression`. Even if the
+        // operator turned the feature off after this blob was written,
+        // the meta still tells us how to reverse the transformation.
+        let data = decompress(decrypted, meta.storage_compression.as_deref())?;
 
         Ok((data, meta))
     }
