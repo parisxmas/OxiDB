@@ -10,7 +10,7 @@ description = "A fast document database engine with optimized date indexing"
 
 [features]
 default = []
-ocr = ["leptess"]
+ocr = ["leptess", "image"]
 gpu = ["wgpu", "pollster", "bytemuck"]
 
 [dependencies]
@@ -23,6 +23,7 @@ sha2 = "0.10"
 aes-gcm = "0.10"
 rand = "0.9"
 leptess = { version = "0.14", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg", "tiff", "bmp", "gif", "webp"] }
 jsonb = "0.5"
 lru = "0.12"
 regex = "1"

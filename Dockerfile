@@ -1,5 +1,11 @@
 FROM rust:1.88-bookworm AS builder
 
+# Tesseract / Leptonica dev libs needed by the `leptess` crate's
+# bindgen step. clang/libclang let bindgen parse the C headers.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libtesseract-dev libleptonica-dev libclang-dev clang pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
@@ -21,12 +27,18 @@ RUN mkdir -p oxidb-app/src-tauri/src && \
     echo '[package]\nname = "oxidb-tail"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > oxidb-tail/Cargo.toml && \
     echo 'fn main() {}' > oxidb-tail/src/main.rs
 
-RUN cargo build --release --package oxidb-server --features cluster
+RUN cargo build --release --package oxidb-server --features cluster,ocr
 
 FROM debian:bookworm-slim
 
+# Runtime needs libtesseract.so + the language traineddata files that
+# leptess loads at OCR time. eng + tur cover the demo's typical mix
+# (Sherlock/Pride excerpts + Turkish government PDFs).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    libtesseract5 \
+    tesseract-ocr-eng \
+    tesseract-ocr-tur \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/oxidb-server /usr/local/bin/oxidb-server
