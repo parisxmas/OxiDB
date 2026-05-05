@@ -15,6 +15,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OxiDb.EntityFrameworkCore",
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OxiDb.Client.Embedded", "OxiDb.Client.Embedded\OxiDb.Client.Embedded.csproj", "{E5F6A7B8-C9D0-1234-EF12-345678901234}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OxiDb.Client.S3", "OxiDb.Client.S3\OxiDb.Client.S3.csproj", "{666F694A-1212-48F6-ADFC-BB3A057C8C7B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "OxiDb.Client.S3.Sample", "OxiDb.Client.S3.Sample\OxiDb.Client.S3.Sample.csproj", "{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -97,6 +101,30 @@ Global
 		{E5F6A7B8-C9D0-1234-EF12-345678901234}.Release|x64.Build.0 = Release|Any CPU
 		{E5F6A7B8-C9D0-1234-EF12-345678901234}.Release|x86.ActiveCfg = Release|Any CPU
 		{E5F6A7B8-C9D0-1234-EF12-345678901234}.Release|x86.Build.0 = Release|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Debug|x64.Build.0 = Debug|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Debug|x86.Build.0 = Debug|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Release|x64.ActiveCfg = Release|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Release|x64.Build.0 = Release|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Release|x86.ActiveCfg = Release|Any CPU
+		{666F694A-1212-48F6-ADFC-BB3A057C8C7B}.Release|x86.Build.0 = Release|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Debug|x64.Build.0 = Debug|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Debug|x86.Build.0 = Debug|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Release|x64.ActiveCfg = Release|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Release|x64.Build.0 = Release|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Release|x86.ActiveCfg = Release|Any CPU
+		{7245D4FB-5C51-4AB5-8DE1-0EE8FBCA6EF7}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
