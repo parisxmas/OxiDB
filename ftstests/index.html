@@ -39,6 +39,19 @@
       font-size: 13px;
       margin-top: 4px;
     }
+    header .proc {
+      display: inline-block;
+      margin-left: 12px;
+      padding: 1px 8px;
+      border-radius: 4px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--ink);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      vertical-align: 1px;
+    }
+    header .proc:empty { display: none; }
     main {
       max-width: 880px;
       margin: 0 auto;
@@ -220,6 +233,160 @@
       font-size: 11px;
       color: var(--ink-soft);
       margin-top: 4px;
+    }
+
+    /* FTS progress panel */
+    .fts-progress {
+      margin: 0 0 24px;
+      padding: 12px 16px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .fts-progress-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .fts-progress-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink);
+    }
+    .fts-progress-summary {
+      font-size: 12px;
+      color: var(--ink-soft);
+      font-variant-numeric: tabular-nums;
+    }
+    .fts-progress-workers,
+    .fts-progress-recent {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .fts-progress-workers li,
+    .fts-progress-recent li {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      padding: 3px 0;
+      color: var(--ink-soft);
+      border-top: 1px solid transparent;
+    }
+    .fts-progress-workers li {
+      color: var(--ink);
+    }
+    .fts-progress-workers li.idle {
+      color: var(--ink-soft);
+      font-style: italic;
+    }
+    .fts-progress-recent {
+      margin-top: 6px;
+      padding-top: 6px;
+      border-top: 1px dashed var(--border);
+    }
+    .fts-progress-recent li.indexed { color: var(--score); }
+    .fts-progress-recent li.failed  { color: #a83232; }
+    .fts-progress-recent li.skipped { color: var(--ink-soft); }
+    .fts-progress .badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      background: var(--bg);
+      color: var(--ink-soft);
+      border: 1px solid var(--border);
+    }
+    .fts-progress .badge.extracting { color: var(--accent); border-color: var(--accent); }
+    .fts-progress .badge.indexing   { color: var(--score);  border-color: var(--score);  }
+    .fts-progress .key {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Public activity feed (recent uploads) */
+    .upload-feed {
+      margin: 32px 0 0;
+      padding: 14px 16px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .upload-feed h2 {
+      margin: 0 0 8px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--ink-soft);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .feed-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      font-size: 13px;
+      font-variant-numeric: tabular-nums;
+    }
+    .feed-list li {
+      display: flex;
+      gap: 12px;
+      align-items: baseline;
+      padding: 4px 0;
+      border-top: 1px dashed var(--border);
+    }
+    .feed-list li:first-child { border-top: none; }
+    .feed-list .ip {
+      min-width: 96px;
+      color: var(--ink-soft);
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 12px;
+    }
+    .feed-list .key {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--ink);
+      cursor: pointer;
+      transition: color 0.12s ease;
+    }
+    .feed-list .key:hover {
+      color: var(--accent);
+      text-decoration: underline;
+    }
+    .feed-list .size {
+      color: var(--ink-soft);
+      min-width: 140px;
+      text-align: right;
+      font-size: 12px;
+    }
+    .feed-list .size .compressed {
+      color: var(--score);
+      font-weight: 600;
+    }
+    .feed-list .size .saved {
+      color: var(--ink-soft);
+      font-size: 11px;
+      margin-left: 4px;
+    }
+    .feed-list .when {
+      color: var(--ink-soft);
+      min-width: 70px;
+      text-align: right;
+      font-size: 12px;
+    }
+    .feed-empty {
+      color: var(--ink-soft);
+      font-style: italic;
+      padding: 4px 0 !important;
+      border-top: none !important;
     }
 
     /* Result cards become clickable */
@@ -427,14 +594,15 @@
   <header>
     <h1>OxiDB FTS Demo</h1>
     <div class="sub">
-      <span id="docCount">…</span> documents indexed
-      <span style="color:var(--ink-soft)"> · Alice · Pride and Prejudice · Sherlock Holmes + your uploads · BM25 over a blob index.</span>
+      <span id="docCount">…</span>
+      <span style="color:var(--ink-soft)"> · BM25 over a blob index · upload PDF/DOCX/XLSX/TXT/HTML/XML/JSON/CSV/MD to index.</span>
+      <span class="proc" id="procStats" title="oxidb-server process metrics"></span>
     </div>
   </header>
 
   <main>
     <form class="search-row" id="form">
-      <input id="q" type="text" placeholder="Search… (try Holmes, Darcy, rabbit)" autocomplete="off" autofocus />
+      <input id="q" type="text" placeholder="Search…" autocomplete="off" autofocus />
       <button id="go" type="submit">Search</button>
     </form>
 
@@ -446,30 +614,34 @@
       <span id="status" style="margin-left:auto"></span>
     </div>
 
-    <div class="examples" id="examples">
-      <span class="chip" data-q="Holmes">Holmes</span>
-      <span class="chip" data-q="Watson">Watson</span>
-      <span class="chip" data-q="Baker Street">Baker Street</span>
-      <span class="chip" data-q="Darcy">Darcy</span>
-      <span class="chip" data-q="Bingley">Bingley</span>
-      <span class="chip" data-q="Elizabeth marriage">Elizabeth marriage</span>
-      <span class="chip" data-q="Cheshire">Cheshire</span>
-      <span class="chip" data-q="rabbit">rabbit</span>
-      <span class="chip" data-q="Queen Hearts">Queen Hearts</span>
-    </div>
-
     <div class="upload" id="dropZone">
       <div class="upload-row">
         <label class="pick" for="files">Choose files…</label>
-        <input id="files" type="file" multiple accept=".pdf,.docx,.xlsx,.txt,.html,.htm,.xml,.json,.md,.csv" style="display:none" />
+        <input id="files" type="file" multiple accept=".pdf,.docx,.xlsx,.txt,.html,.htm,.xml,.json,.md,.csv,.png,.jpg,.jpeg,.tif,.tiff,.bmp" style="display:none" />
         <span class="picked" id="picked">no files selected · drag &amp; drop here too</span>
         <button id="upload" type="button" disabled>Upload</button>
       </div>
       <div class="upload-status" id="uploadStatus"></div>
-      <div class="upload-hint">PDF, DOCX, XLSX, TXT, HTML, XML, JSON, CSV, MD · max 5 MB / file · indexed asynchronously, searchable in ~1&nbsp;s</div>
+      <div class="upload-hint">PDF, DOCX, XLSX, TXT, HTML, XML, JSON, CSV, MD, PNG/JPG (OCR · eng+tur) · max 5 MB / file · indexed asynchronously, searchable in ~1&nbsp;s</div>
+    </div>
+
+    <div class="fts-progress" id="ftsProgress" hidden>
+      <div class="fts-progress-head">
+        <span class="fts-progress-title" id="ftsProgressTitle">Indexing…</span>
+        <span class="fts-progress-summary" id="ftsProgressSummary"></span>
+      </div>
+      <ul class="fts-progress-workers" id="ftsProgressWorkers"></ul>
+      <ul class="fts-progress-recent" id="ftsProgressRecent"></ul>
     </div>
 
     <div id="results"></div>
+
+    <section class="upload-feed" id="uploadFeed">
+      <h2>Recent uploads</h2>
+      <ul class="feed-list" id="feedList">
+        <li class="feed-empty">no uploads yet</li>
+      </ul>
+    </section>
   </main>
 
   <div class="viewer-backdrop" id="viewerBackdrop" role="dialog" aria-modal="true" aria-hidden="true">
@@ -503,13 +675,6 @@
     const statusEl = document.getElementById("status");
     const resultsEl = document.getElementById("results");
 
-    document.querySelectorAll(".chip").forEach((c) => {
-      c.addEventListener("click", () => {
-        qEl.value = c.dataset.q;
-        form.requestSubmit();
-      });
-    });
-
     // -------------------------------------------------------------
     // Header stats
     // -------------------------------------------------------------
@@ -519,13 +684,116 @@
       try {
         const r = await fetch("/api/stats", { cache: "no-store" });
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const { count } = await r.json();
-        docCountEl.textContent = count.toLocaleString();
+        const { count, total_bytes } = await r.json();
+        const noun = count === 1 ? "file" : "files";
+        const size = total_bytes ? ` / ${humanSize(total_bytes)} total` : "";
+        docCountEl.textContent = `${count.toLocaleString()} ${noun} uploaded${size}`;
       } catch (e) {
-        docCountEl.textContent = "?";
+        docCountEl.textContent = "? files uploaded";
       }
     }
     refreshDocCount();
+    // Live counter — every 5 s, every visitor sees the same number
+    // tick up as anyone uploads. Same cadence as the proc-stats poll.
+    setInterval(refreshDocCount, 5000);
+
+    // -------------------------------------------------------------
+    // oxidb-server process metrics (CPU%, MEM, threads, uptime).
+    // The first call returns 0% CPU since there's no previous sample
+    // to delta against — we discard it and render starting from the
+    // second sample so the user never sees a misleading 0.0%.
+    // -------------------------------------------------------------
+    const procStatsEl = document.getElementById("procStats");
+    let procFirstSampleSeen = false;
+
+    function fmtUptime(s) {
+      if (s < 60)        return `${s}s`;
+      if (s < 3600)      return `${Math.floor(s/60)}m`;
+      if (s < 86400)     return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`;
+      return `${Math.floor(s/86400)}d ${Math.floor((s%86400)/3600)}h`;
+    }
+
+    async function refreshProcStats() {
+      try {
+        const r = await fetch("/api/proc-status", { cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const s = await r.json();
+        if (!procFirstSampleSeen) {
+          procFirstSampleSeen = true;
+          // Render minimal info on first sample (CPU% would be 0).
+          procStatsEl.textContent = `MEM ${s.mem_rss_mb} MB · ${s.threads} threads · up ${fmtUptime(s.uptime_s)}`;
+        } else {
+          procStatsEl.textContent =
+            `CPU ${s.cpu_percent}% · MEM ${s.mem_rss_mb} MB · ${s.threads} threads · up ${fmtUptime(s.uptime_s)}`;
+        }
+      } catch (e) {
+        procStatsEl.textContent = "";
+      }
+    }
+    refreshProcStats();
+    setInterval(refreshProcStats, 5000);
+
+    // -------------------------------------------------------------
+    // Public activity feed — last 30 uploads, refreshed every 5 s
+    // for every open tab. IPs are masked server-side as "123.x.x.x"
+    // so visitors see who's contributing without exposing addresses.
+    // -------------------------------------------------------------
+    const feedListEl = document.getElementById("feedList");
+
+    function relTime(epochSec) {
+      if (!epochSec) return "—";
+      const dt = Math.max(0, Math.floor(Date.now() / 1000) - epochSec);
+      if (dt < 5)      return "just now";
+      if (dt < 60)     return `${dt}s ago`;
+      if (dt < 3600)   return `${Math.floor(dt/60)}m ago`;
+      if (dt < 86400)  return `${Math.floor(dt/3600)}h ago`;
+      return `${Math.floor(dt/86400)}d ago`;
+    }
+
+    async function refreshFeed() {
+      try {
+        const r = await fetch("/api/uploads-feed", { cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const { items } = await r.json();
+        if (!items || !items.length) {
+          feedListEl.innerHTML = `<li class="feed-empty">no uploads yet</li>`;
+          return;
+        }
+        feedListEl.innerHTML = items.map((it) => {
+          const orig = it.size || 0;
+          const stored = it.stored_size;
+          // Show "<stored> / <orig> (-N%)" when compression actually
+          // saved at least ~5%; otherwise just the logical size. Old
+          // uploads (no stored_size in the doc) fall through to the
+          // single-number path so the feed never renders nonsense.
+          let sizeHtml;
+          if (stored != null && orig > 0 && stored * 100 < orig * 95) {
+            const pct = Math.round((1 - stored / orig) * 100);
+            sizeHtml = `<span class="compressed">${humanSize(stored)}</span>`
+                     + ` <span class="saved">/ ${humanSize(orig)} −${pct}%</span>`;
+          } else {
+            sizeHtml = humanSize(orig);
+          }
+          return `<li>`
+            + `<span class="ip">${escapeText(it.client_ip || "?")}</span>`
+            + `<span class="key" data-key="${escapeText(it.key)}" title="Open in viewer">${escapeText(it.key)}</span>`
+            + `<span class="size">${sizeHtml}</span>`
+            + `<span class="when">${escapeText(relTime(it.uploaded_at))}</span>`
+            + `</li>`;
+        }).join("");
+      } catch (e) {
+        // Soft fail — leave the previous list in place rather than
+        // wiping it on a transient blip.
+      }
+    }
+    // Event delegation — feed re-renders every 5 s; one listener
+    // here survives all the DOM swaps.
+    feedListEl.addEventListener("click", (e) => {
+      const t = e.target.closest("span.key[data-key]");
+      if (t) openViewer(t.dataset.key);
+    });
+    refreshFeed();
+    setInterval(refreshFeed, 5000);
 
     // -------------------------------------------------------------
     // Upload panel
@@ -538,15 +806,51 @@
 
     let pendingFiles = [];
 
+    // Single source of truth for what the demo accepts. Mirror the
+    // server's ALLOWED_EXTENSIONS set so drag-drop and file picker
+    // share the same rules. Keep them in sync if either side changes.
+    const ALLOWED_EXTS = new Set([
+      "pdf", "docx", "xlsx",
+      "txt", "html", "htm", "xml", "json", "md", "csv",
+      "png", "jpg", "jpeg", "tif", "tiff", "bmp",
+    ]);
+
+    function extOf(name) {
+      const i = name.lastIndexOf(".");
+      return i < 0 ? "" : name.slice(i + 1).toLowerCase();
+    }
+
     function setPending(fs) {
-      pendingFiles = Array.from(fs || []);
-      if (pendingFiles.length === 0) {
+      const incoming = Array.from(fs || []);
+      const accepted = [];
+      const rejected = [];
+      for (const f of incoming) {
+        if (ALLOWED_EXTS.has(extOf(f.name))) accepted.push(f);
+        else rejected.push(f.name);
+      }
+      pendingFiles = accepted;
+      if (pendingFiles.length === 0 && rejected.length === 0) {
         pickedEl.textContent = "no files selected · drag & drop here too";
         uploadBtn.disabled = true;
+        uploadStatus.classList.remove("ok", "err");
+        uploadStatus.textContent = "";
+      } else if (pendingFiles.length === 0) {
+        pickedEl.textContent = "no supported files in selection";
+        uploadBtn.disabled = true;
+        uploadStatus.classList.add("err");
+        uploadStatus.classList.remove("ok");
+        uploadStatus.textContent = `Skipped unsupported: ${rejected.slice(0, 3).join(", ")}${rejected.length > 3 ? ` (+${rejected.length - 3} more)` : ""}`;
       } else {
         const total = pendingFiles.reduce((n, f) => n + f.size, 0);
         pickedEl.textContent = `${pendingFiles.length} file${pendingFiles.length === 1 ? "" : "s"} · ${humanSize(total)}`;
         uploadBtn.disabled = false;
+        if (rejected.length) {
+          uploadStatus.classList.add("err");
+          uploadStatus.textContent = `Skipped ${rejected.length} unsupported: ${rejected.slice(0, 3).join(", ")}${rejected.length > 3 ? ` (+${rejected.length - 3})` : ""}`;
+        } else {
+          uploadStatus.classList.remove("ok", "err");
+          uploadStatus.textContent = "";
+        }
       }
     }
 
@@ -575,8 +879,12 @@
       uploadStatus.classList.remove("ok", "err");
 
       const total = pendingFiles.length;
-      let ok = 0, failed = 0;
-      const failures = [];
+      let ok = 0, failed = 0, duplicate = 0;
+      const messages = [];
+      // Show the indexing progress panel as soon as the first PUT
+      // starts — once the server accepts the blob, FTS jobs will queue.
+      activeUploads = total;
+      startFtsPolling();
       for (let i = 0; i < pendingFiles.length; i++) {
         const f = pendingFiles[i];
         uploadStatus.textContent = `Uploading ${i + 1}/${total} · ${f.name}`;
@@ -588,28 +896,149 @@
           });
           if (!r.ok) {
             const err = await r.json().catch(() => ({}));
-            throw new Error(err.error || `HTTP ${r.status}`);
+            const e = new Error(err.error || `HTTP ${r.status}`);
+            e.isDuplicate = err.duplicate === true || r.status === 409;
+            e.existingKey = err.existing_key;
+            throw e;
           }
           ok++;
         } catch (err) {
-          failed++;
-          failures.push(`${f.name}: ${err.message || err}`);
+          if (err.isDuplicate) {
+            duplicate++;
+            messages.push(`${f.name} ↔ ${err.existingKey || "existing"}`);
+          } else {
+            failed++;
+            messages.push(`${f.name}: ${err.message || err}`);
+          }
+        } finally {
+          activeUploads--;
         }
       }
 
-      if (failed === 0) {
-        uploadStatus.classList.add("ok");
-        uploadStatus.textContent = `Uploaded ${ok}/${total} — indexing in background, searchable in ~1 s.`;
-      } else {
-        uploadStatus.classList.add("err");
-        uploadStatus.textContent = `${ok}/${total} succeeded · ${failed} failed: ${failures.slice(0, 3).join("; ")}`;
-      }
+      // Build a status line that distinguishes uploaded / duplicate /
+      // failed so the user knows duplicates aren't a real error.
+      const parts = [];
+      if (ok)        parts.push(`${ok} uploaded`);
+      if (duplicate) parts.push(`${duplicate} already on file`);
+      if (failed)    parts.push(`${failed} failed`);
+      uploadStatus.classList.toggle("ok",  failed === 0 && duplicate === 0 && ok > 0);
+      uploadStatus.classList.toggle("err", failed > 0);
+      const detail = messages.length ? ` — ${messages.slice(0, 3).join("; ")}` : "";
+      uploadStatus.textContent = parts.join(" · ") + detail;
       // Reset the picker so the user can drop another batch.
       filesEl.value = "";
       setPending([]);
       // Refresh the header count so new uploads are visible immediately.
       if (ok > 0) refreshDocCount();
     });
+
+    // -------------------------------------------------------------
+    // FTS indexing progress (polled state from /api/fts-status)
+    // -------------------------------------------------------------
+    const ftsProgressEl   = document.getElementById("ftsProgress");
+    const ftsWorkersEl    = document.getElementById("ftsProgressWorkers");
+    const ftsRecentEl     = document.getElementById("ftsProgressRecent");
+    const ftsSummaryEl    = document.getElementById("ftsProgressSummary");
+    const ftsTitleEl      = document.getElementById("ftsProgressTitle");
+
+    const FTS_POLL_MS = 500;
+    const FTS_IDLE_THRESHOLD = 2;
+    let ftsPollTimer = null;
+    let ftsIdleStreak = 0;
+    let activeUploads = 0;
+
+    function startFtsPolling() {
+      if (ftsPollTimer != null) return;
+      ftsProgressEl.hidden = false;
+      ftsTitleEl.textContent = "Indexing…";
+      ftsIdleStreak = 0;
+      pollFtsStatus();
+    }
+
+    function stopFtsPolling(finalSummary) {
+      if (ftsPollTimer != null) {
+        clearTimeout(ftsPollTimer);
+        ftsPollTimer = null;
+      }
+      if (finalSummary) ftsSummaryEl.textContent = finalSummary;
+      ftsTitleEl.textContent = "Indexing complete";
+      // Auto-hide the panel after a grace period so the user can see
+      // the final state, but keep it dismissable on next upload.
+      setTimeout(() => {
+        if (ftsPollTimer == null) ftsProgressEl.hidden = true;
+      }, 6000);
+    }
+
+    async function pollFtsStatus() {
+      let status = null;
+      try {
+        const r = await fetch("/api/fts-status", { cache: "no-store" });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        status = await r.json();
+        renderFtsProgress(status);
+      } catch (e) {
+        // Soft-fail: surface a quiet error in the panel and keep
+        // polling for a bit before giving up.
+        ftsSummaryEl.textContent = `status: ${e.message || e}`;
+        ftsIdleStreak++;
+        if (ftsIdleStreak >= 5) {
+          stopFtsPolling("polling stopped");
+          return;
+        }
+        ftsPollTimer = setTimeout(pollFtsStatus, FTS_POLL_MS);
+        return;
+      }
+
+      const idle = status.queue_depth === 0
+        && status.workers.every((w) => !w.current);
+      if (idle && activeUploads === 0) {
+        ftsIdleStreak++;
+        if (ftsIdleStreak >= FTS_IDLE_THRESHOLD) {
+          // One last refresh of the header count, then close.
+          refreshDocCount();
+          const ind = status.recent.filter((r) => r.result.kind === "indexed").length;
+          stopFtsPolling(`${ind} indexed in this batch`);
+          return;
+        }
+      } else {
+        ftsIdleStreak = 0;
+      }
+      ftsPollTimer = setTimeout(pollFtsStatus, FTS_POLL_MS);
+    }
+
+    function renderFtsProgress(s) {
+      const active = s.workers.filter((w) => w.current).length;
+      ftsSummaryEl.textContent = s.queue_depth > 0
+        ? `${s.queue_depth} queued · ${active} active`
+        : (active > 0 ? `${active} active` : "all caught up");
+
+      ftsWorkersEl.innerHTML = s.workers.map((w) => {
+        if (!w.current) {
+          return `<li class="idle">worker ${w.id} · idle</li>`;
+        }
+        const c = w.current;
+        return `<li>`
+          + `<span class="badge ${c.phase}">${c.phase}</span> `
+          + `<span class="key">${escapeText(c.key)}</span> `
+          + `<span>${c.ms_elapsed} ms</span>`
+          + `</li>`;
+      }).join("");
+
+      // Show last 8 recent jobs, newest first.
+      const recent = s.recent.slice(-8).reverse();
+      ftsRecentEl.innerHTML = recent.map((r) => {
+        const kind = r.result.kind;
+        let detail;
+        if (kind === "indexed")      detail = `${r.total_ms} ms`;
+        else if (kind === "skipped") detail = r.result.reason;
+        else                          detail = r.result.error;
+        return `<li class="${kind}">`
+          + `<span class="badge">${kind}</span> `
+          + `<span class="key">${escapeText(r.key)}</span> `
+          + `<span>${escapeText(String(detail))}</span>`
+          + `</li>`;
+      }).join("");
+    }
 
     function humanSize(n) {
       if (n < 1024) return `${n} B`;
@@ -716,10 +1145,11 @@
         findbar.classList.add("hidden");
         return;
       }
-      // After render, decide whether find is even meaningful (PDF and
-      // sandboxed HTML iframes have their own search UIs).
-      const isIframe = viewerBody.querySelector("iframe");
-      if (isIframe) {
+      // After render, decide whether find is even meaningful. PDF and
+      // sandboxed HTML iframes have their own search UIs; raw images
+      // have no text DOM at all.
+      const hasNoText = viewerBody.querySelector("iframe, img");
+      if (hasNoText) {
         findbar.classList.add("hidden");
       } else {
         findbar.classList.remove("hidden");
@@ -777,6 +1207,29 @@
           iframe.setAttribute("sandbox", "");
           iframe.srcdoc = html;
           viewerBody.replaceChildren(iframe);
+          return;
+        }
+
+        case "png":
+        case "jpg":
+        case "jpeg":
+        case "gif":
+        case "webp":
+        case "tif":
+        case "tiff":
+        case "bmp": {
+          // Native <img>; Find-in-doc has nothing to chew on so the
+          // findbar is hidden via the isIframe branch upstream
+          // (treated as "non-text" rendered content).
+          const wrap = document.createElement("div");
+          wrap.style.cssText =
+            "padding:20px;background:#fff;min-height:100%;display:flex;align-items:center;justify-content:center;";
+          const img = document.createElement("img");
+          img.src = blobUrl;
+          img.alt = key;
+          img.style.cssText = "max-width:100%;max-height:100%;height:auto;";
+          wrap.appendChild(img);
+          viewerBody.replaceChildren(wrap);
           return;
         }
 

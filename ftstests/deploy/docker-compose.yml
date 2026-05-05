@@ -18,6 +18,16 @@ services:
       OXIDB_FTS_FLUSH_INTERVAL_MS: "500"
       # English default; change to "tr" later if Turkish content shows up.
       OXIDB_FTS_LANG: "english"
+      # Opt into zstd compression for blob payloads. Read path always
+      # honors per-blob meta, so toggling this off later still serves
+      # previously-compressed blobs correctly. Compression is skipped
+      # automatically when it would save < 5%, so PDFs/zip-based docs
+      # pass through and we don't pay for entropy-saturated formats.
+      OXIDB_BLOB_COMPRESS: "1"
+      # Tesseract languages for image OCR. The image ships eng + tur
+      # traineddata files; this env var picks which subset is loaded
+      # per OCR call. "+"-joined for multi-language pages.
+      OXIDB_OCR_LANGS: "eng+tur"
     volumes:
       - ftsdemo-data:/data
     networks:
