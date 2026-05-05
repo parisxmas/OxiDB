@@ -543,6 +543,10 @@ impl OxiDb {
         }
 
         std::fs::create_dir_all(data_dir)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::check_legacy_dat_layout(data_dir)?;
+
         let blob_store = BlobStore::open_with_encryption(data_dir, encryption.clone())?;
 
         if verbose {
@@ -2195,6 +2199,61 @@ impl OxiDb {
             path: target_dir.to_string_lossy().into_owned(),
             collections: collections.len(),
         })
+    }
+
+    /// Refuse to open a data directory whose collections are still in
+    /// the legacy append-only `.dat` format. The engine is BTree-only
+    /// since v0.25.x — loading that layout would silently shadow the
+    /// old data with empty `.btree` files, which is exactly the silent
+    /// data loss we want to prevent.
+    ///
+    /// A `.dat` file with a sibling `.btree` directory is treated as
+    /// already-migrated debris and ignored (the user can delete the
+    /// `.dat` at their leisure). Set `OXIDB_ALLOW_LEGACY_DAT=1` to
+    /// bypass — only safe if you know the legacy data is disposable.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn check_legacy_dat_layout(dir: &Path) -> Result<()> {
+        if std::env::var("OXIDB_ALLOW_LEGACY_DAT").as_deref() == Ok("1") {
+            return Ok(());
+        }
+        if !dir.exists() {
+            return Ok(());
+        }
+        let mut orphans: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("dat") {
+                continue;
+            }
+            // Skip empty .dat files — a previous run may have created
+            // them as zero-byte placeholders alongside a real .btree.
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.len() == 0 {
+                continue;
+            }
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let btree = dir.join(format!("{stem}.btree"));
+            if !btree.exists() {
+                orphans.push(stem.to_string());
+            }
+        }
+        if orphans.is_empty() {
+            return Ok(());
+        }
+        Err(Error::Io(std::io::Error::other(format!(
+            "legacy .dat collection files detected without matching .btree: [{}]. \
+The current engine is BTree-only and cannot read this layout — opening the database \
+would silently shadow the old data with empty collections. Migrate or delete the \
+.dat files. Set OXIDB_ALLOW_LEGACY_DAT=1 to bypass (acknowledges data loss).",
+            orphans.join(", ")
+        ))))
     }
 
     /// Scan a directory for `*.dat` files and `*.btree` files/directories and return collection names.
