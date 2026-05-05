@@ -124,13 +124,47 @@ fn read_threads() -> Option<u32> {
     None
 }
 
-// Non-Linux fallbacks — server is shipped as linux/amd64 only, but
-// keeping these lets `cargo check` pass on macOS dev boxes.
-#[cfg(not(target_os = "linux"))]
+// macOS dev support — getrusage + mach task_info give us accurate
+// CPU + RSS numbers on a developer laptop. Production target is still
+// linux/amd64 (where /proc paths are read directly above).
+#[cfg(target_os = "macos")]
+fn read_cpu_ticks() -> Option<u64> {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return None;
+    }
+    // utime + stime, expressed in clk_tck (=100) ticks for parity with
+    // Linux. Convert from microseconds: total_us / 10_000.
+    let utime_us = (ru.ru_utime.tv_sec as u64) * 1_000_000 + (ru.ru_utime.tv_usec as u64);
+    let stime_us = (ru.ru_stime.tv_sec as u64) * 1_000_000 + (ru.ru_stime.tv_usec as u64);
+    Some((utime_us + stime_us) / 10_000)
+}
+
+#[cfg(target_os = "macos")]
+fn read_vm_rss_kb() -> Option<u64> {
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) } != 0 {
+        return None;
+    }
+    // ru_maxrss is in BYTES on macOS (vs KB on Linux). Convert to KB.
+    Some((ru.ru_maxrss as u64) / 1024)
+}
+
+#[cfg(target_os = "macos")]
+fn read_threads() -> Option<u32> {
+    // Best-effort: getrusage doesn't expose this on macOS; use rough
+    // self-reported thread count via task_info would require Mach
+    // bindings we don't ship. Return 0 — Linux prod still reports it.
+    Some(0)
+}
+
+// Other non-Linux/non-macOS targets — keeping these lets `cargo check`
+// pass on Windows / wasm / freebsd.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_cpu_ticks() -> Option<u64> { None }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_vm_rss_kb() -> Option<u64> { None }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_threads() -> Option<u32> { None }

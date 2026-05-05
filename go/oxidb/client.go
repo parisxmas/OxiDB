@@ -186,6 +186,38 @@ func (c *Client) BucketFTSSize(bucket string) (uint64, error) {
 	return 0, fmt.Errorf("oxidb: bucket_fts_size: missing 'bytes' field in %v", m)
 }
 
+// ProcStatus returns process self-metrics for the running oxidb-server:
+// {cpu_percent, mem_rss_mb, threads, uptime_s}. cpu_percent is the
+// average over the time since the previous call; the first call always
+// returns 0.0. Cheap to invoke — server-side just samples kernel
+// counters and updates an internal moving average.
+func (c *Client) ProcStatus() (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "proc_status"})
+	if err != nil {
+		return nil, err
+	}
+	m, ok := data.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("oxidb: proc_status: unexpected response shape: %T", data)
+	}
+	return m, nil
+}
+
+// FtsStatus returns a snapshot of the FTS pipeline: queue depth,
+// per-worker in-flight jobs, and a ring of recently completed/failed
+// jobs. Locks the index for read while assembling.
+func (c *Client) FtsStatus() (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "fts_status"})
+	if err != nil {
+		return nil, err
+	}
+	m, ok := data.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("oxidb: fts_status: unexpected response shape: %T", data)
+	}
+	return m, nil
+}
+
 // ------------------------------------------------------------------
 // Collection management
 // ------------------------------------------------------------------
