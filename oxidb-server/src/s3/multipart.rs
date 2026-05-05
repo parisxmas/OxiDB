@@ -67,17 +67,28 @@ pub fn handle_upload_part(state: &S3State, _bucket: &str, _key: &str, req: &Http
             &format!("Part number exceeds maximum ({})", super::MAX_MULTIPART_PARTS), "");
     }
 
+    // Decode aws-chunked framing here too — multipart uploads stream
+    // each part the same way single-PUT does.
+    let raw_body: &[u8] = &req.body;
+    let decoded;
+    let part_bytes: Vec<u8> = if super::object::is_aws_chunked(&req.headers) {
+        decoded = super::object::decode_aws_chunked(raw_body);
+        decoded
+    } else {
+        raw_body.to_vec()
+    };
+
     let mut uploads = state.uploads.lock().unwrap();
     match uploads.get_mut(upload_id.as_str()) {
         Some(upload) => {
-            let new_total = upload.total_bytes + req.body.len();
+            let new_total = upload.total_bytes + part_bytes.len();
             if new_total > super::MAX_MULTIPART_TOTAL {
                 return error_response(400, "EntityTooLarge",
                     "Multipart upload exceeds maximum total size", "");
             }
-            let etag = format!("{:08x}", crc32(&req.body));
+            let etag = format!("{:08x}", crc32(&part_bytes));
             upload.total_bytes = new_total;
-            upload.parts.insert(part_number, req.body.clone());
+            upload.parts.insert(part_number, part_bytes);
             HttpResponse::ok_xml(String::new())
                 .with_header("ETag", &format!("\"{etag}\""))
         }

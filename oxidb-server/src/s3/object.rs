@@ -2,6 +2,99 @@ use std::collections::HashMap;
 use oxidb::OxiDb;
 use oxidb::error::Error as OxiError;
 
+/// Detects aws-chunked / streaming PUT bodies. AWS CLI / boto3 send
+/// these by default; the chunk envelope hides the real payload behind
+/// per-chunk size headers and (optionally) trailing checksums.
+pub(crate) fn is_aws_chunked(headers: &HashMap<String, String>) -> bool {
+    if headers
+        .get("content-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("aws-chunked"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    headers
+        .get("x-amz-content-sha256")
+        .map(|v| v.starts_with("STREAMING-"))
+        .unwrap_or(false)
+}
+
+/// Strip aws-chunked framing back to the original payload. The format
+/// per chunk is:
+///   <size_hex>[;<ext>=<val>...]\r\n
+///   <size bytes>\r\n
+///   ...
+///   0[;<ext>=<val>...]\r\n
+///   [trailer-headers]\r\n
+///   \r\n
+/// We tolerate missing trailers and partial reads — anything that
+/// fails parsing falls back to whatever was reassembled so far rather
+/// than rejecting the request outright.
+pub(crate) fn decode_aws_chunked(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        // Find end of chunk-size line.
+        let nl = match input[i..].windows(2).position(|w| w == b"\r\n") {
+            Some(p) => i + p,
+            None => break,
+        };
+        let header = match std::str::from_utf8(&input[i..nl]) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        // Strip extensions (chunk-signature, etc.) — everything after ';'.
+        let size_hex = header.split(';').next().unwrap_or("").trim();
+        let size = match usize::from_str_radix(size_hex, 16) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        i = nl + 2;
+        if size == 0 {
+            // Final chunk; ignore any trailer headers that follow.
+            break;
+        }
+        if i + size > input.len() {
+            break;
+        }
+        out.extend_from_slice(&input[i..i + size]);
+        i += size;
+        // Skip the trailing \r\n after each data chunk.
+        if i + 2 <= input.len() && &input[i..i + 2] == b"\r\n" {
+            i += 2;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod chunked_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn decodes_simple_chunk() {
+        let body = b"b4\r\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\nPLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\n\r\n0\r\nx-amz-checksum-crc32:RENCRQ==\r\n\r\n";
+        let out = decode_aws_chunked(body);
+        let expected = b"PLAINTEXT-WITNESS-OXIDB-SECRET-DOCUMENT-DEMO\n".repeat(4);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn detects_via_streaming_header() {
+        let mut h = HashMap::new();
+        h.insert("x-amz-content-sha256".to_string(), "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string());
+        assert!(is_aws_chunked(&h));
+    }
+
+    #[test]
+    fn detects_via_content_encoding() {
+        let mut h = HashMap::new();
+        h.insert("content-encoding".to_string(), "aws-chunked".to_string());
+        assert!(is_aws_chunked(&h));
+    }
+}
+
 use super::encryption::{SseMode, parse_sse_headers, encrypt_data, decrypt_data, add_encryption_headers, sse_metadata_marker, is_sse_s3, is_sse_c};
 use super::helpers::{xml_escape, url_decode, parse_range, iso_to_httpdate};
 use super::http::{HttpRequest, HttpResponse, error_response};
@@ -18,8 +111,22 @@ pub fn handle_put_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
         Err(resp) => return resp,
     };
 
+    // Strip aws-chunked framing if present. Modern boto3 / aws-cli
+    // default to STREAMING uploads, which arrive as
+    //   <size_hex>[;<ext>]\r\n<data>\r\n ... 0\r\n[trailers]\r\n
+    // inside the Content-Length-bounded body. Without this step the
+    // raw frames end up persisted as the object's bytes.
+    let raw_body: &[u8] = &req.body;
+    let decoded_body;
+    let body_ref: &[u8] = if is_aws_chunked(&req.headers) {
+        decoded_body = decode_aws_chunked(raw_body);
+        &decoded_body
+    } else {
+        raw_body
+    };
+
     // Encrypt data if needed
-    let data_to_store = match encrypt_data(&req.body, &sse_mode, state.encryption.as_deref()) {
+    let data_to_store = match encrypt_data(body_ref, &sse_mode, state.encryption.as_deref()) {
         Ok(d) => d,
         Err(e) => return error_response(500, "InternalError", &format!("encryption failed: {e}"), key),
     };
