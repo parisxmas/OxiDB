@@ -1129,19 +1129,47 @@ fn main() {
     let db_manager = Arc::new(db_manager);
     db_manager.start_scheduler().expect("failed to start scheduler");
 
-    // Lazy sync mode: defer per-write fsync to a background thread (default: enabled).
-    // Matches MongoDB's default durability semantics (journal flushed every ~10ms).
-    // Disable with OXIDB_LAZY_SYNC=false for strict per-write durability.
+    // Lazy sync mode: defer per-write fsync to a background thread.
+    //
+    // Default OFF (strict ACID — every commit is fsync'd). Enable
+    // explicitly with OXIDB_LAZY_SYNC=true for higher write throughput
+    // at the cost of up to OXIDB_SYNC_INTERVAL_MS of data loss on
+    // crash. Matches PostgreSQL's `synchronous_commit=on` / MongoDB
+    // `j:true` defaults — when a write returns success the bytes are
+    // on disk.
     let lazy_sync = env::var("OXIDB_LAZY_SYNC")
-        .map(|v| v != "false" && v != "0")
-        .unwrap_or(true);
-    if lazy_sync && !in_memory_mode {
-        let sync_interval_ms: u64 = env::var("OXIDB_SYNC_INTERVAL_MS")
-            .unwrap_or_else(|_| "10".to_string())
-            .parse()
-            .expect("OXIDB_SYNC_INTERVAL_MS must be a valid u64");
-        db.enable_lazy_sync(Duration::from_millis(sync_interval_ms));
-        eprintln!("lazy sync: enabled (interval={}ms)", sync_interval_ms);
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    if !in_memory_mode {
+        // The "sync thread" is misnamed — its real job is periodic
+        // BTree snapshot persistence (sync_writes). Both strict and
+        // lazy modes need this; the difference is the cadence:
+        //
+        //   lazy : ~10ms — also functions as the WAL-fsync batcher
+        //          (commits skip per-write fsync, the thread catches up)
+        //   strict: ~1s  — WAL fsync already happens per commit, so the
+        //          thread only needs to capture full snapshots
+        //          occasionally (bounds WAL growth, speeds boot recovery)
+        let sync_interval_ms: u64 = if lazy_sync {
+            env::var("OXIDB_SYNC_INTERVAL_MS")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()
+                .expect("OXIDB_SYNC_INTERVAL_MS must be a valid u64")
+        } else {
+            env::var("OXIDB_SYNC_INTERVAL_MS")
+                .unwrap_or_else(|_| "1000".to_string())
+                .parse()
+                .expect("OXIDB_SYNC_INTERVAL_MS must be a valid u64")
+        };
+        if lazy_sync {
+            db.enable_lazy_sync(Duration::from_millis(sync_interval_ms));
+            eprintln!("lazy sync: ENABLED (interval={}ms) — writes durable up to {}ms after commit",
+                sync_interval_ms, sync_interval_ms);
+        } else {
+            db.enable_periodic_snapshot(Duration::from_millis(sync_interval_ms));
+            eprintln!("lazy sync: DISABLED — every commit fsync'd (strict ACID-D); snapshot every {}ms",
+                sync_interval_ms);
+        }
     }
 
     // TTL eviction thread: automatically remove expired documents.
@@ -1238,6 +1266,52 @@ fn main() {
         gelf,
         auth_enabled,
     });
+
+    // ---- Graceful shutdown wiring ------------------------------------
+    //
+    // SIGTERM (docker stop, systemd) and SIGINT (Ctrl-C) must drain the
+    // engine before the process exits — otherwise lazy_sync's pending
+    // writes and any unpersisted btree pages are lost. process::exit()
+    // skips Drop on Arc'd state, so we have to flush explicitly.
+    //
+    // The signal handler is async-signal-safe: it only stores into a
+    // global atomic. A dedicated watcher thread polls that atomic and
+    // performs the actual flush + exit. Polling is cheap (10ms tick)
+    // and avoids the can-of-worms of doing work inside a signal handler.
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
+        SHUTDOWN_REQUESTED.store(true, AtomicOrdering::SeqCst);
+    }
+    #[cfg(unix)]
+    unsafe {
+        // Install for SIGTERM and SIGINT. Ignore SIGPIPE so a broken
+        // client connection does not kill the process mid-flush.
+        libc::signal(libc::SIGTERM, shutdown_signal_handler as libc::sighandler_t);
+        libc::signal(libc::SIGINT, shutdown_signal_handler as libc::sighandler_t);
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
+    {
+        let state_for_shutdown = Arc::clone(&state);
+        std::thread::Builder::new()
+            .name("oxidb-shutdown".into())
+            .spawn(move || {
+                while !SHUTDOWN_REQUESTED.load(AtomicOrdering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                eprintln!("oxidb-server: shutdown signal received, flushing...");
+                let t0 = std::time::Instant::now();
+                state_for_shutdown.db.shutdown();
+                eprintln!(
+                    "oxidb-server: flush complete in {:?}, exiting cleanly",
+                    t0.elapsed()
+                );
+                std::process::exit(0);
+            })
+            .expect("failed to spawn shutdown watcher thread");
+    }
 
     let listener = TcpListener::bind(&addr).expect("failed to bind TCP listener");
     server_log!(state, GelfLevel::Notice, format!("oxidb-server listening on {addr} (pool_size={pool_size}, data_dir={data_dir}, idle_timeout={idle_timeout_secs}s)"));

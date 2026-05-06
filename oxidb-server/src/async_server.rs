@@ -227,7 +227,10 @@ async fn dispatch_request(
                         let raft_ops: Vec<crate::raft::types::TransactionWriteOp> = write_ops
                             .into_iter()
                             .map(|op| match op {
-                                oxidb::transaction::WriteOp::Insert { collection, data } => {
+                                oxidb::transaction::WriteOp::Insert { collection, data, id: _ } => {
+                                    // Raft replication path: the leader-side id reservation
+                                    // doesn't apply on followers (they reserve from their own
+                                    // counter when replaying). Drop it on the wire.
                                     crate::raft::types::TransactionWriteOp::Insert { collection, document: data }
                                 }
                                 oxidb::transaction::WriteOp::Update { collection, query, update } => {

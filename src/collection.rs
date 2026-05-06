@@ -2880,19 +2880,28 @@ impl Collection {
 
     /// Prepare a transactional insert. Returns (doc_id, PreparedMutation).
     /// Does NOT touch WAL or storage -- caller orchestrates.
-    pub fn prepare_tx_insert(&mut self, mut data: Value, tx_id: u64) -> Result<PreparedMutation> {
+    pub fn prepare_tx_insert(
+        &mut self,
+        mut data: Value,
+        tx_id: u64,
+        preassigned_id: Option<DocumentId>,
+    ) -> Result<PreparedMutation> {
         if !data.is_object() {
             return Err(Error::NotAnObject);
         }
 
-        let id = self.next_id;
+        let id = preassigned_id.unwrap_or(self.next_id);
         let obj = data.as_object_mut().unwrap();
         obj.insert("_id".to_string(), Value::Number(id.into()));
         obj.insert("_version".to_string(), Value::Number(1.into()));
 
         self.check_unique_constraints(&data, None)?;
 
-        self.next_id += 1;
+        // Don't double-bump if the caller already pre-allocated; the
+        // engine's tx_insert reserve already advanced next_id then.
+        if preassigned_id.is_none() {
+            self.next_id += 1;
+        }
 
         let bytes = crate::codec::encode_doc(&data)?;
 

@@ -17,7 +17,12 @@ pub struct ReadRecord {
 
 /// A buffered write operation within a transaction.
 pub enum WriteOp {
-    Insert { collection: String, data: Value },
+    /// `id` is pre-allocated at `tx_insert` time so the caller knows the
+    /// assigned _id before commit (needed for cross-collection foreign
+    /// keys: e.g. inserting a parent doc and its child rows in one tx
+    /// where the child carries the parent's id). Falls back to None for
+    /// legacy callers; commit-time prepare assigns one then.
+    Insert { collection: String, data: Value, id: Option<DocumentId> },
     Update { collection: String, query: Value, update: Value },
     Delete { collection: String, query: Value },
 }

@@ -537,6 +537,14 @@ impl WalBackend {
         }
     }
 
+    pub fn sync(&self) -> Result<()> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::File(w) => w.sync(),
+            Self::Memory => Ok(()),
+        }
+    }
+
     pub fn checkpoint(&self) -> Result<()> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]

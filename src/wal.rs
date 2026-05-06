@@ -211,6 +211,15 @@ impl Wal {
         Ok(())
     }
 
+    /// fsync the WAL file without writing anything else.
+    /// Used after the *_no_sync batch paths when the caller wants to
+    /// finalize durability for a group of writes.
+    pub fn sync(&self) -> Result<()> {
+        let file = self.inner.lock();
+        file.sync_data()?;
+        Ok(())
+    }
+
     /// Truncate the WAL to 0 (checkpoint), then fsync.
     pub fn checkpoint(&self) -> Result<()> {
         let file = self.inner.lock();

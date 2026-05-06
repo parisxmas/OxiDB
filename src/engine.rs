@@ -702,22 +702,63 @@ impl OxiDb {
         }
     }
 
+    /// Drain background workers and persist everything synchronously.
+    ///
+    /// Same effect as letting `Drop` run, but callable explicitly so a
+    /// signal handler can flush before the process exits (process exit
+    /// skips Drop on Arc'd state held by spawned threads). Idempotent:
+    /// once shutdown channels are taken they stay None on the second
+    /// call, and the per-collection flushes are safe to repeat.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn shutdown(&self) {
+        // Drop the senders → background sync/scheduler/alert threads
+        // see RecvError, run their own final-flush blocks, exit.
+        let _ = self.scheduler_shutdown.lock().take();
+        let _ = self.sync_shutdown.lock().take();
+        let _ = self.alert_shutdown.lock().take();
+        // Final checkpoint: persist + truncate WAL. Safe at shutdown
+        // because no writers are racing the persist anymore. During
+        // normal operation we only persist (sync_writes); the WAL
+        // truncate is intentionally deferred to here.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let cols = self.collections.read();
+            for col_arc in cols.values() {
+                let _ = col_arc.final_checkpoint();
+            }
+        }
+        self.flush_indexes();
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     /// Enable lazy sync mode: write operations skip per-operation fsync,
     /// and a background thread flushes all collections every `interval`.
     /// This matches MongoDB's default durability (journal flushed periodically).
     pub fn enable_lazy_sync(self: &Arc<Self>, interval: std::time::Duration) {
         self.lazy_sync.store(true, Ordering::Release);
-
-        // Enable lazy_sync on all currently loaded collections
         {
             let cols = self.collections.read();
             for col_arc in cols.values() {
                 col_arc.set_lazy_sync(true);
             }
         }
+        self.spawn_periodic_sync(interval);
+    }
 
-        // Spawn background sync thread
+    /// Start the background snapshot thread without flipping any
+    /// collection into lazy-fsync mode. Used in strict ACID-D mode
+    /// where every commit already fsyncs the WAL — the background
+    /// thread's only job is to flush BTree snapshots periodically so
+    /// WAL doesn't grow unbounded and recovery time stays short.
+    /// Same shutdown channel and final-flush semantics as
+    /// enable_lazy_sync.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_periodic_snapshot(self: &Arc<Self>, interval: std::time::Duration) {
+        self.spawn_periodic_sync(interval);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_periodic_sync(self: &Arc<Self>, interval: std::time::Duration) {
         let (tx, rx) = mpsc::sync_channel::<()>(0);
         let db = Arc::clone(self);
         std::thread::Builder::new()
@@ -727,23 +768,23 @@ impl OxiDb {
                 loop {
                     match rx.recv_timeout(interval) {
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Periodic flush
                             let cols = db.collections.read();
                             for col_arc in cols.values() {
                                 let _ = col_arc.sync_writes();
                             }
                             drop(cols);
-
-                            // Persist indexes every ~10s (1000 * 10ms interval)
                             flush_counter += 1;
-                            if flush_counter % 1000 == 0 {
+                            // Persist field indexes roughly every 10s
+                            // regardless of cadence — they're small and
+                            // their write is independent of btree pages.
+                            let ticks_per_10s = (10_000 / interval.as_millis().max(1)) as u64;
+                            if flush_counter % ticks_per_10s.max(1) == 0 {
                                 db.flush_indexes();
                             }
                         }
-                        _ => break, // Shutdown signal or sender dropped
+                        _ => break,
                     }
                 }
-                // Final flush on shutdown: sync writes + persist indexes
                 let cols = db.collections.read();
                 for col_arc in cols.values() {
                     let _ = col_arc.sync_writes();
@@ -1265,8 +1306,21 @@ impl OxiDb {
         Ok(tx.write_ops)
     }
 
-    /// Buffer an insert within a transaction.
-    pub fn tx_insert(&self, tx_id: TransactionId, collection: &str, doc: Value) -> Result<()> {
+    /// Buffer an insert within a transaction. Returns the document id
+    /// that will be assigned at commit time. Pre-allocating the id
+    /// here (rather than at commit) lets the caller weave the id into
+    /// sibling writes inside the same tx — e.g. inserting a parent doc
+    /// and a version row referencing it. If the tx rolls back the id
+    /// becomes a gap; that's harmless since ids don't need to be
+    /// contiguous.
+    pub fn tx_insert(&self, tx_id: TransactionId, collection: &str, doc: Value) -> Result<DocumentId> {
+        // Reserve an id from the target collection's monotonic counter.
+        // get_or_create_collection is the same path the commit path
+        // uses, so we don't open a second collection later under a
+        // different name.
+        let col = self.get_or_create_collection(collection)?;
+        let id = col.reserve_ids(1);
+
         let txs = self.active_transactions.read();
         let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
         let mut tx = tx_mutex.lock();
@@ -1274,8 +1328,9 @@ impl OxiDb {
         tx.write_ops.push(WriteOp::Insert {
             collection: collection.to_string(),
             data: doc,
+            id: Some(id),
         });
-        Ok(())
+        Ok(id)
     }
 
     /// Execute a read within a transaction, recording versions for OCC.
@@ -1415,9 +1470,9 @@ impl OxiDb {
 
         for op in tx.write_ops {
             match op {
-                WriteOp::Insert { collection, data } => {
+                WriteOp::Insert { collection, data, id } => {
                     let col = col_map.get(&collection).unwrap();
-                    let mutation = col.prepare_tx_insert(data, tx_id)?;
+                    let mutation = col.prepare_tx_insert(data, tx_id, id)?;
                     all_mutations.entry(collection).or_default().push(mutation);
                 }
                 WriteOp::Update { collection, query, update } => {
@@ -2309,16 +2364,9 @@ would silently shadow the old data with empty collections. Migrate or delete the
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for OxiDb {
     fn drop(&mut self) {
-        let _ = self.scheduler_shutdown.lock().take();
-        let _ = self.sync_shutdown.lock().take();
-        let _ = self.alert_shutdown.lock().take();
-        {
-            let cols = self.collections.read();
-            for col_arc in cols.values() {
-                let _ = col_arc.sync_writes();
-            }
-        }
-        self.flush_indexes();
+        // Re-use the explicit-shutdown path so Drop and the signal
+        // handler converge on the same semantics.
+        self.shutdown();
     }
 }
 

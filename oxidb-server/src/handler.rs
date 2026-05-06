@@ -145,7 +145,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             };
             if let Some(tx_id) = *active_tx {
                 match db.tx_insert(tx_id, col, doc) {
-                    Ok(()) => ok_bytes(json!("buffered")),
+                    Ok(id) => ok_bytes(json!({ "id": id })),
                     Err(e) => err_bytes(&e.to_string()),
                 }
             } else {
@@ -166,12 +166,14 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 _ => return err_bytes("missing or invalid 'docs' array"),
             };
             if let Some(tx_id) = *active_tx {
+                let mut ids = Vec::with_capacity(docs.len());
                 for doc in docs {
-                    if let Err(e) = db.tx_insert(tx_id, col, doc) {
-                        return err_bytes(&e.to_string());
+                    match db.tx_insert(tx_id, col, doc) {
+                        Ok(id) => ids.push(id),
+                        Err(e) => return err_bytes(&e.to_string()),
                     }
                 }
-                ok_bytes(json!("buffered"))
+                ok_bytes(json!(ids))
             } else {
                 match db.insert_many(col, docs) {
                     Ok(ids) => ok_bytes(json!(ids)),
@@ -212,9 +214,28 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             };
             let empty = json!({});
             let query = request.get("query").unwrap_or(&empty);
-            match db.find_one(col, query) {
-                Ok(doc) => ok_bytes(json!(doc)),
-                Err(e) => err_bytes(&e.to_string()),
+            // Inside a tx, route through tx_find so the read version
+            // is recorded for OCC validation. Without this, a
+            // read-then-write pattern (e.g. quota reserve: read row,
+            // check limit, increment) inside a tx would skip the
+            // read-set check at commit, opening a lost-update race.
+            if let Some(tx_id) = *active_tx {
+                match db.tx_find(tx_id, col, query) {
+                    Ok(mut docs) => {
+                        let first = if docs.is_empty() {
+                            Value::Null
+                        } else {
+                            docs.remove(0)
+                        };
+                        ok_bytes(first)
+                    }
+                    Err(e) => err_bytes(&e.to_string()),
+                }
+            } else {
+                match db.find_one(col, query) {
+                    Ok(doc) => ok_bytes(json!(doc)),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
             }
         }
 

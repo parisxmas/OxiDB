@@ -72,6 +72,10 @@ pub struct BTreeCollection {
     ttl_configs: RwLock<Vec<TtlIndexConfig>>,
     /// Dirty flag: set on write, cleared after persist.
     dirty: AtomicBool,
+    /// Lazy-sync mode: when true, WAL writes skip per-commit fsync and
+    /// rely on the engine's background sync thread (~10ms cadence). When
+    /// false, every commit fsyncs the WAL — strict durability for ACID.
+    lazy_sync: AtomicBool,
     wal: WalBackend,
 }
 
@@ -181,6 +185,7 @@ impl BTreeCollection {
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             ttl_configs: RwLock::new(ttl_configs),
             dirty: AtomicBool::new(false),
+            lazy_sync: AtomicBool::new(false),
             wal: wal_backend,
         })
     }
@@ -201,6 +206,7 @@ impl BTreeCollection {
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             ttl_configs: RwLock::new(Vec::new()),
             dirty: AtomicBool::new(false),
+            lazy_sync: AtomicBool::new(false),
             wal: WalBackend::Memory,
         }
     }
@@ -230,8 +236,33 @@ impl BTreeCollection {
     // Configuration (matching Collection API)
     // -----------------------------------------------------------------------
 
-    pub fn set_lazy_sync(&self, _enabled: bool) {
-        // B-tree handles its own durability; this is a no-op.
+    pub fn set_lazy_sync(&self, enabled: bool) {
+        // Switches WAL between per-commit fsync (false → strict ACID-D)
+        // and batched background-sync (true → ~10ms data-loss window
+        // on crash, MongoDB-style). The engine flips this at startup
+        // based on OXIDB_LAZY_SYNC; runtime flips are also safe — the
+        // hot path reads this atomically per-commit.
+        self.lazy_sync.store(enabled, Ordering::Release);
+    }
+
+    /// Single-entry WAL write — fsyncs unless lazy mode is on.
+    #[inline]
+    fn wal_log(&self, entry: &WalEntry) -> Result<()> {
+        if self.lazy_sync.load(Ordering::Acquire) {
+            self.wal.log_no_sync(entry)
+        } else {
+            self.wal.log(entry)
+        }
+    }
+
+    /// Batch WAL write — fsyncs once at the end unless lazy mode is on.
+    #[inline]
+    fn wal_log_batch(&self, entries: &[WalEntry]) -> Result<()> {
+        if self.lazy_sync.load(Ordering::Acquire) {
+            self.wal.log_batch_no_sync(entries)
+        } else {
+            self.wal.log_batch(entries)
+        }
     }
 
     pub fn set_cache_capacity(&self, capacity: usize) {
@@ -242,9 +273,42 @@ impl BTreeCollection {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(()); // nothing changed since last persist
         }
+        // Capture the current btree state to disk via atomic rename.
+        //
+        // Critically, do NOT checkpoint (truncate) the WAL here.
+        // Concurrent inserts can append to the WAL and update the
+        // in-memory btree _after_ persist has begun iterating the
+        // tree but _before_ checkpoint runs — those entries would
+        // be lost (their WAL record erased, but the btree image on
+        // disk doesn't yet reflect them). Tested empirically:
+        // crash-recovery-go lost ~3/2000 acks before the WAL
+        // truncation was removed.
+        //
+        // The cost is unbounded WAL growth between snapshots, which
+        // we bound elsewhere: graceful shutdown does a final persist
+        // and only THEN can safely truncate (no concurrent writers).
+        // Recovery on startup is idempotent — the WAL replays on top
+        // of the snapshot, double-applying inserts is a no-op via
+        // doc_id deduplication.
         #[cfg(not(target_arch = "wasm32"))]
         self.storage.persist()?;
-        self.wal.checkpoint_no_sync()?;
+        Ok(())
+    }
+
+    /// Final checkpoint at shutdown only: persist BTree, then truncate
+    /// the WAL. Safe to truncate here because the engine has stopped
+    /// accepting writes (the listener is closed and worker threads have
+    /// drained). NOT safe to call during normal operation — see
+    /// sync_writes for the race that motivated splitting them.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn final_checkpoint(&self) -> Result<()> {
+        self.storage.persist()?;
+        self.dirty.store(false, Ordering::Release);
+        if self.lazy_sync.load(Ordering::Acquire) {
+            self.wal.checkpoint_no_sync()?;
+        } else {
+            self.wal.checkpoint()?;
+        }
         Ok(())
     }
 
@@ -461,8 +525,9 @@ impl BTreeCollection {
 
         let bytes = codec::encode_doc(&data)?;
 
-        // WAL log before mutation
-        self.wal.log_no_sync(&WalEntry::Insert { doc_id: id, doc_bytes: bytes.clone(), tx_id: 0 })?;
+        // WAL log before mutation. Single-doc insert uses the helper
+        // so per-commit fsync follows the lazy_sync flag.
+        self.wal_log(&WalEntry::Insert { doc_id: id, doc_bytes: bytes.clone(), tx_id: 0 })?;
 
         // Insert directly into B-tree (the B-tree IS the storage)
         self.storage.insert(id, bytes);
@@ -583,6 +648,12 @@ impl BTreeCollection {
         {
             let wal_refs: Vec<(u64, &[u8])> = btree_entries.iter().map(|(id, b)| (*id, b.as_slice())).collect();
             self.wal.log_batch_inserts_no_sync_buffered(&wal_refs)?;
+            // Strict durability: one fsync at the end of the batch
+            // covers every record we just appended. Lazy mode skips
+            // it and lets the periodic sync thread catch up.
+            if !self.lazy_sync.load(Ordering::Acquire) {
+                self.wal.sync()?;
+            }
         }
         self.storage.insert_batch(btree_entries);
 
@@ -646,6 +717,9 @@ impl BTreeCollection {
         {
             let wal_refs: Vec<(u64, &[u8])> = prepared.iter().map(|(id, _, b)| (*id, b.as_slice())).collect();
             self.wal.log_batch_inserts_no_sync_buffered(&wal_refs)?;
+            if !self.lazy_sync.load(Ordering::Acquire) {
+                self.wal.sync()?;
+            }
         }
         let has_indexes = !fi.is_empty() || !ci.is_empty() || ti.is_some() || !vi.is_empty();
         let skip_cache = prepared.len() > 1000;
@@ -1260,7 +1334,7 @@ impl BTreeCollection {
 
         {
             let wal_entries: Vec<WalEntry> = ops.iter().map(|op| WalEntry::Update { doc_id: op.id, doc_bytes: op.new_bytes.clone(), tx_id: 0 }).collect();
-            self.wal.log_batch_no_sync(&wal_entries)?;
+            self.wal_log_batch(&wal_entries)?;
         }
 
         let mut updated_ids = Vec::with_capacity(ops.len());
@@ -1398,7 +1472,7 @@ impl BTreeCollection {
         // Phase 2: Remove from B-tree and update indexes (write locks)
         {
             let wal_entries: Vec<WalEntry> = ops.iter().map(|op| WalEntry::Delete { doc_id: op.id, tx_id: 0 }).collect();
-            self.wal.log_batch_no_sync(&wal_entries)?;
+            self.wal_log_batch(&wal_entries)?;
         }
 
         let mut fi = self.field_indexes.write();
@@ -2075,16 +2149,32 @@ impl BTreeCollection {
     // Transaction support (matching Collection API)
     // -----------------------------------------------------------------------
 
-    pub fn log_wal_batch(&self, _entries: &[crate::wal::WalEntry]) -> Result<()> {
-        // B-tree collection doesn't use WAL — this is a no-op.
-        // Durability is provided by B-tree persistence.
-        Ok(())
+    pub fn log_wal_batch(&self, entries: &[crate::wal::WalEntry]) -> Result<()> {
+        // Tx-commit durability path. Write the batch to the WAL with
+        // a single fsync — mirroring `wal_log_batch` used by the
+        // non-tx hot path. Without this, a crash between
+        // `tx_log.mark_committed` and the next `persist()` would
+        // lose committed writes: the tx is marked committed, but the
+        // btree image on disk doesn't carry the new data and there's
+        // no WAL to replay from.
+        if self.lazy_sync.load(Ordering::Acquire) {
+            self.wal.log_batch_no_sync(entries)
+        } else {
+            self.wal.log_batch(entries)
+        }
     }
 
     pub fn checkpoint_wal(&self) -> Result<()> {
-        // No WAL to checkpoint — persist the B-tree instead.
-        #[cfg(not(target_arch = "wasm32"))]
-        self.storage.persist()?;
+        // Mark the data as needing eventual persistence. The actual
+        // btree-snapshot write is now handled by sync_writes (called
+        // by the periodic sync thread or on shutdown), so commits no
+        // longer pay the full-file rewrite cost on the hot path —
+        // durability is already secured by the WAL fsync in
+        // log_wal_batch above. Writing the snapshot every commit
+        // collapsed throughput from ~250 ops/s to ~1.8 ops/s under
+        // contention; deferred persistence is the standard pattern
+        // (Postgres checkpointer, MongoDB journal flush).
+        self.dirty.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -2092,12 +2182,18 @@ impl BTreeCollection {
         &self,
         mut data: Value,
         tx_id: u64,
+        preassigned_id: Option<DocumentId>,
     ) -> Result<crate::collection::PreparedMutation> {
         if !data.is_object() {
             return Err(Error::NotAnObject);
         }
 
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // If the caller (engine.tx_insert) already reserved an id at
+        // buffering time, use it — that id is the one the API client
+        // already sees. Otherwise fall back to allocating one here
+        // (legacy paths and direct engine callers).
+        let id = preassigned_id
+            .unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::SeqCst));
         let obj = data.as_object_mut().unwrap();
         obj.insert("_id".to_string(), Value::Number(id.into()));
         obj.insert("_version".to_string(), Value::Number(1.into()));

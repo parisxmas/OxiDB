@@ -49,6 +49,14 @@ pub struct BTreeStorage {
     name: String,
     /// Optional encryption key for at-rest encryption of the .btree file.
     encryption: Option<Arc<crate::EncryptionKey>>,
+    /// Serializes concurrent persist() calls. Without this, two
+    /// concurrent commits both write to the same `{name}.btree.tmp`
+    /// file, mangle each other's bytes, and the surviving rename
+    /// produces a corrupt on-disk image — the source of the
+    /// "io error: No such file or directory" / truncated-file errors
+    /// observed under load. Mutex is per-collection so writes to
+    /// different collections still proceed in parallel.
+    persist_mu: crate::locks::Mutex<()>,
 }
 
 /// A cursor for iterating through the storage in ascending key order.
@@ -142,6 +150,7 @@ impl BTreeStorage {
             data_dir: data_dir.to_path_buf(),
             name: name.to_string(),
             encryption,
+            persist_mu: crate::locks::Mutex::new(()),
         }
     }
 
@@ -153,22 +162,62 @@ impl BTreeStorage {
             data_dir: PathBuf::new(),
             name: name.to_string(),
             encryption: None,
+            persist_mu: crate::locks::Mutex::new(()),
         }
     }
 
-    /// Open or load a B-tree from disk. Falls back to empty if no file exists.
+    /// Open or load a B-tree from disk. Falls back to empty if no file
+    /// exists. Tolerates truncation: if the on-disk image got partially
+    /// written before we landed `persist()`'s atomic-rename fix (or in
+    /// any future bug), load every fully-decoded record and let the WAL
+    /// replay catch up with the rest. Without this fallback the engine
+    /// refuses to boot — bricked database for one bad shutdown.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(name: &str, data_dir: &Path, encryption: Option<Arc<crate::EncryptionKey>>) -> Result<Self> {
         let path = data_dir.join(format!("{}.btree", name));
+        let tmp = data_dir.join(format!("{}.btree.tmp", name));
         let storage = Self::new(name, data_dir, encryption);
+
+        // Stale tmp from a crash mid-persist: drop it. The real file
+        // (if present) is either intact (rename completed first) or
+        // partially the old version (rename never ran) — both are
+        // valid starting points; the leftover tmp is just garbage.
+        if tmp.exists() {
+            let _ = std::fs::remove_file(&tmp);
+        }
 
         if path.exists() {
             let mut data = std::fs::read(&path)?;
-            // Decrypt if encryption key is set
             if let Some(ref key) = storage.encryption {
-                data = key.decrypt(&data)?;
+                // Decryption failure on the whole file is fatal — we
+                // can't partially-decrypt to recover. WAL replay alone
+                // (without the BTree base) would still rebuild state
+                // for whatever WAL has retained, so we soldier on.
+                match key.decrypt(&data) {
+                    Ok(d) => data = d,
+                    Err(e) => {
+                        eprintln!(
+                            "[btree] {}.btree decryption failed: {} — \
+                             starting from empty store, WAL replay will rebuild",
+                            name, e
+                        );
+                        return Ok(storage);
+                    }
+                }
             }
-            storage.load_from_bytes(&data)?;
+            if let Err(e) = storage.load_from_bytes(&data) {
+                eprintln!(
+                    "[btree] {}.btree partially loaded ({} records, {} bytes total) \
+                     before error: {} — WAL replay will reconcile",
+                    name,
+                    storage.tree.len(),
+                    data.len(),
+                    e
+                );
+                // Fall through with whatever was loaded — load_from_bytes
+                // upserts records as it parses them, so any prefix that
+                // decoded cleanly is already in `tree`.
+            }
         }
 
         Ok(storage)
@@ -197,13 +246,46 @@ impl BTreeStorage {
         Ok(())
     }
 
-    /// Persist the B-tree to disk.
+    /// Persist the B-tree to disk atomically.
+    ///
+    /// Durability protocol: write to a sibling tmp path, fsync the file
+    /// data, atomically rename onto the target, then fsync the parent
+    /// directory so the rename itself is durable across power loss.
+    ///
+    /// Why each step matters:
+    ///   - tmp + rename: a process crash mid-write leaves the original
+    ///     `{name}.btree` untouched. Without this, a partial overwrite
+    ///     produces the "truncated btree file" startup error we hit.
+    ///   - fsync(tmp): ensures the tmp file's bytes hit disk before we
+    ///     rename. Skipping it lets rename succeed while data is still
+    ///     in OS page cache; a power loss between rename and natural
+    ///     flush re-creates the truncation problem on a "valid-named"
+    ///     file.
+    ///   - fsync(dir): the rename itself is a directory metadata
+    ///     change. POSIX requires fsync on the directory to make the
+    ///     entry durable.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn persist(&self) -> Result<()> {
         if self.data_dir.as_os_str().is_empty() {
             return Ok(()); // in-memory mode
         }
+        // Serialize concurrent persists for THIS collection. Two
+        // concurrent commits that both reach checkpoint_wal would
+        // otherwise both open `{name}.btree.tmp` with truncate(true),
+        // mangle each other's bytes, and the surviving rename leaves
+        // the on-disk image either truncated or unrelated to either
+        // committer's view of state. We hold the lock for the entire
+        // write+rename+fsync sequence so the on-disk image is always
+        // a snapshot of the tree at some single point in time.
+        //
+        // This serializes commits that target the same collection
+        // but doesn't block commits on other collections (each has
+        // its own BTreeStorage with its own mutex).
+        let _persist_guard = self.persist_mu.lock();
+
         let path = self.data_dir.join(format!("{}.btree", self.name));
+        let tmp = self.data_dir.join(format!("{}.btree.tmp", self.name));
+
         let mut buf = Vec::with_capacity(self.total_bytes.load(Ordering::Acquire) as usize + self.tree.len() * 12);
         self.tree.iter_sync(|key, value| {
             buf.extend_from_slice(&key.to_le_bytes());
@@ -211,13 +293,38 @@ impl BTreeStorage {
             buf.extend_from_slice(value);
             true
         });
-        // Encrypt if key is set
         let write_buf = if let Some(ref key) = self.encryption {
             key.encrypt(&buf)?
         } else {
             buf
         };
-        std::fs::write(&path, &write_buf)?;
+
+        // 1) Write + fsync the tmp file.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            std::io::Write::write_all(&mut f, &write_buf)?;
+            f.sync_data()?;
+        }
+
+        // 2) Atomic rename. POSIX guarantees this is observed by other
+        // processes as either the old file or the new one — never a
+        // mix.
+        std::fs::rename(&tmp, &path)?;
+
+        // 3) Fsync the parent directory so the rename hits disk too.
+        // On macOS APFS this is a no-op as far as durability goes (FS
+        // crash-consistency is stronger), but it costs nothing and is
+        // required on ext4 / xfs / etc.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_data();
+            }
+        }
+
         Ok(())
     }
 
