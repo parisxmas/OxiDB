@@ -25,6 +25,8 @@ from typing import Optional
 
 from oxidb_embedded import OxiDbEmbedded
 
+from .middleware import record_db_call
+
 # -------------------------------------------------------------------------
 # Single, lazily-initialized OxiDb instance.
 # -------------------------------------------------------------------------
@@ -62,10 +64,28 @@ def db() -> OxiDbEmbedded:
     with _DB_LOCK:
         if _DB_INSTANCE is None:
             inst = OxiDbEmbedded(_data_dir())
+            _instrument_for_timing(inst)
             _setup_schema(inst)
             _seed_if_empty(inst)
             _DB_INSTANCE = inst
     return _DB_INSTANCE
+
+
+def _instrument_for_timing(inst: OxiDbEmbedded) -> None:
+    """
+    Wrap the FFI boundary (`_execute`) so the timing middleware can
+    attribute every call to the request that made it. All ORM-style
+    helpers in oxidb_embedded — find, insert, put_object, ... — funnel
+    through this one method, so wrapping it once instruments the lot.
+    """
+    original = inst._execute
+    def timed(cmd, *args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return original(cmd, *args, **kwargs)
+        finally:
+            record_db_call((time.perf_counter() - t0) * 1000.0)
+    inst._execute = timed  # type: ignore[method-assign]
 
 
 def _setup_schema(d: OxiDbEmbedded) -> None:

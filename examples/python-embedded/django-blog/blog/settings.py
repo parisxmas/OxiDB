@@ -34,6 +34,10 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # First in the chain so it captures the full request lifecycle,
+    # including session decode + CSRF setup. Has to run before
+    # gzip/content-length-sensitive middleware (we have none here).
+    "posts.middleware.TimingMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
