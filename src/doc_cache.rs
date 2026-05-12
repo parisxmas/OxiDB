@@ -1,5 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::locks::Mutex;
 
 use lru::LruCache;
@@ -23,6 +24,28 @@ const SHARD_MASK: u64 = (NUM_SHARDS as u64) - 1;
 /// MongoDB for concurrent `find_one` workloads.
 pub struct DocCache {
     shards: Vec<Mutex<LruCache<DocumentId, Arc<Value>>>>,
+    /// Cumulative cache hits (Relaxed — counter is observational, not
+    /// load-bearing; missing a few under contention is fine).
+    hits: AtomicU64,
+    /// Cumulative cache misses.
+    misses: AtomicU64,
+}
+
+/// Snapshot of cache hit/miss counters, returned by `DocCache::stats`.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl CacheStats {
+    pub fn total(&self) -> u64 {
+        self.hits + self.misses
+    }
+    pub fn hit_ratio(&self) -> f64 {
+        let total = self.total();
+        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
+    }
 }
 
 #[inline]
@@ -39,14 +62,46 @@ impl DocCache {
         let shards = (0..NUM_SHARDS)
             .map(|_| Mutex::new(LruCache::new(cap)))
             .collect();
-        Self { shards }
+        Self {
+            shards,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
     }
 
     /// Look up a document by ID, promoting it to most-recently-used.
-    /// Returns `None` on cache miss.
+    /// Returns `None` on cache miss. Updates hit/miss counters.
     pub fn get(&self, id: DocumentId) -> Option<Arc<Value>> {
         let mut cache = self.shards[shard_for(id)].lock();
-        cache.get(&id).map(Arc::clone)
+        match cache.get(&id) {
+            Some(v) => {
+                let arc = Arc::clone(v);
+                drop(cache);
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(arc)
+            }
+            None => {
+                drop(cache);
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Snapshot the hit/miss counters. Used for observability and the
+    /// adaptive-sizing decision in tuning workflows.
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Reset the hit/miss counters. Useful when measuring a specific
+    /// window (e.g. ignore warmup phase).
+    pub fn reset_stats(&self) {
+        self.hits.store(0, Ordering::Relaxed);
+        self.misses.store(0, Ordering::Relaxed);
     }
 
     /// Look up without promoting (peek). Useful during iteration

@@ -269,6 +269,22 @@ impl BTreeCollection {
         self.doc_cache.resize(capacity);
     }
 
+    /// Snapshot of (hits, misses) on the per-collection document cache.
+    pub fn doc_cache_stats(&self) -> crate::doc_cache::CacheStats {
+        self.doc_cache.stats()
+    }
+
+    /// Reset the doc cache hit/miss counters. Useful when measuring a
+    /// specific window (e.g. ignore the warmup phase of a benchmark).
+    pub fn doc_cache_stats_reset(&self) {
+        self.doc_cache.reset_stats();
+    }
+
+    /// Evict every entry from the per-collection document cache.
+    pub fn doc_cache_clear(&self) {
+        self.doc_cache.clear();
+    }
+
     pub fn sync_writes(&self) -> Result<()> {
         if !self.dirty.swap(false, Ordering::AcqRel) {
             return Ok(()); // nothing changed since last persist
@@ -400,6 +416,29 @@ impl BTreeCollection {
         let arc = Arc::new(doc);
         self.doc_cache.put(id, Arc::clone(&arc));
         Some(arc)
+    }
+
+    /// Load a document and return it as JSON text, skipping the
+    /// `serde_json::Value` intermediate on the cache-miss path.
+    ///
+    /// - Cache hit  → serialize the cached `Arc<Value>` to text (this
+    ///   matches current find-response behavior; ~3-25 µs per doc).
+    /// - Cache miss → `RawJsonb::to_string` directly off the storage
+    ///   bytes; ~5 µs on a 13 KB document where `decode_doc` followed
+    ///   by `serde_json::to_vec` would cost ~30 µs. The cache is NOT
+    ///   populated on this path — the caller has already gotten the
+    ///   wire payload it wanted, and decoding to Value just to put
+    ///   it in the cache would undo the speedup.
+    ///
+    /// Use this from the server's wire response path. Filter and
+    /// update paths should keep using `load_doc_arc`, which gives
+    /// them the structured Value the cache exists to serve.
+    pub fn load_doc_text(&self, id: DocumentId) -> Option<String> {
+        if let Some(arc) = self.doc_cache.peek(id) {
+            return serde_json::to_string(&*arc).ok();
+        }
+        let bytes = self.storage.get(id)?;
+        codec::decode_doc_to_text(&bytes).ok()
     }
 
     /// Read a document by ID (cloned Value).
