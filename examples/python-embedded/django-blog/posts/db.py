@@ -57,7 +57,25 @@ def _data_dir() -> str:
 
 
 def db() -> OxiDbEmbedded:
-    """Process-wide OxiDb handle. Created on first call."""
+    """
+    Process-wide embedded OxiDb handle. Created on first call.
+
+    Embedded mode is single-process by design — the data dir holds
+    the B-tree, the WAL, and the in-memory caches that the running
+    process owns. Two processes opening the same data dir would race
+    on writes and shred the B-tree. For Django that translates to:
+
+      - `runserver`              → fine, one process by default.
+      - `gunicorn --workers 1
+                  --threads N`   → fine, threads share this one
+                                   embedded handle; the Rust engine
+                                   itself is internally thread-safe.
+      - `gunicorn --workers >1`  → DON'T. Use `bin/start.sh` which
+                                   pins workers=1 and ramps threads.
+
+    True multi-process needs the standalone `oxidb-server` and the
+    pure-Python TCP client — which is a different example.
+    """
     global _DB_INSTANCE
     if _DB_INSTANCE is not None:
         return _DB_INSTANCE
@@ -109,12 +127,21 @@ def _setup_schema(d: OxiDbEmbedded) -> None:
 
 
 def _seed_if_empty(d: OxiDbEmbedded) -> None:
+    """
+    Idempotent seed. Threads within the single embedded process are
+    serialized by `_DB_LOCK` around `db()`, so this only runs once —
+    the try/except is belt-and-suspenders against future callers that
+    skip the lock or share a data dir across processes by mistake.
+    """
     if d.count(ADMINS) == 0:
-        d.insert(ADMINS, {
-            "username": DEFAULT_ADMIN_USER,
-            "password_hash": hash_password(DEFAULT_ADMIN_PASSWORD),
-            "created_at": _now(),
-        })
+        try:
+            d.insert(ADMINS, {
+                "username": DEFAULT_ADMIN_USER,
+                "password_hash": hash_password(DEFAULT_ADMIN_PASSWORD),
+                "created_at": _now(),
+            })
+        except Exception:
+            pass
     if d.count(POSTS) == 0:
         sample_body = (
             "OxiDB is a fast document database. This entire blog runs on "
@@ -124,14 +151,17 @@ def _seed_if_empty(d: OxiDbEmbedded) -> None:
             "served by the same process.\n\n"
             "Edit me from the admin panel, or delete me and start over."
         )
-        d.insert(POSTS, {
-            "title": "Hello from the rust-stained press",
-            "slug": "hello-from-the-rust-stained-press",
-            "body": sample_body,
-            "author": DEFAULT_ADMIN_USER,
-            "created_at": _now(),
-            "image_key": None,
-        })
+        try:
+            d.insert(POSTS, {
+                "title": "Hello from the rust-stained press",
+                "slug": "hello-from-the-rust-stained-press",
+                "body": sample_body,
+                "author": DEFAULT_ADMIN_USER,
+                "created_at": _now(),
+                "image_key": None,
+            })
+        except Exception:
+            pass
 
 
 # -------------------------------------------------------------------------

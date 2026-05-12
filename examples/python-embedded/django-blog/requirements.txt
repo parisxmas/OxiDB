@@ -1,3 +1,14 @@
 django>=4.2
-pillow>=10.0          # only used to mint test images in dev; not required for the app itself
+
+# Runs OxiDB in-process via the FFI shared library bundled inside
+# the wheel. Embedded mode is single-process; concurrency comes from
+# threads inside that one process (see bin/start.sh).
 oxidb-embedded>=0.25.21
+
+# Production-style runner: one worker, many threads. Not required
+# for `python manage.py runserver`.
+gunicorn>=21.0
+
+# Only used by dev tooling — minting test images in the smoke-test
+# fixtures. Not imported by the app itself.
+pillow>=10.0

@@ -48,10 +48,14 @@ source .venv/bin/activate
 # 2) Install oxidb-embedded. Once the new wheel is on PyPI you can do:
 #       pip install oxidb-embedded
 #    For now we install the locally-built wheel:
-pip install ../../../python-embedded/dist/oxidb_embedded-0.25.21-py3-none-any.whl django pillow
+pip install ../../../python-embedded/dist/oxidb_embedded-0.25.21-py3-none-any.whl
+pip install -r requirements.txt
 
-# 3) Run.
+# 3a) Dev — single-process, one thread, autoreload:
 python manage.py runserver 127.0.0.1:8765
+
+# 3b) Production-style — single worker, multi-threaded (see below):
+THREADS=8 PORT=8765 bin/start.sh
 ```
 
 Open <http://127.0.0.1:8765/>.
@@ -59,6 +63,26 @@ Open <http://127.0.0.1:8765/>.
 The composing room is at <http://127.0.0.1:8765/admin/login>. First
 boot seeds an `admin / admin` user and a sample post — change the
 credentials right after.
+
+## Why `bin/start.sh` is `--workers 1 --threads N` (and not `--workers N`)
+
+Embedded OxiDB is single-process by construction. The B-tree, the WAL,
+the document cache, and the FTS worker pool all live as in-process
+state next to the running app. Two processes opening the same data
+directory would race on writes and corrupt the on-disk B-tree image —
+so spawning multiple gunicorn *workers* over one embedded data dir is
+a way to lose data, not a way to scale.
+
+The Rust engine is already internally thread-safe (per-collection
+RwLocks for concurrent reads, lock-free buckets for hot writes), so
+the right concurrency knob for *this* deployment shape is **one
+worker, many threads**. `bin/start.sh` defaults to 8 gthread workers
+inside one gunicorn process; bump `THREADS=` to taste.
+
+If you actually need multiple OS processes serving the blog, that is
+the job of the standalone `oxidb-server` and the pure-Python `oxidb`
+TCP client — a different example, not this one. With this app, more
+processes do not buy more throughput; more threads do.
 
 ## URL map
 
