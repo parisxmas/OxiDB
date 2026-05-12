@@ -6,6 +6,8 @@
 
 **Client libraries:** [Python](python/) | [Go](go/) | [Julia](julia/) | [.NET](dotnet/) | [Swift/iOS](swift/) | [JavaScript/TypeScript](oxidb-js/) | [C FFI](oxidb-client-ffi/) | [VS Code Extension](oxidb-vscode/)
 
+> ⚠️ **WARNING — not production-ready.** OxiDB is under active development. The on-disk data format, the wire/server protocol, the client SDK surface, and the SQL/JSON query language are all subject to **breaking changes between releases** with no migration path or backward-compatibility guarantee. Do not run it against data you cannot afford to lose or rebuild. Pin a specific version, expect to dump-and-reload on upgrade, and treat any production-like use as experimental until a `1.0` release explicitly commits to stability.
+
 ## Installation
 
 ### Option 1: Download a pre-built binary (easiest)
@@ -765,4 +767,13 @@ Date strings (ISO 8601, RFC 3339, `YYYY-MM-DD`) are automatically stored as epoc
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
