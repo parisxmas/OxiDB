@@ -3,8 +3,31 @@ use serde_json::Value;
 use crate::error::{Error, Result};
 
 /// Encode a `serde_json::Value` into JSONB binary format.
+///
+/// Routes Value → JSON text → `jsonb::parse_owned_jsonb_standard_mode`
+/// instead of the direct serde Serialize → JSONB path. The serde
+/// encoder in jsonb 0.5 allocates a fresh `Serializer` (with its own
+/// `Vec<u8>`) for every map value, materializes each child as an
+/// intermediate `OwnedJsonb`, then concatenates them at the end —
+/// the dominant cost in the encode profile (3-4× slower than the
+/// text-parse path) and the cause of an extra `SCALAR_CONTAINER_TAG`
+/// (4 bytes) wrapped around every scalar inside a container (which
+/// inflates the on-disk image by ~30-50% for realistic docs).
+///
+/// The text-parse path produces output bytes that are still a valid
+/// `OwnedJsonb` and decode through the same `jsonb::from_raw_jsonb` /
+/// `RawJsonb::get_by_*` paths — same crate, same struct, same format
+/// surface. Legacy fat-format images from older writers continue to
+/// decode unchanged.
+///
+/// Standard mode is used (rather than extended) because `serde_json`
+/// always emits strict JSON — there are no leading plus signs, NaN
+/// literals, or empty array elements to accommodate.
 pub fn encode_doc(value: &Value) -> Result<Vec<u8>> {
-    let owned = jsonb::to_owned_jsonb(value)
+    let mut text = Vec::with_capacity(64);
+    serde_json::to_writer(&mut text, value)
+        .map_err(|e| Error::Codec(e.to_string()))?;
+    let owned = jsonb::parse_owned_jsonb_standard_mode(&text)
         .map_err(|e| Error::Codec(e.to_string()))?;
     Ok(owned.to_vec())
 }
