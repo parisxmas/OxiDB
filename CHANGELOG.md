@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.25.21
+
+### Decode — 5× faster cold-path wire response
+
+- **`codec::decode_doc_to_text`** (`src/codec.rs`) — JSONB → JSON text via `RawJsonb::to_string`, skipping the `serde_json::Value` intermediate. One walk, no allocated Value tree. Legacy JSON-text bytes pass through unchanged.
+- **`BTreeCollection::load_doc_text`** (`src/btree_collection.rs`) — cache-hit serializes the cached `Arc<Value>` (unchanged hot path); cache-miss reads raw bytes and calls `decode_doc_to_text` directly. Does NOT populate the doc cache on miss — decoding to Value just to cache it would undo the speedup, and the wire payload by itself doesn't carry the structured Value that filter paths need.
+- Driven by measurement (`examples/measure_cache_hitrate.rs`): Zipfian sweep showed DocCache hit ratios of 60-92% for typical OLTP-shaped workloads (Zipf s ~ 1.0-1.2, 10-100× cache cap) and 12-35% for low-skew / big-working-set configs. Cold path is mixed but the absolute hit is biggest there.
+
+  | Doc shape | Cold A (now) | Cold B (this) | Speedup | Hot A | Hot B |
+  |---|---:|---:|---:|---:|---:|
+  | small (4 fields) | 1 503 ns | 305 ns | 4.93× | 131 | 122 |
+  | medium nested | 2 110 ns | 435 ns | 4.85× | 248 | 254 |
+  | LARGE (50 events) | 31 001 ns | 5 752 ns | 5.39× | 4 001 | 3 875 |
+
+- Next step (separate change): wire the server's find/find_one response handler to call `load_doc_text`. The engine-level building block is the prerequisite.
+
+### Observability — DocCache hit/miss counters
+
+- `DocCache` now tracks cumulative hits and misses (atomic Relaxed; cheap). `DocCache::stats()` returns a `CacheStats { hits, misses, hit_ratio() }` snapshot; `reset_stats()` clears the window.
+- Exposed on the collection via `BTreeCollection::doc_cache_stats` / `doc_cache_stats_reset` / `doc_cache_clear`.
+
+### Benches
+
+- **`examples/measure_cache_hitrate.rs`** — Zipfian sweep that produced the hit-ratio data above.
+- **`examples/profile_decode_wire.rs`** — micro-bench isolating the find→wire decode step (JSONB → Value → text vs `RawJsonb::to_string`).
+- **`examples/profile_load_doc_text.rs`** — end-to-end load on a populated `BTreeCollection`, verifies the patch doesn't regress the hot path.
+
+### Versions
+
+- `oxidb-server`: 0.25.20 → 0.25.21
+
 ## v0.25.20
 
 ### Codec — 3-4× faster JSONB encode, ~40% smaller on-disk image
