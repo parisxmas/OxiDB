@@ -64,13 +64,33 @@ HTML/CSS/font fetch happens in parallel.
     {% else %}
       <a href="{% url 'admin_login' %}">~/admin</a>
     {% endif %}
-    <form class="masthead__search" method="get" action="{% url 'search' %}" role="search">
+    <form class="masthead__search js-grep"
+          method="get" action="{% url 'search' %}" role="search"
+          data-suggest-url="{% url 'search_suggest' %}">
       <label class="masthead__search-label" for="masthead-q">grep</label>
-      <input id="masthead-q" name="q" type="search"
-             class="masthead__search-input"
-             placeholder="bm25 across title + body"
-             value="{{ request.GET.q|default:'' }}"
-             autocomplete="off" spellcheck="false">
+      <span class="masthead__search-wrap">
+        <span class="masthead__search-icon" aria-hidden="true">
+          <svg class="ico-search" viewBox="0 0 24 24" width="14" height="14">
+            <circle cx="10" cy="10" r="6" fill="none" stroke="currentColor" stroke-width="2"/>
+            <path d="M15 15 L20 20" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <svg class="ico-spinner" viewBox="0 0 24 24" width="14" height="14">
+            <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor"
+                    stroke-width="2.5" stroke-linecap="round"
+                    stroke-dasharray="14 36" pathLength="60"/>
+          </svg>
+        </span>
+        <input id="masthead-q" name="q" type="search"
+               class="masthead__search-input"
+               placeholder="bm25 across title + body"
+               value="{{ request.GET.q|default:'' }}"
+               autocomplete="off" spellcheck="false"
+               aria-autocomplete="list"
+               aria-controls="grep-suggest"
+               aria-expanded="false"
+               role="combobox">
+      </span>
+      <ul id="grep-suggest" class="masthead__suggest" role="listbox" hidden></ul>
     </form>
   </nav>
 </header>
@@ -84,6 +104,96 @@ HTML/CSS/font fetch happens in parallel.
 {% endif %}
 
 <main>{% block main %}{% endblock %}</main>
+
+<script nonce="{{ request.csp_nonce }}">
+(function () {
+  // Live-suggest for the masthead grep. Vanilla, no framework. The
+  // backend is one Django view (search_suggest) talking to the
+  // embedded OxiDB FTS index — every keystroke goes to a function
+  // call inside the same gunicorn worker.
+  var form = document.querySelector("form.js-grep");
+  if (!form) return;
+  var input = form.querySelector(".masthead__search-input");
+  var list  = form.querySelector(".masthead__suggest");
+  var url   = form.dataset.suggestUrl;
+
+  var t = null, ctrl = null;
+  var DEBOUNCE_MS = 140;
+
+  function setBusy(b) {
+    form.classList.toggle("is-busy", !!b);
+  }
+  function close() {
+    list.hidden = true;
+    list.innerHTML = "";
+    input.setAttribute("aria-expanded", "false");
+    setBusy(false);
+  }
+  function render(items, q) {
+    list.innerHTML = "";
+    if (!items.length) {
+      var li = document.createElement("li");
+      li.className = "masthead__suggest-empty";
+      li.textContent = "// no matches";
+      list.appendChild(li);
+    } else {
+      items.forEach(function (it, i) {
+        var li = document.createElement("li");
+        li.className = "masthead__suggest-item";
+        li.setAttribute("role", "option");
+        var a = document.createElement("a");
+        a.href = "/" + it.slug;
+        a.className = "masthead__suggest-link";
+        var t1 = document.createElement("span");
+        t1.className = "masthead__suggest-title";
+        t1.textContent = it.title;
+        var t2 = document.createElement("span");
+        t2.className = "masthead__suggest-snippet";
+        t2.textContent = it.snippet;
+        a.appendChild(t1);
+        a.appendChild(t2);
+        li.appendChild(a);
+        list.appendChild(li);
+      });
+    }
+    list.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+  }
+
+  function query(q) {
+    if (ctrl) ctrl.abort();
+    ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    setBusy(true);
+    fetch(url + "?q=" + encodeURIComponent(q), {
+      signal: ctrl ? ctrl.signal : undefined,
+      headers: { "Accept": "application/json" },
+      credentials: "same-origin",
+    })
+      .then(function (r) { return r.ok ? r.json() : { results: [] }; })
+      .then(function (j) {
+        if (input.value.trim() !== q) return;  // stale
+        render(j.results || [], q);
+      })
+      .catch(function () { /* aborted or network — ignore */ })
+      .finally(function () {
+        if (input.value.trim() === q) setBusy(false);
+      });
+  }
+
+  input.addEventListener("input", function () {
+    var q = input.value.trim();
+    if (t) clearTimeout(t);
+    if (q.length < 2) { close(); return; }
+    t = setTimeout(function () { query(q); }, DEBOUNCE_MS);
+  });
+  input.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") { close(); input.blur(); }
+  });
+  document.addEventListener("click", function (e) {
+    if (!form.contains(e.target)) close();
+  });
+})();
+</script>
 
 <footer class="colophon">
   <p>

@@ -15,7 +15,8 @@ from typing import Callable
 
 from django.contrib import messages
 from django.http import (Http404, HttpRequest, HttpResponse,
-                         HttpResponseBadRequest, HttpResponseRedirect)
+                         HttpResponseBadRequest, HttpResponseRedirect,
+                         JsonResponse)
 from django.shortcuts import render
 from django.urls import reverse
 from django.views.decorators.http import require_http_methods
@@ -69,6 +70,50 @@ def index(request: HttpRequest) -> HttpResponse:
         # starts at (page-1)*PAGE_SIZE + 1.
         "offset": (page - 1) * PAGE_SIZE,
     })
+
+
+def search_suggest(request: HttpRequest) -> JsonResponse:
+    """
+    Live-suggest endpoint behind the masthead grep input.
+
+    Returns the top-3 BM25-ranked matches as JSON — title, slug,
+    snippet. Stays well under a millisecond inside OxiDB on this
+    dataset; total app time is dominated by Django's request setup.
+    """
+    q = (request.GET.get("q") or "").strip()
+    if not q or len(q) < 2:
+        return JsonResponse({"q": q, "results": []})
+    # BM25 first — fast, ranked, stemmer-aware ("transactions" finds
+    # "transaction"). If the term is a partial word (prefix typing
+    # like "jso" before the user has typed "jsonb"), BM25 returns 0
+    # because it's word-boundary based; fall back to a cheap
+    # case-insensitive substring scan over the small corpus.
+    posts = db.search_posts(q, limit=3)
+    if not posts:
+        ql = q.lower()
+        for p in db.list_posts(limit=200):
+            hay = (p.get("title", "") + " " + p.get("body", "")).lower()
+            if ql in hay:
+                posts.append(p)
+                if len(posts) >= 3:
+                    break
+    out = []
+    for p in posts:
+        snippet = (p.get("body") or "")[:140]
+        if len(p.get("body", "")) > 140:
+            snippet = snippet.rstrip() + "…"
+        out.append({
+            "id": p["id"],
+            "title": p["title"],
+            "slug": p["slug"],
+            "snippet": snippet,
+            "author": p.get("author", ""),
+        })
+    resp = JsonResponse({"q": q, "results": out})
+    # Allow short caching per (q) — same query in quick succession
+    # (typing the same chars) should hit a fresh response.
+    resp["Cache-Control"] = "public, max-age=10"
+    return resp
 
 
 def search(request: HttpRequest) -> HttpResponse:
