@@ -64,6 +64,14 @@ HTML/CSS/font fetch happens in parallel.
     {% else %}
       <a href="{% url 'admin_login' %}">~/admin</a>
     {% endif %}
+    <form class="masthead__search" method="get" action="{% url 'search' %}" role="search">
+      <label class="masthead__search-label" for="masthead-q">grep</label>
+      <input id="masthead-q" name="q" type="search"
+             class="masthead__search-input"
+             placeholder="bm25 across title + body"
+             value="{{ request.GET.q|default:'' }}"
+             autocomplete="off" spellcheck="false">
+    </form>
   </nav>
 </header>
 

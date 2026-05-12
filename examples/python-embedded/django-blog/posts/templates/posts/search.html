@@ -1,0 +1,57 @@
+{% extends "posts/_base.html" %}
+{% block title %}{% if q %}grep "{{ q }}" — /dev/oxide{% else %}grep — /dev/oxide{% endif %}{% endblock %}
+{% block description %}Full-text search across the /dev/oxide build log — BM25 ranking, English stemmer, served straight off the embedded OxiDB index.{% endblock %}
+{% block robots %}noindex,follow{% endblock %}
+
+{% block main %}
+<section class="archive">
+  <h1 class="archive__heading">
+    <span class="archive__kicker">{% if q %}// db.text_search(POSTS, "{{ q }}", limit=50){% else %}// awaiting input{% endif %}</span>
+    {% if q %}{{ result_count }} {{ result_count|pluralize:"match,matches" }}{% else %}grep the archive{% endif %}
+  </h1>
+  <p class="archive__lead">
+    {% if q %}
+      Sorted by BM25 score. The index lives in-process; this query
+      ran against the same gunicorn worker that served the HTML.
+    {% else %}
+      Type a term in the masthead's <code>grep</code> field. Results
+      come from OxiDB's built-in BM25 FTS over post title + body —
+      no Elasticsearch, no Meilisearch, no extra service.
+    {% endif %}
+  </p>
+
+  {% if q and posts %}
+  <ol class="archive__list">
+    {% for post in posts %}
+    <li class="entry">
+      <a class="entry__link" href="{% url 'detail' post.slug %}">
+        <span class="entry__num">{{ post.id|stringformat:"04d" }} · {{ post.created_at|slice:":10" }}</span>
+        <h2 class="entry__title">{{ post.title }}</h2>
+        <div class="entry__meta">
+          <span class="entry__by">@{{ post.author }}</span>
+          <span aria-hidden="true">·</span>
+          <span>{{ post.body|wordcount }} words</span>
+          <span aria-hidden="true">·</span>
+          <span>bm25</span>
+        </div>
+        <p class="entry__teaser">{{ post.body|truncatewords:34 }}</p>
+        {% if post.image_key %}
+        <figure class="entry__plate">
+          <img src="{% url 'media' post.image_key %}"
+               alt="hero image for: {{ post.title }}"
+               width="400" height="225"
+               loading="lazy" decoding="async">
+        </figure>
+        {% endif %}
+      </a>
+    </li>
+    {% endfor %}
+  </ol>
+  {% elif q %}
+  <p class="archive__empty">
+    <code>// 0 results for "{{ q }}"</code> — try a different term, or
+    drop a word.
+  </p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -71,6 +71,20 @@ def index(request: HttpRequest) -> HttpResponse:
     })
 
 
+def search(request: HttpRequest) -> HttpResponse:
+    """BM25 full-text search across the posts collection. The
+    embedded OxiDB FTS index is built and queried in-process —
+    no separate search service, no inverted-index file format
+    on the host."""
+    q = (request.GET.get("q") or "").strip()
+    posts = db.search_posts(q, limit=50) if q else []
+    return render(request, "posts/search.html", {
+        "q": q,
+        "posts": posts,
+        "result_count": len(posts),
+    })
+
+
 def detail(request: HttpRequest, slug: str) -> HttpResponse:
     post = db.get_post_by_slug(slug)
     if not post:

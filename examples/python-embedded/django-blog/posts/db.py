@@ -117,6 +117,16 @@ def _setup_schema(d: OxiDbEmbedded) -> None:
     except Exception:
         pass
     try:
+        # Full-text index on title + body. BM25 ranking, English
+        # tokenization by default (override with OXIDB_FTS_LANG).
+        # On first creation, OxiDB scans the existing collection
+        # and indexes every document — so adding this knob ships
+        # search to a populated collection without a manual reindex
+        # step. Idempotent: re-creating on next boot is a no-op.
+        d.create_text_index(POSTS, ["title", "body"])
+    except Exception:
+        pass
+    try:
         d.create_unique_index(ADMINS, "username")
     except Exception:
         pass
@@ -179,6 +189,25 @@ def list_posts(limit: int = 50, skip: int = 0) -> list[dict]:
 def count_posts() -> int:
     """Total count — used by pagination on the index page."""
     return db().count(POSTS)
+
+
+def search_posts(query: str, limit: int = 25) -> list[dict]:
+    """
+    BM25-ranked full-text search across `title` + `body`. Returns
+    matching post dicts (same shape as `list_posts`) ordered by
+    relevance.
+
+    OxiDB's `text_search` returns score-ordered raw docs. The wrapper
+    exposes the same `id` alias as `list_posts` for template access.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        results = db().text_search(POSTS, q, limit=limit)
+    except Exception:
+        return []
+    return [_expose(d) for d in results]
 
 
 def get_post_by_slug(slug: str) -> Optional[dict]:
