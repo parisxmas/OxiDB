@@ -1,51 +1,61 @@
 {% extends "posts/_base.html" %}
-{% block title %}Composing room{% endblock %}
+{% block title %}~/admin — posts{% endblock %}
 {% block body_class %}is-admin{% endblock %}
 
 {% block main %}
 <section class="adm-room">
   <header class="adm-room__head">
     <div>
-      <p class="adm-room__kicker">Composing room — {{ current_user }}</p>
-      <h1 class="adm-room__title">All pieces on file</h1>
+      <p class="adm-room__kicker">{{ current_user }}</p>
+      <h1 class="adm-room__title">posts/</h1>
     </div>
-    <a class="adm-btn adm-btn--primary" href="{% url 'admin_new_post' %}">+ File a new piece</a>
+    <a class="adm-btn adm-btn--primary" href="{% url 'admin_new_post' %}">new post</a>
   </header>
 
   <table class="adm-table">
     <thead>
       <tr>
-        <th>№</th>
-        <th>Title</th>
-        <th>By</th>
-        <th>Filed</th>
-        <th>Plate</th>
-        <th class="adm-table__actions">Actions</th>
+        <th>id</th>
+        <th>title</th>
+        <th>author</th>
+        <th>created</th>
+        <th>asset</th>
+        <th class="adm-table__actions">ops</th>
       </tr>
     </thead>
     <tbody>
       {% for post in posts %}
       <tr>
-        <td class="adm-table__id">{{ post.id|stringformat:"03d" }}</td>
+        <td class="adm-table__id">{{ post.id|stringformat:"04d" }}</td>
         <td><a class="adm-table__title" href="{% url 'detail' post.slug %}">{{ post.title }}</a></td>
-        <td>{{ post.author }}</td>
+        <td>@{{ post.author }}</td>
         <td>{{ post.created_at|slice:":10" }}</td>
         <td>
-          {% if post.image_key %}<span class="adm-tag adm-tag--has">·image·</span>{% else %}<span class="adm-tag">—</span>{% endif %}
+          {% if post.image_key %}<span class="adm-tag adm-tag--has">image</span>{% else %}<span class="adm-tag">—</span>{% endif %}
         </td>
         <td class="adm-table__actions">
           <a class="adm-link" href="{% url 'admin_edit_post' post.id %}">edit</a>
-          <form method="post" action="{% url 'admin_delete_post' post.id %}" class="adm-inline-form"
-                onsubmit="return confirm('Pull this piece for good?');">
+          <form method="post" action="{% url 'admin_delete_post' post.id %}" class="adm-inline-form js-confirm-drop">
             {% csrf_token %}
-            <button class="adm-link adm-link--danger" type="submit">pull</button>
+            <button class="adm-link adm-link--danger" type="submit">drop</button>
           </form>
         </td>
       </tr>
       {% empty %}
-      <tr><td colspan="6" class="adm-table__empty">Nothing on file. Start the press.</td></tr>
+      <tr><td colspan="6" class="adm-table__empty">empty — no posts on disk yet.</td></tr>
       {% endfor %}
     </tbody>
   </table>
 </section>
+
+{# Wire up the confirm-on-drop without an inline onsubmit, so strict
+   CSP (nonce only, no 'unsafe-inline') doesn't have to allow inline
+   event handlers. #}
+<script nonce="{{ request.csp_nonce }}">
+  document.querySelectorAll("form.js-confirm-drop").forEach(function (f) {
+    f.addEventListener("submit", function (e) {
+      if (!confirm("drop this post for good?")) e.preventDefault();
+    });
+  });
+</script>
 {% endblock %}

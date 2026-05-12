@@ -1,0 +1,51 @@
+# Run from this directory:
+#   DJANGO_SECRET_KEY=$(openssl rand -hex 32) docker compose up -d --build
+#
+# Build context is the OxiDB repo root so the Dockerfile can pick up
+# Cargo.toml + the Rust source for oxidb-embedded-ffi.
+
+services:
+  blog:
+    build:
+      context: ../../..
+      dockerfile: examples/python-embedded/django-blog/Dockerfile
+    image: oxidb-embedded-django:latest
+    container_name: oxidb-embedded-django
+    restart: unless-stopped
+    environment:
+      DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:?DJANGO_SECRET_KEY required — set in .env or env}"
+      DJANGO_DEBUG: "0"
+      # Comma-separated. The host nginx talks to us via 127.0.0.1,
+      # so add it alongside the public host name.
+      DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:-oxidb-embedded-django.baltavista.com,127.0.0.1,localhost}"
+      # Tell Django to trust nginx's X-Forwarded-Proto so SetCookie
+      # gets the Secure flag when accessed via HTTPS.
+      DJANGO_USE_X_FORWARDED_PROTO: "1"
+    ports:
+      # Bound to localhost only — nginx on the host proxies to it.
+      - "127.0.0.1:8101:8000"
+    volumes:
+      - blog-data:/app/_data
+    # Override the Dockerfile CMD so the thread count is configurable
+    # via the GUNICORN_THREADS env var without a rebuild. Embedded
+    # OxiDB is single-process; threads are the concurrency knob.
+    command:
+      - gunicorn
+      - blog.wsgi:application
+      - --bind=0.0.0.0:8000
+      - --workers=1
+      - --threads=${GUNICORN_THREADS:-32}
+      - --worker-class=gthread
+      - --timeout=30
+      - --keep-alive=5
+      - --access-logfile=-
+      - --error-logfile=-
+      - --capture-output
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  blog-data:

@@ -1,27 +1,48 @@
 {% extends "posts/_base.html" %}
-{% block title %}Composing room — sign in{% endblock %}
+{% block title %}~/admin — login{% endblock %}
+{% block description %}Admin login.{% endblock %}
 {% block body_class %}is-admin{% endblock %}
 
 {% block main %}
 <section class="adm-login">
-  <h1 class="adm-login__title">Composing room</h1>
-  <p class="adm-login__sub">Set the next edition.</p>
+  <h1 class="adm-login__title">~/admin</h1>
+  <p class="adm-login__sub">authenticated requests only</p>
 
-  <form method="post" class="adm-form">
+  {% if blocked %}
+    <div class="adm-lockout">
+      <p class="adm-lockout__title">! locked out</p>
+      <p>
+        too many failed attempts from this address.
+        try again in <strong>{{ retry_after }}s</strong>.
+      </p>
+      <p class="adm-lockout__rule">
+        threshold: {{ max_failures }} failures per {{ window_minutes }} min, per ip.
+      </p>
+    </div>
+  {% endif %}
+
+  <form method="post" class="adm-form" autocomplete="off">
     {% csrf_token %}
     <label class="adm-field">
-      <span class="adm-field__label">Username</span>
-      <input class="adm-field__input" type="text" name="username" autofocus required value="admin">
+      <span class="adm-field__label">username</span>
+      <input class="adm-field__input" type="text" name="username"
+             autocomplete="off" autocapitalize="off" autocorrect="off"
+             spellcheck="false" required
+             {% if blocked %}disabled{% else %}autofocus{% endif %}>
     </label>
     <label class="adm-field">
-      <span class="adm-field__label">Password</span>
-      <input class="adm-field__input" type="password" name="password" required value="admin">
+      <span class="adm-field__label">password</span>
+      <input class="adm-field__input" type="password" name="password"
+             autocomplete="new-password" required
+             {% if blocked %}disabled{% endif %}>
     </label>
-    <button class="adm-btn adm-btn--primary" type="submit">Enter the room</button>
+    <button class="adm-btn adm-btn--primary" type="submit"
+            {% if blocked %}disabled{% endif %}>
+      sign in
+    </button>
     <p class="adm-login__hint">
-      Default credentials on first boot are <code>admin&nbsp;/&nbsp;admin</code>.
-      Change them inside the OxiDB <code>admins</code> collection before pressing
-      anything for real.
+      credentials are PBKDF2-SHA256 hashed in the <code>admins</code>
+      collection. rotate via <code>manage.py rotate_admin</code>.
     </p>
   </form>
 </section>

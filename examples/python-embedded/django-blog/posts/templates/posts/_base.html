@@ -1,43 +1,68 @@
-{% load static %}
+{% load static blogtags %}
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>{% block title %}The Oxide Press{% endblock %}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,200..900,0..100;1,9..144,200..900,0..100&family=Newsreader:ital,opsz,wght@0,6..72,200..800;1,6..72,200..800&family=JetBrains+Mono:wght@300;400;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="{% static 'posts/style.css' %}">
+<meta name="color-scheme" content="dark" />
+<title>{% block title %}/dev/oxide{% endblock %}</title>
+<meta name="description" content="{% block description %}A build log on OxiDB — notes, post-mortems, and engineering writing about a fast embedded document database engine written in Rust.{% endblock %}">
+<meta name="robots" content="{% block robots %}index,follow{% endblock %}">
+<link rel="canonical" href="https://{{ request.get_host }}{{ request.path }}">
+<meta property="og:title" content="{% block og_title %}{{ self.title|default:'/dev/oxide' }}{% endblock %}">
+<meta property="og:description" content="{% block og_description %}{{ self.description|default:'A build log on OxiDB.' }}{% endblock %}">
+<meta property="og:type" content="{% block og_type %}website{% endblock %}">
+<meta property="og:site_name" content="/dev/oxide">
+<meta name="twitter:card" content="summary_large_image">
+{% if posts.0.image_key %}
+<meta property="og:image" content="https://{{ request.get_host }}/media/{{ posts.0.image_key }}">
+{% elif post.image_key %}
+<meta property="og:image" content="https://{{ request.get_host }}/media/{{ post.image_key }}">
+{% endif %}
+{% comment %}
+Fonts are self-hosted (under /static/posts/fonts/) and declared as
+@font-face directly inside style.css. No fonts.googleapis.com round
+trip, no extra DNS lookup, no third-party hop on mobile slow
+networks where the cross-origin handshake was costing ~1 s of LCP.
+
+Preload the two latin-subset woff2 files the LCP-critical text uses:
+JetBrains Mono 700 (masthead title) and IBM Plex Sans 400 (body
+copy). Without these, the browser doesn't discover the font URLs
+until after style.css is parsed — a 3-hop critical chain. With them,
+HTML/CSS/font fetch happens in parallel.
+{% endcomment %}
+<link rel="preload" as="font" type="font/woff2" crossorigin
+      href="{% static 'posts/fonts/tDbv2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKwBNntkaToggR7BYRbKPxDcwg.woff2' %}">
+<link rel="preload" as="font" type="font/woff2" crossorigin
+      href="{% static 'posts/fonts/zYXzKVElMYYaJe8bpLHnCwDKr932-G7dytD-Dmu1syxeKYY.woff2' %}">
+{% inline_static "posts/style.css" %}
 {% block extra_head %}{% endblock %}
 </head>
 <body class="{% block body_class %}{% endblock %}">
-{% block grain %}<div class="grain" aria-hidden="true"></div>{% endblock %}
 
 <header class="masthead">
   <div class="masthead__bar">
-    <span class="masthead__issue">Vol.&nbsp;I · No.&nbsp;{{ posts|length|default:"01" }}</span>
+    <span class="masthead__issue">build · oxidb v0.25.21</span>
     <span class="masthead__rule" aria-hidden="true"></span>
-    <span class="masthead__date">Embedded edition</span>
+    <span class="masthead__date">{{ posts|length|default:"0" }} entries on disk</span>
   </div>
   <a href="{% url 'index' %}" class="masthead__title">
     <span class="masthead__title-the">The</span>
-    <span class="masthead__title-main">Oxide&nbsp;Press</span>
+    <span class="masthead__title-main">/dev/oxide</span>
   </a>
   <p class="masthead__strap">
-    A daily filed by one engineer · powered by
-    <a href="https://github.com/parisxmas/OxiDB" target="_blank" rel="noopener">OxiDB embedded</a>
-    — no server, no SQL, no excuses.
+    A build log on shipping
+    <a href="https://github.com/parisxmas/OxiDB" target="_blank" rel="noopener">OxiDB</a>
+    — notes, post-mortems, and the occasional flame war about JSON parsing,
+    pressed straight onto an embedded engine running inside this process.
   </p>
   <nav class="masthead__nav">
-    <a href="{% url 'index' %}">Archive</a>
-    <span aria-hidden="true">·</span>
+    <a href="{% url 'index' %}">archive</a>
     {% if request.session.admin_user %}
-      <a href="{% url 'admin_dashboard' %}">Composing room</a>
-      <span aria-hidden="true">·</span>
-      <a href="{% url 'admin_logout' %}">Sign out</a>
+      <a href="{% url 'admin_dashboard' %}">~/admin</a>
+      <a href="{% url 'admin_logout' %}">logout</a>
     {% else %}
-      <a href="{% url 'admin_login' %}">Composing room</a>
+      <a href="{% url 'admin_login' %}">~/admin</a>
     {% endif %}
   </nav>
 </header>
@@ -53,15 +78,13 @@
 <main>{% block main %}{% endblock %}</main>
 
 <footer class="colophon">
-  <p class="colophon__rule" aria-hidden="true"></p>
   <p>
-    Set in <em>Fraunces</em> and <em>Newsreader</em>.
-    Pressed onto OxiDB v0.25.21.
+    Running on OxiDB v0.25.21 embedded — single process, many threads.
   </p>
   <p class="colophon__timing"><!--TIMING--></p>
   <p class="colophon__small">
-    All copy persisted to a single embedded database directory.
-    Images live in an S3-style bucket inside the same process.
+    Every post and image lives in the same OxiDB data directory.
+    No SQL, no separate object store, no service to spin up.
   </p>
 </footer>
 </body>

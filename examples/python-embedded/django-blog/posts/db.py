@@ -142,24 +142,15 @@ def _seed_if_empty(d: OxiDbEmbedded) -> None:
             })
         except Exception:
             pass
-    if d.count(POSTS) == 0:
-        sample_body = (
-            "OxiDB is a fast document database. This entire blog runs on "
-            "the embedded engine — no SQLite, no Postgres, no service to "
-            "spin up. The posts you are reading live in a single directory "
-            "next to this app and the images sit in an S3-style bucket "
-            "served by the same process.\n\n"
-            "Edit me from the admin panel, or delete me and start over."
-        )
+    # Idempotent over SEED_POSTS: skip any whose slug already exists.
+    # This lets us extend seed_data.py later and pick up the new
+    # entries on next boot without redundant inserts or duplicates.
+    from .seed_data import SEED_POSTS
+    for post in SEED_POSTS:
+        if d.find_one(POSTS, {"slug": post["slug"]}):
+            continue
         try:
-            d.insert(POSTS, {
-                "title": "Hello from the rust-stained press",
-                "slug": "hello-from-the-rust-stained-press",
-                "body": sample_body,
-                "author": DEFAULT_ADMIN_USER,
-                "created_at": _now(),
-                "image_key": None,
-            })
+            d.insert(POSTS, post)
         except Exception:
             pass
 
@@ -178,8 +169,16 @@ def _expose(doc: Optional[dict]) -> Optional[dict]:
     return doc
 
 
-def list_posts(limit: int = 50) -> list[dict]:
-    return [_expose(d) for d in db().find(POSTS, {}, sort={"created_at": -1}, limit=limit)]
+def list_posts(limit: int = 50, skip: int = 0) -> list[dict]:
+    return [
+        _expose(d)
+        for d in db().find(POSTS, {}, sort={"created_at": -1}, limit=limit, skip=skip)
+    ]
+
+
+def count_posts() -> int:
+    """Total count — used by pagination on the index page."""
+    return db().count(POSTS)
 
 
 def get_post_by_slug(slug: str) -> Optional[dict]:

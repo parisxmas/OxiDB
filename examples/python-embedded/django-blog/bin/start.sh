@@ -48,6 +48,12 @@ export DJANGO_DEBUG="${DJANGO_DEBUG:-0}"
 export DJANGO_ALLOWED_HOSTS="${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,$HOST}"
 export DJANGO_SETTINGS_MODULE="blog.settings"
 
+# WhiteNoise serves /static/ from STATIC_ROOT, so we need the assets
+# collected there before gunicorn boots. Quiet output unless something
+# changed; `--clear` skipped so repeat runs are fast.
+echo "▸ collectstatic"
+"$VENV_PY" manage.py collectstatic --noinput --verbosity 0
+
 echo "▸ gunicorn → http://$HOST:$PORT  (1 worker × $THREADS threads, embedded OxiDB)"
 exec "$VENV_GUNICORN" blog.wsgi:application \
   --bind "$HOST:$PORT" \

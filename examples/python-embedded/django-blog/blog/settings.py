@@ -19,7 +19,44 @@ SECRET_KEY = os.environ.get(
 
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
 
+# ---------------------------------------------------------------------------
+# Security hardening (active only when DEBUG=False; keeps dev simple).
+# Everything below is what bumps Lighthouse Best Practices into the 90s.
+# ---------------------------------------------------------------------------
+if not DEBUG:
+    # HSTS — 1 year, includes subdomains, preload-list eligible.
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    # Send the canonical scheme to the browser even when the request
+    # arrives over HTTP (cookies, redirects).
+    SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+
+# Always-on hardening:
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = "DENY"
+
 ALLOWED_HOSTS = ["*"] if DEBUG else os.environ.get("DJANGO_ALLOWED_HOSTS", "").split(",")
+
+# We sit behind nginx (which sits behind Cloudflare). Trust nginx's
+# X-Forwarded-Proto so request.is_secure() reports the real scheme;
+# without this every request looks HTTP to Django and the CSRF
+# checker compares HTTP-side Origin to an HTTPS-side referer, which
+# fails every POST.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# CSRF Origin/Referer whitelist for the public hostnames. Django 4+
+# requires this list to be filled when accepting POSTs from a
+# scheme/host that doesn't match the cookie's host.
+_csrf_origins = [o for o in os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if o]
+if not _csrf_origins:
+    _csrf_origins = [
+        "https://oxidb-embedded-django.baltavista.com",
+        "http://oxidb-embedded-django.baltavista.com",
+    ]
+CSRF_TRUSTED_ORIGINS = _csrf_origins
 
 # Bare-minimum apps. We deliberately skip:
 #   - django.contrib.admin     (we ship our own thin admin)
@@ -38,7 +75,16 @@ MIDDLEWARE = [
     # including session decode + CSRF setup. Has to run before
     # gzip/content-length-sensitive middleware (we have none here).
     "posts.middleware.TimingMiddleware",
+    # CSPNonceMiddleware MUST come before any view rendering so the
+    # nonce is available in `request.csp_nonce` by the time the
+    # template engine fires.
+    "posts.middleware.CSPNonceMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    # WhiteNoise serves the collected static assets straight from the
+    # gunicorn worker so we don't need an nginx/caddy in front for the
+    # CSS to load. Has to come immediately after SecurityMiddleware
+    # per WhiteNoise's docs.
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -79,6 +125,27 @@ USE_TZ = True
 
 STATIC_URL = "/static/"
 STATICFILES_DIRS = [BASE_DIR / "posts" / "static"] if (BASE_DIR / "posts" / "static").exists() else []
+# WhiteNoise serves files from STATIC_ROOT under gunicorn — `runserver`
+# bypasses this and serves directly from STATICFILES_DIRS.
+STATIC_ROOT = BASE_DIR / "staticfiles"
+# Storage strategy:
+#   prod (DEBUG=False) → content-hashed filenames (`style.abc123.css`)
+#                        + gzip variants. WhiteNoise auto-applies
+#                        `Cache-Control: public, max-age=31536000,
+#                        immutable` to anything matching its hashed-
+#                        filename pattern.
+#   dev  (DEBUG=True)  → no hashing; the staticfiles finder serves
+#                        unhashed URLs directly so you don't have to
+#                        run `collectstatic` between every edit.
+_static_backend = (
+    "whitenoise.storage.CompressedManifestStaticFilesStorage"
+    if not DEBUG else
+    "whitenoise.storage.CompressedStaticFilesStorage"
+)
+STORAGES = {
+    "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+    "staticfiles": {"BACKEND": _static_backend},
+}
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 

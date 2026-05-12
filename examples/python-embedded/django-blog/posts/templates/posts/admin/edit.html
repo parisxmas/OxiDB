@@ -1,58 +1,59 @@
 {% extends "posts/_base.html" %}
-{% block title %}{% if post %}Edit · {{ post.title }}{% else %}New piece{% endif %}{% endblock %}
+{% block title %}{% if post %}edit · {{ post.title }}{% else %}new post{% endif %}{% endblock %}
 {% block body_class %}is-admin{% endblock %}
 
 {% block main %}
 <section class="adm-edit">
   <p class="adm-edit__kicker">
-    {% if post %}Editing piece №&nbsp;{{ post.id|stringformat:"03d" }}{% else %}Filing a new piece{% endif %}
+    {% if post %}vi posts/{{ post.id|stringformat:"04d" }}.md{% else %}touch posts/new.md{% endif %}
   </p>
-  <h1 class="adm-edit__title">{% if post %}Edit{% else %}File new{% endif %}</h1>
+  <h1 class="adm-edit__title">{% if post %}edit{% else %}new post{% endif %}</h1>
 
   <form method="post" action="{{ form_action }}" enctype="multipart/form-data" class="adm-form adm-form--wide">
     {% csrf_token %}
 
     <label class="adm-field">
-      <span class="adm-field__label">Title</span>
+      <span class="adm-field__label">title</span>
       <input class="adm-field__input adm-field__input--display" type="text"
              name="title" value="{{ form.title }}" required maxlength="200" autofocus>
     </label>
 
     <label class="adm-field">
-      <span class="adm-field__label">Body</span>
+      <span class="adm-field__label">body</span>
       <textarea class="adm-field__input adm-field__textarea" name="body"
                 rows="14" required>{{ form.body }}</textarea>
-      <span class="adm-field__hint">Blank lines split paragraphs. Plain text only — no markup.</span>
+      <span class="adm-field__hint">plain text. blank lines split paragraphs. no markdown processor yet.</span>
     </label>
 
     <fieldset class="adm-plate">
-      <legend>Plate (image)</legend>
+      <legend>asset</legend>
       {% if post.image_key %}
       <div class="adm-plate__current">
-        <img src="{% url 'media' post.image_key %}" alt="" loading="lazy">
+        <img src="{% url 'media' post.image_key %}" alt="current asset"
+             width="160" height="90" loading="lazy" decoding="async">
         <div class="adm-plate__current-meta">
-          <p>Current plate.</p>
-          <p class="adm-mono">{{ post.image_key }}</p>
+          <p>current attachment.</p>
+          <p class="adm-mono">blob://blog-images/{{ post.image_key }}</p>
           <label class="adm-checkbox">
             <input type="checkbox" name="remove_image" value="1">
-            <span>Remove plate</span>
+            <span>drop attachment</span>
           </label>
         </div>
       </div>
       {% endif %}
       <label class="adm-field">
-        <span class="adm-field__label">Upload a new plate (optional)</span>
+        <span class="adm-field__label">upload new asset (optional)</span>
         <input class="adm-field__input adm-field__file" type="file" name="image"
                accept="image/jpeg,image/png,image/webp,image/gif,image/avif">
-        <span class="adm-field__hint">JPEG / PNG / WebP / GIF / AVIF · up to 10 MB.
-          Stored in the <code>blog-images</code> bucket inside OxiDB.</span>
+        <span class="adm-field__hint">jpeg / png / webp / gif / avif · up to 10 MB.
+          stored in the <code>blog-images</code> S3-style bucket inside OxiDB.</span>
       </label>
     </fieldset>
 
     <div class="adm-actions">
-      <a class="adm-btn adm-btn--ghost" href="{% url 'admin_dashboard' %}">Cancel</a>
+      <a class="adm-btn adm-btn--ghost" href="{% url 'admin_dashboard' %}">cancel</a>
       <button class="adm-btn adm-btn--primary" type="submit">
-        {% if post %}Save changes{% else %}Press to disk{% endif %}
+        {% if post %}save{% else %}commit{% endif %}
       </button>
     </div>
   </form>

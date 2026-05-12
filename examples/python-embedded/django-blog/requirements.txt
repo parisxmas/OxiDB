@@ -9,6 +9,11 @@ oxidb-embedded>=0.25.21
 # for `python manage.py runserver`.
 gunicorn>=21.0
 
+# Serves /static/ straight from the gunicorn worker so we don't
+# need nginx in front for the CSS to load. Bypassed by `runserver`,
+# which serves static files directly from STATICFILES_DIRS in DEBUG.
+whitenoise>=6.0
+
 # Only used by dev tooling — minting test images in the smoke-test
 # fixtures. Not imported by the app itself.
 pillow>=10.0

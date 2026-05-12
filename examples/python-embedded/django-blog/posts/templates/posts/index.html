@@ -1,42 +1,111 @@
 {% extends "posts/_base.html" %}
-{% block title %}The Oxide Press — Archive{% endblock %}
+{% block title %}/dev/oxide — archive{% if page > 1 %} · page {{ page }}{% endif %}{% endblock %}
+{% block description %}{{ total_posts }} build-log entries on OxiDB internals — JSONB encoding, B-tree storage with WAL, parallel collection creation, S3-style blob buckets, full-text search, and more.{% endblock %}
+
+{% comment %}
+Preload the first post's hero image so the LCP candidate starts
+fetching before HTML parsing reaches the entry card. fetchpriority
+tells the browser this is the important one.
+{% endcomment %}
+{% block extra_head %}
+{% if posts.0.image_key %}
+<link rel="preload" as="image" href="{% url 'media' posts.0.image_key %}" fetchpriority="high">
+{% endif %}
+{% if has_prev %}<link rel="prev" href="?page={{ page|add:'-1' }}">{% endif %}
+{% if has_next %}<link rel="next" href="?page={{ page|add:'1' }}">{% endif %}
+<script type="application/ld+json" nonce="{{ request.csp_nonce }}">
+{
+  "@context": "https://schema.org",
+  "@type": "Blog",
+  "name": "/dev/oxide",
+  "description": "A build log on OxiDB — notes, post-mortems, and engineering writing about a fast embedded document database engine written in Rust.",
+  "url": "https://{{ request.get_host }}/",
+  "publisher": {
+    "@type": "Organization",
+    "name": "/dev/oxide",
+    "url": "https://{{ request.get_host }}/"
+  },
+  "blogPost": [
+    {% for post in posts %}
+    {
+      "@type": "BlogPosting",
+      "headline": "{{ post.title|escapejs }}",
+      "datePublished": "{{ post.created_at }}",
+      "author": {"@type": "Person", "name": "{{ post.author|escapejs }}"},
+      "url": "https://{{ request.get_host }}{% url 'detail' post.slug %}"{% if post.image_key %},
+      "image": "https://{{ request.get_host }}/media/{{ post.image_key }}"{% endif %}
+    }{% if not forloop.last %},{% endif %}
+    {% endfor %}
+  ]
+}
+</script>
+{% endblock %}
 
 {% block main %}
 <section class="archive">
   <h1 class="archive__heading">
-    <span class="archive__kicker">— The Archive —</span>
-    Filed dispatches
+    <span class="archive__kicker">archive · sorted desc by ts</span>
+    build log
   </h1>
   <p class="archive__lead">
-    {{ posts|length }} {{ posts|length|pluralize:"piece,pieces" }} on file.
-    Sorted newest first. Composed in the embedded composing room and
-    pressed to disk through OxiDB's append-only WAL.
+    {{ total_posts }} {{ total_posts|pluralize:"entry,entries" }} on disk · page {{ page }}/{{ total_pages }}.
+    Each post + every image lives inside one embedded OxiDB data dir —
+    no external store, no migrations, no schema files.
   </p>
 
   <ol class="archive__list">
     {% for post in posts %}
-    <li class="entry" style="--rot: {% cycle '-0.4deg' '0.3deg' '-0.2deg' '0.5deg' '-0.6deg' %};">
+    <li class="entry">
       <a class="entry__link" href="{% url 'detail' post.slug %}">
-        <span class="entry__num">№ {{ post.id|stringformat:"03d" }}</span>
+        <span class="entry__num">{{ post.id|stringformat:"04d" }} · {{ post.created_at|slice:":10" }}</span>
         <h2 class="entry__title">{{ post.title }}</h2>
         <div class="entry__meta">
-          <span class="entry__by">by {{ post.author }}</span>
+          <span class="entry__by">@{{ post.author }}</span>
           <span aria-hidden="true">·</span>
-          <time>{{ post.created_at|slice:":10" }}</time>
+          <span>{{ post.body|wordcount }} words</span>
+          <span aria-hidden="true">·</span>
+          <span>oxidb-embedded</span>
         </div>
         <p class="entry__teaser">{{ post.body|truncatewords:34 }}</p>
         {% if post.image_key %}
         <figure class="entry__plate">
-          <img src="{% url 'media' post.image_key %}" alt="" loading="lazy">
+          <img src="{% url 'media' post.image_key %}"
+               alt="hero image for: {{ post.title }}"
+               width="480" height="270"
+               loading="lazy" decoding="async">
         </figure>
         {% endif %}
       </a>
     </li>
     {% empty %}
     <li class="entry entry--empty">
-      <p>Nothing on the wire yet. Head to the composing room to file the first piece.</p>
+      <p class="entry__link">no entries yet — head to ~/admin to write the first one.</p>
     </li>
     {% endfor %}
   </ol>
+
+  {% if total_pages > 1 %}
+  <nav class="pager" aria-label="archive pagination">
+    <a class="pager__btn{% if not has_prev %} pager__btn--disabled{% endif %}"
+       {% if has_prev %}href="?page={{ page|add:'-1' }}"{% else %}aria-disabled="true"{% endif %}
+       rel="prev">← prev</a>
+
+    <ol class="pager__nums">
+      {% for n in page_numbers %}
+      <li>
+        {% if n == page %}
+          <span class="pager__num pager__num--current" aria-current="page">{{ n }}</span>
+        {% else %}
+          <a class="pager__num" href="?page={{ n }}">{{ n }}</a>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+
+    <a class="pager__btn{% if not has_next %} pager__btn--disabled{% endif %}"
+       {% if has_next %}href="?page={{ page|add:'1' }}"{% else %}aria-disabled="true"{% endif %}
+       rel="next">next →</a>
+  </nav>
+  {% endif %}
 </section>
 {% endblock %}

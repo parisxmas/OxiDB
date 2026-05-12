@@ -1,27 +1,60 @@
 {% extends "posts/_base.html" %}
-{% block title %}{{ post.title }} — The Oxide Press{% endblock %}
+{% block title %}{{ post.title }} — /dev/oxide{% endblock %}
+{% block description %}{{ post.body|truncatewords:30 }}{% endblock %}
+{% block og_title %}{{ post.title }}{% endblock %}
+{% block og_type %}article{% endblock %}
+
+{% block extra_head %}
+<meta property="article:published_time" content="{{ post.created_at }}">
+<meta property="article:author" content="{{ post.author }}">
+<meta property="article:section" content="Engineering">
+<script type="application/ld+json" nonce="{{ request.csp_nonce }}">
+{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "{{ post.title|escapejs }}",
+  "description": "{{ post.body|truncatewords:30|escapejs }}",
+  "datePublished": "{{ post.created_at }}",
+  "dateModified": "{{ post.created_at }}",
+  "author": {
+    "@type": "Person",
+    "name": "{{ post.author|escapejs }}"
+  },
+  "publisher": {
+    "@type": "Organization",
+    "name": "/dev/oxide",
+    "url": "https://{{ request.get_host }}/"
+  },
+  "mainEntityOfPage": {
+    "@type": "WebPage",
+    "@id": "https://{{ request.get_host }}{{ request.path }}"
+  }{% if post.image_key %},
+  "image": "https://{{ request.get_host }}/media/{{ post.image_key }}"{% endif %}
+}
+</script>
+{% endblock %}
 
 {% block main %}
 <article class="piece">
-  <div class="piece__rail" aria-hidden="true">
-    <span class="piece__rail-num">№ {{ post.id|stringformat:"03d" }}</span>
-    <span class="piece__rail-line"></span>
-  </div>
-
   <header class="piece__header">
-    <p class="piece__kicker">A dispatch · filed {{ post.created_at|slice:":10" }}</p>
+    <p class="piece__kicker">posts/{{ post.id|stringformat:"04d" }}.md · {{ post.created_at|slice:":10" }}</p>
     <h1 class="piece__title">{{ post.title }}</h1>
     <p class="piece__byline">
-      by <span class="piece__author">{{ post.author }}</span>
+      <span class="piece__author">{{ post.author }}</span>
       <span aria-hidden="true">·</span>
-      <span class="piece__stamp">stamped&nbsp;{{ post.created_at }}</span>
+      <span class="piece__stamp">{{ post.created_at }}</span>
+      <span aria-hidden="true">·</span>
+      <span>{{ post.body|wordcount }} words</span>
     </p>
   </header>
 
   {% if post.image_key %}
   <figure class="piece__plate">
-    <img src="{% url 'media' post.image_key %}" alt="">
-    <figcaption>plate — bucket: blog-images · key: {{ post.image_key|slice:":12" }}…</figcaption>
+    <img src="{% url 'media' post.image_key %}"
+         alt="hero image for: {{ post.title }}"
+         width="480" height="270"
+         fetchpriority="high" decoding="async">
+    <figcaption>asset · bucket: blog-images · key: {{ post.image_key }}</figcaption>
   </figure>
   {% endif %}
 
@@ -32,14 +65,11 @@
   </div>
 
   <footer class="piece__end">
-    <span class="piece__cap" aria-hidden="true">⁂</span>
+    <span class="piece__cap" aria-hidden="true">$</span>
     <p>
-      Press the
-      <a href="{% url 'index' %}">archive</a>
-      for more, or
-      <a href="{% if request.session.admin_user %}{% url 'admin_edit_post' post.id %}{% else %}{% url 'admin_login' %}{% endif %}">
-        edit this piece
-      </a>.
+      <a href="{% url 'index' %}">back to archive</a>
+      ·
+      <a href="{% if request.session.admin_user %}{% url 'admin_edit_post' post.id %}{% else %}{% url 'admin_login' %}{% endif %}">edit this entry</a>
     </p>
   </footer>
 </article>
