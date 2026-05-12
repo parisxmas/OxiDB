@@ -152,10 +152,51 @@ fn read_vm_rss_kb() -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn read_threads() -> Option<u32> {
-    // Best-effort: getrusage doesn't expose this on macOS; use rough
-    // self-reported thread count via task_info would require Mach
-    // bindings we don't ship. Return 0 — Linux prod still reports it.
-    Some(0)
+    // Mach `task_threads` returns the live thread set for the calling
+    // task. The length of the returned array IS the thread count —
+    // we just need that scalar, then we must release the array.
+    //
+    // Three FFI calls per probe (~microseconds): task_threads,
+    // mach_port_deallocate per element, then a single vm_deallocate
+    // to free the array. Skipping the deallocate would leak send
+    // rights; this admin/health endpoint runs every 5s so a leak
+    // would surface quickly.
+    type MachPort = libc::mach_port_t;
+    type KernReturn = std::os::raw::c_int;
+    type MachMsgTypeNumber = u32;
+    type ThreadActArray = *mut MachPort;
+
+    unsafe extern "C" {
+        fn mach_task_self() -> MachPort;
+        fn task_threads(
+            task: MachPort,
+            threads: *mut ThreadActArray,
+            count: *mut MachMsgTypeNumber,
+        ) -> KernReturn;
+        fn mach_port_deallocate(task: MachPort, name: MachPort) -> KernReturn;
+        fn vm_deallocate(task: MachPort, addr: usize, size: usize) -> KernReturn;
+    }
+    const KERN_SUCCESS: KernReturn = 0;
+
+    let task = unsafe { mach_task_self() };
+    let mut arr: ThreadActArray = std::ptr::null_mut();
+    let mut count: MachMsgTypeNumber = 0;
+    let kr = unsafe { task_threads(task, &mut arr, &mut count) };
+    if kr != KERN_SUCCESS || arr.is_null() {
+        return None;
+    }
+    // Release the per-thread send rights and the array memory.
+    unsafe {
+        for i in 0..count {
+            let _ = mach_port_deallocate(task, *arr.offset(i as isize));
+        }
+        let _ = vm_deallocate(
+            task,
+            arr as usize,
+            (count as usize) * std::mem::size_of::<MachPort>(),
+        );
+    }
+    Some(count)
 }
 
 // Other non-Linux/non-macOS targets — keeping these lets `cargo check`
