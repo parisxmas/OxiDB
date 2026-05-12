@@ -104,7 +104,7 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
             };
             if let Some(tx_id) = *active_tx {
                 match db.tx_insert(tx_id, col, doc) {
-                    Ok(()) => ok_bytes(json!("buffered")),
+                    Ok(id) => ok_bytes(json!({ "id": id })),
                     Err(e) => err_bytes(&e.to_string()),
                 }
             } else {
@@ -125,12 +125,14 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
                 _ => return err_bytes("missing or invalid 'docs' array"),
             };
             if let Some(tx_id) = *active_tx {
+                let mut ids: Vec<u64> = Vec::with_capacity(docs.len());
                 for doc in docs {
-                    if let Err(e) = db.tx_insert(tx_id, col, doc) {
-                        return err_bytes(&e.to_string());
+                    match db.tx_insert(tx_id, col, doc) {
+                        Ok(id) => ids.push(id),
+                        Err(e) => return err_bytes(&e.to_string()),
                     }
                 }
-                ok_bytes(json!("buffered"))
+                ok_bytes(json!(ids))
             } else {
                 match db.insert_many(col, docs) {
                     Ok(ids) => ok_bytes(json!(ids)),
