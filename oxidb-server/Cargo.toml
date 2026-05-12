@@ -3,6 +3,8 @@ name = "oxidb-server"
 version = "0.25.21"
 edition = "2024"
 description = "TCP server for OxiDB document database"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/parisxmas/OxiDB"
 
 [features]
 default = ["s3"]

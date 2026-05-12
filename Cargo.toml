@@ -7,6 +7,9 @@ name = "oxidb"
 version = "0.25.1"
 edition = "2024"
 description = "A fast document database engine with optimized date indexing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/parisxmas/OxiDB"
+readme = "README.md"
 
 [features]
 default = []

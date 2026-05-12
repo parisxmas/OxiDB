@@ -3,6 +3,8 @@ name = "oxidb-tail"
 version = "0.25.0"
 edition = "2024"
 description = "Real-time colored log viewer for OxiDB GELF logs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/parisxmas/OxiDB"
 
 [[bin]]
 name = "oxidb-tail"

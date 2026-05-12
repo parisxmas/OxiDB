@@ -3,6 +3,8 @@ name = "oxidb-cli"
 version = "0.25.0"
 edition = "2024"
 description = "Interactive CLI and REPL for OxiDB with MongoDB-style syntax"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/parisxmas/OxiDB"
 
 [[bin]]
 name = "oxidb"

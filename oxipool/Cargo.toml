@@ -3,6 +3,8 @@ name = "oxipool"
 version = "0.25.3"
 edition = "2024"
 description = "Connection pooler for OxiDB — like PgBouncer for OxiDB. Supports sharded routing."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/parisxmas/OxiDB"
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "signal"] }
