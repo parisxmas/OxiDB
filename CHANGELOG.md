@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.25.20
+
+### Codec — 3-4× faster JSONB encode, ~40% smaller on-disk image
+
+- **`codec::encode_doc` rewrite** (`src/codec.rs`) — route `Value` → `serde_json::to_writer` → `jsonb::parse_owned_jsonb_standard_mode` instead of `jsonb::to_owned_jsonb` (which uses the serde Serialize path).
+  - The serde encoder in `jsonb` 0.5 allocates a fresh `Serializer` (with its own `Vec<u8>`) for every map value, materializes each child as an intermediate `OwnedJsonb`, then concatenates them in `ObjectBuilder::build → to_vec → buffer.append`. That was the dominant per-encode cost.
+  - It also wrapped every scalar inside a container with a 4-byte `SCALAR_CONTAINER_TAG`, inflating the on-disk image by 30-50%.
+  - The new path produces output bytes that are still a valid `OwnedJsonb` and decode through the same `jsonb::from_raw_jsonb` / `RawJsonb::get_by_*` calls. Legacy fat-format images from older writers continue to round-trip — `decode_doc` is unchanged.
+- **Bench results** (median of 5, `--release`, M2):
+
+  | Doc shape | Before | After | Speedup | Bytes before / after |
+  |---|---:|---:|---:|---:|
+  | flat scalars (5 fields) | 1 177 ns | 259 ns | 4.5× | 198 B / 83 B |
+  | nested objects (2-level) | 2 913 ns | 742 ns | 3.9× | 474 B / 240 B |
+  | array of 50 small objects | 48 348 ns | 12 336 ns | 3.9× | 8 682 B / 4 575 B |
+  | LARGE realistic doc | 61 256 ns | 20 092 ns | 3.0× | 13 571 B / 9 306 B |
+
+- **End-to-end smoke** — existing `wal_checkpoint` test logs the WAL size after 20 inserts: **3 821 B → 1 459 B (-62%)** with no change other than the encoder. Disk space, memory residency, and WAL replay cost all benefit.
+- Standard mode is used (not extended) because `serde_json::to_writer` always emits strict JSON — no NaN/Infinity, no leading plus signs, no empty array elements to accommodate.
+
+### Benches
+
+- **`examples/profile_decode.rs`** — decomposes the decode hot path (full decode vs partial extract vs custom IndexValue extractor) so we can spot regressions on the next `jsonb` bump. Findings: partial extract is doc-size-independent (~90 ns); writing a custom IndexValue deserializer that bypasses serde turned out to be marginally *slower* — `get_by_keypath` is the dominant cost, not the scalar dispatch.
+- **`examples/profile_encode.rs`** — decomposes encode by document shape; the basis for the `encode_doc` rewrite. Both run in a few seconds with `cargo run --release --example <name>`; no `criterion` / external harness.
+
+### Versions
+
+- `oxidb-server`: 0.25.19 → 0.25.20
+
 ## v0.25.19
 
 ### Engine — ACID hardening
