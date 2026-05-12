@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.25.19
+
+### Engine — ACID hardening
+
+- **Durability: "ack means on disk"** (`src/btree_storage.rs`, `src/btree_collection.rs`, `src/wal.rs`)
+  - `persist` switched from non-atomic `fs::write` to tmp + `sync_data` + atomic rename + parent fsync; per-collection mutex prevents concurrent commits from trampling a shared `{name}.btree.tmp`
+  - `OXIDB_LAZY_SYNC` default flipped from `true` → `false`; strict mode fsyncs every commit. Lazy mode still available opt-in.
+  - `set_lazy_sync` wired through every write path (single + batch insert, update, delete, sync_writes) so the env flag actually selects fsync vs no_sync
+  - tx-commit `log_wal_batch` on btree no longer a no-op — durability via WAL fsync at commit, not a synchronous full-file persist
+  - `sync_writes` persists without truncating WAL (truncate was racy with concurrent writers and lost ~3/2000 acks under load); WAL truncation moved to a new `final_checkpoint` that runs only at shutdown
+  - New `enable_periodic_snapshot` (strict mode default 1s cadence) so WAL doesn't grow unbounded between commits
+- **Boot tolerance** — `btree_storage::open` tolerates partial / truncated images and leaves recovery to WAL replay instead of refusing to boot
+- **Graceful shutdown** — `oxidb-server` SIGTERM/SIGINT handler flushes engine via `OxiDb::shutdown` then `process::exit` cleanly; SIGPIPE ignored
+- **Multi-collection atomicity** (`src/transaction.rs`)
+  - `tx_insert` reserves the doc id at buffering time and returns it to the client, so callers can wire the assigned id into sibling writes inside the same transaction
+  - `WriteOp::Insert` carries the pre-allocated id; `prepare_tx_insert` consumes it instead of double-allocating
+  - Wire-protocol `insert`/`insert_many` in tx mode now return `{"id": N}` matching the non-tx response shape (was `"buffered"` with no id)
+  - `find_one` routes through `tx_find` when in a transaction so the read version is recorded for OCC validation — without this a read-then-write inside a tx would skip the conflict check
+- **Crash-test harnesses**
+  - `tests/crash-recovery-go`: 2000 inserts → SIGKILL → restart, every ack'd write must survive; no `.btree.tmp` leftovers; payload spot-check
+  - `tests/atomicity-go`: 3 scenarios — pre-commit SIGKILL, post-commit SIGKILL, mid-tx SIGTERM (graceful) — across two collections with foreign-key linkage, asserting all-or-nothing recovery
+- **Legacy `.dat` data-loss guard** — `OxiDb::open_internal` scans the data dir at startup and refuses to open non-empty `.dat` collection files without a matching `.btree`. Without this, upgrading a pre-BTree binary in place silently shadowed real records with empty collections. `OXIDB_ALLOW_LEGACY_DAT=1` keeps the old behavior for callers that explicitly accept the loss.
+
+### Engine — concurrency
+
+- **Parallel `create_collection`** (`src/engine.rs`) — hold the global write lock only to insert into the collections map, not while opening the `BTreeCollection` from disk. Mirrors `get_or_create_collection`: read-check, lock-free open, then short write lock with a race-loser re-check.
+  - Bench (1000 collections, 8 workers): Phase 1 wall **4m18s → 205ms**, `CreateCollection` p99 **6.25s → 1ms** (~1260× speedup). At 10K collections: p99=11ms, RSS=1.24 GiB — viable as a per-tenant collection-prefix multi-tenancy primitive.
+- **Lock-free blob `put` rename** (`src/blob.rs`) — `fs::rename` no longer held under the bucket write lock; split into: brief lock for id allocation, lock-free renames, brief lock for hashmap commit. Same-key races are safe for content-addressed callers (identical bytes → identical result). Brings 32-way concurrent put p50 down from ~900ms.
+
+### Full-text search
+
+- **Parallel indexing worker pool + introspection** (`src/fts.rs`)
+  - `FtsRuntime` tracks queue depth, per-worker in-flight job, and a ring of recently completed/failed/skipped jobs
+  - Engine: `bucket_fts_size` accessor (powers per-tenant FTS quota accounting); `fts_status` returns the runtime snapshot as JSON
+  - Server: new `fts_status`, `bucket_fts_size`, `proc_status` commands; admin + reader RBAC roles get `fts_status` + `proc_status`
+
+### S3
+
+- **`aws-chunked` request body decoding** (`oxidb-server/src/s3/`) — AWS CLI / boto3 send streaming PUT bodies with `content-encoding: aws-chunked` or `x-amz-content-sha256: STREAMING-*`. Strip the chunk-size framing back to the original payload in both single PUT and multipart upload paths. Tolerates missing trailers and partial reads.
+
+### Blobs
+
+- **Skip zstd for already-compressed mime types** (`src/blob.rs`) — re-compressing image/video/audio buys ~nothing while costing CPU on every Put and Get. Detect the content-type prefix and store raw bytes when compression is futile; decode path stays forward-compatible with legacy zstd-stored blobs.
+
+### OCR
+
+- **Image crate + dockerized tesseract toolchain** — `ocr` feature now pulls `image` (png/jpeg/tiff/bmp/gif/webp) so the pipeline can decode the source file before handing pixels to leptess. Dockerfile installs `libtesseract-dev`/`libleptonica-dev` + libclang for leptess bindgen, plus runtime libs and `eng`/`tur` traineddata in the slim image. Build uses `--features cluster,ocr`.
+
+### Process metrics
+
+- **macOS dev-box `proc_status`** (`oxidb-server/src/proc_stats.rs`) — `getrusage(RUSAGE_SELF)`-backed `read_cpu_ticks` + `read_vm_rss_kb` so dashboards report real CPU% / RSS on Darwin. Linux prod path (`/proc/self/{stat,status}`) unchanged.
+- **Real macOS thread count via Mach `task_threads`** — replaces the placeholder `0` with the live thread count (matches Activity Monitor); releases per-thread send rights and the returned array to avoid port-name leaks under the 5s admin probe.
+
+### Go client
+
+- **`Client.ProcStatus()` / `Client.FtsStatus()`** — typed wrappers so callers don't assemble raw `{"cmd": ...}` maps. `BucketFTSSize` added.
+- **Bounded ping check on pooled connection checkout** (`go/oxidb/pool.go`) — without a deadline, `Ping` on a server-reaped TCP conn that didn't get a clean FIN could hang for the OS keepalive interval (~2h on macOS/Linux). 2s `pingTimeout`; checkout transparently dials a fresh replacement when the pooled conn fails Ping.
+
+### Python client
+
+- `fts_status`, `proc_status` added.
+
+### Build / repo
+
+- `oxidb-wasm`: drop member-level `[profile.release]` — Cargo only honors profile sections at the workspace root; the per-crate config was silently ignored and emitted a warning every build.
+- Drop tracked `target/` symlink — external SSD disconnect left rustc processes hanging in `U` state during build. Cargo creates a fresh local `target/` now.
+
+### Versions
+
+- `oxidb-server`: 0.25.9 → 0.25.19
+
 ## v0.25.9
 
 ### Full-text search — BM25 ranking + multi-language stemmers + highlighting
