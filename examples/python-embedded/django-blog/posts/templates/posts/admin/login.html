@@ -1,0 +1,28 @@
+{% extends "posts/_base.html" %}
+{% block title %}Composing room — sign in{% endblock %}
+{% block body_class %}is-admin{% endblock %}
+
+{% block main %}
+<section class="adm-login">
+  <h1 class="adm-login__title">Composing room</h1>
+  <p class="adm-login__sub">Set the next edition.</p>
+
+  <form method="post" class="adm-form">
+    {% csrf_token %}
+    <label class="adm-field">
+      <span class="adm-field__label">Username</span>
+      <input class="adm-field__input" type="text" name="username" autofocus required value="admin">
+    </label>
+    <label class="adm-field">
+      <span class="adm-field__label">Password</span>
+      <input class="adm-field__input" type="password" name="password" required value="admin">
+    </label>
+    <button class="adm-btn adm-btn--primary" type="submit">Enter the room</button>
+    <p class="adm-login__hint">
+      Default credentials on first boot are <code>admin&nbsp;/&nbsp;admin</code>.
+      Change them inside the OxiDB <code>admins</code> collection before pressing
+      anything for real.
+    </p>
+  </form>
+</section>
+{% endblock %}

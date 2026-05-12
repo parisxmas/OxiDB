@@ -1,0 +1,67 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{% block title %}The Oxide Press{% endblock %}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght,SOFT@0,9..144,200..900,0..100;1,9..144,200..900,0..100&family=Newsreader:ital,opsz,wght@0,6..72,200..800;1,6..72,200..800&family=JetBrains+Mono:wght@300;400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{% static 'posts/style.css' %}">
+{% block extra_head %}{% endblock %}
+</head>
+<body class="{% block body_class %}{% endblock %}">
+{% block grain %}<div class="grain" aria-hidden="true"></div>{% endblock %}
+
+<header class="masthead">
+  <div class="masthead__bar">
+    <span class="masthead__issue">Vol.&nbsp;I · No.&nbsp;{{ posts|length|default:"01" }}</span>
+    <span class="masthead__rule" aria-hidden="true"></span>
+    <span class="masthead__date">Embedded edition</span>
+  </div>
+  <a href="{% url 'index' %}" class="masthead__title">
+    <span class="masthead__title-the">The</span>
+    <span class="masthead__title-main">Oxide&nbsp;Press</span>
+  </a>
+  <p class="masthead__strap">
+    A daily filed by one engineer · powered by
+    <a href="https://github.com/parisxmas/OxiDB" target="_blank" rel="noopener">OxiDB embedded</a>
+    — no server, no SQL, no excuses.
+  </p>
+  <nav class="masthead__nav">
+    <a href="{% url 'index' %}">Archive</a>
+    <span aria-hidden="true">·</span>
+    {% if request.session.admin_user %}
+      <a href="{% url 'admin_dashboard' %}">Composing room</a>
+      <span aria-hidden="true">·</span>
+      <a href="{% url 'admin_logout' %}">Sign out</a>
+    {% else %}
+      <a href="{% url 'admin_login' %}">Composing room</a>
+    {% endif %}
+  </nav>
+</header>
+
+{% if messages %}
+<div class="flash">
+  {% for m in messages %}
+    <p class="flash__line flash__line--{{ m.tags|default:'info' }}">{{ m }}</p>
+  {% endfor %}
+</div>
+{% endif %}
+
+<main>{% block main %}{% endblock %}</main>
+
+<footer class="colophon">
+  <p class="colophon__rule" aria-hidden="true"></p>
+  <p>
+    Set in <em>Fraunces</em> and <em>Newsreader</em>.
+    Pressed onto OxiDB v0.25.21.
+  </p>
+  <p class="colophon__small">
+    All copy persisted to a single embedded database directory.
+    Images live in an S3-style bucket inside the same process.
+  </p>
+</footer>
+</body>
+</html>

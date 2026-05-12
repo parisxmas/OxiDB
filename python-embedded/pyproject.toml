@@ -4,17 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "oxidb-embedded"
-version = "0.22.0"
+version = "0.25.21"
 description = "Embedded OxiDB for Python — run the database in-process via FFI (no server required)"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT OR Apache-2.0"
 requires-python = ">=3.8"
 authors = [{name = "OxiDB"}]
 keywords = ["database", "document", "nosql", "oxidb", "embedded", "ffi"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -33,3 +32,11 @@ Downloads = "https://oxidb.baltavista.com/downloads.html"
 
 [tool.setuptools.packages.find]
 include = ["oxidb_embedded*"]
+
+# Ship the platform-native FFI shared library inside the wheel so
+# `pip install oxidb-embedded` "just works" — no separate OXIDB_LIB_PATH
+# step. Wheels currently bundle the host build (whatever .dylib/.so/.dll
+# was sitting next to the package at build time); a future revision can
+# split into per-platform wheels using cibuildwheel.
+[tool.setuptools.package-data]
+oxidb_embedded = ["*.dylib", "*.so", "*.dll"]

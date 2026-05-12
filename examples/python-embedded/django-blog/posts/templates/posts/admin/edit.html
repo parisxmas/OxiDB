@@ -1,0 +1,60 @@
+{% extends "posts/_base.html" %}
+{% block title %}{% if post %}Edit · {{ post.title }}{% else %}New piece{% endif %}{% endblock %}
+{% block body_class %}is-admin{% endblock %}
+
+{% block main %}
+<section class="adm-edit">
+  <p class="adm-edit__kicker">
+    {% if post %}Editing piece №&nbsp;{{ post.id|stringformat:"03d" }}{% else %}Filing a new piece{% endif %}
+  </p>
+  <h1 class="adm-edit__title">{% if post %}Edit{% else %}File new{% endif %}</h1>
+
+  <form method="post" action="{{ form_action }}" enctype="multipart/form-data" class="adm-form adm-form--wide">
+    {% csrf_token %}
+
+    <label class="adm-field">
+      <span class="adm-field__label">Title</span>
+      <input class="adm-field__input adm-field__input--display" type="text"
+             name="title" value="{{ form.title }}" required maxlength="200" autofocus>
+    </label>
+
+    <label class="adm-field">
+      <span class="adm-field__label">Body</span>
+      <textarea class="adm-field__input adm-field__textarea" name="body"
+                rows="14" required>{{ form.body }}</textarea>
+      <span class="adm-field__hint">Blank lines split paragraphs. Plain text only — no markup.</span>
+    </label>
+
+    <fieldset class="adm-plate">
+      <legend>Plate (image)</legend>
+      {% if post.image_key %}
+      <div class="adm-plate__current">
+        <img src="{% url 'media' post.image_key %}" alt="" loading="lazy">
+        <div class="adm-plate__current-meta">
+          <p>Current plate.</p>
+          <p class="adm-mono">{{ post.image_key }}</p>
+          <label class="adm-checkbox">
+            <input type="checkbox" name="remove_image" value="1">
+            <span>Remove plate</span>
+          </label>
+        </div>
+      </div>
+      {% endif %}
+      <label class="adm-field">
+        <span class="adm-field__label">Upload a new plate (optional)</span>
+        <input class="adm-field__input adm-field__file" type="file" name="image"
+               accept="image/jpeg,image/png,image/webp,image/gif,image/avif">
+        <span class="adm-field__hint">JPEG / PNG / WebP / GIF / AVIF · up to 10 MB.
+          Stored in the <code>blog-images</code> bucket inside OxiDB.</span>
+      </label>
+    </fieldset>
+
+    <div class="adm-actions">
+      <a class="adm-btn adm-btn--ghost" href="{% url 'admin_dashboard' %}">Cancel</a>
+      <button class="adm-btn adm-btn--primary" type="submit">
+        {% if post %}Save changes{% else %}Press to disk{% endif %}
+      </button>
+    </div>
+  </form>
+</section>
+{% endblock %}

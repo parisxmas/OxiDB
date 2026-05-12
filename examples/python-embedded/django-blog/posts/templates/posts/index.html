@@ -1,0 +1,42 @@
+{% extends "posts/_base.html" %}
+{% block title %}The Oxide Press — Archive{% endblock %}
+
+{% block main %}
+<section class="archive">
+  <h1 class="archive__heading">
+    <span class="archive__kicker">— The Archive —</span>
+    Filed dispatches
+  </h1>
+  <p class="archive__lead">
+    {{ posts|length }} {{ posts|length|pluralize:"piece,pieces" }} on file.
+    Sorted newest first. Composed in the embedded composing room and
+    pressed to disk through OxiDB's append-only WAL.
+  </p>
+
+  <ol class="archive__list">
+    {% for post in posts %}
+    <li class="entry" style="--rot: {% cycle '-0.4deg' '0.3deg' '-0.2deg' '0.5deg' '-0.6deg' %};">
+      <a class="entry__link" href="{% url 'detail' post.slug %}">
+        <span class="entry__num">№ {{ post.id|stringformat:"03d" }}</span>
+        <h2 class="entry__title">{{ post.title }}</h2>
+        <div class="entry__meta">
+          <span class="entry__by">by {{ post.author }}</span>
+          <span aria-hidden="true">·</span>
+          <time>{{ post.created_at|slice:":10" }}</time>
+        </div>
+        <p class="entry__teaser">{{ post.body|truncatewords:34 }}</p>
+        {% if post.image_key %}
+        <figure class="entry__plate">
+          <img src="{% url 'media' post.image_key %}" alt="" loading="lazy">
+        </figure>
+        {% endif %}
+      </a>
+    </li>
+    {% empty %}
+    <li class="entry entry--empty">
+      <p>Nothing on the wire yet. Head to the composing room to file the first piece.</p>
+    </li>
+    {% endfor %}
+  </ol>
+</section>
+{% endblock %}
