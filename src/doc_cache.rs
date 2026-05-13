@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::locks::Mutex;
 
 use lru::LruCache;
@@ -22,8 +22,21 @@ const SHARD_MASK: u64 = (NUM_SHARDS as u64) - 1;
 /// its own `Mutex`. Concurrent readers hitting different shards never
 /// contend. This reduces p99 latency from ~8x to near-parity with
 /// MongoDB for concurrent `find_one` workloads.
+///
+/// Shards are lazily allocated: each `Mutex<Option<LruCache<…>>>`
+/// starts at `None`, and the inner `LruCache` is only materialised on
+/// the first `put` to that shard. A 100 K-slot LRU preallocates ~50 KB
+/// of hashtable buckets per shard regardless of use — at 10 K
+/// collections × 16 shards that compounded to several GiB of dead
+/// preallocation in the collection-scale bench. Idle / write-rarely
+/// collections now hold near-zero RSS.
 pub struct DocCache {
-    shards: Vec<Mutex<LruCache<DocumentId, Arc<Value>>>>,
+    /// Per-shard cap target. Used by lazy materialisations and
+    /// updated atomically by `resize`. `AtomicUsize` (not stored as
+    /// NonZeroUsize) so resize is lock-free; constructor + readers
+    /// enforce the `>= 1` invariant.
+    per_shard_cap: AtomicUsize,
+    shards: Vec<Mutex<Option<LruCache<DocumentId, Arc<Value>>>>>,
     /// Cumulative cache hits (Relaxed — counter is observational, not
     /// load-bearing; missing a few under contention is fine).
     hits: AtomicU64,
@@ -55,37 +68,38 @@ fn shard_for(id: DocumentId) -> usize {
 
 impl DocCache {
     /// Create a new cache with the given maximum capacity.
-    /// Capacity is distributed evenly across shards.
+    /// Capacity is distributed evenly across shards. Shards are
+    /// allocated lazily on first `put`; until then each holds `None`.
     pub fn new(capacity: usize) -> Self {
         let per_shard = (capacity / NUM_SHARDS).max(1);
-        let cap = NonZeroUsize::new(per_shard).unwrap();
-        let shards = (0..NUM_SHARDS)
-            .map(|_| Mutex::new(LruCache::new(cap)))
-            .collect();
+        let shards = (0..NUM_SHARDS).map(|_| Mutex::new(None)).collect();
         Self {
+            per_shard_cap: AtomicUsize::new(per_shard),
             shards,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
     }
 
+    fn per_shard_cap(&self) -> NonZeroUsize {
+        NonZeroUsize::new(self.per_shard_cap.load(Ordering::Acquire).max(1)).unwrap()
+    }
+
     /// Look up a document by ID, promoting it to most-recently-used.
     /// Returns `None` on cache miss. Updates hit/miss counters.
     pub fn get(&self, id: DocumentId) -> Option<Arc<Value>> {
-        let mut cache = self.shards[shard_for(id)].lock();
-        match cache.get(&id) {
-            Some(v) => {
-                let arc = Arc::clone(v);
-                drop(cache);
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                Some(arc)
-            }
-            None => {
-                drop(cache);
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+        let mut shard = self.shards[shard_for(id)].lock();
+        let found = match shard.as_mut() {
+            Some(cache) => cache.get(&id).map(Arc::clone),
+            None => None,
+        };
+        drop(shard);
+        if found.is_some() {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
         }
+        found
     }
 
     /// Snapshot the hit/miss counters. Used for observability and the
@@ -107,50 +121,64 @@ impl DocCache {
     /// Look up without promoting (peek). Useful during iteration
     /// when we don't want to disturb eviction order.
     pub fn peek(&self, id: DocumentId) -> Option<Arc<Value>> {
-        let cache = self.shards[shard_for(id)].lock();
-        cache.peek(&id).map(Arc::clone)
+        let shard = self.shards[shard_for(id)].lock();
+        shard.as_ref().and_then(|c| c.peek(&id).map(Arc::clone))
     }
 
-    /// Insert or update a document in the cache. May evict the
-    /// least-recently-used entry if the cache is full.
+    /// Insert or update a document in the cache. Materialises the
+    /// underlying shard if this is the first write to land on it.
+    /// May evict the least-recently-used entry if the shard is full.
     pub fn put(&self, id: DocumentId, doc: Arc<Value>) {
-        let mut cache = self.shards[shard_for(id)].lock();
+        let cap = self.per_shard_cap();
+        let mut shard = self.shards[shard_for(id)].lock();
+        let cache = shard.get_or_insert_with(|| LruCache::new(cap));
         cache.put(id, doc);
     }
 
     /// Remove a document from the cache.
     pub fn remove(&self, id: DocumentId) {
-        let mut cache = self.shards[shard_for(id)].lock();
-        cache.pop(&id);
+        let mut shard = self.shards[shard_for(id)].lock();
+        if let Some(cache) = shard.as_mut() {
+            cache.pop(&id);
+        }
     }
 
-    /// Remove all entries.
+    /// Drop every shard's contents *and* its backing allocation. Next
+    /// `put` re-materialises the affected shard at the current
+    /// per-shard cap.
     pub fn clear(&self) {
         for shard in &self.shards {
-            let mut cache = shard.lock();
-            cache.clear();
+            *shard.lock() = None;
         }
     }
 
     /// Number of entries currently in the cache.
     pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().len()).sum()
+        self.shards
+            .iter()
+            .map(|s| s.lock().as_ref().map(|c| c.len()).unwrap_or(0))
+            .sum()
     }
 
-    /// Resize the cache capacity. Entries beyond the new capacity
-    /// are evicted immediately (LRU order).
+    /// Resize the cache capacity. Updates the lazy-alloc target for
+    /// untouched shards and resizes any already-allocated shards in
+    /// place; entries beyond the new per-shard cap are evicted in LRU
+    /// order.
     pub fn resize(&self, capacity: usize) {
         let per_shard = (capacity / NUM_SHARDS).max(1);
-        let cap = NonZeroUsize::new(per_shard).unwrap();
+        self.per_shard_cap.store(per_shard, Ordering::Release);
+        let new_cap = NonZeroUsize::new(per_shard).unwrap();
         for shard in &self.shards {
-            let mut cache = shard.lock();
-            cache.resize(cap);
+            let mut s = shard.lock();
+            if let Some(cache) = s.as_mut() {
+                cache.resize(new_cap);
+            }
         }
     }
 
-    /// Current maximum capacity.
+    /// Current maximum capacity (per-shard target × shard count).
     pub fn capacity(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().cap().get()).sum()
+        self.per_shard_cap.load(Ordering::Acquire) * NUM_SHARDS
     }
 
     /// Probe the cache for multiple IDs in a single pass.
@@ -169,10 +197,12 @@ impl DocCache {
             if indices.is_empty() {
                 continue;
             }
-            let mut cache = self.shards[shard_idx].lock();
-            for &i in indices {
-                if let Some(arc) = cache.get(&ids[i]) {
-                    result[i] = Some(Arc::clone(arc));
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(cache) = shard.as_mut() {
+                for &i in indices {
+                    if let Some(arc) = cache.get(&ids[i]) {
+                        result[i] = Some(Arc::clone(arc));
+                    }
                 }
             }
         }
@@ -181,6 +211,7 @@ impl DocCache {
     }
 
     /// Insert multiple entries, grouping by shard for efficiency.
+    /// Materialises only the shards that receive at least one entry.
     pub fn put_many(&self, entries: impl IntoIterator<Item = (DocumentId, Arc<Value>)>) {
         // Collect first to group by shard
         let entries: Vec<_> = entries.into_iter().collect();
@@ -191,11 +222,13 @@ impl DocCache {
             shard_groups[shard_for(id)].push((id, doc));
         }
 
+        let cap = self.per_shard_cap();
         for (shard_idx, group) in shard_groups.into_iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
-            let mut cache = self.shards[shard_idx].lock();
+            let mut shard = self.shards[shard_idx].lock();
+            let cache = shard.get_or_insert_with(|| LruCache::new(cap));
             for (id, doc) in group {
                 cache.put(id, doc);
             }
@@ -284,6 +317,32 @@ mod tests {
         assert!(results[0].is_some());
         assert!(results[1].is_none());
         assert!(results[2].is_some());
+    }
+
+    #[test]
+    fn lazy_alloc_until_first_put() {
+        let cache = DocCache::new(160);
+        // Freshly constructed: every shard is None.
+        let allocated = cache
+            .shards
+            .iter()
+            .filter(|s| s.lock().is_some())
+            .count();
+        assert_eq!(allocated, 0, "no shard should be allocated yet");
+        cache.put(0, Arc::new(json!(0)));
+        let after_put = cache
+            .shards
+            .iter()
+            .filter(|s| s.lock().is_some())
+            .count();
+        assert_eq!(after_put, 1, "only the touched shard should allocate");
+        cache.clear();
+        let after_clear = cache
+            .shards
+            .iter()
+            .filter(|s| s.lock().is_some())
+            .count();
+        assert_eq!(after_clear, 0, "clear must reclaim every shard");
     }
 
     #[test]
