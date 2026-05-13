@@ -1,5 +1,68 @@
 # Changelog
 
+## v0.25.22
+
+### Engine — group-commit tx_log + lazy DocCache shards
+
+- **Group commit on the transaction log** (`src/tx_log.rs`) —
+  `mark_committed` was a global `Mutex<File>` + unconditional
+  `sync_data()` per commit. Every transaction on every collection
+  serialised through that single fsync, capping throughput at
+  ~85 doc/s on a single-tenant DMS upload workload regardless of
+  `OXIDB_LAZY_SYNC`. Moved the file behind a dedicated
+  `oxidb-tx-commit` thread that owns an in-memory
+  `HashSet<TransactionId>` + the file handle. Callers submit
+  `Cmd::Mark / Remove / Clear / Read` over `mpsc` and block on a
+  per-call `sync_channel(1)` reply. The committer drains the queue
+  non-blockingly up to **`MAX_BATCH = 512`**, applies all mutations
+  against the in-memory set, and emits **one** `persist + sync_data`
+  per batch. Notifies every waiter only after the fsync, so
+  durability semantics are unchanged. Reads are deferred until after
+  the same batch's fsync — recovery invariant preserved.
+  - File format unchanged: still a sequence of `[tx_id: u64 LE]`.
+    Old logs are parsed once at `open()` into the in-memory set;
+    the file is rewritten in full (sorted ids) at each batch
+    boundary.
+  - Bench (dms-bench, lazy_sync, Turkish FTS, real PDF + metadata
+    uploads, pool=128):
+    - single-tenant: **85 → 850 doc/s** @ 256 workers (~10×)
+    - multitenant 10t × 10w: **73 → 527 doc/s** (~7×)
+  - At 800+ doc/s the new bottleneck is per-collection
+    `btree_storage::persist_mu` — expected, out of scope.
+  - 9/9 tx_log unit tests pass, plus a new
+    `concurrent_marks_all_durable` that fires 64 threads × 32 marks
+    and verifies the post-run set holds all 2048 ids and survives
+    close + reopen.
+
+- **Lazy-allocate DocCache shards** (`src/doc_cache.rs`) — each
+  `BTreeCollection` eagerly built a 16-shard LRU sized for 100K
+  entries on creation. At scale that compounded to ~400 KiB of
+  preallocated hashtable buckets per collection regardless of use:
+  at 10K collections the dms-bench scale-load test hit **3.9 GiB
+  RSS** with **161K anonymous mmap regions**. Switched the shard
+  slots to `Mutex<Option<LruCache<…>>>` with a stored per-shard cap
+  target (`AtomicUsize`). First `put()` to a shard materialises the
+  inner `LruCache` at the cap; `clear()` drops it back to `None` to
+  reclaim. Capacity ceiling unchanged — active collections still
+  grow to the full 100K slots.
+  - 10K populated collections: **3.9 GiB → 269 MiB** RSS (−93%),
+    **161,348 → 6,316** anonymous mmap regions (−96%), insert p99
+    unchanged.
+  - 9/9 doc_cache unit tests pass, including a new
+    `lazy_alloc_until_first_put` assertion.
+
+### Combined effect
+
+Unlocks the **collection-prefix multi-tenancy** primitive started
+in v0.25.19 (`create_collection` 1260× speedup): with both
+parallel-create AND the new memory + commit-throughput patches,
+10K-collection deployments are now realistic — RSS, fsync
+contention, and create-cost all in their right place.
+
+### Versions
+
+- `oxidb-server`: 0.25.21 → 0.25.22
+
 ## v0.25.21
 
 ### Decode — 5× faster cold-path wire response
