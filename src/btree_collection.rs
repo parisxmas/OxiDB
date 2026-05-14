@@ -2258,6 +2258,14 @@ impl BTreeCollection {
         self.wal.seal()
     }
 
+    /// Write barrier on this collection's WAL — once it returns, every
+    /// writer that had allocated a GSN before the call has finished
+    /// appending. The engine uses this in `backup()` so the base-backup
+    /// GSN watermark is sound.
+    pub fn wal_barrier(&self) {
+        self.wal.barrier();
+    }
+
     pub fn prepare_tx_insert(
         &self,
         mut data: Value,

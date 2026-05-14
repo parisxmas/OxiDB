@@ -172,8 +172,7 @@ impl Wal {
     /// Serialize and append a WAL entry, then fsync. Emits a v2 record
     /// (GSN + wall-clock stamped) when an archive sequencer is attached.
     pub fn log(&self, entry: &WalEntry) -> Result<()> {
-        let rec = self.encode_record(entry)?;
-        self.append_locked(&rec, true)
+        self.append_entries_locked(std::slice::from_ref(entry), true)
     }
 
     /// Append a single record stamped with an explicit `meta` (v2 format),
@@ -181,31 +180,27 @@ impl Wal {
     /// for callers that supply their own GSN.
     pub fn log_with_meta(&self, entry: &WalEntry, meta: WalMeta) -> Result<()> {
         let rec = Self::frame(self.serialize_entry(entry, Some(meta))?);
-        self.append_locked(&rec, true)
+        let mut file = self.inner.lock();
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&rec)?;
+        file.sync_data()?;
+        self.maybe_seal_locked(&mut file)?;
+        Ok(())
     }
 
     /// Serialize and append a WAL entry without fsync.
     pub fn log_no_sync(&self, entry: &WalEntry) -> Result<()> {
-        let rec = self.encode_record(entry)?;
-        self.append_locked(&rec, false)
+        self.append_entries_locked(std::slice::from_ref(entry), false)
     }
 
     /// Write multiple WAL entries with a single fsync.
     pub fn log_batch(&self, entries: &[WalEntry]) -> Result<()> {
-        let mut buf = Vec::new();
-        for entry in entries {
-            buf.extend_from_slice(&self.encode_record(entry)?);
-        }
-        self.append_locked(&buf, true)
+        self.append_entries_locked(entries, true)
     }
 
     /// Write multiple WAL entries without fsync.
     pub fn log_batch_no_sync(&self, entries: &[WalEntry]) -> Result<()> {
-        let mut buf = Vec::new();
-        for entry in entries {
-            buf.extend_from_slice(&self.encode_record(entry)?);
-        }
-        self.append_locked(&buf, false)
+        self.append_entries_locked(entries, false)
     }
 
     /// Write multiple insert entries without fsync, avoiding doc_bytes clones.
@@ -216,31 +211,67 @@ impl Wal {
     /// Write multiple insert entries without fsync using a single write_all call.
     /// Builds the entire batch into one buffer, reducing syscalls from 3*N to 1.
     pub fn log_batch_inserts_no_sync_buffered(&self, entries: &[(u64, &[u8])]) -> Result<()> {
+        self.append_inserts_locked(entries, false)
+    }
+
+    /// Acquire the WAL lock, then for each entry allocate its GSN (when a
+    /// sequencer is attached), encode it, and append — optionally fsync,
+    /// then seal if the segment passed its size threshold.
+    ///
+    /// Allocating the GSN *inside* the lock is what makes the base-backup
+    /// watermark sound: once `ArchiveSequencer::current_gsn()` has moved
+    /// past `N`, GSN `N`'s record is already in this file (or being
+    /// written by the thread holding this lock). So a [`Wal::barrier`]
+    /// after reading the counter guarantees a subsequent tar sees every
+    /// record below the watermark — no encode/append gap to race.
+    fn append_entries_locked(&self, entries: &[WalEntry], sync: bool) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut buf = Vec::new();
-        for &(doc_id, doc_bytes) in entries {
-            buf.extend_from_slice(&self.encode_insert_record(doc_id, doc_bytes)?);
-        }
-        self.append_locked(&buf, false)
-    }
-
-    /// Append already-framed record bytes to the live segment under the
-    /// `inner` lock, optionally fsync, then seal the segment if it has
-    /// grown past the threshold. Every `log*` method funnels through here
-    /// so rotation is triggered consistently — and, because the seal
-    /// runs while the lock is still held, atomically against every other
-    /// `log*` / `read_*` / `checkpoint`.
-    fn append_locked(&self, bytes: &[u8], sync: bool) -> Result<()> {
         let mut file = self.inner.lock();
+        let mut buf = Vec::new();
+        for entry in entries {
+            let meta = match &self.sequencer {
+                Some(seq) => Some(seq.next()?),
+                None => None,
+            };
+            buf.extend_from_slice(&Self::frame(self.serialize_entry(entry, meta)?));
+        }
         file.seek(SeekFrom::End(0))?;
-        file.write_all(bytes)?;
+        file.write_all(&buf)?;
         if sync {
             file.sync_data()?;
         }
         self.maybe_seal_locked(&mut file)?;
         Ok(())
+    }
+
+    /// Like [`Wal::append_entries_locked`] but for the no-clone bulk-insert
+    /// path — GSN allocation still happens inside the lock.
+    fn append_inserts_locked(&self, entries: &[(u64, &[u8])], sync: bool) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut file = self.inner.lock();
+        let mut buf = Vec::new();
+        for &(doc_id, doc_bytes) in entries {
+            buf.extend_from_slice(&self.encode_insert_record(doc_id, doc_bytes)?);
+        }
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&buf)?;
+        if sync {
+            file.sync_data()?;
+        }
+        self.maybe_seal_locked(&mut file)?;
+        Ok(())
+    }
+
+    /// Acquire and immediately release the WAL lock — a write barrier.
+    /// Once this returns, every writer that had allocated a GSN before
+    /// the call has finished appending its record to the file. Base
+    /// backup relies on this; see [`Wal::append_entries_locked`].
+    pub fn barrier(&self) {
+        let _guard = self.inner.lock();
     }
 
     /// Seal the current segment now, regardless of size: atomically rename
@@ -520,17 +551,6 @@ impl Wal {
             .unwrap_or_default();
         name.push(format!(".{seq}"));
         wal_path.with_file_name(name)
-    }
-
-    /// Build one on-disk record — `[crc: u32 LE][len: u32 LE][payload]` —
-    /// for `entry`. When an archive sequencer is attached this allocates a
-    /// GSN + wall-clock and emits the v2 payload; otherwise v1.
-    fn encode_record(&self, entry: &WalEntry) -> Result<Vec<u8>> {
-        let meta = match &self.sequencer {
-            Some(seq) => Some(seq.next()?),
-            None => None,
-        };
-        Ok(Self::frame(self.serialize_entry(entry, meta)?))
     }
 
     /// Build one on-disk INSERT record without owning `doc_bytes` — the
@@ -1331,5 +1351,40 @@ mod tests {
             assert!(seen.insert(r.entry.doc_id()), "record duplicated in live WAL");
         }
         assert_eq!(seen.len(), writers * per_writer, "lost an acknowledged write across rotation");
+    }
+
+    // ── PITR Phase 4: GSN allocated under the lock + barrier ────────────
+
+    #[test]
+    fn barrier_flushes_in_flight_writes() {
+        // The base-backup invariant: after `barrier()`, every record below
+        // the GSN counter is present in the file. GSNs are allocated under
+        // the WAL lock, so there is no encode/append gap to race.
+        use crate::pitr::ArchiveSequencer;
+        let dir = TempDir::new().unwrap();
+        let seq = Arc::new(ArchiveSequencer::open(dir.path()).unwrap());
+        let wal = Arc::new(
+            Wal::open(&dir.path().join("b.wal")).unwrap().with_sequencer(Some(Arc::clone(&seq))),
+        );
+
+        let mut handles = Vec::new();
+        for w in 0..4usize {
+            let wal = Arc::clone(&wal);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..250usize {
+                    wal.log(&WalEntry::insert((w * 250 + i) as u64, b"x".to_vec())).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let watermark = seq.current_gsn();
+        wal.barrier();
+        let records = wal.read_records().unwrap();
+        assert_eq!(records.len(), 1000, "every acknowledged write must be in the file");
+        let max_gsn = records.iter().map(|r| r.meta.gsn).max().unwrap_or(0);
+        assert!(max_gsn < watermark, "the GSN counter must sit above every written record");
     }
 }

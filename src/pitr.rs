@@ -27,6 +27,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::Result;
 use crate::locks::Mutex;
 use crate::wal::WalMeta;
@@ -163,6 +165,62 @@ pub fn now_micros() -> u64 {
         .unwrap_or(0)
 }
 
+/// Format version for `base.meta`.
+pub const BASE_META_VERSION: u32 = 1;
+/// Name of the base-backup watermark file. It is written into the data
+/// directory so it travels inside the backup tarball.
+pub const BASE_META_FILE: &str = "base.meta";
+
+/// Watermark embedded in a base backup. The PITR replay tool reads it to
+/// learn where to resume from the archive: the base is guaranteed to
+/// contain every write with `gsn < base_gsn` (the backup barriers every
+/// collection's WAL after reading the counter — see `OxiDb::backup`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaseMeta {
+    pub format_version: u32,
+    /// GSN watermark. `0` means PITR was disabled when the backup ran —
+    /// there is no archive to replay against this base.
+    pub base_gsn: u64,
+    /// Wall-clock (micros since the Unix epoch) the watermark was taken.
+    pub base_wall_clock: u64,
+}
+
+impl BaseMeta {
+    /// A fresh watermark for `base_gsn`, stamped with the current wall-clock.
+    pub fn new(base_gsn: u64) -> Self {
+        Self { format_version: BASE_META_VERSION, base_gsn, base_wall_clock: now_micros() }
+    }
+
+    /// Write `base.meta` into `dir`, atomically (`tmp -> fsync -> rename
+    /// -> fsync dir`) so a crash never leaves a half-written watermark.
+    pub fn write_to(&self, dir: &Path) -> Result<()> {
+        let json = serde_json::to_vec_pretty(self)
+            .map_err(|e| crate::error::Error::Io(std::io::Error::other(e)))?;
+        let tmp = dir.join(format!("{BASE_META_FILE}.tmp"));
+        {
+            let mut f = File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_data()?;
+        }
+        std::fs::rename(&tmp, dir.join(BASE_META_FILE))?;
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    }
+
+    /// Read `base.meta` from `dir`, or `None` if it is not there (e.g. a
+    /// backup taken before PITR existed, or with PITR disabled).
+    pub fn read_from(dir: &Path) -> Result<Option<BaseMeta>> {
+        match std::fs::read(dir.join(BASE_META_FILE)) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| crate::error::Error::Io(std::io::Error::other(e))),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,5 +293,28 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), before, "GSNs must be unique across writers");
         assert_eq!(all.len(), 8 * 500);
+    }
+
+    // ── PITR Phase 4: base-backup watermark ─────────────────────────────
+
+    #[test]
+    fn base_meta_roundtrips() {
+        let dir = TempDir::new().unwrap();
+        let meta = BaseMeta::new(4242);
+        assert_eq!(meta.format_version, BASE_META_VERSION);
+        assert_eq!(meta.base_gsn, 4242);
+        assert!(meta.base_wall_clock > 1_577_836_800_000_000);
+
+        meta.write_to(dir.path()).unwrap();
+        let read = BaseMeta::read_from(dir.path()).unwrap().unwrap();
+        assert_eq!(read.base_gsn, 4242);
+        assert_eq!(read.base_wall_clock, meta.base_wall_clock);
+        assert_eq!(read.format_version, BASE_META_VERSION);
+    }
+
+    #[test]
+    fn base_meta_read_missing_is_none() {
+        let dir = TempDir::new().unwrap();
+        assert!(BaseMeta::read_from(dir.path()).unwrap().is_none());
     }
 }

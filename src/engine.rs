@@ -2323,6 +2323,25 @@ impl OxiDb {
             cols.len()
         };
 
+        // 4b. PITR: capture the GSN watermark, then barrier every WAL so
+        //     the tar is guaranteed to see every record below it. Order
+        //     matters — reading the counter first, then barriering, waits
+        //     out any in-flight write that allocated a GSN below the
+        //     watermark (GSNs are allocated under the WAL lock). The
+        //     watermark is written into the data dir so it travels inside
+        //     the tarball; the PITR replay tool reads it to learn where
+        //     to resume from the archive.
+        if let Some(seq) = &self.archive_sequencer {
+            let base_gsn = seq.current_gsn();
+            {
+                let cols = self.collections.read();
+                for col_arc in cols.values() {
+                    col_arc.wal_barrier();
+                }
+            }
+            crate::pitr::BaseMeta::new(base_gsn).write_to(&self.data_dir)?;
+        }
+
         // 5. Hold collections map read lock for consistent snapshot
         let _cols = self.collections.read();
 

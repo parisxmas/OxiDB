@@ -571,6 +571,16 @@ impl WalBackend {
         }
     }
 
+    /// Write barrier: once this returns, every writer that had allocated
+    /// a GSN before the call has finished appending. No-op in memory mode.
+    pub fn barrier(&self) {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::File(w) => w.barrier(),
+            Self::Memory => {}
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn recover(
         &self,
