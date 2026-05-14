@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-embedded-ffi"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "base64",
  "jni",
@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.25.26"
+version = "0.26.0"
 dependencies = [
  "aes-gcm",
  "argon2",
