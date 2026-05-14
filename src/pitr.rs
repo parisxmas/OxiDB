@@ -38,6 +38,21 @@ const GSN_LEASE: u64 = 10_000;
 /// Name of the lease file under the data directory.
 pub const GSN_FILE: &str = "_gsn";
 
+/// Default live-WAL size at which a collection seals its current segment
+/// and starts a fresh one. Overridable via `OXIDB_WAL_SEGMENT_BYTES`.
+pub const DEFAULT_WAL_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read the WAL segment threshold from `OXIDB_WAL_SEGMENT_BYTES`, falling
+/// back to [`DEFAULT_WAL_SEGMENT_BYTES`]. A zero / unparseable value is
+/// ignored — sealing must always have a positive threshold.
+fn env_segment_threshold() -> u64 {
+    std::env::var("OXIDB_WAL_SEGMENT_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_WAL_SEGMENT_BYTES)
+}
+
 /// Hands out globally-ordered, wall-clock-stamped sequence numbers for
 /// PITR. One instance per `OxiDb`, shared (`Arc`) by every collection's WAL.
 pub struct ArchiveSequencer {
@@ -49,6 +64,10 @@ pub struct ArchiveSequencer {
     /// The `_gsn` file: a single `[u64 LE]` holding `leased_through`.
     /// The mutex serializes lease extensions (rare — once per `GSN_LEASE`).
     state: Mutex<File>,
+    /// Live-WAL size past which a collection seals its current segment.
+    /// Shared by every collection's WAL — PITR config lives on the
+    /// sequencer since it is already the one object every WAL holds.
+    segment_threshold_bytes: u64,
 }
 
 impl ArchiveSequencer {
@@ -82,7 +101,22 @@ impl ArchiveSequencer {
             next_gsn: AtomicU64::new(start),
             leased_through: AtomicU64::new(new_ceiling),
             state: Mutex::new(file),
+            segment_threshold_bytes: env_segment_threshold(),
         })
+    }
+
+    /// Live-WAL size threshold past which a collection seals its current
+    /// segment and rotates to a fresh one.
+    pub fn segment_threshold_bytes(&self) -> u64 {
+        self.segment_threshold_bytes
+    }
+
+    /// Override the segment threshold, ignoring `OXIDB_WAL_SEGMENT_BYTES`.
+    /// Builder-style — for tests and for embedders that configure rotation
+    /// in code rather than through the environment.
+    pub fn with_segment_threshold(mut self, bytes: u64) -> Self {
+        self.segment_threshold_bytes = bytes;
+        self
     }
 
     /// Allocate the next GSN and stamp it with the current wall-clock.

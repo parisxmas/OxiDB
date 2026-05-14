@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::locks::Mutex;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -80,6 +82,15 @@ impl WalEntry {
             WalEntry::Delete { tx_id, .. } => *tx_id,
         }
     }
+
+    /// The document this entry mutates.
+    pub fn doc_id(&self) -> DocumentId {
+        match self {
+            WalEntry::Insert { doc_id, .. } => *doc_id,
+            WalEntry::Update { doc_id, .. } => *doc_id,
+            WalEntry::Delete { doc_id, .. } => *doc_id,
+        }
+    }
 }
 
 /// Per-record metadata carried only by v2 (PITR) WAL records. v1 records
@@ -113,6 +124,10 @@ pub struct Wal {
     /// its records with a GSN + wall-clock and emits the v2 format;
     /// when `None` (PITR disabled — the default) records stay v1.
     sequencer: Option<Arc<ArchiveSequencer>>,
+    /// Next sequence number for a sealed segment (`<path>.<seq>`). Seeded
+    /// past the highest sealed segment already on disk so seals never
+    /// collide across restarts. Only advanced under the `inner` lock.
+    next_seal_seq: AtomicU64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -134,11 +149,14 @@ impl Wal {
             .truncate(false)
             .open(path)?;
 
+        let next_seal_seq = Self::scan_max_seal_seq(path);
+
         Ok(Self {
             inner: Mutex::new(file),
             path: path.to_path_buf(),
             encryption,
             sequencer: None,
+            next_seal_seq: AtomicU64::new(next_seal_seq),
         })
     }
 
@@ -155,11 +173,7 @@ impl Wal {
     /// (GSN + wall-clock stamped) when an archive sequencer is attached.
     pub fn log(&self, entry: &WalEntry) -> Result<()> {
         let rec = self.encode_record(entry)?;
-        let mut file = self.inner.lock();
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(&rec)?;
-        file.sync_data()?;
-        Ok(())
+        self.append_locked(&rec, true)
     }
 
     /// Append a single record stamped with an explicit `meta` (v2 format),
@@ -167,20 +181,13 @@ impl Wal {
     /// for callers that supply their own GSN.
     pub fn log_with_meta(&self, entry: &WalEntry, meta: WalMeta) -> Result<()> {
         let rec = Self::frame(self.serialize_entry(entry, Some(meta))?);
-        let mut file = self.inner.lock();
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(&rec)?;
-        file.sync_data()?;
-        Ok(())
+        self.append_locked(&rec, true)
     }
 
     /// Serialize and append a WAL entry without fsync.
     pub fn log_no_sync(&self, entry: &WalEntry) -> Result<()> {
         let rec = self.encode_record(entry)?;
-        let mut file = self.inner.lock();
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(&rec)?;
-        Ok(())
+        self.append_locked(&rec, false)
     }
 
     /// Write multiple WAL entries with a single fsync.
@@ -189,11 +196,7 @@ impl Wal {
         for entry in entries {
             buf.extend_from_slice(&self.encode_record(entry)?);
         }
-        let mut file = self.inner.lock();
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(&buf)?;
-        file.sync_data()?;
-        Ok(())
+        self.append_locked(&buf, true)
     }
 
     /// Write multiple WAL entries without fsync.
@@ -202,10 +205,7 @@ impl Wal {
         for entry in entries {
             buf.extend_from_slice(&self.encode_record(entry)?);
         }
-        let mut file = self.inner.lock();
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(&buf)?;
-        Ok(())
+        self.append_locked(&buf, false)
     }
 
     /// Write multiple insert entries without fsync, avoiding doc_bytes clones.
@@ -223,10 +223,42 @@ impl Wal {
         for &(doc_id, doc_bytes) in entries {
             buf.extend_from_slice(&self.encode_insert_record(doc_id, doc_bytes)?);
         }
+        self.append_locked(&buf, false)
+    }
+
+    /// Append already-framed record bytes to the live segment under the
+    /// `inner` lock, optionally fsync, then seal the segment if it has
+    /// grown past the threshold. Every `log*` method funnels through here
+    /// so rotation is triggered consistently — and, because the seal
+    /// runs while the lock is still held, atomically against every other
+    /// `log*` / `read_*` / `checkpoint`.
+    fn append_locked(&self, bytes: &[u8], sync: bool) -> Result<()> {
         let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
-        file.write_all(&buf)?;
+        file.write_all(bytes)?;
+        if sync {
+            file.sync_data()?;
+        }
+        self.maybe_seal_locked(&mut file)?;
         Ok(())
+    }
+
+    /// Seal the current segment now, regardless of size: atomically rename
+    /// the live WAL to `<path>.<seq>` and start a fresh empty one. Holds
+    /// the `inner` lock for the whole rotation, so no acknowledged write
+    /// can fall between the sealed segment and the new live WAL.
+    pub fn seal(&self) -> Result<()> {
+        let mut file = self.inner.lock();
+        self.seal_locked(&mut file)
+    }
+
+    /// Every sealed segment for this WAL (`<path>.<seq>`), sorted oldest
+    /// first. The archiver (Phase 3) consumes these; the live WAL and any
+    /// non-numeric sibling files are excluded.
+    pub fn list_sealed_segments(&self) -> Vec<PathBuf> {
+        let mut segs = Self::scan_sealed_segments(&self.path);
+        segs.sort_by_key(|(seq, _)| *seq);
+        segs.into_iter().map(|(_, p)| p).collect()
     }
 
     /// fsync the WAL file without writing anything else.
@@ -398,6 +430,97 @@ impl Wal {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Seal the segment if a sequencer is attached and the live WAL has
+    /// grown past its size threshold. No-op when PITR is disabled — with
+    /// no archiver to consume them, sealed segments would only pile up.
+    /// Caller holds the `inner` lock.
+    fn maybe_seal_locked(&self, file: &mut File) -> Result<()> {
+        let threshold = match &self.sequencer {
+            Some(seq) => seq.segment_threshold_bytes(),
+            None => return Ok(()),
+        };
+        if file.metadata()?.len() < threshold {
+            return Ok(());
+        }
+        self.seal_locked(file)
+    }
+
+    /// Rotate the live WAL: fsync it, atomically rename it to the next
+    /// numbered sealed segment, then open a fresh empty live WAL in its
+    /// place. Caller holds the `inner` lock; `file` is swapped in-place
+    /// for the fresh handle before the lock is released, so the next
+    /// writer always sees the new segment.
+    ///
+    /// Crash safety: a crash between the rename and the dir fsync leaves
+    /// either the old `.wal` intact (rename not durable → replay it) or
+    /// the sealed `<path>.<seq>` present with no `.wal` (`open` recreates
+    /// an empty one, recovery replays the sealed segment). Both states
+    /// are recoverable; no acknowledged write is lost.
+    fn seal_locked(&self, file: &mut File) -> Result<()> {
+        // Flush any not-yet-synced writes into the segment being sealed.
+        file.sync_data()?;
+        let seq = self.next_seal_seq.fetch_add(1, Ordering::SeqCst);
+        let sealed_path = Self::sealed_segment_path(&self.path, seq);
+        fs::rename(&self.path, &sealed_path)?;
+        // Fresh, empty live WAL at the original path.
+        *file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&self.path)?;
+        // Make the rename (and the new file's dir entry) durable.
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    /// Every sealed segment for `wal_path` as `(seq, path)` pairs. Matches
+    /// `<file_name>.<n>` siblings where `<n>` parses as a `u64`; the live
+    /// WAL itself and `.tmp`-style siblings are skipped.
+    fn scan_sealed_segments(wal_path: &Path) -> Vec<(u64, PathBuf)> {
+        let (parent, prefix) = match (wal_path.parent(), wal_path.file_name()) {
+            (Some(p), Some(f)) => (p, format!("{}.", f.to_string_lossy())),
+            _ => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        if let Ok(rd) = fs::read_dir(parent) {
+            for entry in rd.flatten() {
+                let fname = entry.file_name();
+                let fname = fname.to_string_lossy();
+                if let Some(suffix) = fname.strip_prefix(&prefix) {
+                    if let Ok(seq) = suffix.parse::<u64>() {
+                        out.push((seq, entry.path()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The next seal sequence number — one past the highest sealed segment
+    /// already on disk, so seals never collide across restarts.
+    fn scan_max_seal_seq(wal_path: &Path) -> u64 {
+        Self::scan_sealed_segments(wal_path)
+            .iter()
+            .map(|(seq, _)| *seq + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Path of the sealed segment with sequence `seq`: `<wal_path>.<seq>`.
+    fn sealed_segment_path(wal_path: &Path, seq: u64) -> PathBuf {
+        let mut name = wal_path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(format!(".{seq}"));
+        wal_path.with_file_name(name)
+    }
 
     /// Build one on-disk record — `[crc: u32 LE][len: u32 LE][payload]` —
     /// for `entry`. When an archive sequencer is attached this allocates a
@@ -1069,5 +1192,144 @@ mod tests {
         let records = wal.read_records().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].meta, WalMeta::default()); // v1 → zeroed meta
+    }
+
+    // ── PITR Phase 2: WAL segment rotation (seal) ───────────────────────
+
+    #[test]
+    fn seal_creates_numbered_segment_and_fresh_live_wal() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("c.wal");
+        let wal = Wal::open(&wal_path).unwrap();
+
+        wal.log(&WalEntry::insert(1, b"a".to_vec())).unwrap();
+        wal.log(&WalEntry::insert(2, b"b".to_vec())).unwrap();
+        wal.seal().unwrap();
+
+        // The sealed segment exists and holds the two records...
+        let sealed = wal.list_sealed_segments();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(Wal::open(&sealed[0]).unwrap().read_records().unwrap().len(), 2);
+        // ...and the live WAL is fresh and empty, ready for new writes.
+        assert!(wal.read_records().unwrap().is_empty());
+        wal.log(&WalEntry::insert(3, b"c".to_vec())).unwrap();
+        assert_eq!(wal.read_records().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn union_of_sealed_and_live_holds_all_records() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::open(&dir.path().join("c.wal")).unwrap();
+
+        // Spread 9 records across 3 segments (2 sealed + 1 live).
+        for i in 0..3 { wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap(); }
+        wal.seal().unwrap();
+        for i in 3..6 { wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap(); }
+        wal.seal().unwrap();
+        for i in 6..9 { wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap(); }
+
+        let mut ids: Vec<u64> = Vec::new();
+        for seg in wal.list_sealed_segments() {
+            for r in Wal::open(&seg).unwrap().read_records().unwrap() {
+                ids.push(r.entry.doc_id());
+            }
+        }
+        for r in wal.read_records().unwrap() {
+            ids.push(r.entry.doc_id());
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (0..9).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn seal_seq_resumes_after_reopen() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("c.wal");
+        {
+            let wal = Wal::open(&wal_path).unwrap();
+            wal.log(&WalEntry::insert(1, b"a".to_vec())).unwrap();
+            wal.seal().unwrap(); // → c.wal.0
+            wal.log(&WalEntry::insert(2, b"b".to_vec())).unwrap();
+            wal.seal().unwrap(); // → c.wal.1
+        }
+        // A reopened WAL must seal to c.wal.2, not collide with c.wal.0.
+        let wal = Wal::open(&wal_path).unwrap();
+        wal.log(&WalEntry::insert(3, b"c".to_vec())).unwrap();
+        wal.seal().unwrap();
+        let sealed = wal.list_sealed_segments();
+        assert_eq!(sealed.len(), 3);
+        assert!(sealed[2].to_string_lossy().ends_with("c.wal.2"));
+    }
+
+    #[test]
+    fn auto_seal_on_threshold() {
+        use crate::pitr::ArchiveSequencer;
+        let dir = TempDir::new().unwrap();
+        // Tiny threshold so a handful of records trips a rotation.
+        let seq = Arc::new(
+            ArchiveSequencer::open(dir.path()).unwrap().with_segment_threshold(256),
+        );
+        let wal = Wal::open(&dir.path().join("c.wal")).unwrap().with_sequencer(Some(seq));
+
+        for i in 0..40 {
+            wal.log(&WalEntry::insert(i, b"a-reasonably-sized-payload".to_vec())).unwrap();
+        }
+        // Crossing the threshold sealed at least one segment automatically,
+        // and every record is still present across the union.
+        let sealed = wal.list_sealed_segments();
+        assert!(!sealed.is_empty(), "threshold should have triggered an auto-seal");
+        let mut total = wal.read_records().unwrap().len();
+        for seg in sealed {
+            total += Wal::open(&seg).unwrap().read_records().unwrap().len();
+        }
+        assert_eq!(total, 40);
+    }
+
+    #[test]
+    fn seal_is_atomic_under_concurrent_writers() {
+        // The scar this guards against: a seal racing concurrent log()
+        // calls dropping an acknowledged write (see btree_collection's
+        // documented "lost 3/2000 acks" note).
+        let dir = TempDir::new().unwrap();
+        let wal = Arc::new(Wal::open(&dir.path().join("race.wal")).unwrap());
+        let writers = 6usize;
+        let per_writer = 400usize;
+
+        let mut handles = Vec::new();
+        for w in 0..writers {
+            let wal = Arc::clone(&wal);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_writer {
+                    let doc_id = (w * per_writer + i) as u64;
+                    wal.log(&WalEntry::insert(doc_id, b"x".to_vec())).unwrap();
+                }
+            }));
+        }
+        // A sealer rotating the segment underneath the writers.
+        {
+            let wal = Arc::clone(&wal);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..60 {
+                    wal.seal().unwrap();
+                    std::thread::yield_now();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every acknowledged write must appear exactly once across the
+        // union of sealed segments + the live WAL — no loss, no dup.
+        let mut seen = std::collections::HashSet::new();
+        for seg in wal.list_sealed_segments() {
+            for r in Wal::open(&seg).unwrap().read_records().unwrap() {
+                assert!(seen.insert(r.entry.doc_id()), "record duplicated across segments");
+            }
+        }
+        for r in wal.read_records().unwrap() {
+            assert!(seen.insert(r.entry.doc_id()), "record duplicated in live WAL");
+        }
+        assert_eq!(seen.len(), writers * per_writer, "lost an acknowledged write across rotation");
     }
 }

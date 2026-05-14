@@ -226,10 +226,29 @@ impl BTreeCollection {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn replay_wal(wal: &Wal, storage: &BTreeStorage) -> Result<usize> {
-        let entries = wal.read_entries()?;
-        if entries.is_empty() { return Ok(0); }
         let mut count = 0usize;
-        for entry in &entries {
+        // With PITR enabled the history since the last snapshot is split
+        // across sealed segments (`<name>.wal.<seq>`) plus the live
+        // `<name>.wal`. Replay the sealed segments oldest-first, then the
+        // live WAL, so no acknowledged write is missed. Without PITR
+        // there are no sealed segments and this is just the live WAL —
+        // identical to the prior behavior. Replay is idempotent (upsert
+        // by doc_id), so re-applying entries already in the snapshot is
+        // harmless. Sealed segments are left in place for the archiver
+        // (Phase 3) to consume; until then they are re-replayed each open.
+        for seg_path in wal.list_sealed_segments() {
+            let seg = Wal::open(&seg_path)?;
+            count += Self::replay_entries(&seg.read_entries()?, storage);
+        }
+        count += Self::replay_entries(&wal.read_entries()?, storage);
+        Ok(count)
+    }
+
+    /// Apply a batch of WAL entries to `storage` idempotently, returning
+    /// how many were applied.
+    fn replay_entries(entries: &[WalEntry], storage: &BTreeStorage) -> usize {
+        let mut count = 0usize;
+        for entry in entries {
             match entry {
                 WalEntry::Insert { doc_id, doc_bytes, .. }
                 | WalEntry::Update { doc_id, doc_bytes, .. } => {
@@ -242,7 +261,7 @@ impl BTreeCollection {
                 }
             }
         }
-        Ok(count)
+        count
     }
 
     // -----------------------------------------------------------------------
@@ -3090,6 +3109,25 @@ mod tests {
             let doc = col.find_one(&json!({"seq": 25})).unwrap().unwrap();
             assert_eq!(doc.get("data").unwrap().as_str().unwrap(), "val_25");
         }
+    }
+
+    #[test]
+    fn replay_wal_includes_sealed_segments() {
+        // PITR Phase 2: with a rotated WAL, recovery must replay every
+        // sealed segment plus the live WAL — not just the live tail.
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Wal::open(&dir.path().join("rs.wal")).unwrap();
+        // Spread inserts across 3 segments: 2 sealed + 1 live.
+        wal.log(&WalEntry::insert(1, b"a".to_vec())).unwrap();
+        wal.seal().unwrap();
+        wal.log(&WalEntry::insert(2, b"b".to_vec())).unwrap();
+        wal.seal().unwrap();
+        wal.log(&WalEntry::insert(3, b"c".to_vec())).unwrap();
+
+        let storage = BTreeStorage::open("rs", dir.path(), None).unwrap();
+        let replayed = BTreeCollection::replay_wal(&wal, &storage).unwrap();
+        assert_eq!(replayed, 3, "every sealed segment's entries must be replayed");
+        assert_eq!(storage.count(), 3);
     }
 
     #[test]
