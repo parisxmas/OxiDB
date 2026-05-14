@@ -292,6 +292,40 @@ Restore from a backup archive (Admin only):
 
 A server restart is required after restore to load the restored data.
 
+## Point-In-Time Recovery (PITR)
+
+Enable PITR with `OXIDB_PITR=true`. The server then stamps every WAL record
+with a global sequence number (GSN) + wall-clock, rotates sealed WAL
+segments past `OXIDB_WAL_SEGMENT_BYTES`, and runs a background archiver
+that copies sealed segments into `OXIDB_ARCHIVE_DIR` (default
+`<data>/_archive`) every `OXIDB_ARCHIVE_INTERVAL` seconds. A base backup
+taken with PITR on embeds a `base.meta` GSN watermark.
+
+`restore_to_point` (Admin only) rebuilds the database to a point in time —
+extract a base backup, then replay the archive on top of it up to a
+`gsn`, an `at_micros` wall-clock (micros since the Unix epoch), or — by
+default — the latest archived record:
+
+```json
+{"command": "restore_to_point", "base_backup": "/backups/base.tar.gz", "archive": "/var/lib/oxidb/_archive", "target": "/var/lib/oxidb_restored", "gsn": 1500000}
+```
+
+`archive_status` (Admin only) reports the archive's segment count and
+GSN / wall-clock coverage:
+
+```json
+{"command": "archive_status"}
+```
+
+A server restart is required after `restore_to_point`. Set
+`OXIDB_ARCHIVE_RETENTION_HOURS` to prune archived segments older than the
+window (`0` = never); keep a base backup at least as old as the window.
+
+v1 limitations: blob objects are restored only to the base-backup point
+(documents restore to the chosen target); the FTS index is dropped and
+must be rebuilt; create/drop-index DDL between the base and the target is
+not replayed — indexes rebuild against the base-time schema.
+
 ## Change Streams
 
 Watch for real-time changes to collections (Admin only):

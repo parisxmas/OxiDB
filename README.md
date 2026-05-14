@@ -86,6 +86,11 @@ docker compose up -d
 | `OXIDB_FTS_B` | `0.75` | BM25 length normalization (0–1). 0 = ignore document length, 1 = full normalization |
 | `OXIDB_FTS_WORKERS` | `1` | Number of FTS extract+index worker threads (one per core for heavy PDF/DOCX ingestion) |
 | `OXIDB_FTS_FLUSH_INTERVAL_MS` | `1000` | How often the FTS index file is fsynced; batches per-document writes to amortize disk I/O |
+| `OXIDB_PITR` | `false` | Enable Point-In-Time Recovery: stamp WAL records with a global sequence number, rotate sealed WAL segments, and run the background archiver. Off = zero cost |
+| `OXIDB_ARCHIVE_DIR` | `<data>/_archive` | Where the archiver deposits sealed WAL segments and the manifest |
+| `OXIDB_ARCHIVE_INTERVAL` | `10` | Archiver poll cadence in seconds — how often sealed segments are copied to the archive |
+| `OXIDB_WAL_SEGMENT_BYTES` | `16777216` | Live-WAL size at which a collection seals its current segment and rotates (PITR only) |
+| `OXIDB_ARCHIVE_RETENTION_HOURS` | `0` | Prune archived segments older than this many hours. `0` = never prune. Age-based — keep a base backup at least as old as the window |
 
 ## Features
 
@@ -111,6 +116,7 @@ docker compose up -d
 - **Change streams** — real-time `watch`/`unwatch` with collection filtering, backpressure handling, and token-based resume
 - **JSONB binary storage** — compact binary format for faster serialization; backward-compatible with existing JSON data files
 - **Crash-safe** — write-ahead log with CRC32 checksums, verified by SIGKILL recovery tests
+- **Point-In-Time Recovery** — opt-in (`OXIDB_PITR`): every WAL record is stamped with a global sequence number + wall-clock, sealed WAL segments are archived crash-safely with a self-healing manifest, and `restore_to_point` rebuilds the database to any `Gsn` / `Timestamp` / `Latest` target on top of a base backup — with transactionally-consistent cuts (a transaction straddling the cut is excluded whole, never half-applied). v1 limits: blobs restore to the base-backup point only, the FTS index is rebuilt, and index DDL between base and target is not replayed
 - **Encryption at rest** — AES-256-GCM on storage records and B-tree persistence files; per-record nonces
 - **Security** — TLS transport, SCRAM-SHA-256 authentication, role-based access control (Admin/ReadWrite/Read), audit logging
 - **OxiScript** — lightweight stored procedure language; `proc transfer(from, to, amount) { ... }` compiles to JSON steps; supports if/else, variable binding, field access, all DB operations, and procedure-calling-procedure

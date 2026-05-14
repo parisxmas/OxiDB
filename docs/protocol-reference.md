@@ -216,6 +216,8 @@ One of `cron` or `every` must be provided in `create_schedule`. See [Scheduler](
 |---------|----------------|-----------------|--------|----------|
 | `backup` | `path` | - | `{"path": "...", "size_bytes": N, "collections": N}` | Admin |
 | `restore` | `archive`, `target` | - | `{"ok": true}` | Admin |
+| `restore_to_point` | `base_backup`, `archive`, `target` | `gsn`, `at_micros` (default: latest) | `{"path": "...", "collections": N, "target_gsn": N, "records_applied": N}` | Admin |
+| `archive_status` | - | - | `{"segment_count": N, "total_records": N, "min_gsn": N, "max_gsn": N, "min_wall_clock": N, "max_wall_clock": N}` | Admin |
 
 ### Change Streams
 

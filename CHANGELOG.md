@@ -1,5 +1,82 @@
 # Changelog
 
+## v0.25.23
+
+### Point-In-Time Recovery
+
+OxiDB had only full-snapshot `backup`/`restore` — no way to recover to an
+arbitrary moment (e.g. "just before the bad bulk delete"). The hard part:
+OxiDB has **no global write ordering** — each collection's `.wal` is an
+independent byte stream, `_tx_commit_log` is an unordered set, and most
+writes carry `tx_id = 0`. PITR introduces that ordering and the machinery
+to archive and replay against it. Opt-in via `OXIDB_PITR`; **zero cost
+when off** — every record stays byte-identical v1, no extra threads.
+
+- **WAL v2 record format** (`src/wal.rs`) — records gain v2 op-types
+  (high bit) carrying an optional `[gsn][wall_clock_micros]` header.
+  `read_entries` replays mixed v1/v2 files; v1 is still emitted unless a
+  sequencer is attached.
+
+- **Archive sequencer** (`src/pitr.rs`) — `ArchiveSequencer` hands every
+  durable WAL write a global, monotonic, wall-clock-stamped GSN. It
+  survives restarts via a leased `_gsn` file — one fsync per 10k GSNs,
+  never reusing a number. GSN allocation happens **under the WAL lock**,
+  so "the counter passed N" implies "N's record is in the file" — the
+  invariant the base-backup watermark relies on.
+
+- **WAL segment rotation** (`src/wal.rs`) — `Wal::seal()` atomically
+  renames the live WAL to a numbered sealed segment and opens a fresh
+  one, entirely under the WAL lock so it is atomic against every
+  concurrent `log*` (closing the documented "lost acks across
+  truncation" race). `log*` auto-seals past `OXIDB_WAL_SEGMENT_BYTES`
+  (default 16 MiB). `replay_wal` now replays sealed segments + the live
+  WAL, so a rotated WAL still recovers every acknowledged write. A
+  6-writer-plus-sealer concurrency stress asserts zero loss/dup.
+
+- **Archiver** (`src/archive.rs`) — a background `oxidb-archiver` thread
+  copies sealed segments into `OXIDB_ARCHIVE_DIR/segments/*.seg` —
+  verbatim WAL bytes (at-rest encryption preserved) plus a trailer with
+  the GSN/time range + CRC. Crash-safe (`tmp → fsync → rename →
+  fsync-dir`), idempotent (a segment is archived iff `<name>.seg`
+  exists), with a `manifest.json` rebuilt from the `.seg` trailers so a
+  torn manifest self-heals. Best-effort — sealed segments are immutable,
+  read with no locking, never blocking a foreground write.
+
+- **Base-backup watermark** (`src/engine.rs`, `src/pitr.rs`) — `backup()`
+  reads the GSN counter, barriers every collection's WAL, and embeds a
+  `base.meta` watermark in the tarball; the base is then guaranteed to
+  contain every write below it.
+
+- **`restore_to_point`** (`src/engine.rs`, `src/archive.rs`) — extracts a
+  base backup, then `replay_into` advances it to a `Gsn` / `Timestamp` /
+  `Latest` target: gathers every WAL record per collection, resolves the
+  target GSN, applies a **two-pass transactionally-consistent cut** (a
+  transaction is admitted only if its whole footprint — `max(gsn)` over
+  all its records, across collections — fits under the target; one
+  straddling the cut is excluded whole, never half-applied), rewrites
+  each WAL with exactly the admitted records, and drops the stale index
+  caches / FTS index / tx commit log. Idempotent and offline.
+
+- **Server + retention** (`oxidb-server/src/handler.rs`,
+  `src/archive.rs`) — admin commands `restore_to_point` and
+  `archive_status`. `OXIDB_ARCHIVE_RETENTION_HOURS` prunes archived
+  segments older than the window (`0` = disabled).
+
+v1 limitations: blob objects restore to the base-backup point only (the
+document set restores to the target); the FTS index is dropped and must
+be rebuilt; create/drop-index DDL between the base and the target is not
+replayed. SIGKILL preserves the page cache, so the included tests prove
+crash *consistency* and idempotency, not fsync durability under power
+loss — block-layer fault injection is tracked separately.
+
+- 25 new unit tests across `wal`, `pitr`, and `archive`; the full lib
+  suite is green except `wal_checkpoint_clears_wal` and
+  `restore_from_backup`, which already fail on `master`.
+
+### Versions
+
+- `oxidb-server`: 0.25.22 → 0.25.23
+
 ## v0.25.22
 
 ### Engine — group-commit tx_log + lazy DocCache shards

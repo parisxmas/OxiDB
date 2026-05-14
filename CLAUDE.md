@@ -83,6 +83,9 @@ S3-style bucket interface. Objects stored as `_blobs/<bucket>/<id>.data` + `<id>
 ### Encryption (`src/crypto.rs`)
 Transparent AES-GCM encryption at the storage layer. Optional—enabled by passing an encryption key to the engine.
 
+### Point-In-Time Recovery (`src/pitr.rs`, `src/archive.rs`)
+Opt-in via `OXIDB_PITR`. `ArchiveSequencer` (`pitr.rs`) hands every durable WAL write a global, monotonic, wall-clock-stamped GSN (persisted in leases via `_gsn`); WAL records carry it in the **v2** record format (`wal.rs`). The WAL rotates: `Wal::seal()` atomically renames the live `.wal` to a numbered sealed segment under the WAL lock. A background archiver (`archive.rs`, spawned by the engine) copies sealed segments into `_archive/segments/*.seg` (verbatim bytes + trailer) with a self-healing `manifest.json`. `backup()` embeds a `base.meta` GSN watermark. `OxiDb::restore_to_point` extracts a base backup then `archive::replay_into` advances it to a `Gsn`/`Timestamp`/`Latest` target with transactionally-consistent cuts. Off = zero cost.
+
 ### Server Protocol (`oxidb-server/`)
 Length-prefixed JSON over TCP (max 16 MiB). Auth via SCRAM-SHA-256. RBAC roles: Admin, ReadWrite, Read. Configurable via env vars:
 - `OXIDB_ADDR` (default `127.0.0.1:4444`)

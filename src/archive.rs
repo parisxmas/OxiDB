@@ -174,6 +174,90 @@ pub fn archive_dir_for(data_dir: &Path) -> PathBuf {
     }
 }
 
+/// Delete archived segments whose newest record is older than
+/// `retention_hours`, then rebuild the manifest. A no-op when
+/// `retention_hours` is 0 — retention is disabled by default.
+///
+/// Age-based only: the operator must keep a base backup at least as old
+/// as the retention window, or PITR cannot restore through the pruned
+/// range (the standard base-backup + WAL-retention operational contract).
+/// Returns the number of segments pruned.
+pub fn prune_archive(archive_dir: &Path, retention_hours: u64) -> Result<usize> {
+    if retention_hours == 0 {
+        return Ok(0);
+    }
+    let segments_dir = archive_dir.join(SEGMENTS_DIR);
+    let cutoff = crate::pitr::now_micros().saturating_sub(
+        retention_hours.saturating_mul(3600).saturating_mul(1_000_000),
+    );
+    let mut pruned = 0;
+    if let Ok(rd) = fs::read_dir(&segments_dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("seg") {
+                continue;
+            }
+            if let Some(meta) = read_segment_entry(&p)? {
+                // end_wall_clock 0 means the segment carried no v2 records
+                // (no timestamp to age it against) — keep it, to be safe.
+                if meta.end_wall_clock != 0 && meta.end_wall_clock < cutoff {
+                    let _ = fs::remove_file(&p);
+                    pruned += 1;
+                }
+            }
+        }
+    }
+    if pruned > 0 {
+        rebuild_manifest(archive_dir, &segments_dir)?;
+    }
+    Ok(pruned)
+}
+
+/// A summary of the archive — for the `archive_status` server command.
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveStatus {
+    pub segment_count: usize,
+    pub total_records: u64,
+    /// Smallest / largest GSN covered by the archive (0 if empty).
+    pub min_gsn: u64,
+    pub max_gsn: u64,
+    /// Smallest / largest wall-clock (micros) covered by the archive.
+    pub min_wall_clock: u64,
+    pub max_wall_clock: u64,
+}
+
+/// Summarize the archive at `archive_dir` from its manifest. Returns a
+/// zeroed summary when there is no archive yet.
+pub fn archive_status(archive_dir: &Path) -> Result<ArchiveStatus> {
+    let manifest = load_manifest(archive_dir)?;
+    let mut s = ArchiveStatus {
+        segment_count: manifest.segments.len(),
+        total_records: 0,
+        min_gsn: u64::MAX,
+        max_gsn: 0,
+        min_wall_clock: u64::MAX,
+        max_wall_clock: 0,
+    };
+    for e in &manifest.segments {
+        s.total_records += e.record_count;
+        if e.start_gsn != 0 {
+            s.min_gsn = s.min_gsn.min(e.start_gsn);
+        }
+        s.max_gsn = s.max_gsn.max(e.end_gsn);
+        if e.start_wall_clock != 0 {
+            s.min_wall_clock = s.min_wall_clock.min(e.start_wall_clock);
+        }
+        s.max_wall_clock = s.max_wall_clock.max(e.end_wall_clock);
+    }
+    if s.min_gsn == u64::MAX {
+        s.min_gsn = 0;
+    }
+    if s.min_wall_clock == u64::MAX {
+        s.min_wall_clock = 0;
+    }
+    Ok(s)
+}
+
 /// What [`replay_into`] drove the restore to.
 #[derive(Debug, Clone, Copy)]
 pub struct ReplayOutcome {
@@ -838,5 +922,58 @@ mod tests {
         // Derived state is dropped so OxiDb::open rebuilds it cleanly.
         assert!(!target.path().join("c.fidx").exists());
         assert!(!target.path().join("_tx_commit_log").exists());
+    }
+
+    // ── PITR Phase 6: retention + status ────────────────────────────────
+
+    #[test]
+    fn prune_archive_drops_old_segments_by_age() {
+        let data = TempDir::new().unwrap();
+        let archive = TempDir::new().unwrap();
+        // One segment dated to 1970, one dated to now.
+        let old = Wal::open(&data.path().join("old.wal")).unwrap();
+        old.log_with_meta(
+            &WalEntry::insert(1, b"x".to_vec()),
+            WalMeta { gsn: 1, wall_clock_micros: 1_000_000 },
+        )
+        .unwrap();
+        old.seal().unwrap();
+        let recent = Wal::open(&data.path().join("recent.wal")).unwrap();
+        recent
+            .log_with_meta(
+                &WalEntry::insert(2, b"x".to_vec()),
+                WalMeta { gsn: 2, wall_clock_micros: crate::pitr::now_micros() },
+            )
+            .unwrap();
+        recent.seal().unwrap();
+        archive_pass(data.path(), archive.path(), None).unwrap();
+        assert_eq!(load_manifest(archive.path()).unwrap().segments.len(), 2);
+
+        // Retention 0 is disabled — a no-op.
+        assert_eq!(prune_archive(archive.path(), 0).unwrap(), 0);
+        // Retention 1h prunes the 1970 segment, keeps the recent one.
+        assert_eq!(prune_archive(archive.path(), 1).unwrap(), 1);
+        let m = load_manifest(archive.path()).unwrap();
+        assert_eq!(m.segments.len(), 1);
+        assert_eq!(m.segments[0].original, "recent.wal.0");
+    }
+
+    #[test]
+    fn archive_status_summarizes_the_manifest() {
+        let data = TempDir::new().unwrap();
+        let archive = TempDir::new().unwrap();
+        make_sealed_segment(data.path(), "c", 5);
+        archive_pass(data.path(), archive.path(), None).unwrap();
+
+        let s = archive_status(archive.path()).unwrap();
+        assert_eq!(s.segment_count, 1);
+        assert_eq!(s.total_records, 5);
+        assert!(s.min_gsn >= 1 && s.max_gsn >= s.min_gsn);
+
+        // A never-archived directory yields a zeroed summary.
+        let empty = TempDir::new().unwrap();
+        let z = archive_status(empty.path()).unwrap();
+        assert_eq!(z.segment_count, 0);
+        assert_eq!(z.total_records, 0);
     }
 }

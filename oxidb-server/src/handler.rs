@@ -815,6 +815,59 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        "restore_to_point" => {
+            let base_backup = match request.get("base_backup").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return err_bytes("missing 'base_backup'"),
+            };
+            let archive = match request.get("archive").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return err_bytes("missing 'archive'"),
+            };
+            let target = match request.get("target").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return err_bytes("missing 'target'"),
+            };
+            // Target point: an explicit `gsn`, an explicit `at_micros`
+            // (wall-clock, micros since epoch), or — by default — the
+            // latest record in the archive.
+            let point = if let Some(g) = request.get("gsn").and_then(|v| v.as_u64()) {
+                oxidb::PitrTarget::Gsn(g)
+            } else if let Some(t) = request.get("at_micros").and_then(|v| v.as_u64()) {
+                oxidb::PitrTarget::Timestamp(t)
+            } else {
+                oxidb::PitrTarget::Latest
+            };
+            match oxidb::OxiDb::restore_to_point(
+                std::path::Path::new(base_backup),
+                std::path::Path::new(archive),
+                std::path::Path::new(target),
+                point,
+                db.encryption_key(),
+            ) {
+                Ok(info) => ok_bytes(json!({
+                    "path": info.path,
+                    "collections": info.collections,
+                    "target_gsn": info.target_gsn,
+                    "records_applied": info.records_applied,
+                    "message": "point-in-time restore complete; restart server with this data directory to use",
+                })),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "archive_status" => match db.archive_status() {
+            Ok(s) => ok_bytes(json!({
+                "segment_count": s.segment_count,
+                "total_records": s.total_records,
+                "min_gsn": s.min_gsn,
+                "max_gsn": s.max_gsn,
+                "min_wall_clock": s.min_wall_clock,
+                "max_wall_clock": s.max_wall_clock,
+            })),
+            Err(e) => err_bytes(&e.to_string()),
+        },
+
         "sql" => {
             let query_str = match request.get("query").and_then(|v| v.as_str()) {
                 Some(q) => q,

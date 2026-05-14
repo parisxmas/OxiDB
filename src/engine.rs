@@ -907,38 +907,60 @@ impl OxiDb {
             .filter(|&n| n > 0)
             .unwrap_or(10);
         let interval = std::time::Duration::from_secs(interval_secs);
+        // Retention: 0 (default) disables pruning entirely.
+        let retention_hours = std::env::var("OXIDB_ARCHIVE_RETENTION_HOURS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
 
         let (tx, rx) = mpsc::sync_channel::<()>(0);
         let db = Arc::clone(self);
         std::thread::Builder::new()
             .name("oxidb-archiver".into())
             .spawn(move || {
+                // One archiving + retention pass; best-effort, never panics.
+                let pass = |label: &str| {
+                    if let Err(e) = crate::archive::archive_pass(
+                        &db.data_dir,
+                        &archive_dir,
+                        db.encryption.as_ref(),
+                    ) {
+                        eprintln!("[archiver] {label} archive pass failed: {e}");
+                    }
+                    if retention_hours > 0 {
+                        if let Err(e) =
+                            crate::archive::prune_archive(&archive_dir, retention_hours)
+                        {
+                            eprintln!("[archiver] {label} prune failed: {e}");
+                        }
+                    }
+                };
                 loop {
                     match rx.recv_timeout(interval) {
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if let Err(e) = crate::archive::archive_pass(
-                                &db.data_dir,
-                                &archive_dir,
-                                db.encryption.as_ref(),
-                            ) {
-                                eprintln!("[archiver] pass failed: {e}");
-                            }
-                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => pass("periodic"),
                         _ => break,
                     }
                 }
                 // Final pass on shutdown so the last sealed segments land.
-                if let Err(e) = crate::archive::archive_pass(
-                    &db.data_dir,
-                    &archive_dir,
-                    db.encryption.as_ref(),
-                ) {
-                    eprintln!("[archiver] final pass failed: {e}");
-                }
+                pass("final");
             })
             .expect("failed to spawn archiver thread");
 
         *self.archiver_shutdown.lock() = Some(tx);
+    }
+
+    /// Summary of the PITR archive — segment count and GSN / time
+    /// coverage. Returns a zeroed summary when PITR has never run.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn archive_status(&self) -> Result<crate::archive::ArchiveStatus> {
+        crate::archive::archive_status(&crate::archive::archive_dir_for(&self.data_dir))
+    }
+
+    /// The encryption key this database was opened with, if any. Admin
+    /// tooling such as `restore_to_point` needs it to read the same
+    /// at-rest-encrypted WAL segments.
+    pub fn encryption_key(&self) -> Option<Arc<EncryptionKey>> {
+        self.encryption.clone()
     }
 
     /// Returns whether lazy sync mode is enabled.
