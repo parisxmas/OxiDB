@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.25.25
+
+### Relicensed — AGPL-3.0 + commercial (dual-license)
+
+OxiDB moves from `MIT OR Apache-2.0` to a **dual license**: the public,
+open-source license is now **AGPL-3.0-only** (see [`LICENSE`](LICENSE)),
+and a separate **commercial license** is available for closed-source /
+proprietary use that the AGPL's copyleft does not permit — see
+[`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md).
+
+- `LICENSE-MIT` / `LICENSE-APACHE` removed; `LICENSE` is now the full
+  AGPL-3.0 text. `license = "AGPL-3.0-only"` across every workspace
+  crate's `Cargo.toml`.
+- Prior releases remain under `MIT OR Apache-2.0` — that grant on those
+  specific versions cannot be revoked. This and every future version is
+  AGPL-3.0 / commercial.
+- Contributions are accepted under **both** licenses, so the whole of
+  OxiDB — contributed code included — can still be offered commercially.
+
+### Versions
+
+- `oxidb-server`: 0.25.24 → 0.25.25
+
 ## v0.25.24
 
 ### Blob store — opt-in durable writes with group-committed fsync

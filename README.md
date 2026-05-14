@@ -774,13 +774,23 @@ Date strings (ISO 8601, RFC 3339, `YYYY-MM-DD`) are automatically stored as epoc
 
 ## License
 
-Licensed under either of
+OxiDB is **dual-licensed**:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- **Open source** — [GNU AGPL-3.0](LICENSE) (`AGPL-3.0-only`). Free to
+  use, modify, and redistribute, provided you release the complete
+  corresponding source of your work under the AGPL — and note that,
+  under the AGPL, offering OxiDB (or a product built on it) over a
+  network counts as distribution.
+- **Commercial** — for embedding OxiDB in a closed-source product, or
+  otherwise using it on terms the AGPL does not permit, a commercial
+  license is available. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
 
-at your option.
+Prior releases were published under `MIT OR Apache-2.0`; that grant on
+those specific versions cannot be revoked. This and all future versions
+are AGPL-3.0 / commercial.
 
 ### Contribution
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+By submitting a contribution you agree it may be distributed under
+**both** licenses above — see
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md#4-contributions).

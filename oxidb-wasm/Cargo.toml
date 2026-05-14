@@ -3,7 +3,7 @@ name = "oxidb-wasm"
 version = "0.25.0"
 edition = "2024"
 description = "OxiDB document database compiled to WebAssembly"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 repository = "https://github.com/parisxmas/OxiDB"
 
 [lib]

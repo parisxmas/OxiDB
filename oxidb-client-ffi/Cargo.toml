@@ -3,7 +3,7 @@ name = "oxidb-client-ffi"
 version = "0.25.0"
 edition = "2024"
 description = "C-compatible FFI client library for OxiDB server"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-only"
 repository = "https://github.com/parisxmas/OxiDB"
 
 [lib]
