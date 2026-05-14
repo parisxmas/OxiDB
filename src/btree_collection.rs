@@ -82,11 +82,24 @@ pub struct BTreeCollection {
 impl BTreeCollection {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open(name: &str, data_dir: &Path, encryption: Option<std::sync::Arc<crate::EncryptionKey>>) -> Result<Self> {
+        Self::open_with_sequencer(name, data_dir, encryption, None)
+    }
+
+    /// Open a collection, attaching `sequencer` to its WAL. When `Some`
+    /// (PITR enabled), every WAL write is stamped with a global GSN +
+    /// wall-clock and emitted in the v2 record format.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_with_sequencer(
+        name: &str,
+        data_dir: &Path,
+        encryption: Option<std::sync::Arc<crate::EncryptionKey>>,
+        sequencer: Option<std::sync::Arc<crate::pitr::ArchiveSequencer>>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let storage = BTreeStorage::open(name, data_dir, encryption)?;
 
         let wal_path = data_dir.join(format!("{}.wal", name));
-        let wal = Wal::open(&wal_path)?;
+        let wal = Wal::open(&wal_path)?.with_sequencer(sequencer);
         let replayed = Self::replay_wal(&wal, &storage)?;
         let wal_backend = WalBackend::File(wal);
         if replayed > 0 {

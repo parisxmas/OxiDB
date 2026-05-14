@@ -29,6 +29,8 @@ use crate::error::Result;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::index::CompositeIndex;
 #[cfg(not(target_arch = "wasm32"))]
+use crate::pitr::ArchiveSequencer;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::paged_field_index::PagedFieldIndex;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::storage::{DocLocation, Storage};
@@ -107,6 +109,10 @@ pub struct Wal {
     inner: Mutex<File>,
     path: PathBuf,
     encryption: Option<Arc<EncryptionKey>>,
+    /// Archive sequencer for PITR. When `Some`, every `log*` call stamps
+    /// its records with a GSN + wall-clock and emits the v2 format;
+    /// when `None` (PITR disabled — the default) records stay v1.
+    sequencer: Option<Arc<ArchiveSequencer>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -132,101 +138,79 @@ impl Wal {
             inner: Mutex::new(file),
             path: path.to_path_buf(),
             encryption,
+            sequencer: None,
         })
     }
 
-    /// Serialize and append a WAL entry, then fsync.
-    pub fn log(&self, entry: &WalEntry) -> Result<()> {
-        let payload = self.serialize_entry(entry, None)?;
-        let crc = Self::compute_crc(&payload);
+    /// Attach (or detach) the PITR archive sequencer. Builder-style so the
+    /// `open*` signatures stay stable. With a sequencer attached every
+    /// subsequent `log*` call emits v2 records stamped with a GSN +
+    /// wall-clock; without one, records stay v1 (the default).
+    pub fn with_sequencer(mut self, sequencer: Option<Arc<ArchiveSequencer>>) -> Self {
+        self.sequencer = sequencer;
+        self
+    }
 
+    /// Serialize and append a WAL entry, then fsync. Emits a v2 record
+    /// (GSN + wall-clock stamped) when an archive sequencer is attached.
+    pub fn log(&self, entry: &WalEntry) -> Result<()> {
+        let rec = self.encode_record(entry)?;
         let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
-        file.write_all(&crc.to_le_bytes())?;
-        file.write_all(&(payload.len() as u32).to_le_bytes())?;
-        file.write_all(&payload)?;
+        file.write_all(&rec)?;
         file.sync_data()?;
-
         Ok(())
     }
 
-    /// Append a single v2 (PITR) record stamped with `meta`, then fsync.
-    /// This is the entry point used once an archive sequencer is attached
-    /// (Phase 1); the plain `log*` methods always emit v1 records.
+    /// Append a single record stamped with an explicit `meta` (v2 format),
+    /// then fsync — bypassing the attached sequencer. Mainly for tests and
+    /// for callers that supply their own GSN.
     pub fn log_with_meta(&self, entry: &WalEntry, meta: WalMeta) -> Result<()> {
-        let payload = self.serialize_entry(entry, Some(meta))?;
-        let crc = Self::compute_crc(&payload);
-
+        let rec = Self::frame(self.serialize_entry(entry, Some(meta))?);
         let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
-        file.write_all(&crc.to_le_bytes())?;
-        file.write_all(&(payload.len() as u32).to_le_bytes())?;
-        file.write_all(&payload)?;
+        file.write_all(&rec)?;
         file.sync_data()?;
-
         Ok(())
     }
 
     /// Serialize and append a WAL entry without fsync.
     pub fn log_no_sync(&self, entry: &WalEntry) -> Result<()> {
-        let payload = self.serialize_entry(entry, None)?;
-        let crc = Self::compute_crc(&payload);
-
+        let rec = self.encode_record(entry)?;
         let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
-        file.write_all(&crc.to_le_bytes())?;
-        file.write_all(&(payload.len() as u32).to_le_bytes())?;
-        file.write_all(&payload)?;
-
+        file.write_all(&rec)?;
         Ok(())
     }
 
     /// Write multiple WAL entries with a single fsync.
     pub fn log_batch(&self, entries: &[WalEntry]) -> Result<()> {
+        let mut buf = Vec::new();
+        for entry in entries {
+            buf.extend_from_slice(&self.encode_record(entry)?);
+        }
         let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
-        for entry in entries {
-            let payload = self.serialize_entry(entry, None)?;
-            let crc = Self::compute_crc(&payload);
-            file.write_all(&crc.to_le_bytes())?;
-            file.write_all(&(payload.len() as u32).to_le_bytes())?;
-            file.write_all(&payload)?;
-        }
+        file.write_all(&buf)?;
         file.sync_data()?;
         Ok(())
     }
 
     /// Write multiple WAL entries without fsync.
     pub fn log_batch_no_sync(&self, entries: &[WalEntry]) -> Result<()> {
+        let mut buf = Vec::new();
+        for entry in entries {
+            buf.extend_from_slice(&self.encode_record(entry)?);
+        }
         let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
-        for entry in entries {
-            let payload = self.serialize_entry(entry, None)?;
-            let crc = Self::compute_crc(&payload);
-            file.write_all(&crc.to_le_bytes())?;
-            file.write_all(&(payload.len() as u32).to_le_bytes())?;
-            file.write_all(&payload)?;
-        }
+        file.write_all(&buf)?;
         Ok(())
     }
 
     /// Write multiple insert entries without fsync, avoiding doc_bytes clones.
     pub fn log_batch_inserts_no_sync(&self, entries: &[(u64, &[u8])]) -> Result<()> {
-        let mut file = self.inner.lock();
-        file.seek(SeekFrom::End(0))?;
-        for &(doc_id, doc_bytes) in entries {
-            let encrypted = self.maybe_encrypt(doc_bytes)?;
-            let mut payload = Vec::with_capacity(1 + 8 + 8 + encrypted.len());
-            payload.push(OP_INSERT);
-            payload.extend_from_slice(&0u64.to_le_bytes()); // tx_id=0
-            payload.extend_from_slice(&doc_id.to_le_bytes());
-            payload.extend_from_slice(&*encrypted);
-            let crc = Self::compute_crc(&payload);
-            file.write_all(&crc.to_le_bytes())?;
-            file.write_all(&(payload.len() as u32).to_le_bytes())?;
-            file.write_all(&payload)?;
-        }
-        Ok(())
+        self.log_batch_inserts_no_sync_buffered(entries)
     }
 
     /// Write multiple insert entries without fsync using a single write_all call.
@@ -235,26 +219,10 @@ impl Wal {
         if entries.is_empty() {
             return Ok(());
         }
-        // Estimate total buffer size: each entry = 8 (header) + 1 + 8 + 8 + payload
-        let est_size: usize = entries
-            .iter()
-            .map(|(_, doc_bytes)| 8 + 1 + 8 + 8 + doc_bytes.len() + 28) // +28 for possible encryption overhead
-            .sum();
-        let mut buf = Vec::with_capacity(est_size);
-
+        let mut buf = Vec::new();
         for &(doc_id, doc_bytes) in entries {
-            let encrypted = self.maybe_encrypt(doc_bytes)?;
-            let mut payload = Vec::with_capacity(1 + 8 + 8 + encrypted.len());
-            payload.push(OP_INSERT);
-            payload.extend_from_slice(&0u64.to_le_bytes()); // tx_id=0
-            payload.extend_from_slice(&doc_id.to_le_bytes());
-            payload.extend_from_slice(&*encrypted);
-            let crc = Self::compute_crc(&payload);
-            buf.extend_from_slice(&crc.to_le_bytes());
-            buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&payload);
+            buf.extend_from_slice(&self.encode_insert_record(doc_id, doc_bytes)?);
         }
-
         let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         file.write_all(&buf)?;
@@ -430,6 +398,49 @@ impl Wal {
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    /// Build one on-disk record — `[crc: u32 LE][len: u32 LE][payload]` —
+    /// for `entry`. When an archive sequencer is attached this allocates a
+    /// GSN + wall-clock and emits the v2 payload; otherwise v1.
+    fn encode_record(&self, entry: &WalEntry) -> Result<Vec<u8>> {
+        let meta = match &self.sequencer {
+            Some(seq) => Some(seq.next()?),
+            None => None,
+        };
+        Ok(Self::frame(self.serialize_entry(entry, meta)?))
+    }
+
+    /// Build one on-disk INSERT record without owning `doc_bytes` — the
+    /// no-clone fast path for the bulk-insert log methods. Stamps a v2
+    /// header when a sequencer is attached, mirroring `serialize_entry`.
+    fn encode_insert_record(&self, doc_id: u64, doc_bytes: &[u8]) -> Result<Vec<u8>> {
+        let meta = match &self.sequencer {
+            Some(seq) => Some(seq.next()?),
+            None => None,
+        };
+        let encrypted = self.maybe_encrypt(doc_bytes)?;
+        let extra = if meta.is_some() { 16 } else { 0 };
+        let mut payload = Vec::with_capacity(1 + 8 + 8 + extra + encrypted.len());
+        payload.push(if meta.is_some() { OP_INSERT_V2 } else { OP_INSERT });
+        payload.extend_from_slice(&0u64.to_le_bytes()); // tx_id = 0
+        payload.extend_from_slice(&doc_id.to_le_bytes());
+        if let Some(m) = meta {
+            payload.extend_from_slice(&m.gsn.to_le_bytes());
+            payload.extend_from_slice(&m.wall_clock_micros.to_le_bytes());
+        }
+        payload.extend_from_slice(&*encrypted);
+        Ok(Self::frame(payload))
+    }
+
+    /// Wrap a payload in its on-disk frame: `[crc: u32 LE][len: u32 LE][payload]`.
+    fn frame(payload: Vec<u8>) -> Vec<u8> {
+        let crc = Self::compute_crc(&payload);
+        let mut rec = Vec::with_capacity(8 + payload.len());
+        rec.extend_from_slice(&crc.to_le_bytes());
+        rec.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        rec.extend_from_slice(&payload);
+        rec
+    }
 
     /// Serialize an entry's payload.
     ///
@@ -1025,5 +1036,38 @@ mod tests {
 
         let wal2 = Wal::open(&wal_path).unwrap();
         assert_eq!(wal2.read_records().unwrap().len(), 1);
+    }
+
+    // ── PITR Phase 1: sequencer-attached WAL auto-stamps records ────────
+
+    #[test]
+    fn attached_sequencer_auto_stamps_every_log_path() {
+        use crate::pitr::ArchiveSequencer;
+        let dir = TempDir::new().unwrap();
+        let seq = Arc::new(ArchiveSequencer::open(dir.path()).unwrap());
+        let wal = Wal::open(&dir.path().join("seq.wal")).unwrap().with_sequencer(Some(seq));
+
+        // Exercise the single, batch, and no-clone-bulk-insert log paths.
+        wal.log(&WalEntry::insert(1, b"a".to_vec())).unwrap();
+        wal.log_batch(&[WalEntry::update(1, b"b".to_vec()), WalEntry::delete(1)]).unwrap();
+        wal.log_batch_inserts_no_sync_buffered(&[(2, b"c".as_slice())]).unwrap();
+
+        let records = wal.read_records().unwrap();
+        assert_eq!(records.len(), 4);
+        // Every record carries a unique, strictly increasing, non-zero GSN.
+        assert_eq!(records.iter().map(|r| r.meta.gsn).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        for r in &records {
+            assert!(r.meta.wall_clock_micros > 0, "v2 records must carry a wall-clock");
+        }
+    }
+
+    #[test]
+    fn no_sequencer_still_emits_v1() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+        wal.log(&WalEntry::insert(1, b"x".to_vec())).unwrap();
+        let records = wal.read_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].meta, WalMeta::default()); // v1 → zeroed meta
     }
 }

@@ -1,0 +1,205 @@
+//! Point-In-Time Recovery — the archive sequencer.
+//!
+//! PITR needs a single global ordering across every collection's WAL, but
+//! OxiDB has none: each collection's `.wal` is an independent byte stream,
+//! `_tx_commit_log` is an unordered set, and most writes carry `tx_id = 0`.
+//! The [`ArchiveSequencer`] supplies that ordering — a Global Sequence
+//! Number (GSN), monotonic across all collections, plus a wall-clock stamp,
+//! handed to every durable WAL write (see [`crate::wal::Wal`]).
+//!
+//! ## Why the GSN is leased, not bumped-per-write
+//!
+//! The GSN must stay monotonic *across process restarts* — otherwise GSN 5
+//! from Monday and GSN 5 from Tuesday collide in the archive. But the live
+//! WAL is truncated on clean shutdown, so it can't be the source of the
+//! high-water mark. Instead the sequencer persists its ceiling to a tiny
+//! `_gsn` file in **leases**: on `open` it reserves a block of
+//! [`GSN_LEASE`] numbers with one fsync, hands them out from memory, and
+//! only touches the file again when the block is exhausted. A crash wastes
+//! at most one lease worth of GSNs — a harmless gap, since replay tolerates
+//! missing numbers. Cost: one fsync per `GSN_LEASE` writes, not per write.
+
+#![cfg(not(target_arch = "wasm32"))]
+
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::error::Result;
+use crate::locks::Mutex;
+use crate::wal::WalMeta;
+
+/// GSNs reserved per on-disk lease. A crash wastes at most this many as a
+/// harmless gap in the sequence; replay skips missing numbers.
+const GSN_LEASE: u64 = 10_000;
+
+/// Name of the lease file under the data directory.
+pub const GSN_FILE: &str = "_gsn";
+
+/// Hands out globally-ordered, wall-clock-stamped sequence numbers for
+/// PITR. One instance per `OxiDb`, shared (`Arc`) by every collection's WAL.
+pub struct ArchiveSequencer {
+    /// Next GSN to hand out. Always `<= leased_through` once a caller is
+    /// inside `next()`.
+    next_gsn: AtomicU64,
+    /// Highest GSN durably reserved in the `_gsn` file.
+    leased_through: AtomicU64,
+    /// The `_gsn` file: a single `[u64 LE]` holding `leased_through`.
+    /// The mutex serializes lease extensions (rare — once per `GSN_LEASE`).
+    state: Mutex<File>,
+}
+
+impl ArchiveSequencer {
+    /// Open (or create) the `_gsn` lease file under `data_dir` and start
+    /// the sequencer strictly above every GSN that may have been handed
+    /// out before — then immediately reserve the first lease, so even a
+    /// crash before the first write cannot reuse a number.
+    pub fn open(data_dir: &Path) -> Result<Self> {
+        let path = data_dir.join(GSN_FILE);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)?;
+
+        // A short/empty/torn file means "no GSN ever reserved" → start at 1.
+        let mut buf = [0u8; 8];
+        let prev_ceiling = match file.read_exact(&mut buf) {
+            Ok(()) => u64::from_le_bytes(buf),
+            Err(_) => 0,
+        };
+
+        let start = prev_ceiling + 1;
+        let new_ceiling = start + GSN_LEASE;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&new_ceiling.to_le_bytes())?;
+        file.sync_data()?;
+
+        Ok(Self {
+            next_gsn: AtomicU64::new(start),
+            leased_through: AtomicU64::new(new_ceiling),
+            state: Mutex::new(file),
+        })
+    }
+
+    /// Allocate the next GSN and stamp it with the current wall-clock.
+    /// The returned GSN is guaranteed to sit within the durably-reserved
+    /// range before it can appear in a WAL record.
+    pub fn next(&self) -> Result<WalMeta> {
+        let gsn = self.next_gsn.fetch_add(1, Ordering::SeqCst);
+        // If we've run past the durably-reserved ceiling, extend the lease
+        // before letting this GSN escape into a WAL record. The loop covers
+        // many writers racing past the threshold at once.
+        while gsn >= self.leased_through.load(Ordering::Acquire) {
+            self.extend_lease()?;
+        }
+        Ok(WalMeta { gsn, wall_clock_micros: now_micros() })
+    }
+
+    /// Persist a higher ceiling. Serialized by `state`; idempotent — a
+    /// thread that finds the ceiling already far enough ahead does nothing.
+    fn extend_lease(&self) -> Result<()> {
+        let mut file = self.state.lock();
+        let target = self.next_gsn.load(Ordering::Acquire) + GSN_LEASE;
+        if target <= self.leased_through.load(Ordering::Acquire) {
+            return Ok(()); // another writer already extended far enough
+        }
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&target.to_le_bytes())?;
+        file.sync_data()?;
+        self.leased_through.store(target, Ordering::Release);
+        Ok(())
+    }
+
+    /// The next GSN that will be handed out — for watermarks and diagnostics.
+    pub fn current_gsn(&self) -> u64 {
+        self.next_gsn.load(Ordering::SeqCst)
+    }
+}
+
+/// Wall-clock now, microseconds since the Unix epoch. Saturates to 0 if the
+/// clock is before the epoch (it never is in practice).
+pub fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    #[test]
+    fn hands_out_monotonic_gsns() {
+        let dir = TempDir::new().unwrap();
+        let seq = ArchiveSequencer::open(dir.path()).unwrap();
+        let a = seq.next().unwrap().gsn;
+        let b = seq.next().unwrap().gsn;
+        let c = seq.next().unwrap().gsn;
+        assert_eq!((a, b, c), (1, 2, 3));
+        assert_eq!(seq.current_gsn(), 4);
+    }
+
+    #[test]
+    fn stamps_a_plausible_wall_clock() {
+        let dir = TempDir::new().unwrap();
+        let seq = ArchiveSequencer::open(dir.path()).unwrap();
+        let m = seq.next().unwrap();
+        // After 2020-01-01 in micros — i.e. the clock was actually read.
+        assert!(m.wall_clock_micros > 1_577_836_800_000_000);
+    }
+
+    #[test]
+    fn reopen_never_reuses_a_gsn() {
+        let dir = TempDir::new().unwrap();
+        {
+            let seq = ArchiveSequencer::open(dir.path()).unwrap();
+            seq.next().unwrap();
+            seq.next().unwrap(); // handed out 1, 2
+        }
+        // A fresh sequencer must resume strictly above the persisted
+        // ceiling — never reissuing 1 or 2 (the lease reserved a whole
+        // block, so the next run starts past it).
+        let seq2 = ArchiveSequencer::open(dir.path()).unwrap();
+        let g = seq2.next().unwrap().gsn;
+        assert!(g > GSN_LEASE, "expected resume past the reserved lease, got {g}");
+    }
+
+    #[test]
+    fn lease_extends_transparently_past_the_block() {
+        let dir = TempDir::new().unwrap();
+        let seq = ArchiveSequencer::open(dir.path()).unwrap();
+        // Cross the first lease boundary; GSNs stay unique and monotonic.
+        let mut last = 0;
+        for _ in 0..(GSN_LEASE + 50) {
+            let g = seq.next().unwrap().gsn;
+            assert!(g > last);
+            last = g;
+        }
+    }
+
+    #[test]
+    fn concurrent_writers_get_unique_gsns() {
+        let dir = TempDir::new().unwrap();
+        let seq = Arc::new(ArchiveSequencer::open(dir.path()).unwrap());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let seq = Arc::clone(&seq);
+            handles.push(std::thread::spawn(move || {
+                (0..500).map(|_| seq.next().unwrap().gsn).collect::<Vec<_>>()
+            }));
+        }
+        let mut all: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        all.sort_unstable();
+        let before = all.len();
+        all.dedup();
+        assert_eq!(all.len(), before, "GSNs must be unique across writers");
+        assert_eq!(all.len(), 8 * 500);
+    }
+}

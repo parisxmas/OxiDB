@@ -387,6 +387,10 @@ pub struct OxiDb {
     fts_runtime: Arc<FtsRuntime>,
     #[cfg(not(target_arch = "wasm32"))]
     tx_log: TxCommitLog,
+    /// PITR archive sequencer — `Some` when `OXIDB_PITR` is enabled. Shared
+    /// (`Arc`) by every collection's WAL to stamp records with a global GSN.
+    #[cfg(not(target_arch = "wasm32"))]
+    archive_sequencer: Option<Arc<crate::pitr::ArchiveSequencer>>,
     next_tx_id: AtomicU64,
     active_transactions: RwLock<HashMap<TransactionId, Mutex<Transaction>>>,
     encryption: Option<Arc<EncryptionKey>>,
@@ -455,6 +459,7 @@ impl OxiDb {
             fts_tx,
             fts_runtime,
             tx_log,
+            archive_sequencer: None,
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
             encryption: None,
@@ -581,6 +586,25 @@ impl OxiDb {
             tx_log.clear()?;
         }
 
+        // PITR: when OXIDB_PITR is enabled, open the archive sequencer so
+        // every collection's WAL stamps its records with a global GSN +
+        // wall-clock. Disabled by default — zero cost when off.
+        let pitr_enabled = std::env::var("OXIDB_PITR")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        let archive_sequencer = if pitr_enabled {
+            let seq = Arc::new(crate::pitr::ArchiveSequencer::open(data_dir)?);
+            if verbose {
+                vlog(&format!(
+                    "[verbose] PITR enabled — archive sequencer open, next GSN {}",
+                    seq.current_gsn()
+                ));
+            }
+            Some(seq)
+        } else {
+            None
+        };
+
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
             collections: RwLock::new(HashMap::new()),
@@ -589,6 +613,7 @@ impl OxiDb {
             fts_tx,
             fts_runtime,
             tx_log,
+            archive_sequencer,
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
             encryption,
@@ -619,7 +644,7 @@ impl OxiDb {
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
-            BTreeCollection::open(name, &self.data_dir, self.encryption.clone())?
+            BTreeCollection::open_with_sequencer(name, &self.data_dir, self.encryption.clone(), self.archive_sequencer.clone())?
         };
         #[cfg(target_arch = "wasm32")]
         let col = BTreeCollection::open_in_memory(name);
@@ -656,7 +681,7 @@ impl OxiDb {
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
-            BTreeCollection::open(name, &self.data_dir, self.encryption.clone())?
+            BTreeCollection::open_with_sequencer(name, &self.data_dir, self.encryption.clone(), self.archive_sequencer.clone())?
         };
         #[cfg(target_arch = "wasm32")]
         let col = BTreeCollection::open_in_memory(name);
@@ -735,6 +760,18 @@ impl OxiDb {
     /// and a background thread flushes all collections every `interval`.
     /// This matches MongoDB's default durability (journal flushed periodically).
     pub fn enable_lazy_sync(self: &Arc<Self>, interval: std::time::Duration) {
+        // PITR requires per-op WAL durability — every archived record must
+        // already be fsynced. With PITR enabled, lazy-sync downgrades to
+        // just the periodic-snapshot thread; the WAL keeps fsyncing per op.
+        if self.archive_sequencer.is_some() {
+            if self.verbose {
+                eprintln!(
+                    "[verbose] OXIDB_PITR is on — lazy-sync downgraded to periodic-snapshot-only (WAL fsync stays per-op)"
+                );
+            }
+            self.spawn_periodic_sync(interval);
+            return;
+        }
         self.lazy_sync.store(true, Ordering::Release);
         {
             let cols = self.collections.read();
