@@ -2,6 +2,7 @@ using System.Linq.Expressions;
 using System.Reflection;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.ChangeTracking.Internal;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Query;
@@ -20,10 +21,12 @@ public sealed class OxiDbQueryCompiler : IQueryCompiler
 {
     private readonly OxiDbClientManager _clientManager;
     private readonly IModel _model;
+    private readonly ICurrentDbContext _currentContext;
 
     public OxiDbQueryCompiler(OxiDbClientManager clientManager, ICurrentDbContext currentContext)
     {
         _clientManager = clientManager;
+        _currentContext = currentContext;
         _model = currentContext.Context.Model;
     }
 
@@ -181,10 +184,10 @@ public sealed class OxiDbQueryCompiler : IQueryCompiler
         var entityType = GetElementType(typeof(TResult)) ?? parsed.EntityType.ClrType;
 
         var method = typeof(OxiDbQueryCompiler)
-            .GetMethod(nameof(DeserializeList), BindingFlags.NonPublic | BindingFlags.Static)!
+            .GetMethod(nameof(DeserializeList), BindingFlags.NonPublic | BindingFlags.Instance)!
             .MakeGenericMethod(entityType);
 
-        return (TResult)method.Invoke(null, [result, parsed.EntityType])!;
+        return (TResult)method.Invoke(this, [result, parsed.EntityType])!;
     }
 
     private TResult ExecuteSingle<TResult>(
@@ -386,7 +389,7 @@ public sealed class OxiDbQueryCompiler : IQueryCompiler
         return expression;
     }
 
-    private static T DeserializeEntity<T>(JsonElement element, IEntityType entityType)
+    private T DeserializeEntity<T>(JsonElement element, IEntityType entityType)
     {
         var entity = Activator.CreateInstance<T>();
         if (entity == null) return default!;
@@ -411,6 +414,45 @@ public sealed class OxiDbQueryCompiler : IQueryCompiler
             }
         }
 
+        return TrackEntity(entity, entityType);
+    }
+
+    /// <summary>
+    /// Integrates a freshly-materialized entity with the context's change tracker so that
+    /// read-modify-SaveChanges round-trips. If a row with the same primary key is already
+    /// tracked, that instance is returned (identity resolution); otherwise the new entity
+    /// is attached as Unchanged so a later mutation is detected and persisted.
+    /// </summary>
+    private T TrackEntity<T>(T entity, IEntityType entityType)
+    {
+        if (entity is null)
+            return entity;
+
+        var key = entityType.FindPrimaryKey();
+        if (key is null)
+            return entity; // keyless entity — nothing to track against
+
+        var keyValues = new object?[key.Properties.Count];
+        for (int i = 0; i < key.Properties.Count; i++)
+        {
+            var clrProp = entityType.ClrType.GetProperty(key.Properties[i].Name);
+            keyValues[i] = clrProp?.GetValue(entity);
+            if (keyValues[i] is null)
+                return entity; // incomplete key — can't track reliably
+        }
+
+        var context = _currentContext.Context;
+        var stateManager = context.GetService<IStateManager>();
+
+        // Identity resolution: if this row is already tracked, hand back the tracked
+        // instance so mutations land on the object SaveChanges inspects.
+        var existing = stateManager.TryGetEntry(key, keyValues);
+        if (existing != null)
+            return (T)existing.Entity;
+
+        // Otherwise track it as Unchanged — a later mutation is then picked up by
+        // DetectChanges and translated into an update on SaveChanges.
+        context.Attach((object)entity);
         return entity;
     }
 
@@ -452,7 +494,7 @@ public sealed class OxiDbQueryCompiler : IQueryCompiler
         return element.Deserialize(targetType);
     }
 
-    private static List<T> DeserializeList<T>(JsonElement array, IEntityType entityType)
+    private List<T> DeserializeList<T>(JsonElement array, IEntityType entityType)
     {
         var list = new List<T>();
         if (array.ValueKind == JsonValueKind.Array)
