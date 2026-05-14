@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.25.24
+
+### Blob store — opt-in durable writes with group-committed fsync
+
+The blob store acknowledged a `put_object` as soon as the temp files
+were renamed into place, leaving durability to a 1 Hz background fsync
+thread — so a successful put could still be lost to a power cut for up
+to a second. The document WAL has a real 3-fsync protocol; the blob
+store, where large payloads (e.g. mail bodies behind the 16 MiB wire
+cap) actually land, did not. This adds an opt-in durable path.
+
+- **`OXIDB_BLOB_SYNC` / `BlobStore::with_sync_writes`** (`src/blob.rs`)
+  — when set, `put_object` fsyncs the payload and meta temp files, then
+  fsyncs the bucket directory between the `.data` and `.meta` renames
+  and again after. The ordering is load-bearing: `scan_bucket` treats
+  `.meta` as the source of truth, so a `.meta` made durable ahead of
+  its `.data` would be a ghost read on recovery. The second dir fsync
+  is the commit point — once it returns the put is durable and a
+  caller (e.g. an SMTP server) may treat it as committed.
+
+- **Durable `delete_object`** (`src/blob.rs`) — symmetric with `put`:
+  fsyncs the bucket directory after unlinking the `.meta`, so an ack'd
+  delete cannot be resurrected by a crash. In durable mode a real I/O
+  error from the unlink is now propagated instead of swallowed;
+  non-durable mode keeps its prior best-effort behavior.
+
+- **Group-commit directory syncer** (`src/blob.rs`) — a naive per-put
+  implementation would fsync the bucket dir twice per put, fully
+  serial. `DirSyncer` mirrors the `tx_log` committer: a dedicated
+  thread owns the fsync, callers `rename` then enqueue and block, and
+  the thread coalesces every request waiting in its queue into one
+  `fsync` per distinct directory (`MAX_BATCH = 512`). Because a caller
+  always renames before it enqueues, any queued request corresponds to
+  a completed rename — so N concurrent durable puts to one bucket cost
+  ~2 directory fsyncs, not 4N. Single-put latency is unchanged (a
+  channel round-trip is ~µs against an ~ms fsync).
+
+- **Background `blob-sync` thread fix** (`src/blob.rs`) — the periodic
+  fsync thread fsynced the `_blobs` root, but object renames/unlinks
+  happen one level down in the per-bucket directories, and fsyncing a
+  parent does not flush its children. It now enumerates the bucket
+  dirs each tick and fsyncs every one. This is the best-effort path
+  for deployments that leave `OXIDB_BLOB_SYNC` off.
+
+- **Crash-consistency harness** (`tests/blob-crash-recovery-go/`) — a
+  Go harness in the `crash-recovery-go` mould: put N objects, delete a
+  subset, churn a second bucket so the SIGKILL lands mid-`put_object`,
+  cold-boot the same data dir, and assert every ack'd put survived
+  intact, every ack'd delete held, no stray `.tmp` files remain, and
+  every listed object is readable (no ghost `.meta`). Scope is stated
+  honestly in the file header: SIGKILL does not drop the page cache,
+  so this proves crash *consistency*, not fsync *durability* — the
+  latter needs block-layer fault injection (dm-log-writes), tracked
+  separately. 3 new `blob::tests` unit tests cover the sync and
+  group-commit paths plus reopen (9 → 12).
+
+### Versions
+
+- `oxidb-server`: 0.25.23 → 0.25.24
+
 ## v0.25.23
 
 ### Point-In-Time Recovery

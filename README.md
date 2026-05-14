@@ -56,6 +56,7 @@ docker compose up -d
 | `OXIDB_POOL_SIZE` | `4` | Worker thread count |
 | `OXIDB_IDLE_TIMEOUT` | `30` | Idle connection timeout in seconds (0 = no timeout) |
 | `OXIDB_ENCRYPTION_KEY` | — | Path to 32-byte AES-256 key file for encryption at rest |
+| `OXIDB_BLOB_SYNC` | `false` | fsync each blob `put` and `delete` before returning, so a successful write is durable on disk instead of waiting for the 1 Hz background flush. `put` fsyncs payload, meta, and the bucket dir; `delete` fsyncs the bucket dir after unlinking the meta. Directory fsyncs are group-committed across concurrent writers, so throughput stays high. Enable when a caller treats a successful write as a commit |
 | `OXIDB_TLS_CERT` | — | Path to TLS certificate PEM file |
 | `OXIDB_TLS_KEY` | — | Path to TLS private key PEM file |
 | `OXIDB_AUTH` | `false` | Enable SCRAM-SHA-256 authentication |
