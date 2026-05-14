@@ -291,6 +291,29 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        "find_and_modify" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let query = match request.get("query") {
+                Some(q) => q,
+                None => return err_bytes("missing 'query'"),
+            };
+            let update = match request.get("update") {
+                Some(u) => u,
+                None => return err_bytes("missing 'update'"),
+            };
+            // Always an immediate atomic op — never buffered into an open
+            // transaction (it is the alternative to transactions for
+            // contended counters).
+            match db.find_and_modify(col, query, update) {
+                Ok(Some(doc)) => ok_bytes(doc),
+                Ok(None) => ok_bytes(json!(null)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         "delete" => {
             let col = match collection.as_deref() {
                 Some(c) => c,

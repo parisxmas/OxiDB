@@ -16,6 +16,7 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "find"
                 | "find_one"
                 | "update"
+                | "find_and_modify"
                 | "delete"
                 | "count"
                 | "create_index"

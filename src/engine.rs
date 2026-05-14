@@ -1239,6 +1239,34 @@ impl OxiDb {
         Ok(ids.len() as u64)
     }
 
+    /// Atomically find one document, apply the update, and return the
+    /// modified document. The safe primitive for counters — see
+    /// `BTreeCollection::find_and_modify`. Always immediate/atomic; it
+    /// does not participate in an open transaction.
+    pub fn find_and_modify(
+        &self,
+        collection: &str,
+        query: &Value,
+        update: &Value,
+    ) -> Result<Option<Value>> {
+        let col = self.get_or_create_collection(collection)?;
+        let result = col.find_and_modify(query, update)?;
+        if let Some(ref doc) = result {
+            if self.change_broker.has_subscribers() {
+                let doc_id = doc.get("_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.change_broker.emit(ChangeEvent {
+                    token: 0,
+                    operation: OperationType::Update,
+                    collection: collection.to_string(),
+                    doc_id,
+                    document: None,
+                    tx_id: None,
+                });
+            }
+        }
+        Ok(result)
+    }
+
     pub fn delete(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
         let ids = col.delete(query, None)?;

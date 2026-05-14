@@ -1444,6 +1444,126 @@ impl BTreeCollection {
         Ok(updated_ids)
     }
 
+    /// Atomically find ONE document matching `query`, apply `update` to
+    /// it, write it back, and return the resulting document.
+    ///
+    /// Unlike `update`, the find + apply + write all run while this
+    /// collection's index write locks are held — so two concurrent
+    /// `find_and_modify` calls on the same document cannot lose an
+    /// update; each sees the other's result. (`update` reads under a
+    /// read lock, releases it, then writes under a write lock — a
+    /// read-modify-write with a gap, so concurrent `$inc` via `update`
+    /// *does* lose updates.) This is the safe primitive for counters
+    /// such as a mailbox's IMAP `UIDNEXT`: a caller mutating a counter
+    /// must always go through `find_and_modify`, never plain `update`.
+    ///
+    /// Returns the document *as modified* (with the bumped `_version`),
+    /// or `None` if nothing matched.
+    pub fn find_and_modify(
+        &self,
+        query_json: &Value,
+        update_json: &Value,
+    ) -> Result<Option<Value>> {
+        let update_obj = update_json
+            .as_object()
+            .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
+        if update_obj.is_empty() {
+            return Err(Error::InvalidQuery(
+                "update must contain at least one operator".into(),
+            ));
+        }
+        let query = query::parse_query(query_json)?;
+
+        // Take the write locks FIRST, then find — the read-modify-write
+        // is therefore atomic against every other find_and_modify, and
+        // against update's write phase, on this collection.
+        let mut fi = self.field_indexes.write();
+        let mut ci = self.composite_indexes.write();
+        let mut ti = self.text_index.write();
+        let mut vi = self.vector_indexes.write();
+
+        // Find one matching document. read_doc / load_doc_arc /
+        // for_each_doc_arc_while never touch the index locks, so finding
+        // (even by full scan) while holding them is deadlock-free.
+        let mut found: Option<(DocumentId, Value)> = None;
+        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+        if let Some(ref indexed_ids) = candidate_ids {
+            for &id in indexed_ids {
+                if self.storage.contains_key(id) {
+                    if let Some(data) = self.read_doc(id)? {
+                        if query::matches_value(&query, &data) {
+                            found = Some((id, data));
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            self.for_each_doc_arc_while(|id, arc| {
+                if query::matches_value(&query, arc) {
+                    found = Some((id, (**arc).clone()));
+                    return Ok(false);
+                }
+                Ok(true)
+            })?;
+        }
+
+        let (id, old_data) = match found {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+
+        // Apply the operators and bump _version.
+        let mut new_data = old_data.clone();
+        crate::update::apply_update(&mut new_data, update_json)?;
+        let new_version = new_data
+            .get("_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            + 1;
+        if let Some(obj) = new_data.as_object_mut() {
+            obj.insert("_version".to_string(), Value::Number(new_version.into()));
+        }
+        let new_bytes = codec::encode_doc(&new_data)?;
+
+        if fi.values().any(|idx| idx.unique) {
+            Self::check_unique_constraints_with(&fi, &new_data, Some(id))?;
+        }
+
+        // WAL first, then the in-memory btree and the indexes.
+        self.wal_log_batch(&[WalEntry::Update {
+            doc_id: id,
+            doc_bytes: new_bytes.clone(),
+            tx_id: 0,
+        }])?;
+        self.storage.insert(id, new_bytes);
+
+        for idx in fi.values_mut() {
+            let ov = crate::collection::resolve_field_in_value(&old_data, &idx.field);
+            let nv = crate::collection::resolve_field_in_value(&new_data, &idx.field);
+            if ov != nv {
+                idx.remove_value(id, &old_data);
+                idx.insert_value(id, &new_data);
+            }
+        }
+        for idx in ci.iter_mut() {
+            idx.remove_value(id, &old_data);
+            idx.insert_value(id, &new_data);
+        }
+        if let Some(ref mut text_idx) = *ti {
+            text_idx.index_doc(id, &new_data);
+        }
+        for idx in vi.values_mut() {
+            idx.remove(id);
+            let _ = idx.insert(id, &new_data);
+        }
+
+        self.doc_cache.put(id, Arc::new(new_data.clone()));
+        self.dirty.store(true, Ordering::Release);
+
+        Ok(Some(new_data))
+    }
+
     // -----------------------------------------------------------------------
     // Delete
     // -----------------------------------------------------------------------
@@ -3145,6 +3265,74 @@ mod tests {
         let replayed = BTreeCollection::replay_wal(&wal, &storage).unwrap();
         assert_eq!(replayed, 3, "every sealed segment's entries must be replayed");
         assert_eq!(storage.count(), 3);
+    }
+
+    #[test]
+    fn find_and_modify_returns_modified_doc_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let col = BTreeCollection::open("c", dir.path(), None).unwrap();
+        col.insert(json!({"name": "ctr", "v": 41})).unwrap();
+
+        let doc = col
+            .find_and_modify(&json!({"name": "ctr"}), &json!({"$inc": {"v": 1}}))
+            .unwrap()
+            .expect("doc exists");
+        assert_eq!(doc.get("v").and_then(|v| v.as_u64()).unwrap(), 42);
+
+        // No match → None, nothing written.
+        assert!(col
+            .find_and_modify(&json!({"name": "nope"}), &json!({"$set": {"v": 0}}))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn find_and_modify_is_atomic_under_concurrent_inc() {
+        // The mailbox-UIDNEXT scenario: many concurrent allocations of a
+        // counter must neither lose an increment nor hand out a value
+        // twice. (Plain `update` + `$inc` fails this — its read and write
+        // phases are not contiguous.)
+        let dir = tempfile::tempdir().unwrap();
+        let col = Arc::new(BTreeCollection::open("counters", dir.path(), None).unwrap());
+        col.insert(json!({"name": "uidnext", "v": 0})).unwrap();
+
+        let writers = 8usize;
+        let per_writer = 200usize;
+        let mut handles = Vec::new();
+        for _ in 0..writers {
+            let col = Arc::clone(&col);
+            handles.push(std::thread::spawn(move || {
+                let mut got = Vec::with_capacity(per_writer);
+                for _ in 0..per_writer {
+                    let doc = col
+                        .find_and_modify(
+                            &json!({"name": "uidnext"}),
+                            &json!({"$inc": {"v": 1}}),
+                        )
+                        .unwrap()
+                        .expect("counter doc exists");
+                    got.push(doc.get("v").and_then(|v| v.as_u64()).unwrap());
+                }
+                got
+            }));
+        }
+        let mut all: Vec<u64> =
+            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+
+        // No lost updates: the counter reached exactly writers*per_writer...
+        let total = (writers * per_writer) as u64;
+        let final_v = col
+            .find_one(&json!({"name": "uidnext"}))
+            .unwrap()
+            .unwrap()
+            .get("v")
+            .and_then(|v| v.as_u64())
+            .unwrap();
+        assert_eq!(final_v, total, "lost an increment under concurrency");
+        // ...and every call returned a distinct value 1..=total — exactly
+        // what UID assignment needs.
+        all.sort_unstable();
+        assert_eq!(all, (1..=total).collect::<Vec<_>>(), "a value was handed out twice");
     }
 
     #[test]

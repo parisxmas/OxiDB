@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.25.26
+
+### `find_and_modify` — atomic single-document read-modify-write
+
+`update` + `$inc` was never safe for counters. `update` finds matching
+documents under a read lock, releases it, applies the operators, then
+writes under a write lock — a read-modify-write with a gap — so two
+concurrent `$inc` calls on the same document both read the old value
+and one increment is lost. And `update` only ever returns a count,
+never the resulting value.
+
+- **`BTreeCollection::find_and_modify` / `OxiDb::find_and_modify`** —
+  finds one document, applies the update operators, writes it back, and
+  returns the *modified* document, all while the collection's index
+  write locks are held. It is therefore atomic against any other
+  `find_and_modify` (and against `update`'s write phase) on that
+  collection — the safe primitive for counters such as a mailbox's
+  IMAP `UIDNEXT`.
+- Server command `find_and_modify` (ReadWrite role) returns the modified
+  document, not a count; `Client.FindAndModify` added to the Go client.
+- A concurrency test fires 8 writers × 200 `$inc` at one counter
+  document and asserts no increment is lost and every returned value is
+  distinct (1..=1600).
+
+### Versions
+
+- `oxidb-server`: 0.25.25 → 0.25.26
+
 ## v0.25.25
 
 ### Relicensed — AGPL-3.0 + commercial (dual-license)
