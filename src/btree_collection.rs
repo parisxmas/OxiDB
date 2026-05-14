@@ -3191,19 +3191,28 @@ mod tests {
             for i in 0..20 {
                 col.insert(json!({"seq": i})).unwrap();
             }
-            col.sync_writes().unwrap(); // persist + checkpoint WAL
+            col.sync_writes().unwrap(); // persist the btree snapshot
         }
 
-        // WAL file should be empty after checkpoint
+        // `sync_writes` persists the snapshot but deliberately does NOT
+        // truncate the live WAL — doing so concurrently with writers once
+        // lost acknowledged writes (see the comment in `sync_writes`).
+        // The WAL is reclaimed on the next open instead: replay re-applies
+        // it on top of the snapshot, then a post-replay checkpoint
+        // truncates it. So it is non-empty here...
         let wal_path = dir.path().join("wal_cp.wal");
-        let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-        assert_eq!(wal_size, 0, "WAL should be empty after checkpoint");
+        assert!(
+            std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0) > 0,
+            "sync_writes should not truncate the live WAL"
+        );
 
-        // Reopen — no replay needed, all data from .btree file
+        // ...and reclaimed to empty after a reopen, with all data intact.
         {
             let col = BTreeCollection::open("wal_cp", dir.path(), None).unwrap();
             assert_eq!(col.count(), 20);
         }
+        let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        assert_eq!(wal_size, 0, "WAL should be reclaimed after reopen's post-replay checkpoint");
     }
 
     // ---------------------------------------------------------------------

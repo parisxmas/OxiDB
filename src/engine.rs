@@ -2532,21 +2532,27 @@ would silently shadow the old data with empty collections. Migrate or delete the
     /// Scan a directory for `*.dat` files and `*.btree` files/directories and return collection names.
     #[cfg(not(target_arch = "wasm32"))]
     fn discover_collection_names_on_disk(dir: &Path) -> Result<Vec<String>> {
-        let mut names = Vec::new();
+        let mut names = std::collections::HashSet::new();
         if !dir.exists() {
-            return Ok(names);
+            return Ok(Vec::new());
         }
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             let ext = path.extension().and_then(|e| e.to_str());
-            if ext == Some("dat") || ext == Some("btree") {
+            // A collection on disk shows up as a `.btree` snapshot, a
+            // `.wal` (its data may live only in the WAL — e.g. a database
+            // backed up before any snapshot persist ran), or a legacy
+            // `.dat` file. A single collection can have several of these,
+            // so the HashSet dedups them. Sealed WAL segments
+            // `<name>.wal.<seq>` have a numeric extension and are skipped.
+            if matches!(ext, Some("btree") | Some("wal") | Some("dat")) {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    names.push(stem.to_string());
+                    names.insert(stem.to_string());
                 }
             }
         }
-        Ok(names)
+        Ok(names.into_iter().collect())
     }
 
     /// Recursively add directory contents to a tar archive, skipping `.tmp` files.
