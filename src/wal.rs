@@ -37,6 +37,17 @@ const OP_INSERT: u8 = 1;
 const OP_UPDATE: u8 = 2;
 const OP_DELETE: u8 = 3;
 
+// v2 (PITR) record op-types. Same layout as v1 but with an extended
+// header — `[gsn: u64 LE][wall_clock_micros: u64 LE]` — inserted
+// between `doc_id` and `doc_bytes`. The high bit distinguishes them so
+// `read_entries` can replay a file containing a mix of v1 and v2
+// records (e.g. written across an upgrade) with no separate format
+// flag. v1 records are still emitted unless an archive sequencer is
+// attached, so a PITR-disabled database is byte-identical to before.
+const OP_INSERT_V2: u8 = 0x81;
+const OP_UPDATE_V2: u8 = 0x82;
+const OP_DELETE_V2: u8 = 0x83;
+
 /// A WAL entry representing a pending mutation.
 pub enum WalEntry {
     Insert { doc_id: DocumentId, doc_bytes: Vec<u8>, tx_id: u64 },
@@ -67,6 +78,28 @@ impl WalEntry {
             WalEntry::Delete { tx_id, .. } => *tx_id,
         }
     }
+}
+
+/// Per-record metadata carried only by v2 (PITR) WAL records. v1 records
+/// parse back as `WalMeta::default()` (all zeroes), so `gsn == 0` means
+/// "this record predates PITR / was written with PITR disabled".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WalMeta {
+    /// Global Sequence Number — monotonic across every collection's WAL.
+    /// Assigned by the archive sequencer (Phase 1). 0 in v1 records.
+    pub gsn: u64,
+    /// Wall-clock of the write, microseconds since the Unix epoch.
+    /// 0 in v1 records.
+    pub wall_clock_micros: u64,
+}
+
+/// A WAL entry together with its v2 metadata. Returned by `read_records`
+/// for callers that need the GSN/timestamp (the archiver and the PITR
+/// replay tool); `read_entries` drops the meta for the existing replay
+/// paths that don't need it.
+pub struct WalRecord {
+    pub entry: WalEntry,
+    pub meta: WalMeta,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -104,7 +137,24 @@ impl Wal {
 
     /// Serialize and append a WAL entry, then fsync.
     pub fn log(&self, entry: &WalEntry) -> Result<()> {
-        let payload = self.serialize_entry(entry)?;
+        let payload = self.serialize_entry(entry, None)?;
+        let crc = Self::compute_crc(&payload);
+
+        let mut file = self.inner.lock();
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&crc.to_le_bytes())?;
+        file.write_all(&(payload.len() as u32).to_le_bytes())?;
+        file.write_all(&payload)?;
+        file.sync_data()?;
+
+        Ok(())
+    }
+
+    /// Append a single v2 (PITR) record stamped with `meta`, then fsync.
+    /// This is the entry point used once an archive sequencer is attached
+    /// (Phase 1); the plain `log*` methods always emit v1 records.
+    pub fn log_with_meta(&self, entry: &WalEntry, meta: WalMeta) -> Result<()> {
+        let payload = self.serialize_entry(entry, Some(meta))?;
         let crc = Self::compute_crc(&payload);
 
         let mut file = self.inner.lock();
@@ -119,7 +169,7 @@ impl Wal {
 
     /// Serialize and append a WAL entry without fsync.
     pub fn log_no_sync(&self, entry: &WalEntry) -> Result<()> {
-        let payload = self.serialize_entry(entry)?;
+        let payload = self.serialize_entry(entry, None)?;
         let crc = Self::compute_crc(&payload);
 
         let mut file = self.inner.lock();
@@ -136,7 +186,7 @@ impl Wal {
         let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         for entry in entries {
-            let payload = self.serialize_entry(entry)?;
+            let payload = self.serialize_entry(entry, None)?;
             let crc = Self::compute_crc(&payload);
             file.write_all(&crc.to_le_bytes())?;
             file.write_all(&(payload.len() as u32).to_le_bytes())?;
@@ -151,7 +201,7 @@ impl Wal {
         let mut file = self.inner.lock();
         file.seek(SeekFrom::End(0))?;
         for entry in entries {
-            let payload = self.serialize_entry(entry)?;
+            let payload = self.serialize_entry(entry, None)?;
             let crc = Self::compute_crc(&payload);
             file.write_all(&crc.to_le_bytes())?;
             file.write_all(&(payload.len() as u32).to_le_bytes())?;
@@ -381,37 +431,50 @@ impl Wal {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Payload format: [op_type: u8][tx_id: u64 LE][doc_id: u64 LE][doc_bytes...]
-    /// When encryption is enabled, doc_bytes are encrypted before inclusion in payload.
-    /// CRC is computed over the final (possibly encrypted) payload.
-    fn serialize_entry(&self, entry: &WalEntry) -> Result<Vec<u8>> {
-        match entry {
-            WalEntry::Insert { doc_id, doc_bytes, tx_id } => {
+    /// Serialize an entry's payload.
+    ///
+    /// v1 (`meta` is `None`): `[op: u8][tx_id: u64 LE][doc_id: u64 LE][doc_bytes...]`
+    /// v2 (`meta` is `Some`): `[op|0x80][tx_id: u64 LE][doc_id: u64 LE][gsn: u64 LE][wall_clock: u64 LE][doc_bytes...]`
+    ///
+    /// When encryption is enabled, doc_bytes are encrypted before inclusion in
+    /// the payload. CRC is computed by the caller over the final payload.
+    fn serialize_entry(&self, entry: &WalEntry, meta: Option<WalMeta>) -> Result<Vec<u8>> {
+        // Extra header bytes for v2: gsn (8) + wall_clock (8).
+        let extra = if meta.is_some() { 16 } else { 0 };
+        let payload = match entry {
+            WalEntry::Insert { doc_id, doc_bytes, tx_id }
+            | WalEntry::Update { doc_id, doc_bytes, tx_id } => {
+                let is_insert = matches!(entry, WalEntry::Insert { .. });
                 let encrypted = self.maybe_encrypt(doc_bytes)?;
-                let mut payload = Vec::with_capacity(1 + 8 + 8 + encrypted.len());
-                payload.push(OP_INSERT);
+                let mut payload = Vec::with_capacity(1 + 8 + 8 + extra + encrypted.len());
+                let (v1_op, v2_op) = if is_insert {
+                    (OP_INSERT, OP_INSERT_V2)
+                } else {
+                    (OP_UPDATE, OP_UPDATE_V2)
+                };
+                payload.push(if meta.is_some() { v2_op } else { v1_op });
                 payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
+                if let Some(m) = meta {
+                    payload.extend_from_slice(&m.gsn.to_le_bytes());
+                    payload.extend_from_slice(&m.wall_clock_micros.to_le_bytes());
+                }
                 payload.extend_from_slice(&*encrypted);
-                Ok(payload)
-            }
-            WalEntry::Update { doc_id, doc_bytes, tx_id } => {
-                let encrypted = self.maybe_encrypt(doc_bytes)?;
-                let mut payload = Vec::with_capacity(1 + 8 + 8 + encrypted.len());
-                payload.push(OP_UPDATE);
-                payload.extend_from_slice(&tx_id.to_le_bytes());
-                payload.extend_from_slice(&doc_id.to_le_bytes());
-                payload.extend_from_slice(&*encrypted);
-                Ok(payload)
+                payload
             }
             WalEntry::Delete { doc_id, tx_id } => {
-                let mut payload = Vec::with_capacity(1 + 8 + 8);
-                payload.push(OP_DELETE);
+                let mut payload = Vec::with_capacity(1 + 8 + 8 + extra);
+                payload.push(if meta.is_some() { OP_DELETE_V2 } else { OP_DELETE });
                 payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
-                Ok(payload)
+                if let Some(m) = meta {
+                    payload.extend_from_slice(&m.gsn.to_le_bytes());
+                    payload.extend_from_slice(&m.wall_clock_micros.to_le_bytes());
+                }
+                payload
             }
-        }
+        };
+        Ok(payload)
     }
 
     fn maybe_encrypt<'a>(&self, data: &'a [u8]) -> Result<Cow<'a, [u8]>> {
@@ -434,11 +497,26 @@ impl Wal {
         hasher.finalize()
     }
 
+    /// Read all valid entries from the WAL. v2 metadata (GSN/timestamp) is
+    /// dropped here — this is the path used by the existing crash-recovery
+    /// replay, which only needs the mutations. Use `read_records` when the
+    /// metadata matters (the archiver and the PITR replay tool).
     pub fn read_entries(&self) -> Result<Vec<WalEntry>> {
+        Ok(self.scan()?.into_iter().map(|r| r.entry).collect())
+    }
+
+    /// Read all valid records from the WAL, preserving v2 metadata.
+    pub fn read_records(&self) -> Result<Vec<WalRecord>> {
+        self.scan()
+    }
+
+    /// Scan the WAL front-to-back, CRC-verifying each record and stopping
+    /// at the first torn/corrupt one (treating it as the crash boundary).
+    fn scan(&self) -> Result<Vec<WalRecord>> {
         let mut file = self.inner.lock();
         file.seek(SeekFrom::Start(0))?;
         let file_len = file.metadata()?.len();
-        let mut entries = Vec::new();
+        let mut records = Vec::new();
         let mut pos = 0u64;
 
         while pos + 8 <= file_len {
@@ -446,7 +524,7 @@ impl Wal {
             let mut header = [0u8; 8];
             if file.read_exact(&mut header).is_err() {
                 if pos > 0 {
-                    eprintln!("[wal] truncated header at offset {pos}, stopping replay ({} entries recovered)", entries.len());
+                    eprintln!("[wal] truncated header at offset {pos}, stopping replay ({} entries recovered)", records.len());
                 }
                 break;
             }
@@ -468,13 +546,13 @@ impl Wal {
             // Verify CRC
             let computed_crc = Self::compute_crc(&payload);
             if stored_crc != computed_crc {
-                eprintln!("[wal] CRC mismatch at offset {pos}: stored={stored_crc:#010x} computed={computed_crc:#010x}, stopping replay ({} entries recovered)", entries.len());
+                eprintln!("[wal] CRC mismatch at offset {pos}: stored={stored_crc:#010x} computed={computed_crc:#010x}, stopping replay ({} entries recovered)", records.len());
                 break;
             }
 
-            // Parse payload
-            if let Some(entry) = self.parse_payload(&payload) {
-                entries.push(entry);
+            // Parse payload (handles both v1 and v2 records)
+            if let Some((entry, meta)) = self.parse_payload(&payload) {
+                records.push(WalRecord { entry, meta });
             } else {
                 break; // Malformed payload
             }
@@ -482,33 +560,48 @@ impl Wal {
             pos += 8 + payload_len as u64;
         }
 
-        Ok(entries)
+        Ok(records)
     }
 
-    /// Payload format: [op_type: u8][tx_id: u64 LE][doc_id: u64 LE][encrypted_doc_bytes...]
-    fn parse_payload(&self, payload: &[u8]) -> Option<WalEntry> {
+    /// Parse one record payload. Handles both v1 records and v2 (PITR)
+    /// records carrying a `[gsn][wall_clock]` header — see `serialize_entry`.
+    /// Returns the entry plus its metadata (`WalMeta::default()` for v1).
+    fn parse_payload(&self, payload: &[u8]) -> Option<(WalEntry, WalMeta)> {
+        // Every record begins with [op: u8][tx_id: u64 LE][doc_id: u64 LE].
         if payload.len() < 17 {
-            return None; // minimum: 1 (op) + 8 (tx_id) + 8 (doc_id)
+            return None;
         }
-
         let op_type = payload[0];
         let tx_id = u64::from_le_bytes(payload[1..9].try_into().ok()?);
         let doc_id = u64::from_le_bytes(payload[9..17].try_into().ok()?);
 
-        match op_type {
-            OP_INSERT => {
-                let doc_bytes = self.maybe_decrypt(&payload[17..]).ok()?;
-                Some(WalEntry::Insert { doc_id, doc_bytes, tx_id })
+        // v2 records carry [gsn: u64 LE][wall_clock: u64 LE] after doc_id;
+        // the high bit of the op byte marks them.
+        let is_v2 = op_type & 0x80 != 0;
+        let (meta, body_start) = if is_v2 {
+            if payload.len() < 33 {
+                return None; // 1 + 8 + 8 + 8 + 8
             }
-            OP_UPDATE => {
-                let doc_bytes = self.maybe_decrypt(&payload[17..]).ok()?;
-                Some(WalEntry::Update { doc_id, doc_bytes, tx_id })
+            let gsn = u64::from_le_bytes(payload[17..25].try_into().ok()?);
+            let wall_clock_micros = u64::from_le_bytes(payload[25..33].try_into().ok()?);
+            (WalMeta { gsn, wall_clock_micros }, 33)
+        } else {
+            (WalMeta::default(), 17)
+        };
+
+        let entry = match op_type {
+            OP_INSERT | OP_INSERT_V2 => {
+                let doc_bytes = self.maybe_decrypt(&payload[body_start..]).ok()?;
+                WalEntry::Insert { doc_id, doc_bytes, tx_id }
             }
-            OP_DELETE => {
-                Some(WalEntry::Delete { doc_id, tx_id })
+            OP_UPDATE | OP_UPDATE_V2 => {
+                let doc_bytes = self.maybe_decrypt(&payload[body_start..]).ok()?;
+                WalEntry::Update { doc_id, doc_bytes, tx_id }
             }
-            _ => None,
-        }
+            OP_DELETE | OP_DELETE_V2 => WalEntry::Delete { doc_id, tx_id },
+            _ => return None,
+        };
+        Some((entry, meta))
     }
 }
 
@@ -819,5 +912,118 @@ mod tests {
         let wal = test_wal(&dir);
         let entries = wal.read_entries().unwrap();
         assert!(entries.is_empty());
+    }
+
+    // ── PITR Phase 0: v2 (extended-header) record format ────────────────
+
+    #[test]
+    fn v2_record_roundtrips_with_meta() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        let meta = WalMeta { gsn: 7, wall_clock_micros: 1_700_000_000_000_000 };
+        wal.log_with_meta(&WalEntry::insert(3, b"v2_doc".to_vec()), meta).unwrap();
+        wal.log_with_meta(&WalEntry::delete(3), WalMeta { gsn: 8, wall_clock_micros: 1_700_000_000_000_001 }).unwrap();
+
+        let records = wal.read_records().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].meta, meta);
+        match &records[0].entry {
+            WalEntry::Insert { doc_id, doc_bytes, tx_id } => {
+                assert_eq!(*doc_id, 3);
+                assert_eq!(doc_bytes, b"v2_doc");
+                assert_eq!(*tx_id, 0);
+            }
+            _ => panic!("expected Insert"),
+        }
+        assert_eq!(records[1].meta.gsn, 8);
+        assert!(matches!(records[1].entry, WalEntry::Delete { doc_id: 3, .. }));
+    }
+
+    #[test]
+    fn read_entries_drops_v2_meta_but_keeps_entry() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        wal.log_with_meta(
+            &WalEntry::Update { doc_id: 9, doc_bytes: b"x".to_vec(), tx_id: 42 },
+            WalMeta { gsn: 100, wall_clock_micros: 5 },
+        ).unwrap();
+
+        // The legacy replay path still sees the entry, just without meta.
+        let entries = wal.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            WalEntry::Update { doc_id, doc_bytes, tx_id } => {
+                assert_eq!(*doc_id, 9);
+                assert_eq!(doc_bytes, b"x");
+                assert_eq!(*tx_id, 42);
+            }
+            _ => panic!("expected Update"),
+        }
+    }
+
+    #[test]
+    fn mixed_v1_and_v2_records_in_one_file() {
+        let dir = TempDir::new().unwrap();
+        let wal = test_wal(&dir);
+
+        // Simulates a WAL written across an upgrade: v1 records, then v2.
+        wal.log(&WalEntry::insert(1, b"old".to_vec())).unwrap();
+        wal.log_with_meta(&WalEntry::insert(2, b"new".to_vec()), WalMeta { gsn: 1, wall_clock_micros: 11 }).unwrap();
+        wal.log(&WalEntry::delete(1)).unwrap();
+        wal.log_with_meta(&WalEntry::delete(2), WalMeta { gsn: 2, wall_clock_micros: 22 }).unwrap();
+
+        let records = wal.read_records().unwrap();
+        assert_eq!(records.len(), 4);
+        // v1 records parse back with zeroed meta...
+        assert_eq!(records[0].meta, WalMeta::default());
+        assert_eq!(records[2].meta, WalMeta::default());
+        // ...v2 records keep theirs.
+        assert_eq!(records[1].meta.gsn, 1);
+        assert_eq!(records[3].meta.gsn, 2);
+
+        // And the legacy entry-only view still returns all four.
+        assert_eq!(wal.read_entries().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn v2_record_with_encryption_roundtrips() {
+        let dir = TempDir::new().unwrap();
+        let key_path = dir.path().join("v2.key");
+        std::fs::write(&key_path, &[0x17u8; 32]).unwrap();
+        let enc_key = crate::crypto::EncryptionKey::load_from_file(&key_path).unwrap();
+        let wal = Wal::open_with_encryption(&dir.path().join("v2_enc.wal"), Some(enc_key)).unwrap();
+
+        let meta = WalMeta { gsn: 55, wall_clock_micros: 999 };
+        wal.log_with_meta(&WalEntry::insert(1, b"secret_v2".to_vec()), meta).unwrap();
+
+        let records = wal.read_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].meta, meta);
+        match &records[0].entry {
+            WalEntry::Insert { doc_bytes, .. } => assert_eq!(doc_bytes, b"secret_v2"),
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn v2_crc_corruption_stops_replay() {
+        let dir = TempDir::new().unwrap();
+        let wal_path = dir.path().join("v2_corrupt.wal");
+        let wal = Wal::open(&wal_path).unwrap();
+
+        wal.log_with_meta(&WalEntry::insert(1, b"good".to_vec()), WalMeta { gsn: 1, wall_clock_micros: 1 }).unwrap();
+        wal.log_with_meta(&WalEntry::insert(2, b"corrupt_me".to_vec()), WalMeta { gsn: 2, wall_clock_micros: 2 }).unwrap();
+
+        // Corrupt the CRC of the second record.
+        let mut bytes = std::fs::read(&wal_path).unwrap();
+        let first_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        let second_off = 8 + first_len;
+        bytes[second_off] ^= 0xFF;
+        std::fs::write(&wal_path, &bytes).unwrap();
+
+        let wal2 = Wal::open(&wal_path).unwrap();
+        assert_eq!(wal2.read_records().unwrap().len(), 1);
     }
 }
