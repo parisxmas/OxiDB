@@ -94,6 +94,100 @@ fn decompress(payload: Vec<u8>, codec: Option<&str>) -> Result<Vec<u8>> {
     }
 }
 
+/// Write `bytes` to `path`, replacing any existing file. When `sync` is
+/// set, fsync the file before returning so the contents survive a crash —
+/// `std::fs::write` alone leaves them sitting in the page cache.
+fn write_file(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    if sync {
+        f.sync_all()?;
+    }
+    Ok(())
+}
+
+/// fsync a directory so a prior `rename` (or create/unlink) of an entry
+/// inside it is durable. POSIX semantics: on Unix a directory opens as a
+/// read-only `File` whose `sync_all` flushes the directory inode.
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// A request to the group-commit directory syncer: "fsync `dir`, then
+/// signal `reply`". The error is carried as a `String` because one
+/// fsync result fans out to every waiter in a batch and `io::Error`
+/// is not `Clone`.
+struct DirSyncReq {
+    dir: PathBuf,
+    reply: mpsc::SyncSender<std::result::Result<(), String>>,
+}
+
+/// Group-commit fsync for blob directories. Mirrors the `tx_log`
+/// committer: a dedicated thread owns the fsync, callers submit a
+/// request and block until a fsync that *started after* their request
+/// was enqueued completes. Because a caller always `rename`s before it
+/// enqueues, any request the syncer sees in its queue corresponds to a
+/// rename that already happened — so a single `fsync` per directory
+/// makes the whole batch durable. N concurrent durable puts to one
+/// bucket therefore cost one directory fsync, not N.
+struct DirSyncer {
+    tx: mpsc::Sender<DirSyncReq>,
+}
+
+impl DirSyncer {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel::<DirSyncReq>();
+        std::thread::Builder::new()
+            .name("blob-dir-sync".into())
+            .spawn(move || Self::run(rx))
+            .expect("failed to spawn blob-dir-sync thread");
+        Self { tx }
+    }
+
+    fn run(rx: mpsc::Receiver<DirSyncReq>) {
+        // Cap a single batch so a flood of writers can't starve the
+        // fsync indefinitely; matches the tx_log committer's bound.
+        const MAX_BATCH: usize = 512;
+        while let Ok(first) = rx.recv() {
+            let mut batch = vec![first];
+            while batch.len() < MAX_BATCH {
+                match rx.try_recv() {
+                    Ok(req) => batch.push(req),
+                    Err(_) => break,
+                }
+            }
+            // One fsync per distinct directory in the batch, then fan
+            // the result out to every waiter that asked for that dir.
+            let mut done: HashMap<PathBuf, std::result::Result<(), String>> = HashMap::new();
+            for req in &batch {
+                done.entry(req.dir.clone())
+                    .or_insert_with(|| fsync_dir(&req.dir).map_err(|e| e.to_string()));
+            }
+            for req in batch {
+                let result = done.get(&req.dir).cloned().unwrap_or(Ok(()));
+                let _ = req.reply.send(result);
+            }
+        }
+    }
+
+    /// Block until `dir` has been fsynced by a batch that started after
+    /// this call enqueued its request.
+    fn sync(&self, dir: &Path) -> Result<()> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(DirSyncReq { dir: dir.to_path_buf(), reply: reply_tx })
+            .map_err(|_| Error::Io(std::io::Error::other("blob dir-syncer thread is gone")))?;
+        match reply_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(msg)) => Err(Error::Io(std::io::Error::other(msg))),
+            Err(_) => Err(Error::Io(std::io::Error::other(
+                "blob dir-syncer dropped the reply",
+            ))),
+        }
+    }
+}
+
 struct BucketState {
     keys: HashMap<String, u64>,
     metas: HashMap<u64, ObjectMeta>,
@@ -111,6 +205,17 @@ pub struct BlobStore {
     /// blobs were written compressed still works — only new uploads
     /// are affected. Toggled via `OXIDB_BLOB_COMPRESS=1` at startup.
     compression: bool,
+    /// Opt-in per-put fsync. When set, `put_object` and `delete_object`
+    /// fsync their writes (payload, meta, and the bucket directory)
+    /// before returning, so a successful write is durable on disk — not
+    /// merely scheduled for the 1 Hz background flush. The directory
+    /// fsyncs are group-committed across concurrent writers (see
+    /// `DirSyncer`). Enable it when a caller treats a successful write
+    /// as a commit (e.g. an SMTP server that must not `250 OK` a mail it
+    /// could still lose to a power cut). Toggled via `OXIDB_BLOB_SYNC=1`.
+    sync_writes: bool,
+    /// Group-commit directory syncer, present iff `sync_writes` is set.
+    dir_syncer: Option<DirSyncer>,
     delete_tx: mpsc::Sender<PathBuf>,
 }
 
@@ -147,33 +252,76 @@ impl BlobStore {
             })
             .expect("failed to spawn blob-gc thread");
 
-        // Background thread for periodic fsync (durability without per-write cost)
+        // Background thread for periodic fsync. This is the best-effort
+        // durability path for deployments that leave `OXIDB_BLOB_SYNC` off;
+        // when it's on, `put`/`delete` are already durable on return and
+        // this thread is just a redundant safety net.
+        //
+        // A rename/unlink inside a bucket dir is only durable once *that
+        // bucket dir* is fsynced — fsyncing the `_blobs` root does NOT
+        // flush its subdirectories. So each tick we fsync the root (which
+        // catches bucket create/delete) AND every bucket dir under it.
         {
-            let sync_dir = base_dir.clone();
+            let root = base_dir.clone();
             std::thread::Builder::new()
                 .name("blob-sync".into())
                 .spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));
-                    // fsync the blobs root dir to flush all pending renames
-                    if let Ok(dir) = std::fs::File::open(&sync_dir) {
-                        let _ = dir.sync_all();
+                    let _ = fsync_dir(&root);
+                    if let Ok(entries) = std::fs::read_dir(&root) {
+                        for entry in entries.flatten() {
+                            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                let _ = fsync_dir(&entry.path());
+                            }
+                        }
                     }
                 })
                 .expect("failed to spawn blob-sync thread");
         }
 
-        let compression = std::env::var("OXIDB_BLOB_COMPRESS")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
-            .unwrap_or(false);
+        let env_flag = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+                .unwrap_or(false)
+        };
+        let compression = env_flag("OXIDB_BLOB_COMPRESS");
+        let sync_writes = env_flag("OXIDB_BLOB_SYNC");
+        let dir_syncer = sync_writes.then(DirSyncer::new);
 
         Ok(Self {
             base_dir,
             buckets: RwLock::new(buckets),
             encryption,
             compression,
+            sync_writes,
+            dir_syncer,
             delete_tx,
         })
+    }
+
+    /// Override the per-put fsync setting, ignoring `OXIDB_BLOB_SYNC`.
+    /// Builder-style so embedders can configure durability in code
+    /// rather than through the environment:
+    /// `BlobStore::open(dir)?.with_sync_writes(true)`.
+    pub fn with_sync_writes(mut self, sync: bool) -> Self {
+        self.sync_writes = sync;
+        if sync && self.dir_syncer.is_none() {
+            self.dir_syncer = Some(DirSyncer::new());
+        }
+        self
+    }
+
+    /// Make a prior rename/unlink inside `dir` durable. When the
+    /// group-commit syncer is running the fsync is batched with other
+    /// concurrent durable writes; the `None` arm is unreachable while
+    /// `sync_writes` is set but falls back to a direct fsync rather than
+    /// silently skipping durability.
+    fn sync_dir(&self, dir: &Path) -> Result<()> {
+        match &self.dir_syncer {
+            Some(s) => s.sync(dir),
+            None => fsync_dir(dir).map_err(Error::Io),
+        }
     }
 
     fn scan_bucket(bucket_path: &Path, encryption: &Option<Arc<EncryptionKey>>) -> Result<BucketState> {
@@ -366,13 +514,15 @@ impl BlobStore {
             None => meta_json,
         };
 
-        // Write to temp files with random names (no lock needed — unique per call)
+        // Write to temp files with random names (no lock needed — unique per
+        // call). With `sync_writes` the temp files are fsynced here, so by the
+        // time they're renamed into place their contents are already durable.
         let tmp_id = rand::random::<u64>();
         let bucket_dir = self.bucket_path(bucket);
         let data_tmp = bucket_dir.join(format!("{tmp_id}.data.tmp"));
         let meta_tmp = bucket_dir.join(format!("{tmp_id}.meta.tmp"));
-        std::fs::write(&data_tmp, data_to_write)?;
-        std::fs::write(&meta_tmp, meta_to_write)?;
+        write_file(&data_tmp, &data_to_write, self.sync_writes)?;
+        write_file(&meta_tmp, &meta_to_write, self.sync_writes)?;
 
         // Phase 2a: brief lock to allocate / look up the id. We DON'T
         // hold the lock during the renames — concurrent puts to the
@@ -396,10 +546,24 @@ impl BlobStore {
         // key is a sha256 of the data → identical bytes → identical
         // result). Mismatched keys can't collide on id because the
         // counter increment under the lock above guarantees uniqueness.
+        //
+        // Crash-recovery ordering (see `scan_bucket`): `.meta` is the
+        // source of truth and an orphan `.data` is swept on the next
+        // open, but a `.meta` with no `.data` is a ghost read. So the
+        // `.data` rename must be durable *before* the `.meta` rename.
+        // With `sync_writes` we fsync the bucket dir between the two
+        // renames to enforce that order; the second fsync is the
+        // commit point — once it returns the put is durable.
         let data_path = self.data_path(bucket, id);
         let meta_path = self.meta_path(bucket, id);
         std::fs::rename(&data_tmp, &data_path)?;
+        if self.sync_writes {
+            self.sync_dir(&bucket_dir)?;
+        }
         std::fs::rename(&meta_tmp, &meta_path)?;
+        if self.sync_writes {
+            self.sync_dir(&bucket_dir)?;
+        }
 
         // Phase 2c: commit hashmap entries under a brief lock.
         {
@@ -408,9 +572,13 @@ impl BlobStore {
             state.metas.insert(id, meta.clone());
         }
 
-        // Durability: fsync is handled by the background sync thread (every 1s),
-        // not per-write. rename() on POSIX is metadata-atomic; the background
-        // fsync ensures data reaches disk within 1 second.
+        // Durability: with `sync_writes` (OXIDB_BLOB_SYNC=1) a successful
+        // return means the payload and meta are fsynced to disk — a caller
+        // may treat the put as a commit. The two directory fsyncs are
+        // group-committed (see `DirSyncer`), so concurrent puts to the same
+        // bucket share fsyncs instead of each paying its own. Otherwise
+        // rename() is only metadata-atomic and the bytes reach disk via the
+        // 1 Hz background sync thread (or the kernel's normal writeback).
 
         Ok(meta)
     }
@@ -510,8 +678,24 @@ impl BlobStore {
 
         // Delete .meta synchronously — this is the commit point for scan_bucket.
         // On crash recovery, absent .meta = object is deleted (no ghost reads).
-        let _ = std::fs::remove_file(&meta_path);
-        // Defer .data deletion to background thread (large file, slow I/O)
+        // With `sync_writes` we fsync the bucket dir after the unlink so the
+        // deletion itself is durable: otherwise a crash could resurrect a
+        // "deleted" object when scan_bucket sees the .meta reappear.
+        match std::fs::remove_file(&meta_path) {
+            Ok(()) => {}
+            // Already gone — that's the desired end state, treat as success.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // In durable mode a real I/O error must not be reported as a
+            // successful delete; non-sync mode keeps its prior best-effort
+            // behavior (the in-memory state is already updated either way).
+            Err(e) if self.sync_writes => return Err(Error::Io(e)),
+            Err(_) => {}
+        }
+        if self.sync_writes {
+            self.sync_dir(&self.bucket_path(bucket))?;
+        }
+        // Defer .data deletion to background thread (large file, slow I/O).
+        // An orphan .data with no .meta is harmless — scan_bucket sweeps it.
         let _ = self.delete_tx.send(data_path);
 
         Ok(())
@@ -744,5 +928,75 @@ mod tests {
 
         let err = store.get_object("b", "f.txt").unwrap_err();
         assert!(err.to_string().contains("bucket not found"));
+    }
+
+    #[test]
+    fn sync_writes_put_get_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap().with_sync_writes(true);
+        let data = b"durable payload";
+        store
+            .put_object("mail", "msg-1", data, "message/rfc822", HashMap::new())
+            .unwrap();
+
+        // Visible immediately through the same store.
+        let (got, meta) = store.get_object("mail", "msg-1").unwrap();
+        assert_eq!(got, data);
+        assert_eq!(meta.size, data.len() as u64);
+
+        // ...and after a fresh open that rebuilds state from disk,
+        // exercising the temp-write → fsync → rename → dir-fsync commit path.
+        drop(store);
+        let reopened = BlobStore::open(dir.path()).unwrap();
+        let (got2, _) = reopened.get_object("mail", "msg-1").unwrap();
+        assert_eq!(got2, data);
+    }
+
+    #[test]
+    fn sync_writes_delete_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap().with_sync_writes(true);
+        store
+            .put_object("mail", "msg-1", b"body", "message/rfc822", HashMap::new())
+            .unwrap();
+        store.delete_object("mail", "msg-1").unwrap();
+        assert!(store.get_object("mail", "msg-1").is_err());
+
+        // The deletion must hold across a fresh open — the .meta unlink was
+        // fsynced, so scan_bucket won't resurrect the object from a stale dir
+        // entry. (A leftover .data with no .meta is swept as an orphan.)
+        drop(store);
+        let reopened = BlobStore::open(dir.path()).unwrap();
+        assert!(reopened.get_object("mail", "msg-1").is_err());
+    }
+
+    #[test]
+    fn sync_writes_group_commit_concurrent_puts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(BlobStore::open(dir.path()).unwrap().with_sync_writes(true));
+
+        // 32 concurrent durable puts to the same bucket — the directory
+        // fsyncs are group-committed, but every put must still come back
+        // durable and intact.
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let body = format!("body-{i}").into_bytes();
+                store
+                    .put_object("mail", &format!("msg-{i}"), &body, "message/rfc822", HashMap::new())
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        drop(store);
+        let reopened = BlobStore::open(dir.path()).unwrap();
+        for i in 0..32 {
+            let (got, _) = reopened.get_object("mail", &format!("msg-{i}")).unwrap();
+            assert_eq!(got, format!("body-{i}").into_bytes());
+        }
     }
 }
