@@ -1150,6 +1150,42 @@ func (c *Client) Restore(archive, target string) (map[string]any, error) {
 	return m, nil
 }
 
+// RestoreToPoint performs a Point-In-Time Recovery: it extracts the base
+// backup at baseBackup, then replays the PITR archive at archiveDir on top
+// of it into targetDir, up to a chosen point. The point is selected via
+// opts: {"gsn": <u64>} for an exact GSN, {"at_micros": <u64>} for a
+// wall-clock cutoff (micros since the Unix epoch), or nil for the latest
+// archived record. Returns info with path, collections, target_gsn,
+// records_applied, and a message. Restart a server on targetDir to use it.
+func (c *Client) RestoreToPoint(baseBackup, archiveDir, targetDir string, opts map[string]any) (map[string]any, error) {
+	payload := map[string]any{
+		"cmd":         "restore_to_point",
+		"base_backup": baseBackup,
+		"archive":     archiveDir,
+		"target":      targetDir,
+	}
+	for k, v := range opts {
+		payload[k] = v
+	}
+	data, err := c.checked(payload)
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
+// ArchiveStatus reports the PITR archive's segment count and GSN /
+// wall-clock coverage.
+func (c *Client) ArchiveStatus() (map[string]any, error) {
+	data, err := c.checked(map[string]any{"cmd": "archive_status"})
+	if err != nil {
+		return nil, err
+	}
+	m, _ := data.(map[string]any)
+	return m, nil
+}
+
 // ------------------------------------------------------------------
 // SQL dialect
 // ------------------------------------------------------------------
