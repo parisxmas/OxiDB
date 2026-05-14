@@ -57,7 +57,9 @@ pub use collection::{Collection, CompactStats, IndexInfo};
 pub use crypto::EncryptionKey;
 pub use database_manager::DatabaseManager;
 pub use document::DocumentId;
-pub use engine::{BackupInfo, LogCallback, OxiDb, RestoreInfo};
+pub use engine::{BackupInfo, LogCallback, OxiDb, PitrRestoreInfo, RestoreInfo};
+#[cfg(not(target_arch = "wasm32"))]
+pub use pitr::PitrTarget;
 pub use error::{Error, Result};
 pub use sql::{execute_sql, execute_sql_with_db_manager, execute_sql_with_dialect, SqlDialect, SqlResult};
 #[cfg(not(target_arch = "wasm32"))]

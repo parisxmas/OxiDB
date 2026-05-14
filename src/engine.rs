@@ -71,6 +71,17 @@ pub struct RestoreInfo {
     pub collections: usize,
 }
 
+/// Information about a completed point-in-time restore (`restore_to_point`).
+#[derive(Debug)]
+pub struct PitrRestoreInfo {
+    pub path: String,
+    pub collections: usize,
+    /// The GSN the database was restored to (inclusive).
+    pub target_gsn: u64,
+    /// Archived records applied on top of the base backup.
+    pub records_applied: u64,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 enum FtsJob {
     Index {
@@ -2364,26 +2375,18 @@ impl OxiDb {
         })
     }
 
-    /// Restore a tar.gz backup archive to a target directory.
-    ///
-    /// This is a static method — the caller should open a new `OxiDb` instance
-    /// on the target directory after restoration.
+    /// Validate and extract a backup tarball into `target_dir`. Shared by
+    /// `restore` and `restore_to_point`.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn restore(archive_path: &Path, target_dir: &Path) -> Result<RestoreInfo> {
-        // 1. Validate archive exists
+    fn extract_backup(archive_path: &Path, target_dir: &Path) -> Result<()> {
         if !archive_path.exists() {
             return Err(Error::Backup(format!(
                 "archive not found: {}",
                 archive_path.display()
             )));
         }
-
-        // 2. Validate target directory is empty or doesn't exist
         if target_dir.exists() {
-            let has_entries = std::fs::read_dir(target_dir)?
-                .next()
-                .is_some();
-            if has_entries {
+            if std::fs::read_dir(target_dir)?.next().is_some() {
                 return Err(Error::Backup(format!(
                     "target directory is not empty: {}",
                     target_dir.display()
@@ -2392,19 +2395,60 @@ impl OxiDb {
         } else {
             std::fs::create_dir_all(target_dir)?;
         }
-
-        // 3. Extract tar.gz into target directory
         let file = std::fs::File::open(archive_path)?;
         let dec = GzDecoder::new(file);
         let mut archive = tar::Archive::new(dec);
         archive.unpack(target_dir)?;
+        Ok(())
+    }
 
-        // 4. Count .dat files
+    /// Restore a tar.gz backup archive to a target directory.
+    ///
+    /// This is a static method — the caller should open a new `OxiDb` instance
+    /// on the target directory after restoration.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn restore(archive_path: &Path, target_dir: &Path) -> Result<RestoreInfo> {
+        Self::extract_backup(archive_path, target_dir)?;
         let collections = Self::discover_collection_names_on_disk(target_dir)?;
-
         Ok(RestoreInfo {
             path: target_dir.to_string_lossy().into_owned(),
             collections: collections.len(),
+        })
+    }
+
+    /// Restore the database to a point in time: extract `base_backup`,
+    /// then replay the archive in `archive_dir` on top of it up to
+    /// `target`.
+    ///
+    /// Static method — open a fresh `OxiDb` on `target_dir` afterward to
+    /// get the point-in-time state. The base backup must have been taken
+    /// with PITR enabled (it carries a `base.meta` watermark); a base
+    /// without one degrades to a plain restore. `archive_dir` is the live
+    /// database's archive directory (`OXIDB_ARCHIVE_DIR`, default
+    /// `<data_dir>/_archive`); `encryption` must be the same key the
+    /// source database used, if any.
+    ///
+    /// v1 limitations: blob objects are restored only to the base-backup
+    /// point (the document set is restored to `target`); the FTS index is
+    /// dropped and must be rebuilt; create/drop-index DDL between the base
+    /// and `target` is not replayed — indexes rebuild against the
+    /// base-time schema.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn restore_to_point(
+        base_backup: &Path,
+        archive_dir: &Path,
+        target_dir: &Path,
+        target: crate::pitr::PitrTarget,
+        encryption: Option<Arc<EncryptionKey>>,
+    ) -> Result<PitrRestoreInfo> {
+        Self::extract_backup(base_backup, target_dir)?;
+        let outcome =
+            crate::archive::replay_into(target_dir, archive_dir, target, encryption.as_ref())?;
+        Ok(PitrRestoreInfo {
+            path: target_dir.to_string_lossy().into_owned(),
+            collections: outcome.collections,
+            target_gsn: outcome.target_gsn,
+            records_applied: outcome.records_applied,
         })
     }
 

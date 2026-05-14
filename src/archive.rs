@@ -44,6 +44,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -53,6 +54,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::EncryptionKey;
 use crate::error::{Error, Result};
+use crate::pitr::{BaseMeta, PitrTarget};
 use crate::wal::{Wal, WalRecord};
 
 /// Manifest format version — bumped on any breaking manifest change.
@@ -172,9 +174,234 @@ pub fn archive_dir_for(data_dir: &Path) -> PathBuf {
     }
 }
 
+/// What [`replay_into`] drove the restore to.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayOutcome {
+    /// GSN the restore was driven to (inclusive).
+    pub target_gsn: u64,
+    /// Records applied to the restored WALs.
+    pub records_applied: u64,
+    /// Records skipped — beyond `target_gsn`, or excluded because their
+    /// transaction straddled the cut.
+    pub records_skipped: u64,
+    /// Collections materialized.
+    pub collections: usize,
+}
+
+/// Advance an already-extracted base backup in `target_dir` up to
+/// `target` by replaying the archive on top of it.
+///
+/// The base backup, once extracted, holds `<collection>.btree` snapshots
+/// plus `<collection>.wal` / `.wal.<seq>` files; the archive holds the
+/// sealed segments since. This rewrites each collection's live WAL to
+/// contain exactly the records that belong in the restored state — every
+/// record with `gsn <= target_gsn`, minus any whose transaction straddles
+/// the cut — and drops the stale index caches, the FTS index and the tx
+/// commit log, so a plain `OxiDb::open(target_dir)` afterward yields the
+/// point-in-time state. The `.btree` snapshots are taken as-is: they
+/// predate the base watermark, so they are always within `target_gsn`.
+///
+/// Idempotent and offline — it never touches the source database.
+pub fn replay_into(
+    target_dir: &Path,
+    archive_dir: &Path,
+    target: PitrTarget,
+    encryption: Option<&Arc<EncryptionKey>>,
+) -> Result<ReplayOutcome> {
+    // The base's GSN watermark — 0 / absent means the base predates PITR;
+    // the restore then degrades to whatever the base + archive hold.
+    let _base_gsn = BaseMeta::read_from(target_dir)?.map(|m| m.base_gsn).unwrap_or(0);
+
+    // 1. Gather every WAL record per collection: from the base's own WAL
+    //    files in target_dir, and from the archived sealed segments.
+    let mut by_collection: HashMap<String, Vec<WalRecord>> = HashMap::new();
+
+    // 1a. Base WAL files already in target_dir (live `.wal` + sealed `.wal.<seq>`).
+    for (collection, path) in base_wal_files(target_dir) {
+        let recs = Wal::open_with_encryption(&path, encryption.cloned())?.read_records()?;
+        by_collection.entry(collection).or_default().extend(recs);
+    }
+    // Collections present only as a `.btree` snapshot (no WAL yet) still count.
+    for collection in base_collection_names(target_dir) {
+        by_collection.entry(collection).or_default();
+    }
+    // 1b. Archived sealed segments.
+    let manifest = load_manifest(archive_dir)?;
+    let segments_dir = archive_dir.join(SEGMENTS_DIR);
+    for entry in &manifest.segments {
+        let collection = match collection_of(&entry.original) {
+            Some(c) => c,
+            None => continue,
+        };
+        let seg_path = segments_dir.join(&entry.segment);
+        let recs = Wal::open_with_encryption(&seg_path, encryption.cloned())?
+            .read_records_prefix(entry.wal_byte_len)?;
+        by_collection.entry(collection).or_default().extend(recs);
+    }
+
+    // 2. Resolve target_gsn from the full record set.
+    let target_gsn = resolve_target_gsn(&by_collection, target);
+
+    // 3. Two-pass transaction filter across ALL collections (a tx may span
+    //    collections). Pass 1: the max GSN each tx touches. Pass 2 admits
+    //    a tx only if its whole footprint fits under target_gsn — so a
+    //    transaction straddling the cut is excluded entirely, never half-
+    //    applied.
+    let mut tx_max: HashMap<u64, u64> = HashMap::new();
+    for recs in by_collection.values() {
+        for r in recs {
+            let tx = r.entry.tx_id();
+            if tx != 0 {
+                let e = tx_max.entry(tx).or_insert(0);
+                *e = (*e).max(r.meta.gsn);
+            }
+        }
+    }
+    let admitted = |r: &WalRecord| -> bool {
+        if r.meta.gsn > target_gsn {
+            return false;
+        }
+        let tx = r.entry.tx_id();
+        tx == 0 || tx_max.get(&tx).map(|&m| m <= target_gsn).unwrap_or(true)
+    };
+
+    // 4. Rewrite each collection's WAL with exactly the admitted records,
+    //    in GSN order. The base's WAL files are removed first.
+    let mut records_applied = 0u64;
+    let mut records_skipped = 0u64;
+    let collections = by_collection.len();
+    for (collection, mut recs) in by_collection {
+        recs.sort_by_key(|r| r.meta.gsn);
+        let mut seen = HashSet::new();
+        let mut included = Vec::new();
+        for r in recs {
+            if !admitted(&r) {
+                records_skipped += 1;
+                continue;
+            }
+            // The same record can appear in both a base WAL and an
+            // archived segment — `(gsn, doc_id)` dedups them. GSN 0
+            // (pre-PITR base records) cannot be deduped this way, so
+            // those are kept unconditionally.
+            if r.meta.gsn != 0 && !seen.insert((r.meta.gsn, r.entry.doc_id())) {
+                continue;
+            }
+            included.push(r);
+        }
+        records_applied += included.len() as u64;
+
+        remove_collection_wals(target_dir, &collection);
+        let wal_path = target_dir.join(format!("{collection}.wal"));
+        Wal::open_with_encryption(&wal_path, encryption.cloned())?.log_records(&included)?;
+    }
+
+    // 5. Drop derived/stale state so `OxiDb::open` rebuilds it cleanly.
+    drop_derived_state(target_dir);
+
+    Ok(ReplayOutcome { target_gsn, records_applied, records_skipped, collections })
+}
+
 // -----------------------------------------------------------------------
 // Internal helpers
 // -----------------------------------------------------------------------
+
+/// `(collection, path)` for every base WAL file in `dir` — the live
+/// `<C>.wal` and any sealed `<C>.wal.<seq>` the base backup carried.
+fn base_wal_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(c) = name.strip_suffix(".wal") {
+                out.push((c.to_string(), entry.path()));
+            } else if let Some(c) = collection_of(&name) {
+                out.push((c, entry.path()));
+            }
+        }
+    }
+    out
+}
+
+/// Collection names that have a `.btree` snapshot in `dir`.
+fn base_collection_names(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(c) = name.strip_suffix(".btree") {
+                out.push(c.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The collection name from a sealed-segment name `<C>.wal.<seq>`.
+fn collection_of(sealed_name: &str) -> Option<String> {
+    let (head, tail) = sealed_name.rsplit_once('.')?;
+    tail.parse::<u64>().ok()?; // `<seq>` must be numeric
+    Some(head.strip_suffix(".wal")?.to_string())
+}
+
+/// Resolve a [`PitrTarget`] to a concrete GSN against the full record set.
+fn resolve_target_gsn(by_collection: &HashMap<String, Vec<WalRecord>>, target: PitrTarget) -> u64 {
+    match target {
+        PitrTarget::Gsn(g) => g,
+        PitrTarget::Latest => by_collection
+            .values()
+            .flatten()
+            .map(|r| r.meta.gsn)
+            .max()
+            .unwrap_or(0),
+        // Largest GSN whose record's wall-clock is at or before `t`.
+        // Resolving by value (not position) tolerates a non-monotonic
+        // wall-clock; records with no wall-clock (v1) never qualify.
+        PitrTarget::Timestamp(t) => by_collection
+            .values()
+            .flatten()
+            .filter(|r| r.meta.wall_clock_micros != 0 && r.meta.wall_clock_micros <= t)
+            .map(|r| r.meta.gsn)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+/// Remove `<collection>.wal` and every `<collection>.wal.<seq>` from `dir`.
+fn remove_collection_wals(dir: &Path, collection: &str) {
+    let _ = fs::remove_file(dir.join(format!("{collection}.wal")));
+    let prefix = format!("{collection}.wal.");
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name
+                .strip_prefix(&prefix)
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some()
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// Drop the derived state the base brought along that no longer matches
+/// the restored document set: index caches (`.fidx/.cidx/.vidx` — the
+/// `.idx` *metadata* is kept, as it is the schema), the FTS index, the tx
+/// commit log, and the stale copy of the source's archive. All of these
+/// rebuild (or stay empty) on the next `OxiDb::open`.
+fn drop_derived_state(dir: &Path) {
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".fidx") || name.ends_with(".cidx") || name.ends_with(".vidx") {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir.join("_fts"));
+    let _ = fs::remove_file(dir.join("_tx_commit_log"));
+    let _ = fs::remove_dir_all(dir.join(DEFAULT_ARCHIVE_SUBDIR));
+}
 
 /// Copy one sealed segment into the archive, crash-safely. The verbatim
 /// WAL bytes are copied untouched; the records are read (decrypting if a
@@ -357,7 +584,7 @@ fn crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use crate::pitr::ArchiveSequencer;
-    use crate::wal::WalEntry;
+    use crate::wal::{WalEntry, WalMeta};
     use tempfile::TempDir;
 
     /// Build a sealed segment `<name>.wal.<seq>` in `dir` carrying `n`
@@ -480,5 +707,136 @@ mod tests {
         // ...and the trailer's wal_byte_len points exactly at the boundary.
         let entry = load_manifest(archive.path()).unwrap().segments.pop().unwrap();
         assert_eq!(entry.wal_byte_len, original_bytes.len() as u64);
+    }
+
+    // ── PITR Phase 5: replay_into (restore_to_point core) ───────────────
+
+    /// GSNs in the rewritten `c.wal` of `target_dir`, sorted.
+    fn restored_gsns(target_dir: &Path) -> Vec<u64> {
+        let mut g: Vec<u64> = Wal::open(&target_dir.join("c.wal"))
+            .unwrap()
+            .read_records()
+            .unwrap()
+            .iter()
+            .map(|r| r.meta.gsn)
+            .collect();
+        g.sort_unstable();
+        g
+    }
+
+    /// A `target_dir` standing in for an extracted base backup: a
+    /// `base.meta` watermark and an (empty) `c.wal` so the collection is
+    /// discovered.
+    fn fake_extracted_base(target_dir: &Path, base_gsn: u64) {
+        BaseMeta::new(base_gsn).write_to(target_dir).unwrap();
+        Wal::open(&target_dir.join("c.wal")).unwrap();
+    }
+
+    #[test]
+    fn replay_to_gsn_filters_the_record_set() {
+        let target = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        let archive = TempDir::new().unwrap();
+
+        // Archive: one sealed segment, GSNs 1..=10 for collection "c".
+        let seq = Arc::new(ArchiveSequencer::open(src.path()).unwrap());
+        let wal = Wal::open(&src.path().join("c.wal")).unwrap().with_sequencer(Some(seq));
+        for i in 1..=10u64 {
+            wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap();
+        }
+        wal.seal().unwrap();
+        archive_pass(src.path(), archive.path(), None).unwrap();
+
+        fake_extracted_base(target.path(), 1);
+        let outcome =
+            replay_into(target.path(), archive.path(), PitrTarget::Gsn(6), None).unwrap();
+        assert_eq!(outcome.target_gsn, 6);
+        assert_eq!(outcome.records_applied, 6);
+        assert_eq!(restored_gsns(target.path()), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn replay_latest_includes_every_archived_record() {
+        let target = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        let archive = TempDir::new().unwrap();
+
+        let seq = Arc::new(ArchiveSequencer::open(src.path()).unwrap());
+        let wal = Wal::open(&src.path().join("c.wal")).unwrap().with_sequencer(Some(seq));
+        for i in 1..=7u64 {
+            wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap();
+        }
+        wal.seal().unwrap();
+        archive_pass(src.path(), archive.path(), None).unwrap();
+
+        fake_extracted_base(target.path(), 1);
+        let outcome =
+            replay_into(target.path(), archive.path(), PitrTarget::Latest, None).unwrap();
+        assert_eq!(outcome.target_gsn, 7);
+        assert_eq!(restored_gsns(target.path()), vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn replay_excludes_a_transaction_straddling_the_cut() {
+        let target = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        let archive = TempDir::new().unwrap();
+
+        // GSN 1-5 non-transactional, 6 & 7 belong to tx 99, 8 non-transactional.
+        let seq = Arc::new(ArchiveSequencer::open(src.path()).unwrap());
+        let wal = Wal::open(&src.path().join("c.wal")).unwrap().with_sequencer(Some(seq));
+        for i in 1..=5u64 {
+            wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap();
+        }
+        wal.log(&WalEntry::Insert { doc_id: 6, doc_bytes: b"x".to_vec(), tx_id: 99 }).unwrap();
+        wal.log(&WalEntry::Insert { doc_id: 7, doc_bytes: b"x".to_vec(), tx_id: 99 }).unwrap();
+        wal.log(&WalEntry::insert(8, b"x".to_vec())).unwrap();
+        wal.seal().unwrap();
+        archive_pass(src.path(), archive.path(), None).unwrap();
+
+        fake_extracted_base(target.path(), 1);
+        // Cut at GSN 6: tx 99 reaches GSN 7 > 6, so the whole tx is dropped —
+        // GSN 6 is excluded even though 6 <= 6.
+        let outcome =
+            replay_into(target.path(), archive.path(), PitrTarget::Gsn(6), None).unwrap();
+        assert_eq!(restored_gsns(target.path()), vec![1, 2, 3, 4, 5]);
+        assert!(outcome.records_skipped >= 1);
+    }
+
+    #[test]
+    fn replay_timestamp_resolves_by_wall_clock_and_drops_derived_state() {
+        let target = TempDir::new().unwrap();
+        let src = TempDir::new().unwrap();
+        let archive = TempDir::new().unwrap();
+
+        // Explicit wall-clocks: GSN i carries wall-clock i seconds.
+        let wal = Wal::open(&src.path().join("c.wal")).unwrap();
+        for i in 1..=5u64 {
+            wal.log_with_meta(
+                &WalEntry::insert(i, b"x".to_vec()),
+                WalMeta { gsn: i, wall_clock_micros: i * 1_000_000 },
+            )
+            .unwrap();
+        }
+        wal.seal().unwrap();
+        archive_pass(src.path(), archive.path(), None).unwrap();
+
+        fake_extracted_base(target.path(), 1);
+        // Stale derived state the base would have carried along.
+        fs::write(target.path().join("c.fidx"), b"stale index cache").unwrap();
+        fs::write(target.path().join("_tx_commit_log"), b"stale").unwrap();
+
+        let outcome = replay_into(
+            target.path(),
+            archive.path(),
+            PitrTarget::Timestamp(3_000_000),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome.target_gsn, 3);
+        assert_eq!(restored_gsns(target.path()), vec![1, 2, 3]);
+        // Derived state is dropped so OxiDb::open rebuilds it cleanly.
+        assert!(!target.path().join("c.fidx").exists());
+        assert!(!target.path().join("_tx_commit_log").exists());
     }
 }

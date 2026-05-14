@@ -165,6 +165,20 @@ pub fn now_micros() -> u64 {
         .unwrap_or(0)
 }
 
+/// Where to restore the database to in [`crate::archive::replay_into`] /
+/// `OxiDb::restore_to_point`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PitrTarget {
+    /// Restore to the largest GSN whose record's wall-clock is `<=` this
+    /// timestamp (micros since the Unix epoch). Tolerates non-monotonic
+    /// wall-clocks — it resolves by value, not by position.
+    Timestamp(u64),
+    /// Restore to exactly this GSN (inclusive).
+    Gsn(u64),
+    /// Restore to the newest record present in the archive.
+    Latest,
+}
+
 /// Format version for `base.meta`.
 pub const BASE_META_VERSION: u32 = 1;
 /// Name of the base-backup watermark file. It is written into the data

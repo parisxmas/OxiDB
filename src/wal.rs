@@ -656,20 +656,48 @@ impl Wal {
     /// replay, which only needs the mutations. Use `read_records` when the
     /// metadata matters (the archiver and the PITR replay tool).
     pub fn read_entries(&self) -> Result<Vec<WalEntry>> {
-        Ok(self.scan()?.into_iter().map(|r| r.entry).collect())
+        Ok(self.scan(u64::MAX)?.into_iter().map(|r| r.entry).collect())
     }
 
     /// Read all valid records from the WAL, preserving v2 metadata.
     pub fn read_records(&self) -> Result<Vec<WalRecord>> {
-        self.scan()
+        self.scan(u64::MAX)
     }
 
-    /// Scan the WAL front-to-back, CRC-verifying each record and stopping
-    /// at the first torn/corrupt one (treating it as the crash boundary).
-    fn scan(&self) -> Result<Vec<WalRecord>> {
+    /// Read records from only the first `max_bytes` of the file. Used to
+    /// read the WAL records out of an archived `.seg` file — that file is
+    /// the verbatim WAL bytes followed by a fixed trailer, so `max_bytes`
+    /// is the trailer offset and the trailer is never mis-parsed.
+    pub fn read_records_prefix(&self, max_bytes: u64) -> Result<Vec<WalRecord>> {
+        self.scan(max_bytes)
+    }
+
+    /// Append a batch of records with their explicit v2 metadata, with a
+    /// single fsync. Used by the PITR replay tool to materialize a
+    /// filtered WAL during `restore_to_point` — no auto-seal, since the
+    /// target database is being built, not run.
+    pub fn log_records(&self, records: &[WalRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut file = self.inner.lock();
+        let mut buf = Vec::new();
+        for r in records {
+            buf.extend_from_slice(&Self::frame(self.serialize_entry(&r.entry, Some(r.meta))?));
+        }
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(&buf)?;
+        file.sync_data()?;
+        Ok(())
+    }
+
+    /// Scan the WAL front-to-back over the first `limit` bytes,
+    /// CRC-verifying each record and stopping at the first torn/corrupt
+    /// one (treating it as the crash boundary).
+    fn scan(&self, limit: u64) -> Result<Vec<WalRecord>> {
         let mut file = self.inner.lock();
         file.seek(SeekFrom::Start(0))?;
-        let file_len = file.metadata()?.len();
+        let file_len = file.metadata()?.len().min(limit);
         let mut records = Vec::new();
         let mut pos = 0u64;
 
