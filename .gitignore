@@ -10,6 +10,7 @@ dotnet/**/obj/
 tests/**/bin/
 tests/**/obj/
 test_output.log
+test_output_innetwork.log
 
 # Java / Maven
 **/target/
