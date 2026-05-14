@@ -2,12 +2,14 @@
 
 Julia client for [OxiDB](https://github.com/parisxmas/OxiDB) document database. Two packages:
 
-| Package | Mode | Server needed? |
-|---------|------|----------------|
-| **`OxiDbEmbedded`** | In-process via FFI | No |
-| **`OxiDb`** | TCP client | Yes |
+| Package | Mode | Server needed? | API surface |
+|---------|------|----------------|-------------|
+| **[`OxiDbEmbedded`](../OxiDbEmbedded)** | In-process via FFI | No | Full — every helper below is an exported function |
+| **`OxiDb`** | TCP client | Yes | Minimal — `connect`, `exec`, and the core CRUD helpers; everything else via `exec` |
 
-Both share the same API (insert, find, update, delete, aggregate, transactions, blobs, FTS).
+Both speak to the same engine and cover the same operations (insert, find,
+update, delete, aggregate, transactions, blobs, FTS). They differ in *how much*
+is wrapped as a named function — see [API Reference](#api-reference).
 
 ## Requirements
 
@@ -63,18 +65,40 @@ Pkg.develop(path="julia/OxiDb")
 ```julia
 using OxiDb
 
-client = connect_oxidb("127.0.0.1", 4444)
+# `connect` is not exported (it would clash with Sockets.connect) — call it qualified.
+client = OxiDb.connect("127.0.0.1", 4444)
 
 insert(client, "users", Dict("name" => "Alice", "age" => 30))
-docs = find(client, "users", Dict("name" => "Alice"))
+docs = find(client, "users"; query = Dict("name" => "Alice"))
 println(docs)
 
 close(client)
+
+# Or the do-block form, which closes the connection for you (even on error):
+OxiDb.connect("127.0.0.1", 4444) do client
+    @show ping(client)
+end
 ```
 
 ## API Reference
 
-Both packages export the same functions. Replace `db`/`client` interchangeably.
+The reference below describes the **full helper surface**, which
+[`OxiDbEmbedded`](../OxiDbEmbedded) exports in its entirety.
+
+The TCP **`OxiDb`** client exports the core CRUD/query helpers — `ping`,
+`insert`, `insert_many`, `find`, `find_one`, `update`, `update_one`, `delete`,
+`delete_one`, `count_docs`, `aggregate`, `sql` — plus `connect` and `exec`.
+For anything else (index creation, transactions, blobs, document FTS,
+compaction, OxiScript procedures) call it through the generic `exec`:
+
+```julia
+exec(client, "create_index"; collection = "users", field = "email")
+exec(client, "begin_tx"); exec(client, "commit_tx")
+```
+
+So: in the examples below, `db` (embedded) calls a named helper directly;
+`client` (TCP) calls the same-named helpers for CRUD and `exec(client, …)`
+for the rest.
 
 ### Open / Connect
 
@@ -84,8 +108,8 @@ db = open_db("/tmp/mydb")
 db = open_db("/tmp/mydb"; encryption_key_path="/path/to/key")
 close(db)
 
-# TCP client
-client = connect_oxidb("127.0.0.1", 4444)
+# TCP client — `connect` is not exported, call it qualified
+client = OxiDb.connect("127.0.0.1", 4444)
 close(client)
 ```
 
