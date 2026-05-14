@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -29,13 +30,36 @@ import (
 // ═══════════════════════════════════════════════════════════════════════════
 
 const (
-	oxidbHost  = "127.0.0.1"
-	oxidbPort  = 4444
-	mongoURI   = "mongodb://127.0.0.1:27017"
 	totalDocs  = 100_000
 	batchSize  = 1000
 	collection = "bench_employees"
 )
+
+// Connection targets — overridable via env so the suite can run either from
+// the host (through Docker's port-forward) or from inside the compose network
+// (container-to-container, apples-to-apples). See run.sh BENCH_MODE.
+var (
+	oxidbHost = envOr("OXIDB_HOST", "127.0.0.1")
+	oxidbPort = envInt("OXIDB_PORT", 4444)
+	mongoURI  = envOr("MONGO_URI", "mongodb://127.0.0.1:27017")
+	mongoAddr = envOr("MONGO_ADDR", "127.0.0.1:27017")
+)
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
 
 var (
 	oxiClient   *oxidb.Client
@@ -123,7 +147,7 @@ func TestMain(m *testing.M) {
 	}
 
 	// Wait for MongoDB
-	if err := waitFor("MongoDB", "127.0.0.1:27017", 60*time.Second); err != nil {
+	if err := waitFor("MongoDB", mongoAddr, 60*time.Second); err != nil {
 		fmt.Fprintf(os.Stderr, "FATAL: %v\n", err)
 		os.Exit(1)
 	}

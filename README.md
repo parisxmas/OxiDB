@@ -693,32 +693,42 @@ OXIPOOL_SHARDS=localhost:4444,localhost:4445 \
 
 Cross-shard transactions are detected and rejected.
 
-## Benchmark: OxiDB vs MongoDB 8
+## Benchmark: OxiDB vs MongoDB 7
 
-100K documents, 12 fields each, 8 indexed fields. Native Apple Silicon. **OxiDB wins 18/18 tests.**
+100K documents, 14 fields each (including a nested object). OxiDB and MongoDB 7
+both run in Docker with tmpfs storage; the benchmark client runs **in-network**
+(container-to-container) so the numbers reflect the engines, not the host's
+container-networking stack. Each figure is the **median of 5 runs**.
+**OxiDB wins 21/22 tests.** Reproduce with `tests/comparison-mongodb/run.sh`.
 
 | Category | Operation | OxiDB | MongoDB | Ratio |
 |----------|-----------|-------|---------|-------|
-| **INSERT** | 100K docs (batch 5000) | 786ms | 2.73s | **3.5x** |
-| **INDEX** | 8 indexes | 317ms | 2.66s | **8.4x** |
-| **QUERY** | Exact match (indexed) | 151µs | 1ms | **8x** |
-| | Equality (indexed) | 1ms | 50ms | **40x** |
-| | Range (indexed) | 4ms | 122ms | **30x** |
-| | Range + equality | 7ms | 43ms | **5.4x** |
-| | Multi-condition AND | 2ms | 100ms | **37x** |
-| | Unindexed scan | 5ms | 59ms | **11x** |
-| | find_one (indexed) | 119µs | 277µs | **2.3x** |
-| | Count (indexed) | 83µs | 1ms | **13x** |
-| | Sort + limit 10 | 99µs | 376µs | **3.8x** |
-| **UPDATE** | UpdateOne (indexed) | 129µs | 187µs | **1.4x** |
-| | UpdateMany (bulk) | 1ms | 38ms | **25x** |
-| **AGGREGATE** | Group by dept + avg | 20ms | 27ms | **1.3x** |
-| | Match region + group | 3ms | 9ms | **2.9x** |
-| | Group by city + stats | 13ms | 30ms | **2.3x** |
-| **CONCURRENT** | find_one (10 workers) | 14ms | 55ms | **3.8x** |
-| **DELETE** | DeleteMany | 3ms | 479ms | **126x** |
+| **INSERT** | Bulk insert 100K | 325K docs/s | 195K docs/s | **1.7x** |
+| | Single-doc insert | 16.9K docs/s | 11.1K docs/s | **1.5x** |
+| **INDEX** | Create 4 indexes | 74ms | 230ms | **3.1x** |
+| **QUERY** | Exact match | 33.2ms | 127.0ms | **3.8x** |
+| | Range (age ≥ 50) | 68.2ms | 297.6ms | **4.4x** |
+| | Compound AND | 22.6ms | 49.1ms | **2.2x** |
+| | `$or` | 37.8ms | 134.0ms | **3.5x** |
+| | `$in` | 47.7ms | 191.4ms | **4.0x** |
+| | Range (salary) | 47.5ms | 192.4ms | **4.1x** |
+| | Boolean | 71.3ms | 298.9ms | **4.2x** |
+| | Nested field | 29.6ms | 80.6ms | **2.7x** |
+| **INDEXED QUERY** | Equality (department) | 26.1ms | 125.4ms | **4.8x** |
+| | Range (age ≥ 60) | 37.8ms | 186.9ms | **4.9x** |
+| | Equality (city) | 13.2ms | 62.4ms | **4.7x** |
+| | Range (salary) | 31.5ms | 163.8ms | **5.2x** |
+| **COUNT** | Count all | 100µs | 17.9ms | **179x** |
+| | Count (department) | 100µs | 3.3ms | **33x** |
+| | Count (age ≥ 50) | 100µs | 6.6ms | **66x** |
+| **FIND** | find loop (queries/s) | 40.0/s | 8.3/s | **4.8x** |
+| **AGGREGATE** | Group by dept + avg | 73.5ms | 43.2ms | **0.6x** |
+| | Top 5 cities by count | 100µs | 35.3ms | **353x** |
+| | Match + group | 8.0ms | 11.1ms | **1.4x** |
 
-**Concurrent mixed workload** (10 workers, 70% read / 20% update / 10% insert): OxiDB 32K ops/sec vs MongoDB 19K ops/sec.
+The one MongoDB win is grouped aggregation with `$avg`; OxiDB's `$group` path is
+slower there. Counts are lopsided because OxiDB answers them from index-set
+cardinality without touching documents.
 
 ### 1M Telco CRM Scenario (nested documents, ~3KB each)
 

@@ -378,6 +378,30 @@ func (c *Client) UpdateOne(collection string, query, update map[string]any) (map
 	return map[string]any{"status": data}, nil
 }
 
+// FindAndModify atomically finds one document matching query, applies
+// update to it, and returns the modified document (with its bumped
+// _version) — or nil if nothing matched. Unlike Update + $inc, this is
+// safe under concurrency: the find and the write are contiguous, so it
+// is the correct primitive for counters such as a mailbox's IMAP
+// UIDNEXT. A caller mutating a counter must always use FindAndModify,
+// never plain Update.
+func (c *Client) FindAndModify(collection string, query, update map[string]any) (map[string]any, error) {
+	data, err := c.checked(map[string]any{
+		"cmd": "find_and_modify", "collection": collection,
+		"query": query, "update": update,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil // no document matched
+	}
+	if m, ok := data.(map[string]any); ok {
+		return m, nil
+	}
+	return nil, &Error{Msg: fmt.Sprintf("find_and_modify: unexpected response %T", data)}
+}
+
 // Delete deletes documents matching a query.
 func (c *Client) Delete(collection string, query map[string]any) (map[string]any, error) {
 	data, err := c.checked(map[string]any{
