@@ -561,6 +561,16 @@ impl WalBackend {
         }
     }
 
+    /// Seal the live WAL segment (PITR rotation), turning the current
+    /// tail into a numbered sealed segment. No-op in memory mode.
+    pub fn seal(&self) -> Result<()> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::File(w) => w.seal(),
+            Self::Memory => Ok(()),
+        }
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn recover(
         &self,

@@ -402,6 +402,10 @@ pub struct OxiDb {
     lazy_sync: AtomicBool,
     #[cfg(not(target_arch = "wasm32"))]
     sync_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
+    /// Shutdown channel for the PITR archiver thread (`None` until it is
+    /// spawned, which only happens when `OXIDB_PITR` is enabled).
+    #[cfg(not(target_arch = "wasm32"))]
+    archiver_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
     cache_capacity: AtomicUsize,
     in_memory: bool,
     #[cfg(not(target_arch = "wasm32"))]
@@ -469,6 +473,7 @@ impl OxiDb {
             scheduler_shutdown: Mutex::new(None),
             lazy_sync: AtomicBool::new(false),
             sync_shutdown: Mutex::new(None),
+            archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: true,
             ttl_shutdown: Mutex::new(None),
@@ -623,6 +628,7 @@ impl OxiDb {
             scheduler_shutdown: Mutex::new(None),
             lazy_sync: AtomicBool::new(false),
             sync_shutdown: Mutex::new(None),
+            archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: false,
             ttl_shutdown: Mutex::new(None),
@@ -741,12 +747,35 @@ impl OxiDb {
         let _ = self.scheduler_shutdown.lock().take();
         let _ = self.sync_shutdown.lock().take();
         let _ = self.alert_shutdown.lock().take();
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = self.archiver_shutdown.lock().take();
         // Final checkpoint: persist + truncate WAL. Safe at shutdown
         // because no writers are racing the persist anymore. During
         // normal operation we only persist (sync_writes); the WAL
         // truncate is intentionally deferred to here.
         #[cfg(not(target_arch = "wasm32"))]
         {
+            // PITR: before final_checkpoint truncates the live WAL, seal
+            // each collection's tail into a sealed segment and run one
+            // synchronous archive pass — otherwise the un-sealed tail
+            // would never reach the archive. Sealed segments survive the
+            // truncate, so even if this races the archiver thread the
+            // next startup's reconcile still picks them up.
+            if let Some(archive_dir) = self.pitr_archive_dir() {
+                {
+                    let cols = self.collections.read();
+                    for col_arc in cols.values() {
+                        let _ = col_arc.seal_wal();
+                    }
+                }
+                if let Err(e) = crate::archive::archive_pass(
+                    &self.data_dir,
+                    &archive_dir,
+                    self.encryption.as_ref(),
+                ) {
+                    eprintln!("[archiver] shutdown pass failed: {e}");
+                }
+            }
             let cols = self.collections.read();
             for col_arc in cols.values() {
                 let _ = col_arc.final_checkpoint();
@@ -832,6 +861,73 @@ impl OxiDb {
             .expect("failed to spawn sync thread");
 
         *self.sync_shutdown.lock() = Some(tx);
+
+        // When PITR is enabled, run the archiver alongside the periodic
+        // snapshot — it copies sealed WAL segments into the archive on
+        // its own cadence.
+        if self.archive_sequencer.is_some() {
+            self.spawn_archiver();
+        }
+    }
+
+    /// The PITR archive directory, when PITR is enabled — `OXIDB_ARCHIVE_DIR`
+    /// if set, else `<data_dir>/_archive`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pitr_archive_dir(&self) -> Option<PathBuf> {
+        self.archive_sequencer
+            .as_ref()
+            .map(|_| crate::archive::archive_dir_for(&self.data_dir))
+    }
+
+    /// Spawn the PITR archiver thread: every `OXIDB_ARCHIVE_INTERVAL`
+    /// seconds (default 10) it copies any sealed WAL segments into the
+    /// archive directory, crash-safely. Best-effort — a failed pass is
+    /// logged and retried next tick; it never blocks or fails a
+    /// foreground write, and reads only immutable sealed segments.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_archiver(self: &Arc<Self>) {
+        let archive_dir = match self.pitr_archive_dir() {
+            Some(d) => d,
+            None => return,
+        };
+        let interval_secs = std::env::var("OXIDB_ARCHIVE_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(10);
+        let interval = std::time::Duration::from_secs(interval_secs);
+
+        let (tx, rx) = mpsc::sync_channel::<()>(0);
+        let db = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("oxidb-archiver".into())
+            .spawn(move || {
+                loop {
+                    match rx.recv_timeout(interval) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Err(e) = crate::archive::archive_pass(
+                                &db.data_dir,
+                                &archive_dir,
+                                db.encryption.as_ref(),
+                            ) {
+                                eprintln!("[archiver] pass failed: {e}");
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                // Final pass on shutdown so the last sealed segments land.
+                if let Err(e) = crate::archive::archive_pass(
+                    &db.data_dir,
+                    &archive_dir,
+                    db.encryption.as_ref(),
+                ) {
+                    eprintln!("[archiver] final pass failed: {e}");
+                }
+            })
+            .expect("failed to spawn archiver thread");
+
+        *self.archiver_shutdown.lock() = Some(tx);
     }
 
     /// Returns whether lazy sync mode is enabled.

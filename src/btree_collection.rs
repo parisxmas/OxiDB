@@ -2249,6 +2249,15 @@ impl BTreeCollection {
         Ok(())
     }
 
+    /// Seal this collection's live WAL into a numbered sealed segment.
+    /// No-op for in-memory collections. The engine uses this at shutdown
+    /// (PITR mode) so the un-sealed tail becomes a sealed segment the
+    /// archiver can pick up, instead of being lost to the WAL truncate
+    /// in `final_checkpoint`.
+    pub fn seal_wal(&self) -> Result<()> {
+        self.wal.seal()
+    }
+
     pub fn prepare_tx_insert(
         &self,
         mut data: Value,

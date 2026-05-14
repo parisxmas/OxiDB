@@ -1,6 +1,8 @@
 pub mod locks;
 
 #[cfg(not(target_arch = "wasm32"))]
+pub mod archive;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod blob;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod btree;
