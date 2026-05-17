@@ -90,8 +90,13 @@ impl CommandExecutor for EmbeddedExecutor {
                     _ => return err_val("missing 'doc'"),
                 };
                 if let Some(tx_id) = self.active_tx {
+                    // tx_insert now returns the doc id (engine API
+                    // changed from Result<()> to Result<u64> when
+                    // the buffered-id surface was added); mirror it
+                    // back to the caller so CLI output matches what
+                    // the server-side handler returns.
                     match self.db.tx_insert(tx_id, col, doc) {
-                        Ok(()) => ok_val(json!("buffered")),
+                        Ok(id) => ok_val(json!({"id": id})),
                         Err(e) => err_val(&e.to_string()),
                     }
                 } else {

@@ -1887,6 +1887,10 @@ impl OxiDb {
     /// by per-tenant FTS quota accounting; the caller maps `bucket` to
     /// a tenant id (e.g. DMS uses `t_<tid>`). Locks the index for read,
     /// so it competes with search but never with writes.
+    ///
+    /// Native-only — the WASM build of OxiDb compiles without an
+    /// `fts_index` field, so this method doesn't exist there.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn bucket_fts_size(&self, bucket: &str) -> u64 {
         self.fts_index.read().bucket_text_size(bucket)
     }

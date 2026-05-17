@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compile and package a v0.25.3 release for all 5 platforms.
+# Cross-compile and package a release for all 5 platforms.
 #
 # Output: releases/v$VERSION/
 #   <binary>-v$VERSION-<friendly-target>.{tar.gz,zip}
@@ -9,9 +9,9 @@
 
 set -euo pipefail
 
-VERSION="${VERSION:-0.25.3}"
+VERSION="${VERSION:-0.28.0}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.."; pwd)"
-TARGET_DIR="${ROOT}/target-local"
+TARGET_DIR="${ROOT}/target"
 OUT_DIR="${ROOT}/releases/v${VERSION}"
 mkdir -p "$OUT_DIR"
 
