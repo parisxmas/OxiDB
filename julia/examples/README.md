@@ -2,9 +2,9 @@
 
 Two sets of self-contained scripts:
 
-- **`embedded/`** — the [`OxiDbEmbedded`](../OxiDbEmbedded) package (v0.5.0):
+- **`embedded/`** — the [`OxiDbEmbedded`](../OxiDbEmbedded) package (v0.6.0):
   the engine runs **in your process**, no server.
-- **`*.jl` (numbered)** — the [`OxiDb`](../OxiDb) TCP client (v0.6.0) against a
+- **`*.jl` (numbered)** — the [`OxiDb`](../OxiDb) TCP client (v0.7.0) against a
   local `oxidb-server`.
 
 New to OxiDB? Start with `embedded/` — there's nothing to install or run first.
@@ -47,7 +47,7 @@ In-process, no server. The full helper API is exported directly.
 | # | File | What it shows |
 |---|---|---|
 | 01 | `embedded/01_hello.jl`             | Smallest possible program — `open_db`, insert, find |
-| 02 | `embedded/02_persistence.jl`       | Close + reopen the same path; data persists, like SQLite |
+| 02 | `embedded/02_persistence.jl`       | Close + reopen the same path; the data persists |
 | 03 | `embedded/03_transactions.jl`      | `transaction(db) do … end` — auto-commit, auto-rollback on throw |
 | 04 | `embedded/04_indexes.jl`           | `create_index` / `create_unique_index`, indexed lookup |
 | 05 | `embedded/05_aggregation.jl`       | `$match` → `$group` → `$sort` pipeline |
@@ -69,7 +69,6 @@ Need a running `oxidb-server`.
 | 07 | `07_vector_search.jl`          | `create_vector_index` + cosine `vector_search` |
 | 08 | `08_oxiscript_procedure.jl`    | Server-side OxiScript proc, one-round-trip workflow |
 | 09 | `09_ttl_sessions.jl`           | TTL index that auto-expires session rows |
-| 10 | `10_sql_dashboard.jl`          | Same data, queried with `SELECT … GROUP BY` |
 
 ## A note on the two client APIs
 
@@ -77,10 +76,10 @@ Need a running `oxidb-server`.
 named function (see [its README](../OxiDbEmbedded/README.md)).
 
 The TCP `OxiDb` client is intentionally **minimal**: `connect`, `exec`, and a
-dozen CRUD/query helpers (`insert`, `find`, `update`, `delete`, `count_docs`,
-`aggregate`, `sql`, …). Anything without a dedicated helper — index creation,
-transactions, TTL, vector/text indexes, OxiScript procedures — is reached
-through the generic escape hatch:
+dozen document CRUD/query helpers (`insert`, `find`, `update`, `delete`,
+`count_docs`, `aggregate`). Anything without a dedicated helper — index
+creation, transactions, TTL, vector/text indexes, OxiScript procedures — is
+reached through the generic escape hatch:
 
 ```julia
 exec(db, "create_ttl_index"; collection = "sessions",

@@ -1,6 +1,6 @@
 #!/usr/bin/env julia
-# 02_persistence.jl — the embedded database is a real on-disk store, like
-# SQLite. Close it, reopen the same path, and the data is still there.
+# 02_persistence.jl — the embedded database is a real on-disk store.
+# Close it, reopen the same path, and the data is still there.
 
 using OxiDbEmbedded
 
