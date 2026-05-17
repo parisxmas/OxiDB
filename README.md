@@ -8,6 +8,13 @@
 
 > ⚠️ **WARNING — not production-ready.** OxiDB is under active development. The on-disk data format, the wire/server protocol, the client SDK surface, and the JSON query language are all subject to **breaking changes between releases** with no migration path or backward-compatibility guarantee. Do not run it against data you cannot afford to lose or rebuild. Pin a specific version, expect to dump-and-reload on upgrade, and treat any production-like use as experimental until a `1.0` release explicitly commits to stability.
 
+> 📅 **Roadmap & adoption**
+>
+> - **CERN / enterprise / large-scale research adoption** — honest gap analysis (today: no; what would be needed: see Layers 1-5): [`docs/cern-compatibility.md`](docs/cern-compatibility.md)
+> - **1.0 stability scope** — what 1.0 will cover and what stays experimental: [ADR-0003](docs/decisions/0003-1.0-stability-scope.md)
+> - **Release policy** — LTS, deprecation, JSON-DSL stability rules: [ADR-0004](docs/decisions/0004-phase-0-answers.md)
+> - **All architectural decisions** — [`docs/decisions/`](docs/decisions/)
+
 ## Installation
 
 ### Option 1: Download a pre-built binary (easiest)
