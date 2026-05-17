@@ -50,7 +50,18 @@ pub fn read_value<R: BufRead>(reader: &mut R) -> io::Result<RespValue> {
     }
 
     let prefix = line.as_bytes()[0];
-    let rest = &line[1..];
+    // Byte 1 may not be a char boundary if the first byte is the start
+    // of a multi-byte UTF-8 sequence (e.g. 0xCB 0x87 = 'ˇ'). Naive
+    // `&line[1..]` would panic — surfaced by the wire-protocol fuzz
+    // target `wire_resp` (PR #45). For *valid* protocol-prefixed lines
+    // (+, -, :, $, *) byte 1 IS a char boundary, so this guard only
+    // affects the inline-command fallback path, which uses `line`
+    // directly anyway.
+    let rest = if line.is_char_boundary(1) {
+        &line[1..]
+    } else {
+        ""
+    };
 
     match prefix {
         b'+' => Ok(RespValue::SimpleString(rest.to_string())),
@@ -232,5 +243,23 @@ mod tests {
         let mut buf = Vec::new();
         write_value(&mut buf, &array(vec![bulk_string("a"), integer(42)])).unwrap();
         assert_eq!(buf, b"*2\r\n$1\r\na\r\n:42\r\n");
+    }
+
+    /// Regression for the wire_resp fuzz finding (post-PR #45). Two
+    /// bytes (`0xCB 0x87` = UTF-8 caron 'ˇ') followed by no CRLF used
+    /// to panic at `&line[1..]` with "start byte index 1 is not a
+    /// char boundary". MUST now return an `Err` cleanly — any panic
+    /// here is a DoS vector on the OxiMem RESP listener.
+    #[test]
+    fn fuzz_regression_multibyte_utf8_prefix_does_not_panic() {
+        // No CRLF — read_line consumes to EOF, returning a 2-byte line.
+        let mut reader = Cursor::new(&[0xCBu8, 0x87u8][..]);
+        // Must NOT panic. Either Ok with the inline-command fallback,
+        // or Err — both are acceptable; what matters is no panic.
+        let _ = read_value(&mut reader);
+
+        // With a CRLF terminator the same input must also be safe.
+        let mut reader = Cursor::new(&[0xCBu8, 0x87u8, b'\r', b'\n'][..]);
+        let _ = read_value(&mut reader);
     }
 }
