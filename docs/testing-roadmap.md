@@ -15,7 +15,7 @@ landed alongside this doc.
 | # | Category | First-slice status | What "complete" looks like |
 |---|---|---|---|
 | 1 | **ACID & isolation** | ✅ partial — first concurrent-transfers test in [`tests/cern_acid_transfers.rs`](../tests/cern_acid_transfers.rs) | Reference anomaly suite (A5A/A5B, write skew, lost update, dirty read, phantom) |
-| 2 | **Crash recovery** | ✅ partial — soft-crash WAL replay test in [`tests/cern_crash_recovery.rs`](../tests/cern_crash_recovery.rs) | Byte-offset SIGKILL matrix via a victim subprocess; ENOSPC/EIO/cosmic-bit-flip injection |
+| 2 | **Crash recovery** | ✅ partial — soft-crash test in [`tests/cern_crash_recovery.rs`](../tests/cern_crash_recovery.rs) + hard-SIGKILL subprocess test in [`tests/cern_sigkill_drill.rs`](../tests/cern_sigkill_drill.rs) | Byte-offset SIGKILL matrix (currently only one offset — "after N acks"); ENOSPC/EIO injection; cosmic-bit-flip simulation |
 | 3 | **Performance & long-tail** | ✅ partial — bounded soak in [`tests/cern_soak.rs`](../tests/cern_soak.rs) | Multi-day soak, RSS / fd / WAL-size leak detection, HEP-shaped workload (bursty ingest + long-range scans + high-fanout reads) |
 | 4 | **HA / Raft fault injection** | ❌ not started | **Jepsen-style suite** (split-brain, partition, clock skew, slow disk) — biggest single gap |
 | 5 | **Security** | ❌ not started | Wire-protocol fuzzing (`cargo-fuzz`), external pentest (Cure53 / Trail of Bits), authn/authz bypass attempts |
@@ -61,10 +61,35 @@ Two soft-crash tests using `std::mem::forget(db)` to bypass `Drop`
 Catches: WAL fsync ordering bugs, transaction-id replay-set bugs in
 `_tx_commit_log`.
 
-Does NOT yet cover the real-world hard cases: SIGKILL at every byte
-offset of a write, fsync-returns-EIO mid-batch, power-loss
-simulation. Those need a subprocess + fault-injection harness — a
-follow-up.
+### `cern_sigkill_drill.rs`
+
+The real thing: a victim subprocess (self-spawned via
+`env::current_exe()` + a role env var, no extra `[[bin]]` target)
+opens OxiDb and inserts forever, ack'ing each `insert()` over its
+stdout pipe. The parent reads N acks, then sends **SIGKILL** via
+`Child::kill()`, then reopens the same data dir and asserts:
+
+- **Every ACKed record is recovered.** The victim only writes the
+  ack AFTER `insert()` returns, by which time `insert`'s WAL fsync
+  has completed. A missing record here would be a "lost
+  acknowledged write" — the textbook database durability bug.
+- **No phantom data.** Recovered ids form a contiguous prefix of
+  the insert sequence — replay never fabricates documents.
+
+Unlike `mem::forget`, this exercises the OS-process boundary:
+SIGKILL is uncatchable, lands anywhere in the victim's execution
+including mid-fsync, mid-syscall. That's the real crash shape.
+
+Empirically the parent observes 0–1 "extra durable" records beyond
+the last ack on each run — this is correct (the child may have
+completed the next insert's fsync between the ack write and the
+SIGKILL landing) and demonstrates the test is genuinely racing the
+kernel.
+
+Does NOT yet cover: byte-offset SIGKILL matrix (kill at offsets 1,
+2, ..., N of a single fsync), fsync-returns-EIO mid-batch,
+power-loss simulation. Those need an offset-fault-injection
+harness — a follow-up.
 
 ### `cern_soak.rs`
 
@@ -90,6 +115,7 @@ cargo test -- --ignored
 # Or one at a time:
 cargo test --test cern_acid_transfers -- --ignored
 cargo test --test cern_crash_recovery -- --ignored
+cargo test --test cern_sigkill_drill  -- --ignored
 cargo test --test cern_soak           -- --ignored
 
 # Longer soak (default 30s):
