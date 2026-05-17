@@ -1,6 +1,6 @@
 [package]
 name = "oxidb-tail"
-version = "0.25.0"
+version = "0.28.0"
 edition = "2024"
 description = "Real-time colored log viewer for OxiDB GELF logs"
 license = "AGPL-3.0-only"
