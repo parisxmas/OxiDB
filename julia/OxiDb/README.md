@@ -187,6 +187,23 @@ results = aggregate(db, "orders", [
 
 **Accumulators:** `$sum`, `$avg`, `$min`, `$max`, `$count`, `$first`, `$last`, `$push`
 
+### Tables.jl / DataFrames interop
+
+`find` and `aggregate` return an `OxiDbResult` — walks like a `Vector` of row
+`Dict`s *and* satisfies the [Tables.jl](https://github.com/JuliaData/Tables.jl)
+row-access interface. So it flows straight into DataFrames, CSV, MLJ, Plots —
+anything that consumes a Tables.jl table. Heterogeneous-schema documents are
+handled automatically: missing fields become `missing` in the column.
+
+```julia
+using OxiDb, DataFrames
+
+rows = find(db, "users"; query = Dict("age" => Dict("\$gte" => 18)))
+length(rows)            # walks like a Vector{Dict}…
+rows[1]["name"]
+DataFrame(rows)         # …and like a Tables.jl table — no manual conversion
+```
+
 ### Transactions
 
 ```julia
