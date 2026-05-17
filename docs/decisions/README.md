@@ -31,3 +31,4 @@ Don't rewrite an old ADR — write a new one that references it
 | # | Title | Status |
 |---|---|---|
 | [0001](0001-julia-no-dbinterface.md) | Julia clients do not implement `DBInterface.jl` | Accepted |
+| [0002](0002-mongodb-bench-in-network.md) | MongoDB comparison benchmark runs in-network, not from the host | Accepted |
