@@ -6,6 +6,15 @@ const PROTOCOL_VERSION_30: i32 = 196608; // 3 << 16
 /// SSL request code (special startup message)
 const SSL_REQUEST_CODE: i32 = 80877103;
 
+/// Hard upper bound on a single pg_wire frontend message (16 MiB),
+/// matching the main JSON wire-protocol limit. Larger length fields
+/// are rejected before any allocation — without this guard, the
+/// `payload_len = (len - 4) as usize` cast lets a hostile i32
+/// (e.g. -1, which is 0xFFFFFFFF) become ~18 EiB on the unsigned
+/// side and trigger an alloc-bomb / capacity-overflow abort.
+/// Surfaced by the `wire_pg` fuzz target (PR #45).
+const MAX_PG_MESSAGE_LEN: i32 = 16 * 1024 * 1024;
+
 /// Parsed startup message from the client.
 pub struct StartupMessage {
     pub params: Vec<(String, String)>,
@@ -51,10 +60,10 @@ pub enum FrontendMessage {
 /// Startup messages have no tag byte — just `[i32 length][i32 version][params]`.
 pub fn read_startup<R: Read>(r: &mut R) -> io::Result<FrontendMessage> {
     let len = read_i32(r)?;
-    if len < 8 {
+    if !(8..=MAX_PG_MESSAGE_LEN).contains(&len) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "startup message too short",
+            format!("startup message length out of range: {len}"),
         ));
     }
     let code = read_i32(r)?;
@@ -89,6 +98,12 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<FrontendMessage> {
     let tag = tag[0];
 
     let len = read_i32(r)?;
+    if !(4..=MAX_PG_MESSAGE_LEN).contains(&len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("pg_wire message length out of range: {len} (tag={tag:#x})"),
+        ));
+    }
     let payload_len = (len - 4) as usize;
 
     match tag {
@@ -741,5 +756,79 @@ mod tests {
         let (s2, rest2) = read_cstr_from_buf(rest);
         assert_eq!(s2, "world");
         assert!(rest2.is_empty());
+    }
+
+    /// Regression for the wire_pg fuzz finding (post-PR #45). 6 bytes
+    /// (tag=0xFF, len=0xFF_FF_0A_0A interpreted as i32 = a hostile
+    /// value) used to trigger `vec![0u8; (len-4) as usize]` with a
+    /// negative-i32-cast-to-usize = ~18 EiB, causing a capacity-
+    /// overflow abort that takes down the whole pg_wire listener.
+    /// MUST now return an `Err` cleanly.
+    #[test]
+    fn fuzz_regression_negative_message_length_does_not_overflow() {
+        use std::io::Cursor;
+
+        // read_message: tag byte + i32 len. With len = -1
+        // (0xFFFFFFFF), the old code did (len - 4) as usize = giant.
+        let mut c = Cursor::new(&[0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8][..]);
+        let err = match read_message(&mut c) {
+            Ok(_) => panic!("expected Err for malformed message length"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Same vector with the original fuzz-found bytes.
+        let mut c = Cursor::new(
+            &[0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8, 0x0Au8, 0x0Au8][..],
+        );
+        let err = match read_message(&mut c) {
+            Ok(_) => panic!("expected Err for malformed message length"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Edge: exactly at the cap is accepted, one past it is not.
+        let at_max = MAX_PG_MESSAGE_LEN.to_be_bytes();
+        let one_past = (MAX_PG_MESSAGE_LEN + 1).to_be_bytes();
+        let mut tag_plus_cap = vec![b'Q'];
+        tag_plus_cap.extend_from_slice(&at_max);
+        // No payload follows — read_message will accept the length but
+        // then fail on read_exact for the payload, which is correct
+        // and NOT a panic.
+        let mut c = Cursor::new(&tag_plus_cap);
+        let _ = read_message(&mut c); // either ok or Err on EOF, both fine
+
+        let mut tag_plus_overflow = vec![b'Q'];
+        tag_plus_overflow.extend_from_slice(&one_past);
+        let mut c = Cursor::new(&tag_plus_overflow);
+        let err = match read_message(&mut c) {
+            Ok(_) => panic!("expected Err for malformed message length"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn fuzz_regression_startup_length_bounded() {
+        use std::io::Cursor;
+
+        // Startup with negative length must error cleanly.
+        let neg = (-1i32).to_be_bytes();
+        let mut c = Cursor::new(&neg[..]);
+        let err = match read_startup(&mut c) {
+            Ok(_) => panic!("expected Err for malformed startup length"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Length one past the cap.
+        let mut bytes = (MAX_PG_MESSAGE_LEN + 1).to_be_bytes().to_vec();
+        bytes.extend_from_slice(&PROTOCOL_VERSION_30.to_be_bytes());
+        let mut c = Cursor::new(&bytes);
+        let err = match read_startup(&mut c) {
+            Ok(_) => panic!("expected Err for malformed startup length"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
