@@ -87,6 +87,14 @@ pub enum Error {
 
     #[error("invalid database name: {0}")]
     InvalidDatabaseName(String),
+
+    /// On-disk format version is newer than this engine recognises.
+    /// Triggered by the forward-compatibility tripwires landing in
+    /// the format-spec compliance work (docs/format/*.md). Better to
+    /// refuse loudly than to attempt a best-effort read of fields
+    /// whose semantics may have changed.
+    #[error("incompatible on-disk format: {0}")]
+    IncompatibleFormat(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
