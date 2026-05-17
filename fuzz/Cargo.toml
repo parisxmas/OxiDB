@@ -29,6 +29,11 @@ oxidb-server = { path = "../oxidb-server" }
 # bytes. Far more efficient at exploring the message space.
 arbitrary = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Reference MsgPack decoder for the msgpack_roundtrip target — the
+# encoder under test is OxiDB's own `protocol::value_to_msgpack`;
+# decoding via the canonical `rmp_serde` makes any divergence a
+# real bug rather than a same-author blind spot.
+rmp-serde = "1"
 
 # Prevent this crate from being picked up by the root workspace.
 [workspace]
@@ -65,6 +70,24 @@ bench = false
 [[bin]]
 name = "oxiwire_roundtrip"
 path = "fuzz_targets/oxiwire_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# Structure-aware: RESP roundtrip via Arbitrary RespValue tree.
+[[bin]]
+name = "resp_roundtrip"
+path = "fuzz_targets/resp_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# Structure-aware: MsgPack roundtrip via Arbitrary Value tree.
+# Encoder under test: protocol::value_to_msgpack
+# Decoder (reference): rmp_serde::from_slice
+[[bin]]
+name = "msgpack_roundtrip"
+path = "fuzz_targets/msgpack_roundtrip.rs"
 test = false
 doc = false
 bench = false
