@@ -85,10 +85,11 @@ Rust panic message and a stack trace. Triage:
   results, treat divergence as a finding. Multi-week effort.
 - **Coverage reporting.** `cargo +nightly fuzz coverage <target>`
   exists but needs an `llvm-cov` setup; deliberately deferred.
-- **Continuous OSS-Fuzz integration.** OSS-Fuzz runs cargo-fuzz
-  targets 24/7 on Google infrastructure for free; needs a
-  separate PR adding the OSS-Fuzz integration files
-  (`projects/oxidb/` upstream).
+- **Continuous OSS-Fuzz integration.** Infrastructure files
+  committed in [`infra/oss-fuzz/`](../infra/oss-fuzz/) — see that
+  directory's README for the submission playbook. The upstream PR
+  to `google/oss-fuzz` (adding `projects/oxidb/`) is a separate
+  manual step.
 
 ## CI policy
 

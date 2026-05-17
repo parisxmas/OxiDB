@@ -91,7 +91,7 @@ roundtrip). See [`fuzz/`](../../fuzz/).
 | Structure-aware roundtrip for MsgPack | **xs** | Same pattern; uses `rmp_serde`. |
 | Differential fuzz vs real Redis | **m** | Bring up `redis-server` subprocess, feed same input to both, compare. |
 | Differential fuzz vs real Postgres | **m** | Same shape; libpq subprocess. |
-| OSS-Fuzz continuous integration | **m** | Submit `projects/oxidb/` to OSS-Fuzz upstream + Dockerfile + build wrappers. Google runs it for free 24/7. |
+| OSS-Fuzz continuous integration | ⏳ **infra landed** ([`infra/oss-fuzz/`](../../infra/oss-fuzz/)) — upstream PR pending. The Dockerfile / build.sh / project.yaml are committed; submitting to `google/oss-fuzz` is a manual step documented in that directory's README. |
 | External pentest (Cure53 / Trail of Bits) | **xxl** wall-clock, **0** internal eng | Contracted engagement. Cost + scheduling, not engineering effort. |
 | Authn/authz bypass test corpus | **m** | SCRAM-SHA-256 fuzz, JWT signature tampering, RBAC privilege-escalation attempts. |
 | Coverage reporting (`cargo +nightly fuzz coverage`) | **xs** | One command + a CI step. |
