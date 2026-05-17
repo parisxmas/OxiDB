@@ -113,6 +113,30 @@ The current format has no header. Phase 1b will introduce one:
 - Changing the "set, sorted on disk" invariant — code already
   depends on it (tests, reproducibility).
 
+## Isolation level (observed)
+
+OxiDB's OCC validates the **write set** at commit time; reads
+inside a tx see the latest committed data rather than a
+`begin_transaction`-time snapshot. Empirically (pinned in
+[`tests/cern_acid_isolation.rs`](../../tests/cern_acid_isolation.rs)):
+
+| Anomaly | Occurs? | Why |
+|---|---|---|
+| Dirty read | ❌ | Writes are buffered until commit; uncommitted data never reaches the visible state |
+| Lost update | ❌ | Write-set conflict detection — second commit gets `Error::TransactionConflict` |
+| Phantom read | ✅ | Reads see committed data, not a snapshot — a concurrent committed insert appears in a later predicate read inside the same tx |
+| Write skew (A5B) | ✅ | Two txs writing to *different* docs with a cross-row constraint both commit — OCC sees no write-write conflict |
+
+In ANSI SQL terms this is **read committed** with OCC-mediated lost-
+update prevention — between read-committed and snapshot isolation.
+Equivalent to PostgreSQL's `READ COMMITTED` plus serializable-update
+protection.
+
+If/when serializable snapshot isolation (SSI) lands, the phantom-
+read and write-skew assertions in `cern_acid_isolation.rs` flip and
+those flips are the intentional documentation that the engine has
+been promoted.
+
 ## Code refs
 
 - `src/tx_log.rs:75` — `pub fn open(...)`
