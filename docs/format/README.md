@@ -24,11 +24,12 @@ matching format-version increment) changes with it.
 | `.btree` (B-tree storage) | **Stable** | [btree.md](btree.md) |
 | `.wal` (write-ahead log) | **Stable** | [wal.md](wal.md) |
 | `_blobs/<bucket>/<id>.{data,meta}` (blob storage) | **Stable** | [blob-object.md](blob-object.md) |
-| `.fidx` (field index) | Stable | _spec pending — see `src/index_persist.rs`_ |
-| `.cidx` (composite index) | Stable | _spec pending — see `src/index_persist.rs`_ |
-| `_tx_commit_log` (transaction commit log) | Stable | _spec pending — see `src/tx_log.rs`_ |
-| `_fts/index.json` (document FTS) | Stable | _spec pending — see `src/fts.rs`_ |
-| `.vidx` (vector index) | Experimental | _intentionally unspecced — see ADR-0003_ |
+| `.fidx` (field index cache) | **Stable** | [index-cache.md](index-cache.md) |
+| `.cidx` (composite index cache) | **Stable** | [index-cache.md](index-cache.md) |
+| `_tx_commit_log` (transaction commit log) | **Stable** | [tx-commit-log.md](tx-commit-log.md) |
+| _Document FTS_ (`text_search`) | **Stable** | _no on-disk file — index is rebuilt from `.btree` on startup_ |
+| `.vidx` (vector index cache) | Experimental | _intentionally unspecced — see ADR-0003_ |
+| `_fts/index.json` (blob FTS) | Experimental | _intentionally unspecced — the blob `search()` is not in the 1.0 stable surface (per ADR-0003)_ |
 | `_archive/segments/*.seg` + `manifest.json` (PITR) | Experimental | _intentionally unspecced — see ADR-0003_ |
 
 (See [ADR-0003 §"1.0 covers" / §"NOT covered by 1.0"](../decisions/0003-1.0-stability-scope.md#decision)
