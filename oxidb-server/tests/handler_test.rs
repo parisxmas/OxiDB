@@ -1063,3 +1063,88 @@ fn test_linked_collection_unreachable_remote_errors_cleanly() {
         err
     );
 }
+
+// ===========================================================================
+// Linked collections — connection pool (FDW v2a)
+// ===========================================================================
+
+/// Repeated proxy calls reuse a pooled connection: after N calls the
+/// pool holds 1 idle conn for that remote (not N). The first call
+/// dials; the rest return-then-take the same conn.
+#[test]
+fn test_linked_collection_pool_reuses_connection() {
+    use oxidb_server::remote_client;
+
+    let remote = TestServer::start();
+    let mut bclient = Client::connect(remote.addr);
+    bclient.send(&json!({"cmd": "insert", "collection": "users", "doc": {"x": 1}}));
+
+    let local = TestServer::start();
+    let mut aclient = Client::connect(local.addr);
+    let url = format!("oxidb://127.0.0.1:{}/users", remote.addr.port());
+    aclient.send(&json!({
+        "cmd": "link_collection",
+        "collection": "remote_users",
+        "url": url,
+    }));
+
+    // Fire 5 finds against the link.
+    for _ in 0..5 {
+        let resp = aclient.send(&json!({"cmd": "find", "collection": "remote_users", "query": {}}));
+        assert_ok(&resp);
+    }
+
+    // Pool should hold exactly 1 idle conn for the remote — every
+    // call returned it before the next took it.
+    let p = remote_client::pool();
+    let port = remote.addr.port();
+    let idle = p.idle_count("127.0.0.1", port);
+    assert_eq!(idle, 1, "pool idle_count after 5 sequential calls = {}, want 1", idle);
+}
+
+/// When a pooled connection has been killed by the remote (e.g.
+/// process restart or LB tear-down), the next proxy call must NOT
+/// surface that as an error — it has to drop the dead conn and
+/// retry with a fresh dial transparently.
+#[test]
+fn test_linked_collection_pool_retries_when_pooled_conn_is_dead() {
+    use oxidb_server::remote_client;
+
+    let remote = TestServer::start();
+    let mut bclient = Client::connect(remote.addr);
+    bclient.send(&json!({"cmd": "insert", "collection": "users", "doc": {"x": 1}}));
+
+    let local = TestServer::start();
+    let mut aclient = Client::connect(local.addr);
+    let url = format!("oxidb://127.0.0.1:{}/users", remote.addr.port());
+    aclient.send(&json!({
+        "cmd": "link_collection",
+        "collection": "remote_dead",
+        "url": url,
+    }));
+
+    // Prime the pool with one good conn.
+    assert_ok(&aclient.send(&json!({"cmd": "find", "collection": "remote_dead", "query": {}})));
+    let port = remote.addr.port();
+    assert_eq!(remote_client::pool().idle_count("127.0.0.1", port), 1);
+
+    // Forcibly close the pooled conn by taking it out and dropping it.
+    // (Simulates the remote killing it while we held it idle.)
+    let dead = remote_client::pool().take("127.0.0.1", port).expect("had idle conn");
+    // Half-close so the next write/read on it errors out. shutdown()
+    // is the most realistic stand-in for a server-side close.
+    let _ = dead.shutdown(std::net::Shutdown::Both);
+    remote_client::pool().give_back("127.0.0.1", port, dead);
+    assert_eq!(remote_client::pool().idle_count("127.0.0.1", port), 1);
+
+    // Next call must still succeed — the pool returns the dead conn,
+    // round_trip fails, the code path falls through to a fresh dial.
+    let resp = aclient.send(&json!({"cmd": "find", "collection": "remote_dead", "query": {}}));
+    assert_ok(&resp);
+    let docs = resp["data"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+
+    // After the retry, exactly 1 idle conn (the fresh one) is back
+    // in the pool.
+    assert_eq!(remote_client::pool().idle_count("127.0.0.1", port), 1);
+}
