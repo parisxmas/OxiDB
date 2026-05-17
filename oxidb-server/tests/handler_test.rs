@@ -1148,3 +1148,200 @@ fn test_linked_collection_pool_retries_when_pooled_conn_is_dead() {
     // in the pool.
     assert_eq!(remote_client::pool().idle_count("127.0.0.1", port), 1);
 }
+
+// ===========================================================================
+// SCRAM-SHA-256 (RFC 7677) — server-side refactor end-to-end test
+// ===========================================================================
+
+/// Full RFC 7677 SCRAM-SHA-256 exchange between a stub client (this
+/// test, doing the math by hand) and the server-side ScramState
+/// machine. Exercises:
+///
+///   1. Server returns the user's STORED salt + iter_count in
+///      server-first (was per-call random before the refactor).
+///   2. Client derives proof from PLAINTEXT password using that salt
+///      — the whole point of real SCRAM.
+///   3. Server verifies the proof against the stored_key on the user
+///      record; returns server-final v=<server_signature>.
+///   4. Wrong password produces "authentication failed", not a panic.
+#[test]
+fn test_scram_rfc7677_roundtrip_against_stored_verifier() {
+    use hmac::{Hmac, Mac};
+    use oxidb_server::auth::{Role, UserStore, SCRAM_ITER_COUNT};
+    use oxidb_server::scram::{
+        base64_decode_simple_pub as b64dec, base64_encode_simple_pub as b64enc,
+        hmac_sha256_pub as hmac256, pbkdf2_sha256_pub as pbkdf2, sha256_hash_pub as sha256,
+        ScramState,
+    };
+    type HmacSha256 = Hmac<sha2::Sha256>;
+
+    // Boot a fresh UserStore + create a user — this exercises
+    // create_user_internal which now derives the SCRAM verifier from
+    // the plaintext password at creation time.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = UserStore::open(dir.path()).unwrap();
+    store.create_user("scramuser", "correct-horse-battery", Role::Admin).unwrap();
+
+    // Sanity: the on-record user has the four scram_* fields set.
+    let user = store.get_user("scramuser").expect("user exists");
+    assert!(user.scram_salt.is_some(), "create_user must populate scram_salt");
+    assert!(user.scram_iter_count.is_some());
+    assert!(user.scram_stored_key.is_some());
+    assert!(user.scram_server_key.is_some());
+
+    // --- CLIENT: build client-first-message-bare ---
+    let client_nonce = "fyko+d2lbbFgONRv9qkxdawL"; // RFC 7677 example nonce
+    let client_first_bare = format!("n=scramuser,r={}", client_nonce);
+    let client_first_full = format!("n,,{}", client_first_bare);
+
+    // --- SERVER: process_client_first ---
+    let (server_first, mut scram_state) =
+        ScramState::process_client_first(&client_first_full, &store).expect("server-first");
+
+    // Parse server-first to harvest salt + iter_count + combined nonce.
+    let mut combined_nonce = String::new();
+    let mut server_salt_b64 = String::new();
+    let mut iter_count: u32 = 0;
+    for part in server_first.split(',') {
+        if let Some(r) = part.strip_prefix("r=") { combined_nonce = r.to_string(); }
+        if let Some(s) = part.strip_prefix("s=") { server_salt_b64 = s.to_string(); }
+        if let Some(i) = part.strip_prefix("i=") { iter_count = i.parse().unwrap(); }
+    }
+    assert!(combined_nonce.starts_with(client_nonce),
+        "combined nonce must extend client_nonce: {}", combined_nonce);
+    // Salt + iter_count match what the server stored, not a fresh
+    // per-call random — this is the whole point of the refactor.
+    assert_eq!(iter_count, SCRAM_ITER_COUNT);
+    assert_eq!(server_salt_b64, user.scram_salt.clone().unwrap());
+
+    // --- CLIENT: derive proof from PLAINTEXT password + server salt ---
+    let salt = b64dec(&server_salt_b64).unwrap();
+    let salted = pbkdf2(b"correct-horse-battery", &salt, iter_count);
+    let client_key = hmac256(&salted, b"Client Key");
+    let stored_key_client = sha256(&client_key);
+
+    let channel_binding_b64 = "biws"; // base64 of "n,,"
+    let client_final_no_proof = format!("c={},r={}", channel_binding_b64, combined_nonce);
+    let auth_message = format!("{},{},{}", client_first_bare, server_first, client_final_no_proof);
+    let client_signature = hmac256(&stored_key_client, auth_message.as_bytes());
+    let client_proof: Vec<u8> = client_key.iter().zip(client_signature.iter())
+        .map(|(a, b)| a ^ b).collect();
+    let client_final = format!("{},p={}", client_final_no_proof, b64enc(&client_proof));
+
+    // --- SERVER: process_client_final ---
+    let (server_final, role) = scram_state
+        .process_client_final(&client_final, &store)
+        .expect("server-final (correct password)");
+    assert_eq!(role, Role::Admin);
+
+    // Verify server-final's v=<server_signature> matches what the
+    // client computes — closes the loop.
+    let v_b64 = server_final.strip_prefix("v=").unwrap();
+    let server_sig_from_server = b64dec(v_b64).unwrap();
+    // The client knows server_key from PBKDF2(plaintext, salt, iters)
+    // -> HMAC(salted, "Server Key").
+    let server_key_client = {
+        let mut mac = HmacSha256::new_from_slice(&salted).unwrap();
+        mac.update(b"Server Key");
+        mac.finalize().into_bytes().to_vec()
+    };
+    let server_sig_from_client = hmac256(&server_key_client, auth_message.as_bytes());
+    assert_eq!(server_sig_from_server, server_sig_from_client,
+        "server-final signature must verify against client-derived server_key");
+}
+
+/// Wrong-password attempt produces "authentication failed", not a
+/// successful exchange or a panic.
+#[test]
+fn test_scram_rfc7677_wrong_password_is_rejected() {
+    use oxidb_server::auth::{Role, UserStore};
+    use oxidb_server::scram::{
+        base64_decode_simple_pub as b64dec, base64_encode_simple_pub as b64enc,
+        hmac_sha256_pub as hmac256, pbkdf2_sha256_pub as pbkdf2, sha256_hash_pub as sha256,
+        ScramState,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = UserStore::open(dir.path()).unwrap();
+    store.create_user("baduser", "right-password", Role::Read).unwrap();
+
+    // Client-first
+    let client_nonce = "abcdefghijklmnop";
+    let client_first_bare = format!("n=baduser,r={}", client_nonce);
+    let client_first_full = format!("n,,{}", client_first_bare);
+    let (server_first, scram_state) =
+        ScramState::process_client_first(&client_first_full, &store).unwrap();
+
+    // Parse out salt + iter_count + nonce
+    let mut combined_nonce = String::new();
+    let mut salt_b64 = String::new();
+    let mut iter_count: u32 = 0;
+    for part in server_first.split(',') {
+        if let Some(r) = part.strip_prefix("r=") { combined_nonce = r.to_string(); }
+        if let Some(s) = part.strip_prefix("s=") { salt_b64 = s.to_string(); }
+        if let Some(i) = part.strip_prefix("i=") { iter_count = i.parse().unwrap(); }
+    }
+    let salt = b64dec(&salt_b64).unwrap();
+
+    // Client derives proof from WRONG password.
+    let salted = pbkdf2(b"WRONG-password", &salt, iter_count);
+    let client_key = hmac256(&salted, b"Client Key");
+    let stored_key_c = sha256(&client_key);
+    let client_final_no_proof = format!("c=biws,r={}", combined_nonce);
+    let auth_message = format!("{},{},{}", client_first_bare, server_first, client_final_no_proof);
+    let client_signature = hmac256(&stored_key_c, auth_message.as_bytes());
+    let proof: Vec<u8> = client_key.iter().zip(client_signature.iter()).map(|(a,b)| a^b).collect();
+    let client_final = format!("{},p={}", client_final_no_proof, b64enc(&proof));
+
+    let err = scram_state.process_client_final(&client_final, &store).expect_err("must fail");
+    assert!(
+        err.contains("authentication failed"),
+        "wrong-password error must say 'authentication failed': {}",
+        err
+    );
+}
+
+/// A user record without scram_* fields (i.e. created before this
+/// refactor, loaded from a legacy users.json) cannot SCRAM-auth —
+/// the server refuses with an actionable error pointing the operator
+/// at the password update path.
+#[test]
+fn test_scram_rfc7677_legacy_user_without_verifier_is_refused() {
+    use oxidb_server::auth::{Role, UserRecord, UserStore};
+    use oxidb_server::scram::ScramState;
+    use std::collections::HashMap;
+    use std::fs;
+
+    let dir = tempfile::tempdir().unwrap();
+    let auth_dir = dir.path().join("_auth");
+    fs::create_dir_all(&auth_dir).unwrap();
+    // Hand-craft a users.json the way pre-refactor OxiDB would have
+    // written it: password_hash + role only, no scram_* fields.
+    let legacy = vec![UserRecord {
+        username: "legacy".into(),
+        password_hash: "$argon2id$v=19$m=19456,t=2,p=1$abcdefghij$_FAKE_HASH".into(),
+        role: Role::Read,
+        db_roles: HashMap::new(),
+        scram_salt: None,
+        scram_iter_count: None,
+        scram_stored_key: None,
+        scram_server_key: None,
+    }];
+    fs::write(
+        auth_dir.join("users.json"),
+        serde_json::to_string_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+    let store = UserStore::open(dir.path()).unwrap();
+    assert!(store.get_user("legacy").is_some());
+
+    let err = match ScramState::process_client_first("n,,n=legacy,r=xyz", &store) {
+        Ok(_) => panic!("process_client_first must fail for a legacy user"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("no SCRAM verifier") && err.contains("account passwd"),
+        "legacy-user error must mention the verifier + the recovery command: {}",
+        err
+    );
+}

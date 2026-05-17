@@ -5,7 +5,29 @@ use crate::auth::{Role, UserStore};
 
 type HmacSha256 = Hmac<Sha256>;
 
-const ITERATION_COUNT: u32 = 4096;
+// Public re-exports used by crate::auth::derive_scram_verifier to
+// avoid duplicating the SHA-256 / HMAC / PBKDF2 / base64 helpers in
+// two places. The "_pub" suffix keeps the existing private helpers
+// untouched and signals "this is module-internal, used by other
+// modules in the same crate".
+pub fn hmac_sha256_pub(key: &[u8], data: &[u8]) -> Vec<u8> {
+    hmac_sha256(key, data)
+}
+pub fn sha256_hash_pub(data: &[u8]) -> Vec<u8> {
+    sha256_hash(data)
+}
+pub fn pbkdf2_sha256_pub(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
+    pbkdf2_sha256(password, salt, iterations)
+}
+pub fn generate_salt_pub() -> Vec<u8> {
+    generate_salt()
+}
+pub fn base64_encode_simple_pub(data: &[u8]) -> String {
+    base64_encode_simple(data)
+}
+pub fn base64_decode_simple_pub(input: &str) -> Result<Vec<u8>, String> {
+    base64_decode_simple(input)
+}
 
 /// Server-side SCRAM-SHA-256 state machine (simplified RFC 7677).
 ///
@@ -30,6 +52,17 @@ pub struct ScramState {
 
 impl ScramState {
     /// Process client-first message. Returns (server_first_message, state).
+    ///
+    /// RFC 7677 §3: the server's stored credentials are
+    /// (salt, iter_count, stored_key, server_key) — derived ONCE
+    /// from the plaintext password at user-creation / password-update
+    /// time. This function looks them up on the UserRecord and
+    /// echoes salt+iter_count back to the client in server-first.
+    ///
+    /// Users created before the SCRAM-verifier migration have
+    /// `scram_*` fields = None; this function refuses SCRAM auth for
+    /// them with a clear error pointing the operator at
+    /// `account passwd` (which now writes the verifier on save).
     pub fn process_client_first(
         client_msg: &str,
         user_store: &UserStore,
@@ -55,39 +88,54 @@ impl ScramState {
         let username = username.ok_or("missing username in client-first")?;
         let client_nonce = client_nonce.ok_or("missing nonce in client-first")?;
 
-        // Verify user exists
-        let _user = user_store
+        // Verify user exists and has SCRAM credentials. Legacy users
+        // (pre-verifier migration) lack scram_* fields and must
+        // have their password re-set with a SCRAM-aware
+        // `account passwd` to be SCRAM-auth'able.
+        let user = user_store
             .get_user(&username)
             .ok_or_else(|| format!("user '{}' not found", username))?;
+        let salt_b64 = user.scram_salt.as_ref().ok_or_else(|| {
+            format!(
+                "user '{}' has no SCRAM verifier — update its password \
+                via `account passwd` so the verifier is generated",
+                username
+            )
+        })?;
+        let iter_count = user
+            .scram_iter_count
+            .ok_or_else(|| "user has SCRAM salt but no iter_count".to_string())?;
+        let stored_key_b64 = user
+            .scram_stored_key
+            .as_ref()
+            .ok_or_else(|| "user has SCRAM salt but no stored_key".to_string())?;
+        let server_key_b64 = user
+            .scram_server_key
+            .as_ref()
+            .ok_or_else(|| "user has SCRAM salt but no server_key".to_string())?;
 
-        // Generate server nonce and salt
+        let salt = base64_decode_simple(salt_b64).map_err(|e| format!("decode salt: {}", e))?;
+        let stored_key =
+            base64_decode_simple(stored_key_b64).map_err(|e| format!("decode stored_key: {}", e))?;
+        let server_key =
+            base64_decode_simple(server_key_b64).map_err(|e| format!("decode server_key: {}", e))?;
+
+        // Generate server nonce
         let server_nonce = generate_nonce();
         let combined_nonce = format!("{}{}", client_nonce, server_nonce);
-        let salt = generate_salt();
-        let salt_b64 = base64_encode_simple(&salt);
 
         // client-first-message-bare (without GS2 header)
         let client_first_bare = msg.to_string();
 
         let server_first = format!(
             "r={},s={},i={}",
-            combined_nonce, salt_b64, ITERATION_COUNT
+            combined_nonce, salt_b64, iter_count
         );
 
         let auth_message = format!(
             "{},{},c=biws,r={}",
             client_first_bare, server_first, combined_nonce
         );
-
-        // Derive keys from the user's password hash
-        // In a real SCRAM, we'd use the raw password with PBKDF2.
-        // Here we use a simplified approach: PBKDF2 over the stored Argon2 hash as a "password".
-        let user = user_store.get_user(&username).unwrap();
-        let salted_password = pbkdf2_sha256(user.password_hash.as_bytes(), &salt, ITERATION_COUNT);
-
-        let client_key = hmac_sha256(&salted_password, b"Client Key");
-        let stored_key = sha256_hash(&client_key);
-        let server_key = hmac_sha256(&salted_password, b"Server Key");
 
         Ok((
             server_first,

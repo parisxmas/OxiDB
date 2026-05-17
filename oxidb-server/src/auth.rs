@@ -38,6 +38,10 @@ impl Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     pub username: String,
+    /// Argon2 hash of the password. Used by the direct `authenticate`
+    /// (plaintext-over-the-wire) code path. SCRAM does NOT use this —
+    /// SCRAM has its own verifier below, derived from the same
+    /// plaintext password at creation time.
     pub password_hash: String,
     pub role: Role,
     /// Per-database role overrides. If a user has a role set for a specific
@@ -45,7 +49,35 @@ pub struct UserRecord {
     /// on that database.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub db_roles: HashMap<String, Role>,
+
+    /// SCRAM-SHA-256 verifier (RFC 7677 §3). The four fields together
+    /// let the server complete the SCRAM exchange without ever
+    /// touching the plaintext password again — they're derived once,
+    /// at user creation / password update, from the user's plaintext.
+    ///
+    /// All four are `Option`s for backward compatibility: a user
+    /// record stored before this revision has none of them; the
+    /// server refuses SCRAM auth for such users with a clear error
+    /// pointing the operator at `account passwd`.
+    ///
+    /// Encodings: scram_salt / scram_stored_key / scram_server_key
+    /// are base64-encoded byte strings; scram_iter_count is the
+    /// integer iteration count fed to PBKDF2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scram_salt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scram_iter_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scram_stored_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scram_server_key: Option<String>,
 }
+
+/// SCRAM iteration count used at user-creation / password-update time.
+/// 4096 matches what the per-call generator used to produce; high
+/// enough to slow a stolen-verifier attacker without making auth
+/// noticeably slow for a real client.
+pub const SCRAM_ITER_COUNT: u32 = 4096;
 
 pub struct UserStore {
     users: HashMap<String, UserRecord>,
@@ -130,6 +162,14 @@ impl UserStore {
 
         if let Some(pw) = password {
             record.password_hash = hash_password(pw)?;
+            // Re-derive the SCRAM verifier from the new plaintext.
+            // Skipping this would leave SCRAM auth on the OLD
+            // password — confusing and a security gap.
+            let verifier = derive_scram_verifier(pw);
+            record.scram_salt = Some(verifier.salt_b64);
+            record.scram_iter_count = Some(verifier.iter_count);
+            record.scram_stored_key = Some(verifier.stored_key_b64);
+            record.scram_server_key = Some(verifier.server_key_b64);
         }
         if let Some(r) = role {
             record.role = r;
@@ -184,11 +224,16 @@ impl UserStore {
 
     fn create_user_internal(&mut self, username: &str, password: &str, role: Role) -> Result<(), String> {
         let password_hash = hash_password(password)?;
+        let verifier = derive_scram_verifier(password);
         let record = UserRecord {
             username: username.to_string(),
             password_hash,
             role,
             db_roles: HashMap::new(),
+            scram_salt: Some(verifier.salt_b64),
+            scram_iter_count: Some(verifier.iter_count),
+            scram_stored_key: Some(verifier.stored_key_b64),
+            scram_server_key: Some(verifier.server_key_b64),
         };
         self.users.insert(username.to_string(), record);
         self.save()
@@ -211,6 +256,52 @@ fn hash_password(password: &str) -> Result<String, String> {
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| format!("password hashing failed: {e}"))?;
     Ok(hash.to_string())
+}
+
+/// ScramVerifier is the four pieces a SCRAM-SHA-256 server needs to
+/// finish an authentication exchange against a given user without
+/// knowing their plaintext password: a fixed salt + iter count, and
+/// the stored_key + server_key derived per RFC 7677 §3.
+pub struct ScramVerifier {
+    pub salt_b64: String,
+    pub iter_count: u32,
+    pub stored_key_b64: String,
+    pub server_key_b64: String,
+}
+
+/// derive_scram_verifier follows RFC 7677 §3 to turn a plaintext
+/// password into a SCRAM verifier:
+///
+///   1. salt = random 16 bytes
+///   2. salted_password = PBKDF2-HMAC-SHA-256(password, salt, iters)
+///   3. client_key = HMAC-SHA-256(salted_password, "Client Key")
+///   4. stored_key = SHA-256(client_key)
+///   5. server_key = HMAC-SHA-256(salted_password, "Server Key")
+///
+/// The salt + iter_count are stored alongside stored_key and
+/// server_key on the user record; the plaintext is never persisted.
+/// At auth time the server sends salt+iters to the client, the
+/// client derives client_key from its plaintext and provides a
+/// proof, and the server checks the proof against stored_key.
+pub fn derive_scram_verifier(password: &str) -> ScramVerifier {
+    use crate::scram::{
+        base64_encode_simple_pub as base64_encode, generate_salt_pub as generate_salt,
+        hmac_sha256_pub as hmac_sha256, pbkdf2_sha256_pub as pbkdf2_sha256,
+        sha256_hash_pub as sha256_hash,
+    };
+
+    let salt = generate_salt();
+    let salted_password = pbkdf2_sha256(password.as_bytes(), &salt, SCRAM_ITER_COUNT);
+    let client_key = hmac_sha256(&salted_password, b"Client Key");
+    let stored_key = sha256_hash(&client_key);
+    let server_key = hmac_sha256(&salted_password, b"Server Key");
+
+    ScramVerifier {
+        salt_b64: base64_encode(&salt),
+        iter_count: SCRAM_ITER_COUNT,
+        stored_key_b64: base64_encode(&stored_key),
+        server_key_b64: base64_encode(&server_key),
+    }
 }
 
 fn generate_random_password() -> String {
