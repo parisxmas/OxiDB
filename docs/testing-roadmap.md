@@ -14,7 +14,7 @@ landed alongside this doc.
 
 | # | Category | First-slice status | What "complete" looks like |
 |---|---|---|---|
-| 1 | **ACID & isolation** | ✅ partial — first concurrent-transfers test in [`tests/cern_acid_transfers.rs`](../tests/cern_acid_transfers.rs) | Reference anomaly suite (A5A/A5B, write skew, lost update, dirty read, phantom) |
+| 1 | **ACID & isolation** | ✅ partial — concurrent transfers ([`tests/cern_acid_transfers.rs`](../tests/cern_acid_transfers.rs)) + isolation-anomaly suite ([`tests/cern_acid_isolation.rs`](../tests/cern_acid_isolation.rs): dirty/phantom/write-skew, all pinned) | A5A (read skew), explicit snapshot vs serializable, multi-version concurrency check |
 | 2 | **Crash recovery** | ✅ partial — soft-crash ([`tests/cern_crash_recovery.rs`](../tests/cern_crash_recovery.rs)) + hard-SIGKILL ([`tests/cern_sigkill_drill.rs`](../tests/cern_sigkill_drill.rs)) + byte-offset SIGKILL matrix ([`tests/cern_sigkill_byte_offset.rs`](../tests/cern_sigkill_byte_offset.rs)) | ENOSPC/EIO injection; cosmic-bit-flip simulation; deeper init-time kill cases (e.g. mid-WAL-header-write) |
 | 3 | **Performance & long-tail** | ✅ partial — bounded soak in [`tests/cern_soak.rs`](../tests/cern_soak.rs) | Multi-day soak, RSS / fd / WAL-size leak detection, HEP-shaped workload (bursty ingest + long-range scans + high-fanout reads) |
 | 4 | **HA / Raft fault injection** | ❌ not started | **Jepsen-style suite** (split-brain, partition, clock skew, slow disk) — biggest single gap |
@@ -43,9 +43,33 @@ created or destroyed.
 Catches: lost update, partial commit, isolation breakage on the
 critical-section path.
 
-Does NOT yet cover: write skew, phantom, dirty read, snapshot vs
-serializable distinctions. Those land in follow-up tests as the
-isolation contract gets explicit names.
+Does NOT yet cover: A5A (read skew, monotonic-reads), explicit
+snapshot vs serializable distinctions. Those land in follow-up
+tests as the isolation contract gets explicit names.
+
+### `cern_acid_isolation.rs`
+
+Three isolation-anomaly tests that empirically **pin** OxiDB's
+observed behaviour:
+
+| Anomaly | Test | OxiDB result |
+|---|---|---|
+| Dirty read | `dirty_read_does_not_occur` | ❌ NEVER occurs |
+| Phantom read | `phantom_read_pinned_behaviour` | ✅ Occurs (read-committed) |
+| Write skew (A5B) | `write_skew_pinned_behaviour` | ✅ Occurs (OCC ≠ SSI) |
+
+The phantom and write-skew tests **assert that the anomaly DOES
+happen** — so any future isolation upgrade (SSI / serializable
+snapshot) flips them, and that flip is the deliberate documentation
+that the engine got stronger. Pinning observed behaviour in tests
+is the only way to make isolation-level changes visible at PR-
+review time.
+
+ANSI SQL classification: OxiDB sits at **read committed + OCC
+lost-update protection** — equivalent to PostgreSQL's `READ
+COMMITTED` with serializable-update guards. See
+[`docs/format/tx-commit-log.md`](format/tx-commit-log.md#isolation-level-observed)
+for the per-anomaly classification table.
 
 ### `cern_crash_recovery.rs`
 
