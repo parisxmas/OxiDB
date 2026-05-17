@@ -8,7 +8,7 @@ no socket, no separate process to manage.
 |---|---|
 | **Mode** | Embedded (in-process, FFI) |
 | **Server needed?** | No |
-| **Version** | 0.5.0 |
+| **Version** | 0.6.0 |
 | **Julia** | 1.6+ |
 
 For the client/server (TCP) variant, see [`../OxiDb`](../OxiDb).
@@ -69,7 +69,7 @@ db = open_db("/path/to/data"; encryption_key_path = "/path/to/key")
 
 `OxiDbEmbedded` exports the **full** helper surface — CRUD, indexes,
 aggregation, transactions, blob storage, full-text search, OxiScript
-procedures, SQL:
+procedures:
 
 | Group | Functions |
 |-------|-----------|
@@ -82,7 +82,6 @@ procedures, SQL:
 | Full-text search | `text_search` (documents), `search` (blobs) |
 | Blob storage | `create_bucket`, `list_buckets`, `delete_bucket`, `put_object`, `get_object`, `head_object`, `delete_object`, `list_objects` |
 | OxiScript | `compile_oxiscript`, `create_procedure`, `call_procedure`, `list_procedures`, `get_procedure`, `delete_procedure` |
-| SQL | `sql` |
 | Maintenance | `compact` |
 
 Detailed usage for each group — with the same call shapes used here — is in the

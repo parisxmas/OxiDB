@@ -85,11 +85,11 @@ end
 The reference below describes the **full helper surface**, which
 [`OxiDbEmbedded`](../OxiDbEmbedded) exports in its entirety.
 
-The TCP **`OxiDb`** client exports the core CRUD/query helpers — `ping`,
-`insert`, `insert_many`, `find`, `find_one`, `update`, `update_one`, `delete`,
-`delete_one`, `count_docs`, `aggregate`, `sql` — plus `connect` and `exec`.
-For anything else (index creation, transactions, blobs, document FTS,
-compaction, OxiScript procedures) call it through the generic `exec`:
+The TCP **`OxiDb`** client exports the core document CRUD/query helpers —
+`ping`, `insert`, `insert_many`, `find`, `find_one`, `update`, `update_one`,
+`delete`, `delete_one`, `count_docs`, `aggregate` — plus `connect` and
+`exec`. For anything else (index creation, transactions, blobs, document
+FTS, compaction, OxiScript procedures) call it through the generic `exec`:
 
 ```julia
 exec(client, "create_index"; collection = "users", field = "email")

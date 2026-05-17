@@ -50,8 +50,6 @@ export OxiDatabase, OxiDbError, TransactionConflictError, OxiDbResult,
        put_object, get_object, head_object, delete_object, list_objects,
        # FTS (blobs)
        search,
-       # SQL
-       sql,
        # Stored procedures & OxiScript
        compile_oxiscript, create_procedure, call_procedure,
        list_procedures, get_procedure, delete_procedure
@@ -613,18 +611,6 @@ function search(db::OxiDatabase, query::AbstractString;
     bucket !== nothing && (payload["bucket"] = bucket)
     _checked(db, payload)
 end
-
-# ------------------------------------------------------------------
-# SQL
-# ------------------------------------------------------------------
-
-"""
-    sql(db, query)
-
-Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES.
-"""
-sql(db::OxiDatabase, query::AbstractString) =
-    _checked(db, Dict("cmd" => "sql", "query" => query))
 
 # ------------------------------------------------------------------
 # Stored procedures & OxiScript

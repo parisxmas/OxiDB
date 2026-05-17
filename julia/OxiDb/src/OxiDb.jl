@@ -36,7 +36,7 @@ using Tables
 export OxiDbClient, OxiDbError, OxiDbResult, exec, ping,
        insert, insert_many, find, find_one,
        update, update_one, delete, delete_one,
-       count_docs, aggregate, sql
+       count_docs, aggregate
 
 # ─── Errors ────────────────────────────────────────────────────────────────
 
@@ -195,7 +195,5 @@ end
 
 aggregate(c::OxiDbClient, collection::AbstractString, pipeline::AbstractVector) =
     OxiDbResult(exec(c, "aggregate"; collection, pipeline))
-
-sql(c::OxiDbClient, query::AbstractString) = exec(c, "sql"; query)
 
 end # module
