@@ -1023,18 +1023,36 @@ fn test_linked_collection_proxies_reads() {
     assert_ok(&resp);
     assert_eq!(resp["data"]["count"], 2);
 
-    // A write against the linked collection is refused with a
-    // policy error — the message MUST mention read-only so the
-    // caller can distinguish from a transient remote failure.
+    // v2c: a write through the link IS now proxied — the remote
+    // gets a new doc. The doc shows up both via the link's count and
+    // via the remote's own client, proving it was the remote that
+    // actually wrote (not a local-only ghost).
     let resp = aclient.send(&json!({
         "cmd": "insert",
         "collection": "remote_users",
-        "doc": {"name": "Carol"},
+        "doc": {"name": "Carol", "age": 22},
+    }));
+    assert_ok(&resp);
+    let resp = aclient.send(&json!({"cmd": "count", "collection": "remote_users", "query": {}}));
+    assert_eq!(resp["data"]["count"], 3, "remote count incremented via the link");
+    let resp = bclient.send(&json!({"cmd": "find", "collection": "users",
+        "query": {"name": "Carol"}}));
+    assert_eq!(resp["data"].as_array().unwrap().len(), 1,
+        "Carol exists on the remote when read directly — proves the proxy WROTE");
+
+    // Non-CRUD commands (schema / transactional / admin) MUST still
+    // refuse through a link — those would either mutate remote schema
+    // silently or break pool reuse. The refusal message must mention
+    // "CRUD" so callers can distinguish from a transient remote error.
+    let resp = aclient.send(&json!({
+        "cmd": "create_index",
+        "collection": "remote_users",
+        "field": "name",
     }));
     assert_eq!(resp["ok"], false);
     assert!(
-        resp["error"].as_str().unwrap().contains("read-only"),
-        "write refusal should say 'read-only': {:?}",
+        resp["error"].as_str().unwrap().contains("only CRUD"),
+        "schema-cmd refusal should say 'only CRUD': {:?}",
         resp["error"]
     );
 }
@@ -1061,6 +1079,127 @@ fn test_linked_collection_unreachable_remote_errors_cleanly() {
         err.contains("connect") || err.contains("refused") || err.contains("127.0.0.1:1"),
         "error mentions transport: {}",
         err
+    );
+}
+
+// ===========================================================================
+// Linked collections — write proxy (FDW v2c)
+// ===========================================================================
+
+/// Full CRUD round-trip through a link: insert_many, update_one,
+/// delete_one. Every mutation goes through the link from instance A,
+/// every result is verified by reading instance B directly — so a
+/// passing test means the proxy actually wrote to the remote (not
+/// to a local shadow or to nowhere at all).
+#[test]
+fn test_linked_collection_write_proxy_full_crud() {
+    let remote = TestServer::start();
+    let mut bclient = Client::connect(remote.addr);
+
+    let local = TestServer::start();
+    let mut aclient = Client::connect(local.addr);
+    let url = format!("oxidb://127.0.0.1:{}/items", remote.addr.port());
+    assert_ok(&aclient.send(&json!({
+        "cmd": "link_collection",
+        "collection": "remote_items",
+        "url": url,
+    })));
+
+    // insert_many through the link → remote should have all 3.
+    assert_ok(&aclient.send(&json!({
+        "cmd": "insert_many",
+        "collection": "remote_items",
+        "docs": [
+            {"sku": "A", "qty": 1},
+            {"sku": "B", "qty": 2},
+            {"sku": "C", "qty": 3},
+        ],
+    })));
+    let resp = bclient.send(&json!({"cmd": "count", "collection": "items", "query": {}}));
+    assert_eq!(resp["data"]["count"], 3, "insert_many landed on the remote");
+
+    // update_one through the link → remote's B doc has qty=20.
+    let resp = aclient.send(&json!({
+        "cmd": "update_one",
+        "collection": "remote_items",
+        "query": {"sku": "B"},
+        "update": {"$set": {"qty": 20}},
+    }));
+    assert_ok(&resp);
+    let resp = bclient.send(&json!({"cmd": "find_one", "collection": "items",
+        "query": {"sku": "B"}}));
+    assert_ok(&resp);
+    assert_eq!(resp["data"]["qty"], 20, "update reflected on the remote");
+
+    // delete_one through the link → remote loses C; count drops to 2.
+    assert_ok(&aclient.send(&json!({
+        "cmd": "delete_one",
+        "collection": "remote_items",
+        "query": {"sku": "C"},
+    })));
+    let resp = bclient.send(&json!({"cmd": "count", "collection": "items", "query": {}}));
+    assert_eq!(resp["data"]["count"], 2, "delete reflected on the remote");
+
+    // Sanity: a find through the link sees the post-mutation state
+    // (so the linked-collection read path agrees with the direct
+    // read on B). Two docs left: A (qty=1), B (qty=20).
+    let resp = aclient.send(&json!({"cmd": "find", "collection": "remote_items", "query": {}}));
+    assert_ok(&resp);
+    let docs = resp["data"].as_array().unwrap();
+    assert_eq!(docs.len(), 2);
+    let qtys: Vec<i64> = docs.iter().map(|d| d["qty"].as_i64().unwrap()).collect();
+    assert!(qtys.contains(&1) && qtys.contains(&20),
+        "post-mutation state visible through the link: {:?}", qtys);
+}
+
+/// Write proxy reuses the same pool as the read proxy — interleaved
+/// reads + writes against one link don't accumulate idle conns above
+/// 1. This is the v2c invariant the v2a pool gave us; this test
+/// pins it so a future refactor that accidentally side-pools writes
+/// trips immediately.
+#[test]
+fn test_linked_collection_write_proxy_shares_pool() {
+    use oxidb_server::remote_client;
+
+    let remote = TestServer::start();
+    let local = TestServer::start();
+    let mut aclient = Client::connect(local.addr);
+    let url = format!("oxidb://127.0.0.1:{}/things", remote.addr.port());
+    assert_ok(&aclient.send(&json!({
+        "cmd": "link_collection",
+        "collection": "remote_things",
+        "url": url,
+    })));
+
+    // Interleave: insert, find, update, find, delete, find. Each
+    // call returns the pool conn before the next takes it; idle
+    // count should stay at 1.
+    for i in 0..3 {
+        assert_ok(&aclient.send(&json!({
+            "cmd": "insert", "collection": "remote_things",
+            "doc": {"i": i},
+        })));
+        assert_ok(&aclient.send(&json!({
+            "cmd": "find", "collection": "remote_things", "query": {},
+        })));
+    }
+    assert_ok(&aclient.send(&json!({
+        "cmd": "update_one",
+        "collection": "remote_things",
+        "query": {"i": 0},
+        "update": {"$set": {"i": 99}},
+    })));
+    assert_ok(&aclient.send(&json!({
+        "cmd": "delete_one",
+        "collection": "remote_things",
+        "query": {"i": 99},
+    })));
+
+    let port = remote.addr.port();
+    assert_eq!(
+        remote_client::pool().idle_count("127.0.0.1", port, None),
+        1,
+        "mixed reads + writes through one link reuse the same pooled conn"
     );
 }
 

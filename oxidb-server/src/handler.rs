@@ -1300,28 +1300,38 @@ fn is_link_management_cmd(cmd: &str) -> bool {
 }
 
 /// handle_linked_command routes a query against a linked collection.
-/// Read commands are proxied to the remote OxiDB after rewriting the
-/// `collection` field from the local link name to the remote
-/// collection name. Write / schema commands are refused — v1 of FDW
-/// is read-only.
+/// Read AND write commands are proxied to the remote OxiDB after
+/// rewriting the `collection` field from the local link name to the
+/// remote collection name (v2c). Schema, transactional, and admin
+/// commands are still refused — those operate on whole-DB state and
+/// should be issued directly against the remote, not laundered
+/// through a link.
 ///
 /// Returns the pre-serialized response bytes; the caller (the main
 /// dispatch in handle_request) just returns this directly.
 fn handle_linked_command(cmd: &str, link: &oxidb::links::LinkConfig, mut request: Value) -> Vec<u8> {
     use crate::remote_client;
 
-    // Read commands are the only ones we proxy. Writes / schema
-    // commands are refused with a clear message — better than the
-    // alternative of silently mutating the remote without an audit
-    // trail.
+    // Allow-list: every CRUD command that operates on a single
+    // collection's documents. Schema / transaction / management
+    // commands stay refused — proxying them through a link would
+    // either silently mutate the remote's schema or break pool reuse
+    // (transactions need a sticky conn).
     match cmd {
-        // Read commands — proxy through.
-        "find" | "find_one" | "count" | "aggregate" | "text_search" => {}
-        // Everything else against a linked collection is rejected.
+        // Reads.
+        "find" | "find_one" | "count" | "aggregate" | "text_search"
+        // Writes (v2c).
+        | "insert" | "insert_many"
+        | "update" | "update_one" | "find_and_modify"
+        | "delete" | "delete_one" => {}
+        // Everything else against a linked collection is rejected with
+        // a clear, actionable message.
         _ => {
             return err_bytes(&format!(
                 "command {:?} is not allowed on linked collection {:?} \
-                — linked collections are read-only in this version (FDW v1)",
+                — only CRUD commands are proxied through a link; schema, \
+                index, transaction, and admin commands must be issued \
+                directly against the remote",
                 cmd, link.name
             ));
         }
