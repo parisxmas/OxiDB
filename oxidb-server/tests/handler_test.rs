@@ -1098,7 +1098,7 @@ fn test_linked_collection_pool_reuses_connection() {
     // call returned it before the next took it.
     let p = remote_client::pool();
     let port = remote.addr.port();
-    let idle = p.idle_count("127.0.0.1", port);
+    let idle = p.idle_count("127.0.0.1", port, None);
     assert_eq!(idle, 1, "pool idle_count after 5 sequential calls = {}, want 1", idle);
 }
 
@@ -1126,16 +1126,16 @@ fn test_linked_collection_pool_retries_when_pooled_conn_is_dead() {
     // Prime the pool with one good conn.
     assert_ok(&aclient.send(&json!({"cmd": "find", "collection": "remote_dead", "query": {}})));
     let port = remote.addr.port();
-    assert_eq!(remote_client::pool().idle_count("127.0.0.1", port), 1);
+    assert_eq!(remote_client::pool().idle_count("127.0.0.1", port, None), 1);
 
     // Forcibly close the pooled conn by taking it out and dropping it.
     // (Simulates the remote killing it while we held it idle.)
-    let dead = remote_client::pool().take("127.0.0.1", port).expect("had idle conn");
+    let dead = remote_client::pool().take("127.0.0.1", port, None).expect("had idle conn");
     // Half-close so the next write/read on it errors out. shutdown()
     // is the most realistic stand-in for a server-side close.
     let _ = dead.shutdown(std::net::Shutdown::Both);
-    remote_client::pool().give_back("127.0.0.1", port, dead);
-    assert_eq!(remote_client::pool().idle_count("127.0.0.1", port), 1);
+    remote_client::pool().give_back("127.0.0.1", port, None, dead);
+    assert_eq!(remote_client::pool().idle_count("127.0.0.1", port, None), 1);
 
     // Next call must still succeed — the pool returns the dead conn,
     // round_trip fails, the code path falls through to a fresh dial.
@@ -1146,7 +1146,7 @@ fn test_linked_collection_pool_retries_when_pooled_conn_is_dead() {
 
     // After the retry, exactly 1 idle conn (the fresh one) is back
     // in the pool.
-    assert_eq!(remote_client::pool().idle_count("127.0.0.1", port), 1);
+    assert_eq!(remote_client::pool().idle_count("127.0.0.1", port, None), 1);
 }
 
 // ===========================================================================
@@ -1195,7 +1195,7 @@ fn test_scram_rfc7677_roundtrip_against_stored_verifier() {
     let client_first_full = format!("n,,{}", client_first_bare);
 
     // --- SERVER: process_client_first ---
-    let (server_first, mut scram_state) =
+    let (server_first, scram_state) =
         ScramState::process_client_first(&client_first_full, &store).expect("server-first");
 
     // Parse server-first to harvest salt + iter_count + combined nonce.
@@ -1343,5 +1343,301 @@ fn test_scram_rfc7677_legacy_user_without_verifier_is_refused() {
         err.contains("no SCRAM verifier") && err.contains("account passwd"),
         "legacy-user error must mention the verifier + the recovery command: {}",
         err
+    );
+}
+
+// ===========================================================================
+// FDW SCRAM auth passthrough (v2b PR2)
+// ===========================================================================
+//
+// `proxy_command` now performs a SCRAM exchange against the remote
+// when the link URL carries userinfo, then forwards the actual
+// command over the now-authenticated socket. These tests use a tiny
+// auth-aware mock server that:
+//   1. Refuses every non-auth command on an unauthenticated session.
+//   2. Implements `authenticate` + `authenticate_continue` via
+//      ScramState against a real UserStore.
+//   3. After successful SCRAM, forwards subsequent commands to
+//      handler::handle_request — which is enough to test that the
+//      authed socket actually services real reads.
+//
+// We deliberately don't reuse the OXIDB_AUTH-aware async_server here:
+// the rest of this test file is sync-handle_request-based, and a
+// purpose-built mock keeps these tests independent of any tokio
+// runtime spin-up.
+
+/// Spawn a mock auth-required OxiDB server. Returns (addr, kept-alive
+/// data dir). Keeps the temp dir alive via the returned struct so
+/// dropping it on test exit cleans up the on-disk user store.
+struct AuthTestServer {
+    addr: SocketAddr,
+    _dir: TempDir,
+}
+
+impl AuthTestServer {
+    fn start(users: Vec<(&'static str, &'static str, oxidb_server::auth::Role)>) -> Self {
+        use oxidb_server::auth::UserStore;
+
+        let dir = TempDir::new().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let db = Arc::new(OxiDb::open(&data_dir).unwrap());
+
+        // Provision the SCRAM user store under data_dir/auth/. Bumps the
+        // verifier at create-user time per the PR #15 refactor.
+        let auth_dir = data_dir.join("auth");
+        std::fs::create_dir_all(&auth_dir).unwrap();
+        let mut store = UserStore::open(&auth_dir).unwrap();
+        for (u, p, r) in users {
+            store.create_user(u, p, r).unwrap();
+        }
+        let user_store = Arc::new(Mutex::new(store));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if let Ok(stream) = stream {
+                    let db = Arc::clone(&db);
+                    let user_store = Arc::clone(&user_store);
+                    std::thread::spawn(move || {
+                        Self::serve(stream, db, user_store);
+                    });
+                }
+            }
+        });
+
+        Self {
+            addr,
+            _dir: dir,
+        }
+    }
+
+    fn serve(
+        mut stream: TcpStream,
+        db: Arc<OxiDb>,
+        user_store: Arc<Mutex<oxidb_server::auth::UserStore>>,
+    ) {
+        use oxidb_server::scram::ScramState;
+
+        // Per-connection session state. Authed sessions get a username
+        // (currently only used to gate command dispatch — handle_request
+        // doesn't check RBAC in this mock, matching the rest of the
+        // tests that bypass RBAC).
+        let mut authed: Option<String> = None;
+        let mut scram_state: Option<ScramState> = None;
+        let mut active_tx: Option<u64> = None;
+
+        loop {
+            let msg = match read_message(&mut stream) {
+                Ok(m) => m,
+                Err(_) => break,
+            };
+            let request: Value = match serde_json::from_slice(&msg) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let cmd = request.get("command")
+                .or_else(|| request.get("cmd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let resp = match cmd {
+                "authenticate" => {
+                    let payload = request.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+                    let store = user_store.lock().unwrap();
+                    match ScramState::process_client_first(payload, &store) {
+                        Ok((server_first, state)) => {
+                            scram_state = Some(state);
+                            json!({"ok": true, "data": {"payload": server_first, "done": false}})
+                        }
+                        Err(e) => json!({"ok": false, "error": e}),
+                    }
+                }
+                "authenticate_continue" => {
+                    let payload = request.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+                    match scram_state.take() {
+                        Some(state) => {
+                            let store = user_store.lock().unwrap();
+                            match state.process_client_final(payload, &store) {
+                                Ok((server_final, _role)) => {
+                                    authed = Some(state.username().to_string());
+                                    json!({"ok": true, "data": {"payload": server_final, "done": true}})
+                                }
+                                Err(e) => json!({"ok": false, "error": e}),
+                            }
+                        }
+                        None => json!({"ok": false, "error": "no SCRAM state"}),
+                    }
+                }
+                _ => {
+                    // Every other command requires the session to have
+                    // completed SCRAM first. This is exactly the
+                    // wire-level gate `authenticate()` must defeat.
+                    if authed.is_none() {
+                        json!({"ok": false, "error": "authentication required"})
+                    } else {
+                        let bytes = oxidb_server::handler::handle_request(&db, request, &mut active_tx);
+                        serde_json::from_slice::<Value>(&bytes).unwrap()
+                    }
+                }
+            };
+
+            let bytes = resp.to_string().into_bytes();
+            if write_message(&mut stream, &bytes).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn test_fdw_authenticate_helper_unlocks_a_remote_session() {
+    use oxidb::links::parse_remote;
+    use oxidb_server::remote_client;
+    use std::net::TcpStream as RawStream;
+
+    // Set up an auth-required remote with one user, then seed a doc
+    // through a privileged side channel (the remote DB is shared with
+    // the mock listener; we open it directly to insert without going
+    // through the wire).
+    let remote = AuthTestServer::start(vec![
+        ("fdw_user", "s3cret-pass", oxidb_server::auth::Role::Admin),
+    ]);
+    {
+        let db = OxiDb::open(remote._dir.path()).unwrap();
+        db.insert("people", json!({"name": "alice", "age": 30})).unwrap();
+        db.insert("people", json!({"name": "bob", "age": 25})).unwrap();
+    }
+
+    // Confirm the gate: an unauthenticated socket gets refused.
+    let stream = RawStream::connect(remote.addr).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let req = json!({"cmd": "find", "collection": "people", "query": {}});
+    write_message(&mut (&stream), &req.to_string().into_bytes()).unwrap();
+    let resp_bytes = read_message(&mut (&stream)).unwrap();
+    let resp: Value = serde_json::from_slice(&resp_bytes).unwrap();
+    assert_eq!(resp["ok"], false, "must refuse unauthed find: {resp}");
+    assert!(resp["error"].as_str().unwrap().contains("authentication required"));
+    drop(stream);
+
+    // Now: a freshly-dialed socket, after authenticate(), services the
+    // same find — proves the helper actually moved the session state
+    // from "anonymous" to "authed".
+    let stream = RawStream::connect(remote.addr).unwrap();
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    remote_client::authenticate(&stream, "fdw_user", "s3cret-pass")
+        .expect("authenticate must succeed against a real remote");
+
+    let req = json!({"cmd": "find", "collection": "people", "query": {}});
+    write_message(&mut (&stream), &req.to_string().into_bytes()).unwrap();
+    let resp_bytes = read_message(&mut (&stream)).unwrap();
+    let resp: Value = serde_json::from_slice(&resp_bytes).unwrap();
+    assert_eq!(resp["ok"], true, "post-auth find must succeed: {resp}");
+    let docs = resp["data"].as_array().expect("data is array");
+    assert_eq!(docs.len(), 2, "must see both seeded docs");
+
+    // And: a wrong password makes the helper return the SCRAM-level
+    // error verbatim — useful for ops debugging.
+    let stream2 = RawStream::connect(remote.addr).unwrap();
+    stream2.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    let err = remote_client::authenticate(&stream2, "fdw_user", "WRONG").unwrap_err();
+    assert!(
+        err.contains("authentication failed"),
+        "wrong-password error must surface the server's message: {}",
+        err
+    );
+
+    // Sanity: parse_remote on the URL form we expect operators to use
+    // sets user + password correctly so proxy_command will call into
+    // authenticate() on its own.
+    let parsed = parse_remote(&format!(
+        "oxidb://fdw_user:s3cret-pass@127.0.0.1:{}/people",
+        remote.addr.port()
+    )).unwrap();
+    assert_eq!(parsed.user.as_deref(), Some("fdw_user"));
+    assert_eq!(parsed.password.as_deref(), Some("s3cret-pass"));
+}
+
+#[test]
+fn test_fdw_proxy_command_authenticates_and_pools_per_user() {
+    use oxidb::links::parse_remote;
+    use oxidb_server::remote_client;
+
+    let remote = AuthTestServer::start(vec![
+        ("p_user", "pw-A", oxidb_server::auth::Role::Admin),
+    ]);
+    {
+        let db = OxiDb::open(remote._dir.path()).unwrap();
+        db.insert("items", json!({"sku": "x"})).unwrap();
+    }
+    let port = remote.addr.port();
+    let url = format!("oxidb://p_user:pw-A@127.0.0.1:{}/items", port);
+    let parsed = parse_remote(&url).unwrap();
+
+    // First call: cold pool → dial + authenticate + find.
+    let cmd = json!({"cmd": "find", "collection": "items", "query": {}});
+    let resp = remote_client::proxy_command(&parsed, &cmd)
+        .expect("proxy_command with valid creds must succeed");
+    assert_eq!(resp["ok"], true, "{resp}");
+    assert_eq!(resp["data"].as_array().unwrap().len(), 1);
+
+    // The conn should now live under the user-keyed bucket — NOT
+    // under the anonymous bucket, which would let an unauthed link
+    // accidentally reuse our authed socket.
+    let pool = remote_client::pool();
+    assert_eq!(
+        pool.idle_count("127.0.0.1", port, Some("p_user")),
+        1,
+        "authed conn must land in the per-user bucket"
+    );
+    assert_eq!(
+        pool.idle_count("127.0.0.1", port, None),
+        0,
+        "anonymous bucket must remain empty for an authed remote"
+    );
+
+    // Second call: reuses the pooled authed conn. If the helper had
+    // re-authenticated it would still pass, but observably idle_count
+    // would dip to 0 mid-call — what we really want to assert is that
+    // the call works without a fresh handshake. The simplest proxy
+    // for "no fresh handshake" is "the wrong-password variant of the
+    // helper, if it had run, would have errored". So instead we just
+    // make the call and assert success: combined with the bucket
+    // assertion above, that's enough.
+    let resp2 = remote_client::proxy_command(&parsed, &cmd).unwrap();
+    assert_eq!(resp2["ok"], true, "{resp2}");
+    assert_eq!(
+        pool.idle_count("127.0.0.1", port, Some("p_user")),
+        1,
+        "pool stays at 1 after reuse"
+    );
+
+    // Wrong password → proxy_command surfaces the failure cleanly
+    // and does NOT pool the half-authed conn. Use a SECOND server +
+    // a username that has never had a successful auth in this process,
+    // so the pool can't sneak us a previously-authed reuse. (Once a
+    // user has authed, the pool happily reuses that session — the
+    // pool key is `(host, port, user)`, deliberately not including
+    // the password.)
+    let remote2 = AuthTestServer::start(vec![
+        ("bad_pw_user", "the-real-pw", oxidb_server::auth::Role::Admin),
+    ]);
+    let bad_url = format!(
+        "oxidb://bad_pw_user:WRONG@127.0.0.1:{}/items",
+        remote2.addr.port()
+    );
+    let bad_parsed = parse_remote(&bad_url).unwrap();
+    let err = remote_client::proxy_command(&bad_parsed, &cmd).unwrap_err();
+    assert!(
+        err.contains("authentication failed"),
+        "wrong-pw error must surface verbatim: {}",
+        err
+    );
+    // Failed auth must NOT pool the half-authed conn.
+    assert_eq!(
+        pool.idle_count("127.0.0.1", remote2.addr.port(), Some("bad_pw_user")),
+        0,
+        "failed-auth conn must NOT pool"
     );
 }

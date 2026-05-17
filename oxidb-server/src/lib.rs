@@ -12,6 +12,7 @@ pub mod remote_client;
 pub mod oximem;
 pub mod resp;
 pub mod scram;
+pub mod scram_client;
 pub mod session;
 pub mod tls;
 pub mod udp_ingest;
