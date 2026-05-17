@@ -238,7 +238,15 @@ pub fn decode_value(buf: &[u8], pos: &mut usize) -> Result<Value, String> {
             }
             let count = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
             *pos += 4;
-            let mut arr = Vec::with_capacity(count);
+            // ALLOC GUARD (fuzz finding, post-PR #45): the wire-provided
+            // count is attacker-controlled. Pre-allocating with that
+            // capacity is an alloc bomb — a 7-byte payload claiming
+            // 0xFFFFFFFF elements asked for ~32 GiB of Vec headroom and
+            // OOM'd the process. Cap at remaining bytes; the loop body
+            // would fail on the very first truncation anyway, so this
+            // changes nothing for honest inputs.
+            let cap = count.min(buf.len().saturating_sub(*pos));
+            let mut arr = Vec::with_capacity(cap);
             for _ in 0..count {
                 arr.push(decode_value(buf, pos)?);
             }
@@ -250,7 +258,11 @@ pub fn decode_value(buf: &[u8], pos: &mut usize) -> Result<Value, String> {
             }
             let count = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
             *pos += 4;
-            let mut map = serde_json::Map::with_capacity(count);
+            // Same alloc-guard rationale as TAG_ARRAY above. A map
+            // entry needs at least 4 bytes (key-len u32), so the
+            // remaining-bytes / 4 ceiling is a tighter cap.
+            let cap = count.min(buf.len().saturating_sub(*pos) / 4);
+            let mut map = serde_json::Map::with_capacity(cap);
             for _ in 0..count {
                 // Keys are bare strings (length + bytes, no type tag)
                 if *pos + 4 > buf.len() {
@@ -378,5 +390,47 @@ mod tests {
         encode_value(&original, &mut buf);
         let decoded = decode_request(&buf).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// Regression for the wire_oxiwire / wire_deserialize fuzz findings
+    /// (post-PR #45). A 7-byte payload claiming TAG_ARRAY with
+    /// `0xFFFFFFFF` element count used to call `Vec::with_capacity(4B)`
+    /// and OOM the process before reaching the truncation check in the
+    /// loop body. Must now return an `Err` cleanly.
+    #[test]
+    fn fuzz_regression_array_count_does_not_alloc_bomb() {
+        // wire_deserialize OOM input: [0xDB, 0x07, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+        // 0xDB = MAGIC, 0x07 = TAG_ARRAY, then 4 bytes of u32 count =
+        // 0xFFFFFFFF = ~4 billion elements claimed, only 1 byte of
+        // payload after. Must NOT pre-allocate 4B-sized Vec.
+        let input = [0xDBu8, TAG_ARRAY, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8];
+        let res = decode_request(&input);
+        assert!(res.is_err(), "expected Err, got {res:?}");
+    }
+
+    #[test]
+    fn fuzz_regression_map_count_does_not_alloc_bomb() {
+        // wire_oxiwire OOM input: [0xDB, 0x08, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xDB]
+        // 0xDB = MAGIC, 0x08 = TAG_MAP, then 4 bytes of u32 count.
+        let input = [
+            0xDBu8, TAG_MAP, 0x00u8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8, 0xDBu8,
+        ];
+        let res = decode_request(&input);
+        assert!(res.is_err(), "expected Err, got {res:?}");
+    }
+
+    #[test]
+    fn fuzz_regression_array_with_honest_count_still_works() {
+        // Sanity: the alloc-guard must NOT break the happy path. An
+        // array of 3 nulls is 1 (MAGIC) + 1 (TAG_ARRAY) + 4 (count=3) + 3 (NULLs)
+        let input = [0xDBu8, TAG_ARRAY, 3u8, 0u8, 0u8, 0u8, TAG_NULL, TAG_NULL, TAG_NULL];
+        let decoded = decode_request(&input).expect("honest 3-element array");
+        match decoded {
+            Value::Array(a) => {
+                assert_eq!(a.len(), 3);
+                assert!(a.iter().all(|v| v.is_null()));
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
     }
 }
