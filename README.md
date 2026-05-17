@@ -10,6 +10,8 @@
 
 > ⚠️ **WARNING — not production-ready.** OxiDB is under active development. The on-disk data format, the wire/server protocol, the client SDK surface, and the JSON query language are all subject to **breaking changes between releases** with no migration path or backward-compatibility guarantee. Do not run it against data you cannot afford to lose or rebuild. Pin a specific version, expect to dump-and-reload on upgrade, and treat any production-like use as experimental until a `1.0` release explicitly commits to stability.
 
+> 🔬 **Quality & testing.** All 8 categories of the [CERN-grade testing roadmap](docs/testing-roadmap.md) are at ✅ partial: ACID isolation pinned (read-committed + OCC, write-skew documented), crash recovery covers soft + hard SIGKILL + byte-offset matrix, performance soak, scale workload at 100K docs, Raft (7 cluster-fault tests), DR drill (backup→wipe→restore, ~30ms RTO), upgrade-chain fixture corpus, 7-target fuzz harness with structure-aware roundtrips (line coverage up to 55%). The first 30 seconds of fuzzing in May 2026 found **4 DoS bugs** in TCP-facing decoders, all fixed in PRs [#46](https://github.com/parisxmas/OxiDB/pull/46) / [#47](https://github.com/parisxmas/OxiDB/pull/47) / [#48](https://github.com/parisxmas/OxiDB/pull/48). Remaining gaps have effort estimates in [ADR-0006](docs/decisions/0006-cern-testing-gap-estimates.md); OSS-Fuzz integration infra committed in [`infra/oss-fuzz/`](infra/oss-fuzz/) (upstream PR pending).
+
 ## Installation
 
 ### Option 1: Download a pre-built binary (easiest)
