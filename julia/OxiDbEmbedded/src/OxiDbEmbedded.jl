@@ -22,8 +22,9 @@ module OxiDbEmbedded
 
 using Base64
 using JSON3
+using Tables
 
-export OxiDatabase, OxiDbError, TransactionConflictError,
+export OxiDatabase, OxiDbError, TransactionConflictError, OxiDbResult,
        open_db,
        # Utility
        ping,
@@ -70,6 +71,43 @@ struct TransactionConflictError <: Exception
 end
 
 Base.showerror(io::IO, e::TransactionConflictError) = print(io, "TransactionConflictError: ", e.msg)
+
+# ------------------------------------------------------------------
+# Query result wrapper (Tables.jl interop)
+# ------------------------------------------------------------------
+
+"""
+    OxiDbResult <: AbstractVector{Any}
+
+Return type of [`find`](@ref) and [`aggregate`](@ref). Walks like a
+`Vector` of row `Dict`s — `length`, `getindex`, iteration all work — *and*
+satisfies the [Tables.jl](https://github.com/JuliaData/Tables.jl)
+row-access interface, so `DataFrames.DataFrame(result)`, `CSV.write(io,
+result)`, `MLJ` pipelines, etc. accept it with no manual conversion.
+
+```julia
+rows = find(db, "users", Dict("age" => Dict("\$gte" => 18)))
+length(rows)               # n
+rows[1]["name"]            # individual-row access still works
+DataFrame(rows)            # ...and Tables.jl interop
+```
+"""
+struct OxiDbResult <: AbstractVector{Any}
+    rows::Vector{Any}
+end
+OxiDbResult(x::AbstractVector) = OxiDbResult(Vector{Any}(x))
+OxiDbResult(::Nothing) = OxiDbResult(Any[])
+
+Base.size(r::OxiDbResult) = size(r.rows)
+Base.getindex(r::OxiDbResult, i::Integer) = r.rows[i]
+Base.IndexStyle(::Type{<:OxiDbResult}) = IndexLinear()
+
+# Tables.jl row-access — heterogeneous-schema row dicts are handled by
+# Tables.dictrowtable (it merges keys across rows, fills missing with `missing`).
+Tables.istable(::Type{<:OxiDbResult}) = true
+Tables.rowaccess(::Type{<:OxiDbResult}) = true
+Tables.rows(r::OxiDbResult) = Tables.rows(
+    Tables.dictrowtable(Vector{Dict{String,Any}}(r.rows)))
 
 # ------------------------------------------------------------------
 # Library download
@@ -261,7 +299,7 @@ function find(db::OxiDatabase, collection::AbstractString, query::Dict=Dict();
     sort !== nothing && (payload["sort"] = sort)
     skip !== nothing && (payload["skip"] = skip)
     limit !== nothing && (payload["limit"] = limit)
-    _checked(db, payload)
+    OxiDbResult(_checked(db, payload))
 end
 
 """
@@ -408,7 +446,7 @@ end
 Run an aggregation pipeline. Returns list of result documents.
 """
 aggregate(db::OxiDatabase, collection::AbstractString, pipeline::Vector) =
-    _checked(db, Dict("cmd" => "aggregate", "collection" => collection, "pipeline" => pipeline))
+    OxiDbResult(_checked(db, Dict("cmd" => "aggregate", "collection" => collection, "pipeline" => pipeline)))
 
 # ------------------------------------------------------------------
 # Compaction

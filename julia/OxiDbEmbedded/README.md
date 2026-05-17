@@ -8,7 +8,7 @@ no socket, no separate process to manage.
 |---|---|
 | **Mode** | Embedded (in-process, FFI) |
 | **Server needed?** | No |
-| **Version** | 0.4.0 |
+| **Version** | 0.5.0 |
 | **Julia** | 1.6+ |
 
 For the client/server (TCP) variant, see [`../OxiDb`](../OxiDb).
@@ -94,6 +94,27 @@ transaction(db) do
     insert(db, "ledger", Dict("action" => "credit", "amount" => 100))
 end   # auto-commits; auto-rolls back if the block throws
 ```
+
+## Tables.jl / DataFrames interop
+
+`find` and `aggregate` return an `OxiDbResult` that walks like a `Vector` of
+row `Dict`s *and* satisfies the [Tables.jl] row-access interface. So it flows
+straight into DataFrames, CSV, MLJ, Plots — anything that consumes a
+Tables.jl table. Heterogeneous-schema documents are handled automatically:
+missing fields become `missing` in the materialized column.
+
+```julia
+using OxiDbEmbedded, DataFrames
+
+rows = find(db, "users", Dict("age" => Dict("\$gte" => 18)))
+
+length(rows)        # walks like a Vector{Dict}…
+rows[1]["name"]
+
+DataFrame(rows)     # …and like a Tables.jl table — no manual conversion
+```
+
+[Tables.jl]: https://github.com/JuliaData/Tables.jl
 
 ## Errors
 

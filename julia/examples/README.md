@@ -2,9 +2,9 @@
 
 Two sets of self-contained scripts:
 
-- **`embedded/`** — the [`OxiDbEmbedded`](../OxiDbEmbedded) package (v0.4.0):
+- **`embedded/`** — the [`OxiDbEmbedded`](../OxiDbEmbedded) package (v0.5.0):
   the engine runs **in your process**, no server.
-- **`*.jl` (numbered)** — the [`OxiDb`](../OxiDb) TCP client (v0.5.0) against a
+- **`*.jl` (numbered)** — the [`OxiDb`](../OxiDb) TCP client (v0.6.0) against a
   local `oxidb-server`.
 
 New to OxiDB? Start with `embedded/` — there's nothing to install or run first.
@@ -52,6 +52,7 @@ In-process, no server. The full helper API is exported directly.
 | 04 | `embedded/04_indexes.jl`           | `create_index` / `create_unique_index`, indexed lookup |
 | 05 | `embedded/05_aggregation.jl`       | `$match` → `$group` → `$sort` pipeline |
 | 06 | `embedded/06_encryption_at_rest.jl`| `open_db(path; encryption_key_path=…)` — AES-encrypted on disk |
+| 07 | `embedded/07_tables_interop.jl`    | Tables.jl interop — `DataFrame(rows)` / `CSV.write` / MLJ work out of the box |
 
 ## TCP-client examples — numbered scripts
 
