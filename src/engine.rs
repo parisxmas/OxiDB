@@ -984,6 +984,15 @@ impl OxiDb {
     }
 
     /// Drop a collection and its data.
+    ///
+    /// On-disk a collection's `.btree` snapshot can be either a file
+    /// (single-page collections) or a directory (multi-page); see the
+    /// comment on `discover_collection_names_on_disk` and the use of
+    /// "files/directories" there. The drop path must handle both —
+    /// blindly calling `remove_dir_all` on a file raises
+    /// `io error: Not a directory (os error 20)` and aborts the drop
+    /// with the collection's bookkeeping already cleared from the
+    /// in-memory map (leaving the data files orphaned on disk).
     pub fn drop_collection(&self, name: &str) -> Result<()> {
         let mut cols = self.collections.write();
         cols.remove(name);
@@ -995,9 +1004,11 @@ impl OxiDb {
                     std::fs::remove_file(path)?;
                 }
             }
-            let btree_dir = self.data_dir.join(format!("{}.btree", name));
-            if btree_dir.exists() {
-                std::fs::remove_dir_all(btree_dir)?;
+            let btree_path = self.data_dir.join(format!("{}.btree", name));
+            if btree_path.is_dir() {
+                std::fs::remove_dir_all(&btree_path)?;
+            } else if btree_path.exists() {
+                std::fs::remove_file(&btree_path)?;
             }
         }
         Ok(())
@@ -3436,5 +3447,62 @@ mod tests {
             }
             _ => panic!("expected Select"),
         }
+    }
+
+    /// Regression: dropping a collection whose `.btree` snapshot is a
+    /// file (not a directory) used to bail out with
+    /// `io error: Not a directory (os error 20)` because the drop path
+    /// unconditionally called `remove_dir_all`. drop_collection must
+    /// handle BOTH the file shape (small / single-page collection) and
+    /// the directory shape (multi-page snapshot).
+    #[test]
+    fn drop_collection_handles_btree_file_layout() {
+        let dir = tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+
+        // Insert a doc so the collection materialises a .btree on disk.
+        db.insert("orphans", json!({"x": 1})).unwrap();
+
+
+        // Make .btree a FILE (the legacy single-page layout). We do
+        // this by removing whatever the engine wrote, then touching an
+        // empty file with the same name — drop_collection should still
+        // succeed without raising "Not a directory".
+        let btree = dir.path().join("orphans.btree");
+        if btree.is_dir() {
+            std::fs::remove_dir_all(&btree).unwrap();
+        } else if btree.exists() {
+            std::fs::remove_file(&btree).unwrap();
+        }
+        std::fs::write(&btree, b"").unwrap();
+        assert!(btree.exists() && !btree.is_dir(), "preflight: .btree should be a file");
+
+        db.drop_collection("orphans").expect("drop_collection on a .btree file shape should succeed");
+        assert!(!btree.exists(), ".btree file should be removed by drop_collection");
+    }
+
+    /// Companion: the directory-shape `.btree` (multi-page snapshot)
+    /// keeps working too — the same drop path must handle both.
+    #[test]
+    fn drop_collection_handles_btree_directory_layout() {
+        let dir = tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+
+        db.insert("dirty", json!({"x": 1})).unwrap();
+
+        let btree = dir.path().join("dirty.btree");
+        // Force the directory layout: remove whatever the engine wrote,
+        // then mkdir + drop a sentinel file inside.
+        if btree.is_dir() {
+            std::fs::remove_dir_all(&btree).unwrap();
+        } else if btree.exists() {
+            std::fs::remove_file(&btree).unwrap();
+        }
+        std::fs::create_dir_all(&btree).unwrap();
+        std::fs::write(btree.join("page-0000"), b"").unwrap();
+        assert!(btree.is_dir(), "preflight: .btree should be a directory");
+
+        db.drop_collection("dirty").expect("drop_collection on a .btree dir shape should succeed");
+        assert!(!btree.exists(), ".btree dir should be removed by drop_collection");
     }
 }
