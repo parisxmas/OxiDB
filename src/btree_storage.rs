@@ -26,6 +26,24 @@ use scc::HashMap as SccMap;
 
 use crate::error::{Error, Result};
 
+// ── File header (Phase 1b of ADR-0003 / docs/format/btree.md) ──
+//
+// Layout (8 bytes, little-endian) sitting at the start of the plaintext
+// (i.e. inside the encrypted blob when encryption is on):
+//   [b"OXBT" (4)][version u16][flags u16]
+//
+// Files written by versions predating the header are accepted as
+// legacy: detected by the absence of `OXBT` magic at the start of the
+// (post-decrypt) plaintext. The next `persist()` rewrites them with a
+// v1 header automatically — every persist serializes the whole tree in
+// full, so there's no migration window beyond "first persist after
+// upgrade". Recognising a version we don't know is fatal — `open()`
+// surfaces it as `Error::Io(InvalidData)` rather than silently loading
+// from an empty state and letting WAL replay paper over a data loss.
+const BTREE_MAGIC: &[u8; 4] = b"OXBT";
+const BTREE_VERSION: u16 = 1;
+const BTREE_HEADER_SIZE: usize = 8;
+
 /// Concurrent B-tree storage using an `scc::HashMap<u64, Vec<u8>>`.
 ///
 /// All mutating methods take `&self` — `scc::HashMap` handles internal locking
@@ -205,7 +223,36 @@ impl BTreeStorage {
                     }
                 }
             }
-            if let Err(e) = storage.load_from_bytes(&data) {
+
+            // Phase 1b version check. If the plaintext starts with `OXBT`,
+            // validate the version and strip the header before parsing;
+            // otherwise it's a legacy (pre-Phase-1b) file and we parse
+            // records from offset 0. An unknown version is fatal — we must
+            // not silently load from empty and let WAL replay claim it
+            // reconciled an image we never read.
+            let records: &[u8] =
+                if data.len() >= BTREE_HEADER_SIZE && &data[0..4] == BTREE_MAGIC {
+                    let version = u16::from_le_bytes([data[4], data[5]]);
+                    if version != BTREE_VERSION {
+                        return Err(Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "unsupported .btree format version {} at {}; \
+                                 this binary understands version {}",
+                                version,
+                                path.display(),
+                                BTREE_VERSION
+                            ),
+                        )));
+                    }
+                    // data[6..8] = flags; reserved at 0 — ignored until a
+                    // bit is documented + assigned.
+                    &data[BTREE_HEADER_SIZE..]
+                } else {
+                    &data[..]
+                };
+
+            if let Err(e) = storage.load_from_bytes(records) {
                 eprintln!(
                     "[btree] {}.btree partially loaded ({} records, {} bytes total) \
                      before error: {} — WAL replay will reconcile",
@@ -223,8 +270,11 @@ impl BTreeStorage {
         Ok(storage)
     }
 
-    /// Deserialize the B-tree from a binary dump.
-    /// Format: repeated [key: u64 LE][len: u32 LE][value bytes]
+    /// Deserialize the B-tree from a binary dump (after any decryption
+    /// and after `open()` has stripped the OXBT file header, if present).
+    /// Body format: repeated `[key: u64 LE][len: u32 LE][value bytes]`.
+    /// See [`docs/format/btree.md`](../../docs/format/btree.md) for the full
+    /// on-disk layout including the v1 file header.
     fn load_from_bytes(&self, data: &[u8]) -> Result<()> {
         let mut pos = 0;
         let mut total = 0u64;
@@ -286,7 +336,14 @@ impl BTreeStorage {
         let path = self.data_dir.join(format!("{}.btree", self.name));
         let tmp = self.data_dir.join(format!("{}.btree.tmp", self.name));
 
-        let mut buf = Vec::with_capacity(self.total_bytes.load(Ordering::Acquire) as usize + self.tree.len() * 12);
+        // Phase 1b: plaintext = [OXBT header][record stream]. The header
+        // sits INSIDE the encrypted blob when encryption is on, so the
+        // reader detects + validates it after decryption.
+        let body_cap = self.total_bytes.load(Ordering::Acquire) as usize + self.tree.len() * 12;
+        let mut buf = Vec::with_capacity(BTREE_HEADER_SIZE + body_cap);
+        buf.extend_from_slice(BTREE_MAGIC);
+        buf.extend_from_slice(&BTREE_VERSION.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // flags reserved
         self.tree.iter_sync(|key, value| {
             buf.extend_from_slice(&key.to_le_bytes());
             buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
@@ -631,5 +688,91 @@ mod tests {
             assert_eq!(storage.get(2).unwrap().as_slice(), b"beta");
             assert_eq!(storage.get(3).unwrap().as_slice(), b"gamma");
         }
+    }
+
+    // ── Phase 1b header (docs/format/btree.md) ────────────────────────
+
+    /// `persist()` prepends the OXBT / version=1 / flags=0 header to the
+    /// plaintext, just before the record stream. Verified by reading raw
+    /// bytes on the unencrypted path.
+    #[test]
+    fn persist_writes_oxbt_header_unencrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = BTreeStorage::new("hdr", dir.path(), None);
+        storage.insert(0x1122334455667788, b"X".to_vec());
+        storage.persist().unwrap();
+
+        let raw = std::fs::read(dir.path().join("hdr.btree")).unwrap();
+        assert!(raw.len() >= BTREE_HEADER_SIZE + 8 + 4 + 1, "header + 1 record minimum");
+        assert_eq!(&raw[0..4], BTREE_MAGIC, "OXBT magic at offset 0");
+        assert_eq!(u16::from_le_bytes([raw[4], raw[5]]), BTREE_VERSION);
+        assert_eq!(u16::from_le_bytes([raw[6], raw[7]]), 0, "flags reserved 0");
+        // First record's key sits immediately after the header.
+        assert_eq!(
+            u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+            0x1122334455667788
+        );
+    }
+
+    /// A pre-Phase-1b file (no OXBT magic at offset 0 of the plaintext)
+    /// reads correctly. After one `persist()` the file is rewritten with
+    /// the v1 header — every persist serialises the whole tree, so the
+    /// migration window is exactly "first persist after upgrade".
+    #[test]
+    fn reads_legacy_header_less_btree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.btree");
+
+        // Hand-craft a legacy file: just one [key u64][len u32][value] record,
+        // no header. This is byte-identical to what a pre-Phase-1b engine
+        // would have written for an unencrypted .btree.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&42u64.to_le_bytes());
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(b"hello");
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Open + read: legacy bytes parse correctly.
+        let storage = BTreeStorage::open("legacy", dir.path(), None).unwrap();
+        assert_eq!(storage.count(), 1);
+        assert_eq!(storage.get(42).unwrap().as_slice(), b"hello");
+
+        // The next persist rewrites with a v1 header.
+        storage.persist().unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(&raw[0..4], BTREE_MAGIC, "legacy file migrated on next persist");
+
+        // ...and still reads back correctly on reopen.
+        let reopened = BTreeStorage::open("legacy", dir.path(), None).unwrap();
+        assert_eq!(reopened.count(), 1);
+        assert_eq!(reopened.get(42).unwrap().as_slice(), b"hello");
+    }
+
+    /// A `.btree` file with a newer format version we don't recognise must
+    /// be refused at `open()` rather than silently loaded as empty (which
+    /// would let WAL replay paper over a real data loss).
+    #[test]
+    fn refuses_newer_btree_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.btree");
+
+        // Hand-craft a v2 file: OXBT + version=2 + flags=0 + one record.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BTREE_MAGIC);
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // a record we should never reach
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.push(b'A');
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = BTreeStorage::open("future", dir.path(), None)
+            .err()
+            .expect("open should reject a newer btree format version");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported .btree format version 2"),
+            "error should name the unsupported version: {msg}"
+        );
     }
 }
