@@ -689,7 +689,11 @@ Interior mutability — no collection-level lock:
 
 ### Write-Ahead Log
 
-Every insert/update/delete is logged to a `.wal` file before mutating storage. On crash recovery, WAL entries are replayed to restore un-persisted writes. WAL is checkpointed (truncated) after each successful `.btree` file persist (~every 10ms when dirty).
+Every insert/update/delete is appended to a per-collection `.wal` file **before** the in-memory B-tree is mutated. Each record carries a CRC32 checksum and a transaction id, so recovery can skip aborted transactions and ignore a partially-written tail.
+
+By default each commit fsyncs the WAL (strict ACID-D — when a write returns success the bytes are on disk; matches `synchronous_commit=on` / MongoDB `j:true`). `OXIDB_LAZY_SYNC=true` instead batches fsyncs into the background snapshot thread, trading up to `OXIDB_SYNC_INTERVAL_MS` of data loss on crash for higher write throughput. Default cadence is **1000 ms in strict mode, 10 ms in lazy mode**.
+
+The same background thread also writes periodic `.btree` snapshots but deliberately does **not** truncate the WAL afterward: a concurrent insert can land between the snapshot and the truncation and would otherwise be lost. The WAL therefore grows between snapshots and is replayed idempotently on top of the last `.btree` image at startup. Truncation happens only in the final checkpoint on graceful shutdown, when no writers are active.
 
 ### Performance Optimizations
 
