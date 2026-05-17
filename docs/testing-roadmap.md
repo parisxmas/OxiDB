@@ -18,7 +18,7 @@ landed alongside this doc.
 | 2 | **Crash recovery** | ✅ partial — soft-crash ([`tests/cern_crash_recovery.rs`](../tests/cern_crash_recovery.rs)) + hard-SIGKILL ([`tests/cern_sigkill_drill.rs`](../tests/cern_sigkill_drill.rs)) + byte-offset SIGKILL matrix ([`tests/cern_sigkill_byte_offset.rs`](../tests/cern_sigkill_byte_offset.rs)) | ENOSPC/EIO injection; cosmic-bit-flip simulation; deeper init-time kill cases (e.g. mid-WAL-header-write) |
 | 3 | **Performance & long-tail** | ✅ partial — bounded soak in [`tests/cern_soak.rs`](../tests/cern_soak.rs) | Multi-day soak, RSS / fd / WAL-size leak detection, HEP-shaped workload (bursty ingest + long-range scans + high-fanout reads) |
 | 4 | **HA / Raft fault injection** | ❌ not started | **Jepsen-style suite** (split-brain, partition, clock skew, slow disk) — biggest single gap |
-| 5 | **Security** | ✅ partial — wire-protocol fuzz harness in [`fuzz/`](../fuzz/) (4 targets: top-level dispatcher, OxiWire, RESP, pg_wire) | Structure-aware fuzzing via `arbitrary`; differential fuzz vs real Redis / Postgres; OSS-Fuzz continuous integration; external pentest (Cure53 / Trail of Bits); authn/authz bypass tests |
+| 5 | **Security** | ✅ partial — wire-protocol fuzz harness in [`fuzz/`](../fuzz/) — 4 mutation targets (dispatcher, OxiWire, RESP, pg_wire) + 1 structure-aware target (OxiWire roundtrip via `arbitrary`) | Structure-aware roundtrip for RESP / MsgPack / pg_wire; differential fuzz vs real Redis / Postgres; OSS-Fuzz continuous integration; external pentest (Cure53 / Trail of Bits); authn/authz bypass tests |
 | 6 | **Upgrade / migration** | ❌ not started | Byte-identical fixture corpus per release; N → N+1 → N+2 round-trip; downgrade where allowed |
 | 7 | **Scale** | ❌ not started | 10⁹+ doc dataset, 24-hour sustained insert + scan, multi-TB on-disk |
 | 8 | **Disaster recovery / drills** | ❌ not started | Power-loss VM drill, primary-site-down 24h, restore-from-cold-backup time-to-recover SLA |
@@ -137,11 +137,19 @@ The harness is the deliverable; what it finds is follow-up. The
 first smoke run found multiple crashers across all four targets —
 each gets its own fix PR with a pinned regression test.
 
-Does NOT yet cover: structure-aware fuzzing (the `arbitrary` crate
-+ `Arbitrary` impls would explore message space far more
-efficiently than mutation-based bit-flipping); differential fuzz
-against a reference impl (RESP vs real Redis, pg_wire vs real
-Postgres); OSS-Fuzz continuous-integration; coverage reporting.
+**Update:** structure-aware fuzzing landed for OxiWire — see
+`oxiwire_roundtrip` target. Generates an `Arbitrary` value tree,
+encodes through `oxiwire::encode_value`, decodes via
+`oxiwire::decode_request`, asserts JSON-canonical equality. Runs
+~6× faster than bit-flipping (~18k iter/s vs ~3k iter/s in 30s
+smoke runs) because every input is valid-by-construction and
+libfuzzer mutates *meaningfully* rather than throwing megabytes of
+garbage that bounce off the decoder's first byte check.
+
+Does NOT yet cover: structure-aware roundtrip for the remaining 3
+wire formats (RESP, MsgPack, pg_wire); differential fuzz against a
+reference impl (RESP vs real Redis, pg_wire vs real Postgres);
+OSS-Fuzz continuous-integration; coverage reporting.
 
 ### `cern_sigkill_byte_offset.rs`
 
