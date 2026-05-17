@@ -1290,6 +1290,157 @@ fn test_linked_collection_csv_adapter_full_crud() {
     assert!(resp["error"].as_str().unwrap().contains("only CRUD"));
 }
 
+// ===========================================================================
+// Linked collections — REST adapter (FDW v3b)
+// ===========================================================================
+
+/// Spawn a tiny in-process HTTP/1.1 server that scripts (method, path)
+/// → (status, body) responses. Same shape as the rest_adapter unit
+/// tests' mock — we re-implement it here (rather than pub-exposing
+/// it) so the integration test stays isolated to its own
+/// dependencies and the unit-test mock can stay private.
+struct WireHttpMock {
+    port: u16,
+}
+
+impl WireHttpMock {
+    fn start(responses: Vec<(&'static str, &'static str, u16, &'static str)>) -> Self {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let resps = responses.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+                    let mut buf = [0u8; 8192];
+                    let mut total = Vec::new();
+                    loop {
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        if n == 0 { break; }
+                        total.extend_from_slice(&buf[..n]);
+                        if let Some(idx) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = std::str::from_utf8(&total[..idx]).unwrap_or("");
+                            let cl = head
+                                .lines()
+                                .find_map(|l| l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                .unwrap_or(0);
+                            if total.len() >= idx + 4 + cl { break; }
+                        }
+                    }
+                    let head_end = total.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(total.len());
+                    let head_str = std::str::from_utf8(&total[..head_end]).unwrap_or("");
+                    let line = head_str.lines().next().unwrap_or("");
+                    let mut parts = line.split(' ');
+                    let method = parts.next().unwrap_or("");
+                    let path = parts.next().unwrap_or("");
+                    let (status, payload) = resps
+                        .iter()
+                        .find(|(m, p, _, _)| *m == method && *p == path)
+                        .map(|(_, _, s, b)| (*s, *b))
+                        .unwrap_or((404, ""));
+                    let body_bytes = payload.as_bytes();
+                    let resp = format!(
+                        "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status, body_bytes.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.write_all(body_bytes);
+                });
+            }
+        });
+        Self { port }
+    }
+}
+
+/// End-to-end REST adapter test: link `users` → http://mock/users,
+/// then exercise find / find_one / insert / update_one / delete_one
+/// through the public OxiDB wire. Proves the dispatcher routes
+/// `http://` URLs to `RestAdapter` and that the adapter's HTTP/1.1
+/// client actually talks to a real (mock) endpoint.
+#[test]
+fn test_linked_collection_rest_adapter_full_crud() {
+    let mock = WireHttpMock::start(vec![
+        ("GET", "/users", 200, r#"[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]"#),
+        ("GET", "/users/1", 200, r#"{"id":1,"name":"alice"}"#),
+        ("POST", "/users", 201, r#"{"id":3,"name":"carol"}"#),
+        ("PATCH", "/users/1", 200, r#"{"id":1,"name":"alice-updated"}"#),
+        ("DELETE", "/users/2", 204, ""),
+    ]);
+
+    let local = TestServer::start();
+    let mut c = Client::connect(local.addr);
+    let url = format!("http://127.0.0.1:{}/users", mock.port);
+    assert_ok(&c.send(&json!({
+        "cmd": "link_collection",
+        "collection": "users_api",
+        "url": url,
+    })));
+
+    // find → mock returns 2 users
+    let resp = c.send(&json!({"cmd": "find", "collection": "users_api", "query": {}}));
+    assert_ok(&resp);
+    assert_eq!(resp["data"].as_array().unwrap().len(), 2);
+
+    // find_one by id → GET /users/1
+    let resp = c.send(&json!({
+        "cmd": "find_one", "collection": "users_api", "query": {"id": 1}
+    }));
+    assert_eq!(resp["data"]["name"], "alice");
+
+    // insert → POST returns created doc with new id
+    let resp = c.send(&json!({
+        "cmd": "insert", "collection": "users_api", "doc": {"name": "carol"}
+    }));
+    assert_eq!(resp["data"]["id"], 3);
+
+    // update_one with $set → PATCH /users/1
+    let resp = c.send(&json!({
+        "cmd": "update_one",
+        "collection": "users_api",
+        "query": {"id": 1},
+        "update": {"$set": {"name": "alice-updated"}},
+    }));
+    assert_eq!(resp["data"]["modified"], 1);
+    assert_eq!(resp["data"]["doc"]["name"], "alice-updated");
+
+    // delete_one → DELETE /users/2
+    let resp = c.send(&json!({
+        "cmd": "delete_one", "collection": "users_api", "query": {"id": 2}
+    }));
+    assert_eq!(resp["data"]["deleted"], 1);
+
+    // Schema commands still refused regardless of adapter.
+    let resp = c.send(&json!({
+        "cmd": "create_index", "collection": "users_api", "field": "name"
+    }));
+    assert_eq!(resp["ok"], false);
+    assert!(resp["error"].as_str().unwrap().contains("only CRUD"));
+}
+
+/// A REST link to an unreachable endpoint surfaces as an error on
+/// first query, not a panic. Mirrors the OxiDB-link version of this
+/// test — same operator failure mode, different transport.
+#[test]
+fn test_linked_collection_rest_unreachable_endpoint_errors_cleanly() {
+    let local = TestServer::start();
+    let mut c = Client::connect(local.addr);
+    // 127.0.0.1:1 is reserved for tcpmux; nothing listens. Any
+    // request times out / connection-refuses immediately.
+    assert_ok(&c.send(&json!({
+        "cmd": "link_collection",
+        "collection": "dead_api",
+        "url": "http://127.0.0.1:1/anything",
+    })));
+    let resp = c.send(&json!({"cmd": "find", "collection": "dead_api", "query": {}}));
+    assert_eq!(resp["ok"], false);
+    assert!(resp["error"].as_str().unwrap().contains("connect"),
+        "{:?}", resp["error"]);
+}
+
 /// A CSV link to a file:// URL with the wrong extension MUST be
 /// refused at link-time (well — at first-query time, since
 /// link_collection doesn't pre-validate the URL). The error must

@@ -5,18 +5,19 @@
 //! trait, and a single URL-scheme dispatcher picks the right impl
 //! for a given link.
 //!
-//! Schemes wired in (v3a):
-//!   - `oxidb://[user:pw@]host:port/<collection>` — peer OxiDB
-//!   - `file:///path/to/file.csv`                  — local CSV file
-//!   - `csv:///path/to/file.csv`                   — same, explicit
+//! Schemes wired in:
+//!   - `oxidb://[user:pw@]host:port/<collection>`  — peer OxiDB (v3a)
+//!   - `file:///path/to/file.csv`                  — local CSV file (v3a)
+//!   - `csv:///path/to/file.csv`                   — same, explicit (v3a)
+//!   - `http://host:port/resource`                 — REST API (v3b)
 //!
-//! Future PRs (#71) will plug in Postgres + REST without touching
-//! the handler.
+//! Future PR will plug in Postgres without touching the handler.
 
 use serde_json::Value;
 
 pub mod csv_adapter;
 pub mod oxidb_adapter;
+pub mod rest_adapter;
 
 /// An FDW adapter knows how to translate the local server's CRUD
 /// commands into whatever shape the remote understands (another
@@ -49,6 +50,8 @@ pub trait Adapter: Send + Sync {
 pub fn adapter_for(url: &str) -> Result<Box<dyn Adapter>, String> {
     if url.starts_with("oxidb://") {
         Ok(Box::new(oxidb_adapter::OxiDbAdapter::from_url(url)?))
+    } else if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(Box::new(rest_adapter::RestAdapter::from_url(url)?))
     } else if url.starts_with("csv://") {
         Ok(Box::new(csv_adapter::CsvAdapter::from_url(
             url.trim_start_matches("csv://"),
@@ -70,7 +73,7 @@ pub fn adapter_for(url: &str) -> Result<Box<dyn Adapter>, String> {
     } else {
         Err(format!(
             "no FDW adapter for URL scheme: {} \
-            — supported: oxidb://, file://*.csv, csv://",
+            — supported: oxidb://, http://, https:// (REST), file://*.csv, csv://",
             url
         ))
     }
