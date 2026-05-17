@@ -929,3 +929,137 @@ fn test_role_as_str() {
     assert_eq!(Role::ReadWrite.as_str(), "readWrite");
     assert_eq!(Role::Read.as_str(), "read");
 }
+
+// ===========================================================================
+// Linked collections (FDW v1)
+// ===========================================================================
+
+/// link_collection / unlink_collection / list_links roundtrip on one
+/// instance — the registry surface works independently of any actual
+/// proxy traffic.
+#[test]
+fn test_link_collection_registry_roundtrip() {
+    let server = TestServer::start();
+    let mut c = Client::connect(server.addr);
+
+    // Register a link.
+    let resp = c.send(&json!({
+        "cmd": "link_collection",
+        "collection": "remote_users",
+        "url": "oxidb://central.example.com:4444/users",
+    }));
+    assert_ok(&resp);
+    assert_eq!(resp["data"]["name"], "remote_users");
+    assert_eq!(resp["data"]["url"], "oxidb://central.example.com:4444/users");
+
+    // list_links sees it.
+    let resp = c.send(&json!({"cmd": "list_links"}));
+    assert_ok(&resp);
+    let list = resp["data"].as_array().expect("list_links data is an array");
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["name"], "remote_users");
+
+    // Bad URL is rejected at registration time, not on query.
+    let resp = c.send(&json!({
+        "cmd": "link_collection",
+        "collection": "bogus",
+        "url": "not-a-url",
+    }));
+    assert_eq!(resp["ok"], false);
+    assert!(resp["error"].as_str().unwrap().contains("oxidb://"));
+
+    // Unlink.
+    let resp = c.send(&json!({"cmd": "unlink_collection", "collection": "remote_users"}));
+    assert_ok(&resp);
+    assert_eq!(resp["data"]["unlinked"], "remote_users");
+    let resp = c.send(&json!({"cmd": "list_links"}));
+    assert_eq!(resp["data"].as_array().unwrap().len(), 0);
+}
+
+/// Two OxiDB servers on different ports: instance A links a remote
+/// collection on instance B. A `find` against the link on A actually
+/// hits B and returns B's documents. Read commands proxied, writes
+/// refused.
+#[test]
+fn test_linked_collection_proxies_reads() {
+    // B is the "remote" — seed it with two docs in a `users` collection.
+    let remote = TestServer::start();
+    let mut bclient = Client::connect(remote.addr);
+    bclient.send(&json!({"cmd": "insert", "collection": "users",
+        "doc": {"name": "Alice", "age": 30}}));
+    bclient.send(&json!({"cmd": "insert", "collection": "users",
+        "doc": {"name": "Bob", "age": 25}}));
+
+    // A is the "local" — register a link `remote_users` → B/users.
+    let local = TestServer::start();
+    let mut aclient = Client::connect(local.addr);
+    let url = format!("oxidb://127.0.0.1:{}/users", remote.addr.port());
+    let resp = aclient.send(&json!({
+        "cmd": "link_collection",
+        "collection": "remote_users",
+        "url": url,
+    }));
+    assert_ok(&resp);
+
+    // A `find` against the LOCAL link name returns B's docs.
+    let resp = aclient.send(&json!({"cmd": "find", "collection": "remote_users", "query": {}}));
+    assert_ok(&resp);
+    let docs = resp["data"].as_array().expect("find data is an array");
+    assert_eq!(docs.len(), 2);
+
+    // Filtered find — predicate pushed through.
+    let resp = aclient.send(&json!({
+        "cmd": "find",
+        "collection": "remote_users",
+        "query": {"age": {"$gt": 27}},
+    }));
+    assert_ok(&resp);
+    let docs = resp["data"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["name"], "Alice");
+
+    // count works too — the count endpoint returns {"count": N}.
+    let resp = aclient.send(&json!({"cmd": "count", "collection": "remote_users", "query": {}}));
+    assert_ok(&resp);
+    assert_eq!(resp["data"]["count"], 2);
+
+    // A write against the linked collection is refused with a
+    // policy error — the message MUST mention read-only so the
+    // caller can distinguish from a transient remote failure.
+    let resp = aclient.send(&json!({
+        "cmd": "insert",
+        "collection": "remote_users",
+        "doc": {"name": "Carol"},
+    }));
+    assert_eq!(resp["ok"], false);
+    assert!(
+        resp["error"].as_str().unwrap().contains("read-only"),
+        "write refusal should say 'read-only': {:?}",
+        resp["error"]
+    );
+}
+
+/// A find against a missing remote (port not listening) returns an
+/// error, not a panic — and the error names both the link and the
+/// underlying transport reason.
+#[test]
+fn test_linked_collection_unreachable_remote_errors_cleanly() {
+    let local = TestServer::start();
+    let mut c = Client::connect(local.addr);
+
+    // Link to a deliberately-closed port.
+    c.send(&json!({
+        "cmd": "link_collection",
+        "collection": "unreachable",
+        "url": "oxidb://127.0.0.1:1/dummy", // port 1 — reserved, nothing listens
+    }));
+    let resp = c.send(&json!({"cmd": "find", "collection": "unreachable", "query": {}}));
+    assert_eq!(resp["ok"], false);
+    let err = resp["error"].as_str().unwrap();
+    assert!(err.contains("unreachable"), "error mentions link name: {}", err);
+    assert!(
+        err.contains("connect") || err.contains("refused") || err.contains("127.0.0.1:1"),
+        "error mentions transport: {}",
+        err
+    );
+}

@@ -94,8 +94,58 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
     // Take ownership of mutable request for extracting fields without cloning
     let mut request = request;
 
+    // FDW v1: if the targeted collection is registered as a linked
+    // collection (see oxidb::links), route to the remote OxiDB
+    // instead of the local engine. Read commands are proxied; write
+    // commands are refused with an explicit "read-only" error so the
+    // caller knows the failure is policy, not a transient error.
+    //
+    // The link-management commands themselves (link_collection /
+    // unlink_collection / list_links) are handled below in their own
+    // match arms — they DO carry a `collection` field but it names
+    // the link being registered, not a collection to query. We skip
+    // the proxy check for them.
+    if let Some(ref col) = collection {
+        if !is_link_management_cmd(&cmd) {
+            if let Some(link) = db.lookup_link(col) {
+                return handle_linked_command(&cmd, &link, request);
+            }
+        }
+    }
+
     match cmd.as_str() {
         "ping" => ok_bytes(json!("pong")),
+
+        // -------------------------------------------------------------------
+        // Linked collections (FDW v1)
+        // -------------------------------------------------------------------
+
+        "link_collection" => {
+            let name = match collection.as_deref() {
+                Some(c) if !c.is_empty() => c,
+                _ => return err_bytes("missing 'collection' (the local link name)"),
+            };
+            let url = match request.get("url").and_then(|v| v.as_str()) {
+                Some(u) if !u.is_empty() => u,
+                _ => return err_bytes("missing 'url'"),
+            };
+            match db.link_collection(name, url) {
+                Ok(cfg) => ok_bytes(json!(cfg)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+        "unlink_collection" => {
+            let name = match collection.as_deref() {
+                Some(c) if !c.is_empty() => c,
+                _ => return err_bytes("missing 'collection'"),
+            };
+            match db.unlink_collection(name) {
+                Ok(true) => ok_bytes(json!({"unlinked": name})),
+                Ok(false) => err_bytes(&format!("no such linked collection {:?}", name)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+        "list_links" => ok_bytes(json!(db.list_links())),
 
         // -------------------------------------------------------------------
         // Transaction commands
@@ -1237,6 +1287,72 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         }
 
         _ => err_bytes(&format!("unknown command: {cmd}")),
+    }
+}
+
+/// is_link_management_cmd returns true for commands that take a
+/// `collection` field as a LINK NAME (not a query target). Used by
+/// the FDW pre-dispatch hook to skip the proxy lookup for these
+/// commands so registering / removing a link doesn't try to proxy
+/// itself.
+fn is_link_management_cmd(cmd: &str) -> bool {
+    matches!(cmd, "link_collection" | "unlink_collection")
+}
+
+/// handle_linked_command routes a query against a linked collection.
+/// Read commands are proxied to the remote OxiDB after rewriting the
+/// `collection` field from the local link name to the remote
+/// collection name. Write / schema commands are refused — v1 of FDW
+/// is read-only.
+///
+/// Returns the pre-serialized response bytes; the caller (the main
+/// dispatch in handle_request) just returns this directly.
+fn handle_linked_command(cmd: &str, link: &oxidb::links::LinkConfig, mut request: Value) -> Vec<u8> {
+    use crate::remote_client;
+
+    // Read commands are the only ones we proxy. Writes / schema
+    // commands are refused with a clear message — better than the
+    // alternative of silently mutating the remote without an audit
+    // trail.
+    match cmd {
+        // Read commands — proxy through.
+        "find" | "find_one" | "count" | "aggregate" | "text_search" => {}
+        // Everything else against a linked collection is rejected.
+        _ => {
+            return err_bytes(&format!(
+                "command {:?} is not allowed on linked collection {:?} \
+                — linked collections are read-only in this version (FDW v1)",
+                cmd, link.name
+            ));
+        }
+    }
+
+    // Parse the remote endpoint. Re-validated on every call (cheap)
+    // so a partial-disk corruption to _links.json shows up as a
+    // proxy error rather than a panic.
+    let remote = match remote_client::parse_remote(&link.url) {
+        Ok(r) => r,
+        Err(e) => return err_bytes(&format!("linked {}: {}", link.name, e)),
+    };
+
+    // Rewrite the collection field from the LOCAL link name to the
+    // REMOTE collection name. Clone+replace; the request was already
+    // taken by value here.
+    if let Some(obj) = request.as_object_mut() {
+        obj.insert(
+            "collection".to_string(),
+            Value::String(remote.remote_collection.clone()),
+        );
+    }
+
+    match remote_client::proxy_command(&remote, &request) {
+        Ok(resp) => {
+            // The remote already returned a fully-formed `{ok, ...}`
+            // envelope. Pass it through verbatim — the local server
+            // is just a proxy.
+            serde_json::to_vec(&resp).unwrap_or_else(|_| err_bytes("proxy: encode response"))
+        }
+        Err(e) => err_bytes(&format!("linked {} → {}: {}", link.name, link.url, e)),
     }
 }
 

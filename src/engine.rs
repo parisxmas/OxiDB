@@ -32,6 +32,7 @@ use crate::document::DocumentId;
 use crate::error::{Error, Result};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::fts::{self, FtsIndex};
+use crate::links::{LinkConfig, LinksTable};
 use crate::pipeline::Pipeline;
 use crate::query::FindOptions;
 use crate::transaction::{ReadRecord, Transaction, WriteOp};
@@ -419,6 +420,11 @@ pub struct OxiDb {
     archiver_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
     cache_capacity: AtomicUsize,
     in_memory: bool,
+    /// Linked-collection registry (FDW-style remote proxies). Reads
+    /// of every collection-targeting command consult this table; a
+    /// hit means proxy to the remote OxiDB instead of touching the
+    /// local engine. See `src/links.rs`.
+    links: Arc<LinksTable>,
     #[cfg(not(target_arch = "wasm32"))]
     ttl_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -487,6 +493,7 @@ impl OxiDb {
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: true,
+            links: LinksTable::in_memory(),
             ttl_shutdown: Mutex::new(None),
             alert_shutdown: Mutex::new(None),
             #[cfg(feature = "gpu")]
@@ -510,6 +517,7 @@ impl OxiDb {
             lazy_sync: AtomicBool::new(false),
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: true,
+            links: LinksTable::in_memory(),
         })
     }
 
@@ -642,11 +650,56 @@ impl OxiDb {
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
             in_memory: false,
+            links: LinksTable::open(data_dir)?,
             ttl_shutdown: Mutex::new(None),
             alert_shutdown: Mutex::new(None),
             #[cfg(feature = "gpu")]
             gpu: Mutex::new(None),
 })
+    }
+
+    // -----------------------------------------------------------------------
+    // Linked collections (FDW v1)
+    // -----------------------------------------------------------------------
+
+    /// Register a linked collection — a local name that, when used in
+    /// read commands (find / find_one / count / aggregate), proxies to
+    /// a remote OxiDB. Write commands against a linked name are
+    /// refused by the handler.
+    ///
+    /// Replaces any existing link with the same name. URL validation
+    /// happens here so a malformed URL is caught at registration,
+    /// not on every subsequent query.
+    pub fn link_collection(&self, name: &str, url: &str) -> Result<LinkConfig> {
+        if name.is_empty() {
+            return Err(Error::InvalidQuery("link name must not be empty".into()));
+        }
+        let cfg = LinkConfig {
+            name: name.to_string(),
+            url: url.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        self.links.insert(cfg.clone())?;
+        Ok(cfg)
+    }
+
+    /// Drop a previously registered link. Returns `true` if the link
+    /// existed; `false` for an unknown name (the same behaviour as
+    /// `drop_collection` on a missing collection).
+    pub fn unlink_collection(&self, name: &str) -> Result<bool> {
+        self.links.remove(name)
+    }
+
+    /// Snapshot every registered link, ordered by name.
+    pub fn list_links(&self) -> Vec<LinkConfig> {
+        self.links.list()
+    }
+
+    /// Look up the link config for a local collection name, or
+    /// `None` if not linked. Used by the handler to route reads to
+    /// the proxy and to refuse writes.
+    pub fn lookup_link(&self, name: &str) -> Option<LinkConfig> {
+        self.links.get(name)
     }
 
     /// Return an Arc to a collection, auto-creating if needed.

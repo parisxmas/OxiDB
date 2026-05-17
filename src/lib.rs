@@ -22,6 +22,7 @@ pub mod engine;
 pub mod error;
 pub mod fts;
 pub mod index;
+pub mod links;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod index_bundle;
 #[cfg(not(target_arch = "wasm32"))]

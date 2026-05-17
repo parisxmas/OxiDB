@@ -8,6 +8,7 @@ pub mod oxiwire;
 pub mod pg_wire;
 pub mod protocol;
 pub mod rbac;
+pub mod remote_client;
 pub mod oximem;
 pub mod resp;
 pub mod scram;
