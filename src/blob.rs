@@ -9,6 +9,19 @@ use sha2::{Sha256, Digest};
 use crate::crypto::EncryptionKey;
 use crate::error::{Error, Result};
 
+/// Highest blob meta JSON schema version this engine knows how to
+/// read. Bump (and add a migration path) whenever a backwards-
+/// incompatible meta field is introduced. Specced in
+/// `docs/format/blob-object.md` (the "Versioning" section).
+pub const CURRENT_BLOB_META_VERSION: u32 = 1;
+
+/// Serde default for `ObjectMeta::format_version` — used when
+/// deserialising a meta file written before the field existed.
+/// Per the format spec, absence means legacy ⇒ treat as v1.
+fn default_blob_meta_version() -> u32 {
+    1
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ObjectMeta {
     pub key: String,
@@ -31,6 +44,16 @@ pub struct ObjectMeta {
     /// this field existed; readers should fall back to `size`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stored_size: Option<u64>,
+    /// JSON schema version of this meta file. Newly-written metas
+    /// always carry the current version constant; metas written
+    /// before this field existed parse cleanly thanks to `default`
+    /// and are treated as version 1 (specced in
+    /// `docs/format/blob-object.md`). Readers REFUSE versions newer
+    /// than they know about — a forward-compatibility tripwire so a
+    /// newer engine writing semantics-changing fields can't
+    /// silently corrupt data when read by an older binary.
+    #[serde(default = "default_blob_meta_version")]
+    pub format_version: u32,
 }
 
 /// Returns true for content types that are already entropy-saturated
@@ -342,6 +365,20 @@ impl BlobStore {
                         None => raw_meta,
                     };
                     let mut meta: ObjectMeta = serde_json::from_slice(&meta_bytes)?;
+                    // Forward-compat tripwire: refuse meta files
+                    // written by a future engine with a schema
+                    // version we don't recognise. `serde(default)`
+                    // backfills v1 for legacy metas missing the
+                    // field, so this only fires on metas that
+                    // explicitly declare a higher version.
+                    if meta.format_version > CURRENT_BLOB_META_VERSION {
+                        return Err(Error::IncompatibleFormat(format!(
+                            "blob meta for id {id} has format_version={} which \
+                             is newer than this engine supports (max {}). \
+                             Refusing to open to prevent silent corruption.",
+                            meta.format_version, CURRENT_BLOB_META_VERSION
+                        )));
+                    }
                     // Backfill `stored_size` for blobs written before
                     // the field existed. We stat the matching .data
                     // file rather than rewriting the on-disk meta.
@@ -507,6 +544,7 @@ impl BlobStore {
             metadata,
             storage_compression: codec.map(|s| s.to_string()),
             stored_size: Some(data_to_write.len() as u64),
+            format_version: CURRENT_BLOB_META_VERSION,
         };
         let meta_json = serde_json::to_vec(&meta)?;
         let meta_to_write = match &self.encryption {
@@ -997,6 +1035,103 @@ mod tests {
         for i in 0..32 {
             let (got, _) = reopened.get_object("mail", &format!("msg-{i}")).unwrap();
             assert_eq!(got, format!("body-{i}").into_bytes());
+        }
+    }
+
+    /// New metas MUST carry the explicit format_version field on the
+    /// wire so a future reader can tell at a glance what schema it
+    /// is looking at. Pins both the field-name and the current value.
+    #[test]
+    fn new_meta_serialises_format_version() {
+        let (_dir, store) = temp_store();
+        store
+            .put_object("b", "k", b"hello", "text/plain", HashMap::new())
+            .unwrap();
+        let meta_path = _dir.path().join("_blobs").join("b");
+        // Find the single .meta file in the bucket dir.
+        let meta_file = std::fs::read_dir(&meta_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().ends_with(".meta"))
+            .expect("at least one .meta written");
+        let raw = std::fs::read(meta_file.path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            parsed["format_version"], CURRENT_BLOB_META_VERSION,
+            "newly-written meta must declare its schema version explicitly"
+        );
+    }
+
+    /// Legacy metas written before the field existed (no
+    /// `format_version` key) MUST still parse — the field is
+    /// additive and defaults to v1. Open() with such metas in the
+    /// bucket dir must succeed.
+    #[test]
+    fn legacy_meta_without_format_version_still_parses() {
+        let (dir, store) = temp_store();
+        store
+            .put_object("b", "k", b"x", "text/plain", HashMap::new())
+            .unwrap();
+        let bucket_dir = dir.path().join("_blobs").join("b");
+        let meta_file = std::fs::read_dir(&bucket_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().ends_with(".meta"))
+            .unwrap();
+
+        // Rewrite the meta with the format_version stripped — exactly
+        // what a pre-upgrade engine would have written.
+        let raw = std::fs::read(meta_file.path()).unwrap();
+        let mut parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        parsed.as_object_mut().unwrap().remove("format_version");
+        std::fs::write(
+            meta_file.path(),
+            serde_json::to_vec(&parsed).unwrap(),
+        )
+        .unwrap();
+
+        // Reopen — must succeed (default = v1).
+        drop(store);
+        let reopened = BlobStore::open(dir.path()).unwrap();
+        let (got, _) = reopened.get_object("b", "k").unwrap();
+        assert_eq!(got, b"x");
+    }
+
+    /// Forward-compat tripwire: a meta declaring a higher version
+    /// MUST be refused at open(). Better to error loudly than to
+    /// best-effort read fields with potentially different semantics.
+    #[test]
+    fn meta_with_future_version_refused_on_open() {
+        let (dir, store) = temp_store();
+        store
+            .put_object("b", "k", b"y", "text/plain", HashMap::new())
+            .unwrap();
+        let bucket_dir = dir.path().join("_blobs").join("b");
+        let meta_file = std::fs::read_dir(&bucket_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().ends_with(".meta"))
+            .unwrap();
+
+        // Bump the version to one past what we support.
+        let raw = std::fs::read(meta_file.path()).unwrap();
+        let mut parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        parsed["format_version"] = serde_json::json!(CURRENT_BLOB_META_VERSION + 1);
+        std::fs::write(
+            meta_file.path(),
+            serde_json::to_vec(&parsed).unwrap(),
+        )
+        .unwrap();
+
+        drop(store);
+        let res = BlobStore::open(dir.path());
+        match res {
+            Ok(_) => panic!("expected IncompatibleFormat, got Ok(_)"),
+            Err(Error::IncompatibleFormat(msg)) => {
+                assert!(msg.contains("format_version"), "msg was: {msg}");
+                assert!(msg.contains("newer"), "msg was: {msg}");
+            }
+            Err(other) => panic!("expected IncompatibleFormat, got {other:?}"),
         }
     }
 }

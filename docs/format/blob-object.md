@@ -123,7 +123,7 @@ versioning marker.
 above) rather than a discrete version byte. This works in practice
 because the meta is small and structured.
 
-**Planned for Phase 1 — minimal change:**
+**Phase 1b — landed:**
 
 - `<id>.data` gets no version header; the meta's
   `storage_compression` field is already the read-path discriminator.
@@ -131,9 +131,12 @@ because the meta is small and structured.
   modes) requires extending that field's vocabulary, which IS a
   versioning event but is already wired into how readers behave (an
   unknown codec value surfaces as an error, never silent corruption).
-- `<id>.meta` gains an optional `"format_version": 1` field for
-  clarity. Absence ⇒ legacy ⇒ treated as version 1. Engine refuses
-  to read versions it doesn't know.
+- `<id>.meta` carries an explicit `"format_version": 1` field
+  (`src/blob.rs::CURRENT_BLOB_META_VERSION`). Absence ⇒ legacy ⇒
+  treated as version 1 (serde `default = "default_blob_meta_version"`).
+  Engine refuses to open metas declaring a version newer than it
+  knows about (`Error::IncompatibleFormat`) — better to fail loudly
+  than to best-effort read fields whose semantics may have changed.
 
 ## Compatibility rules
 
