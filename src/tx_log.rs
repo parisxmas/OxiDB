@@ -12,6 +12,21 @@ use crate::error::{Error, Result};
 
 pub type TransactionId = u64;
 
+// ── On-disk header (Phase 1b of ADR-0003 / docs/format/tx-commit-log.md) ──
+//
+// Layout (8 bytes, little-endian):
+//   [b"OXTX" (4)][version u16][flags u16]
+//
+// version=1 is the current format. The reader accepts both v1 and a
+// legacy header-less form (detected by absence of `OXTX` at offset 0);
+// the next `persist` rewrites legacy files with a v1 header. Reading a
+// version we don't recognise is a hard error rather than silent
+// misinterpretation.
+
+const TX_MAGIC: &[u8; 4] = b"OXTX";
+const TX_VERSION: u16 = 1;
+const TX_HEADER_SIZE: usize = 8;
+
 /// Upper bound on how many submissions ride a single fsync. A pending
 /// queue larger than this gets sliced into batches of this size; the
 /// next iteration picks up the rest. Higher = more amortisation under
@@ -37,7 +52,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// once into the in-memory set and that becomes the source of truth;
 /// the file is rewritten in full at each batch boundary.
 ///
-/// File format unchanged: a sequence of `[tx_id: u64 LE]` entries.
+/// File format: `[magic "OXTX"][version u16 LE][flags u16 LE]` header
+/// followed by a sequence of `[tx_id: u64 LE]` entries. Files written
+/// by versions predating the header are accepted as legacy: detected
+/// by the absence of `OXTX` magic at offset 0; the entries stream
+/// starts at offset 0 instead of offset 8. The first `persist` rewrites
+/// any legacy file with the v1 header. See
+/// [`docs/format/tx-commit-log.md`](../../docs/format/tx-commit-log.md)
+/// for the byte-level spec.
+///
 /// Readers (e.g. recovery via `read_committed`) see only durable
 /// state — a Read in the same batch as a Mark is deferred until after
 /// the batch's fsync, so callers never observe an entry that hasn't
@@ -202,7 +225,39 @@ fn parse_log(file: &mut File) -> std::io::Result<HashSet<TransactionId>> {
     file.seek(SeekFrom::Start(0))?;
     let file_len = file.metadata()?.len();
     let mut set = HashSet::new();
-    let entry_count = file_len / 8;
+    if file_len == 0 {
+        return Ok(set);
+    }
+
+    // Try the new-style header. A file written by a current engine starts with
+    // `OXTX` magic; anything else is treated as legacy (header-less) — those
+    // 8 bytes are the first tx_id and we rewind to read it.
+    let mut entries_start: u64 = 0;
+    if file_len >= TX_HEADER_SIZE as u64 {
+        let mut header = [0u8; TX_HEADER_SIZE];
+        file.read_exact(&mut header)?;
+        if &header[0..4] == TX_MAGIC {
+            let version = u16::from_le_bytes([header[4], header[5]]);
+            if version != TX_VERSION {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "unsupported _tx_commit_log format version {version}; \
+                         this binary understands version {TX_VERSION}"
+                    ),
+                ));
+            }
+            // header[6..8] = flags; reserved at 0 for now — ignored by readers
+            // until a bit is documented + assigned.
+            entries_start = TX_HEADER_SIZE as u64;
+        }
+    }
+    if entries_start == 0 {
+        file.seek(SeekFrom::Start(0))?;
+    }
+
+    let entries_len = file_len.saturating_sub(entries_start);
+    let entry_count = entries_len / 8;
     for _ in 0..entry_count {
         let mut buf = [0u8; 8];
         if file.read_exact(&mut buf).is_err() {
@@ -219,7 +274,13 @@ fn parse_log(file: &mut File) -> std::io::Result<HashSet<TransactionId>> {
 fn persist(file: &mut File, set: &HashSet<TransactionId>) -> std::io::Result<()> {
     let mut ids: Vec<TransactionId> = set.iter().copied().collect();
     ids.sort_unstable();
-    let mut buf: Vec<u8> = Vec::with_capacity(ids.len() * 8);
+    let mut buf: Vec<u8> = Vec::with_capacity(TX_HEADER_SIZE + ids.len() * 8);
+    // Header: magic + version + flags. Phase 1b of ADR-0003; every persist
+    // rewrites the whole file, so a legacy header-less file is migrated to the
+    // v1 header on the first batch after upgrade.
+    buf.extend_from_slice(TX_MAGIC);
+    buf.extend_from_slice(&TX_VERSION.to_le_bytes());
+    buf.extend_from_slice(&0u16.to_le_bytes()); // flags, reserved
     for id in &ids {
         buf.extend_from_slice(&id.to_le_bytes());
     }
@@ -481,5 +542,83 @@ mod tests {
         let _ = log.mark_committed(7);
         let s = log.read_committed().unwrap();
         assert!(s.contains(&7));
+    }
+
+    // ── Phase 1b header (docs/format/tx-commit-log.md) ───────────────────
+
+    /// Persist writes the OXTX magic + version 1 + flags 0 header before
+    /// the entries stream — verified by reading the raw file bytes.
+    #[test]
+    fn persist_writes_oxtx_header() {
+        let dir = TempDir::new().unwrap();
+        let log = TxCommitLog::open(dir.path()).unwrap();
+        log.mark_committed(0x0102030405060708).unwrap();
+        log.close().unwrap();
+
+        let raw = fs::read(dir.path().join("_tx_commit_log")).unwrap();
+        assert!(raw.len() >= TX_HEADER_SIZE + 8, "header + 1 entry expected");
+        assert_eq!(&raw[0..4], TX_MAGIC, "OXTX magic at offset 0");
+        assert_eq!(u16::from_le_bytes([raw[4], raw[5]]), TX_VERSION);
+        assert_eq!(u16::from_le_bytes([raw[6], raw[7]]), 0, "flags reserved 0");
+        // Entry sits immediately after the 8-byte header.
+        assert_eq!(
+            u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+            0x0102030405060708,
+        );
+    }
+
+    /// A legacy (header-less) file written by a pre-Phase-1b engine is
+    /// still readable — the absence of OXTX at offset 0 is detected and
+    /// the file is parsed as a flat u64 stream from offset 0.
+    #[test]
+    fn reads_legacy_header_less_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("_tx_commit_log");
+
+        // Hand-write a pre-Phase-1b file: just three sorted u64s, no header.
+        let mut bytes = Vec::new();
+        for id in [10u64, 20, 30] {
+            bytes.extend_from_slice(&id.to_le_bytes());
+        }
+        fs::write(&path, &bytes).unwrap();
+
+        let log = TxCommitLog::open(dir.path()).unwrap();
+        let committed = log.read_committed().unwrap();
+        assert_eq!(committed.len(), 3);
+        assert!(committed.contains(&10));
+        assert!(committed.contains(&20));
+        assert!(committed.contains(&30));
+
+        // After a single mutation, the file is rewritten with the new header.
+        log.mark_committed(40).unwrap();
+        log.close().unwrap();
+        let raw = fs::read(&path).unwrap();
+        assert_eq!(&raw[0..4], TX_MAGIC, "legacy file migrated on next persist");
+    }
+
+    /// A file with a newer format version we don't recognise must be
+    /// refused rather than silently misinterpreted. The error surfaces
+    /// up to the caller (TxCommitLog::open) — engine startup fails fast.
+    #[test]
+    fn refuses_newer_format_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("_tx_commit_log");
+
+        // Hand-write a v2 file: OXTX + version=2 + flags=0 + one entry.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(TX_MAGIC);
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&42u64.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let err = TxCommitLog::open(dir.path())
+            .err()
+            .expect("open should fail on newer format version");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported _tx_commit_log format version 2"),
+            "error should mention the version: {msg}"
+        );
     }
 }
