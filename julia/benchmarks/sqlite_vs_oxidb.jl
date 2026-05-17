@@ -184,14 +184,25 @@ function bench_sqlite(rows)
         end
     end
 
-    # 5. Update by indexed id ($inc-equivalent)
+    # 5a. Update by indexed id ($inc-equivalent), auto-commit per stmt
     ids = rand(1:N, N_UPDATES)
-    results["Update by id"] = bench(warmup=1, runs=RUNS) do
+    results["Update by id (auto-commit)"] = bench(warmup=1, runs=RUNS) do
         stmt = DBInterface.prepare(db, "UPDATE people SET age = age + 1 WHERE id = ?")
         for i in ids
             DBInterface.execute(stmt, (i,))
         end
         DBInterface.close!(stmt)
+    end
+
+    # 5b. Same updates wrapped in ONE transaction — collapses N fsyncs to 1
+    results["Update by id (1 tx)"] = bench(warmup=1, runs=RUNS) do
+        SQLite.transaction(db) do
+            stmt = DBInterface.prepare(db, "UPDATE people SET age = age + 1 WHERE id = ?")
+            for i in ids
+                DBInterface.execute(stmt, (i,))
+            end
+            DBInterface.close!(stmt)
+        end
     end
 
     DBInterface.close!(db); rm(path; force=true)
@@ -246,12 +257,23 @@ function bench_oxidb(rows)
         end
     end
 
-    # 5. Update by indexed id ($inc)
+    # 5a. Update by indexed id ($inc), auto-commit per call
     ids = rand(1:N, N_UPDATES)
-    results["Update by id"] = bench(warmup=1, runs=RUNS) do
+    results["Update by id (auto-commit)"] = bench(warmup=1, runs=RUNS) do
         for i in ids
             update(db, "people", Dict("id" => i),
                    Dict("\$inc" => Dict("age" => 1)))
+        end
+    end
+
+    # 5b. Same updates wrapped in ONE transaction — engine collapses
+    #     N WAL fsyncs to 1 via the committer-loop batched commit.
+    results["Update by id (1 tx)"] = bench(warmup=1, runs=RUNS) do
+        transaction(db) do
+            for i in ids
+                update(db, "people", Dict("id" => i),
+                       Dict("\$inc" => Dict("age" => 1)))
+            end
         end
     end
 
@@ -288,7 +310,8 @@ println("Median ± stddev, milliseconds (lower is better). Ratio = OxiDB / SQLit
 println("| Operation | SQLite | OxiDB | Ratio |")
 println("|-----------|--------|-------|-------|")
 ops = ["Bulk insert $N", "Point lookup (indexed)", "Range query (indexed)",
-       "Aggregate (group + avg)", "Update by id"]
+       "Aggregate (group + avg)",
+       "Update by id (auto-commit)", "Update by id (1 tx)"]
 for op in ops
     s = stats(sql_res[op]);  o = stats(oxi_res[op])
     ratio = o.median / s.median
