@@ -1,0 +1,46 @@
+# OSS-Fuzz project metadata for OxiDB.
+#
+# This file is committed here so the canonical source of truth lives
+# with the codebase. When submitting to OSS-Fuzz upstream, copy this
+# file (and the Dockerfile + build.sh siblings) to
+# `projects/oxidb/` in the https://github.com/google/oss-fuzz repo.
+#
+# See `infra/oss-fuzz/README.md` for the full submission playbook.
+#
+# Schema reference:
+#   https://google.github.io/oss-fuzz/getting-started/new-project-guide/#projectyaml
+
+homepage: "https://github.com/parisxmas/OxiDB"
+main_repo: "https://github.com/parisxmas/OxiDB"
+language: rust
+
+# Sanitizers run on every fuzz iteration. AddressSanitizer catches
+# heap-buffer-overflow / use-after-free / double-free. Undefined
+# behaviour sanitizer catches signed-overflow / nullptr-deref / etc.
+# Memory sanitizer is intentionally omitted — Rust's safe-by-default
+# allocations make MSAN findings rare relative to its CI cost.
+sanitizers:
+  - address
+  - undefined
+
+# libfuzzer is the canonical engine for cargo-fuzz targets.
+fuzzing_engines:
+  - libfuzzer
+
+# Filing crash issues to OSS-Fuzz's bug tracker, which auto-emails
+# the contacts below. `true` means anyone can see the issue (after
+# the 90-day default disclosure embargo).
+file_github_issue: true
+
+# Primary contact and auto-cc emails MUST be set by the submitter
+# before the OSS-Fuzz upstream PR. Left as placeholders here because
+# the repo is public — committing personal emails to a public file
+# is exactly what the parisxmas/OxiDB memory rule says not to do.
+# See infra/oss-fuzz/README.md "Email substitution" section.
+primary_contact: "REPLACE-WITH-MAINTAINER-EMAIL@example.com"
+auto_ccs:
+  - "REPLACE-WITH-MAINTAINER-EMAIL@example.com"
+
+# The repo type is open-source under AGPL-3.0 / commercial dual
+# licence (per LICENSE). Both are OSS-Fuzz eligible.
+vendor_ccs: []
