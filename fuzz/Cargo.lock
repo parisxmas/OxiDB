@@ -1000,13 +1000,15 @@ dependencies = [
 name = "oxidb-fuzz"
 version = "0.0.0"
 dependencies = [
+ "arbitrary",
  "libfuzzer-sys",
  "oxidb-server",
+ "serde_json",
 ]
 
 [[package]]
 name = "oxidb-server"
-version = "0.28.0"
+version = "0.28.4"
 dependencies = [
  "aes-gcm",
  "argon2",

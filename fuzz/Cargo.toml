@@ -24,6 +24,11 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 oxidb-server = { path = "../oxidb-server" }
+# Structure-aware fuzzing: derive Arbitrary on a typed grammar so
+# libfuzzer mutates *valid* (or near-valid) values instead of raw
+# bytes. Far more efficient at exploring the message space.
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Prevent this crate from being picked up by the root workspace.
 [workspace]
@@ -52,6 +57,14 @@ bench = false
 [[bin]]
 name = "wire_pg"
 path = "fuzz_targets/wire_pg.rs"
+test = false
+doc = false
+bench = false
+
+# Structure-aware: OxiWire roundtrip via Arbitrary value tree.
+[[bin]]
+name = "oxiwire_roundtrip"
+path = "fuzz_targets/oxiwire_roundtrip.rs"
 test = false
 doc = false
 bench = false
