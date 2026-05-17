@@ -27,7 +27,7 @@ use crate::doc_cache::DocCache;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::engine::LogCallback;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::error::Result;
+use crate::error::{Error, Result};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::index::CompositeIndex;
 #[cfg(not(target_arch = "wasm32"))]
@@ -51,6 +51,37 @@ const OP_DELETE: u8 = 3;
 const OP_INSERT_V2: u8 = 0x81;
 const OP_UPDATE_V2: u8 = 0x82;
 const OP_DELETE_V2: u8 = 0x83;
+
+// ── File-level header (Phase 1b of ADR-0003 / docs/format/wal.md) ──
+//
+// Layout (8 bytes, little-endian):
+//   [b"OXWA" (4)][version u16][flags u16]
+//
+// Sits at the very start of a WAL file written by a current engine. The
+// reader accepts both v1 and legacy header-less files (detected by the
+// absence of `OXWA` magic at offset 0). The writer writes the header
+// only when starting from an empty file — legacy files are never
+// retro-prepended; on the next `seal()` rotation the new live WAL
+// starts empty and the next append writes the header. Recognising a
+// version we don't know is a hard error, not a silent misread.
+
+#[cfg(not(target_arch = "wasm32"))]
+const WAL_MAGIC: &[u8; 4] = b"OXWA";
+#[cfg(not(target_arch = "wasm32"))]
+const WAL_VERSION: u16 = 1;
+#[cfg(not(target_arch = "wasm32"))]
+const WAL_HEADER_SIZE: usize = 8;
+
+#[cfg(not(target_arch = "wasm32"))]
+mod header_state {
+    /// File is currently empty — the header writes on the first append.
+    pub const NEEDED: u8 = 0;
+    /// File already starts with `OXWA`; records start at offset 8.
+    pub const PRESENT: u8 = 1;
+    /// File is a pre-Phase-1b legacy file (no magic). Records start at
+    /// offset 0; the engine never retro-prepends a header.
+    pub const LEGACY: u8 = 2;
+}
 
 /// A WAL entry representing a pending mutation.
 pub enum WalEntry {
@@ -128,6 +159,12 @@ pub struct Wal {
     /// past the highest sealed segment already on disk so seals never
     /// collide across restarts. Only advanced under the `inner` lock.
     next_seal_seq: AtomicU64,
+    /// One of `header_state::{NEEDED,PRESENT,LEGACY}`. Decides whether
+    /// the next append prepends the OXWA header and whether the scanner
+    /// skips the first 8 bytes. Only mutated under the `inner` lock,
+    /// but exposed as an atomic so read-only paths (like `scan`) can
+    /// observe it without taking the lock twice.
+    header_state: std::sync::atomic::AtomicU8,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -142,7 +179,7 @@ impl Wal {
             fs::create_dir_all(parent)?;
         }
 
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
@@ -150,6 +187,7 @@ impl Wal {
             .open(path)?;
 
         let next_seal_seq = Self::scan_max_seal_seq(path);
+        let header_state = Self::detect_header_state(&mut file, path)?;
 
         Ok(Self {
             inner: Mutex::new(file),
@@ -157,7 +195,80 @@ impl Wal {
             encryption,
             sequencer: None,
             next_seal_seq: AtomicU64::new(next_seal_seq),
+            header_state: std::sync::atomic::AtomicU8::new(header_state),
         })
+    }
+
+    /// Decide whether the file has an OXWA header, is legacy, or is empty
+    /// (header pending). Called once at open time; the result is stored
+    /// in `self.header_state` and updated under the `inner` lock when an
+    /// empty file gets its first append or `seal` rotates a fresh empty
+    /// file in.
+    fn detect_header_state(file: &mut File, path: &Path) -> Result<u8> {
+        let file_len = file.metadata()?.len();
+        if file_len == 0 {
+            return Ok(header_state::NEEDED);
+        }
+        if file_len < WAL_HEADER_SIZE as u64 {
+            // 1-7 bytes — corrupt / truncated header. Treat as legacy so the
+            // scanner's per-record CRC catches the torn tail.
+            return Ok(header_state::LEGACY);
+        }
+        let mut probe = [0u8; WAL_HEADER_SIZE];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut probe)?;
+        if &probe[0..4] != WAL_MAGIC {
+            return Ok(header_state::LEGACY);
+        }
+        let version = u16::from_le_bytes([probe[4], probe[5]]);
+        if version != WAL_VERSION {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported WAL format version {} at {}; this binary understands version {}",
+                    version,
+                    path.display(),
+                    WAL_VERSION
+                ),
+            )));
+        }
+        // probe[6..8] = flags; reserved at 0 — ignored until a bit is
+        // documented + assigned.
+        Ok(header_state::PRESENT)
+    }
+
+    /// Write the OXWA header at offset 0 if the current state is `NEEDED`.
+    /// Assumes the caller already holds the `inner` lock and that `file`
+    /// is the live WAL file (not a sealed segment). After this returns,
+    /// `header_state` is `PRESENT` and the file cursor is left at offset 8.
+    fn ensure_header_locked(&self, file: &mut File) -> Result<()> {
+        if self.header_state.load(std::sync::atomic::Ordering::Acquire)
+            != header_state::NEEDED
+        {
+            return Ok(());
+        }
+        let mut header = Vec::with_capacity(WAL_HEADER_SIZE);
+        header.extend_from_slice(WAL_MAGIC);
+        header.extend_from_slice(&WAL_VERSION.to_le_bytes());
+        header.extend_from_slice(&0u16.to_le_bytes()); // flags reserved
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header)?;
+        self.header_state
+            .store(header_state::PRESENT, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Byte offset of the first record in the live file — 8 for OXWA-
+    /// headed files, 0 for legacy / brand-new files. Used by the scanner
+    /// to skip the header when present without re-probing the bytes.
+    fn records_start_offset(&self) -> u64 {
+        if self.header_state.load(std::sync::atomic::Ordering::Acquire)
+            == header_state::PRESENT
+        {
+            WAL_HEADER_SIZE as u64
+        } else {
+            0
+        }
     }
 
     /// Attach (or detach) the PITR archive sequencer. Builder-style so the
@@ -181,6 +292,7 @@ impl Wal {
     pub fn log_with_meta(&self, entry: &WalEntry, meta: WalMeta) -> Result<()> {
         let rec = Self::frame(self.serialize_entry(entry, Some(meta))?);
         let mut file = self.inner.lock();
+        self.ensure_header_locked(&mut file)?;
         file.seek(SeekFrom::End(0))?;
         file.write_all(&rec)?;
         file.sync_data()?;
@@ -229,6 +341,7 @@ impl Wal {
             return Ok(());
         }
         let mut file = self.inner.lock();
+        self.ensure_header_locked(&mut file)?;
         let mut buf = Vec::new();
         for entry in entries {
             let meta = match &self.sequencer {
@@ -253,6 +366,7 @@ impl Wal {
             return Ok(());
         }
         let mut file = self.inner.lock();
+        self.ensure_header_locked(&mut file)?;
         let mut buf = Vec::new();
         for &(doc_id, doc_bytes) in entries {
             buf.extend_from_slice(&self.encode_insert_record(doc_id, doc_bytes)?);
@@ -501,6 +615,9 @@ impl Wal {
             .write(true)
             .truncate(false)
             .open(&self.path)?;
+        // New file is empty — the next append writes the OXWA header.
+        self.header_state
+            .store(header_state::NEEDED, std::sync::atomic::Ordering::Release);
         // Make the rename (and the new file's dir entry) durable.
         if let Some(parent) = self.path.parent() {
             if let Ok(dir) = File::open(parent) {
@@ -681,6 +798,7 @@ impl Wal {
             return Ok(());
         }
         let mut file = self.inner.lock();
+        self.ensure_header_locked(&mut file)?;
         let mut buf = Vec::new();
         for r in records {
             buf.extend_from_slice(&Self::frame(self.serialize_entry(&r.entry, Some(r.meta))?));
@@ -696,10 +814,13 @@ impl Wal {
     /// one (treating it as the crash boundary).
     fn scan(&self, limit: u64) -> Result<Vec<WalRecord>> {
         let mut file = self.inner.lock();
-        file.seek(SeekFrom::Start(0))?;
         let file_len = file.metadata()?.len().min(limit);
+        // Skip the OXWA file header when it's present; legacy / brand-new
+        // files start the record stream at offset 0.
+        let start = self.records_start_offset().min(file_len);
+        file.seek(SeekFrom::Start(start))?;
         let mut records = Vec::new();
-        let mut pos = 0u64;
+        let mut pos = start;
 
         while pos + 8 <= file_len {
             // Read header: crc32 (4) + payload_len (4)
@@ -893,16 +1014,19 @@ mod tests {
         wal.log(&WalEntry::insert(2, b"will_corrupt".to_vec())).unwrap();
         wal.log(&WalEntry::insert(3, b"after_corrupt".to_vec())).unwrap();
 
-        // Corrupt the CRC of the second entry
+        // Corrupt the CRC of the second entry. File layout post-Phase-1b:
+        //   [OXWA header 8B][rec0 crc 4B][rec0 len 4B][rec0 payload …]
+        //   [rec1 crc 4B][rec1 len 4B][rec1 payload …]
         let mut file_data = std::fs::read(&wal_path).unwrap();
-        // First entry: 8 header + payload, then second starts
-        // Find the second entry's offset: parse first entry length
+        let first_payload_off = WAL_HEADER_SIZE + 8; // header + first record's framing
         let first_payload_len = u32::from_le_bytes([
-            file_data[4], file_data[5], file_data[6], file_data[7],
+            file_data[WAL_HEADER_SIZE + 4],
+            file_data[WAL_HEADER_SIZE + 5],
+            file_data[WAL_HEADER_SIZE + 6],
+            file_data[WAL_HEADER_SIZE + 7],
         ]) as usize;
-        let second_offset = 8 + first_payload_len;
-        // Corrupt the CRC bytes of the second entry
-        file_data[second_offset] ^= 0xFF;
+        let second_offset = first_payload_off + first_payload_len; // start of rec1 framing
+        file_data[second_offset] ^= 0xFF; // flip a CRC byte of rec1
         std::fs::write(&wal_path, &file_data).unwrap();
 
         // Reopen and read — should stop at corrupt entry
@@ -1198,10 +1322,16 @@ mod tests {
         wal.log_with_meta(&WalEntry::insert(1, b"good".to_vec()), WalMeta { gsn: 1, wall_clock_micros: 1 }).unwrap();
         wal.log_with_meta(&WalEntry::insert(2, b"corrupt_me".to_vec()), WalMeta { gsn: 2, wall_clock_micros: 2 }).unwrap();
 
-        // Corrupt the CRC of the second record.
+        // Corrupt the CRC of the second record. File layout post-Phase-1b:
+        //   [OXWA header 8B][rec0 framing 8B][rec0 payload][rec1 framing 8B][rec1 payload]
         let mut bytes = std::fs::read(&wal_path).unwrap();
-        let first_len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
-        let second_off = 8 + first_len;
+        let first_len = u32::from_le_bytes([
+            bytes[WAL_HEADER_SIZE + 4],
+            bytes[WAL_HEADER_SIZE + 5],
+            bytes[WAL_HEADER_SIZE + 6],
+            bytes[WAL_HEADER_SIZE + 7],
+        ]) as usize;
+        let second_off = WAL_HEADER_SIZE + 8 + first_len;
         bytes[second_off] ^= 0xFF;
         std::fs::write(&wal_path, &bytes).unwrap();
 
@@ -1414,5 +1544,104 @@ mod tests {
         assert_eq!(records.len(), 1000, "every acknowledged write must be in the file");
         let max_gsn = records.iter().map(|r| r.meta.gsn).max().unwrap_or(0);
         assert!(max_gsn < watermark, "the GSN counter must sit above every written record");
+    }
+
+    // ── Phase 1b header (docs/format/wal.md) ─────────────────────────────
+
+    /// A fresh WAL writes the OXWA / version=1 / flags=0 header at the
+    /// very start of the file, just before the first record.
+    #[test]
+    fn first_append_writes_oxwa_header() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("a.wal");
+        let wal = Wal::open(&path).unwrap();
+        wal.log(&WalEntry::insert(1, b"x".to_vec())).unwrap();
+        drop(wal);
+
+        let raw = fs::read(&path).unwrap();
+        assert!(raw.len() >= WAL_HEADER_SIZE + 8, "header + at least one framed record");
+        assert_eq!(&raw[0..4], WAL_MAGIC, "OXWA magic at offset 0");
+        assert_eq!(u16::from_le_bytes([raw[4], raw[5]]), WAL_VERSION);
+        assert_eq!(u16::from_le_bytes([raw[6], raw[7]]), 0, "flags reserved 0");
+    }
+
+    /// A pre-Phase-1b WAL file (no OXWA magic at offset 0) reads correctly,
+    /// and subsequent appends extend it as-is — we never retro-prepend a
+    /// header onto an existing file.
+    #[test]
+    fn reads_and_extends_legacy_wal() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("legacy.wal");
+
+        // Hand-craft a legacy WAL by writing one record via the engine, then
+        // stripping the 8-byte header we now produce. That gives us a byte
+        // sequence identical to what a pre-Phase-1b engine would have written.
+        {
+            let wal = Wal::open(&path).unwrap();
+            wal.log(&WalEntry::insert(7, b"hello".to_vec())).unwrap();
+        }
+        let with_header = fs::read(&path).unwrap();
+        assert_eq!(&with_header[0..4], WAL_MAGIC);
+        fs::write(&path, &with_header[WAL_HEADER_SIZE..]).unwrap();
+
+        // Reopen + read: legacy bytes parse correctly.
+        let wal = Wal::open(&path).unwrap();
+        let entries = wal.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+
+        // Append another record. File is still legacy (no header retro-prepend);
+        // both entries are recoverable on reopen.
+        wal.log(&WalEntry::insert(8, b"world".to_vec())).unwrap();
+        drop(wal);
+
+        let raw = fs::read(&path).unwrap();
+        assert_ne!(&raw[0..4], WAL_MAGIC, "legacy file must NOT get a retro header");
+
+        let wal = Wal::open(&path).unwrap();
+        assert_eq!(wal.read_entries().unwrap().len(), 2);
+    }
+
+    /// A WAL file with a newer format version we don't recognise must be
+    /// refused at open time rather than silently misinterpreted.
+    #[test]
+    fn refuses_newer_wal_version() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("future.wal");
+
+        // Hand-craft a v2 WAL: OXWA + version=2 + flags=0, no records.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(WAL_MAGIC);
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+
+        let err = Wal::open(&path).err().expect("open should reject a newer format");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported WAL format version 2"),
+            "error should name the unsupported version: {msg}"
+        );
+    }
+
+    /// After `seal()` rotates a fresh empty file into place, the next append
+    /// writes a new OXWA header — so each new live segment starts with one.
+    #[test]
+    fn seal_then_append_writes_fresh_header() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("rot.wal");
+        let wal = Wal::open(&path).unwrap();
+        wal.log(&WalEntry::insert(1, b"a".to_vec())).unwrap();
+        wal.seal().unwrap();
+        wal.log(&WalEntry::insert(2, b"b".to_vec())).unwrap();
+
+        // Live file (post-seal) starts with OXWA.
+        let live = fs::read(&path).unwrap();
+        assert_eq!(&live[0..4], WAL_MAGIC, "new live segment after seal must carry a header");
+
+        // The sealed segment (the previous .wal renamed to .0) ALSO starts
+        // with a header — it was written by this same engine before sealing.
+        let sealed_path = path.with_file_name("rot.wal.0");
+        let sealed = fs::read(&sealed_path).unwrap();
+        assert_eq!(&sealed[0..4], WAL_MAGIC, "sealed segment retains its header");
     }
 }
