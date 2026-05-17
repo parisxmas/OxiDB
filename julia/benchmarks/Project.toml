@@ -1,0 +1,19 @@
+# Environment for the SQLite vs OxiDB benchmark.
+#
+#   julia --project=julia/benchmarks -e 'using Pkg; Pkg.instantiate()'    # once
+#   julia --project=julia/benchmarks julia/benchmarks/sqlite_vs_oxidb.jl
+#
+# Tunables (env vars):
+#   OXIDB_BENCH_N      number of documents in the dataset (default 100_000)
+#   OXIDB_BENCH_RUNS   measured runs per operation       (default 5)
+
+[deps]
+DBInterface = "a10d1c49-ce27-4219-8d33-6db1a4562965"
+OxiDbEmbedded = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SQLite = "0aa819cd-b072-5ff4-a722-6bc24af294d9"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+
+[sources]
+OxiDbEmbedded = {path = "../OxiDbEmbedded"}
