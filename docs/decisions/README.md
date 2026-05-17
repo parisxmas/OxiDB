@@ -33,3 +33,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0001](0001-julia-no-dbinterface.md) | Julia clients do not implement `DBInterface.jl` | Accepted |
 | [0002](0002-mongodb-bench-in-network.md) | MongoDB comparison benchmark runs in-network, not from the host | Accepted |
 | [0003](0003-1.0-stability-scope.md) | 1.0 stability surface and scope | Accepted |
+| [0004](0004-phase-0-answers.md) | Release policy: Phase 0 answers (promotion criteria, LTS, cadence, client tiering, DSL stability) | Accepted |
