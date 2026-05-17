@@ -1,6 +1,6 @@
 # OxiDB Documentation
 
-OxiDB is a fast, embeddable document database engine written in Rust. It supports both SQL and JSON-based queries, ACID transactions, full-text search, blob storage, stored procedures, and more. It can run as an embedded library, a standalone TCP server, or be accessed via client libraries in Python, Go, Julia, .NET, and Swift.
+OxiDB is a fast, embeddable document database engine written in Rust. It supports JSON-based queries, ACID transactions, full-text search, blob storage, stored procedures, and more. It can run as an embedded library, a standalone TCP server, or be accessed via client libraries in Python, Go, Julia, .NET, and Swift.
 
 ## Quick Start
 
@@ -36,8 +36,6 @@ with OxiDbClient() as db:
 ### Advanced Features
 
 - **[Aggregation Pipeline](aggregation.md)** -- Pipeline stages (`$match`, `$group`, `$sort`, `$skip`, `$limit`, `$project`, `$count`, `$unwind`, `$addFields`, `$lookup`), accumulators, and arithmetic expressions.
-
-- **[SQL Query Language](sql.md)** -- SELECT, INSERT, UPDATE, DELETE, JOINs, GROUP BY, HAVING, CREATE TABLE, CREATE INDEX, SHOW TABLES. SQL WHERE operators mapped to JSON-based queries.
 
 - **[Blob Storage](blobs.md)** -- S3-style bucket and object storage with full-text search on stored documents (PDF, DOCX, XLSX, HTML, images with OCR).
 

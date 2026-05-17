@@ -2,11 +2,11 @@
   <img src="logo.png" alt="OxiDB" width="500">
 </p>
 
-<p align="center">A fast, embeddable document database written in Rust. SQL and JSON queries, S3-compatible API, Redis-compatible in-memory store, MQTT messaging, GELF log ingestion with auto-indexing, alerting, retention policies, GPU-accelerated vector search, hash sharding, Raft replication, AES-256 encryption, crash-safe WAL, single binary, zero configuration.</p>
+<p align="center">A fast, embeddable document database written in Rust. JSON queries, S3-compatible API, Redis-compatible in-memory store, MQTT messaging, GELF log ingestion with auto-indexing, alerting, retention policies, GPU-accelerated vector search, hash sharding, Raft replication, AES-256 encryption, crash-safe WAL, single binary, zero configuration.</p>
 
 **Client libraries:** [Python](python/) | [Go](go/) | [Julia](julia/) | [.NET](dotnet/) | [Swift/iOS](swift/) | [JavaScript/TypeScript](oxidb-js/) | [C FFI](oxidb-client-ffi/) | [VS Code Extension](oxidb-vscode/)
 
-> ⚠️ **WARNING — not production-ready.** OxiDB is under active development. The on-disk data format, the wire/server protocol, the client SDK surface, and the SQL/JSON query language are all subject to **breaking changes between releases** with no migration path or backward-compatibility guarantee. Do not run it against data you cannot afford to lose or rebuild. Pin a specific version, expect to dump-and-reload on upgrade, and treat any production-like use as experimental until a `1.0` release explicitly commits to stability.
+> ⚠️ **WARNING — not production-ready.** OxiDB is under active development. The on-disk data format, the wire/server protocol, the client SDK surface, and the JSON query language are all subject to **breaking changes between releases** with no migration path or backward-compatibility guarantee. Do not run it against data you cannot afford to lose or rebuild. Pin a specific version, expect to dump-and-reload on upgrade, and treat any production-like use as experimental until a `1.0` release explicitly commits to stability.
 
 ## Installation
 
@@ -67,7 +67,6 @@ docker compose up -d
 | `OXIDB_RAFT_ADDR` | `127.0.0.1:4445` | Raft inter-node communication address |
 | `OXIDB_RAFT_PEERS` | — | Comma-separated peer list: `"1=host1:4445,2=host2:4445,3=host3:4445"` |
 | `OXIDB_OXIMEM_PORT` | — | Enable OxiMem (Redis-compatible) RESP listener on this port |
-| `OXIDB_OXIMEM_SQL` | `false` | Mirror OxiMem data to OxiDB collections for SQL querying |
 | `OXIDB_MQTT_PORT` | — | Enable MQTT v3.1.1 listener on this port |
 | `OXIDB_S3_PORT` | — | Enable S3-compatible HTTP API on this port |
 | `OXIDB_S3_ACCESS_KEY` | — | S3 access key for AWS SigV4 authentication |
@@ -95,7 +94,6 @@ docker compose up -d
 
 ## Features
 
-- **SQL query language** — `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE/DROP TABLE`, `CREATE INDEX`, `SHOW TABLES` with `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, `JOIN`, `LIMIT`, `OFFSET`
 - **Document database** — JSON documents, no schema required, collections auto-created on insert
 - **JSON-based queries** — `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$exists`, `$regex`, `$elemMatch`, `$all`, `$size`, `$not`, `$type`, `$mod`, `$and`, `$or`, `$nor`, `$expr`
 - **12 update operators** — `$set`, `$unset`, `$inc`, `$mul`, `$min`, `$max`, `$rename`, `$currentDate`, `$push`, `$pull`, `$addToSet`, `$pop`
@@ -106,9 +104,9 @@ docker compose up -d
 - **B-tree storage engine** — `scc::HashMap` concurrent document storage with interior mutability; reads never block reads, writes to different documents proceed in parallel; WAL for crash safety; persisted field indexes for instant startup
 - **Zero-copy reads** — `find_one`, `update`, and `delete` use Arc-based document iteration, cloning only matching documents instead of every visited document
 - **Transactions** — OCC (optimistic concurrency control) with begin/commit/rollback
-- **REST HTTP API** — JSON-over-HTTP interface for all document operations (CRUD, aggregation, indexes, SQL, procedures); works with `curl`, Postman, or any HTTP client; CORS enabled
+- **REST HTTP API** — JSON-over-HTTP interface for all document operations (CRUD, aggregation, indexes, procedures); works with `curl`, Postman, or any HTTP client; CORS enabled
 - **S3-compatible API** — full HTTP REST API with path-style requests, multipart upload, range reads, object tagging, copy, conditional requests, SSE-S3/SSE-C encryption; compatible with AWS CLI and boto3
-- **OxiMem (Redis-compatible)** — in-memory key-value store with RESP wire protocol; 50+ commands (strings, hashes, lists, sets, sorted sets, pub/sub); optional SQL mirroring to OxiDB collections
+- **OxiMem (Redis-compatible)** — in-memory key-value store with RESP wire protocol; 50+ commands (strings, hashes, lists, sets, sorted sets, pub/sub)
 - **MQTT v3.1.1** — publish/subscribe messaging with cross-protocol bridging to OxiMem pub/sub channels
 - **Hash sharding** — OxiPool proxy with CRC32 hash routing, scatter-gather queries, per-collection shard keys, and cross-shard transaction detection
 - **Blob storage** — S3-style buckets with put/get/head/delete/list and CRC32 etags
@@ -135,66 +133,6 @@ docker compose up -d
 - **VS Code extension** — collection browser, MongoDB-style query editor, OxiScript syntax highlighting
 - **CLI tool** — interactive shell with JSON-based syntax, embedded and client modes
 - **Multi-language clients** — Python, Go, Julia, .NET, Swift/iOS — all zero or minimal dependencies
-
-## SQL Query Language
-
-OxiDB supports SQL as a query interface. SQL statements are parsed and translated to the document engine — no separate storage layer.
-
-### Supported Statements
-
-| Statement | Example |
-|-----------|---------|
-| `SELECT` | `SELECT * FROM users WHERE age > 21 ORDER BY name LIMIT 10` |
-| `SELECT` (aggregate) | `SELECT dept, AVG(salary) FROM employees GROUP BY dept HAVING AVG(salary) > 50000` |
-| `SELECT` (join) | `SELECT u.name, o.total FROM users u JOIN orders o ON u._id = o.user_id` |
-| `INSERT` | `INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25)` |
-| `UPDATE` | `UPDATE users SET age = 31 WHERE name = 'Alice'` |
-| `DELETE` | `DELETE FROM users WHERE age < 18` |
-| `CREATE TABLE` | `CREATE TABLE users (id INT, name TEXT)` |
-| `DROP TABLE` | `DROP TABLE users` |
-| `CREATE INDEX` | `CREATE INDEX idx_name ON users (name)` |
-| `SHOW TABLES` | `SHOW TABLES` |
-
-### WHERE Clause
-
-`=`, `!=`, `<>`, `>`, `>=`, `<`, `<=`, `AND`, `OR`, `IN (...)`, `IS NULL`, `IS NOT NULL`, `LIKE`, `BETWEEN ... AND ...`
-
-### Aggregate Functions
-
-`COUNT(*)`, `COUNT(field)`, `SUM(field)`, `AVG(field)`, `MIN(field)`, `MAX(field)`
-
-### Server Usage
-
-```json
-{"cmd": "sql", "query": "SELECT * FROM users WHERE age > 21 ORDER BY name LIMIT 10"}
-```
-
-### Client Library Usage
-
-```python
-# Python
-result = client.sql("SELECT name, age FROM users WHERE age > 21")
-```
-
-```go
-// Go
-result, err := client.SQL("SELECT name, age FROM users WHERE age > 21")
-```
-
-```julia
-# Julia
-result = sql(client, "SELECT name, age FROM users WHERE age > 21")
-```
-
-```csharp
-// .NET
-var result = client.Sql("SELECT name, age FROM users WHERE age > 21");
-```
-
-```swift
-// Swift
-let result = try client.sql(query: "SELECT name, age FROM users WHERE age > 21")
-```
 
 ## Query Operators
 
@@ -353,7 +291,6 @@ Max message size is 16 MiB.
 | `delete_object`          | `bucket`, `key`                                    |
 | `list_objects`           | `bucket`, `prefix?`, `limit?`                      |
 | `search`                 | `query`, `bucket?`, `limit?`                       |
-| `sql`                    | `query`                                            |
 | `create_procedure`       | `name`, `params`, `steps`                          |
 | `call_procedure`         | `name`, `params?`                                  |
 | `list_procedures`        | —                                                  |
@@ -569,8 +506,6 @@ redis-cli -p 6379
 | **Pub/Sub** | `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE` |
 | **Server** | `PING`, `ECHO`, `QUIT`, `SELECT`, `COMMAND`, `CLIENT`, `AUTH`, `INFO`, `CONFIG` |
 
-Set `OXIDB_OXIMEM_SQL=true` to mirror all OxiMem data to OxiDB collections (`_kv`, `_hash`, `_list`, `_set`), making it queryable via SQL.
-
 ## MQTT v3.1.1
 
 Built-in MQTT message broker with cross-protocol bridging to OxiMem pub/sub channels.
@@ -627,11 +562,6 @@ curl -X POST http://localhost:8080/api/users/documents \
 
 # Find
 curl 'http://localhost:8080/api/users/documents?q={"age":{"$gt":21}}&sort={"age":-1}&limit=10'
-
-# SQL
-curl -X POST http://localhost:8080/api/sql \
-  -H "Content-Type: application/json" \
-  -d '{"query": "SELECT * FROM users WHERE age > 21"}'
 ```
 
 ### Endpoints
@@ -651,7 +581,6 @@ curl -X POST http://localhost:8080/api/sql \
 | `POST` | `/api/{collection}/indexes` | Create index (`{"field": "...", "type": "field\|unique\|ttl"}`) |
 | `GET` | `/api/{collection}/indexes` | List indexes |
 | `DELETE` | `/api/{collection}/indexes/{name}` | Drop index |
-| `POST` | `/api/sql` | SQL query (`{"query": "SELECT ..."}`) |
 | `POST` | `/api/procedures` | Create procedure (`{"script": "proc ..."}`) |
 | `POST` | `/api/procedures/{name}/call` | Call procedure |
 | `GET` | `/api/procedures` | List procedures |
