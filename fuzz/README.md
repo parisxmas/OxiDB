@@ -32,7 +32,9 @@ cargo install cargo-fuzz                 # 0.13+
 
 | Target | What it checks | File |
 |---|---|---|
-| `oxiwire_roundtrip` | OxiWire encoder ↔ decoder mutual consistency. `Arbitrary` value tree → `encode_value` → `decode_request` → JSON-canonical equality. Catches encoder/decoder mismatch bugs that bit-flipping can't reach. | `fuzz_targets/oxiwire_roundtrip.rs` |
+| `oxiwire_roundtrip` | OxiWire encoder ↔ decoder mutual consistency. `Arbitrary` value tree → `encode_value` → `decode_request` → JSON-canonical equality. | `fuzz_targets/oxiwire_roundtrip.rs` |
+| `resp_roundtrip` | RESP encoder ↔ decoder mutual consistency. `Arbitrary RespValue` → `write_value` → `read_value` → bytes-equal after re-encoding. CR/LF normalised out of SimpleString/Error at input (line-based framing constraint). | `fuzz_targets/resp_roundtrip.rs` |
+| `msgpack_roundtrip` | OxiDB's hand-rolled MsgPack encoder (`protocol::value_to_msgpack`) ↔ canonical `rmp_serde::from_slice` decoder. Cross-implementation comparison surfaces encoder bugs the same-author decoder couldn't see. | `fuzz_targets/msgpack_roundtrip.rs` |
 
 Structure-aware fuzz runs **~6× faster** (~18k iter/s vs ~3k iter/s
 for byte-flipping in 30s smoke runs) because every iteration starts
@@ -75,11 +77,10 @@ Rust panic message and a stack trace. Triage:
 
 ## What this harness explicitly does NOT do (yet)
 
-- **Structure-aware fuzzing for the remaining 3 wire formats.** The
-  first structure-aware target (`oxiwire_roundtrip`) covers OxiWire.
-  Follow-ups: same encode↔decode roundtrip for RESP, MsgPack (via
-  `rmp_serde`), and pg_wire (where applicable — pg_wire is more
-  decode-only than encode/decode-symmetric).
+- **Structure-aware fuzzing for pg_wire.** pg_wire is more decode-
+  only than encode/decode-symmetric — there's no `value_to_pg_wire`
+  to fuzz the inverse of. Differential fuzz vs real Postgres (next
+  bullet) is the natural shape for pg_wire.
 - **Differential fuzzing against a reference impl.** RESP vs real
   Redis, pg_wire vs PostgreSQL — feed both, compare the parsed
   results, treat divergence as a finding. Multi-week effort.

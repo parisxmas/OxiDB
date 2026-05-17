@@ -87,8 +87,8 @@ roundtrip). See [`fuzz/`](../../fuzz/).
 
 | Gap | Effort | Notes / unblockers |
 |---|---|---|
-| Structure-aware roundtrip for RESP | **xs** | Same pattern as `oxiwire_roundtrip.rs`. |
-| Structure-aware roundtrip for MsgPack | **xs** | Same pattern; uses `rmp_serde`. |
+| Structure-aware roundtrip for RESP | ✅ landed — [`fuzz/fuzz_targets/resp_roundtrip.rs`](../../fuzz/fuzz_targets/resp_roundtrip.rs) (558k iter/30s clean) |
+| Structure-aware roundtrip for MsgPack | ✅ landed — [`fuzz/fuzz_targets/msgpack_roundtrip.rs`](../../fuzz/fuzz_targets/msgpack_roundtrip.rs) (570k iter/30s clean, cross-impl diff vs `rmp_serde`) |
 | Differential fuzz vs real Redis | **m** | Bring up `redis-server` subprocess, feed same input to both, compare. |
 | Differential fuzz vs real Postgres | **m** | Same shape; libpq subprocess. |
 | OSS-Fuzz continuous integration | ⏳ **infra landed** ([`infra/oss-fuzz/`](../../infra/oss-fuzz/)) — upstream PR pending. The Dockerfile / build.sh / project.yaml are committed; submitting to `google/oss-fuzz` is a manual step documented in that directory's README. |

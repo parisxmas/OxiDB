@@ -116,12 +116,14 @@ shared across thousands of projects, so each cycle matters).
 
 ## Targets registered
 
-All 5 targets from `fuzz/fuzz_targets/` are listed by name in
+All 7 targets from `fuzz/fuzz_targets/` are listed by name in
 `build.sh`. When adding a new target, append it to the for-loop in
 `build.sh` (and remember to update this list):
 
-- `wire_deserialize` — top-level message dispatcher
-- `wire_oxiwire` — OxiWire binary decoder
-- `wire_resp` — RESP / OxiMem
-- `wire_pg` — pg_wire frontend
-- `oxiwire_roundtrip` — structure-aware encode↔decode roundtrip
+- `wire_deserialize` — top-level message dispatcher (mutation)
+- `wire_oxiwire` — OxiWire binary decoder (mutation)
+- `wire_resp` — RESP / OxiMem (mutation)
+- `wire_pg` — pg_wire frontend (mutation)
+- `oxiwire_roundtrip` — OxiWire encode↔decode roundtrip (structure-aware)
+- `resp_roundtrip` — RESP encode↔decode roundtrip (structure-aware)
+- `msgpack_roundtrip` — MsgPack encode↔decode via `rmp_serde` reference (structure-aware, cross-impl differential)
