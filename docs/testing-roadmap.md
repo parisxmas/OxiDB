@@ -15,7 +15,7 @@ landed alongside this doc.
 | # | Category | First-slice status | What "complete" looks like |
 |---|---|---|---|
 | 1 | **ACID & isolation** | ✅ partial — first concurrent-transfers test in [`tests/cern_acid_transfers.rs`](../tests/cern_acid_transfers.rs) | Reference anomaly suite (A5A/A5B, write skew, lost update, dirty read, phantom) |
-| 2 | **Crash recovery** | ✅ partial — soft-crash test in [`tests/cern_crash_recovery.rs`](../tests/cern_crash_recovery.rs) + hard-SIGKILL subprocess test in [`tests/cern_sigkill_drill.rs`](../tests/cern_sigkill_drill.rs) | Byte-offset SIGKILL matrix (currently only one offset — "after N acks"); ENOSPC/EIO injection; cosmic-bit-flip simulation |
+| 2 | **Crash recovery** | ✅ partial — soft-crash ([`tests/cern_crash_recovery.rs`](../tests/cern_crash_recovery.rs)) + hard-SIGKILL ([`tests/cern_sigkill_drill.rs`](../tests/cern_sigkill_drill.rs)) + byte-offset SIGKILL matrix ([`tests/cern_sigkill_byte_offset.rs`](../tests/cern_sigkill_byte_offset.rs)) | ENOSPC/EIO injection; cosmic-bit-flip simulation; deeper init-time kill cases (e.g. mid-WAL-header-write) |
 | 3 | **Performance & long-tail** | ✅ partial — bounded soak in [`tests/cern_soak.rs`](../tests/cern_soak.rs) | Multi-day soak, RSS / fd / WAL-size leak detection, HEP-shaped workload (bursty ingest + long-range scans + high-fanout reads) |
 | 4 | **HA / Raft fault injection** | ❌ not started | **Jepsen-style suite** (split-brain, partition, clock skew, slow disk) — biggest single gap |
 | 5 | **Security** | ❌ not started | Wire-protocol fuzzing (`cargo-fuzz`), external pentest (Cure53 / Trail of Bits), authn/authz bypass attempts |
@@ -86,10 +86,36 @@ completed the next insert's fsync between the ack write and the
 SIGKILL landing) and demonstrates the test is genuinely racing the
 kernel.
 
-Does NOT yet cover: byte-offset SIGKILL matrix (kill at offsets 1,
-2, ..., N of a single fsync), fsync-returns-EIO mid-batch,
-power-loss simulation. Those need an offset-fault-injection
-harness — a follow-up.
+Extends to byte-offset matrix via `cern_sigkill_byte_offset.rs`
+(below). Does NOT yet cover: fsync-returns-EIO mid-batch,
+power-loss simulation, ENOSPC injection. Those need a syscall
+interposer or LD_PRELOAD harness — a follow-up.
+
+### `cern_sigkill_byte_offset.rs`
+
+Extends the SIGKILL drill to a **matrix of kill delays** (100µs,
+500µs, 1ms, 5ms, 10ms, 50ms, 200ms). For each delay: spawn victim
+→ sleep → SIGKILL → drain pipe → reopen → check invariants. Same
+durability + no-phantom invariants as the basic drill, asserted
+at every delay.
+
+Across the grid, the kill lands at a different point in the
+engine's write trajectory:
+- **100µs–1ms** → engine still inside `DB::open` initialisation
+- **5ms** → first insert mid-fsync (kernel completes the syscall
+  before death; `+1 extra durable` shows up here)
+- **10ms+** → first ACKs reach parent, then steady-state kills
+
+Also asserts **reopen succeeds at every delay** — a kill mid-init
+that leaves the data dir unrecoverable would be a real bug.
+
+Across 5 consecutive runs the matrix is highly reproducible:
+the `+1 extra-durable` count is stable at every non-zero delay,
+indicating the WAL-fsync-to-ack race is well-bounded.
+
+Does NOT yet cover: SIGKILL at offset 1, 2, ..., K bytes *within*
+a single fsync syscall (needs syscall interposition — fsync is
+uninterruptible from userspace, so we can't pause it mid-byte).
 
 ### `cern_soak.rs`
 
@@ -116,6 +142,7 @@ cargo test -- --ignored
 cargo test --test cern_acid_transfers -- --ignored
 cargo test --test cern_crash_recovery -- --ignored
 cargo test --test cern_sigkill_drill  -- --ignored
+cargo test --test cern_sigkill_byte_offset -- --ignored --nocapture
 cargo test --test cern_soak           -- --ignored
 
 # Longer soak (default 30s):
