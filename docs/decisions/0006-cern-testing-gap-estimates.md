@@ -94,7 +94,7 @@ roundtrip). See [`fuzz/`](../../fuzz/).
 | OSS-Fuzz continuous integration | ⏳ **infra landed** ([`infra/oss-fuzz/`](../../infra/oss-fuzz/)) — upstream PR pending. The Dockerfile / build.sh / project.yaml are committed; submitting to `google/oss-fuzz` is a manual step documented in that directory's README. |
 | External pentest (Cure53 / Trail of Bits) | **xxl** wall-clock, **0** internal eng | Contracted engagement. Cost + scheduling, not engineering effort. |
 | Authn/authz bypass test corpus | **m** | SCRAM-SHA-256 fuzz, JWT signature tampering, RBAC privilege-escalation attempts. |
-| Coverage reporting (`cargo +nightly fuzz coverage`) | **xs** | One command + a CI step. |
+| Coverage reporting (`cargo +nightly fuzz coverage`) | ✅ landed — [`fuzz/coverage.sh`](../../fuzz/coverage.sh) wraps `cargo fuzz coverage` + `llvm-cov report`, filters to files the target actually touched, supports HTML output. CI step still pending (no nightly fuzz CI yet). |
 
 **Suggested order:** RESP + MsgPack roundtrip (xs each, same day),
 coverage reporting (xs), OSS-Fuzz (m, highest leverage), then
