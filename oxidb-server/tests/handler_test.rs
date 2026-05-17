@@ -1204,6 +1204,115 @@ fn test_linked_collection_write_proxy_shares_pool() {
 }
 
 // ===========================================================================
+// Linked collections — CSV adapter (FDW v3a)
+// ===========================================================================
+
+/// End-to-end CSV adapter test: link a local CSV file via `csv://`,
+/// then exercise the full CRUD cycle through the public wire — same
+/// surface as the OxiDB-to-OxiDB tests above. Proves the dispatcher
+/// in `fdw::adapter_for` actually wires `handle_linked_command` to
+/// `CsvAdapter` based on URL scheme.
+#[test]
+fn test_linked_collection_csv_adapter_full_crud() {
+    let dir = TempDir::new().unwrap();
+    let csv_path = dir.path().join("people.csv");
+    std::fs::write(&csv_path, "name,age\nalice,30\nbob,25\n").unwrap();
+
+    let local = TestServer::start();
+    let mut c = Client::connect(local.addr);
+
+    // Link `people` → csv://<path>. Note the URL is a local-file
+    // path; nothing crosses the network here.
+    let url = format!("csv://{}", csv_path.to_str().unwrap());
+    assert_ok(&c.send(&json!({
+        "cmd": "link_collection",
+        "collection": "people",
+        "url": url,
+    })));
+
+    // find: empty query returns both seed rows.
+    let resp = c.send(&json!({"cmd": "find", "collection": "people", "query": {}}));
+    assert_ok(&resp);
+    let rows = resp["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["name"], "alice");
+
+    // count agrees.
+    let resp = c.send(&json!({"cmd": "count", "collection": "people", "query": {}}));
+    assert_eq!(resp["data"]["count"], 2);
+
+    // find with predicate.
+    let resp = c.send(&json!({"cmd": "find", "collection": "people",
+        "query": {"age": "25"}}));
+    assert_eq!(resp["data"].as_array().unwrap().len(), 1);
+    assert_eq!(resp["data"][0]["name"], "bob");
+
+    // insert appends — count goes to 3, file on disk has the new row.
+    assert_ok(&c.send(&json!({
+        "cmd": "insert",
+        "collection": "people",
+        "doc": {"name": "carol", "age": "22"},
+    })));
+    let resp = c.send(&json!({"cmd": "count", "collection": "people", "query": {}}));
+    assert_eq!(resp["data"]["count"], 3);
+    let raw = std::fs::read_to_string(&csv_path).unwrap();
+    assert!(raw.contains("carol,22"), "insert landed in the CSV: {:?}", raw);
+
+    // update_one with $set.
+    assert_ok(&c.send(&json!({
+        "cmd": "update_one",
+        "collection": "people",
+        "query": {"name": "alice"},
+        "update": {"$set": {"age": "31"}},
+    })));
+    let resp = c.send(&json!({"cmd": "find_one", "collection": "people",
+        "query": {"name": "alice"}}));
+    assert_eq!(resp["data"]["age"], "31");
+
+    // delete_one drops bob.
+    assert_ok(&c.send(&json!({
+        "cmd": "delete_one",
+        "collection": "people",
+        "query": {"name": "bob"},
+    })));
+    let resp = c.send(&json!({"cmd": "count", "collection": "people", "query": {}}));
+    assert_eq!(resp["data"]["count"], 2, "bob removed; alice + carol remain");
+
+    // Schema commands must still be refused on a linked collection
+    // regardless of the underlying adapter — the policy lives in the
+    // handler, not in the adapter.
+    let resp = c.send(&json!({
+        "cmd": "create_index",
+        "collection": "people",
+        "field": "name",
+    }));
+    assert_eq!(resp["ok"], false);
+    assert!(resp["error"].as_str().unwrap().contains("only CRUD"));
+}
+
+/// A CSV link to a file:// URL with the wrong extension MUST be
+/// refused at link-time (well — at first-query time, since
+/// link_collection doesn't pre-validate the URL). The error must
+/// name .csv specifically so an operator can fix the typo.
+#[test]
+fn test_linked_collection_csv_rejects_non_csv_file_url() {
+    let local = TestServer::start();
+    let mut c = Client::connect(local.addr);
+    assert_ok(&c.send(&json!({
+        "cmd": "link_collection",
+        "collection": "broken",
+        "url": "file:///tmp/data.parquet",
+    })));
+    let resp = c.send(&json!({"cmd": "find", "collection": "broken", "query": {}}));
+    assert_eq!(resp["ok"], false);
+    assert!(
+        resp["error"].as_str().unwrap().contains(".csv"),
+        "{}",
+        resp["error"]
+    );
+}
+
+// ===========================================================================
 // Linked collections — connection pool (FDW v2a)
 // ===========================================================================
 

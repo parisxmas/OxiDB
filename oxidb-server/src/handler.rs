@@ -1309,8 +1309,8 @@ fn is_link_management_cmd(cmd: &str) -> bool {
 ///
 /// Returns the pre-serialized response bytes; the caller (the main
 /// dispatch in handle_request) just returns this directly.
-fn handle_linked_command(cmd: &str, link: &oxidb::links::LinkConfig, mut request: Value) -> Vec<u8> {
-    use crate::remote_client;
+fn handle_linked_command(cmd: &str, link: &oxidb::links::LinkConfig, request: Value) -> Vec<u8> {
+    use crate::fdw;
 
     // Allow-list: every CRUD command that operates on a single
     // collection's documents. Schema / transaction / management
@@ -1337,29 +1337,18 @@ fn handle_linked_command(cmd: &str, link: &oxidb::links::LinkConfig, mut request
         }
     }
 
-    // Parse the remote endpoint. Re-validated on every call (cheap)
-    // so a partial-disk corruption to _links.json shows up as a
-    // proxy error rather than a panic.
-    let remote = match remote_client::parse_remote(&link.url) {
-        Ok(r) => r,
+    // Pick the right adapter from the link URL scheme (v3a). Bad URLs
+    // surface here as a proxy error rather than a panic — same shape
+    // the v1/v2 parse_remote error path had.
+    let adapter = match fdw::adapter_for(&link.url) {
+        Ok(a) => a,
         Err(e) => return err_bytes(&format!("linked {}: {}", link.name, e)),
     };
 
-    // Rewrite the collection field from the LOCAL link name to the
-    // REMOTE collection name. Clone+replace; the request was already
-    // taken by value here.
-    if let Some(obj) = request.as_object_mut() {
-        obj.insert(
-            "collection".to_string(),
-            Value::String(remote.remote_collection.clone()),
-        );
-    }
-
-    match remote_client::proxy_command(&remote, &request) {
+    match adapter.execute(cmd, &request) {
         Ok(resp) => {
-            // The remote already returned a fully-formed `{ok, ...}`
-            // envelope. Pass it through verbatim — the local server
-            // is just a proxy.
+            // Adapters return a fully-formed `{ok, ...}` envelope.
+            // Pass through verbatim — the local server is just a proxy.
             serde_json::to_vec(&resp).unwrap_or_else(|_| err_bytes("proxy: encode response"))
         }
         Err(e) => err_bytes(&format!("linked {} → {}: {}", link.name, link.url, e)),

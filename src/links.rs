@@ -167,10 +167,34 @@ impl LinksTable {
 
 /// validate_url rejects obviously bad link URLs at registration time
 /// — better to fail loudly when the operator wires the link than
-/// silently on every subsequent query. The grammar is the same one
-/// `parse_remote` (in remote_client) accepts.
+/// silently on every subsequent query.
+///
+/// The engine crate doesn't know which schemes the server's FDW
+/// dispatcher actually supports (it might be just `oxidb://`, or it
+/// might include `csv://`, `file://*.csv`, `postgres://`, …). Rather
+/// than duplicate the scheme list here — and silently desync it from
+/// `oxidb-server::fdw::adapter_for` — this only does the shape check
+/// that's universally true: there must be a `<scheme>://` prefix.
+/// Per-scheme grammar validation happens at adapter-construction
+/// time, which surfaces a clear error on the first query against a
+/// misconfigured link.
+///
+/// `oxidb://` URLs additionally go through `parse_remote` so the
+/// legacy strict validation (must include /<collection>, port must
+/// parse, …) still fires at link-time for the original adapter.
 pub fn validate_url(url: &str) -> Result<()> {
-    let _ = parse_remote(url)?;
+    if url.is_empty() {
+        return Err(Error::InvalidQuery("link URL is empty".to_string()));
+    }
+    if !url.contains("://") {
+        return Err(Error::InvalidQuery(format!(
+            "link URL must include a scheme (e.g. oxidb://, csv://, file://) — got {:?}",
+            url
+        )));
+    }
+    if url.starts_with("oxidb://") {
+        let _ = parse_remote(url)?;
+    }
     Ok(())
 }
 
