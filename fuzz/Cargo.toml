@@ -1,0 +1,60 @@
+# Fuzz harness — excluded from the workspace because libfuzzer-sys
+# requires nightly Rust and the sanitizer pulls in heavy code-gen the
+# normal `cargo build` shouldn't pay for.
+#
+# Run targets (after `cargo install cargo-fuzz` and `rustup toolchain
+# install nightly`):
+#
+#   cargo +nightly fuzz run wire_deserialize
+#   cargo +nightly fuzz run wire_oxiwire
+#   cargo +nightly fuzz run wire_resp
+#   cargo +nightly fuzz run wire_pg
+#
+# See fuzz/README.md for the longer-form playbook.
+
+[package]
+name = "oxidb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+oxidb-server = { path = "../oxidb-server" }
+
+# Prevent this crate from being picked up by the root workspace.
+[workspace]
+
+[[bin]]
+name = "wire_deserialize"
+path = "fuzz_targets/wire_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_oxiwire"
+path = "fuzz_targets/wire_oxiwire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_resp"
+path = "fuzz_targets/wire_resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_pg"
+path = "fuzz_targets/wire_pg.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

@@ -18,7 +18,7 @@ landed alongside this doc.
 | 2 | **Crash recovery** | ✅ partial — soft-crash ([`tests/cern_crash_recovery.rs`](../tests/cern_crash_recovery.rs)) + hard-SIGKILL ([`tests/cern_sigkill_drill.rs`](../tests/cern_sigkill_drill.rs)) + byte-offset SIGKILL matrix ([`tests/cern_sigkill_byte_offset.rs`](../tests/cern_sigkill_byte_offset.rs)) | ENOSPC/EIO injection; cosmic-bit-flip simulation; deeper init-time kill cases (e.g. mid-WAL-header-write) |
 | 3 | **Performance & long-tail** | ✅ partial — bounded soak in [`tests/cern_soak.rs`](../tests/cern_soak.rs) | Multi-day soak, RSS / fd / WAL-size leak detection, HEP-shaped workload (bursty ingest + long-range scans + high-fanout reads) |
 | 4 | **HA / Raft fault injection** | ❌ not started | **Jepsen-style suite** (split-brain, partition, clock skew, slow disk) — biggest single gap |
-| 5 | **Security** | ❌ not started | Wire-protocol fuzzing (`cargo-fuzz`), external pentest (Cure53 / Trail of Bits), authn/authz bypass attempts |
+| 5 | **Security** | ✅ partial — wire-protocol fuzz harness in [`fuzz/`](../fuzz/) (4 targets: top-level dispatcher, OxiWire, RESP, pg_wire) | Structure-aware fuzzing via `arbitrary`; differential fuzz vs real Redis / Postgres; OSS-Fuzz continuous integration; external pentest (Cure53 / Trail of Bits); authn/authz bypass tests |
 | 6 | **Upgrade / migration** | ❌ not started | Byte-identical fixture corpus per release; N → N+1 → N+2 round-trip; downgrade where allowed |
 | 7 | **Scale** | ❌ not started | 10⁹+ doc dataset, 24-hour sustained insert + scan, multi-TB on-disk |
 | 8 | **Disaster recovery / drills** | ❌ not started | Power-loss VM drill, primary-site-down 24h, restore-from-cold-backup time-to-recover SLA |
@@ -90,6 +90,34 @@ Extends to byte-offset matrix via `cern_sigkill_byte_offset.rs`
 (below). Does NOT yet cover: fsync-returns-EIO mid-batch,
 power-loss simulation, ENOSPC injection. Those need a syscall
 interposer or LD_PRELOAD harness — a follow-up.
+
+### `fuzz/` — wire-protocol fuzz harness
+
+`cargo-fuzz` + `libfuzzer-sys` targets in `fuzz/fuzz_targets/`,
+excluded from the main workspace (the harness needs sanitizer-
+friendly compile flags the normal `cargo build` shouldn't pay
+for). Four targets:
+
+- `wire_deserialize` — the top-level message dispatcher
+  (`{`/`[` → JSON, `0xDB` → OxiWire, else → MsgPack)
+- `wire_oxiwire` — hand-rolled OxiWire binary decoder
+- `wire_resp` — RESP (Redis-compatible) parser used by OxiMem
+- `wire_pg` — PostgreSQL frontend-message decoder
+
+Each target is a thin wrapper: take `&[u8]`, call the parser, drop
+the `Result`. libfuzzer counts any panic / abort / sanitizer
+finding as a crash. Run with `cargo +nightly fuzz run <target>` —
+see [`fuzz/README.md`](../fuzz/README.md) for the playbook.
+
+The harness is the deliverable; what it finds is follow-up. The
+first smoke run found multiple crashers across all four targets —
+each gets its own fix PR with a pinned regression test.
+
+Does NOT yet cover: structure-aware fuzzing (the `arbitrary` crate
++ `Arbitrary` impls would explore message space far more
+efficiently than mutation-based bit-flipping); differential fuzz
+against a reference impl (RESP vs real Redis, pg_wire vs real
+Postgres); OSS-Fuzz continuous-integration; coverage reporting.
 
 ### `cern_sigkill_byte_offset.rs`
 
