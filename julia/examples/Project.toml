@@ -1,19 +1,23 @@
 # Environment for the OxiDb.jl example scripts.
 #
 # Run a single example:
-#   julia --project=julia/examples julia/examples/01_hello.jl
-# Run them all (starts a throwaway server for you):
+#   julia --project=julia/examples julia/examples/01_hello.jl            # TCP client
+#   julia --project=julia/examples julia/examples/embedded/01_hello.jl   # embedded
+# Run them all (starts a throwaway server for the TCP examples):
 #   julia/examples/run_all.sh
 #
-# The OxiDb TCP client is resolved straight from the sibling ../OxiDb
-# checkout via [sources] — no registry, no manual Pkg.develop.
+# Both OxiDb (TCP client) and OxiDbEmbedded (in-process FFI) are resolved
+# straight from the sibling ../OxiDb and ../OxiDbEmbedded checkouts via
+# [sources] — no registry, no manual Pkg.develop.
 # Requires Julia 1.11+ for the [sources] feature.
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 OxiDb = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+OxiDbEmbedded = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [sources]
 OxiDb = {path = "../OxiDb"}
+OxiDbEmbedded = {path = "../OxiDbEmbedded"}

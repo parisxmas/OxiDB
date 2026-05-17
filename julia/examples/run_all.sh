@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Run every OxiDb.jl example against a local oxidb-server.
+# Run every OxiDb.jl example — both the embedded (in-process) scripts and
+# the TCP-client scripts.
 #
-# If a server is already listening on 127.0.0.1:4444 it is reused; otherwise
-# a throwaway one is started (built from source if needed) on a temp data
-# directory and torn down on exit. Exits non-zero if any example fails.
+# The embedded examples need nothing. For the TCP examples, a server already
+# listening on 127.0.0.1:4444 is reused; otherwise a throwaway one is started
+# (built from source if needed) on a temp data directory and torn down on
+# exit. Exits non-zero if any example fails.
 #
 #   julia/examples/run_all.sh
 set -uo pipefail
@@ -13,7 +15,7 @@ REPO_ROOT="$(cd "$EXAMPLES_DIR/../.." && pwd)"
 HOST=127.0.0.1
 PORT=4444
 
-GREEN=$'\033[0;32m'; RED=$'\033[0;31m'; CYAN=$'\033[0;36m'; RESET=$'\033[0m'
+GREEN=$'\033[0;32m'; RED=$'\033[0;31m'; CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
 
 server_up() { (exec 3<>"/dev/tcp/$HOST/$PORT") 2>/dev/null; }
 
@@ -25,7 +27,36 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── Server ───────────────────────────────────────────────────────────
+pass=0; fail=0
+tmp_out="$(mktemp)"
+
+run_example() {
+    local f="$1" label="$2"
+    if julia --project="$EXAMPLES_DIR" "$f" >"$tmp_out" 2>&1; then
+        echo "${GREEN}PASS${RESET}  $label"
+        pass=$((pass + 1))
+    else
+        echo "${RED}FAIL${RESET}  $label"
+        sed 's/^/      /' "$tmp_out" | tail -8
+        fail=$((fail + 1))
+    fi
+}
+
+# ── Examples environment ─────────────────────────────────────────────
+echo "${CYAN}Instantiating the examples environment...${RESET}"
+julia --project="$EXAMPLES_DIR" -e 'using Pkg; Pkg.instantiate()' \
+    || { echo "${RED}Pkg.instantiate failed${RESET}"; exit 1; }
+
+# ── Embedded examples (no server needed) ─────────────────────────────
+echo ""
+echo "${BOLD}Embedded examples (in-process, no server)${RESET}"
+for f in "$EXAMPLES_DIR"/embedded/[0-9]*.jl; do
+    run_example "$f" "embedded/$(basename "$f")"
+done
+
+# ── TCP examples (need a server) ─────────────────────────────────────
+echo ""
+echo "${BOLD}TCP-client examples${RESET}"
 if server_up; then
     echo "${CYAN}Reusing the oxidb-server already on $HOST:$PORT${RESET}"
 else
@@ -42,29 +73,11 @@ else
     for _ in $(seq 1 40); do server_up && break; sleep 0.25; done
     server_up || { echo "${RED}oxidb-server did not come up${RESET}"; exit 1; }
 fi
-
-# ── Examples environment ─────────────────────────────────────────────
-echo "${CYAN}Instantiating the examples environment...${RESET}"
-julia --project="$EXAMPLES_DIR" -e 'using Pkg; Pkg.instantiate()' \
-    || { echo "${RED}Pkg.instantiate failed${RESET}"; exit 1; }
-echo ""
-
-# ── Run every numbered example ───────────────────────────────────────
-pass=0; fail=0
-tmp_out="$(mktemp)"
 for f in "$EXAMPLES_DIR"/[0-9]*.jl; do
-    name="$(basename "$f")"
-    if julia --project="$EXAMPLES_DIR" "$f" >"$tmp_out" 2>&1; then
-        echo "${GREEN}PASS${RESET}  $name"
-        pass=$((pass + 1))
-    else
-        echo "${RED}FAIL${RESET}  $name"
-        sed 's/^/      /' "$tmp_out" | tail -8
-        fail=$((fail + 1))
-    fi
+    run_example "$f" "$(basename "$f")"
 done
-rm -f "$tmp_out"
 
+rm -f "$tmp_out"
 echo ""
 echo "${CYAN}$pass passed, $fail failed${RESET}"
 [ "$fail" -eq 0 ]
