@@ -21,7 +21,7 @@ landed alongside this doc.
 | 5 | **Security** | ✅ partial — wire-protocol fuzz harness in [`fuzz/`](../fuzz/) — 4 mutation targets (dispatcher, OxiWire, RESP, pg_wire) + 1 structure-aware target (OxiWire roundtrip via `arbitrary`) | Structure-aware roundtrip for RESP / MsgPack / pg_wire; differential fuzz vs real Redis / Postgres; OSS-Fuzz continuous integration; external pentest (Cure53 / Trail of Bits); authn/authz bypass tests |
 | 6 | **Upgrade / migration** | ❌ not started | Byte-identical fixture corpus per release; N → N+1 → N+2 round-trip; downgrade where allowed |
 | 7 | **Scale** | ❌ not started | 10⁹+ doc dataset, 24-hour sustained insert + scan, multi-TB on-disk |
-| 8 | **Disaster recovery / drills** | ❌ not started | Power-loss VM drill, primary-site-down 24h, restore-from-cold-backup time-to-recover SLA |
+| 8 | **Disaster recovery / drills** | ✅ partial — backup→wipe→restore drill in [`tests/cern_dr_drill.rs`](../tests/cern_dr_drill.rs) (1500 docs + indexes + blobs, RTO ~30ms on dev hardware) | Power-loss VM drill (kvm + qemu), primary-site-down 24h, RTO SLA over realistic dataset sizes, restore-from-encrypted-backup |
 
 (Categories #4–#8 each warrant their own multi-PR effort; ADRs to scope
 them individually will come as the engine matures.)
