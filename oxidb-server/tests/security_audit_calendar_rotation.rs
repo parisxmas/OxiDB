@@ -186,6 +186,7 @@ fn audit_log_calendar_does_not_disable_size_trigger() {
         max_bytes: Some(1024),
         max_age: None,
         calendar: Some(CalendarBoundary::HourlyUtc),
+    compress: false,
     };
     let log = AuditLog::open_with_policy(dir.path(), policy).unwrap();
     // ~10 events at ~120 bytes each comfortably crosses 1 KiB.

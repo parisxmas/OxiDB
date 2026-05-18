@@ -96,3 +96,4 @@ Length-prefixed JSON over TCP (max 16 MiB). Auth via SCRAM-SHA-256. RBAC roles: 
 - `OXIDB_AUDIT_MAX_BYTES` (optional; rotates audit log when live file reaches this many bytes)
 - `OXIDB_AUDIT_MAX_AGE_SECS` (optional; rotates after this many elapsed seconds since file became active)
 - `OXIDB_AUDIT_CALENDAR` (optional; `hourly` / `daily` / `none` — UTC calendar boundary)
+- `OXIDB_AUDIT_COMPRESS` (optional; `true`/`1`/`yes`/`on` to gzip rotated audit files; default off)
