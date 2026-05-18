@@ -1,9 +1,11 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -83,6 +85,21 @@ pub struct RotationPolicy {
     /// next HH:00:00 UTC regardless of how long the file has
     /// already been active.
     pub calendar: Option<CalendarBoundary>,
+    /// When `true`, gzip rotated files in place (rename to
+    /// `audit.log.<unix_micros>.gz`, delete the uncompressed
+    /// version). Cuts archived log size by 80-95% typical for
+    /// JSON line-delimited text. Default `false` — preserves
+    /// backwards-compat behaviour from PRs #70/#71/#74 where
+    /// rotated files stayed uncompressed.
+    ///
+    /// Compression happens **inside** the rotation mutex (same
+    /// critical section as the rename), which keeps test
+    /// observability simple. For very large audit logs in
+    /// production this could become a latency concern — async
+    /// compression via a dedicated worker thread is a future
+    /// optimisation tracked alongside the other audit ergonomics
+    /// items.
+    pub compress: bool,
 }
 
 impl RotationPolicy {
@@ -92,6 +109,7 @@ impl RotationPolicy {
             max_bytes: None,
             max_age: None,
             calendar: None,
+            compress: false,
         }
     }
 
@@ -101,6 +119,7 @@ impl RotationPolicy {
             max_bytes: Some(max_bytes),
             max_age: None,
             calendar: None,
+            compress: false,
         }
     }
 
@@ -111,6 +130,7 @@ impl RotationPolicy {
             max_bytes: None,
             max_age: Some(Duration::from_secs(secs)),
             calendar: None,
+            compress: false,
         }
     }
 
@@ -121,6 +141,7 @@ impl RotationPolicy {
             max_bytes: Some(max_bytes),
             max_age: Some(Duration::from_secs(secs)),
             calendar: None,
+            compress: false,
         }
     }
 
@@ -131,6 +152,7 @@ impl RotationPolicy {
             max_bytes: None,
             max_age: None,
             calendar: Some(CalendarBoundary::HourlyUtc),
+            compress: false,
         }
     }
 
@@ -140,7 +162,17 @@ impl RotationPolicy {
             max_bytes: None,
             max_age: None,
             calendar: Some(CalendarBoundary::DailyUtc),
+            compress: false,
         }
+    }
+
+    /// Chainable setter to enable gzip compression on rotated
+    /// files. Returns `self` so it composes with the named
+    /// constructors:
+    ///   `RotationPolicy::daily_utc().with_compress()`
+    pub const fn with_compress(mut self) -> Self {
+        self.compress = true;
+        self
     }
 
     /// Parse a `RotationPolicy` from raw string env-var values.
@@ -160,6 +192,7 @@ impl RotationPolicy {
         max_bytes: Option<&str>,
         max_age_secs: Option<&str>,
         calendar: Option<&str>,
+        compress: Option<&str>,
     ) -> Self {
         let max_bytes = max_bytes.map(|s| {
             s.parse::<u64>()
@@ -183,21 +216,37 @@ impl RotationPolicy {
                 "OXIDB_AUDIT_CALENDAR must be 'hourly' / 'daily' / 'none', got {other:?}"
             ),
         };
-        Self { max_bytes, max_age, calendar }
+        let compress = match compress.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            // Common bool-shaped opt-ins. Mirrors OXIDB_AUDIT itself.
+            Some("true") | Some("1") | Some("yes") | Some("on") => true,
+            // Explicit-off, blank, or unset all disable.
+            None | Some("") | Some("false") | Some("0") | Some("no") | Some("off") => false,
+            Some(other) => panic!(
+                "OXIDB_AUDIT_COMPRESS must be a bool-shaped value (true/false/1/0/yes/no/on/off), got {other:?}"
+            ),
+        };
+        Self {
+            max_bytes,
+            max_age,
+            calendar,
+            compress,
+        }
     }
 
-    /// Read the three `OXIDB_AUDIT_*` env vars and build the
+    /// Read the four `OXIDB_AUDIT_*` env vars and build the
     /// corresponding `RotationPolicy`. All vars are optional;
-    /// unset means "no trigger of that kind". All-unset ⇒
-    /// `unbounded()`.
+    /// unset means "no trigger of that kind" or `compress=false`.
+    /// All-unset ⇒ `unbounded()`.
     pub fn from_env() -> Self {
         let max_bytes = std::env::var("OXIDB_AUDIT_MAX_BYTES").ok();
         let max_age = std::env::var("OXIDB_AUDIT_MAX_AGE_SECS").ok();
         let calendar = std::env::var("OXIDB_AUDIT_CALENDAR").ok();
+        let compress = std::env::var("OXIDB_AUDIT_COMPRESS").ok();
         Self::from_env_strs(
             max_bytes.as_deref(),
             max_age.as_deref(),
             calendar.as_deref(),
+            compress.as_deref(),
         )
     }
 
@@ -214,6 +263,9 @@ impl RotationPolicy {
         }
         if let Some(c) = self.calendar {
             parts.push(format!("calendar={c:?}"));
+        }
+        if self.compress {
+            parts.push("compress=gzip".to_string());
         }
         if parts.is_empty() {
             "unbounded".to_string()
@@ -356,9 +408,10 @@ impl AuditLog {
     }
 
     /// Atomically rotate the live audit file. Caller must hold the
-    /// state mutex.
+    /// state mutex. If `policy.compress` is set, gzip the rotated
+    /// file in place before returning (also inside the mutex —
+    /// see RotationPolicy.compress field-doc for rationale).
     fn rotate(&self, state: &mut LogState) -> Result<(), String> {
-        use std::time::{SystemTime, UNIX_EPOCH};
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros())
@@ -384,7 +437,74 @@ impl AuditLog {
         state.bytes_written = 0;
         state.active_since = Instant::now();
         state.active_since_wall = SystemTime::now();
+
+        // Best-effort gzip. If compression fails (e.g. disk full,
+        // permission denied on the .gz target), leave the
+        // uncompressed file in place — better than losing audit
+        // data. Log to stderr so an operator can investigate.
+        if self.policy.compress {
+            if let Err(e) = gzip_in_place(&rotated_path) {
+                eprintln!(
+                    "audit: gzip of {} failed ({e}); leaving uncompressed",
+                    rotated_path.display()
+                );
+            }
+        }
+
         Ok(())
+    }
+}
+
+/// Compress `path` into `path.gz` using deflate, then delete the
+/// original on success. Atomic-ish: if compression fails part-way,
+/// the partial `.gz` is removed and the original stays put. The
+/// caller treats failure as "leave the uncompressed file" so audit
+/// data is never lost to a compression error.
+fn gzip_in_place(path: &Path) -> io::Result<()> {
+    let gz_path = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".gz");
+        PathBuf::from(p)
+    };
+
+    // If a `.gz` already exists at the target name (extremely
+    // unlikely — would require two rotations in the same
+    // microsecond — but treated explicitly), bail out without
+    // overwriting; the uncompressed file stays as the durable
+    // record.
+    if gz_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} already exists", gz_path.display()),
+        ));
+    }
+
+    let result = (|| -> io::Result<()> {
+        let mut input = File::open(path)?;
+        let output = File::create(&gz_path)?;
+        let mut encoder = GzEncoder::new(output, Compression::default());
+        io::copy(&mut input, &mut encoder)?;
+        encoder.finish()?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            // Compression succeeded — drop the uncompressed
+            // original. If this delete fails, the .gz is intact
+            // and the original is intact too; that's "duplicate
+            // data", not "lost data", so propagate the error so
+            // the operator sees it but the audit state is safe.
+            fs::remove_file(path)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Compression failed — remove the partial .gz so the
+            // uncompressed original remains the single source of
+            // truth. Best-effort; ignore secondary errors.
+            let _ = fs::remove_file(&gz_path);
+            Err(e)
+        }
     }
 }
 

@@ -27,7 +27,7 @@ use std::time::Duration;
 
 #[test]
 fn env_policy_all_unset_is_unbounded() {
-    let p = RotationPolicy::from_env_strs(None, None, None);
+    let p = RotationPolicy::from_env_strs(None, None, None, None);
     assert_eq!(p.max_bytes, None);
     assert_eq!(p.max_age, None);
     assert_eq!(p.calendar, None);
@@ -41,7 +41,7 @@ fn env_policy_all_unset_is_unbounded() {
 
 #[test]
 fn env_policy_max_bytes_parses() {
-    let p = RotationPolicy::from_env_strs(Some("1048576"), None, None);
+    let p = RotationPolicy::from_env_strs(Some("1048576"), None, None, None);
     assert_eq!(p.max_bytes, Some(1_048_576));
     assert!(p.describe().contains("size=1048576B"));
 }
@@ -50,21 +50,21 @@ fn env_policy_max_bytes_parses() {
 fn env_policy_max_bytes_zero_is_legal() {
     // Edge case: max_bytes=0 means "rotate after every write".
     // Weird but valid; parser accepts it.
-    let p = RotationPolicy::from_env_strs(Some("0"), None, None);
+    let p = RotationPolicy::from_env_strs(Some("0"), None, None, None);
     assert_eq!(p.max_bytes, Some(0));
 }
 
 #[test]
 #[should_panic(expected = "OXIDB_AUDIT_MAX_BYTES must be a valid u64")]
 fn env_policy_max_bytes_malformed_panics() {
-    let _ = RotationPolicy::from_env_strs(Some("not-a-number"), None, None);
+    let _ = RotationPolicy::from_env_strs(Some("not-a-number"), None, None, None);
 }
 
 #[test]
 #[should_panic(expected = "OXIDB_AUDIT_MAX_BYTES must be a valid u64")]
 fn env_policy_max_bytes_negative_panics() {
     // u64 parse rejects negatives — message is the same.
-    let _ = RotationPolicy::from_env_strs(Some("-1"), None, None);
+    let _ = RotationPolicy::from_env_strs(Some("-1"), None, None, None);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ fn env_policy_max_bytes_negative_panics() {
 
 #[test]
 fn env_policy_max_age_secs_parses() {
-    let p = RotationPolicy::from_env_strs(None, Some("3600"), None);
+    let p = RotationPolicy::from_env_strs(None, Some("3600"), None, None);
     assert_eq!(p.max_age, Some(Duration::from_secs(3600)));
     assert!(p.describe().contains("age=3600s"));
 }
@@ -81,7 +81,7 @@ fn env_policy_max_age_secs_parses() {
 #[test]
 #[should_panic(expected = "OXIDB_AUDIT_MAX_AGE_SECS must be a valid u64")]
 fn env_policy_max_age_malformed_panics() {
-    let _ = RotationPolicy::from_env_strs(None, Some("an-hour"), None);
+    let _ = RotationPolicy::from_env_strs(None, Some("an-hour"), None, None);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -91,7 +91,7 @@ fn env_policy_max_age_malformed_panics() {
 #[test]
 fn env_policy_calendar_hourly_aliases_all_parse() {
     for input in &["hourly", "hourly-utc", "hourlyutc", "Hourly", "HOURLY", "Hourly-UTC"] {
-        let p = RotationPolicy::from_env_strs(None, None, Some(input));
+        let p = RotationPolicy::from_env_strs(None, None, Some(input), None);
         assert_eq!(
             p.calendar,
             Some(CalendarBoundary::HourlyUtc),
@@ -104,7 +104,7 @@ fn env_policy_calendar_hourly_aliases_all_parse() {
 #[test]
 fn env_policy_calendar_daily_aliases_all_parse() {
     for input in &["daily", "daily-utc", "dailyutc", "Daily", "DAILY", "Daily-UTC"] {
-        let p = RotationPolicy::from_env_strs(None, None, Some(input));
+        let p = RotationPolicy::from_env_strs(None, None, Some(input), None);
         assert_eq!(
             p.calendar,
             Some(CalendarBoundary::DailyUtc),
@@ -117,21 +117,21 @@ fn env_policy_calendar_daily_aliases_all_parse() {
 #[test]
 fn env_policy_calendar_none_and_empty_disable_calendar() {
     for input in &[None, Some(""), Some("none"), Some("None"), Some("NONE")] {
-        let p = RotationPolicy::from_env_strs(None, None, *input);
+        let p = RotationPolicy::from_env_strs(None, None, *input, None);
         assert_eq!(p.calendar, None, "expected None for {input:?}");
     }
 }
 
 #[test]
 fn env_policy_calendar_whitespace_trimmed() {
-    let p = RotationPolicy::from_env_strs(None, None, Some("  hourly  "));
+    let p = RotationPolicy::from_env_strs(None, None, Some("  hourly  "), None);
     assert_eq!(p.calendar, Some(CalendarBoundary::HourlyUtc));
 }
 
 #[test]
 #[should_panic(expected = "OXIDB_AUDIT_CALENDAR must be 'hourly' / 'daily' / 'none'")]
 fn env_policy_calendar_unknown_value_panics() {
-    let _ = RotationPolicy::from_env_strs(None, None, Some("weekly"));
+    let _ = RotationPolicy::from_env_strs(None, None, Some("weekly"), None);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -140,7 +140,7 @@ fn env_policy_calendar_unknown_value_panics() {
 
 #[test]
 fn env_policy_all_three_set_compose_correctly() {
-    let p = RotationPolicy::from_env_strs(Some("2048"), Some("60"), Some("hourly"));
+    let p = RotationPolicy::from_env_strs(Some("2048"), Some("60"), Some("hourly"), None);
     assert_eq!(p.max_bytes, Some(2048));
     assert_eq!(p.max_age, Some(Duration::from_secs(60)));
     assert_eq!(p.calendar, Some(CalendarBoundary::HourlyUtc));
@@ -156,7 +156,7 @@ fn env_policy_all_three_set_compose_correctly() {
 fn env_policy_describe_unbounded_does_not_say_size_zero() {
     // Catch a future "let's default missing fields to 0" patch
     // that would silently change unbounded → "rotate-every-write".
-    let p = RotationPolicy::from_env_strs(None, None, None);
+    let p = RotationPolicy::from_env_strs(None, None, None, None);
     let d = p.describe();
     assert!(!d.contains("size=0"), "unbounded must NOT describe as size=0: {d}");
     assert!(!d.contains("age=0"), "unbounded must NOT describe as age=0: {d}");
