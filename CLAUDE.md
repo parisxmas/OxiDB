@@ -92,3 +92,7 @@ Length-prefixed JSON over TCP (max 16 MiB). Auth via SCRAM-SHA-256. RBAC roles: 
 - `OXIDB_DATA` (default `./oxidb_data`)
 - `OXIDB_POOL_SIZE` (default 4 worker threads)
 - `OXIDB_IDLE_TIMEOUT` (default 30s, 0 = never)
+- `OXIDB_AUDIT` (default off; set to `true`/`1` to enable audit log)
+- `OXIDB_AUDIT_MAX_BYTES` (optional; rotates audit log when live file reaches this many bytes)
+- `OXIDB_AUDIT_MAX_AGE_SECS` (optional; rotates after this many elapsed seconds since file became active)
+- `OXIDB_AUDIT_CALENDAR` (optional; `hourly` / `daily` / `none` — UTC calendar boundary)

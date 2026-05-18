@@ -142,6 +142,85 @@ impl RotationPolicy {
             calendar: Some(CalendarBoundary::DailyUtc),
         }
     }
+
+    /// Parse a `RotationPolicy` from raw string env-var values.
+    /// Pure function — no `std::env::var` reads — so tests can
+    /// drive every parsing edge case without touching process-
+    /// wide state. Panics on malformed numeric values or
+    /// unknown calendar names; matches the existing
+    /// `OXIDB_POOL_SIZE` / `OXIDB_IDLE_TIMEOUT` convention of
+    /// failing loudly at startup rather than silently ignoring.
+    ///
+    /// Calendar value parsing is case-insensitive and accepts
+    /// the common shorthand:
+    ///   `"hourly"` / `"hourly-utc"` → `HourlyUtc`
+    ///   `"daily"` / `"daily-utc"`   → `DailyUtc`
+    ///   `"none"` / `""`             → no calendar trigger
+    pub fn from_env_strs(
+        max_bytes: Option<&str>,
+        max_age_secs: Option<&str>,
+        calendar: Option<&str>,
+    ) -> Self {
+        let max_bytes = max_bytes.map(|s| {
+            s.parse::<u64>()
+                .expect("OXIDB_AUDIT_MAX_BYTES must be a valid u64")
+        });
+        let max_age = max_age_secs.map(|s| {
+            let secs: u64 = s
+                .parse()
+                .expect("OXIDB_AUDIT_MAX_AGE_SECS must be a valid u64");
+            Duration::from_secs(secs)
+        });
+        let calendar = match calendar.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") | Some("none") => None,
+            Some("hourly") | Some("hourly-utc") | Some("hourlyutc") => {
+                Some(CalendarBoundary::HourlyUtc)
+            }
+            Some("daily") | Some("daily-utc") | Some("dailyutc") => {
+                Some(CalendarBoundary::DailyUtc)
+            }
+            Some(other) => panic!(
+                "OXIDB_AUDIT_CALENDAR must be 'hourly' / 'daily' / 'none', got {other:?}"
+            ),
+        };
+        Self { max_bytes, max_age, calendar }
+    }
+
+    /// Read the three `OXIDB_AUDIT_*` env vars and build the
+    /// corresponding `RotationPolicy`. All vars are optional;
+    /// unset means "no trigger of that kind". All-unset ⇒
+    /// `unbounded()`.
+    pub fn from_env() -> Self {
+        let max_bytes = std::env::var("OXIDB_AUDIT_MAX_BYTES").ok();
+        let max_age = std::env::var("OXIDB_AUDIT_MAX_AGE_SECS").ok();
+        let calendar = std::env::var("OXIDB_AUDIT_CALENDAR").ok();
+        Self::from_env_strs(
+            max_bytes.as_deref(),
+            max_age.as_deref(),
+            calendar.as_deref(),
+        )
+    }
+
+    /// Human-readable summary for the operator-visible startup
+    /// stderr line. Renders `unbounded` when no trigger is set,
+    /// else a compact comma-separated list.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(n) = self.max_bytes {
+            parts.push(format!("size={n}B"));
+        }
+        if let Some(d) = self.max_age {
+            parts.push(format!("age={}s", d.as_secs()));
+        }
+        if let Some(c) = self.calendar {
+            parts.push(format!("calendar={c:?}"));
+        }
+        if parts.is_empty() {
+            "unbounded".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
 }
 
 /// Mutex-protected state inside `AuditLog` — the live file, a

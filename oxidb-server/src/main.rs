@@ -1247,11 +1247,16 @@ fn main() {
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
     let audit_log = if audit_enabled {
-        let log =
-            AuditLog::open(Path::new(&data_dir)).expect("failed to open audit log");
-        eprintln!("audit logging: enabled");
+        let policy = oxidb_server::audit::RotationPolicy::from_env();
+        let log = AuditLog::open_with_policy(Path::new(&data_dir), policy)
+            .expect("failed to open audit log");
+        eprintln!("audit logging: enabled (rotation: {})", policy.describe());
         if let Some(g) = &gelf {
-            g.send(GelfLevel::Informational, "audit logging: enabled", &[]);
+            g.send(
+                GelfLevel::Informational,
+                &format!("audit logging: enabled (rotation: {})", policy.describe()),
+                &[],
+            );
         }
         Some(Arc::new(log))
     } else {
@@ -1681,10 +1686,16 @@ fn run_cluster_mode() {
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
     let audit_log = if audit_enabled {
-        let log = AuditLog::open(Path::new(&data_dir)).expect("failed to open audit log");
-        eprintln!("audit logging: enabled");
+        let policy = oxidb_server::audit::RotationPolicy::from_env();
+        let log = AuditLog::open_with_policy(Path::new(&data_dir), policy)
+            .expect("failed to open audit log");
+        eprintln!("audit logging: enabled (rotation: {})", policy.describe());
         if let Some(g) = &gelf {
-            g.send(GelfLevel::Informational, "audit logging: enabled", &[]);
+            g.send(
+                GelfLevel::Informational,
+                &format!("audit logging: enabled (rotation: {})", policy.describe()),
+                &[],
+            );
         }
         Some(Arc::new(log))
     } else {
