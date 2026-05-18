@@ -39,6 +39,12 @@ rmp-serde = "1"
 # avoid pulling in tokio / TLS / num-bigint etc. — the sync byte-
 # parser doesn't need them.
 redis = { version = "1", default-features = false }
+# Reference Postgres frontend-message parser (pgwire crate) for the
+# pg_diff_pgwire differential target. Same cross-implementation
+# differential pattern as resp_diff_redis / msgpack_roundtrip.
+# `bytes` for the BytesMut buffer the pgwire decoder consumes.
+pgwire = { version = "0.40", default-features = false }
+bytes = "1"
 
 # Prevent this crate from being picked up by the root workspace.
 [workspace]
@@ -104,6 +110,17 @@ bench = false
 [[bin]]
 name = "resp_diff_redis"
 path = "fuzz_targets/resp_diff_redis.rs"
+test = false
+doc = false
+bench = false
+
+# Cross-implementation differential: OxiDB pg_wire decoder vs the
+# pgwire crate's PgWireFrontendMessage::decode. Same pattern as
+# resp_diff_redis; reference implementation is a separate Rust
+# crate written by a different community.
+[[bin]]
+name = "pg_diff_pgwire"
+path = "fuzz_targets/pg_diff_pgwire.rs"
 test = false
 doc = false
 bench = false

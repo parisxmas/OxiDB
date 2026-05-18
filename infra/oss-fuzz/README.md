@@ -116,7 +116,7 @@ shared across thousands of projects, so each cycle matters).
 
 ## Targets registered
 
-All 8 targets from `fuzz/fuzz_targets/` are listed by name in
+All 9 targets from `fuzz/fuzz_targets/` are listed by name in
 `build.sh`. When adding a new target, append it to the for-loop in
 `build.sh` (and remember to update this list):
 
@@ -128,3 +128,4 @@ All 8 targets from `fuzz/fuzz_targets/` are listed by name in
 - `resp_roundtrip` — RESP encode↔decode roundtrip (structure-aware)
 - `msgpack_roundtrip` — MsgPack encode↔decode via `rmp_serde` reference (structure-aware, cross-impl differential)
 - `resp_diff_redis` — OxiDB RESP vs `redis::parse_redis_value` reference (mutation, cross-impl differential, scoped to `:` / `$` framing)
+- `pg_diff_pgwire` — OxiDB pg_wire vs `pgwire::PgWireFrontendMessage::decode` reference (mutation, cross-impl differential, scoped to `Q P D H C X` tagged messages with a panic-hook filter that ignores known pgwire bugs)

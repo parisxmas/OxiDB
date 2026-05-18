@@ -120,8 +120,16 @@ For posting standalone without a thread:
 
 ## Numbers to keep accurate when re-posting
 
-- 8/8 categories ✅ partial (after PRs #42-#61 merged 2026-05-18)
-- 8 fuzz targets (4 mutation + 3 structure-aware roundtrip + 1 cross-impl diff vs redis-rs)
-- 5 fuzz-found DoS bugs + 1 correctness bug (RESP UTF-8 panic / pg_wire i32 overflow / OxiWire array+map OOM / RESP bulk-string OOM / RESP SimpleString CR-truncation)
-- Server version: 0.28.5 (bumped 0.28.0 → 0.28.5 across the security/correctness fixes)
+- 8/8 categories ✅ partial (after PRs #42-#65 merged 2026-05-18)
+- 9 fuzz targets (4 mutation + 3 structure-aware roundtrip + 2 cross-impl diff: vs `redis-rs` and the `pgwire` crate)
+- 7 fuzz-found DoS bugs + 1 correctness bug:
+    1. RESP UTF-8 panic (2 B)              PR #46
+    2. pg_wire i32 overflow (6 B)          PR #47
+    3. OxiWire array OOM (7 B)             PR #48
+    4. OxiWire map OOM (8 B)               PR #48
+    5. RESP bulk-string OOM (14 B)         PR #61
+    6. pg_wire Bind/Parse i16 overflow     PR #65 (this batch)
+    7. pg_wire Describe/Close empty body   PR #65 (this batch)
+    + correctness: RESP SimpleString CR-truncation (PR #61)
+- Server version: 0.28.6 (bumped 0.28.0 → 0.28.6 across the security/correctness fixes)
 - ADR-0003 / 0005 / 0006 are the load-bearing decision documents

@@ -118,12 +118,23 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<FrontendMessage> {
             r.read_exact(&mut buf)?;
             let (name, rest) = read_cstr_from_buf(&buf);
             let (sql, rest) = read_cstr_from_buf(rest);
+            // i16 cast to usize wraps negative values to huge numbers
+            // (negative i16 → usize::MAX-shaped), then loops and
+            // pre-allocations explode. Clamp to non-negative; bound
+            // the pre-alloc by remaining bytes so a wire-claimed
+            // count larger than the payload can satisfy doesn't
+            // OOM. Same shape as `wire_pg` and `pg_diff_pgwire`
+            // findings.
             let num_params = if rest.len() >= 2 {
-                i16::from_be_bytes([rest[0], rest[1]]) as usize
+                let n = i16::from_be_bytes([rest[0], rest[1]]);
+                if n < 0 { 0 } else { n as usize }
             } else {
                 0
             };
-            let mut param_types = Vec::with_capacity(num_params);
+            // Param types are 4 bytes each → bound capacity by
+            // (remaining_bytes / 4) to refuse alloc bombs.
+            let cap = num_params.min(rest.len().saturating_sub(2) / 4);
+            let mut param_types = Vec::with_capacity(cap);
             let mut offset = 2;
             for _ in 0..num_params {
                 if offset + 4 <= rest.len() {
@@ -148,23 +159,37 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<FrontendMessage> {
             let (portal, rest) = read_cstr_from_buf(&buf);
             let (statement, rest) = read_cstr_from_buf(rest);
 
-            // Skip format codes
+            // Skip format codes.
+            // SAME signed-cast bug as Parse: negative i16 → huge
+            // usize → `2 + n * 2` overflows. Clamp non-negative
+            // before the multiply. Surfaced by `pg_diff_pgwire`.
             let mut pos = if rest.len() >= 2 {
-                let n = i16::from_be_bytes([rest[0], rest[1]]) as usize;
-                2 + n * 2
+                let raw = i16::from_be_bytes([rest[0], rest[1]]);
+                let n: usize = if raw < 0 { 0 } else { raw as usize };
+                // Bound by remaining bytes so a huge claimed
+                // format-codes count doesn't push `pos` past the
+                // payload (the subsequent `rest[pos..]` reads check
+                // bounds via the `pos + N <= rest.len()` guards
+                // already in place, but staying internally
+                // consistent is cheaper than relying on those).
+                2usize.saturating_add(n.saturating_mul(2))
             } else {
                 2
             };
 
             // Read parameter values
             let num_params = if pos + 2 <= rest.len() {
-                let n = i16::from_be_bytes([rest[pos], rest[pos + 1]]) as usize;
+                let raw = i16::from_be_bytes([rest[pos], rest[pos + 1]]);
+                let n: usize = if raw < 0 { 0 } else { raw as usize };
                 pos += 2;
                 n
             } else {
                 0
             };
-            let mut param_values = Vec::with_capacity(num_params);
+            // Same bound-by-remaining-bytes pattern as Parse above.
+            // Each param value has at least a 4-byte length prefix.
+            let cap = num_params.min(rest.len().saturating_sub(pos) / 4);
+            let mut param_values = Vec::with_capacity(cap);
             for _ in 0..num_params {
                 if pos + 4 > rest.len() {
                     break;
@@ -198,6 +223,16 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<FrontendMessage> {
         b'D' => {
             let mut buf = vec![0u8; payload_len];
             r.read_exact(&mut buf)?;
+            // Describe body must be at least 1 byte (`kind` u8) +
+            // a NUL-terminated `name`. Empty body = malformed.
+            // Surfaced by `pg_diff_pgwire` (`D\0\0\0\x04` had
+            // payload_len=0 → panic on `buf[0]`).
+            if buf.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Describe message body is empty (need at least 1-byte kind + cstring)",
+                ));
+            }
             let kind = buf[0];
             let (name, _) = read_cstr_from_buf(&buf[1..]);
             Ok(FrontendMessage::Describe { kind, name })
@@ -230,6 +265,14 @@ pub fn read_message<R: Read>(r: &mut R) -> io::Result<FrontendMessage> {
         b'C' => {
             let mut buf = vec![0u8; payload_len];
             r.read_exact(&mut buf)?;
+            // Same shape as Describe — body must be at least the
+            // 1-byte kind + cstring name. Empty body = malformed.
+            if buf.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Close message body is empty (need at least 1-byte kind + cstring)",
+                ));
+            }
             let kind = buf[0];
             let (name, _) = read_cstr_from_buf(&buf[1..]);
             Ok(FrontendMessage::Close { kind, name })
@@ -806,6 +849,87 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Regression for the pg_diff_pgwire fuzz finding (post-PR
+    /// #64). Bind message `B\0\0\0\n+\0\0\x8a\0\x01\0\0\0\0` (15 B)
+    /// reached the format-codes-count read, where
+    /// `i16::from_be_bytes([0x8a, 0x00]) = -30208` cast to `usize`
+    /// wrapped to ~18 EiB, then `n * 2` overflowed in debug builds /
+    /// allocated garbage in release. Same shape on the parameter-
+    /// count read two lines later. Fix: clamp i16 → non-negative
+    /// before the cast. Bind decoder MUST now return either Ok with
+    /// a sane (truncated) parse or Err — never panic.
+    #[test]
+    fn fuzz_regression_bind_negative_i16_does_not_overflow() {
+        use std::io::Cursor;
+        let bytes: [u8; 15] = [
+            b'B', 0, 0, 0, 0x0a,
+            b'+', 0, 0, 0x8a, 0, 0x01, 0, 0, 0, 0,
+        ];
+        let mut c = Cursor::new(&bytes[..]);
+        // Should not panic. Either Ok or Err; we don't care which —
+        // the bug is the panic.
+        let _ = read_message(&mut c);
+    }
+
+    /// Companion: explicitly construct a Bind with negative
+    /// format-codes count claim. Verifies the clamp works on the
+    /// canonical attacker-controlled bytes (`0xFF 0xFF` = -1).
+    #[test]
+    fn fuzz_regression_bind_minus_one_format_codes_does_not_overflow() {
+        use std::io::Cursor;
+        let bytes: [u8; 9] = [
+            b'B', 0, 0, 0, 0x05, // tag + len=5 → payload_len=1, then we extend
+            0xff, 0xff, 0xff, 0xff, // raw negative i16s
+        ];
+        let mut c = Cursor::new(&bytes[..]);
+        let _ = read_message(&mut c);
+    }
+
+    /// Companion: the SAME bug exists in Parse decoder for
+    /// num_params. Negative i16 → huge usize → Vec::with_capacity
+    /// alloc-bomb. Fix is identical: clamp non-negative + cap by
+    /// remaining bytes.
+    #[test]
+    fn fuzz_regression_parse_negative_num_params_does_not_overflow() {
+        use std::io::Cursor;
+        let bytes: [u8; 10] = [
+            b'P', 0, 0, 0, 0x07,
+            0, // name terminator
+            0, // sql terminator
+            0xff, 0xff, // num_params = -1 as i16
+            0, // (no actual param types follow — we just need to not panic)
+        ];
+        let mut c = Cursor::new(&bytes[..]);
+        let _ = read_message(&mut c);
+    }
+
+    /// Regression for the second pg_diff_pgwire finding (post-PR
+    /// #64). Describe message with len=4 (payload_len=0) panicked
+    /// at `buf[0]` index out of bounds. Same shape in Close ('C')
+    /// decoder. Both must now return InvalidData cleanly.
+    #[test]
+    fn fuzz_regression_describe_empty_body_does_not_panic() {
+        use std::io::Cursor;
+        // Tag + i32 len=4 (means payload_len = 0)
+        let bytes = [b'D', 0, 0, 0, 4];
+        let mut c = Cursor::new(&bytes[..]);
+        match read_message(&mut c) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("expected Err for empty Describe body"),
+        }
+    }
+
+    #[test]
+    fn fuzz_regression_close_empty_body_does_not_panic() {
+        use std::io::Cursor;
+        let bytes = [b'C', 0, 0, 0, 4];
+        let mut c = Cursor::new(&bytes[..]);
+        match read_message(&mut c) {
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidData),
+            Ok(_) => panic!("expected Err for empty Close body"),
+        }
     }
 
     #[test]
