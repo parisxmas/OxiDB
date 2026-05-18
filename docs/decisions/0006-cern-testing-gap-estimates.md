@@ -72,7 +72,7 @@ via env var).
 |---|---|---|
 | RSS leak detection | **s** | macOS: `mach_task_basic_info`; Linux: `/proc/self/status`. Conditional compilation. |
 | fd leak detection | **s** | Same per-platform syscalls. |
-| WAL-size unbounded growth check | **xs** | `std::fs::metadata` on the live `.wal` file. |
+| WAL-size unbounded growth check | ✅ landed — `cern_soak.rs` now asserts `<dir>/soak.wal` stays ≤ 64 MiB after the steady-state insert/update/delete loop. Empirical: 1.73 MiB after 30s / 21,950 mixed ops on dev hw. Catches "rotation disabled" regressions. |
 | Multi-day soak | **m** ops, **xxl** wall-clock | Test code is one env-var tweak; the *running* is a 30-day commitment of a CI agent. |
 | HEP-shaped workload (bursty + scans + high-fanout reads) | **s** | Mostly composition of patterns already in `cern_scale.rs`. |
 
