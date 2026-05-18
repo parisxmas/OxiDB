@@ -38,7 +38,7 @@ Existing: 4 tests (transfers + dirty + phantom + write-skew). See
 
 | Gap | Effort | Notes / unblockers |
 |---|---|---|
-| A5A (read skew / monotonic reads) test | **xs** | Same harness shape as the existing isolation tests. ~50 lines. |
+| A5A (read skew / monotonic reads) test | ✅ landed — [`tests/cern_acid_isolation.rs::read_skew_pinned_behaviour`](../../tests/cern_acid_isolation.rs). Pinned dual finding: read-skew IS visible during the tx (X stale, Y fresh), AND OCC catches it at commit with `TransactionConflict`. Stronger than pure read-committed. |
 | Explicit snapshot-isolation API (`OXIDB_SNAPSHOT_ISO` mode) | **m** | Engine change, not test change. Pre-req for the "is this *actually* snapshot now?" test. Needs its own ADR. |
 | Multi-version concurrency control (MVCC) | **xl** | Major engine work, not a test. Replaces or augments OCC. ADR-worthy. |
 | Reference anomaly suite (Adya / Berenson exhaustive) | **m** | A5A/B done; remaining are P0, P1, P2, P3, P4 — each ~50 lines. |

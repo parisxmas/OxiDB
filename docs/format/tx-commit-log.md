@@ -115,27 +115,40 @@ The current format has no header. Phase 1b will introduce one:
 
 ## Isolation level (observed)
 
-OxiDB's OCC validates the **write set** at commit time; reads
-inside a tx see the latest committed data rather than a
-`begin_transaction`-time snapshot. Empirically (pinned in
-[`tests/cern_acid_isolation.rs`](../../tests/cern_acid_isolation.rs)):
+OxiDB's OCC validates **both the read-set and the write-set** at
+commit time. Reads *inside* a tx see the latest committed data
+(read-committed visibility), but the read-set is recorded and
+re-checked at commit — a concurrent committed update to anything
+tx1 read will abort tx1 with `Error::TransactionConflict`. This
+is stronger than pure read-committed and closer to *optimistic
+snapshot isolation at commit time*.
 
-| Anomaly | Occurs? | Why |
-|---|---|---|
-| Dirty read | ❌ | Writes are buffered until commit; uncommitted data never reaches the visible state |
-| Lost update | ❌ | Write-set conflict detection — second commit gets `Error::TransactionConflict` |
-| Phantom read | ✅ | Reads see committed data, not a snapshot — a concurrent committed insert appears in a later predicate read inside the same tx |
-| Write skew (A5B) | ✅ | Two txs writing to *different* docs with a cross-row constraint both commit — OCC sees no write-write conflict |
+Empirically pinned in [`tests/cern_acid_isolation.rs`](../../tests/cern_acid_isolation.rs):
 
-In ANSI SQL terms this is **read committed** with OCC-mediated lost-
-update prevention — between read-committed and snapshot isolation.
-Equivalent to PostgreSQL's `READ COMMITTED` plus serializable-update
-protection.
+| Anomaly | Visible during tx? | Caught at commit? | Net effect |
+|---|---|---|---|
+| Dirty read | ❌ | n/a | Writes are buffered until commit; never visible |
+| Lost update | ❌ | ✅ (write-set conflict) | Second writer aborts with `TransactionConflict` |
+| Phantom read | ✅ | ❌ | Concurrent INSERT matching a predicate appears in a later read; commit succeeds (no existing doc's version changed) |
+| Read skew (A5A) | ✅ | ✅ (read-set conflict on commit) | tx1 sees inconsistent (X stale, Y fresh); commit fails — app learns and can retry |
+| Write skew (A5B) | n/a | ❌ | Two txs writing to *different* docs with a cross-row constraint both commit — read-set check apparently doesn't fire for the cross-overlap pattern |
 
-If/when serializable snapshot isolation (SSI) lands, the phantom-
-read and write-skew assertions in `cern_acid_isolation.rs` flip and
-those flips are the intentional documentation that the engine has
-been promoted.
+ANSI SQL placement: **between READ COMMITTED and SNAPSHOT
+ISOLATION** — visibility during the tx is read-committed, but the
+commit-time read-set validation gives back some of snapshot-isolation's
+"if anything you read changed, retry" guarantee. Not quite SI because:
+
+- Phantoms (newly-inserted matching rows) are not caught — the
+  read-set tracks specific document versions, not predicate
+  populations.
+- Write skew (A5B) is admitted — see the open question in
+  [`tests/cern_acid_isolation.rs::write_skew_pinned_behaviour`](../../tests/cern_acid_isolation.rs)
+  for why read-set validation doesn't fire there.
+
+If/when full serializable snapshot isolation (SSI) lands, the
+phantom-read and write-skew assertions in `cern_acid_isolation.rs`
+flip and those flips are the intentional documentation that the
+engine has been promoted.
 
 ## Code refs
 
