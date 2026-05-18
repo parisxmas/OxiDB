@@ -238,3 +238,136 @@ fn write_skew_pinned_behaviour() {
          If this fails, isolation has been promoted."
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// Read skew (Berenson A5A / "monotonic reads") — a read-only tx
+// observes mutually inconsistent values because its reads straddle
+// another tx's commit. Distinct from phantom-read (which is about
+// predicate queries returning different result sets) and write-skew
+// (which involves the long tx WRITING). Here tx1 only READS — and
+// still sees inconsistency.
+//
+// Setup: X=50, Y=50, cross-row invariant X+Y=100.
+//   tx1 begins, reads X (sees 50)
+//   tx2 begins, swaps 30 between X and Y, commits (X=20, Y=80)
+//   tx1 reads Y
+//     - Snapshot isolation: Y=50 (matches snapshot at tx1's begin)
+//     - Read committed:     Y=80 (sees tx2's commit) → tx1's view
+//                                  of the world is X=50 (stale)
+//                                  + Y=80 (fresh) → invariant
+//                                  appears violated FROM tx1's POV
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn read_skew_pinned_behaviour() {
+    let dir = tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+
+    db.insert("accts", json!({"id": "x", "balance": 50i64})).unwrap();
+    db.insert("accts", json!({"id": "y", "balance": 50i64})).unwrap();
+
+    // tx1 begins. First half of a read-only consistency check.
+    let tx1 = db.begin_transaction();
+    let x_seen_by_tx1 = db
+        .tx_find(tx1, "accts", &json!({"id": "x"}))
+        .unwrap()[0]["balance"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(x_seen_by_tx1, 50, "setup precondition");
+
+    // tx2: atomic 30-unit swap between x and y, preserving the
+    // invariant from tx2's own perspective.
+    let tx2 = db.begin_transaction();
+    db.tx_update(
+        tx2,
+        "accts",
+        &json!({"id": "x"}),
+        &json!({"$inc": {"balance": -30i64}}),
+    )
+    .unwrap();
+    db.tx_update(
+        tx2,
+        "accts",
+        &json!({"id": "y"}),
+        &json!({"$inc": {"balance":  30i64}}),
+    )
+    .unwrap();
+    db.commit_transaction(tx2).unwrap();
+
+    // tx1 reads Y. Under read-committed it'll see tx2's update;
+    // under snapshot isolation it'd see the pre-tx2 value.
+    let y_seen_by_tx1 = db
+        .tx_find(tx1, "accts", &json!({"id": "y"}))
+        .unwrap()[0]["balance"]
+        .as_i64()
+        .unwrap();
+
+    let tx1_perceived_total = x_seen_by_tx1 + y_seen_by_tx1;
+    eprintln!(
+        "[read-skew] tx1 saw x={x_seen_by_tx1}, y={y_seen_by_tx1}, \
+         tx1's perceived X+Y = {tx1_perceived_total} (real invariant = 100)"
+    );
+
+    // PINNED: OxiDB is read-committed. tx1's reads straddle tx2's
+    // commit, so X is stale (50) and Y is fresh (80) — tx1 sees the
+    // world as X+Y=130, which is impossible under any single point
+    // in real history.
+    //
+    // If/when SSI lands and tx1's snapshot is preserved, y_seen_by_tx1
+    // will be 50 and tx1_perceived_total will be 100. That flip is
+    // the intentional documentation that isolation got stronger.
+    assert_eq!(
+        y_seen_by_tx1, 80,
+        "PINNED: read-committed → tx1 sees tx2's committed update. \
+         If this fails, isolation has been promoted to SI/SSI; \
+         update this test + docs/format/tx-commit-log.md."
+    );
+    assert_eq!(
+        tx1_perceived_total, 130,
+        "PINNED: read-skew → tx1's worldview violates the invariant. \
+         If this fails, isolation has been promoted."
+    );
+
+    // SECOND FINDING (orthogonal to read-skew itself):
+    //
+    // OxiDB's OCC validates the READ-SET at commit, even for tx1
+    // which only read. Since tx2 bumped x's version between tx1's
+    // begin and commit, tx1's commit_transaction returns
+    // `TransactionConflict` with `expected_version: 1, actual_version: 2`.
+    //
+    // This is *stronger* than pure read-committed and closer to
+    // OPTIMISTIC SNAPSHOT ISOLATION at commit time — the
+    // application learns its reads were inconsistent and can
+    // retry. (Read-committed alone would silently let tx1 commit.)
+    //
+    // Important nuance: the read-set validation fires here but
+    // NOT in the parallel write-skew test (PR #50) where both txs
+    // write to *different* docs and both commit successfully. The
+    // exact rules for when validation fires deserve their own
+    // empirical investigation; for now we pin what THIS test
+    // observes.
+    let commit_result = db.commit_transaction(tx1);
+    eprintln!("[read-skew] tx1 commit result: {commit_result:?}");
+    assert!(
+        commit_result.is_err(),
+        "PINNED: read-only tx1's commit MUST fail because OCC \
+         validates the read-set and x's version bumped since tx1 \
+         read it. If this passes (Ok), the engine has weakened to \
+         pure read-committed (no read-set validation) — that's a \
+         deliberate change, update this test + docs."
+    );
+
+    // After everything settles, the REAL state still satisfies the
+    // invariant — read skew is a per-transaction-perception bug,
+    // not a state-corruption one.
+    let final_x = db
+        .find_one("accts", &json!({"id": "x"}))
+        .unwrap().unwrap()["balance"].as_i64().unwrap();
+    let final_y = db
+        .find_one("accts", &json!({"id": "y"}))
+        .unwrap().unwrap()["balance"].as_i64().unwrap();
+    assert_eq!(final_x + final_y, 100, "real state invariant must hold");
+    assert_eq!(final_x, 20);
+    assert_eq!(final_y, 80);
+}
