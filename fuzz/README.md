@@ -35,6 +35,7 @@ cargo install cargo-fuzz                 # 0.13+
 | `oxiwire_roundtrip` | OxiWire encoder ↔ decoder mutual consistency. `Arbitrary` value tree → `encode_value` → `decode_request` → JSON-canonical equality. | `fuzz_targets/oxiwire_roundtrip.rs` |
 | `resp_roundtrip` | RESP encoder ↔ decoder mutual consistency. `Arbitrary RespValue` → `write_value` → `read_value` → bytes-equal after re-encoding. CR/LF normalised out of SimpleString/Error at input (line-based framing constraint). | `fuzz_targets/resp_roundtrip.rs` |
 | `msgpack_roundtrip` | OxiDB's hand-rolled MsgPack encoder (`protocol::value_to_msgpack`) ↔ canonical `rmp_serde::from_slice` decoder. Cross-implementation comparison surfaces encoder bugs the same-author decoder couldn't see. | `fuzz_targets/msgpack_roundtrip.rs` |
+| `resp_diff_redis` | Decoder differential: OxiDB `resp::read_value` vs canonical `redis::parse_redis_value` (redis-rs). Scoped to length-prefixed scalar types (`:`, `$`) where RESP2 spec is unambiguous. Found a 12-byte bulk-string OOM + a SimpleString CR-truncation bug on its first smoke run (both fixed in this PR). | `fuzz_targets/resp_diff_redis.rs` |
 
 Structure-aware fuzz runs **~6× faster** (~18k iter/s vs ~3k iter/s
 for byte-flipping in 30s smoke runs) because every iteration starts

@@ -120,8 +120,8 @@ For posting standalone without a thread:
 
 ## Numbers to keep accurate when re-posting
 
-- 8/8 categories ✅ partial (after PRs #42-#59 merged 2026-05-18)
-- 7 fuzz targets (4 mutation + 3 structure-aware)
-- 4 fuzz-found DoS bugs (RESP UTF-8 / pg_wire overflow / OxiWire ×2)
-- Server version: 0.28.4 (bumped 0.28.0 → 0.28.4 across the security fixes)
+- 8/8 categories ✅ partial (after PRs #42-#61 merged 2026-05-18)
+- 8 fuzz targets (4 mutation + 3 structure-aware roundtrip + 1 cross-impl diff vs redis-rs)
+- 5 fuzz-found DoS bugs + 1 correctness bug (RESP UTF-8 panic / pg_wire i32 overflow / OxiWire array+map OOM / RESP bulk-string OOM / RESP SimpleString CR-truncation)
+- Server version: 0.28.5 (bumped 0.28.0 → 0.28.5 across the security/correctness fixes)
 - ADR-0003 / 0005 / 0006 are the load-bearing decision documents

@@ -89,7 +89,7 @@ roundtrip). See [`fuzz/`](../../fuzz/).
 |---|---|---|
 | Structure-aware roundtrip for RESP | ✅ landed — [`fuzz/fuzz_targets/resp_roundtrip.rs`](../../fuzz/fuzz_targets/resp_roundtrip.rs) (558k iter/30s clean) |
 | Structure-aware roundtrip for MsgPack | ✅ landed — [`fuzz/fuzz_targets/msgpack_roundtrip.rs`](../../fuzz/fuzz_targets/msgpack_roundtrip.rs) (570k iter/30s clean, cross-impl diff vs `rmp_serde`) |
-| Differential fuzz vs real Redis | **m** | Bring up `redis-server` subprocess, feed same input to both, compare. |
+| Differential fuzz vs real Redis | ✅ landed (first slice) — [`fuzz/fuzz_targets/resp_diff_redis.rs`](../../fuzz/fuzz_targets/resp_diff_redis.rs) uses `redis::parse_redis_value` (canonical redis-rs parser) as the reference rather than a subprocess. Scoped to `:` / `$` framing where RESP2 spec is unambiguous; found 1 OOM + 1 correctness bug on first run (both fixed). Subprocess-against-real-redis-server is a follow-up. |
 | Differential fuzz vs real Postgres | **m** | Same shape; libpq subprocess. |
 | OSS-Fuzz continuous integration | ⏳ **infra landed** ([`infra/oss-fuzz/`](../../infra/oss-fuzz/)) — upstream PR pending. The Dockerfile / build.sh / project.yaml are committed; submitting to `google/oss-fuzz` is a manual step documented in that directory's README. |
 | External pentest (Cure53 / Trail of Bits) | **xxl** wall-clock, **0** internal eng | Contracted engagement. Cost + scheduling, not engineering effort. |
