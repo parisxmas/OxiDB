@@ -13,9 +13,17 @@ The CERN-grade testing roadmap originally listed category 4 (HA / Raft
 fault injection) as `❌ not started`, with the placeholder "**Jepsen-
 style suite** (split-brain, partition, clock skew, slow disk) — biggest
 single gap". That was inaccurate. A look at `oxidb-server/tests/raft_test.rs`
-(behind the `cluster` feature) shows **7 substantial Raft fault-injection
+(behind the `cluster` feature) shows **6 substantial Raft fault-injection
 tests** already in tree. This ADR pins what's there and scopes what
 remains for a full Jepsen-style program.
+
+**Errata (2026-05-18):** the original version of this ADR (PR #55)
+miscounted as 7 by including a `test_split_brain_prevention` entry
+that doesn't exist in `raft_test.rs` — that was a hallucination from
+a careless `grep -c` that picked up the `test_openraft_config` helper
+fn. The actual list is the 6 below. Split-brain prevention is a
+property the existing tests collectively assert (via leader-kill
+failover + minority-can't-elect), not a standalone test fn.
 
 ## What already exists (`oxidb-server/tests/raft_test.rs`, `cluster` feature)
 
@@ -27,7 +35,6 @@ remains for a full Jepsen-style program.
 | `test_data_consistency_after_failover` | Kill leader after writes | All survivors agree on the same final state |
 | `test_kill_two_nodes` | 5-node cluster, kill 2 followers | Majority (3 of 5) still makes progress |
 | `test_minority_cannot_elect_leader` | 4-node cluster, kill 3 | Survivor cannot elect itself leader (no quorum) |
-| `test_split_brain_prevention` (in adjacent code paths) | Two would-be leaders | Only one can advance the log |
 
 These are **not** "compiles and runs once" smoke tests — they exercise the
 real openraft state machine across multiple processes' worth of
@@ -138,7 +145,7 @@ cluster mode itself.
 - **Add yet another chaos test now.** Rejected — duplicates existing
   coverage without addressing the real gap (linearizability check).
 - **Wait until Jepsen integration to flip the row.** Rejected — sets
-  a false zero baseline for the 7 tests that already exist and do
+  a false zero baseline for the 6 tests that already exist and do
   real work.
 - **Block 1.0 on Jepsen.** Rejected per ADR-0003 — cluster mode is
   not in the 1.0 stable surface, so its testing program doesn't
