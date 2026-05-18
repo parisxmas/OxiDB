@@ -15,9 +15,11 @@
 //! What this does NOT yet test:
 //!   - RSS leak (needs platform-specific /proc/self/status or mach_task_basic_info)
 //!   - fd leak (needs /proc/self/fd or equivalent)
-//!   - Unbounded WAL growth (needs to read the .wal file size and assert bound)
-//! Each is a small follow-up; deliberately out of scope to keep the
-//! harness portable across Linux/macOS without conditional compilation.
+//!
+//! WAL-size unbounded growth IS now tested — see the asserts at the
+//! end of `soak_keeps_doc_count_bounded`. The other two need
+//! platform-specific syscalls that would require conditional
+//! compilation to stay portable across Linux / macOS.
 
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -116,6 +118,52 @@ fn soak_keeps_doc_count_bounded() {
         inserted >= 10,
         "soak inserted only {inserted} records in {secs}s — engine looks stalled"
     );
+
+    // WAL-SIZE UNBOUNDED-GROWTH CHECK (ADR-0006 §3).
+    //
+    // Steady-state ops should produce a steady-state WAL. The engine
+    // rotates / seals .wal segments when they cross internal
+    // thresholds; if rotation is broken, the live `<collection>.wal`
+    // file grows linearly with op count instead of oscillating.
+    //
+    // Bound: 64 MiB per collection's live segment. The actual
+    // checkpoint/rotation threshold is engine-internal — this bound
+    // is loose enough to absorb the worst-case "just before next
+    // rotation" peak but tight enough to catch a regression that
+    // disables rotation entirely.
+    let wal_path = dir.path().join("soak.wal");
+    if wal_path.exists() {
+        let wal_size = std::fs::metadata(&wal_path)
+            .expect("stat soak.wal")
+            .len();
+        let bound = 64 * 1024 * 1024;
+        eprintln!(
+            "[soak] WAL size at end of run: {wal_size} bytes ({:.2} MiB)",
+            wal_size as f64 / (1024.0 * 1024.0)
+        );
+        assert!(
+            wal_size <= bound,
+            "WAL UNBOUNDED GROWTH: soak.wal is {wal_size} bytes \
+             ({:.1} MiB) after {secs}s of bounded steady-state ops — \
+             exceeds {bound}-byte ({} MiB) bound. The engine should \
+             rotate / seal / checkpoint long before this; if it isn't, \
+             rotation is broken and the WAL will grow forever in \
+             production.",
+            wal_size as f64 / (1024.0 * 1024.0),
+            bound / (1024 * 1024),
+        );
+    } else {
+        // Surface this loudly — if no soak.wal exists at end of run
+        // the collection-naming convention may have shifted; the
+        // bound check is silently no-op'd and the test would still
+        // pass while the protection is gone.
+        eprintln!(
+            "[soak] WARN: expected {} after run but not present — \
+             WAL-size bound check skipped. If the .wal naming \
+             convention changed, update this test.",
+            wal_path.display()
+        );
+    }
 
     eprintln!(
         "[soak] DONE  iter={iter} inserted={inserted} updated={updated} deleted={deleted} live={live}"
