@@ -141,7 +141,7 @@ Existing: `cern_dr_drill.rs` (backup → wipe → restore, RTO ~30ms on
 | Power-loss VM drill (kvm + qemu) | **m** | Suspend the engine VM mid-fsync, snapshot, restore, verify. Real cost is the VM tooling setup. |
 | Primary-site-down 24h drill | **s** code, **xl** wall-clock | A live cluster running 24h on snapshot+restore cycle. Coordination, not engineering. |
 | RTO SLA over realistic dataset sizes | **xs** | Scale up `cern_dr_drill.rs` via env var, time each phase. |
-| Restore-from-encrypted-backup | **s** | Engine supports encryption; add the encrypted-key flag to the drill. |
+| Restore-from-encrypted-backup | ✅ landed — `cern_dr_drill.rs::encrypted_backup_wipe_restore_round_trip` covers all three sub-cases: correct key (50 docs recovered), wrong key (0 docs, no plaintext leak), no key (0 docs, no plaintext leak). Engine's AEAD authentication tag catches wrong keys at decryption time. |
 
 **Suggested order:** RTO scale-up (xs) and encrypted variant (s)
 first. Power-loss VM is a separate harness; 24h drill is operational.
