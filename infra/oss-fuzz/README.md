@@ -116,7 +116,7 @@ shared across thousands of projects, so each cycle matters).
 
 ## Targets registered
 
-All 7 targets from `fuzz/fuzz_targets/` are listed by name in
+All 8 targets from `fuzz/fuzz_targets/` are listed by name in
 `build.sh`. When adding a new target, append it to the for-loop in
 `build.sh` (and remember to update this list):
 
@@ -127,3 +127,4 @@ All 7 targets from `fuzz/fuzz_targets/` are listed by name in
 - `oxiwire_roundtrip` — OxiWire encode↔decode roundtrip (structure-aware)
 - `resp_roundtrip` — RESP encode↔decode roundtrip (structure-aware)
 - `msgpack_roundtrip` — MsgPack encode↔decode via `rmp_serde` reference (structure-aware, cross-impl differential)
+- `resp_diff_redis` — OxiDB RESP vs `redis::parse_redis_value` reference (mutation, cross-impl differential, scoped to `:` / `$` framing)

@@ -34,6 +34,11 @@ serde_json = "1"
 # decoding via the canonical `rmp_serde` makes any divergence a
 # real bug rather than a same-author blind spot.
 rmp-serde = "1"
+# Reference RESP parser (redis-rs / `redis::parse_redis_value`) for
+# the resp_diff_redis differential target. default-features=false to
+# avoid pulling in tokio / TLS / num-bigint etc. — the sync byte-
+# parser doesn't need them.
+redis = { version = "1", default-features = false }
 
 # Prevent this crate from being picked up by the root workspace.
 [workspace]
@@ -88,6 +93,17 @@ bench = false
 [[bin]]
 name = "msgpack_roundtrip"
 path = "fuzz_targets/msgpack_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+# Cross-implementation differential: OxiDB RESP decoder vs the
+# canonical redis-rs parse_redis_value. Mutation-based — libfuzzer
+# feeds raw bytes to BOTH parsers, divergence on the both-accept
+# case is a finding.
+[[bin]]
+name = "resp_diff_redis"
+path = "fuzz_targets/resp_diff_redis.rs"
 test = false
 doc = false
 bench = false
