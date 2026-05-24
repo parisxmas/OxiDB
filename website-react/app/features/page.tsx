@@ -96,7 +96,7 @@ export default function Page() {
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><line x1="7" y1="7" x2="10" y2="10"/><line x1="14" y1="10" x2="17" y2="7"/><line x1="7" y1="17" x2="10" y2="14"/><line x1="14" y1="14" x2="17" y2="17"/></svg></div>
-        <h3>Raft Replication <span class="version-badge latest">v0.25.3</span></h3>
+        <h3>Raft Replication <span class="version-badge latest">v0.28.12</span></h3>
         <p>Multi-node replication via openraft consensus. Persistent state (<code>raft_meta.json</code> + append-only <code>raft_log.jsonl</code>) survives container restarts. Quorum-based commits, automatic catch-up on rejoin, verified at 1M records under mid-stream failover.</p>
       </div>
       <div class="feature-card">

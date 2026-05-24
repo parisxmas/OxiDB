@@ -11,12 +11,53 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.28.12 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.28.12</h3>
+        <span class="version-date">2026-05-24</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>Audit log rotation</strong> &mdash; <code>RotationPolicy</code> in <code>oxidb-server/src/audit.rs</code> supports size-based (<code>OXIDB_AUDIT_MAX_BYTES</code>), age-based (<code>OXIDB_AUDIT_MAX_AGE_SECS</code>), and calendar-aligned UTC rotation (<code>OXIDB_AUDIT_CALENDAR=hourly|daily</code>), with optional gzip compression of rotated files (<code>OXIDB_AUDIT_COMPRESS=true</code>). Wired into both standalone and cluster modes.
+          </li>
+          <li>
+            <strong>CERN-grade testing program</strong> &mdash; 9 cargo-fuzz targets (RESP, pg_wire, OxiWire, MsgPack, differential vs Redis &amp; Postgres), OSS-Fuzz integration scaffolding, coverage reporting, ACID isolation-anomaly suite, HEP-shaped scale workload, encrypted-backup DR drill, upgrade-chain fixture corpus, and 39 authn/authz/SCRAM/canonicalisation/audit attack patterns &mdash; all rejected by the server.
+          </li>
+          <li>
+            <strong>Format version headers</strong> &mdash; OXTX for <code>_tx_commit_log</code>, OXWA for <code>.wal</code>, OXBT for <code>.btree</code>; explicit <code>format_version</code> in blob <code>.meta</code> JSON. Establishes the 1.0 on-disk-format contract.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed</h4>
+        <ul>
+          <li>
+            <strong>Unauthenticated DoS bugs</strong> found by fuzzing &mdash; RESP multi-byte UTF-8 line splitter panic, RESP CR-truncation + allocator-bomb, pg_wire message length unbounded allocation (now capped at 16 MiB), pg_wire i16-overflow + empty-body panic, OxiWire array/map pre-allocation now bounded by remaining bytes. Server versions &lt; 0.28.3 vulnerable.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Changed</h4>
+        <ul>
+          <li>
+            <strong>Julia client surface</strong> &mdash; <code>find</code> / <code>aggregate</code> now return a <code>Tables.jl</code>-compatible row collection (DataFrames, CSV, MLJ, GLM accept it directly). SQL exports removed from Julia clients &mdash; OxiDB is a document database; Tables.jl covers the data-frame integration story.
+          </li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.25.3 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.25.3</h3>
         <span class="version-date">2026-04-25</span>
-        <span class="version-badge latest">latest</span>
       </div>
 
       <div class="change-group">

@@ -2259,13 +2259,14 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.28.0"
+version = "0.28.12"
 dependencies = [
  "aes-gcm",
  "argon2",
  "base64",
  "chrono",
  "crossbeam-channel",
+ "flate2",
  "hmac",
  "libc",
  "md-5",

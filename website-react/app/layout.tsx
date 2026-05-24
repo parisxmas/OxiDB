@@ -17,7 +17,7 @@ export const metadata: Metadata = {
   openGraph: {
     title: 'OxiDB - Fast Versatile Document Database',
     description:
-      'JSON & SQL. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. Verified at 1M records under failover. v0.25.3.',
+      'JSON & SQL. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. Verified at 1M records under failover. v0.28.12.',
     url: 'https://oxidb.baltavista.com',
     siteName: 'OxiDB',
     type: 'website',
@@ -26,7 +26,7 @@ export const metadata: Metadata = {
         url: '/og-card.png',
         width: 1200,
         height: 630,
-        alt: 'OxiDB v0.25.3 — sharded, Raft-replicated, persistent. 1M records verified under failover.',
+        alt: 'OxiDB v0.28.12 — sharded, Raft-replicated, persistent. 1M records verified under failover.',
       },
     ],
   },
@@ -34,7 +34,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: 'OxiDB - Fast Versatile Document Database',
     description:
-      'JSON & SQL. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. v0.25.3.',
+      'JSON & SQL. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. v0.28.12.',
     images: ['/og-card.png'],
   },
   icons: {
