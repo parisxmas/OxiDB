@@ -9,6 +9,9 @@ pub struct Session {
     pub scram_state: Option<ScramState>,
     pub current_database: String,
     pub sql_dialect: oxidb::SqlDialect,
+    /// Wire-protocol version negotiated via HELLO. Defaults to v1 for clients
+    /// that never call `hello` (backward-compat with pre-1.0 clients).
+    pub wire_version: u32,
 }
 
 impl Session {
@@ -20,6 +23,7 @@ impl Session {
             scram_state: None,
             current_database: "oxidb".to_string(),
             sql_dialect: oxidb::SqlDialect::default(),
+            wire_version: 1,
         }
     }
 

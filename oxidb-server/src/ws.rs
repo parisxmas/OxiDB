@@ -157,9 +157,34 @@ fn do_handshake(stream: &mut TcpStream) -> bool {
     let hash = hasher.finalize();
     let accept = base64::engine::general_purpose::STANDARD.encode(hash);
 
-    let response = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n");
+    // Phase 2 (ADR-0003): negotiate Sec-WebSocket-Protocol. Server advertises
+    // `oxidb.v1` as the 1.0 stable subprotocol. Clients that don't offer it
+    // still connect (no subprotocol header in the response — backward compat).
+    let chosen_subprotocol = headers
+        .get("sec-websocket-protocol")
+        .and_then(|hdr| {
+            hdr.split(',')
+                .map(|s| s.trim())
+                .find(|p| SUPPORTED_WS_SUBPROTOCOLS.contains(p))
+                .map(|s| s.to_string())
+        });
+
+    let subprotocol_line = match &chosen_subprotocol {
+        Some(p) => format!("Sec-WebSocket-Protocol: {p}\r\n"),
+        None => String::new(),
+    };
+
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n{subprotocol_line}\r\n"
+    );
     stream.write_all(response.as_bytes()).is_ok()
 }
+
+/// WebSocket subprotocol identifiers this server supports. `oxidb.v1` is the
+/// 1.0 stable subprotocol per ADR-0003 Phase 2. Future major versions add
+/// new identifiers here (e.g. `oxidb.v2`); the v1 identifier keeps working
+/// for the lifetime of the v1 stable surface.
+pub const SUPPORTED_WS_SUBPROTOCOLS: &[&str] = &["oxidb.v1"];
 
 // ---------------------------------------------------------------------------
 // WebSocket frame reading/writing

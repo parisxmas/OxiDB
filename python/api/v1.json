@@ -1,0 +1,1008 @@
+{
+  "classes": {
+    "OxiDbClient": {
+      "bases": [],
+      "methods": {
+        "__enter__": {
+          "params": [],
+          "return": "<no-annotation>"
+        },
+        "__exit__": {
+          "params": [
+            {
+              "annotation": "<no-annotation>",
+              "default": "<no-default>",
+              "kind": "VAR_POSITIONAL",
+              "name": "exc"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "__init__": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "'127.0.0.1'",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "host"
+            },
+            {
+              "annotation": "int",
+              "default": "4444",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "port"
+            },
+            {
+              "annotation": "float",
+              "default": "5.0",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "timeout"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "aggregate": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "list",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "pipeline"
+            }
+          ],
+          "return": "list"
+        },
+        "begin_tx": {
+          "params": [],
+          "return": "dict"
+        },
+        "close": {
+          "params": [],
+          "return": "<no-annotation>"
+        },
+        "commit_tx": {
+          "params": [],
+          "return": "<no-annotation>"
+        },
+        "compact": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            }
+          ],
+          "return": "dict"
+        },
+        "count": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "dict",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            }
+          ],
+          "return": "int"
+        },
+        "create_alert": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "dict",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "condition"
+            },
+            {
+              "annotation": "list",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "actions"
+            },
+            {
+              "annotation": "int",
+              "default": "300",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "cooldown_seconds"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_bucket": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "bucket"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_collection": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_composite_index": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "list",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "fields"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_database": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_index": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "field"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_schedule": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "procedure"
+            },
+            {
+              "annotation": "str",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "cron"
+            },
+            {
+              "annotation": "str",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "every"
+            },
+            {
+              "annotation": "dict",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "params"
+            },
+            {
+              "annotation": "bool",
+              "default": "True",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "enabled"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_text_index": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "list",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "fields"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_ttl_index": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "field"
+            },
+            {
+              "annotation": "int",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "expire_after_seconds"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_unique_index": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "field"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "create_vector_index": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "field"
+            },
+            {
+              "annotation": "int",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "dimension"
+            },
+            {
+              "annotation": "str",
+              "default": "'cosine'",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "metric"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "delete": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "dict",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "delete_alert": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "delete_bucket": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "bucket"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "delete_object": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "bucket"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "key"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "delete_one": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "dict",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "delete_retention": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "delete_schedule": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "disable_schedule": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "drop_collection": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "drop_database": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "drop_index": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "index_name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "enable_schedule": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "extract_text": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "bucket"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "key"
+            }
+          ],
+          "return": "str"
+        },
+        "find": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "dict",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            },
+            {
+              "annotation": "dict",
+              "default": "None",
+              "kind": "KEYWORD_ONLY",
+              "name": "sort"
+            },
+            {
+              "annotation": "int",
+              "default": "None",
+              "kind": "KEYWORD_ONLY",
+              "name": "skip"
+            },
+            {
+              "annotation": "int",
+              "default": "None",
+              "kind": "KEYWORD_ONLY",
+              "name": "limit"
+            }
+          ],
+          "return": "list"
+        },
+        "find_one": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "dict",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "fts_status": {
+          "params": [],
+          "return": "dict"
+        },
+        "get_alert": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "dict"
+        },
+        "get_object": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "bucket"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "key"
+            }
+          ],
+          "return": "tuple"
+        },
+        "get_retention": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            }
+          ],
+          "return": "dict"
+        },
+        "get_schedule": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "dict"
+        },
+        "grant_db_role": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "username"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "database"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "role"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "head_object": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "bucket"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "key"
+            }
+          ],
+          "return": "dict"
+        },
+        "insert": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "dict",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "doc"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "insert_many": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "list",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "docs"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "list_alert_history": {
+          "params": [],
+          "return": "list"
+        },
+        "list_alerts": {
+          "params": [],
+          "return": "list"
+        },
+        "list_buckets": {
+          "params": [],
+          "return": "list"
+        },
+        "list_collections": {
+          "params": [],
+          "return": "list"
+        },
+        "list_databases": {
+          "params": [],
+          "return": "list"
+        },
+        "list_indexes": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            }
+          ],
+          "return": "list"
+        },
+        "list_objects": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "bucket"
+            },
+            {
+              "annotation": "str",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "prefix"
+            },
+            {
+              "annotation": "int",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "limit"
+            }
+          ],
+          "return": "list"
+        },
+        "list_retentions": {
+          "params": [],
+          "return": "list"
+        },
+        "list_schedules": {
+          "params": [],
+          "return": "list"
+        },
+        "ping": {
+          "params": [],
+          "return": "str"
+        },
+        "proc_status": {
+          "params": [],
+          "return": "dict"
+        },
+        "put_object": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "bucket"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "key"
+            },
+            {
+              "annotation": "bytes",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "data"
+            },
+            {
+              "annotation": "str",
+              "default": "'application/octet-stream'",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "content_type"
+            },
+            {
+              "annotation": "dict",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "metadata"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "revoke_db_role": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "username"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "database"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "rollback_tx": {
+          "params": [],
+          "return": "<no-annotation>"
+        },
+        "search": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            },
+            {
+              "annotation": "str",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "bucket"
+            },
+            {
+              "annotation": "int",
+              "default": "10",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "limit"
+            }
+          ],
+          "return": "list"
+        },
+        "set_retention": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "int",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "days"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "sql": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            },
+            {
+              "annotation": "str",
+              "default": "None",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "db"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "test_alert": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "dict"
+        },
+        "text_search": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            },
+            {
+              "annotation": "int",
+              "default": "10",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "limit"
+            }
+          ],
+          "return": "list"
+        },
+        "transaction": {
+          "params": [],
+          "return": "<no-annotation>"
+        },
+        "update": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "dict",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            },
+            {
+              "annotation": "dict",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "update"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "update_one": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "dict",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "query"
+            },
+            {
+              "annotation": "dict",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "update"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "use_database": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "name"
+            }
+          ],
+          "return": "<no-annotation>"
+        },
+        "vector_search": {
+          "params": [
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "collection"
+            },
+            {
+              "annotation": "str",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "field"
+            },
+            {
+              "annotation": "list",
+              "default": "<no-default>",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "vector"
+            },
+            {
+              "annotation": "int",
+              "default": "10",
+              "kind": "POSITIONAL_OR_KEYWORD",
+              "name": "limit"
+            }
+          ],
+          "return": "list"
+        }
+      }
+    },
+    "OxiDbError": {
+      "bases": [
+        "Exception"
+      ],
+      "methods": {}
+    },
+    "TransactionConflictError": {
+      "bases": [
+        "OxiDbError"
+      ],
+      "methods": {}
+    }
+  },
+  "functions": {},
+  "module": "oxidb",
+  "schema_version": 1
+}

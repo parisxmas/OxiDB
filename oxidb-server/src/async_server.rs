@@ -158,6 +158,13 @@ async fn dispatch_request(
         .map(|s| s.to_string());
 
     // ---------------------------------------------------------------
+    // HELLO handshake — pre-auth, idempotent, returns server info.
+    // ---------------------------------------------------------------
+    if cmd == "hello" {
+        return crate::hello::handle(&request, session, state.auth_enabled);
+    }
+
+    // ---------------------------------------------------------------
     // Authentication flow (SCRAM-SHA-256)
     // ---------------------------------------------------------------
     if state.auth_enabled && !session.is_authenticated() {

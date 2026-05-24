@@ -153,11 +153,38 @@ fn handle_connection(mut stream: TcpStream, state: &RestState) {
 
 fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     let path = req.path.trim_end_matches('/');
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let raw_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
     // CORS preflight
     if req.method == "OPTIONS" {
         return with_rest_cors(json_response(204, "No Content", json!(null)));
+    }
+
+    // ── Phase 2 (ADR-0003): /v1/ is the 1.0 stable URL prefix. ──────────
+    // Both `/v1/api/...` and the legacy bare `/api/...` resolve to the
+    // same handlers during the deprecation window; see docs/format/compat-matrix.md.
+    // When a future major (2.0) ships, `/v1/api/...` continues working with
+    // 1.0 semantics, `/v2/api/...` gets the new semantics, and bare
+    // `/api/...` either redirects or errors per release notes.
+    let segments: Vec<&str> = if raw_segments.first() == Some(&"v1") {
+        raw_segments[1..].to_vec()
+    } else {
+        raw_segments.clone()
+    };
+
+    // Top-level HELLO equivalent for REST: GET /v1/hello returns server info.
+    // Same fields as the OxiWire HELLO so a REST-only client can discover
+    // version + features without authenticating.
+    if (req.method.as_str(), segments.as_slice()) == ("GET", &["hello"][..]) {
+        return with_rest_cors(json_response(200, "OK", json!({
+            "server": {
+                "name": "oxidb-server",
+                "version": crate::hello::SERVER_VERSION,
+                "stable_surface_version": crate::hello::STABLE_SURFACE_VERSION,
+                "rest_api_version": "v1",
+                "supported_wire_versions": crate::hello::SUPPORTED_WIRE_VERSIONS,
+            }
+        })));
     }
 
     // ── Auth endpoints (always public) ──────────────────────────────────

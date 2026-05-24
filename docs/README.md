@@ -52,3 +52,17 @@ with OxiDbClient() as db:
 - **[Client Libraries](client-libraries.md)** -- Per-language setup, connection, error handling, transaction helpers, blob handling, and complete API method tables for Python, Go, Julia, .NET, and Swift.
 
 - **[Protocol Reference](protocol-reference.md)** -- Complete TCP protocol command reference with all fields, return values, and RBAC role requirements.
+
+### 1.0 release policy
+
+These four documents define what the 1.0 stability promise covers and how it
+will be operated. They derive from [ADR-0003](decisions/0003-1.0-stability-scope.md)
+(scope) and [ADR-0004](decisions/0004-phase-0-answers.md) (release policy).
+
+- **[Semantic Versioning](SEMVER.md)** -- What counts as patch / minor / major; the additive vs breaking change rules.
+
+- **[Stability Policy](STABILITY.md)** -- The 1.0 stable surface (engine, wire, on-disk, env vars, Tier-A clients) vs experimental surface; promotion criteria.
+
+- **[Deprecation Policy](DEPRECATION.md)** -- Notice period, code markers, removal timing, and the special-case rules for reserved operator names and security removals.
+
+- **[Security Policy](SECURITY.md)** -- Reporting channel (GitHub Security Advisories), disclosure timeline, supported-versions backport matrix, and operational hardening checklist.

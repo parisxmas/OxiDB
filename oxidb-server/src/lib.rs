@@ -4,6 +4,7 @@ pub mod fdw;
 pub mod gelf;
 pub mod gelf_ingest;
 pub mod handler;
+pub mod hello;
 pub mod mqtt;
 pub mod oxiwire;
 pub mod pg_wire;
