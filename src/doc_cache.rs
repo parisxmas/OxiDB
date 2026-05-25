@@ -9,7 +9,30 @@ use serde_json::Value;
 use crate::document::DocumentId;
 
 /// Default maximum number of documents held in the LRU cache.
-pub const DEFAULT_CAPACITY: usize = 100_000;
+/// Hard-coded floor used when the env override is absent or unparseable.
+/// 100K matches the legacy const; the env var lets ops tune higher when
+/// working sets exceed cache size (1M+ doc collections start missing badly
+/// at 100K — see tests/comparison-mongodb v2 benchmark notes).
+const DEFAULT_CAPACITY_FALLBACK: usize = 100_000;
+
+/// Read the doc cache capacity from `OXIDB_DOC_CACHE_SIZE`, cached after the
+/// first call. Returns `DEFAULT_CAPACITY_FALLBACK` if the env var is absent
+/// or doesn't parse.
+pub fn default_capacity() -> usize {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("OXIDB_DOC_CACHE_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= NUM_SHARDS) // need at least 1 entry per shard
+            .unwrap_or(DEFAULT_CAPACITY_FALLBACK)
+    })
+}
+
+/// Legacy alias for code that hard-coded the constant. New callers should
+/// use `default_capacity()` to pick up the env override.
+pub const DEFAULT_CAPACITY: usize = DEFAULT_CAPACITY_FALLBACK;
 
 /// Number of shards to reduce lock contention under concurrent access.
 /// Must be a power of two for fast modulo via bitmask.

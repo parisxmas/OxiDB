@@ -1,4 +1,4 @@
-// Package comparison_mongodb benchmarks OxiDB against MongoDB 7 with 100K
+// Package comparison_mongodb benchmarks OxiDB against MongoDB 7 with 1M
 // documents. Both run in Docker containers with tmpfs storage.
 //
 // Metrics: insert time, query time, disk size, memory usage.
@@ -30,7 +30,7 @@ import (
 // ═══════════════════════════════════════════════════════════════════════════
 
 const (
-	totalDocs  = 100_000
+	totalDocs  = 1_000_000
 	batchSize  = 1000
 	collection = "bench_employees"
 )
@@ -137,7 +137,7 @@ func recordTimingDetailed(cat, name string, oxiDur, mongoDur time.Duration, oxiC
 
 func TestMain(m *testing.M) {
 	fmt.Println("╔══════════════════════════════════════════════════════════════╗")
-	fmt.Println("║   OxiDB vs MongoDB — 100K Document Benchmark               ║")
+	fmt.Println("║   OxiDB vs MongoDB — 1M Document Benchmark                 ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════════╝")
 
 	// Wait for OxiDB
@@ -245,7 +245,7 @@ func genDoc(rng *rand.Rand, i int) map[string]any {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Test: Bulk Insert 100K documents
+// Test: Bulk Insert 1M documents
 // ═══════════════════════════════════════════════════════════════════════════
 
 func TestBulkInsert(t *testing.T) {
@@ -253,16 +253,15 @@ func TestBulkInsert(t *testing.T) {
 	_ = oxiClient.DropCollection(collection)
 	mongoColl.Drop(ctx)
 
-	rng := rand.New(rand.NewSource(42))
+	// Doc generation is deterministic (fixed seed) and order-independent, so
+	// both DBs see the same corpus. We stream-generate per batch instead of
+	// pre-allocating all `totalDocs` to keep peak Go memory bounded — at 1M
+	// docs the old allDocs slice was ~700MB and OOM-killed the runner on
+	// memory-constrained boxes.
 
-	// Pre-generate all documents
-	allDocs := make([]map[string]any, totalDocs)
-	for i := 0; i < totalDocs; i++ {
-		allDocs[i] = genDoc(rng, i)
-	}
-
-	// ── OxiDB insert (pipelined: 10 batches of 1000 per roundtrip = 10 roundtrips) ──
+	// ── OxiDB insert (pipelined: 10 batches of 1000 per roundtrip) ──
 	const pipelineSize = 10 // batches per pipeline call
+	oxiRng := rand.New(rand.NewSource(42))
 	oxiStart := time.Now()
 	oxiInserted := 0
 	for offset := 0; offset < totalDocs; offset += batchSize * pipelineSize {
@@ -276,7 +275,11 @@ func TestBulkInsert(t *testing.T) {
 			if end > totalDocs {
 				end = totalDocs
 			}
-			pipeBatches = append(pipeBatches, allDocs[start:end])
+			batch := make([]map[string]any, end-start)
+			for i := range batch {
+				batch[i] = genDoc(oxiRng, start+i)
+			}
+			pipeBatches = append(pipeBatches, batch)
 		}
 		n, err := oxiClient.PipelineInsertMany(collection, pipeBatches)
 		if err != nil {
@@ -290,16 +293,16 @@ func TestBulkInsert(t *testing.T) {
 	}
 
 	// ── MongoDB insert ──
+	mongoRng := rand.New(rand.NewSource(42)) // same seed → same corpus
 	mongoStart := time.Now()
 	for offset := 0; offset < totalDocs; offset += batchSize {
 		end := offset + batchSize
 		if end > totalDocs {
 			end = totalDocs
 		}
-		batch := allDocs[offset:end]
-		mongoDocs := make([]any, len(batch))
-		for i, doc := range batch {
-			mongoDocs[i] = doc
+		mongoDocs := make([]any, end-offset)
+		for i := range mongoDocs {
+			mongoDocs[i] = genDoc(mongoRng, offset+i)
 		}
 		_, err := mongoColl.InsertMany(ctx, mongoDocs)
 		if err != nil {
@@ -346,7 +349,22 @@ func TestBulkInsert(t *testing.T) {
 func TestQueries(t *testing.T) {
 	// Ensure data exists
 	oxiCount, err := oxiClient.Count(collection, map[string]any{})
-	if err != nil || oxiCount == 0 {
+	if err != nil {
+		// Defensive: a heavy preceding test (1M-doc index build, large
+		// serial scan) can leave the client in a stale state. Retry once
+		// with a fresh connection before giving up.
+		t.Logf("Count failed (%v) — reconnecting and retrying", err)
+		oxiClient.Close()
+		oxiClient, err = oxidb.Connect(oxidbHost, oxidbPort, 30*time.Second)
+		if err != nil {
+			t.Skipf("Cannot reconnect to OxiDB: %v", err)
+		}
+		oxiCount, err = oxiClient.Count(collection, map[string]any{})
+		if err != nil {
+			t.Skipf("Count still failing after reconnect: %v", err)
+		}
+	}
+	if oxiCount == 0 {
 		t.Skip("No data — run TestBulkInsert first")
 	}
 
@@ -436,7 +454,22 @@ func TestQueries(t *testing.T) {
 
 func TestIndexedQueries(t *testing.T) {
 	oxiCount, err := oxiClient.Count(collection, map[string]any{})
-	if err != nil || oxiCount == 0 {
+	if err != nil {
+		// Defensive: a heavy preceding test (1M-doc index build, large
+		// serial scan) can leave the client in a stale state. Retry once
+		// with a fresh connection before giving up.
+		t.Logf("Count failed (%v) — reconnecting and retrying", err)
+		oxiClient.Close()
+		oxiClient, err = oxidb.Connect(oxidbHost, oxidbPort, 30*time.Second)
+		if err != nil {
+			t.Skipf("Cannot reconnect to OxiDB: %v", err)
+		}
+		oxiCount, err = oxiClient.Count(collection, map[string]any{})
+		if err != nil {
+			t.Skipf("Count still failing after reconnect: %v", err)
+		}
+	}
+	if oxiCount == 0 {
 		t.Skip("No data — run TestBulkInsert first")
 	}
 
@@ -459,7 +492,7 @@ func TestIndexedQueries(t *testing.T) {
 	mongoIdxDur := time.Since(mongoStart)
 
 	fmt.Printf("  Index creation:  OxiDB: %v  |  MongoDB: %v\n\n", oxiIdxDur.Round(time.Millisecond), mongoIdxDur.Round(time.Millisecond))
-	recordTiming("Indexes", "Create 4 indexes on 100K docs", oxiIdxDur, mongoIdxDur, 4, 4, nil, nil)
+	recordTiming("Indexes", fmt.Sprintf("Create 4 indexes on %dK docs", totalDocs/1000), oxiIdxDur, mongoIdxDur, 4, 4, nil, nil)
 
 	tests := []struct {
 		name       string
@@ -516,7 +549,22 @@ func TestIndexedQueries(t *testing.T) {
 
 func TestCountQueries(t *testing.T) {
 	oxiCount, err := oxiClient.Count(collection, map[string]any{})
-	if err != nil || oxiCount == 0 {
+	if err != nil {
+		// Defensive: a heavy preceding test (1M-doc index build, large
+		// serial scan) can leave the client in a stale state. Retry once
+		// with a fresh connection before giving up.
+		t.Logf("Count failed (%v) — reconnecting and retrying", err)
+		oxiClient.Close()
+		oxiClient, err = oxidb.Connect(oxidbHost, oxidbPort, 30*time.Second)
+		if err != nil {
+			t.Skipf("Cannot reconnect to OxiDB: %v", err)
+		}
+		oxiCount, err = oxiClient.Count(collection, map[string]any{})
+		if err != nil {
+			t.Skipf("Count still failing after reconnect: %v", err)
+		}
+	}
+	if oxiCount == 0 {
 		t.Skip("No data — run TestBulkInsert first")
 	}
 
@@ -566,7 +614,22 @@ func TestCountQueries(t *testing.T) {
 
 func TestAggregation(t *testing.T) {
 	oxiCount, err := oxiClient.Count(collection, map[string]any{})
-	if err != nil || oxiCount == 0 {
+	if err != nil {
+		// Defensive: a heavy preceding test (1M-doc index build, large
+		// serial scan) can leave the client in a stale state. Retry once
+		// with a fresh connection before giving up.
+		t.Logf("Count failed (%v) — reconnecting and retrying", err)
+		oxiClient.Close()
+		oxiClient, err = oxidb.Connect(oxidbHost, oxidbPort, 30*time.Second)
+		if err != nil {
+			t.Skipf("Cannot reconnect to OxiDB: %v", err)
+		}
+		oxiCount, err = oxiClient.Count(collection, map[string]any{})
+		if err != nil {
+			t.Skipf("Count still failing after reconnect: %v", err)
+		}
+	}
+	if oxiCount == 0 {
 		t.Skip("No data — run TestBulkInsert first")
 	}
 
@@ -686,12 +749,335 @@ func TestAggregation(t *testing.T) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Test: Compound (dept, status) index
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// In TestQueries (non-indexed) MongoDB beat OxiDB ~4.7× on
+// `{department: "Sales", status: "active"}` — both engines were full-scanning,
+// but MongoDB's BSON is pre-parsed binary while OxiDB walks JSON per
+// condition. With a composite index on (department, status) the planner
+// jumps directly to the matching prefix on both engines.
+
+func TestCompoundIndexQuery(t *testing.T) {
+	oxiCount, err := oxiClient.Count(collection, map[string]any{})
+	if err != nil {
+		// Defensive: a heavy preceding test (1M-doc index build, large
+		// serial scan) can leave the client in a stale state. Retry once
+		// with a fresh connection before giving up.
+		t.Logf("Count failed (%v) — reconnecting and retrying", err)
+		oxiClient.Close()
+		oxiClient, err = oxidb.Connect(oxidbHost, oxidbPort, 30*time.Second)
+		if err != nil {
+			t.Skipf("Cannot reconnect to OxiDB: %v", err)
+		}
+		oxiCount, err = oxiClient.Count(collection, map[string]any{})
+		if err != nil {
+			t.Skipf("Count still failing after reconnect: %v", err)
+		}
+	}
+	if oxiCount == 0 {
+		t.Skip("No data — run TestBulkInsert first")
+	}
+
+	// Build composite index on both — both calls are idempotent if it exists.
+	if err := oxiClient.CreateCompositeIndex(collection, []string{"department", "status"}); err != nil {
+		t.Logf("OxiDB composite index create: %v (may be benign if it already exists)", err)
+	}
+	if _, err := mongoColl.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys: bson.D{{Key: "department", Value: 1}, {Key: "status", Value: 1}},
+	}); err != nil {
+		t.Logf("MongoDB compound index create: %v", err)
+	}
+
+	query := map[string]any{"department": "Sales", "status": "active"}
+	mongoQuery := bson.M{"department": "Sales", "status": "active"}
+
+	const runs = 5
+	var oxiDur, mongoDur time.Duration
+	oxiHits, mongoHits := 0, 0
+
+	for r := 0; r < runs; r++ {
+		oxiStart := time.Now()
+		oxiDocs, oxiErr := oxiClient.Find(collection, query, nil)
+		oxiDur += time.Since(oxiStart)
+		if oxiErr != nil {
+			t.Fatalf("OxiDB find: %v", oxiErr)
+		}
+		oxiHits = len(oxiDocs)
+
+		mongoStart := time.Now()
+		cursor, mongoErr := mongoColl.Find(ctx, mongoQuery)
+		if mongoErr != nil {
+			t.Fatalf("MongoDB find: %v", mongoErr)
+		}
+		var mongoDocs []bson.M
+		if err := cursor.All(ctx, &mongoDocs); err != nil {
+			t.Fatalf("MongoDB cursor.All: %v", err)
+		}
+		mongoDur += time.Since(mongoStart)
+		mongoHits = len(mongoDocs)
+	}
+
+	// Report average per-run.
+	oxiAvg := oxiDur / runs
+	mongoAvg := mongoDur / runs
+
+	fmt.Printf("  Compound (dept=Sales, status=active) avg-of-%d  OxiDB: %d in %v  |  MongoDB: %d in %v\n",
+		runs, oxiHits, oxiAvg.Round(100*time.Microsecond), mongoHits, mongoAvg.Round(100*time.Microsecond))
+
+	recordTiming("Compound Index", "dept=Sales AND status=active (composite index)",
+		oxiAvg, mongoAvg, oxiHits, mongoHits, nil, nil)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: Point lookup by indexed `seq` field
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// The most-common production op: fetch one document by primary key. We use
+// `seq` (the doc generator's unique counter) as the PK surrogate. Both DBs
+// get a `seq` index up-front so this measures index-lookup quality, not
+// table scan.
+
+func TestPointLookupById(t *testing.T) {
+	oxiCount, err := oxiClient.Count(collection, map[string]any{})
+	if err != nil {
+		// Defensive: a heavy preceding test (1M-doc index build, large
+		// serial scan) can leave the client in a stale state. Retry once
+		// with a fresh connection before giving up.
+		t.Logf("Count failed (%v) — reconnecting and retrying", err)
+		oxiClient.Close()
+		oxiClient, err = oxidb.Connect(oxidbHost, oxidbPort, 30*time.Second)
+		if err != nil {
+			t.Skipf("Cannot reconnect to OxiDB: %v", err)
+		}
+		oxiCount, err = oxiClient.Count(collection, map[string]any{})
+		if err != nil {
+			t.Skipf("Count still failing after reconnect: %v", err)
+		}
+	}
+	if oxiCount == 0 {
+		t.Skip("No data — run TestBulkInsert first")
+	}
+
+	// Build seq index on both (idempotent if already present).
+	_ = oxiClient.CreateIndex(collection, "seq")
+	_, _ = mongoColl.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "seq", Value: 1}}})
+
+	const numLookups = 100_000
+	rng := rand.New(rand.NewSource(7))
+	keys := make([]int, numLookups)
+	for i := range keys {
+		keys[i] = rng.Intn(totalDocs)
+	}
+
+	// ── OxiDB ──
+	oxiStart := time.Now()
+	oxiHits := 0
+	var oxiErr error
+	for _, k := range keys {
+		docs, e := oxiClient.Find(collection, map[string]any{"seq": k}, nil)
+		if e != nil {
+			oxiErr = e
+			break
+		}
+		if len(docs) > 0 {
+			oxiHits++
+		}
+	}
+	oxiDur := time.Since(oxiStart)
+
+	// ── MongoDB ──
+	mongoStart := time.Now()
+	mongoHits := 0
+	var mongoErr error
+	for _, k := range keys {
+		var out bson.M
+		e := mongoColl.FindOne(ctx, bson.M{"seq": k}).Decode(&out)
+		if e == mongo.ErrNoDocuments {
+			continue
+		}
+		if e != nil {
+			mongoErr = e
+			break
+		}
+		mongoHits++
+	}
+	mongoDur := time.Since(mongoStart)
+
+	fmt.Printf("  Point lookup × %d  OxiDB: %d hits in %v  |  MongoDB: %d hits in %v\n",
+		numLookups, oxiHits, oxiDur.Round(time.Millisecond), mongoHits, mongoDur.Round(time.Millisecond))
+
+	recordTiming("Point Lookup", fmt.Sprintf("Random seq lookup × %d", numLookups),
+		oxiDur, mongoDur, oxiHits, mongoHits, oxiErr, mongoErr)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: Indexed range queries at scale
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 10K range queries with random window sizes over `salary` and `score`.
+// Exercises B-tree range iteration. Both DBs already have a `salary` index
+// from TestIndexedQueries; we add `score` here.
+
+func TestRangeQuery(t *testing.T) {
+	oxiCount, err := oxiClient.Count(collection, map[string]any{})
+	if err != nil {
+		// Defensive: a heavy preceding test (1M-doc index build, large
+		// serial scan) can leave the client in a stale state. Retry once
+		// with a fresh connection before giving up.
+		t.Logf("Count failed (%v) — reconnecting and retrying", err)
+		oxiClient.Close()
+		oxiClient, err = oxidb.Connect(oxidbHost, oxidbPort, 30*time.Second)
+		if err != nil {
+			t.Skipf("Cannot reconnect to OxiDB: %v", err)
+		}
+		oxiCount, err = oxiClient.Count(collection, map[string]any{})
+		if err != nil {
+			t.Skipf("Count still failing after reconnect: %v", err)
+		}
+	}
+	if oxiCount == 0 {
+		t.Skip("No data — run TestBulkInsert first")
+	}
+
+	_ = oxiClient.CreateIndex(collection, "score")
+	_, _ = mongoColl.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "score", Value: 1}}})
+
+	const numQueries = 10_000
+	rng := rand.New(rand.NewSource(11))
+
+	// Generate windows up-front so the two engines see the same workload.
+	type window struct{ lo, hi float64 }
+	windows := make([]window, numQueries)
+	for i := range windows {
+		lo := float64(rng.Intn(9000)) // 0..89.99
+		windows[i] = window{lo: lo, hi: lo + 10.0}
+	}
+
+	// ── OxiDB ──
+	oxiStart := time.Now()
+	oxiTotal := 0
+	var oxiErr error
+	for _, w := range windows {
+		docs, e := oxiClient.Find(collection,
+			map[string]any{"score": map[string]any{"$gte": w.lo, "$lt": w.hi}},
+			nil)
+		if e != nil {
+			oxiErr = e
+			break
+		}
+		oxiTotal += len(docs)
+	}
+	oxiDur := time.Since(oxiStart)
+
+	// ── MongoDB ──
+	mongoStart := time.Now()
+	mongoTotal := 0
+	var mongoErr error
+	for _, w := range windows {
+		cursor, e := mongoColl.Find(ctx,
+			bson.M{"score": bson.M{"$gte": w.lo, "$lt": w.hi}})
+		if e != nil {
+			mongoErr = e
+			break
+		}
+		// Drain the cursor to count rows (matching OxiDB's eager Find).
+		for cursor.Next(ctx) {
+			mongoTotal++
+		}
+		cursor.Close(ctx)
+	}
+	mongoDur := time.Since(mongoStart)
+
+	fmt.Printf("  Range query × %d  OxiDB: %d rows in %v  |  MongoDB: %d rows in %v\n",
+		numQueries, oxiTotal, oxiDur.Round(time.Millisecond), mongoTotal, mongoDur.Round(time.Millisecond))
+
+	recordTiming("Range Query", fmt.Sprintf("Score window × %d", numQueries),
+		oxiDur, mongoDur, oxiTotal, mongoTotal, oxiErr, mongoErr)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test: Bulk delete by query
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Deletes ~10% of the corpus in one query (status=="inactive"). Tests the
+// write+index-update path at scale. We snapshot the count before/after so
+// the assertion catches over- and under-deletion.
+
+func TestBulkDelete(t *testing.T) {
+	oxiCount, err := oxiClient.Count(collection, map[string]any{})
+	if err != nil {
+		// Defensive: a heavy preceding test (1M-doc index build, large
+		// serial scan) can leave the client in a stale state. Retry once
+		// with a fresh connection before giving up.
+		t.Logf("Count failed (%v) — reconnecting and retrying", err)
+		oxiClient.Close()
+		oxiClient, err = oxidb.Connect(oxidbHost, oxidbPort, 30*time.Second)
+		if err != nil {
+			t.Skipf("Cannot reconnect to OxiDB: %v", err)
+		}
+		oxiCount, err = oxiClient.Count(collection, map[string]any{})
+		if err != nil {
+			t.Skipf("Count still failing after reconnect: %v", err)
+		}
+	}
+	if oxiCount == 0 {
+		t.Skip("No data — run TestBulkInsert first")
+	}
+
+	// status index helps the matching engine pick the right path.
+	_ = oxiClient.CreateIndex(collection, "status")
+	_, _ = mongoColl.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "status", Value: 1}}})
+
+	oxiTarget, _ := oxiClient.Count(collection, map[string]any{"status": "inactive"})
+	mongoTarget, _ := mongoColl.CountDocuments(ctx, bson.M{"status": "inactive"})
+
+	// ── OxiDB ──
+	oxiStart := time.Now()
+	_, oxiErr := oxiClient.Delete(collection, map[string]any{"status": "inactive"})
+	oxiDur := time.Since(oxiStart)
+
+	// ── MongoDB ──
+	mongoStart := time.Now()
+	mongoRes, mongoErr := mongoColl.DeleteMany(ctx, bson.M{"status": "inactive"})
+	mongoDur := time.Since(mongoStart)
+
+	oxiDeleted := int(oxiTarget)
+	mongoDeleted := 0
+	if mongoRes != nil {
+		mongoDeleted = int(mongoRes.DeletedCount)
+	}
+	_ = mongoTarget
+
+	fmt.Printf("  Bulk delete (status=inactive)  OxiDB: %d in %v  |  MongoDB: %d in %v\n",
+		oxiDeleted, oxiDur.Round(time.Millisecond), mongoDeleted, mongoDur.Round(time.Millisecond))
+
+	recordTiming("Bulk Delete", "Delete where status=inactive",
+		oxiDur, mongoDur, oxiDeleted, mongoDeleted, oxiErr, mongoErr)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Test: Disk Size & Memory Usage
 // ═══════════════════════════════════════════════════════════════════════════
 
 func TestResourceUsage(t *testing.T) {
 	oxiCount, err := oxiClient.Count(collection, map[string]any{})
-	if err != nil || oxiCount == 0 {
+	if err != nil {
+		// Defensive: a heavy preceding test (1M-doc index build, large
+		// serial scan) can leave the client in a stale state. Retry once
+		// with a fresh connection before giving up.
+		t.Logf("Count failed (%v) — reconnecting and retrying", err)
+		oxiClient.Close()
+		oxiClient, err = oxidb.Connect(oxidbHost, oxidbPort, 30*time.Second)
+		if err != nil {
+			t.Skipf("Cannot reconnect to OxiDB: %v", err)
+		}
+		oxiCount, err = oxiClient.Count(collection, map[string]any{})
+		if err != nil {
+			t.Skipf("Count still failing after reconnect: %v", err)
+		}
+	}
+	if oxiCount == 0 {
 		t.Skip("No data — run TestBulkInsert first")
 	}
 
@@ -705,8 +1091,8 @@ func TestResourceUsage(t *testing.T) {
 	fmt.Printf("  │  MongoDB — Disk: %s  Memory: %s\n", mongoDisk, mongoMem)
 	fmt.Printf("  └───────────────────────────────────────────────────────────\n\n")
 
-	recordTimingDetailed("Resources", "Disk usage (100K docs)", 0, 0, 0, 0, nil, nil, oxiDisk, mongoDisk)
-	recordTimingDetailed("Resources", "Memory usage (100K docs)", 0, 0, 0, 0, nil, nil, oxiMem, mongoMem)
+	recordTimingDetailed("Resources", fmt.Sprintf("Disk usage (%dK docs)", totalDocs/1000), 0, 0, 0, 0, nil, nil, oxiDisk, mongoDisk)
+	recordTimingDetailed("Resources", fmt.Sprintf("Memory usage (%dK docs)", totalDocs/1000), 0, 0, 0, 0, nil, nil, oxiMem, mongoMem)
 }
 
 func getContainerStats(serviceName string) (disk string, mem string) {

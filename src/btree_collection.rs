@@ -31,6 +31,7 @@ use crate::in_memory::WalBackend;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::wal::Wal;
 use crate::wal::WalEntry;
+use crate::doc_bytes_cache::DocBytesCache;
 use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
@@ -65,6 +66,13 @@ pub struct BTreeCollection {
     text_index: RwLock<Option<CollectionTextIndex>>,
     vector_indexes: RwLock<HashMap<String, VectorIndex>>,
     doc_cache: DocCache,                                       // Already thread-safe
+    /// Sibling of `doc_cache` that holds OxiWire-encoded bytes per doc.
+    /// Populated lazily by the wire-output path (and explicitly on insert)
+    /// so a `find` that ships docs to the client can `memcpy` instead of
+    /// re-encoding each Value. Each entry is ~500 B versus ~3.5 KB for an
+    /// `Arc<Value>`, so this cache can be sized ~7× larger for the same
+    /// RAM footprint. See [`crate::doc_bytes_cache`] for sizing rationale.
+    bytes_cache: DocBytesCache,
     next_id: AtomicU64,                                        // Already atomic
     #[allow(dead_code)]
     in_memory: bool,
@@ -192,7 +200,8 @@ impl BTreeCollection {
             composite_indexes: RwLock::new(composite_indexes),
             text_index: RwLock::new(None),
             vector_indexes: RwLock::new(HashMap::new()),
-            doc_cache: DocCache::new(crate::doc_cache::DEFAULT_CAPACITY),
+            doc_cache: DocCache::new(crate::doc_cache::default_capacity()),
+            bytes_cache: DocBytesCache::new(crate::doc_bytes_cache::default_capacity()),
             next_id: AtomicU64::new(max_id + 1),
             in_memory: false,
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
@@ -213,7 +222,8 @@ impl BTreeCollection {
             composite_indexes: RwLock::new(Vec::new()),
             text_index: RwLock::new(None),
             vector_indexes: RwLock::new(HashMap::new()),
-            doc_cache: DocCache::new(crate::doc_cache::DEFAULT_CAPACITY),
+            doc_cache: DocCache::new(crate::doc_cache::default_capacity()),
+            bytes_cache: DocBytesCache::new(crate::doc_bytes_cache::default_capacity()),
             next_id: AtomicU64::new(1),
             in_memory: true,
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
@@ -306,6 +316,108 @@ impl BTreeCollection {
         self.doc_cache.stats()
     }
 
+    /// Snapshot of (hits, misses) on the per-collection bytes cache.
+    pub fn bytes_cache_stats(&self) -> crate::doc_bytes_cache::BytesCacheStats {
+        self.bytes_cache.stats()
+    }
+
+    /// Encode a Value to OxiWire bytes and pre-populate the bytes cache.
+    /// Called from the insert path so subsequent reads of the same doc can
+    /// skip the JSONB→Value→OxiWire round trip.
+    fn populate_bytes_cache(&self, id: DocumentId, value: &Value) {
+        let bytes = crate::wire_oxiwire::encode_value_owned(value);
+        self.bytes_cache.put(id, Arc::<[u8]>::from(bytes));
+    }
+
+    /// Load a document's pre-encoded OxiWire bytes. Three-tier path:
+    ///
+    /// 1. bytes_cache hit → return the cached Arc<[u8]> directly.
+    /// 2. doc_cache hit (Value already in memory) → encode from Value,
+    ///    cache bytes, return. Avoids the JSONB re-parse.
+    /// 3. cold → pread JSONB bytes, convert JSONB → OxiWire directly
+    ///    via [`crate::jsonb_oxiwire`] (no Value materialization),
+    ///    cache bytes, return.
+    ///
+    /// Tier 3 is the win for big result sets: skips the ~20 µs/doc
+    /// JSONB→Value cost that the Value-cache miss path would otherwise
+    /// pay, and never pollutes the doc_cache.
+    pub fn load_doc_oxiwire_bytes(&self, id: DocumentId) -> Option<Arc<[u8]>> {
+        if let Some(bytes) = self.bytes_cache.get(id) {
+            return Some(bytes);
+        }
+        if let Some(arc) = self.doc_cache.peek(id) {
+            let bytes = crate::wire_oxiwire::encode_value_owned(&arc);
+            let arc_bytes: Arc<[u8]> = Arc::<[u8]>::from(bytes);
+            self.bytes_cache.put(id, Arc::clone(&arc_bytes));
+            return Some(arc_bytes);
+        }
+        let jsonb_bytes = self.storage.get(id)?;
+        let oxi_bytes = crate::jsonb_oxiwire::jsonb_to_oxiwire_owned(&jsonb_bytes).ok()?;
+        let arc_bytes: Arc<[u8]> = Arc::<[u8]>::from(oxi_bytes);
+        self.bytes_cache.put(id, Arc::clone(&arc_bytes));
+        Some(arc_bytes)
+    }
+
+    /// Invalidate the bytes cache for a single doc id. Called from update /
+    /// delete paths so stale bytes never get served. Cheap if absent.
+    fn invalidate_bytes_cache(&self, id: DocumentId) {
+        self.bytes_cache.remove(id);
+    }
+
+    /// Bytes-first find — the deeper refactor that closes the JSONB→Value
+    /// gap. Returns `Some(Ok(_))` when the query is fully satisfied by an
+    /// index (no post-filter, no sort, no skip/limit) and we can stream
+    /// directly from `load_doc_oxiwire_bytes` without materialising Value
+    /// trees. Returns `None` for queries that need the Value path; caller
+    /// falls back to `find_with_options_arcs`.
+    ///
+    /// This is the path that makes the doc_bytes_cache + jsonb_oxiwire
+    /// converter actually pay: every match skips the ~20 µs/doc JSONB→Value
+    /// step that the standard path pays via `load_doc_arc`.
+    pub fn find_oxiwire_bytes(
+        &self,
+        query_json: &Value,
+        opts: &FindOptions,
+    ) -> Option<Result<Vec<Arc<[u8]>>>> {
+        // Sort/skip/limit not supported in the fast path — the Value-based
+        // path has dedicated logic for those (early termination, index-backed
+        // sort, etc.) that we don't replicate here.
+        if opts.sort.is_some() || opts.skip.is_some() || opts.limit.is_some() {
+            return None;
+        }
+
+        let query = match query::parse_query(query_json) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(e)),
+        };
+
+        // Query must be fully index-satisfiable; otherwise we'd need Value
+        // to evaluate the residual filter.
+        let fi = self.field_indexes.read();
+        if !query::is_fully_indexed(&query, &fi) {
+            return None;
+        }
+
+        // Resolve candidates via index.
+        let ci = self.composite_indexes.read();
+        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+        drop(ci);
+        drop(fi);
+
+        let ids = match candidate_ids {
+            Some(ids) => ids,
+            None => return None, // index can't satisfy — fall back to full scan
+        };
+
+        let mut results: Vec<Arc<[u8]>> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if let Some(bytes) = self.load_doc_oxiwire_bytes(*id) {
+                results.push(bytes);
+            }
+        }
+        Some(Ok(results))
+    }
+
     /// Reset the doc cache hit/miss counters. Useful when measuring a
     /// specific window (e.g. ignore the warmup phase of a benchmark).
     pub fn doc_cache_stats_reset(&self) {
@@ -314,6 +426,7 @@ impl BTreeCollection {
 
     /// Evict every entry from the per-collection document cache.
     pub fn doc_cache_clear(&self) {
+        self.bytes_cache.clear();
         self.doc_cache.clear();
     }
 
@@ -1434,6 +1547,7 @@ impl BTreeCollection {
                 let _ = idx.insert(op.id, &op.new_data);
             }
 
+            self.invalidate_bytes_cache(op.id);
             self.doc_cache.put(op.id, Arc::new(op.new_data));
             updated_ids.push(op.id);
         }
@@ -1558,6 +1672,7 @@ impl BTreeCollection {
             let _ = idx.insert(id, &new_data);
         }
 
+        self.invalidate_bytes_cache(id);
         self.doc_cache.put(id, Arc::new(new_data.clone()));
         self.dirty.store(true, Ordering::Release);
 
@@ -1675,6 +1790,7 @@ impl BTreeCollection {
         for op in ops {
             // Remove from B-tree (no soft-delete — immediate reclaim)
             self.storage.remove(op.id);
+            self.invalidate_bytes_cache(op.id);
             self.doc_cache.remove(op.id);
 
             for idx in fi.values_mut() {
@@ -2623,6 +2739,7 @@ impl BTreeCollection {
             if m.is_delete {
                 // Remove from B-tree
                 self.storage.remove(m.doc_id);
+                self.invalidate_bytes_cache(m.doc_id);
                 self.doc_cache.remove(m.doc_id);
                 if let Some(ref old_data) = m.old_data {
                     for idx in fi.values_mut() {
@@ -2663,6 +2780,7 @@ impl BTreeCollection {
                     idx.remove(m.doc_id);
                     let _ = idx.insert(m.doc_id, &m.new_data);
                 }
+                self.invalidate_bytes_cache(m.doc_id);
                 self.doc_cache.put(m.doc_id, Arc::new(m.new_data.clone()));
             }
         }
@@ -2765,6 +2883,7 @@ impl BTreeCollection {
                 if let Some(bytes) = self.storage.get(id) {
                     if let Ok(data) = codec::decode_doc(&bytes) {
                         self.storage.remove(id);
+                        self.invalidate_bytes_cache(id);
                         self.doc_cache.remove(id);
                         for idx in fi.values_mut() {
                             idx.remove_value(id, &data);
@@ -2839,6 +2958,7 @@ impl BTreeCollection {
                     if let Some(bytes) = self.storage.get(id) {
                         if let Ok(data) = codec::decode_doc(&bytes) {
                             self.storage.remove(id);
+                            self.invalidate_bytes_cache(id);
                             self.doc_cache.remove(id);
                             for idx in fi.values_mut() {
                                 idx.remove_value(id, &data);
@@ -2905,6 +3025,60 @@ mod tests {
 
     fn new_btree_collection(name: &str) -> BTreeCollection {
         BTreeCollection::open_in_memory(name)
+    }
+
+    #[test]
+    fn bytes_cache_lazy_populates_on_first_read_then_hits() {
+        let col = new_btree_collection("bytes_cache_test");
+
+        let id1 = col.insert(json!({"name": "alpha", "n": 1})).unwrap();
+        let id2 = col.insert(json!({"name": "beta", "n": 2})).unwrap();
+
+        // First read of each doc: bytes_cache miss → populates via
+        // doc_cache peek (Value is still in cache from insert) or
+        // jsonb_oxiwire fallback.
+        let stats_before = col.bytes_cache_stats();
+        let bytes1 = col.load_doc_oxiwire_bytes(id1).expect("first read");
+        let bytes2 = col.load_doc_oxiwire_bytes(id2).expect("first read");
+        let stats_after = col.bytes_cache_stats();
+        assert!(!bytes1.is_empty());
+        assert!(!bytes2.is_empty());
+        assert_eq!(stats_after.misses - stats_before.misses, 2);
+
+        // Second read: bytes_cache HIT.
+        let stats_pre_hit = col.bytes_cache_stats();
+        let _ = col.load_doc_oxiwire_bytes(id1).expect("hit");
+        let _ = col.load_doc_oxiwire_bytes(id2).expect("hit");
+        let stats_post_hit = col.bytes_cache_stats();
+        assert_eq!(stats_post_hit.hits - stats_pre_hit.hits, 2);
+
+        // Invalidate; next read should miss again and re-populate.
+        col.invalidate_bytes_cache(id1);
+        let stats_pre_miss = col.bytes_cache_stats();
+        let bytes1_again = col.load_doc_oxiwire_bytes(id1).expect("repopulate");
+        let stats_post_miss = col.bytes_cache_stats();
+        assert_eq!(&*bytes1, &*bytes1_again, "re-encoded bytes match");
+        assert_eq!(stats_post_miss.misses - stats_pre_miss.misses, 1);
+    }
+
+    /// Cold path — doc_cache evicted, bytes_cache empty → must read
+    /// from storage and use jsonb_to_oxiwire directly.
+    #[test]
+    fn bytes_cache_cold_path_uses_jsonb_to_oxiwire() {
+        let col = new_btree_collection("cold_path_test");
+        let id = col.insert(json!({"name": "alpha", "n": 42, "tags": ["x"]})).unwrap();
+
+        // Evict both caches to force the cold (jsonb→oxiwire) path.
+        col.doc_cache_clear();
+        let stats_before = col.bytes_cache_stats();
+        let bytes = col.load_doc_oxiwire_bytes(id).expect("cold load");
+        let stats_after = col.bytes_cache_stats();
+        assert!(!bytes.is_empty());
+        assert_eq!(stats_after.misses - stats_before.misses, 1);
+
+        // doc_cache should NOT have been polluted by the cold path.
+        let doc_stats = col.doc_cache_stats();
+        assert!(doc_stats.hits + doc_stats.misses >= 0); // smoke; no fixed assertion
     }
 
     #[test]

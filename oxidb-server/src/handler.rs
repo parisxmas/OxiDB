@@ -249,7 +249,22 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                     Ok(o) => o,
                     Err(e) => return err_bytes(&e.to_string()),
                 };
-                // Zero-copy path: serialize directly from Arc references
+                // Bytes-first fast path: when the wire format is OxiWire AND
+                // the query is fully index-satisfiable, skip the Value
+                // materialization entirely. The engine streams pre-encoded
+                // OxiWire bytes via the doc_bytes_cache + jsonb_oxiwire
+                // converter (no JSONB→Value→encode round-trip). Falls back
+                // to the Value path for any query the fast path can't
+                // handle (post-filters, sorts, projections).
+                if protocol::wire_format() == WireFormat::OxiWire {
+                    if let Some(result) = db.find_oxiwire_bytes(col, query, &opts) {
+                        match result {
+                            Ok(byte_arcs) => return crate::oxiwire::ok_docs_bytes_response(&byte_arcs),
+                            Err(e) => return err_bytes(&e.to_string()),
+                        }
+                    }
+                }
+                // Fallback: existing zero-copy Arc<Value> path.
                 match db.find_with_options_arcs(col, query, &opts) {
                     Ok(arcs) => ok_docs_bytes(&arcs),
                     Err(e) => err_bytes(&e.to_string()),

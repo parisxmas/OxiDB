@@ -12,6 +12,9 @@ pub mod change_stream;
 pub mod codec;
 pub mod collection;
 pub mod doc_cache;
+pub mod doc_bytes_cache;
+pub mod jsonb_oxiwire;
+pub mod wire_oxiwire;
 pub mod crypto;
 pub mod database_manager;
 

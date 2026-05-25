@@ -131,6 +131,23 @@ pub fn ok_docs_response_fast(docs: &[Arc<Value>]) -> Vec<u8> {
     ok_docs_response(docs)
 }
 
+/// Build an OxiWire response from pre-encoded doc bytes. Used by the
+/// bytes-first find path: each `Arc<[u8]>` already contains a valid
+/// OxiWire-encoded document body, so we just frame them in the response
+/// array. No per-doc encode runs.
+pub fn ok_docs_bytes_response(docs: &[Arc<[u8]>]) -> Vec<u8> {
+    let total: usize = docs.iter().map(|b| b.len()).sum();
+    let mut buf = Vec::with_capacity(total + 16);
+    buf.push(MAGIC);
+    buf.push(0x00);
+    buf.push(TAG_ARRAY);
+    buf.extend_from_slice(&(docs.len() as u32).to_le_bytes());
+    for d in docs {
+        buf.extend_from_slice(d);
+    }
+    buf
+}
+
 /// Parallel serialization path for large result sets.
 /// Splits doc slice into chunks, each thread serializes into one contiguous buffer.
 fn ok_docs_response_parallel(docs: &[Arc<Value>]) -> Vec<u8> {

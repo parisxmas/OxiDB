@@ -295,7 +295,7 @@ impl Collection {
         }
 
         let mut primary_index = HashMap::new();
-        let doc_cache = DocCache::new(doc_cache::DEFAULT_CAPACITY);
+        let doc_cache = DocCache::new(doc_cache::default_capacity());
         let mut version_index = HashMap::new();
         let shard_id_offset = Self::shard_id_offset();
         let mut next_id: DocumentId = 1 + shard_id_offset;
@@ -521,7 +521,7 @@ impl Collection {
             storage: StorageBackend::Memory(InMemStorage::new()),
             wal: WalBackend::Memory,
             primary_index: HashMap::new(),
-            doc_cache: DocCache::new(doc_cache::DEFAULT_CAPACITY),
+            doc_cache: DocCache::new(doc_cache::default_capacity()),
             field_indexes: HashMap::new(),
             composite_indexes: Vec::new(),
             text_index: None,

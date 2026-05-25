@@ -491,7 +491,7 @@ impl OxiDb {
             lazy_sync: AtomicBool::new(false),
             sync_shutdown: Mutex::new(None),
             archiver_shutdown: Mutex::new(None),
-            cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
+            cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
             links: LinksTable::in_memory(),
             ttl_shutdown: Mutex::new(None),
@@ -515,7 +515,7 @@ impl OxiDb {
             log_callback: None,
             change_broker: ChangeStreamBroker::new(),
             lazy_sync: AtomicBool::new(false),
-            cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
+            cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
             links: LinksTable::in_memory(),
         })
@@ -648,7 +648,7 @@ impl OxiDb {
             lazy_sync: AtomicBool::new(false),
             sync_shutdown: Mutex::new(None),
             archiver_shutdown: Mutex::new(None),
-            cache_capacity: AtomicUsize::new(crate::doc_cache::DEFAULT_CAPACITY),
+            cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: false,
             links: LinksTable::open(data_dir)?,
             ttl_shutdown: Mutex::new(None),
@@ -1260,6 +1260,34 @@ impl OxiDb {
     ) -> Result<Vec<Arc<Value>>> {
         let col = self.get_or_create_collection(collection)?;
         col.find_with_options_arcs(query, opts)
+    }
+
+    /// Look up a single doc's pre-encoded OxiWire bytes. Used by the
+    /// server's find→wire path to skip per-doc encoding when the bytes
+    /// cache (populated at insert time) is warm. Returns `None` if the
+    /// collection doesn't exist or the id was never seen.
+    pub fn get_oxiwire_bytes(&self, collection: &str, id: crate::document::DocumentId) -> Option<Arc<[u8]>> {
+        let cols = self.collections.read();
+        let col = cols.get(collection)?;
+        col.load_doc_oxiwire_bytes(id)
+    }
+
+    /// Bytes-first find — the fast path that closes the JSONB→Value gap on
+    /// the find→wire pipeline. Returns `Some(Ok(_))` when the query can be
+    /// fully satisfied by an index (no post-filter, no sort/skip/limit);
+    /// otherwise returns `None` so the caller falls back to the
+    /// Value-based path. See `BTreeCollection::find_oxiwire_bytes`.
+    pub fn find_oxiwire_bytes(
+        &self,
+        collection: &str,
+        query: &Value,
+        opts: &FindOptions,
+    ) -> Option<Result<Vec<Arc<[u8]>>>> {
+        let col = match self.get_or_create_collection(collection) {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
+        col.find_oxiwire_bytes(query, opts)
     }
 
     pub fn find_one(&self, collection: &str, query: &Value) -> Result<Option<Value>> {
