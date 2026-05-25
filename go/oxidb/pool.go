@@ -23,11 +23,40 @@ type Pool struct {
 	size    int
 	mu      sync.Mutex
 	closed  bool
+
+	// user/pass are non-empty when the pool was constructed via
+	// NewPoolAuth. Every fresh connection — eager at NewPool time and
+	// any later reconnect during checkout's stale-conn recovery —
+	// AuthSimple's against these credentials before being used.
+	user string
+	pass string
 }
 
 // NewPool creates a connection pool with the given size.
 // All connections are established eagerly during creation.
+// Connections are anonymous — for an OxiDB with OXIDB_AUTH enabled,
+// use NewPoolAuth instead.
 func NewPool(host string, port int, size int, timeout time.Duration) (*Pool, error) {
+	return newPool(host, port, size, timeout, "", "")
+}
+
+// NewPoolAuth is the SCRAM-style variant of NewPool. Every connection
+// AuthSimple's with the given (user, pass) before being returned to
+// the pool. Reconnects during stale-conn checkout re-authenticate
+// transparently so callers don't need to handle auth state at the
+// request layer.
+//
+// Empty user is invalid here — call NewPool for anonymous pools.
+// Pass-through of the credentials means they live in the Pool struct
+// for its lifetime; close the pool when done.
+func NewPoolAuth(host string, port, size int, timeout time.Duration, user, pass string) (*Pool, error) {
+	if user == "" {
+		return nil, fmt.Errorf("oxidb pool: NewPoolAuth requires a non-empty user; use NewPool for anonymous")
+	}
+	return newPool(host, port, size, timeout, user, pass)
+}
+
+func newPool(host string, port int, size int, timeout time.Duration, user, pass string) (*Pool, error) {
 	if size <= 0 {
 		size = 4
 	}
@@ -37,9 +66,11 @@ func NewPool(host string, port int, size int, timeout time.Duration) (*Pool, err
 		port:    port,
 		timeout: timeout,
 		size:    size,
+		user:    user,
+		pass:    pass,
 	}
 	for i := 0; i < size; i++ {
-		c, err := Connect(host, port, timeout)
+		c, err := p.dial()
 		if err != nil {
 			p.Close()
 			return nil, fmt.Errorf("oxidb pool: connect %d/%d: %w", i+1, size, err)
@@ -47,6 +78,23 @@ func NewPool(host string, port int, size int, timeout time.Duration) (*Pool, err
 		p.conns <- c
 	}
 	return p, nil
+}
+
+// dial opens a fresh connection and authenticates it (if the pool
+// holds credentials). Used by NewPool's eager init AND by checkout's
+// stale-conn replacement path — the auth state survives both.
+func (p *Pool) dial() (*Client, error) {
+	c, err := Connect(p.host, p.port, p.timeout)
+	if err != nil {
+		return nil, err
+	}
+	if p.user != "" {
+		if _, err := c.AuthSimple(p.user, p.pass); err != nil {
+			c.Close()
+			return nil, fmt.Errorf("auth: %w", err)
+		}
+	}
+	return c, nil
 }
 
 // Get checks out a connection from the pool.
@@ -85,7 +133,7 @@ func (p *Pool) checkout(c *Client) (*Client, error) {
 		return c, nil
 	}
 	c.Close()
-	fresh, derr := Connect(p.host, p.port, p.timeout)
+	fresh, derr := p.dial()
 	if derr != nil {
 		return nil, fmt.Errorf("oxidb pool: reconnect: %w", derr)
 	}
