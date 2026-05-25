@@ -216,6 +216,36 @@ drop(db);</code></pre></div>
       <div class="lang-panel" data-lang="dotnet"><pre><code><span class="kw">var</span> result = <span class="kw">await</span> client.PingAsync(); <span class="co">// "pong"</span></code></pre></div>
     </div>
 
+    <div class="doc-block" id="hello">
+      <h3>Hello (handshake) <span class="version-badge latest">v0.28.13+</span></h3>
+      <p>Pre-auth, idempotent server-info handshake. Returns the server&apos;s version, the wire-protocol versions it speaks, the 1.0 stable feature set, the experimental feature set, and the auth methods accepted. New clients send this as the first message to negotiate capabilities; old clients that skip it still work (the server defaults to wire v1). See <a href="/format/compat-matrix/" target="_blank" rel="noopener">compat-matrix.md</a> for the full negotiation rules.</p>
+      <p><strong>Wire format</strong> (OxiWire over TCP):</p>
+      <pre><code><span class="co">// Request</span>
+{
+  <span class="str">"cmd"</span>: <span class="str">"hello"</span>,
+  <span class="str">"client"</span>: <span class="str">"oxidb-py/1.0"</span>,        <span class="co">// optional, free-form identification</span>
+  <span class="str">"wire_versions"</span>: [<span class="num">1</span>]          <span class="co">// optional, defaults to [1]</span>
+}
+
+<span class="co">// Response</span>
+{
+  <span class="str">"ok"</span>: <span class="kw">true</span>,
+  <span class="str">"server"</span>: {
+    <span class="str">"name"</span>: <span class="str">"oxidb-server"</span>,
+    <span class="str">"version"</span>: <span class="str">"0.28.18"</span>,
+    <span class="str">"wire_version"</span>: <span class="num">1</span>,
+    <span class="str">"supported_wire_versions"</span>: [<span class="num">1</span>],
+    <span class="str">"stable_surface_version"</span>: <span class="str">"1.0"</span>,
+    <span class="str">"features"</span>: [<span class="str">"fts"</span>, <span class="str">"blobs"</span>, <span class="str">"txn"</span>, <span class="str">"rbac"</span>, <span class="str">"tls"</span>, <span class="str">"encryption_at_rest"</span>, <span class="str">"audit"</span>, <span class="str">"scram_sha_256"</span>, <span class="str">"indexes"</span>, <span class="str">"aggregation"</span>],
+    <span class="str">"experimental_features"</span>: [<span class="str">"raft"</span>, <span class="str">"pitr"</span>, <span class="str">"vector_search"</span>, <span class="str">"fdw"</span>, <span class="str">"stored_procedures"</span>, <span class="str">"ttl_indexes"</span>, <span class="str">"change_streams"</span>, <span class="str">"rest_http"</span>, <span class="str">"websocket"</span>, <span class="str">"oximem"</span>, <span class="str">"mqtt"</span>, <span class="str">"s3"</span>, <span class="str">"pg_wire"</span>, <span class="str">"gelf"</span>],
+    <span class="str">"auth_methods"</span>: [<span class="str">"scram-sha-256"</span>]    <span class="co">// or ["anonymous"] when auth is disabled</span>
+  }
+}</code></pre>
+      <p>If the client&apos;s <code>wire_versions</code> array shares no element with the server&apos;s <code>supported_wire_versions</code>, the server returns <code>&#123;"ok": false, "error": "no compatible wire version …"&#125;</code> and the client should close the connection.</p>
+      <p><strong>REST equivalent:</strong> <code>GET /v1/hello</code> returns the same server-info envelope (unauthenticated).</p>
+      <p><strong>Note:</strong> Client SDK methods (<code>db.hello()</code>, <code>client.hello()</code>, etc.) are scheduled for Phase 3 of the 1.0 prep. For now, you can send the raw command via the low-level <code>send_raw</code> / <code>execute</code> escape hatch most clients expose.</p>
+    </div>
+
     <!-- ============================================================ -->
     <!-- COLLECTIONS                                                   -->
     <!-- ============================================================ -->
