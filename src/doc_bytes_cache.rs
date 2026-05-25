@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use lru::LruCache;
-use parking_lot::Mutex;
 
 use crate::document::DocumentId;
+use crate::locks::Mutex;
 
 /// Hard-coded fallback. Larger than `DocCache::DEFAULT_CAPACITY` because
 /// each entry is 7× smaller — 1M entries fit in ~500 MB at typical doc
