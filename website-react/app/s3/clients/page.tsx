@@ -1,0 +1,145 @@
+import type { Metadata } from "next"
+export const metadata: Metadata = { title: "S3 Clients" }
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<p class="docs-eyebrow">S3 · Use it From</p>
+<h2>Clients</h2>
+<p>Anything that talks AWS S3 talks to OxiDB. Pass <code>--endpoint-url</code> (or set <code>endpoint_url</code> in the SDK config), and you're done.</p>
+
+<h3>aws-cli</h3>
+<pre><code class="lang-bash">aws configure set aws_access_key_id minioadmin
+aws configure set aws_secret_access_key minioadmin
+aws configure set default.region us-east-1
+
+ENDPOINT=http://localhost:9000
+aws --endpoint-url $ENDPOINT s3 ls
+aws --endpoint-url $ENDPOINT s3 mb s3://photos
+aws --endpoint-url $ENDPOINT s3 cp ./local s3://photos/ --recursive
+aws --endpoint-url $ENDPOINT s3 sync ./local s3://photos/
+
+<span class="co"># Persist endpoint to skip the flag (~/.aws/config)</span>
+[profile oxidb]
+endpoint_url = http://localhost:9000
+region = us-east-1
+
+aws --profile oxidb s3 ls</code></pre>
+
+<h3>Python — boto3</h3>
+<pre><code class="lang-python"><span class="kw">import</span> boto3
+
+s3 = boto3.client(
+    <span class="str">"s3"</span>,
+    endpoint_url=<span class="str">"http://localhost:9000"</span>,
+    aws_access_key_id=<span class="str">"minioadmin"</span>,
+    aws_secret_access_key=<span class="str">"minioadmin"</span>,
+    region_name=<span class="str">"us-east-1"</span>
+)
+
+s3.create_bucket(Bucket=<span class="str">"photos"</span>)
+s3.upload_file(<span class="str">"avatar.png"</span>, <span class="str">"photos"</span>, <span class="str">"me.png"</span>)
+s3.download_file(<span class="str">"photos"</span>, <span class="str">"me.png"</span>, <span class="str">"local.png"</span>)
+<span class="kw">for</span> page <span class="kw">in</span> s3.get_paginator(<span class="str">"list_objects_v2"</span>).paginate(Bucket=<span class="str">"photos"</span>):
+    <span class="kw">for</span> o <span class="kw">in</span> page.get(<span class="str">"Contents"</span>, []):
+        <span class="kw">print</span>(o[<span class="str">"Key"</span>], o[<span class="str">"Size"</span>])</code></pre>
+
+<h3>Python — s3fs</h3>
+<pre><code class="lang-python"><span class="kw">import</span> s3fs
+
+fs = s3fs.S3FileSystem(
+    key=<span class="str">"minioadmin"</span>, secret=<span class="str">"minioadmin"</span>,
+    client_kwargs={<span class="str">"endpoint_url"</span>: <span class="str">"http://localhost:9000"</span>}
+)
+
+<span class="kw">with</span> fs.open(<span class="str">"photos/me.png"</span>, <span class="str">"wb"</span>) <span class="kw">as</span> f:
+    f.write(image_bytes)
+
+<span class="kw">for</span> path <span class="kw">in</span> fs.ls(<span class="str">"photos"</span>):
+    <span class="kw">print</span>(path)</code></pre>
+
+<h3>mc — MinIO client</h3>
+<pre><code class="lang-bash">mc alias set oxidb http://localhost:9000 minioadmin minioadmin
+
+mc mb oxidb/photos
+mc cp avatar.png oxidb/photos/me.png
+mc ls oxidb/photos/
+mc cat oxidb/photos/me.png &gt; recovered.png
+mc rm oxidb/photos/me.png
+mc rb oxidb/photos
+mc mirror ./local oxidb/photos/</code></pre>
+
+<h3>JavaScript — AWS SDK v3</h3>
+<pre><code class="lang-javascript"><span class="kw">import</span> { S3Client, PutObjectCommand, GetObjectCommand } <span class="kw">from</span> <span class="str">"@aws-sdk/client-s3"</span>
+
+<span class="kw">const</span> s3 = <span class="kw">new</span> S3Client({
+  endpoint: <span class="str">"http://localhost:9000"</span>,
+  region: <span class="str">"us-east-1"</span>,
+  credentials: { accessKeyId: <span class="str">"minioadmin"</span>, secretAccessKey: <span class="str">"minioadmin"</span> },
+  forcePathStyle: <span class="kw">true</span>     <span class="co">// IMPORTANT — OxiDB uses path-style URLs</span>
+})
+
+<span class="kw">await</span> s3.send(<span class="kw">new</span> PutObjectCommand({
+  Bucket: <span class="str">"photos"</span>, Key: <span class="str">"me.png"</span>, Body: imageBuffer,
+  ContentType: <span class="str">"image/png"</span>
+}))
+
+<span class="kw">const</span> obj = <span class="kw">await</span> s3.send(<span class="kw">new</span> GetObjectCommand({
+  Bucket: <span class="str">"photos"</span>, Key: <span class="str">"me.png"</span>
+}))</code></pre>
+
+<h3>Go — aws-sdk-go-v2</h3>
+<pre><code class="lang-go"><span class="kw">import</span> (
+    <span class="str">"context"</span>
+    <span class="str">"github.com/aws/aws-sdk-go-v2/aws"</span>
+    <span class="str">"github.com/aws/aws-sdk-go-v2/credentials"</span>
+    <span class="str">"github.com/aws/aws-sdk-go-v2/service/s3"</span>
+)
+
+cfg := aws.Config{
+    Region: <span class="str">"us-east-1"</span>,
+    Credentials: credentials.NewStaticCredentialsProvider(<span class="str">"minioadmin"</span>, <span class="str">"minioadmin"</span>, <span class="str">""</span>),
+    BaseEndpoint: aws.String(<span class="str">"http://localhost:9000"</span>),
+}
+
+client := s3.NewFromConfig(cfg, <span class="kw">func</span>(o *s3.Options) {
+    o.UsePathStyle = <span class="kw">true</span>
+})
+
+client.PutObject(context.TODO(), &amp;s3.PutObjectInput{
+    Bucket: aws.String(<span class="str">"photos"</span>),
+    Key:    aws.String(<span class="str">"me.png"</span>),
+    Body:   bytes.NewReader(data),
+})</code></pre>
+
+<h3>rclone</h3>
+<pre><code class="lang-bash"># ~/.config/rclone/rclone.conf
+[oxidb]
+type = s3
+provider = Other
+access_key_id = minioadmin
+secret_access_key = minioadmin
+endpoint = http://localhost:9000
+force_path_style = true
+
+rclone copy ./local oxidb:photos/
+rclone sync oxidb:photos/ ./backup/
+rclone ls oxidb:photos</code></pre>
+
+<h3>Browser uploads — presigned URL + fetch</h3>
+<pre><code class="lang-javascript"><span class="co">// Backend (boto3)</span>
+url = s3.generate_presigned_url(<span class="str">"put_object"</span>,
+  Params={<span class="str">"Bucket"</span>: <span class="str">"uploads"</span>, <span class="str">"Key"</span>: <span class="str">"u-1.png"</span>, <span class="str">"ContentType"</span>: <span class="str">"image/png"</span>},
+  ExpiresIn=<span class="num">600</span>)
+
+<span class="co">// Frontend (any modern browser)</span>
+<span class="kw">await</span> fetch(url, {
+  method: <span class="str">"PUT"</span>,
+  body: file,
+  headers: { <span class="str">"Content-Type"</span>: <span class="str">"image/png"</span> }
+})</code></pre>
+
+<div class="docs-callout"><strong>Path style vs virtual host:</strong> OxiDB only speaks <strong>path-style</strong> URLs (<code>http://endpoint/bucket/key</code>). Force this in any SDK that defaults to virtual-host style — the option is usually called <code>force_path_style</code> or <code>UsePathStyle</code>.</div>
+
+<div class="docs-prevnext">
+  <a href="/s3/encryption/" class="prev"><div class="label">Previous</div><div class="title">← Encryption</div></a>
+  <a href="/s3/" class="next"><div class="label">Back to</div><div class="title">S3 overview →</div></a>
+</div>` }} />
+}

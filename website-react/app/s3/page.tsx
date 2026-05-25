@@ -1,0 +1,51 @@
+import type { Metadata } from "next"
+export const metadata: Metadata = {
+  title: "S3-Compatible API",
+  description: `OxiDB ships an S3-compatible HTTP server: AWS Signature V4, multipart upload, presigned URLs, SSE-S3 / SSE-C encryption, object tagging. Drop-in for aws-cli, boto3, mc, and any S3 SDK.`,
+}
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<p class="docs-eyebrow">S3</p>
+<h2>S3-compatible API</h2>
+<p>OxiDB ships an S3 HTTP server that speaks the AWS S3 protocol — AWS Signature V4 auth, multipart upload, presigned URLs, server-side encryption (SSE-S3 + SSE-C), object tagging, batch delete, range/conditional reads. It's a drop-in for aws-cli, boto3, mc (MinIO client), AWS SDKs, and anything else that talks S3.</p>
+
+<div class="docs-callout"><strong>One binary, two protocols.</strong> The same <code>oxidb-server</code> serves OxiDB's native protocol on port 4444 AND the S3 API on port 9000. Pick what you need with env vars. No extra processes.</div>
+
+<h3>What's supported</h3>
+<ul>
+  <li><strong>Bucket ops:</strong> create, list, delete, head, list-objects (with prefix &amp; pagination)</li>
+  <li><strong>Object ops:</strong> PUT, GET (with Range, conditional <code>If-Match</code> / <code>If-None-Match</code>), HEAD, DELETE, COPY (<code>x-amz-copy-source</code>)</li>
+  <li><strong>Multipart upload:</strong> initiate, upload-part, complete, abort, list-parts; up to 10,000 parts and 5 GiB total</li>
+  <li><strong>Auth:</strong> AWS Signature V4 (header), presigned URL, single-key or multi-tenant access keys</li>
+  <li><strong>Encryption:</strong> SSE-S3 (server-managed AES-256-GCM), SSE-C (client-supplied key), default-bucket-encryption mode</li>
+  <li><strong>Tagging:</strong> GET / PUT / DELETE on <code>?tagging</code>, used for lifecycle and access policies</li>
+  <li><strong>Batch delete:</strong> POST <code>?delete</code> with up to 1000 keys at a time</li>
+  <li><strong>CORS:</strong> configurable origin via env var</li>
+</ul>
+
+<h3>Where to start</h3>
+<div class="docs-grid-2">
+  <a href="/s3/quickstart/" class="feature-card"><h3>Quick Start</h3><p>Enable the S3 port, set credentials, upload your first object with aws-cli in under two minutes.</p></a>
+  <a href="/s3/auth/" class="feature-card"><h3>Auth</h3><p>Single-tenant, multi-tenant, presigned URLs, what gets verified on every request.</p></a>
+  <a href="/s3/objects/" class="feature-card"><h3>Object operations</h3><p>PUT / GET / HEAD / DELETE, range &amp; conditional reads, copy, tagging.</p></a>
+  <a href="/s3/multipart/" class="feature-card"><h3>Multipart upload</h3><p>Stream multi-gigabyte objects in 5 MiB+ parts with parallel uploads.</p></a>
+  <a href="/s3/encryption/" class="feature-card"><h3>Encryption</h3><p>SSE-S3 with a server-managed key, or SSE-C with per-request keys.</p></a>
+  <a href="/s3/clients/" class="feature-card"><h3>Clients</h3><p>aws-cli, boto3, mc/MinIO client, AWS SDK for JS — all confirmed working.</p></a>
+</div>
+
+<h3>The 30-second smoke test</h3>
+<pre><code class="lang-bash"><span class="co"># 1. Start the server with S3 enabled</span>
+OXIDB_S3_PORT=9000 \\
+OXIDB_S3_ACCESS_KEY=minioadmin \\
+OXIDB_S3_SECRET_KEY=minioadmin \\
+OXIDB_DATA=./data \\
+oxidb-server &amp;
+
+<span class="co"># 2. Configure aws-cli</span>
+aws configure set aws_access_key_id minioadmin
+aws configure set aws_secret_access_key minioadmin
+
+<span class="co"># 3. Use it</span>
+aws --endpoint-url http://localhost:9000 s3 mb s3://photos
+aws --endpoint-url http://localhost:9000 s3 cp ~/avatar.jpg s3://photos/me.jpg
+aws --endpoint-url http://localhost:9000 s3 ls s3://photos/</code></pre>` }} />
+}

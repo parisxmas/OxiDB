@@ -1,0 +1,74 @@
+import type { Metadata } from "next"
+export const metadata: Metadata = { title: "REST endpoints" }
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<p class="docs-eyebrow">API · 2 of 3</p>
+<h2>REST endpoints</h2>
+<p>Enable with <code>OXIDB_HTTP_PORT=8080</code>. JSON in, JSON out, CORS-friendly.</p>
+
+<h3>Endpoint summary</h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>GET</td><td><code>/api/procedures</code></td><td>List procedure names</td></tr>
+<tr><td>POST</td><td><code>/api/procedures</code></td><td>Create from OxiScript or raw JSON</td></tr>
+<tr><td>POST</td><td><code>/api/procedures/&lt;name&gt;/call</code></td><td>Call a procedure</td></tr>
+<tr><td>DELETE</td><td><code>/api/procedures/&lt;name&gt;</code></td><td>Remove a procedure</td></tr>
+</tbody></table></div>
+
+<h3>List</h3>
+<pre><code class="lang-bash">curl http://localhost:8080/api/procedures</code></pre>
+<pre><code class="lang-json">{<span class="str">"ok"</span>: <span class="kw">true</span>, <span class="str">"data"</span>: [<span class="str">"hi"</span>, <span class="str">"transfer"</span>, <span class="str">"place_order"</span>]}</code></pre>
+
+<h3>Create from OxiScript</h3>
+<pre><code class="lang-bash">curl -X POST http://localhost:8080/api/procedures \\
+  -H <span class="str">"Content-Type: application/json"</span> \\
+  -d <span class="str">'{
+    "name": "transfer",
+    "script": "proc transfer(from, to, amount) { let s = find_one(\\"accounts\\", {_id: from}) if s.balance &lt; amount { abort \\"insufficient funds\\" } update(\\"accounts\\", {_id: from}, {$inc: {balance: -amount}}) update(\\"accounts\\", {_id: to}, {$inc: {balance: amount}}) return {ok: true} }"
+  }'</span></code></pre>
+
+<h3>Create from raw JSON definition</h3>
+<pre><code class="lang-bash">curl -X POST http://localhost:8080/api/procedures \\
+  -H <span class="str">"Content-Type: application/json"</span> \\
+  -d <span class="str">'{
+    "name": "noop",
+    "params": [],
+    "steps": [{"step": "return", "value": {"ok": true}}]
+  }'</span></code></pre>
+
+<h3>Call</h3>
+<pre><code class="lang-bash">curl -X POST http://localhost:8080/api/procedures/transfer/call \\
+  -H <span class="str">"Content-Type: application/json"</span> \\
+  -d <span class="str">'{"from":"alice","to":"bob","amount":1500}'</span></code></pre>
+<pre><code class="lang-json">{<span class="str">"ok"</span>: <span class="kw">true</span>, <span class="str">"data"</span>: {<span class="str">"ok"</span>: <span class="kw">true</span>}}</code></pre>
+
+<h3>Call returns the abort error</h3>
+<pre><code class="lang-bash">curl -X POST http://localhost:8080/api/procedures/transfer/call \\
+  -d <span class="str">'{"from":"empty","to":"bob","amount":1}'</span>
+<span class="co"># → 400 Bad Request</span>
+<span class="co"># {"ok": false, "error": "insufficient funds"}</span></code></pre>
+
+<h3>Delete</h3>
+<pre><code class="lang-bash">curl -X DELETE http://localhost:8080/api/procedures/transfer</code></pre>
+
+<h3>JS / fetch example</h3>
+<pre><code class="lang-javascript"><span class="kw">async function</span> <span class="fn">callProcedure</span>(name, params) {
+  <span class="kw">const</span> r = <span class="kw">await</span> fetch(<span class="str">\`http://localhost:8080/api/procedures/\${name}/call\`</span>, {
+    method: <span class="str">"POST"</span>,
+    headers: {<span class="str">"Content-Type"</span>: <span class="str">"application/json"</span>},
+    body: JSON.stringify(params)
+  })
+  <span class="kw">return</span> r.json()
+}
+
+<span class="kw">const</span> result = <span class="kw">await</span> callProcedure(<span class="str">"transfer"</span>, {
+  from: <span class="str">"alice"</span>, to: <span class="str">"bob"</span>, amount: <span class="num">1500</span>
+})</code></pre>
+
+<div class="docs-callout"><strong>CORS:</strong> the REST handler sends permissive CORS headers, so you can call procedures from any browser origin out of the box. For production, front it with a reverse proxy that locks origins down.</div>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/api/tcp/" class="prev"><div class="label">Previous</div><div class="title">← TCP / OxiWire</div></a>
+  <a href="/oxiscript/api/sdks/" class="next"><div class="label">Next</div><div class="title">SDKs →</div></a>
+</div>` }} />
+}

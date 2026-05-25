@@ -1,0 +1,80 @@
+import type { Metadata } from "next"
+export const metadata: Metadata = { title: "Comments" }
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<p class="docs-eyebrow">Syntax · 6 of 6</p>
+<h2>Comments</h2>
+<p>Two comment styles, both ignored by the lexer.</p>
+
+<h3>Line comments</h3>
+<pre><code class="lang-rust"><span class="co">// This is a line comment.</span>
+let x = <span class="num">42</span>   <span class="co">// trailing comments work too</span></code></pre>
+
+<h3>Block comments</h3>
+<pre><code class="lang-rust"><span class="co">/* This is a block comment.
+   It can span multiple lines. */</span>
+proc demo() { <span class="kw">return</span> <span class="num">1</span> }</code></pre>
+
+<h3>Practical examples</h3>
+
+<h4>Documenting intent</h4>
+<pre><code class="lang-rust">proc transfer(from, to, amount) {
+    <span class="co">// Validate amount before touching the database — cheap fail.</span>
+    <span class="kw">if</span> amount &lt;= <span class="num">0</span> { <span class="kw">abort</span> <span class="str">"invalid amount"</span> }
+    <span class="kw">if</span> from == to  { <span class="kw">abort</span> <span class="str">"self-transfer not allowed"</span> }
+
+    <span class="co">// Load both accounts. We need sender for the balance check anyway.</span>
+    let sender   = find_one(<span class="str">"accounts"</span>, {account_id: from})
+    let receiver = find_one(<span class="str">"accounts"</span>, {account_id: to})
+
+    <span class="co">// MUST combine all field updates per doc — OCC validates per document.</span>
+    update(<span class="str">"accounts"</span>, {account_id: from}, {$inc: {balance: -amount, tx_count: <span class="num">1</span>}})
+    update(<span class="str">"accounts"</span>, {account_id: to},   {$inc: {balance:  amount, tx_count: <span class="num">1</span>}})
+
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h4>Disabling code temporarily</h4>
+<pre><code class="lang-rust">proc charge(account, amount) {
+    update(<span class="str">"accounts"</span>, {_id: account}, {$inc: {balance: -amount}})
+
+    <span class="co">/* TODO: re-enable email notification once the
+       outbound queue is fixed (see #234)
+    insert("email_queue", {
+        to: account.email,
+        subject: "Receipt",
+        body: "..."
+    })
+    */</span>
+
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h4>Section dividers</h4>
+<pre><code class="lang-rust">proc place_order(user_id, items) {
+    <span class="co">// ────────── 1. Validate ──────────</span>
+    <span class="kw">if</span> user_id == <span class="kw">null</span> { <span class="kw">abort</span> <span class="str">"user_id required"</span> }
+
+    <span class="co">// ────────── 2. Reserve stock ──────────</span>
+    <span class="kw">for</span> i <span class="kw">in</span> items {
+        update(<span class="str">"products"</span>, {sku: i.sku}, {$inc: {reserved: i.qty}})
+    }
+
+    <span class="co">// ────────── 3. Charge ──────────</span>
+    <span class="co">// (omitted)</span>
+
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Style guidance</h3>
+<ul>
+  <li>Comment <em>why</em>, not <em>what</em>. Names should explain the what.</li>
+  <li>Call out invariants the OCC engine relies on (the "MUST combine all field updates per doc" comment above is gold).</li>
+  <li>Reference issue numbers or PRs for temporary code.</li>
+  <li>Block comments are great for large sections that are temporarily disabled — easier to spot than rows of <code>//</code>.</li>
+</ul>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/syntax/loops/" class="prev"><div class="label">Previous</div><div class="title">← for / in loops</div></a>
+  <a href="/oxiscript/db/find/" class="next"><div class="label">Next</div><div class="title">find / find_one →</div></a>
+</div>` }} />
+}

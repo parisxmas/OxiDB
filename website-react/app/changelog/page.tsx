@@ -11,12 +11,80 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.28.18 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.28.18</h3>
+        <span class="version-date">2026-05-25</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li>
+            <strong>OxiWire HELLO handshake</strong> &mdash; new <code>cmd: "hello"</code> returns server version, supported wire versions, stable-surface feature set, experimental feature set, and auth methods. Pre-auth, idempotent, backward-compatible (clients without HELLO default to wire v1). See <code>oxidb-server/src/hello.rs</code> and ADR-0003 Phase 2.
+          </li>
+          <li>
+            <strong>REST <code>/v1/</code> URL prefix</strong> &mdash; <code>GET /v1/hello</code> returns server info; <code>/v1/api/...</code> is the 1.0 stable surface entry point. Legacy bare <code>/api/...</code> still routes during the deprecation window.
+          </li>
+          <li>
+            <strong>WebSocket subprotocol versioning</strong> &mdash; server advertises <code>oxidb.v1</code> via <code>Sec-WebSocket-Protocol</code>. Clients without the header still connect.
+          </li>
+          <li>
+            <strong><code>oxidb migrate</code> CLI</strong> &mdash; new subcommand on <code>oxidb-cli</code>: <code>migrate inspect --data &lt;PATH&gt;</code> walks a data directory and reports each file&apos;s on-disk format version (OXWA / OXTX / OXBT / OXIX / blob <code>format_version</code>). <code>migrate run</code> validates versions and is the scaffold for future v2 migrations (ADR-0003 Phase 4).
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type changed">Performance</h4>
+        <ul>
+          <li>
+            <strong>Bytes-first find path for OxiWire responses</strong> &mdash; new <code>jsonb_oxiwire</code> module converts JSONB to OxiWire bytes via a custom serde Visitor, skipping the <code>serde_json::Value</code> tree intermediate (~20 µs/doc saving on cache miss). A new <code>doc_bytes_cache</code> (env-tunable via <code>OXIDB_DOC_BYTES_CACHE_SIZE</code>, default 1M) keeps pre-encoded bytes around.
+          </li>
+          <li>
+            <strong>Composite-index fast path</strong> &mdash; <code>find</code> queries that are exactly covered by a composite index&apos;s fields now route through <code>find_prefix</code> directly, skipping post-filter and Value materialisation.
+          </li>
+          <li>
+            <strong>Partial-JSONB filter</strong> &mdash; new helper evaluates top-level <code>$eq</code>/<code>$ne</code>/<code>$gt</code>/<code>$gte</code>/<code>$lt</code>/<code>$lte</code>/<code>$in</code> conditions plus <code>$and</code> / <code>$or</code> / dot-paths directly against JSONB bytes using <code>codec::extract_field</code>. Wired into the aggregation pipeline&apos;s <code>$match</code> step AND the find full-scan rayon path; reserves the full JSONB&rarr;Value decode for queries with predicates the partial matcher can&apos;t evaluate.
+          </li>
+          <li>
+            <strong>Doc cache capacity is env-tunable</strong> &mdash; <code>OXIDB_DOC_CACHE_SIZE</code> overrides the 100K default. Production hardware with more RAM can hold the full working set.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">Benchmark</h4>
+        <ul>
+          <li>
+            <strong>OxiDB sweeps MongoDB at 1M docs.</strong> The full <code>tests/comparison-mongodb</code> bench at 1M-document scale (in-network Docker harness, no port-forward artifact) goes <strong>OxiDB 24 &ndash; MongoDB 0</strong> across 24 measured workloads. Largest wins: count-all 2189&times;, Top-5 cities aggregation 1262&times;, composite-indexed compound 4.1&times;. Smallest wins: bulk insert 1.1&times;, range-10K-rows-each 1.2&times;. Resource footprint at peak: OxiDB 1.71 GiB RSS / 741 MB disk vs MongoDB 1.00 GiB / 626 MB. See <a href="/benchmarks/">Benchmarks</a>.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
+        <h4 class="change-type added">1.0 prep docs</h4>
+        <ul>
+          <li>
+            <code>docs/SEMVER.md</code>, <code>docs/STABILITY.md</code>, <code>docs/DEPRECATION.md</code>, <code>docs/SECURITY.md</code> &mdash; Phase 5 of ADR-0003. Translate the ADR-0004 release-policy decisions into operational docs (24-month LTS, additive-only minor releases, GitHub Security Advisories channel, etc.).
+          </li>
+          <li>
+            <code>docs/PHASE3-SDK-FREEZE.md</code> + Python client <code>api/v1.json</code> snapshot + CI gate script (template for the other 9 Tier-A clients).
+          </li>
+          <li>
+            <code>docs/format/compat-matrix.md</code> &mdash; Phase 2 cross-version compat matrix (OxiWire / REST / WebSocket).
+          </li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.28.12 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.28.12</h3>
         <span class="version-date">2026-05-24</span>
-        <span class="version-badge latest">latest</span>
       </div>
 
       <div class="change-group">

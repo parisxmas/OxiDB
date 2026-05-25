@@ -1,0 +1,87 @@
+import type { Metadata } from "next"
+export const metadata: Metadata = { title: "Inventory recipe" }
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<p class="docs-eyebrow">Recipes · 3 of 6</p>
+<h2>Inventory — stock check, restock, reservations</h2>
+
+<h3>Schema</h3>
+<pre><code class="lang-bash">products:     {sku, name, stock, reserved, threshold, supplier_id}
+restock_log:  {sku, qty, supplier_id, ts}
+reservations: {sku, user_id, qty, status, expires_at}</code></pre>
+
+<h3>restock</h3>
+<pre><code class="lang-rust">proc restock(sku, qty, supplier_id) {
+    <span class="kw">if</span> qty &lt;= <span class="num">0</span> { <span class="kw">abort</span> <span class="str">"qty must be positive"</span> }
+    let p = find_one(<span class="str">"products"</span>, {sku: sku})
+    <span class="kw">if</span> p == <span class="kw">null</span> { <span class="kw">abort</span> <span class="str">"product not found"</span> }
+    update(<span class="str">"products"</span>, {sku: sku}, {$inc: {stock: qty}, $set: {needs_restock: <span class="kw">false</span>}})
+    insert(<span class="str">"restock_log"</span>, {sku: sku, qty: qty, supplier_id: supplier_id})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>, new_stock: p.stock + qty}
+}</code></pre>
+
+<h3>reserve</h3>
+<pre><code class="lang-rust">proc reserve(sku, user_id, qty) {
+    let p = find_one(<span class="str">"products"</span>, {sku: sku})
+    <span class="kw">if</span> p == <span class="kw">null</span>                       { <span class="kw">abort</span> <span class="str">"not found"</span> }
+    <span class="kw">if</span> p.stock - p.reserved &lt; qty       { <span class="kw">abort</span> <span class="str">"insufficient available stock"</span> }
+    update(<span class="str">"products"</span>, {sku: sku}, {$inc: {reserved: qty}})
+    let id = insert(<span class="str">"reservations"</span>, {
+        sku: sku, user_id: user_id, qty: qty, status: <span class="str">"active"</span>
+    })
+    <span class="kw">return</span> {ok: <span class="kw">true</span>, reservation_id: id}
+}</code></pre>
+
+<h3>commit_reservation</h3>
+<pre><code class="lang-rust">proc commit_reservation(reservation_id) {
+    let r = find_one(<span class="str">"reservations"</span>, {_id: reservation_id})
+    <span class="kw">if</span> r == <span class="kw">null</span>                      { <span class="kw">abort</span> <span class="str">"reservation not found"</span> }
+    <span class="kw">if</span> r.status != <span class="str">"active"</span>           { <span class="kw">abort</span> <span class="str">"reservation not active"</span> }
+
+    update(<span class="str">"products"</span>, {sku: r.sku}, {$inc: {stock: -r.qty, reserved: -r.qty, sold: r.qty}})
+    update(<span class="str">"reservations"</span>, {_id: reservation_id}, {$set: {status: <span class="str">"committed"</span>}})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>release_reservation</h3>
+<pre><code class="lang-rust">proc release_reservation(reservation_id) {
+    let r = find_one(<span class="str">"reservations"</span>, {_id: reservation_id})
+    <span class="kw">if</span> r == <span class="kw">null</span>                      { <span class="kw">abort</span> <span class="str">"reservation not found"</span> }
+    <span class="kw">if</span> r.status != <span class="str">"active"</span>           { <span class="kw">return</span> {ok: <span class="kw">true</span>, was_active: <span class="kw">false</span>} }
+
+    update(<span class="str">"products"</span>, {sku: r.sku}, {$inc: {reserved: -r.qty}})
+    update(<span class="str">"reservations"</span>, {_id: reservation_id}, {$set: {status: <span class="str">"released"</span>}})
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>flag_low_stock</h3>
+<pre><code class="lang-rust">proc flag_low_stock() {
+    let lows = find(<span class="str">"products"</span>, {needs_restock: {$ne: <span class="kw">true</span>}})
+    let flagged = <span class="num">0</span>
+    <span class="kw">for</span> p <span class="kw">in</span> lows {
+        <span class="kw">if</span> p.stock - p.reserved &lt; p.threshold {
+            update(<span class="str">"products"</span>, {sku: p.sku}, {$set: {needs_restock: <span class="kw">true</span>}})
+            insert(<span class="str">"reorder_queue"</span>, {sku: p.sku, current: p.stock, target: p.threshold * <span class="num">3</span>})
+            flagged = flagged + <span class="num">1</span>
+        }
+    }
+    <span class="kw">return</span> {flagged: flagged}
+}</code></pre>
+
+<h3>inventory_report</h3>
+<pre><code class="lang-rust">proc inventory_report() {
+    <span class="kw">return</span> {
+        total_skus:    count(<span class="str">"products"</span>),
+        out_of_stock:  count(<span class="str">"products"</span>, {stock: <span class="num">0</span>}),
+        low_stock:     count(<span class="str">"products"</span>, {needs_restock: <span class="kw">true</span>}),
+        active_reservations: count(<span class="str">"reservations"</span>, {status: <span class="str">"active"</span>}),
+        by_supplier: aggregate(<span class="str">"products"</span>, [
+            {$group: {_id: <span class="str">"$supplier_id"</span>, n: {$sum: <span class="num">1</span>}, total_stock: {$sum: <span class="str">"$stock"</span>}}}
+        ])
+    }
+}</code></pre>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/recipes/ecommerce/" class="prev"><div class="label">Previous</div><div class="title">← E-commerce</div></a>
+  <a href="/oxiscript/recipes/audit-log/" class="next"><div class="label">Next</div><div class="title">Audit log →</div></a>
+</div>` }} />
+}

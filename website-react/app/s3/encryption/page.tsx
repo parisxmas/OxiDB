@@ -1,0 +1,99 @@
+import type { Metadata } from "next"
+export const metadata: Metadata = { title: "S3 Encryption (SSE)" }
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<p class="docs-eyebrow">S3 · API</p>
+<h2>Server-Side Encryption (SSE)</h2>
+<p>Two modes, both AES-256-GCM at rest.</p>
+
+<div class="table-wrap"><table>
+<thead><tr><th>Mode</th><th>Key managed by</th><th>Per-request header</th><th>Use when</th></tr></thead>
+<tbody>
+<tr><td><strong>SSE-S3</strong></td><td>Server (one master key)</td><td><code>x-amz-server-side-encryption: AES256</code></td><td>Always-on encryption with no client involvement</td></tr>
+<tr><td><strong>SSE-C</strong></td><td>Client (per object)</td><td><code>x-amz-server-side-encryption-customer-*</code></td><td>Per-object keys; you keep custody</td></tr>
+</tbody></table></div>
+
+<h3>SSE-S3 — server-managed key</h3>
+
+<h4>Set up the master key</h4>
+<pre><code class="lang-bash"><span class="co"># 32 bytes hex = 64 hex characters</span>
+KEY=$(openssl rand -hex 32)
+
+OXIDB_S3_PORT=9000 \\
+OXIDB_S3_ACCESS_KEY=minioadmin \\
+OXIDB_S3_SECRET_KEY=minioadmin \\
+OXIDB_S3_ENCRYPTION_KEY=<span class="str">"$KEY"</span> \\
+oxidb-server</code></pre>
+
+<h4>Encrypt one object</h4>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3api put-object \\
+  --bucket photos --key secret.png \\
+  --body ./secret.png \\
+  --server-side-encryption AES256</code></pre>
+
+<h4>Encrypt every PUT by default</h4>
+<pre><code class="lang-bash">OXIDB_S3_ENCRYPTION_KEY=<span class="str">"$KEY"</span> \\
+OXIDB_S3_DEFAULT_ENCRYPTION=true \\
+oxidb-server</code></pre>
+<p>Now every PUT is silently encrypted on the wire even if the client doesn't ask.</p>
+
+<h4>Decryption is automatic</h4>
+<p>GET on an encrypted object returns the plaintext bytes. The client doesn't need to do anything special.</p>
+<pre><code class="lang-bash">aws --endpoint-url http://localhost:9000 s3 cp s3://photos/secret.png /tmp/recovered.png
+<span class="co"># Server decrypts on the fly</span></code></pre>
+
+<h3>SSE-C — client-supplied key</h3>
+<p>The client provides a 32-byte key on every PUT and GET. Server doesn't store the key — only a SHA-256 hash for validation.</p>
+
+<h4>boto3 PUT</h4>
+<pre><code class="lang-python"><span class="kw">import</span> boto3, secrets, base64, hashlib
+
+key = secrets.token_bytes(<span class="num">32</span>)
+key_b64 = base64.b64encode(key).decode()
+key_md5 = base64.b64encode(hashlib.md5(key).digest()).decode()
+
+s3.put_object(
+    Bucket=<span class="str">"photos"</span>, Key=<span class="str">"vault.png"</span>,
+    Body=open(<span class="str">"local.png"</span>, <span class="str">"rb"</span>),
+    SSECustomerAlgorithm=<span class="str">"AES256"</span>,
+    SSECustomerKey=key_b64,
+    SSECustomerKeyMD5=key_md5
+)</code></pre>
+
+<h4>GET back with the same key</h4>
+<pre><code class="lang-python">resp = s3.get_object(
+    Bucket=<span class="str">"photos"</span>, Key=<span class="str">"vault.png"</span>,
+    SSECustomerAlgorithm=<span class="str">"AES256"</span>,
+    SSECustomerKey=key_b64,
+    SSECustomerKeyMD5=key_md5
+)
+data = resp[<span class="str">"Body"</span>].read()</code></pre>
+<p>Lose the key, lose the data — there's no recovery.</p>
+
+<h3>Wire-level headers</h3>
+<pre><code class="lang-bash"><span class="co"># SSE-S3</span>
+x-amz-server-side-encryption: AES256
+
+<span class="co"># SSE-C (PUT)</span>
+x-amz-server-side-encryption-customer-algorithm: AES256
+x-amz-server-side-encryption-customer-key: &lt;base64 key&gt;
+x-amz-server-side-encryption-customer-key-MD5: &lt;base64 md5&gt;
+
+<span class="co"># SSE-C (GET) — same three headers</span></code></pre>
+
+<h3>What's encrypted</h3>
+<ul>
+  <li><strong>Object body</strong> — AES-256-GCM, 12-byte nonce, 16-byte auth tag.</li>
+  <li><strong>Object metadata</strong> — stored alongside the body, also encrypted under SSE-S3.</li>
+  <li>Bucket names, keys, and the listing of objects are NOT encrypted (so you can list them without the key).</li>
+</ul>
+
+<h3>Combined with TLS</h3>
+<p>Server-side encryption protects data <em>at rest</em>. For data <em>in transit</em>, terminate TLS in front of the S3 port (Caddy, nginx, Cloudflare). The S3 server itself speaks plain HTTP — by design, so it composes well with proxies.</p>
+
+<div class="docs-callout"><strong>Key rotation:</strong> SSE-S3 uses one master key. To rotate, set a new <code>OXIDB_S3_ENCRYPTION_KEY</code>, then re-PUT each object. There's no automatic re-encryption pass.</div>
+
+<div class="docs-prevnext">
+  <a href="/s3/multipart/" class="prev"><div class="label">Previous</div><div class="title">← Multipart</div></a>
+  <a href="/s3/clients/" class="next"><div class="label">Next</div><div class="title">Clients →</div></a>
+</div>` }} />
+}

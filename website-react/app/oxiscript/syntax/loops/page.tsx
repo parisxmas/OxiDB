@@ -1,0 +1,91 @@
+import type { Metadata } from "next"
+export const metadata: Metadata = { title: "for / in loops" }
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<p class="docs-eyebrow">Syntax · 5 of 6</p>
+<h2><code>for</code> / <code>in</code> loops</h2>
+<p>Iterate over an array — typically a <code>find</code> result. The loop body runs once per element with <code>var</code> bound to the current item.</p>
+
+<h3>Basic shape</h3>
+<pre><code class="lang-rust">for item in collection_or_array {
+    <span class="co">// body — has access to \`item\`</span>
+}</code></pre>
+
+<h3>Iterating a find result</h3>
+<pre><code class="lang-rust">proc deactivate_stale(days) {
+    let users = find(<span class="str">"users"</span>, {last_seen_days: {$gte: days}})
+    <span class="kw">for</span> u <span class="kw">in</span> users {
+        update(<span class="str">"users"</span>, {_id: u._id}, {$set: {active: <span class="kw">false</span>}})
+    }
+    <span class="kw">return</span> {deactivated: count(<span class="str">"users"</span>, {active: <span class="kw">false</span>})}
+}</code></pre>
+
+<h3>Iterating a literal array</h3>
+<pre><code class="lang-rust">proc seed_categories() {
+    let cats = [<span class="str">"electronics"</span>, <span class="str">"books"</span>, <span class="str">"clothing"</span>, <span class="str">"food"</span>]
+    <span class="kw">for</span> c <span class="kw">in</span> cats {
+        insert(<span class="str">"categories"</span>, {name: c, created_at: <span class="str">"now"</span>})
+    }
+    <span class="kw">return</span> {seeded: <span class="num">4</span>}
+}</code></pre>
+
+<h3>Filter then loop</h3>
+<pre><code class="lang-rust">proc flag_low_stock(threshold) {
+    let lows = find(<span class="str">"products"</span>, {stock: {$lt: threshold}})
+    <span class="kw">for</span> p <span class="kw">in</span> lows {
+        update(<span class="str">"products"</span>, {sku: p.sku}, {$set: {needs_restock: <span class="kw">true</span>}})
+        insert(<span class="str">"reorder_queue"</span>, {sku: p.sku, current: p.stock})
+    }
+    <span class="kw">return</span> {flagged: count(<span class="str">"reorder_queue"</span>)}
+}</code></pre>
+
+<h3>Conditional inside the loop</h3>
+<pre><code class="lang-rust">proc charge_subscriptions() {
+    let due = find(<span class="str">"subscriptions"</span>, {status: <span class="str">"active"</span>, due: <span class="kw">true</span>})
+    <span class="kw">for</span> sub <span class="kw">in</span> due {
+        let user = find_one(<span class="str">"users"</span>, {_id: sub.user_id})
+        <span class="kw">if</span> user.balance &gt;= sub.price {
+            update(<span class="str">"users"</span>, {_id: sub.user_id}, {$inc: {balance: -sub.price}})
+            insert(<span class="str">"charges"</span>, {sub_id: sub._id, amount: sub.price, status: <span class="str">"ok"</span>})
+        } <span class="kw">else</span> {
+            update(<span class="str">"subscriptions"</span>, {_id: sub._id}, {$set: {status: <span class="str">"past_due"</span>}})
+            insert(<span class="str">"charges"</span>, {sub_id: sub._id, amount: sub.price, status: <span class="str">"failed"</span>})
+        }
+    }
+    <span class="kw">return</span> {processed: count(<span class="str">"charges"</span>)}
+}</code></pre>
+
+<h3>Nested loops</h3>
+<pre><code class="lang-rust">proc fanout_notifications(group_id, message) {
+    let members = find(<span class="str">"group_members"</span>, {group_id: group_id})
+    <span class="kw">for</span> m <span class="kw">in</span> members {
+        let devices = find(<span class="str">"devices"</span>, {user_id: m.user_id})
+        <span class="kw">for</span> d <span class="kw">in</span> devices {
+            insert(<span class="str">"notifications"</span>, {
+                device_id: d._id,
+                user_id: m.user_id,
+                message: message,
+                status: <span class="str">"queued"</span>
+            })
+        }
+    }
+    <span class="kw">return</span> {ok: <span class="kw">true</span>}
+}</code></pre>
+
+<h3>Aggregating in a loop</h3>
+<p>Sometimes <code>aggregate</code> is cleaner — but a loop works fine for small result sets.</p>
+<pre><code class="lang-rust">proc total_owed(account_id) {
+    let invoices = find(<span class="str">"invoices"</span>, {account_id: account_id, status: <span class="str">"open"</span>})
+    let sum = <span class="num">0</span>
+    <span class="kw">for</span> i <span class="kw">in</span> invoices {
+        sum = sum + i.amount
+    }
+    <span class="kw">return</span> {account_id: account_id, owed: sum}
+}</code></pre>
+
+<div class="docs-callout"><strong>Performance tip:</strong> if your loop touches the same document many times, prefer one <code>update</code> with an array of <code>$inc</code>/<code>$set</code> fields over many small ones. OCC validates a version per document, not per field.</div>
+
+<div class="docs-prevnext">
+  <a href="/oxiscript/syntax/control-flow/" class="prev"><div class="label">Previous</div><div class="title">← if / else</div></a>
+  <a href="/oxiscript/syntax/comments/" class="next"><div class="label">Next</div><div class="title">Comments →</div></a>
+</div>` }} />
+}
