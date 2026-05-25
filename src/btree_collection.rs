@@ -371,9 +371,15 @@ impl BTreeCollection {
     /// trees. Returns `None` for queries that need the Value path; caller
     /// falls back to `find_with_options_arcs`.
     ///
-    /// This is the path that makes the doc_bytes_cache + jsonb_oxiwire
-    /// converter actually pay: every match skips the ~20 µs/doc JSONB→Value
-    /// step that the standard path pays via `load_doc_arc`.
+    /// Two index strategies are tried, in order:
+    /// 1. **Composite index** — when the query is exactly an AND of `$eq`
+    ///    conditions covering some composite index's fields, use
+    ///    `find_prefix` for direct ID resolution. This is the path that
+    ///    matters for multi-field equality queries (the TestCompoundIndexQuery
+    ///    shape in the bench).
+    /// 2. **Single-field index path** — for queries `is_fully_indexed`
+    ///    recognises (single eq, range, $in), fall through to
+    ///    `execute_indexed` which intersects per-field index results.
     pub fn find_oxiwire_bytes(
         &self,
         query_json: &Value,
@@ -391,14 +397,22 @@ impl BTreeCollection {
             Err(e) => return Some(Err(e)),
         };
 
-        // Query must be fully index-satisfiable; otherwise we'd need Value
-        // to evaluate the residual filter.
+        // ── Strategy 1: composite-index exact cover ─────────────────────
+        if let Some(ids) = self.try_composite_lookup(&query) {
+            let mut results: Vec<Arc<[u8]>> = Vec::with_capacity(ids.len());
+            for id in &ids {
+                if let Some(bytes) = self.load_doc_oxiwire_bytes(*id) {
+                    results.push(bytes);
+                }
+            }
+            return Some(Ok(results));
+        }
+
+        // ── Strategy 2: single-field index path ─────────────────────────
         let fi = self.field_indexes.read();
         if !query::is_fully_indexed(&query, &fi) {
             return None;
         }
-
-        // Resolve candidates via index.
         let ci = self.composite_indexes.read();
         let candidate_ids = query::execute_indexed(&query, &fi, &ci);
         drop(ci);
@@ -406,7 +420,7 @@ impl BTreeCollection {
 
         let ids = match candidate_ids {
             Some(ids) => ids,
-            None => return None, // index can't satisfy — fall back to full scan
+            None => return None,
         };
 
         let mut results: Vec<Arc<[u8]>> = Vec::with_capacity(ids.len());
@@ -416,6 +430,40 @@ impl BTreeCollection {
             }
         }
         Some(Ok(results))
+    }
+
+    /// If a composite index's `fields` exactly matches the query's set of
+    /// top-level `$eq` conditions (no extra conditions, no non-eq ops),
+    /// build the prefix and look up via `find_prefix`. Returns `None`
+    /// otherwise so the caller can try the single-field path.
+    fn try_composite_lookup(&self, query: &Query) -> Option<std::collections::BTreeSet<DocumentId>> {
+        let eq_conditions = query::extract_eq_conditions(query)?;
+        // The query must be eq-only — no $gt/$in/etc. mixed in. We can't
+        // catch mixed conditions just from extract_eq_conditions because
+        // that helper skips non-eq subs silently; verify with is_eq_only_on.
+        let eq_fields: Vec<String> = eq_conditions.keys().cloned().collect();
+        if !query::is_eq_only_on(query, &eq_fields) {
+            return None;
+        }
+
+        let composites = self.composite_indexes.read();
+        for ci in composites.iter() {
+            if ci.fields.len() != eq_conditions.len() {
+                continue;
+            }
+            // Composite's field set must exactly match the query's.
+            if !ci.fields.iter().all(|f| eq_conditions.contains_key(f)) {
+                continue;
+            }
+            // Build the prefix in the index's field order.
+            let prefix: Vec<IndexValue> = ci
+                .fields
+                .iter()
+                .map(|f| eq_conditions.get(f).unwrap().clone())
+                .collect();
+            return Some(ci.find_prefix(&prefix));
+        }
+        None
     }
 
     /// Reset the doc cache hit/miss counters. Useful when measuring a
@@ -3059,6 +3107,53 @@ mod tests {
         let stats_post_miss = col.bytes_cache_stats();
         assert_eq!(&*bytes1, &*bytes1_again, "re-encoded bytes match");
         assert_eq!(stats_post_miss.misses - stats_pre_miss.misses, 1);
+    }
+
+    #[test]
+    fn find_oxiwire_bytes_uses_composite_index() {
+        let col = new_btree_collection("composite_test");
+        // Seed: 4 docs, three with status=active across dept variants.
+        col.insert(json!({"dept": "Sales", "status": "active", "n": 1})).unwrap();
+        col.insert(json!({"dept": "Sales", "status": "inactive", "n": 2})).unwrap();
+        col.insert(json!({"dept": "Eng", "status": "active", "n": 3})).unwrap();
+        col.insert(json!({"dept": "Sales", "status": "active", "n": 4})).unwrap();
+
+        col.create_composite_index(vec!["dept".to_string(), "status".to_string()])
+            .unwrap();
+
+        // Query covered exactly by the composite index — should hit the
+        // bytes-first composite path (returns 2 matches: n=1 and n=4).
+        let query = json!({"dept": "Sales", "status": "active"});
+        let result = col
+            .find_oxiwire_bytes(&query, &FindOptions::default())
+            .expect("fast path engaged")
+            .expect("ok");
+        assert_eq!(
+            result.len(),
+            2,
+            "expected 2 matches via composite-index lookup"
+        );
+        for bytes in &result {
+            assert!(!bytes.is_empty(), "encoded doc bytes must be non-empty");
+        }
+    }
+
+    #[test]
+    fn find_oxiwire_bytes_returns_none_for_mixed_ops() {
+        // Composite path only fires for pure-eq queries that exactly match
+        // a composite index's fields. A query with $gte falls through.
+        let col = new_btree_collection("composite_falls_through");
+        col.insert(json!({"dept": "Sales", "n": 10})).unwrap();
+        col.insert(json!({"dept": "Eng", "n": 20})).unwrap();
+        col.create_composite_index(vec!["dept".to_string(), "n".to_string()])
+            .unwrap();
+
+        let query = json!({"dept": "Sales", "n": {"$gte": 5}});
+        // is_eq_only_on returns false for $gte → composite path doesn't fire.
+        // No single-field index on `dept` here either → single-field path
+        // also can't fully satisfy. Should return None.
+        let result = col.find_oxiwire_bytes(&query, &FindOptions::default());
+        assert!(result.is_none(), "mixed-op queries should fall back");
     }
 
     /// Cold path — doc_cache evicted, bytes_cache empty → must read
