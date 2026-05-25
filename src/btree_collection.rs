@@ -3128,12 +3128,7 @@ fn matches_query_partial_jsonb(query: &Query, bytes: &[u8]) -> Option<bool> {
     match query {
         Query::All => Some(true),
         Query::Field { field, op } => {
-            // Dot paths (`address.zip`) are excluded — `codec::extract_field`
-            // only handles top-level keys.
-            if field.contains('.') {
-                return None;
-            }
-            let field_val = codec::extract_field(bytes, field);
+            let field_val = extract_field_path(bytes, field);
             eval_field_op_partial(op, field_val.as_ref())
         }
         Query::And(subs) => {
@@ -3146,9 +3141,52 @@ fn matches_query_partial_jsonb(query: &Query, bytes: &[u8]) -> Option<bool> {
             }
             Some(true)
         }
-        // Or/Nor/Expr need fuller evaluation — let the caller full-decode.
-        Query::Or(_) | Query::Nor(_) | Query::Expr(_) => None,
+        Query::Or(subs) => {
+            // Short-circuit on first definite match. If all definite subs
+            // return Some(false) and none return None, we know it's a
+            // mismatch. Any None makes the whole $or undecidable.
+            let mut saw_undecidable = false;
+            for sub in subs {
+                match matches_query_partial_jsonb(sub, bytes) {
+                    Some(true) => return Some(true),
+                    Some(false) => continue,
+                    None => saw_undecidable = true,
+                }
+            }
+            if saw_undecidable {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        // Nor/Expr need fuller evaluation — let the caller full-decode.
+        Query::Nor(_) | Query::Expr(_) => None,
     }
+}
+
+/// Extract a (possibly-dotted) field path from JSONB bytes. For top-level
+/// names this is just `codec::extract_field`; for dotted paths
+/// (`address.zip`) the first segment is extracted from JSONB, then
+/// subsequent segments walk the resulting `Value` tree.
+///
+/// Returns `None` when the path doesn't resolve to a value (missing key
+/// at any level, or intermediate level isn't an object).
+fn extract_field_path(bytes: &[u8], path: &str) -> Option<Value> {
+    if !path.contains('.') {
+        return codec::extract_field(bytes, path);
+    }
+    let mut parts = path.split('.');
+    let first = parts.next()?;
+    let mut current = codec::extract_field(bytes, first)?;
+    for part in parts {
+        match current {
+            Value::Object(mut map) => {
+                current = map.remove(part)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 fn eval_field_op_partial(op: &crate::query::QueryOp, field_val: Option<&Value>) -> Option<bool> {
@@ -3263,17 +3301,78 @@ mod tests {
     }
 
     #[test]
-    fn partial_jsonb_filter_returns_none_for_dot_paths_and_regex() {
+    fn partial_jsonb_filter_returns_none_for_regex() {
         let v = json!({"x": 1});
         let bytes = codec::encode_doc(&v).unwrap();
-
-        // Dot-path: outside the fast path's scope.
-        let q_dot = query::parse_query(&json!({"address.zip": "94100"})).unwrap();
-        assert_eq!(matches_query_partial_jsonb(&q_dot, &bytes), None);
-
         // Regex: defer to full decode.
         let q_regex = query::parse_query(&json!({"name": {"$regex": "^A"}})).unwrap();
         assert_eq!(matches_query_partial_jsonb(&q_regex, &bytes), None);
+    }
+
+    #[test]
+    fn partial_jsonb_filter_walks_dot_paths() {
+        let v = json!({
+            "address": {"street": "1 Main", "zip": "94100"},
+            "name": "Alice"
+        });
+        let bytes = codec::encode_doc(&v).unwrap();
+
+        // Top-level eq still works.
+        let q_top = query::parse_query(&json!({"name": "Alice"})).unwrap();
+        assert_eq!(matches_query_partial_jsonb(&q_top, &bytes), Some(true));
+
+        // Nested eq via dot-path.
+        let q_eq = query::parse_query(&json!({"address.zip": "94100"})).unwrap();
+        assert_eq!(matches_query_partial_jsonb(&q_eq, &bytes), Some(true));
+
+        // Nested range via dot-path (the bench's actual case).
+        let q_range = query::parse_query(&json!({
+            "address.zip": {"$gte": "00000", "$lt": "10000"}
+        }))
+        .unwrap();
+        // "94100" is NOT in [00000, 10000) → false.
+        assert_eq!(matches_query_partial_jsonb(&q_range, &bytes), Some(false));
+
+        // Same range, doc that's in range.
+        let v2 = json!({"address": {"zip": "05500"}});
+        let bytes2 = codec::encode_doc(&v2).unwrap();
+        assert_eq!(matches_query_partial_jsonb(&q_range, &bytes2), Some(true));
+
+        // Missing path segment → Some(false) via Eq's null-coercion. (The
+        // caller is OK with conservatism here — None would force a full
+        // decode that also wouldn't match.)
+        let q_missing = query::parse_query(&json!({"address.zip": "X"})).unwrap();
+        let v3 = json!({"address": {}});
+        let bytes3 = codec::encode_doc(&v3).unwrap();
+        assert_eq!(matches_query_partial_jsonb(&q_missing, &bytes3), Some(false));
+    }
+
+    #[test]
+    fn partial_jsonb_filter_handles_or() {
+        let v = json!({"city": "Tokyo", "n": 1});
+        let bytes = codec::encode_doc(&v).unwrap();
+
+        // The bench's exact $or shape.
+        let q = query::parse_query(&json!({
+            "$or": [{"city": "Tokyo"}, {"city": "Paris"}]
+        }))
+        .unwrap();
+        assert_eq!(matches_query_partial_jsonb(&q, &bytes), Some(true));
+
+        let v2 = json!({"city": "London"});
+        let bytes2 = codec::encode_doc(&v2).unwrap();
+        assert_eq!(matches_query_partial_jsonb(&q, &bytes2), Some(false));
+
+        // $or with one undecidable sub → None.
+        let q_mixed = query::parse_query(&json!({
+            "$or": [{"city": "London"}, {"name": {"$regex": "^A"}}]
+        }))
+        .unwrap();
+        // city=London fails on the first doc, regex undecidable on the
+        // second → whole $or is undecidable.
+        let v3 = json!({"city": "Berlin", "name": "Alice"});
+        let bytes3 = codec::encode_doc(&v3).unwrap();
+        assert_eq!(matches_query_partial_jsonb(&q_mixed, &bytes3), None);
     }
 
     #[test]
