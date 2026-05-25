@@ -631,6 +631,21 @@ impl Wal {
     /// `<file_name>.<n>` siblings where `<n>` parses as a `u64`; the live
     /// WAL itself and `.tmp`-style siblings are skipped.
     fn scan_sealed_segments(wal_path: &Path) -> Vec<(u64, PathBuf)> {
+        // Fast path: sealed segments are allocated consecutively from 0 by
+        // `seal_locked`, and the engine never deletes the lowest live
+        // segment (only the archiver removes empty ones, and only when
+        // PITR is on — in which case `.0` exists alongside any survivor).
+        // If `<path>.0` isn't there, no segments exist on disk and we can
+        // skip the parent-directory scan. This collapses two read_dir
+        // calls per `BTreeCollection::open` (one from `Wal::open`'s
+        // `scan_max_seal_seq`, one from `replay_wal`'s
+        // `list_sealed_segments`) to two `stat` calls when PITR is off —
+        // the common case. At scale 10K collections in one data dir the
+        // dropped work is O(N²) read_dir entries (~456s observed in the
+        // collection-scale bench).
+        if !Self::sealed_segment_path(wal_path, 0).exists() {
+            return Vec::new();
+        }
         let (parent, prefix) = match (wal_path.parent(), wal_path.file_name()) {
             (Some(p), Some(f)) => (p, format!("{}.", f.to_string_lossy())),
             _ => return Vec::new(),
