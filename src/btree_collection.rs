@@ -85,6 +85,14 @@ pub struct BTreeCollection {
     /// false, every commit fsyncs the WAL — strict durability for ACID.
     lazy_sync: AtomicBool,
     wal: WalBackend,
+    /// WORM phase 2 — engine-level immutability log. None on
+    /// in-memory collections (no place to persist) and during the
+    /// pre-Phase-2 transition window before any worm op has touched
+    /// the collection. update / delete / find_and_modify consult
+    /// `worm.is_locked(doc_id, now)` before applying; locked docs
+    /// surface `Error::DocumentWormLocked` directly out of the
+    /// storage layer.
+    worm: Option<crate::worm::WormSet>,
 }
 
 impl BTreeCollection {
@@ -192,6 +200,12 @@ impl BTreeCollection {
             })
             .collect();
 
+        // Open the WORM log alongside the storage / WAL. Lives in
+        // the same data dir, sibling to `<name>.wal`. Created lazily
+        // on first read — empty file = empty set.
+        let coll_marker = data_dir.join(name);
+        let worm = crate::worm::WormSet::open(&coll_marker).ok();
+
         Ok(Self {
             name: name.to_string(),
             data_dir: data_dir.to_path_buf(),
@@ -209,6 +223,7 @@ impl BTreeCollection {
             dirty: AtomicBool::new(false),
             lazy_sync: AtomicBool::new(false),
             wal: wal_backend,
+            worm,
         })
     }
 
@@ -231,6 +246,7 @@ impl BTreeCollection {
             dirty: AtomicBool::new(false),
             lazy_sync: AtomicBool::new(false),
             wal: WalBackend::Memory,
+            worm: None, // in-memory collections don't persist WORM state
         }
     }
 
@@ -1437,6 +1453,74 @@ impl BTreeCollection {
     }
 
     // -----------------------------------------------------------------------
+    // WORM (engine-level immutability)
+    // -----------------------------------------------------------------------
+
+    /// Lock `doc_id` until `locked_until_micros`. After this returns,
+    /// update / delete / find_and_modify on the doc refuse with
+    /// `Error::DocumentWormLocked`. Pass `crate::worm::INDEFINITE` for
+    /// retention without a wall-clock expiry (release is the only way
+    /// out).
+    ///
+    /// No-op (returns Ok) on in-memory collections — they have no
+    /// place to persist the lock log. Callers in DMS only invoke this
+    /// for on-disk per-tenant docs collections, so the in-memory case
+    /// is a test convenience.
+    pub fn worm_lock(&self, doc_id: DocumentId, locked_until_micros: u64) -> Result<()> {
+        match &self.worm {
+            Some(w) => w.lock(doc_id, locked_until_micros),
+            None => Ok(()),
+        }
+    }
+
+    /// Release a previously-set WORM lock. Admin-only at the wire
+    /// layer (handler.rs gate); this method is the storage path.
+    pub fn worm_release(&self, doc_id: DocumentId) -> Result<()> {
+        match &self.worm {
+            Some(w) => w.release(doc_id),
+            None => Ok(()),
+        }
+    }
+
+    /// Report whether `doc_id` is currently locked at the engine level.
+    /// `now_micros` is the caller's wall-clock reading.
+    pub fn worm_is_locked(&self, doc_id: DocumentId, now_micros: u64) -> bool {
+        match &self.worm {
+            Some(w) => w.is_locked(doc_id, now_micros),
+            None => false,
+        }
+    }
+
+    /// `locked_until_micros` for a doc, or `None` if unlocked. Surfaces
+    /// in admin status views.
+    pub fn worm_locked_until(&self, doc_id: DocumentId) -> Option<u64> {
+        self.worm.as_ref().and_then(|w| w.locked_until(doc_id))
+    }
+
+    /// check_worm_for_ids refuses if any id in the iterator is locked.
+    /// Returns the first locked id as `Error::DocumentWormLocked` —
+    /// callers (update / delete / find_and_modify) hit this before
+    /// touching storage so a rejected mutation leaves no partial state.
+    fn check_worm_for_ids<I: IntoIterator<Item = DocumentId>>(&self, ids: I) -> Result<()> {
+        let worm = match &self.worm {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        let now = crate::pitr::now_micros();
+        for id in ids {
+            if worm.is_locked(id, now) {
+                return Err(Error::DocumentWormLocked {
+                    collection: self.name.clone(),
+                    doc_id: id,
+                    locked_until_micros: worm.locked_until(id).unwrap_or(0),
+                    now_micros: now,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Update
     // -----------------------------------------------------------------------
 
@@ -1530,6 +1614,12 @@ impl BTreeCollection {
         if matches.is_empty() {
             return Ok(Vec::new());
         }
+
+        // WORM phase 2 gate: refuse the entire update batch if any
+        // target is engine-locked. Surfaces before we prepare any
+        // write so the rejection is clean and atomic — no partial
+        // application.
+        self.check_worm_for_ids(matches.iter().map(|(id, _)| *id))?;
 
         // Phase 2: Prepare and validate updates (no lock needed)
         struct UpdateOp {
@@ -1706,6 +1796,9 @@ impl BTreeCollection {
             None => return Ok(None),
         };
 
+        // WORM phase 2 gate before we touch storage.
+        self.check_worm_for_ids(std::iter::once(id))?;
+
         // Apply the operators and bump _version.
         let mut new_data = old_data.clone();
         crate::update::apply_update(&mut new_data, update_json)?;
@@ -1853,6 +1946,10 @@ impl BTreeCollection {
         if ops.is_empty() {
             return Ok(Vec::new());
         }
+
+        // WORM phase 2 gate: refuse the entire delete batch if any
+        // target is locked. Same atomicity contract as update.
+        self.check_worm_for_ids(ops.iter().map(|op| op.id))?;
 
         // Phase 2: Remove from B-tree and update indexes (write locks)
         {

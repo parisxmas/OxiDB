@@ -95,6 +95,20 @@ pub enum Error {
     /// whose semantics may have changed.
     #[error("incompatible on-disk format: {0}")]
     IncompatibleFormat(String),
+
+    /// WORM phase 2 — document is engine-level locked and the
+    /// requested mutation (update / delete / find_and_modify) is
+    /// refused at the storage layer. Distinct from the
+    /// application-level WORMViolation that DMS surfaces from
+    /// CheckMutation; this one fires regardless of whether the
+    /// caller is the DMS API or a direct admin connection.
+    #[error("document is WORM-locked on '{collection}' doc {doc_id} until {locked_until_micros} (now {now_micros})")]
+    DocumentWormLocked {
+        collection: String,
+        doc_id: u64,
+        locked_until_micros: u64,
+        now_micros: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

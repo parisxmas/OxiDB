@@ -1335,6 +1335,30 @@ impl OxiDb {
     /// modified document. The safe primitive for counters — see
     /// `BTreeCollection::find_and_modify`. Always immediate/atomic; it
     /// does not participate in an open transaction.
+    /// WORM phase 2 — engine-level lock. Subsequent update / delete /
+    /// find_and_modify on `doc_id` return `Error::DocumentWormLocked`
+    /// until `worm_release` clears the lock OR `locked_until_micros`
+    /// passes. `crate::worm::INDEFINITE` is the sentinel for
+    /// "never time-expire". Idempotent on equal-value locks; refuses
+    /// to LOWER an existing lock (operator intent: tighten only).
+    pub fn worm_lock(&self, collection: &str, doc_id: u64, locked_until_micros: u64) -> Result<()> {
+        let col = self.get_or_create_collection(collection)?;
+        col.worm_lock(doc_id, locked_until_micros)
+    }
+
+    /// WORM phase 2 — clear an engine-level lock. Admin-gated at the
+    /// wire layer; this is the storage path.
+    pub fn worm_release(&self, collection: &str, doc_id: u64) -> Result<()> {
+        let col = self.get_or_create_collection(collection)?;
+        col.worm_release(doc_id)
+    }
+
+    /// `locked_until_micros` for the doc, or 0 if not locked.
+    pub fn worm_locked_until(&self, collection: &str, doc_id: u64) -> Result<u64> {
+        let col = self.get_or_create_collection(collection)?;
+        Ok(col.worm_locked_until(doc_id).unwrap_or(0))
+    }
+
     pub fn find_and_modify(
         &self,
         collection: &str,

@@ -491,6 +491,56 @@ func (c *Client) FindAndModify(collection string, query, update map[string]any) 
 	return nil, &Error{Msg: fmt.Sprintf("find_and_modify: unexpected response %T", data)}
 }
 
+// ------------------------------------------------------------------
+// WORM phase 2 (engine-level immutability)
+// ------------------------------------------------------------------
+
+// WormIndefinite is the sentinel for "no time expiry" — used as
+// lockedUntilMicros when the operator wants the lock to outlive any
+// wall-clock retention window (legal hold, indefinite WORM).
+const WormIndefinite uint64 = 0xFFFFFFFFFFFFFFFF
+
+// WormLock pins a single document at the engine layer. Subsequent
+// Update / Delete / FindAndModify on (collection, docID) return an
+// error from the server (Error{Msg: "document is WORM-locked ..."}).
+// Idempotent on equal-value locks; refuses to LOWER an existing
+// lock.
+func (c *Client) WormLock(collection string, docID uint64, lockedUntilMicros uint64) error {
+	_, err := c.checked(map[string]any{
+		"cmd": "worm_lock", "collection": collection,
+		"doc_id": docID, "locked_until_micros": lockedUntilMicros,
+	})
+	return err
+}
+
+// WormRelease clears the engine-level lock on (collection, docID).
+// Admin-only operation at the wire layer.
+func (c *Client) WormRelease(collection string, docID uint64) error {
+	_, err := c.checked(map[string]any{
+		"cmd": "worm_release", "collection": collection, "doc_id": docID,
+	})
+	return err
+}
+
+// WormStatus returns the locked_until_micros for a doc, or 0 if the
+// doc is not currently locked. Read-only.
+func (c *Client) WormStatus(collection string, docID uint64) (uint64, error) {
+	data, err := c.checked(map[string]any{
+		"cmd": "worm_status", "collection": collection, "doc_id": docID,
+	})
+	if err != nil {
+		return 0, err
+	}
+	m, ok := data.(map[string]any)
+	if !ok {
+		return 0, &Error{Msg: fmt.Sprintf("worm_status: unexpected response %T", data)}
+	}
+	if v, ok := m["locked_until_micros"].(float64); ok {
+		return uint64(v), nil
+	}
+	return 0, nil
+}
+
 // Delete deletes documents matching a query.
 func (c *Client) Delete(collection string, query map[string]any) (map[string]any, error) {
 	data, err := c.checked(map[string]any{

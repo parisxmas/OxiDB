@@ -356,6 +356,64 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        "worm_lock" => {
+            // WORM phase 2 admin op — engine-level immutability.
+            // RBAC is enforced by the caller (handler dispatch
+            // gates admin commands separately). This branch is the
+            // pure storage path: locks `doc_id` on `collection`
+            // until `locked_until_micros` (u64::MAX = indefinite).
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let doc_id = match request.get("doc_id").and_then(|v| v.as_u64()) {
+                Some(v) => v,
+                None => return err_bytes("missing or invalid 'doc_id' (u64)"),
+            };
+            let until = match request.get("locked_until_micros").and_then(|v| v.as_u64()) {
+                Some(v) => v,
+                None => return err_bytes("missing or invalid 'locked_until_micros' (u64)"),
+            };
+            match db.worm_lock(col, doc_id, until) {
+                Ok(()) => ok_bytes(json!({"locked": true, "doc_id": doc_id, "locked_until_micros": until})),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "worm_release" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let doc_id = match request.get("doc_id").and_then(|v| v.as_u64()) {
+                Some(v) => v,
+                None => return err_bytes("missing or invalid 'doc_id' (u64)"),
+            };
+            match db.worm_release(col, doc_id) {
+                Ok(()) => ok_bytes(json!({"released": true, "doc_id": doc_id})),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        "worm_status" => {
+            // Read-only: surface `locked_until_micros` for a doc.
+            // 0 means "not locked". Operators use this from the
+            // admin UI / status endpoint without needing to attempt
+            // a doomed write.
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let doc_id = match request.get("doc_id").and_then(|v| v.as_u64()) {
+                Some(v) => v,
+                None => return err_bytes("missing or invalid 'doc_id' (u64)"),
+            };
+            match db.worm_locked_until(col, doc_id) {
+                Ok(until) => ok_bytes(json!({"doc_id": doc_id, "locked_until_micros": until})),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         "find_and_modify" => {
             let col = match collection.as_deref() {
                 Some(c) => c,

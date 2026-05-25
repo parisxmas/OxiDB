@@ -55,6 +55,7 @@ pub mod storage;
 pub mod value;
 pub mod vector;
 pub mod wal;
+pub mod worm;
 
 pub use change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
 pub use collection::{Collection, CompactStats, IndexInfo};
