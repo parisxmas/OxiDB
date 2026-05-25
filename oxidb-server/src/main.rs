@@ -99,6 +99,16 @@ fn dispatch_request(
         .map(|s| s.to_string());
 
     // ---------------------------------------------------------------
+    // HELLO handshake — pre-auth, idempotent, returns server info.
+    // Matches async_server::dispatch_request; both standalone and
+    // cluster paths must surface HELLO so clients can negotiate wire
+    // version + feature discovery before any auth state matters.
+    // ---------------------------------------------------------------
+    if cmd == "hello" {
+        return oxidb_server::hello::handle(request, session, state.auth_enabled);
+    }
+
+    // ---------------------------------------------------------------
     // Authentication flow (SCRAM-SHA-256)
     // ---------------------------------------------------------------
     if state.auth_enabled && !session.is_authenticated() {

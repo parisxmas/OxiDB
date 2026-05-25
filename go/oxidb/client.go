@@ -159,6 +159,95 @@ func (c *Client) Ping() (string, error) {
 	return s, nil
 }
 
+// ServerInfo is the negotiated state returned by HELLO. See
+// oxidb-server's hello.rs (ADR-0003 Phase 2) for the response shape.
+type ServerInfo struct {
+	Name                  string
+	Version               string
+	WireVersion           uint32
+	SupportedWireVersions []uint32
+	StableSurfaceVersion  string
+	Features              []string
+	ExperimentalFeatures  []string
+	AuthMethods           []string
+}
+
+// Hello performs the OxiWire HELLO handshake: negotiates the wire
+// version and learns which engine features the server has compiled in.
+// Pre-auth, idempotent — safe to call at any point in the connection,
+// does not affect auth state.
+//
+// Supported by oxidb-server v0.28.13+. Older servers will reject "hello"
+// as an unknown command; the caller can treat that as "wire v1, unknown
+// feature surface".
+func (c *Client) Hello() (*ServerInfo, error) {
+	resp, err := c.request(map[string]any{
+		"cmd":           "hello",
+		"wire_versions": []uint32{1},
+	})
+	if err != nil {
+		return nil, err
+	}
+	ok, _ := resp["ok"].(bool)
+	if !ok {
+		errMsg, _ := resp["error"].(string)
+		if errMsg == "" {
+			errMsg = "hello failed"
+		}
+		return nil, &Error{Msg: errMsg}
+	}
+	server, _ := resp["server"].(map[string]any)
+	if server == nil {
+		return nil, fmt.Errorf("oxidb: hello: missing 'server' field in response")
+	}
+	info := &ServerInfo{}
+	if v, ok := server["name"].(string); ok {
+		info.Name = v
+	}
+	if v, ok := server["version"].(string); ok {
+		info.Version = v
+	}
+	if v, ok := server["wire_version"].(float64); ok {
+		info.WireVersion = uint32(v)
+	}
+	if v, ok := server["stable_surface_version"].(string); ok {
+		info.StableSurfaceVersion = v
+	}
+	info.SupportedWireVersions = readU32Array(server["supported_wire_versions"])
+	info.Features = readStringArray(server["features"])
+	info.ExperimentalFeatures = readStringArray(server["experimental_features"])
+	info.AuthMethods = readStringArray(server["auth_methods"])
+	return info, nil
+}
+
+func readU32Array(v any) []uint32 {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]uint32, 0, len(arr))
+	for _, x := range arr {
+		if n, ok := x.(float64); ok {
+			out = append(out, uint32(n))
+		}
+	}
+	return out
+}
+
+func readStringArray(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, x := range arr {
+		if s, ok := x.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // BucketFTSSize returns the bytes of indexed text attributable to a single
 // blob bucket. Useful for per-tenant FTS storage accounting (DMS quota).
 // Result is approximate for indexes written before the per-doc text_bytes
