@@ -107,6 +107,12 @@ case "$BENCH_MODE" in
     both)      run_host; run_innetwork ;;
 esac
 
+# ── Resource snapshot ────────────────────────────────────────────────
+# Capture container memory + disk *before* teardown. The in-network
+# runner has no docker CLI, so TestResourceUsage gets skipped on that
+# path; this hook fills the gap from the host side.
+bash "$(dirname "$0")/resource-snapshot.sh" || true
+
 # ── Cleanup ──────────────────────────────────────────────────────────
 echo -e "${CYAN}Stopping containers...${RESET}"
 docker compose down -v --remove-orphans 2>/dev/null || true
