@@ -3,6 +3,11 @@ name = "oxidb-app"
 version = "0.3.0"
 edition = "2024"
 
+# Keep this Tauri app outside the main OxiDB workspace — its Tauri
+# dep tree conflicts with the workspace's resolver. Empty `[workspace]`
+# means "I am my own workspace root."
+[workspace]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
