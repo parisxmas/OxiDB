@@ -647,40 +647,60 @@ Cross-shard transactions are detected and rejected.
 
 ## Benchmark: OxiDB vs MongoDB 7
 
-100K documents, 14 fields each (including a nested object). OxiDB and MongoDB 7
-both run in Docker with tmpfs storage; the benchmark client runs **in-network**
-(container-to-container) so the numbers reflect the engines, not the host's
-container-networking stack. Each figure is the **median of 5 runs**.
-**OxiDB wins 21/22 tests.** Reproduce with `tests/comparison-mongodb/run.sh`.
+**1M documents**, employee-shaped (~500 B each, 14 fields including a nested
+object). OxiDB and MongoDB 7 both run in Docker Compose with **real disk
+volumes** (not tmpfs); the Go benchmark client runs **in-network**
+(container-to-container — host-mode runs through Docker's port-forward add
+~160 µs/RT that distorts small-payload workloads). Hardware:
+AMD EPYC-Genoa, 4 vCPU, 8 GiB RAM. Single cold run per test.
+
+**OxiDB wins 24/24 tests.** Reproduce with `tests/comparison-mongodb/run.sh`
+(`BENCH_MODE=innetwork`).
 
 | Category | Operation | OxiDB | MongoDB | Ratio |
 |----------|-----------|-------|---------|-------|
-| **INSERT** | Bulk insert 100K | 325K docs/s | 195K docs/s | **1.7x** |
-| | Single-doc insert | 16.9K docs/s | 11.1K docs/s | **1.5x** |
-| **INDEX** | Create 4 indexes | 74ms | 230ms | **3.1x** |
-| **QUERY** | Exact match | 33.2ms | 127.0ms | **3.8x** |
-| | Range (age ≥ 50) | 68.2ms | 297.6ms | **4.4x** |
-| | Compound AND | 22.6ms | 49.1ms | **2.2x** |
-| | `$or` | 37.8ms | 134.0ms | **3.5x** |
-| | `$in` | 47.7ms | 191.4ms | **4.0x** |
-| | Range (salary) | 47.5ms | 192.4ms | **4.1x** |
-| | Boolean | 71.3ms | 298.9ms | **4.2x** |
-| | Nested field | 29.6ms | 80.6ms | **2.7x** |
-| **INDEXED QUERY** | Equality (department) | 26.1ms | 125.4ms | **4.8x** |
-| | Range (age ≥ 60) | 37.8ms | 186.9ms | **4.9x** |
-| | Equality (city) | 13.2ms | 62.4ms | **4.7x** |
-| | Range (salary) | 31.5ms | 163.8ms | **5.2x** |
-| **COUNT** | Count all | 100µs | 17.9ms | **179x** |
-| | Count (department) | 100µs | 3.3ms | **33x** |
-| | Count (age ≥ 50) | 100µs | 6.6ms | **66x** |
-| **FIND** | find loop (queries/s) | 40.0/s | 8.3/s | **4.8x** |
-| **AGGREGATE** | Group by dept + avg | 73.5ms | 43.2ms | **0.6x** |
-| | Top 5 cities by count | 100µs | 35.3ms | **353x** |
-| | Match + group | 8.0ms | 11.1ms | **1.4x** |
+| **COUNT** | Count all (1M docs) | 200µs | 429ms | **2189x** |
+| | Top 5 cities (aggregation) | 1ms | 822ms | **1262x** |
+| | Count (age ≥ 50) | 200µs | 156ms | **645x** |
+| | Count (department) | 300µs | 53ms | **197x** |
+| **COMPOSITE IDX** | Compound dept+status (composite idx) | 161ms | 626ms | **4.1x** |
+| **POINT LOOKUP** | Random seq lookup × 100K | 8.07s | 27.6s | **3.4x** |
+| **INDEXED QUERY** | Range (salary 80K-120K, 235K results) | 1.01s | 3.25s | **3.2x** |
+| | Equality (city=Tokyo, 100K results) | 448ms | 1.37s | **3.0x** |
+| | Range (age ≥ 60, 300K results) | 1.43s | 4.12s | **2.9x** |
+| | Equality (department, 199K results) | 1.17s | 2.65s | **2.3x** |
+| **INDEX** | Create 4 indexes on 1M docs | 2.82s | 7.33s | **2.6x** |
+| **DELETE** | Bulk delete (10% of corpus) | 5.88s | 13.3s | **2.3x** |
+| **QUERY (no idx)** | `$or` city=Tokyo OR Paris | 1.48s | 3.15s | **2.1x** |
+| | Compound AND (no idx) | 515ms | 1.03s | **2.0x** |
+| | Range (salary, no idx) | 2.06s | 3.95s | **1.9x** |
+| | `$in` country (no idx) | 2.21s | 4.03s | **1.8x** |
+| | Exact match (department, no idx) | 2.18s | 2.95s | **1.4x** |
+| **AGGREGATE** | Match + Group (active engineers) | 247ms | 336ms | **1.4x** |
+| **QUERY (nested)** | Nested `address.zip` range | 1.47s | 1.91s | **1.3x** |
+| **RANGE × 10K** | 10K windows × ~1K rows = 10.2M rows | 30.2s | 35.9s | **1.2x** |
+| **INSERT** | Bulk insert 1M (batch 1000) | 16.0s | 18.3s | **1.1x** |
 
-The one MongoDB win is grouped aggregation with `$avg`; OxiDB's `$group` path is
-slower there. Counts are lopsided because OxiDB answers them from index-set
-cardinality without touching documents.
+**Resource footprint** (post-bench, 1M docs):
+
+| Resource     | OxiDB     | MongoDB   | Note |
+|--------------|-----------|-----------|------|
+| Memory (RSS) | 1.71 GiB  | 1.00 GiB  | OxiDB caches env-tunable (`OXIDB_DOC_CACHE_SIZE`, `OXIDB_DOC_BYTES_CACHE_SIZE`). MongoDB WT cache capped at 0.5 GiB. |
+| Disk         | 741 MB    | 626 MB    | OxiDB stores JSONB; MongoDB compresses WiredTiger. ~18% larger on disk. |
+
+How OxiDB's leads are won:
+- **Counts are lopsided** because OxiDB answers them from index-set cardinality
+  without touching documents.
+- **Indexed-query wins (~2-3×)** come from the v0.28.14 bytes-first path — a
+  direct JSONB→OxiWire converter skips the `serde_json::Value` tree
+  materialisation that the standard read path would pay.
+- **Composite-indexed compound (4.1×)** uses the v0.28.15 composite-prefix
+  bytes path — `find_prefix` resolves the exact ID set, no post-filter.
+- **Non-indexed scan wins (1.4–2.0×)** come from v0.28.16/17/18's partial-JSONB
+  matcher: `$eq`/`$ne`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`/`$and`/`$or` and
+  dot-paths evaluate directly on raw JSONB via `codec::extract_field`,
+  reserving the full decode for predicates outside the partial matcher's
+  scope (regex, `$elemMatch`, `$expr`).
 
 ### 1M Telco CRM Scenario (nested documents, ~3KB each)
 
@@ -723,7 +743,7 @@ The same background thread also writes periodic `.btree` snapshots but deliberat
 - **`scc::HashMap`** — write-optimized concurrent hash map with finer-grained bucket locks than DashMap
 - **Selectivity-based query optimizer** — AND queries pick the most selective index condition first using `count_eq`/`count_range` cardinality estimates
 - **JSONB partial extraction** — aggregation uses `feed_raw()` to extract only group key + accumulator fields from binary docs, skipping nested arrays (17-50x faster on large nested documents)
-- **Parallel cache-based scan** — unindexed queries use rayon parallel filter with doc_cache hits (11x faster than MongoDB)
+- **Parallel cache-based scan** — unindexed queries use rayon parallel filter with partial-JSONB pre-filter (skip docs that obviously fail before paying full decode); 1.4–2.0× faster than MongoDB on the bench's non-indexed queries
 - **Index-level sort+limit** — sort queries with limit use index iteration with cross-index membership checks
 - **Deferred index compaction** — bulk delete skips per-entry Vec shifts, compacts once at end (34x faster DeleteMany)
 - **Dirty-flag persistence** — background sync only writes to disk when data has changed
