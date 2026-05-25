@@ -1,5 +1,223 @@
 # Changelog
 
+## v0.28.18
+
+### `$or` + dot-paths in the partial-JSONB matcher
+
+Final two MongoDB-winning tests in `tests/comparison-mongodb` (1M docs)
+flip with this. `matches_query_partial_jsonb`:
+
+- **`Query::Or`** — short-circuits on the first `Some(true)`; returns
+  `Some(false)` when all definite subs miss; returns `None` when any
+  sub is undecidable so the caller can fall back to full decode.
+- **Dot-paths** — new `extract_field_path` walks the first segment via
+  `codec::extract_field` (JSONB-bytes fast path) then chains `Value`
+  navigation for nested segments. `address.zip` and friends now match
+  partially.
+
+Bench (vs v0.28.17):
+- `$or city=Tokyo OR Paris`:   3.16s → 1.48s (−53%; flips to OxiDB 2.1× win)
+- Nested `address.zip` range: 2.71s → 1.47s (−46%; flips to OxiDB 1.3× win)
+
+Win count: **OxiDB 24 / MongoDB 0** at 1M docs.
+
+### Versions
+
+- `oxidb-server`: 0.28.17 → 0.28.18
+
+## v0.28.17
+
+### Partial-JSONB pre-filter on the find full-scan path
+
+`find_with_options_arcs`'s no-index branch used to call `load_doc_arc`
+on every doc in the collection — a full JSONB → `serde_json::Value`
+decode at ~20 µs/doc just to evaluate the filter on the rejected
+majority. The rayon `par_iter` (and wasm sequential) loop now routes
+through `matches_query_partial_jsonb` first: ~5 µs partial extract on
+raw JSONB bytes, with the full decode reserved for the docs that pass.
+
+Same closure logic as v0.28.16's aggregate_streaming path, reused via
+a local `filter_one` closure: `Some(false)` → skip,
+`Some(true)` → materialise Arc (no redundant `matches_value` re-check),
+`None` → full decode + `matches_value`.
+
+Bench (vs v0.28.16, 1M docs, full-scan queries):
+- Compound (dept=Sales AND status=active):  3.25s → 515 ms (−84%; FLIP)
+- `$in` country:                            4.48s → 2.21s (−51%; FLIP)
+- Exact match dept=Engineering:             4.31s → 2.18s (−49%; FLIP)
+- Range (salary 50K-100K):                  3.63s → 2.06s (−43%)
+- Range (age ≥ 50):                         6.62s → 4.37s (−34%)
+- Boolean (verified=true):                  4.92s → 3.72s (−24%)
+
+### Versions
+
+- `oxidb-server`: 0.28.16 → 0.28.17
+
+## v0.28.16
+
+### Partial-JSONB post-filter in `aggregate_streaming`
+
+When the leading `$match` of an aggregation pipeline can't be fully
+satisfied by an index (e.g. `department` has a field index but
+`status` doesn't), the streaming path historically called
+`load_doc_arc` on every over-approximation candidate to run the
+residual filter — a full JSONB → `serde_json::Value` decode at
+~20 µs/doc.
+
+Now the slow path tries a partial-JSONB matcher first:
+```rust
+matches_query_partial_jsonb(query, raw_jsonb_bytes) -> Option<bool>
+```
+Handles top-level `$eq`, `$ne`, `$gt`/`$gte`/`$lt`/`$lte`, `$in` with
+`codec::extract_field` (single-key extract straight off JSONB, no
+full decode). Anything outside that set (dot-paths, `$regex`,
+`$elemMatch`, `$expr`, `$or`, `$nor`, `$not`, ...) returns `None` and
+the caller falls back to full decode.
+
+Bench (vs v0.28.15, 1M docs, `Match + Group` active engineers):
+- OxiDB:    1.58 s → 213 ms   (−86%; 7.4× faster)
+- Verdict:  4.9× MongoDB win → 1.6× OxiDB win (FLIP).
+
+### Versions
+
+- `oxidb-server`: 0.28.15 → 0.28.16
+
+## v0.28.15
+
+### Bytes-first composite-index path
+
+Extends `find_oxiwire_bytes` to recognise queries that are exactly
+covered by a composite index's fields, and routes them through
+`CompositeIndex::find_prefix` for direct ID resolution. The previous
+single-field-only path missed this case: a multi-field equality query
+fell through to the Value-based fallback even when a composite index
+could satisfy it natively.
+
+New helper `try_composite_lookup`:
+- Verifies query is pure AND-of-`$eq` via `extract_eq_conditions` +
+  `is_eq_only_on` (no `$gt`/`$in`/regex/etc.).
+- For each registered composite index, checks that its `fields`
+  exactly cover the query's eq-field set (order-independent).
+- Builds the prefix vec in index field order and calls `find_prefix`.
+
+Bench (vs v0.28.14, composite-indexed `dept=Sales AND status=active`):
+- OxiDB:   2.07 s → 157 ms   (−92%; 13× faster)
+- Verdict: 2.8× MongoDB win → 4.1× OxiDB win (FLIP).
+
+### Versions
+
+- `oxidb-server`: 0.28.14 → 0.28.15
+
+## v0.28.14
+
+### Bytes-first find path for OxiWire responses
+
+Closes the JSONB → `Value` materialisation bottleneck on the find →
+wire pipeline. For queries fully satisfied by an index (no post-filter,
+no sort/skip/limit), the engine now streams pre-encoded OxiWire bytes
+directly from storage instead of materializing a `serde_json::Value`
+tree per row.
+
+New modules:
+- `src/jsonb_oxiwire.rs`: direct JSONB → OxiWire byte converter built
+  on a custom serde Visitor + DeserializeSeed. Walks JSONB once and
+  emits OxiWire tags inline; never constructs Value. 7 roundtrip tests.
+- `src/doc_bytes_cache.rs`: per-collection sharded LRU of `Arc<[u8]>`;
+  env-tunable capacity (`OXIDB_DOC_BYTES_CACHE_SIZE`, default 1M).
+- `src/wire_oxiwire.rs`: engine-local copy of the OxiWire encoder
+  (byte-compatible with `oxidb-server/src/oxiwire.rs`) for the
+  `doc_cache.peek` warm path that re-encodes from Value.
+
+`BTreeCollection::load_doc_oxiwire_bytes` — 3-tier lookup:
+- `bytes_cache` hit       → return cached `Arc<[u8]>`
+- `doc_cache.peek` hit    → encode Value, cache, return
+- cold                    → pread JSONB, jsonb→oxiwire, cache, return
+
+`BTreeCollection::find_oxiwire_bytes` — returns `Some(Ok(_))` only when
+`query::is_fully_indexed` is true AND `execute_indexed` yields a
+candidate ID set; returns `None` to fall through to the Value path.
+Bytes-cache invalidation hooks added at every `doc_cache` mutation site.
+
+`doc_cache::DEFAULT_CAPACITY` const → env-tunable `default_capacity()`
+function (`OXIDB_DOC_CACHE_SIZE`). Const kept as a legacy alias.
+
+Bench (vs v0.28.13, 1M docs):
+- Indexed: dept=Engineering   2.60s → 1.18s   (−55%)
+- Indexed: age ≥ 60           3.87s → 1.52s   (−61%)
+- Indexed: city=Tokyo         0.99s → 0.49s   (−50%)
+- Indexed: salary range       2.67s → 1.06s   (−61%)
+- Range query 10K windows  128.91s → 31.26s   (−76%, flips: now beats Mongo)
+
+Net win count: OxiDB 17 / MongoDB 7 (was 16/8).
+
+### Versions
+
+- `oxidb-server`: 0.28.13 → 0.28.14
+
+## v0.28.13
+
+### 1.0 prep: Phases 2 + 3 + 5 + Phase 4 carryover
+
+A focused tranche of 1.0 prep landings — does not change the engine
+surface, adds versioning + discovery hooks across the wire protocols
+and the client SDK story.
+
+**Phase 2 — Wire handshake** ([ADR-0003](docs/decisions/0003-1.0-stability-scope.md)):
+- `oxidb-server/src/hello.rs` (new): OxiWire `HELLO` handler. `cmd: "hello"`
+  returns server-info + features + auth methods, picks the highest
+  mutually-supported wire version, pre-auth + idempotent.
+- `session.rs`: `wire_version` field.
+- `async_server.rs`: dispatch `HELLO` before the auth check.
+- `rest/mod.rs`: `/v1/` URL prefix + `GET /v1/hello` discovery endpoint;
+  legacy bare paths still route during the deprecation window.
+- `ws.rs`: RFC 6455 `Sec-WebSocket-Protocol: oxidb.v1` negotiation;
+  clients without the header still connect (backward-compat).
+- [`docs/format/compat-matrix.md`](docs/format/compat-matrix.md):
+  cross-version compat matrix + per-protocol negotiation rules.
+
+**Phase 3 — Client SDK freeze** (scaffold; Python as the template):
+- `python/scripts/generate_api_snapshot.py`: `inspect`-based introspection.
+- `python/scripts/check_api_snapshot.py`: CI gate; unified-diff on mismatch.
+- `python/api/v1.json`: ~68 public symbols captured (1008 lines).
+- [`docs/PHASE3-SDK-FREEZE.md`](docs/PHASE3-SDK-FREEZE.md): pattern doc
+  + per-client introspection-mechanism table for the remaining 9
+  Tier-A clients.
+
+**Phase 4 — `oxidb migrate` CLI scaffold**:
+- `oxidb-cli/src/migrate.rs` (new, ~340 LOC) — magic-byte sniffer for
+  OXWA/OXTX/OXBT/OXIX + blob `.meta` JSON. Walks data dir, classifies
+  each file as `Current(v)` / `Older(v)` / `Newer(v)` / `Legacy` /
+  `Unreadable`. `run()` validates, refuses on `Newer`, errors on
+  `Older` (no v1→v2 paths registered yet).
+- New subcommands: `oxidb migrate inspect --data <PATH>` and
+  `oxidb migrate run --data <PATH>` (with `--dry-run`, `--no-backup`,
+  `--in-place`, `--out` flags).
+- Existing REPL/eval entrypoint preserved via clap's optional-subcommand
+  pattern.
+
+**Phase 5 — Policy docs** (operationalises [ADR-0004](docs/decisions/0004-phase-0-answers.md)):
+- [`docs/SEMVER.md`](docs/SEMVER.md): patch/minor/major rules + the
+  additive vs breaking change list.
+- [`docs/STABILITY.md`](docs/STABILITY.md): the 1.0 stable surface +
+  experimental subsystems + Tier-A/B clients + 5-criterion promotion
+  bar.
+- [`docs/DEPRECATION.md`](docs/DEPRECATION.md): notice-period table +
+  4-announcement requirements + reserved-name special case.
+- [`docs/SECURITY.md`](docs/SECURITY.md): GitHub Security Advisories
+  channel + 3-day ack / 90-day disclosure + supported-versions
+  backport matrix.
+- `docs/README.md` indexed all four under "1.0 release policy".
+
+### Versions
+
+- `oxidb-server`: 0.28.12 → 0.28.13
+
+<!-- Gap: v0.25.27 → v0.28.12 entries are not in this file. Major work
+     in that range: PRs #42–#76 (CERN-grade testing program, 9 fuzz
+     targets, 7 DoS bugs found+fixed, audit rotation by size/age/
+     calendar-aligned UTC/gzip). Captured in the GitHub release notes
+     for v0.28.12 (auto-generated). -->
+
 ## v0.25.26
 
 ### `find_and_modify` — atomic single-document read-modify-write
