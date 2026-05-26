@@ -31,7 +31,7 @@ db = OxiDbClient("127.0.0.1", 4444)</code></pre>
       <div class="client-card">
         <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
         <h3>Go <span class="version-badge latest">v0.25.1</span></h3>
-        <p>Native Go client with OxiWire binary protocol. v0.25.1 added stored procedures, TTL indexes, retention policies, alerting, blob text extraction, backup/restore, and SQL dialect switching.</p>
+        <p>Native Go client with OxiWire binary protocol. Stored procedures, TTL indexes, retention policies, alerting, blob text extraction, and backup/restore.</p>
         <pre><code>import "oxidb"
 client, _ := oxidb.ConnectDefault()
 client.UseOxiWire()
@@ -44,10 +44,9 @@ client.CallProcedure(<span class="str">"name"</span>, args)
 client.CreateTTLIndex(<span class="str">"sessions"</span>, <span class="str">"created_at"</span>, <span class="num">3600</span>)
 client.SetRetention(<span class="str">"events"</span>, <span class="num">30</span>)
 
-<span class="co">// Alerting · Backup · Dialect</span>
+<span class="co">// Alerting · Backup</span>
 client.CreateAlert(rule)
-client.Backup(path)
-client.SetDialect(<span class="str">"postgresql"</span>)</code></pre>
+client.Backup(path)</code></pre>
       </div>
 
       <div class="client-card">
@@ -65,16 +64,9 @@ client.SetDialect(<span class="str">"postgresql"</span>)</code></pre>
       </div>
 
       <div class="client-card">
-        <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div>
-        <h3>.NET (EF Core) <span class="version-badge latest">v0.28.18</span></h3>
-        <p>Entity Framework Core provider. LINQ, migrations, both TCP and embedded modes. Works against either <code>OxiDb.Client.Tcp</code> or <code>OxiDb.Client.Embedded</code> as the transport.</p>
-        <pre><code>dotnet add package OxiDb.EntityFrameworkCore</code></pre>
-      </div>
-
-      <div class="client-card">
         <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
-        <h3>.NET (LINQ) <span class="version-badge latest">v0.28.18 NEW</span></h3>
-        <p>Standalone LINQ provider over <code>IOxiDbClient</code>. <code>client.GetCollection&lt;T&gt;("users").Where(u =&gt; u.Age &gt;= 18).ToListAsync()</code>. Translates expression trees to OxiWire queries; doesn&apos;t require EF Core.</p>
+        <h3>.NET (LINQ) <span class="version-badge latest">v0.28.18</span></h3>
+        <p>Standalone LINQ provider over <code>IOxiDbClient</code>. <code>client.GetCollection&lt;T&gt;("users").Where(u =&gt; u.Age &gt;= 18).ToListAsync()</code>. Translates expression trees to OxiWire document queries — no SQL, no EF Core.</p>
         <pre><code>dotnet add package OxiDb.Linq</code></pre>
       </div>
 

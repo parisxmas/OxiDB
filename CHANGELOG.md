@@ -1,12 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### SQL surface removed — OxiDB is a document database
+
+The engine SQL surface (`oxidb::sql`, `SqlDialect`, `SqlResult`, `execute_sql`),
+the PostgreSQL wire listener (`oxidb-server::pg_wire`), the JDBC driver
+(`oxidb-jdbc/`), and the EF Core provider (`dotnet/OxiDb.EntityFrameworkCore/`)
+have all been deleted. The `cmd: "sql"` over TCP, REST `/sql`, and WebSocket
+`sql` endpoints now return errors. NuGet `OxiDb.EntityFrameworkCore` is
+deprecated; use `OxiDb.Linq` for typed query syntax. SQL benchmark/comparison
+directories (`tests/comparison-sqlite`, `tests/comparison-efcore`,
+`tests/efcore-*`, `examples/bench_vs_sqlite.rs`) removed alongside.
+
 ## v0.28.18
 
 ### .NET clients — developer-friendly rework
 
-Four NuGet packages published at v0.28.18 (`OxiDb.Client.Tcp`,
-`OxiDb.Client.Embedded`, `OxiDb.EntityFrameworkCore`, and **NEW:
-`OxiDb.Linq`** — previously source-only).
+Three published NuGet packages at v0.28.18 (`OxiDb.Client.Tcp`,
+`OxiDb.Client.Embedded`, and **NEW: `OxiDb.Linq`** — previously
+source-only).
 
 New on the .NET TCP client (all backward-compatible):
 
@@ -26,10 +39,6 @@ New on the .NET TCP client (all backward-compatible):
 - **DI integration:** `services.AddOxiDbTcp(opts => opts.Host(...))`.
 - **Type-safe query builder:** `Query.Eq/Gte/Lt/In/And/Or/Range/...`
   for runtime-constructed queries.
-
-EF Core: `dotnet/OxiDb.EntityFrameworkCore/EF1001-AUDIT.md` lists the
-one internal-API use (identity resolution via `IStateManager`) and
-the planned migration paths. EF1001 cleanup is a follow-up.
 
 ### `$or` + dot-paths in the partial-JSONB matcher
 

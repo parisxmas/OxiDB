@@ -43,7 +43,6 @@ pub mod pipeline;
 pub mod procedure;
 pub mod query;
 pub mod scheduler;
-pub mod sql;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stripe;
 pub mod transaction;
@@ -66,7 +65,6 @@ pub use engine::{BackupInfo, LogCallback, OxiDb, PitrRestoreInfo, RestoreInfo};
 #[cfg(not(target_arch = "wasm32"))]
 pub use pitr::PitrTarget;
 pub use error::{Error, Result};
-pub use sql::{execute_sql, execute_sql_with_db_manager, execute_sql_with_dialect, SqlDialect, SqlResult};
 #[cfg(not(target_arch = "wasm32"))]
 pub use tx_log::TransactionId;
 #[cfg(target_arch = "wasm32")]

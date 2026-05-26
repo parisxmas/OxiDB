@@ -1,18 +1,19 @@
 # OxiDB .NET Clients
 
-Three published NuGet packages + two helper libraries cover the
-.NET integration story:
+OxiDB is a **document database** — these clients speak the OxiWire document protocol directly; there is no SQL or EF Core provider.
 
 | Package | What it does | NuGet | Target |
 |---|---|---|---|
 | **`OxiDb.Client.Tcp`** | Pure-managed TCP/OxiWire client | `dotnet add package OxiDb.Client.Tcp` | `net10.0` |
 | **`OxiDb.Client.Embedded`** | Embedded FFI client (no server) | `dotnet add package OxiDb.Client.Embedded` | `net10.0` |
-| **`OxiDb.EntityFrameworkCore`** | EF Core provider | `dotnet add package OxiDb.EntityFrameworkCore` | `net10.0` |
-| **`OxiDb.Linq`** | LINQ provider over either client | `dotnet add package OxiDb.Linq` *(0.28.18+)* | `net10.0` |
+| **`OxiDb.Linq`** | LINQ provider over either client | `dotnet add package OxiDb.Linq` | `net10.0` |
 | `OxiDb.Client.S3` | S3-API client (multi-target) | — | `net9.0; net10.0` |
 
 All packages ship at the same version as the server (`0.28.18`), bumped
 together via `dotnet/Directory.Build.props`.
+
+> `OxiDb.EntityFrameworkCore` has been **discontinued** — OxiDB does not
+> expose a SQL surface; use `OxiDb.Linq` for typed queries instead.
 
 ## 60-second start (TCP)
 
@@ -124,23 +125,6 @@ These mix freely with anonymous-object literals — the typed helpers
 return `Dictionary<string, object?>` which the wire layer already
 accepts.
 
-## EF Core
-
-```csharp
-public class AppDb : DbContext
-{
-    public DbSet<User> Users => Set<User>();
-
-    protected override void OnConfiguring(DbContextOptionsBuilder options) =>
-        options.UseOxiDb("Host=127.0.0.1;Port=4444");
-}
-```
-
-The EF Core provider currently emits `EF1001` warnings for one
-internal-API use (identity resolution). See
-[`OxiDb.EntityFrameworkCore/EF1001-AUDIT.md`](OxiDb.EntityFrameworkCore/EF1001-AUDIT.md)
-for the planned migration to public surface.
-
 ## Roadmap (Phase 3 — 1.0 SDK freeze)
 
 - `api/v1.json` surface snapshot per client + CI diff gate
@@ -149,4 +133,3 @@ for the planned migration to public surface.
   `[OxiCollection]`-tagged records into compile-time-translated
   queries. Currently a stub; full LINQ compile-time translation is a
   separate PR (estimated 1–2 weeks).
-- EF1001-clean EF Core provider — see audit file above.

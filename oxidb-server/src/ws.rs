@@ -576,27 +576,7 @@ fn handle_command(
             }
         }
 
-        "sql" => {
-            let query = match cmd["query"].as_str() {
-                Some(q) => q,
-                None => return json!({"ok": false, "error": "missing 'query'"}),
-            };
-            match oxidb::sql::execute_sql(&state.db, query) {
-                Ok(result) => {
-                    let data = match result {
-                        oxidb::sql::SqlResult::Select(rows) => json!(rows),
-                        oxidb::sql::SqlResult::Insert(ids) => json!({"inserted": ids}),
-                        oxidb::sql::SqlResult::Update(n) => json!({"modified": n}),
-                        oxidb::sql::SqlResult::Delete(n) => json!({"deleted": n}),
-                        oxidb::sql::SqlResult::Ddl(msg) => json!({"result": msg}),
-                        oxidb::sql::SqlResult::UseDatabase(name) => json!({"database": name}),
-                        oxidb::sql::SqlResult::ShowDatabases(names) => json!({"databases": names}),
-                    };
-                    json!({"ok": true, "data": data})
-                }
-                Err(e) => json!({"ok": false, "error": e.to_string()}),
-            }
-        }
+        // (`sql` cmd removed alongside the SQL surface.)
 
         _ => json!({"ok": false, "error": format!("unknown command: {cmd_name}")}),
     }

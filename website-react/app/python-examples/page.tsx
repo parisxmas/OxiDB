@@ -179,29 +179,6 @@ client.begin_tx()
 client.commit_tx()   <span class="co"># or client.rollback_tx()</span></code></pre>
     </div>
 
-    <!-- SQL -->
-    <div class="doc-block">
-      <h3>SQL Queries</h3>
-      <pre><code><span class="co"># Execute SQL queries</span>
-result = client.sql(<span class="str">"SELECT * FROM users WHERE age > 25 ORDER BY name"</span>)
-
-client.sql(<span class="str">"INSERT INTO users (name, age) VALUES ('Eve', 22)"</span>)
-
-client.sql(<span class="str">"UPDATE users SET age = 31 WHERE name = 'Alice'"</span>)
-
-client.sql(<span class="str">"DELETE FROM users WHERE age &lt; 18"</span>)
-
-client.sql(<span class="str">"CREATE INDEX idx_age ON users (age)"</span>)
-
-<span class="co"># JOINs and GROUP BY</span>
-result = client.sql(<span class="str">"""
-    SELECT u.name, COUNT(o._id) as order_count
-    FROM users u
-    JOIN orders o ON u._id = o.user_id
-    GROUP BY u.name
-    ORDER BY order_count DESC
-"""</span>)</code></pre>
-    </div>
 
     <!-- Full-Text Search -->
     <div class="doc-block">

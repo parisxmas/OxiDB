@@ -242,7 +242,8 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         ("DELETE", ["api", col, "indexes", name]) => handle_drop_index(col, name, state),
 
         // SQL
-        ("POST", ["api", "sql"]) => handle_sql(req, state),
+        // SQL endpoint removed alongside the engine SQL surface.
+        ("POST", ["api", "sql"]) => Err((410, "SQL removed — use document CRUD")),
 
         // Procedures
         ("GET", ["api", "procedures"]) => handle_list_procedures(state),
@@ -436,19 +437,12 @@ fn handle_drop_index(col: &str, name: &str, state: &RestState) -> Result<Value, 
     Ok(json!({"dropped": name}))
 }
 
-fn handle_sql(req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
-    let body = parse_json_body(req)?;
-    let query = body["query"].as_str().ok_or((400, "missing 'query'"))?;
-    let result = oxidb::sql::execute_sql(&state.db, query).map_err(db_err)?;
-    match result {
-        oxidb::sql::SqlResult::Select(rows) => Ok(json!(rows)),
-        oxidb::sql::SqlResult::Insert(ids) => Ok(json!({"inserted": ids})),
-        oxidb::sql::SqlResult::Update(n) => Ok(json!({"modified": n})),
-        oxidb::sql::SqlResult::Delete(n) => Ok(json!({"deleted": n})),
-        oxidb::sql::SqlResult::Ddl(msg) => Ok(json!({"result": msg})),
-        oxidb::sql::SqlResult::UseDatabase(name) => Ok(json!({"database": name})),
-        oxidb::sql::SqlResult::ShowDatabases(names) => Ok(json!({"databases": names})),
-    }
+// (`handle_sql` removed alongside the SQL surface. The REST /v1/sql
+//  route used to live here; clients should use the document-CRUD
+//  routes instead.)
+#[allow(dead_code)]
+fn handle_sql(_req: &HttpRequest, _state: &RestState) -> Result<Value, (u16, &'static str)> {
+    Err((410, "SQL endpoint removed — OxiDB is a document database"))
 }
 
 fn handle_list_procedures(state: &RestState) -> Result<Value, (u16, &'static str)> {

@@ -21,8 +21,8 @@ export default function Page() {
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div>
-        <h3>JSON + SQL</h3>
-        <p>Query with MongoDB-style JSON operators or standard SQL. SELECT, INSERT, UPDATE, DELETE, JOINs, GROUP BY.</p>
+        <h3>JSON document queries</h3>
+        <p>MongoDB-style operators ($eq, $gt, $in, $regex, $or, $elemMatch, $expr) plus an aggregation pipeline (JOINs via $lookup, GROUP BY via $group).</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
@@ -92,7 +92,7 @@ export default function Page() {
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><path d="M7 10h2l1-3 2 6 1-3h2"/></svg></div>
         <h3>WebAssembly</h3>
-        <p>Run OxiDB entirely in the browser via WASM. No server needed — in-memory mode with full query, SQL, and aggregation support. ~1.5 MB gzipped.</p>
+        <p>Run OxiDB entirely in the browser via WASM. No server needed — in-memory mode with full query and aggregation support. ~1.5 MB gzipped.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><line x1="7" y1="7" x2="10" y2="10"/><line x1="14" y1="10" x2="17" y2="7"/><line x1="7" y1="17" x2="10" y2="14"/><line x1="14" y1="14" x2="17" y2="17"/></svg></div>

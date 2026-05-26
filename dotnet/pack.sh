@@ -122,9 +122,6 @@ dotnet_pack() {
     dotnet pack "$SCRIPT_DIR/OxiDb.Client.Embedded/OxiDb.Client.Embedded.csproj" \
         -c "$CONFIGURATION" -o "$ARTIFACTS_DIR" --no-restore
 
-    dotnet pack "$SCRIPT_DIR/OxiDb.EntityFrameworkCore/OxiDb.EntityFrameworkCore.csproj" \
-        -c "$CONFIGURATION" -o "$ARTIFACTS_DIR" --no-restore
-
     dotnet pack "$SCRIPT_DIR/OxiDb.Linq/OxiDb.Linq.csproj" \
         -c "$CONFIGURATION" -o "$ARTIFACTS_DIR" --no-restore
 

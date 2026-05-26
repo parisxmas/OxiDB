@@ -2,14 +2,14 @@ import type { Metadata } from "next"
 
 export const metadata: Metadata = {
   title: ".NET Examples",
-  description: `End-to-end examples for the OxiDB .NET clients — TCP, Embedded (FFI), EF Core, and the new OxiDb.Linq standalone LINQ provider. Four NuGet packages. .NET 10.0+.`,
+  description: `End-to-end examples for the OxiDB .NET clients — TCP, Embedded (FFI), and the OxiDb.Linq standalone LINQ provider. Three NuGet packages. .NET 10.0+.`,
 }
 
 export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<section class="section">
   <div class="container">
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> .NET Examples</h2>
-    <p class="section-desc">Four NuGet packages — TCP client, embedded (in-process FFI) client, a full Entity Framework Core provider, and the standalone <strong>OxiDb.Linq</strong> provider. Targets <code>net10.0+</code>.</p>
+    <p class="section-desc">Three NuGet packages — TCP client, embedded (in-process FFI) client, and the standalone <strong>OxiDb.Linq</strong> provider. Targets <code>net10.0+</code>. OxiDB is a <strong>document database</strong> — no SQL, no EF Core.</p>
 
     <!-- Install -->
     <div class="doc-block">
@@ -20,12 +20,9 @@ dotnet add package OxiDb.Client.Tcp
 <span class="co"># Embedded (in-process via native FFI) — bundles platform runtimes</span>
 dotnet add package OxiDb.Client.Embedded
 
-<span class="co"># Standalone LINQ provider (no EF Core dependency, lightweight)</span>
-dotnet add package OxiDb.Linq
-
-<span class="co"># Full EF Core provider — works with both modes via UseOxiDb / UseOxiDbEmbedded</span>
-dotnet add package OxiDb.EntityFrameworkCore</code></pre>
-      <p>Available on nuget.org. Latest TCP/Embedded/EF Core: <strong>v0.19.3</strong>. Source &amp; samples in <code>dotnet/</code>.</p>
+<span class="co"># Standalone LINQ provider (typed queries over either client)</span>
+dotnet add package OxiDb.Linq</code></pre>
+      <p>Available on nuget.org. Latest: <strong>v0.28.18</strong>. Source &amp; samples in <code>dotnet/</code>.</p>
     </div>
 
     <!-- OxiDb.Linq -->
@@ -115,18 +112,6 @@ dotnet add package OxiDb.EntityFrameworkCore</code></pre>
         <li>Deserialization is case-insensitive, so <code>Tier</code> matches <code>"tier"</code> and <code>"Tier"</code>.</li>
       </ul>
 
-      <h4>EF Core vs. OxiDb.Linq</h4>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th></th><th><code>OxiDb.EntityFrameworkCore</code></th><th><code>OxiDb.Linq</code></th></tr></thead>
-          <tbody>
-            <tr><td>Dependency</td><td>EF Core 10 (~50 MB)</td><td>OxiDb.Client.Tcp only</td></tr>
-            <tr><td>API style</td><td><code>DbContext</code>, <code>DbSet&lt;T&gt;</code>, change tracking, <code>SaveChangesAsync()</code></td><td><code>OxiCollection&lt;T&gt;</code>, fire-and-forget mutations</td></tr>
-            <tr><td>Best for</td><td>Apps already on EF Core, multi-entity transactions</td><td>Single collections, microservices, low overhead</td></tr>
-            <tr><td>Migrations</td><td>Yes, EF tooling</td><td>Use OxiDB indexes directly</td></tr>
-          </tbody>
-        </table>
-      </div>
     </div>
 
     <!-- Connect (TCP) -->
@@ -290,94 +275,6 @@ dotnet add package OxiDb.EntityFrameworkCore</code></pre>
       <p>Full <a href="/oxiscript/">OxiScript reference</a>.</p>
     </div>
 
-    <!-- EF Core setup -->
-    <div class="doc-block">
-      <h3>Entity Framework Core — setup</h3>
-      <pre><code><span class="kw">using</span> Microsoft.EntityFrameworkCore;
-<span class="kw">using</span> OxiDb.EntityFrameworkCore.Extensions;
-
-<span class="kw">public class</span> ShopContext : DbContext
-{
-    <span class="kw">public</span> DbSet&lt;Product&gt;  Products  => Set&lt;Product&gt;();
-    <span class="kw">public</span> DbSet&lt;Customer&gt; Customers => Set&lt;Customer&gt;();
-    <span class="kw">public</span> DbSet&lt;Order&gt;    Orders    => Set&lt;Order&gt;();
-
-    <span class="kw">public</span> ShopContext(DbContextOptions&lt;ShopContext&gt; options) : <span class="kw">base</span>(options) { }
-}
-
-<span class="kw">public class</span> Product
-{
-    <span class="kw">public string</span> Id { get; set; } = <span class="str">""</span>;
-    <span class="kw">public string</span> Name { get; set; } = <span class="str">""</span>;
-    <span class="kw">public decimal</span> Price { get; set; }
-    <span class="kw">public string</span> Category { get; set; } = <span class="str">""</span>;
-    <span class="kw">public int</span> Stock { get; set; }
-}</code></pre>
-    </div>
-
-    <!-- EF Core registration -->
-    <div class="doc-block">
-      <h3>EF Core — Program.cs</h3>
-      <pre><code><span class="kw">var</span> builder = WebApplication.CreateBuilder(args);
-
-<span class="co">// TCP mode — talk to a separate oxidb-server process</span>
-builder.Services.AddDbContext&lt;ShopContext&gt;(opts =>
-    opts.UseOxiDb(<span class="str">"127.0.0.1"</span>, <span class="num">4444</span>,
-                  username: <span class="str">"admin"</span>, password: <span class="str">"secret"</span>));
-
-<span class="co">// OR — Embedded mode, no server, in-process</span>
-<span class="co">// builder.Services.AddDbContext&lt;ShopContext&gt;(opts =&gt;</span>
-<span class="co">//     opts.UseOxiDbEmbedded("./data"));</span>
-
-<span class="kw">var</span> app = builder.Build();</code></pre>
-    </div>
-
-    <!-- EF Core LINQ -->
-    <div class="doc-block">
-      <h3>EF Core — LINQ queries</h3>
-      <pre><code><span class="kw">app</span>.MapGet(<span class="str">"/products"</span>, <span class="kw">async</span> (ShopContext db, <span class="kw">string</span>? category) =>
-{
-    IQueryable&lt;Product&gt; q = db.Products;
-    <span class="kw">if</span> (category <span class="kw">is not null</span>)
-        q = q.Where(p =&gt; p.Category == category);
-
-    <span class="kw">return await</span> q
-        .Where(p =&gt; p.Stock &gt; <span class="num">0</span>)
-        .OrderByDescending(p =&gt; p.Price)
-        .Take(<span class="num">50</span>)
-        .ToListAsync();
-});
-
-<span class="kw">app</span>.MapGet(<span class="str">"/products/{id}"</span>, <span class="kw">async</span> (ShopContext db, <span class="kw">string</span> id) =&gt;
-    <span class="kw">await</span> db.Products.FindAsync(id) <span class="kw">is</span> { } p
-        ? Results.Ok(p)
-        : Results.NotFound());
-
-<span class="kw">app</span>.MapPost(<span class="str">"/products"</span>, <span class="kw">async</span> (ShopContext db, Product input) =&gt;
-{
-    db.Products.Add(input);
-    <span class="kw">await</span> db.SaveChangesAsync();
-    <span class="kw">return</span> Results.Created(<span class="str">$"/products/{input.Id}"</span>, input);
-});</code></pre>
-    </div>
-
-    <!-- ASP.NET full sample link -->
-    <div class="doc-block">
-      <h3>Full ASP.NET Core minimal API sample</h3>
-      <p>The repo ships a complete shop sample with Products / Customers / Orders, seed endpoint, and CRUD across all three: <code>samples/web-api/</code> in the OxiDB repo.</p>
-      <pre><code><span class="co"># Start the server</span>
-oxidb-server &amp;
-
-<span class="co"># Run the sample</span>
-cd samples/web-api
-dotnet run
-
-<span class="co"># Try it</span>
-curl -X POST http://localhost:5000/seed
-curl http://localhost:5000/products
-curl http://localhost:5000/products?category=Electronics</code></pre>
-    </div>
-
     <!-- Indexes -->
     <div class="doc-block">
       <h3>Indexes</h3>
@@ -400,14 +297,14 @@ curl http://localhost:5000/products?category=Electronics</code></pre>
 
     <!-- Mode comparison -->
     <div class="doc-block">
-      <h3>TCP vs. Embedded vs. EF Core — when to pick which</h3>
+      <h3>TCP vs. Embedded — when to pick which</h3>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Package</th><th>Process model</th><th>Use when</th></tr></thead>
           <tbody>
             <tr><td><code>OxiDb.Client.Tcp</code></td><td>Talks to a separate <code>oxidb-server</code></td><td>Multiple apps share the DB, you want auth/RBAC, container deploys</td></tr>
             <tr><td><code>OxiDb.Client.Embedded</code></td><td>In-process via native FFI</td><td>Single-process apps, desktop tools, short-lived workers, tests</td></tr>
-            <tr><td><code>OxiDb.EntityFrameworkCore</code></td><td>Wraps either of the above</td><td>You want LINQ + change tracking + migrations on top of OxiDB</td></tr>
+            <tr><td><code>OxiDb.Linq</code></td><td>Layered on either of the above</td><td>You want LINQ syntax (<code>Where</code>/<code>OrderBy</code>/...) over a document collection</td></tr>
           </tbody>
         </table>
       </div>

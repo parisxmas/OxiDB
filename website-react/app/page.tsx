@@ -10,7 +10,7 @@ export default function Page() {
     <p class="hero-kicker"><span class="hero-pulse"></span>v0.28.18 &middot; durable Raft state &middot; 1M-record cluster verified</p>
     <h1>OxiDB</h1>
     <p class="tagline">A fast, versatile document database.</p>
-    <p class="sub">JSON &amp; SQL queries. ACID transactions. Full-text &amp; vector search. S3-compatible blob storage. <strong>Sharded routing via oxipool. Raft replication with persistent state.</strong> Encryption at rest.</p>
+    <p class="sub">MongoDB-style JSON queries. ACID transactions. Full-text &amp; vector search. S3-compatible blob storage. <strong>Sharded routing via oxipool. Raft replication with persistent state.</strong> Encryption at rest.</p>
     <div class="hero-actions">
       <a href="/quickstart/" class="btn btn-primary">Get Started</a>
       <a href="/downloads/" class="btn btn-secondary">Downloads v0.28.18</a>
@@ -92,8 +92,8 @@ dotnet add package OxiDb.Client.Tcp</code></pre>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div>
-        <h3>JSON + SQL</h3>
-        <p>MongoDB-style JSON queries with $eq, $gt, $in, $regex, $or. Or use standard SQL with JOINs and GROUP BY.</p>
+        <h3>JSON document queries</h3>
+        <p>MongoDB-style JSON queries with $eq, $gt, $in, $regex, $or, $elemMatch, $expr, plus an aggregation pipeline (JOINs via $lookup, GROUP BY via $group).</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
@@ -123,7 +123,7 @@ dotnet add package OxiDb.Client.Tcp</code></pre>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
         <h3>Multi-Language</h3>
-        <p>Official clients for Rust, Python, Go, .NET (TCP + Embedded + EF Core), Julia, and Swift.</p>
+        <p>Official clients for Rust, Python, Go, .NET (TCP + Embedded + LINQ), Java, Julia, and Swift.</p>
       </div>
     </div>
   </div>
@@ -157,9 +157,9 @@ dotnet add package OxiDb.Client.Tcp</code></pre>
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
         <span>10 client libraries</span>
       </a>
-      <a href="/sql/" class="glance-item">
+      <a href="/docs/" class="glance-item">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-        <span>Full SQL support</span>
+        <span>MongoDB-style queries</span>
       </a>
       <a href="/blobs/" class="glance-item">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>

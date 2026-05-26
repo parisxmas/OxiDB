@@ -348,7 +348,7 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
             <tr><td>Go client</td><td><code>go get oxidb</code></td></tr>
             <tr><td>.NET TCP client</td><td><code>dotnet add package OxiDb.Client.Tcp</code></td></tr>
             <tr><td>.NET Embedded</td><td><code>dotnet add package OxiDb.Client.Embedded</code></td></tr>
-            <tr><td>.NET EF Core</td><td><code>dotnet add package OxiDb.EntityFrameworkCore</code></td></tr>
+            <tr><td>.NET LINQ provider</td><td><code>dotnet add package OxiDb.Linq</code></td></tr>
             <tr><td>WebAssembly (browser)</td><td><code>See /wasm for setup</code></td></tr>
             <tr><td>Build server from source</td><td><code>cargo build --release -p oxidb-server</code></td></tr>
             <tr><td>Build CLI from source</td><td><code>cargo build --release -p oxidb-cli</code></td></tr>

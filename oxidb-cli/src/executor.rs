@@ -559,28 +559,8 @@ impl CommandExecutor for EmbeddedExecutor {
                 }
             }
 
-            // --- SQL ---
-            "sql" => {
-                let query = match request.get("query").and_then(|v| v.as_str()) {
-                    Some(q) => q,
-                    None => return err_val("missing 'query'"),
-                };
-                match oxidb::sql::execute_sql(&self.db, query) {
-                    Ok(result) => {
-                        use oxidb::sql::SqlResult;
-                        match result {
-                            SqlResult::Select(rows) => ok_val(json!(rows)),
-                            SqlResult::Insert(ids) => ok_val(json!({"inserted_ids": ids})),
-                            SqlResult::Update(n) => ok_val(json!({"modified": n})),
-                            SqlResult::Delete(n) => ok_val(json!({"deleted": n})),
-                            SqlResult::Ddl(msg) => ok_val(json!(msg)),
-                            SqlResult::UseDatabase(name) => ok_val(json!(format!("switched to {name}"))),
-                            SqlResult::ShowDatabases(dbs) => ok_val(json!(dbs)),
-                        }
-                    }
-                    Err(e) => err_val(&e.to_string()),
-                }
-            }
+            // --- SQL removed alongside the engine SQL surface ---
+            "sql" => err_val("SQL removed — OxiDB is a document database"),
 
             // --- Vector search ---
             "create_vector_index" => {

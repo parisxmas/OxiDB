@@ -79,9 +79,9 @@ experimental APIs as such, and ships an `api/v1.json` snapshot diffed in CI.
 - `julia/OxiDbEmbedded` — embedded FFI
 - `dotnet/OxiDb.Client.Tcp`
 - `dotnet/OxiDb.Client.Embedded`
-- `dotnet/OxiDb.EntityFrameworkCore`
+- `dotnet/OxiDb.Linq` — typed query syntax over either .NET client
 - `oxidb-js/` — JS/TS (REST + WebSocket)
-- `oxidb-jdbc/` — JDBC driver
+- `oxidb-java/` — pure-Java OxiWire client (`com.oxidb:oxidb-client`)
 
 ### Tier B — shipped but explicitly Experimental
 
@@ -120,7 +120,6 @@ the stable surface. They are gated by env vars, feature flags, or
 - MQTT v3.1.1 (`OXIDB_MQTT_PORT`)
 - S3 API (`OXIDB_S3_PORT`)
 - GELF ingest (`OXIDB_GELF_PORT`, `OXIDB_UDP_PORT`)
-- PostgreSQL wire (`pg_wire`)
 
 Each is individually a candidate for stabilisation in a 1.x minor via the
 promotion process below.

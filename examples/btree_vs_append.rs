@@ -33,7 +33,7 @@ fn main() {
         }
 
         if use_btree {
-            let mut col = oxidb::btree_collection::BTreeCollection::open("bench", &sub).unwrap();
+            let mut col = oxidb::btree_collection::BTreeCollection::open("bench", &sub, None).unwrap();
 
             let t0 = Instant::now();
             col.insert_many(docs).unwrap();

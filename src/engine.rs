@@ -3541,23 +3541,6 @@ mod tests {
         assert_eq!(docs[0]["type"], "current");
     }
 
-    #[test]
-    fn in_memory_sql() {
-        let db = Arc::new(mem_db());
-        db.insert("products", json!({"name": "Widget", "price": 9.99})).unwrap();
-        db.insert("products", json!({"name": "Gadget", "price": 19.99})).unwrap();
-
-        let result = crate::sql::execute_sql(&db, "SELECT * FROM products WHERE price > 10");
-        assert!(result.is_ok());
-        match result.unwrap() {
-            crate::sql::SqlResult::Select(rows) => {
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0]["name"], "Gadget");
-            }
-            _ => panic!("expected Select"),
-        }
-    }
-
     /// Regression: dropping a collection whose `.btree` snapshot is a
     /// file (not a directory) used to bail out with
     /// `io error: Not a directory (os error 20)` because the drop path

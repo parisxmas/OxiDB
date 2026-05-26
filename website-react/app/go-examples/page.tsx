@@ -202,30 +202,6 @@ client.BeginTx()
 client.CommitTx()   <span class="co">// or client.RollbackTx()</span></code></pre>
     </div>
 
-    <!-- SQL -->
-    <div class="doc-block">
-      <h3>SQL Queries</h3>
-      <pre><code><span class="co">// Execute SQL queries</span>
-result, err := client.SQL(<span class="str">"SELECT * FROM users WHERE age > 25 ORDER BY name"</span>)
-
-result, err = client.SQL(<span class="str">"INSERT INTO users (name, age) VALUES ('Eve', 22)"</span>)
-
-result, err = client.SQL(<span class="str">"UPDATE users SET age = 31 WHERE name = 'Alice'"</span>)
-
-result, err = client.SQL(<span class="str">"DELETE FROM users WHERE age < 18"</span>)
-
-result, err = client.SQL(<span class="str">"CREATE INDEX idx_age ON users (age)"</span>)
-
-<span class="co">// JOINs and GROUP BY</span>
-result, err = client.SQL(<span class="str">\`
-    SELECT u.name, COUNT(o._id) as order_count
-    FROM users u
-    JOIN orders o ON u._id = o.user_id
-    GROUP BY u.name
-    ORDER BY order_count DESC
-\`</span>)</code></pre>
-    </div>
-
     <!-- Full-Text Search -->
     <div class="doc-block">
       <h3>Full-Text Search</h3>

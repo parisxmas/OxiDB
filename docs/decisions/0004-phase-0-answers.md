@@ -113,9 +113,9 @@ The 9-ish official clients ship at two tiers under 1.0:
 - `julia/OxiDbEmbedded` — embedded FFI
 - `dotnet/OxiDb.Client.Tcp`
 - `dotnet/OxiDb.Client.Embedded`
-- `dotnet/OxiDb.EntityFrameworkCore`
+- `dotnet/OxiDb.Linq` — typed query syntax
 - `oxidb-js/` — JS/TS (REST + WebSocket)
-- `oxidb-jdbc/` — JDBC driver
+- `oxidb-java/` — pure-Java OxiWire client
 
 Each tier-A client must, before 1.0 GA: tag a `1.0` package version,
 audit its public surface, mark experimental APIs as such, and have an

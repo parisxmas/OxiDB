@@ -54,7 +54,6 @@ const EXPERIMENTAL_FEATURES: &[&str] = &[
     "oximem",
     "mqtt",
     "s3",
-    "pg_wire",
     "gelf",
 ];
 

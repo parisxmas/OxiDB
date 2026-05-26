@@ -284,16 +284,7 @@ fn dispatch_request(
             log_audit(state, session, &cmd, None, "ok", name);
             return handler::ok_bytes(serde_json::json!(format!("switched to database '{name}'")));
         }
-        "set_dialect" => {
-            let dialect_str = match request.get("dialect").and_then(|v| v.as_str()) {
-                Some(d) => d,
-                None => return handler::err_bytes("missing 'dialect' (mysql, postgresql, mssql, generic)"),
-            };
-            let dialect = oxidb::SqlDialect::from_str(dialect_str);
-            session.set_sql_dialect(dialect);
-            log_audit(state, session, &cmd, None, "ok", dialect_str);
-            return handler::ok_bytes(serde_json::json!(format!("SQL dialect set to {dialect:?}")));
-        }
+        // (`set_dialect` removed alongside the SQL surface.)
         _ => {}
     }
 
@@ -324,45 +315,9 @@ fn dispatch_request(
     // ---------------------------------------------------------------
     // Standard command dispatch
     // ---------------------------------------------------------------
-    let resp_bytes = if cmd == "sql" {
-        // SQL commands get access to the DatabaseManager for CREATE/DROP DATABASE.
-        let query_str = match request.get("query").and_then(|v| v.as_str()) {
-            Some(q) => q,
-            None => return handler::err_bytes("missing 'query' string"),
-        };
-        let dialect = request
-            .get("dialect")
-            .and_then(|v| v.as_str())
-            .map(oxidb::SqlDialect::from_str)
-            .unwrap_or(session.sql_dialect);
-        match oxidb::sql::execute_sql_with_db_manager(&target_db, query_str, Some(&state.db_manager), dialect) {
-            Ok(result) => match result {
-                oxidb::SqlResult::Select(docs) => handler::ok_bytes(serde_json::json!(docs)),
-                oxidb::SqlResult::Insert(ids) => handler::ok_bytes(serde_json::json!({ "ids": ids })),
-                oxidb::SqlResult::Update(count) => handler::ok_bytes(serde_json::json!({ "modified": count })),
-                oxidb::SqlResult::Delete(count) => handler::ok_bytes(serde_json::json!({ "deleted": count })),
-                oxidb::SqlResult::Ddl(msg) => handler::ok_bytes(serde_json::json!(msg)),
-                oxidb::SqlResult::UseDatabase(name) => {
-                    if !state.db_manager.database_exists(&name) {
-                        handler::err_bytes(&format!("database not found: {name}"))
-                    } else {
-                        session.set_database(name.clone());
-                        handler::ok_bytes(serde_json::json!(format!("switched to database '{name}'")))
-                    }
-                }
-                oxidb::SqlResult::ShowDatabases(names) => {
-                    let docs: Vec<serde_json::Value> = names
-                        .into_iter()
-                        .map(|n| serde_json::json!({"database_name": n}))
-                        .collect();
-                    handler::ok_bytes(serde_json::json!(docs))
-                }
-            },
-            Err(e) => handler::err_bytes(&e.to_string()),
-        }
-    } else {
-        handler::handle_request(&target_db, request.clone(), active_tx)
-    };
+    // (The `sql` cmd dispatch was removed alongside the SQL surface;
+    // every request now flows through the document-API handler.)
+    let resp_bytes = handler::handle_request(&target_db, request.clone(), active_tx);
 
     log_audit(state, session, &cmd, collection.as_deref(), "ok", "");
 
@@ -1331,49 +1286,7 @@ fn main() {
     let listener = TcpListener::bind(&addr).expect("failed to bind TCP listener");
     server_log!(state, GelfLevel::Notice, format!("oxidb-server listening on {addr} (pool_size={pool_size}, data_dir={data_dir}, idle_timeout={idle_timeout_secs}s)"));
 
-    // PostgreSQL wire protocol listener (optional, enabled via OXIDB_PG_PORT)
-    let pg_port: u16 = env::var("OXIDB_PG_PORT")
-        .unwrap_or_else(|_| "0".to_string())
-        .parse()
-        .expect("OXIDB_PG_PORT must be a valid u16");
-
-    if pg_port > 0 {
-        let pg_addr = format!("0.0.0.0:{pg_port}");
-        let pg_listener =
-            TcpListener::bind(&pg_addr).expect("failed to bind PostgreSQL wire protocol listener");
-        server_log!(state, GelfLevel::Notice, format!("PostgreSQL wire protocol listening on {pg_addr}"));
-
-        // Accept PG connections in a background thread, spawning a thread per connection.
-        let state_pg = Arc::clone(&state);
-        std::thread::spawn(move || {
-            for stream in pg_listener.incoming() {
-                match stream {
-                    Ok(s) => {
-                        let _ = s.set_nodelay(true);
-                        let db_mgr = Arc::clone(&state_pg.db_manager);
-                        std::thread::spawn(move || {
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                oxidb_server::pg_wire::handle_pg_connection(&s, &db_mgr);
-                            }));
-                            if let Err(e) = result {
-                                let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                                    s.to_string()
-                                } else if let Some(s) = e.downcast_ref::<String>() {
-                                    s.clone()
-                                } else {
-                                    "unknown panic".to_string()
-                                };
-                                eprintln!("[pg_wire] connection handler panicked: {msg}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        server_log!(state_pg, GelfLevel::Error, format!("[pg_wire] accept error: {e}"));
-                    }
-                }
-            }
-        });
-    }
+    // (PostgreSQL wire protocol listener removed alongside the SQL surface.)
 
     // Command logging: OXIDB_LOG_COMMANDS=true logs all OxiMem/MQTT commands and responses
     let log_commands = env::var("OXIDB_LOG_COMMANDS")

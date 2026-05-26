@@ -7,7 +7,6 @@ pub mod handler;
 pub mod hello;
 pub mod mqtt;
 pub mod oxiwire;
-pub mod pg_wire;
 pub mod protocol;
 pub mod rbac;
 pub mod remote_client;

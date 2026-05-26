@@ -148,10 +148,10 @@ smoke runs) because every input is valid-by-construction and
 libfuzzer mutates *meaningfully* rather than throwing megabytes of
 garbage that bounce off the decoder's first byte check.
 
-Does NOT yet cover: structure-aware roundtrip for the remaining 3
-wire formats (RESP, MsgPack, pg_wire); differential fuzz against a
-reference impl (RESP vs real Redis, pg_wire vs real Postgres);
-OSS-Fuzz continuous-integration; coverage reporting.
+Does NOT yet cover: structure-aware roundtrip for the remaining 2
+wire formats (RESP, MsgPack); broader differential fuzz against
+additional reference impls; OSS-Fuzz continuous-integration;
+coverage reporting.
 
 ### `cern_sigkill_byte_offset.rs`
 

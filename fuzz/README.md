@@ -26,7 +26,6 @@ cargo install cargo-fuzz                 # 0.13+
 | `wire_deserialize` | The top-level message dispatcher (`{`/`[` → JSON, `0xDB` → OxiWire, else → MsgPack) | `fuzz_targets/wire_deserialize.rs` |
 | `wire_oxiwire` | OxiWire hand-rolled MsgPack-derived binary decoder | `fuzz_targets/wire_oxiwire.rs` |
 | `wire_resp` | RESP (Redis-compatible) wire decoder used by OxiMem | `fuzz_targets/wire_resp.rs` |
-| `wire_pg` | PostgreSQL frontend-message decoder | `fuzz_targets/wire_pg.rs` |
 
 ### Structure-aware (typed grammar → encode → decode → equality)
 
@@ -36,7 +35,6 @@ cargo install cargo-fuzz                 # 0.13+
 | `resp_roundtrip` | RESP encoder ↔ decoder mutual consistency. `Arbitrary RespValue` → `write_value` → `read_value` → bytes-equal after re-encoding. CR/LF normalised out of SimpleString/Error at input (line-based framing constraint). | `fuzz_targets/resp_roundtrip.rs` |
 | `msgpack_roundtrip` | OxiDB's hand-rolled MsgPack encoder (`protocol::value_to_msgpack`) ↔ canonical `rmp_serde::from_slice` decoder. Cross-implementation comparison surfaces encoder bugs the same-author decoder couldn't see. | `fuzz_targets/msgpack_roundtrip.rs` |
 | `resp_diff_redis` | Decoder differential: OxiDB `resp::read_value` vs canonical `redis::parse_redis_value` (redis-rs). Scoped to length-prefixed scalar types (`:`, `$`) where RESP2 spec is unambiguous. Found a 12-byte bulk-string OOM + a SimpleString CR-truncation bug on its first smoke run (both fixed in PR #61). | `fuzz_targets/resp_diff_redis.rs` |
-| `pg_diff_pgwire` | Decoder differential: OxiDB `pg_wire::codec::read_message` vs `pgwire` crate's `PgWireFrontendMessage::decode`. Scoped to `Q P D H C X` tagged frontend messages. Found two real OxiDB bugs on first smoke runs: signed-i16 cast → usize overflow in Bind/Parse decoders + empty-body panic in Describe/Close decoders (both fixed in this PR's branch). Includes a panic-hook filter that ignores known pgwire 0.40 truncated-message panic paths. | `fuzz_targets/pg_diff_pgwire.rs` |
 
 Structure-aware fuzz runs **~6× faster** (~18k iter/s vs ~3k iter/s
 for byte-flipping in 30s smoke runs) because every iteration starts
@@ -60,7 +58,6 @@ this script):
 | `wire_deserialize` | `oxiwire.rs` + `protocol.rs` | 42% / 19% |
 | `wire_oxiwire` | `oxiwire.rs` | 43% |
 | `wire_resp` | `resp.rs` | 46% |
-| `wire_pg` | `pg_wire/codec.rs` | 18% |
 | `oxiwire_roundtrip` | `oxiwire.rs` | **55%** |
 | `resp_roundtrip` | `resp.rs` | **52%** |
 | `msgpack_roundtrip` | `protocol.rs` | 31% |
@@ -107,13 +104,9 @@ Rust panic message and a stack trace. Triage:
 
 ## What this harness explicitly does NOT do (yet)
 
-- **Structure-aware fuzzing for pg_wire.** pg_wire is more decode-
-  only than encode/decode-symmetric — there's no `value_to_pg_wire`
-  to fuzz the inverse of. Differential fuzz vs real Postgres (next
-  bullet) is the natural shape for pg_wire.
-- **Differential fuzzing against a reference impl.** RESP vs real
-  Redis, pg_wire vs PostgreSQL — feed both, compare the parsed
-  results, treat divergence as a finding. Multi-week effort.
+- **Differential fuzzing against more reference impls.** RESP vs real
+  Redis (above) — feed both, compare the parsed results, treat
+  divergence as a finding. Multi-week effort to extend further.
 - **Coverage reporting.** `cargo +nightly fuzz coverage <target>`
   exists but needs an `llvm-cov` setup; deliberately deferred.
 - **Continuous OSS-Fuzz integration.** Infrastructure files

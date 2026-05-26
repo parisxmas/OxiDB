@@ -113,26 +113,6 @@ pub fn drop_collection(name: &str) -> Result<(), JsValue> {
     with_db(|db| db.drop_collection(name))
 }
 
-/// Execute a SQL query. Returns JSON string with the result.
-#[wasm_bindgen]
-pub fn sql(query: &str) -> Result<String, JsValue> {
-    let guard = DB.read();
-    let db = guard
-        .as_ref()
-        .ok_or_else(|| JsValue::from_str("database not initialized"))?;
-    let result = oxidb::execute_sql(db, query).map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let value = match result {
-        oxidb::SqlResult::Select(rows) => json!({"type": "select", "rows": rows}),
-        oxidb::SqlResult::Insert(ids) => json!({"type": "insert", "ids": ids}),
-        oxidb::SqlResult::Update(n) => json!({"type": "update", "modified": n}),
-        oxidb::SqlResult::Delete(n) => json!({"type": "delete", "deleted": n}),
-        oxidb::SqlResult::Ddl(msg) => json!({"type": "ddl", "message": msg}),
-        oxidb::SqlResult::UseDatabase(name) => json!({"type": "use", "database": name}),
-        oxidb::SqlResult::ShowDatabases(names) => json!({"type": "show", "databases": names}),
-    };
-    serde_json::to_string(&value).map_err(|e| JsValue::from_str(&e.to_string()))
-}
-
 /// Run an aggregation pipeline. Returns JSON array string.
 #[wasm_bindgen]
 pub fn aggregate(collection: &str, pipeline: &str) -> Result<String, JsValue> {

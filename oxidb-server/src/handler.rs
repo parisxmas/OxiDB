@@ -1014,35 +1014,8 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             Err(e) => err_bytes(&e.to_string()),
         },
 
-        "sql" => {
-            let query_str = match request.get("query").and_then(|v| v.as_str()) {
-                Some(q) => q,
-                None => return err_bytes("missing 'query' string"),
-            };
-            let dialect = request
-                .get("dialect")
-                .and_then(|v| v.as_str())
-                .map(oxidb::SqlDialect::from_str)
-                .unwrap_or_default();
-            match oxidb::execute_sql_with_dialect(db, query_str, dialect) {
-                Ok(result) => match result {
-                    oxidb::SqlResult::Select(docs) => ok_bytes(json!(docs)),
-                    oxidb::SqlResult::Insert(ids) => ok_bytes(json!({ "ids": ids })),
-                    oxidb::SqlResult::Update(count) => ok_bytes(json!({ "modified": count })),
-                    oxidb::SqlResult::Delete(count) => ok_bytes(json!({ "deleted": count })),
-                    oxidb::SqlResult::Ddl(msg) => ok_bytes(json!(msg)),
-                    oxidb::SqlResult::UseDatabase(name) => ok_bytes(json!(format!("use database: {name}"))),
-                    oxidb::SqlResult::ShowDatabases(names) => {
-                        let docs: Vec<Value> = names
-                            .into_iter()
-                            .map(|n| json!({"database_name": n}))
-                            .collect();
-                        ok_bytes(json!(docs))
-                    }
-                },
-                Err(e) => err_bytes(&e.to_string()),
-            }
-        }
+        // (`sql` cmd removed alongside the SQL surface. OxiDB is a
+        //  document database — use document CRUD + aggregation pipeline.)
 
         // -------------------------------------------------------------------
         // Stored procedures

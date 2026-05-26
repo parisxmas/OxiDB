@@ -9,15 +9,15 @@ export const metadata: Metadata = {
     template: '%s | OxiDB',
   },
   description:
-    'A fast, versatile document database. JSON & SQL queries, ACID transactions, full-text & vector search, Raft replication, encryption at rest.',
+    'A fast, versatile document database. MongoDB-style JSON queries, ACID transactions, full-text & vector search, Raft replication, encryption at rest.',
   keywords: [
     'database', 'document database', 'nosql', 'embedded database', 'rust',
-    'json', 'sql', 'full-text search', 'vector search', 'transactions',
+    'json', 'mongodb', 'full-text search', 'vector search', 'transactions',
   ],
   openGraph: {
     title: 'OxiDB - Fast Versatile Document Database',
     description:
-      'JSON & SQL. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. Verified at 1M records under failover. v0.28.18.',
+      'MongoDB-style JSON queries. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. Verified at 1M records under failover. v0.28.18.',
     url: 'https://oxidb.baltavista.com',
     siteName: 'OxiDB',
     type: 'website',
@@ -34,7 +34,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: 'OxiDB - Fast Versatile Document Database',
     description:
-      'JSON & SQL. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. v0.28.18.',
+      'MongoDB-style JSON queries. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. v0.28.18.',
     images: ['/og-card.png'],
   },
   icons: {

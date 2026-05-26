@@ -91,9 +91,9 @@ The pattern translates to each language's idioms:
 | `julia/OxiDbEmbedded` (FFI)               | same                                                | `julia/OxiDbEmbedded/api/v1.json`                |
 | `dotnet/OxiDb.Client.Tcp`                 | `Microsoft.CodeAnalysis` over the assembly         | `dotnet/OxiDb.Client.Tcp/api/v1.json`            |
 | `dotnet/OxiDb.Client.Embedded`            | same                                                | `dotnet/OxiDb.Client.Embedded/api/v1.json`       |
-| `dotnet/OxiDb.EntityFrameworkCore`        | same                                                | `dotnet/OxiDb.EntityFrameworkCore/api/v1.json`   |
+| `dotnet/OxiDb.Linq`                       | same                                                | `dotnet/OxiDb.Linq/api/v1.json`                  |
 | `oxidb-js/` (REST + WebSocket)            | `typescript` compiler API + `.d.ts` parsing        | `oxidb-js/api/v1.json`                           |
-| `oxidb-jdbc/`                             | Reflection over the JAR                             | `oxidb-jdbc/api/v1.json`                         |
+| `oxidb-java/`                             | Reflection over the JAR                             | `oxidb-java/api/v1.json`                         |
 
 Every snapshot has the same top-level shape (`module`, `schema_version`,
 `classes`, `functions`) so cross-language diffs are visually consistent and

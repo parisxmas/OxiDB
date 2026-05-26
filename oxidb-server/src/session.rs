@@ -8,7 +8,6 @@ pub struct Session {
     pub role: Option<Role>,
     pub scram_state: Option<ScramState>,
     pub current_database: String,
-    pub sql_dialect: oxidb::SqlDialect,
     /// Wire-protocol version negotiated via HELLO. Defaults to v1 for clients
     /// that never call `hello` (backward-compat with pre-1.0 clients).
     pub wire_version: u32,
@@ -22,7 +21,6 @@ impl Session {
             role: None,
             scram_state: None,
             current_database: "oxidb".to_string(),
-            sql_dialect: oxidb::SqlDialect::default(),
             wire_version: 1,
         }
     }
@@ -30,11 +28,6 @@ impl Session {
     /// Set the current database for this session.
     pub fn set_database(&mut self, name: String) {
         self.current_database = name;
-    }
-
-    /// Set the SQL dialect for this session.
-    pub fn set_sql_dialect(&mut self, dialect: oxidb::SqlDialect) {
-        self.sql_dialect = dialect;
     }
 
     /// Mark session as authenticated with given username and role.

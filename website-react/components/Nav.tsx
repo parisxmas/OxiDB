@@ -14,7 +14,6 @@ const navItems = [
   { href: '/aggregation', label: 'Aggregation' },
   { href: '/indexes', label: 'Indexes' },
   { href: '/transactions', label: 'Transactions' },
-  { href: '/sql', label: 'SQL' },
   { href: '/search', label: 'Search' },
   { href: '/vectors', label: 'Vectors' },
   { href: '/blobs', label: 'Blobs' },

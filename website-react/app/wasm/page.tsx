@@ -2,14 +2,14 @@ import type { Metadata } from "next"
 
 export const metadata: Metadata = {
   title: "WebAssembly",
-  description: `Run OxiDB entirely in the browser via WebAssembly. No server needed — JSON queries, SQL, aggregation all work in-memory.`,
+  description: `Run OxiDB entirely in the browser via WebAssembly. No server needed — JSON queries and aggregation all work in-memory.`,
 }
 
 export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<section class="section">
   <div class="container">
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> WebAssembly</h2>
-    <p class="section-desc">Run OxiDB entirely in the browser. No server needed &mdash; all data lives in memory within the WASM module. Supports JSON queries, SQL, aggregation, and indexes.</p>
+    <p class="section-desc">Run OxiDB entirely in the browser. No server needed &mdash; all data lives in memory within the WASM module. Supports MongoDB-style JSON queries, aggregation, and indexes.</p>
 
     <!-- Install -->
     <div class="doc-block">
@@ -114,31 +114,6 @@ const berliners = oxidb.count('users',
 );</code></pre>
     </div>
 
-    <!-- SQL -->
-    <div class="doc-block">
-      <h3>SQL Queries</h3>
-      <p>Full SQL support &mdash; same dialect as native OxiDB:</p>
-      <pre><code>// SELECT
-const result = JSON.parse(oxidb.sql(
-  'SELECT name, age FROM users WHERE age > 25 ORDER BY age'
-));
-console.log(result.rows);
-
-// INSERT
-oxidb.sql("INSERT INTO products (name, price) VALUES ('Laptop', 999)");
-
-// UPDATE
-oxidb.sql("UPDATE users SET age = age + 1 WHERE city = 'Berlin'");
-
-// DELETE
-oxidb.sql("DELETE FROM users WHERE age &lt; 20");
-
-// GROUP BY
-const stats = JSON.parse(oxidb.sql(
-  'SELECT city, COUNT(*) as n, AVG(age) as avg_age FROM users GROUP BY city'
-));</code></pre>
-    </div>
-
     <!-- Indexes -->
     <div class="doc-block">
       <h3>Indexes</h3>
@@ -198,18 +173,13 @@ oxidb.drop_collection('old_data');</code></pre>
       JSON.stringify({ priority: 'high', done: false })
     ));
 
-    // SQL query
-    const result = JSON.parse(oxidb.sql(
-      "SELECT priority, COUNT(*) as n FROM tasks GROUP BY priority"
-    ));
-
     // Aggregation
     const stats = JSON.parse(oxidb.aggregate('tasks', JSON.stringify([
       { $group: { _id: '$done', count: { $sum: 1 } } }
     ])));
 
     document.getElementById('out').textContent =
-      JSON.stringify({ urgent, sql: result.rows, stats }, null, 2);
+      JSON.stringify({ urgent, stats }, null, 2);
   &lt;/script&gt;
 &lt;/body&gt;
 &lt;/html&gt;</code></pre>
@@ -230,7 +200,6 @@ oxidb.drop_collection('old_data');</code></pre>
             <tr><td><code>update(collection, queryStr, updateStr)</code></td><td>filter, update operations</td><td>Modified count (number)</td></tr>
             <tr><td><code>delete(collection, queryStr)</code></td><td>collection name, JSON query string</td><td>Deleted count (number)</td></tr>
             <tr><td><code>count(collection, queryStr)</code></td><td>collection name, JSON query string</td><td>Count (number)</td></tr>
-            <tr><td><code>sql(queryStr)</code></td><td>SQL query string</td><td>JSON result string</td></tr>
             <tr><td><code>aggregate(collection, pipelineStr)</code></td><td>collection name, JSON pipeline string</td><td>JSON array string</td></tr>
             <tr><td><code>create_index(collection, field)</code></td><td>collection name, field name</td><td>&mdash;</td></tr>
             <tr><td><code>list_collections()</code></td><td>&mdash;</td><td>JSON array of names</td></tr>
@@ -261,7 +230,7 @@ cd OxiDB/oxidb-wasm
         <li>All data is <strong>in-memory only</strong> &mdash; does not persist across page reloads</li>
         <li>WASM binary is ~1.5 MB gzipped (~4.7 MB uncompressed)</li>
         <li>All queries run synchronously on the main thread</li>
-        <li>Supports the same query operators, SQL dialect, and aggregation pipeline as native OxiDB</li>
+        <li>Supports the same query operators and aggregation pipeline as native OxiDB</li>
         <li>TypeScript types included (<code>oxidb_wasm.d.ts</code>)</li>
       </ul>
     </div>

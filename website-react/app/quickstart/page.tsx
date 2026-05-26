@@ -121,9 +121,9 @@ docs, _ := client.Find(<span class="str">"users"</span>, <span class="kw">map</s
     <span class="str">"age"</span>: <span class="kw">map</span>[<span class="ty">string</span>]<span class="kw">any</span>{<span class="str">"$gte"</span>: <span class="num">25</span>},
 }, <span class="kw">nil</span>)</code></pre>
 
-    <h4>.NET (TCP or EF Core)</h4>
+    <h4>.NET (TCP + LINQ)</h4>
     <pre><code class="lang-bash">dotnet add package OxiDb.Client.Tcp
-dotnet add package OxiDb.EntityFrameworkCore  <span class="co"># optional EF Core provider</span></code></pre>
+dotnet add package OxiDb.Linq  <span class="co"># optional typed LINQ surface</span></code></pre>
     <pre><code class="lang-csharp"><span class="co">// Program.cs</span>
 builder.Services.AddOxiDb(options => {
     options.UseTcp(<span class="str">"127.0.0.1"</span>, <span class="num">4444</span>);
@@ -187,7 +187,7 @@ oxidb raft_change_membership --members=1,2,3</code></pre>
     <h3>Next steps</h3>
     <ul>
       <li><a href="/queries/">Query operators</a> — JSON query language reference</li>
-      <li><a href="/sql/">SQL</a> — standard SQL with JOINs and GROUP BY</li>
+      <li><a href="/aggregation/">Aggregation</a> — pipeline stages, JOINs via $lookup, GROUP BY via $group</li>
       <li><a href="/indexes/">Indexes</a> — single-field, composite, unique, vector</li>
       <li><a href="/transactions/">Transactions</a> — multi-collection ACID with OCC</li>
       <li><a href="/server/">Server</a> — TLS, auth, RBAC, sharding, Raft</li>

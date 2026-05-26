@@ -38,9 +38,9 @@ if [ ! -d "$FUZZ_TARGET_BIN_DIR" ]; then
   FUZZ_TARGET_BIN_DIR="target/release"
 fi
 
-for target in wire_deserialize wire_oxiwire wire_resp wire_pg \
+for target in wire_deserialize wire_oxiwire wire_resp \
               oxiwire_roundtrip resp_roundtrip msgpack_roundtrip \
-              resp_diff_redis pg_diff_pgwire; do
+              resp_diff_redis; do
   if [ -x "$FUZZ_TARGET_BIN_DIR/$target" ]; then
     cp "$FUZZ_TARGET_BIN_DIR/$target" "$OUT/$target"
     echo "[oss-fuzz] copied $target → \$OUT/$target"

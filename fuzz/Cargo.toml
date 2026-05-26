@@ -8,7 +8,6 @@
 #   cargo +nightly fuzz run wire_deserialize
 #   cargo +nightly fuzz run wire_oxiwire
 #   cargo +nightly fuzz run wire_resp
-#   cargo +nightly fuzz run wire_pg
 #
 # See fuzz/README.md for the longer-form playbook.
 
@@ -39,12 +38,6 @@ rmp-serde = "1"
 # avoid pulling in tokio / TLS / num-bigint etc. — the sync byte-
 # parser doesn't need them.
 redis = { version = "1", default-features = false }
-# Reference Postgres frontend-message parser (pgwire crate) for the
-# pg_diff_pgwire differential target. Same cross-implementation
-# differential pattern as resp_diff_redis / msgpack_roundtrip.
-# `bytes` for the BytesMut buffer the pgwire decoder consumes.
-pgwire = { version = "0.40", default-features = false }
-bytes = "1"
 
 # Prevent this crate from being picked up by the root workspace.
 [workspace]
@@ -66,13 +59,6 @@ bench = false
 [[bin]]
 name = "wire_resp"
 path = "fuzz_targets/wire_resp.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "wire_pg"
-path = "fuzz_targets/wire_pg.rs"
 test = false
 doc = false
 bench = false
@@ -110,17 +96,6 @@ bench = false
 [[bin]]
 name = "resp_diff_redis"
 path = "fuzz_targets/resp_diff_redis.rs"
-test = false
-doc = false
-bench = false
-
-# Cross-implementation differential: OxiDB pg_wire decoder vs the
-# pgwire crate's PgWireFrontendMessage::decode. Same pattern as
-# resp_diff_redis; reference implementation is a separate Rust
-# crate written by a different community.
-[[bin]]
-name = "pg_diff_pgwire"
-path = "fuzz_targets/pg_diff_pgwire.rs"
 test = false
 doc = false
 bench = false

@@ -87,10 +87,6 @@ export default function Page() {
         <a href="#transaction-ctx">Transaction Context</a>
       </div>
       <div class="toc-group">
-        <h4>SQL</h4>
-        <a href="#sql">Execute SQL</a>
-      </div>
-      <div class="toc-group">
         <h4>Search</h4>
         <a href="#text-search">Text Search</a>
         <a href="#search">Search (Blobs)</a>
@@ -176,11 +172,8 @@ client.UseOxiWire()
 <span class="co">// Embedded client</span>
 <span class="kw">var</span> client = <span class="kw">new</span> OxiDbEmbeddedClient(<span class="str">"./my_data"</span>);
 
-<span class="co">// EF Core</span>
-builder.Services.AddOxiDb(options => {
-    options.UseTcp(<span class="str">"127.0.0.1"</span>, <span class="num">4444</span>);
-    <span class="co">// or: options.UseEmbedded("./data");</span>
-});</code></pre></div>
+<span class="co">// LINQ over either client</span>
+<span class="kw">var</span> users = client.GetCollection&lt;User&gt;(<span class="str">"users"</span>);</code></pre></div>
     </div>
 
     <div class="doc-block" id="close">
@@ -237,7 +230,7 @@ drop(db);</code></pre></div>
     <span class="str">"supported_wire_versions"</span>: [<span class="num">1</span>],
     <span class="str">"stable_surface_version"</span>: <span class="str">"1.0"</span>,
     <span class="str">"features"</span>: [<span class="str">"fts"</span>, <span class="str">"blobs"</span>, <span class="str">"txn"</span>, <span class="str">"rbac"</span>, <span class="str">"tls"</span>, <span class="str">"encryption_at_rest"</span>, <span class="str">"audit"</span>, <span class="str">"scram_sha_256"</span>, <span class="str">"indexes"</span>, <span class="str">"aggregation"</span>],
-    <span class="str">"experimental_features"</span>: [<span class="str">"raft"</span>, <span class="str">"pitr"</span>, <span class="str">"vector_search"</span>, <span class="str">"fdw"</span>, <span class="str">"stored_procedures"</span>, <span class="str">"ttl_indexes"</span>, <span class="str">"change_streams"</span>, <span class="str">"rest_http"</span>, <span class="str">"websocket"</span>, <span class="str">"oximem"</span>, <span class="str">"mqtt"</span>, <span class="str">"s3"</span>, <span class="str">"pg_wire"</span>, <span class="str">"gelf"</span>],
+    <span class="str">"experimental_features"</span>: [<span class="str">"raft"</span>, <span class="str">"pitr"</span>, <span class="str">"vector_search"</span>, <span class="str">"fdw"</span>, <span class="str">"stored_procedures"</span>, <span class="str">"ttl_indexes"</span>, <span class="str">"change_streams"</span>, <span class="str">"rest_http"</span>, <span class="str">"websocket"</span>, <span class="str">"oximem"</span>, <span class="str">"mqtt"</span>, <span class="str">"s3"</span>, <span class="str">"gelf"</span>],
     <span class="str">"auth_methods"</span>: [<span class="str">"scram-sha-256"</span>]    <span class="co">// or ["anonymous"] when auth is disabled</span>
   }
 }</code></pre>
@@ -400,8 +393,8 @@ users, err := client.Find(<span class="str">"users"</span>, <span class="kw">map
       <div class="lang-panel" data-lang="dotnet"><pre><code><span class="co">// Simple query</span>
 <span class="kw">var</span> users = <span class="kw">await</span> client.FindAsync(<span class="str">"users"</span>, <span class="kw">new</span> { age = <span class="kw">new</span> { _gt = <span class="num">25</span> } });
 
-<span class="co">// EF Core LINQ</span>
-<span class="kw">var</span> users = <span class="kw">await</span> db.Users
+<span class="co">// OxiDb.Linq</span>
+<span class="kw">var</span> users = <span class="kw">await</span> db.GetCollection&lt;User&gt;(<span class="str">"users"</span>)
     .Where(u => u.Age > <span class="num">25</span>)
     .OrderByDescending(u => u.Age)
     .Skip(<span class="num">0</span>).Take(<span class="num">10</span>)
@@ -758,51 +751,7 @@ adults, err := client.Count(<span class="str">"users"</span>, <span class="kw">m
 });</code></pre></div>
     </div>
 
-    <!-- ============================================================ -->
-    <!-- SQL                                                           -->
-    <!-- ============================================================ -->
-
-    <h3 style="font-size:22px; margin-top:40px; padding-top:24px; border-top:2px solid var(--accent-light);">SQL</h3>
-
-    <div class="doc-block" id="sql">
-      <h3>Execute SQL</h3>
-      <p>Run SQL queries. Supports SELECT, INSERT, UPDATE, DELETE, CREATE INDEX, CREATE TABLE, JOINs, GROUP BY, ORDER BY.</p>
-      <div class="lang-tabs" data-group="sql">
-        <button class="lang-tab active" data-lang="rust">Rust</button>
-        <button class="lang-tab" data-lang="python">Python</button>
-        <button class="lang-tab" data-lang="go">Go</button>
-        <button class="lang-tab" data-lang="dotnet">C# / .NET</button>
-      </div>
-      <div class="lang-panel active" data-lang="rust"><pre><code><span class="kw">use</span> oxidb::sql::execute_sql;
-
-<span class="kw">let</span> result = execute_sql(&amp;db, <span class="str">"SELECT * FROM users WHERE age > 25 ORDER BY name"</span>).unwrap();
-execute_sql(&amp;db, <span class="str">"INSERT INTO users (name, age) VALUES ('Eve', 22)"</span>).unwrap();
-execute_sql(&amp;db, <span class="str">"UPDATE users SET age = 31 WHERE name = 'Alice'"</span>).unwrap();
-execute_sql(&amp;db, <span class="str">"DELETE FROM users WHERE age &lt; 18"</span>).unwrap();
-execute_sql(&amp;db, <span class="str">"CREATE INDEX idx_age ON users (age)"</span>).unwrap();</code></pre></div>
-      <div class="lang-panel" data-lang="python"><pre><code>result = client.sql(<span class="str">"SELECT * FROM users WHERE age > 25 ORDER BY name"</span>)
-client.sql(<span class="str">"INSERT INTO users (name, age) VALUES ('Eve', 22)"</span>)
-client.sql(<span class="str">"UPDATE users SET age = 31 WHERE name = 'Alice'"</span>)
-client.sql(<span class="str">"DELETE FROM users WHERE age &lt; 18"</span>)
-
-<span class="co"># JOINs</span>
-result = client.sql(<span class="str">"""
-    SELECT u.name, COUNT(o._id) as order_count
-    FROM users u JOIN orders o ON u._id = o.user_id
-    GROUP BY u.name ORDER BY order_count DESC
-"""</span>)</code></pre></div>
-      <div class="lang-panel" data-lang="go"><pre><code>result, err := client.SQL(<span class="str">"SELECT * FROM users WHERE age > 25 ORDER BY name"</span>)
-client.SQL(<span class="str">"INSERT INTO users (name, age) VALUES ('Eve', 22)"</span>)
-client.SQL(<span class="str">"UPDATE users SET age = 31 WHERE name = 'Alice'"</span>)
-client.SQL(<span class="str">"DELETE FROM users WHERE age &lt; 18"</span>)</code></pre></div>
-      <div class="lang-panel" data-lang="dotnet"><pre><code><span class="kw">var</span> result = <span class="kw">await</span> client.SqlAsync(<span class="str">"SELECT * FROM users WHERE age > 25 ORDER BY name"</span>);
-
-<span class="co">// EF Core LINQ (compiles to queries internally)</span>
-<span class="kw">var</span> users = <span class="kw">await</span> db.Users
-    .Where(u => u.Age > <span class="num">25</span>)
-    .OrderBy(u => u.Name)
-    .ToListAsync();</code></pre></div>
-    </div>
+    <!-- SQL section removed — OxiDB is a document database. -->
 
     <!-- ============================================================ -->
     <!-- SEARCH                                                        -->

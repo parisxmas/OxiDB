@@ -53,7 +53,7 @@ The server responds:
     "supported_wire_versions": [1],
     "stable_surface_version": "1.0",
     "features": ["fts", "blobs", "txn", "rbac", "tls", "encryption_at_rest", "audit", "scram_sha_256", "indexes", "aggregation"],
-    "experimental_features": ["raft", "pitr", "vector_search", "fdw", "stored_procedures", "ttl_indexes", "change_streams", "rest_http", "websocket", "oximem", "mqtt", "s3", "pg_wire", "gelf"],
+    "experimental_features": ["raft", "pitr", "vector_search", "fdw", "stored_procedures", "ttl_indexes", "change_streams", "rest_http", "websocket", "oximem", "mqtt", "s3", "gelf"],
     "auth_methods": ["scram-sha-256"]
   }
 }
@@ -159,9 +159,9 @@ Per [STABILITY.md §Tier A](../STABILITY.md), the following clients ship
 - `python/` (TCP), `python-embedded/` (FFI)
 - `go/` (OxiWire)
 - `julia/OxiDb` (TCP), `julia/OxiDbEmbedded` (FFI)
-- `dotnet/OxiDb.Client.Tcp`, `dotnet/OxiDb.Client.Embedded`, `dotnet/OxiDb.EntityFrameworkCore`
+- `dotnet/OxiDb.Client.Tcp`, `dotnet/OxiDb.Client.Embedded`, `dotnet/OxiDb.Linq`
 - `oxidb-js/` (REST + WebSocket)
-- `oxidb-jdbc/` (JDBC)
+- `oxidb-java/` (pure-Java OxiWire)
 
 Tier-B clients (`php/`, `swift/`) ship with `1.0-experimental` markers and
 are **not** covered by this matrix.
