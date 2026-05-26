@@ -2,6 +2,35 @@
 
 ## v0.28.18
 
+### .NET clients — developer-friendly rework
+
+Four NuGet packages published at v0.28.18 (`OxiDb.Client.Tcp`,
+`OxiDb.Client.Embedded`, `OxiDb.EntityFrameworkCore`, and **NEW:
+`OxiDb.Linq`** — previously source-only).
+
+New on the .NET TCP client (all backward-compatible):
+
+- **Exception hierarchy:** `OxiDbException` base with subclasses for
+  `DuplicateKey`, `TransactionConflict`, `Authentication`, `NotFound`,
+  `Immutable` (WORM), `Connection`, `Protocol`. Server error strings
+  routed to the right subclass via `FromServerMessage`.
+  `OxiDbTcpException` retained as `[Obsolete]` alias (removed in 2.0).
+- **`HelloAsync` + `HelloResponse` record** — wire-protocol HELLO
+  surfaced to .NET consumers, returns server version, supported wire
+  versions, stable + experimental feature sets, auth methods.
+- **Typed CRUD:** `FindAsync<T>`, `FindOneAsync<T>`,
+  `InsertReturningIdAsync` (`long`), `InsertManyReturningIdsAsync`
+  (`long[]`). Eliminates the `JsonElement`→parse dance.
+- **`IAsyncEnumerable<T>` streaming** — `StreamAsync<T>` over
+  paginated LIMIT/SKIP batches for million-row result sets.
+- **DI integration:** `services.AddOxiDbTcp(opts => opts.Host(...))`.
+- **Type-safe query builder:** `Query.Eq/Gte/Lt/In/And/Or/Range/...`
+  for runtime-constructed queries.
+
+EF Core: `dotnet/OxiDb.EntityFrameworkCore/EF1001-AUDIT.md` lists the
+one internal-API use (identity resolution via `IStateManager`) and
+the planned migration paths. EF1001 cleanup is a follow-up.
+
 ### `$or` + dot-paths in the partial-JSONB matcher
 
 Final two MongoDB-winning tests in `tests/comparison-mongodb` (1M docs)

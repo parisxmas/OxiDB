@@ -65,6 +65,33 @@ export default function Page() {
       </div>
 
       <div class="change-group">
+        <h4 class="change-type added">.NET clients (developer-friendly rework)</h4>
+        <ul>
+          <li>
+            <strong>4 NuGet packages published at v0.28.18</strong> &mdash; <code>OxiDb.Client.Tcp</code>, <code>OxiDb.Client.Embedded</code>, <code>OxiDb.EntityFrameworkCore</code>, and <strong>NEW: <code>OxiDb.Linq</code></strong> (LINQ provider, previously source-only).
+          </li>
+          <li>
+            <strong>Exception hierarchy</strong> &mdash; <code>OxiDbException</code> base + <code>OxiDbDuplicateKeyException</code>, <code>OxiDbTransactionConflictException</code>, <code>OxiDbAuthenticationException</code>, <code>OxiDbNotFoundException</code>, <code>OxiDbImmutableException</code> (WORM), <code>OxiDbConnectionException</code>, <code>OxiDbProtocolException</code>. Server error strings routed to the right subclass via <code>FromServerMessage</code>. Legacy <code>OxiDbTcpException</code> retained as <code>[Obsolete]</code> alias.
+          </li>
+          <li>
+            <strong><code>HelloAsync</code> + <code>HelloResponse</code> record</strong> &mdash; wire-protocol handshake returning server version, supported wire versions, stable + experimental feature sets, auth methods.
+          </li>
+          <li>
+            <strong>Typed CRUD overloads</strong> &mdash; <code>FindAsync&lt;T&gt;</code>, <code>FindOneAsync&lt;T&gt;</code>, <code>InsertReturningIdAsync</code> (returns <code>long</code>), <code>InsertManyReturningIdsAsync</code> (returns <code>long[]</code>). Eliminate the <code>JsonElement</code>&rarr;parse dance.
+          </li>
+          <li>
+            <strong><code>StreamAsync&lt;T&gt;</code></strong> &mdash; <code>IAsyncEnumerable&lt;T&gt;</code> over paginated LIMIT/SKIP batches for million-row result sets.
+          </li>
+          <li>
+            <strong>DI integration</strong> &mdash; <code>services.AddOxiDbTcp(opts =&gt; opts.Host(&hellip;))</code> registers <code>IOxiDbClient</code> as a singleton.
+          </li>
+          <li>
+            <strong>Type-safe query builder</strong> &mdash; <code>Query.Eq</code>, <code>Query.Gte</code>, <code>Query.In</code>, <code>Query.And</code>, <code>Query.Or</code>, <code>Query.Range</code> &hellip; for runtime-constructed queries that don&apos;t fit LINQ.
+          </li>
+        </ul>
+      </div>
+
+      <div class="change-group">
         <h4 class="change-type added">1.0 prep docs</h4>
         <ul>
           <li>
