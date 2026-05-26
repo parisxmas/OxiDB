@@ -103,8 +103,73 @@ public sealed class OxiDbTcpClient : IOxiDbClient
         {
             int read = await _stream.ReadAsync(buffer.AsMemory(offset), ct);
             if (read == 0)
-                throw new OxiDbTcpException("Connection closed by server");
+                throw new OxiDbConnectionException("Connection closed by server");
             offset += read;
+        }
+    }
+
+    /// <summary>
+    /// Escape hatch: send an arbitrary wire-level payload and return the
+    /// server's raw <c>data</c> field as <see cref="JsonElement"/>.
+    /// Used by typed wrappers for commands not yet on the interface.
+    /// Prefer the typed overloads where they exist.
+    /// </summary>
+    public Task<JsonElement> ExecRawAsync(Dictionary<string, object?> payload, CancellationToken ct = default)
+        => RequestAsync(payload, ct);
+
+    /// <summary>
+    /// Like <see cref="ExecRawAsync"/> but returns the **entire response
+    /// envelope** instead of just <c>data</c>. Use this for commands
+    /// whose response shape isn't <c>{"ok": true, "data": ...}</c> —
+    /// notably HELLO, which puts its payload under <c>server</c>.
+    /// </summary>
+    public Task<JsonElement> ExecRawEnvelopeAsync(Dictionary<string, object?> payload, CancellationToken ct = default)
+        => RequestEnvelopeAsync(payload, ct);
+
+    private async Task<JsonElement> RequestEnvelopeAsync(Dictionary<string, object?> payload, CancellationToken ct)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            byte[] reqBytes = _useOxiWire
+                ? OxiWire.EncodeRequest(payload)
+                : JsonSerializer.SerializeToUtf8Bytes(payload);
+
+            await SendAsync(reqBytes, ct);
+            var respBytes = await ReceiveAsync(ct);
+
+            // For OxiWire-encoded responses, DecodeResponse already
+            // returns the full envelope as a JsonElement.
+            if (_useOxiWire && OxiWire.IsOxiWire(respBytes))
+            {
+                var (ok, data) = OxiWire.DecodeResponse(respBytes);
+                if (!ok)
+                {
+                    var errMsg = data.ValueKind == JsonValueKind.String
+                        ? data.GetString() ?? "unknown error"
+                        : "unknown error";
+                    throw OxiDbException.FromServerMessage(errMsg);
+                }
+                return data;
+            }
+
+            // JSON response: server returns `{"ok": ..., "data" | "server" | "error": ...}`.
+            // Return the whole root so the caller can pick the right field.
+            using var doc = JsonDocument.Parse(respBytes);
+            var root = doc.RootElement.Clone();
+            if (root.TryGetProperty("ok", out var okProp) && !okProp.GetBoolean())
+            {
+                var errMsg = root.TryGetProperty("error", out var errProp)
+                    ? errProp.GetString() ?? "unknown error"
+                    : "unknown error";
+                throw OxiDbException.FromServerMessage(errMsg);
+            }
+            return root;
+        }
+        finally
+        {
+            _lock.Release();
         }
     }
 
@@ -131,7 +196,7 @@ public sealed class OxiDbTcpClient : IOxiDbClient
                     var errMsg = data.ValueKind == JsonValueKind.String
                         ? data.GetString() ?? "unknown error"
                         : "unknown error";
-                    throw new OxiDbTcpException(errMsg);
+                    throw OxiDbException.FromServerMessage(errMsg);
                 }
                 return data;
             }
@@ -144,7 +209,7 @@ public sealed class OxiDbTcpClient : IOxiDbClient
                 var errMsg = root.TryGetProperty("error", out var errProp)
                     ? errProp.GetString() ?? "unknown error"
                     : "unknown error";
-                throw new OxiDbTcpException(errMsg);
+                throw OxiDbException.FromServerMessage(errMsg);
             }
 
             if (root.TryGetProperty("data", out var dataProp))
@@ -400,7 +465,5 @@ public sealed class OxiDbTcpClient : IOxiDbClient
     }
 }
 
-public class OxiDbTcpException : Exception
-{
-    public OxiDbTcpException(string message) : base(message) { }
-}
+// OxiDbTcpException now lives in Exceptions.cs as a legacy alias of
+// OxiDbException — kept for binary compatibility, marked [Obsolete].

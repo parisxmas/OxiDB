@@ -11,4 +11,11 @@
     <IsPackable>true</IsPackable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Small (~30 KB) — used by the optional DI extension methods in
+         ServiceCollectionExtensions.cs. Transitively available to
+         consumers without forcing them onto a specific DI host. -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.0" />
+  </ItemGroup>
+
 </Project>

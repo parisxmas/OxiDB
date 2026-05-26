@@ -220,7 +220,7 @@ public static class OxiWire
     public static (bool Ok, JsonElement Data) DecodeResponse(ReadOnlySpan<byte> payload)
     {
         if (payload.Length < 2 || payload[0] != Magic)
-            throw new OxiDbTcpException("OxiWire: invalid magic byte");
+            throw new OxiDbProtocolException("OxiWire: invalid magic byte");
 
         var status = payload[1];
         var pos = 2;
@@ -244,7 +244,7 @@ public static class OxiWire
     private static void DecodeValueToJson(ReadOnlySpan<byte> buf, ref int pos, Utf8JsonWriter writer)
     {
         if (pos >= buf.Length)
-            throw new OxiDbTcpException("OxiWire: unexpected end of input");
+            throw new OxiDbProtocolException("OxiWire: unexpected end of input");
 
         var tag = buf[pos++];
 
@@ -320,13 +320,13 @@ public static class OxiWire
                 break;
 
             default:
-                throw new OxiDbTcpException($"OxiWire: unknown tag 0x{tag:X2} at position {pos - 1}");
+                throw new OxiDbProtocolException($"OxiWire: unknown tag 0x{tag:X2} at position {pos - 1}");
         }
     }
 
     private static void EnsureBytes(ReadOnlySpan<byte> buf, int pos, int need)
     {
         if (pos + need > buf.Length)
-            throw new OxiDbTcpException($"OxiWire: truncated data at position {pos}, need {need} bytes");
+            throw new OxiDbProtocolException($"OxiWire: truncated data at position {pos}, need {need} bytes");
     }
 }
