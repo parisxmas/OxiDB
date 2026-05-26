@@ -1,128 +1,146 @@
 package com.oxidb.example;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.oxidb.spring.OxiDbClient;
-import com.oxidb.spring.OxiDbException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.oxidb.client.OxiDbClient;
+import com.oxidb.client.OxiDbException;
+import com.oxidb.client.Query;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.nio.charset.StandardCharsets;
+import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 
+/**
+ * REST API translating the standard CRUD shape into OxiDB calls.
+ * Each route is a thin wrapper around an {@link OxiDbClient} method —
+ * the goal is to show the API surface side-by-side with the routes a
+ * typical Spring developer would build on top.
+ *
+ * <p>Routes:
+ * <ul>
+ *   <li>GET    /ping                       — server liveness</li>
+ *   <li>GET    /hello                      — server version + features</li>
+ *   <li>POST   /{collection}               — insert (body: JSON doc)</li>
+ *   <li>GET    /{collection}?query=...     — find (query is a JSON string)</li>
+ *   <li>GET    /{collection}/count         — count all in the collection</li>
+ *   <li>PATCH  /{collection}               — update (body: {"query": ..., "update": ...})</li>
+ *   <li>DELETE /{collection}               — delete (body: JSON query)</li>
+ *   <li>GET    /{collection}/typed/{name}  — typed findOne example</li>
+ * </ul>
+ */
 @RestController
 public class OxiDbController {
 
+    private static final ObjectMapper JSON = new ObjectMapper();
     private final OxiDbClient db;
 
     public OxiDbController(OxiDbClient db) {
         this.db = db;
     }
 
-    // ---- Ping ----
+    /** Demo entity for the typed example below. */
+    public record User(long _id, String name, int age, boolean active) {}
+
+    // ── Liveness / handshake ────────────────────────────────────────────
 
     @GetMapping("/ping")
-    public ResponseEntity<?> ping() {
-        return ok(db.ping());
+    public Object ping() throws IOException {
+        return Map.of("data", db.ping());
     }
 
-    // ---- CRUD ----
+    @GetMapping("/hello")
+    public Object hello() throws IOException {
+        var h = db.hello("spring-boot-example/1.0");
+        return Map.of(
+            "name", h.name(),
+            "version", h.version(),
+            "wire_version", h.wireVersion(),
+            "stable_surface_version", h.stableSurfaceVersion(),
+            "features", h.features(),
+            "experimental_features", h.experimentalFeatures(),
+            "auth_methods", h.authMethods()
+        );
+    }
+
+    // ── CRUD ────────────────────────────────────────────────────────────
 
     @PostMapping("/{collection}")
-    public ResponseEntity<?> insert(@PathVariable String collection,
-                                    @RequestBody String docJson) {
-        return ok(db.insert(collection, docJson));
+    public Object insert(@PathVariable String collection,
+                         @RequestBody Map<String, Object> doc) throws IOException {
+        long id = db.insertReturningId(collection, doc);
+        return Map.of("id", id);
     }
 
     @GetMapping("/{collection}")
-    public ResponseEntity<?> find(@PathVariable String collection,
-                                  @RequestParam(defaultValue = "{}") String query,
-                                  @RequestParam(required = false) Integer skip,
-                                  @RequestParam(required = false) Integer limit) {
-        return ok(db.find(collection, query != null ? parseJson(query) : null, null, skip, limit));
+    public List<Map<String, Object>> find(@PathVariable String collection,
+                                          @RequestParam(defaultValue = "{}") String query)
+            throws IOException {
+        return db.find(collection, parseJson(query));
     }
 
-    @PutMapping("/{collection}")
-    public ResponseEntity<?> update(@PathVariable String collection,
-                                    @RequestBody Map<String, Object> body) {
+    @GetMapping("/{collection}/count")
+    public Object count(@PathVariable String collection) throws IOException {
+        return Map.of("count", db.count(collection, null));
+    }
+
+    @PatchMapping("/{collection}")
+    public Object update(@PathVariable String collection,
+                         @RequestBody Map<String, Object> body) throws IOException {
         @SuppressWarnings("unchecked")
         Map<String, Object> query = (Map<String, Object>) body.get("query");
         @SuppressWarnings("unchecked")
         Map<String, Object> update = (Map<String, Object>) body.get("update");
-        return ok(db.update(collection, query, update));
+        int modified = db.update(collection, query, update);
+        return Map.of("modified", modified);
     }
 
     @DeleteMapping("/{collection}")
-    public ResponseEntity<?> delete(@PathVariable String collection,
-                                    @RequestBody String queryJson) {
-        return ok(db.delete(collection, queryJson));
+    public Object delete(@PathVariable String collection,
+                         @RequestBody(required = false) Map<String, Object> query)
+            throws IOException {
+        int deleted = db.delete(collection, query != null ? query : Map.of());
+        return Map.of("deleted", deleted);
     }
 
-    @GetMapping("/{collection}/count")
-    public ResponseEntity<?> count(@PathVariable String collection) {
-        return ok(Map.of("count", db.count(collection)));
+    // ── Typed example ───────────────────────────────────────────────────
+
+    /**
+     * Shows {@code findOne} with typed deserialization to a record.
+     * Returns 404 if the user isn't found.
+     */
+    @GetMapping("/{collection}/typed/{name}")
+    public ResponseEntity<User> findUserByName(@PathVariable String collection,
+                                               @PathVariable String name) throws IOException {
+        User user = db.findOne(collection, Query.eq("name", name), User.class);
+        return user != null ? ResponseEntity.ok(user) : ResponseEntity.notFound().build();
     }
 
-    // ---- Transaction demo ----
+    // ── Error handling ──────────────────────────────────────────────────
 
-    @PostMapping("/tx/demo")
-    public ResponseEntity<?> txDemo() {
-        db.withTransaction(() -> {
-            db.insert("tx_log", Map.of("action", "debit", "amount", 100));
-            db.insert("tx_log", Map.of("action", "credit", "amount", 100));
-        });
-        return ok(Map.of("status", "committed", "description", "Inserted debit + credit atomically"));
+    @ExceptionHandler(OxiDbException.OxiDbNotFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNotFound(OxiDbException.OxiDbNotFoundException e) {
+        return ResponseEntity.status(404).body(Map.of("error", e.getServerMessage()));
     }
 
-    // ---- Blob storage ----
-
-    @PostMapping("/blobs/{bucket}")
-    public ResponseEntity<?> createBucket(@PathVariable String bucket) {
-        return ok(db.createBucket(bucket));
-    }
-
-    @PutMapping("/blobs/{bucket}/{key}")
-    public ResponseEntity<?> putObject(@PathVariable String bucket,
-                                       @PathVariable String key,
-                                       @RequestBody byte[] data) {
-        return ok(db.putObject(bucket, key, data));
-    }
-
-    @GetMapping("/blobs/{bucket}/{key}")
-    public ResponseEntity<byte[]> getObject(@PathVariable String bucket,
-                                            @PathVariable String key) {
-        JsonNode result = db.getObject(bucket, key);
-        byte[] content = db.decodeObjectContent(result);
-        return ResponseEntity.ok(content);
-    }
-
-    // ---- Full-text search ----
-
-    @GetMapping("/search")
-    public ResponseEntity<?> search(@RequestParam String q,
-                                    @RequestParam(required = false) String bucket,
-                                    @RequestParam(defaultValue = "10") int limit) {
-        return ok(db.search(q, bucket, limit));
-    }
-
-    // ---- Helpers ----
-
-    private ResponseEntity<?> ok(Object data) {
-        return ResponseEntity.ok(data);
-    }
-
-    private Map<String, Object> parseJson(String json) {
-        try {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> map = new com.fasterxml.jackson.databind.ObjectMapper()
-                    .readValue(json, Map.class);
-            return map;
-        } catch (Exception e) {
-            throw new OxiDbException("Invalid JSON query: " + e.getMessage(), e);
-        }
+    @ExceptionHandler(OxiDbException.OxiDbDuplicateKeyException.class)
+    public ResponseEntity<Map<String, Object>> handleDuplicate(OxiDbException.OxiDbDuplicateKeyException e) {
+        return ResponseEntity.status(409).body(Map.of("error", e.getServerMessage()));
     }
 
     @ExceptionHandler(OxiDbException.class)
-    public ResponseEntity<?> handleOxiDbError(OxiDbException e) {
-        return ResponseEntity.internalServerError().body(Map.of("error", e.getMessage()));
+    public ResponseEntity<Map<String, Object>> handleAny(OxiDbException e) {
+        return ResponseEntity.internalServerError().body(Map.of("error", e.getServerMessage()));
+    }
+
+    // ── Helpers ─────────────────────────────────────────────────────────
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> parseJson(String json) {
+        try {
+            return JSON.readValue(json, Map.class);
+        } catch (Exception e) {
+            throw new OxiDbException("Invalid JSON query: " + e.getMessage(), e);
+        }
     }
 }

@@ -11,8 +11,10 @@ TCP transport over the OxiWire binary protocol. Java 17+.
 </dependency>
 ```
 
-For SQL-flavoured access via JDBC (read-only-ish, mostly suited to
-reporting tools), use the sibling [`oxidb-jdbc`](../oxidb-jdbc/) artifact.
+OxiDB is a document database — MongoDB-style JSON queries via this
+client are the canonical API. (Earlier versions shipped an experimental
+SQL surface via JDBC; SQL has been removed and the JDBC driver is no
+longer maintained.)
 
 ## 60-second start
 
@@ -126,7 +128,7 @@ pool). HikariCP-style pooling is on the roadmap below.
 
 ## Roadmap
 
-The artifacts published at **v0.28.18** ship the core client + JDBC
+The artifacts published at **v0.28.18** ship the native document client
 driver. The list below tracks bigger-scope work for upcoming releases:
 
 | Item | Status |

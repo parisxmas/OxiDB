@@ -1,6 +1,7 @@
 package com.oxidb.client;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -38,7 +39,13 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class OxiDbClient implements AutoCloseable {
 
-    private static final ObjectMapper JSON = new ObjectMapper();
+    // Tolerant ObjectMapper: the server auto-injects engine fields (_id,
+    // _version) on every doc. User-defined records / classes typically
+    // don't model _version, so we ignore unknown properties by default.
+    // Users can supply their own ObjectMapper later if they want stricter
+    // validation.
+    private static final ObjectMapper JSON = new ObjectMapper()
+        .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
 
     private final Socket socket;
     private final InputStream in;
@@ -87,7 +94,10 @@ public final class OxiDbClient implements AutoCloseable {
      */
     public Object execRaw(Map<String, Object> payload) throws IOException {
         Map<String, Object> envelope = sendCommand(payload, false);
-        return envelope.get("data");
+        // OxiWire path: envelope IS the full response map → unwrap "data".
+        // JSON path: same shape, server returns {ok, data}; also unwrap.
+        // For HELLO (no "data"), callers should use execRawEnvelope instead.
+        return envelope.containsKey("data") ? envelope.get("data") : envelope;
     }
 
     /**
@@ -99,6 +109,9 @@ public final class OxiDbClient implements AutoCloseable {
         return sendCommand(payload, true);
     }
 
+    private static final com.fasterxml.jackson.databind.ObjectMapper RESP_JSON =
+        new com.fasterxml.jackson.databind.ObjectMapper();
+
     @SuppressWarnings("unchecked")
     private Map<String, Object> sendCommand(Map<String, Object> payload, boolean wantEnvelope) throws IOException {
         if (closed) throw new OxiDbException("Client is closed");
@@ -107,20 +120,32 @@ public final class OxiDbClient implements AutoCloseable {
             byte[] reqBytes = OxiWireCodec.encodeRequest(payload);
             OxiWireCodec.writeFrame(out, reqBytes);
             byte[] respBytes = OxiWireCodec.readFrame(in);
-            OxiWireCodec.OxiWireResponse resp = OxiWireCodec.decodeResponse(respBytes);
 
-            if (!resp.ok()) {
-                throw OxiDbException.fromServerMessage(resp.errorMessage());
+            // Server may respond in either OxiWire (0xDB magic) or JSON.
+            // HELLO in particular always returns JSON regardless of the
+            // request's wire format. Sniff the first byte to dispatch.
+            if (respBytes.length > 0 && (respBytes[0] & 0xFF) == (OxiWireCodec.MAGIC & 0xFF)) {
+                OxiWireCodec.OxiWireResponse resp = OxiWireCodec.decodeResponse(respBytes);
+                if (!resp.ok()) {
+                    throw OxiDbException.fromServerMessage(resp.errorMessage());
+                }
+                if (resp.value() instanceof Map<?, ?> map) {
+                    return (Map<String, Object>) map;
+                }
+                Map<String, Object> wrapped = new LinkedHashMap<>();
+                wrapped.put("data", resp.value());
+                return wrapped;
             }
-            // For OxiWire responses, the decoded value IS the full envelope.
-            if (resp.value() instanceof Map<?, ?> map) {
-                return (Map<String, Object>) map;
+
+            // JSON envelope: {"ok": bool, "data" | "server" | "error": ...}
+            Map<String, Object> root = RESP_JSON.readValue(respBytes, Map.class);
+            Object okFlag = root.get("ok");
+            if (Boolean.FALSE.equals(okFlag)) {
+                Object errObj = root.get("error");
+                String errMsg = errObj != null ? errObj.toString() : "unknown error";
+                throw OxiDbException.fromServerMessage(errMsg);
             }
-            // Some commands return scalars (e.g. ping → "pong"). Wrap so the
-            // caller can pull from "data".
-            Map<String, Object> wrapped = new LinkedHashMap<>();
-            wrapped.put("data", resp.value());
-            return wrapped;
+            return root;
         } finally {
             lock.unlock();
         }
@@ -163,20 +188,26 @@ public final class OxiDbClient implements AutoCloseable {
     }
 
     public long insertReturningId(String collection, Map<String, Object> doc) throws IOException {
-        Map<String, Object> resp = (Map<String, Object>) execRaw(
-            Map.of("cmd", "insert", "collection", collection, "doc", doc));
-        Object id = resp.get("id");
-        if (id instanceof Number n) return n.longValue();
-        throw new OxiDbException("Insert response missing numeric 'id': " + resp);
+        Object data = execRaw(Map.of("cmd", "insert", "collection", collection, "doc", doc));
+        if (data instanceof Map<?, ?> map) {
+            Object id = map.get("id");
+            if (id instanceof Number n) return n.longValue();
+        }
+        if (data instanceof Number n) return n.longValue(); // some servers return id scalar
+        throw new OxiDbException("Insert response did not include a numeric 'id': " + data);
     }
 
     @SuppressWarnings("unchecked")
     public long[] insertManyReturningIds(String collection, List<Map<String, Object>> docs) throws IOException {
-        Map<String, Object> resp = (Map<String, Object>) execRaw(
-            Map.of("cmd", "insert_many", "collection", collection, "docs", docs));
-        Object ids = resp.get("ids");
-        if (!(ids instanceof List<?> list)) {
-            throw new OxiDbException("InsertMany response missing 'ids' array: " + resp);
+        Object data = execRaw(Map.of("cmd", "insert_many", "collection", collection, "docs", docs));
+        List<?> list = null;
+        if (data instanceof Map<?, ?> map && map.get("ids") instanceof List<?> idsList) {
+            list = idsList;
+        } else if (data instanceof List<?> direct) {
+            list = direct;
+        }
+        if (list == null) {
+            throw new OxiDbException("InsertMany response missing 'ids' array: " + data);
         }
         long[] out = new long[list.size()];
         for (int i = 0; i < list.size(); i++) {
@@ -233,24 +264,31 @@ public final class OxiDbClient implements AutoCloseable {
     }
 
     public int update(String collection, Map<String, Object> query, Map<String, Object> update) throws IOException {
-        Map<String, Object> resp = (Map<String, Object>) execRaw(Map.of(
+        Object data = execRaw(Map.of(
             "cmd", "update",
             "collection", collection,
             "query", query,
             "update", update
         ));
-        Object n = resp.get("modified");
-        return n instanceof Number num ? num.intValue() : 0;
+        return countFrom(data, "modified");
     }
 
     public int delete(String collection, Map<String, Object> query) throws IOException {
-        Map<String, Object> resp = (Map<String, Object>) execRaw(Map.of(
+        Object data = execRaw(Map.of(
             "cmd", "delete",
             "collection", collection,
             "query", query
         ));
-        Object n = resp.get("deleted");
-        return n instanceof Number num ? num.intValue() : 0;
+        return countFrom(data, "deleted");
+    }
+
+    private static int countFrom(Object data, String field) {
+        if (data instanceof Map<?, ?> map) {
+            Object n = map.get(field);
+            if (n instanceof Number num) return num.intValue();
+        }
+        if (data instanceof Number n) return n.intValue();
+        return 0;
     }
 
     // ── Async variants (CompletableFuture) ──────────────────────────────

@@ -11,13 +11,17 @@
         <relativePath/>
     </parent>
 
-    <groupId>com.oxidb</groupId>
+    <groupId>com.oxidb.examples</groupId>
     <artifactId>oxidb-example-spring-boot</artifactId>
-    <version>0.2.0</version>
+    <version>0.28.18</version>
     <packaging>jar</packaging>
 
     <name>OxiDB Spring Boot Example</name>
-    <description>Example Spring Boot app using OxiDB</description>
+    <description>
+        Spring Boot REST API backed by OxiDB. Manual @Bean wiring of
+        OxiDbClient — no starter required (Spring Data starter is on
+        the roadmap, see oxidb-java/README.md).
+    </description>
 
     <properties>
         <java.version>17</java.version>
@@ -31,8 +35,8 @@
 
         <dependency>
             <groupId>com.oxidb</groupId>
-            <artifactId>oxidb-spring-boot-starter</artifactId>
-            <version>0.2.0</version>
+            <artifactId>oxidb-client</artifactId>
+            <version>0.28.18</version>
         </dependency>
     </dependencies>
 
