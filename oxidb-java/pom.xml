@@ -1,16 +1,21 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                             http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.oxidb</groupId>
-    <artifactId>oxidb-jdbc</artifactId>
+    <artifactId>oxidb-client</artifactId>
     <version>0.28.18</version>
     <packaging>jar</packaging>
 
-    <name>OxiDB JDBC Driver</name>
-    <description>Pure Java JDBC driver for OxiDB using the OxiWire binary protocol</description>
+    <name>OxiDB Client</name>
+    <description>
+        Pure-Java document client for the OxiDB database server. TCP transport,
+        OxiWire binary protocol, typed CRUD, HELLO handshake, exception
+        hierarchy, query builder. Java 17+.
+    </description>
     <url>https://oxidb.baltavista.com</url>
 
     <licenses>
@@ -40,23 +45,40 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
     </properties>
+
+    <dependencies>
+        <!-- JSON parsing for response payloads. Jackson is the de-facto
+             standard; consumers usually already have it. Light core
+             package (~370 KB) — no Spring / Guava transitive cost. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.18.2</version>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.11.4</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
 
     <build>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-jar-plugin</artifactId>
-                <version>3.3.0</version>
-                <configuration>
-                    <archive>
-                        <manifestEntries>
-                            <Implementation-Title>OxiDB JDBC Driver</Implementation-Title>
-                            <Implementation-Version>${project.version}</Implementation-Version>
-                        </manifestEntries>
-                    </archive>
-                </configuration>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.4.2</version>
+            </plugin>
+            <!-- Sources + Javadoc jars are required by Maven Central. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-source-plugin</artifactId>
@@ -82,9 +104,17 @@
                     <doclint>none</doclint>
                 </configuration>
             </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.2</version>
+            </plugin>
         </plugins>
     </build>
 
+    <!-- Maven Central publishing via the `release` profile.
+         Activate with: mvn -P release deploy
+         Requires GPG key + ~/.m2/settings.xml with central credentials. -->
     <profiles>
         <profile>
             <id>release</id>
