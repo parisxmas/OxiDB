@@ -458,11 +458,20 @@ impl BTreeCollection {
     /// 2. **Single-field index path** — for queries `is_fully_indexed`
     ///    recognises (single eq, range, $in), fall through to
     ///    `execute_indexed` which intersects per-field index results.
-    pub fn find_oxiwire_bytes(
+    /// OxiWire bytes-first `find`: returns `(count, concatenated_doc_bytes)`
+    /// where the bytes are each matching document's self-delimiting OxiWire
+    /// encoding appended into a **single** buffer. The server prepends the
+    /// array-response header — it never re-collects per-doc `Arc`s.
+    ///
+    /// All matches are encoded into one growing `Vec<u8>` (amortized growth,
+    /// no per-doc allocation), so a large result set's peak memory tracks the
+    /// compact encoded bytes rather than a `Vec` of 7×-heavier `Value`s — the
+    /// difference between completing and OOM-ing on a big unindexed result.
+    pub fn find_oxiwire_concat(
         &self,
         query_json: &Value,
         opts: &FindOptions,
-    ) -> Option<Result<Vec<Arc<[u8]>>>> {
+    ) -> Option<Result<(usize, Vec<u8>)>> {
         // Sort/skip/limit not supported in the fast path — the Value-based
         // path has dedicated logic for those (early termination, index-backed
         // sort, etc.) that we don't replicate here.
@@ -475,15 +484,19 @@ impl BTreeCollection {
             Err(e) => return Some(Err(e)),
         };
 
+        let mut buf: Vec<u8> = Vec::new();
+        let mut count = 0usize;
+
         // ── Strategy 1: composite-index exact cover ─────────────────────
         if let Some(ids) = self.try_composite_lookup(&query) {
-            let mut results: Vec<Arc<[u8]>> = Vec::with_capacity(ids.len());
+            buf.reserve(ids.len() * 64);
             for id in &ids {
                 if let Some(bytes) = self.load_doc_oxiwire_bytes(*id) {
-                    results.push(bytes);
+                    buf.extend_from_slice(&bytes);
+                    count += 1;
                 }
             }
-            return Some(Ok(results));
+            return Some(Ok((count, buf)));
         }
 
         // ── Strategy 2: single-field index path (no post-filter) ───────
@@ -499,44 +512,41 @@ impl BTreeCollection {
                 Some(ids) => ids,
                 None => return None,
             };
-            let mut results: Vec<Arc<[u8]>> = Vec::with_capacity(ids.len());
+            buf.reserve(ids.len() * 64);
             for id in &ids {
                 if let Some(bytes) = self.load_doc_oxiwire_bytes(*id) {
-                    results.push(bytes);
+                    buf.extend_from_slice(&bytes);
+                    count += 1;
                 }
             }
-            return Some(Ok(results));
+            return Some(Ok((count, buf)));
         }
 
         // ── Strategy 3: post-filter, encode-direct (no Vec<Value>) ──────
         // The query needs a post-filter the index can't satisfy. Mirror the
         // Value path's candidate selection (index-narrow when possible, else
-        // full scan), but decode one doc at a time and collect ENCODED
-        // OxiWire bytes — never a Vec of materialized Values. Peak memory
-        // tracks the compact result bytes (~7× smaller than Values), which is
-        // what keeps a large unindexed result set (e.g. `verified=true` over
-        // 1M docs) from ballooning RSS into an OOM.
+        // full scan), decode one doc at a time, and append each match's
+        // encoding straight into the shared buffer — no per-doc Vec or Arc.
         drop(fi);
-        let mut results: Vec<Arc<[u8]>> = Vec::new();
         if let Some(ids) = candidate_ids {
             for id in &ids {
                 if let Some(arc) = self.load_doc_arc(*id) {
                     if query::matches_value(&query, &arc) {
-                        results.push(Arc::<[u8]>::from(crate::wire_oxiwire::encode_value_owned(
-                            &arc,
-                        )));
+                        crate::wire_oxiwire::encode_value(&arc, &mut buf);
+                        count += 1;
                     }
                 }
             }
-            return Some(Ok(results));
+            return Some(Ok((count, buf)));
         }
         let scan = self.for_each_doc_streaming(|doc| {
             if query::matches_value(&query, doc) {
-                results.push(Arc::<[u8]>::from(crate::wire_oxiwire::encode_value_owned(doc)));
+                crate::wire_oxiwire::encode_value(doc, &mut buf);
+                count += 1;
             }
             Ok(true)
         });
-        Some(scan.map(|_| results))
+        Some(scan.map(|_| (count, buf)))
     }
 
     /// If a composite index's `fields` exactly matches the query's set of
@@ -3575,22 +3585,16 @@ mod tests {
         // Query covered exactly by the composite index — should hit the
         // bytes-first composite path (returns 2 matches: n=1 and n=4).
         let query = json!({"dept": "Sales", "status": "active"});
-        let result = col
-            .find_oxiwire_bytes(&query, &FindOptions::default())
+        let (count, bytes) = col
+            .find_oxiwire_concat(&query, &FindOptions::default())
             .expect("fast path engaged")
             .expect("ok");
-        assert_eq!(
-            result.len(),
-            2,
-            "expected 2 matches via composite-index lookup"
-        );
-        for bytes in &result {
-            assert!(!bytes.is_empty(), "encoded doc bytes must be non-empty");
-        }
+        assert_eq!(count, 2, "expected 2 matches via composite-index lookup");
+        assert!(!bytes.is_empty(), "encoded doc bytes must be non-empty");
     }
 
     #[test]
-    fn find_oxiwire_bytes_post_filters_mixed_ops() {
+    fn find_oxiwire_concat_post_filters_mixed_ops() {
         // The composite/single-field index paths can't fully satisfy a $gte,
         // so Strategy 3 post-filters with encode-direct (no Vec<Value>) rather
         // than falling back to the Value path. The result must still be exact.
@@ -3602,18 +3606,16 @@ mod tests {
             .unwrap();
 
         let query = json!({"dept": "Sales", "n": {"$gte": 5}});
-        let result = col
-            .find_oxiwire_bytes(&query, &FindOptions::default())
+        let (count, bytes) = col
+            .find_oxiwire_concat(&query, &FindOptions::default())
             .expect("Strategy 3 handles post-filter queries")
             .expect("scan ok");
-        assert_eq!(result.len(), 1, "only the Sales/n=10 doc matches");
-        for bytes in &result {
-            assert!(!bytes.is_empty(), "encoded doc bytes must be non-empty");
-        }
+        assert_eq!(count, 1, "only the Sales/n=10 doc matches");
+        assert!(!bytes.is_empty(), "encoded doc bytes must be non-empty");
     }
 
     #[test]
-    fn find_oxiwire_bytes_full_scan_matches_value_path() {
+    fn find_oxiwire_concat_full_scan_matches_value_path() {
         // An unindexed equality (the OOM-trigger shape: large unindexed result)
         // must return exactly the same set via the bytes path as the Value path.
         let col = new_btree_collection("fullscan_parity");
@@ -3622,13 +3624,13 @@ mod tests {
         }
         let query = json!({"v": true});
         let opts = FindOptions::default();
-        let bytes = col
-            .find_oxiwire_bytes(&query, &opts)
+        let (count, _bytes) = col
+            .find_oxiwire_concat(&query, &opts)
             .expect("Strategy 3 handles unindexed full scan")
             .expect("scan ok");
         let values = col.find_with_options_arcs(&query, &opts).unwrap();
-        assert_eq!(bytes.len(), values.len(), "bytes path count == Value path");
-        assert_eq!(bytes.len(), 100);
+        assert_eq!(count, values.len(), "bytes path count == Value path");
+        assert_eq!(count, 100);
     }
 
     /// Cold path — doc_cache evicted, bytes_cache empty → must read

@@ -1329,21 +1329,21 @@ impl OxiDb {
     }
 
     /// Bytes-first find — the fast path that closes the JSONB→Value gap on
-    /// the find→wire pipeline. Returns `Some(Ok(_))` when the query can be
-    /// fully satisfied by an index (no post-filter, no sort/skip/limit);
-    /// otherwise returns `None` so the caller falls back to the
-    /// Value-based path. See `BTreeCollection::find_oxiwire_bytes`.
-    pub fn find_oxiwire_bytes(
+    /// the find→wire pipeline. Returns `Some(Ok((count, bytes)))` where `bytes`
+    /// is the concatenation of each matching document's OxiWire encoding in a
+    /// single buffer; `None` only when sort/skip/limit force the Value path.
+    /// See `BTreeCollection::find_oxiwire_concat`.
+    pub fn find_oxiwire_concat(
         &self,
         collection: &str,
         query: &Value,
         opts: &FindOptions,
-    ) -> Option<Result<Vec<Arc<[u8]>>>> {
+    ) -> Option<Result<(usize, Vec<u8>)>> {
         let col = match self.get_or_create_collection(collection) {
             Ok(c) => c,
             Err(e) => return Some(Err(e)),
         };
-        col.find_oxiwire_bytes(query, opts)
+        col.find_oxiwire_concat(query, opts)
     }
 
     pub fn find_one(&self, collection: &str, query: &Value) -> Result<Option<Value>> {

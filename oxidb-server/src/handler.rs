@@ -257,9 +257,11 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 // to the Value path for any query the fast path can't
                 // handle (post-filters, sorts, projections).
                 if protocol::wire_format() == WireFormat::OxiWire {
-                    if let Some(result) = db.find_oxiwire_bytes(col, query, &opts) {
+                    if let Some(result) = db.find_oxiwire_concat(col, query, &opts) {
                         match result {
-                            Ok(byte_arcs) => return crate::oxiwire::ok_docs_bytes_response(&byte_arcs),
+                            Ok((count, doc_bytes)) => {
+                                return crate::oxiwire::ok_docs_concat_response(count, &doc_bytes)
+                            }
                             Err(e) => return err_bytes(&e.to_string()),
                         }
                     }

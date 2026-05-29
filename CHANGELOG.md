@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Encode-direct large `find` results — avoid Value materialization (server 0.28.22)
+### Single-buffer encode for large `find` results — avoid Value materialization (server 0.28.23)
 
 A `find` whose query couldn't be fully satisfied by an index fell back to
 materializing the entire result as `Vec<Arc<Value>>`. A `serde_json::Value` is
@@ -11,14 +11,17 @@ materializing the entire result as `Vec<Arc<Value>>`. A `serde_json::Value` is
 of transient heap — enough to trigger the OOM killer on a memory-constrained
 host.
 
-The OxiWire bytes-first `find` path now has a post-filter strategy: when the
-query needs a filter the index can't satisfy, it decodes one document at a
-time, matches it, and collects the **encoded bytes** (`Arc<[u8]>`) — never a
-`Vec` of materialized Values. Peak memory now tracks the compact result bytes
-(~7× smaller) instead of the heavyweight Value set. Index-narrowing is
-preserved for partially-indexed queries (mirrors the Value path's candidate
-selection), so there's no scan regression. Results are identical to the Value
-path (verified by parity tests).
+The OxiWire bytes-first `find` path (`find_oxiwire_concat`) now encodes **all
+matches into a single growing buffer** and returns `(count, bytes)`; the server
+frames it with one array header (`ok_docs_concat_response`). For queries the
+index can't fully satisfy it post-filters one document at a time, appending
+each match's encoding directly into that buffer — never a `Vec` of
+materialized Values and never a per-document `Arc` (the earlier per-doc
+`encode_value_owned`+`Arc::from` churned the allocator). Peak memory now tracks
+the compact encoded bytes (~7× smaller than Values) with amortized buffer
+growth. Index-narrowing is preserved for partially-indexed queries (mirrors the
+Value path's candidate selection), so there's no scan regression, and results
+are identical to the Value path (parity tests).
 
 ### Bound the in-memory caches by a fixed budget (server 0.28.21)
 
