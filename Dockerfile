@@ -15,6 +15,7 @@ COPY oxidb-client-ffi/ oxidb-client-ffi/
 COPY oxidb-embedded-ffi/ oxidb-embedded-ffi/
 COPY oxidb-cli/ oxidb-cli/
 COPY oxipool/ oxipool/
+COPY oxidb-agg-merge/ oxidb-agg-merge/
 
 # Create stubs for workspace members not needed for server build
 RUN mkdir -p oxidb-app/src-tauri/src && \
