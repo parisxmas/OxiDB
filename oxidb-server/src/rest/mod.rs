@@ -35,11 +35,12 @@ use std::time::Duration;
 
 use oxidb::OxiDb;
 use oxidb::query::FindOptions;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use crate::auth;
 use crate::jwt;
 use crate::rules::{self, AuthContext, Operation};
-use crate::s3::http::{parse_request_from_reader, HttpRequest, HttpResponse};
+use crate::s3::http::{HttpRequest, HttpResponse, parse_request_from_reader};
 
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
@@ -55,7 +56,11 @@ struct RestState {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn start_rest_listener(addr: &str, db: Arc<OxiDb>, jwt_secret: Option<String>) -> std::thread::JoinHandle<()> {
+pub fn start_rest_listener(
+    addr: &str,
+    db: Arc<OxiDb>,
+    jwt_secret: Option<String>,
+) -> std::thread::JoinHandle<()> {
     let listener = TcpListener::bind(addr).expect("failed to bind REST HTTP listener");
 
     if jwt_secret.is_some() {
@@ -78,25 +83,27 @@ pub fn start_rest_listener(addr: &str, db: Arc<OxiDb>, jwt_secret: Option<String
         let state = Arc::clone(&state);
         std::thread::Builder::new()
             .name(format!("rest-worker-{i}"))
-            .spawn(move || loop {
-                let stream = match rx.lock().unwrap().recv() {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                state.active.fetch_add(1, Ordering::Relaxed);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_connection(stream, &state);
-                }));
-                state.active.fetch_sub(1, Ordering::Relaxed);
-                if let Err(e) = result {
-                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = e.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "unknown panic".to_string()
+            .spawn(move || {
+                loop {
+                    let stream = match rx.lock().unwrap().recv() {
+                        Ok(s) => s,
+                        Err(_) => return,
                     };
-                    eprintln!("[rest] handler panicked: {msg}");
+                    state.active.fetch_add(1, Ordering::Relaxed);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_connection(stream, &state);
+                    }));
+                    state.active.fetch_sub(1, Ordering::Relaxed);
+                    if let Err(e) = result {
+                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        eprintln!("[rest] handler panicked: {msg}");
+                    }
                 }
             })
             .expect("failed to spawn rest worker");
@@ -176,23 +183,37 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // Same fields as the OxiWire HELLO so a REST-only client can discover
     // version + features without authenticating.
     if (req.method.as_str(), segments.as_slice()) == ("GET", &["hello"][..]) {
-        return with_rest_cors(json_response(200, "OK", json!({
-            "server": {
-                "name": "oxidb-server",
-                "version": crate::hello::SERVER_VERSION,
-                "stable_surface_version": crate::hello::STABLE_SURFACE_VERSION,
-                "rest_api_version": "v1",
-                "supported_wire_versions": crate::hello::SUPPORTED_WIRE_VERSIONS,
-            }
-        })));
+        return with_rest_cors(json_response(
+            200,
+            "OK",
+            json!({
+                "server": {
+                    "name": "oxidb-server",
+                    "version": crate::hello::SERVER_VERSION,
+                    "stable_surface_version": crate::hello::STABLE_SURFACE_VERSION,
+                    "rest_api_version": "v1",
+                    "supported_wire_versions": crate::hello::SUPPORTED_WIRE_VERSIONS,
+                }
+            }),
+        ));
     }
 
     // ── Auth endpoints (always public) ──────────────────────────────────
     let result = match (req.method.as_str(), segments.as_slice()) {
-        ("POST", ["api", "auth", "signup"]) => return with_rest_cors(handle_auth_signup(req, state)),
+        ("POST", ["api", "auth", "signup"]) => {
+            return with_rest_cors(handle_auth_signup(req, state));
+        }
         ("POST", ["api", "auth", "login"]) => return with_rest_cors(handle_auth_login(req, state)),
-        ("GET", ["api", "auth", "verify"]) => return with_rest_cors(handle_auth_verify(req, state)),
-        ("GET", ["api", "ping"]) => return with_rest_cors(json_response(200, "OK", json!({"status": "ok", "data": "pong"}))),
+        ("GET", ["api", "auth", "verify"]) => {
+            return with_rest_cors(handle_auth_verify(req, state));
+        }
+        ("GET", ["api", "ping"]) => {
+            return with_rest_cors(json_response(
+                200,
+                "OK",
+                json!({"status": "ok", "data": "pong"}),
+            ));
+        }
         _ => None::<Value>,
     };
     if let Some(_) = result {
@@ -200,19 +221,50 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     }
 
     // ── JWT enforcement + extract auth context ─────────────────────
-    let auth_ctx = if let Some(ref secret) = state.jwt_secret {
-        let auth_header = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
+    // `enforced_role` is `Some` only when auth is enabled (a JWT secret is
+    // configured). When it is `Some`, we gate every protected endpoint on the
+    // caller's role below — without this, any valid token (even `read`) could
+    // drop collections, rewrite security rules, or create stored procedures.
+    let (auth_ctx, enforced_role) = if let Some(ref secret) = state.jwt_secret {
+        let auth_header = req
+            .headers
+            .get("authorization")
+            .map(|s| s.as_str())
+            .unwrap_or("");
         if let Some(token) = jwt::extract_bearer(auth_header) {
             match jwt::verify(token, secret) {
-                Ok(claims) => AuthContext::from_claims(&claims.sub, &claims.role),
-                Err(e) => return with_rest_cors(json_response(401, "Unauthorized", json!({"error": e}))),
+                Ok(claims) => {
+                    let role = auth::Role::from_str(&claims.role).unwrap_or(auth::Role::Read);
+                    (
+                        AuthContext::from_claims(&claims.sub, &claims.role),
+                        Some(role),
+                    )
+                }
+                Err(e) => {
+                    return with_rest_cors(json_response(401, "Unauthorized", json!({"error": e})));
+                }
             }
         } else {
-            return with_rest_cors(json_response(401, "Unauthorized", json!({"error": "missing Authorization: Bearer <token>"})));
+            return with_rest_cors(json_response(
+                401,
+                "Unauthorized",
+                json!({"error": "missing Authorization: Bearer <token>"}),
+            ));
         }
     } else {
-        AuthContext::anonymous()
+        (AuthContext::anonymous(), None)
     };
+
+    // ── Authorization (role) gate ─────────────────────────────────────
+    if let Some(role) = enforced_role {
+        if !rest_permitted(role, req.method.as_str(), segments.as_slice()) {
+            return with_rest_cors(json_response(
+                403,
+                "Forbidden",
+                json!({"error": "insufficient privileges for this operation"}),
+            ));
+        }
+    }
 
     // ── Protected endpoints ──────────────────────────────────────────
     let result = match (req.method.as_str(), segments.as_slice()) {
@@ -227,8 +279,12 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         // Documents (with security rules enforcement)
         ("POST", ["api", col, "documents"]) => handle_insert_with_rules(col, req, state, &auth_ctx),
         ("GET", ["api", col, "documents"]) => handle_find_with_rules(col, req, state, &auth_ctx),
-        ("PATCH", ["api", col, "documents"]) => handle_update_with_rules(col, req, state, &auth_ctx),
-        ("DELETE", ["api", col, "documents"]) => handle_delete_with_rules(col, req, state, &auth_ctx),
+        ("PATCH", ["api", col, "documents"]) => {
+            handle_update_with_rules(col, req, state, &auth_ctx)
+        }
+        ("DELETE", ["api", col, "documents"]) => {
+            handle_delete_with_rules(col, req, state, &auth_ctx)
+        }
 
         // Count
         ("GET", ["api", col, "count"]) => handle_count(col, req, state),
@@ -297,19 +353,32 @@ fn handle_list_collections(state: &RestState) -> Result<Value, (u16, &'static st
     Ok(json!({"collections": cols}))
 }
 
-fn handle_create_collection(req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_create_collection(
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     let name = body["name"].as_str().ok_or((400, "missing 'name'"))?;
-    state.db.create_collection(name).map_err(|_| (409, "collection already exists"))?;
+    state
+        .db
+        .create_collection(name)
+        .map_err(|_| (409, "collection already exists"))?;
     Ok(json!({"created": name}))
 }
 
 fn handle_drop_collection(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
-    state.db.drop_collection(name).map_err(|_| (404, "collection not found"))?;
+    state
+        .db
+        .drop_collection(name)
+        .map_err(|_| (404, "collection not found"))?;
     Ok(json!({"dropped": name}))
 }
 
-fn handle_insert(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_insert(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     if let Some(doc) = body.get("doc") {
         let id = state.db.insert(col, doc.clone()).map_err(db_err)?;
@@ -322,7 +391,11 @@ fn handle_insert(col: &str, req: &HttpRequest, state: &RestState) -> Result<Valu
     }
 }
 
-fn handle_find(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_find(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let query = query_param_json(&req.query, "q").unwrap_or(json!({}));
     let skip = query_param_u64(&req.query, "skip");
     let limit = query_param_u64(&req.query, "limit");
@@ -349,11 +422,18 @@ fn handle_find(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value,
         limit,
     };
 
-    let docs = state.db.find_with_options(col, &query, &opts).map_err(db_err)?;
+    let docs = state
+        .db
+        .find_with_options(col, &query, &opts)
+        .map_err(db_err)?;
     Ok(json!(docs))
 }
 
-fn handle_update(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_update(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     let query = body.get("query").ok_or((400, "missing 'query'"))?;
     let update = body.get("update").ok_or((400, "missing 'update'"))?;
@@ -368,7 +448,11 @@ fn handle_update(col: &str, req: &HttpRequest, state: &RestState) -> Result<Valu
     }
 }
 
-fn handle_delete(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_delete(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let body = if req.body.is_empty() {
         let q = query_param_json(&req.query, "q").unwrap_or(json!({}));
         json!({"query": q})
@@ -380,13 +464,21 @@ fn handle_delete(col: &str, req: &HttpRequest, state: &RestState) -> Result<Valu
     Ok(json!({"deleted": n}))
 }
 
-fn handle_count(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_count(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let query = query_param_json(&req.query, "q").unwrap_or(json!({}));
     let n = state.db.count(col, &query).map_err(db_err)?;
     Ok(json!({"count": n}))
 }
 
-fn handle_aggregate(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_aggregate(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     let pipeline = body.get("pipeline").ok_or((400, "missing 'pipeline'"))?;
     let results = state.db.aggregate(col, pipeline).map_err(db_err)?;
@@ -398,7 +490,11 @@ fn handle_list_indexes(col: &str, state: &RestState) -> Result<Value, (u16, &'st
     Ok(json!(indexes))
 }
 
-fn handle_create_index(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_create_index(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     let idx_type = body.get("type").and_then(|v| v.as_str()).unwrap_or("field");
 
@@ -415,13 +511,21 @@ fn handle_create_index(col: &str, req: &HttpRequest, state: &RestState) -> Resul
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
-            let name = state.db.create_composite_index(col, fields).map_err(db_err)?;
+            let name = state
+                .db
+                .create_composite_index(col, fields)
+                .map_err(db_err)?;
             Ok(json!({"created": name, "type": "composite"}))
         }
         "ttl" => {
             let field = body["field"].as_str().ok_or((400, "missing 'field'"))?;
-            let expire = body["expireAfterSeconds"].as_u64().ok_or((400, "missing 'expireAfterSeconds'"))?;
-            state.db.create_ttl_index(col, field, expire).map_err(db_err)?;
+            let expire = body["expireAfterSeconds"]
+                .as_u64()
+                .ok_or((400, "missing 'expireAfterSeconds'"))?;
+            state
+                .db
+                .create_ttl_index(col, field, expire)
+                .map_err(db_err)?;
             Ok(json!({"created": format!("{field}_ttl"), "type": "ttl"}))
         }
         _ => {
@@ -432,7 +536,11 @@ fn handle_create_index(col: &str, req: &HttpRequest, state: &RestState) -> Resul
     }
 }
 
-fn handle_drop_index(col: &str, name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_drop_index(
+    col: &str,
+    name: &str,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     state.db.drop_index(col, name).map_err(db_err)?;
     Ok(json!({"dropped": name}))
 }
@@ -450,7 +558,10 @@ fn handle_list_procedures(state: &RestState) -> Result<Value, (u16, &'static str
     Ok(json!(procs))
 }
 
-fn handle_create_procedure(req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_create_procedure(
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     if let Some(script) = body.get("script").and_then(|v| v.as_str()) {
         let compiled = oxidb::oxiscript::compile(script)
@@ -459,13 +570,22 @@ fn handle_create_procedure(req: &HttpRequest, state: &RestState) -> Result<Value
         state.db.create_procedure(&name, compiled).map_err(db_err)?;
         Ok(json!({"created": name}))
     } else {
-        let name = body["name"].as_str().ok_or((400, "missing 'name' or 'script'"))?;
-        state.db.create_procedure(name, body.clone()).map_err(db_err)?;
+        let name = body["name"]
+            .as_str()
+            .ok_or((400, "missing 'name' or 'script'"))?;
+        state
+            .db
+            .create_procedure(name, body.clone())
+            .map_err(db_err)?;
         Ok(json!({"created": name}))
     }
 }
 
-fn handle_call_procedure(name: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_call_procedure(
+    name: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let params = if req.body.is_empty() {
         json!({})
     } else {
@@ -484,7 +604,12 @@ fn handle_delete_procedure(name: &str, state: &RestState) -> Result<Value, (u16,
 // CRUD with security rules
 // ---------------------------------------------------------------------------
 
-fn handle_insert_with_rules(col: &str, req: &HttpRequest, state: &RestState, auth: &AuthContext) -> Result<Value, (u16, &'static str)> {
+fn handle_insert_with_rules(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+    auth: &AuthContext,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     if let Some(doc) = body.get("doc") {
         rules::check_access(&state.db, col, Operation::Create, auth, None, Some(doc))
@@ -504,14 +629,24 @@ fn handle_insert_with_rules(col: &str, req: &HttpRequest, state: &RestState, aut
     }
 }
 
-fn handle_find_with_rules(col: &str, req: &HttpRequest, state: &RestState, auth: &AuthContext) -> Result<Value, (u16, &'static str)> {
+fn handle_find_with_rules(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+    auth: &AuthContext,
+) -> Result<Value, (u16, &'static str)> {
     // Check read access (without specific doc — collection-level check)
     rules::check_access(&state.db, col, Operation::Read, auth, None, None)
         .map_err(|_| (403, "access denied"))?;
     handle_find(col, req, state)
 }
 
-fn handle_update_with_rules(col: &str, req: &HttpRequest, state: &RestState, auth: &AuthContext) -> Result<Value, (u16, &'static str)> {
+fn handle_update_with_rules(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+    auth: &AuthContext,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     let query = body.get("query").ok_or((400, "missing 'query'"))?;
     let update = body.get("update").ok_or((400, "missing 'update'"))?;
@@ -533,7 +668,12 @@ fn handle_update_with_rules(col: &str, req: &HttpRequest, state: &RestState, aut
     }
 }
 
-fn handle_delete_with_rules(col: &str, req: &HttpRequest, state: &RestState, auth: &AuthContext) -> Result<Value, (u16, &'static str)> {
+fn handle_delete_with_rules(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+    auth: &AuthContext,
+) -> Result<Value, (u16, &'static str)> {
     let body = if req.body.is_empty() {
         let q = query_param_json(&req.query, "q").unwrap_or(json!({}));
         json!({"query": q})
@@ -557,7 +697,11 @@ fn handle_delete_with_rules(col: &str, req: &HttpRequest, state: &RestState, aut
 // Rules management handlers
 // ---------------------------------------------------------------------------
 
-fn handle_set_rules(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_set_rules(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     rules::set_rules(&state.db, col, &body).map_err(|_| (500, "failed to set rules"))?;
     Ok(json!({"collection": col, "rules": "set"}))
@@ -585,24 +729,43 @@ fn handle_delete_rules(col: &str, state: &RestState) -> Result<Value, (u16, &'st
 // Retention policy handlers
 // ---------------------------------------------------------------------------
 
-fn handle_set_retention(col: &str, req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
+fn handle_set_retention(
+    col: &str,
+    req: &HttpRequest,
+    state: &RestState,
+) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
-    let days = body.get("days").and_then(|v| v.as_u64()).ok_or((400, "missing 'days'"))?;
-    state.db.set_retention(col, days).map_err(|_| (500, "failed to set retention"))?;
+    let days = body
+        .get("days")
+        .and_then(|v| v.as_u64())
+        .ok_or((400, "missing 'days'"))?;
+    state
+        .db
+        .set_retention(col, days)
+        .map_err(|_| (500, "failed to set retention"))?;
     Ok(json!({"collection": col, "retain_days": days}))
 }
 
 fn handle_get_retention(col: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
-    state.db.get_retention(col).map_err(|_| (404, "no retention policy for this collection"))
+    state
+        .db
+        .get_retention(col)
+        .map_err(|_| (404, "no retention policy for this collection"))
 }
 
 fn handle_delete_retention(col: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
-    state.db.delete_retention(col).map_err(|_| (404, "no retention policy for this collection"))?;
+    state
+        .db
+        .delete_retention(col)
+        .map_err(|_| (404, "no retention policy for this collection"))?;
     Ok(json!({"collection": col, "retention": "deleted"}))
 }
 
 fn handle_list_retentions(state: &RestState) -> Result<Value, (u16, &'static str)> {
-    let policies = state.db.list_retentions().map_err(|_| (500, "failed to list retentions"))?;
+    let policies = state
+        .db
+        .list_retentions()
+        .map_err(|_| (500, "failed to list retentions"))?;
     Ok(json!(policies))
 }
 
@@ -612,32 +775,104 @@ fn handle_list_retentions(state: &RestState) -> Result<Value, (u16, &'static str
 
 fn handle_create_alert(req: &HttpRequest, state: &RestState) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
-    let name = body.get("name").and_then(|v| v.as_str()).ok_or((400, "missing 'name'"))?;
-    state.db.create_alert(name, body.clone()).map_err(|_| (400, "failed to create alert"))?;
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or((400, "missing 'name'"))?;
+    state
+        .db
+        .create_alert(name, body.clone())
+        .map_err(|_| (400, "failed to create alert"))?;
     Ok(json!({"alert": name, "status": "created"}))
 }
 
 fn handle_list_alerts(state: &RestState) -> Result<Value, (u16, &'static str)> {
-    let alerts = state.db.list_alerts().map_err(|_| (500, "failed to list alerts"))?;
+    let alerts = state
+        .db
+        .list_alerts()
+        .map_err(|_| (500, "failed to list alerts"))?;
     Ok(json!(alerts))
 }
 
 fn handle_get_alert(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
-    state.db.get_alert(name).map_err(|_| (404, "alert not found"))
+    state
+        .db
+        .get_alert(name)
+        .map_err(|_| (404, "alert not found"))
 }
 
 fn handle_delete_alert(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
-    state.db.delete_alert(name).map_err(|_| (404, "alert not found"))?;
+    state
+        .db
+        .delete_alert(name)
+        .map_err(|_| (404, "alert not found"))?;
     Ok(json!({"alert": name, "status": "deleted"}))
 }
 
 fn handle_test_alert(name: &str, state: &RestState) -> Result<Value, (u16, &'static str)> {
-    state.db.test_alert(name).map_err(|_| (404, "alert not found"))
+    state
+        .db
+        .test_alert(name)
+        .map_err(|_| (404, "alert not found"))
 }
 
 fn handle_alert_history(state: &RestState) -> Result<Value, (u16, &'static str)> {
-    let history = state.db.list_alert_history().map_err(|_| (500, "failed to list alert history"))?;
+    let history = state
+        .db
+        .list_alert_history()
+        .map_err(|_| (500, "failed to list alert history"))?;
     Ok(json!(history))
+}
+
+// ---------------------------------------------------------------------------
+// Authorization
+// ---------------------------------------------------------------------------
+
+/// Decide whether `role` may invoke the REST endpoint addressed by
+/// `(method, segments)`. Mirrors the TCP `rbac::is_permitted` default-deny
+/// posture for the HTTP surface:
+///
+/// - **Admin** — everything.
+/// - **ReadWrite** — document CRUD, counts, aggregation, index management, and
+///   procedure calls. NOT collection drops, procedure/rule/retention/alert
+///   management (those are admin-only).
+/// - **Read** — only read-only endpoints (any `GET`, plus the read-only
+///   `aggregate` POST).
+fn rest_permitted(role: auth::Role, method: &str, segments: &[&str]) -> bool {
+    use auth::Role::*;
+    if role == Admin {
+        return true;
+    }
+
+    // Mutating administrative endpoints — admin only.
+    let admin_only = matches!(
+        (method, segments),
+        ("DELETE", ["api", "collections", _])
+            | ("POST", ["api", "procedures"])
+            | ("DELETE", ["api", "procedures", _])
+            | ("POST", ["api", "rules", _])
+            | ("DELETE", ["api", "rules", _])
+            | ("POST", ["api", "retention", _])
+            | ("DELETE", ["api", "retention", _])
+            | ("POST", ["api", "alerts"])
+            | ("DELETE", ["api", "alerts", _])
+            | ("POST", ["api", "alerts", _, "test"])
+    );
+    if admin_only {
+        return false;
+    }
+
+    match role {
+        Admin => true,
+        // ReadWrite gets everything that is not admin-only.
+        ReadWrite => true,
+        // Read is restricted to read-only operations: any GET, plus the
+        // read-only aggregation POST.
+        Read => matches!(
+            (method, segments),
+            ("GET", _) | ("POST", ["api", _, "aggregate"])
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +882,13 @@ fn handle_alert_history(state: &RestState) -> Result<Value, (u16, &'static str)>
 fn handle_auth_signup(req: &HttpRequest, state: &RestState) -> HttpResponse {
     let secret = match &state.jwt_secret {
         Some(s) => s,
-        None => return json_response(400, "Bad Request", json!({"error": "auth not enabled (set OXIDB_JWT_SECRET)"})),
+        None => {
+            return json_response(
+                400,
+                "Bad Request",
+                json!({"error": "auth not enabled (set OXIDB_JWT_SECRET)"}),
+            );
+        }
     };
     let body = match serde_json::from_slice::<Value>(&req.body) {
         Ok(v) => v,
@@ -661,7 +902,18 @@ fn handle_auth_signup(req: &HttpRequest, state: &RestState) -> HttpResponse {
         Some(p) => p,
         None => return json_response(400, "Bad Request", json!({"error": "missing 'password'"})),
     };
+    // Public self-service signup must NOT let a caller mint themselves an
+    // admin account. Reject any attempt to self-assign `admin`; privileged
+    // accounts have to be provisioned out-of-band. Default to the lowest
+    // write-capable role.
     let role = body["role"].as_str().unwrap_or("readwrite");
+    if role.eq_ignore_ascii_case("admin") {
+        return json_response(
+            403,
+            "Forbidden",
+            json!({"error": "cannot self-assign 'admin' role via public signup"}),
+        );
+    }
 
     match jwt::signup(&state.db, username, password, role) {
         Ok(user) => {
@@ -678,7 +930,13 @@ fn handle_auth_signup(req: &HttpRequest, state: &RestState) -> HttpResponse {
 fn handle_auth_login(req: &HttpRequest, state: &RestState) -> HttpResponse {
     let secret = match &state.jwt_secret {
         Some(s) => s,
-        None => return json_response(400, "Bad Request", json!({"error": "auth not enabled (set OXIDB_JWT_SECRET)"})),
+        None => {
+            return json_response(
+                400,
+                "Bad Request",
+                json!({"error": "auth not enabled (set OXIDB_JWT_SECRET)"}),
+            );
+        }
     };
     let body = match serde_json::from_slice::<Value>(&req.body) {
         Ok(v) => v,
@@ -704,18 +962,32 @@ fn handle_auth_verify(req: &HttpRequest, state: &RestState) -> HttpResponse {
         Some(s) => s,
         None => return json_response(400, "Bad Request", json!({"error": "auth not enabled"})),
     };
-    let auth_header = req.headers.get("authorization").map(|s| s.as_str()).unwrap_or("");
+    let auth_header = req
+        .headers
+        .get("authorization")
+        .map(|s| s.as_str())
+        .unwrap_or("");
     let token = match jwt::extract_bearer(auth_header) {
         Some(t) => t,
-        None => return json_response(401, "Unauthorized", json!({"error": "missing Bearer token"})),
+        None => {
+            return json_response(
+                401,
+                "Unauthorized",
+                json!({"error": "missing Bearer token"}),
+            );
+        }
     };
     match jwt::verify(token, secret) {
-        Ok(claims) => json_response(200, "OK", json!({
-            "valid": true,
-            "username": claims.sub,
-            "role": claims.role,
-            "exp": claims.exp,
-        })),
+        Ok(claims) => json_response(
+            200,
+            "OK",
+            json!({
+                "valid": true,
+                "username": claims.sub,
+                "role": claims.role,
+                "exp": claims.exp,
+            }),
+        ),
         Err(e) => json_response(401, "Unauthorized", json!({"error": e})),
     }
 }
@@ -732,17 +1004,17 @@ fn parse_json_body(req: &HttpRequest) -> Result<Value, (u16, &'static str)> {
 }
 
 fn query_param_json(query: &str, key: &str) -> Option<Value> {
-    parse_query_string(query)
-        .get(key)
-        .and_then(|v| {
-            // Try URL-decoded JSON parse
-            let decoded = url_decode(v);
-            serde_json::from_str(&decoded).ok()
-        })
+    parse_query_string(query).get(key).and_then(|v| {
+        // Try URL-decoded JSON parse
+        let decoded = url_decode(v);
+        serde_json::from_str(&decoded).ok()
+    })
 }
 
 fn query_param_u64(query: &str, key: &str) -> Option<u64> {
-    parse_query_string(query).get(key).and_then(|v| v.parse().ok())
+    parse_query_string(query)
+        .get(key)
+        .and_then(|v| v.parse().ok())
 }
 
 fn parse_query_string(query: &str) -> HashMap<String, String> {
@@ -796,7 +1068,13 @@ fn json_response(status: u16, status_text: &'static str, body: Value) -> HttpRes
 
 fn with_rest_cors(resp: HttpResponse) -> HttpResponse {
     resp.with_header("Access-Control-Allow-Origin", "*")
-        .with_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-        .with_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        .with_header(
+            "Access-Control-Allow-Methods",
+            "GET, POST, PATCH, DELETE, OPTIONS",
+        )
+        .with_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization",
+        )
         .with_header("Access-Control-Max-Age", "3600")
 }

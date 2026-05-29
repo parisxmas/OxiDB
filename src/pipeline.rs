@@ -171,7 +171,10 @@ pub(crate) enum Accumulator {
 
 enum AccumulatorState {
     Sum(f64),
-    Avg { sum: f64, count: u64 },
+    Avg {
+        sum: f64,
+        count: u64,
+    },
     Min(Option<(Value, IndexValue)>),
     Max(Option<(Value, IndexValue)>),
     Count(u64),
@@ -179,7 +182,10 @@ enum AccumulatorState {
     Last(Option<Value>),
     Push(Vec<Value>),
     AddToSet(Vec<Value>),
-    Percentile { percentiles: Vec<f64>, values: Vec<f64> },
+    Percentile {
+        percentiles: Vec<f64>,
+        values: Vec<f64>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -251,7 +257,7 @@ pub struct Pipeline {
 /// Resolve a field path by reference — zero allocations.
 /// Supports numeric segments as array indexes: `"items.0.name"` resolves
 /// `items[0].name` when `items` is an array.
-fn resolve_field_ref<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
+pub(crate) fn resolve_field_ref<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
     let mut current = doc;
     for part in path.split('.') {
         match current {
@@ -285,9 +291,13 @@ pub(crate) fn set_field(doc: &mut Value, path: &str, value: Value) {
                 }
                 Value::Array(arr) => {
                     if let Ok(idx) = part.parse::<usize>() {
-                        if idx < arr.len() {
-                            arr[idx] = value;
+                        // MongoDB pads an array with nulls when the target
+                        // index is past the end, rather than silently dropping
+                        // the write.
+                        if idx >= arr.len() {
+                            arr.resize(idx + 1, Value::Null);
                         }
+                        arr[idx] = value;
                     }
                 }
                 _ => {}
@@ -298,7 +308,8 @@ pub(crate) fn set_field(doc: &mut Value, path: &str, value: Value) {
         match current {
             Value::Object(map) => {
                 if let Some(idx) = part.parse::<usize>().ok().filter(|_| {
-                    map.get(*part).map_or(false, |v| v.is_array() || v.is_object())
+                    map.get(*part)
+                        .map_or(false, |v| v.is_array() || v.is_object())
                         == false
                         && !map.contains_key(*part)
                 }) {
@@ -316,11 +327,14 @@ pub(crate) fn set_field(doc: &mut Value, path: &str, value: Value) {
             }
             Value::Array(arr) => {
                 if let Ok(idx) = part.parse::<usize>() {
-                    if idx < arr.len() {
-                        current = &mut arr[idx];
-                    } else {
-                        return;
+                    if idx >= arr.len() {
+                        // Pad with nulls (MongoDB semantics), then place a
+                        // fresh object in the new slot so we can descend into
+                        // the remaining path segments.
+                        arr.resize(idx + 1, Value::Null);
+                        arr[idx] = json!({});
                     }
+                    current = &mut arr[idx];
                 } else {
                     return;
                 }
@@ -421,9 +435,9 @@ fn parse_expression(val: &Value) -> Result<Expression> {
             let (key, arg) = map.iter().next().unwrap();
             match key.as_str() {
                 "$add" => {
-                    let arr = arg.as_array().ok_or_else(|| {
-                        Error::InvalidPipeline("$add requires an array".into())
-                    })?;
+                    let arr = arg
+                        .as_array()
+                        .ok_or_else(|| Error::InvalidPipeline("$add requires an array".into()))?;
                     let exprs: Result<Vec<_>> = arr.iter().map(parse_expression).collect();
                     Ok(Expression::Add(exprs?))
                 }
@@ -463,34 +477,32 @@ fn parse_expression(val: &Value) -> Result<Expression> {
                     ))
                 }
                 // Conditional
-                "$cond" => {
-                    match arg {
-                        Value::Array(arr) if arr.len() == 3 => Ok(Expression::Cond(
-                            Box::new(parse_expression(&arr[0])?),
-                            Box::new(parse_expression(&arr[1])?),
-                            Box::new(parse_expression(&arr[2])?),
-                        )),
-                        Value::Object(obj) => {
-                            let if_expr = obj.get("if").ok_or_else(|| {
-                                Error::InvalidPipeline("$cond requires 'if' field".into())
-                            })?;
-                            let then_expr = obj.get("then").ok_or_else(|| {
-                                Error::InvalidPipeline("$cond requires 'then' field".into())
-                            })?;
-                            let else_expr = obj.get("else").ok_or_else(|| {
-                                Error::InvalidPipeline("$cond requires 'else' field".into())
-                            })?;
-                            Ok(Expression::Cond(
-                                Box::new(parse_expression(if_expr)?),
-                                Box::new(parse_expression(then_expr)?),
-                                Box::new(parse_expression(else_expr)?),
-                            ))
-                        }
-                        _ => Err(Error::InvalidPipeline(
-                            "$cond requires array [if,then,else] or object {if,then,else}".into(),
-                        )),
+                "$cond" => match arg {
+                    Value::Array(arr) if arr.len() == 3 => Ok(Expression::Cond(
+                        Box::new(parse_expression(&arr[0])?),
+                        Box::new(parse_expression(&arr[1])?),
+                        Box::new(parse_expression(&arr[2])?),
+                    )),
+                    Value::Object(obj) => {
+                        let if_expr = obj.get("if").ok_or_else(|| {
+                            Error::InvalidPipeline("$cond requires 'if' field".into())
+                        })?;
+                        let then_expr = obj.get("then").ok_or_else(|| {
+                            Error::InvalidPipeline("$cond requires 'then' field".into())
+                        })?;
+                        let else_expr = obj.get("else").ok_or_else(|| {
+                            Error::InvalidPipeline("$cond requires 'else' field".into())
+                        })?;
+                        Ok(Expression::Cond(
+                            Box::new(parse_expression(if_expr)?),
+                            Box::new(parse_expression(then_expr)?),
+                            Box::new(parse_expression(else_expr)?),
+                        ))
                     }
-                }
+                    _ => Err(Error::InvalidPipeline(
+                        "$cond requires array [if,then,else] or object {if,then,else}".into(),
+                    )),
+                },
                 "$ifNull" => {
                     let arr = arg.as_array().ok_or_else(|| {
                         Error::InvalidPipeline("$ifNull requires an array".into())
@@ -530,21 +542,19 @@ fn parse_expression(val: &Value) -> Result<Expression> {
                         Box::new(parse_expression(&arr[2])?),
                     ))
                 }
-                "$trim" => {
-                    match arg {
-                        Value::Object(obj) => {
-                            let input = obj.get("input").ok_or_else(|| {
-                                Error::InvalidPipeline("$trim requires 'input' field".into())
-                            })?;
-                            Ok(Expression::Trim(Box::new(parse_expression(input)?)))
-                        }
-                        _ => Ok(Expression::Trim(Box::new(parse_expression(arg)?))),
+                "$trim" => match arg {
+                    Value::Object(obj) => {
+                        let input = obj.get("input").ok_or_else(|| {
+                            Error::InvalidPipeline("$trim requires 'input' field".into())
+                        })?;
+                        Ok(Expression::Trim(Box::new(parse_expression(input)?)))
                     }
-                }
+                    _ => Ok(Expression::Trim(Box::new(parse_expression(arg)?))),
+                },
                 "$split" => {
-                    let arr = arg.as_array().ok_or_else(|| {
-                        Error::InvalidPipeline("$split requires an array".into())
-                    })?;
+                    let arr = arg
+                        .as_array()
+                        .ok_or_else(|| Error::InvalidPipeline("$split requires an array".into()))?;
                     if arr.len() != 2 {
                         return Err(Error::InvalidPipeline(
                             "$split requires exactly 2 arguments".into(),
@@ -565,9 +575,9 @@ fn parse_expression(val: &Value) -> Result<Expression> {
                 "$dayOfWeek" => Ok(Expression::DayOfWeek(Box::new(parse_expression(arg)?))),
                 // Math
                 "$mod" => {
-                    let arr = arg.as_array().ok_or_else(|| {
-                        Error::InvalidPipeline("$mod requires an array".into())
-                    })?;
+                    let arr = arg
+                        .as_array()
+                        .ok_or_else(|| Error::InvalidPipeline("$mod requires an array".into()))?;
                     if arr.len() != 2 {
                         return Err(Error::InvalidPipeline(
                             "$mod requires exactly 2 arguments".into(),
@@ -626,12 +636,10 @@ impl Expression {
     fn eval_ref<'a>(&'a self, doc: &'a Value) -> ValRef<'a> {
         match self {
             Expression::Literal(v) => ValRef::Borrowed(v),
-            Expression::FieldRef(path) => {
-                match resolve_field_ref(doc, path) {
-                    Some(v) => ValRef::Borrowed(v),
-                    None => ValRef::Borrowed(&NULL_VALUE),
-                }
-            }
+            Expression::FieldRef(path) => match resolve_field_ref(doc, path) {
+                Some(v) => ValRef::Borrowed(v),
+                None => ValRef::Borrowed(&NULL_VALUE),
+            },
             _ => ValRef::Owned(self.eval(doc)),
         }
     }
@@ -650,12 +658,10 @@ impl Expression {
                 }
                 number_to_value(sum)
             }
-            Expression::Subtract(a, b) => {
-                match (to_f64(&a.eval(doc)), to_f64(&b.eval(doc))) {
-                    (Some(a), Some(b)) => number_to_value(a - b),
-                    _ => Value::Null,
-                }
-            }
+            Expression::Subtract(a, b) => match (to_f64(&a.eval(doc)), to_f64(&b.eval(doc))) {
+                (Some(a), Some(b)) => number_to_value(a - b),
+                _ => Value::Null,
+            },
             Expression::Multiply(exprs) => {
                 let mut product = 1.0_f64;
                 for e in exprs {
@@ -666,18 +672,14 @@ impl Expression {
                 }
                 number_to_value(product)
             }
-            Expression::Divide(a, b) => {
-                match (to_f64(&a.eval(doc)), to_f64(&b.eval(doc))) {
-                    (Some(a), Some(b)) if b != 0.0 => number_to_value(a / b),
-                    _ => Value::Null,
-                }
-            }
-            Expression::Mod(a, b) => {
-                match (to_f64(&a.eval(doc)), to_f64(&b.eval(doc))) {
-                    (Some(a), Some(b)) if b != 0.0 => number_to_value(a % b),
-                    _ => Value::Null,
-                }
-            }
+            Expression::Divide(a, b) => match (to_f64(&a.eval(doc)), to_f64(&b.eval(doc))) {
+                (Some(a), Some(b)) if b != 0.0 => number_to_value(a / b),
+                _ => Value::Null,
+            },
+            Expression::Mod(a, b) => match (to_f64(&a.eval(doc)), to_f64(&b.eval(doc))) {
+                (Some(a), Some(b)) if b != 0.0 => number_to_value(a % b),
+                _ => Value::Null,
+            },
             // Conditional
             Expression::Cond(cond, then_expr, else_expr) => {
                 if is_truthy(&cond.eval(doc)) {
@@ -705,18 +707,14 @@ impl Expression {
                 }
                 Value::String(result)
             }
-            Expression::ToLower(expr) => {
-                match value_to_string(&expr.eval(doc)) {
-                    Some(s) => Value::String(s.to_lowercase()),
-                    None => Value::Null,
-                }
-            }
-            Expression::ToUpper(expr) => {
-                match value_to_string(&expr.eval(doc)) {
-                    Some(s) => Value::String(s.to_uppercase()),
-                    None => Value::Null,
-                }
-            }
+            Expression::ToLower(expr) => match value_to_string(&expr.eval(doc)) {
+                Some(s) => Value::String(s.to_lowercase()),
+                None => Value::Null,
+            },
+            Expression::ToUpper(expr) => match value_to_string(&expr.eval(doc)) {
+                Some(s) => Value::String(s.to_uppercase()),
+                None => Value::Null,
+            },
             Expression::Substr(string_expr, start_expr, len_expr) => {
                 let s = match value_to_string(&string_expr.eval(doc)) {
                     Some(s) => s,
@@ -724,19 +722,22 @@ impl Expression {
                 };
                 let start = to_f64(&start_expr.eval(doc)).unwrap_or(0.0) as usize;
                 let len = to_f64(&len_expr.eval(doc)).unwrap_or(0.0) as usize;
-                if start >= s.len() {
+                // Operate on Unicode code points, not raw bytes: byte-slicing
+                // `s[start..end]` panics when an offset lands mid-character on
+                // multibyte input. For ASCII this is identical to byte
+                // indexing.
+                let chars: Vec<char> = s.chars().collect();
+                if start >= chars.len() {
                     Value::String(String::new())
                 } else {
-                    let end = (start + len).min(s.len());
-                    Value::String(s[start..end].to_string())
+                    let end = start.saturating_add(len).min(chars.len());
+                    Value::String(chars[start..end].iter().collect())
                 }
             }
-            Expression::Trim(expr) => {
-                match value_to_string(&expr.eval(doc)) {
-                    Some(s) => Value::String(s.trim().to_string()),
-                    None => Value::Null,
-                }
-            }
+            Expression::Trim(expr) => match value_to_string(&expr.eval(doc)) {
+                Some(s) => Value::String(s.trim().to_string()),
+                None => Value::Null,
+            },
             Expression::Split(string_expr, delim_expr) => {
                 let s = match value_to_string(&string_expr.eval(doc)) {
                     Some(s) => s,
@@ -746,59 +747,46 @@ impl Expression {
                     Some(d) => d,
                     None => return Value::Null,
                 };
-                let parts: Vec<Value> = s.split(&delim).map(|p| Value::String(p.to_string())).collect();
+                let parts: Vec<Value> = s
+                    .split(&delim)
+                    .map(|p| Value::String(p.to_string()))
+                    .collect();
                 Value::Array(parts)
             }
             // Date
-            Expression::Year(expr) => {
-                match parse_date_parts(&expr.eval(doc)) {
-                    Some((year, _, _, _, _, _, _)) => json!(year),
-                    None => Value::Null,
-                }
-            }
-            Expression::Month(expr) => {
-                match parse_date_parts(&expr.eval(doc)) {
-                    Some((_, month, _, _, _, _, _)) => json!(month),
-                    None => Value::Null,
-                }
-            }
-            Expression::DayOfMonth(expr) => {
-                match parse_date_parts(&expr.eval(doc)) {
-                    Some((_, _, day, _, _, _, _)) => json!(day),
-                    None => Value::Null,
-                }
-            }
-            Expression::Hour(expr) => {
-                match parse_date_parts(&expr.eval(doc)) {
-                    Some((_, _, _, hour, _, _, _)) => json!(hour),
-                    None => Value::Null,
-                }
-            }
-            Expression::Minute(expr) => {
-                match parse_date_parts(&expr.eval(doc)) {
-                    Some((_, _, _, _, minute, _, _)) => json!(minute),
-                    None => Value::Null,
-                }
-            }
-            Expression::Second(expr) => {
-                match parse_date_parts(&expr.eval(doc)) {
-                    Some((_, _, _, _, _, second, _)) => json!(second),
-                    None => Value::Null,
-                }
-            }
-            Expression::DayOfWeek(expr) => {
-                match parse_date_parts(&expr.eval(doc)) {
-                    Some((_, _, _, _, _, _, dow)) => json!(dow),
-                    None => Value::Null,
-                }
-            }
+            Expression::Year(expr) => match parse_date_parts(&expr.eval(doc)) {
+                Some((year, _, _, _, _, _, _)) => json!(year),
+                None => Value::Null,
+            },
+            Expression::Month(expr) => match parse_date_parts(&expr.eval(doc)) {
+                Some((_, month, _, _, _, _, _)) => json!(month),
+                None => Value::Null,
+            },
+            Expression::DayOfMonth(expr) => match parse_date_parts(&expr.eval(doc)) {
+                Some((_, _, day, _, _, _, _)) => json!(day),
+                None => Value::Null,
+            },
+            Expression::Hour(expr) => match parse_date_parts(&expr.eval(doc)) {
+                Some((_, _, _, hour, _, _, _)) => json!(hour),
+                None => Value::Null,
+            },
+            Expression::Minute(expr) => match parse_date_parts(&expr.eval(doc)) {
+                Some((_, _, _, _, minute, _, _)) => json!(minute),
+                None => Value::Null,
+            },
+            Expression::Second(expr) => match parse_date_parts(&expr.eval(doc)) {
+                Some((_, _, _, _, _, second, _)) => json!(second),
+                None => Value::Null,
+            },
+            Expression::DayOfWeek(expr) => match parse_date_parts(&expr.eval(doc)) {
+                Some((_, _, _, _, _, _, dow)) => json!(dow),
+                None => Value::Null,
+            },
             // Array
-            Expression::Size(expr) => {
-                match expr.eval(doc) {
-                    Value::Array(arr) => json!(arr.len()),
-                    _ => Value::Null,
-                }
-            }
+            Expression::Size(expr) => match expr.eval(doc) {
+                Value::Array(arr) => json!(arr.len()),
+                _ => Value::Null,
+            },
             Expression::DateBucket(expr, interval) => {
                 let inner = expr.eval(doc);
                 match value_to_epoch_millis(&inner) {
@@ -989,9 +977,7 @@ fn parse_date_histogram_stage(val: &Value) -> Result<(Stage, Option<Stage>)> {
     let field = obj
         .get("field")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            Error::InvalidPipeline("$dateHistogram requires 'field' string".into())
-        })?
+        .ok_or_else(|| Error::InvalidPipeline("$dateHistogram requires 'field' string".into()))?
         .to_string();
 
     let interval_raw = obj
@@ -1031,9 +1017,7 @@ fn parse_date_histogram_stage(val: &Value) -> Result<(Stage, Option<Stage>)> {
 
     if let Some(extra) = obj.get("accumulators") {
         let extra_obj = extra.as_object().ok_or_else(|| {
-            Error::InvalidPipeline(
-                "$dateHistogram 'accumulators' must be an object".into(),
-            )
+            Error::InvalidPipeline("$dateHistogram 'accumulators' must be an object".into())
         })?;
         for (name, acc_val) in extra_obj {
             accumulators.push((name.clone(), parse_accumulator(acc_val)?));
@@ -1085,20 +1069,15 @@ fn parse_accumulator(val: &Value) -> Result<Accumulator> {
 /// `Percentile` accumulator. `p` values must be in [0, 1].
 fn parse_percentile_accumulator(arg: &Value) -> Result<Accumulator> {
     let obj = arg.as_object().ok_or_else(|| {
-        Error::InvalidPipeline(
-            "$percentile must be an object: { input, p: [...] }".into(),
-        )
+        Error::InvalidPipeline("$percentile must be an object: { input, p: [...] }".into())
     })?;
     let input = obj
         .get("input")
         .ok_or_else(|| Error::InvalidPipeline("$percentile requires 'input'".into()))?;
     let expr = parse_expression(input)?;
-    let p_arr = obj
-        .get("p")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| {
-            Error::InvalidPipeline("$percentile requires 'p' as an array of numbers".into())
-        })?;
+    let p_arr = obj.get("p").and_then(|v| v.as_array()).ok_or_else(|| {
+        Error::InvalidPipeline("$percentile requires 'p' as an array of numbers".into())
+    })?;
     if p_arr.is_empty() {
         return Err(Error::InvalidPipeline(
             "$percentile 'p' array must not be empty".into(),
@@ -1171,7 +1150,7 @@ fn parse_sort(val: &Value) -> Result<Vec<(String, SortOrder)>> {
             _ => {
                 return Err(Error::InvalidPipeline(
                     "sort direction must be 1 or -1".into(),
-                ))
+                ));
             }
         };
         fields.push((field.clone(), order));
@@ -1204,9 +1183,7 @@ fn parse_unwind(val: &Value) -> Result<(String, bool)> {
             let path = obj
                 .get("path")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    Error::InvalidPipeline("$unwind requires 'path' string".into())
-                })?;
+                .ok_or_else(|| Error::InvalidPipeline("$unwind requires 'path' string".into()))?;
             if !path.starts_with('$') {
                 return Err(Error::InvalidPipeline(
                     "$unwind path must start with $".into(),
@@ -1571,10 +1548,7 @@ fn exec_group<D: DocRef>(
             .iter()
             .map(|(_, acc)| match acc {
                 Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
-                Accumulator::Avg(_) => AccumulatorState::Avg {
-                    sum: 0.0,
-                    count: 0,
-                },
+                Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
                 Accumulator::Min(_) => AccumulatorState::Min(None),
                 Accumulator::Max(_) => AccumulatorState::Max(None),
                 Accumulator::Count => AccumulatorState::Count(0),
@@ -1618,9 +1592,10 @@ fn exec_group<D: DocRef>(
                 AccumulatorState::Last(v) => v.unwrap_or(Value::Null),
                 AccumulatorState::Push(v) => Value::Array(v),
                 AccumulatorState::AddToSet(v) => Value::Array(v),
-                AccumulatorState::Percentile { percentiles, values } => {
-                    finalize_percentile(percentiles, values)
-                }
+                AccumulatorState::Percentile {
+                    percentiles,
+                    values,
+                } => finalize_percentile(percentiles, values),
             };
             doc.insert(name.clone(), val);
         }
@@ -1687,13 +1662,13 @@ fn exec_project(docs: Vec<Value>, fields: &[(String, ProjectionField)]) -> Vec<V
                 for (name, pf) in fields {
                     match pf {
                         ProjectionField::Include => {
-                            let val = resolve_field(&doc, name);
-                            if !val.is_null()
-                                || doc
-                                    .as_object()
-                                    .map_or(false, |m| m.contains_key(name.as_str()))
-                            {
-                                result.insert(name.clone(), val);
+                            // A field is projected when it is *present*, even
+                            // if its value is null. Checking presence via
+                            // `resolve_field_ref` (not top-level `contains_key`)
+                            // means a present-but-null nested path like
+                            // `address.zip` is kept rather than silently dropped.
+                            if let Some(val) = resolve_field_ref(&doc, name) {
+                                result.insert(name.clone(), val.clone());
                             }
                         }
                         ProjectionField::Compute(expr) => {
@@ -1839,15 +1814,34 @@ pub(crate) fn try_index_only_count(
     let is_count_only = accumulators.iter().all(|(_, acc)| {
         matches!(
             acc,
-            Accumulator::Count
-                | Accumulator::Sum(Expression::Literal(Value::Number(_)))
+            Accumulator::Count | Accumulator::Sum(Expression::Literal(Value::Number(_)))
         )
     });
     if !is_count_only {
         return None;
     }
 
-    let total_indexed: usize = fi.iter_asc().map(|(_, ids)| ids.len()).sum();
+    // Sum the per-key counts and, at the same time, count the *distinct*
+    // document ids. Each document should appear under exactly one key (the
+    // index is single-key: arrays are stored as one stringified value, not
+    // multikey). If `distinct < total_indexed`, some document is indexed under
+    // more than one key — index-based grouping would then both double-count it
+    // and place it in multiple groups, and the `total_docs - total_indexed`
+    // null-group accounting would be wrong. In that case we cannot use the
+    // index-only fast path, so fall back to the hashing group path.
+    let mut distinct_ids: std::collections::HashSet<DocumentId> = std::collections::HashSet::new();
+    let mut total_indexed: usize = 0;
+    for (_, ids) in fi.iter_asc() {
+        total_indexed += ids.len();
+        for id in ids.iter() {
+            distinct_ids.insert(*id);
+        }
+    }
+    if distinct_ids.len() != total_indexed {
+        return None;
+    }
+    // `distinct_ids.len() == total_indexed` here, so either bound is the count
+    // of documents that have the field.
     if total_docs < total_indexed {
         return None;
     }
@@ -1937,15 +1931,29 @@ fn try_index_group(
     let is_count_only = accumulators.iter().all(|(_, acc)| {
         matches!(
             acc,
-            Accumulator::Count
-                | Accumulator::Sum(Expression::Literal(Value::Number(_)))
+            Accumulator::Count | Accumulator::Sum(Expression::Literal(Value::Number(_)))
         )
     });
 
     if is_count_only {
         // If docs is the full collection (no $match filter), use index directly
-        // We detect this by checking if docs.len() >= total indexed doc count
-        let total_indexed: usize = fi.iter_asc().map(|(_, ids)| ids.len()).sum();
+        // We detect this by checking if docs.len() >= total indexed doc count.
+        // As in `try_index_only_count`, guard against a document indexed under
+        // more than one key (which would double-count and misgroup): if the
+        // distinct id count differs from the summed per-key counts, fall back
+        // to the hashing path rather than the index.
+        let mut distinct_ids: std::collections::HashSet<DocumentId> =
+            std::collections::HashSet::new();
+        let mut total_indexed: usize = 0;
+        for (_, ids) in fi.iter_asc() {
+            total_indexed += ids.len();
+            for id in ids.iter() {
+                distinct_ids.insert(*id);
+            }
+        }
+        if distinct_ids.len() != total_indexed {
+            return Ok(None);
+        }
         if docs.len() >= total_indexed {
             // Pure index-only count: no doc reads at all
             let mut results = Vec::new();
@@ -2190,9 +2198,10 @@ fn finalize_accumulator(state: AccumulatorState) -> Value {
         AccumulatorState::Last(v) => v.unwrap_or(Value::Null),
         AccumulatorState::Push(v) => Value::Array(v),
         AccumulatorState::AddToSet(v) => Value::Array(v),
-        AccumulatorState::Percentile { percentiles, values } => {
-            finalize_percentile(percentiles, values)
-        }
+        AccumulatorState::Percentile {
+            percentiles,
+            values,
+        } => finalize_percentile(percentiles, values),
     }
 }
 
@@ -2412,8 +2421,7 @@ impl StreamingGroup {
                 compute_fast_key_single(vr.as_value())
             }
             GroupKey::Compound(fields) => {
-                let vals: Vec<ValRef> =
-                    fields.iter().map(|(_, expr)| expr.eval_ref(doc)).collect();
+                let vals: Vec<ValRef> = fields.iter().map(|(_, expr)| expr.eval_ref(doc)).collect();
                 compute_fast_key_multi(vals.iter().map(|vr| vr.as_value()), vals.len())
             }
         };
@@ -2442,10 +2450,7 @@ impl StreamingGroup {
             .iter()
             .map(|(_, acc)| match acc {
                 Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
-                Accumulator::Avg(_) => AccumulatorState::Avg {
-                    sum: 0.0,
-                    count: 0,
-                },
+                Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
                 Accumulator::Min(_) => AccumulatorState::Min(None),
                 Accumulator::Max(_) => AccumulatorState::Max(None),
                 Accumulator::Count => AccumulatorState::Count(0),
@@ -2490,8 +2495,7 @@ impl StreamingGroup {
                     Expression::FieldRef(path) => {
                         if let Some(owned) = extract_raw_field(&raw, path) {
                             if !hash_raw_owned(&owned, &mut hasher) {
-                                let doc: Value =
-                                    jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
+                                let doc: Value = jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
                                 return self.feed(&doc);
                             }
                         } else {
@@ -2524,8 +2528,7 @@ impl StreamingGroup {
                         }
                         Expression::Literal(v) => hash_json_value(v, &mut hasher),
                         _ => {
-                            let doc: Value =
-                                jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
+                            let doc: Value = jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
                             return self.feed(&doc);
                         }
                     }
@@ -2574,10 +2577,7 @@ impl StreamingGroup {
             .iter()
             .map(|(_, acc)| match acc {
                 Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
-                Accumulator::Avg(_) => AccumulatorState::Avg {
-                    sum: 0.0,
-                    count: 0,
-                },
+                Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
                 Accumulator::Min(_) => AccumulatorState::Min(None),
                 Accumulator::Max(_) => AccumulatorState::Max(None),
                 Accumulator::Count => AccumulatorState::Count(0),
@@ -2681,9 +2681,9 @@ impl Pipeline {
                 }
                 "$project" => Stage::Project(parse_project(stage_body)?),
                 "$count" => {
-                    let field = stage_body.as_str().ok_or_else(|| {
-                        Error::InvalidPipeline("$count must be a string".into())
-                    })?;
+                    let field = stage_body
+                        .as_str()
+                        .ok_or_else(|| Error::InvalidPipeline("$count must be a string".into()))?;
                     Stage::Count(field.to_string())
                 }
                 "$unwind" => {
@@ -2707,30 +2707,26 @@ impl Pipeline {
                     let obj = stage_body.as_object().ok_or_else(|| {
                         Error::InvalidPipeline("$lookup must be an object".into())
                     })?;
-                    let from = obj
-                        .get("from")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            Error::InvalidPipeline("$lookup requires 'from' string".into())
-                        })?;
-                    let local_field = obj
-                        .get("localField")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            Error::InvalidPipeline("$lookup requires 'localField' string".into())
-                        })?;
+                    let from = obj.get("from").and_then(|v| v.as_str()).ok_or_else(|| {
+                        Error::InvalidPipeline("$lookup requires 'from' string".into())
+                    })?;
+                    let local_field =
+                        obj.get("localField")
+                            .and_then(|v| v.as_str())
+                            .ok_or_else(|| {
+                                Error::InvalidPipeline(
+                                    "$lookup requires 'localField' string".into(),
+                                )
+                            })?;
                     let foreign_field = obj
                         .get("foreignField")
                         .and_then(|v| v.as_str())
                         .ok_or_else(|| {
                             Error::InvalidPipeline("$lookup requires 'foreignField' string".into())
                         })?;
-                    let as_field = obj
-                        .get("as")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            Error::InvalidPipeline("$lookup requires 'as' string".into())
-                        })?;
+                    let as_field = obj.get("as").and_then(|v| v.as_str()).ok_or_else(|| {
+                        Error::InvalidPipeline("$lookup requires 'as' string".into())
+                    })?;
                     // Optional extra field pairs for composite joins
                     let extra_pairs = match (
                         obj.get("localFields").and_then(|v| v.as_array()),
@@ -2763,7 +2759,7 @@ impl Pipeline {
                     return Err(Error::InvalidPipeline(format!(
                         "unknown stage: {}",
                         stage_name
-                    )))
+                    )));
                 }
             };
             stages.push(stage);
@@ -2795,9 +2791,7 @@ impl Pipeline {
         start: usize,
     ) -> Option<(&GroupKey, &[(String, Accumulator)], usize)> {
         match self.stages.get(start) {
-            Some(Stage::Group { key, accumulators }) => {
-                Some((key, accumulators, start + 1))
-            }
+            Some(Stage::Group { key, accumulators }) => Some((key, accumulators, start + 1)),
             _ => None,
         }
     }
@@ -2825,13 +2819,9 @@ impl Pipeline {
                 }
                 Stage::Group { key, accumulators } => {
                     // Try index-accelerated group path
-                    if let Some(result) = try_index_group(
-                        key,
-                        accumulators,
-                        &docs,
-                        field_indexes,
-                        doc_lookup,
-                    )? {
+                    if let Some(result) =
+                        try_index_group(key, accumulators, &docs, field_indexes, doc_lookup)?
+                    {
                         return self.execute_from(start + i + 1, result, lookup_fn);
                     }
                     // $group reads by reference → produces small owned Vec<Value>
@@ -2914,7 +2904,15 @@ impl Pipeline {
                     foreign_field,
                     as_field,
                     extra_pairs,
-                } => exec_lookup(current, from, local_field, foreign_field, as_field, extra_pairs, lookup_fn)?,
+                } => exec_lookup(
+                    current,
+                    from,
+                    local_field,
+                    foreign_field,
+                    as_field,
+                    extra_pairs,
+                    lookup_fn,
+                )?,
                 Stage::Out(_) => {
                     // $out is handled at the engine level after pipeline execution.
                     // The pipeline returns the docs; the engine writes them to the target collection.
@@ -2986,6 +2984,74 @@ mod tests {
     }
 
     #[test]
+    fn index_only_count_normal_with_missing_field() {
+        use crate::paged_field_index::PagedFieldIndex;
+        use crate::value::IndexValue;
+        let mut fi = PagedFieldIndex::new("status".to_string());
+        fi.insert_raw(1, IndexValue::from_json(&json!("active")));
+        fi.insert_raw(2, IndexValue::from_json(&json!("active")));
+        fi.insert_raw(3, IndexValue::from_json(&json!("idle")));
+        let mut field_indexes = HashMap::new();
+        field_indexes.insert("status".to_string(), fi);
+
+        let key = GroupKey::Single(Expression::FieldRef("status".to_string()));
+        let accs = vec![("count".to_string(), Accumulator::Count)];
+        // 5 docs total → 2 have no `status` → null group must report count 2.
+        let result = try_index_only_count(&key, &accs, &field_indexes, 5, None).unwrap();
+        let null_group = result.iter().find(|d| d["_id"].is_null()).unwrap();
+        assert_eq!(null_group["count"], 2);
+        let active = result.iter().find(|d| d["_id"] == json!("active")).unwrap();
+        assert_eq!(active["count"], 2);
+    }
+
+    #[test]
+    fn index_only_count_bails_on_double_counted_doc() {
+        use crate::paged_field_index::PagedFieldIndex;
+        use crate::value::IndexValue;
+        // Simulate an inconsistent (multikey-like) index where doc 1 is filed
+        // under two keys. The summed per-key counts (3) then exceed the
+        // distinct doc count (2), which would corrupt both the per-group counts
+        // and the `total_docs - total_indexed` null-group math. The fast path
+        // must decline so the caller falls back to the hashing group path.
+        let mut fi = PagedFieldIndex::new("status".to_string());
+        fi.insert_raw(1, IndexValue::from_json(&json!("a")));
+        fi.insert_raw(1, IndexValue::from_json(&json!("b")));
+        fi.insert_raw(2, IndexValue::from_json(&json!("a")));
+        let mut field_indexes = HashMap::new();
+        field_indexes.insert("status".to_string(), fi);
+
+        let key = GroupKey::Single(Expression::FieldRef("status".to_string()));
+        let accs = vec![("count".to_string(), Accumulator::Count)];
+        // total_docs == total_indexed (2 == ... no: 2 docs, 3 entries) — the
+        // distinct guard, not the `<` guard, is what rejects this.
+        let result = try_index_only_count(&key, &accs, &field_indexes, 2, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn expr_substr_ascii() {
+        let doc = json!({"s": "hello"});
+        let expr = parse_expression(&json!({"$substr": ["$s", 0, 3]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("hel"));
+    }
+
+    #[test]
+    fn expr_substr_multibyte_does_not_panic() {
+        // Regression: byte-slicing "héllo" at [0..2] used to panic because the
+        // 'é' is two bytes. Code-point indexing returns the first two chars.
+        let doc = json!({"s": "héllo"});
+        let expr = parse_expression(&json!({"$substr": ["$s", 0, 2]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!("hé"));
+    }
+
+    #[test]
+    fn expr_substr_out_of_range_is_empty() {
+        let doc = json!({"s": "hi"});
+        let expr = parse_expression(&json!({"$substr": ["$s", 10, 5]})).unwrap();
+        assert_eq!(expr.eval(&doc), json!(""));
+    }
+
+    #[test]
     fn expr_add() {
         let doc = json!({"a": 10, "b": 20});
         let expr = parse_expression(&json!({"$add": ["$a", "$b"]})).unwrap();
@@ -3046,11 +3112,7 @@ mod tests {
 
     #[test]
     fn match_with_operators() {
-        let docs = vec![
-            json!({"age": 15}),
-            json!({"age": 25}),
-            json!({"age": 35}),
-        ];
+        let docs = vec![json!({"age": 15}), json!({"age": 25}), json!({"age": 35})];
         let result = exec_match(docs, &json!({"age": {"$gte": 20}})).unwrap();
         assert_eq!(result.len(), 2);
     }
@@ -3107,11 +3169,7 @@ mod tests {
 
     #[test]
     fn group_min_max() {
-        let docs = vec![
-            json!({"v": 5}),
-            json!({"v": 1}),
-            json!({"v": 9}),
-        ];
+        let docs = vec![json!({"v": 5}), json!({"v": 1}), json!({"v": 9})];
         let stage = parse_group_stage(&json!({
             "_id": null,
             "min_v": {"$min": "$v"},
@@ -3337,13 +3395,28 @@ mod tests {
 
     #[test]
     fn date_interval_parses_long_forms() {
-        assert_eq!(DateInterval::parse("minute"), Some(DateInterval::Seconds(60)));
-        assert_eq!(DateInterval::parse("hour"), Some(DateInterval::Seconds(3600)));
-        assert_eq!(DateInterval::parse("day"), Some(DateInterval::Seconds(86_400)));
-        assert_eq!(DateInterval::parse("week"), Some(DateInterval::Seconds(604_800)));
+        assert_eq!(
+            DateInterval::parse("minute"),
+            Some(DateInterval::Seconds(60))
+        );
+        assert_eq!(
+            DateInterval::parse("hour"),
+            Some(DateInterval::Seconds(3600))
+        );
+        assert_eq!(
+            DateInterval::parse("day"),
+            Some(DateInterval::Seconds(86_400))
+        );
+        assert_eq!(
+            DateInterval::parse("week"),
+            Some(DateInterval::Seconds(604_800))
+        );
         assert_eq!(DateInterval::parse("month"), Some(DateInterval::Month));
         assert_eq!(DateInterval::parse("year"), Some(DateInterval::Year));
-        assert_eq!(DateInterval::parse("seconds"), Some(DateInterval::Seconds(1)));
+        assert_eq!(
+            DateInterval::parse("seconds"),
+            Some(DateInterval::Seconds(1))
+        );
     }
 
     #[test]
@@ -3352,9 +3425,18 @@ mod tests {
         assert_eq!(DateInterval::parse("5m"), Some(DateInterval::Seconds(300)));
         assert_eq!(DateInterval::parse("15m"), Some(DateInterval::Seconds(900)));
         assert_eq!(DateInterval::parse("1h"), Some(DateInterval::Seconds(3600)));
-        assert_eq!(DateInterval::parse("6h"), Some(DateInterval::Seconds(21_600)));
-        assert_eq!(DateInterval::parse("1d"), Some(DateInterval::Seconds(86_400)));
-        assert_eq!(DateInterval::parse("1w"), Some(DateInterval::Seconds(604_800)));
+        assert_eq!(
+            DateInterval::parse("6h"),
+            Some(DateInterval::Seconds(21_600))
+        );
+        assert_eq!(
+            DateInterval::parse("1d"),
+            Some(DateInterval::Seconds(86_400))
+        );
+        assert_eq!(
+            DateInterval::parse("1w"),
+            Some(DateInterval::Seconds(604_800))
+        );
         assert_eq!(DateInterval::parse("1M"), Some(DateInterval::Month));
         assert_eq!(DateInterval::parse("1y"), Some(DateInterval::Year));
         // Lowercase 'm' is minute, uppercase 'M' is month — guard against confusion
@@ -3421,13 +3503,22 @@ mod tests {
             "interval": "1h"
         }))
         .unwrap();
-        assert!(fill.is_none(), "default min_doc_count=1 should not emit fill");
+        assert!(
+            fill.is_none(),
+            "default min_doc_count=1 should not emit fill"
+        );
         if let Stage::Group { key, accumulators } = &stage {
             let result = exec_group(&docs, key, accumulators).unwrap();
             assert_eq!(result.len(), 2);
-            let h10 = result.iter().find(|d| d["_id"] == "2026-04-29T10:00:00Z").unwrap();
+            let h10 = result
+                .iter()
+                .find(|d| d["_id"] == "2026-04-29T10:00:00Z")
+                .unwrap();
             assert_eq!(h10["count"], json!(2));
-            let h11 = result.iter().find(|d| d["_id"] == "2026-04-29T11:00:00Z").unwrap();
+            let h11 = result
+                .iter()
+                .find(|d| d["_id"] == "2026-04-29T11:00:00Z")
+                .unwrap();
             assert_eq!(h11["count"], json!(1));
         } else {
             panic!("expected Group stage");
@@ -3452,7 +3543,10 @@ mod tests {
         .unwrap();
         if let Stage::Group { key, accumulators } = &stage {
             let result = exec_group(&docs, key, accumulators).unwrap();
-            let h10 = result.iter().find(|d| d["_id"] == "2026-04-29T10:00:00Z").unwrap();
+            let h10 = result
+                .iter()
+                .find(|d| d["_id"] == "2026-04-29T10:00:00Z")
+                .unwrap();
             assert_eq!(h10["count"], json!(2));
             assert_eq!(h10["total"], json!(15));
             assert_eq!(h10["max_amount"], json!(10));
@@ -3587,11 +3681,7 @@ mod tests {
     #[test]
     fn sort_type_aware() {
         // Numbers come before strings in IndexValue ordering
-        let docs = vec![
-            json!({"v": "hello"}),
-            json!({"v": 42}),
-            json!({"v": null}),
-        ];
+        let docs = vec![json!({"v": "hello"}), json!({"v": 42}), json!({"v": null})];
         let result = exec_sort(docs, &[("v".into(), SortOrder::Asc)]);
         assert_eq!(result[0]["v"], Value::Null);
         assert_eq!(result[1]["v"], 42);
@@ -3784,8 +3874,16 @@ mod tests {
             }
         };
 
-        let result =
-            exec_lookup(docs, "inventory", "item", "sku", "matched", &[], &mock_lookup).unwrap();
+        let result = exec_lookup(
+            docs,
+            "inventory",
+            "item",
+            "sku",
+            "matched",
+            &[],
+            &mock_lookup,
+        )
+        .unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["matched"].as_array().unwrap().len(), 1);
         assert_eq!(result[1]["matched"].as_array().unwrap().len(), 2);
@@ -4044,7 +4142,10 @@ mod tests {
     #[test]
     fn feed_raw_avg_basic() {
         let key = GroupKey::Single(Expression::FieldRef("city".to_string()));
-        let accs = vec![("avg_age".to_string(), Accumulator::Avg(Expression::FieldRef("age".to_string())))];
+        let accs = vec![(
+            "avg_age".to_string(),
+            Accumulator::Avg(Expression::FieldRef("age".to_string())),
+        )];
         assert!(is_raw_eligible(&key, &accs));
 
         let mut group = StreamingGroup::new(&key, &accs);
@@ -4090,7 +4191,8 @@ mod tests {
         ];
         let pipeline = Pipeline::parse(&json!([
             {"$group": {"_id": "$dept", "languages": {"$addToSet": "$lang"}}}
-        ])).unwrap();
+        ]))
+        .unwrap();
         let results = pipeline.execute_from(0, docs, &no_lookup).unwrap();
         assert_eq!(results.len(), 2);
         for doc in &results {
@@ -4122,7 +4224,8 @@ mod tests {
         let doc = json!({"active": false});
         let expr = parse_expression(&json!({
             "$cond": {"if": "$active", "then": "yes", "else": "no"}
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(expr.eval(&doc), json!("no"));
     }
 
@@ -4303,7 +4406,8 @@ mod tests {
         let pipeline = Pipeline::parse(&json!([
             {"$match": {"status": "active"}},
             {"$out": "results"}
-        ])).unwrap();
+        ]))
+        .unwrap();
         assert_eq!(pipeline.out_collection(), Some("results"));
     }
 
@@ -4311,7 +4415,8 @@ mod tests {
     fn pipeline_without_out() {
         let pipeline = Pipeline::parse(&json!([
             {"$match": {"status": "active"}}
-        ])).unwrap();
+        ]))
+        .unwrap();
         assert_eq!(pipeline.out_collection(), None);
     }
 
@@ -4333,24 +4438,23 @@ mod tests {
             }}
         ])).unwrap();
         let results = pipeline.execute_from(0, docs, &no_lookup).unwrap();
-        assert_eq!(results[0]["grade"], json!("pass"));  // 90-50=40 → truthy
+        assert_eq!(results[0]["grade"], json!("pass")); // 90-50=40 → truthy
         assert_eq!(results[0]["label"], json!("Alice: P"));
-        assert_eq!(results[1]["grade"], json!("pass"));  // 40-50=-10 → truthy (non-zero)
+        assert_eq!(results[1]["grade"], json!("pass")); // 40-50=-10 → truthy (non-zero)
         assert_eq!(results[1]["label"], json!("Bob: P"));
     }
 
     #[test]
     fn addfields_with_date_and_string() {
-        let docs = vec![
-            json!({"created": "2024-06-15T08:30:00Z", "name": "test"}),
-        ];
+        let docs = vec![json!({"created": "2024-06-15T08:30:00Z", "name": "test"})];
         let pipeline = Pipeline::parse(&json!([
             {"$addFields": {
                 "year": {"$year": "$created"},
                 "month": {"$month": "$created"},
                 "upper_name": {"$toUpper": "$name"}
             }}
-        ])).unwrap();
+        ]))
+        .unwrap();
         let results = pipeline.execute_from(0, docs, &no_lookup).unwrap();
         assert_eq!(results[0]["year"], json!(2024));
         assert_eq!(results[0]["month"], json!(6));
@@ -4369,7 +4473,8 @@ mod tests {
                 "_id": {"$month": "$date"},
                 "total": {"$sum": "$amount"}
             }}
-        ])).unwrap();
+        ]))
+        .unwrap();
         let results = pipeline.execute_from(0, docs, &no_lookup).unwrap();
         assert_eq!(results.len(), 2);
         for doc in &results {

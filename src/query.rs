@@ -17,7 +17,10 @@ use crate::value::IndexValue;
 
 /// Estimate how many documents a query condition would match using index metadata.
 /// Returns None if the condition can't be estimated (no index, regex, exists, etc.).
-pub fn estimate_rows(query: &Query, field_indexes: &HashMap<String, PagedFieldIndex>) -> Option<usize> {
+pub fn estimate_rows(
+    query: &Query,
+    field_indexes: &HashMap<String, PagedFieldIndex>,
+) -> Option<usize> {
     match query {
         Query::All => None,
         Query::Field { field, op } => {
@@ -30,22 +33,38 @@ pub fn estimate_rows(query: &Query, field_indexes: &HashMap<String, PagedFieldIn
                 QueryOp::Lt(v) => Some(idx.count_range(Bound::Unbounded, Bound::Excluded(v))),
                 QueryOp::Lte(v) => Some(idx.count_range(Bound::Unbounded, Bound::Included(v))),
                 QueryOp::In(vals) => Some(idx.count_in(vals)),
-                QueryOp::Nin(_) | QueryOp::Exists(_) | QueryOp::Regex(_)
-                | QueryOp::ElemMatch(_) | QueryOp::Not(_) | QueryOp::ArrayAll(_)
-                | QueryOp::Size(_) | QueryOp::Type(_) | QueryOp::Mod(..) => None,
+                QueryOp::Nin(_)
+                | QueryOp::Exists(_)
+                | QueryOp::Regex(_)
+                | QueryOp::ElemMatch(_)
+                | QueryOp::Not(_)
+                | QueryOp::ArrayAll(_)
+                | QueryOp::Size(_)
+                | QueryOp::Type(_)
+                | QueryOp::Mod(..) => None,
             }
         }
         Query::And(subs) => {
-            let estimates: Vec<usize> = subs.iter()
+            let estimates: Vec<usize> = subs
+                .iter()
                 .filter_map(|s| estimate_rows(s, field_indexes))
                 .collect();
-            if estimates.is_empty() { None } else { Some(*estimates.iter().min().unwrap()) }
+            if estimates.is_empty() {
+                None
+            } else {
+                Some(*estimates.iter().min().unwrap())
+            }
         }
         Query::Or(subs) => {
-            let estimates: Vec<usize> = subs.iter()
+            let estimates: Vec<usize> = subs
+                .iter()
                 .filter_map(|s| estimate_rows(s, field_indexes))
                 .collect();
-            if estimates.is_empty() { None } else { Some(estimates.iter().sum()) }
+            if estimates.is_empty() {
+                None
+            } else {
+                Some(estimates.iter().sum())
+            }
         }
         Query::Nor(_) | Query::Expr(_) => None,
     }
@@ -83,7 +102,7 @@ pub fn parse_find_options(request: &JsonValue) -> Result<FindOptions> {
                     _ => {
                         return Err(Error::InvalidQuery(
                             "sort direction must be 1 (asc) or -1 (desc)".into(),
-                        ))
+                        ));
                     }
                 };
                 sort_fields.push((field.clone(), order));
@@ -126,7 +145,7 @@ pub enum QueryOp {
     Exists(bool),
     Regex(regex::Regex),
     ElemMatch(Box<Query>),
-    Not(Vec<QueryOp>),        // negate: {"field": {"$not": {"$gt": 30}}}
+    Not(Vec<QueryOp>),         // negate: {"field": {"$not": {"$gt": 30}}}
     ArrayAll(Vec<IndexValue>), // array contains all: {"tags": {"$all": ["a","b"]}}
     Size(usize),               // array length: {"tags": {"$size": 3}}
     Type(String),              // JSON type check: {"field": {"$type": "string"}}
@@ -138,9 +157,9 @@ pub enum Query {
     Field { field: String, op: QueryOp },
     And(Vec<Query>),
     Or(Vec<Query>),
-    Nor(Vec<Query>),           // none match: {"$nor": [{...}, {...}]}
-    Expr(ExprCondition),       // cross-field comparison: {"$expr": {"$gt": ["$a", "$b"]}}
-    All,                       // match everything
+    Nor(Vec<Query>),     // none match: {"$nor": [{...}, {...}]}
+    Expr(ExprCondition), // cross-field comparison: {"$expr": {"$gt": ["$a", "$b"]}}
+    All,                 // match everything
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +294,9 @@ fn parse_op(
             let arr = op_val
                 .as_array()
                 .ok_or_else(|| Error::InvalidQuery("$nin must be an array".into()))?;
-            Ok(QueryOp::Nin(arr.iter().map(IndexValue::from_json).collect()))
+            Ok(QueryOp::Nin(
+                arr.iter().map(IndexValue::from_json).collect(),
+            ))
         }
         "$exists" => {
             let b = op_val
@@ -296,9 +317,8 @@ fn parse_op(
                 re_pattern.push_str("(?i)");
             }
             re_pattern.push_str(pattern);
-            let re = regex::Regex::new(&re_pattern).map_err(|e| {
-                Error::InvalidQuery(format!("invalid regex: {}", e))
-            })?;
+            let re = regex::Regex::new(&re_pattern)
+                .map_err(|e| Error::InvalidQuery(format!("invalid regex: {}", e)))?;
             Ok(QueryOp::Regex(re))
         }
         "$elemMatch" => {
@@ -317,7 +337,9 @@ fn parse_op(
                 inner_ops.push(parse_op(k, v, inner_obj)?);
             }
             if inner_ops.is_empty() {
-                return Err(Error::InvalidQuery("$not must contain at least one operator".into()));
+                return Err(Error::InvalidQuery(
+                    "$not must contain at least one operator".into(),
+                ));
             }
             Ok(QueryOp::Not(inner_ops))
         }
@@ -325,12 +347,14 @@ fn parse_op(
             let arr = op_val
                 .as_array()
                 .ok_or_else(|| Error::InvalidQuery("$all must be an array".into()))?;
-            Ok(QueryOp::ArrayAll(arr.iter().map(IndexValue::from_json).collect()))
+            Ok(QueryOp::ArrayAll(
+                arr.iter().map(IndexValue::from_json).collect(),
+            ))
         }
         "$size" => {
-            let n = op_val
-                .as_u64()
-                .ok_or_else(|| Error::InvalidQuery("$size must be a non-negative integer".into()))?;
+            let n = op_val.as_u64().ok_or_else(|| {
+                Error::InvalidQuery("$size must be a non-negative integer".into())
+            })?;
             Ok(QueryOp::Size(n as usize))
         }
         "$type" => {
@@ -340,18 +364,22 @@ fn parse_op(
             Ok(QueryOp::Type(t.to_string()))
         }
         "$mod" => {
-            let arr = op_val
-                .as_array()
-                .ok_or_else(|| Error::InvalidQuery("$mod must be an array [divisor, remainder]".into()))?;
+            let arr = op_val.as_array().ok_or_else(|| {
+                Error::InvalidQuery("$mod must be an array [divisor, remainder]".into())
+            })?;
             if arr.len() != 2 {
-                return Err(Error::InvalidQuery("$mod must have exactly 2 elements [divisor, remainder]".into()));
+                return Err(Error::InvalidQuery(
+                    "$mod must have exactly 2 elements [divisor, remainder]".into(),
+                ));
             }
-            let divisor = arr[0].as_i64()
+            let divisor = arr[0]
+                .as_i64()
                 .ok_or_else(|| Error::InvalidQuery("$mod divisor must be an integer".into()))?;
             if divisor == 0 {
                 return Err(Error::InvalidQuery("$mod divisor must not be zero".into()));
             }
-            let remainder = arr[1].as_i64()
+            let remainder = arr[1]
+                .as_i64()
                 .ok_or_else(|| Error::InvalidQuery("$mod remainder must be an integer".into()))?;
             Ok(QueryOp::Mod(divisor, remainder))
         }
@@ -424,7 +452,9 @@ fn parse_expr(val: &JsonValue) -> Result<ExprCondition> {
         .as_object()
         .ok_or_else(|| Error::InvalidQuery("$expr must be an object".into()))?;
     if obj.len() != 1 {
-        return Err(Error::InvalidQuery("$expr must contain exactly one comparison operator".into()));
+        return Err(Error::InvalidQuery(
+            "$expr must contain exactly one comparison operator".into(),
+        ));
     }
     let (op_str, args_val) = obj.iter().next().unwrap();
     let op = match op_str.as_str() {
@@ -434,13 +464,19 @@ fn parse_expr(val: &JsonValue) -> Result<ExprCondition> {
         "$gte" => ExprCmpOp::Gte,
         "$lt" => ExprCmpOp::Lt,
         "$lte" => ExprCmpOp::Lte,
-        other => return Err(Error::InvalidQuery(format!("$expr: unsupported operator: {other}"))),
+        other => {
+            return Err(Error::InvalidQuery(format!(
+                "$expr: unsupported operator: {other}"
+            )));
+        }
     };
-    let args = args_val
-        .as_array()
-        .ok_or_else(|| Error::InvalidQuery("$expr operator value must be a 2-element array".into()))?;
+    let args = args_val.as_array().ok_or_else(|| {
+        Error::InvalidQuery("$expr operator value must be a 2-element array".into())
+    })?;
     if args.len() != 2 {
-        return Err(Error::InvalidQuery("$expr operator value must have exactly 2 elements".into()));
+        return Err(Error::InvalidQuery(
+            "$expr operator value must have exactly 2 elements".into(),
+        ));
     }
     let lhs = parse_expr_arg(&args[0]);
     let rhs = parse_expr_arg(&args[1]);
@@ -496,11 +532,7 @@ pub fn execute_indexed(
                     break;
                 }
             }
-            if all_resolved {
-                Some(result)
-            } else {
-                None
-            }
+            if all_resolved { Some(result) } else { None }
         }
         Query::Nor(_) | Query::Expr(_) => None,
     }
@@ -522,8 +554,14 @@ fn execute_field_op(
         QueryOp::Lt(v) => idx.find_range(Bound::Unbounded, Bound::Excluded(v)),
         QueryOp::Lte(v) => idx.find_range(Bound::Unbounded, Bound::Included(v)),
         QueryOp::In(vals) => idx.find_in(vals),
-        QueryOp::Nin(_) | QueryOp::Exists(_) | QueryOp::Regex(_) | QueryOp::ElemMatch(_)
-        | QueryOp::Not(_) | QueryOp::ArrayAll(_) | QueryOp::Size(_) | QueryOp::Type(_)
+        QueryOp::Nin(_)
+        | QueryOp::Exists(_)
+        | QueryOp::Regex(_)
+        | QueryOp::ElemMatch(_)
+        | QueryOp::Not(_)
+        | QueryOp::ArrayAll(_)
+        | QueryOp::Size(_)
+        | QueryOp::Type(_)
         | QueryOp::Mod(..) => return None,
     })
 }
@@ -668,8 +706,14 @@ pub fn execute_indexed_lazy(
                     });
                     cont
                 }
-                QueryOp::Nin(_) | QueryOp::Exists(_) | QueryOp::Regex(_) | QueryOp::ElemMatch(_)
-                | QueryOp::Not(_) | QueryOp::ArrayAll(_) | QueryOp::Size(_) | QueryOp::Type(_)
+                QueryOp::Nin(_)
+                | QueryOp::Exists(_)
+                | QueryOp::Regex(_)
+                | QueryOp::ElemMatch(_)
+                | QueryOp::Not(_)
+                | QueryOp::ArrayAll(_)
+                | QueryOp::Size(_)
+                | QueryOp::Type(_)
                 | QueryOp::Mod(..) => return None,
             })
         }
@@ -702,7 +746,8 @@ pub fn execute_indexed_lazy(
 
                 // If there are other indexed subs, materialize them for intersection
                 let other_indexed: Vec<BTreeSet<DocumentId>> = if all_indexable {
-                    subs.iter().enumerate()
+                    subs.iter()
+                        .enumerate()
                         .filter(|(i, _)| *i != idx)
                         .filter_map(|(_, s)| execute_indexed(s, field_indexes, &[]))
                         .collect()
@@ -738,21 +783,22 @@ pub fn execute_indexed_lazy(
 fn eval_field_op(op: &QueryOp, field_val: Option<&JsonValue>) -> bool {
     match op {
         QueryOp::Exists(expected) => field_val.is_some() == *expected,
-        QueryOp::Regex(re) => {
-            field_val
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| re.is_match(s))
-        }
+        QueryOp::Regex(re) => field_val
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| re.is_match(s)),
         QueryOp::ElemMatch(inner) => match field_val {
             Some(JsonValue::Array(arr)) => array_any_matches(arr, inner),
             _ => false,
         },
         QueryOp::Not(inner_ops) => {
             // $not inverts the result. Missing field → inner ops return false → !false = true.
-            !inner_ops.iter().all(|inner| eval_field_op(inner, field_val))
+            !inner_ops
+                .iter()
+                .all(|inner| eval_field_op(inner, field_val))
         }
         QueryOp::ArrayAll(required) => match field_val {
-            Some(JsonValue::Array(arr)) => {
+            // `$all: []` matches nothing (MongoDB semantics), not every array.
+            Some(JsonValue::Array(arr)) if !required.is_empty() => {
                 let arr_vals: Vec<IndexValue> = arr.iter().map(IndexValue::from_json).collect();
                 required.iter().all(|v| arr_vals.contains(v))
             }
@@ -767,9 +813,24 @@ fn eval_field_op(op: &QueryOp, field_val: Option<&JsonValue>) -> bool {
             None => false,
         },
         QueryOp::Mod(divisor, remainder) => {
+            // A zero divisor would panic on `%`; treat it as a non-match
+            // rather than aborting the whole query (MongoDB rejects it).
+            if *divisor == 0 {
+                return false;
+            }
             field_val
                 .and_then(|v| v.as_f64())
-                .is_some_and(|n| (n as i64) % divisor == *remainder)
+                .filter(|n| n.is_finite())
+                .is_some_and(|n| {
+                    // Truncate toward zero (MongoDB semantics), guarding the
+                    // i64 cast so an out-of-range float doesn't saturate to
+                    // i64::MAX/MIN and produce an arbitrary match.
+                    let t = n.trunc();
+                    if t < i64::MIN as f64 || t > i64::MAX as f64 {
+                        return false;
+                    }
+                    (t as i64) % divisor == *remainder
+                })
         }
         _ => {
             let Some(val) = field_val else {
@@ -794,7 +855,11 @@ fn eval_field_op(op: &QueryOp, field_val: Option<&JsonValue>) -> bool {
 /// Check if a JSON value matches a MongoDB-style type name.
 fn json_type_matches(val: &JsonValue, type_name: &str) -> bool {
     match type_name {
-        "double" | "number" => val.is_f64() || val.is_i64() || val.is_u64(),
+        // A "double" is a non-integral JSON number only — an integer like `42`
+        // must NOT match `$type:"double"`. "number" is the union of all
+        // numeric types.
+        "double" => val.is_f64(),
+        "number" => val.is_f64() || val.is_i64() || val.is_u64(),
         "string" => val.is_string(),
         "object" => val.is_object(),
         "array" => val.is_array(),
@@ -867,9 +932,15 @@ pub fn is_fully_indexed(
         Query::Field { field, op } => {
             if matches!(
                 op,
-                QueryOp::Exists(_) | QueryOp::Regex(_) | QueryOp::Nin(_) | QueryOp::ElemMatch(_)
-                    | QueryOp::Not(_) | QueryOp::ArrayAll(_) | QueryOp::Size(_)
-                    | QueryOp::Type(_) | QueryOp::Mod(..)
+                QueryOp::Exists(_)
+                    | QueryOp::Regex(_)
+                    | QueryOp::Nin(_)
+                    | QueryOp::ElemMatch(_)
+                    | QueryOp::Not(_)
+                    | QueryOp::ArrayAll(_)
+                    | QueryOp::Size(_)
+                    | QueryOp::Type(_)
+                    | QueryOp::Mod(..)
             ) {
                 return false;
             }
@@ -899,8 +970,14 @@ pub fn count_indexed(
                 QueryOp::Lt(v) => idx.count_range(Bound::Unbounded, Bound::Excluded(v)),
                 QueryOp::Lte(v) => idx.count_range(Bound::Unbounded, Bound::Included(v)),
                 QueryOp::In(vals) => idx.count_in(vals),
-                QueryOp::Nin(_) | QueryOp::Exists(_) | QueryOp::Regex(_) | QueryOp::ElemMatch(_)
-                | QueryOp::Not(_) | QueryOp::ArrayAll(_) | QueryOp::Size(_) | QueryOp::Type(_)
+                QueryOp::Nin(_)
+                | QueryOp::Exists(_)
+                | QueryOp::Regex(_)
+                | QueryOp::ElemMatch(_)
+                | QueryOp::Not(_)
+                | QueryOp::ArrayAll(_)
+                | QueryOp::Size(_)
+                | QueryOp::Type(_)
                 | QueryOp::Mod(..) => return None,
             })
         }
@@ -978,7 +1055,9 @@ fn count_single_field_and(
 /// Extract equality conditions from a query as a field→value map.
 /// Returns None if the query contains no equality conditions.
 /// Only extracts top-level $eq conditions (not nested in $or).
-pub fn extract_eq_conditions(query: &Query) -> Option<std::collections::HashMap<String, IndexValue>> {
+pub fn extract_eq_conditions(
+    query: &Query,
+) -> Option<std::collections::HashMap<String, IndexValue>> {
     let mut map = std::collections::HashMap::new();
     match query {
         Query::Field {
@@ -1000,11 +1079,7 @@ pub fn extract_eq_conditions(query: &Query) -> Option<std::collections::HashMap<
         }
         _ => {}
     }
-    if map.is_empty() {
-        None
-    } else {
-        Some(map)
-    }
+    if map.is_empty() { None } else { Some(map) }
 }
 
 /// Check if every condition in a query is a $eq on one of the given fields.
@@ -1029,9 +1104,9 @@ pub fn matches_value(query: &Query, data: &JsonValue) -> bool {
         Query::And(subs) => subs.iter().all(|s| matches_value(s, data)),
         Query::Or(subs) => subs.iter().any(|s| matches_value(s, data)),
         Query::Nor(subs) => !subs.iter().any(|s| matches_value(s, data)),
-        Query::Expr(expr) => {
-            eval_expr_with(expr, |f| resolve_field_ref(data, f).map(IndexValue::from_json))
-        }
+        Query::Expr(expr) => eval_expr_with(expr, |f| {
+            resolve_field_ref(data, f).map(IndexValue::from_json)
+        }),
     }
 }
 
@@ -1059,8 +1134,12 @@ fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
             // Complex ops require full decode — fall back
             if matches!(
                 op,
-                QueryOp::ElemMatch(_) | QueryOp::Not(_) | QueryOp::ArrayAll(_)
-                    | QueryOp::Size(_) | QueryOp::Type(_) | QueryOp::Mod(..)
+                QueryOp::ElemMatch(_)
+                    | QueryOp::Not(_)
+                    | QueryOp::ArrayAll(_)
+                    | QueryOp::Size(_)
+                    | QueryOp::Type(_)
+                    | QueryOp::Mod(..)
             ) {
                 return None;
             }
@@ -1515,14 +1594,22 @@ mod tests {
     fn elem_match_object_fields() {
         // Match array of objects where element has price > 100
         let q = parse_query(&json!({"items": {"$elemMatch": {"price": {"$gt": 100}}}})).unwrap();
-        let doc_match = Document::new(1, json!({"items": [
-            {"name": "A", "price": 50},
-            {"name": "B", "price": 150}
-        ]})).unwrap();
-        let doc_no = Document::new(2, json!({"items": [
-            {"name": "A", "price": 50},
-            {"name": "B", "price": 80}
-        ]})).unwrap();
+        let doc_match = Document::new(
+            1,
+            json!({"items": [
+                {"name": "A", "price": 50},
+                {"name": "B", "price": 150}
+            ]}),
+        )
+        .unwrap();
+        let doc_no = Document::new(
+            2,
+            json!({"items": [
+                {"name": "A", "price": 50},
+                {"name": "B", "price": 80}
+            ]}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &doc_match));
         assert!(!matches_doc(&q, &doc_no));
     }
@@ -1533,17 +1620,26 @@ mod tests {
         let q = parse_query(&json!({"items": {"$elemMatch": {
             "price": {"$gt": 100},
             "inStock": true
-        }}})).unwrap();
+        }}}))
+        .unwrap();
         // Element B has price > 100 AND inStock true → match
-        let doc_match = Document::new(1, json!({"items": [
-            {"price": 50, "inStock": true},
-            {"price": 150, "inStock": true}
-        ]})).unwrap();
+        let doc_match = Document::new(
+            1,
+            json!({"items": [
+                {"price": 50, "inStock": true},
+                {"price": 150, "inStock": true}
+            ]}),
+        )
+        .unwrap();
         // No single element satisfies both: price>100 is B (inStock false), inStock true is A (price 50)
-        let doc_no = Document::new(2, json!({"items": [
-            {"price": 50, "inStock": true},
-            {"price": 150, "inStock": false}
-        ]})).unwrap();
+        let doc_no = Document::new(
+            2,
+            json!({"items": [
+                {"price": 50, "inStock": true},
+                {"price": 150, "inStock": false}
+            ]}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &doc_match));
         assert!(!matches_doc(&q, &doc_no));
     }
@@ -1573,23 +1669,34 @@ mod tests {
 
     #[test]
     fn elem_match_nested_dot_notation() {
-        let q = parse_query(&json!({"items": {"$elemMatch": {"details.cost": {"$gte": 50}}}})).unwrap();
-        let doc_match = Document::new(1, json!({"items": [
-            {"details": {"cost": 30}},
-            {"details": {"cost": 75}}
-        ]})).unwrap();
-        let doc_no = Document::new(2, json!({"items": [
-            {"details": {"cost": 10}},
-            {"details": {"cost": 20}}
-        ]})).unwrap();
+        let q =
+            parse_query(&json!({"items": {"$elemMatch": {"details.cost": {"$gte": 50}}}})).unwrap();
+        let doc_match = Document::new(
+            1,
+            json!({"items": [
+                {"details": {"cost": 30}},
+                {"details": {"cost": 75}}
+            ]}),
+        )
+        .unwrap();
+        let doc_no = Document::new(
+            2,
+            json!({"items": [
+                {"details": {"cost": 10}},
+                {"details": {"cost": 20}}
+            ]}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &doc_match));
         assert!(!matches_doc(&q, &doc_no));
     }
 
     #[test]
     fn elem_match_with_regex() {
-        let q = parse_query(&json!({"emails": {"$elemMatch": {"$regex": "@example\\.com$"}}})).unwrap();
-        let doc_match = Document::new(1, json!({"emails": ["a@test.com", "b@example.com"]})).unwrap();
+        let q =
+            parse_query(&json!({"emails": {"$elemMatch": {"$regex": "@example\\.com$"}}})).unwrap();
+        let doc_match =
+            Document::new(1, json!({"emails": ["a@test.com", "b@example.com"]})).unwrap();
         let doc_no = Document::new(2, json!({"emails": ["a@test.com", "b@other.org"]})).unwrap();
         assert!(matches_doc(&q, &doc_match));
         assert!(!matches_doc(&q, &doc_no));
@@ -1611,10 +1718,13 @@ mod tests {
         let q = parse_query(&json!({
             "status": "active",
             "scores": {"$elemMatch": {"$gte": 90}}
-        })).unwrap();
+        }))
+        .unwrap();
         let doc_match = Document::new(1, json!({"status": "active", "scores": [80, 95]})).unwrap();
-        let doc_wrong_status = Document::new(2, json!({"status": "inactive", "scores": [80, 95]})).unwrap();
-        let doc_low_scores = Document::new(3, json!({"status": "active", "scores": [80, 85]})).unwrap();
+        let doc_wrong_status =
+            Document::new(2, json!({"status": "inactive", "scores": [80, 95]})).unwrap();
+        let doc_low_scores =
+            Document::new(3, json!({"status": "active", "scores": [80, 85]})).unwrap();
         assert!(matches_doc(&q, &doc_match));
         assert!(!matches_doc(&q, &doc_wrong_status));
         assert!(!matches_doc(&q, &doc_low_scores));
@@ -1622,15 +1732,24 @@ mod tests {
 
     #[test]
     fn elem_match_exists_inside() {
-        let q = parse_query(&json!({"items": {"$elemMatch": {"discount": {"$exists": true}}}})).unwrap();
-        let doc_match = Document::new(1, json!({"items": [
-            {"price": 10},
-            {"price": 20, "discount": 5}
-        ]})).unwrap();
-        let doc_no = Document::new(2, json!({"items": [
-            {"price": 10},
-            {"price": 20}
-        ]})).unwrap();
+        let q = parse_query(&json!({"items": {"$elemMatch": {"discount": {"$exists": true}}}}))
+            .unwrap();
+        let doc_match = Document::new(
+            1,
+            json!({"items": [
+                {"price": 10},
+                {"price": 20, "discount": 5}
+            ]}),
+        )
+        .unwrap();
+        let doc_no = Document::new(
+            2,
+            json!({"items": [
+                {"price": 10},
+                {"price": 20}
+            ]}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &doc_match));
         assert!(!matches_doc(&q, &doc_no));
     }
@@ -1694,10 +1813,23 @@ mod tests {
         let q = parse_query(&json!({
             "spam_score": {"$not": {"$gte": 0.8}},
             "published": true
-        })).unwrap();
-        let clean = Document::new(1, json!({"title": "Good post", "spam_score": 0.1, "published": true})).unwrap();
-        let spam = Document::new(2, json!({"title": "Buy now!!!", "spam_score": 0.95, "published": true})).unwrap();
-        let draft = Document::new(3, json!({"title": "Draft", "spam_score": 0.1, "published": false})).unwrap();
+        }))
+        .unwrap();
+        let clean = Document::new(
+            1,
+            json!({"title": "Good post", "spam_score": 0.1, "published": true}),
+        )
+        .unwrap();
+        let spam = Document::new(
+            2,
+            json!({"title": "Buy now!!!", "spam_score": 0.95, "published": true}),
+        )
+        .unwrap();
+        let draft = Document::new(
+            3,
+            json!({"title": "Draft", "spam_score": 0.1, "published": false}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &clean));
         assert!(!matches_doc(&q, &spam));
         assert!(!matches_doc(&q, &draft));
@@ -1711,7 +1843,8 @@ mod tests {
     fn nor_basic() {
         let q = parse_query(&json!({
             "$nor": [{"status": "deleted"}, {"status": "banned"}]
-        })).unwrap();
+        }))
+        .unwrap();
         let active = Document::new(1, json!({"status": "active"})).unwrap();
         let deleted = Document::new(2, json!({"status": "deleted"})).unwrap();
         let banned = Document::new(3, json!({"status": "banned"})).unwrap();
@@ -1724,7 +1857,8 @@ mod tests {
     fn nor_multiple_fields() {
         let q = parse_query(&json!({
             "$nor": [{"age": {"$lt": 18}}, {"banned": true}]
-        })).unwrap();
+        }))
+        .unwrap();
         let adult = Document::new(1, json!({"age": 25, "banned": false})).unwrap();
         let minor = Document::new(2, json!({"age": 15, "banned": false})).unwrap();
         let banned_adult = Document::new(3, json!({"age": 30, "banned": true})).unwrap();
@@ -1742,11 +1876,28 @@ mod tests {
                 {"discontinued": true},
                 {"price": {"$lte": 0}}
             ]
-        })).unwrap();
-        let available = Document::new(1, json!({"name": "Widget", "stock": 50, "discontinued": false, "price": 29.99})).unwrap();
-        let out_of_stock = Document::new(2, json!({"name": "Gadget", "stock": 0, "discontinued": false, "price": 19.99})).unwrap();
-        let discontinued = Document::new(3, json!({"name": "Old Phone", "stock": 5, "discontinued": true, "price": 99.99})).unwrap();
-        let free = Document::new(4, json!({"name": "Sample", "stock": 100, "discontinued": false, "price": 0})).unwrap();
+        }))
+        .unwrap();
+        let available = Document::new(
+            1,
+            json!({"name": "Widget", "stock": 50, "discontinued": false, "price": 29.99}),
+        )
+        .unwrap();
+        let out_of_stock = Document::new(
+            2,
+            json!({"name": "Gadget", "stock": 0, "discontinued": false, "price": 19.99}),
+        )
+        .unwrap();
+        let discontinued = Document::new(
+            3,
+            json!({"name": "Old Phone", "stock": 5, "discontinued": true, "price": 99.99}),
+        )
+        .unwrap();
+        let free = Document::new(
+            4,
+            json!({"name": "Sample", "stock": 100, "discontinued": false, "price": 0}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &available));
         assert!(!matches_doc(&q, &out_of_stock));
         assert!(!matches_doc(&q, &discontinued));
@@ -1766,6 +1917,17 @@ mod tests {
         assert!(matches_doc(&q, &both));
         assert!(!matches_doc(&q, &one_only));
         assert!(!matches_doc(&q, &neither));
+    }
+
+    #[test]
+    fn all_empty_matches_nothing() {
+        // `$all: []` must match no documents (MongoDB semantics), not every
+        // array-valued document.
+        let q = parse_query(&json!({"tags": {"$all": []}})).unwrap();
+        let arr = Document::new(1, json!({"tags": ["red", "blue"]})).unwrap();
+        let empty = Document::new(2, json!({"tags": []})).unwrap();
+        assert!(!matches_doc(&q, &arr));
+        assert!(!matches_doc(&q, &empty));
     }
 
     #[test]
@@ -1801,10 +1963,19 @@ mod tests {
         let q = parse_query(&json!({
             "skills": {"$all": ["rust", "postgresql", "docker"]},
             "years_exp": {"$gte": 3}
-        })).unwrap();
+        }))
+        .unwrap();
         let perfect = Document::new(1, json!({"name": "Alice", "skills": ["rust", "postgresql", "docker", "k8s"], "years_exp": 5})).unwrap();
-        let missing_skill = Document::new(2, json!({"name": "Bob", "skills": ["rust", "postgresql"], "years_exp": 4})).unwrap();
-        let junior = Document::new(3, json!({"name": "Charlie", "skills": ["rust", "postgresql", "docker"], "years_exp": 1})).unwrap();
+        let missing_skill = Document::new(
+            2,
+            json!({"name": "Bob", "skills": ["rust", "postgresql"], "years_exp": 4}),
+        )
+        .unwrap();
+        let junior = Document::new(
+            3,
+            json!({"name": "Charlie", "skills": ["rust", "postgresql", "docker"], "years_exp": 1}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &perfect));
         assert!(!matches_doc(&q, &missing_skill));
         assert!(!matches_doc(&q, &junior));
@@ -1815,9 +1986,18 @@ mod tests {
     fn all_scenario_recipe_ingredients() {
         let q = parse_query(&json!({
             "ingredients": {"$all": ["flour", "eggs", "butter"]}
-        })).unwrap();
-        let cake = Document::new(1, json!({"name": "Cake", "ingredients": ["flour", "eggs", "butter", "sugar", "vanilla"]})).unwrap();
-        let omelette = Document::new(2, json!({"name": "Omelette", "ingredients": ["eggs", "butter", "cheese"]})).unwrap();
+        }))
+        .unwrap();
+        let cake = Document::new(
+            1,
+            json!({"name": "Cake", "ingredients": ["flour", "eggs", "butter", "sugar", "vanilla"]}),
+        )
+        .unwrap();
+        let omelette = Document::new(
+            2,
+            json!({"name": "Omelette", "ingredients": ["eggs", "butter", "cheese"]}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &cake));
         assert!(!matches_doc(&q, &omelette));
     }
@@ -1861,9 +2041,18 @@ mod tests {
         let q = parse_query(&json!({
             "followers": {"$size": 0},
             "verified": false
-        })).unwrap();
-        let new_user = Document::new(1, json!({"name": "newbie", "followers": [], "verified": false})).unwrap();
-        let has_followers = Document::new(2, json!({"name": "popular", "followers": ["user1"], "verified": false})).unwrap();
+        }))
+        .unwrap();
+        let new_user = Document::new(
+            1,
+            json!({"name": "newbie", "followers": [], "verified": false}),
+        )
+        .unwrap();
+        let has_followers = Document::new(
+            2,
+            json!({"name": "popular", "followers": ["user1"], "verified": false}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &new_user));
         assert!(!matches_doc(&q, &has_followers));
     }
@@ -1872,8 +2061,16 @@ mod tests {
     #[test]
     fn size_scenario_quiz_validation() {
         let q = parse_query(&json!({"options": {"$size": 4}})).unwrap();
-        let valid = Document::new(1, json!({"question": "What is 2+2?", "options": ["3", "4", "5", "6"]})).unwrap();
-        let invalid = Document::new(2, json!({"question": "True or false?", "options": ["true", "false"]})).unwrap();
+        let valid = Document::new(
+            1,
+            json!({"question": "What is 2+2?", "options": ["3", "4", "5", "6"]}),
+        )
+        .unwrap();
+        let invalid = Document::new(
+            2,
+            json!({"question": "True or false?", "options": ["true", "false"]}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &valid));
         assert!(!matches_doc(&q, &invalid));
     }
@@ -1955,12 +2152,23 @@ mod tests {
         assert!(!matches_doc(&q, &float_val));
     }
 
+    #[test]
+    fn type_double_excludes_integers() {
+        // "double" is a floating-point type only — an integer must NOT match.
+        let q = parse_query(&json!({"v": {"$type": "double"}})).unwrap();
+        let int_val = Document::new(1, json!({"v": 42})).unwrap();
+        let float_val = Document::new(2, json!({"v": 42.5})).unwrap();
+        assert!(!matches_doc(&q, &int_val));
+        assert!(matches_doc(&q, &float_val));
+    }
+
     // Real-world: data quality — find documents where "email" is not a string
     #[test]
     fn type_scenario_data_validation() {
         let q = parse_query(&json!({
             "email": {"$not": {"$type": "string"}}
-        })).unwrap();
+        }))
+        .unwrap();
         let valid = Document::new(1, json!({"email": "alice@example.com"})).unwrap();
         let corrupt_num = Document::new(2, json!({"email": 12345})).unwrap();
         let corrupt_null = Document::new(3, json!({"email": null})).unwrap();
@@ -1989,9 +2197,9 @@ mod tests {
     #[test]
     fn mod_with_remainder() {
         let q = parse_query(&json!({"num": {"$mod": [3, 1]}})).unwrap();
-        let r1 = Document::new(1, json!({"num": 7})).unwrap();  // 7 % 3 == 1
-        let r0 = Document::new(2, json!({"num": 9})).unwrap();  // 9 % 3 == 0
-        let r2 = Document::new(3, json!({"num": 8})).unwrap();  // 8 % 3 == 2
+        let r1 = Document::new(1, json!({"num": 7})).unwrap(); // 7 % 3 == 1
+        let r0 = Document::new(2, json!({"num": 9})).unwrap(); // 9 % 3 == 0
+        let r2 = Document::new(3, json!({"num": 8})).unwrap(); // 8 % 3 == 2
         assert!(matches_doc(&q, &r1));
         assert!(!matches_doc(&q, &r0));
         assert!(!matches_doc(&q, &r2));
@@ -2016,10 +2224,10 @@ mod tests {
     #[test]
     fn mod_scenario_sharding() {
         let q = parse_query(&json!({"user_id": {"$mod": [5, 2]}})).unwrap();
-        let shard2a = Document::new(1, json!({"user_id": 7})).unwrap();   // 7 % 5 == 2
-        let shard2b = Document::new(2, json!({"user_id": 12})).unwrap();  // 12 % 5 == 2
-        let shard0 = Document::new(3, json!({"user_id": 10})).unwrap();   // 10 % 5 == 0
-        let shard1 = Document::new(4, json!({"user_id": 11})).unwrap();   // 11 % 5 == 1
+        let shard2a = Document::new(1, json!({"user_id": 7})).unwrap(); // 7 % 5 == 2
+        let shard2b = Document::new(2, json!({"user_id": 12})).unwrap(); // 12 % 5 == 2
+        let shard0 = Document::new(3, json!({"user_id": 10})).unwrap(); // 10 % 5 == 0
+        let shard1 = Document::new(4, json!({"user_id": 11})).unwrap(); // 11 % 5 == 1
         assert!(matches_doc(&q, &shard2a));
         assert!(matches_doc(&q, &shard2b));
         assert!(!matches_doc(&q, &shard0));
@@ -2062,9 +2270,18 @@ mod tests {
 
     #[test]
     fn expr_eq_two_fields() {
-        let q = parse_query(&json!({"$expr": {"$eq": ["$password", "$confirm_password"]}})).unwrap();
-        let match_doc = Document::new(1, json!({"password": "abc123", "confirm_password": "abc123"})).unwrap();
-        let mismatch = Document::new(2, json!({"password": "abc123", "confirm_password": "xyz789"})).unwrap();
+        let q =
+            parse_query(&json!({"$expr": {"$eq": ["$password", "$confirm_password"]}})).unwrap();
+        let match_doc = Document::new(
+            1,
+            json!({"password": "abc123", "confirm_password": "abc123"}),
+        )
+        .unwrap();
+        let mismatch = Document::new(
+            2,
+            json!({"password": "abc123", "confirm_password": "xyz789"}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &match_doc));
         assert!(!matches_doc(&q, &mismatch));
     }
@@ -2101,10 +2318,23 @@ mod tests {
     fn expr_scenario_inventory_reorder() {
         let q = parse_query(&json!({
             "$expr": {"$lte": ["$stock", "$reorder_level"]},
-        })).unwrap();
-        let needs_reorder = Document::new(1, json!({"product": "Widget", "stock": 5, "reorder_level": 10})).unwrap();
-        let ok = Document::new(2, json!({"product": "Gadget", "stock": 50, "reorder_level": 10})).unwrap();
-        let exact = Document::new(3, json!({"product": "Bolt", "stock": 10, "reorder_level": 10})).unwrap();
+        }))
+        .unwrap();
+        let needs_reorder = Document::new(
+            1,
+            json!({"product": "Widget", "stock": 5, "reorder_level": 10}),
+        )
+        .unwrap();
+        let ok = Document::new(
+            2,
+            json!({"product": "Gadget", "stock": 50, "reorder_level": 10}),
+        )
+        .unwrap();
+        let exact = Document::new(
+            3,
+            json!({"product": "Bolt", "stock": 10, "reorder_level": 10}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &needs_reorder));
         assert!(!matches_doc(&q, &ok));
         assert!(matches_doc(&q, &exact)); // stock == reorder_level → needs reorder
@@ -2115,9 +2345,18 @@ mod tests {
     fn expr_scenario_below_cost() {
         let q = parse_query(&json!({
             "$expr": {"$lt": ["$sale_price", "$cost"]}
-        })).unwrap();
-        let loss = Document::new(1, json!({"item": "Clearance TV", "sale_price": 199, "cost": 250})).unwrap();
-        let profit = Document::new(2, json!({"item": "Phone Case", "sale_price": 25, "cost": 5})).unwrap();
+        }))
+        .unwrap();
+        let loss = Document::new(
+            1,
+            json!({"item": "Clearance TV", "sale_price": 199, "cost": 250}),
+        )
+        .unwrap();
+        let profit = Document::new(
+            2,
+            json!({"item": "Phone Case", "sale_price": 25, "cost": 5}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &loss));
         assert!(!matches_doc(&q, &profit));
     }
@@ -2127,9 +2366,18 @@ mod tests {
     fn expr_scenario_sla_breach() {
         let q = parse_query(&json!({
             "$expr": {"$gt": ["$response_ms", "$sla_limit_ms"]}
-        })).unwrap();
-        let breach = Document::new(1, json!({"endpoint": "/api/data", "response_ms": 550, "sla_limit_ms": 500})).unwrap();
-        let ok = Document::new(2, json!({"endpoint": "/api/health", "response_ms": 50, "sla_limit_ms": 500})).unwrap();
+        }))
+        .unwrap();
+        let breach = Document::new(
+            1,
+            json!({"endpoint": "/api/data", "response_ms": 550, "sla_limit_ms": 500}),
+        )
+        .unwrap();
+        let ok = Document::new(
+            2,
+            json!({"endpoint": "/api/health", "response_ms": 50, "sla_limit_ms": 500}),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &breach));
         assert!(!matches_doc(&q, &ok));
     }
@@ -2158,23 +2406,40 @@ mod tests {
             "conditions": {"$all": ["diabetes", "hypertension"]},
             "last_visit_days_ago": {"$gt": 90},
             "$nor": [{"status": "deceased"}, {"status": "transferred"}]
-        })).unwrap();
-        let needs_followup = Document::new(1, json!({
-            "name": "Patient A", "conditions": ["diabetes", "hypertension", "obesity"],
-            "last_visit_days_ago": 120, "status": "active"
-        })).unwrap();
-        let recent_visit = Document::new(2, json!({
-            "name": "Patient B", "conditions": ["diabetes", "hypertension"],
-            "last_visit_days_ago": 30, "status": "active"
-        })).unwrap();
-        let transferred = Document::new(3, json!({
-            "name": "Patient C", "conditions": ["diabetes", "hypertension"],
-            "last_visit_days_ago": 200, "status": "transferred"
-        })).unwrap();
-        let missing_condition = Document::new(4, json!({
-            "name": "Patient D", "conditions": ["diabetes"],
-            "last_visit_days_ago": 150, "status": "active"
-        })).unwrap();
+        }))
+        .unwrap();
+        let needs_followup = Document::new(
+            1,
+            json!({
+                "name": "Patient A", "conditions": ["diabetes", "hypertension", "obesity"],
+                "last_visit_days_ago": 120, "status": "active"
+            }),
+        )
+        .unwrap();
+        let recent_visit = Document::new(
+            2,
+            json!({
+                "name": "Patient B", "conditions": ["diabetes", "hypertension"],
+                "last_visit_days_ago": 30, "status": "active"
+            }),
+        )
+        .unwrap();
+        let transferred = Document::new(
+            3,
+            json!({
+                "name": "Patient C", "conditions": ["diabetes", "hypertension"],
+                "last_visit_days_ago": 200, "status": "transferred"
+            }),
+        )
+        .unwrap();
+        let missing_condition = Document::new(
+            4,
+            json!({
+                "name": "Patient D", "conditions": ["diabetes"],
+                "last_visit_days_ago": 150, "status": "active"
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &needs_followup));
         assert!(!matches_doc(&q, &recent_visit));
         assert!(!matches_doc(&q, &transferred));
@@ -2191,15 +2456,24 @@ mod tests {
             ],
             "sensor_type": {"$type": "string"},
             "sensor_id": {"$mod": [10, 0]}
-        })).unwrap();
-        let anomaly = Document::new(1, json!({
-            "sensor_id": 100, "sensor_type": "temperature",
-            "readings": [22.0, 23.0, 105.0, 21.0, 22.5]
-        })).unwrap();
-        let normal = Document::new(2, json!({
-            "sensor_id": 100, "sensor_type": "temperature",
-            "readings": [22.0, 23.0, 24.0, 21.0, 22.5]
-        })).unwrap();
+        }))
+        .unwrap();
+        let anomaly = Document::new(
+            1,
+            json!({
+                "sensor_id": 100, "sensor_type": "temperature",
+                "readings": [22.0, 23.0, 105.0, 21.0, 22.5]
+            }),
+        )
+        .unwrap();
+        let normal = Document::new(
+            2,
+            json!({
+                "sensor_id": 100, "sensor_type": "temperature",
+                "readings": [22.0, 23.0, 24.0, 21.0, 22.5]
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &anomaly));
         assert!(!matches_doc(&q, &normal));
     }
@@ -2211,22 +2485,35 @@ mod tests {
             "items": {"$elemMatch": {"qty": {"$gte": 100}}},
             "$nor": [{"status": "cancelled"}, {"status": "returned"}],
             "$expr": {"$gt": ["$total", "$discount_threshold"]}
-        })).unwrap();
-        let eligible = Document::new(1, json!({
-            "order_id": 1001, "status": "confirmed",
-            "items": [{"name": "Bolts", "qty": 200}, {"name": "Nuts", "qty": 50}],
-            "total": 5000, "discount_threshold": 1000
-        })).unwrap();
-        let too_small = Document::new(2, json!({
-            "order_id": 1002, "status": "confirmed",
-            "items": [{"name": "Bolts", "qty": 10}],
-            "total": 500, "discount_threshold": 1000
-        })).unwrap();
-        let cancelled = Document::new(3, json!({
-            "order_id": 1003, "status": "cancelled",
-            "items": [{"name": "Bolts", "qty": 200}],
-            "total": 5000, "discount_threshold": 1000
-        })).unwrap();
+        }))
+        .unwrap();
+        let eligible = Document::new(
+            1,
+            json!({
+                "order_id": 1001, "status": "confirmed",
+                "items": [{"name": "Bolts", "qty": 200}, {"name": "Nuts", "qty": 50}],
+                "total": 5000, "discount_threshold": 1000
+            }),
+        )
+        .unwrap();
+        let too_small = Document::new(
+            2,
+            json!({
+                "order_id": 1002, "status": "confirmed",
+                "items": [{"name": "Bolts", "qty": 10}],
+                "total": 500, "discount_threshold": 1000
+            }),
+        )
+        .unwrap();
+        let cancelled = Document::new(
+            3,
+            json!({
+                "order_id": 1003, "status": "cancelled",
+                "items": [{"name": "Bolts", "qty": 200}],
+                "total": 5000, "discount_threshold": 1000
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &eligible));
         assert!(!matches_doc(&q, &too_small));
         assert!(!matches_doc(&q, &cancelled));
@@ -2289,23 +2576,40 @@ mod tests {
             "currency": {"$nin": ["USD", "EUR", "GBP"]},
             "account_age_days": {"$lt": 30},
             "$nor": [{"verified": true}, {"whitelisted": true}]
-        })).unwrap();
-        let suspicious = Document::new(1, json!({
-            "tx_id": "TX-9001", "amount": 25000, "currency": "BTC",
-            "account_age_days": 3, "verified": false, "whitelisted": false
-        })).unwrap();
-        let normal_currency = Document::new(2, json!({
-            "tx_id": "TX-9002", "amount": 25000, "currency": "USD",
-            "account_age_days": 3, "verified": false, "whitelisted": false
-        })).unwrap();
-        let verified = Document::new(3, json!({
-            "tx_id": "TX-9003", "amount": 25000, "currency": "BTC",
-            "account_age_days": 3, "verified": true, "whitelisted": false
-        })).unwrap();
-        let old_account = Document::new(4, json!({
-            "tx_id": "TX-9004", "amount": 25000, "currency": "BTC",
-            "account_age_days": 365, "verified": false, "whitelisted": false
-        })).unwrap();
+        }))
+        .unwrap();
+        let suspicious = Document::new(
+            1,
+            json!({
+                "tx_id": "TX-9001", "amount": 25000, "currency": "BTC",
+                "account_age_days": 3, "verified": false, "whitelisted": false
+            }),
+        )
+        .unwrap();
+        let normal_currency = Document::new(
+            2,
+            json!({
+                "tx_id": "TX-9002", "amount": 25000, "currency": "USD",
+                "account_age_days": 3, "verified": false, "whitelisted": false
+            }),
+        )
+        .unwrap();
+        let verified = Document::new(
+            3,
+            json!({
+                "tx_id": "TX-9003", "amount": 25000, "currency": "BTC",
+                "account_age_days": 3, "verified": true, "whitelisted": false
+            }),
+        )
+        .unwrap();
+        let old_account = Document::new(
+            4,
+            json!({
+                "tx_id": "TX-9004", "amount": 25000, "currency": "BTC",
+                "account_age_days": 365, "verified": false, "whitelisted": false
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &suspicious));
         assert!(!matches_doc(&q, &normal_currency));
         assert!(!matches_doc(&q, &verified));
@@ -2320,23 +2624,40 @@ mod tests {
             "credit_score": {"$gte": 650},
             "existing_loans": {"$not": {"$gt": 3}},
             "employment_status": {"$in": ["employed", "self_employed"]}
-        })).unwrap();
-        let eligible = Document::new(1, json!({
-            "name": "Alice", "monthly_income": 8000, "monthly_expenses": 5000,
-            "credit_score": 720, "existing_loans": 1, "employment_status": "employed"
-        })).unwrap();
-        let low_credit = Document::new(2, json!({
-            "name": "Bob", "monthly_income": 8000, "monthly_expenses": 5000,
-            "credit_score": 580, "existing_loans": 1, "employment_status": "employed"
-        })).unwrap();
-        let too_many_loans = Document::new(3, json!({
-            "name": "Carol", "monthly_income": 8000, "monthly_expenses": 5000,
-            "credit_score": 720, "existing_loans": 5, "employment_status": "employed"
-        })).unwrap();
-        let unemployed = Document::new(4, json!({
-            "name": "Dave", "monthly_income": 8000, "monthly_expenses": 5000,
-            "credit_score": 720, "existing_loans": 1, "employment_status": "unemployed"
-        })).unwrap();
+        }))
+        .unwrap();
+        let eligible = Document::new(
+            1,
+            json!({
+                "name": "Alice", "monthly_income": 8000, "monthly_expenses": 5000,
+                "credit_score": 720, "existing_loans": 1, "employment_status": "employed"
+            }),
+        )
+        .unwrap();
+        let low_credit = Document::new(
+            2,
+            json!({
+                "name": "Bob", "monthly_income": 8000, "monthly_expenses": 5000,
+                "credit_score": 580, "existing_loans": 1, "employment_status": "employed"
+            }),
+        )
+        .unwrap();
+        let too_many_loans = Document::new(
+            3,
+            json!({
+                "name": "Carol", "monthly_income": 8000, "monthly_expenses": 5000,
+                "credit_score": 720, "existing_loans": 5, "employment_status": "employed"
+            }),
+        )
+        .unwrap();
+        let unemployed = Document::new(
+            4,
+            json!({
+                "name": "Dave", "monthly_income": 8000, "monthly_expenses": 5000,
+                "credit_score": 720, "existing_loans": 1, "employment_status": "unemployed"
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &eligible));
         assert!(!matches_doc(&q, &low_credit));
         assert!(!matches_doc(&q, &too_many_loans));
@@ -2353,27 +2674,44 @@ mod tests {
             "service": {"$regex": "^payment-"},
             "tags": {"$all": ["production", "us-east"]},
             "retry_count": {"$mod": [3, 0]}
-        })).unwrap();
-        let alert = Document::new(1, json!({
-            "level": "error", "service": "payment-gateway",
-            "tags": ["production", "us-east", "high-priority"],
-            "retry_count": 6, "message": "timeout"
-        })).unwrap();
-        let wrong_service = Document::new(2, json!({
-            "level": "error", "service": "user-auth",
-            "tags": ["production", "us-east"],
-            "retry_count": 6, "message": "timeout"
-        })).unwrap();
-        let wrong_region = Document::new(3, json!({
-            "level": "error", "service": "payment-api",
-            "tags": ["production", "eu-west"],
-            "retry_count": 6, "message": "timeout"
-        })).unwrap();
-        let not_retry_cycle = Document::new(4, json!({
-            "level": "error", "service": "payment-api",
-            "tags": ["production", "us-east"],
-            "retry_count": 5, "message": "timeout"
-        })).unwrap();
+        }))
+        .unwrap();
+        let alert = Document::new(
+            1,
+            json!({
+                "level": "error", "service": "payment-gateway",
+                "tags": ["production", "us-east", "high-priority"],
+                "retry_count": 6, "message": "timeout"
+            }),
+        )
+        .unwrap();
+        let wrong_service = Document::new(
+            2,
+            json!({
+                "level": "error", "service": "user-auth",
+                "tags": ["production", "us-east"],
+                "retry_count": 6, "message": "timeout"
+            }),
+        )
+        .unwrap();
+        let wrong_region = Document::new(
+            3,
+            json!({
+                "level": "error", "service": "payment-api",
+                "tags": ["production", "eu-west"],
+                "retry_count": 6, "message": "timeout"
+            }),
+        )
+        .unwrap();
+        let not_retry_cycle = Document::new(
+            4,
+            json!({
+                "level": "error", "service": "payment-api",
+                "tags": ["production", "us-east"],
+                "retry_count": 5, "message": "timeout"
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &alert));
         assert!(!matches_doc(&q, &wrong_service));
         assert!(!matches_doc(&q, &wrong_region));
@@ -2390,19 +2728,32 @@ mod tests {
                 {"results": {"$size": 3}}
             ],
             "test_suite": {"$type": "string"}
-        })).unwrap();
-        let flaky = Document::new(1, json!({
-            "test_name": "test_payment_flow", "test_suite": "integration",
-            "results": ["pass", "fail", "pass"]
-        })).unwrap();
-        let stable_pass = Document::new(2, json!({
-            "test_name": "test_health", "test_suite": "unit",
-            "results": ["pass", "pass", "pass"]
-        })).unwrap();
-        let stable_fail = Document::new(3, json!({
-            "test_name": "test_broken", "test_suite": "integration",
-            "results": ["fail", "fail", "fail"]
-        })).unwrap();
+        }))
+        .unwrap();
+        let flaky = Document::new(
+            1,
+            json!({
+                "test_name": "test_payment_flow", "test_suite": "integration",
+                "results": ["pass", "fail", "pass"]
+            }),
+        )
+        .unwrap();
+        let stable_pass = Document::new(
+            2,
+            json!({
+                "test_name": "test_health", "test_suite": "unit",
+                "results": ["pass", "pass", "pass"]
+            }),
+        )
+        .unwrap();
+        let stable_fail = Document::new(
+            3,
+            json!({
+                "test_name": "test_broken", "test_suite": "integration",
+                "results": ["fail", "fail", "fail"]
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &flaky));
         assert!(!matches_doc(&q, &stable_pass));
         assert!(!matches_doc(&q, &stable_fail));
@@ -2422,31 +2773,48 @@ mod tests {
             ],
             "certifications": {"$elemMatch": {"status": "active"}},
             "$expr": {"$gte": ["$completed_projects", "$target_projects"]}
-        })).unwrap();
-        let eligible = Document::new(1, json!({
-            "name": "Alice", "performance_scores": [4, 5, 4, 5],
-            "years_in_role": 3, "on_pip": false, "department": "engineering",
-            "certifications": [{"name": "AWS", "status": "active"}],
-            "completed_projects": 12, "target_projects": 10
-        })).unwrap();
-        let on_pip = Document::new(2, json!({
-            "name": "Bob", "performance_scores": [4, 5, 4, 5],
-            "years_in_role": 3, "on_pip": true, "department": "engineering",
-            "certifications": [{"name": "AWS", "status": "active"}],
-            "completed_projects": 12, "target_projects": 10
-        })).unwrap();
-        let low_perf = Document::new(3, json!({
-            "name": "Carol", "performance_scores": [3, 3, 4, 3],
-            "years_in_role": 5, "on_pip": false, "department": "engineering",
-            "certifications": [{"name": "AWS", "status": "active"}],
-            "completed_projects": 15, "target_projects": 10
-        })).unwrap();
-        let under_target = Document::new(4, json!({
-            "name": "Dave", "performance_scores": [4, 5, 5, 4],
-            "years_in_role": 3, "on_pip": false, "department": "engineering",
-            "certifications": [{"name": "AWS", "status": "active"}],
-            "completed_projects": 7, "target_projects": 10
-        })).unwrap();
+        }))
+        .unwrap();
+        let eligible = Document::new(
+            1,
+            json!({
+                "name": "Alice", "performance_scores": [4, 5, 4, 5],
+                "years_in_role": 3, "on_pip": false, "department": "engineering",
+                "certifications": [{"name": "AWS", "status": "active"}],
+                "completed_projects": 12, "target_projects": 10
+            }),
+        )
+        .unwrap();
+        let on_pip = Document::new(
+            2,
+            json!({
+                "name": "Bob", "performance_scores": [4, 5, 4, 5],
+                "years_in_role": 3, "on_pip": true, "department": "engineering",
+                "certifications": [{"name": "AWS", "status": "active"}],
+                "completed_projects": 12, "target_projects": 10
+            }),
+        )
+        .unwrap();
+        let low_perf = Document::new(
+            3,
+            json!({
+                "name": "Carol", "performance_scores": [3, 3, 4, 3],
+                "years_in_role": 5, "on_pip": false, "department": "engineering",
+                "certifications": [{"name": "AWS", "status": "active"}],
+                "completed_projects": 15, "target_projects": 10
+            }),
+        )
+        .unwrap();
+        let under_target = Document::new(
+            4,
+            json!({
+                "name": "Dave", "performance_scores": [4, 5, 5, 4],
+                "years_in_role": 3, "on_pip": false, "department": "engineering",
+                "certifications": [{"name": "AWS", "status": "active"}],
+                "completed_projects": 7, "target_projects": 10
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &eligible));
         assert!(!matches_doc(&q, &on_pip));
         assert!(!matches_doc(&q, &low_perf));
@@ -2467,31 +2835,48 @@ mod tests {
                 {"afk_count": {"$gte": 3}}
             ],
             "ping_ms": {"$lt": 100}
-        })).unwrap();
-        let good_player = Document::new(1, json!({
-            "username": "pro_gamer", "elo": 1520,
-            "preferred_modes": ["ranked", "casual"],
-            "recent_results": ["win", "win", "loss"],
-            "banned": false, "afk_count": 0, "ping_ms": 45
-        })).unwrap();
-        let too_high_elo = Document::new(2, json!({
-            "username": "grandmaster", "elo": 2100,
-            "preferred_modes": ["ranked"],
-            "recent_results": ["win", "win"],
-            "banned": false, "afk_count": 0, "ping_ms": 30
-        })).unwrap();
-        let afk_abuser = Document::new(3, json!({
-            "username": "afk_andy", "elo": 1500,
-            "preferred_modes": ["ranked"],
-            "recent_results": ["loss"],
-            "banned": false, "afk_count": 5, "ping_ms": 50
-        })).unwrap();
-        let high_ping = Document::new(4, json!({
-            "username": "laggy", "elo": 1500,
-            "preferred_modes": ["ranked"],
-            "recent_results": ["win"],
-            "banned": false, "afk_count": 0, "ping_ms": 250
-        })).unwrap();
+        }))
+        .unwrap();
+        let good_player = Document::new(
+            1,
+            json!({
+                "username": "pro_gamer", "elo": 1520,
+                "preferred_modes": ["ranked", "casual"],
+                "recent_results": ["win", "win", "loss"],
+                "banned": false, "afk_count": 0, "ping_ms": 45
+            }),
+        )
+        .unwrap();
+        let too_high_elo = Document::new(
+            2,
+            json!({
+                "username": "grandmaster", "elo": 2100,
+                "preferred_modes": ["ranked"],
+                "recent_results": ["win", "win"],
+                "banned": false, "afk_count": 0, "ping_ms": 30
+            }),
+        )
+        .unwrap();
+        let afk_abuser = Document::new(
+            3,
+            json!({
+                "username": "afk_andy", "elo": 1500,
+                "preferred_modes": ["ranked"],
+                "recent_results": ["loss"],
+                "banned": false, "afk_count": 5, "ping_ms": 50
+            }),
+        )
+        .unwrap();
+        let high_ping = Document::new(
+            4,
+            json!({
+                "username": "laggy", "elo": 1500,
+                "preferred_modes": ["ranked"],
+                "recent_results": ["win"],
+                "banned": false, "afk_count": 0, "ping_ms": 250
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &good_player));
         assert!(!matches_doc(&q, &too_high_elo));
         assert!(!matches_doc(&q, &afk_abuser));
@@ -2513,40 +2898,61 @@ mod tests {
                 {"status": "under_offer"}
             ],
             "photos": {"$not": {"$size": 0}}
-        })).unwrap();
-        let dream_home = Document::new(1, json!({
-            "address": "123 Oak Lane", "price": 350000, "bedrooms": 4,
-            "amenities": ["parking", "garden", "pool"],
-            "features": [
-                {"type": "renovation", "year": 2022, "detail": "kitchen"},
-                {"type": "original", "year": 1990}
-            ],
-            "status": "available", "photos": ["front.jpg", "kitchen.jpg"]
-        })).unwrap();
-        let too_expensive = Document::new(2, json!({
-            "address": "456 Elm St", "price": 750000, "bedrooms": 5,
-            "amenities": ["parking", "garden"],
-            "features": [{"type": "renovation", "year": 2023}],
-            "status": "available", "photos": ["front.jpg"]
-        })).unwrap();
-        let no_garden = Document::new(3, json!({
-            "address": "789 Pine Ave", "price": 300000, "bedrooms": 3,
-            "amenities": ["parking"],
-            "features": [{"type": "renovation", "year": 2021}],
-            "status": "available", "photos": ["front.jpg"]
-        })).unwrap();
-        let sold = Document::new(4, json!({
-            "address": "321 Maple Dr", "price": 400000, "bedrooms": 4,
-            "amenities": ["parking", "garden"],
-            "features": [{"type": "renovation", "year": 2022}],
-            "status": "sold", "photos": ["front.jpg"]
-        })).unwrap();
-        let old_renovation = Document::new(5, json!({
-            "address": "654 Birch Rd", "price": 280000, "bedrooms": 3,
-            "amenities": ["parking", "garden"],
-            "features": [{"type": "renovation", "year": 2015}],
-            "status": "available", "photos": ["front.jpg"]
-        })).unwrap();
+        }))
+        .unwrap();
+        let dream_home = Document::new(
+            1,
+            json!({
+                "address": "123 Oak Lane", "price": 350000, "bedrooms": 4,
+                "amenities": ["parking", "garden", "pool"],
+                "features": [
+                    {"type": "renovation", "year": 2022, "detail": "kitchen"},
+                    {"type": "original", "year": 1990}
+                ],
+                "status": "available", "photos": ["front.jpg", "kitchen.jpg"]
+            }),
+        )
+        .unwrap();
+        let too_expensive = Document::new(
+            2,
+            json!({
+                "address": "456 Elm St", "price": 750000, "bedrooms": 5,
+                "amenities": ["parking", "garden"],
+                "features": [{"type": "renovation", "year": 2023}],
+                "status": "available", "photos": ["front.jpg"]
+            }),
+        )
+        .unwrap();
+        let no_garden = Document::new(
+            3,
+            json!({
+                "address": "789 Pine Ave", "price": 300000, "bedrooms": 3,
+                "amenities": ["parking"],
+                "features": [{"type": "renovation", "year": 2021}],
+                "status": "available", "photos": ["front.jpg"]
+            }),
+        )
+        .unwrap();
+        let sold = Document::new(
+            4,
+            json!({
+                "address": "321 Maple Dr", "price": 400000, "bedrooms": 4,
+                "amenities": ["parking", "garden"],
+                "features": [{"type": "renovation", "year": 2022}],
+                "status": "sold", "photos": ["front.jpg"]
+            }),
+        )
+        .unwrap();
+        let old_renovation = Document::new(
+            5,
+            json!({
+                "address": "654 Birch Rd", "price": 280000, "bedrooms": 3,
+                "amenities": ["parking", "garden"],
+                "features": [{"type": "renovation", "year": 2015}],
+                "status": "available", "photos": ["front.jpg"]
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &dream_home));
         assert!(!matches_doc(&q, &too_expensive));
         assert!(!matches_doc(&q, &no_garden));
@@ -2569,25 +2975,38 @@ mod tests {
                 {"on_leave": true}
             ],
             "advisor_notes": {"$type": "array"}
-        })).unwrap();
-        let at_risk = Document::new(1, json!({
-            "name": "Student A", "gpa": 1.5, "absences": 15,
-            "failed_courses": ["MATH101", "PHYS201"],
-            "status": "enrolled", "on_leave": false,
-            "advisor_notes": ["Struggling with coursework"]
-        })).unwrap();
-        let doing_fine = Document::new(2, json!({
-            "name": "Student B", "gpa": 3.5, "absences": 2,
-            "failed_courses": [],
-            "status": "enrolled", "on_leave": false,
-            "advisor_notes": []
-        })).unwrap();
-        let withdrawn = Document::new(3, json!({
-            "name": "Student C", "gpa": 1.2, "absences": 20,
-            "failed_courses": ["ENG101"],
-            "status": "withdrawn", "on_leave": false,
-            "advisor_notes": ["Left program"]
-        })).unwrap();
+        }))
+        .unwrap();
+        let at_risk = Document::new(
+            1,
+            json!({
+                "name": "Student A", "gpa": 1.5, "absences": 15,
+                "failed_courses": ["MATH101", "PHYS201"],
+                "status": "enrolled", "on_leave": false,
+                "advisor_notes": ["Struggling with coursework"]
+            }),
+        )
+        .unwrap();
+        let doing_fine = Document::new(
+            2,
+            json!({
+                "name": "Student B", "gpa": 3.5, "absences": 2,
+                "failed_courses": [],
+                "status": "enrolled", "on_leave": false,
+                "advisor_notes": []
+            }),
+        )
+        .unwrap();
+        let withdrawn = Document::new(
+            3,
+            json!({
+                "name": "Student C", "gpa": 1.2, "absences": 20,
+                "failed_courses": ["ENG101"],
+                "status": "withdrawn", "on_leave": false,
+                "advisor_notes": ["Left program"]
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &at_risk));
         assert!(!matches_doc(&q, &doing_fine));
         assert!(!matches_doc(&q, &withdrawn));
@@ -2608,29 +3027,42 @@ mod tests {
                 "status": "delayed",
                 "reason": {"$regex": "customs|weather"}
             }}
-        })).unwrap();
-        let problem = Document::new(1, json!({
-            "shipment_id": "SH-001", "actual_days": 14, "estimated_days": 7,
-            "actual_cost": 5200, "budgeted_cost": 3000, "priority": "high",
-            "checkpoints": [
-                {"location": "port_a", "status": "cleared", "reason": ""},
-                {"location": "customs_b", "status": "delayed", "reason": "customs hold"}
-            ]
-        })).unwrap();
-        let on_time = Document::new(2, json!({
-            "shipment_id": "SH-002", "actual_days": 5, "estimated_days": 7,
-            "actual_cost": 2800, "budgeted_cost": 3000, "priority": "high",
-            "checkpoints": [
-                {"location": "port_a", "status": "cleared", "reason": ""}
-            ]
-        })).unwrap();
-        let low_priority = Document::new(3, json!({
-            "shipment_id": "SH-003", "actual_days": 14, "estimated_days": 7,
-            "actual_cost": 5200, "budgeted_cost": 3000, "priority": "low",
-            "checkpoints": [
-                {"location": "customs_b", "status": "delayed", "reason": "customs hold"}
-            ]
-        })).unwrap();
+        }))
+        .unwrap();
+        let problem = Document::new(
+            1,
+            json!({
+                "shipment_id": "SH-001", "actual_days": 14, "estimated_days": 7,
+                "actual_cost": 5200, "budgeted_cost": 3000, "priority": "high",
+                "checkpoints": [
+                    {"location": "port_a", "status": "cleared", "reason": ""},
+                    {"location": "customs_b", "status": "delayed", "reason": "customs hold"}
+                ]
+            }),
+        )
+        .unwrap();
+        let on_time = Document::new(
+            2,
+            json!({
+                "shipment_id": "SH-002", "actual_days": 5, "estimated_days": 7,
+                "actual_cost": 2800, "budgeted_cost": 3000, "priority": "high",
+                "checkpoints": [
+                    {"location": "port_a", "status": "cleared", "reason": ""}
+                ]
+            }),
+        )
+        .unwrap();
+        let low_priority = Document::new(
+            3,
+            json!({
+                "shipment_id": "SH-003", "actual_days": 14, "estimated_days": 7,
+                "actual_cost": 5200, "budgeted_cost": 3000, "priority": "low",
+                "checkpoints": [
+                    {"location": "customs_b", "status": "delayed", "reason": "customs hold"}
+                ]
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &problem));
         assert!(!matches_doc(&q, &on_time));
         assert!(!matches_doc(&q, &low_priority));
@@ -2651,49 +3083,74 @@ mod tests {
                 {"flagged": true},
                 {"duplicate_of": {"$exists": true}}
             ]
-        })).unwrap();
-        let ready = Document::new(1, json!({
-            "title": "Great Article", "status": "draft", "word_count": 1200,
-            "tags": ["reviewed-by-ai", "seo-optimized", "featured"],
-            "categories": ["tech", "tutorial"],
-            "meta": {"author_role": "editor", "author": "alice"},
-            "flagged": false
-        })).unwrap();
-        let too_short = Document::new(2, json!({
-            "title": "Quick Note", "status": "draft", "word_count": 150,
-            "tags": ["reviewed-by-ai", "seo-optimized"],
-            "categories": ["blog"],
-            "meta": {"author_role": "editor"},
-            "flagged": false
-        })).unwrap();
-        let missing_tag = Document::new(3, json!({
-            "title": "Needs SEO", "status": "draft", "word_count": 800,
-            "tags": ["reviewed-by-ai"],
-            "categories": ["tech"],
-            "meta": {"author_role": "editor"},
-            "flagged": false
-        })).unwrap();
-        let flagged = Document::new(4, json!({
-            "title": "Plagiarized", "status": "draft", "word_count": 900,
-            "tags": ["reviewed-by-ai", "seo-optimized"],
-            "categories": ["tech"],
-            "meta": {"author_role": "editor"},
-            "flagged": true
-        })).unwrap();
-        let duplicate = Document::new(5, json!({
-            "title": "Copy of Great Article", "status": "draft", "word_count": 1200,
-            "tags": ["reviewed-by-ai", "seo-optimized"],
-            "categories": ["tech"],
-            "meta": {"author_role": "editor"},
-            "flagged": false, "duplicate_of": "article-001"
-        })).unwrap();
-        let junior = Document::new(6, json!({
-            "title": "My First Post", "status": "draft", "word_count": 600,
-            "tags": ["reviewed-by-ai", "seo-optimized"],
-            "categories": ["blog"],
-            "meta": {"author_role": "intern"},
-            "flagged": false
-        })).unwrap();
+        }))
+        .unwrap();
+        let ready = Document::new(
+            1,
+            json!({
+                "title": "Great Article", "status": "draft", "word_count": 1200,
+                "tags": ["reviewed-by-ai", "seo-optimized", "featured"],
+                "categories": ["tech", "tutorial"],
+                "meta": {"author_role": "editor", "author": "alice"},
+                "flagged": false
+            }),
+        )
+        .unwrap();
+        let too_short = Document::new(
+            2,
+            json!({
+                "title": "Quick Note", "status": "draft", "word_count": 150,
+                "tags": ["reviewed-by-ai", "seo-optimized"],
+                "categories": ["blog"],
+                "meta": {"author_role": "editor"},
+                "flagged": false
+            }),
+        )
+        .unwrap();
+        let missing_tag = Document::new(
+            3,
+            json!({
+                "title": "Needs SEO", "status": "draft", "word_count": 800,
+                "tags": ["reviewed-by-ai"],
+                "categories": ["tech"],
+                "meta": {"author_role": "editor"},
+                "flagged": false
+            }),
+        )
+        .unwrap();
+        let flagged = Document::new(
+            4,
+            json!({
+                "title": "Plagiarized", "status": "draft", "word_count": 900,
+                "tags": ["reviewed-by-ai", "seo-optimized"],
+                "categories": ["tech"],
+                "meta": {"author_role": "editor"},
+                "flagged": true
+            }),
+        )
+        .unwrap();
+        let duplicate = Document::new(
+            5,
+            json!({
+                "title": "Copy of Great Article", "status": "draft", "word_count": 1200,
+                "tags": ["reviewed-by-ai", "seo-optimized"],
+                "categories": ["tech"],
+                "meta": {"author_role": "editor"},
+                "flagged": false, "duplicate_of": "article-001"
+            }),
+        )
+        .unwrap();
+        let junior = Document::new(
+            6,
+            json!({
+                "title": "My First Post", "status": "draft", "word_count": 600,
+                "tags": ["reviewed-by-ai", "seo-optimized"],
+                "categories": ["blog"],
+                "meta": {"author_role": "intern"},
+                "flagged": false
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &ready));
         assert!(!matches_doc(&q, &too_short));
         assert!(!matches_doc(&q, &missing_tag));
@@ -2714,37 +3171,54 @@ mod tests {
             "features": {"$elemMatch": {"name": "5g", "available": true}},
             "contract_months": {"$mod": [12, 0]},
             "plan_type": {"$not": {"$in": ["prepaid", "business"]}}
-        })).unwrap();
+        }))
+        .unwrap();
         let good_plan = Document::new(1, json!({
             "name": "Ultra Plan", "data_gb": 100, "price": 55,
             "coverage_regions": ["urban", "suburban", "rural"],
             "features": [{"name": "5g", "available": true}, {"name": "hotspot", "available": true}],
             "contract_months": 24, "plan_type": "postpaid"
         })).unwrap();
-        let too_expensive = Document::new(2, json!({
-            "name": "Premium Plan", "data_gb": 200, "price": 120,
-            "coverage_regions": ["urban", "suburban", "rural"],
-            "features": [{"name": "5g", "available": true}],
-            "contract_months": 12, "plan_type": "postpaid"
-        })).unwrap();
-        let no_5g = Document::new(3, json!({
-            "name": "Basic Plan", "data_gb": 50, "price": 30,
-            "coverage_regions": ["urban", "suburban"],
-            "features": [{"name": "5g", "available": false}],
-            "contract_months": 12, "plan_type": "postpaid"
-        })).unwrap();
-        let odd_contract = Document::new(4, json!({
-            "name": "Flex Plan", "data_gb": 80, "price": 45,
-            "coverage_regions": ["urban", "suburban"],
-            "features": [{"name": "5g", "available": true}],
-            "contract_months": 18, "plan_type": "postpaid"
-        })).unwrap();
-        let prepaid = Document::new(5, json!({
-            "name": "Prepaid Special", "data_gb": 60, "price": 40,
-            "coverage_regions": ["urban", "suburban"],
-            "features": [{"name": "5g", "available": true}],
-            "contract_months": 12, "plan_type": "prepaid"
-        })).unwrap();
+        let too_expensive = Document::new(
+            2,
+            json!({
+                "name": "Premium Plan", "data_gb": 200, "price": 120,
+                "coverage_regions": ["urban", "suburban", "rural"],
+                "features": [{"name": "5g", "available": true}],
+                "contract_months": 12, "plan_type": "postpaid"
+            }),
+        )
+        .unwrap();
+        let no_5g = Document::new(
+            3,
+            json!({
+                "name": "Basic Plan", "data_gb": 50, "price": 30,
+                "coverage_regions": ["urban", "suburban"],
+                "features": [{"name": "5g", "available": false}],
+                "contract_months": 12, "plan_type": "postpaid"
+            }),
+        )
+        .unwrap();
+        let odd_contract = Document::new(
+            4,
+            json!({
+                "name": "Flex Plan", "data_gb": 80, "price": 45,
+                "coverage_regions": ["urban", "suburban"],
+                "features": [{"name": "5g", "available": true}],
+                "contract_months": 18, "plan_type": "postpaid"
+            }),
+        )
+        .unwrap();
+        let prepaid = Document::new(
+            5,
+            json!({
+                "name": "Prepaid Special", "data_gb": 60, "price": 40,
+                "coverage_regions": ["urban", "suburban"],
+                "features": [{"name": "5g", "available": true}],
+                "contract_months": 12, "plan_type": "prepaid"
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &good_plan));
         assert!(!matches_doc(&q, &too_expensive));
         assert!(!matches_doc(&q, &no_5g));
@@ -2767,35 +3241,52 @@ mod tests {
                 {"accepting_orders": false}
             ],
             "delivery_zones": {"$elemMatch": {"$eq": "downtown"}}
-        })).unwrap();
-        let match_restaurant = Document::new(1, json!({
-            "name": "Green Bowl", "dietary_options": ["vegan", "gluten_free", "organic"],
-            "rating": 4.7, "delivery_fee": 3.50,
-            "menu_items": ["salad", "smoothie", "wrap"],
-            "temporarily_closed": false, "accepting_orders": true,
-            "delivery_zones": ["downtown", "midtown", "uptown"]
-        })).unwrap();
-        let low_rating = Document::new(2, json!({
-            "name": "Cheap Eats", "dietary_options": ["vegan", "gluten_free"],
-            "rating": 3.2, "delivery_fee": 2.0,
-            "menu_items": ["burger"],
-            "temporarily_closed": false, "accepting_orders": true,
-            "delivery_zones": ["downtown"]
-        })).unwrap();
-        let closed = Document::new(3, json!({
-            "name": "Zen Kitchen", "dietary_options": ["vegan", "gluten_free"],
-            "rating": 4.8, "delivery_fee": 4.0,
-            "menu_items": ["ramen"],
-            "temporarily_closed": true, "accepting_orders": true,
-            "delivery_zones": ["downtown"]
-        })).unwrap();
-        let no_zone = Document::new(4, json!({
-            "name": "Far Away", "dietary_options": ["vegan", "gluten_free"],
-            "rating": 4.5, "delivery_fee": 3.0,
-            "menu_items": ["pasta"],
-            "temporarily_closed": false, "accepting_orders": true,
-            "delivery_zones": ["suburbs", "airport"]
-        })).unwrap();
+        }))
+        .unwrap();
+        let match_restaurant = Document::new(
+            1,
+            json!({
+                "name": "Green Bowl", "dietary_options": ["vegan", "gluten_free", "organic"],
+                "rating": 4.7, "delivery_fee": 3.50,
+                "menu_items": ["salad", "smoothie", "wrap"],
+                "temporarily_closed": false, "accepting_orders": true,
+                "delivery_zones": ["downtown", "midtown", "uptown"]
+            }),
+        )
+        .unwrap();
+        let low_rating = Document::new(
+            2,
+            json!({
+                "name": "Cheap Eats", "dietary_options": ["vegan", "gluten_free"],
+                "rating": 3.2, "delivery_fee": 2.0,
+                "menu_items": ["burger"],
+                "temporarily_closed": false, "accepting_orders": true,
+                "delivery_zones": ["downtown"]
+            }),
+        )
+        .unwrap();
+        let closed = Document::new(
+            3,
+            json!({
+                "name": "Zen Kitchen", "dietary_options": ["vegan", "gluten_free"],
+                "rating": 4.8, "delivery_fee": 4.0,
+                "menu_items": ["ramen"],
+                "temporarily_closed": true, "accepting_orders": true,
+                "delivery_zones": ["downtown"]
+            }),
+        )
+        .unwrap();
+        let no_zone = Document::new(
+            4,
+            json!({
+                "name": "Far Away", "dietary_options": ["vegan", "gluten_free"],
+                "rating": 4.5, "delivery_fee": 3.0,
+                "menu_items": ["pasta"],
+                "temporarily_closed": false, "accepting_orders": true,
+                "delivery_zones": ["suburbs", "airport"]
+            }),
+        )
+        .unwrap();
         assert!(matches_doc(&q, &match_restaurant));
         assert!(!matches_doc(&q, &low_rating));
         assert!(!matches_doc(&q, &closed));

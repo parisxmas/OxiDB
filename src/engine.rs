@@ -1,17 +1,17 @@
+use crate::locks::{Mutex, RwLock};
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::VecDeque;
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::{Path, PathBuf};
 #[cfg(target_arch = "wasm32")]
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
-use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
-use crate::locks::{Mutex, RwLock};
 
 #[cfg(not(target_arch = "wasm32"))]
 use flate2::Compression;
@@ -19,14 +19,16 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 #[cfg(not(target_arch = "wasm32"))]
 use flate2::write::GzEncoder;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::blob::BlobStore;
 use crate::btree_collection::BTreeCollection;
-use crate::change_stream::{ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter, WatchHandle};
+use crate::change_stream::{
+    ChangeEvent, ChangeStreamBroker, OperationType, ResumeError, SubscriberId, WatchFilter,
+    WatchHandle,
+};
 use crate::collection::{CompactStats, IndexInfo, resolve_field_in_value};
-use crate::value::IndexValue;
 use crate::crypto::EncryptionKey;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
@@ -38,6 +40,7 @@ use crate::query::FindOptions;
 use crate::transaction::{ReadRecord, Transaction, WriteOp};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::tx_log::{TransactionId, TxCommitLog};
+use crate::value::IndexValue;
 #[cfg(target_arch = "wasm32")]
 type TransactionId = u64;
 
@@ -50,10 +53,12 @@ fn index_metadata(col: &BTreeCollection) -> (Vec<String>, bool, bool) {
     let fi = col.field_indexes();
     let ci = col.composite_indexes();
     let vi = col.vector_indexes();
-    let unique_fields: Vec<String> = fi.values()
-        .filter(|idx| idx.unique).map(|idx| idx.field.clone()).collect();
-    let need = !fi.is_empty() || !ci.is_empty()
-        || col.has_text_index() || !vi.is_empty();
+    let unique_fields: Vec<String> = fi
+        .values()
+        .filter(|idx| idx.unique)
+        .map(|idx| idx.field.clone())
+        .collect();
+    let need = !fi.is_empty() || !ci.is_empty() || col.has_text_index() || !vi.is_empty();
     (unique_fields, need, col.has_text_index())
 }
 
@@ -362,8 +367,9 @@ fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> (FtsDispatcher, Arc<F
                         runtime_w.advance_to_indexing(worker_id);
                         match fts_worker.write().remove_document(&bucket, &key) {
                             Ok(()) => runtime_w.finish(worker_id, JobOutcome::Indexed),
-                            Err(e) => runtime_w
-                                .finish(worker_id, JobOutcome::Failed(e.to_string())),
+                            Err(e) => {
+                                runtime_w.finish(worker_id, JobOutcome::Failed(e.to_string()))
+                            }
                         }
                     }
                 }
@@ -376,9 +382,11 @@ fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> (FtsDispatcher, Arc<F
     // flush_interval_ms regardless of how many docs were indexed.
     if flush_interval_ms > 0 {
         let flush_target = Arc::clone(fts_index);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(flush_interval_ms));
-            let _ = flush_target.write().flush();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(flush_interval_ms));
+                let _ = flush_target.write().flush();
+            }
         });
     }
 
@@ -420,6 +428,14 @@ pub struct OxiDb {
     archiver_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
     cache_capacity: AtomicUsize,
     in_memory: bool,
+    /// Serializes the OCC commit critical section (version validation
+    /// through apply). Without it, two transactions that both read a
+    /// document at version N can both pass validation, both prepare
+    /// version N+1, and both apply — the second silently overwriting the
+    /// first (a lost update). Holding this lock from validation through
+    /// apply guarantees the loser observes the winner's new version and
+    /// aborts with a `TransactionConflict`, as OCC requires.
+    commit_lock: Mutex<()>,
     /// Linked-collection registry (FDW-style remote proxies). Reads
     /// of every collection-targeting command consult this table; a
     /// hit means proxy to the remote OxiDB instead of touching the
@@ -441,12 +457,19 @@ impl OxiDb {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn open_with_options(data_dir: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
+    pub fn open_with_options(
+        data_dir: &Path,
+        encryption: Option<Arc<EncryptionKey>>,
+    ) -> Result<Self> {
         Self::open_internal(data_dir, encryption, false, None)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn open_verbose(data_dir: &Path, encryption: Option<Arc<EncryptionKey>>, verbose: bool) -> Result<Self> {
+    pub fn open_verbose(
+        data_dir: &Path,
+        encryption: Option<Arc<EncryptionKey>>,
+        verbose: bool,
+    ) -> Result<Self> {
         Self::open_internal(data_dir, encryption, verbose, None)
     }
 
@@ -493,12 +516,13 @@ impl OxiDb {
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
+            commit_lock: Mutex::new(()),
             links: LinksTable::in_memory(),
             ttl_shutdown: Mutex::new(None),
             alert_shutdown: Mutex::new(None),
             #[cfg(feature = "gpu")]
             gpu: Mutex::new(None),
-})
+        })
     }
 
     /// Create a pure in-memory database for WebAssembly.
@@ -517,6 +541,7 @@ impl OxiDb {
             lazy_sync: AtomicBool::new(false),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
+            commit_lock: Mutex::new(()),
             links: LinksTable::in_memory(),
         })
     }
@@ -568,7 +593,10 @@ impl OxiDb {
         };
 
         if verbose {
-            vlog(&format!("[verbose] opening database at {}", data_dir.display()));
+            vlog(&format!(
+                "[verbose] opening database at {}",
+                data_dir.display()
+            ));
         }
 
         std::fs::create_dir_all(data_dir)?;
@@ -650,12 +678,13 @@ impl OxiDb {
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: false,
+            commit_lock: Mutex::new(()),
             links: LinksTable::open(data_dir)?,
             ttl_shutdown: Mutex::new(None),
             alert_shutdown: Mutex::new(None),
             #[cfg(feature = "gpu")]
             gpu: Mutex::new(None),
-})
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -714,7 +743,12 @@ impl OxiDb {
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
-            BTreeCollection::open_with_sequencer(name, &self.data_dir, self.encryption.clone(), self.archive_sequencer.clone())?
+            BTreeCollection::open_with_sequencer(
+                name,
+                &self.data_dir,
+                self.encryption.clone(),
+                self.archive_sequencer.clone(),
+            )?
         };
         #[cfg(target_arch = "wasm32")]
         let col = BTreeCollection::open_in_memory(name);
@@ -751,7 +785,12 @@ impl OxiDb {
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
-            BTreeCollection::open_with_sequencer(name, &self.data_dir, self.encryption.clone(), self.archive_sequencer.clone())?
+            BTreeCollection::open_with_sequencer(
+                name,
+                &self.data_dir,
+                self.encryption.clone(),
+                self.archive_sequencer.clone(),
+            )?
         };
         #[cfg(target_arch = "wasm32")]
         let col = BTreeCollection::open_in_memory(name);
@@ -981,8 +1020,7 @@ impl OxiDb {
                         eprintln!("[archiver] {label} archive pass failed: {e}");
                     }
                     if retention_hours > 0 {
-                        if let Err(e) =
-                            crate::archive::prune_archive(&archive_dir, retention_hours)
+                        if let Err(e) = crate::archive::prune_archive(&archive_dir, retention_hours)
                         {
                             eprintln!("[archiver] {label} prune failed: {e}");
                         }
@@ -1144,7 +1182,12 @@ impl OxiDb {
                 }
             }
 
-            (first_id, !unique_fields.is_empty(), unique_fields, need_values)
+            (
+                first_id,
+                !unique_fields.is_empty(),
+                unique_fields,
+                need_values,
+            )
         };
 
         // Phase 2: Pre-serialize all documents (no lock held — other threads can work)
@@ -1166,7 +1209,8 @@ impl OxiDb {
 
             // Intra-batch uniqueness check
             if has_unique_indexes {
-                let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
+                let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> =
+                    HashMap::new();
                 for field in &unique_fields {
                     if let Some(value) = resolve_field_in_value(&data, field) {
                         let iv = IndexValue::from_json(value);
@@ -1185,24 +1229,32 @@ impl OxiDb {
 
         // Parallel JSONB encode for large batches
         #[cfg(not(target_arch = "wasm32"))]
-        let prepared: Vec<(DocumentId, Value, Vec<u8>)> = if docs_with_ids.len() > 500 && !has_unique_indexes {
-            use rayon::prelude::*;
-            docs_with_ids.into_par_iter().map(|(id, data)| {
-                let bytes = crate::codec::encode_doc(&data).unwrap_or_default();
-                if keep_values { (id, data, bytes) } else { (id, Value::Null, bytes) }
-            }).collect()
-        } else {
-            let mut prepared = Vec::with_capacity(docs_with_ids.len());
-            for (id, data) in docs_with_ids {
-                let bytes = crate::codec::encode_doc(&data)?;
-                if keep_values {
-                    prepared.push((id, data, bytes));
-                } else {
-                    prepared.push((id, Value::Null, bytes));
+        let prepared: Vec<(DocumentId, Value, Vec<u8>)> =
+            if docs_with_ids.len() > 500 && !has_unique_indexes {
+                use rayon::prelude::*;
+                docs_with_ids
+                    .into_par_iter()
+                    .map(|(id, data)| {
+                        let bytes = crate::codec::encode_doc(&data).unwrap_or_default();
+                        if keep_values {
+                            (id, data, bytes)
+                        } else {
+                            (id, Value::Null, bytes)
+                        }
+                    })
+                    .collect()
+            } else {
+                let mut prepared = Vec::with_capacity(docs_with_ids.len());
+                for (id, data) in docs_with_ids {
+                    let bytes = crate::codec::encode_doc(&data)?;
+                    if keep_values {
+                        prepared.push((id, data, bytes));
+                    } else {
+                        prepared.push((id, Value::Null, bytes));
+                    }
                 }
-            }
-            prepared
-        };
+                prepared
+            };
         #[cfg(target_arch = "wasm32")]
         let prepared: Vec<(DocumentId, Value, Vec<u8>)> = {
             let mut prepared = Vec::with_capacity(docs_with_ids.len());
@@ -1266,7 +1318,11 @@ impl OxiDb {
     /// server's find→wire path to skip per-doc encoding when the bytes
     /// cache (populated at insert time) is warm. Returns `None` if the
     /// collection doesn't exist or the id was never seen.
-    pub fn get_oxiwire_bytes(&self, collection: &str, id: crate::document::DocumentId) -> Option<Arc<[u8]>> {
+    pub fn get_oxiwire_bytes(
+        &self,
+        collection: &str,
+        id: crate::document::DocumentId,
+    ) -> Option<Arc<[u8]>> {
         let cols = self.collections.read();
         let col = cols.get(collection)?;
         col.load_doc_oxiwire_bytes(id)
@@ -1429,11 +1485,7 @@ impl OxiDb {
         col.create_unique_index(field)
     }
 
-    pub fn create_composite_index(
-        &self,
-        collection: &str,
-        fields: Vec<String>,
-    ) -> Result<String> {
+    pub fn create_composite_index(&self, collection: &str, fields: Vec<String>) -> Result<String> {
         let col = self.get_or_create_collection(collection)?;
         col.create_composite_index(fields)
     }
@@ -1477,12 +1529,7 @@ impl OxiDb {
         col.create_text_index(fields)
     }
 
-    pub fn text_search(
-        &self,
-        collection: &str,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<Value>> {
+    pub fn text_search(&self, collection: &str, query: &str, limit: usize) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
         col.text_search(query, limit)
     }
@@ -1533,9 +1580,8 @@ impl OxiDb {
         let (leading_match, start_idx) = pipeline.take_leading_match();
         let out_collection = pipeline.out_collection().map(|s| s.to_string());
 
-        let lookup_fn = |foreign: &str, query: &Value| -> Result<Vec<Value>> {
-            self.find(foreign, query)
-        };
+        let lookup_fn =
+            |foreign: &str, query: &Value| -> Result<Vec<Value>> { self.find(foreign, query) };
 
         // Streaming fast path: when pipeline is [$match?] -> $group -> [rest],
         // stream docs through storage sequentially instead of materializing
@@ -1603,7 +1649,9 @@ impl OxiDb {
     pub fn begin_transaction(&self) -> TransactionId {
         let tx_id = self.next_tx_id.fetch_add(1, Ordering::SeqCst);
         let tx = Transaction::new(tx_id);
-        self.active_transactions.write().insert(tx_id, Mutex::new(tx));
+        self.active_transactions
+            .write()
+            .insert(tx_id, Mutex::new(tx));
         tx_id
     }
 
@@ -1611,7 +1659,9 @@ impl OxiDb {
     /// Removes the transaction from the active set.
     pub fn extract_transaction_writes(&self, tx_id: TransactionId) -> Result<Vec<WriteOp>> {
         let mut txs = self.active_transactions.write();
-        let tx_mutex = txs.remove(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
+        let tx_mutex = txs
+            .remove(&tx_id)
+            .ok_or(Error::TransactionNotFound(tx_id))?;
         let tx = tx_mutex.into_inner();
         Ok(tx.write_ops)
     }
@@ -1623,7 +1673,12 @@ impl OxiDb {
     /// and a version row referencing it. If the tx rolls back the id
     /// becomes a gap; that's harmless since ids don't need to be
     /// contiguous.
-    pub fn tx_insert(&self, tx_id: TransactionId, collection: &str, doc: Value) -> Result<DocumentId> {
+    pub fn tx_insert(
+        &self,
+        tx_id: TransactionId,
+        collection: &str,
+        doc: Value,
+    ) -> Result<DocumentId> {
         // Reserve an id from the target collection's monotonic counter.
         // get_or_create_collection is the same path the commit path
         // uses, so we don't open a second collection later under a
@@ -1644,7 +1699,12 @@ impl OxiDb {
     }
 
     /// Execute a read within a transaction, recording versions for OCC.
-    pub fn tx_find(&self, tx_id: TransactionId, collection: &str, query: &Value) -> Result<Vec<Value>> {
+    pub fn tx_find(
+        &self,
+        tx_id: TransactionId,
+        collection: &str,
+        query: &Value,
+    ) -> Result<Vec<Value>> {
         let col = self.get_or_create_collection(collection)?;
         let results = col.find(query)?;
 
@@ -1705,12 +1765,7 @@ impl OxiDb {
     }
 
     /// Buffer a delete within a transaction, recording read versions.
-    pub fn tx_delete(
-        &self,
-        tx_id: TransactionId,
-        collection: &str,
-        query: &Value,
-    ) -> Result<()> {
+    pub fn tx_delete(&self, tx_id: TransactionId, collection: &str, query: &Value) -> Result<()> {
         let col = self.get_or_create_collection(collection)?;
         let matching = col.find(query)?;
 
@@ -1754,9 +1809,19 @@ impl OxiDb {
             locked_collections.push((col_name.clone(), col));
         }
 
+        // Serialize the validate→apply critical section across all committers.
+        // Held until the end of the function so that version validation (step
+        // 3) and the corresponding apply (step 8) are atomic with respect to
+        // other commits — preventing the lost-update race where two commits
+        // both validate the same version and both write.
+        let _commit_guard = self.commit_lock.lock();
+
         // 3. OCC validation: verify all recorded versions match current versions
         for record in &tx.read_set {
-            if let Some((_, col)) = locked_collections.iter().find(|(n, _)| n == &record.collection) {
+            if let Some((_, col)) = locked_collections
+                .iter()
+                .find(|(n, _)| n == &record.collection)
+            {
                 let current_version = col.get_version(record.doc_id);
                 if current_version != record.version {
                     return Err(Error::TransactionConflict {
@@ -1770,30 +1835,46 @@ impl OxiDb {
         }
 
         // Build a name→Arc map for quick lookup
-        let col_map: HashMap<String, Arc<BTreeCollection>> = locked_collections.iter()
+        let col_map: HashMap<String, Arc<BTreeCollection>> = locked_collections
+            .iter()
             .map(|(n, c)| (n.clone(), Arc::clone(c)))
             .collect();
 
         // 4. Prepare: execute each WriteOp against the collection
         //    Collect WAL entries and mutations per collection
-        let mut all_mutations: HashMap<String, Vec<crate::collection::PreparedMutation>> = HashMap::new();
+        let mut all_mutations: HashMap<String, Vec<crate::collection::PreparedMutation>> =
+            HashMap::new();
 
         for op in tx.write_ops {
             match op {
-                WriteOp::Insert { collection, data, id } => {
+                WriteOp::Insert {
+                    collection,
+                    data,
+                    id,
+                } => {
                     let col = col_map.get(&collection).unwrap();
                     let mutation = col.prepare_tx_insert(data, tx_id, id)?;
                     all_mutations.entry(collection).or_default().push(mutation);
                 }
-                WriteOp::Update { collection, query, update } => {
+                WriteOp::Update {
+                    collection,
+                    query,
+                    update,
+                } => {
                     let col = col_map.get(&collection).unwrap();
                     let mutations = col.prepare_tx_update(&query, &update, tx_id)?;
-                    all_mutations.entry(collection).or_default().extend(mutations);
+                    all_mutations
+                        .entry(collection)
+                        .or_default()
+                        .extend(mutations);
                 }
                 WriteOp::Delete { collection, query } => {
                     let col = col_map.get(&collection).unwrap();
                     let mutations = col.prepare_tx_delete(&query, tx_id)?;
-                    all_mutations.entry(collection).or_default().extend(mutations);
+                    all_mutations
+                        .entry(collection)
+                        .or_default()
+                        .extend(mutations);
                 }
             }
         }
@@ -1804,20 +1885,24 @@ impl OxiDb {
             let entries: Vec<crate::wal::WalEntry> = mutations
                 .iter()
                 .map(|m| match &m.wal_entry {
-                    crate::wal::WalEntry::Insert { doc_id, doc_bytes, tx_id } => {
-                        crate::wal::WalEntry::Insert {
-                            doc_id: *doc_id,
-                            doc_bytes: doc_bytes.clone(),
-                            tx_id: *tx_id,
-                        }
-                    }
-                    crate::wal::WalEntry::Update { doc_id, doc_bytes, tx_id } => {
-                        crate::wal::WalEntry::Update {
-                            doc_id: *doc_id,
-                            doc_bytes: doc_bytes.clone(),
-                            tx_id: *tx_id,
-                        }
-                    }
+                    crate::wal::WalEntry::Insert {
+                        doc_id,
+                        doc_bytes,
+                        tx_id,
+                    } => crate::wal::WalEntry::Insert {
+                        doc_id: *doc_id,
+                        doc_bytes: doc_bytes.clone(),
+                        tx_id: *tx_id,
+                    },
+                    crate::wal::WalEntry::Update {
+                        doc_id,
+                        doc_bytes,
+                        tx_id,
+                    } => crate::wal::WalEntry::Update {
+                        doc_id: *doc_id,
+                        doc_bytes: doc_bytes.clone(),
+                        tx_id: *tx_id,
+                    },
                     crate::wal::WalEntry::Delete { doc_id, tx_id } => {
                         crate::wal::WalEntry::Delete {
                             doc_id: *doc_id,
@@ -2013,12 +2098,7 @@ impl OxiDb {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn search(
-        &self,
-        bucket: Option<&str>,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<Value>> {
+    pub fn search(&self, bucket: Option<&str>, query: &str, limit: usize) -> Result<Vec<Value>> {
         let results = self.fts_index.read().search(bucket, query, limit);
         Ok(results
             .into_iter()
@@ -2064,12 +2144,8 @@ impl OxiDb {
             if max_snippets > 0 && snippet_chars > 0 {
                 if let Ok((data, meta)) = self.blob_store.get_object(&r.bucket, &r.key) {
                     if let Some(text) = crate::fts::extract_text(&data, &meta.content_type) {
-                        let snippets = crate::fts::highlight(
-                            &text,
-                            query,
-                            snippet_chars,
-                            max_snippets,
-                        );
+                        let snippets =
+                            crate::fts::highlight(&text, query, snippet_chars, max_snippets);
                         if !snippets.is_empty() {
                             let arr: Vec<Value> = snippets
                                 .into_iter()
@@ -2203,16 +2279,11 @@ impl OxiDb {
             obj.insert("name".to_string(), Value::String(name.to_string()));
             obj.entry("enabled".to_string())
                 .or_insert(Value::Bool(true));
-            obj.entry("last_run".to_string())
-                .or_insert(Value::Null);
-            obj.entry("last_run_epoch".to_string())
-                .or_insert(json!(0));
-            obj.entry("last_status".to_string())
-                .or_insert(Value::Null);
-            obj.entry("last_error".to_string())
-                .or_insert(Value::Null);
-            obj.entry("run_count".to_string())
-                .or_insert(json!(0));
+            obj.entry("last_run".to_string()).or_insert(Value::Null);
+            obj.entry("last_run_epoch".to_string()).or_insert(json!(0));
+            obj.entry("last_status".to_string()).or_insert(Value::Null);
+            obj.entry("last_error".to_string()).or_insert(Value::Null);
+            obj.entry("run_count".to_string()).or_insert(json!(0));
         }
 
         let col = self.get_or_create_collection("_schedules")?;
@@ -2319,7 +2390,9 @@ impl OxiDb {
         let policy_col = self.get_or_create_collection("_retention_policies")?;
         let deleted = policy_col.delete(&json!({"collection": collection}), None)?;
         if deleted.is_empty() {
-            return Err(Error::InvalidQuery(format!("no retention policy for '{collection}'")));
+            return Err(Error::InvalidQuery(format!(
+                "no retention policy for '{collection}'"
+            )));
         }
         Ok(())
     }
@@ -2371,7 +2444,9 @@ impl OxiDb {
                 return Err(Error::InvalidQuery("condition missing 'type'".to_string()));
             }
             if !cond.contains_key("threshold") {
-                return Err(Error::InvalidQuery("condition missing 'threshold'".to_string()));
+                return Err(Error::InvalidQuery(
+                    "condition missing 'threshold'".to_string(),
+                ));
             }
         }
 
@@ -2382,7 +2457,8 @@ impl OxiDb {
         obj.entry("last_fired").or_insert(json!(null));
         obj.entry("last_fired_epoch").or_insert(json!(0));
         obj.entry("fire_count").or_insert(json!(0));
-        obj.entry("_ts").or_insert(json!(chrono::Utc::now().to_rfc3339()));
+        obj.entry("_ts")
+            .or_insert(json!(chrono::Utc::now().to_rfc3339()));
 
         // Check for duplicate
         let alert_col = self.get_or_create_collection("_alerts")?;
@@ -2425,9 +2501,12 @@ impl OxiDb {
         let alert = self.get_alert(name)?;
         let now = crate::scheduler::epoch_now();
 
-        let collection = alert.get("collection").and_then(|v| v.as_str())
+        let collection = alert
+            .get("collection")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| Error::InvalidQuery("alert missing 'collection'".to_string()))?;
-        let condition = alert.get("condition")
+        let condition = alert
+            .get("condition")
             .ok_or_else(|| Error::InvalidQuery("alert missing 'condition'".to_string()))?;
         let cond_type = condition.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -2438,8 +2517,14 @@ impl OxiDb {
                     Some(q) => self.count(collection, &q)? as i64,
                     None => 0,
                 };
-                let threshold = condition.get("threshold").and_then(|v| v.as_i64()).unwrap_or(0);
-                let operator = condition.get("operator").and_then(|v| v.as_str()).unwrap_or("gte");
+                let threshold = condition
+                    .get("threshold")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let operator = condition
+                    .get("operator")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("gte");
                 json!({
                     "alert": name,
                     "type": "count_threshold",
@@ -2449,7 +2534,9 @@ impl OxiDb {
                     "would_fire": crate::alerting::compare_pub(count, threshold, operator),
                 })
             }
-            _ => json!({"alert": name, "error": format!("unsupported condition type: {cond_type}")}),
+            _ => {
+                json!({"alert": name, "error": format!("unsupported condition type: {cond_type}")})
+            }
         };
 
         Ok(result)
@@ -2533,7 +2620,9 @@ impl OxiDb {
 
         Self::add_dir_to_tar(&mut archive, &self.data_dir, &self.data_dir)?;
 
-        let enc = archive.into_inner().map_err(|e| Error::Backup(e.to_string()))?;
+        let enc = archive
+            .into_inner()
+            .map_err(|e| Error::Backup(e.to_string()))?;
         enc.finish().map_err(|e| Error::Backup(e.to_string()))?;
 
         // 7. Return info
@@ -2757,7 +2846,8 @@ mod tests {
     fn tx_insert_commit() {
         let db = temp_db();
         let tx_id = db.begin_transaction();
-        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"}))
+            .unwrap();
         db.commit_transaction(tx_id).unwrap();
 
         let docs = db.find("users", &json!({})).unwrap();
@@ -2769,7 +2859,8 @@ mod tests {
     fn tx_insert_rollback() {
         let db = temp_db();
         let tx_id = db.begin_transaction();
-        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"}))
+            .unwrap();
         db.rollback_transaction(tx_id).unwrap();
 
         let docs = db.find("users", &json!({})).unwrap();
@@ -2780,8 +2871,10 @@ mod tests {
     fn tx_multi_collection_commit() {
         let db = temp_db();
         let tx_id = db.begin_transaction();
-        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
-        db.tx_insert(tx_id, "orders", json!({"item": "Widget"})).unwrap();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"}))
+            .unwrap();
+        db.tx_insert(tx_id, "orders", json!({"item": "Widget"}))
+            .unwrap();
         db.commit_transaction(tx_id).unwrap();
 
         let users = db.find("users", &json!({})).unwrap();
@@ -2794,8 +2887,10 @@ mod tests {
     fn tx_multi_collection_rollback() {
         let db = temp_db();
         let tx_id = db.begin_transaction();
-        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
-        db.tx_insert(tx_id, "orders", json!({"item": "Widget"})).unwrap();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"}))
+            .unwrap();
+        db.tx_insert(tx_id, "orders", json!({"item": "Widget"}))
+            .unwrap();
         db.rollback_transaction(tx_id).unwrap();
 
         let users = db.find("users", &json!({})).unwrap();
@@ -2808,7 +2903,8 @@ mod tests {
     fn tx_occ_conflict() {
         let db = temp_db();
         // Insert a doc outside of a transaction
-        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
+        db.insert("users", json!({"name": "Alice", "age": 30}))
+            .unwrap();
 
         // TX1 reads the doc
         let tx1 = db.begin_transaction();
@@ -2817,11 +2913,23 @@ mod tests {
 
         // TX2 updates the doc and commits
         let tx2 = db.begin_transaction();
-        db.tx_update(tx2, "users", &json!({"name": "Alice"}), &json!({"$set": {"age": 31}})).unwrap();
+        db.tx_update(
+            tx2,
+            "users",
+            &json!({"name": "Alice"}),
+            &json!({"$set": {"age": 31}}),
+        )
+        .unwrap();
         db.commit_transaction(tx2).unwrap();
 
         // TX1 tries to update -- should get a conflict since the version changed
-        db.tx_update(tx1, "users", &json!({"name": "Alice"}), &json!({"$set": {"age": 32}})).unwrap();
+        db.tx_update(
+            tx1,
+            "users",
+            &json!({"name": "Alice"}),
+            &json!({"$set": {"age": 32}}),
+        )
+        .unwrap();
         let result = db.commit_transaction(tx1);
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -2833,25 +2941,45 @@ mod tests {
     #[test]
     fn concurrent_no_conflict() {
         let db = temp_db();
-        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
-        db.insert("users", json!({"name": "Bob", "age": 25})).unwrap();
+        db.insert("users", json!({"name": "Alice", "age": 30}))
+            .unwrap();
+        db.insert("users", json!({"name": "Bob", "age": 25}))
+            .unwrap();
 
         // TX1 reads and updates Alice
         let tx1 = db.begin_transaction();
         db.tx_find(tx1, "users", &json!({"name": "Alice"})).unwrap();
-        db.tx_update(tx1, "users", &json!({"name": "Alice"}), &json!({"$set": {"age": 31}})).unwrap();
+        db.tx_update(
+            tx1,
+            "users",
+            &json!({"name": "Alice"}),
+            &json!({"$set": {"age": 31}}),
+        )
+        .unwrap();
 
         // TX2 reads and updates Bob (different doc)
         let tx2 = db.begin_transaction();
         db.tx_find(tx2, "users", &json!({"name": "Bob"})).unwrap();
-        db.tx_update(tx2, "users", &json!({"name": "Bob"}), &json!({"$set": {"age": 26}})).unwrap();
+        db.tx_update(
+            tx2,
+            "users",
+            &json!({"name": "Bob"}),
+            &json!({"$set": {"age": 26}}),
+        )
+        .unwrap();
 
         // Both should succeed
         db.commit_transaction(tx1).unwrap();
         db.commit_transaction(tx2).unwrap();
 
-        let alice = db.find_one("users", &json!({"name": "Alice"})).unwrap().unwrap();
-        let bob = db.find_one("users", &json!({"name": "Bob"})).unwrap().unwrap();
+        let alice = db
+            .find_one("users", &json!({"name": "Alice"}))
+            .unwrap()
+            .unwrap();
+        let bob = db
+            .find_one("users", &json!({"name": "Bob"}))
+            .unwrap()
+            .unwrap();
         assert_eq!(alice["age"], 31);
         assert_eq!(bob["age"], 26);
     }
@@ -2860,7 +2988,8 @@ mod tests {
     fn auto_rollback_on_drop() {
         let db = temp_db();
         let tx_id = db.begin_transaction();
-        db.tx_insert(tx_id, "users", json!({"name": "Ghost"})).unwrap();
+        db.tx_insert(tx_id, "users", json!({"name": "Ghost"}))
+            .unwrap();
         // Simulate disconnect: just rollback without commit
         db.rollback_transaction(tx_id).unwrap();
 
@@ -2949,7 +3078,10 @@ mod tests {
 
         let id = db.insert("users", json!({"name": "Alice"})).unwrap();
 
-        let event = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let event = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
         assert_eq!(event.operation, OperationType::Insert);
         assert_eq!(event.collection, "users");
         assert_eq!(event.doc_id, id);
@@ -2963,12 +3095,22 @@ mod tests {
     #[test]
     fn watch_update_emits_event() {
         let db = temp_db();
-        let id = db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
+        let id = db
+            .insert("users", json!({"name": "Alice", "age": 30}))
+            .unwrap();
 
         let handle = db.watch(WatchFilter::All, None).unwrap();
-        db.update("users", &json!({"name": "Alice"}), &json!({"$set": {"age": 31}})).unwrap();
+        db.update(
+            "users",
+            &json!({"name": "Alice"}),
+            &json!({"$set": {"age": 31}}),
+        )
+        .unwrap();
 
-        let event = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let event = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
         assert_eq!(event.operation, OperationType::Update);
         assert_eq!(event.collection, "users");
         assert_eq!(event.doc_id, id);
@@ -2983,7 +3125,10 @@ mod tests {
         let handle = db.watch(WatchFilter::All, None).unwrap();
         db.delete("users", &json!({"name": "Alice"})).unwrap();
 
-        let event = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let event = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
         assert_eq!(event.operation, OperationType::Delete);
         assert_eq!(event.collection, "users");
         assert_eq!(event.doc_id, id);
@@ -2996,12 +3141,20 @@ mod tests {
         let handle = db.watch(WatchFilter::All, None).unwrap();
 
         let tx_id = db.begin_transaction();
-        db.tx_insert(tx_id, "users", json!({"name": "Alice"})).unwrap();
-        db.tx_insert(tx_id, "users", json!({"name": "Bob"})).unwrap();
+        db.tx_insert(tx_id, "users", json!({"name": "Alice"}))
+            .unwrap();
+        db.tx_insert(tx_id, "users", json!({"name": "Bob"}))
+            .unwrap();
         db.commit_transaction(tx_id).unwrap();
 
-        let e1 = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
-        let e2 = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let e1 = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let e2 = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
         assert_eq!(e1.operation, OperationType::Insert);
         assert_eq!(e2.operation, OperationType::Insert);
         assert!(e1.tx_id.is_some());
@@ -3016,23 +3169,38 @@ mod tests {
         db.unwatch(handle.id);
         db.insert("users", json!({"name": "Alice"})).unwrap();
 
-        assert!(handle.rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        assert!(
+            handle
+                .rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
     }
 
     #[test]
     fn watch_filters_by_collection() {
         let db = temp_db();
-        let handle = db.watch(WatchFilter::Collection("orders".to_string()), None).unwrap();
+        let handle = db
+            .watch(WatchFilter::Collection("orders".to_string()), None)
+            .unwrap();
 
         db.insert("users", json!({"name": "Alice"})).unwrap();
         let order_id = db.insert("orders", json!({"item": "Widget"})).unwrap();
 
-        let event = handle.rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let event = handle
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
         assert_eq!(event.collection, "orders");
         assert_eq!(event.doc_id, order_id);
 
         // No more events (the users insert was filtered out)
-        assert!(handle.rx.recv_timeout(std::time::Duration::from_millis(50)).is_err());
+        assert!(
+            handle
+                .rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
     }
 
     #[test]
@@ -3040,62 +3208,74 @@ mod tests {
         let db = temp_db();
 
         // ── Seed data ──────────────────────────────────────────────
-        db.insert("accounts", json!({
-            "account_id": "ACC001", "owner": "Alice", "balance": 500
-        })).unwrap();
-        db.insert("accounts", json!({
-            "account_id": "ACC002", "owner": "Bob", "balance": 200
-        })).unwrap();
+        db.insert(
+            "accounts",
+            json!({
+                "account_id": "ACC001", "owner": "Alice", "balance": 500
+            }),
+        )
+        .unwrap();
+        db.insert(
+            "accounts",
+            json!({
+                "account_id": "ACC002", "owner": "Bob", "balance": 200
+            }),
+        )
+        .unwrap();
 
         // ── 1. Create a stored procedure ───────────────────────────
-        db.create_procedure("transfer_funds", json!({
-            "name": "transfer_funds",
-            "params": ["from_account", "to_account", "amount"],
-            "steps": [
-                {
-                    "step": "find_one",
-                    "collection": "accounts",
-                    "query": { "account_id": "$param.from_account" },
-                    "as": "sender"
-                },
-                {
-                    "step": "find_one",
-                    "collection": "accounts",
-                    "query": { "account_id": "$param.to_account" },
-                    "as": "receiver"
-                },
-                {
-                    "step": "if",
-                    "condition": { "$expr": { "$lt": ["$sender.balance", "$param.amount"] } },
-                    "then": [
-                        { "step": "abort", "message": "insufficient funds" }
-                    ]
-                },
-                {
-                    "step": "update",
-                    "collection": "accounts",
-                    "query": { "account_id": "$param.from_account" },
-                    "update": { "$inc": { "balance": -150 } }
-                },
-                {
-                    "step": "update",
-                    "collection": "accounts",
-                    "query": { "account_id": "$param.to_account" },
-                    "update": { "$inc": { "balance": 150 } }
-                },
-                {
-                    "step": "return",
-                    "value": {
-                        "status": "ok",
-                        "from": "$param.from_account",
-                        "to": "$param.to_account",
-                        "amount": "$param.amount",
-                        "sender_old_balance": "$sender.balance",
-                        "receiver_old_balance": "$receiver.balance"
+        db.create_procedure(
+            "transfer_funds",
+            json!({
+                "name": "transfer_funds",
+                "params": ["from_account", "to_account", "amount"],
+                "steps": [
+                    {
+                        "step": "find_one",
+                        "collection": "accounts",
+                        "query": { "account_id": "$param.from_account" },
+                        "as": "sender"
+                    },
+                    {
+                        "step": "find_one",
+                        "collection": "accounts",
+                        "query": { "account_id": "$param.to_account" },
+                        "as": "receiver"
+                    },
+                    {
+                        "step": "if",
+                        "condition": { "$expr": { "$lt": ["$sender.balance", "$param.amount"] } },
+                        "then": [
+                            { "step": "abort", "message": "insufficient funds" }
+                        ]
+                    },
+                    {
+                        "step": "update",
+                        "collection": "accounts",
+                        "query": { "account_id": "$param.from_account" },
+                        "update": { "$inc": { "balance": -150 } }
+                    },
+                    {
+                        "step": "update",
+                        "collection": "accounts",
+                        "query": { "account_id": "$param.to_account" },
+                        "update": { "$inc": { "balance": 150 } }
+                    },
+                    {
+                        "step": "return",
+                        "value": {
+                            "status": "ok",
+                            "from": "$param.from_account",
+                            "to": "$param.to_account",
+                            "amount": "$param.amount",
+                            "sender_old_balance": "$sender.balance",
+                            "receiver_old_balance": "$receiver.balance"
+                        }
                     }
-                }
-            ]
-        })).unwrap();
+                ]
+            }),
+        )
+        .unwrap();
 
         // ── 2. List procedures ─────────────────────────────────────
         let procs = db.list_procedures().unwrap();
@@ -3104,20 +3284,37 @@ mod tests {
 
         // ── 3. Get procedure definition ────────────────────────────
         let def = db.get_procedure("transfer_funds").unwrap();
-        println!("\n=== Procedure definition:\n{}", serde_json::to_string_pretty(&def).unwrap());
+        println!(
+            "\n=== Procedure definition:\n{}",
+            serde_json::to_string_pretty(&def).unwrap()
+        );
 
         // ── 4. Call the procedure (success) ────────────────────────
-        let result = db.call_procedure("transfer_funds", json!({
-            "from_account": "ACC001",
-            "to_account": "ACC002",
-            "amount": 150
-        })).unwrap();
-        println!("\n=== Transfer result:\n{}", serde_json::to_string_pretty(&result).unwrap());
+        let result = db
+            .call_procedure(
+                "transfer_funds",
+                json!({
+                    "from_account": "ACC001",
+                    "to_account": "ACC002",
+                    "amount": 150
+                }),
+            )
+            .unwrap();
+        println!(
+            "\n=== Transfer result:\n{}",
+            serde_json::to_string_pretty(&result).unwrap()
+        );
         assert_eq!(result["status"], "ok");
 
         // Verify balances after transfer
-        let alice = db.find_one("accounts", &json!({"account_id": "ACC001"})).unwrap().unwrap();
-        let bob = db.find_one("accounts", &json!({"account_id": "ACC002"})).unwrap().unwrap();
+        let alice = db
+            .find_one("accounts", &json!({"account_id": "ACC001"}))
+            .unwrap()
+            .unwrap();
+        let bob = db
+            .find_one("accounts", &json!({"account_id": "ACC002"}))
+            .unwrap()
+            .unwrap();
         println!("\n=== After transfer:");
         println!("  Alice: {}", alice["balance"]);
         println!("  Bob:   {}", bob["balance"]);
@@ -3125,16 +3322,25 @@ mod tests {
         assert_eq!(bob["balance"], 350);
 
         // ── 5. Call the procedure (insufficient funds → abort) ─────
-        let err = db.call_procedure("transfer_funds", json!({
-            "from_account": "ACC001",
-            "to_account": "ACC002",
-            "amount": 9999
-        }));
+        let err = db.call_procedure(
+            "transfer_funds",
+            json!({
+                "from_account": "ACC001",
+                "to_account": "ACC002",
+                "amount": 9999
+            }),
+        );
         println!("\n=== Insufficient funds error: {}", err.unwrap_err());
 
         // Verify balances unchanged after abort
-        let alice = db.find_one("accounts", &json!({"account_id": "ACC001"})).unwrap().unwrap();
-        let bob = db.find_one("accounts", &json!({"account_id": "ACC002"})).unwrap().unwrap();
+        let alice = db
+            .find_one("accounts", &json!({"account_id": "ACC001"}))
+            .unwrap()
+            .unwrap();
+        let bob = db
+            .find_one("accounts", &json!({"account_id": "ACC002"}))
+            .unwrap()
+            .unwrap();
         println!("  Alice still: {}", alice["balance"]);
         println!("  Bob still:   {}", bob["balance"]);
         assert_eq!(alice["balance"], 350);
@@ -3152,15 +3358,27 @@ mod tests {
         let db = temp_db();
 
         // Seed: users with different ages and membership tiers
-        db.insert("users", json!({
-            "name": "Alice", "age": 25, "tier": "gold", "balance": 1000
-        })).unwrap();
-        db.insert("users", json!({
-            "name": "Bob", "age": 16, "tier": "silver", "balance": 500
-        })).unwrap();
-        db.insert("users", json!({
-            "name": "Charlie", "age": 30, "tier": "bronze", "balance": 50
-        })).unwrap();
+        db.insert(
+            "users",
+            json!({
+                "name": "Alice", "age": 25, "tier": "gold", "balance": 1000
+            }),
+        )
+        .unwrap();
+        db.insert(
+            "users",
+            json!({
+                "name": "Bob", "age": 16, "tier": "silver", "balance": 500
+            }),
+        )
+        .unwrap();
+        db.insert(
+            "users",
+            json!({
+                "name": "Charlie", "age": 30, "tier": "bronze", "balance": 50
+            }),
+        )
+        .unwrap();
 
         // A procedure that classifies a user's discount based on nested rules:
         //   - if age < 18 → "minor_not_eligible"
@@ -3242,19 +3460,25 @@ mod tests {
         })).unwrap();
 
         // Alice: age 25, gold, balance 1000 → gold_high_balance (30%)
-        let r = db.call_procedure("calc_discount", json!({"username": "Alice"})).unwrap();
+        let r = db
+            .call_procedure("calc_discount", json!({"username": "Alice"}))
+            .unwrap();
         println!("\nAlice: {}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["discount"], 30);
         assert_eq!(r["reason"], "gold_high_balance");
 
         // Bob: age 16 → minor_not_eligible (0%)
-        let r = db.call_procedure("calc_discount", json!({"username": "Bob"})).unwrap();
+        let r = db
+            .call_procedure("calc_discount", json!({"username": "Bob"}))
+            .unwrap();
         println!("\nBob: {}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["discount"], 0);
         assert_eq!(r["reason"], "minor_not_eligible");
 
         // Charlie: age 30, bronze, balance 50 → standard_low_balance (5%)
-        let r = db.call_procedure("calc_discount", json!({"username": "Charlie"})).unwrap();
+        let r = db
+            .call_procedure("calc_discount", json!({"username": "Charlie"}))
+            .unwrap();
         println!("\nCharlie: {}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["discount"], 5);
         assert_eq!(r["reason"], "standard_low_balance");
@@ -3271,8 +3495,10 @@ mod tests {
     #[test]
     fn in_memory_insert_find() {
         let db = mem_db();
-        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
-        db.insert("users", json!({"name": "Bob", "age": 25})).unwrap();
+        db.insert("users", json!({"name": "Alice", "age": 30}))
+            .unwrap();
+        db.insert("users", json!({"name": "Bob", "age": 25}))
+            .unwrap();
 
         let docs = db.find("users", &json!({})).unwrap();
         assert_eq!(docs.len(), 2);
@@ -3285,9 +3511,15 @@ mod tests {
     #[test]
     fn in_memory_update_delete() {
         let db = mem_db();
-        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
+        db.insert("users", json!({"name": "Alice", "age": 30}))
+            .unwrap();
 
-        db.update("users", &json!({"name": "Alice"}), &json!({"$set": {"age": 31}})).unwrap();
+        db.update(
+            "users",
+            &json!({"name": "Alice"}),
+            &json!({"$set": {"age": 31}}),
+        )
+        .unwrap();
         let docs = db.find("users", &json!({"name": "Alice"})).unwrap();
         assert_eq!(docs[0]["age"], 31);
 
@@ -3315,10 +3547,14 @@ mod tests {
     fn in_memory_indexes() {
         let db = mem_db();
         db.create_index("users", "email").unwrap();
-        db.insert("users", json!({"name": "Alice", "email": "alice@test.com"})).unwrap();
-        db.insert("users", json!({"name": "Bob", "email": "bob@test.com"})).unwrap();
+        db.insert("users", json!({"name": "Alice", "email": "alice@test.com"}))
+            .unwrap();
+        db.insert("users", json!({"name": "Bob", "email": "bob@test.com"}))
+            .unwrap();
 
-        let docs = db.find("users", &json!({"email": "alice@test.com"})).unwrap();
+        let docs = db
+            .find("users", &json!({"email": "alice@test.com"}))
+            .unwrap();
         assert_eq!(docs.len(), 1);
         assert_eq!(docs[0]["name"], "Alice");
     }
@@ -3341,7 +3577,8 @@ mod tests {
         db.insert("users", json!({"name": "Existing"})).unwrap();
 
         let tx = db.begin_transaction();
-        db.tx_insert(tx, "users", json!({"name": "Temporary"})).unwrap();
+        db.tx_insert(tx, "users", json!({"name": "Temporary"}))
+            .unwrap();
         db.rollback_transaction(tx).unwrap();
 
         let docs = db.find("users", &json!({})).unwrap();
@@ -3362,7 +3599,8 @@ mod tests {
     fn in_memory_ttl_eviction() {
         let db = mem_db();
         // Insert a doc with 0-second TTL (expires immediately)
-        db.insert("cache", json!({"key": "session", "_ttl": 0})).unwrap();
+        db.insert("cache", json!({"key": "session", "_ttl": 0}))
+            .unwrap();
         // Insert a doc without TTL
         db.insert("cache", json!({"key": "permanent"})).unwrap();
 
@@ -3408,11 +3646,16 @@ mod tests {
         // Insert a doc with a timestamp 5 seconds in the past (should be expired)
         let past = chrono::Utc::now() - chrono::Duration::seconds(5);
         let past_str = past.to_rfc3339();
-        db.insert("sessions", json!({"user": "expired", "created_at": past_str})).unwrap();
+        db.insert(
+            "sessions",
+            json!({"user": "expired", "created_at": past_str}),
+        )
+        .unwrap();
 
         // Insert a doc with current timestamp (should survive)
         let now_str = chrono::Utc::now().to_rfc3339();
-        db.insert("sessions", json!({"user": "active", "created_at": now_str})).unwrap();
+        db.insert("sessions", json!({"user": "active", "created_at": now_str}))
+            .unwrap();
 
         // Both exist before eviction
         let docs = db.find("sessions", &json!({})).unwrap();
@@ -3439,7 +3682,8 @@ mod tests {
 
         // Insert a doc with current timestamp — should NOT be evicted
         let now_str = chrono::Utc::now().to_rfc3339();
-        db.insert("cache", json!({"key": "fresh", "ts": now_str})).unwrap();
+        db.insert("cache", json!({"key": "fresh", "ts": now_str}))
+            .unwrap();
 
         {
             let col = db.get_or_create_collection("cache").unwrap();
@@ -3490,10 +3734,18 @@ mod tests {
 
             // Insert an already-expired doc (5s ago, TTL=2s)
             let past = chrono::Utc::now() - chrono::Duration::seconds(5);
-            db.insert("sessions", json!({"user": "old", "created_at": past.to_rfc3339()})).unwrap();
+            db.insert(
+                "sessions",
+                json!({"user": "old", "created_at": past.to_rfc3339()}),
+            )
+            .unwrap();
 
             // Insert a fresh doc
-            db.insert("sessions", json!({"user": "new", "created_at": chrono::Utc::now().to_rfc3339()})).unwrap();
+            db.insert(
+                "sessions",
+                json!({"user": "new", "created_at": chrono::Utc::now().to_rfc3339()}),
+            )
+            .unwrap();
 
             // Flush to disk
             let col = db.get_or_create_collection("sessions").unwrap();
@@ -3530,8 +3782,13 @@ mod tests {
         let db = mem_db();
         // Insert already-expired docs BEFORE creating the TTL index
         let past = chrono::Utc::now() - chrono::Duration::seconds(10);
-        db.insert("events", json!({"type": "old", "at": past.to_rfc3339()})).unwrap();
-        db.insert("events", json!({"type": "current", "at": chrono::Utc::now().to_rfc3339()})).unwrap();
+        db.insert("events", json!({"type": "old", "at": past.to_rfc3339()}))
+            .unwrap();
+        db.insert(
+            "events",
+            json!({"type": "current", "at": chrono::Utc::now().to_rfc3339()}),
+        )
+        .unwrap();
 
         // Creating the TTL index should immediately evict the old doc
         db.create_ttl_index("events", "at", 5).unwrap();
@@ -3555,7 +3812,6 @@ mod tests {
         // Insert a doc so the collection materialises a .btree on disk.
         db.insert("orphans", json!({"x": 1})).unwrap();
 
-
         // Make .btree a FILE (the legacy single-page layout). We do
         // this by removing whatever the engine wrote, then touching an
         // empty file with the same name — drop_collection should still
@@ -3567,10 +3823,17 @@ mod tests {
             std::fs::remove_file(&btree).unwrap();
         }
         std::fs::write(&btree, b"").unwrap();
-        assert!(btree.exists() && !btree.is_dir(), "preflight: .btree should be a file");
+        assert!(
+            btree.exists() && !btree.is_dir(),
+            "preflight: .btree should be a file"
+        );
 
-        db.drop_collection("orphans").expect("drop_collection on a .btree file shape should succeed");
-        assert!(!btree.exists(), ".btree file should be removed by drop_collection");
+        db.drop_collection("orphans")
+            .expect("drop_collection on a .btree file shape should succeed");
+        assert!(
+            !btree.exists(),
+            ".btree file should be removed by drop_collection"
+        );
     }
 
     /// Companion: the directory-shape `.btree` (multi-page snapshot)
@@ -3594,7 +3857,11 @@ mod tests {
         std::fs::write(btree.join("page-0000"), b"").unwrap();
         assert!(btree.is_dir(), "preflight: .btree should be a directory");
 
-        db.drop_collection("dirty").expect("drop_collection on a .btree dir shape should succeed");
-        assert!(!btree.exists(), ".btree dir should be removed by drop_collection");
+        db.drop_collection("dirty")
+            .expect("drop_collection on a .btree dir shape should succeed");
+        assert!(
+            !btree.exists(),
+            ".btree dir should be removed by drop_collection"
+        );
     }
 }

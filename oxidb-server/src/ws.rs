@@ -23,19 +23,20 @@
 //! ```
 
 use std::collections::HashMap;
-use std::io::{BufReader, BufRead, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine as _;
+use serde_json::{Value, json};
 use sha1::Digest;
-use serde_json::{json, Value};
 
-use oxidb::OxiDb;
-use oxidb::change_stream::{WatchFilter, WatchHandle, SubscriberId};
+use crate::auth;
 use crate::jwt;
+use oxidb::OxiDb;
+use oxidb::change_stream::{SubscriberId, WatchFilter, WatchHandle};
 
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
@@ -51,11 +52,17 @@ struct WsState {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-pub fn start_ws_listener(addr: &str, db: Arc<OxiDb>, jwt_secret: Option<String>) -> std::thread::JoinHandle<()> {
+pub fn start_ws_listener(
+    addr: &str,
+    db: Arc<OxiDb>,
+    jwt_secret: Option<String>,
+) -> std::thread::JoinHandle<()> {
     let listener = TcpListener::bind(addr).expect("failed to bind WebSocket listener");
 
     if jwt_secret.is_some() {
-        eprintln!("[ws] JWT authentication enabled (send {{\"cmd\":\"auth\",\"token\":\"...\"}} first)");
+        eprintln!(
+            "[ws] JWT authentication enabled (send {{\"cmd\":\"auth\",\"token\":\"...\"}} first)"
+        );
     }
 
     let state = Arc::new(WsState {
@@ -72,25 +79,27 @@ pub fn start_ws_listener(addr: &str, db: Arc<OxiDb>, jwt_secret: Option<String>)
         let state = Arc::clone(&state);
         std::thread::Builder::new()
             .name(format!("ws-worker-{i}"))
-            .spawn(move || loop {
-                let stream = match rx.lock().unwrap().recv() {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                state.active.fetch_add(1, Ordering::Relaxed);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_connection(stream, &state);
-                }));
-                state.active.fetch_sub(1, Ordering::Relaxed);
-                if let Err(e) = result {
-                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = e.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "unknown panic".to_string()
+            .spawn(move || {
+                loop {
+                    let stream = match rx.lock().unwrap().recv() {
+                        Ok(s) => s,
+                        Err(_) => return,
                     };
-                    eprintln!("[ws] handler panicked: {msg}");
+                    state.active.fetch_add(1, Ordering::Relaxed);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_connection(stream, &state);
+                    }));
+                    state.active.fetch_sub(1, Ordering::Relaxed);
+                    if let Err(e) = result {
+                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        eprintln!("[ws] handler panicked: {msg}");
+                    }
                 }
             })
             .expect("failed to spawn ws worker");
@@ -160,14 +169,12 @@ fn do_handshake(stream: &mut TcpStream) -> bool {
     // Phase 2 (ADR-0003): negotiate Sec-WebSocket-Protocol. Server advertises
     // `oxidb.v1` as the 1.0 stable subprotocol. Clients that don't offer it
     // still connect (no subprotocol header in the response — backward compat).
-    let chosen_subprotocol = headers
-        .get("sec-websocket-protocol")
-        .and_then(|hdr| {
-            hdr.split(',')
-                .map(|s| s.trim())
-                .find(|p| SUPPORTED_WS_SUBPROTOCOLS.contains(p))
-                .map(|s| s.to_string())
-        });
+    let chosen_subprotocol = headers.get("sec-websocket-protocol").and_then(|hdr| {
+        hdr.split(',')
+            .map(|s| s.trim())
+            .find(|p| SUPPORTED_WS_SUBPROTOCOLS.contains(p))
+            .map(|s| s.to_string())
+    });
 
     let subprotocol_line = match &chosen_subprotocol {
         Some(p) => format!("Sec-WebSocket-Protocol: {p}\r\n"),
@@ -298,6 +305,11 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
 
     // JWT auth: if enabled, require {"cmd": "auth", "token": "..."} as first message
     let mut authenticated = state.jwt_secret.is_none(); // open if no secret
+    // The caller's role is enforced on every mutating command below. `None`
+    // means auth is disabled (open mode). When auth is on, the role from the
+    // verified token governs which commands are permitted — without this, a
+    // `read` token could insert/update/delete.
+    let mut enforced_role: Option<auth::Role> = None;
     if !authenticated {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
         match read_frame(&mut stream) {
@@ -308,12 +320,22 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
                             if let Some(token) = cmd["token"].as_str() {
                                 if let Some(ref secret) = state.jwt_secret {
                                     match jwt::verify(token, secret) {
-                                        Ok(_claims) => {
+                                        Ok(claims) => {
                                             authenticated = true;
-                                            let _ = send_json(&mut stream, &json!({"ok": true, "data": "authenticated"}));
+                                            enforced_role = Some(
+                                                auth::Role::from_str(&claims.role)
+                                                    .unwrap_or(auth::Role::Read),
+                                            );
+                                            let _ = send_json(
+                                                &mut stream,
+                                                &json!({"ok": true, "data": "authenticated"}),
+                                            );
                                         }
                                         Err(e) => {
-                                            let _ = send_json(&mut stream, &json!({"ok": false, "error": e}));
+                                            let _ = send_json(
+                                                &mut stream,
+                                                &json!({"ok": false, "error": e}),
+                                            );
                                             return;
                                         }
                                     }
@@ -326,7 +348,10 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
             _ => {}
         }
         if !authenticated {
-            let _ = send_json(&mut stream, &json!({"ok": false, "error": "auth required: send {\"cmd\":\"auth\",\"token\":\"...\"}"}));
+            let _ = send_json(
+                &mut stream,
+                &json!({"ok": false, "error": "auth required: send {\"cmd\":\"auth\",\"token\":\"...\"}"}),
+            );
             return;
         }
         let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
@@ -341,7 +366,7 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
                 // Text frame — parse JSON command
                 if let Ok(text) = std::str::from_utf8(&payload) {
                     if let Ok(cmd) = serde_json::from_str::<Value>(text) {
-                        let resp = handle_command(&cmd, state, &mut subscriptions);
+                        let resp = handle_command(&cmd, state, &mut subscriptions, enforced_role);
                         if !send_json(&mut stream, &resp) {
                             break;
                         }
@@ -363,8 +388,9 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
                 // by attempting a zero-length peek
                 let mut peek = [0u8; 1];
                 match stream.peek(&mut peek) {
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
                     Err(_) => break, // connection closed
                     Ok(0) => break,  // EOF
                     Ok(_) => {}      // data available, will read next iteration
@@ -443,15 +469,28 @@ fn handle_command(
     cmd: &Value,
     state: &WsState,
     subs: &mut HashMap<String, Subscription>,
+    role: Option<auth::Role>,
 ) -> Value {
     let cmd_name = cmd["cmd"].as_str().unwrap_or("");
+
+    // Authorization gate: when auth is enabled, mutating commands require a
+    // ReadWrite (or Admin) role. Read-only commands are allowed for any role.
+    if let Some(role) = role {
+        let is_mutating = matches!(cmd_name, "insert" | "update" | "delete");
+        if is_mutating && role == auth::Role::Read {
+            return json!({"ok": false, "error": "insufficient privileges: write operations require readWrite or admin"});
+        }
+    }
 
     match cmd_name {
         "ping" => json!({"ok": true, "data": "pong"}),
 
         "subscribe" => {
             let sub_id = cmd["id"].as_str().unwrap_or("default").to_string();
-            let collection = cmd.get("collection").and_then(|v| v.as_str()).map(String::from);
+            let collection = cmd
+                .get("collection")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             let query = cmd.get("query").cloned();
 
             let filter = match &collection {
@@ -462,11 +501,14 @@ fn handle_command(
             match state.db.watch(filter, None) {
                 Ok(handle) => {
                     let wh_id = handle.id;
-                    subs.insert(sub_id.clone(), Subscription {
-                        handle,
-                        collection,
-                        query,
-                    });
+                    subs.insert(
+                        sub_id.clone(),
+                        Subscription {
+                            handle,
+                            collection,
+                            query,
+                        },
+                    );
                     json!({"ok": true, "data": {"subscribed": sub_id, "watch_id": wh_id}})
                 }
                 Err(e) => json!({"ok": false, "error": format!("{e}")}),
@@ -577,7 +619,6 @@ fn handle_command(
         }
 
         // (`sql` cmd removed alongside the SQL surface.)
-
         _ => json!({"ok": false, "error": format!("unknown command: {cmd_name}")}),
     }
 }

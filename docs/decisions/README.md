@@ -36,3 +36,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0004](0004-phase-0-answers.md) | Release policy: Phase 0 answers (promotion criteria, LTS, cadence, client tiering, DSL stability) | Accepted |
 | [0005](0005-raft-fault-injection-scope.md) | Raft / HA fault-injection — what exists, what's missing for full Jepsen-grade | Accepted |
 | [0006](0006-cern-testing-gap-estimates.md) | Effort estimates for remaining CERN-grade testing gaps across categories 1, 2, 3, 5, 6, 7, 8 | Accepted |
+| [0007](0007-wal-commit-record-atomic-recovery.md) | In-WAL commit record for atomic transaction recovery | Proposed |
