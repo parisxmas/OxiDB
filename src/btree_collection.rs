@@ -22,25 +22,25 @@ use serde_json::Value;
 
 use crate::btree_storage::BTreeStorage;
 use crate::codec;
-use crate::collection::{CompactStats, IndexInfo, IndexMetadata, resolve_field_in_value};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::collection::load_index_metadata;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::index_persist;
-use crate::in_memory::WalBackend;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::wal::Wal;
-use crate::wal::WalEntry;
+use crate::collection::{CompactStats, IndexInfo, IndexMetadata, resolve_field_in_value};
 use crate::doc_bytes_cache::DocBytesCache;
 use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
 use crate::fts::CollectionTextIndex;
+use crate::in_memory::WalBackend;
 use crate::index::CompositeIndex;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::index_persist;
 use crate::paged_field_index::PagedFieldIndex;
 use crate::query::{self, FindOptions, Query, SortOrder};
 use crate::value::IndexValue;
 use crate::vector::{DistanceMetric, VectorIndex};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::wal::Wal;
+use crate::wal::WalEntry;
 
 /// A B-tree-native collection that stores documents directly in a `BTreeStorage`.
 ///
@@ -55,17 +55,42 @@ pub struct TtlIndexConfig {
     pub expire_after_seconds: u64,
 }
 
+/// Resident memory breakdown for a single collection (see
+/// [`BTreeCollection::memory_report`]). All figures are bytes computed from the
+/// live data structures, independent of process RSS / allocator retention.
+#[derive(Debug, Clone, Copy)]
+pub struct CollectionMemory {
+    /// Number of live documents resident in the in-RAM primary store.
+    pub storage_entries: usize,
+    /// Sum of encoded document payload bytes held resident in the primary store.
+    pub storage_payload: usize,
+    /// Estimated per-entry container overhead of the primary store.
+    pub storage_overhead: usize,
+    /// Resident bytes across all single-field indexes.
+    pub field_index_bytes: usize,
+    /// Resident bytes across all composite indexes.
+    pub composite_index_bytes: usize,
+}
+
+impl CollectionMemory {
+    /// Total resident bytes attributable to this collection's primary store
+    /// plus indexes (excludes the LRU caches).
+    pub fn total(&self) -> usize {
+        self.storage_payload + self.storage_overhead + self.field_index_bytes + self.composite_index_bytes
+    }
+}
+
 pub struct BTreeCollection {
     #[allow(dead_code)]
     name: String,
     #[allow(dead_code)]
     data_dir: PathBuf,
-    storage: BTreeStorage,                                     // Already thread-safe (scc::HashMap)
+    storage: BTreeStorage, // Already thread-safe (scc::HashMap)
     field_indexes: RwLock<HashMap<String, PagedFieldIndex>>,
     composite_indexes: RwLock<Vec<CompositeIndex>>,
     text_index: RwLock<Option<CollectionTextIndex>>,
     vector_indexes: RwLock<HashMap<String, VectorIndex>>,
-    doc_cache: DocCache,                                       // Already thread-safe
+    doc_cache: DocCache, // Already thread-safe
     /// Sibling of `doc_cache` that holds OxiWire-encoded bytes per doc.
     /// Populated lazily by the wire-output path (and explicitly on insert)
     /// so a `find` that ships docs to the client can `memcpy` instead of
@@ -73,7 +98,7 @@ pub struct BTreeCollection {
     /// `Arc<Value>`, so this cache can be sized ~7× larger for the same
     /// RAM footprint. See [`crate::doc_bytes_cache`] for sizing rationale.
     bytes_cache: DocBytesCache,
-    next_id: AtomicU64,                                        // Already atomic
+    next_id: AtomicU64, // Already atomic
     #[allow(dead_code)]
     in_memory: bool,
     ttl_index: Mutex<std::collections::BTreeMap<u64, Vec<DocumentId>>>,
@@ -97,7 +122,11 @@ pub struct BTreeCollection {
 
 impl BTreeCollection {
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn open(name: &str, data_dir: &Path, encryption: Option<std::sync::Arc<crate::EncryptionKey>>) -> Result<Self> {
+    pub fn open(
+        name: &str,
+        data_dir: &Path,
+        encryption: Option<std::sync::Arc<crate::EncryptionKey>>,
+    ) -> Result<Self> {
         Self::open_with_sequencer(name, data_dir, encryption, None)
     }
 
@@ -120,7 +149,9 @@ impl BTreeCollection {
         let wal_backend = WalBackend::File(wal);
         if replayed > 0 {
             storage.persist()?;
-            if let WalBackend::File(ref w) = wal_backend { w.checkpoint_no_sync()?; }
+            if let WalBackend::File(ref w) = wal_backend {
+                w.checkpoint_no_sync()?;
+            }
         }
 
         // Determine next_id by scanning the tree for the max key
@@ -159,7 +190,9 @@ impl BTreeCollection {
                 if info.index_type == "field" || info.index_type == "unique" {
                     let field = &info.fields[0];
                     let mut idx = PagedFieldIndex::new(field.clone());
-                    if info.unique { idx.unique = true; }
+                    if info.unique {
+                        idx.unique = true;
+                    }
                     // Build index by scanning all docs
                     let mut pairs: Vec<(IndexValue, DocumentId)> = Vec::new();
                     storage.scan_all_while(|id, bytes| {
@@ -182,7 +215,8 @@ impl BTreeCollection {
 
         let cidx_path = data_dir.join(format!("{}.cidx", name));
         let composite_indexes = if !persisted_indexes.is_empty() {
-            let loaded = index_persist::load_composite_indexes(&cidx_path, doc_count, max_id + 1, None);
+            let loaded =
+                index_persist::load_composite_indexes(&cidx_path, doc_count, max_id + 1, None);
             loaded.unwrap_or_default()
         } else {
             Vec::new()
@@ -276,8 +310,12 @@ impl BTreeCollection {
         let mut count = 0usize;
         for entry in entries {
             match entry {
-                WalEntry::Insert { doc_id, doc_bytes, .. }
-                | WalEntry::Update { doc_id, doc_bytes, .. } => {
+                WalEntry::Insert {
+                    doc_id, doc_bytes, ..
+                }
+                | WalEntry::Update {
+                    doc_id, doc_bytes, ..
+                } => {
                     storage.insert(*doc_id, doc_bytes.clone());
                     count += 1;
                 }
@@ -335,6 +373,30 @@ impl BTreeCollection {
     /// Snapshot of (hits, misses) on the per-collection bytes cache.
     pub fn bytes_cache_stats(&self) -> crate::doc_bytes_cache::BytesCacheStats {
         self.bytes_cache.stats()
+    }
+
+    /// Resident memory breakdown for this collection, computed by walking the
+    /// live structures (allocator-independent — unlike process RSS, which is
+    /// inflated by transient high-water marks the OS hasn't reclaimed).
+    pub fn memory_report(&self) -> CollectionMemory {
+        let storage_entries = self.storage.count();
+        let storage_payload = self.storage.total_bytes() as usize;
+        // Per-entry overhead in the scc::HashMap<u64, Vec<u8>>: 8-byte key, the
+        // 24-byte Vec header stored in the slot, plus bucket bookkeeping.
+        let storage_overhead = storage_entries * (8 + 24 + 16);
+
+        let field_index_bytes: usize =
+            self.field_indexes.read().values().map(|i| i.memory_bytes()).sum();
+        let composite_index_bytes: usize =
+            self.composite_indexes.read().iter().map(|c| c.memory_bytes()).sum();
+
+        CollectionMemory {
+            storage_entries,
+            storage_payload,
+            storage_overhead,
+            field_index_bytes,
+            composite_index_bytes,
+        }
     }
 
     /// Encode a Value to OxiWire bytes and pre-populate the bytes cache.
@@ -452,7 +514,10 @@ impl BTreeCollection {
     /// top-level `$eq` conditions (no extra conditions, no non-eq ops),
     /// build the prefix and look up via `find_prefix`. Returns `None`
     /// otherwise so the caller can try the single-field path.
-    fn try_composite_lookup(&self, query: &Query) -> Option<std::collections::BTreeSet<DocumentId>> {
+    fn try_composite_lookup(
+        &self,
+        query: &Query,
+    ) -> Option<std::collections::BTreeSet<DocumentId>> {
         let eq_conditions = query::extract_eq_conditions(query)?;
         // The query must be eq-only — no $gt/$in/etc. mixed in. We can't
         // catch mixed conditions just from extract_eq_conditions because
@@ -541,7 +606,9 @@ impl BTreeCollection {
     // Accessor methods (matching Collection API)
     // -----------------------------------------------------------------------
 
-    pub fn field_indexes(&self) -> crate::locks::RwLockReadGuard<'_, HashMap<String, PagedFieldIndex>> {
+    pub fn field_indexes(
+        &self,
+    ) -> crate::locks::RwLockReadGuard<'_, HashMap<String, PagedFieldIndex>> {
         self.field_indexes.read()
     }
 
@@ -553,7 +620,9 @@ impl BTreeCollection {
         self.text_index.read().is_some()
     }
 
-    pub fn vector_indexes(&self) -> crate::locks::RwLockReadGuard<'_, HashMap<String, VectorIndex>> {
+    pub fn vector_indexes(
+        &self,
+    ) -> crate::locks::RwLockReadGuard<'_, HashMap<String, VectorIndex>> {
         self.vector_indexes.read()
     }
 
@@ -573,7 +642,13 @@ impl BTreeCollection {
             }
             let fidx_path = self.data_dir.join(format!("{}.fidx", self.name));
             let field_refs: Vec<&PagedFieldIndex> = fi.values().collect();
-            let _ = index_persist::save_field_indexes(&fidx_path, &field_refs, doc_count, next_id, None);
+            let _ = index_persist::save_field_indexes(
+                &fidx_path,
+                &field_refs,
+                doc_count,
+                next_id,
+                None,
+            );
         }
 
         // Save composite indexes
@@ -582,7 +657,9 @@ impl BTreeCollection {
             if !ci.is_empty() {
                 let cidx_path = self.data_dir.join(format!("{}.cidx", self.name));
                 let comp_refs: Vec<&CompositeIndex> = ci.iter().collect();
-                let _ = index_persist::save_composite_indexes(&cidx_path, &comp_refs, doc_count, next_id, None);
+                let _ = index_persist::save_composite_indexes(
+                    &cidx_path, &comp_refs, doc_count, next_id, None,
+                );
             }
         }
     }
@@ -775,7 +852,11 @@ impl BTreeCollection {
 
         // WAL log before mutation. Single-doc insert uses the helper
         // so per-commit fsync follows the lazy_sync flag.
-        self.wal_log(&WalEntry::Insert { doc_id: id, doc_bytes: bytes.clone(), tx_id: 0 })?;
+        self.wal_log(&WalEntry::Insert {
+            doc_id: id,
+            doc_bytes: bytes.clone(),
+            tx_id: 0,
+        })?;
 
         // Insert directly into B-tree (the B-tree IS the storage)
         self.storage.insert(id, bytes);
@@ -854,16 +935,21 @@ impl BTreeCollection {
 
         // Unique constraint check (only when needed)
         if has_unique {
-            let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
+            let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> =
+                HashMap::new();
             for (id, data) in &docs_with_ids {
                 Self::check_unique_constraints_with(&fi, data, None)?;
                 for idx in fi.values() {
-                    if !idx.unique { continue; }
+                    if !idx.unique {
+                        continue;
+                    }
                     if let Some(value) = resolve_field_in_value(data, &idx.field) {
                         let iv = IndexValue::from_json(value);
                         let field_map = pending_unique.entry(idx.field.clone()).or_default();
                         if field_map.contains_key(&iv) {
-                            return Err(Error::UniqueViolation { field: idx.field.clone() });
+                            return Err(Error::UniqueViolation {
+                                field: idx.field.clone(),
+                            });
                         }
                         field_map.insert(iv, *id);
                     }
@@ -874,16 +960,19 @@ impl BTreeCollection {
         // Parallel JSONB encode (sequential on wasm32)
         #[cfg(not(target_arch = "wasm32"))]
         let btree_entries: Vec<(u64, Vec<u8>)> = if doc_count > 500 {
-            docs_with_ids.par_iter()
+            docs_with_ids
+                .par_iter()
                 .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
                 .collect()
         } else {
-            docs_with_ids.iter()
+            docs_with_ids
+                .iter()
                 .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
                 .collect()
         };
         #[cfg(target_arch = "wasm32")]
-        let btree_entries: Vec<(u64, Vec<u8>)> = docs_with_ids.iter()
+        let btree_entries: Vec<(u64, Vec<u8>)> = docs_with_ids
+            .iter()
             .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
             .collect();
 
@@ -894,7 +983,10 @@ impl BTreeCollection {
         }
         let ids: Vec<DocumentId> = btree_entries.iter().map(|(id, _)| *id).collect();
         {
-            let wal_refs: Vec<(u64, &[u8])> = btree_entries.iter().map(|(id, b)| (*id, b.as_slice())).collect();
+            let wal_refs: Vec<(u64, &[u8])> = btree_entries
+                .iter()
+                .map(|(id, b)| (*id, b.as_slice()))
+                .collect();
             self.wal.log_batch_inserts_no_sync_buffered(&wal_refs)?;
             // Strict durability: one fsync at the end of the batch
             // covers every record we just appended. Lazy mode skips
@@ -937,7 +1029,8 @@ impl BTreeCollection {
             }
         }
 
-        self.next_id.store(first_id + doc_count as u64, Ordering::SeqCst);
+        self.next_id
+            .store(first_id + doc_count as u64, Ordering::SeqCst);
 
         Ok(ids)
     }
@@ -963,7 +1056,10 @@ impl BTreeCollection {
 
         let mut ids = Vec::with_capacity(prepared.len());
         {
-            let wal_refs: Vec<(u64, &[u8])> = prepared.iter().map(|(id, _, b)| (*id, b.as_slice())).collect();
+            let wal_refs: Vec<(u64, &[u8])> = prepared
+                .iter()
+                .map(|(id, _, b)| (*id, b.as_slice()))
+                .collect();
             self.wal.log_batch_inserts_no_sync_buffered(&wal_refs)?;
             if !self.lazy_sync.load(Ordering::Acquire) {
                 self.wal.sync()?;
@@ -1016,11 +1112,7 @@ impl BTreeCollection {
     }
 
     /// Find documents matching a query with sort/skip/limit options.
-    pub fn find_with_options(
-        &self,
-        query_json: &Value,
-        opts: &FindOptions,
-    ) -> Result<Vec<Value>> {
+    pub fn find_with_options(&self, query_json: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
         let arcs = self.find_with_options_arcs(query_json, opts)?;
         Ok(arcs
             .into_iter()
@@ -1064,17 +1156,19 @@ impl BTreeCollection {
             if sort_fields.len() == 1 {
                 let (sort_field, sort_order) = &sort_fields[0];
                 if let Some(field_idx) = fi.get(sort_field) {
-                    let need = opts.skip.unwrap_or(0) as usize
-                        + opts.limit.unwrap_or(u64::MAX) as usize;
+                    let need =
+                        opts.skip.unwrap_or(0) as usize + opts.limit.unwrap_or(u64::MAX) as usize;
                     let mut results = Vec::new();
                     let skip_filter = matches!(query, Query::All);
 
                     // Extract eq conditions for index-level containment check
                     let eq_checks: Vec<(String, IndexValue)> = if !skip_filter {
                         query::extract_eq_conditions(&query)
-                            .map(|m| m.into_iter()
-                                .filter(|(f, _)| fi.contains_key(f) && f != sort_field)
-                                .collect())
+                            .map(|m| {
+                                m.into_iter()
+                                    .filter(|(f, _)| fi.contains_key(f) && f != sort_field)
+                                    .collect()
+                            })
                             .unwrap_or_default()
                     } else {
                         Vec::new()
@@ -1096,9 +1190,14 @@ impl BTreeCollection {
                         SortOrder::Asc => {
                             'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
                                 for &id in doc_ids {
-                                    if use_index_check && !check_id(id) { continue; }
+                                    if use_index_check && !check_id(id) {
+                                        continue;
+                                    }
                                     if let Some(arc) = self.read_doc_arc(id) {
-                                        if skip_filter || use_index_check || query::matches_value(&query, &arc) {
+                                        if skip_filter
+                                            || use_index_check
+                                            || query::matches_value(&query, &arc)
+                                        {
                                             results.push(arc);
                                             if results.len() >= need {
                                                 break 'outer_asc;
@@ -1111,9 +1210,14 @@ impl BTreeCollection {
                         SortOrder::Desc => {
                             'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
                                 for &id in doc_ids.iter().rev() {
-                                    if use_index_check && !check_id(id) { continue; }
+                                    if use_index_check && !check_id(id) {
+                                        continue;
+                                    }
                                     if let Some(arc) = self.read_doc_arc(id) {
-                                        if skip_filter || use_index_check || query::matches_value(&query, &arc) {
+                                        if skip_filter
+                                            || use_index_check
+                                            || query::matches_value(&query, &arc)
+                                        {
                                             results.push(arc);
                                             if results.len() >= need {
                                                 break 'outer_desc;
@@ -1222,32 +1326,24 @@ impl BTreeCollection {
 
         // Try lazy index iteration for limit queries
         if let Some(limit) = early_limit {
-            let lazy_result = query::execute_indexed_lazy(
-                &query,
-                &fi,
-                &mut |id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            results.push(arc);
-                            if results.len() >= limit {
-                                return false;
-                            }
+            let lazy_result = query::execute_indexed_lazy(&query, &fi, &mut |id| {
+                if let Some(arc) = self.load_doc_arc(id) {
+                    if skip_post_filter || query::matches_value(&query, &arc) {
+                        results.push(arc);
+                        if results.len() >= limit {
+                            return false;
                         }
                     }
-                    true
-                },
-            );
+                }
+                true
+            });
             if lazy_result.is_some() {
                 return Ok(results);
             }
         }
 
         let ci = self.composite_indexes.read();
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &fi,
-            &ci,
-        );
+        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
         drop(ci);
 
         if let Some(ref indexed_ids) = candidate_ids {
@@ -1285,7 +1381,9 @@ impl BTreeCollection {
                 // Full scan — collect doc_ids then parallel filter
                 let doc_ids: Vec<u64> = {
                     let mut ids = Vec::new();
-                    self.storage.scan_keys(|k| { ids.push(k); });
+                    self.storage.scan_keys(|k| {
+                        ids.push(k);
+                    });
                     ids
                 };
                 // Filter closure: try the partial-JSONB matcher first so
@@ -1335,10 +1433,8 @@ impl BTreeCollection {
                     .filter_map(|&id| filter_one(id))
                     .collect();
                 #[cfg(target_arch = "wasm32")]
-                let matched: Vec<Arc<Value>> = doc_ids
-                    .iter()
-                    .filter_map(|&id| filter_one(id))
-                    .collect();
+                let matched: Vec<Arc<Value>> =
+                    doc_ids.iter().filter_map(|&id| filter_one(id)).collect();
                 results = matched;
             }
 
@@ -1393,19 +1489,15 @@ impl BTreeCollection {
         // Try lazy index path first
         if !matches!(query, Query::All) {
             let mut found: Option<Value> = None;
-            let lazy_result = query::execute_indexed_lazy(
-                &query,
-                &fi,
-                &mut |id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            found = Some((*arc).clone());
-                            return false;
-                        }
+            let lazy_result = query::execute_indexed_lazy(&query, &fi, &mut |id| {
+                if let Some(arc) = self.load_doc_arc(id) {
+                    if skip_post_filter || query::matches_value(&query, &arc) {
+                        found = Some((*arc).clone());
+                        return false;
                     }
-                    true
-                },
-            );
+                }
+                true
+            });
             if lazy_result.is_some() {
                 return Ok(found);
             }
@@ -1414,11 +1506,7 @@ impl BTreeCollection {
         // Fallback: index or cursor scan
         let candidate_ids = if !matches!(query, Query::All) {
             let ci = self.composite_indexes.read();
-            query::execute_indexed(
-                &query,
-                &fi,
-                &ci,
-            )
+            query::execute_indexed(&query, &fi, &ci)
         } else {
             None
         };
@@ -1550,23 +1638,19 @@ impl BTreeCollection {
             if limit.is_some() {
                 let skip_post_filter = query::is_fully_indexed(&query, &fi);
                 let lim = limit.unwrap();
-                let lazy_result = query::execute_indexed_lazy(
-                    &query,
-                    &fi,
-                    &mut |id| {
-                        if self.storage.contains_key(id) {
-                            if let Some(arc) = self.load_doc_arc(id) {
-                                if skip_post_filter || query::matches_value(&query, &arc) {
-                                    matches.push((id, (*arc).clone()));
-                                    if matches.len() >= lim {
-                                        return false;
-                                    }
+                let lazy_result = query::execute_indexed_lazy(&query, &fi, &mut |id| {
+                    if self.storage.contains_key(id) {
+                        if let Some(arc) = self.load_doc_arc(id) {
+                            if skip_post_filter || query::matches_value(&query, &arc) {
+                                matches.push((id, (*arc).clone()));
+                                if matches.len() >= lim {
+                                    return false;
                                 }
                             }
                         }
-                        true
-                    },
-                );
+                    }
+                    true
+                });
                 if lazy_result.is_some() {
                     lazy_handled = true;
                 }
@@ -1574,11 +1658,7 @@ impl BTreeCollection {
 
             if !lazy_handled {
                 let ci = self.composite_indexes.read();
-                let candidate_ids = query::execute_indexed(
-                    &query,
-                    &fi,
-                    &ci,
-                );
+                let candidate_ids = query::execute_indexed(&query, &fi, &ci);
                 drop(ci);
 
                 if let Some(ref indexed_ids) = candidate_ids {
@@ -1648,10 +1728,7 @@ impl BTreeCollection {
 
             crate::update::apply_update(&mut data, update_json)?;
 
-            let old_version = data
-                .get("_version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+            let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
             let new_version = old_version + 1;
             if let Some(obj) = data.as_object_mut() {
                 obj.insert("_version".to_string(), Value::Number(new_version.into()));
@@ -1686,7 +1763,14 @@ impl BTreeCollection {
         }
 
         {
-            let wal_entries: Vec<WalEntry> = ops.iter().map(|op| WalEntry::Update { doc_id: op.id, doc_bytes: op.new_bytes.clone(), tx_id: 0 }).collect();
+            let wal_entries: Vec<WalEntry> = ops
+                .iter()
+                .map(|op| WalEntry::Update {
+                    doc_id: op.id,
+                    doc_bytes: op.new_bytes.clone(),
+                    tx_id: 0,
+                })
+                .collect();
             self.wal_log_batch(&wal_entries)?;
         }
 
@@ -1856,11 +1940,7 @@ impl BTreeCollection {
     // -----------------------------------------------------------------------
 
     /// Delete documents matching a query. Returns IDs of deleted documents.
-    pub fn delete(
-        &self,
-        query_json: &Value,
-        limit: Option<usize>,
-    ) -> Result<Vec<DocumentId>> {
+    pub fn delete(&self, query_json: &Value, limit: Option<usize>) -> Result<Vec<DocumentId>> {
         let query = query::parse_query(query_json)?;
 
         // Phase 1: Find matching docs
@@ -1876,26 +1956,22 @@ impl BTreeCollection {
             if limit.is_some() {
                 let skip_post_filter = query::is_fully_indexed(&query, &fi);
                 let lim = limit.unwrap();
-                let lazy_result = query::execute_indexed_lazy(
-                    &query,
-                    &fi,
-                    &mut |id| {
-                        if let Some(arc) = self.load_doc_arc(id) {
-                            if skip_post_filter || query::matches_value(&query, &arc) {
-                                if self.storage.contains_key(id) {
-                                    ops.push(DeleteOp {
-                                        id,
-                                        data: (*arc).clone(),
-                                    });
-                                    if ops.len() >= lim {
-                                        return false;
-                                    }
+                let lazy_result = query::execute_indexed_lazy(&query, &fi, &mut |id| {
+                    if let Some(arc) = self.load_doc_arc(id) {
+                        if skip_post_filter || query::matches_value(&query, &arc) {
+                            if self.storage.contains_key(id) {
+                                ops.push(DeleteOp {
+                                    id,
+                                    data: (*arc).clone(),
+                                });
+                                if ops.len() >= lim {
+                                    return false;
                                 }
                             }
                         }
-                        true
-                    },
-                );
+                    }
+                    true
+                });
                 if lazy_result.is_some() {
                     lazy_handled = true;
                 }
@@ -1903,11 +1979,7 @@ impl BTreeCollection {
 
             if !lazy_handled {
                 let ci = self.composite_indexes.read();
-                let candidate_ids = query::execute_indexed(
-                    &query,
-                    &fi,
-                    &ci,
-                );
+                let candidate_ids = query::execute_indexed(&query, &fi, &ci);
                 drop(ci);
 
                 if let Some(ref indexed_ids) = candidate_ids {
@@ -1953,7 +2025,13 @@ impl BTreeCollection {
 
         // Phase 2: Remove from B-tree and update indexes (write locks)
         {
-            let wal_entries: Vec<WalEntry> = ops.iter().map(|op| WalEntry::Delete { doc_id: op.id, tx_id: 0 }).collect();
+            let wal_entries: Vec<WalEntry> = ops
+                .iter()
+                .map(|op| WalEntry::Delete {
+                    doc_id: op.id,
+                    tx_id: 0,
+                })
+                .collect();
             self.wal_log_batch(&wal_entries)?;
         }
 
@@ -2018,11 +2096,7 @@ impl BTreeCollection {
         }
 
         let ci = self.composite_indexes.read();
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &fi,
-            &ci,
-        );
+        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
         drop(ci);
 
         let skip_post_filter = query::is_fully_indexed(&query, &fi);
@@ -2046,27 +2120,37 @@ impl BTreeCollection {
             // Parallel scan using doc_cache (avoids cloning raw bytes)
             let doc_ids: Vec<u64> = {
                 let mut ids = Vec::new();
-                self.storage.scan_keys(|k| { ids.push(k); });
+                self.storage.scan_keys(|k| {
+                    ids.push(k);
+                });
                 ids
             };
             #[cfg(not(target_arch = "wasm32"))]
-            { count = doc_ids
-                .par_iter()
-                .filter(|&&id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        query::matches_value(&query, &arc)
-                    } else { false }
-                })
-                .count(); }
+            {
+                count = doc_ids
+                    .par_iter()
+                    .filter(|&&id| {
+                        if let Some(arc) = self.load_doc_arc(id) {
+                            query::matches_value(&query, &arc)
+                        } else {
+                            false
+                        }
+                    })
+                    .count();
+            }
             #[cfg(target_arch = "wasm32")]
-            { count = doc_ids
-                .iter()
-                .filter(|&&id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        query::matches_value(&query, &arc)
-                    } else { false }
-                })
-                .count(); }
+            {
+                count = doc_ids
+                    .iter()
+                    .filter(|&&id| {
+                        if let Some(arc) = self.load_doc_arc(id) {
+                            query::matches_value(&query, &arc)
+                        } else {
+                            false
+                        }
+                    })
+                    .count();
+            }
         }
 
         Ok(count)
@@ -2395,10 +2479,7 @@ impl BTreeCollection {
         for result in search_results {
             if let Some(mut doc) = self.read_doc(result.doc_id)? {
                 if let Some(obj) = doc.as_object_mut() {
-                    obj.insert(
-                        "_score".to_string(),
-                        serde_json::json!(result.score),
-                    );
+                    obj.insert("_score".to_string(), serde_json::json!(result.score));
                 }
                 docs.push(doc);
             }
@@ -2431,12 +2512,8 @@ impl BTreeCollection {
                 if max_snippets > 0 && snippet_chars > 0 {
                     for field in &indexed_fields {
                         for text in crate::collection::collect_field_strings(&doc, field) {
-                            let snippets = crate::fts::highlight(
-                                &text,
-                                query,
-                                snippet_chars,
-                                max_snippets,
-                            );
+                            let snippets =
+                                crate::fts::highlight(&text, query, snippet_chars, max_snippets);
                             if !snippets.is_empty() {
                                 let arr: Vec<Value> = snippets
                                     .into_iter()
@@ -2455,10 +2532,7 @@ impl BTreeCollection {
                 if let Some(obj) = doc.as_object_mut() {
                     obj.insert("_score".to_string(), serde_json::json!(result.score));
                     if !highlights.is_empty() {
-                        obj.insert(
-                            "_highlights".to_string(),
-                            Value::Object(highlights),
-                        );
+                        obj.insert("_highlights".to_string(), Value::Object(highlights));
                     }
                 }
                 docs.push(doc);
@@ -2527,10 +2601,7 @@ impl BTreeCollection {
                         "_similarity".to_string(),
                         serde_json::json!(result.similarity),
                     );
-                    obj.insert(
-                        "_distance".to_string(),
-                        serde_json::json!(result.distance),
-                    );
+                    obj.insert("_distance".to_string(), serde_json::json!(result.distance));
                 }
                 docs.push(doc);
             }
@@ -2550,8 +2621,7 @@ impl BTreeCollection {
         group_key: &crate::pipeline::GroupKey,
         accumulators: &[(String, crate::pipeline::Accumulator)],
     ) -> Result<Vec<Value>> {
-        let mut group =
-            crate::pipeline::StreamingGroup::new(group_key, accumulators);
+        let mut group = crate::pipeline::StreamingGroup::new(group_key, accumulators);
 
         match match_query_json {
             None => {
@@ -2581,13 +2651,8 @@ impl BTreeCollection {
                     // Try index-accelerated path
                     let fi = self.field_indexes.read();
                     let ci = self.composite_indexes.read();
-                    let candidate_ids = query::execute_indexed(
-                        &query,
-                        &fi,
-                        &ci,
-                    );
-                    let skip_post_filter =
-                        query::is_fully_indexed(&query, &fi);
+                    let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+                    let skip_post_filter = query::is_fully_indexed(&query, &fi);
                     drop(ci);
 
                     if let Some(ref ids) = candidate_ids {
@@ -2710,8 +2775,7 @@ impl BTreeCollection {
         // buffering time, use it — that id is the one the API client
         // already sees. Otherwise fall back to allocating one here
         // (legacy paths and direct engine callers).
-        let id = preassigned_id
-            .unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::SeqCst));
+        let id = preassigned_id.unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::SeqCst));
         let obj = data.as_object_mut().unwrap();
         obj.insert("_id".to_string(), Value::Number(id.into()));
         obj.insert("_version".to_string(), Value::Number(1.into()));
@@ -2753,51 +2817,46 @@ impl BTreeCollection {
         let query = query::parse_query(query_json)?;
         let fi = self.field_indexes.read();
         let ci = self.composite_indexes.read();
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &fi,
-            &ci,
-        );
+        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
 
         let mut mutations = Vec::new();
 
-        let process_candidate =
-            |id: DocumentId,
-             cached: &Value,
-             mutations: &mut Vec<crate::collection::PreparedMutation>|
-             -> Result<()> {
-                if !query::matches_value(&query, cached) {
-                    return Ok(());
-                }
-                let old_data = cached.clone();
-                let mut data = cached.clone();
+        let process_candidate = |id: DocumentId,
+                                 cached: &Value,
+                                 mutations: &mut Vec<crate::collection::PreparedMutation>|
+         -> Result<()> {
+            if !query::matches_value(&query, cached) {
+                return Ok(());
+            }
+            let old_data = cached.clone();
+            let mut data = cached.clone();
 
-                crate::update::apply_update(&mut data, update_json)?;
+            crate::update::apply_update(&mut data, update_json)?;
 
-                let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                let new_version = old_version + 1;
-                data.as_object_mut()
-                    .unwrap()
-                    .insert("_version".to_string(), Value::Number(new_version.into()));
+            let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+            let new_version = old_version + 1;
+            data.as_object_mut()
+                .unwrap()
+                .insert("_version".to_string(), Value::Number(new_version.into()));
 
-                Self::check_unique_constraints_with(&fi, &data, Some(id))?;
+            Self::check_unique_constraints_with(&fi, &data, Some(id))?;
 
-                let new_bytes = codec::encode_doc(&data)?;
-                mutations.push(crate::collection::PreparedMutation {
-                    wal_entry: crate::wal::WalEntry::Update {
-                        doc_id: id,
-                        doc_bytes: new_bytes.clone(),
-                        tx_id,
-                    },
+            let new_bytes = codec::encode_doc(&data)?;
+            mutations.push(crate::collection::PreparedMutation {
+                wal_entry: crate::wal::WalEntry::Update {
                     doc_id: id,
-                    new_bytes,
-                    old_loc: None, // No DocLocation in B-tree mode
-                    old_data: Some(old_data),
-                    new_data: data,
-                    is_delete: false,
-                });
-                Ok(())
-            };
+                    doc_bytes: new_bytes.clone(),
+                    tx_id,
+                },
+                doc_id: id,
+                new_bytes,
+                old_loc: None, // No DocLocation in B-tree mode
+                old_data: Some(old_data),
+                new_data: data,
+                is_delete: false,
+            });
+            Ok(())
+        };
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
@@ -2869,35 +2928,30 @@ impl BTreeCollection {
         let query = query::parse_query(query_json)?;
         let fi = self.field_indexes.read();
         let ci = self.composite_indexes.read();
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &fi,
-            &ci,
-        );
+        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
         drop(ci);
         drop(fi);
 
         let mut mutations = Vec::new();
 
-        let process_candidate =
-            |id: DocumentId,
-             cached: &Value,
-             mutations: &mut Vec<crate::collection::PreparedMutation>|
-             -> Result<()> {
-                if !query::matches_value(&query, cached) {
-                    return Ok(());
-                }
-                mutations.push(crate::collection::PreparedMutation {
-                    wal_entry: crate::wal::WalEntry::Delete { doc_id: id, tx_id },
-                    doc_id: id,
-                    new_bytes: vec![],
-                    old_loc: None,
-                    old_data: Some(cached.clone()),
-                    new_data: Value::Null,
-                    is_delete: true,
-                });
-                Ok(())
-            };
+        let process_candidate = |id: DocumentId,
+                                 cached: &Value,
+                                 mutations: &mut Vec<crate::collection::PreparedMutation>|
+         -> Result<()> {
+            if !query::matches_value(&query, cached) {
+                return Ok(());
+            }
+            mutations.push(crate::collection::PreparedMutation {
+                wal_entry: crate::wal::WalEntry::Delete { doc_id: id, tx_id },
+                doc_id: id,
+                new_bytes: vec![],
+                old_loc: None,
+                old_data: Some(cached.clone()),
+                new_data: Value::Null,
+                is_delete: true,
+            });
+            Ok(())
+        };
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
@@ -3112,9 +3166,7 @@ impl BTreeCollection {
                 .as_millis() as u64;
             let expires_at = now_ms + secs * 1000;
             let mut ttl = self.ttl_index.lock();
-            ttl.entry(expires_at)
-                .or_insert_with(Vec::new)
-                .push(doc_id);
+            ttl.entry(expires_at).or_insert_with(Vec::new).push(doc_id);
         }
     }
 
@@ -3131,9 +3183,7 @@ impl BTreeCollection {
             if ttl.is_empty() {
                 return 0;
             }
-            ttl.range(..=now_ms)
-                .map(|(&k, v)| (k, v.clone()))
-                .collect()
+            ttl.range(..=now_ms).map(|(&k, v)| (k, v.clone())).collect()
         };
 
         if expired.is_empty() {
@@ -3250,11 +3300,7 @@ fn matches_query_partial_jsonb(query: &Query, bytes: &[u8]) -> Option<bool> {
                     None => saw_undecidable = true,
                 }
             }
-            if saw_undecidable {
-                None
-            } else {
-                Some(false)
-            }
+            if saw_undecidable { None } else { Some(false) }
         }
         // Nor/Expr need fuller evaluation — let the caller full-decode.
         Query::Nor(_) | Query::Expr(_) => None,
@@ -3291,11 +3337,15 @@ fn eval_field_op_partial(op: &crate::query::QueryOp, field_val: Option<&Value>) 
     use crate::value::IndexValue;
     match op {
         QueryOp::Eq(want) => {
-            let iv = field_val.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
+            let iv = field_val
+                .map(IndexValue::from_json)
+                .unwrap_or(IndexValue::Null);
             Some(&iv == want)
         }
         QueryOp::Ne(want) => {
-            let iv = field_val.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
+            let iv = field_val
+                .map(IndexValue::from_json)
+                .unwrap_or(IndexValue::Null);
             Some(&iv != want)
         }
         QueryOp::Gt(want) => {
@@ -3315,7 +3365,9 @@ fn eval_field_op_partial(op: &crate::query::QueryOp, field_val: Option<&Value>) 
             Some(&iv <= want)
         }
         QueryOp::In(opts) => {
-            let iv = field_val.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
+            let iv = field_val
+                .map(IndexValue::from_json)
+                .unwrap_or(IndexValue::Null);
             Some(opts.iter().any(|o| o == &iv))
         }
         // Defer everything else (regex, nin, exists, elemMatch, etc.) to
@@ -3441,7 +3493,10 @@ mod tests {
         let q_missing = query::parse_query(&json!({"address.zip": "X"})).unwrap();
         let v3 = json!({"address": {}});
         let bytes3 = codec::encode_doc(&v3).unwrap();
-        assert_eq!(matches_query_partial_jsonb(&q_missing, &bytes3), Some(false));
+        assert_eq!(
+            matches_query_partial_jsonb(&q_missing, &bytes3),
+            Some(false)
+        );
     }
 
     #[test]
@@ -3476,10 +3531,14 @@ mod tests {
     fn find_oxiwire_bytes_uses_composite_index() {
         let col = new_btree_collection("composite_test");
         // Seed: 4 docs, three with status=active across dept variants.
-        col.insert(json!({"dept": "Sales", "status": "active", "n": 1})).unwrap();
-        col.insert(json!({"dept": "Sales", "status": "inactive", "n": 2})).unwrap();
-        col.insert(json!({"dept": "Eng", "status": "active", "n": 3})).unwrap();
-        col.insert(json!({"dept": "Sales", "status": "active", "n": 4})).unwrap();
+        col.insert(json!({"dept": "Sales", "status": "active", "n": 1}))
+            .unwrap();
+        col.insert(json!({"dept": "Sales", "status": "inactive", "n": 2}))
+            .unwrap();
+        col.insert(json!({"dept": "Eng", "status": "active", "n": 3}))
+            .unwrap();
+        col.insert(json!({"dept": "Sales", "status": "active", "n": 4}))
+            .unwrap();
 
         col.create_composite_index(vec!["dept".to_string(), "status".to_string()])
             .unwrap();
@@ -3524,7 +3583,9 @@ mod tests {
     #[test]
     fn bytes_cache_cold_path_uses_jsonb_to_oxiwire() {
         let col = new_btree_collection("cold_path_test");
-        let id = col.insert(json!({"name": "alpha", "n": 42, "tags": ["x"]})).unwrap();
+        let id = col
+            .insert(json!({"name": "alpha", "n": 42, "tags": ["x"]}))
+            .unwrap();
 
         // Evict both caches to force the cold (jsonb→oxiwire) path.
         col.doc_cache_clear();
@@ -3654,7 +3715,11 @@ mod tests {
 
         // Update Alice's age
         let updated = col
-            .update(&json!({"name": "Alice"}), &json!({"$set": {"age": 31}}), None)
+            .update(
+                &json!({"name": "Alice"}),
+                &json!({"$set": {"age": 31}}),
+                None,
+            )
             .unwrap();
         assert_eq!(updated.len(), 1);
 
@@ -3866,7 +3931,8 @@ mod tests {
         {
             let col = BTreeCollection::open("wal_test", dir.path(), None).unwrap();
             for i in 0..50 {
-                col.insert(json!({"seq": i, "data": format!("val_{}", i)})).unwrap();
+                col.insert(json!({"seq": i, "data": format!("val_{}", i)}))
+                    .unwrap();
             }
             // NO sync_writes — WAL has entries but .btree file is empty
         }
@@ -3895,7 +3961,10 @@ mod tests {
 
         let storage = BTreeStorage::open("rs", dir.path(), None).unwrap();
         let replayed = BTreeCollection::replay_wal(&wal, &storage).unwrap();
-        assert_eq!(replayed, 3, "every sealed segment's entries must be replayed");
+        assert_eq!(
+            replayed, 3,
+            "every sealed segment's entries must be replayed"
+        );
         assert_eq!(storage.count(), 3);
     }
 
@@ -3912,10 +3981,11 @@ mod tests {
         assert_eq!(doc.get("v").and_then(|v| v.as_u64()).unwrap(), 42);
 
         // No match → None, nothing written.
-        assert!(col
-            .find_and_modify(&json!({"name": "nope"}), &json!({"$set": {"v": 0}}))
-            .unwrap()
-            .is_none());
+        assert!(
+            col.find_and_modify(&json!({"name": "nope"}), &json!({"$set": {"v": 0}}))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -3937,10 +4007,7 @@ mod tests {
                 let mut got = Vec::with_capacity(per_writer);
                 for _ in 0..per_writer {
                     let doc = col
-                        .find_and_modify(
-                            &json!({"name": "uidnext"}),
-                            &json!({"$inc": {"v": 1}}),
-                        )
+                        .find_and_modify(&json!({"name": "uidnext"}), &json!({"$inc": {"v": 1}}))
                         .unwrap()
                         .expect("counter doc exists");
                     got.push(doc.get("v").and_then(|v| v.as_u64()).unwrap());
@@ -3948,8 +4015,10 @@ mod tests {
                 got
             }));
         }
-        let mut all: Vec<u64> =
-            handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let mut all: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
 
         // No lost updates: the counter reached exactly writers*per_writer...
         let total = (writers * per_writer) as u64;
@@ -3964,7 +4033,11 @@ mod tests {
         // ...and every call returned a distinct value 1..=total — exactly
         // what UID assignment needs.
         all.sort_unstable();
-        assert_eq!(all, (1..=total).collect::<Vec<_>>(), "a value was handed out twice");
+        assert_eq!(
+            all,
+            (1..=total).collect::<Vec<_>>(),
+            "a value was handed out twice"
+        );
     }
 
     #[test]
@@ -3985,7 +4058,8 @@ mod tests {
             let col = BTreeCollection::open("wal_ud", dir.path(), None).unwrap();
             assert_eq!(col.count(), 10);
             // Update key=5 → value=999
-            col.update(&json!({"key": 5}), &json!({"$set": {"value": 999}}), None).unwrap();
+            col.update(&json!({"key": 5}), &json!({"$set": {"value": 999}}), None)
+                .unwrap();
             // Delete key=0
             col.delete(&json!({"key": 0}), None).unwrap();
             // NO sync_writes — crash
@@ -4032,7 +4106,10 @@ mod tests {
             assert_eq!(col.count(), 20);
         }
         let wal_size = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-        assert_eq!(wal_size, 0, "WAL should be reclaimed after reopen's post-replay checkpoint");
+        assert_eq!(
+            wal_size, 0,
+            "WAL should be reclaimed after reopen's post-replay checkpoint"
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -4055,9 +4132,7 @@ mod tests {
         }))
         .unwrap();
 
-        let results = col
-            .text_search_highlighted("rust", 10, 80, 3)
-            .unwrap();
+        let results = col.text_search_highlighted("rust", 10, 80, 3).unwrap();
         assert_eq!(results.len(), 1);
         let hl = results[0].get("_highlights").expect("missing _highlights");
         let hl_obj = hl.as_object().unwrap();
@@ -4065,10 +4140,16 @@ mod tests {
         // The match is in "title" and "body" — at least one should highlight.
         let any_marked = hl_obj.values().any(|v| {
             v.as_array()
-                .map(|arr| arr.iter().any(|s| s.as_str().unwrap_or("").contains("<mark>")))
+                .map(|arr| {
+                    arr.iter()
+                        .any(|s| s.as_str().unwrap_or("").contains("<mark>"))
+                })
                 .unwrap_or(false)
         });
-        assert!(any_marked, "expected at least one snippet with <mark> tag, got: {hl:?}");
+        assert!(
+            any_marked,
+            "expected at least one snippet with <mark> tag, got: {hl:?}"
+        );
 
         // The doc body still has its original fields.
         assert_eq!(results[0]["title"], json!("Rust Programming Guide"));

@@ -1,19 +1,29 @@
+use crate::locks::Mutex;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use crate::locks::Mutex;
 
 use lru::LruCache;
 use serde_json::Value;
 
 use crate::document::DocumentId;
 
-/// Default maximum number of documents held in the LRU cache.
-/// Hard-coded floor used when the env override is absent or unparseable.
-/// 100K matches the legacy const; the env var lets ops tune higher when
-/// working sets exceed cache size (1M+ doc collections start missing badly
-/// at 100K — see tests/comparison-mongodb v2 benchmark notes).
-const DEFAULT_CAPACITY_FALLBACK: usize = 100_000;
+/// Memory budget for the deserialized-`Value` cache, and the per-entry size
+/// used to derive a bounded entry count from it.
+///
+/// This cache is a *speed* layer over the primary store, which already holds
+/// every document's encoded bytes resident in RAM — a miss here costs only a
+/// re-decode (CPU), never I/O. So the cache is bounded by a fixed memory
+/// budget that does **not** scale with the dataset, rather than an entry count
+/// that could grow to cache an entire collection. A `serde_json::Value` for a
+/// typical document is ~4 KiB on the heap (nested maps, per-`String` boxes),
+/// so the default budget yields ~32K entries. The old default (100K entries
+/// ≈ ~400 MiB) sized the cache to large collections and dominated RSS; see the
+/// 1M-doc memory probe in `tests/mem_probe.rs`. Ops can still raise it via
+/// `OXIDB_DOC_CACHE_SIZE` when a larger hot Value set pays off.
+const VALUE_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+const APPROX_VALUE_HEAP_BYTES: usize = 4096;
+const DEFAULT_CAPACITY_FALLBACK: usize = VALUE_CACHE_BUDGET_BYTES / APPROX_VALUE_HEAP_BYTES;
 
 /// Read the doc cache capacity from `OXIDB_DOC_CACHE_SIZE`, cached after the
 /// first call. Returns `DEFAULT_CAPACITY_FALLBACK` if the env var is absent
@@ -80,7 +90,11 @@ impl CacheStats {
     }
     pub fn hit_ratio(&self) -> f64 {
         let total = self.total();
-        if total == 0 { 0.0 } else { self.hits as f64 / total as f64 }
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
     }
 }
 
@@ -346,25 +360,13 @@ mod tests {
     fn lazy_alloc_until_first_put() {
         let cache = DocCache::new(160);
         // Freshly constructed: every shard is None.
-        let allocated = cache
-            .shards
-            .iter()
-            .filter(|s| s.lock().is_some())
-            .count();
+        let allocated = cache.shards.iter().filter(|s| s.lock().is_some()).count();
         assert_eq!(allocated, 0, "no shard should be allocated yet");
         cache.put(0, Arc::new(json!(0)));
-        let after_put = cache
-            .shards
-            .iter()
-            .filter(|s| s.lock().is_some())
-            .count();
+        let after_put = cache.shards.iter().filter(|s| s.lock().is_some()).count();
         assert_eq!(after_put, 1, "only the touched shard should allocate");
         cache.clear();
-        let after_clear = cache
-            .shards
-            .iter()
-            .filter(|s| s.lock().is_some())
-            .count();
+        let after_clear = cache.shards.iter().filter(|s| s.lock().is_some()).count();
         assert_eq!(after_clear, 0, "clear must reclaim every shard");
     }
 

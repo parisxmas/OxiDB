@@ -33,6 +33,17 @@ impl Hash for IndexValue {
     }
 }
 
+impl IndexValue {
+    /// Heap bytes owned by this value beyond its inline size (the `String`
+    /// buffer, if any). Used for memory accounting / introspection.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            IndexValue::String(s) => s.capacity(),
+            _ => 0,
+        }
+    }
+}
+
 impl PartialEq for IndexValue {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
@@ -139,11 +150,9 @@ impl IndexValue {
             IndexValue::Null => JsonValue::Null,
             IndexValue::Boolean(b) => JsonValue::Bool(*b),
             IndexValue::Integer(i) => JsonValue::Number((*i).into()),
-            IndexValue::Float(f) => {
-                serde_json::Number::from_f64(*f)
-                    .map(JsonValue::Number)
-                    .unwrap_or(JsonValue::Null)
-            }
+            IndexValue::Float(f) => serde_json::Number::from_f64(*f)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null),
             IndexValue::DateTime(ms) => {
                 // Convert back to ISO 8601 string
                 let secs = ms / 1000;
@@ -235,9 +244,8 @@ impl IndexValue {
                 let len = u32::from_le_bytes(len_buf) as usize;
                 let mut str_buf = vec![0u8; len];
                 r.read_exact(&mut str_buf)?;
-                let s = String::from_utf8(str_buf).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, e)
-                })?;
+                let s = String::from_utf8(str_buf)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 Ok(IndexValue::String(s))
             }
             _ => Err(io::Error::new(

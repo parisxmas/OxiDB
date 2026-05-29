@@ -1657,6 +1657,19 @@ impl OxiDb {
         pipeline.execute_from(0, docs, &lookup_fn)
     }
 
+    /// Resident memory breakdown for `collection` (primary store + indexes),
+    /// computed from the live structures — independent of process RSS. Returns
+    /// `None` if the collection is not currently open. Intended for
+    /// introspection / capacity planning.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn memory_report(
+        &self,
+        collection: &str,
+    ) -> Option<crate::btree_collection::CollectionMemory> {
+        let cols = self.collections.read();
+        cols.get(collection).map(|c| c.memory_report())
+    }
+
     // -----------------------------------------------------------------------
     // Transaction methods
     // -----------------------------------------------------------------------

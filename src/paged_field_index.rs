@@ -199,34 +199,26 @@ impl PagedFieldIndex {
         end: Bound<&IndexValue>,
     ) -> (usize, usize) {
         let lo = match start {
-            Bound::Included(v) => {
-                match self.find_pos(v) {
-                    Ok(pos) => pos,
-                    Err(pos) => pos,
-                }
-            }
-            Bound::Excluded(v) => {
-                match self.find_pos(v) {
-                    Ok(pos) => pos + 1,
-                    Err(pos) => pos,
-                }
-            }
+            Bound::Included(v) => match self.find_pos(v) {
+                Ok(pos) => pos,
+                Err(pos) => pos,
+            },
+            Bound::Excluded(v) => match self.find_pos(v) {
+                Ok(pos) => pos + 1,
+                Err(pos) => pos,
+            },
             Bound::Unbounded => 0,
         };
 
         let hi = match end {
-            Bound::Included(v) => {
-                match self.find_pos(v) {
-                    Ok(pos) => pos + 1,
-                    Err(pos) => pos,
-                }
-            }
-            Bound::Excluded(v) => {
-                match self.find_pos(v) {
-                    Ok(pos) => pos,
-                    Err(pos) => pos,
-                }
-            }
+            Bound::Included(v) => match self.find_pos(v) {
+                Ok(pos) => pos + 1,
+                Err(pos) => pos,
+            },
+            Bound::Excluded(v) => match self.find_pos(v) {
+                Ok(pos) => pos,
+                Err(pos) => pos,
+            },
             Bound::Unbounded => self.entries.len(),
         };
 
@@ -244,8 +236,12 @@ impl PagedFieldIndex {
             }
             for op in &self.write_buffer {
                 match op {
-                    WriteOp::Insert(k, id) if k == value => { result.insert(*id); }
-                    WriteOp::Remove(k, id) if k == value => { result.remove(id); }
+                    WriteOp::Insert(k, id) if k == value => {
+                        result.insert(*id);
+                    }
+                    WriteOp::Remove(k, id) if k == value => {
+                        result.remove(id);
+                    }
                     _ => {}
                 }
             }
@@ -268,11 +264,7 @@ impl PagedFieldIndex {
         }
     }
 
-    pub fn count_range(
-        &self,
-        start: Bound<&IndexValue>,
-        end: Bound<&IndexValue>,
-    ) -> usize {
+    pub fn count_range(&self, start: Bound<&IndexValue>, end: Bound<&IndexValue>) -> usize {
         if !self.write_buffer.is_empty() {
             return self.find_range(start, end).len();
         }
@@ -313,13 +305,19 @@ impl PagedFieldIndex {
             let mut result = BTreeSet::new();
             for (k, ids) in &self.entries {
                 if k != value {
-                    for &id in ids { result.insert(id); }
+                    for &id in ids {
+                        result.insert(id);
+                    }
                 }
             }
             for op in &self.write_buffer {
                 match op {
-                    WriteOp::Insert(k, id) if k != value => { result.insert(*id); }
-                    WriteOp::Remove(k, id) if k != value => { result.remove(id); }
+                    WriteOp::Insert(k, id) if k != value => {
+                        result.insert(*id);
+                    }
+                    WriteOp::Remove(k, id) if k != value => {
+                        result.remove(id);
+                    }
                     _ => {}
                 }
             }
@@ -329,7 +327,9 @@ impl PagedFieldIndex {
         let mut result = BTreeSet::new();
         for (k, ids) in &self.entries {
             if k != value {
-                for &id in ids { result.insert(id); }
+                for &id in ids {
+                    result.insert(id);
+                }
             }
         }
         result
@@ -344,15 +344,21 @@ impl PagedFieldIndex {
             let mut result = BTreeSet::new();
             let (lo, hi) = self.range_positions(start, end);
             for i in lo..hi {
-                for &id in &self.entries[i].1 { result.insert(id); }
+                for &id in &self.entries[i].1 {
+                    result.insert(id);
+                }
             }
             for op in &self.write_buffer {
                 match op {
                     WriteOp::Insert(k, id) => {
-                        if in_bounds(k, start, end) { result.insert(*id); }
+                        if in_bounds(k, start, end) {
+                            result.insert(*id);
+                        }
                     }
                     WriteOp::Remove(k, id) => {
-                        if in_bounds(k, start, end) { result.remove(id); }
+                        if in_bounds(k, start, end) {
+                            result.remove(id);
+                        }
                     }
                 }
             }
@@ -362,7 +368,9 @@ impl PagedFieldIndex {
         let (lo, hi) = self.range_positions(start, end);
         let mut result = BTreeSet::new();
         for i in lo..hi {
-            for &id in &self.entries[i].1 { result.insert(id); }
+            for &id in &self.entries[i].1 {
+                result.insert(id);
+            }
         }
         result
     }
@@ -372,13 +380,19 @@ impl PagedFieldIndex {
             let mut result = BTreeSet::new();
             for v in values {
                 if let Ok(pos) = self.find_pos(v) {
-                    for &id in &self.entries[pos].1 { result.insert(id); }
+                    for &id in &self.entries[pos].1 {
+                        result.insert(id);
+                    }
                 }
             }
             for op in &self.write_buffer {
                 match op {
-                    WriteOp::Insert(k, id) if values.contains(k) => { result.insert(*id); }
-                    WriteOp::Remove(k, id) if values.contains(k) => { result.remove(id); }
+                    WriteOp::Insert(k, id) if values.contains(k) => {
+                        result.insert(*id);
+                    }
+                    WriteOp::Remove(k, id) if values.contains(k) => {
+                        result.remove(id);
+                    }
                     _ => {}
                 }
             }
@@ -388,7 +402,9 @@ impl PagedFieldIndex {
         let mut result = BTreeSet::new();
         for v in values {
             if let Ok(pos) = self.find_pos(v) {
-                for &id in &self.entries[pos].1 { result.insert(id); }
+                for &id in &self.entries[pos].1 {
+                    result.insert(id);
+                }
             }
         }
         result
@@ -397,12 +413,18 @@ impl PagedFieldIndex {
     pub fn all_ids(&self) -> BTreeSet<DocumentId> {
         let mut result = BTreeSet::new();
         for (_, ids) in &self.entries {
-            for &id in ids { result.insert(id); }
+            for &id in ids {
+                result.insert(id);
+            }
         }
         for op in &self.write_buffer {
             match op {
-                WriteOp::Insert(_, id) => { result.insert(*id); }
-                WriteOp::Remove(_, id) => { result.remove(id); }
+                WriteOp::Insert(_, id) => {
+                    result.insert(*id);
+                }
+                WriteOp::Remove(_, id) => {
+                    result.remove(id);
+                }
             }
         }
         result
@@ -416,13 +438,17 @@ impl PagedFieldIndex {
     {
         if !self.write_buffer.is_empty() {
             for id in self.find_eq(value) {
-                if !f(id) { return; }
+                if !f(id) {
+                    return;
+                }
             }
             return;
         }
         if let Ok(pos) = self.find_pos(value) {
             for &id in &self.entries[pos].1 {
-                if !f(id) { return; }
+                if !f(id) {
+                    return;
+                }
             }
         }
     }
@@ -433,37 +459,41 @@ impl PagedFieldIndex {
     {
         if !self.write_buffer.is_empty() {
             for id in self.find_ne(value) {
-                if !f(id) { return; }
+                if !f(id) {
+                    return;
+                }
             }
             return;
         }
         for (k, ids) in &self.entries {
             if k != value {
                 for &id in ids {
-                    if !f(id) { return; }
+                    if !f(id) {
+                        return;
+                    }
                 }
             }
         }
     }
 
-    pub fn for_each_in_range<F>(
-        &self,
-        start: Bound<&IndexValue>,
-        end: Bound<&IndexValue>,
-        mut f: F,
-    ) where
+    pub fn for_each_in_range<F>(&self, start: Bound<&IndexValue>, end: Bound<&IndexValue>, mut f: F)
+    where
         F: FnMut(DocumentId) -> bool,
     {
         if !self.write_buffer.is_empty() {
             for id in self.find_range(start, end) {
-                if !f(id) { return; }
+                if !f(id) {
+                    return;
+                }
             }
             return;
         }
         let (lo, hi) = self.range_positions(start, end);
         for i in lo..hi {
             for &id in &self.entries[i].1 {
-                if !f(id) { return; }
+                if !f(id) {
+                    return;
+                }
             }
         }
     }
@@ -474,14 +504,18 @@ impl PagedFieldIndex {
     {
         if !self.write_buffer.is_empty() {
             for id in self.find_in(values) {
-                if !f(id) { return; }
+                if !f(id) {
+                    return;
+                }
             }
             return;
         }
         for v in values {
             if let Ok(pos) = self.find_pos(v) {
                 for &id in &self.entries[pos].1 {
-                    if !f(id) { return; }
+                    if !f(id) {
+                        return;
+                    }
                 }
             }
         }
@@ -538,6 +572,21 @@ impl PagedFieldIndex {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Approximate resident heap bytes of this index: the entries `Vec`
+    /// capacity plus the heap owned by string keys and large doc-id sets.
+    /// Excludes the (usually small) pending write buffer's heap beyond its
+    /// inline slots.
+    pub fn memory_bytes(&self) -> usize {
+        let slot = std::mem::size_of::<(IndexValue, DocIdSet)>();
+        let mut total = self.entries.capacity() * slot;
+        for (iv, ids) in &self.entries {
+            total += iv.heap_bytes();
+            total += ids.heap_bytes();
+        }
+        total += self.write_buffer.capacity() * std::mem::size_of::<WriteOp>();
+        total
     }
 
     pub fn is_empty(&self) -> bool {
@@ -599,10 +648,16 @@ impl PagedFieldIndex {
         w.write_all(name_bytes)?;
         w.write_all(&[self.unique as u8])?;
         // Count entries (skip empties from write buffer)
-        let entry_count = self.entries.iter().filter(|(_, ids)| !ids.is_empty()).count();
+        let entry_count = self
+            .entries
+            .iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .count();
         w.write_all(&(entry_count as u32).to_le_bytes())?;
         for (key, ids) in &self.entries {
-            if ids.is_empty() { continue; }
+            if ids.is_empty() {
+                continue;
+            }
             key.write_to(w)?;
             w.write_all(&(ids.len() as u32).to_le_bytes())?;
             for &id in ids {
@@ -703,7 +758,10 @@ mod tests {
         idx.insert_raw(2, IndexValue::Integer(20));
         idx.insert_raw(3, IndexValue::Integer(10));
 
-        assert_eq!(idx.find_eq(&IndexValue::Integer(10)), BTreeSet::from([1, 3]));
+        assert_eq!(
+            idx.find_eq(&IndexValue::Integer(10)),
+            BTreeSet::from([1, 3])
+        );
         assert_eq!(idx.find_eq(&IndexValue::Integer(20)), BTreeSet::from([2]));
         assert_eq!(idx.find_eq(&IndexValue::Integer(30)), BTreeSet::new());
     }
@@ -816,8 +874,10 @@ mod tests {
         let mut idx = PagedFieldIndex::new("x".into());
         idx.insert_raw(1, IndexValue::Integer(10));
         // Manually push to write_buffer
-        idx.write_buffer.push(WriteOp::Insert(IndexValue::Integer(20), 2));
-        idx.write_buffer.push(WriteOp::Insert(IndexValue::Integer(30), 3));
+        idx.write_buffer
+            .push(WriteOp::Insert(IndexValue::Integer(20), 2));
+        idx.write_buffer
+            .push(WriteOp::Insert(IndexValue::Integer(30), 3));
 
         // Before flush, find_eq should still work (handles write buffer)
         assert_eq!(idx.find_eq(&IndexValue::Integer(20)), BTreeSet::from([2]));
@@ -842,13 +902,27 @@ mod tests {
         idx.insert_raw(2, IndexValue::Integer(10));
         idx.insert_raw(3, IndexValue::Integer(20));
 
-        let asc: Vec<i64> = idx.iter_asc()
-            .filter_map(|(k, _)| if let IndexValue::Integer(i) = k { Some(*i) } else { None })
+        let asc: Vec<i64> = idx
+            .iter_asc()
+            .filter_map(|(k, _)| {
+                if let IndexValue::Integer(i) = k {
+                    Some(*i)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(asc, vec![10, 20, 30]);
 
-        let desc: Vec<i64> = idx.iter_desc()
-            .filter_map(|(k, _)| if let IndexValue::Integer(i) = k { Some(*i) } else { None })
+        let desc: Vec<i64> = idx
+            .iter_desc()
+            .filter_map(|(k, _)| {
+                if let IndexValue::Integer(i) = k {
+                    Some(*i)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(desc, vec![30, 20, 10]);
     }
@@ -880,7 +954,10 @@ mod tests {
 
         idx1.merge(idx2);
 
-        assert_eq!(idx1.find_eq(&IndexValue::Integer(10)), BTreeSet::from([1, 3]));
+        assert_eq!(
+            idx1.find_eq(&IndexValue::Integer(10)),
+            BTreeSet::from([1, 3])
+        );
         assert_eq!(idx1.find_eq(&IndexValue::Integer(20)), BTreeSet::from([2]));
         assert_eq!(idx1.find_eq(&IndexValue::Integer(30)), BTreeSet::from([4]));
     }
@@ -897,8 +974,14 @@ mod tests {
         let decoded = PagedFieldIndex::read_from(&mut &buf[..]).unwrap();
 
         assert_eq!(decoded.field, "status");
-        assert_eq!(decoded.find_eq(&IndexValue::String("active".into())), BTreeSet::from([1, 3]));
-        assert_eq!(decoded.find_eq(&IndexValue::String("inactive".into())), BTreeSet::from([2]));
+        assert_eq!(
+            decoded.find_eq(&IndexValue::String("active".into())),
+            BTreeSet::from([1, 3])
+        );
+        assert_eq!(
+            decoded.find_eq(&IndexValue::String("inactive".into())),
+            BTreeSet::from([2])
+        );
     }
 
     #[test]
@@ -914,7 +997,10 @@ mod tests {
         let pfi = PagedFieldIndex::read_from(&mut &buf[..]).unwrap();
 
         assert_eq!(pfi.field, "age");
-        assert_eq!(pfi.find_eq(&IndexValue::Integer(25)), BTreeSet::from([10, 30]));
+        assert_eq!(
+            pfi.find_eq(&IndexValue::Integer(25)),
+            BTreeSet::from([10, 30])
+        );
         assert_eq!(pfi.find_eq(&IndexValue::Integer(30)), BTreeSet::from([20]));
     }
 }

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Bound the in-memory caches by a fixed budget (server 0.28.21)
+
+The per-collection document caches previously used entry-count defaults that
+*scaled with the dataset*: the encoded-bytes cache defaulted to **1,000,000
+entries** (enough to cache an entire 1M-doc collection, ~500–768 MiB) and the
+deserialized-`Value` cache to **100,000 entries** (~400 MiB). On the 1M-doc
+MongoDB benchmark these dominated RSS (OxiDB 1.71 GiB vs MongoDB's 0.5 GiB
+hard-capped page cache).
+
+Both caches are now bounded by a fixed **memory budget (~128 MiB each, ~256 MiB
+total)** that does not grow with the dataset:
+
+- `OXIDB_DOC_BYTES_CACHE_SIZE` default: 1,000,000 → **~175,000** entries.
+- `OXIDB_DOC_CACHE_SIZE` default: 100,000 → **~32,000** entries.
+
+These caches sit on top of the primary store, which already holds every
+document resident in RAM, so a miss costs only a re-decode/transcode (CPU),
+never I/O — making the bound safe. A 1M-doc in-process probe confirms the
+`Value`-cache change alone cuts ~280 MiB of RSS; the bytes-cache ceiling drops
+from ~500+ MiB to ~134 MiB. Both remain tunable via their env vars for
+workloads that benefit from a larger hot set.
+
+Also adds `OxiDb::memory_report(collection)` — an allocator-independent
+resident-memory breakdown (primary store + indexes) computed from the live
+structures, for introspection and capacity planning.
+
 ### Correct cross-shard aggregation in OxiPool (server 0.28.20)
 
 OxiPool previously merged scatter-gather `aggregate` results by **concatenating**

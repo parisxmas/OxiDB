@@ -15,18 +15,29 @@
 //! the cost across one of the writer's batches.
 
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use lru::LruCache;
 
 use crate::document::DocumentId;
 use crate::locks::Mutex;
 
-/// Hard-coded fallback. Larger than `DocCache::DEFAULT_CAPACITY` because
-/// each entry is 7× smaller — 1M entries fit in ~500 MB at typical doc
-/// sizes, comfortably less than the Value-cache footprint at its 100K cap.
-const DEFAULT_BYTES_CAPACITY_FALLBACK: usize = 1_000_000;
+/// Memory budget for the encoded-bytes (wire) cache, and the per-entry size
+/// used to derive a bounded entry count from it.
+///
+/// Like the `Value` cache, this is a speed layer over an already-resident
+/// store: a miss costs a JSONB→Value→OxiWire transcode (CPU), not I/O. The old
+/// default of 1,000,000 entries was sized to cache an *entire* 1M-doc
+/// collection (~500 MB) — it scaled with the dataset and was the single
+/// largest tunable contributor to RSS in the 1M-doc benchmark. We instead
+/// bound it to a fixed budget. Each entry is the OxiWire encoding of one doc
+/// (~500 B payload) plus `Arc<[u8]>` + LRU node overhead (~768 B all-in), so
+/// the default budget yields ~170K entries. Tunable via
+/// `OXIDB_DOC_BYTES_CACHE_SIZE`.
+const BYTES_CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
+const APPROX_BYTES_ENTRY: usize = 768;
+const DEFAULT_BYTES_CAPACITY_FALLBACK: usize = BYTES_CACHE_BUDGET_BYTES / APPROX_BYTES_ENTRY;
 
 const NUM_SHARDS: usize = 16;
 const SHARD_MASK: u64 = (NUM_SHARDS as u64) - 1;

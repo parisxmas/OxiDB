@@ -101,6 +101,16 @@ impl DocIdSet {
         }
     }
 
+    /// Approximate heap bytes owned beyond the inline enum size. For `Set`,
+    /// counts the BTreeSet's node storage (~each `u64` plus B-tree node
+    /// bookkeeping). Used for memory accounting.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            DocIdSet::Set(s) => s.len() * (std::mem::size_of::<DocumentId>() + 8),
+            _ => 0,
+        }
+    }
+
     /// Convert to a BTreeSet (for query result APIs that return BTreeSet).
     pub fn to_btreeset(&self) -> BTreeSet<DocumentId> {
         match self {
@@ -279,11 +289,7 @@ impl FieldIndex {
     }
 
     /// Count docs in a range without building a BTreeSet.
-    pub fn count_range(
-        &self,
-        start: Bound<&IndexValue>,
-        end: Bound<&IndexValue>,
-    ) -> usize {
+    pub fn count_range(&self, start: Bound<&IndexValue>, end: Bound<&IndexValue>) -> usize {
         let mut count = 0;
         for (_key, ids) in self.tree.range((start, end)) {
             count += ids.len();
@@ -384,12 +390,8 @@ impl FieldIndex {
     }
 
     /// Iterate IDs in a range, calling `f` per ID. Stops when `f` returns false.
-    pub fn for_each_in_range<F>(
-        &self,
-        start: Bound<&IndexValue>,
-        end: Bound<&IndexValue>,
-        mut f: F,
-    ) where
+    pub fn for_each_in_range<F>(&self, start: Bound<&IndexValue>, end: Bound<&IndexValue>, mut f: F)
+    where
         F: FnMut(DocumentId) -> bool,
     {
         for (_key, ids) in self.tree.range((start, end)) {
@@ -495,7 +497,11 @@ impl FieldIndex {
             };
             tree.insert(key, ids);
         }
-        Ok(Self { field, unique, tree })
+        Ok(Self {
+            field,
+            unique,
+            tree,
+        })
     }
 }
 
@@ -522,6 +528,25 @@ impl CompositeIndex {
 
     pub fn name(&self) -> String {
         self.fields.join("_")
+    }
+
+    /// Approximate resident heap bytes of this composite index: per-entry
+    /// B-tree node storage plus the heap owned by string key components and
+    /// large doc-id sets.
+    pub fn memory_bytes(&self) -> usize {
+        // Per-entry B-tree overhead: key + value inline sizes + node bookkeeping.
+        let per_entry = std::mem::size_of::<CompositeKey>()
+            + std::mem::size_of::<DocIdSet>()
+            + 24;
+        let mut total = self.tree.len() * per_entry;
+        for (key, ids) in &self.tree {
+            total += key.0.capacity() * std::mem::size_of::<IndexValue>();
+            for iv in &key.0 {
+                total += iv.heap_bytes();
+            }
+            total += ids.heap_bytes();
+        }
+        total
     }
 
     fn extract_key_from_value(&self, data: &Value) -> CompositeKey {
@@ -920,7 +945,10 @@ mod tests {
 
         let lo = IndexValue::Integer(15);
         let hi = IndexValue::Integer(25);
-        assert_eq!(idx.count_range(Bound::Included(&lo), Bound::Included(&hi)), 1);
+        assert_eq!(
+            idx.count_range(Bound::Included(&lo), Bound::Included(&hi)),
+            1
+        );
     }
 
     #[test]
@@ -939,7 +967,10 @@ mod tests {
         idx.insert(&make_doc(3, json!({"x": "c"})));
 
         assert_eq!(
-            idx.count_in(&[IndexValue::String("a".into()), IndexValue::String("c".into())]),
+            idx.count_in(&[
+                IndexValue::String("a".into()),
+                IndexValue::String("c".into())
+            ]),
             2
         );
     }
@@ -971,7 +1002,10 @@ mod tests {
         idx.insert_value(1, &json!({"name": "Alice"}));
         idx.insert_value(2, &json!({"name": "Bob"}));
 
-        assert_eq!(idx.find_eq(&IndexValue::String("Alice".into())), BTreeSet::from([1]));
+        assert_eq!(
+            idx.find_eq(&IndexValue::String("Alice".into())),
+            BTreeSet::from([1])
+        );
     }
 
     #[test]
@@ -990,10 +1024,24 @@ mod tests {
         idx.insert(&make_doc(3, json!({"x": 2})));
 
         let asc: Vec<_> = idx.iter_asc().map(|(v, _)| v.clone()).collect();
-        assert_eq!(asc, vec![IndexValue::Integer(1), IndexValue::Integer(2), IndexValue::Integer(3)]);
+        assert_eq!(
+            asc,
+            vec![
+                IndexValue::Integer(1),
+                IndexValue::Integer(2),
+                IndexValue::Integer(3)
+            ]
+        );
 
         let desc: Vec<_> = idx.iter_desc().map(|(v, _)| v.clone()).collect();
-        assert_eq!(desc, vec![IndexValue::Integer(3), IndexValue::Integer(2), IndexValue::Integer(1)]);
+        assert_eq!(
+            desc,
+            vec![
+                IndexValue::Integer(3),
+                IndexValue::Integer(2),
+                IndexValue::Integer(1)
+            ]
+        );
     }
 
     #[test]
@@ -1066,7 +1114,10 @@ mod tests {
         idx.insert_value(1, &json!({"address": {"city": "NYC"}}));
         idx.insert_value(2, &json!({"address": {"city": "LA"}}));
 
-        assert_eq!(idx.find_eq(&IndexValue::String("NYC".into())), BTreeSet::from([1]));
+        assert_eq!(
+            idx.find_eq(&IndexValue::String("NYC".into())),
+            BTreeSet::from([1])
+        );
     }
 
     #[test]
@@ -1082,8 +1133,14 @@ mod tests {
 
         assert_eq!(decoded.field, "email");
         assert!(decoded.unique);
-        assert_eq!(decoded.find_eq(&IndexValue::String("alice@test.com".into())), BTreeSet::from([1]));
-        assert_eq!(decoded.find_eq(&IndexValue::String("bob@test.com".into())), BTreeSet::from([2]));
+        assert_eq!(
+            decoded.find_eq(&IndexValue::String("alice@test.com".into())),
+            BTreeSet::from([1])
+        );
+        assert_eq!(
+            decoded.find_eq(&IndexValue::String("bob@test.com".into())),
+            BTreeSet::from([2])
+        );
         assert_eq!(decoded.count_all(), 3);
     }
 
@@ -1101,7 +1158,10 @@ mod tests {
         idx.write_to(&mut buf).unwrap();
         let decoded = FieldIndex::read_from(&mut &buf[..]).unwrap();
         assert_eq!(decoded.count_all(), 6);
-        assert_eq!(decoded.find_eq(&IndexValue::Integer(42)), BTreeSet::from([3]));
+        assert_eq!(
+            decoded.find_eq(&IndexValue::Integer(42)),
+            BTreeSet::from([3])
+        );
     }
 
     #[test]
