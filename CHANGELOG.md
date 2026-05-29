@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### Code-review pass — security, correctness, and storage hardening (server 0.28.19)
+
+A review across the server, query engine, and storage layers fixed 13 bugs
+with regression tests, and scoped the one deferred item as ADR-0007.
+
+**Security (REST/WS — only relevant when `OXIDB_HTTP_PORT`/`OXIDB_WS_PORT` +
+`OXIDB_JWT_SECRET` are enabled):**
+
+- Public `POST /api/auth/signup` no longer honors a client-supplied `admin`
+  role — self-assigning `admin` is rejected (403).
+- The JWT role is now **enforced** on every protected REST endpoint and on
+  mutating WebSocket commands. Previously any valid token (even `read`) could
+  drop collections, create stored procedures, or rewrite a collection's
+  security rules. Mirrors the TCP RBAC default-deny posture.
+- Cluster (async) dispatch now honors per-database role overrides
+  (`effective_role`), matching the standalone path; a `grant_db_role`
+  downgrade is no longer bypassed in cluster mode.
+
+**Transactions:**
+
+- Added a commit lock serializing the OCC validate→apply window, closing a
+  concurrent lost-update race where two commits on the same document could
+  both validate and both write.
+
+**Query / update engine:**
+
+- `$type:"double"` no longer matches integers; `"number"` is the numeric union.
+- `$all: []` matches nothing (was: every array-valued document).
+- `$substr` is code-point based — no more panic on multibyte UTF-8 input.
+- `$mod` guards against a zero divisor and out-of-range float casts.
+- `$inc`/`$mul`/`$min`/`$max` distinguish a present `null` from a missing
+  field (e.g. `$mul` on `{"price": null}` errors instead of yielding `0`).
+- `$project` keeps present-but-null nested fields instead of dropping them.
+- `$set`/`$inc` on an out-of-bounds array index pad with `null`s (MongoDB
+  semantics) instead of silently dropping the write.
+- Index-only `$group` count falls back to the hashing path when a document is
+  indexed under multiple keys, fixing a balanced miscount of the null group.
+
+**Storage robustness:**
+
+- WAL `Update` replay materializes orphan updates into storage/`primary_index`
+  so field/composite indexes and the doc cache never reference a missing doc.
+- zstd decompression buffer is clamped to a 1 GiB ceiling so a corrupt frame
+  header can't drive an OOM allocation on read.
+- Data-file scanners treat a torn final record as a clean end-of-data boundary
+  instead of erroring or allocating from a bogus length.
+- mmap read offsets use checked `u64` math (no 32-bit truncation/wrap).
+
+**Deferred (see [ADR-0007](docs/decisions/0007-wal-commit-record-atomic-recovery.md)):**
+
+- True crash-atomic transaction recovery needs an in-WAL commit record; the
+  naive committed-set replay filter was reverted because it conflicts with the
+  lazy-checkpoint + `remove_committed` design (it discarded committed data).
+  Recovery currently favors durability over atomicity; ADR-0007 scopes the fix.
+
 ### SQL surface removed — OxiDB is a document database
 
 The engine SQL surface (`oxidb::sql`, `SqlDialect`, `SqlResult`, `execute_sql`),
