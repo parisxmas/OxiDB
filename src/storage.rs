@@ -7,6 +7,8 @@ pub struct DocLocation {
 
 // Everything below is native-only (filesystem, compression, mmap).
 #[cfg(not(target_arch = "wasm32"))]
+use crate::locks::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
 use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{self, File, OpenOptions};
@@ -16,8 +18,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::locks::Mutex;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::crypto::EncryptionKey;
@@ -31,6 +31,19 @@ const RECORD_DELETED: u8 = 1;
 
 #[cfg(not(target_arch = "wasm32"))]
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Hard ceiling on the buffer we will pre-allocate to decompress a single
+/// stored record. Far above any realistic document, but bounded so a corrupt
+/// or hostile zstd frame header declaring an enormous content size cannot
+/// drive an out-of-memory allocation during a read.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_DECOMPRESSED_RECORD: usize = 1 << 30; // 1 GiB
+
+/// Build an `InvalidData` I/O error for a corrupt/overflowing record location.
+#[cfg(not(target_arch = "wasm32"))]
+fn storage_corrupt(msg: &str) -> crate::error::Error {
+    crate::error::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+}
 #[cfg(not(target_arch = "wasm32"))]
 const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
 #[cfg(not(target_arch = "wasm32"))]
@@ -71,7 +84,10 @@ impl Storage {
         Self::open_with_encryption(path, None)
     }
 
-    pub fn open_with_encryption(path: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
+    pub fn open_with_encryption(
+        path: &Path,
+        encryption: Option<Arc<EncryptionKey>>,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -112,11 +128,9 @@ impl Storage {
     /// Compress with zstd using a reusable thread-local compressor.
     /// Only returns compressed form if it actually shrinks the data.
     fn maybe_compress<'a>(&self, data: &'a [u8]) -> Cow<'a, [u8]> {
-        ZSTD_COMPRESSOR.with(|c| {
-            match c.borrow_mut().compress(data) {
-                Ok(compressed) if compressed.len() < data.len() => Cow::Owned(compressed),
-                _ => Cow::Borrowed(data),
-            }
+        ZSTD_COMPRESSOR.with(|c| match c.borrow_mut().compress(data) {
+            Ok(compressed) if compressed.len() < data.len() => Cow::Owned(compressed),
+            _ => Cow::Borrowed(data),
         })
     }
 
@@ -129,16 +143,21 @@ impl Storage {
         // zstd frame
         if data[..4] == ZSTD_MAGIC {
             let exact = zstd::zstd_safe::get_frame_content_size(data);
+            // The declared frame content size is attacker/corruption-
+            // controlled (a single flipped byte can fake the zstd magic in
+            // the data file, which has no per-record CRC). Clamp the buffer
+            // hint so a bogus multi-exabyte size can't trigger an OOM
+            // `Vec::with_capacity` while merely reading a record. Legit
+            // records decompress fine under the ceiling; a frame that truly
+            // needs more will just fail to decompress.
             let capacity = match exact {
-                Ok(Some(size)) => size as usize,
-                _ => std::cmp::max(data.len() * 16, 65536),
+                Ok(Some(size)) => (size as usize).min(MAX_DECOMPRESSED_RECORD),
+                _ => std::cmp::max(data.len() * 16, 65536).min(MAX_DECOMPRESSED_RECORD),
             };
             return ZSTD_DECOMPRESSOR.with(|d| {
-                d.borrow_mut()
-                    .decompress(data, capacity)
-                    .map_err(|e| crate::error::Error::Io(
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-                    ))
+                d.borrow_mut().decompress(data, capacity).map_err(|e| {
+                    crate::error::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                })
             });
         }
 
@@ -207,14 +226,25 @@ impl Storage {
     /// Read a document without acquiring the Mutex.
     /// Uses mmap when available (zero syscall), falls back to pread.
     pub fn read_lockfree(&self, loc: DocLocation) -> Result<Vec<u8>> {
-        let data_start = (loc.offset + 5) as usize;
-        let data_end = data_start + loc.length as usize;
+        // Compute the byte range in u64 with overflow checks. `loc.offset` is
+        // u64 and `loc.length` u32; casting to usize first would truncate on
+        // 32-bit targets and let a corrupt DocLocation wrap back inside the
+        // mmap bounds, returning the wrong bytes past the `<= mmap.len()` guard.
+        let data_start_u64 = loc
+            .offset
+            .checked_add(5)
+            .ok_or_else(|| storage_corrupt("document offset overflow"))?;
+        let data_end_u64 = data_start_u64
+            .checked_add(loc.length as u64)
+            .ok_or_else(|| storage_corrupt("document length overflow"))?;
 
         // Fast path: read from mmap (no syscall)
         {
             let guard = self.read_mmap.read();
             if let Some(ref mmap) = *guard {
-                if data_end <= mmap.len() {
+                if data_end_u64 <= mmap.len() as u64 {
+                    let data_start = data_start_u64 as usize;
+                    let data_end = data_end_u64 as usize;
                     return self.decode_payload(&mmap[data_start..data_end]);
                 }
             }
@@ -247,13 +277,20 @@ impl Storage {
 
         let mut results = Vec::with_capacity(locs.len());
         for &(idx, loc) in locs.iter() {
-            let data_start = (loc.offset + 5) as usize;
-            let data_end = data_start + loc.length as usize;
+            // u64 + checked math, as in `read_lockfree`, so a truncated/wrapped
+            // offset can't pass the mmap-bounds check and read wrong bytes.
+            let data_start_u64 = loc
+                .offset
+                .checked_add(5)
+                .ok_or_else(|| storage_corrupt("document offset overflow"))?;
+            let data_end_u64 = data_start_u64
+                .checked_add(loc.length as u64)
+                .ok_or_else(|| storage_corrupt("document length overflow"))?;
 
             let decoded = if let Some(ref mmap) = mmap_ref {
-                if data_end <= mmap_len {
+                if data_end_u64 <= mmap_len as u64 {
                     // Zero-syscall mmap read
-                    self.decode_payload(&mmap[data_start..data_end])?
+                    self.decode_payload(&mmap[data_start_u64 as usize..data_end_u64 as usize])?
                 } else {
                     self.pread_decode(loc)?
                 }
@@ -446,7 +483,10 @@ impl Storage {
 
         let locations = relative_locations
             .into_iter()
-            .map(|(rel, length)| DocLocation { offset: base_offset + rel, length })
+            .map(|(rel, length)| DocLocation {
+                offset: base_offset + rel,
+                length,
+            })
             .collect();
 
         Ok(locations)
@@ -491,7 +531,8 @@ impl Storage {
             if let Ok(new_mmap) = unsafe { memmap2::Mmap::map(&self.read_file) } {
                 let new_len = new_mmap.len() as u64;
                 *self.read_mmap.write() = Some(new_mmap);
-                self.mmap_len.store(new_len, std::sync::atomic::Ordering::Relaxed);
+                self.mmap_len
+                    .store(new_len, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -518,17 +559,35 @@ impl Storage {
         let mut pos = 0u64;
 
         while pos < file_len {
+            // A torn final record (process crashed mid-append) leaves fewer
+            // than a full header+payload at the tail. Treat that as a clean
+            // end-of-data boundary rather than erroring out — the data file is
+            // reconstructable from the WAL, so an unopenable file would be far
+            // worse than dropping a never-acknowledged trailing write.
+            if pos + 5 > file_len {
+                break;
+            }
             let mut header = [0u8; 5];
             inner.file.read_exact(&mut header)?;
 
             let status = header[0];
             let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
 
+            if pos + 5 + length as u64 > file_len {
+                break; // torn payload — stop at last valid record
+            }
+
             if status == RECORD_ACTIVE {
                 let mut data = vec![0u8; length as usize];
                 inner.file.read_exact(&mut data)?;
                 let plaintext = self.decode_payload(&data)?;
-                results.push((DocLocation { offset: pos, length }, plaintext));
+                results.push((
+                    DocLocation {
+                        offset: pos,
+                        length,
+                    },
+                    plaintext,
+                ));
             } else {
                 inner.file.seek(SeekFrom::Current(length as i64))?;
             }
@@ -551,11 +610,19 @@ impl Storage {
         let mut pos = 0u64;
 
         while pos < file_len {
+            // Stop cleanly at a torn final record (see `iter_active`).
+            if pos + 5 > file_len {
+                break;
+            }
             let mut header = [0u8; 5];
             inner.file.read_exact(&mut header)?;
 
             let status = header[0];
             let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
+
+            if pos + 5 + length as u64 > file_len {
+                break; // torn payload — stop at last valid record
+            }
 
             if status == RECORD_ACTIVE {
                 let mut data = vec![0u8; length as usize];
@@ -563,7 +630,13 @@ impl Storage {
                 let plaintext = self.decode_payload(&data)?;
                 // Drop inner lock before callback (callback may need to read storage)
                 drop(inner);
-                f(DocLocation { offset: pos, length }, plaintext)?;
+                f(
+                    DocLocation {
+                        offset: pos,
+                        length,
+                    },
+                    plaintext,
+                )?;
                 inner = self.inner.lock();
                 // Re-seek to continue after this record
                 inner.file.seek(SeekFrom::Start(pos + 5 + length as u64))?;
@@ -594,11 +667,18 @@ impl Storage {
         let mut buf = Vec::with_capacity(4096);
 
         while pos < file_len {
+            // Stop cleanly at a torn final record (see `iter_active`).
+            if pos + 5 > file_len {
+                break;
+            }
             let mut header = [0u8; 5];
             reader.read_exact(&mut header)?;
             let status = header[0];
-            let length =
-                u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+            if pos + 5 + length as u64 > file_len {
+                break; // torn payload — stop at last valid record
+            }
 
             if status == RECORD_ACTIVE {
                 buf.resize(length, 0);
@@ -639,13 +719,21 @@ impl Storage {
         let mut buf = Vec::with_capacity(4096);
 
         while pos < end_offset {
+            if pos + 5 > end_offset {
+                break; // torn header at the segment tail
+            }
             let mut header = [0u8; 5];
             if reader.read_exact(&mut header).is_err() {
                 break;
             }
             let status = header[0];
-            let length =
-                u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
+
+            // Bound the resize against the segment so a bogus length from a
+            // torn record can't drive an arbitrary allocation.
+            if pos + 5 + length as u64 > end_offset {
+                break; // torn payload — stop at last valid record
+            }
 
             if status == RECORD_ACTIVE {
                 buf.resize(length, 0);
@@ -682,6 +770,40 @@ mod tests {
         let loc = storage.append(data).unwrap();
         let read_back = storage.read(loc).unwrap();
         assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn torn_tail_record_is_not_a_hard_error() {
+        // A crash mid-append can leave a partial header or a header with a
+        // payload that runs past EOF. Scanning must stop cleanly at the last
+        // valid record rather than erroring (which would make the data file —
+        // reconstructable from the WAL — unopenable) or allocating from a
+        // bogus length.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.dat");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.append(b"first").unwrap();
+            storage.append(b"second").unwrap();
+        }
+        // Simulate a torn tail: a status byte + a length field claiming a huge
+        // payload that does not exist on disk.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[RECORD_ACTIVE]).unwrap();
+            f.write_all(&u32::MAX.to_le_bytes()).unwrap(); // bogus 4 GiB length
+            f.write_all(b"xx").unwrap(); // only a couple of payload bytes
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        let active = storage.iter_active().unwrap();
+        assert_eq!(
+            active.len(),
+            2,
+            "torn tail must be ignored, valid records kept"
+        );
+        assert_eq!(active[0].1, b"first");
+        assert_eq!(active[1].1, b"second");
     }
 
     #[test]
@@ -776,11 +898,9 @@ mod tests {
         std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
         let enc_key = EncryptionKey::load_from_file(&key_path).unwrap();
 
-        let storage = Storage::open_with_encryption(
-            &dir.path().join("encrypted.dat"),
-            Some(enc_key),
-        )
-        .unwrap();
+        let storage =
+            Storage::open_with_encryption(&dir.path().join("encrypted.dat"), Some(enc_key))
+                .unwrap();
 
         let data = b"secret document payload";
         let loc = storage.append(data).unwrap();
@@ -813,11 +933,9 @@ mod tests {
         std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
         let enc_key = EncryptionKey::load_from_file(&key_path).unwrap();
 
-        let storage = Storage::open_with_encryption(
-            &dir.path().join("encrypted.dat"),
-            Some(enc_key),
-        )
-        .unwrap();
+        let storage =
+            Storage::open_with_encryption(&dir.path().join("encrypted.dat"), Some(enc_key))
+                .unwrap();
 
         storage.append(b"doc_a").unwrap();
         let loc_b = storage.append(b"doc_b").unwrap();

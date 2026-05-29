@@ -1,6 +1,8 @@
 use crate::document::DocumentId;
 
 #[cfg(not(target_arch = "wasm32"))]
+use crate::locks::Mutex;
+#[cfg(not(target_arch = "wasm32"))]
 use std::borrow::Cow;
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::{HashMap, HashSet};
@@ -14,8 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::locks::Mutex;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crc32fast::Hasher;
@@ -31,9 +31,9 @@ use crate::error::{Error, Result};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::index::CompositeIndex;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::pitr::ArchiveSequencer;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::paged_field_index::PagedFieldIndex;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::pitr::ArchiveSequencer;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::storage::{DocLocation, Storage};
 
@@ -85,20 +85,39 @@ mod header_state {
 
 /// A WAL entry representing a pending mutation.
 pub enum WalEntry {
-    Insert { doc_id: DocumentId, doc_bytes: Vec<u8>, tx_id: u64 },
-    Update { doc_id: DocumentId, doc_bytes: Vec<u8>, tx_id: u64 },
-    Delete { doc_id: DocumentId, tx_id: u64 },
+    Insert {
+        doc_id: DocumentId,
+        doc_bytes: Vec<u8>,
+        tx_id: u64,
+    },
+    Update {
+        doc_id: DocumentId,
+        doc_bytes: Vec<u8>,
+        tx_id: u64,
+    },
+    Delete {
+        doc_id: DocumentId,
+        tx_id: u64,
+    },
 }
 
 impl WalEntry {
     /// Create an Insert entry with tx_id=0 (non-transactional).
     pub fn insert(doc_id: DocumentId, doc_bytes: Vec<u8>) -> Self {
-        WalEntry::Insert { doc_id, doc_bytes, tx_id: 0 }
+        WalEntry::Insert {
+            doc_id,
+            doc_bytes,
+            tx_id: 0,
+        }
     }
 
     /// Create an Update entry with tx_id=0 (non-transactional).
     pub fn update(doc_id: DocumentId, doc_bytes: Vec<u8>) -> Self {
-        WalEntry::Update { doc_id, doc_bytes, tx_id: 0 }
+        WalEntry::Update {
+            doc_id,
+            doc_bytes,
+            tx_id: 0,
+        }
     }
 
     /// Create a Delete entry with tx_id=0 (non-transactional).
@@ -174,7 +193,10 @@ impl Wal {
         Self::open_with_encryption(path, None)
     }
 
-    pub fn open_with_encryption(path: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
+    pub fn open_with_encryption(
+        path: &Path,
+        encryption: Option<Arc<EncryptionKey>>,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -242,9 +264,7 @@ impl Wal {
     /// is the live WAL file (not a sealed segment). After this returns,
     /// `header_state` is `PRESENT` and the file cursor is left at offset 8.
     fn ensure_header_locked(&self, file: &mut File) -> Result<()> {
-        if self.header_state.load(std::sync::atomic::Ordering::Acquire)
-            != header_state::NEEDED
-        {
+        if self.header_state.load(std::sync::atomic::Ordering::Acquire) != header_state::NEEDED {
             return Ok(());
         }
         let mut header = Vec::with_capacity(WAL_HEADER_SIZE);
@@ -262,9 +282,7 @@ impl Wal {
     /// headed files, 0 for legacy / brand-new files. Used by the scanner
     /// to skip the header when present without re-probing the bytes.
     fn records_start_offset(&self) -> u64 {
-        if self.header_state.load(std::sync::atomic::Ordering::Acquire)
-            == header_state::PRESENT
-        {
+        if self.header_state.load(std::sync::atomic::Ordering::Acquire) == header_state::PRESENT {
             WAL_HEADER_SIZE as u64
         } else {
             0
@@ -456,7 +474,10 @@ impl Wal {
         let entries = self.read_entries()?;
 
         if verbose && !entries.is_empty() {
-            vlog(&format!("[verbose] WAL: {} entries to replay", entries.len()));
+            vlog(&format!(
+                "[verbose] WAL: {} entries to replay",
+                entries.len()
+            ));
         }
 
         let mut inserts = 0u64;
@@ -473,7 +494,9 @@ impl Wal {
             }
 
             match entry {
-                WalEntry::Insert { doc_id, doc_bytes, .. } => {
+                WalEntry::Insert {
+                    doc_id, doc_bytes, ..
+                } => {
                     // Skip if already present in primary_index
                     if primary_index.contains_key(&doc_id) {
                         skipped += 1;
@@ -499,9 +522,12 @@ impl Wal {
                     }
                     inserts += 1;
                 }
-                WalEntry::Update { doc_id, doc_bytes, .. } => {
-                    // Remove old values from indexes before updating
+                WalEntry::Update {
+                    doc_id, doc_bytes, ..
+                } => {
                     if let Some(&old_loc) = primary_index.get(&doc_id) {
+                        // Existing doc — remove old index values, then replace
+                        // storage if the bytes actually changed.
                         if let Ok(old_doc) = crate::codec::decode_doc(&storage.read(old_loc)?) {
                             for idx in field_indexes.values_mut() {
                                 idx.remove_value(doc_id, &old_doc);
@@ -510,15 +536,30 @@ impl Wal {
                                 idx.remove_value(doc_id, &old_doc);
                             }
                         }
-                        // Read current doc bytes; if different, apply update
                         let current_bytes = storage.read(old_loc)?;
                         if current_bytes != doc_bytes {
                             let new_loc = storage.append(&doc_bytes)?;
                             storage.mark_deleted(old_loc)?;
                             primary_index.insert(doc_id, new_loc);
                         }
+                    } else {
+                        // Orphan update: there is no prior record for this
+                        // doc_id in the replay (e.g. its Insert lived in an
+                        // earlier, already-checkpointed segment, or this is a
+                        // committed full-document replace). Materialize it as an
+                        // insert so storage and primary_index stay consistent
+                        // with the field/composite indexes and doc cache updated
+                        // below — otherwise those would reference a doc with no
+                        // storage location or primary-index entry.
+                        let loc = storage.append(&doc_bytes)?;
+                        primary_index.insert(doc_id, loc);
+                        if doc_id >= *next_id {
+                            *next_id = doc_id + 1;
+                        }
                     }
-                    // Update version_index and indexes from the new doc bytes
+                    // Update version_index and indexes from the new doc bytes.
+                    // Safe to run unconditionally now: the branch above
+                    // guarantees `doc_id` is present in storage/primary_index.
                     if let Ok(doc) = crate::codec::decode_doc(&doc_bytes) {
                         let ver = doc.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                         version_index.insert(doc_id, ver);
@@ -696,7 +737,11 @@ impl Wal {
         let encrypted = self.maybe_encrypt(doc_bytes)?;
         let extra = if meta.is_some() { 16 } else { 0 };
         let mut payload = Vec::with_capacity(1 + 8 + 8 + extra + encrypted.len());
-        payload.push(if meta.is_some() { OP_INSERT_V2 } else { OP_INSERT });
+        payload.push(if meta.is_some() {
+            OP_INSERT_V2
+        } else {
+            OP_INSERT
+        });
         payload.extend_from_slice(&0u64.to_le_bytes()); // tx_id = 0
         payload.extend_from_slice(&doc_id.to_le_bytes());
         if let Some(m) = meta {
@@ -728,8 +773,16 @@ impl Wal {
         // Extra header bytes for v2: gsn (8) + wall_clock (8).
         let extra = if meta.is_some() { 16 } else { 0 };
         let payload = match entry {
-            WalEntry::Insert { doc_id, doc_bytes, tx_id }
-            | WalEntry::Update { doc_id, doc_bytes, tx_id } => {
+            WalEntry::Insert {
+                doc_id,
+                doc_bytes,
+                tx_id,
+            }
+            | WalEntry::Update {
+                doc_id,
+                doc_bytes,
+                tx_id,
+            } => {
                 let is_insert = matches!(entry, WalEntry::Insert { .. });
                 let encrypted = self.maybe_encrypt(doc_bytes)?;
                 let mut payload = Vec::with_capacity(1 + 8 + 8 + extra + encrypted.len());
@@ -750,7 +803,11 @@ impl Wal {
             }
             WalEntry::Delete { doc_id, tx_id } => {
                 let mut payload = Vec::with_capacity(1 + 8 + 8 + extra);
-                payload.push(if meta.is_some() { OP_DELETE_V2 } else { OP_DELETE });
+                payload.push(if meta.is_some() {
+                    OP_DELETE_V2
+                } else {
+                    OP_DELETE
+                });
                 payload.extend_from_slice(&tx_id.to_le_bytes());
                 payload.extend_from_slice(&doc_id.to_le_bytes());
                 if let Some(m) = meta {
@@ -842,7 +899,10 @@ impl Wal {
             let mut header = [0u8; 8];
             if file.read_exact(&mut header).is_err() {
                 if pos > 0 {
-                    eprintln!("[wal] truncated header at offset {pos}, stopping replay ({} entries recovered)", records.len());
+                    eprintln!(
+                        "[wal] truncated header at offset {pos}, stopping replay ({} entries recovered)",
+                        records.len()
+                    );
                 }
                 break;
             }
@@ -852,7 +912,11 @@ impl Wal {
                 u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
 
             if pos + 8 + payload_len as u64 > file_len {
-                eprintln!("[wal] truncated payload at offset {pos} (need {} bytes, file has {}), stopping replay", payload_len, file_len - pos - 8);
+                eprintln!(
+                    "[wal] truncated payload at offset {pos} (need {} bytes, file has {}), stopping replay",
+                    payload_len,
+                    file_len - pos - 8
+                );
                 break;
             }
 
@@ -864,7 +928,10 @@ impl Wal {
             // Verify CRC
             let computed_crc = Self::compute_crc(&payload);
             if stored_crc != computed_crc {
-                eprintln!("[wal] CRC mismatch at offset {pos}: stored={stored_crc:#010x} computed={computed_crc:#010x}, stopping replay ({} entries recovered)", records.len());
+                eprintln!(
+                    "[wal] CRC mismatch at offset {pos}: stored={stored_crc:#010x} computed={computed_crc:#010x}, stopping replay ({} entries recovered)",
+                    records.len()
+                );
                 break;
             }
 
@@ -902,7 +969,13 @@ impl Wal {
             }
             let gsn = u64::from_le_bytes(payload[17..25].try_into().ok()?);
             let wall_clock_micros = u64::from_le_bytes(payload[25..33].try_into().ok()?);
-            (WalMeta { gsn, wall_clock_micros }, 33)
+            (
+                WalMeta {
+                    gsn,
+                    wall_clock_micros,
+                },
+                33,
+            )
         } else {
             (WalMeta::default(), 17)
         };
@@ -910,11 +983,19 @@ impl Wal {
         let entry = match op_type {
             OP_INSERT | OP_INSERT_V2 => {
                 let doc_bytes = self.maybe_decrypt(&payload[body_start..]).ok()?;
-                WalEntry::Insert { doc_id, doc_bytes, tx_id }
+                WalEntry::Insert {
+                    doc_id,
+                    doc_bytes,
+                    tx_id,
+                }
             }
             OP_UPDATE | OP_UPDATE_V2 => {
                 let doc_bytes = self.maybe_decrypt(&payload[body_start..]).ok()?;
-                WalEntry::Update { doc_id, doc_bytes, tx_id }
+                WalEntry::Update {
+                    doc_id,
+                    doc_bytes,
+                    tx_id,
+                }
             }
             OP_DELETE | OP_DELETE_V2 => WalEntry::Delete { doc_id, tx_id },
             _ => return None,
@@ -943,7 +1024,11 @@ mod tests {
         let entries = wal.read_entries().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0] {
-            WalEntry::Insert { doc_id, doc_bytes, tx_id } => {
+            WalEntry::Insert {
+                doc_id,
+                doc_bytes,
+                tx_id,
+            } => {
                 assert_eq!(*doc_id, 1);
                 assert_eq!(doc_bytes, b"doc_data");
                 assert_eq!(*tx_id, 0);
@@ -963,7 +1048,11 @@ mod tests {
         let entries = wal.read_entries().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0] {
-            WalEntry::Update { doc_id, doc_bytes, tx_id } => {
+            WalEntry::Update {
+                doc_id,
+                doc_bytes,
+                tx_id,
+            } => {
                 assert_eq!(*doc_id, 5);
                 assert_eq!(doc_bytes, b"updated_data");
                 assert_eq!(*tx_id, 0);
@@ -1026,8 +1115,10 @@ mod tests {
         let wal = Wal::open(&wal_path).unwrap();
 
         wal.log(&WalEntry::insert(1, b"good".to_vec())).unwrap();
-        wal.log(&WalEntry::insert(2, b"will_corrupt".to_vec())).unwrap();
-        wal.log(&WalEntry::insert(3, b"after_corrupt".to_vec())).unwrap();
+        wal.log(&WalEntry::insert(2, b"will_corrupt".to_vec()))
+            .unwrap();
+        wal.log(&WalEntry::insert(3, b"after_corrupt".to_vec()))
+            .unwrap();
 
         // Corrupt the CRC of the second entry. File layout post-Phase-1b:
         //   [OXWA header 8B][rec0 crc 4B][rec0 len 4B][rec0 payload …]
@@ -1084,8 +1175,19 @@ mod tests {
         let mut fi = HashMap::new();
         let mut ci = Vec::new();
         let dc = DocCache::new(1000);
-        wal.recover(&storage, &mut primary_index, &dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
-            .unwrap();
+        wal.recover(
+            &storage,
+            &mut primary_index,
+            &dc,
+            &mut next_id,
+            &committed,
+            &mut version_index,
+            &mut fi,
+            &mut ci,
+            false,
+            &None,
+        )
+        .unwrap();
 
         assert_eq!(primary_index.len(), 1);
         assert!(primary_index.contains_key(&0));
@@ -1114,8 +1216,19 @@ mod tests {
         let mut ci = Vec::new();
         let dc = DocCache::new(1000);
 
-        wal.recover(&storage, &mut primary_index, &dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
-            .unwrap();
+        wal.recover(
+            &storage,
+            &mut primary_index,
+            &dc,
+            &mut next_id,
+            &committed,
+            &mut version_index,
+            &mut fi,
+            &mut ci,
+            false,
+            &None,
+        )
+        .unwrap();
 
         assert!(primary_index.is_empty()); // Should be skipped
     }
@@ -1142,8 +1255,19 @@ mod tests {
         let mut ci = Vec::new();
         let dc = DocCache::new(1000);
 
-        wal.recover(&storage, &mut primary_index, &dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
-            .unwrap();
+        wal.recover(
+            &storage,
+            &mut primary_index,
+            &dc,
+            &mut next_id,
+            &committed,
+            &mut version_index,
+            &mut fi,
+            &mut ci,
+            false,
+            &None,
+        )
+        .unwrap();
 
         assert_eq!(primary_index.len(), 1);
     }
@@ -1170,8 +1294,19 @@ mod tests {
         let wal = Wal::open(&wal_path).unwrap();
         wal.log(&WalEntry::delete(0)).unwrap();
 
-        wal.recover(&storage, &mut primary_index, &dc, &mut next_id, &committed, &mut version_index, &mut fi, &mut ci, false, &None)
-            .unwrap();
+        wal.recover(
+            &storage,
+            &mut primary_index,
+            &dc,
+            &mut next_id,
+            &committed,
+            &mut version_index,
+            &mut fi,
+            &mut ci,
+            false,
+            &None,
+        )
+        .unwrap();
 
         assert!(primary_index.is_empty());
     }
@@ -1183,11 +1318,8 @@ mod tests {
         std::fs::write(&key_path, &[0x42u8; 32]).unwrap();
         let enc_key = crate::crypto::EncryptionKey::load_from_file(&key_path).unwrap();
 
-        let wal = Wal::open_with_encryption(
-            &dir.path().join("encrypted.wal"),
-            Some(enc_key),
-        )
-        .unwrap();
+        let wal =
+            Wal::open_with_encryption(&dir.path().join("encrypted.wal"), Some(enc_key)).unwrap();
 
         let data = b"secret_doc_content";
         wal.log(&WalEntry::insert(1, data.to_vec())).unwrap();
@@ -1217,11 +1349,13 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let wal = test_wal(&dir);
 
-        wal.log_no_sync(&WalEntry::insert(1, b"a".to_vec())).unwrap();
+        wal.log_no_sync(&WalEntry::insert(1, b"a".to_vec()))
+            .unwrap();
         wal.log_batch_no_sync(&[
             WalEntry::insert(2, b"b".to_vec()),
             WalEntry::insert(3, b"c".to_vec()),
-        ]).unwrap();
+        ])
+        .unwrap();
 
         let entries = wal.read_entries().unwrap();
         assert_eq!(entries.len(), 3);
@@ -1242,15 +1376,30 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let wal = test_wal(&dir);
 
-        let meta = WalMeta { gsn: 7, wall_clock_micros: 1_700_000_000_000_000 };
-        wal.log_with_meta(&WalEntry::insert(3, b"v2_doc".to_vec()), meta).unwrap();
-        wal.log_with_meta(&WalEntry::delete(3), WalMeta { gsn: 8, wall_clock_micros: 1_700_000_000_000_001 }).unwrap();
+        let meta = WalMeta {
+            gsn: 7,
+            wall_clock_micros: 1_700_000_000_000_000,
+        };
+        wal.log_with_meta(&WalEntry::insert(3, b"v2_doc".to_vec()), meta)
+            .unwrap();
+        wal.log_with_meta(
+            &WalEntry::delete(3),
+            WalMeta {
+                gsn: 8,
+                wall_clock_micros: 1_700_000_000_000_001,
+            },
+        )
+        .unwrap();
 
         let records = wal.read_records().unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].meta, meta);
         match &records[0].entry {
-            WalEntry::Insert { doc_id, doc_bytes, tx_id } => {
+            WalEntry::Insert {
+                doc_id,
+                doc_bytes,
+                tx_id,
+            } => {
                 assert_eq!(*doc_id, 3);
                 assert_eq!(doc_bytes, b"v2_doc");
                 assert_eq!(*tx_id, 0);
@@ -1258,7 +1407,10 @@ mod tests {
             _ => panic!("expected Insert"),
         }
         assert_eq!(records[1].meta.gsn, 8);
-        assert!(matches!(records[1].entry, WalEntry::Delete { doc_id: 3, .. }));
+        assert!(matches!(
+            records[1].entry,
+            WalEntry::Delete { doc_id: 3, .. }
+        ));
     }
 
     #[test]
@@ -1267,15 +1419,27 @@ mod tests {
         let wal = test_wal(&dir);
 
         wal.log_with_meta(
-            &WalEntry::Update { doc_id: 9, doc_bytes: b"x".to_vec(), tx_id: 42 },
-            WalMeta { gsn: 100, wall_clock_micros: 5 },
-        ).unwrap();
+            &WalEntry::Update {
+                doc_id: 9,
+                doc_bytes: b"x".to_vec(),
+                tx_id: 42,
+            },
+            WalMeta {
+                gsn: 100,
+                wall_clock_micros: 5,
+            },
+        )
+        .unwrap();
 
         // The legacy replay path still sees the entry, just without meta.
         let entries = wal.read_entries().unwrap();
         assert_eq!(entries.len(), 1);
         match &entries[0] {
-            WalEntry::Update { doc_id, doc_bytes, tx_id } => {
+            WalEntry::Update {
+                doc_id,
+                doc_bytes,
+                tx_id,
+            } => {
                 assert_eq!(*doc_id, 9);
                 assert_eq!(doc_bytes, b"x");
                 assert_eq!(*tx_id, 42);
@@ -1291,9 +1455,23 @@ mod tests {
 
         // Simulates a WAL written across an upgrade: v1 records, then v2.
         wal.log(&WalEntry::insert(1, b"old".to_vec())).unwrap();
-        wal.log_with_meta(&WalEntry::insert(2, b"new".to_vec()), WalMeta { gsn: 1, wall_clock_micros: 11 }).unwrap();
+        wal.log_with_meta(
+            &WalEntry::insert(2, b"new".to_vec()),
+            WalMeta {
+                gsn: 1,
+                wall_clock_micros: 11,
+            },
+        )
+        .unwrap();
         wal.log(&WalEntry::delete(1)).unwrap();
-        wal.log_with_meta(&WalEntry::delete(2), WalMeta { gsn: 2, wall_clock_micros: 22 }).unwrap();
+        wal.log_with_meta(
+            &WalEntry::delete(2),
+            WalMeta {
+                gsn: 2,
+                wall_clock_micros: 22,
+            },
+        )
+        .unwrap();
 
         let records = wal.read_records().unwrap();
         assert_eq!(records.len(), 4);
@@ -1316,8 +1494,12 @@ mod tests {
         let enc_key = crate::crypto::EncryptionKey::load_from_file(&key_path).unwrap();
         let wal = Wal::open_with_encryption(&dir.path().join("v2_enc.wal"), Some(enc_key)).unwrap();
 
-        let meta = WalMeta { gsn: 55, wall_clock_micros: 999 };
-        wal.log_with_meta(&WalEntry::insert(1, b"secret_v2".to_vec()), meta).unwrap();
+        let meta = WalMeta {
+            gsn: 55,
+            wall_clock_micros: 999,
+        };
+        wal.log_with_meta(&WalEntry::insert(1, b"secret_v2".to_vec()), meta)
+            .unwrap();
 
         let records = wal.read_records().unwrap();
         assert_eq!(records.len(), 1);
@@ -1334,8 +1516,22 @@ mod tests {
         let wal_path = dir.path().join("v2_corrupt.wal");
         let wal = Wal::open(&wal_path).unwrap();
 
-        wal.log_with_meta(&WalEntry::insert(1, b"good".to_vec()), WalMeta { gsn: 1, wall_clock_micros: 1 }).unwrap();
-        wal.log_with_meta(&WalEntry::insert(2, b"corrupt_me".to_vec()), WalMeta { gsn: 2, wall_clock_micros: 2 }).unwrap();
+        wal.log_with_meta(
+            &WalEntry::insert(1, b"good".to_vec()),
+            WalMeta {
+                gsn: 1,
+                wall_clock_micros: 1,
+            },
+        )
+        .unwrap();
+        wal.log_with_meta(
+            &WalEntry::insert(2, b"corrupt_me".to_vec()),
+            WalMeta {
+                gsn: 2,
+                wall_clock_micros: 2,
+            },
+        )
+        .unwrap();
 
         // Corrupt the CRC of the second record. File layout post-Phase-1b:
         //   [OXWA header 8B][rec0 framing 8B][rec0 payload][rec1 framing 8B][rec1 payload]
@@ -1361,19 +1557,29 @@ mod tests {
         use crate::pitr::ArchiveSequencer;
         let dir = TempDir::new().unwrap();
         let seq = Arc::new(ArchiveSequencer::open(dir.path()).unwrap());
-        let wal = Wal::open(&dir.path().join("seq.wal")).unwrap().with_sequencer(Some(seq));
+        let wal = Wal::open(&dir.path().join("seq.wal"))
+            .unwrap()
+            .with_sequencer(Some(seq));
 
         // Exercise the single, batch, and no-clone-bulk-insert log paths.
         wal.log(&WalEntry::insert(1, b"a".to_vec())).unwrap();
-        wal.log_batch(&[WalEntry::update(1, b"b".to_vec()), WalEntry::delete(1)]).unwrap();
-        wal.log_batch_inserts_no_sync_buffered(&[(2, b"c".as_slice())]).unwrap();
+        wal.log_batch(&[WalEntry::update(1, b"b".to_vec()), WalEntry::delete(1)])
+            .unwrap();
+        wal.log_batch_inserts_no_sync_buffered(&[(2, b"c".as_slice())])
+            .unwrap();
 
         let records = wal.read_records().unwrap();
         assert_eq!(records.len(), 4);
         // Every record carries a unique, strictly increasing, non-zero GSN.
-        assert_eq!(records.iter().map(|r| r.meta.gsn).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(
+            records.iter().map(|r| r.meta.gsn).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
         for r in &records {
-            assert!(r.meta.wall_clock_micros > 0, "v2 records must carry a wall-clock");
+            assert!(
+                r.meta.wall_clock_micros > 0,
+                "v2 records must carry a wall-clock"
+            );
         }
     }
 
@@ -1402,7 +1608,10 @@ mod tests {
         // The sealed segment exists and holds the two records...
         let sealed = wal.list_sealed_segments();
         assert_eq!(sealed.len(), 1);
-        assert_eq!(Wal::open(&sealed[0]).unwrap().read_records().unwrap().len(), 2);
+        assert_eq!(
+            Wal::open(&sealed[0]).unwrap().read_records().unwrap().len(),
+            2
+        );
         // ...and the live WAL is fresh and empty, ready for new writes.
         assert!(wal.read_records().unwrap().is_empty());
         wal.log(&WalEntry::insert(3, b"c".to_vec())).unwrap();
@@ -1415,11 +1624,17 @@ mod tests {
         let wal = Wal::open(&dir.path().join("c.wal")).unwrap();
 
         // Spread 9 records across 3 segments (2 sealed + 1 live).
-        for i in 0..3 { wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap(); }
+        for i in 0..3 {
+            wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap();
+        }
         wal.seal().unwrap();
-        for i in 3..6 { wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap(); }
+        for i in 3..6 {
+            wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap();
+        }
         wal.seal().unwrap();
-        for i in 6..9 { wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap(); }
+        for i in 6..9 {
+            wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap();
+        }
 
         let mut ids: Vec<u64> = Vec::new();
         for seg in wal.list_sealed_segments() {
@@ -1460,17 +1675,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Tiny threshold so a handful of records trips a rotation.
         let seq = Arc::new(
-            ArchiveSequencer::open(dir.path()).unwrap().with_segment_threshold(256),
+            ArchiveSequencer::open(dir.path())
+                .unwrap()
+                .with_segment_threshold(256),
         );
-        let wal = Wal::open(&dir.path().join("c.wal")).unwrap().with_sequencer(Some(seq));
+        let wal = Wal::open(&dir.path().join("c.wal"))
+            .unwrap()
+            .with_sequencer(Some(seq));
 
         for i in 0..40 {
-            wal.log(&WalEntry::insert(i, b"a-reasonably-sized-payload".to_vec())).unwrap();
+            wal.log(&WalEntry::insert(i, b"a-reasonably-sized-payload".to_vec()))
+                .unwrap();
         }
         // Crossing the threshold sealed at least one segment automatically,
         // and every record is still present across the union.
         let sealed = wal.list_sealed_segments();
-        assert!(!sealed.is_empty(), "threshold should have triggered an auto-seal");
+        assert!(
+            !sealed.is_empty(),
+            "threshold should have triggered an auto-seal"
+        );
         let mut total = wal.read_records().unwrap().len();
         for seg in sealed {
             total += Wal::open(&seg).unwrap().read_records().unwrap().len();
@@ -1517,13 +1740,23 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for seg in wal.list_sealed_segments() {
             for r in Wal::open(&seg).unwrap().read_records().unwrap() {
-                assert!(seen.insert(r.entry.doc_id()), "record duplicated across segments");
+                assert!(
+                    seen.insert(r.entry.doc_id()),
+                    "record duplicated across segments"
+                );
             }
         }
         for r in wal.read_records().unwrap() {
-            assert!(seen.insert(r.entry.doc_id()), "record duplicated in live WAL");
+            assert!(
+                seen.insert(r.entry.doc_id()),
+                "record duplicated in live WAL"
+            );
         }
-        assert_eq!(seen.len(), writers * per_writer, "lost an acknowledged write across rotation");
+        assert_eq!(
+            seen.len(),
+            writers * per_writer,
+            "lost an acknowledged write across rotation"
+        );
     }
 
     // ── PITR Phase 4: GSN allocated under the lock + barrier ────────────
@@ -1537,7 +1770,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let seq = Arc::new(ArchiveSequencer::open(dir.path()).unwrap());
         let wal = Arc::new(
-            Wal::open(&dir.path().join("b.wal")).unwrap().with_sequencer(Some(Arc::clone(&seq))),
+            Wal::open(&dir.path().join("b.wal"))
+                .unwrap()
+                .with_sequencer(Some(Arc::clone(&seq))),
         );
 
         let mut handles = Vec::new();
@@ -1545,7 +1780,8 @@ mod tests {
             let wal = Arc::clone(&wal);
             handles.push(std::thread::spawn(move || {
                 for i in 0..250usize {
-                    wal.log(&WalEntry::insert((w * 250 + i) as u64, b"x".to_vec())).unwrap();
+                    wal.log(&WalEntry::insert((w * 250 + i) as u64, b"x".to_vec()))
+                        .unwrap();
                 }
             }));
         }
@@ -1556,9 +1792,16 @@ mod tests {
         let watermark = seq.current_gsn();
         wal.barrier();
         let records = wal.read_records().unwrap();
-        assert_eq!(records.len(), 1000, "every acknowledged write must be in the file");
+        assert_eq!(
+            records.len(),
+            1000,
+            "every acknowledged write must be in the file"
+        );
         let max_gsn = records.iter().map(|r| r.meta.gsn).max().unwrap_or(0);
-        assert!(max_gsn < watermark, "the GSN counter must sit above every written record");
+        assert!(
+            max_gsn < watermark,
+            "the GSN counter must sit above every written record"
+        );
     }
 
     // ── Phase 1b header (docs/format/wal.md) ─────────────────────────────
@@ -1574,7 +1817,10 @@ mod tests {
         drop(wal);
 
         let raw = fs::read(&path).unwrap();
-        assert!(raw.len() >= WAL_HEADER_SIZE + 8, "header + at least one framed record");
+        assert!(
+            raw.len() >= WAL_HEADER_SIZE + 8,
+            "header + at least one framed record"
+        );
         assert_eq!(&raw[0..4], WAL_MAGIC, "OXWA magic at offset 0");
         assert_eq!(u16::from_le_bytes([raw[4], raw[5]]), WAL_VERSION);
         assert_eq!(u16::from_le_bytes([raw[6], raw[7]]), 0, "flags reserved 0");
@@ -1610,7 +1856,11 @@ mod tests {
         drop(wal);
 
         let raw = fs::read(&path).unwrap();
-        assert_ne!(&raw[0..4], WAL_MAGIC, "legacy file must NOT get a retro header");
+        assert_ne!(
+            &raw[0..4],
+            WAL_MAGIC,
+            "legacy file must NOT get a retro header"
+        );
 
         let wal = Wal::open(&path).unwrap();
         assert_eq!(wal.read_entries().unwrap().len(), 2);
@@ -1630,7 +1880,9 @@ mod tests {
         bytes.extend_from_slice(&0u16.to_le_bytes());
         fs::write(&path, &bytes).unwrap();
 
-        let err = Wal::open(&path).err().expect("open should reject a newer format");
+        let err = Wal::open(&path)
+            .err()
+            .expect("open should reject a newer format");
         let msg = format!("{err}");
         assert!(
             msg.contains("unsupported WAL format version 2"),
@@ -1651,12 +1903,20 @@ mod tests {
 
         // Live file (post-seal) starts with OXWA.
         let live = fs::read(&path).unwrap();
-        assert_eq!(&live[0..4], WAL_MAGIC, "new live segment after seal must carry a header");
+        assert_eq!(
+            &live[0..4],
+            WAL_MAGIC,
+            "new live segment after seal must carry a header"
+        );
 
         // The sealed segment (the previous .wal renamed to .0) ALSO starts
         // with a header — it was written by this same engine before sealing.
         let sealed_path = path.with_file_name("rot.wal.0");
         let sealed = fs::read(&sealed_path).unwrap();
-        assert_eq!(&sealed[0..4], WAL_MAGIC, "sealed segment retains its header");
+        assert_eq!(
+            &sealed[0..4],
+            WAL_MAGIC,
+            "sealed segment retains its header"
+        );
     }
 }

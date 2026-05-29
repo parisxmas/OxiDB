@@ -178,12 +178,42 @@ async fn dispatch_request(
         if let Some(role) = session.role() {
             let is_user_cmd = matches!(
                 cmd.as_str(),
-                "create_user" | "drop_user" | "update_user" | "list_users"
+                "create_user"
+                    | "drop_user"
+                    | "update_user"
+                    | "list_users"
+                    | "grant_db_role"
+                    | "revoke_db_role"
             );
+
+            // Resolve the effective role for the target database. For user
+            // management and database-level commands, use the global role.
+            // For everything else, honor per-database role overrides so a
+            // `db_roles` downgrade is enforced in cluster mode too (matches
+            // the standalone dispatch path).
+            let effective_role = if is_user_cmd
+                || matches!(
+                    cmd.as_str(),
+                    "create_database" | "drop_database" | "list_databases" | "use_db"
+                ) {
+                role
+            } else if let Some(ref user_store) = state.user_store {
+                let target_db = request
+                    .get("db")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&session.current_database);
+                let store = user_store.lock().unwrap();
+                store
+                    .effective_role(session.username_str(), target_db)
+                    .unwrap_or(role)
+            } else {
+                role
+            };
+
             let permitted = if is_user_cmd {
                 role == Role::Admin
             } else {
-                rbac::is_permitted(role, &cmd)
+                rbac::is_permitted(effective_role, &cmd)
             };
 
             if !permitted {
@@ -234,17 +264,33 @@ async fn dispatch_request(
                         let raft_ops: Vec<crate::raft::types::TransactionWriteOp> = write_ops
                             .into_iter()
                             .map(|op| match op {
-                                oxidb::transaction::WriteOp::Insert { collection, data, id: _ } => {
+                                oxidb::transaction::WriteOp::Insert {
+                                    collection,
+                                    data,
+                                    id: _,
+                                } => {
                                     // Raft replication path: the leader-side id reservation
                                     // doesn't apply on followers (they reserve from their own
                                     // counter when replaying). Drop it on the wire.
-                                    crate::raft::types::TransactionWriteOp::Insert { collection, document: data }
+                                    crate::raft::types::TransactionWriteOp::Insert {
+                                        collection,
+                                        document: data,
+                                    }
                                 }
-                                oxidb::transaction::WriteOp::Update { collection, query, update } => {
-                                    crate::raft::types::TransactionWriteOp::Update { collection, query, update }
-                                }
+                                oxidb::transaction::WriteOp::Update {
+                                    collection,
+                                    query,
+                                    update,
+                                } => crate::raft::types::TransactionWriteOp::Update {
+                                    collection,
+                                    query,
+                                    update,
+                                },
                                 oxidb::transaction::WriteOp::Delete { collection, query } => {
-                                    crate::raft::types::TransactionWriteOp::Delete { collection, query }
+                                    crate::raft::types::TransactionWriteOp::Delete {
+                                        collection,
+                                        query,
+                                    }
                                 }
                             })
                             .collect();
@@ -257,8 +303,12 @@ async fn dispatch_request(
                             Ok(resp) => {
                                 let raft_resp: crate::raft::types::OxiDbResponse = resp.data;
                                 match raft_resp {
-                                    crate::raft::types::OxiDbResponse::Ok { data } => handler::ok_bytes(data),
-                                    crate::raft::types::OxiDbResponse::Error { message } => handler::err_bytes(&message),
+                                    crate::raft::types::OxiDbResponse::Ok { data } => {
+                                        handler::ok_bytes(data)
+                                    }
+                                    crate::raft::types::OxiDbResponse::Error { message } => {
+                                        handler::err_bytes(&message)
+                                    }
                                 }
                             }
                             Err(e) => handler::err_bytes(&format!("raft error: {e}")),
@@ -283,7 +333,15 @@ async fn dispatch_request(
                 Some(req) => req,
                 None => {
                     // Fall through to local handler if we can't build a raft request
-                    return dispatch_local(state, request, active_tx, session, &cmd, collection.as_deref()).await;
+                    return dispatch_local(
+                        state,
+                        request,
+                        active_tx,
+                        session,
+                        &cmd,
+                        collection.as_deref(),
+                    )
+                    .await;
                 }
             };
             let result = raft.client_write(raft_req).await;
@@ -304,7 +362,15 @@ async fn dispatch_request(
     // ---------------------------------------------------------------
     // Local execution (standalone mode, reads, or transactions)
     // ---------------------------------------------------------------
-    dispatch_local(state, request, active_tx, session, &cmd, collection.as_deref()).await
+    dispatch_local(
+        state,
+        request,
+        active_tx,
+        session,
+        &cmd,
+        collection.as_deref(),
+    )
+    .await
 }
 
 /// Execute a request locally via spawn_blocking.
@@ -335,12 +401,7 @@ async fn dispatch_local(
         (resp, tx)
     })
     .await
-    .unwrap_or_else(|e| {
-        (
-            handler::err_bytes(&format!("internal error: {e}")),
-            None,
-        )
-    });
+    .unwrap_or_else(|e| (handler::err_bytes(&format!("internal error: {e}")), None));
     *active_tx = resp_bytes.1;
     let bytes = resp_bytes.0;
 
@@ -387,10 +448,7 @@ fn build_raft_request(cmd: &str, request: &Value) -> Option<OxiDbRequest> {
         }),
         "insert_many" => Some(OxiDbRequest::InsertMany {
             collection: collection?,
-            documents: request
-                .get("docs")
-                .and_then(|v| v.as_array())
-                .cloned()?,
+            documents: request.get("docs").and_then(|v| v.as_array()).cloned()?,
         }),
         "update" => Some(OxiDbRequest::Update {
             collection: collection?,
@@ -410,12 +468,8 @@ fn build_raft_request(cmd: &str, request: &Value) -> Option<OxiDbRequest> {
             collection: collection?,
             query: request.get("query")?.clone(),
         }),
-        "create_collection" => Some(OxiDbRequest::CreateCollection {
-            name: collection?,
-        }),
-        "drop_collection" => Some(OxiDbRequest::DropCollection {
-            name: collection?,
-        }),
+        "create_collection" => Some(OxiDbRequest::CreateCollection { name: collection? }),
+        "drop_collection" => Some(OxiDbRequest::DropCollection { name: collection? }),
         "compact" => Some(OxiDbRequest::Compact {
             collection: collection?,
         }),
@@ -428,20 +482,24 @@ fn build_raft_request(cmd: &str, request: &Value) -> Option<OxiDbRequest> {
             field: request.get("field")?.as_str()?.to_string(),
         }),
         "create_composite_index" => {
-            let fields: Option<Vec<String>> = request
-                .get("fields")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+            let fields: Option<Vec<String>> =
+                request.get("fields").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                });
             Some(OxiDbRequest::CreateCompositeIndex {
                 collection: collection?,
                 fields: fields?,
             })
         }
         "create_text_index" => {
-            let fields: Option<Vec<String>> = request
-                .get("fields")
-                .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+            let fields: Option<Vec<String>> =
+                request.get("fields").and_then(|v| v.as_array()).map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                });
             Some(OxiDbRequest::CreateTextIndex {
                 collection: collection?,
                 fields: fields?,
@@ -477,12 +535,7 @@ fn build_raft_request(cmd: &str, request: &Value) -> Option<OxiDbRequest> {
 }
 
 /// Handle authentication commands. Mirrors the sync main.rs logic exactly.
-fn handle_auth(
-    cmd: &str,
-    request: &Value,
-    state: &ServerState,
-    session: &mut Session,
-) -> Vec<u8> {
+fn handle_auth(cmd: &str, request: &Value, state: &ServerState, session: &mut Session) -> Vec<u8> {
     match cmd {
         "ping" => handler::ok_bytes(json!("pong")),
 

@@ -1,7 +1,7 @@
 use serde_json::{Map, Value};
 
 use crate::error::{Error, Result};
-use crate::pipeline::{resolve_field, set_field};
+use crate::pipeline::{resolve_field, resolve_field_ref, set_field};
 use crate::value::IndexValue;
 
 /// Apply all update operators in `update` to `doc`.
@@ -15,9 +15,9 @@ pub fn apply_update(doc: &mut Value, update: &Value) -> Result<()> {
         .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
 
     for (op, fields) in obj {
-        let fields = fields.as_object().ok_or_else(|| {
-            Error::InvalidQuery(format!("{op} value must be an object"))
-        })?;
+        let fields = fields
+            .as_object()
+            .ok_or_else(|| Error::InvalidQuery(format!("{op} value must be an object")))?;
         match op.as_str() {
             "$set" => apply_set(doc, fields)?,
             "$unset" => apply_unset(doc, fields)?,
@@ -34,7 +34,7 @@ pub fn apply_update(doc: &mut Value, update: &Value) -> Result<()> {
             _ => {
                 return Err(Error::InvalidQuery(format!(
                     "unknown update operator: {op}"
-                )))
+                )));
             }
         }
     }
@@ -64,10 +64,13 @@ fn apply_inc(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
         let inc = inc_val.as_f64().ok_or_else(|| {
             Error::InvalidQuery(format!("$inc value for '{path}' must be numeric"))
         })?;
-        let current = resolve_field(doc, path);
-        let new_val = match &current {
-            Value::Null => inc,
-            v => {
+        // Distinguish a missing field (initialize to `inc`) from a field that
+        // is present but non-numeric — including an explicit `null` — which is
+        // an error. `resolve_field` collapses both into `Null`, so use
+        // `resolve_field_ref` to tell them apart.
+        let new_val = match resolve_field_ref(doc, path) {
+            None => inc,
+            Some(v) => {
                 let cur = v.as_f64().ok_or_else(|| {
                     Error::InvalidQuery(format!(
                         "$inc cannot be applied to non-numeric field '{path}'"
@@ -86,10 +89,11 @@ fn apply_mul(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
         let mul = mul_val.as_f64().ok_or_else(|| {
             Error::InvalidQuery(format!("$mul value for '{path}' must be numeric"))
         })?;
-        let current = resolve_field(doc, path);
-        let new_val = match &current {
-            Value::Null => 0.0,
-            v => {
+        // Missing field → initialize to 0 (MongoDB semantics). A present but
+        // non-numeric field (including explicit `null`) is an error.
+        let new_val = match resolve_field_ref(doc, path) {
+            None => 0.0,
+            Some(v) => {
                 let cur = v.as_f64().ok_or_else(|| {
                     Error::InvalidQuery(format!(
                         "$mul cannot be applied to non-numeric field '{path}'"
@@ -105,14 +109,18 @@ fn apply_mul(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
 
 fn apply_min(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     for (path, new_val) in fields {
-        let current = resolve_field(doc, path);
-        if current.is_null() {
-            set_field(doc, path, new_val.clone());
-        } else {
-            let cur_iv = IndexValue::from_json(&current);
-            let new_iv = IndexValue::from_json(new_val);
-            if new_iv < cur_iv {
-                set_field(doc, path, new_val.clone());
+        // Only a *missing* field is initialized unconditionally. A present
+        // value — including explicit `null`, which is the lowest in the cross-
+        // type ordering — is compared, so `$min` against a null field leaves
+        // it unchanged rather than overwriting it.
+        match resolve_field_ref(doc, path) {
+            None => set_field(doc, path, new_val.clone()),
+            Some(current) => {
+                let cur_iv = IndexValue::from_json(current);
+                let new_iv = IndexValue::from_json(new_val);
+                if new_iv < cur_iv {
+                    set_field(doc, path, new_val.clone());
+                }
             }
         }
     }
@@ -121,14 +129,17 @@ fn apply_min(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
 
 fn apply_max(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     for (path, new_val) in fields {
-        let current = resolve_field(doc, path);
-        if current.is_null() {
-            set_field(doc, path, new_val.clone());
-        } else {
-            let cur_iv = IndexValue::from_json(&current);
-            let new_iv = IndexValue::from_json(new_val);
-            if new_iv > cur_iv {
-                set_field(doc, path, new_val.clone());
+        // See `apply_min`: only a missing field is initialized unconditionally;
+        // a present `null` is compared (and, being the lowest value, replaced
+        // by any non-null `new_val`).
+        match resolve_field_ref(doc, path) {
+            None => set_field(doc, path, new_val.clone()),
+            Some(current) => {
+                let cur_iv = IndexValue::from_json(current);
+                let new_iv = IndexValue::from_json(new_val);
+                if new_iv > cur_iv {
+                    set_field(doc, path, new_val.clone());
+                }
             }
         }
     }
@@ -138,9 +149,7 @@ fn apply_max(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
 fn apply_rename(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     for (old_path, new_path_val) in fields {
         let new_path = new_path_val.as_str().ok_or_else(|| {
-            Error::InvalidQuery(format!(
-                "$rename target for '{old_path}' must be a string"
-            ))
+            Error::InvalidQuery(format!("$rename target for '{old_path}' must be a string"))
         })?;
         let val = resolve_field(doc, old_path);
         if !val.is_null() {
@@ -239,9 +248,7 @@ fn apply_pop(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
                     continue;
                 }
                 let dir = dir_val.as_i64().ok_or_else(|| {
-                    Error::InvalidQuery(format!(
-                        "$pop value for '{path}' must be 1 or -1"
-                    ))
+                    Error::InvalidQuery(format!("$pop value for '{path}' must be 1 or -1"))
                 })?;
                 let mut new_arr = arr.clone();
                 match dir {
@@ -354,6 +361,61 @@ mod tests {
         let mut doc = json!({"name": "Alice", "age": 25});
         apply_update(&mut doc, &json!({"$set": {"age": 30}})).unwrap();
         assert_eq!(doc["age"], 30);
+    }
+
+    // -----------------------------------------------------------------------
+    // null-vs-missing semantics (regression)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn inc_on_missing_field_initializes() {
+        let mut doc = json!({"name": "Alice"});
+        apply_update(&mut doc, &json!({"$inc": {"count": 5}})).unwrap();
+        assert_eq!(doc["count"], 5.0);
+    }
+
+    #[test]
+    fn inc_on_present_null_is_error() {
+        // An explicit null is non-numeric → $inc must error, not silently
+        // treat it as a missing field initialized to the increment.
+        let mut doc = json!({"count": null});
+        assert!(apply_update(&mut doc, &json!({"$inc": {"count": 5}})).is_err());
+    }
+
+    #[test]
+    fn mul_on_missing_field_yields_zero() {
+        let mut doc = json!({"name": "Alice"});
+        apply_update(&mut doc, &json!({"$mul": {"price": 2}})).unwrap();
+        assert_eq!(doc["price"], 0.0);
+    }
+
+    #[test]
+    fn mul_on_present_null_is_error() {
+        let mut doc = json!({"price": null});
+        assert!(apply_update(&mut doc, &json!({"$mul": {"price": 2}})).is_err());
+    }
+
+    #[test]
+    fn min_leaves_present_null_unchanged() {
+        // null is the lowest value in the ordering, so $min against it must
+        // not overwrite with a larger value.
+        let mut doc = json!({"score": null});
+        apply_update(&mut doc, &json!({"$min": {"score": 50}})).unwrap();
+        assert_eq!(doc["score"], Value::Null);
+    }
+
+    #[test]
+    fn max_replaces_present_null() {
+        let mut doc = json!({"score": null});
+        apply_update(&mut doc, &json!({"$max": {"score": 50}})).unwrap();
+        assert_eq!(doc["score"], 50);
+    }
+
+    #[test]
+    fn min_on_missing_field_initializes() {
+        let mut doc = json!({"name": "Alice"});
+        apply_update(&mut doc, &json!({"$min": {"score": 50}})).unwrap();
+        assert_eq!(doc["score"], 50);
     }
 
     // -----------------------------------------------------------------------
@@ -623,11 +685,7 @@ mod tests {
     #[test]
     fn multiple_operators() {
         let mut doc = json!({"a": 1, "b": 10});
-        apply_update(
-            &mut doc,
-            &json!({"$set": {"a": 99}, "$inc": {"b": 5}}),
-        )
-        .unwrap();
+        apply_update(&mut doc, &json!({"$set": {"a": 99}, "$inc": {"b": 5}})).unwrap();
         assert_eq!(doc["a"], 99);
         assert_eq!(doc["b"], 15);
     }
@@ -674,8 +732,8 @@ mod tests {
         apply_update(&mut doc, &json!({"$set": {"variants.0.stock": 8}})).unwrap();
         assert_eq!(doc["variants"][0]["stock"], 8);
         assert_eq!(doc["variants"][0]["size"], "M"); // preserved
-        assert_eq!(doc["variants"][1]["stock"], 5);  // untouched
-        assert!(doc["variants"].is_array());         // still an array
+        assert_eq!(doc["variants"][1]["stock"], 5); // untouched
+        assert!(doc["variants"].is_array()); // still an array
     }
 
     #[test]
@@ -711,10 +769,21 @@ mod tests {
     }
 
     #[test]
-    fn set_array_out_of_bounds_noop() {
+    fn set_array_out_of_bounds_pads_with_null() {
+        // MongoDB pads the array with nulls up to the target index rather than
+        // dropping the write.
         let mut doc = json!({"arr": [1, 2]});
         apply_update(&mut doc, &json!({"$set": {"arr.5": 99}})).unwrap();
-        assert_eq!(doc["arr"], json!([1, 2])); // unchanged
+        assert_eq!(doc["arr"], json!([1, 2, null, null, null, 99]));
+    }
+
+    #[test]
+    fn inc_array_out_of_bounds_creates_element() {
+        // $inc on a missing array slot initializes it to the increment after
+        // padding (the slot is "missing", so it starts from the increment).
+        let mut doc = json!({"arr": [1, 2]});
+        apply_update(&mut doc, &json!({"$inc": {"arr.4": 7}})).unwrap();
+        assert_eq!(doc["arr"], json!([1, 2, null, null, 7]));
     }
 
     #[test]
@@ -734,7 +803,8 @@ mod tests {
 
     #[test]
     fn push_to_nested_array_element() {
-        let mut doc = json!({"users": [{"name": "A", "roles": ["read"]}, {"name": "B", "roles": ["admin"]}]});
+        let mut doc =
+            json!({"users": [{"name": "A", "roles": ["read"]}, {"name": "B", "roles": ["admin"]}]});
         apply_update(&mut doc, &json!({"$push": {"users.0.roles": "write"}})).unwrap();
         assert_eq!(doc["users"][0]["roles"], json!(["read", "write"]));
         assert_eq!(doc["users"][1]["roles"], json!(["admin"])); // untouched
