@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Encode-direct large `find` results — avoid Value materialization (server 0.28.22)
+
+A `find` whose query couldn't be fully satisfied by an index fell back to
+materializing the entire result as `Vec<Arc<Value>>`. A `serde_json::Value` is
+~7× heavier than the encoded form, so a large unindexed result (e.g.
+`verified=true` over 1M docs ≈ 500K matches) ballooned the server to ~3.5 GiB
+of transient heap — enough to trigger the OOM killer on a memory-constrained
+host.
+
+The OxiWire bytes-first `find` path now has a post-filter strategy: when the
+query needs a filter the index can't satisfy, it decodes one document at a
+time, matches it, and collects the **encoded bytes** (`Arc<[u8]>`) — never a
+`Vec` of materialized Values. Peak memory now tracks the compact result bytes
+(~7× smaller) instead of the heavyweight Value set. Index-narrowing is
+preserved for partially-indexed queries (mirrors the Value path's candidate
+selection), so there's no scan regression. Results are identical to the Value
+path (verified by parity tests).
+
 ### Bound the in-memory caches by a fixed budget (server 0.28.21)
 
 The per-collection document caches previously used entry-count defaults that
