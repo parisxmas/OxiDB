@@ -11,3 +11,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 crc32fast = "1"
+oxidb-agg-merge = { path = "../oxidb-agg-merge" }

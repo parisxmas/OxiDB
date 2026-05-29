@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Correct cross-shard aggregation in OxiPool (server 0.28.20)
+
+OxiPool previously merged scatter-gather `aggregate` results by **concatenating**
+each shard's output, which is only correct for per-document pipelines —
+cross-shard `$group`/`$sort`/`$limit`/`$count` returned duplicated, unordered,
+or over-limited results. Aggregations now split into a shard-local half and a
+merge half (MongoDB-style), so results match a single-node run. See
+[ADR-0008](docs/decisions/0008-cross-shard-aggregation-merge.md).
+
+- **New `oxidb-agg-merge` crate** — `split_pipeline()` decomposes a pipeline
+  into shard + merge halves. Handles `$sum`, `$count`, `$min`, `$max`, `$avg`
+  group accumulators and `$sort`/`$limit`/`$skip`/`$count` blockers; `$avg`
+  ships `{sum,count}` partials and finalizes `Σsum/Σcount` at the merge.
+- **New `aggregate_docs` command** (+ `OxiDb::aggregate_docs`) — runs a
+  pipeline over a supplied document array using the real executor, so the merge
+  pass has identical semantics to single-node aggregation. Read-level RBAC.
+- **OxiPool** runs the shard pipeline on every shard, concatenates the
+  partials, and runs the merge pipeline on one shard via `aggregate_docs`.
+  Per-document pipelines still concat directly.
+- **Honest errors instead of wrong answers:** pipelines that can't be merged
+  correctly across shards — `$push`/`$addToSet`/`$percentile`/`$first`/`$last`
+  group accumulators, `$facet`/`$bucket`/`$sortByCount`/`$dateHistogram`,
+  `$lookup` — now return a clear error suggesting a shard-key `$match` or a
+  single-node run. (Previously these were silently wrong.)
+- Tests prove split→shard→merge equals the single-node baseline across 1–5
+  shards for sum/count/min/max/avg/mixed/sort-limit/count/passthrough.
+
 ### Code-review pass — security, correctness, and storage hardening (server 0.28.19)
 
 A review across the server, query engine, and storage layers fixed 13 bugs

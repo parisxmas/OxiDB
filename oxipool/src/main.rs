@@ -628,9 +628,13 @@ async fn handle_client_sharded(
                 } else {
                     stats.scatter_requests.fetch_add(1, Ordering::Relaxed);
 
-                    // Special case: insert_many needs doc splitting
+                    // Special case: insert_many needs doc splitting; aggregate
+                    // needs a pipeline-aware split+merge (correct cross-shard
+                    // $group/$sort/$limit/$count) instead of naive concat.
                     let response = if parsed.cmd == "insert_many" {
                         scatter::scatter_insert_many(&shard_pools, &payload, &router).await
+                    } else if parsed.cmd == "aggregate" {
+                        scatter::scatter_aggregate(&shard_pools, &payload).await
                     } else {
                         let strategy = scatter::MergeStrategy::for_command(&parsed.cmd);
                         scatter::scatter_gather(&shard_pools, &payload, strategy).await

@@ -135,6 +135,94 @@ pub async fn forward_to_shard(pool: &Arc<Pool>, payload: &[u8]) -> Result<Vec<u8
     Ok(response)
 }
 
+// ─── cross-shard aggregation ────────────────────────────────────────
+
+/// Scatter-gather an `aggregate` command with a correct cross-shard merge.
+///
+/// Splits the pipeline (via `oxidb_agg_merge`) into a shard-local half and a
+/// merge half. The shard half runs on every shard and emits *partial* results;
+/// those are concatenated and the merge half runs once (on a single shard's
+/// executor, via the `aggregate_docs` command) to produce the final answer.
+/// Per-document pipelines fall back to plain concatenation; pipelines that
+/// can't be merged correctly (e.g. `$push`/`$percentile`/`$lookup`/`$facet`)
+/// return a clear error instead of a silently-wrong result.
+pub async fn scatter_aggregate(pools: &[Arc<Pool>], payload: &[u8]) -> Vec<u8> {
+    let req: Value = match serde_json::from_slice(payload) {
+        Ok(v) => v,
+        // Not JSON we can introspect — fall back to plain concat.
+        Err(_) => return scatter_gather(pools, payload, MergeStrategy::ConcatDocs).await,
+    };
+
+    let pipeline = match req.get("pipeline").and_then(|v| v.as_array()) {
+        Some(p) => p.as_slice(),
+        // No pipeline array — let the shards reject it; just concat.
+        None => return scatter_gather(pools, payload, MergeStrategy::ConcatDocs).await,
+    };
+
+    match oxidb_agg_merge::split_pipeline(pipeline) {
+        oxidb_agg_merge::SplitPlan::Passthrough => {
+            // Per-document pipeline: concatenation is exact.
+            scatter_gather(pools, payload, MergeStrategy::ConcatDocs).await
+        }
+        oxidb_agg_merge::SplitPlan::Unsupported(reason) => error_response(&format!(
+            "cross-shard aggregation not supported: {reason}. \
+             Add a $match on the shard key to target a single shard, or run against a single node."
+        )),
+        oxidb_agg_merge::SplitPlan::Split {
+            shard_pipeline,
+            merge_pipeline,
+        } => {
+            // 1. Run the shard pipeline on every shard, gather concatenated partials.
+            let mut shard_req = req.clone();
+            shard_req["pipeline"] = Value::Array(shard_pipeline);
+            let shard_payload = match serde_json::to_vec(&shard_req) {
+                Ok(b) => b,
+                Err(e) => return error_response(&format!("failed to encode shard pipeline: {e}")),
+            };
+            let concat = scatter_gather(pools, &shard_payload, MergeStrategy::ConcatDocs).await;
+
+            // Propagate a shard-side error verbatim (ConcatDocs fails fast).
+            let concat_val: Value = match serde_json::from_slice(&concat) {
+                Ok(v) => v,
+                Err(e) => return error_response(&format!("malformed shard response: {e}")),
+            };
+            if concat_val.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                return concat;
+            }
+            let partials = concat_val
+                .get("data")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            // 2. Run the merge pipeline once over the partials, on one shard's
+            //    executor (aggregate_docs touches no stored collection).
+            let merge_req = json!({
+                "cmd": "aggregate_docs",
+                "pipeline": Value::Array(merge_pipeline),
+                "docs": partials,
+            });
+            let merge_payload = match serde_json::to_vec(&merge_req) {
+                Ok(b) => b,
+                Err(e) => return error_response(&format!("failed to encode merge pipeline: {e}")),
+            };
+
+            // Try shards in order so a single down node doesn't fail the merge.
+            for pool in pools {
+                match forward_to_shard(pool, &merge_payload).await {
+                    Ok(resp) => return resp,
+                    Err(_) => continue,
+                }
+            }
+            error_response("cross-shard aggregation merge failed: no shard available")
+        }
+    }
+}
+
+fn error_response(msg: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({"ok": false, "error": msg})).unwrap()
+}
+
 // ─── insert_many splitting ──────────────────────────────────────────
 
 /// Split an insert_many request by shard key, send each subset to its target shard.

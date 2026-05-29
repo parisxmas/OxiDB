@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli", "oxidb-tail", "oxipool", "oxidb-wasm"]
+members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli", "oxidb-tail", "oxipool", "oxidb-wasm", "oxidb-agg-merge"]
 resolver = "3"
 
 [package]
@@ -58,6 +58,7 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 [dev-dependencies]
 tempfile = "3"
 rusqlite = { version = "0.31", features = ["bundled"] }
+oxidb-agg-merge = { path = "oxidb-agg-merge" }
 
 [[example]]
 name = "demo"

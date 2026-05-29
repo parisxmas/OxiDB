@@ -1641,6 +1641,22 @@ impl OxiDb {
         Ok(result)
     }
 
+    /// Run an aggregation `pipeline` over an explicitly-supplied set of
+    /// documents instead of a stored collection.
+    ///
+    /// This is the merge half of cross-shard scatter-gather aggregation: a
+    /// proxy (OxiPool) collects each shard's partial results, concatenates
+    /// them, and calls this to run the merge pipeline over the partials using
+    /// the real executor — so the merge has identical semantics to a
+    /// single-node run, with no logic duplicated in the proxy. `$lookup`
+    /// inside the pipeline resolves against this engine's collections.
+    pub fn aggregate_docs(&self, pipeline_json: &Value, docs: Vec<Value>) -> Result<Vec<Value>> {
+        let pipeline = Pipeline::parse(pipeline_json)?;
+        let lookup_fn =
+            |foreign: &str, query: &Value| -> Result<Vec<Value>> { self.find(foreign, query) };
+        pipeline.execute_from(0, docs, &lookup_fn)
+    }
+
     // -----------------------------------------------------------------------
     // Transaction methods
     // -----------------------------------------------------------------------

@@ -2206,6 +2206,7 @@ dependencies = [
  "lru",
  "lz4_flex",
  "memmap2",
+ "oxidb-agg-merge",
  "parking_lot",
  "pdf-extract",
  "pollster",
@@ -2226,6 +2227,13 @@ dependencies = [
  "wgpu",
  "zip",
  "zstd",
+]
+
+[[package]]
+name = "oxidb-agg-merge"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -2259,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.28.18"
+version = "0.28.20"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2319,6 +2327,7 @@ name = "oxipool"
 version = "0.28.0"
 dependencies = [
  "crc32fast",
+ "oxidb-agg-merge",
  "serde",
  "serde_json",
  "tokio",

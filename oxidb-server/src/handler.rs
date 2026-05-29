@@ -711,6 +711,25 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        "aggregate_docs" => {
+            // Run a pipeline over a supplied document array (not a stored
+            // collection). Used by the OxiPool sharding proxy to run the merge
+            // half of a cross-shard aggregation over the shards' concatenated
+            // partial results, reusing the real executor.
+            let pipeline = match request.get("pipeline") {
+                Some(p) => p,
+                None => return err_bytes("missing 'pipeline'"),
+            };
+            let docs: Vec<Value> = match request.get("docs").and_then(|v| v.as_array()) {
+                Some(arr) => arr.clone(),
+                None => return err_bytes("missing 'docs' array"),
+            };
+            match db.aggregate_docs(pipeline, docs) {
+                Ok(out) => ok_bytes(json!(out)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         // -------------------------------------------------------------------
         // Blob storage + FTS commands
         // -------------------------------------------------------------------
