@@ -1809,6 +1809,12 @@ pub(crate) fn try_index_only_count(
     };
 
     let fi = field_indexes.get(group_field)?;
+    // The count-only fast path reads posting-list sizes via `iter_asc`, which
+    // a disk-backed index doesn't support transparently — fall back to the
+    // hashing group path for those.
+    if fi.is_disk() {
+        return None;
+    }
 
     // All accumulators must be count-only
     let is_count_only = accumulators.iter().all(|(_, acc)| {
@@ -1926,6 +1932,11 @@ fn try_index_group(
         Some(idx) => idx,
         None => return Ok(None),
     };
+    // Disk-backed indexes don't support the `iter_asc`-based fast paths; fall
+    // back to the standard hashing group path.
+    if fi.is_disk() {
+        return Ok(None);
+    }
 
     // Check if this is a count-only aggregation (Opt 4)
     let is_count_only = accumulators.iter().all(|(_, acc)| {

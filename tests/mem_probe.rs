@@ -82,8 +82,39 @@ fn one_million_doc_rss() {
     let bytes_cap = oxidb::doc_bytes_cache::default_capacity();
     let doc_cap = oxidb::doc_cache::default_capacity();
 
-    let dir = tempfile::tempdir().unwrap();
-    let db = OxiDb::open(dir.path()).unwrap();
+    // PROBE_DIR (persistent) lets a second process reopen the built DB to
+    // measure steady-state resident memory without the build high-water that a
+    // single process retains. PROBE_REOPEN=1 => open-and-measure only.
+    let probe_dir = std::env::var("PROBE_DIR").ok();
+    let _tmp = if probe_dir.is_none() {
+        Some(tempfile::tempdir().unwrap())
+    } else {
+        None
+    };
+    let dir_path: std::path::PathBuf = match &probe_dir {
+        Some(d) => std::path::PathBuf::from(d),
+        None => _tmp.as_ref().unwrap().path().to_path_buf(),
+    };
+
+    if std::env::var("PROBE_REOPEN").is_ok() {
+        println!("\n── mem_probe REOPEN: {dir_path:?} ──");
+        println!("  RSS before open: {:.0} MiB", rss_mib());
+        let db = OxiDb::open(&dir_path).unwrap();
+        println!("  RSS after open : {:.0} MiB", rss_mib());
+        // Touch each indexed field with a small indexed query (faults in only
+        // the pages the query needs, not the whole index).
+        let mut n = 0;
+        n += db.find("bench", &json!({"department": "Sales"})).unwrap().len();
+        n += db.find("bench", &json!({"city": "Tokyo"})).unwrap().len();
+        n += db.count("bench", &json!({"age": {"$gte": 50}})).unwrap();
+        println!("  RSS after indexed queries (touched {n}): {:.0} MiB", rss_mib());
+        let m = db.memory_report("bench").unwrap();
+        let mib = |b: usize| b as f64 / 1024.0 / 1024.0;
+        println!("  field-index resident estimate: {:.1} MiB", mib(m.field_index_bytes));
+        return;
+    }
+
+    let db = OxiDb::open(&dir_path).unwrap();
 
     println!("\n── mem_probe: {total} docs ──");
     println!("  OXIDB_DOC_BYTES_CACHE_SIZE = {bytes_cap}");

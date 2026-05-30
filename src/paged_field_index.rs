@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 use std::io::{self, Read, Write};
 use std::ops::Bound;
+use std::path::PathBuf;
 
 use serde_json::Value;
 
@@ -58,11 +59,20 @@ pub struct PagedFieldIndex {
     pub field: String,
     pub unique: bool,
     /// Main sorted array — contiguous memory, cache-friendly binary search.
+    /// Empty when disk-backed (`disk` is `Some`).
     entries: Vec<(IndexValue, DocIdSet)>,
     /// Write buffer for recent mutations — merged when full.
     write_buffer: Vec<WriteOp>,
     /// Maximum write buffer size before automatic merge.
     write_buffer_limit: usize,
+    /// Disk-first backing (opt-in via `OXIDB_DISK_FIRST`). When `Some`, the
+    /// index entries live in an mmap'd `.mfidx` file (paged in on demand) with
+    /// a small in-memory write overlay, instead of the resident `entries` Vec.
+    /// Every method delegates to it; the public API is unchanged. `iter_asc`/
+    /// `iter_desc` are the exception — their borrow-vs-owned item types can't be
+    /// unified, so the count-only `$group` fast paths skip disk-backed indexes
+    /// (`is_disk()`) and fall back to the hashing path.
+    disk: Option<crate::mmap_field_index::MmapFieldIndex>,
 }
 
 impl PagedFieldIndex {
@@ -73,6 +83,7 @@ impl PagedFieldIndex {
             entries: Vec::new(),
             write_buffer: Vec::new(),
             write_buffer_limit: 1000,
+            disk: None,
         }
     }
 
@@ -83,13 +94,66 @@ impl PagedFieldIndex {
             entries: Vec::new(),
             write_buffer: Vec::new(),
             write_buffer_limit: 1000,
+            disk: None,
         }
+    }
+
+    /// Create a disk-backed field index whose entries live in `path` (an
+    /// mmap'd `.mfidx` file). Used in disk-first mode.
+    pub fn new_disk(field: String, unique: bool, path: PathBuf) -> Self {
+        let mut m = if unique {
+            crate::mmap_field_index::MmapFieldIndex::new_unique(field.clone())
+        } else {
+            crate::mmap_field_index::MmapFieldIndex::new(field.clone())
+        };
+        m.set_path(path);
+        Self {
+            field,
+            unique,
+            entries: Vec::new(),
+            write_buffer: Vec::new(),
+            write_buffer_limit: 1000,
+            disk: Some(m),
+        }
+    }
+
+    /// Open an existing disk-backed index by mmap'ing its `.mfidx` file —
+    /// instant, no deserialization, empty write overlay (small resident
+    /// memory). Used on reopen so the index isn't rebuilt from a full scan.
+    pub fn open_disk(path: PathBuf) -> io::Result<Self> {
+        let m = crate::mmap_field_index::MmapFieldIndex::open(&path)?;
+        Ok(Self {
+            field: m.field.clone(),
+            unique: m.unique,
+            entries: Vec::new(),
+            write_buffer: Vec::new(),
+            write_buffer_limit: 1000,
+            disk: Some(m),
+        })
+    }
+
+    /// True when this index is disk-backed (mmap), so the count-only group fast
+    /// paths (which use `iter_asc`) should skip it.
+    pub fn is_disk(&self) -> bool {
+        self.disk.is_some()
+    }
+
+    /// Flush the disk-backed overlay to its `.mfidx` file (no-op for in-RAM).
+    pub fn persist_disk(&mut self) -> io::Result<()> {
+        if let Some(m) = &mut self.disk {
+            m.persist()?;
+        }
+        Ok(())
     }
 
     // -- Write operations ----------------------------------------------------
 
     /// Insert a document into the index by extracting the field value from the document.
     pub fn insert_value(&mut self, id: DocumentId, data: &Value) {
+        if let Some(m) = &mut self.disk {
+            m.insert_value(id, data);
+            return;
+        }
         if let Some(value) = resolve_value_field(data, &self.field) {
             let key = IndexValue::from_json(value);
             self.insert_raw(id, key);
@@ -98,6 +162,10 @@ impl PagedFieldIndex {
 
     /// Insert a pre-computed IndexValue directly.
     pub fn insert_raw(&mut self, id: DocumentId, key: IndexValue) {
+        if let Some(m) = &mut self.disk {
+            m.insert_raw(id, key);
+            return;
+        }
         // Try direct insertion into entries for better performance on single ops
         if self.write_buffer.is_empty() {
             match self.entries.binary_search_by(|e| e.0.cmp(&key)) {
@@ -120,6 +188,10 @@ impl PagedFieldIndex {
 
     /// Remove a document from the index by extracting the field value.
     pub fn remove_value(&mut self, id: DocumentId, data: &Value) {
+        if let Some(m) = &mut self.disk {
+            m.remove_value(id, data);
+            return;
+        }
         if let Some(value) = resolve_value_field(data, &self.field) {
             let key = IndexValue::from_json(value);
             self.remove_raw(id, key);
@@ -228,6 +300,7 @@ impl PagedFieldIndex {
     // -- Query helpers -------------------------------------------------------
 
     pub fn find_eq(&self, value: &IndexValue) -> BTreeSet<DocumentId> {
+        if let Some(m) = &self.disk { return m.find_eq(value); }
         // Check write buffer
         if !self.write_buffer.is_empty() {
             let mut result = BTreeSet::new();
@@ -255,6 +328,7 @@ impl PagedFieldIndex {
     }
 
     pub fn count_eq(&self, value: &IndexValue) -> usize {
+        if let Some(m) = &self.disk { return m.count_eq(value); }
         if !self.write_buffer.is_empty() {
             return self.find_eq(value).len();
         }
@@ -265,6 +339,7 @@ impl PagedFieldIndex {
     }
 
     pub fn count_range(&self, start: Bound<&IndexValue>, end: Bound<&IndexValue>) -> usize {
+        if let Some(m) = &self.disk { return m.count_range(start, end); }
         if !self.write_buffer.is_empty() {
             return self.find_range(start, end).len();
         }
@@ -277,6 +352,7 @@ impl PagedFieldIndex {
     }
 
     pub fn count_in(&self, values: &[IndexValue]) -> usize {
+        if let Some(m) = &self.disk { return m.count_in(values); }
         if !self.write_buffer.is_empty() {
             return self.find_in(values).len();
         }
@@ -290,6 +366,7 @@ impl PagedFieldIndex {
     }
 
     pub fn count_all(&self) -> usize {
+        if let Some(m) = &self.disk { return m.count_all(); }
         if !self.write_buffer.is_empty() {
             return self.all_ids().len();
         }
@@ -301,6 +378,7 @@ impl PagedFieldIndex {
     }
 
     pub fn find_ne(&self, value: &IndexValue) -> BTreeSet<DocumentId> {
+        if let Some(m) = &self.disk { return m.find_ne(value); }
         if !self.write_buffer.is_empty() {
             let mut result = BTreeSet::new();
             for (k, ids) in &self.entries {
@@ -340,6 +418,7 @@ impl PagedFieldIndex {
         start: Bound<&IndexValue>,
         end: Bound<&IndexValue>,
     ) -> BTreeSet<DocumentId> {
+        if let Some(m) = &self.disk { return m.find_range(start, end); }
         if !self.write_buffer.is_empty() {
             let mut result = BTreeSet::new();
             let (lo, hi) = self.range_positions(start, end);
@@ -376,6 +455,7 @@ impl PagedFieldIndex {
     }
 
     pub fn find_in(&self, values: &[IndexValue]) -> BTreeSet<DocumentId> {
+        if let Some(m) = &self.disk { return m.find_in(values); }
         if !self.write_buffer.is_empty() {
             let mut result = BTreeSet::new();
             for v in values {
@@ -411,6 +491,7 @@ impl PagedFieldIndex {
     }
 
     pub fn all_ids(&self) -> BTreeSet<DocumentId> {
+        if let Some(m) = &self.disk { return m.all_ids(); }
         let mut result = BTreeSet::new();
         for (_, ids) in &self.entries {
             for &id in ids {
@@ -436,6 +517,7 @@ impl PagedFieldIndex {
     where
         F: FnMut(DocumentId) -> bool,
     {
+        if let Some(m) = &self.disk { m.for_each_eq(value, f); return; }
         if !self.write_buffer.is_empty() {
             for id in self.find_eq(value) {
                 if !f(id) {
@@ -457,6 +539,7 @@ impl PagedFieldIndex {
     where
         F: FnMut(DocumentId) -> bool,
     {
+        if let Some(m) = &self.disk { m.for_each_ne(value, f); return; }
         if !self.write_buffer.is_empty() {
             for id in self.find_ne(value) {
                 if !f(id) {
@@ -480,6 +563,7 @@ impl PagedFieldIndex {
     where
         F: FnMut(DocumentId) -> bool,
     {
+        if let Some(m) = &self.disk { m.for_each_in_range(start, end, f); return; }
         if !self.write_buffer.is_empty() {
             for id in self.find_range(start, end) {
                 if !f(id) {
@@ -502,6 +586,7 @@ impl PagedFieldIndex {
     where
         F: FnMut(DocumentId) -> bool,
     {
+        if let Some(m) = &self.disk { m.for_each_in(values, f); return; }
         if !self.write_buffer.is_empty() {
             for id in self.find_in(values) {
                 if !f(id) {
@@ -537,6 +622,7 @@ impl PagedFieldIndex {
 
     /// Check if a doc_id exists under a given index value. O(log n) binary search.
     pub fn contains_doc_id(&self, value: &IndexValue, doc_id: DocumentId) -> bool {
+        if let Some(m) = &self.disk { return m.contains_doc_id(value, doc_id); }
         let idx = self.entries.partition_point(|(k, _)| k < value);
         if idx < self.entries.len() && &self.entries[idx].0 == value {
             return self.entries[idx].1.contains(&doc_id);
@@ -545,6 +631,7 @@ impl PagedFieldIndex {
     }
 
     pub fn check_unique(&self, value: &IndexValue, exclude_id: Option<DocumentId>) -> bool {
+        if let Some(m) = &self.disk { return m.check_unique(value, exclude_id); }
         if !self.write_buffer.is_empty() {
             let ids = self.find_eq(value);
             return match exclude_id {
@@ -571,6 +658,7 @@ impl PagedFieldIndex {
     }
 
     pub fn len(&self) -> usize {
+        if let Some(m) = &self.disk { return m.len(); }
         self.entries.len()
     }
 
@@ -579,6 +667,7 @@ impl PagedFieldIndex {
     /// Excludes the (usually small) pending write buffer's heap beyond its
     /// inline slots.
     pub fn memory_bytes(&self) -> usize {
+        if let Some(m) = &self.disk { return m.len() * 24; }
         let slot = std::mem::size_of::<(IndexValue, DocIdSet)>();
         let mut total = self.entries.capacity() * slot;
         for (iv, ids) in &self.entries {
@@ -590,6 +679,7 @@ impl PagedFieldIndex {
     }
 
     pub fn is_empty(&self) -> bool {
+        if let Some(m) = &self.disk { return m.is_empty(); }
         self.entries.is_empty() && self.write_buffer.is_empty()
     }
 
@@ -709,6 +799,7 @@ impl PagedFieldIndex {
             entries,
             write_buffer: Vec::new(),
             write_buffer_limit: 1000,
+            disk: None,
         })
     }
 }

@@ -82,6 +82,26 @@ before it can be trusted as the default. Shipping it opt-in lets it be exercised
 and benchmarked in the field with zero risk to existing deployments; flipping
 the default is a separate, later decision once it has miles on it.
 
+## Update: disk-first field indexes (2026-05-30)
+
+Under the same `OXIDB_DISK_FIRST` flag, single-field indexes are now disk-backed
+too, via the existing `MmapFieldIndex` (mmap'd `.mfidx`, paged in on demand,
+with a small in-memory write overlay). `PagedFieldIndex` gained an additive
+`Option<MmapFieldIndex>` and delegates every method to it in disk mode — so the
+query layer and its ~90 call sites are unchanged. The one exception is
+`iter_asc`/`iter_desc` (borrow-vs-owned item types can't be unified): the
+count-only `$group` fast paths detect a disk-backed index (`is_disk()`) and
+fall back to the hashing path. On reopen the index is **mmap-loaded** (instant,
+empty overlay), not rebuilt.
+
+Result: a fresh process opening a 500K-doc collection with 5 indexes sits at
+**~7 MiB resident** — both the document store and the indexes are off the
+resident heap (faulted in lazily, reclaimable). Full core suite passes in both
+modes. Caveats: index *build* still materializes the overlay (a transient
+spike, not steady state); the composite index remains in-RAM; and a query that
+returns a large result set still materializes it (the read-path transient,
+tracked separately).
+
 ## Follow-ups before this can be the default
 
 - Auto-compaction trigger for the `.bdat` file (reclaim dead space under update/

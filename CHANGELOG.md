@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Disk-first field indexes (opt-in, server 0.28.26)
+
+Extends disk-first mode (`OXIDB_DISK_FIRST=1`) to single-field indexes: they're
+now backed by the mmap'd `MmapFieldIndex` (`.mfidx`, paged in on demand, small
+in-memory write overlay) instead of the fully-resident `PagedFieldIndex`.
+`PagedFieldIndex` gained an additive `Option<MmapFieldIndex>` and delegates
+every method to it in disk mode, so the query layer is unchanged; the
+count-only `$group` fast paths (which use `iter_asc`) detect a disk-backed
+index and fall back to the hashing path. On reopen the index is mmap-loaded
+(instant), not rebuilt.
+
+- **Memory:** a fresh process opening a 500K-doc collection with 5 indexes sits
+  at **~7 MiB resident** — store *and* indexes are off the resident heap, so
+  memory no longer scales with the dataset. (Index *build* still spikes
+  transiently; a large query result still materializes — separate concerns.)
+- **Correctness:** full core suite passes in both modes (in-RAM default
+  unchanged at 799/799). See [ADR-0009](docs/decisions/0009-disk-first-storage.md).
+
 ### Disk-first storage mode (opt-in, server 0.28.25)
 
 The default `BTreeStorage` keeps every document's bytes resident in RAM

@@ -589,6 +589,16 @@ impl BTreeStorage {
         self.tree.len()
     }
 
+    /// True when this storage is running in disk-first mode.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn is_disk_first(&self) -> bool {
+        self.disk.is_some()
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn is_disk_first(&self) -> bool {
+        false
+    }
+
     /// Total bytes stored.
     pub fn total_bytes(&self) -> u64 {
         self.total_bytes.load(Ordering::Acquire)

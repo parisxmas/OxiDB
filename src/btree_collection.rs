@@ -167,10 +167,13 @@ impl BTreeCollection {
         let idx_path = data_dir.join(format!("{}.idx", name));
         let persisted_indexes = load_index_metadata(&idx_path).unwrap_or_default();
 
-        // Try loading cached index data
+        // Try loading cached index data. Disk-first indexes use their own
+        // mmap'd `.mfidx` format (not the `.fidx` PagedFieldIndex cache), so
+        // skip the cache and rebuild them disk-backed below.
+        let disk_first = storage.is_disk_first();
         let doc_count = storage.count() as u64;
         let fidx_path = data_dir.join(format!("{}.fidx", name));
-        let loaded_field_indexes = if !persisted_indexes.is_empty() {
+        let loaded_field_indexes = if !persisted_indexes.is_empty() && !disk_first {
             index_persist::load_field_indexes(&fidx_path, doc_count, max_id + 1, None)
         } else {
             None
@@ -189,6 +192,31 @@ impl BTreeCollection {
             for info in &persisted_indexes {
                 if info.index_type == "field" || info.index_type == "unique" {
                     let field = &info.fields[0];
+                    if disk_first {
+                        let mpath = data_dir.join(format!("{}.{}.mfidx", name, field));
+                        // Reopen: mmap the persisted index (instant, empty
+                        // overlay, small resident). First creation / missing
+                        // file: build into the overlay from a scan, then persist.
+                        let idx = match PagedFieldIndex::open_disk(mpath.clone()) {
+                            Ok(idx) => idx,
+                            Err(_) => {
+                                let mut idx =
+                                    PagedFieldIndex::new_disk(field.clone(), info.unique, mpath);
+                                storage.scan_all_while(|_id, bytes| {
+                                    if let Ok(doc) = crate::codec::decode_doc(bytes) {
+                                        if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                                            idx.insert_value(id, &doc);
+                                        }
+                                    }
+                                    Ok(true)
+                                })?;
+                                let _ = idx.persist_disk();
+                                idx
+                            }
+                        };
+                        map.insert(field.clone(), idx);
+                        continue;
+                    }
                     let mut idx = PagedFieldIndex::new(field.clone());
                     if info.unique {
                         idx.unique = true;
@@ -582,7 +610,22 @@ impl BTreeCollection {
         // doc_id deduplication.
         #[cfg(not(target_arch = "wasm32"))]
         self.storage.persist()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.persist_disk_indexes();
         Ok(())
+    }
+
+    /// Flush disk-backed field indexes' mmap overlays to their `.mfidx` files.
+    /// No-op in in-RAM mode (indexes persist via `save_index_data` instead).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn persist_disk_indexes(&self) {
+        if !self.storage.is_disk_first() {
+            return;
+        }
+        let mut fi = self.field_indexes.write();
+        for idx in fi.values_mut() {
+            let _ = idx.persist_disk();
+        }
     }
 
     /// Final checkpoint at shutdown only: persist BTree, then truncate
@@ -593,6 +636,7 @@ impl BTreeCollection {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn final_checkpoint(&self) -> Result<()> {
         self.storage.persist()?;
+        self.persist_disk_indexes();
         self.dirty.store(false, Ordering::Release);
         if self.lazy_sync.load(Ordering::Acquire) {
             self.wal.checkpoint_no_sync()?;
@@ -2234,9 +2278,20 @@ impl BTreeCollection {
         // Sort by IndexValue so build_from_sorted can append in order (no O(n) shifts)
         pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
-        let mut idx = PagedFieldIndex::new(field.to_string());
         let sorted_pairs: Vec<(IndexValue, u64)> = pairs;
-        idx.build_from_sorted(sorted_pairs.into_iter().map(|(iv, id)| (iv, id)).collect());
+        let idx = if self.storage.is_disk_first() {
+            let mpath = self.data_dir.join(format!("{}.{}.mfidx", self.name, field));
+            let mut idx = PagedFieldIndex::new_disk(field.to_string(), false, mpath);
+            for (iv, id) in sorted_pairs {
+                idx.insert_raw(id, iv);
+            }
+            let _ = idx.persist_disk();
+            idx
+        } else {
+            let mut idx = PagedFieldIndex::new(field.to_string());
+            idx.build_from_sorted(sorted_pairs);
+            idx
+        };
 
         let mut fi = self.field_indexes.write();
         fi.insert(field.to_string(), idx);
@@ -2254,7 +2309,12 @@ impl BTreeCollection {
             }
         }
 
-        let mut idx = PagedFieldIndex::new_unique(field.to_string());
+        let mut idx = if self.storage.is_disk_first() {
+            let mpath = self.data_dir.join(format!("{}.{}.mfidx", self.name, field));
+            PagedFieldIndex::new_disk(field.to_string(), true, mpath)
+        } else {
+            PagedFieldIndex::new_unique(field.to_string())
+        };
 
         self.storage.scan_bytes_while(|bytes| {
             if !bytes.is_empty() && bytes[0] != b'{' && bytes[0] != b'[' {
@@ -2286,6 +2346,7 @@ impl BTreeCollection {
             }
             Ok(true)
         })?;
+        let _ = idx.persist_disk();
 
         let mut fi = self.field_indexes.write();
         fi.insert(field.to_string(), idx);
