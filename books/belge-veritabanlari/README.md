@@ -77,4 +77,9 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 26. Uyumluluk katmanları ve istemciler ✅
 27. Bellek optimizasyonu ve karşılaştırmalı değerlendirme ✅
 
-**Ek A** — Sözlük · **Ek B** — Kaynaklar
+**Ek A** — Sözlük ✅ · **Ek B** — Kaynaklar ✅
+
+---
+
+**Durum:** Kitabın tamamı yazıldı — Önsöz + 27 bölüm + 2 ek. `./build.sh` ile
+(kapak `kapak.png` dizinde olduğunda) tek bir PDF/EPUB/HTML olarak derlenebilir.
