@@ -176,9 +176,8 @@ için gereken biçime dönüştürülür. Yani sistem, sonunda atacağı belgele
 Bu yolun teknik kalbi, ikili biçimin **kısmi çıkarım** (partial extraction)
 yeteneğidir. JSON'un düz metin biçiminde bir alanın değerine ulaşmak için, metni
 baştan sona ayrıştırmak gerekir; çünkü alanların nerede başlayıp bittiği ancak
-okunarak anlaşılır. OxiDB'nin kullandığı ikili biçim ise — JSON'un yapılandırılmış
-ikili bir akrabası — bir belgenin hangi alanı nerede tuttuğunu, baytlar üzerinde
-gezilerek bulunabilir biçimde kodlar. Böylece motor, bir koşulun ilgilendiği
+okunarak anlaşılır. OxiDB'nin kullandığı ikili biçim ise, bir belgenin hangi
+alanı nerede tuttuğunu, baytlar üzerinde gezilerek bulunabilir biçimde kodlar. Böylece motor, bir koşulun ilgilendiği
 **yalnızca o alanın** değerini, belgenin geri kalanına hiç dokunmadan, doğrudan
 baytlardan okuyabilir. Bir koşul "yaş > 30" diyorsa, motor belgenin baytlarında
 "yaş" alanına gider, oradaki sayısal değeri çıkarır ve karşılaştırır; belgenin

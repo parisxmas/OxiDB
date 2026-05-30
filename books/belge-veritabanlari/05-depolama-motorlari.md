@@ -227,8 +227,8 @@ değiştirilmez. Zamanla diskte böyle birçok SSTable birikir. Arka planda çal
 bir süreç, bu dosyaları periyodik olarak **birleştirir** (merge): birkaç sıralı
 dosyayı, sıralı listeleri birleştirme tekniğiyle tek bir büyük sıralı dosyaya
 kaynaştırır, bu sırada bir anahtarın eski sürümlerini ve silinmiş kayıtları
-ayıklar. Buna **sıkıştırma** (compaction) denir ve append-only modelin
-temizliğinin daha düzenli, kademeli bir biçimidir.
+ayıklar. Bu da bir sıkıştırmadır — append-only modelde az önce gördüğümüz
+temizliğin daha düzenli, kademeli bir biçimi.
 
 ### İki birleştirme stratejisi: leveled ve size-tiered
 

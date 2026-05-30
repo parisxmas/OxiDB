@@ -134,7 +134,7 @@ sayfaları diskte zaten bir kopyası olduğu için doğrudan serbest bırakabili
 
 Bunun somut sonucu, on üçüncü bölümde tartıştığımız bellek ölçümü inceliğinin
 canlı bir örneğidir. Disk-öncelikli kipte, beş yüz bin belgelik bir koleksiyonu
-taze açtığınızda, sistemin yerleşik belleği yalnızca birkaç düzine megabayt
+taze açtığınızda, sistemin yerleşik belleği yalnızca birkaç megabayt
 mertebesindedir — çünkü henüz yalnızca o küçük dizin bellektedir, belgelerin
 gövdesi diskte beklemektedir. Buna karşılık aynı veriyi belleğe öncelikli kipte
 açtığınızda, tüm belgeler belleğe yüklendiği için yerleşik bellek kat kat
@@ -165,7 +165,7 @@ kılar. Bir belgeyi okumak için sistem, kimlik-konum dizininden başlangıç ko
 alır, beş baytlık başlığı (bir durum baytı artı dört baytlık uzunluk) atlar ve
 uzunluğun söylediği kadar yükü okur. **Soft-delete** ise yalnızca durum baytını
 "canlı"dan "silinmiş"e çevirmektir: gövdeye hiç dokunulmaz, dosya yeniden
-yazılmaz: tek bir bayt yerinde değişir. Bu yüzden silme neredeyse bedavadır;
+yazılmaz — tek bir bayt yerinde değişir. Bu yüzden silme neredeyse bedavadır;
 bedeli, silinen kaydın yerinin bir süre ölü alan olarak kalmasıdır. Yükün
 sıkıştırılmış mı yoksa ham mı olduğu, ayrı bir bayrağa gerek kalmadan, yükün ilk
 baytlarındaki sıkıştırma biçiminin sihirli imzasından (magic bytes) anlaşılır;

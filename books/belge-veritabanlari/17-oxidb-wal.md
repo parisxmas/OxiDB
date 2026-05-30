@@ -41,14 +41,16 @@ biçimdeki dosyayı sessizce yanlış okumak yerine açıkça reddetmesini sağl
 ![WAL kaydının bayt düzeni.](sekiller/17b-wal-kayit.svg){width=80%}
 
 Bu biçimin zarif bir ayrıntısı, **noktasal kurtarma** (PITR) ile ilgilidir; ona
-yirmi ikinci bölümde döneceğiz, ama tohumu burada atılır. İşlem kodunun en üst
+yirmi üçüncü bölümde döneceğiz, ama tohumu burada atılır. İşlem kodunun en üst
 biti, kaydın daha zengin bir ikinci sürüm (v2) olup olmadığını ayırır: v2
 kayıtları, işlem ve belge kimliğinin ardına, kayda küresel ve tekel olarak artan
 bir sıra numarası (GSN) ile bir duvar-saati zaman damgası ekler. Bu üst-bit
 hilesi sayesinde, aynı dosyada hem eski (v1) hem de yeni (v2) kayıtlar karışık
 bulunabilir ve hepsi tek bir geçişte doğru oynatılabilir; noktasal kurtarma
 kapalıyken yazılan dosya, eskisiyle bayt bayt aynı kalır. Yani bu yetenek,
-kapalıyken hiçbir maliyet getirmeyecek biçimde tasarlanmıştır. Bir yazma geldiğinde, OxiDB önce bu
+kapalıyken hiçbir maliyet getirmeyecek biçimde tasarlanmıştır.
+
+Bir yazma geldiğinde, OxiDB önce bu
 kaydı günlüğe ekler ve onu dayanıklı kılar; ancak ondan sonra, değişikliği bir
 önceki bölümdeki depolama katmanına — belleğe öncelikli kipte bellekteki
 eşlemeye, disk-öncelikli kipte `.bdat` dosyasına — ve indekslere uygular. Yani
@@ -212,7 +214,7 @@ dosyasıyla (manifest) izler. Daha önce gördüğümüz, kayıtların taşıdı
 sıra numarası (GSN) ve zaman damgası, işte burada anlam kazanır: bir yedeğin
 üstüne, bu segmentleri belirli bir sıra numarasına ya da zaman noktasına kadar
 yeniden oynatarak, geçmişin tutarlı bir kesitine dönmek mümkün olur. Bu, yirmi
-ikinci bölümün konusudur; burada yalnızca, günlüğün bu kurtarma yeteneğinin de
+üçüncü bölümün konusudur; burada yalnızca, günlüğün bu kurtarma yeteneğinin de
 temeli olduğunu görmek yeterli.
 
 ## WAL her iki kibin de önünde durur

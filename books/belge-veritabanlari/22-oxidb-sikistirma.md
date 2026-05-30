@@ -158,7 +158,7 @@ Bu otomatik tetikleyicinin zarif bir özelliği, **kendini sınırlamasıdır**.
 sıkıştırma yapıldığında, ölü alan sıfırlanır; dolayısıyla ölçüt bir süre daha
 sağlanmaz ve sıkıştırma boşuna tekrar tekrar tetiklenmez. Sistem, yalnızca ölü
 alan yeniden birikip eşiği aştığında tekrar sıkıştırır. Bu eşikler ayarlanabilir
-ve on ikinci bölümde gördüğümüz gibi per-koleksiyon belirlenebilir; istenirse
+ve on altıncı bölümde gördüğümüz gibi per-koleksiyon belirlenebilir; istenirse
 otomatik tetikleme tümüyle kapatılıp sıkıştırma elle yönetilebilir.
 
 ## Sıkıştırmanın bedeli ve dengesi

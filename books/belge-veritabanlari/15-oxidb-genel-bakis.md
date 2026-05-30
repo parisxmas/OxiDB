@@ -58,9 +58,9 @@ zaman bir darboğaza dönüşmez. Asıl eşzamanlılık ise koleksiyonun **için
 yaşar: belge baytları, kova düzeyinde (bucket-level) kilitlenen, kilitsiz okumaya
 yakın davranan eş zamanlı bir hash eşlemesinde tutulur. Bu yapı sayesinde aynı
 koleksiyonun farklı belgelerine dokunan birçok iş parçacığı, tek bir büyük kilidi
-sırayla beklemek yerine paralel ilerler.^[scc (Scalable Concurrent Containers) — kova düzeyinde kilitleme ve atomik göstericilerle eş zamanlı okuma/yazmayı tek bir dış kilit darboğazı olmadan destekleyen Rust veri yapıları kütüphanesi.] Bu, on
-beşinci bölümde değindiğimiz "koleksiyon içinde eş zamanlı erişim" yeteneğinin
-mimari temelidir.
+sırayla beklemek yerine paralel ilerler.^[scc (Scalable Concurrent Containers) — kova düzeyinde kilitleme ve atomik göstericilerle eş zamanlı okuma/yazmayı tek bir dış kilit darboğazı olmadan destekleyen Rust veri yapıları kütüphanesi.] Bu yapı, kitap
+boyunca andığımız "koleksiyon içinde eş zamanlı erişim" yeteneğinin mimari
+temelidir.
 
 Her **koleksiyon**, kendi içinde, ikinci kısımda tanıdığımız bileşenleri
 barındırır: belge baytlarını tutan bir depolama katmanı; dayanıklılığı sağlayan

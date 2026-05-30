@@ -63,8 +63,8 @@ sergilediğidir: programlar gelişigüzel her yere değil, belirli bir süre boy
 verinin dar bir bölgesine yoğunlaşır. Bu yüzden çalışma kümesi genelde tüm
 veriden çok daha küçüktür ve belleğe sığma şansı yüksektir. Pencere ne kadar
 geniş seçilirse çalışma kümesi o kadar büyür; doğru pencere, "şu an gerçekten
-gerekli olanı" yakalayacak kadar geniş ama soğuk geçmişi kapsayacak kadar geniş
-olmayandır. Bir sistemi boyutlandırmak, aslında bu çalışma kümesini ölçüp ona
+gerekli olanı" yakalayacak kadar geniş, ama soğuk geçmişi de içine çekecek kadar
+geniş olmayanıdır. Bir sistemi boyutlandırmak, aslında bu çalışma kümesini ölçüp ona
 yetecek belleği sağlamak demektir.
 
 Buradan çarpıcı bir gerçek doğar: performans, kademeli bir eğim değil, bir

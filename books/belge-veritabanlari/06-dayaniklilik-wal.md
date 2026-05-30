@@ -171,8 +171,9 @@ değişikliğin hangisinden önce geldiğini kesin biçimde söyler. Daha da
 değişikliğin LSN'i damgalanır. Bu damga, az sonra göreceğimiz kurtarmanın kalbinde
 yatar: bir sayfanın taşıdığı LSN, bir günlük kaydının LSN'inden büyük ya da eşitse,
 o değişikliğin o sayfaya **zaten uygulandığını** kesin biçimde anlarız ve onu
-yeniden uygulamaktan kaçınırız. İşte bir önceki bölümde söz ettiğimiz etkisiz
-tekrarlanabilirliğin somut mekanizması budur.
+yeniden uygulamaktan kaçınırız. Bu, az sonra kurtarmayı anlatırken adını
+koyacağımız o kritik özelliğin — bir değişikliği kaç kez tekrarlarsan tekrarla
+sonucun değişmemesinin — somut mekanizmasıdır.
 
 ## Kurtarma: enkazın içinden geri dönmek
 
@@ -198,19 +199,19 @@ başlaması gerektiğini, yani en eski yansımamış değişikliğin LSN'ini bu 
 söyler. Analiz fazı tek başına hiçbir şey değiştirmez; yalnızca sonraki iki fazın
 yol haritasını çizer.
 
-İkinci faz **yinelemedir** (redo). Veritabanı, analiz fazının belirlediği
+İkinci faz **yinelemedir**. Veritabanı, analiz fazının belirlediği
 başlangıç noktasından itibaren günlüğü ileriye doğru oynatır ve gördüğü her
 değişikliği — tamamlanmış işlemlere ait olsun ya da olmasın — asıl veriye yeniden
 uygular. Bu, sezgiye aykırı görünebilir: neden tamamlanmamış işlemlerin
 değişikliklerini de uygulayalım? ARIES'in cevabı "tarihi olduğu gibi tekrarla"
 ilkesidir; önce çökme anındaki tam durumu birebir yeniden kuruyoruz, ardından
 gelen üçüncü faz tamamlanmamışları temizleyecek. Yinelemenin güvenli olması, az
-önce anlattığımız LSN damgalarına dayanır: bir sayfanın taşıdığı LSN, günlük
-kaydının LSN'inden büyük ya da eşitse, o değişiklik o sayfaya zaten yansımıştır
-ve yeniden uygulanmaz. İşte yinelemeyi **etkisiz tekrarlanabilir** (idempotent)
-kılan budur — aynı kurtarma yarıda kesilip baştan başlasa bile sonuç değişmez.
+önce anlattığımız LSN damga karşılaştırmasına dayanır: sayfaya zaten yansımış bir
+değişiklik yeniden uygulanmaz. İşte yinelemeyi **etkisiz tekrarlanabilir**
+(idempotent) kılan budur — aynı kurtarma yarıda kesilip baştan başlasa bile sonuç
+değişmez.
 
-Üçüncü faz **geri-almadır** (undo). Şimdi sıra, analiz fazında "tamamlanmamış"
+Üçüncü faz **geri-almadır**. Şimdi sıra, analiz fazında "tamamlanmamış"
 diye işaretlenen işlemlerin etkilerini söküp atmaya gelir. Veritabanı, günlüğü
 bu kez **geriye** doğru tarar ve bu işlemlerin yaptığı her değişikliği, günlükteki
 geri-alma bilgisini kullanarak tersine çevirir. İncelik şudur: geri-almanın

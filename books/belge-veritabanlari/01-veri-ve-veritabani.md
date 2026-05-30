@@ -109,13 +109,14 @@ biner: işletim sisteminin sayfa önbelleği, diskin kendi tampon belleği, hatt
 sürücünün üzerindeki uçucu önbellek. Bu katmanlar performansa yardım eder ama
 dayanıklılık açısından bir tuzak kurar: "diske yaz" dediğinizde veri çoğu zaman
 yalnızca bu uçucu tamponlardan birine ulaşır, henüz kalıcı yüzeye işlenmemiştir.
-Veriyi gerçekten kalıcı kılmak için, sistemden bu tüm tamponları kalıcı katmana
+Veriyi gerçekten kalıcı kılmak için, sistemden bu tamponların tümünü kalıcı katmana
 **boşaltmasını** açıkça istemek gerekir — bu isteğe genellikle `fsync` denir ve
 pahalıdır, çünkü tüm o hızlı ara katmanları atlayıp en yavaş, en kalıcı yüzeye
 inmeyi zorlar. Altıncı bölümde dayanıklılığın bedelinin neden büyük ölçüde bu tek
-çağrıda toplandığını ayrıntısıyla göreceğiz; şimdilik şunu aklınızda tutun:
-veriyi kalıcı kılmak, onu yalnızca diske göndermek değil, oraya **gerçekten
-ulaştığından emin olmaktır**.
+çağrıda toplandığını ayrıntısıyla göreceğiz. Bölümün başında belirttiğimiz o
+ilke — veriyi kalıcı kılmanın, onu diske göndermek değil oraya gerçekten
+ulaştığından emin olmak demek olduğu — işte bu ara katmanlar yüzünden bu kadar
+incelik taşır.
 
 ## Neden sadece dosya kullanmıyoruz
 
@@ -156,8 +157,8 @@ işlem (transaction) kavramıyla bunu sistematik biçimde sağlar.
 ne olur? Dosyanın yarısı yeni, yarısı eski veriyle, belki de bir kısmı bozuk
 kalabilir. Bu, soyut bir kaygı değil; somut bir başarısızlık kipidir. Diskin
 yalnızca tam bloklar halinde yazdığını söylemiştik; bir kayıt birden fazla bloğa
-yayılıyorsa ve elektrik tam ikinci blok yazılmadan kesilirse, ortaya **kısmi
-yazma** (torn write) çıkar: kaydın ilk yarısı yeni, ikinci yarısı eski veriden
+yayılıyorsa ve elektrik tam ikinci blok yazılmadan kesilirse, ortaya **yarım
+kalmış yazma** (torn write) çıkar: kaydın ilk yarısı yeni, ikinci yarısı eski veriden
 oluşan, hiçbir zaman var olmamış, anlamsız bir melez. Düz bir dosyayla çalışan
 bir program, yeniden açıldığında bu melezi sağlam bir kayıt sanır ve onun
 üzerinden işlem yapmaya kalkar. Daha sinsi bir kip, işletim sisteminin yazmaları
@@ -215,8 +216,7 @@ katmanında** (abstraction layer) sunmasıdır. Bu katmanlı düşünce, ilişki
 modeli ortaya koyan çalışmada açıkça dile getirilmiş ve sonraki tüm veritabanı
 tasarımına sinmiştir.^[E. F. Codd, "A Relational Model of Data for Large Shared Data Banks," *Communications of the ACM* 13(6), 1970.] En üstte **mantıksal katman** durur: verinin
 sizin gözünüzde aldığı biçim — tablolar, belgeler, alanlar. Bu, "veri neye
-benziyor" sorusunun yanıtıdır ve bir önceki bölümün, daha doğrusu bir sonraki
-bölümün konusu olan veri modelidir. En altta **fiziksel katman** vardır:
+benziyor" sorusunun yanıtıdır ve bir sonraki bölümün konusu olan veri modelidir. En altta **fiziksel katman** vardır:
 baytların diskte tam olarak nasıl yerleştiği, hangi bloğun nerede durduğu, hangi
 indeks yapısının kullanıldığı. Bu, "veri nasıl saklanıyor" sorusunun yanıtıdır.
 

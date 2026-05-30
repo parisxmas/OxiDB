@@ -41,7 +41,8 @@ yeni lideri seçen çoğunluk, o yazmayı bilen en az bir düğümü içerir.
 
 On ikinci bölümün vaatleri, bu kitap yazılırken gerçek, çok-düğümlü bir test
 paketiyle sınandı; bu, kitabın "anlattığını gösterme" yaklaşımının iyi bir
-örneğidir. Dört düğümlü bir küme kurulup şu senaryolar tek tek doğrulandı: tüm
+örneğidir. Çok düğümlü kümeler kurulup — senaryonun gerektirdiği düğüm sayısıyla —
+şu durumlar tek tek doğrulandı: tüm
 düğümlerin aynı lider üzerinde anlaşması; lidere yazılan belgelerin tüm düğümlere
 yayılması; liderin öldürülüp bir takipçinin devralması; failover sonrası verinin
 tutarlı kalması; düğümlerin azınlığının kaybedilmesine rağmen çalışmaya devam

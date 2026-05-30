@@ -73,9 +73,9 @@ kendisi ağ üzerinden gönderilmez, bir meydan-okuma yanıt yöntemiyle bilindi
 kanıtlanır. OxiDB, sunucu kimlik doğrulamasında tam olarak bu iki kuralı uygular.
 
 OxiDB, parolaları doğrularken **SCRAM-SHA-256** adlı, yaygın olarak kullanılan,
-standartlaştırılmış bir meydan-okuma yanıt protokolü kullanır.^[A. Menon-Sen, A.
-Melnikov, C. Newman ve N. Williams, "Salted Challenge Response Authentication
-Mechanism (SCRAM) SASL and GSS-API Mechanisms," RFC 5802, 2010.] Bu protokolün iç
+standartlaştırılmış bir meydan-okuma yanıt protokolü kullanır.^[T. Hansen, "SCRAM-SHA-256
+and SCRAM-SHA-256-PLUS Simple Authentication and Security Layer (SASL) Mechanisms," RFC 7677,
+2015. SCRAM çatısının kendisi RFC 5802'de (A. Menon-Sen v.d., 2010) tanımlanır.] Bu protokolün iç
 işleyişi, on dördüncü bölümdeki iki kuralın zarif bir somutlaşmasıdır; adımlarını
 görelim.
 

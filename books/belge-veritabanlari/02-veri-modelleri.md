@@ -256,8 +256,8 @@ ayıracağız.
 Tamlık için, manzaranın birkaç parçasından daha söz edelim. **Nesne-yönelimli**
 (object-oriented) model, 1980'lerde, programlama dillerindeki nesneleri hiçbir
 çeviri yapmadan, olduğu gibi diske kalıcı kılma vaadiyle ortaya çıktı; iç içe
-nesneleri, hatta nesneler arası işaretçileri doğrudan saklardı. Birazdan
-göreceğimiz nesne-ilişkisel uyumsuzluğa en doğrudan saldırı buydu, ama
+nesneleri, hatta nesneler arası işaretçileri doğrudan saklardı. Az önce
+değindiğimiz nesne-ilişkisel uyumsuzluğa en doğrudan saldırı buydu, ama
 işaretçiye dayalı yapısı onu ağ modelinin bazı katılıklarına geri sürükledi ve
 geniş çapta tutunamadı; yine de bıraktığı fikir — veriyi uygulamanın düşündüğü
 biçimde saklamak — belge modelinde yeniden hayat bulacaktı.

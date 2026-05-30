@@ -156,7 +156,8 @@ mekanizmalarını sırtlamak zorundadır.
 
 ## Konsensüs: çoğunlukla anlaşmak
 
-**Konsensüs**, bir grup makinenin, bazıları çökse ya da ağdan kopsa bile, ortak
+**Konsensüs** — önceki bölümde mutabakat diye andığımız kavramın aldığı ad —
+bir grup makinenin, bazıları çökse ya da ağdan kopsa bile, ortak
 bir karar üzerinde güvenle anlaşmasını sağlayan mekanizmadır. Modern dağıtık
 veritabanlarının çoğu, bu işi çoğunluk oylamasına dayanan bir protokolle yapar;
 en yaygın olanlardan birinin fikrini burada özetleyeceğiz.
@@ -177,7 +178,7 @@ bir makineyi içerir; dolayısıyla yeni lider o değişikliği asla kaybetmez.
 Bu fikrin kuramsal temeli, dağıtık sistemler literatürünün dönüm
 noktalarından biridir. Bir grup makinenin, bazıları çökse bile tek bir değer
 üzerinde güvenle anlaşmasını sağlayan ilk eksiksiz protokol, **Paxos** adıyla
-ortaya konmuştur.^[Leslie Lamport, "The Part-Time Parliament," *ACM Transactions on Computer Systems*, 11(2), 1998.]
+ortaya konmuştur.^[L. Lamport, "The Part-Time Parliament," *ACM Transactions on Computer Systems* 16(2), 1998.]
 Paxos'un mantığı, hayalî bir adada toplanan ve sürekli salondan ayrılıp dönen
 bir meclisin, tutanağın tek bir tutarlı kopyası üzerinde nasıl anlaşabileceği
 benzetmesiyle anlatılır. Protokolün özü iki aşamalıdır. Önce bir makine, kendini
