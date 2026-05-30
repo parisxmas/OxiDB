@@ -116,6 +116,53 @@ class OxiDbClient:
         """Explicitly create a collection. Collections are also auto-created on insert."""
         return self._checked({"cmd": "create_collection", "collection": name})
 
+    def create_collection_with_options(
+        self,
+        name: str,
+        *,
+        disk_first: bool = None,
+        compress: bool = None,
+        auto_compact: bool = None,
+        compact_min_bytes: int = None,
+        compact_dead_ratio: float = None,
+        options: dict = None,
+    ):
+        """Create a collection with explicit per-collection storage options.
+
+        Options map to the server's ``StorageOptions``; any field left unset
+        falls back to the server default (in-RAM, compressed, auto-compaction
+        on). The chosen storage shape is persisted, so the collection reopens
+        the same way regardless of the server's environment.
+
+        Pass individual keyword args, and/or a full ``options`` dict (keyword
+        args take precedence over matching keys in ``options``)::
+
+            db.create_collection_with_options("events", disk_first=True, compress=False)
+            db.create_collection_with_options("logs", options={"disk_first": True})
+
+        Keyword args:
+            disk_first: store documents on disk (mmap'd ``.bdat``) keeping only
+                the offset index resident, instead of the default in-RAM store.
+            compress: zstd-compress on-disk records (ignored when not disk_first).
+            auto_compact: reclaim dead space automatically (disk_first only).
+            compact_min_bytes: don't auto-compact a data file smaller than this.
+            compact_dead_ratio: dead-space fraction (0..1) that triggers compaction.
+        """
+        opts = dict(options) if options else {}
+        if disk_first is not None:
+            opts["disk_first"] = disk_first
+        if compress is not None:
+            opts["compress"] = compress
+        if auto_compact is not None:
+            opts["auto_compact"] = auto_compact
+        if compact_min_bytes is not None:
+            opts["compact_min_bytes"] = compact_min_bytes
+        if compact_dead_ratio is not None:
+            opts["compact_dead_ratio"] = compact_dead_ratio
+        return self._checked(
+            {"cmd": "create_collection_with_options", "collection": name, "options": opts}
+        )
+
     def list_collections(self) -> list:
         """Return a list of collection names."""
         return self._checked({"cmd": "list_collections"})
