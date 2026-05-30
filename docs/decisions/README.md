@@ -38,3 +38,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0006](0006-cern-testing-gap-estimates.md) | Effort estimates for remaining CERN-grade testing gaps across categories 1, 2, 3, 5, 6, 7, 8 | Accepted |
 | [0007](0007-wal-commit-record-atomic-recovery.md) | In-WAL commit record for atomic transaction recovery | Proposed |
 | [0008](0008-cross-shard-aggregation-merge.md) | Correct cross-shard aggregation merge in OxiPool | Accepted |
+| [0009](0009-disk-first-storage.md) | Disk-first storage mode (opt-in) | Accepted |

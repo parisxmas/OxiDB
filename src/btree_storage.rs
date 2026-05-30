@@ -26,6 +26,26 @@ use scc::HashMap as SccMap;
 
 use crate::error::{Error, Result};
 
+/// Disk-first value store (opt-in via `OXIDB_DISK_FIRST`). Instead of holding
+/// every document's bytes resident in RAM, the in-memory map keeps only a
+/// compact `doc_id → DocLocation{offset,len}` index (~24 B/doc vs the full
+/// ~hundreds of B/doc payload), and the document bytes live in an mmap'd
+/// append-only data file read on demand. This reuses the hardened append-only
+/// [`crate::storage::Storage`] backend (mmap reads, soft-delete, CRC,
+/// encryption, torn-tail recovery).
+///
+/// Trade-off: point reads cost an mmap lookup (cheap; reclaimable under memory
+/// pressure) instead of a RAM clone, and resident memory no longer scales with
+/// the dataset. Updates/deletes leave dead space in the data file reclaimed by
+/// compaction.
+#[cfg(not(target_arch = "wasm32"))]
+struct DiskBackend {
+    /// doc_id → location of the live record in `data`.
+    index: SccMap<u64, crate::storage::DocLocation>,
+    /// The mmap'd append-only data file holding document bytes.
+    data: Arc<crate::storage::Storage>,
+}
+
 // ── File header (Phase 1b of ADR-0003 / docs/format/btree.md) ──
 //
 // Layout (8 bytes, little-endian) sitting at the start of the plaintext
@@ -75,6 +95,24 @@ pub struct BTreeStorage {
     /// observed under load. Mutex is per-collection so writes to
     /// different collections still proceed in parallel.
     persist_mu: crate::locks::Mutex<()>,
+    /// When `Some`, this collection runs in disk-first mode: `tree` is unused
+    /// and document bytes live in `disk.data`, with only the offset index
+    /// resident. `None` = the default in-RAM mode (values live in `tree`).
+    #[cfg(not(target_arch = "wasm32"))]
+    disk: Option<DiskBackend>,
+}
+
+/// Whether disk-first storage is enabled (env `OXIDB_DISK_FIRST` truthy).
+/// Read once. Off by default — the in-RAM path is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+fn disk_first_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("OXIDB_DISK_FIRST")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false)
+    })
 }
 
 /// A cursor for iterating through the storage in ascending key order.
@@ -169,10 +207,13 @@ impl BTreeStorage {
             name: name.to_string(),
             encryption,
             persist_mu: crate::locks::Mutex::new(()),
+            #[cfg(not(target_arch = "wasm32"))]
+            disk: None,
         }
     }
 
-    /// Create a new in-memory B-tree storage (no persistence).
+    /// Create a new in-memory B-tree storage (no persistence). Always in-RAM
+    /// mode — disk-first requires a data directory.
     pub fn new_in_memory(name: &str) -> Self {
         Self {
             tree: SccMap::new(),
@@ -181,6 +222,8 @@ impl BTreeStorage {
             name: name.to_string(),
             encryption: None,
             persist_mu: crate::locks::Mutex::new(()),
+            #[cfg(not(target_arch = "wasm32"))]
+            disk: None,
         }
     }
 
@@ -191,7 +234,14 @@ impl BTreeStorage {
     /// replay catch up with the rest. Without this fallback the engine
     /// refuses to boot — bricked database for one bad shutdown.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn open(name: &str, data_dir: &Path, encryption: Option<Arc<crate::EncryptionKey>>) -> Result<Self> {
+    pub fn open(
+        name: &str,
+        data_dir: &Path,
+        encryption: Option<Arc<crate::EncryptionKey>>,
+    ) -> Result<Self> {
+        if disk_first_enabled() {
+            return Self::open_disk(name, data_dir, encryption);
+        }
         let path = data_dir.join(format!("{}.btree", name));
         let tmp = data_dir.join(format!("{}.btree.tmp", name));
         let storage = Self::new(name, data_dir, encryption);
@@ -230,27 +280,26 @@ impl BTreeStorage {
             // records from offset 0. An unknown version is fatal — we must
             // not silently load from empty and let WAL replay claim it
             // reconciled an image we never read.
-            let records: &[u8] =
-                if data.len() >= BTREE_HEADER_SIZE && &data[0..4] == BTREE_MAGIC {
-                    let version = u16::from_le_bytes([data[4], data[5]]);
-                    if version != BTREE_VERSION {
-                        return Err(Error::Io(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "unsupported .btree format version {} at {}; \
+            let records: &[u8] = if data.len() >= BTREE_HEADER_SIZE && &data[0..4] == BTREE_MAGIC {
+                let version = u16::from_le_bytes([data[4], data[5]]);
+                if version != BTREE_VERSION {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "unsupported .btree format version {} at {}; \
                                  this binary understands version {}",
-                                version,
-                                path.display(),
-                                BTREE_VERSION
-                            ),
-                        )));
-                    }
-                    // data[6..8] = flags; reserved at 0 — ignored until a
-                    // bit is documented + assigned.
-                    &data[BTREE_HEADER_SIZE..]
-                } else {
-                    &data[..]
-                };
+                            version,
+                            path.display(),
+                            BTREE_VERSION
+                        ),
+                    )));
+                }
+                // data[6..8] = flags; reserved at 0 — ignored until a
+                // bit is documented + assigned.
+                &data[BTREE_HEADER_SIZE..]
+            } else {
+                &data[..]
+            };
 
             if let Err(e) = storage.load_from_bytes(records) {
                 eprintln!(
@@ -268,6 +317,52 @@ impl BTreeStorage {
         }
 
         Ok(storage)
+    }
+
+    /// Open in disk-first mode: open the append-only data file and rebuild the
+    /// in-memory `doc_id → DocLocation` index by scanning its live records
+    /// (each document carries its `_id`). Document bytes stay on disk.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_disk(
+        name: &str,
+        data_dir: &Path,
+        encryption: Option<Arc<crate::EncryptionKey>>,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        // `.bdat` (BTree disk-first data), deliberately NOT `.dat` — the engine
+        // treats bare `.dat` as the legacy append-only `Collection` format and
+        // refuses to open it.
+        let data_path = data_dir.join(format!("{}.bdat", name));
+        let data = crate::storage::Storage::open_with_encryption(&data_path, encryption.clone())?;
+
+        let index: SccMap<u64, crate::storage::DocLocation> = SccMap::new();
+        let mut total: u64 = 0;
+        // Rebuild the index from the data file's live records. File order is
+        // append order, so for a doc updated in place (old record soft-deleted,
+        // new appended) only the live record is visited; if any duplicate live
+        // record slipped through a crash, the later (higher-offset) append wins.
+        data.for_each_active(|loc, bytes| {
+            if let Ok(doc) = crate::codec::decode_doc(&bytes) {
+                if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                    let _ = index.upsert_sync(id, loc);
+                    total += loc.length as u64;
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(Self {
+            tree: SccMap::new(), // unused in disk-first mode
+            total_bytes: AtomicU64::new(total),
+            data_dir: data_dir.to_path_buf(),
+            name: name.to_string(),
+            encryption,
+            persist_mu: crate::locks::Mutex::new(()),
+            disk: Some(DiskBackend {
+                index,
+                data: Arc::new(data),
+            }),
+        })
     }
 
     /// Deserialize the B-tree from a binary dump (after any decryption
@@ -316,6 +411,14 @@ impl BTreeStorage {
     ///     entry durable.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn persist(&self) -> Result<()> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            // Document bytes are already appended to the data file; the index
+            // is rebuilt from it on open, so there's no separate snapshot to
+            // write — just fsync the data file.
+            let _guard = self.persist_mu.lock();
+            return d.data.sync();
+        }
         if self.data_dir.as_os_str().is_empty() {
             return Ok(()); // in-memory mode
         }
@@ -397,6 +500,34 @@ impl BTreeStorage {
     /// Uses atomic `fetch_add` / `fetch_sub` for `total_bytes` to avoid
     /// load+store races under concurrent inserts.
     pub fn insert(&self, key: u64, value: Vec<u8>) -> Option<Vec<u8>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            let new_len = value.len() as u64;
+            // `_no_sync`: durability for this write comes from the WAL (fsynced
+            // per commit). The data file is flushed in `persist()` at
+            // checkpoint — fsyncing every single append would serialize writes
+            // on the disk and is what the in-RAM path (a plain RAM store)
+            // doesn't pay either.
+            match d.data.append_no_sync(&value) {
+                Ok(new_loc) => {
+                    let old_loc = d.index.upsert_sync(key, new_loc);
+                    if let Some(old) = old_loc {
+                        let _ = d.data.mark_deleted_no_sync(old);
+                        self.total_bytes
+                            .fetch_sub(old.length as u64, Ordering::AcqRel);
+                    }
+                    self.total_bytes.fetch_add(new_len, Ordering::AcqRel);
+                }
+                Err(e) => {
+                    // The WAL still holds this write; recovery will reconcile.
+                    eprintln!(
+                        "[btree-disk] {} append failed: {} — WAL replay will reconcile",
+                        self.name, e
+                    );
+                }
+            }
+            return None; // displaced value is not read back in disk mode
+        }
         let new_len = value.len() as u64;
         let old = self.tree.upsert_sync(key, value);
         if let Some(ref old_val) = old {
@@ -413,11 +544,25 @@ impl BTreeStorage {
     /// Get a value by key. Returns a cloned `Vec<u8>` because `scc::HashMap`
     /// entry guards cannot outlive the bucket lock scope.
     pub fn get(&self, key: u64) -> Option<Vec<u8>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            let loc = d.index.read_sync(&key, |_, loc| *loc)?;
+            return d.data.read_lockfree(loc).ok();
+        }
         self.tree.read_sync(&key, |_, v| v.clone())
     }
 
     /// Remove a key-value pair. Returns the removed value.
     pub fn remove(&self, key: u64) -> Option<Vec<u8>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            if let Some((_, old)) = d.index.remove_sync(&key) {
+                let _ = d.data.mark_deleted_no_sync(old);
+                self.total_bytes
+                    .fetch_sub(old.length as u64, Ordering::AcqRel);
+            }
+            return None;
+        }
         let old = self.tree.remove_sync(&key).map(|(_, v)| v);
         if let Some(ref val) = old {
             let len = val.len() as u64;
@@ -428,11 +573,19 @@ impl BTreeStorage {
 
     /// Check if a key exists.
     pub fn contains_key(&self, key: u64) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            return d.index.contains_sync(&key);
+        }
         self.tree.contains_sync(&key)
     }
 
     /// Number of entries in the storage.
     pub fn count(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            return d.index.len();
+        }
         self.tree.len()
     }
 
@@ -445,18 +598,68 @@ impl BTreeStorage {
     // Cursor-based iteration
     // -----------------------------------------------------------------------
 
+    /// Collect cursor entries from disk: sorted (key, value) pairs, reading
+    /// each value from the data file. Like the in-RAM cursor, this materializes
+    /// the snapshot (a transient per-query cost); the steady-state memory win
+    /// is that the resident index holds only locations.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn disk_cursor_entries(
+        &self,
+        d: &DiskBackend,
+        min_key: Option<u64>,
+        descending: bool,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
+        d.index.iter_sync(|k, loc| {
+            if min_key.is_none_or(|m| *k >= m) {
+                items.push((*k, *loc));
+            }
+            true
+        });
+        if descending {
+            items.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        } else {
+            items.sort_unstable_by_key(|(k, _)| *k);
+        }
+        items
+            .into_iter()
+            .filter_map(|(k, loc)| d.data.read_lockfree(loc).ok().map(|v| (k, v)))
+            .collect()
+    }
+
     /// Create a forward cursor starting at the first entry.
     pub fn cursor_first(&self) -> Result<Cursor> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            return Ok(Cursor {
+                entries: self.disk_cursor_entries(d, None, false),
+                pos: 0,
+            });
+        }
         Cursor::seek_first(&self.tree)
     }
 
     /// Create a forward cursor starting at the given key.
     pub fn cursor_seek(&self, key: u64) -> Result<Cursor> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            return Ok(Cursor {
+                entries: self.disk_cursor_entries(d, Some(key), false),
+                pos: 0,
+            });
+        }
         Cursor::seek(&self.tree, key)
     }
 
     /// Create a reverse cursor starting at the last entry.
     pub fn cursor_last(&self) -> Result<ReverseCursor> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            return Ok(ReverseCursor {
+                entries: self.disk_cursor_entries(d, None, true),
+                pos: 0,
+            });
+        }
         ReverseCursor::seek_last(&self.tree)
     }
 
@@ -468,6 +671,23 @@ impl BTreeStorage {
     where
         F: FnMut(u64, &[u8]) -> Result<bool>,
     {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
+            d.index.iter_sync(|k, loc| {
+                items.push((*k, *loc));
+                true
+            });
+            items.sort_unstable_by_key(|(k, _)| *k);
+            for (key, loc) in items {
+                if let Ok(value) = d.data.read_lockfree(loc) {
+                    if !f(key, &value)? {
+                        break;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let mut keys: Vec<u64> = Vec::new();
         self.tree.iter_sync(|k, _| {
             keys.push(*k);
@@ -490,6 +710,23 @@ impl BTreeStorage {
     where
         F: FnMut(&[u8]) -> Result<bool>,
     {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
+            d.index.iter_sync(|k, loc| {
+                items.push((*k, *loc));
+                true
+            });
+            items.sort_unstable_by_key(|(k, _)| *k);
+            for (_key, loc) in items {
+                if let Ok(value) = d.data.read_lockfree(loc) {
+                    if !f(&value)? {
+                        break;
+                    }
+                }
+            }
+            return Ok(());
+        }
         let mut keys: Vec<u64> = Vec::new();
         self.tree.iter_sync(|k, _| {
             keys.push(*k);
@@ -508,6 +745,14 @@ impl BTreeStorage {
 
     /// Clear all entries.
     pub fn clear(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            d.index.clear_sync();
+            self.total_bytes.store(0, Ordering::Release);
+            // Data-file space is reclaimed by compaction / when the collection
+            // is dropped; the orphaned records are now unreferenced.
+            return;
+        }
         self.tree.clear_sync();
         self.total_bytes.store(0, Ordering::Release);
     }
@@ -524,6 +769,28 @@ impl BTreeStorage {
     /// IMPORTANT: Only use for new keys (no replacements). If keys might exist,
     /// use the regular `insert()` loop instead.
     pub fn insert_batch(&self, entries: Vec<(u64, Vec<u8>)>) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            // New keys only (per contract). One batched, un-synced append for
+            // the whole batch (durability via WAL; flushed in persist()), then
+            // record each returned location.
+            let slices: Vec<&[u8]> = entries.iter().map(|(_, v)| v.as_slice()).collect();
+            match d.data.append_batch_no_sync(&slices) {
+                Ok(locs) => {
+                    let mut added = 0u64;
+                    for ((key, value), loc) in entries.iter().zip(locs.iter()) {
+                        let _ = d.index.upsert_sync(*key, *loc);
+                        added += value.len() as u64;
+                    }
+                    self.total_bytes.fetch_add(added, Ordering::AcqRel);
+                }
+                Err(e) => eprintln!(
+                    "[btree-disk] {} batch append failed: {} — WAL replay will reconcile",
+                    self.name, e
+                ),
+            }
+            return;
+        }
         let total_new: u64 = entries.iter().map(|(_, v)| v.len() as u64).sum();
         #[cfg(not(target_arch = "wasm32"))]
         if entries.len() > 1000 {
@@ -546,6 +813,18 @@ impl BTreeStorage {
     /// Return all values as owned `Vec<u8>` copies for parallel processing.
     /// Values are cloned because `scc::HashMap` bucket guards cannot outlive iteration.
     pub fn values_as_slices(&self) -> Vec<Vec<u8>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            let mut locs: Vec<crate::storage::DocLocation> = Vec::new();
+            d.index.iter_sync(|_, loc| {
+                locs.push(*loc);
+                true
+            });
+            return locs
+                .into_iter()
+                .filter_map(|loc| d.data.read_lockfree(loc).ok())
+                .collect();
+        }
         let mut values = Vec::new();
         self.tree.iter_sync(|_, v| {
             values.push(v.clone());
@@ -559,6 +838,14 @@ impl BTreeStorage {
     where
         F: FnMut(u64),
     {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            d.index.iter_sync(|key, _| {
+                f(*key);
+                true
+            });
+            return;
+        }
         self.tree.iter_sync(|key, _| {
             f(*key);
             true
@@ -571,15 +858,31 @@ impl BTreeStorage {
     where
         F: FnMut(u64, &[u8]) -> Result<bool>,
     {
-        let mut err: Option<Error> = None;
-        self.tree.iter_sync(|key, value| {
-            match f(*key, value) {
-                Ok(true) => true,
-                Ok(false) => false,
-                Err(e) => {
-                    err = Some(e);
-                    false
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(d) = &self.disk {
+            // Collect (key, loc) first — we can't read `data` while holding an
+            // index bucket guard. Order is arbitrary (matches in-RAM semantics).
+            let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
+            d.index.iter_sync(|k, loc| {
+                items.push((*k, *loc));
+                true
+            });
+            for (key, loc) in items {
+                if let Ok(value) = d.data.read_lockfree(loc) {
+                    if !f(key, &value)? {
+                        return Ok(());
+                    }
                 }
+            }
+            return Ok(());
+        }
+        let mut err: Option<Error> = None;
+        self.tree.iter_sync(|key, value| match f(*key, value) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                err = Some(e);
+                false
             }
         });
         if let Some(e) = err {
@@ -664,15 +967,18 @@ mod tests {
         }
 
         let mut count = 0;
-        storage.scan_all_while(|_key, _value| {
-            count += 1;
-            Ok(count < 5)
-        }).unwrap();
+        storage
+            .scan_all_while(|_key, _value| {
+                count += 1;
+                Ok(count < 5)
+            })
+            .unwrap();
         assert_eq!(count, 5); // stopped after 5
     }
 
     #[test]
     fn persistence_roundtrip() {
+        if disk_first_enabled() { return; } // tests the in-RAM .btree format
         let dir = tempfile::tempdir().unwrap();
         {
             let storage = BTreeStorage::new("test_persist", dir.path(), None);
@@ -703,7 +1009,10 @@ mod tests {
         storage.persist().unwrap();
 
         let raw = std::fs::read(dir.path().join("hdr.btree")).unwrap();
-        assert!(raw.len() >= BTREE_HEADER_SIZE + 8 + 4 + 1, "header + 1 record minimum");
+        assert!(
+            raw.len() >= BTREE_HEADER_SIZE + 8 + 4 + 1,
+            "header + 1 record minimum"
+        );
         assert_eq!(&raw[0..4], BTREE_MAGIC, "OXBT magic at offset 0");
         assert_eq!(u16::from_le_bytes([raw[4], raw[5]]), BTREE_VERSION);
         assert_eq!(u16::from_le_bytes([raw[6], raw[7]]), 0, "flags reserved 0");
@@ -720,6 +1029,7 @@ mod tests {
     /// migration window is exactly "first persist after upgrade".
     #[test]
     fn reads_legacy_header_less_btree() {
+        if disk_first_enabled() { return; } // tests the in-RAM .btree format
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.btree");
 
@@ -740,7 +1050,11 @@ mod tests {
         // The next persist rewrites with a v1 header.
         storage.persist().unwrap();
         let raw = std::fs::read(&path).unwrap();
-        assert_eq!(&raw[0..4], BTREE_MAGIC, "legacy file migrated on next persist");
+        assert_eq!(
+            &raw[0..4],
+            BTREE_MAGIC,
+            "legacy file migrated on next persist"
+        );
 
         // ...and still reads back correctly on reopen.
         let reopened = BTreeStorage::open("legacy", dir.path(), None).unwrap();
@@ -753,6 +1067,7 @@ mod tests {
     /// would let WAL replay paper over a real data loss).
     #[test]
     fn refuses_newer_btree_version() {
+        if disk_first_enabled() { return; } // tests the in-RAM .btree format
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.btree");
 

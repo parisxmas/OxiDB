@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Disk-first storage mode (opt-in, server 0.28.25)
+
+The default `BTreeStorage` keeps every document's bytes resident in RAM
+(`scc::HashMap<u64, Vec<u8>>`), so memory scales with the dataset (~370 B/doc
+of payload + overhead). A new **opt-in disk-first mode** (`OXIDB_DISK_FIRST=1`)
+keeps only a compact `doc_id → DocLocation{offset,len}` index resident (~24
+B/doc) and stores document bytes in an mmap'd append-only `{collection}.bdat`
+file, read on demand — reusing the hardened `src/storage.rs` backend (mmap
+reads, soft-delete, CRC, encryption, torn-tail recovery). See
+[ADR-0009](docs/decisions/0009-disk-first-storage.md).
+
+- **Memory:** a 1M-doc probe shows **RSS after insert: 161 MiB (disk-first) vs
+  812 MiB (in-RAM)** — the resident store drops ~80% (162 vs 844 B/doc).
+- **Writes** use un-synced/batched appends; durability comes from the WAL
+  (fsynced per commit), with the data file flushed at checkpoint — so writes
+  aren't serialized on a per-append fsync.
+- **Correctness:** the full core suite passes in **both** modes (CRUD, queries,
+  transactions, recovery, backup/restore, TTL, indexes). The in-RAM path is
+  byte-identical — disk mode is an additive branch, so the default is
+  unaffected.
+- **Opt-in for now:** it's the core durability path, so it needs soak-testing
+  (auto-compaction, lazy cursors, crash-injection) before it can become the
+  default. ADR-0009 lists the follow-ups.
+
 ### Bound the in-memory caches by a fixed budget (server 0.28.21)
 
 The per-collection document caches previously used entry-count defaults that
