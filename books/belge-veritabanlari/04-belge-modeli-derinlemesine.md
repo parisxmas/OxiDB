@@ -54,11 +54,60 @@ tutarlılığını güvence altına alan merkezi bir otorite yoktur. Bir belgede
 bir hata olarak görmez; bu tutarsızlıkla baş etmek size kalır. Bu, şema esnekliği
 tartışmasının kalbinde yatan gerilimdir ve birazdan ona döneceğiz.
 
+## JSON nedir ve nereden geldi
+
+Belgeyi bir bilgisayarda tutmak başka şeydir, onu insanlar ve programlar
+arasında **yazıya dökerek aktarmak** başka şeydir. Bir belgeyi bir dosyada
+saklamak, bir ağ üzerinden göndermek ya da bir kayıt üzerine yazmak için, onun
+metinsel bir gösterimine ihtiyaç duyarız. İşte JSON, tam da bu işi yapan bir
+**gösterim biçimidir**. Adı, İngilizce "JavaScript Object Notation"
+ifadesinin kısaltmasıdır; Türkçeye "JavaScript Nesne Gösterimi" olarak
+çevrilebilir. Adında JavaScript geçmesine karşın, JSON belirli bir programlama
+diline bağlı değildir; herhangi bir dilde okunup yazılabilen, dilden bağımsız
+bir veri değiş-tokuş biçimidir.
+
+JSON'un yapısı şaşırtıcı derecede sadedir ve tam olarak bu bölümün başında
+anlattığımız belge yapısına karşılık gelir. Yalnızca birkaç yapı taşı vardır.
+Bir **nesne**, süslü parantezler içinde, ad-değer çiftlerinden oluşan bir
+topluluktur — yani bir belgenin ta kendisi. Bir **dizi**, köşeli parantezler
+içinde, sıralı bir değerler listesidir. Ve değerlerin kendisi ya bir metin
+(çift tırnak içinde), bir sayı, bir mantıksal değer (doğru/yanlış), boş değer
+(null), ya da yine bir nesne veya dizi olabilir. Değerlerin nesne ve dizi
+olabilmesi sayesinde JSON, tıpkı belgeler gibi, istenildiği kadar iç içe
+geçebilir. Yani JSON'un dilbilgisi, belge modelinin yapısının yazıya dökülmüş
+hâlinden başka bir şey değildir.
+
+JSON'un kökeni öğreticidir. JavaScript dili 1990'ların ortasında, web
+tarayıcılarında çalışmak üzere doğdu ve bu dilin, nesneleri ve listeleri kısaca
+yazmaya yarayan kendine özgü bir sözdizimi vardı — buna nesne ve dizi "değişmez
+gösterimi" (literal) denir. 2000'lerin başında, web sayfalarının sunucularla
+veri alışverişi yapma ihtiyacı hızla arttı. O dönemde bu iş için yaygın olarak
+XML adlı, etiketlere dayalı ve oldukça ağır bir biçim kullanılıyordu. Douglas
+Crockford adlı bir mühendis, JavaScript'in zaten var olan o sade nesne
+gösteriminin, veri aktarımı için XML'den çok daha hafif ve kullanışlı bir
+biçim olarak kullanılabileceğini fark etti; bu fikri derleyip toparlayarak,
+ona bir ad (JSON) ve açık bir tanım kazandırdı ve `json.org` adresinde
+yayımladı. Yani JSON icat edilmedi denebilir; daha çok, JavaScript'in içinde
+zaten saklı duran sade bir alt küme keşfedilip bağımsız bir biçim olarak öne
+çıkarıldı. JSON'un nesnelere bu kadar doğal uymasının nedeni de budur: o, bir
+programlama dilinin nesne yazma biçiminin doğrudan kendisinden türemiştir.
+
+JSON'un yükselişi, web'in olgunlaşmasıyla el ele gitti. Tarayıcıların sayfayı
+baştan yüklemeden sunucuyla arka planda veri alışverişi yapabildiği tekniklerin
+yaygınlaşmasıyla, bu alışverişte taşınacak hafif bir biçime ihtiyaç doğdu ve
+JSON, ağır XML'in yerini hızla aldı. Zamanla, biçimin herkesçe aynı yorumlanması
+için resmî standartlara da bağlandı: hem yazılım endüstrisi standartları hem de
+internet standartları, JSON'un dilbilgisini kesin biçimde tanımlayan belgeler
+yayımladı. Böylece JSON, bir kişinin derlediği pratik bir fikirden, tüm
+dünyanın üzerinde anlaştığı resmî bir veri değiş-tokuş biçimine dönüştü ve bugün
+web servislerinden yapılandırma dosyalarına, kayıt sistemlerinden — bu kitabın
+konusu olan — belge veritabanlarına kadar her yerde karşımıza çıkıyor.
+
 ## JSON neden kazandı
 
-Belgeleri yazıya dökmenin birçok yolu olabilirdi, ama pratikte bir gösterim
-neredeyse evrensel hale geldi: JSON. Bunun nedenleri öğreticidir. JSON,
-insan tarafından okunabilir düz metindir; bir belgeye bakıp ne olduğunu hemen
+JSON'un ne olduğunu ve nereden geldiğini gördükten sonra, onu belge dünyasının
+ortak diline dönüştüren özellikleri toparlayabiliriz; bu özellikler öğreticidir.
+JSON, insan tarafından okunabilir düz metindir; bir belgeye bakıp ne olduğunu hemen
 anlarsınız. Yapısı, tam da az önce anlattığımız belge yapısına uyar: adlandırılmış
 alanlar, skaler değerler, listeler ve iç içe nesneler. Ve belki en önemlisi,
 modern programlama dillerindeki nesnelere neredeyse doğrudan karşılık gelir;
