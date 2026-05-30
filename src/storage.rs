@@ -80,6 +80,14 @@ pub struct Storage {
     inner: Mutex<StorageInner>,
     read_file: File,
     encryption: Option<Arc<EncryptionKey>>,
+    /// Whether new records are zstd-compressed before writing. Default `true`.
+    /// Disk-first storage can disable it (`OXIDB_DISK_UNCOMPRESSED`) to trade
+    /// disk space for CPU: uncompressed records skip the per-record compress on
+    /// write *and* the decompress on read, and (when unencrypted) become
+    /// zero-copy reads from the mmap. Reads stay adaptive either way — records
+    /// are decoded by their magic bytes — so flipping this needs no migration
+    /// and mixed compressed/uncompressed files read back correctly.
+    compress: bool,
     /// Memory-mapped view of the data file for zero-syscall reads.
     /// Re-mapped when the file grows significantly.
     read_mmap: parking_lot::RwLock<Option<memmap2::Mmap>>,
@@ -96,6 +104,16 @@ impl Storage {
     pub fn open_with_encryption(
         path: &Path,
         encryption: Option<Arc<EncryptionKey>>,
+    ) -> Result<Self> {
+        Self::open_with_options(path, encryption, true)
+    }
+
+    /// Like [`open_with_encryption`](Self::open_with_encryption) but lets the
+    /// caller disable zstd compression of new records (`compress = false`).
+    pub fn open_with_options(
+        path: &Path,
+        encryption: Option<Arc<EncryptionKey>>,
+        compress: bool,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -129,6 +147,7 @@ impl Storage {
             }),
             read_file,
             encryption,
+            compress,
             read_mmap: parking_lot::RwLock::new(mmap),
             mmap_len: std::sync::atomic::AtomicU64::new(mmap_len),
         })
@@ -136,7 +155,11 @@ impl Storage {
 
     /// Compress with zstd using a reusable thread-local compressor.
     /// Only returns compressed form if it actually shrinks the data.
+    /// No-op when compression is disabled for this store.
     fn maybe_compress<'a>(&self, data: &'a [u8]) -> Cow<'a, [u8]> {
+        if !self.compress {
+            return Cow::Borrowed(data);
+        }
         ZSTD_COMPRESSOR.with(|c| match c.borrow_mut().compress(data) {
             Ok(compressed) if compressed.len() < data.len() => Cow::Owned(compressed),
             _ => Cow::Borrowed(data),
@@ -486,8 +509,10 @@ impl Storage {
         const PAR_THRESHOLD: usize = 256;
         let n = items.len();
 
-        if n < PAR_THRESHOLD || self.encryption.is_some() {
-            // Sequential path
+        if n < PAR_THRESHOLD || self.encryption.is_some() || !self.compress {
+            // Sequential path. Also taken when compression is disabled —
+            // `prepare_payload` then just copies the bytes (no zstd), so there's
+            // nothing to parallelize.
             return items
                 .iter()
                 .map(|doc_bytes| {
@@ -497,7 +522,7 @@ impl Storage {
                 .collect();
         }
 
-        // Parallel compression (no encryption)
+        // Parallel compression (no encryption, compression enabled)
         let cpus = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -857,6 +882,37 @@ mod tests {
         let loc = storage.append(data).unwrap();
         let read_back = storage.read(loc).unwrap();
         assert_eq!(read_back, data);
+    }
+
+    #[test]
+    fn uncompressed_mode_stores_raw_and_reads_adaptively() {
+        let dir = TempDir::new().unwrap();
+        // A highly compressible payload that zstd would normally shrink.
+        let payload = vec![b'x'; 4096];
+
+        // compress = false: the record must be stored verbatim (no zstd frame).
+        let path = dir.path().join("raw.dat");
+        let raw = Storage::open_with_options(&path, None, false).unwrap();
+        let loc = raw.append(&payload).unwrap();
+        assert_eq!(raw.read(loc).unwrap(), payload, "uncompressed round-trip");
+        // On-disk length == payload length (+ no shrink), i.e. not compressed.
+        assert_eq!(loc.length as usize, payload.len(), "stored raw, not zstd-shrunk");
+
+        // A compressed store shrinks the same payload.
+        let cpath = dir.path().join("zstd.dat");
+        let comp = Storage::open_with_options(&cpath, None, true).unwrap();
+        let cloc = comp.append(&payload).unwrap();
+        assert!((cloc.length as usize) < payload.len(), "compressed store shrinks it");
+
+        // Reads are adaptive: an uncompressed-mode handle still decodes a
+        // previously-compressed file correctly (mixed files need no migration).
+        drop(comp);
+        let reopened_uncompressed = Storage::open_with_options(&cpath, None, false).unwrap();
+        assert_eq!(
+            reopened_uncompressed.read(cloc).unwrap(),
+            payload,
+            "uncompressed-mode handle still reads compressed records"
+        );
     }
 
     #[test]

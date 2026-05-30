@@ -168,10 +168,39 @@ A 1M-doc benchmark in disk-first mode surfaced three issues — fixed in server
   Caveat: small *compressible* documents stay decompression-bound (each record
   carries a zstd frame, so the zero-copy borrow doesn't trigger and every scan
   re-decompresses) — the in-RAM store keeps raw bytes resident and pays none of
-  this. **Still TODO:** for the compressible-doc full-scan path, either store the
-  disk-first `.bdat` uncompressed (trade disk for scan speed — aligned with the
-  mode's low-*memory* goal) or keep a decoded-bytes cache, so `$avg`/`$sum`/full
-  group-bys stop re-decompressing the whole collection on every scan.
+  this. **Resolved** by the uncompressed `.bdat` mode below.
+
+### Uncompressed `.bdat` mode — closes the scan/insert gap (2026-05-30)
+
+`OXIDB_DISK_UNCOMPRESSED=1` (with `OXIDB_DISK_FIRST=1`) writes the data file
+without zstd compression — a `compress: bool` on `Storage`
+(`open_with_options`), default on; the in-RAM store and the default compressed
+disk-first mode are untouched. Uncompressed records skip the per-record
+compress on write and decompress on read, and (unencrypted) are read zero-copy
+from the mmap by `for_each_payload`. Reads stay adaptive (magic-byte decode), so
+no migration is needed and mixed files read back fine; compaction rewrites in
+whichever mode is active.
+
+This was the lever the two caveats above pointed at — full scans/aggregations
+and index builds were decompression-bound. 1M-doc benchmark, disk-first:
+
+| Operation             | compressed | uncompressed | in-RAM | MongoDB |
+|-----------------------|-----------:|-------------:|-------:|--------:|
+| Insert                |      6.24s |        5.45s |  5.26s |   ~5.0s |
+| Build 8 indexes       |     18.2s  |        2.43s |  1.53s |    4.6s |
+| Group by dept + avg   |      2.54s |        248ms |  280ms |   360ms |
+| Group by city + stats |      2.36s |        378ms |  391ms |   305ms |
+| Unindexed scan        |      714ms |        582ms |  429ms |   586ms |
+| Wins vs MongoDB       |     5 / 18 |     11 / 18  | 12/18  |       — |
+| Disk footprint        |       689M |         727M |   612M |    323M |
+
+Uncompressed disk-first wins 11/18 (≈ in-RAM's 12/18) — aggregations ~10×
+faster (now beating/tying MongoDB), index build ~7× — while keeping the
+low-resident-memory property. Disk grew only ~5% (689M→727M): zstd bought almost
+nothing on these small structured docs while costing ~10× on every scan. For
+genuinely compressible corpora the default compressed mode is still preferable;
+uncompressed is the choice for scan/aggregation-heavy workloads where disk is
+cheap relative to memory and CPU.
 
 ### Soak tests (done)
 

@@ -120,6 +120,25 @@ fn disk_first_enabled() -> bool {
     })
 }
 
+/// Whether disk-first stores write the `.bdat` **uncompressed** (env
+/// `OXIDB_DISK_UNCOMPRESSED` truthy). Read once. Off by default. Trades disk
+/// space for CPU: new records skip the per-record compress on write and the
+/// decompress on read, and (when unencrypted) become zero-copy mmap reads —
+/// faster bulk insert and faster full-collection scans/aggregations. Only
+/// meaningful with `OXIDB_DISK_FIRST`. Reads stay adaptive (records decoded by
+/// magic bytes), so toggling it needs no migration; compaction rewrites records
+/// in whichever mode is active.
+#[cfg(not(target_arch = "wasm32"))]
+fn disk_compress_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var("OXIDB_DISK_UNCOMPRESSED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false)
+    })
+}
+
 /// Auto-compaction tuning (read once). The periodic sync path calls
 /// [`BTreeStorage::should_compact`] and compacts when the disk-first data file
 /// is at least `OXIDB_COMPACT_MIN_BYTES` (default 4 MiB) AND at least
@@ -379,7 +398,11 @@ impl BTreeStorage {
         // treats bare `.dat` as the legacy append-only `Collection` format and
         // refuses to open it.
         let data_path = data_dir.join(format!("{}.bdat", name));
-        let data = crate::storage::Storage::open_with_encryption(&data_path, encryption.clone())?;
+        let data = crate::storage::Storage::open_with_options(
+            &data_path,
+            encryption.clone(),
+            disk_compress_enabled(),
+        )?;
 
         let index: SccMap<u64, crate::storage::DocLocation> = SccMap::new();
         let mut total: u64 = 0;
@@ -678,7 +701,11 @@ impl BTreeStorage {
         // Copy live records into a fresh data file.
         let tmp = self.data_dir.join(format!("{}.bdat.compact", self.name));
         let _ = std::fs::remove_file(&tmp);
-        let fresh = crate::storage::Storage::open_with_encryption(&tmp, self.encryption.clone())?;
+        let fresh = crate::storage::Storage::open_with_options(
+            &tmp,
+            self.encryption.clone(),
+            disk_compress_enabled(),
+        )?;
         let mut new_entries: Vec<(u64, crate::storage::DocLocation)> =
             Vec::with_capacity(entries.len());
         let mut total = 0u64;
@@ -695,7 +722,11 @@ impl BTreeStorage {
         // Atomic swap: replace the live file, reopen, swap the handle, remap.
         let live = self.data_dir.join(format!("{}.bdat", self.name));
         std::fs::rename(&tmp, &live)?;
-        let reopened = crate::storage::Storage::open_with_encryption(&live, self.encryption.clone())?;
+        let reopened = crate::storage::Storage::open_with_options(
+            &live,
+            self.encryption.clone(),
+            disk_compress_enabled(),
+        )?;
         *data_guard = Arc::new(reopened); // old Storage drops → old fd/mmap freed
         d.index.clear_sync();
         for (id, loc) in new_entries {

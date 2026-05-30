@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Uncompressed `.bdat` mode for disk-first storage (server 0.29.3)
+
+New opt-in `OXIDB_DISK_UNCOMPRESSED=1` (only meaningful with
+`OXIDB_DISK_FIRST=1`): disk-first stores write the `.bdat` **without** zstd
+compression. This trades a little disk for a lot of CPU — uncompressed records
+skip the per-record compress on write *and* the decompress on read, and (when
+unencrypted) are read **zero-copy** straight from the mmap via the
+`Storage::for_each_payload` scan path added in 0.29.1. Reads stay adaptive
+(records are decoded by their magic bytes), so the flag needs no migration and
+mixed compressed/uncompressed files read back correctly; compaction rewrites
+records in whichever mode is active.
+
+This closes nearly the entire disk-first performance gap on the 1M-doc
+benchmark — full-collection scans/aggregations and index builds were
+decompression-bound (every record carried a zstd frame, defeating the zero-copy
+path; see the 0.29.1 caveat):
+
+| 1M-doc, disk-first        | compressed | uncompressed | in-RAM | MongoDB |
+|---------------------------|-----------:|-------------:|-------:|--------:|
+| Insert                    |      6.24s |        5.45s |  5.26s |   ~5.0s |
+| Build 8 indexes           |     18.2s  |        2.43s |  1.53s |    4.6s |
+| Group by dept + avg       |      2.54s |        248ms |  280ms |   360ms |
+| Group by city + stats     |      2.36s |        378ms |  391ms |   305ms |
+| Unindexed scan            |      714ms |        582ms |  429ms |   586ms |
+| **Wins vs MongoDB**       |     5 / 18 |     11 / 18  | 12/18  |       — |
+| Disk footprint            |       689M |         727M |   612M |    323M |
+
+Uncompressed disk-first now wins 11/18 (vs in-RAM's 12/18) — aggregations went
+~10× faster and now beat/tie MongoDB, index build ~7×, all while keeping the
+low resident-memory benefit. Disk grew only ~5% (689M→727M): zstd was buying
+almost nothing on these small structured docs while costing ~10× on every scan.
+Implemented as a `compress: bool` on `Storage` (`open_with_options`); the in-RAM
+store and the default compressed disk-first mode are unchanged. Full lib (801)
+suite passes in all three configs (default / disk-first / disk-first
+uncompressed).
+
 ### Batched parallel-compress append for bulk insert (server 0.29.2)
 
 Disk-first bulk insert was ~2.4× slower than MongoDB (and the in-RAM store)
