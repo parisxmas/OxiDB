@@ -200,6 +200,57 @@ enum ProjectionField {
 }
 
 // ---------------------------------------------------------------------------
+// Window functions ($setWindowFields)
+// ---------------------------------------------------------------------------
+
+/// One endpoint of a document-based window frame (`window: { documents: [lo, hi] }`).
+#[derive(Debug, Clone)]
+enum WindowBound {
+    /// Start/end of the partition.
+    Unbounded,
+    /// The current document.
+    Current,
+    /// Offset (in documents) relative to the current document; negative =
+    /// preceding, positive = following.
+    Offset(i64),
+}
+
+#[derive(Debug, Clone)]
+struct WindowFrame {
+    lo: WindowBound,
+    hi: WindowBound,
+}
+
+/// A single `output` operator in `$setWindowFields`.
+#[derive(Debug, Clone)]
+enum WindowOp {
+    /// An accumulator ($sum/$avg/$min/$max/$count/$first/$last/$push/...)
+    /// evaluated over the window frame. Default frame = whole partition.
+    Accum(Accumulator, WindowFrame),
+    /// `$rank` — 1-based rank within the partition by `sortBy`; ties share a
+    /// rank and the next distinct value skips ahead (1,1,3,...).
+    Rank,
+    /// `$denseRank` — like `$rank` but without gaps (1,1,2,...).
+    DenseRank,
+    /// `$documentNumber` — 1-based position within the partition, ties broken
+    /// by sort order (1,2,3,...).
+    DocumentNumber,
+    /// `$shift` — value of `output` from the document `by` positions away in the
+    /// sorted partition (lag/lead); `default` when out of range.
+    Shift {
+        output: Expression,
+        by: i64,
+        default: Value,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct WindowOutput {
+    field: String,
+    op: WindowOp,
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline stages
 // ---------------------------------------------------------------------------
 
@@ -234,6 +285,15 @@ enum Stage {
     /// result array. Used for one-pass multi-faceted analytics (faceted search,
     /// dashboards). Each entry is `(output_field, sub_pipeline)`.
     Facet(Vec<(String, Pipeline)>),
+    /// `$setWindowFields`: partition by `partition_by`, order each partition by
+    /// `sort_by`, then add each `output` field computed over a window of
+    /// neighbouring documents — without collapsing rows (running totals, moving
+    /// averages, ranks, lag/lead).
+    SetWindowFields {
+        partition_by: Option<Expression>,
+        sort_by: Vec<(String, SortOrder)>,
+        output: Vec<WindowOutput>,
+    },
     /// Synthetic post-processing stage emitted by `$dateHistogram` when
     /// the user requests `min_doc_count: 0`. Walks the bucket list
     /// output by the preceding `$group`, parses each `_id` as a date,
@@ -1104,6 +1164,154 @@ fn parse_percentile_accumulator(arg: &Value) -> Result<Accumulator> {
     Ok(Accumulator::Percentile(expr, percentiles))
 }
 
+fn parse_window_bound(v: &Value) -> Result<WindowBound> {
+    if let Some(s) = v.as_str() {
+        match s {
+            "unbounded" => Ok(WindowBound::Unbounded),
+            "current" => Ok(WindowBound::Current),
+            other => Err(Error::InvalidPipeline(format!(
+                "window bound must be a number, \"unbounded\" or \"current\", got \"{other}\""
+            ))),
+        }
+    } else if let Some(n) = v.as_i64() {
+        Ok(WindowBound::Offset(n))
+    } else {
+        Err(Error::InvalidPipeline(
+            "window bound must be an integer offset or \"unbounded\"/\"current\"".into(),
+        ))
+    }
+}
+
+fn parse_window_frame(w: &Value) -> Result<WindowFrame> {
+    let obj = w
+        .as_object()
+        .ok_or_else(|| Error::InvalidPipeline("window must be an object".into()))?;
+    // Only document-based windows are supported (not range/time windows).
+    let docs = obj
+        .get("documents")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| {
+            Error::InvalidPipeline(
+                "window currently supports only { documents: [lo, hi] }".into(),
+            )
+        })?;
+    if docs.len() != 2 {
+        return Err(Error::InvalidPipeline(
+            "window 'documents' must be a [lo, hi] pair".into(),
+        ));
+    }
+    Ok(WindowFrame {
+        lo: parse_window_bound(&docs[0])?,
+        hi: parse_window_bound(&docs[1])?,
+    })
+}
+
+fn parse_window_op(
+    field: &str,
+    spec: &Value,
+    has_sort: bool,
+) -> Result<WindowOp> {
+    let obj = spec.as_object().ok_or_else(|| {
+        Error::InvalidPipeline(format!("$setWindowFields output '{field}' must be an object"))
+    })?;
+    let frame = match obj.get("window") {
+        Some(w) => parse_window_frame(w)?,
+        // Default frame: the entire partition.
+        None => WindowFrame {
+            lo: WindowBound::Unbounded,
+            hi: WindowBound::Unbounded,
+        },
+    };
+    // The single operator key (everything except the optional "window").
+    let mut op_key: Option<(&str, &Value)> = None;
+    for (k, v) in obj {
+        if k == "window" {
+            continue;
+        }
+        if op_key.is_some() {
+            return Err(Error::InvalidPipeline(format!(
+                "$setWindowFields output '{field}' must have exactly one operator"
+            )));
+        }
+        op_key = Some((k.as_str(), v));
+    }
+    let (op, arg) = op_key.ok_or_else(|| {
+        Error::InvalidPipeline(format!("$setWindowFields output '{field}' has no operator"))
+    })?;
+
+    // Rank/positional operators require a sort order to be meaningful.
+    let needs_sort = matches!(op, "$rank" | "$denseRank" | "$documentNumber" | "$shift");
+    if needs_sort && !has_sort {
+        return Err(Error::InvalidPipeline(format!(
+            "$setWindowFields '{op}' requires 'sortBy'"
+        )));
+    }
+
+    match op {
+        "$rank" => Ok(WindowOp::Rank),
+        "$denseRank" => Ok(WindowOp::DenseRank),
+        "$documentNumber" => Ok(WindowOp::DocumentNumber),
+        "$shift" => {
+            let so = arg.as_object().ok_or_else(|| {
+                Error::InvalidPipeline("$shift must be an object { output, by, default? }".into())
+            })?;
+            let output = parse_expression(
+                so.get("output")
+                    .ok_or_else(|| Error::InvalidPipeline("$shift requires 'output'".into()))?,
+            )?;
+            let by = so
+                .get("by")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| Error::InvalidPipeline("$shift requires integer 'by'".into()))?;
+            let default = so.get("default").cloned().unwrap_or(Value::Null);
+            Ok(WindowOp::Shift { output, by, default })
+        }
+        _ => {
+            // Anything else must be an accumulator; reuse the $group parser by
+            // handing it just `{ <op>: <arg> }`.
+            let acc = parse_accumulator(&json!({ op: arg.clone() }))?;
+            Ok(WindowOp::Accum(acc, frame))
+        }
+    }
+}
+
+fn parse_set_window_fields(body: &Value) -> Result<Stage> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| Error::InvalidPipeline("$setWindowFields must be an object".into()))?;
+
+    let partition_by = match obj.get("partitionBy") {
+        Some(v) if !v.is_null() => Some(parse_expression(v)?),
+        _ => None,
+    };
+    let sort_by = match obj.get("sortBy") {
+        Some(v) => parse_sort(v)?,
+        None => Vec::new(),
+    };
+    let out_obj = obj
+        .get("output")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| Error::InvalidPipeline("$setWindowFields requires an 'output' object".into()))?;
+    if out_obj.is_empty() {
+        return Err(Error::InvalidPipeline(
+            "$setWindowFields 'output' must define at least one field".into(),
+        ));
+    }
+    let has_sort = !sort_by.is_empty();
+    let mut output = Vec::with_capacity(out_obj.len());
+    for (field, spec) in out_obj {
+        output.push(WindowOutput {
+            field: field.clone(),
+            op: parse_window_op(field, spec, has_sort)?,
+        });
+    }
+    Ok(Stage::SetWindowFields {
+        partition_by,
+        sort_by,
+        output,
+    })
+}
+
 fn parse_group_stage(val: &Value) -> Result<Stage> {
     let obj = val
         .as_object()
@@ -1728,6 +1936,167 @@ where
         out.insert(name.clone(), Value::Array(result));
     }
     Ok(vec![Value::Object(out)])
+}
+
+/// Fresh, zero-valued state for an accumulator.
+fn init_accumulator_state(acc: &Accumulator) -> AccumulatorState {
+    match acc {
+        Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
+        Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
+        Accumulator::Min(_) => AccumulatorState::Min(None),
+        Accumulator::Max(_) => AccumulatorState::Max(None),
+        Accumulator::Count => AccumulatorState::Count(0),
+        Accumulator::First(_) => AccumulatorState::First(None),
+        Accumulator::Last(_) => AccumulatorState::Last(None),
+        Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+        Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
+        Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
+            percentiles: percentiles.clone(),
+            values: Vec::new(),
+        },
+    }
+}
+
+/// The `sortBy` key tuple for a document (used to detect ties for ranking).
+fn window_sort_key(doc: &Value, sort_by: &[(String, SortOrder)]) -> Vec<IndexValue> {
+    sort_by
+        .iter()
+        .map(|(f, _)| {
+            resolve_field_ref(doc, f)
+                .map(IndexValue::from_json)
+                .unwrap_or(IndexValue::Null)
+        })
+        .collect()
+}
+
+/// Resolve a window frame to absolute `[lo, hi]` document indices within a
+/// partition of length `n`, or `None` if the frame covers no documents.
+fn resolve_window_frame(frame: &WindowFrame, i: usize, n: usize) -> Option<(usize, usize)> {
+    let bound = |b: &WindowBound, default_hi: bool| -> i64 {
+        match b {
+            WindowBound::Unbounded => {
+                if default_hi {
+                    n as i64 - 1
+                } else {
+                    0
+                }
+            }
+            WindowBound::Current => i as i64,
+            WindowBound::Offset(o) => i as i64 + o,
+        }
+    };
+    let lo_raw = bound(&frame.lo, false);
+    let hi_raw = bound(&frame.hi, true);
+    let lo = lo_raw.max(0);
+    let hi = hi_raw.min(n as i64 - 1);
+    if lo > hi || hi < 0 {
+        None
+    } else {
+        Some((lo as usize, hi as usize))
+    }
+}
+
+/// `$setWindowFields`: partition, sort each partition, then add windowed output
+/// fields to every document without collapsing rows.
+fn exec_set_window_fields(
+    docs: Vec<Value>,
+    partition_by: Option<&Expression>,
+    sort_by: &[(String, SortOrder)],
+    output: &[WindowOutput],
+) -> Vec<Value> {
+    // Partition, preserving first-seen partition order.
+    let mut order: Vec<IndexValue> = Vec::new();
+    let mut parts: HashMap<IndexValue, Vec<Value>> = HashMap::new();
+    for doc in docs {
+        let key = match partition_by {
+            Some(e) => IndexValue::from_json(&e.eval(&doc)),
+            None => IndexValue::Null,
+        };
+        if !parts.contains_key(&key) {
+            order.push(key.clone());
+        }
+        parts.entry(key).or_default().push(doc);
+    }
+
+    let needs_rank = output.iter().any(|o| {
+        matches!(
+            o.op,
+            WindowOp::Rank | WindowOp::DenseRank | WindowOp::DocumentNumber
+        )
+    });
+
+    let mut result = Vec::new();
+    for key in order {
+        let mut part = parts.remove(&key).unwrap();
+        if !sort_by.is_empty() {
+            part = exec_sort(part, sort_by); // stable sort
+        }
+        let n = part.len();
+
+        // Pre-compute rank / denseRank (documentNumber is just i+1).
+        let (ranks, dense): (Vec<u64>, Vec<u64>) = if needs_rank && n > 0 {
+            let mut ranks = vec![0u64; n];
+            let mut dense = vec![0u64; n];
+            ranks[0] = 1;
+            dense[0] = 1;
+            let mut prev = window_sort_key(&part[0], sort_by);
+            for i in 1..n {
+                let cur = window_sort_key(&part[i], sort_by);
+                if cur == prev {
+                    ranks[i] = ranks[i - 1];
+                    dense[i] = dense[i - 1];
+                } else {
+                    ranks[i] = i as u64 + 1;
+                    dense[i] = dense[i - 1] + 1;
+                }
+                prev = cur;
+            }
+            (ranks, dense)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        // Compute all additions from the immutable partition first, then apply,
+        // so output fields never feed into each other within this stage.
+        let mut additions: Vec<Vec<(String, Value)>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut row = Vec::with_capacity(output.len());
+            for out in output {
+                let val = match &out.op {
+                    WindowOp::DocumentNumber => json!(i as u64 + 1),
+                    WindowOp::Rank => json!(ranks[i]),
+                    WindowOp::DenseRank => json!(dense[i]),
+                    WindowOp::Shift { output, by, default } => {
+                        let j = i as i64 + by;
+                        if j >= 0 && (j as usize) < n {
+                            output.eval(&part[j as usize])
+                        } else {
+                            default.clone()
+                        }
+                    }
+                    WindowOp::Accum(acc, frame) => match resolve_window_frame(frame, i, n) {
+                        Some((lo, hi)) => {
+                            let mut state = init_accumulator_state(acc);
+                            for d in &part[lo..=hi] {
+                                update_accumulator_state(&mut state, acc, d);
+                            }
+                            finalize_accumulator(state)
+                        }
+                        None => finalize_accumulator(init_accumulator_state(acc)),
+                    },
+                };
+                row.push((out.field.clone(), val));
+            }
+            additions.push(row);
+        }
+        for (doc, row) in part.iter_mut().zip(additions) {
+            for (field, val) in row {
+                set_field(doc, &field, val);
+            }
+        }
+        result.extend(part);
+    }
+    result
 }
 
 fn exec_unwind(docs: Vec<Value>, path: &str, preserve_null: bool) -> Vec<Value> {
@@ -2794,6 +3163,7 @@ impl Pipeline {
                     })?;
                     Stage::Out(coll.to_string())
                 }
+                "$setWindowFields" => parse_set_window_fields(stage_body)?,
                 "$facet" => {
                     let obj = stage_body.as_object().ok_or_else(|| {
                         Error::InvalidPipeline("$facet must be an object of sub-pipelines".into())
@@ -2987,6 +3357,11 @@ impl Pipeline {
                     current
                 }
                 Stage::Facet(facets) => exec_facet(current, facets, lookup_fn)?,
+                Stage::SetWindowFields {
+                    partition_by,
+                    sort_by,
+                    output,
+                } => exec_set_window_fields(current, partition_by.as_ref(), sort_by, output),
                 Stage::DateBucketFill {
                     interval,
                     count_field,
@@ -3066,6 +3441,110 @@ mod tests {
         assert_eq!(top.len(), 2);
         assert_eq!(top[0]["price"], 40);
         assert_eq!(top[1]["price"], 30);
+    }
+
+    #[test]
+    fn window_running_total_moving_avg_and_shift() {
+        let docs = vec![
+            json!({"region": "E", "date": 1, "amt": 10}),
+            json!({"region": "E", "date": 3, "amt": 20}), // deliberately out of order
+            json!({"region": "E", "date": 2, "amt": 20}),
+            json!({"region": "W", "date": 2, "amt": 5}),
+            json!({"region": "W", "date": 1, "amt": 100}),
+        ];
+        let p = Pipeline::parse(&json!([{ "$setWindowFields": {
+            "partitionBy": "$region",
+            "sortBy": { "date": 1 },
+            "output": {
+                "running": { "$sum": "$amt", "window": { "documents": ["unbounded", "current"] } },
+                "total":   { "$sum": "$amt" },                                   // default = whole partition
+                "mavg":    { "$avg": "$amt", "window": { "documents": [-1, 0] } }, // 2-row moving avg
+                "rownum":  { "$documentNumber": {} },
+                "prevAmt": { "$shift": { "output": "$amt", "by": -1, "default": 0 } }
+            }
+        }}]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out.len(), 5);
+
+        let mut m = std::collections::HashMap::new();
+        for d in &out {
+            m.insert(
+                (d["region"].as_str().unwrap().to_string(), d["date"].as_i64().unwrap()),
+                d.clone(),
+            );
+        }
+        let g = |r: &str, dt: i64| m[&(r.to_string(), dt)].clone();
+
+        // Region E, sorted by date → amts 10, 20, 20
+        assert_eq!(g("E", 1)["running"].as_f64(), Some(10.0));
+        assert_eq!(g("E", 2)["running"].as_f64(), Some(30.0));
+        assert_eq!(g("E", 3)["running"].as_f64(), Some(50.0));
+        assert_eq!(g("E", 2)["total"].as_f64(), Some(50.0)); // whole-partition sum
+        assert_eq!(g("E", 1)["mavg"].as_f64(), Some(10.0)); // just itself
+        assert_eq!(g("E", 2)["mavg"].as_f64(), Some(15.0)); // (10+20)/2
+        assert_eq!(g("E", 3)["mavg"].as_f64(), Some(20.0)); // (20+20)/2
+        assert_eq!(g("E", 1)["rownum"].as_u64(), Some(1));
+        assert_eq!(g("E", 3)["rownum"].as_u64(), Some(3));
+        assert_eq!(g("E", 1)["prevAmt"].as_i64(), Some(0)); // default (no prior row)
+        assert_eq!(g("E", 2)["prevAmt"].as_i64(), Some(10));
+        assert_eq!(g("E", 3)["prevAmt"].as_i64(), Some(20));
+
+        // Region W is an independent partition.
+        assert_eq!(g("W", 1)["running"].as_f64(), Some(100.0));
+        assert_eq!(g("W", 2)["running"].as_f64(), Some(105.0));
+        assert_eq!(g("W", 2)["prevAmt"].as_i64(), Some(100));
+        assert_eq!(g("W", 1)["prevAmt"].as_i64(), Some(0));
+    }
+
+    #[test]
+    fn window_rank_dense_rank_ties() {
+        let docs = vec![
+            json!({"score": 40}),
+            json!({"score": 30}),
+            json!({"score": 30}),
+            json!({"score": 10}),
+        ];
+        let out = Pipeline::parse(&json!([{ "$setWindowFields": {
+            "sortBy": { "score": -1 },
+            "output": {
+                "r":  { "$rank": {} },
+                "dr": { "$denseRank": {} },
+                "rn": { "$documentNumber": {} }
+            }
+        }}]))
+        .unwrap()
+        .execute_from(0, docs, &no_lookup)
+        .unwrap();
+        // Single partition → output in sort order: 40, 30, 30, 10
+        let got: Vec<_> = out
+            .iter()
+            .map(|d| {
+                (
+                    d["score"].as_i64().unwrap(),
+                    d["r"].as_u64().unwrap(),
+                    d["dr"].as_u64().unwrap(),
+                    d["rn"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![(40, 1, 1, 1), (30, 2, 2, 2), (30, 2, 2, 3), (10, 4, 3, 4)]
+        );
+    }
+
+    #[test]
+    fn window_rank_requires_sort() {
+        // $rank/$shift/etc. are meaningless without an ordering.
+        assert!(
+            Pipeline::parse(&json!([{ "$setWindowFields": {
+                "output": { "r": { "$rank": {} } }
+            }}]))
+            .is_err()
+        );
+        // 'output' is required.
+        assert!(Pipeline::parse(&json!([{ "$setWindowFields": { "sortBy": { "x": 1 } } }])).is_err());
     }
 
     #[test]

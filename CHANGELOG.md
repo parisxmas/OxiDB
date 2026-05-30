@@ -2,6 +2,45 @@
 
 ## Unreleased
 
+### Aggregation: window functions (`$setWindowFields`) (server 0.30.5)
+
+Adds SQL-style window functions — compute a value for each document from a
+window of neighbouring documents **without collapsing rows** (the way `$group`
+does). Partition by an expression, order each partition by `sortBy`, then add
+`output` fields:
+
+```json
+[{ "$setWindowFields": {
+     "partitionBy": "$region",
+     "sortBy": { "date": 1 },
+     "output": {
+       "runningTotal": { "$sum": "$amount", "window": { "documents": ["unbounded", "current"] } },
+       "movingAvg7":   { "$avg": "$amount", "window": { "documents": [-6, 0] } },
+       "rank":         { "$rank": {} },
+       "prevDay":      { "$shift": { "output": "$amount", "by": -1, "default": 0 } }
+     }
+} }]
+```
+
+Supported `output` operators:
+- **Accumulators over a window**: `$sum`, `$avg`, `$min`, `$max`, `$count`,
+  `$first`, `$last`, `$push`, `$addToSet`, `$percentile` (reuses the `$group`
+  accumulator machinery). Document-based windows `window: { documents: [lo, hi] }`
+  where each bound is an integer offset, `"unbounded"`, or `"current"`; the
+  default window (no `window`) is the whole partition.
+- **Positional/ranking**: `$rank` (ties share a rank, gaps after),
+  `$denseRank` (no gaps), `$documentNumber`, and `$shift` (lag/lead with a
+  default). These require `sortBy`.
+
+Implementation (`src/pipeline.rs`): partitions by the `partitionBy` expression
+(preserving first-seen order), stable-sorts each partition by `sortBy`, then for
+each row computes outputs from the immutable partition (so window outputs never
+feed into each other) and writes them back. Works on every aggregation path (the
+Arc executor delegates to the owned-value executor). Range/time windows are not
+yet supported (clear error). Tested at the pipeline level (running total, moving
+average, `$shift`, rank/denseRank/documentNumber with ties, validation) and
+end-to-end over the wire.
+
 ### Aggregation: `$facet` stage (server 0.30.4)
 
 New `$facet` aggregation stage — runs several independent sub-pipelines over the
