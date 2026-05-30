@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Compaction for disk-first storage (server 0.28.28)
+
+The disk-first store is append-only, so updates/deletes leave dead records that
+grow the `.bdat` with the number of writes, not the live size (the soak suite
+measured ~17× bloat under heavy update churn). `compact()` now reclaims it:
+`BTreeStorage::compact` rewrites the data file keeping only live records and
+atomically swaps it in. The `data` handle is an `RwLock<Arc<Storage>>` — normal
+ops hold the read lock spanning their index-lookup + data-read (so a
+`DocLocation` is never used against a swapped file), and compaction holds the
+write lock, rebuilding + remapping under exclusivity. Field indexes are
+doc_id-keyed (unaffected by the store rewrite); their `.mfidx` is rewritten
+cleanly by the overlay-merge on persist.
+
+Soak-verified (`tests/disk_first_soak.rs::compaction_reclaims_space_and_preserves_data`):
+167 KB → 34 KB (~5×) after heavy update churn, with all live values + indexed
+queries intact through compaction *and* a clean reopen. In-RAM `compact()` is
+unchanged (persists the snapshot — no dead space to reclaim). An automatic
+trigger (compact on a dead-space threshold) remains a follow-up; today it's an
+explicit `compact` call.
+
 ### Byte-level post-filter find — no Value materialization (server 0.28.27)
 
 A `find` whose query an index couldn't satisfy materialized the entire result

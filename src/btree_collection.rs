@@ -2261,20 +2261,29 @@ impl BTreeCollection {
     /// Compact the B-tree storage.
     /// Since B-tree has no soft-deletes, this is mainly a rebuild/persistence operation.
     pub fn compact(&self) -> Result<CompactStats> {
-        let old_size = self.storage.total_bytes();
-
-        // Persist current state to disk
         #[cfg(not(target_arch = "wasm32"))]
-        self.storage.persist()?;
-
-        let new_size = self.storage.total_bytes();
-        let docs_kept = self.storage.count();
-
-        Ok(CompactStats {
-            old_size,
-            new_size,
-            docs_kept,
-        })
+        {
+            // Reclaim dead space in the data file (disk-first) or persist the
+            // snapshot (in-RAM). Field indexes are doc_id-keyed, so the store
+            // rewrite doesn't invalidate them; persist_disk_indexes rewrites the
+            // .mfidx files cleanly (overlay merged), reclaiming their dead space.
+            let (old_size, new_size) = self.storage.compact()?;
+            self.persist_disk_indexes();
+            return Ok(CompactStats {
+                old_size,
+                new_size,
+                docs_kept: self.storage.count(),
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let sz = self.storage.total_bytes();
+            Ok(CompactStats {
+                old_size: sz,
+                new_size: sz,
+                docs_kept: self.storage.count(),
+            })
+        }
     }
 
     // -----------------------------------------------------------------------

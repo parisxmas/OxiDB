@@ -42,8 +42,13 @@ use crate::error::{Error, Result};
 struct DiskBackend {
     /// doc_id → location of the live record in `data`.
     index: SccMap<u64, crate::storage::DocLocation>,
-    /// The mmap'd append-only data file holding document bytes.
-    data: Arc<crate::storage::Storage>,
+    /// The mmap'd append-only data file holding document bytes. Behind an
+    /// `RwLock` so `compact()` can atomically swap in a fresh, dead-space-free
+    /// file: every normal op takes the read lock spanning its index lookup +
+    /// data read (so a `DocLocation` is never used against a swapped file);
+    /// compaction takes the write lock, excluding all readers/writers while it
+    /// rebuilds the file and remaps the index.
+    data: crate::locks::RwLock<Arc<crate::storage::Storage>>,
 }
 
 // ── File header (Phase 1b of ADR-0003 / docs/format/btree.md) ──
@@ -360,7 +365,7 @@ impl BTreeStorage {
             persist_mu: crate::locks::Mutex::new(()),
             disk: Some(DiskBackend {
                 index,
-                data: Arc::new(data),
+                data: crate::locks::RwLock::new(Arc::new(data)),
             }),
         })
     }
@@ -417,7 +422,7 @@ impl BTreeStorage {
             // is rebuilt from it on open, so there's no separate snapshot to
             // write — just fsync the data file.
             let _guard = self.persist_mu.lock();
-            return d.data.sync();
+            return d.data.read().sync();
         }
         if self.data_dir.as_os_str().is_empty() {
             return Ok(()); // in-memory mode
@@ -503,16 +508,18 @@ impl BTreeStorage {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
             let new_len = value.len() as u64;
-            // `_no_sync`: durability for this write comes from the WAL (fsynced
-            // per commit). The data file is flushed in `persist()` at
-            // checkpoint — fsyncing every single append would serialize writes
-            // on the disk and is what the in-RAM path (a plain RAM store)
-            // doesn't pay either.
-            match d.data.append_no_sync(&value) {
+            // Read guard: shared with other readers/writers, excluded only by
+            // compaction's write lock. `_no_sync`: durability for this write
+            // comes from the WAL (fsynced per commit). The data file is flushed
+            // in `persist()` at checkpoint — fsyncing every single append would
+            // serialize writes on the disk and is what the in-RAM path (a plain
+            // RAM store) doesn't pay either.
+            let data = d.data.read();
+            match data.append_no_sync(&value) {
                 Ok(new_loc) => {
                     let old_loc = d.index.upsert_sync(key, new_loc);
                     if let Some(old) = old_loc {
-                        let _ = d.data.mark_deleted_no_sync(old);
+                        let _ = data.mark_deleted_no_sync(old);
                         self.total_bytes
                             .fetch_sub(old.length as u64, Ordering::AcqRel);
                     }
@@ -546,8 +553,9 @@ impl BTreeStorage {
     pub fn get(&self, key: u64) -> Option<Vec<u8>> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
+            let data = d.data.read();
             let loc = d.index.read_sync(&key, |_, loc| *loc)?;
-            return d.data.read_lockfree(loc).ok();
+            return data.read_lockfree(loc).ok();
         }
         self.tree.read_sync(&key, |_, v| v.clone())
     }
@@ -556,8 +564,9 @@ impl BTreeStorage {
     pub fn remove(&self, key: u64) -> Option<Vec<u8>> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
+            let data = d.data.read();
             if let Some((_, old)) = d.index.remove_sync(&key) {
-                let _ = d.data.mark_deleted_no_sync(old);
+                let _ = data.mark_deleted_no_sync(old);
                 self.total_bytes
                     .fetch_sub(old.length as u64, Ordering::AcqRel);
             }
@@ -593,6 +602,66 @@ impl BTreeStorage {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn is_disk_first(&self) -> bool {
         self.disk.is_some()
+    }
+
+    /// Reclaim dead space left by updates/deletes. Returns
+    /// `(old_file_bytes, new_file_bytes)`.
+    ///
+    /// In-RAM mode has no dead space (updates are in place) — this just
+    /// persists the snapshot. Disk-first mode rewrites the append-only data
+    /// file keeping only the live records (those still referenced by the
+    /// index), then atomically swaps it in and remaps the index. The write
+    /// lock makes this exclusive w.r.t. all readers/writers, so a
+    /// `DocLocation` is never used against the swapped file.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn compact(&self) -> Result<(u64, u64)> {
+        let d = match &self.disk {
+            Some(d) => d,
+            None => {
+                self.persist()?;
+                let sz = self.total_bytes();
+                return Ok((sz, sz));
+            }
+        };
+
+        let mut data_guard = d.data.write(); // exclusive: no concurrent ops
+        let old_size = data_guard.file_size();
+
+        // Snapshot the live (doc_id, location) set.
+        let mut entries: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
+        d.index.iter_sync(|k, loc| {
+            entries.push((*k, *loc));
+            true
+        });
+
+        // Copy live records into a fresh data file.
+        let tmp = self.data_dir.join(format!("{}.bdat.compact", self.name));
+        let _ = std::fs::remove_file(&tmp);
+        let fresh = crate::storage::Storage::open_with_encryption(&tmp, self.encryption.clone())?;
+        let mut new_entries: Vec<(u64, crate::storage::DocLocation)> =
+            Vec::with_capacity(entries.len());
+        let mut total = 0u64;
+        for (id, old_loc) in &entries {
+            if let Ok(bytes) = data_guard.read_lockfree(*old_loc) {
+                let new_loc = fresh.append_no_sync(&bytes)?;
+                new_entries.push((*id, new_loc));
+                total += new_loc.length as u64;
+            }
+        }
+        fresh.sync()?;
+        let new_size = fresh.file_size();
+
+        // Atomic swap: replace the live file, reopen, swap the handle, remap.
+        let live = self.data_dir.join(format!("{}.bdat", self.name));
+        std::fs::rename(&tmp, &live)?;
+        let reopened = crate::storage::Storage::open_with_encryption(&live, self.encryption.clone())?;
+        *data_guard = Arc::new(reopened); // old Storage drops → old fd/mmap freed
+        d.index.clear_sync();
+        for (id, loc) in new_entries {
+            let _ = d.index.upsert_sync(id, loc);
+        }
+        self.total_bytes.store(total, Ordering::Release);
+        Ok((old_size, new_size))
     }
     #[cfg(target_arch = "wasm32")]
     pub fn is_disk_first(&self) -> bool {
@@ -631,9 +700,10 @@ impl BTreeStorage {
         } else {
             items.sort_unstable_by_key(|(k, _)| *k);
         }
+        let data = d.data.read();
         items
             .into_iter()
-            .filter_map(|(k, loc)| d.data.read_lockfree(loc).ok().map(|v| (k, v)))
+            .filter_map(|(k, loc)| data.read_lockfree(loc).ok().map(|v| (k, v)))
             .collect()
     }
 
@@ -683,6 +753,7 @@ impl BTreeStorage {
     {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
+            let data = d.data.read();
             let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
             d.index.iter_sync(|k, loc| {
                 items.push((*k, *loc));
@@ -690,7 +761,7 @@ impl BTreeStorage {
             });
             items.sort_unstable_by_key(|(k, _)| *k);
             for (key, loc) in items {
-                if let Ok(value) = d.data.read_lockfree(loc) {
+                if let Ok(value) = data.read_lockfree(loc) {
                     if !f(key, &value)? {
                         break;
                     }
@@ -722,6 +793,7 @@ impl BTreeStorage {
     {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
+            let data = d.data.read();
             let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
             d.index.iter_sync(|k, loc| {
                 items.push((*k, *loc));
@@ -729,7 +801,7 @@ impl BTreeStorage {
             });
             items.sort_unstable_by_key(|(k, _)| *k);
             for (_key, loc) in items {
-                if let Ok(value) = d.data.read_lockfree(loc) {
+                if let Ok(value) = data.read_lockfree(loc) {
                     if !f(&value)? {
                         break;
                     }
@@ -785,7 +857,8 @@ impl BTreeStorage {
             // the whole batch (durability via WAL; flushed in persist()), then
             // record each returned location.
             let slices: Vec<&[u8]> = entries.iter().map(|(_, v)| v.as_slice()).collect();
-            match d.data.append_batch_no_sync(&slices) {
+            let data = d.data.read();
+            match data.append_batch_no_sync(&slices) {
                 Ok(locs) => {
                     let mut added = 0u64;
                     for ((key, value), loc) in entries.iter().zip(locs.iter()) {
@@ -825,6 +898,7 @@ impl BTreeStorage {
     pub fn values_as_slices(&self) -> Vec<Vec<u8>> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
+            let data = d.data.read();
             let mut locs: Vec<crate::storage::DocLocation> = Vec::new();
             d.index.iter_sync(|_, loc| {
                 locs.push(*loc);
@@ -832,7 +906,7 @@ impl BTreeStorage {
             });
             return locs
                 .into_iter()
-                .filter_map(|loc| d.data.read_lockfree(loc).ok())
+                .filter_map(|loc| data.read_lockfree(loc).ok())
                 .collect();
         }
         let mut values = Vec::new();
@@ -870,6 +944,7 @@ impl BTreeStorage {
     {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
+            let data = d.data.read();
             // Collect (key, loc) first — we can't read `data` while holding an
             // index bucket guard. Order is arbitrary (matches in-RAM semantics).
             let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
@@ -878,7 +953,7 @@ impl BTreeStorage {
                 true
             });
             for (key, loc) in items {
-                if let Ok(value) = d.data.read_lockfree(loc) {
+                if let Ok(value) = data.read_lockfree(loc) {
                     if !f(key, &value)? {
                         return Ok(());
                     }

@@ -278,3 +278,64 @@ fn bdat_growth_under_update_churn() {
     let db = OxiDb::open(dir.path()).unwrap();
     assert_eq!(db.count("c", &json!({})).unwrap() as u64, keys, "live count after reopen");
 }
+
+/// Compaction reclaims the dead space left by update churn, and the live data
+/// survives intact (values + indexed queries) across compact and a reopen.
+#[test]
+fn compaction_reclaims_space_and_preserves_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+    db.create_index("c", "bucket").unwrap();
+    let keys = 300u64;
+    let mut model: HashMap<u64, u64> = HashMap::new();
+    for k in 0..keys {
+        let v = k;
+        db.insert("c", doc(k, v)).unwrap();
+        model.insert(k, v);
+    }
+    // Heavy in-place update churn → lots of dead records (disk-first).
+    let mut rng = Lcg(55);
+    for _ in 0..(rounds() * 30) {
+        let k = rng.below(keys);
+        let v = rng.next();
+        db.update("c", &json!({ "k": k }), &json!({ "$set": { "v": v, "bucket": (v % 8) as i64 } }))
+            .unwrap();
+        model.insert(k, v);
+    }
+
+    let stats = db.compact("c").unwrap();
+    assert_eq!(stats.docs_kept as u64, keys, "compaction keeps the live set");
+    if disk_first() {
+        assert!(
+            stats.new_size < stats.old_size,
+            "disk-first compaction must shrink the file: {} -> {}",
+            stats.old_size,
+            stats.new_size
+        );
+        println!(
+            "\n[soak] compaction: {} -> {} bytes ({} live docs)",
+            stats.old_size, stats.new_size, stats.docs_kept
+        );
+    }
+
+    // Correctness immediately after compaction.
+    assert_eq!(db.count("c", &json!({})).unwrap() as u64, keys);
+    for (&k, &v) in model.iter().take(50) {
+        let got = db.find_one("c", &json!({ "k": k })).unwrap();
+        assert_eq!(got.and_then(|d| d["v"].as_u64()), Some(v), "k={k} after compact");
+    }
+    for bucket in 0..8i64 {
+        let expected = model.values().filter(|v| (*v % 8) as i64 == bucket).count();
+        assert_eq!(db.count("c", &json!({ "bucket": bucket })).unwrap(), expected, "indexed after compact");
+    }
+
+    // And after a clean reopen (compacted file must be readable + correct).
+    db.shutdown();
+    drop(db);
+    let db = OxiDb::open(dir.path()).unwrap();
+    assert_eq!(db.count("c", &json!({})).unwrap() as u64, keys, "live count after compact+reopen");
+    for (&k, &v) in model.iter().take(50) {
+        let got = db.find_one("c", &json!({ "k": k })).unwrap();
+        assert_eq!(got.and_then(|d| d["v"].as_u64()), Some(v), "k={k} after compact+reopen");
+    }
+}

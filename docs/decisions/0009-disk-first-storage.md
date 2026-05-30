@@ -104,12 +104,17 @@ tracked separately).
 
 ## Follow-ups before this can be the default
 
-- **Auto-compaction** for the `.bdat`/`.mfidx` files (reclaim dead space under
-  update/delete churn) + a size/ratio policy. **The soak suite below quantifies
-  the need**: 200 live docs after 6000 in-place updates leave a ~690 KiB `.bdat`
-  (≈17× the live footprint) — correctness holds and a reopen reconciles to the
-  live set, but the append-only file grows with the number of writes, not the
-  live size.
+- **Compaction — implemented** (`BTreeStorage::compact` → `OxiDb::compact`):
+  rewrites the `.bdat` keeping only live records and atomically swaps it in (the
+  `data` handle is an `RwLock<Arc<Storage>>`; normal ops take the read lock
+  spanning index-lookup+data-read, compaction takes the write lock, so a
+  `DocLocation` is never used against the swapped file). Field indexes are
+  doc_id-keyed so the store rewrite doesn't touch them; their `.mfidx` is
+  rewritten cleanly by the overlay merge on persist. Soak-verified: 167 KB →
+  34 KB (~5×) after heavy update churn, with all live data + indexed queries
+  intact through compact and a reopen. **Still TODO:** an *automatic* trigger
+  (run compaction on a dead-space ratio/size threshold) — today it's an explicit
+  `compact` call.
 - Lazy cursors (stream values instead of materializing the snapshot) to also cut
   the transient per-sorted-query spike.
 - A 1M-doc bench run in disk mode on a quiet box to confirm the RSS win and
