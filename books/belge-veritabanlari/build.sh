@@ -7,8 +7,13 @@
 # basictex` (sonra `sudo tlmgr install xetex`), ya da `brew install pandoc
 # mactex`. Linux: `apt install pandoc texlive-xetex texlive-fonts-recommended`.
 #
+# LaTeX yoksa, LaTeX gerektirmeyen Chrome tabanlı yol kullanılabilir:
+#   ./build.sh pdf-html   # pandoc -> HTML (print.css + kapak) -> Chrome -> PDF
+# Bu yol yalnızca pandoc + Google Chrome ister (xelatex gerekmez).
+#
 # Kullanım:
-#   ./build.sh            # belge-veritabanlari.pdf üretir
+#   ./build.sh            # belge-veritabanlari.pdf üretir (xelatex gerektirir)
+#   ./build.sh pdf-html   # belge-veritabanlari.pdf üretir (Chrome ile, LaTeX'siz)
 #   ./build.sh epub       # belge-veritabanlari.epub üretir
 #   ./build.sh html       # tek dosyalık belge-veritabanlari.html üretir
 set -euo pipefail
@@ -48,8 +53,27 @@ case "$fmt" in
     pandoc metadata.yaml "${chapters[@]}" --toc --standalone --number-sections -o "${out}.html"
     echo "yazıldı: ${out}.html"
     ;;
+  pdf-html)
+    # LaTeX'siz yol: pandoc ile gömülü (kapak + CSS) tek HTML üret, Chrome ile bas.
+    local_cover=()
+    [[ -f kapak.png ]] && local_cover=(--include-before-body=cover.html)
+    pandoc metadata.yaml "${chapters[@]}" \
+      --standalone --embed-resources --toc --toc-depth=2 --number-sections \
+      -c print.css "${local_cover[@]}" \
+      -o kitap.html
+    chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    [[ -x "$chrome" ]] || chrome="$(command -v google-chrome || command -v chromium || true)"
+    if [[ -z "$chrome" ]]; then
+      echo "Google Chrome bulunamadı; kitap.html üretildi, elle PDF'e basabilirsiniz." >&2
+      exit 1
+    fi
+    "$chrome" --headless=new --disable-gpu --no-pdf-header-footer \
+      --print-to-pdf="${out}.pdf" "file://$PWD/kitap.html"
+    rm -f kitap.html
+    echo "yazıldı: ${out}.pdf (Chrome ile)"
+    ;;
   *)
-    echo "bilinmeyen format: $fmt (pdf|epub|html)" >&2
+    echo "bilinmeyen format: $fmt (pdf|pdf-html|epub|html)" >&2
     exit 1
     ;;
 esac

@@ -1,0 +1,33 @@
+@page { margin: 2.2cm 2cm; }
+html { -webkit-print-color-adjust: exact; }
+body {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 11pt; line-height: 1.55; color: #111;
+  hyphens: auto;
+}
+p { text-align: justify; margin: 0 0 0.8em; }
+/* Kapak: tek başına sayfa */
+.cover { text-align: center; page-break-after: always; }
+.cover img { max-width: 100%; max-height: 95vh; }
+/* Başlık bloğu ve içindekiler ayrı sayfalar */
+#title-block-header { page-break-after: always; text-align: center; margin-top: 30vh; }
+#title-block-header .title { font-size: 26pt; margin-bottom: .2em; }
+#title-block-header .subtitle { font-size: 15pt; color:#444; font-weight: normal; }
+#title-block-header .author, #title-block-header .date { font-size: 12pt; color:#333; }
+nav#TOC { page-break-after: always; }
+nav#TOC > ul { list-style: none; padding-left: 0; }
+nav#TOC ul ul { list-style: none; padding-left: 1.2em; }
+nav#TOC a { text-decoration: none; color: #111; }
+/* Her bölüm yeni sayfada (başlık bloğu hariç) */
+h1:not(.title) { page-break-before: always; font-size: 19pt; margin: 0 0 .6em; line-height:1.2; }
+h2 { font-size: 14pt; margin: 1.3em 0 .4em; }
+h3 { font-size: 12pt; margin: 1em 0 .3em; }
+h1, h2, h3 { page-break-after: avoid; }
+code, pre { font-family: "SF Mono", "DejaVu Sans Mono", monospace; font-size: 9.5pt; }
+pre { background:#f5f5f5; padding:.6em .8em; border-radius:4px; white-space:pre-wrap; }
+table { border-collapse: collapse; margin: 1em 0; font-size: 10pt; width:100%; }
+th, td { border: 1px solid #bbb; padding: 4px 8px; text-align: left; }
+th { background: #eee; }
+dt { font-weight: bold; margin-top: .6em; }
+dd { margin: 0 0 .2em 1.5em; }
+blockquote { border-left: 3px solid #ccc; margin: 1em 0; padding-left: 1em; color:#444; }

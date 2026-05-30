@@ -30,13 +30,15 @@ başına `# Bölüm Başlığı` koyun. Numaralandırma ve içindekiler otomatik
 ## PDF'e (veya EPUB/HTML'e) çevirme
 
 ```sh
-./build.sh          # belge-veritabanlari.pdf
-./build.sh epub     # belge-veritabanlari.epub
-./build.sh html     # belge-veritabanlari.html
+./build.sh           # belge-veritabanlari.pdf  (pandoc + xelatex gerektirir)
+./build.sh pdf-html  # belge-veritabanlari.pdf  (pandoc + Google Chrome; LaTeX'siz)
+./build.sh epub      # belge-veritabanlari.epub
+./build.sh html      # belge-veritabanlari.html
 ```
 
-Gereksinim: `pandoc` ve `xelatex` (Türkçe karakterler için). Kurulum örnekleri
-`build.sh` başında.
+Gereksinim: `pandoc`. PDF için ya `xelatex` (varsayılan yol) ya da Google Chrome
+(`pdf-html` yolu, LaTeX'siz; `print.css` ile sayfa düzeni, kapak ilk sayfada).
+Depodaki `belge-veritabanlari.pdf`, `pdf-html` yoluyla üretilmiştir (137 sayfa).
 
 ## İçindekiler (plan)
 
