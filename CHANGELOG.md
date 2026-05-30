@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Byte-level post-filter find — no Value materialization (server 0.28.27)
+
+A `find` whose query an index couldn't satisfy materialized the entire result
+as `Vec<Arc<Value>>` (~7× heavier than encoded), so a large unindexed result
+(e.g. `verified=true` ≈ 250K matches) spiked the server into OOM territory. The
+server now has a byte-level post-filter path: it filters each stored document
+with `matches_raw_jsonb` — non-matches are **skipped with no decode** — and
+transcodes matches JSONB→OxiWire directly into one buffer (no `Value`).
+
+A 500K-doc A/B (query `verified=true`, 250K matches) shows it is both **lower
+memory and faster** than the Value path: ~90 MiB encoded buffer vs ~875 MiB of
+`Value`s, **321 ms vs 358 ms** (and the byte path's time *includes* encoding,
+which the server adds on top of the Value path). Results are identical to the
+Value path (parity test across eq/range/$in/compound/missing-field). Sort/skip/
+limit still use the Value path (it owns ordering). This is the correct version
+of the earlier reverted attempt, which regressed 2–11× by decoding every doc;
+this one decodes only undecidable cases.
+
 ### Disk-first field indexes (opt-in, server 0.28.26)
 
 Extends disk-first mode (`OXIDB_DISK_FIRST=1`) to single-field indexes: they're

@@ -1346,6 +1346,22 @@ impl OxiDb {
         col.find_oxiwire_bytes(query, opts)
     }
 
+    /// Low-memory post-filter find: encodes matching docs straight into one
+    /// OxiWire buffer (no `Vec<Arc<Value>>`). See
+    /// `BTreeCollection::find_oxiwire_postfilter`. `None` for sort/skip/limit.
+    pub fn find_oxiwire_postfilter(
+        &self,
+        collection: &str,
+        query: &Value,
+        opts: &FindOptions,
+    ) -> Option<Result<(usize, Vec<u8>)>> {
+        let col = match self.get_or_create_collection(collection) {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
+        col.find_oxiwire_postfilter(query, opts)
+    }
+
     pub fn find_one(&self, collection: &str, query: &Value) -> Result<Option<Value>> {
         let col = self.get_or_create_collection(collection)?;
         col.find_one(query)

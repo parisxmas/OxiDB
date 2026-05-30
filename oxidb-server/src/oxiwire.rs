@@ -148,6 +148,19 @@ pub fn ok_docs_bytes_response(docs: &[Arc<[u8]>]) -> Vec<u8> {
     buf
 }
 
+/// Frame `count` already-concatenated OxiWire document encodings into an array
+/// response. Pairs with `OxiDb::find_oxiwire_postfilter`, which encodes all
+/// matches into one buffer — framed with a single header, no per-doc `Arc`.
+pub fn ok_docs_concat_response(count: usize, doc_bytes: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(doc_bytes.len() + 8);
+    buf.push(MAGIC);
+    buf.push(0x00);
+    buf.push(TAG_ARRAY);
+    buf.extend_from_slice(&(count as u32).to_le_bytes());
+    buf.extend_from_slice(doc_bytes);
+    buf
+}
+
 /// Parallel serialization path for large result sets.
 /// Splits doc slice into chunks, each thread serializes into one contiguous buffer.
 fn ok_docs_response_parallel(docs: &[Arc<Value>]) -> Vec<u8> {

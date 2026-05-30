@@ -486,6 +486,60 @@ impl BTreeCollection {
     /// 2. **Single-field index path** — for queries `is_fully_indexed`
     ///    recognises (single eq, range, $in), fall through to
     ///    `execute_indexed` which intersects per-field index results.
+    /// Post-filter `find` that encodes the matching documents directly into a
+    /// single OxiWire buffer — never materializing a `Vec<Arc<Value>>`.
+    ///
+    /// This is the low-memory path for queries an index can't fully satisfy
+    /// (e.g. `verified=true` over a whole collection). It byte-filters each
+    /// stored document with [`query::matches_raw_jsonb`] — non-matches are
+    /// skipped with **no decode at all** — and transcodes matches JSONB→OxiWire
+    /// (no `Value`). So peak memory tracks the compact result bytes, not the
+    /// ~7×-heavier `Value` set that OOM'd large unindexed results. Returns
+    /// `None` for sort/skip/limit (the Value path owns ordering) so they fall
+    /// back unchanged.
+    pub fn find_oxiwire_postfilter(
+        &self,
+        query_json: &Value,
+        opts: &FindOptions,
+    ) -> Option<Result<(usize, Vec<u8>)>> {
+        if opts.sort.is_some() || opts.skip.is_some() || opts.limit.is_some() {
+            return None;
+        }
+        let query = match query::parse_query(query_json) {
+            Ok(q) => q,
+            Err(e) => return Some(Err(e)),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        let mut count = 0usize;
+        let scan = self.storage.scan_bytes_while(|bytes| {
+            // Byte-level match: skip non-matches without decoding to Value.
+            let matched = match query::matches_raw_jsonb(&query, bytes) {
+                Some(b) => b,
+                None => match crate::codec::decode_doc(bytes) {
+                    Ok(doc) => query::matches_value(&query, &doc),
+                    Err(_) => false,
+                },
+            };
+            if matched {
+                // Transcode the stored bytes straight to OxiWire (no Value).
+                match crate::jsonb_oxiwire::jsonb_to_oxiwire_owned(bytes) {
+                    Ok(oxi) => buf.extend_from_slice(&oxi),
+                    Err(_) => {
+                        // Legacy JSON record: decode + encode (rare).
+                        if let Ok(doc) = crate::codec::decode_doc(bytes) {
+                            crate::wire_oxiwire::encode_value(&doc, &mut buf);
+                        } else {
+                            return Ok(true);
+                        }
+                    }
+                }
+                count += 1;
+            }
+            Ok(true)
+        });
+        Some(scan.map(|_| (count, buf)))
+    }
+
     pub fn find_oxiwire_bytes(
         &self,
         query_json: &Value,
@@ -3444,6 +3498,40 @@ mod tests {
 
     fn new_btree_collection(name: &str) -> BTreeCollection {
         BTreeCollection::open_in_memory(name)
+    }
+
+    #[test]
+    fn find_oxiwire_postfilter_count_matches_value_path() {
+        // The byte-level post-filter must select exactly the same documents as
+        // the Value path across a range of unindexed query shapes.
+        let col = new_btree_collection("postfilter_parity");
+        for i in 0..500 {
+            let city = ["Tokyo", "Paris", "Berlin"][i % 3];
+            col.insert(json!({
+                "v": i % 2 == 0,
+                "age": 18 + (i % 60),
+                "city": city,
+                "score": (i % 100) as f64,
+            }))
+            .unwrap();
+        }
+        let opts = FindOptions::default();
+        for q in [
+            json!({"v": true}),
+            json!({"age": {"$gte": 50}}),
+            json!({"city": "Paris"}),
+            json!({"score": {"$lt": 25}}),
+            json!({"v": false, "city": "Tokyo"}),
+            json!({"age": {"$in": [20, 30, 40]}}),
+            json!({"nonexistent": 1}),
+        ] {
+            let (count, _buf) = col
+                .find_oxiwire_postfilter(&q, &opts)
+                .expect("postfilter handles no sort/skip/limit")
+                .expect("scan ok");
+            let baseline = col.find_with_options_arcs(&q, &opts).unwrap().len();
+            assert_eq!(count, baseline, "mismatch for query {}", q);
+        }
     }
 
     #[test]

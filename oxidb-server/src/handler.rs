@@ -263,6 +263,16 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                             Err(e) => return err_bytes(&e.to_string()),
                         }
                     }
+                    // Not index-satisfiable: byte-level post-filter encoding,
+                    // avoiding a Vec<Arc<Value>> for large unindexed results.
+                    if let Some(result) = db.find_oxiwire_postfilter(col, query, &opts) {
+                        match result {
+                            Ok((count, doc_bytes)) => {
+                                return crate::oxiwire::ok_docs_concat_response(count, &doc_bytes)
+                            }
+                            Err(e) => return err_bytes(&e.to_string()),
+                        }
+                    }
                 }
                 // Fallback: existing zero-copy Arc<Value> path.
                 match db.find_with_options_arcs(col, query, &opts) {

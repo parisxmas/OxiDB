@@ -75,6 +75,39 @@ fn rss_mib() -> f64 {
     kib / 1024.0
 }
 
+/// A/B: byte-level post-filter find vs the Value path, for a large unindexed
+/// result. The earlier (reverted) attempt regressed 2-11x because it decoded
+/// every doc; this one byte-filters (skips non-matches) and transcodes matches.
+#[test]
+#[ignore = "perf A/B; run explicitly with --ignored --nocapture"]
+fn postfilter_vs_value_timing() {
+    let total: usize = std::env::var("PROBE_DOCS").ok().and_then(|v| v.parse().ok()).unwrap_or(500_000);
+    let dir = tempfile::tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+    let mut rng = Lcg(42);
+    let mut i = 0;
+    while i < total {
+        let end = (i + 5000).min(total);
+        db.insert_many("bench", (i..end).map(|k| gen_doc(&mut rng, k)).collect()).unwrap();
+        i = end;
+    }
+    let q = json!({"verified": true});
+    let opts = oxidb::query::FindOptions::default();
+    // Warm + measure the Value path.
+    let t0 = std::time::Instant::now();
+    let vlen = db.find("bench", &q).unwrap().len();
+    let value_ms = t0.elapsed().as_millis();
+    // Measure the byte post-filter path (collection-level, via a fresh handle
+    // would be ideal; engine method exercises the same code).
+    let t1 = std::time::Instant::now();
+    let (count, buf) = db.find_oxiwire_postfilter("bench", &q, &opts).unwrap().unwrap();
+    let bytes_ms = t1.elapsed().as_millis();
+    println!("\n── postfilter A/B: {total} docs, query verified=true ──");
+    println!("  Value path   : {value_ms} ms  ({vlen} docs materialized as Vec<Value>)");
+    println!("  Byte path    : {bytes_ms} ms  ({count} docs, {} KiB encoded buffer)", buf.len() / 1024);
+    println!("  (byte path matches Value count: {})", count == vlen);
+}
+
 #[test]
 #[ignore = "heavy 1M-doc memory probe; run explicitly with --ignored --nocapture"]
 fn one_million_doc_rss() {
