@@ -59,7 +59,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 10. İşlemler: ACID, izolasyon, kilitleme, MVCC ve OCC ✅
 11. Eşzamanlılık ve tutarlılık ✅
 12. Ölçeklendirme: replikasyon, konsensüs ve sharding ✅
-13. Bellek, önbellek ve disk ödünleşimi
+13. Bellek, önbellek ve disk ödünleşimi ✅
 14. Güvenlik: kimlik doğrulama, yetkilendirme, şifreleme, denetim
 
 ### Kısım III — OxiDB Adım Adım
