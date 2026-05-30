@@ -758,6 +758,17 @@ Null < Boolean < Integer/Float < DateTime < String
 
 Date strings (ISO 8601, RFC 3339, `YYYY-MM-DD`) are automatically stored as epoch milliseconds for fast integer comparison.
 
+## Book (Turkish)
+
+A full-length Turkish book, **_OxiDB Doküman Veritabanı_** — a ground-up,
+code-free explanation of document databases and then how OxiDB works, step by
+step — lives in [`books/belge-veritabanlari/`](books/belge-veritabanlari/).
+~116 pages, cover + 27 hand-drawn diagrams.
+
+📖 **[Download the PDF](https://github.com/parisxmas/OxiDB/raw/master/books/belge-veritabanlari/belge-veritabanlari.pdf)**
+(GitHub does not preview PDFs in the file list; use this link or open the file
+and click **Download**.)
+
 ## License
 
 OxiDB is **dual-licensed**:

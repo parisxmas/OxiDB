@@ -3,6 +3,13 @@
 **Ölçeklenebilir, NoSQL Doküman Tabanlı Çözümler Rehberi** — Barış AKIN ve
 Anthropic (2026).
 
+### 📖 [PDF'i indir](https://github.com/parisxmas/OxiDB/raw/master/books/belge-veritabanlari/belge-veritabanlari.pdf)
+
+Kitabın derlenmiş tam hali (PDF, ~116 sayfa, kapak + 27 diyagram dahil) bu
+dizinde `belge-veritabanlari.pdf` olarak bulunur. Yukarıdaki bağlantı dosyayı
+doğrudan indirir. (GitHub PDF'leri dosya listesinde önizlemez; ya bu bağlantıyı
+kullanın ya da dosyaya tıklayıp **"Download"** deyin.)
+
 Bu dizin, belge (doküman) veritabanlarını **sıfırdan** anlatan, ardından
 OxiDB'nin nasıl çalıştığını **adım adım** açıklayan Türkçe bir kitabın
 kaynağıdır. Kitap düz metindir (örnek kod içermez); O'Reilly tarzında,
