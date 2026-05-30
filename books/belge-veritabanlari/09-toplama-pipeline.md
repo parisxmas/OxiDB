@@ -9,6 +9,8 @@ bölgedeki ortalama yaş nedir", "her aydaki toplam satış kaçtır", "en çok 
 (aggregation) ve onun ardındaki pipeline modelini — inceliyor. Toplama, bir
 veritabanını bir kayıt deposundan bir analiz aracına dönüştüren yetenektir.
 
+![Şekil 9 — Toplama boru hattı: belge akışını dönüştüren ardışık aşamalar.](sekiller/09-toplama-pipeline.svg){width=80%}
+
 ## Süzmenin ötesi: veriyi özetlemek
 
 Önceki bölümdeki sorgular, hep belgeleri **seçmekle** ilgiliydi; sonuç, her

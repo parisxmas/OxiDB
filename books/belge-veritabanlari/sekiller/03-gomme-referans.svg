@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="320" font-family="Georgia, serif">
+  <rect width="720" height="320" fill="#fbfbf8"/>
+  <text x="180" y="32" font-size="14" font-weight="bold" text-anchor="middle">İlişkisel: parçala + birleştir (join)</text>
+  <text x="545" y="32" font-size="14" font-weight="bold" text-anchor="middle">Belge: tek bir bütün (gömme)</text>
+  <line x1="360" y1="50" x2="360" y2="300" stroke="#ddd" stroke-dasharray="4"/>
+  <!-- left: tables -->
+  <g font-size="11" text-anchor="middle">
+    <rect x="40" y="70" width="120" height="50" fill="#fff" stroke="#888"/><text x="100" y="62" font-size="11" fill="#666">Sipariş</text><line x1="40" y1="90" x2="160" y2="90" stroke="#bbb"/>
+    <rect x="200" y="70" width="120" height="50" fill="#fff" stroke="#888"/><text x="260" y="62" font-size="11" fill="#666">Müşteri</text><line x1="200" y1="90" x2="320" y2="90" stroke="#bbb"/>
+    <rect x="40" y="180" width="120" height="50" fill="#fff" stroke="#888"/><text x="100" y="172" font-size="11" fill="#666">Kalemler</text><line x1="40" y1="200" x2="160" y2="200" stroke="#bbb"/>
+    <rect x="200" y="180" width="120" height="50" fill="#fff" stroke="#888"/><text x="260" y="172" font-size="11" fill="#666">Ürün</text><line x1="200" y1="200" x2="320" y2="200" stroke="#bbb"/>
+  </g>
+  <g stroke="#c0392b" stroke-width="1.4" fill="none">
+    <line x1="160" y1="95" x2="200" y2="95"/><line x1="100" y1="120" x2="100" y2="180"/><line x1="160" y1="205" x2="200" y2="205"/>
+  </g>
+  <text x="180" y="270" font-size="11" text-anchor="middle" fill="#c0392b">okumak için birleştirme gerekir</text>
+  <!-- right: nested doc -->
+  <rect x="420" y="60" width="250" height="200" rx="8" fill="#e8f3ea" stroke="#3a8a52" stroke-width="2"/>
+  <g font-size="11">
+    <text x="436" y="86">sipariş {</text>
+    <text x="456" y="108">müşteri: { ad, adres }</text>
+    <text x="456" y="130">kalemler: [</text>
+    <text x="476" y="150">{ ürün, miktar },</text>
+    <text x="476" y="170">{ ürün, miktar }</text>
+    <text x="456" y="190">]</text>
+    <text x="436" y="212">}</text>
+  </g>
+  <text x="545" y="245" font-size="11" text-anchor="middle" fill="#3a8a52">tek okumayla, yerel</text>
+  <text x="360" y="305" font-size="10.5" text-anchor="middle" fill="#999">Ödünleşim: yerellik ↔ çoğaltma · erişim örüntüsü kararı belirler</text>
+</svg>

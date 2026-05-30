@@ -8,6 +8,8 @@ bölüm, veritabanlarını taramaya mahkûm olmaktan kurtaran o yardımcı yapı
 indekslere — eğiliyor. İndeksler, bir veritabanının hızının büyük bölümünün
 geldiği yerdir; onlarsız her soru, tüm veriyi okumayı gerektirirdi.
 
+![Şekil 7 — Tam tarama ile sıralı indeks erişiminin karşılaştırması.](sekiller/07-indeksleme.svg){width=80%}
+
 ## Tarama sorunu
 
 Bir koleksiyonda bir milyon kullanıcı belgesi olduğunu ve belirli bir e-posta

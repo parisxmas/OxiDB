@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="290" font-family="Georgia, serif">
+  <rect width="720" height="290" fill="#fbfbf8"/>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Tek çekirdek, birçok yüz</text>
+  <ellipse cx="360" cy="150" rx="95" ry="50" fill="#e8f3ea" stroke="#3a8a52" stroke-width="2"/>
+  <text x="360" y="148" font-size="13" font-weight="bold" text-anchor="middle">OxiDB çekirdeği</text>
+  <text x="360" y="166" font-size="9.5" text-anchor="middle" fill="#666">(Rust)</text>
+  <g font-size="10.5" text-anchor="middle">
+    <rect x="40" y="60" width="120" height="34" rx="6" fill="#e8eef7" stroke="#2b6cb0"/><text x="100" y="82">Gömülü (FFI)</text>
+    <rect x="40" y="205" width="120" height="34" rx="6" fill="#e8eef7" stroke="#2b6cb0"/><text x="100" y="227">TCP sunucu</text>
+    <rect x="560" y="60" width="130" height="34" rx="6" fill="#f3eef7" stroke="#7a4fa0"/><text x="625" y="82">REST / WebSocket</text>
+    <rect x="560" y="205" width="130" height="34" rx="6" fill="#fdeee0" stroke="#c97b2c"/><text x="625" y="227">RESP / MQTT</text>
+    <rect x="290" y="245" width="140" height="34" rx="6" fill="#eef0f5" stroke="#555"/><text x="360" y="267">Py · Go · .NET · JS · …</text>
+  </g>
+  <g stroke="#999" stroke-width="1.4">
+    <line x1="160" y1="80" x2="280" y2="135"/><line x1="160" y1="222" x2="280" y2="165"/>
+    <line x1="560" y1="80" x2="440" y2="135"/><line x1="560" y1="222" x2="440" y2="165"/>
+    <line x1="360" y1="200" x2="360" y2="245"/>
+  </g>
+  <text x="360" y="288" font-size="10.5" text-anchor="middle" fill="#999">Aynı motor; her istemci ya gömülü çağırır ya da bir tel protokolü konuşur</text>
+</svg>

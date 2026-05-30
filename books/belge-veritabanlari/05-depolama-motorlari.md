@@ -10,6 +10,8 @@ sayfa tabanlı B-ağaçlarını ve append-only/log-yapılı yaklaşımları —
 inceleyeceğiz. Buradan sonraki birkaç bölüm daha teknik olacak, ama yöntemimiz
 aynı: her tasarımı, çözmeye çalıştığı somut sorundan başlayarak anlamak.
 
+![Şekil 5 — Yerinde güncelleme ile ekle-only depolamanın temel ödünleşimi.](sekiller/05-depolama-motorlari.svg){width=80%}
+
 ## Depolama motoru ne yapar
 
 Bir depolama motorunu, veritabanının geri kalanından soyutlayarak düşünmek

@@ -9,6 +9,8 @@ inceleyeceğiz. Bu bölüm, Kısım I'in son durağı; onu bitirdiğimizde belge
 olduğunu tam olarak bilecek ve Kısım II'de bir veritabanının bu belgeleri içeride
 *nasıl* sakladığına geçmeye hazır olacağız.
 
+![Şekil 4 — Belge, alanlardan oluşan ve iç içe geçebilen bir ağaçtır.](sekiller/04-belge-agaci.svg){width=80%}
+
 ## Bir belge neyden yapılır
 
 Bir belge, özünde, **adlandırılmış alanların** bir koleksiyonudur. Her alanın

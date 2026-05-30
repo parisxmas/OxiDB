@@ -9,6 +9,8 @@ hassastır; bu da onu bir hedef yapar. Bu bölüm, bir veritabanının güvenlik
 boyutunu — verinin kim tarafından, nasıl erişilebileceğini ve çalınsa bile
 korunmasını sağlayan mekanizmaları — ele alarak Kısım II'yi kapatıyor.
 
+![Şekil 14 — Güvenliğin dört katmanı: kimlik, yetki, şifreleme, denetim.](sekiller/14-guvenlik.svg){width=80%}
+
 ## Tehdit ve katmanlı savunma ilkesi
 
 Güvenliği düşünmenin ilk adımı, neye karşı korunduğumuzu görmektir. Tehdit, hem

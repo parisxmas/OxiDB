@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" font-family="Georgia, serif">
+  <rect width="720" height="360" fill="#fbfbf8"/>
+  <ellipse cx="360" cy="180" rx="92" ry="48" fill="#e8f3ea" stroke="#3a8a52" stroke-width="2"/>
+  <text x="360" y="178" font-size="17" font-weight="bold" text-anchor="middle">VTYS</text>
+  <text x="360" y="198" font-size="11" text-anchor="middle" fill="#555">(veriyi yöneten yazılım)</text>
+  <g font-size="13" text-anchor="middle">
+    <rect x="120" y="40" width="150" height="40" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="195" y="65">Arama</text>
+    <rect x="450" y="40" width="150" height="40" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="525" y="65">Eşzamanlılık</text>
+    <rect x="40" y="160" width="150" height="40" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="115" y="185">Bütünlük</text>
+    <rect x="530" y="160" width="150" height="40" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="605" y="185">Kurtarma</text>
+    <rect x="285" y="290" width="150" height="40" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="360" y="315">Soyutlama</text>
+  </g>
+  <g stroke="#999" stroke-width="1.5">
+    <line x1="250" y1="80" x2="310" y2="145"/><line x1="470" y1="80" x2="410" y2="145"/>
+    <line x1="190" y1="180" x2="268" y2="180"/><line x1="452" y1="180" x2="530" y2="180"/>
+    <line x1="360" y1="228" x2="360" y2="290"/>
+  </g>
+  <text x="360" y="350" font-size="10.5" text-anchor="middle" fill="#999">Düz bir dosyanın çözmediği, VTYS'nin sistemli biçimde çözdüğü beş sorun</text>
+</svg>

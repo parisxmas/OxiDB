@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="300" font-family="Georgia, serif">
+  <rect width="720" height="300" fill="#fbfbf8"/>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">1M-belge karşılaştırması: kazanılan test sayısı (24 test)</text>
+  <!-- axes -->
+  <line x1="120" y1="60" x2="120" y2="230" stroke="#888"/>
+  <line x1="120" y1="230" x2="640" y2="230" stroke="#888"/>
+  <!-- OxiDB bar 24 -->
+  <rect x="200" y="70" width="80" height="160" fill="#3a8a52" stroke="#2f7042"/>
+  <text x="240" y="60" font-size="13" font-weight="bold" text-anchor="middle">24</text>
+  <text x="240" y="250" font-size="12" text-anchor="middle">OxiDB</text>
+  <!-- MongoDB bar 0 -->
+  <rect x="430" y="227" width="80" height="3" fill="#c0392b" stroke="#a13226"/>
+  <text x="470" y="218" font-size="13" font-weight="bold" text-anchor="middle">0</text>
+  <text x="470" y="250" font-size="12" text-anchor="middle">MongoDB</text>
+  <text x="110" y="74" font-size="9.5" text-anchor="end" fill="#666">24</text>
+  <text x="110" y="154" font-size="9.5" text-anchor="end" fill="#666">12</text>
+  <text x="110" y="232" font-size="9.5" text-anchor="end" fill="#666">0</text>
+  <text x="360" y="282" font-size="10.5" text-anchor="middle" fill="#999">Yerel, ağ-içi 1M-belge yığını; başlangıç 16/8 idi, performans çalışmasıyla temiz süpürme</text>
+</svg>

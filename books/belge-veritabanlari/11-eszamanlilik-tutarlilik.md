@@ -10,6 +10,8 @@ o an, sandığımızdan çok daha derin bir soru belirir: birden çok kopya vark
 Bu bölüm, bu soruyu ele alıyor ve bizi, verinin nasıl dağıtıldığını anlatacak bir
 sonraki bölüme hazırlıyor.
 
+![Şekil 11 — Tutarlılık bir spektrumdur; bölünme anında CAP seçimi dayatılır.](sekiller/11-tutarlilik-cap.svg){width=80%}
+
 ## Neden birden çok kopya
 
 Önce, neden tek bir kopyayla yetinmediğimizi kısaca görelim; ayrıntısı bir

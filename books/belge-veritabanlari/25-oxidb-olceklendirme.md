@@ -11,6 +11,8 @@ kısmının bu kitap yazılırken çok-düğümlü testlerle **doğrulanmış** 
 böylece on ikinci bölümün vaatlerini yalnızca tarif etmekle kalmayıp, gösterilmiş
 davranışlarla bağlayabiliyoruz.
 
+![Şekil 25 — Raft çoğunluk onayı ve OxiPool dağıt-topla.](sekiller/25-oxidb-olceklendirme.svg){width=80%}
+
 ## Raft kümesi: replikasyon ve konsensüs
 
 On ikinci bölümde, güçlü tutarlı bir replikasyonun iki fikirden — tek bir otorite

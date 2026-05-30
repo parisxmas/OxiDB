@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="280" font-family="Georgia, serif">
+  <rect width="720" height="280" fill="#fbfbf8"/>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Türler-arası toplam sıralama: karışık tipler tek eksende</text>
+  <g font-size="11" text-anchor="middle">
+    <rect x="40" y="70" width="90" height="44" rx="6" fill="#eef0f5" stroke="#555"/><text x="85" y="92">Null</text><text x="85" y="107" font-size="9">yok</text>
+    <rect x="148" y="70" width="90" height="44" rx="6" fill="#eef0f5" stroke="#555"/><text x="193" y="92">Bool</text>
+    <rect x="256" y="70" width="90" height="44" rx="6" fill="#e8eef7" stroke="#2b6cb0"/><text x="301" y="92">Sayı</text>
+    <rect x="364" y="70" width="120" height="44" rx="6" fill="#e8f3ea" stroke="#3a8a52"/><text x="424" y="92">Tarih</text><text x="424" y="107" font-size="9">epoch ms</text>
+    <rect x="502" y="70" width="120" height="44" rx="6" fill="#f3eef7" stroke="#7a4fa0"/><text x="562" y="92">Metin</text>
+  </g>
+  <line x1="40" y1="130" x2="640" y2="130" stroke="#888" stroke-width="1.5"/>
+  <polygon points="640,130 632,126 632,134" fill="#888"/>
+  <text x="40" y="150" font-size="10" text-anchor="start" fill="#666">küçük</text>
+  <text x="640" y="150" font-size="10" text-anchor="end" fill="#666">büyük</text>
+  <text x="360" y="180" font-size="11" text-anchor="middle" fill="#666">ISO/RFC tarih metinleri otomatik algılanıp epoch-ms olarak saklanır → doğru sıralanır</text>
+  <!-- mmap index file -->
+  <rect x="200" y="200" width="320" height="40" rx="8" fill="#eef0f5" stroke="#555"/>
+  <text x="360" y="225" font-size="11" text-anchor="middle">disk indeksi (.mfidx, mmap) → indeks-yalnız sayım mümkün</text>
+  <text x="360" y="262" font-size="10.5" text-anchor="middle" fill="#999">Sıralı yapı sayesinde sayım belgelere dokunmadan, küme boyutundan döner</text>
+</svg>

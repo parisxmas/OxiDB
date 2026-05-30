@@ -8,6 +8,8 @@ Amacımız bir galip ilan etmek değil; bu kitabın baştan beri savunduğu gibi
 sayının altındaki ödünleşimi görmek ve OxiDB'nin tercihlerini, onların gerçek
 sonuçlarıyla birlikte anlamaktır.
 
+![Şekil 27 — 1M-belge karşılaştırmasında kazanılan test sayısı.](sekiller/27-benchmark.svg){width=80%}
+
 ## Belleği yerleşik yığından çıkarma yolculuğu
 
 On üçüncü ve on altıncı bölümlerde, belleğe öncelikli bir veritabanının temel

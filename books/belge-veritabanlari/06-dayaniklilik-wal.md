@@ -8,6 +8,8 @@ alır: bir yazmanın gerçekten dayanıklı olduğundan emin olmak ve sistem en
 beklenmedik anda çökerse, enkazın içinden tutarlı biçimde geri dönmek. Bu,
 veritabanını basit bir dosyadan ayıran en derin farklardan biridir.
 
+![Şekil 6 — Önce-yaz günlüğü (WAL) akışı ve çökmeden kurtarma.](sekiller/06-wal.svg){width=80%}
+
 ## "Yazdım" demek neden yetmez
 
 Bir programın diske yazma isteği, sandığınız gibi tek adımda diskin yüzeyine

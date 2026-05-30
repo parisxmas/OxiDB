@@ -2,7 +2,7 @@
 html { -webkit-print-color-adjust: exact; }
 body {
   font-family: Georgia, "Times New Roman", serif;
-  font-size: 11pt; line-height: 1.55; color: #111;
+  font-size: 9.5pt; line-height: 1.5; color: #111;
   hyphens: auto;
 }
 p { text-align: justify; margin: 0 0 0.8em; }
@@ -11,17 +11,17 @@ p { text-align: justify; margin: 0 0 0.8em; }
 .cover img { max-width: 100%; max-height: 95vh; }
 /* Başlık bloğu ve içindekiler ayrı sayfalar */
 #title-block-header { page-break-after: always; text-align: center; margin-top: 30vh; }
-#title-block-header .title { font-size: 26pt; margin-bottom: .2em; }
-#title-block-header .subtitle { font-size: 15pt; color:#444; font-weight: normal; }
-#title-block-header .author, #title-block-header .date { font-size: 12pt; color:#333; }
+#title-block-header .title { font-size: 22pt; margin-bottom: .2em; }
+#title-block-header .subtitle { font-size: 13pt; color:#444; font-weight: normal; }
+#title-block-header .author, #title-block-header .date { font-size: 11pt; color:#333; }
 nav#TOC { page-break-after: always; }
 nav#TOC > ul { list-style: none; padding-left: 0; }
 nav#TOC ul ul { list-style: none; padding-left: 1.2em; }
 nav#TOC a { text-decoration: none; color: #111; }
 /* Her bölüm yeni sayfada (başlık bloğu hariç) */
-h1:not(.title) { page-break-before: always; font-size: 19pt; margin: 0 0 .6em; line-height:1.2; }
-h2 { font-size: 14pt; margin: 1.3em 0 .4em; }
-h3 { font-size: 12pt; margin: 1em 0 .3em; }
+h1:not(.title) { page-break-before: always; font-size: 16pt; margin: 0 0 .6em; line-height:1.2; }
+h2 { font-size: 12.5pt; margin: 1.3em 0 .4em; }
+h3 { font-size: 11pt; margin: 1em 0 .3em; }
 h1, h2, h3 { page-break-after: avoid; }
 code, pre { font-family: "SF Mono", "DejaVu Sans Mono", monospace; font-size: 9.5pt; }
 pre { background:#f5f5f5; padding:.6em .8em; border-radius:4px; white-space:pre-wrap; }
@@ -31,3 +31,8 @@ th { background: #eee; }
 dt { font-weight: bold; margin-top: .6em; }
 dd { margin: 0 0 .2em 1.5em; }
 blockquote { border-left: 3px solid #ccc; margin: 1em 0; padding-left: 1em; color:#444; }
+/* Şekiller */
+img { max-width: 100%; height: auto; }
+figure { text-align: center; page-break-inside: avoid; margin: 1.3em 0; }
+figure img { max-width: 90%; }
+figcaption { font-size: 9.5pt; color: #555; margin-top: .4em; font-style: italic; }

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="280" font-family="Georgia, serif">
+  <rect width="720" height="280" fill="#fbfbf8"/>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Tutarlılık bir spektrumdur; bölünme anında bir seçim dayatılır</text>
+  <!-- spectrum -->
+  <defs><linearGradient id="g" x1="0" x2="1"><stop offset="0" stop-color="#3a8a52"/><stop offset="1" stop-color="#c97b2c"/></linearGradient></defs>
+  <rect x="80" y="60" width="560" height="22" rx="11" fill="url(#g)"/>
+  <text x="80" y="100" font-size="11" text-anchor="start">güçlü tutarlılık</text>
+  <text x="640" y="100" font-size="11" text-anchor="end">nihai tutarlılık</text>
+  <text x="80" y="116" font-size="9.5" text-anchor="start" fill="#666">her okuma en güncel</text>
+  <text x="640" y="116" font-size="9.5" text-anchor="end" fill="#666">sonunda yakınsar</text>
+  <!-- CAP triangle -->
+  <g text-anchor="middle">
+    <text x="360" y="150" font-size="12" fill="#666">Ağ bölündüğünde (P kaçınılmaz) seçim:</text>
+    <rect x="180" y="170" width="160" height="70" rx="10" fill="#e8eef7" stroke="#2b6cb0"/><text x="260" y="198" font-size="13" font-weight="bold">Tutarlılık (C)</text><text x="260" y="220" font-size="10">yanıtı reddet,</text><text x="260" y="234" font-size="10">yanlış veri verme</text>
+    <rect x="380" y="170" width="160" height="70" rx="10" fill="#fdeee0" stroke="#c97b2c"/><text x="460" y="198" font-size="13" font-weight="bold">Erişilebilirlik (A)</text><text x="460" y="220" font-size="10">yanıt ver,</text><text x="460" y="234" font-size="10">bayat olabilir</text>
+  </g>
+  <text x="360" y="265" font-size="10.5" text-anchor="middle" fill="#999">CAP: bölünme varken C ve A aynı anda tam sağlanamaz — biri seçilir</text>
+</svg>

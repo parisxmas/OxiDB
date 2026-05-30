@@ -9,6 +9,8 @@ korunur; sistem, bir avuç kullanıcının veriyi kaosa sürüklemesine izin ver
 düzeni nasıl sürdürür? Bu bölüm, veritabanının belki de en zarif kavramına —
 işlemlere — ve onların verdiği güvencelere eğiliyor.
 
+![Şekil 10 — İyimser eşzamanlılıkta üç fazlı commit.](sekiller/10-islemler.svg){width=80%}
+
 ## İşlem nedir: bölünmez bir bütün
 
 Birinci bölümdeki para transferi örneğini hatırlayalım: bir hesaptan para düşmek

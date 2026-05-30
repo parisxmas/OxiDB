@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="270" font-family="Georgia, serif">
+  <rect width="720" height="270" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Bir sorgunun yaşam döngüsü</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="30" y="60" width="120" height="50" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="90" y="82">ayrıştır</text><text x="90" y="100" font-size="9.5">metin → AST</text>
+    <rect x="190" y="60" width="130" height="50" rx="8" fill="#f3eef7" stroke="#7a4fa0"/><text x="255" y="82">planla</text><text x="255" y="100" font-size="9.5">indeks seç</text>
+    <rect x="360" y="60" width="130" height="50" rx="8" fill="#e8f3ea" stroke="#3a8a52"/><text x="425" y="82">çalıştır</text><text x="425" y="100" font-size="9.5">daralt + süz</text>
+    <rect x="530" y="60" width="120" height="50" rx="8" fill="#eef0f5" stroke="#555"/><text x="590" y="88">sonuç</text>
+  </g>
+  <g stroke="#888" stroke-width="1.6" marker-end="url(#a)">
+    <line x1="150" y1="85" x2="188" y2="85"/><line x1="320" y1="85" x2="358" y2="85"/><line x1="490" y1="85" x2="528" y2="85"/>
+  </g>
+  <!-- narrow then refine -->
+  <g text-anchor="middle">
+    <path d="M120,160 L600,160 L470,230 L250,230 Z" fill="#e8f3ea" stroke="#3a8a52" opacity="0.6"/>
+    <text x="360" y="155" font-size="11" fill="#666">tüm belgeler</text>
+    <text x="360" y="185" font-size="12">indeks ile DARALT (geniş kümeyi küçült)</text>
+    <text x="360" y="218" font-size="12">kalan filtreyle SÜZ (eşleşmeyeni at)</text>
+    <text x="360" y="252" font-size="10.5" fill="#999">İyi plan: önce en seçici indeksle az belgeye in, pahalı işi ona uygula</text>
+  </g>
+</svg>

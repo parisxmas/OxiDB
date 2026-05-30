@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="250" font-family="Georgia, serif">
+  <rect width="720" height="250" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#7a4fa0"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Toplama boru hattı: belge akışını dönüştüren aşamalar</text>
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="20" y="80" width="100" height="46" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="70" y="100">$match</text><text x="70" y="116" font-size="9">süz</text>
+    <rect x="155" y="80" width="100" height="46" rx="8" fill="#f3eef7" stroke="#7a4fa0"/><text x="205" y="100">$group</text><text x="205" y="116" font-size="9">topla</text>
+    <rect x="290" y="80" width="100" height="46" rx="8" fill="#f3eef7" stroke="#7a4fa0"/><text x="340" y="100">$sort</text><text x="340" y="116" font-size="9">sırala</text>
+    <rect x="425" y="80" width="100" height="46" rx="8" fill="#f3eef7" stroke="#7a4fa0"/><text x="475" y="100">$limit</text><text x="475" y="116" font-size="9">kısıtla</text>
+    <rect x="560" y="80" width="120" height="46" rx="8" fill="#e8f3ea" stroke="#3a8a52"/><text x="620" y="100">$project</text><text x="620" y="116" font-size="9">biçimle</text>
+  </g>
+  <g stroke="#7a4fa0" stroke-width="1.8" marker-end="url(#a)">
+    <line x1="120" y1="103" x2="153" y2="103"/><line x1="255" y1="103" x2="288" y2="103"/><line x1="390" y1="103" x2="423" y2="103"/><line x1="525" y1="103" x2="558" y2="103"/>
+  </g>
+  <text x="70" y="160" font-size="20" text-anchor="middle" fill="#bbb">▦▦▦</text>
+  <text x="205" y="160" font-size="16" text-anchor="middle" fill="#bbb">▦▦</text>
+  <text x="620" y="160" font-size="14" text-anchor="middle" fill="#bbb">◧</text>
+  <text x="360" y="200" font-size="11" text-anchor="middle" fill="#666">Her aşamanın çıktısı bir sonrakinin girdisidir; veri akar ve daralır</text>
+  <text x="360" y="224" font-size="10.5" text-anchor="middle" fill="#999">Erken süzme (önce $match) sonraki aşamaların işini hafifletir</text>
+</svg>

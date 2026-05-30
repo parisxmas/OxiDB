@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="270" font-family="Georgia, serif">
+  <rect width="720" height="270" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">İyimser eşzamanlılık: üç fazlı commit</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="40" y="70" width="150" height="56" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="115" y="93">1. Hazırla</text><text x="115" y="112" font-size="9.5">yazmaları tamponla</text>
+    <rect x="285" y="70" width="150" height="56" rx="8" fill="#fdeee0" stroke="#c97b2c" stroke-width="2"/><text x="360" y="93">2. Doğrula</text><text x="360" y="112" font-size="9.5">sürümler değişti mi?</text>
+    <rect x="530" y="70" width="150" height="56" rx="8" fill="#e8f3ea" stroke="#3a8a52"/><text x="605" y="93">3. Uygula</text><text x="605" y="112" font-size="9.5">atomik yaz + artır</text>
+  </g>
+  <g stroke="#888" stroke-width="1.6" marker-end="url(#a)">
+    <line x1="190" y1="98" x2="283" y2="98"/><line x1="435" y1="98" x2="528" y2="98"/>
+  </g>
+  <path d="M360,126 q-120,80 -245,0" fill="none" stroke="#c0392b" stroke-width="1.6" marker-end="url(#a)" stroke-dasharray="5"/>
+  <text x="235" y="215" font-size="11" text-anchor="middle" fill="#c0392b">çakışma → iptal et, baştan dene</text>
+  <text x="500" y="180" font-size="11" text-anchor="middle" fill="#3a8a52">çakışma yok → kalıcı</text>
+  <text x="360" y="250" font-size="10.5" text-anchor="middle" fill="#999">Kilit yerine "önce çalış, commit'te doğrula": düşük çekişmede hızlı</text>
+</svg>

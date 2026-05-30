@@ -9,6 +9,8 @@ dururken şifrelemeyi ve zamanın bir noktasına geri dönmeyi sağlayan kurtarm
 Bu dört yüzeyin ortak özelliği, hepsinin aynı çekirdek motorun üzerine oturması
 ve isteğe bağlı olmasıdır; kullandığınız kadarının bedelini ödersiniz.
 
+![Şekil 23 — Tek çekirdek motor üstündeki dört ek yüzey.](sekiller/23-oxidb-ek-yuzeyler.svg){width=80%}
+
 ## Tam metin arama: ters indeksin somutu
 
 Yedinci bölümde, metnin içinde sözcük aramayı mümkün kılan **ters indeksi** —

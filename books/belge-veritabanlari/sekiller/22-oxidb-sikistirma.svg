@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="270" font-family="Georgia, serif">
+  <rect width="720" height="270" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Sıkıştırma: ölü alanı geri kazan</text>
+  <text x="180" y="62" font-size="11" text-anchor="middle" fill="#666">önce (ekle-only dosya)</text>
+  <g font-size="9" text-anchor="middle">
+    <rect x="40" y="75" width="50" height="34" fill="#fde7e1" stroke="#c0392b"/><text x="65" y="96">ölü</text>
+    <rect x="92" y="75" width="50" height="34" fill="#cde8d3" stroke="#3a8a52"/><text x="117" y="96">canlı</text>
+    <rect x="144" y="75" width="50" height="34" fill="#fde7e1" stroke="#c0392b"/><text x="169" y="96">ölü</text>
+    <rect x="196" y="75" width="50" height="34" fill="#fde7e1" stroke="#c0392b"/><text x="221" y="96">ölü</text>
+    <rect x="248" y="75" width="50" height="34" fill="#cde8d3" stroke="#3a8a52"/><text x="273" y="96">canlı</text>
+  </g>
+  <line x1="320" y1="92" x2="400" y2="92" stroke="#888" stroke-width="1.8" marker-end="url(#a)"/>
+  <text x="540" y="62" font-size="11" text-anchor="middle" fill="#666">sonra (taze dosya)</text>
+  <g font-size="9" text-anchor="middle">
+    <rect x="430" y="75" width="60" height="34" fill="#cde8d3" stroke="#3a8a52"/><text x="460" y="96">canlı</text>
+    <rect x="492" y="75" width="60" height="34" fill="#cde8d3" stroke="#3a8a52"/><text x="522" y="96">canlı</text>
+    <rect x="554" y="75" width="80" height="34" fill="none" stroke="#bbb" stroke-dasharray="3"/><text x="594" y="96" fill="#aaa">boş</text>
+  </g>
+  <text x="360" y="160" font-size="12" text-anchor="middle">Otomatik tetik: dosya ≥ eşik <tspan font-style="italic">ve</tspan> ölü oran ≥ eşik</text>
+  <text x="360" y="185" font-size="11" text-anchor="middle" fill="#666">canlı kayıtlar yeni dosyaya kopyalanır, eski dosya atılır</text>
+  <text x="360" y="230" font-size="10.5" text-anchor="middle" fill="#999">Ödünleşim: sıkıştırma anlık I/O ve CPU harcar; ama alanı ve okuma yerelliğini geri verir</text>
+</svg>

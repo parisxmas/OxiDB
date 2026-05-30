@@ -7,6 +7,8 @@ bölüm, OxiDB'nin aramayı hızlandıran yapılarını — alan indekslerini, b
 indeksleri ve disk-öncelikli kipte belleğe yansıtılan indeksleri — ele alıyor ve
 bunların yedinci bölümdeki ilkelerle nasıl örtüştüğünü gösteriyor.
 
+![Şekil 18 — Türler-arası toplam sıralama ve mmap tabanlı disk indeksi.](sekiller/18-oxidb-indeksler.svg){width=80%}
+
 ## Alan indeksleri: sıralı bir eşleme
 
 Yedinci bölümde bir indeksi, "bir alanın değerlerinden o değere sahip belgelerin

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="290" font-family="Georgia, serif">
+  <rect width="720" height="290" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Önce-yaz günlüğü (WAL): niyeti dayanıklı kıl, sonra uygula</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="30" y="60" width="120" height="48" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="90" y="89">değişiklik</text>
+    <rect x="195" y="60" width="140" height="48" rx="8" fill="#fdeee0" stroke="#c97b2c" stroke-width="2"/><text x="265" y="83">WAL'a yaz</text><text x="265" y="100" font-size="10">+ fsync ✓</text>
+    <rect x="380" y="60" width="140" height="48" rx="8" fill="#e8f3ea" stroke="#3a8a52"/><text x="450" y="83">veriye uygula</text><text x="450" y="100" font-size="10">(tembel olabilir)</text>
+    <rect x="565" y="60" width="125" height="48" rx="8" fill="#eef0f5" stroke="#555"/><text x="627" y="83">checkpoint</text><text x="627" y="100" font-size="10">WAL kırp</text>
+  </g>
+  <g stroke="#888" stroke-width="1.6" marker-end="url(#a)">
+    <line x1="150" y1="84" x2="193" y2="84"/><line x1="335" y1="84" x2="378" y2="84"/><line x1="520" y1="84" x2="563" y2="84"/>
+  </g>
+  <!-- crash recovery -->
+  <rect x="120" y="160" width="480" height="80" rx="10" fill="#fff5f5" stroke="#c0392b" stroke-dasharray="5"/>
+  <text x="360" y="185" font-size="13" font-weight="bold" text-anchor="middle" fill="#c0392b">⚡ Çökme</text>
+  <text x="360" y="208" font-size="11.5" text-anchor="middle">Açılışta WAL yeniden oynatılır: dayanıklı yazılmış ama</text>
+  <text x="360" y="226" font-size="11.5" text-anchor="middle">uygulanmamış değişiklikler tamamlanır → tutarlı duruma dönülür</text>
+  <text x="360" y="262" font-size="10.5" text-anchor="middle" fill="#999">Kural: değişiklik veriye yansımadan önce niyeti diske işlenir (fsync)</text>
+</svg>

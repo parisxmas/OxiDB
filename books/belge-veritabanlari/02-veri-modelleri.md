@@ -9,6 +9,8 @@ kendinden öncekinin acı veren bir eksiğine yanıt olarak doğduğunu görmek,
 modelinin neden ortaya çıktığını ve hangi sorunları çözmeyi vaat ettiğini
 anlamanın en sağlam yoludur.
 
+![Şekil 2 — Veri modellerinin evrimi; her biri bir öncekinin eksiğine yanıt olarak doğdu.](sekiller/02-veri-modelleri.svg){width=80%}
+
 ## Veri modeli neyi belirler
 
 Bir veri modeli üç soruyu birden yanıtlar. Birincisi: veriyi hangi **biçimde**

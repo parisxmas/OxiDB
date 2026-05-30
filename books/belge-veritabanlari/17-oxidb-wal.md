@@ -8,6 +8,8 @@ tanıdığımız o dayanıklılık tayfında — her commit'i diske zorlamak ile
 zorlamak arasında — nereye oturduğunu ele alıyor. Bu, OxiDB'nin verdiği en temel
 sözlerden birinin — "tamamlandı dediysem, kaybolmaz" — ardındaki düzenektir.
 
+![Şekil 17 — Katı ve gevşek senkronizasyon; grup commit.](sekiller/17-oxidb-wal.svg){width=80%}
+
 ## OxiDB'nin yazma-öncesi günlüğü
 
 Altıncı bölümdeki ilkeyi hatırlayalım: asıl veriyi değiştirmeden önce, ne

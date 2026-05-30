@@ -9,6 +9,8 @@ ardındaki gerekçeye bağlayacağız. Bu bölüm, ayrıntılara dalmadan önce 
 bakışı sunuyor: OxiDB nedir, hangi parçalardan oluşur ve bu parçalar birbirine
 nasıl bağlanır?
 
+![Şekil 15 — OxiDB'nin katmanlı mimarisi ve bir isteğin akışı.](sekiller/15-mimari.svg){width=80%}
+
 ## OxiDB nedir
 
 OxiDB, Rust dilinde yazılmış, hızlı ve gömülebilir bir belge veritabanı
