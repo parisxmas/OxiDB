@@ -75,6 +75,6 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 24. Sunucu: OxiWire protokolü, kimlik doğrulama, RBAC, denetim ✅
 25. Ölçeklendirme: Raft kümesi ve OxiPool ile sharding ✅
 26. Uyumluluk katmanları ve istemciler ✅
-27. Bellek optimizasyonu ve karşılaştırmalı değerlendirme
+27. Bellek optimizasyonu ve karşılaştırmalı değerlendirme ✅
 
 **Ek A** — Sözlük · **Ek B** — Kaynaklar
