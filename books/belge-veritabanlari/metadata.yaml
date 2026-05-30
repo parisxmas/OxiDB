@@ -1,0 +1,13 @@
+---
+title: "Belge Veritabanları"
+subtitle: "Temellerden OxiDB'ye"
+author: "OxiDB Projesi"
+lang: tr-TR
+toc: true
+toc-depth: 2
+numbersections: true
+documentclass: book
+geometry: "margin=2.5cm"
+fontsize: 11pt
+linkcolor: black
+---
