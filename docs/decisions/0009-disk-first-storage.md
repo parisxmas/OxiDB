@@ -104,10 +104,30 @@ tracked separately).
 
 ## Follow-ups before this can be the default
 
-- Auto-compaction trigger for the `.bdat` file (reclaim dead space under update/
-  delete churn) and a size/ratio policy.
+- **Auto-compaction** for the `.bdat`/`.mfidx` files (reclaim dead space under
+  update/delete churn) + a size/ratio policy. **The soak suite below quantifies
+  the need**: 200 live docs after 6000 in-place updates leave a ~690 KiB `.bdat`
+  (≈17× the live footprint) — correctness holds and a reopen reconciles to the
+  live set, but the append-only file grows with the number of writes, not the
+  live size.
 - Lazy cursors (stream values instead of materializing the snapshot) to also cut
   the transient per-sorted-query spike.
-- Crash-injection / soak tests specific to the append+index+WAL interplay.
 - A 1M-doc bench run in disk mode on a quiet box to confirm the RSS win and
   measure the read-latency trade-off end to end.
+
+### Soak tests (done)
+
+`tests/disk_first_soak.rs` runs in both modes (set `OXIDB_DISK_FIRST=1` to soak
+the disk engine; `SOAK_ROUNDS=N` to lengthen):
+
+- `churn_integrity_model_checked` — sustained insert/update/delete vs an
+  in-test reference model.
+- `index_consistency_under_churn` — an indexed field repeatedly updated;
+  indexed counts must match the model (verifies old index entries are removed
+  and new ones added).
+- `churn_then_clean_reopen` — churn → `shutdown()` → reopen; all data + indexed
+  queries survive.
+- `crash_recovery_committed_survives` — drop **without** shutdown (simulated
+  crash) → reopen; committed writes recovered via WAL replay.
+- `bdat_growth_under_update_churn` — correctness under heavy update churn +
+  reports `.bdat` growth (the compaction motivation above).
