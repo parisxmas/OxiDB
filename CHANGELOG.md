@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Batched parallel-compress append for bulk insert (server 0.29.2)
+
+Disk-first bulk insert was ~2.4× slower than MongoDB (and the in-RAM store)
+because `insert_many_prepared` wrote the data file **one document at a time**:
+each `storage.insert` was a `Storage::append_no_sync` that zstd-compressed the
+single doc, took the storage mutex, `lseek(SEEK_END)`'d, and issued three
+`write_all`s — ×1,000,000. The codebase already had a batched append that
+compresses the whole batch **in parallel** and writes it with a single lock +
+seek + `write_all` (`append_batch_no_sync_buffered`), but nothing used it.
+
+`insert_many_prepared` now splits the prepared batch into its encoded bytes
+(one `storage.insert_batch` call — buffered parallel-compress append on disk, a
+parallel tree fill in-RAM) and the `(id, Value)` pairs the index/cache pass
+needs, instead of interleaving a per-document storage write. The WAL path is
+unchanged (still one buffered write + one fsync per batch), so durability is
+identical.
+
+Result on the 1M-doc benchmark, disk-first: **insert 12.1s → 6.24s** (~1.9×;
+from 2.4× down to 1.3× vs MongoDB, approaching the in-RAM 5.26s). In-RAM and
+MongoDB-parity inserts are unchanged. Full lib + soak suites pass in both modes.
+
 ### Disk-first aggregation/scan/sort fixes (server 0.29.1)
 
 Profiling the 1M-doc benchmark in disk-first mode (`OXIDB_DISK_FIRST=1`) found

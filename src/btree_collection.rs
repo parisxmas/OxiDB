@@ -1173,10 +1173,34 @@ impl BTreeCollection {
         }
         let has_indexes = !fi.is_empty() || !ci.is_empty() || ti.is_some() || !vi.is_empty();
         let skip_cache = prepared.len() > 1000;
-        for (id, data, bytes) in prepared {
-            self.storage.insert(id, bytes);
+        let need_index_pass = has_indexes || !skip_cache;
 
-            if has_indexes || !skip_cache {
+        // Split the prepared batch into the encoded bytes (for one batched
+        // storage append) and the `(id, Value)` pairs the index/cache pass
+        // needs. The storage write goes through `insert_batch` — in disk-first
+        // mode that's a single parallel-compressed, single-`write_all` append
+        // for the whole batch rather than a per-document lock/seek/compress/
+        // write (the bulk-insert bottleneck); in-RAM it's a parallel tree fill.
+        // All ids here are freshly reserved (new keys), satisfying
+        // `insert_batch`'s no-replacement contract.
+        let mut storage_entries: Vec<(u64, Vec<u8>)> = Vec::with_capacity(prepared.len());
+        let mut index_items: Vec<(DocumentId, Value)> = if need_index_pass {
+            Vec::with_capacity(prepared.len())
+        } else {
+            Vec::new()
+        };
+        for (id, data, bytes) in prepared {
+            storage_entries.push((id, bytes));
+            if need_index_pass {
+                index_items.push((id, data));
+            }
+            ids.push(id);
+        }
+
+        self.storage.insert_batch(storage_entries);
+
+        if need_index_pass {
+            for (id, data) in index_items {
                 let data_arc = Arc::new(data);
                 for idx in fi.values_mut() {
                     idx.insert_value(id, &data_arc);
@@ -1194,7 +1218,6 @@ impl BTreeCollection {
                     self.doc_cache.put(id, data_arc);
                 }
             }
-            ids.push(id);
         }
         if !ids.is_empty() {
             self.dirty.store(true, Ordering::Release);

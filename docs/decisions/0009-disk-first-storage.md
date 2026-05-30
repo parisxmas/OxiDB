@@ -131,6 +131,20 @@ tracked separately).
 - A 1M-doc bench run in disk mode on a quiet box to confirm the RSS win and
   measure the read-latency trade-off end to end.
 
+### Bulk-insert append batching (2026-05-30)
+
+Disk-first bulk insert (`insert_many_prepared`) appended to the `.bdat` **one
+document at a time** — each per-doc `Storage::append_no_sync` compressed a
+single record, took the storage mutex, `lseek`'d to the end, and wrote, ×N.
+That per-doc compress + unbatched append made disk-first insert ~2.4× slower
+than the in-RAM store (and MongoDB), even though the WAL path (one buffered
+write + one fsync per batch) was already amortized. The fix routes the storage
+write through `BTreeStorage::insert_batch` →
+`Storage::append_batch_no_sync_buffered`, which compresses the whole batch in
+parallel and writes it with a single lock + seek + `write_all` (in-RAM:
+parallel tree fill). 1M-doc benchmark, disk-first: insert **12.1s → 6.24s**
+(~1.9×; 2.4× → 1.3× vs MongoDB). Durability unchanged. Server 0.29.2.
+
 ### Aggregation / scan / sort fixes (2026-05-30)
 
 A 1M-doc benchmark in disk-first mode surfaced three issues — fixed in server

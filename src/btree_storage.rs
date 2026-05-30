@@ -920,10 +920,13 @@ impl BTreeStorage {
         if let Some(d) = &self.disk {
             // New keys only (per contract). One batched, un-synced append for
             // the whole batch (durability via WAL; flushed in persist()), then
-            // record each returned location.
+            // record each returned location. The `_buffered` variant compresses
+            // the batch in parallel and writes it with a single lock + seek +
+            // `write_all`, instead of a per-record lock/seek/write — the win on
+            // the bulk-insert path.
             let slices: Vec<&[u8]> = entries.iter().map(|(_, v)| v.as_slice()).collect();
             let data = d.data.read();
-            match data.append_batch_no_sync(&slices) {
+            match data.append_batch_no_sync_buffered(&slices) {
                 Ok(locs) => {
                     let mut added = 0u64;
                     for ((key, value), loc) in entries.iter().zip(locs.iter()) {
