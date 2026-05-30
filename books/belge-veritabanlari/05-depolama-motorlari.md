@@ -77,7 +77,7 @@ Birinci felsefe, veriyi **düzenli tutmayı** önceler ve onlarca yıl boyunca
 veritabanı dünyasına egemen oldu. Bu yaklaşımda disk, sabit boyutlu **sayfalara**
 bölünür — her sayfa, belirli sayıda kaydı tutan, diskten tek seferde okunup
 yazılan bir blok. Veri, bu sayfalar üzerinde **B-ağacı** denen bir yapıyla
-düzenlenir.
+düzenlenir (Bayer ve McCreight, 1972).
 
 B-ağacını, devasa, çok katmanlı bir dosyalama dolabı gibi düşünebilirsiniz. En
 üstte, "A–M arası şu çekmecede, N–Z arası bu çekmecede" diyen bir yönlendirme
@@ -145,8 +145,8 @@ ayıracağız.)
 
 Append-only fikrini bir adım ileri taşıyan ve birçok modern belge ve geniş-sütun
 veritabanının kalbinde yatan tasarıma **LSM ağacı** denir — açılımı "log-yapılı
-birleştirmeli ağaç". Saf append-only yaklaşımının okuma zorluğunu, akıllıca bir
-düzenlemeyle hafifletir.
+birleştirmeli ağaç" (O'Neil vd., 1996). Saf append-only yaklaşımının okuma
+zorluğunu, akıllıca bir düzenlemeyle hafifletir.
 
 LSM'nin fikri şudur: gelen yazmaları önce **bellekte**, sıralı bir yapıda
 biriktir. Bellek hızlı olduğu için bu yazmalar anında kabul edilir. Bellekteki

@@ -25,7 +25,9 @@ bir kavram.
 bakıldığında, tek bir an'da, bölünmeden gerçekleşmiş gibi görünür. Yarıda kalmış,
 yarısı olmuş bir durum asla görünmez. Bu söz, sandığınızdan çok daha zor tutulur;
 çünkü hem çökmeyle hem de aynı anda çalışan diğer işlemlerle baş etmek gerekir.
-Bu güvencelerin tümü, geleneksel olarak dört harfle özetlenir: ACID.
+İşlem kavramının erdemleri ve sınırları, veritabanı kuramında klasik bir
+incelemenin konusudur (Gray, 1981). Bu güvencelerin tümü, geleneksel olarak dört
+harfle özetlenir: ACID.
 
 ## Dört güvence: ACID
 
@@ -100,7 +102,9 @@ düzey daha güvenlidir ama daha az eşzamanlılığa, yani daha düşük perfor
 olur. Bir veritabanı tasarımcısının ya da kullanıcısının seçimi, çoğu zaman bu
 tayf üzerinde "ne kadar güvence, ne kadar hız" sorusunu yanıtlamaktır. Mutlak
 doğru bir nokta yoktur; uygulamanın ne kadar güçlü bir güvenceye gerçekten
-ihtiyaç duyduğuna bağlıdır.
+ihtiyaç duyduğuna bağlıdır. Bu standart yalıtım düzeylerinin tam olarak neyi
+garanti edip neyi etmediği, ünlü bir eleştiride titizlikle çözümlenmiştir
+(Berenson vd., 1995).
 
 ## Yalıtımı sağlamanın üç felsefesi
 
@@ -153,7 +157,9 @@ sürümler orada zaten vardır.
 ### OCC: iyimser yaklaşım
 
 Üçüncü felsefe, kilitlemenin tam tersi bir ruh hâliyle yaklaşır ve adı **iyimser
-eşzamanlılık denetimidir** (OCC). Varsayımı şudur: çatışmalar aslında nadirdir;
+eşzamanlılık denetimidir** (OCC) — fikri ilk kez resmî biçimde ortaya koyan
+çalışmaya kadar uzanır (Kung ve Robinson, 1981). Varsayımı şudur: çatışmalar
+aslında nadirdir;
 çoğu zaman iki işlem aynı veriye aynı anda dokunmaz. Madem öyle, neden baştan
 kilitleyip herkesi bekletelim?
 

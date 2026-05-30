@@ -84,11 +84,11 @@ Bu kenetlenmeyi kırmak, bir sonraki büyük fikrin işi olacaktı.
 
 ## İlişkisel model: büyük ayrışma
 
-1970'te, bu kenetlenmeden rahatsız olan bir araştırmacı, radikal bir öneri
-getirdi. Verinin fiziksel olarak nasıl saklandığı ile mantıksal olarak nasıl
-düşünüldüğünü birbirinden tamamen **ayırmayı** önerdi. Bu fikir, **ilişkisel
-model** olarak bilinir ve onlarca yıl boyunca veritabanı dünyasına egemen
-oldu.
+1970'te, bu kenetlenmeden rahatsız olan bir araştırmacı — E. F. Codd — radikal
+bir öneri getirdi (Codd, 1970). Verinin fiziksel olarak nasıl saklandığı ile
+mantıksal olarak nasıl düşünüldüğünü birbirinden tamamen **ayırmayı** önerdi. Bu
+fikir, **ilişkisel model** olarak bilinir ve onlarca yıl boyunca veritabanı
+dünyasına egemen oldu.
 
 İlişkisel modelin temel yapısı şaşırtıcı derecede sadedir: her şey bir
 **tablodur**. Bir tablo, sütunları (alanlar) ve satırları (kayıtlar) olan bir

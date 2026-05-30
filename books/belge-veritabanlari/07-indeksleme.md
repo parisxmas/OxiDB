@@ -175,9 +175,11 @@ O sözcüğün sık geçtiği, kısa bir belge, o sözcüğün bir kez geçtiği
 belgeden büyük olasılıkla daha ilgilidir. Bu yüzden metin arama sistemleri,
 sonuçları yalnızca bulmakla kalmaz, **sıralar** da: hangi belgenin sorguya daha
 alakalı olduğunu, sözcüğün belgede ne sıklıkta geçtiği ve genel olarak ne kadar
-yaygın bir sözcük olduğu gibi ölçütlere bakarak puanlar. Üçüncü kısımda OxiDB'nin
-tam metin aramayı, böyle bir ters indeks ve alaka puanlaması üzerine kurduğunu
-göreceğiz.
+yaygın bir sözcük olduğu gibi ölçütlere bakarak puanlar. Bu sezginin olgun
+biçimleri — terim sıklığına dayalı puanlama ve onun olasılıksal akrabası — bilgi
+erişimi alanının temel konularıdır (Manning vd., 2008; Robertson ve Zaragoza,
+2009). Üçüncü kısımda OxiDB'nin tam metin aramayı, böyle bir ters indeks ve alaka
+puanlaması üzerine kurduğunu göreceğiz.
 
 ## İndeksler de dayanıklı olmalı
 

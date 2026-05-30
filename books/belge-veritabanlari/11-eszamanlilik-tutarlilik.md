@@ -96,13 +96,14 @@ olamadığım bir yanıtı vermem" dersiniz — ama o zaman erişilebilirlikten 
 verirsiniz. Bölünme sırasında, **tutarlılık ile erişilebilirlik arasında**
 seçim yapmak zorundasınızdır; ikisine birden sahip olamazsınız. Bu içgörü,
 dağıtık sistemler kuramının en bilinen sonucudur ve genellikle "CAP" adıyla
-anılır. Önemli olan, onu doğru anlamaktır: bu bir "her zaman üçten ikisini seç"
-sloganı değildir; özellikle ağ bölündüğünde, tutarlılık ile erişilebilirlik
-arasında yapılması gereken bir tercihtir.
+anılır (Gilbert ve Lynch, 2002). Önemli olan, onu doğru anlamaktır: bu bir "her
+zaman üçten ikisini seç" sloganı değildir; özellikle ağ bölündüğünde, tutarlılık
+ile erişilebilirlik arasında yapılması gereken bir tercihtir — ilkenin kâşifi de
+yıllar sonra bu inceliğin altını özellikle çizmiştir (Brewer, 2012).
 
 Daha az bilinen ama eşit derecede önemli bir incelik vardır: ağ hiç bölünmese
-bile, tutarlılık bir gecikme bedeliyle gelir. Güçlü tutarlılık daha fazla
-koordinasyon, daha fazla koordinasyon ise daha fazla bekleme demektir. Yani
+bile, tutarlılık bir gecikme bedeliyle gelir (Abadi, 2012). Güçlü tutarlılık daha
+fazla koordinasyon, koordinasyon da daha fazla bekleme demektir. Yani
 seçim yalnızca felaket anında değil, sıradan zamanda da karşınızdadır: ne kadar
 güçlü tutarlılık isterseniz, her işlem o kadar yavaşlar. Tutarlılık, bedava
 gelmeyen bir lükstür.

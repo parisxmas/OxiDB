@@ -17,7 +17,8 @@ davranışlarla bağlayabiliyoruz.
 
 On ikinci bölümde, güçlü tutarlı bir replikasyonun iki fikirden — tek bir otorite
 ve çoğunluk mutabakatı — beslendiğini görmüştük. OxiDB'nin küme kipi, tam da bunu
-yapan bir çoğunluk-konsensüs protokolüne dayanır. Bir grup düğüm vardır; biri
+yapan, **Raft** adlı anlaşılır olmaya özen göstererek tasarlanmış bir
+çoğunluk-konsensüs protokolüne dayanır (Ongaro ve Ousterhout, 2014). Bir grup düğüm vardır; biri
 **lider** olur; tüm yazmalar liderden geçer ve bir yazma, düğümlerin **çoğunluğu**
 onu kalıcı kıldığında "tamamlanmış" sayılır.
 

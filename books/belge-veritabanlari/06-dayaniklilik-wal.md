@@ -107,7 +107,9 @@ huzurludur.
 
 WAL'ın asıl sınavı, çökmeden sonra verdiği vaattir. Sistem yeniden açıldığında,
 veritabanı kendini tutarlı bir duruma getirmek zorundadır ve bunu günlüğü
-**okuyarak** yapar. Bu sürece **kurtarma** (recovery) denir.
+**okuyarak** yapar. Bu sürece **kurtarma** (recovery) denir. Bu kurtarma
+düzeninin klasik, etkili biçimi, veritabanı literatüründe ARIES yöntemi olarak
+bilinir (Mohan vd., 1992).
 
 Kurtarma şöyle ilerler. Veritabanı, günlüğü baştan tarar ve her kaydı inceler.
 Günlükte dayanıklı biçimde yer alan ama asıl veri dosyalarına henüz yansımamış
