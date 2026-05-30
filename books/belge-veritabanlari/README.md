@@ -37,7 +37,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 1. Veri, veritabanı ve veritabanı yönetim sistemleri ✅
 2. Veri modelleri: hiyerarşikten belgeye ✅
 3. İlişkisel modelden belge modeline: neden ve ne zaman ✅
-4. Belge modeli derinlemesine: JSON, şema esnekliği, gömme ve referans
+4. Belge modeli derinlemesine: JSON, şema esnekliği, gömme ve referans ✅
 
 ### Kısım II — Bir Belge Veritabanı İçeride Nasıl Çalışır
 5. Depolama motorları: sayfa tabanlı, append-only, LSM ve B-ağaçları
