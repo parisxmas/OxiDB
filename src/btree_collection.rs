@@ -132,7 +132,8 @@ impl BTreeCollection {
 
     /// Open a collection, attaching `sequencer` to its WAL. When `Some`
     /// (PITR enabled), every WAL write is stamped with a global GSN +
-    /// wall-clock and emitted in the v2 record format.
+    /// wall-clock and emitted in the v2 record format. Storage options are
+    /// resolved per-collection (persisted `.bopts` or env defaults).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_with_sequencer(
         name: &str,
@@ -140,8 +141,37 @@ impl BTreeCollection {
         encryption: Option<std::sync::Arc<crate::EncryptionKey>>,
         sequencer: Option<std::sync::Arc<crate::pitr::ArchiveSequencer>>,
     ) -> Result<Self> {
+        Self::open_resolved(name, data_dir, encryption, sequencer, None)
+    }
+
+    /// Open a collection with **explicit** per-collection
+    /// [`StorageOptions`](crate::btree_storage::StorageOptions) (disk-first,
+    /// compression, compaction policy) instead of the resolved/env defaults.
+    /// Used by `OxiDb::create_collection_with_options`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_with_options(
+        name: &str,
+        data_dir: &Path,
+        encryption: Option<std::sync::Arc<crate::EncryptionKey>>,
+        sequencer: Option<std::sync::Arc<crate::pitr::ArchiveSequencer>>,
+        opts: crate::btree_storage::StorageOptions,
+    ) -> Result<Self> {
+        Self::open_resolved(name, data_dir, encryption, sequencer, Some(opts))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn open_resolved(
+        name: &str,
+        data_dir: &Path,
+        encryption: Option<std::sync::Arc<crate::EncryptionKey>>,
+        sequencer: Option<std::sync::Arc<crate::pitr::ArchiveSequencer>>,
+        storage_opts: Option<crate::btree_storage::StorageOptions>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
-        let storage = BTreeStorage::open(name, data_dir, encryption)?;
+        let storage = match storage_opts {
+            Some(opts) => BTreeStorage::open_with_options(name, data_dir, encryption, opts)?,
+            None => BTreeStorage::open(name, data_dir, encryption)?,
+        };
 
         let wal_path = data_dir.join(format!("{}.wal", name));
         let wal = Wal::open(&wal_path)?.with_sequencer(sequencer);

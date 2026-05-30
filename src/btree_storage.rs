@@ -105,6 +105,9 @@ pub struct BTreeStorage {
     /// resident. `None` = the default in-RAM mode (values live in `tree`).
     #[cfg(not(target_arch = "wasm32"))]
     disk: Option<DiskBackend>,
+    /// Resolved per-collection storage options (compression + compaction
+    /// policy). `disk_first` here mirrors `disk.is_some()`.
+    opts: StorageOptions,
 }
 
 /// Whether disk-first storage is enabled (env `OXIDB_DISK_FIRST` truthy).
@@ -178,6 +181,72 @@ fn compact_dead_ratio() -> f64 {
             .filter(|r: &f64| *r > 0.0 && *r < 1.0)
             .unwrap_or(0.5)
     })
+}
+
+/// Per-collection storage options.
+///
+/// These were previously process-wide `OXIDB_*` env vars; they are now
+/// per-collection. A collection created via `create_collection_with_options`
+/// carries its own settings; collections created implicitly (or without
+/// options) fall back to [`StorageOptions::from_env`], so the env-var workflow
+/// and all existing behavior are preserved as the *default*.
+///
+/// For a disk-first collection the resolved options are persisted next to its
+/// data as `<name>.bopts`, so a reopen uses the same settings regardless of the
+/// current environment — flipping `OXIDB_DISK_FIRST` between runs can no longer
+/// mismatch an existing collection's on-disk format.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StorageOptions {
+    /// Disk-first mode: only the offset index is resident and document bytes
+    /// live in an mmap'd `.bdat`. `false` = the default in-RAM `.btree` store.
+    pub disk_first: bool,
+    /// Compress `.bdat` records with zstd. Ignored in in-RAM mode. Disable to
+    /// trade disk for CPU on scan/insert-heavy workloads (reads stay adaptive).
+    pub compress: bool,
+    /// Run compaction automatically from the periodic sync path.
+    pub auto_compact: bool,
+    /// Compaction floor: never compact a `.bdat` smaller than this.
+    pub compact_min_bytes: u64,
+    /// Compaction trigger: dead-space fraction (0..1) at/above which to compact.
+    pub compact_dead_ratio: f64,
+}
+
+impl Default for StorageOptions {
+    /// In-RAM, compressed, auto-compaction on with the standard thresholds —
+    /// matches the engine's defaults when no env vars are set.
+    fn default() -> Self {
+        Self {
+            disk_first: false,
+            compress: true,
+            auto_compact: true,
+            compact_min_bytes: 4 * 1024 * 1024,
+            compact_dead_ratio: 0.5,
+        }
+    }
+}
+
+impl StorageOptions {
+    /// Options sourced from the `OXIDB_*` env vars — the default for collections
+    /// created without explicit options.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn from_env() -> Self {
+        Self {
+            disk_first: disk_first_enabled(),
+            compress: disk_compress_enabled(),
+            auto_compact: auto_compact_enabled(),
+            compact_min_bytes: compact_min_bytes(),
+            compact_dead_ratio: compact_dead_ratio(),
+        }
+    }
+
+    /// A disk-first preset starting from the env defaults.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn disk_first() -> Self {
+        Self {
+            disk_first: true,
+            ..Self::from_env()
+        }
+    }
 }
 
 /// A cursor for iterating through the storage in ascending key order.
@@ -274,6 +343,10 @@ impl BTreeStorage {
             persist_mu: crate::locks::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             disk: None,
+            opts: StorageOptions {
+                disk_first: false,
+                ..StorageOptions::default()
+            },
         }
     }
 
@@ -289,6 +362,10 @@ impl BTreeStorage {
             persist_mu: crate::locks::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             disk: None,
+            opts: StorageOptions {
+                disk_first: false,
+                ..StorageOptions::default()
+            },
         }
     }
 
@@ -304,12 +381,50 @@ impl BTreeStorage {
         data_dir: &Path,
         encryption: Option<Arc<crate::EncryptionKey>>,
     ) -> Result<Self> {
-        if disk_first_enabled() {
-            return Self::open_disk(name, data_dir, encryption);
+        let opts = Self::resolve_opts(name, data_dir);
+        Self::open_with_options(name, data_dir, encryption, opts)
+    }
+
+    /// Resolve the storage options for opening `name`. Precedence:
+    /// 1. A persisted `<name>.bopts` (written when a disk-first collection was
+    ///    created) — authoritative across reopens regardless of the env.
+    /// 2. Otherwise the env defaults ([`StorageOptions::from_env`]), with
+    ///    `disk_first` overridden by **detecting the on-disk format**: a
+    ///    `.bdat` forces disk-first, a `.btree` forces in-RAM. This keeps an
+    ///    existing collection readable even if `OXIDB_DISK_FIRST` flipped
+    ///    between runs.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn resolve_opts(name: &str, data_dir: &Path) -> StorageOptions {
+        let bopts_path = data_dir.join(format!("{}.bopts", name));
+        if let Ok(bytes) = std::fs::read(&bopts_path) {
+            if let Ok(o) = serde_json::from_slice::<StorageOptions>(&bytes) {
+                return o;
+            }
+        }
+        let mut o = StorageOptions::from_env();
+        if data_dir.join(format!("{}.bdat", name)).exists() {
+            o.disk_first = true;
+        } else if data_dir.join(format!("{}.btree", name)).exists() {
+            o.disk_first = false;
+        }
+        o
+    }
+
+    /// Open or load a B-tree with explicit per-collection [`StorageOptions`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_with_options(
+        name: &str,
+        data_dir: &Path,
+        encryption: Option<Arc<crate::EncryptionKey>>,
+        opts: StorageOptions,
+    ) -> Result<Self> {
+        if opts.disk_first {
+            return Self::open_disk(name, data_dir, encryption, opts);
         }
         let path = data_dir.join(format!("{}.btree", name));
         let tmp = data_dir.join(format!("{}.btree.tmp", name));
-        let storage = Self::new(name, data_dir, encryption);
+        let mut storage = Self::new(name, data_dir, encryption);
+        storage.opts = opts;
 
         // Stale tmp from a crash mid-persist: drop it. The real file
         // (if present) is either intact (rename completed first) or
@@ -392,8 +507,18 @@ impl BTreeStorage {
         name: &str,
         data_dir: &Path,
         encryption: Option<Arc<crate::EncryptionKey>>,
+        opts: StorageOptions,
     ) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
+        // Persist the resolved options next to the data so a reopen is
+        // consistent regardless of the env. Written once (don't clobber an
+        // existing file — that's the authoritative record for reopens).
+        let bopts_path = data_dir.join(format!("{}.bopts", name));
+        if !bopts_path.exists() {
+            if let Ok(json) = serde_json::to_vec_pretty(&opts) {
+                let _ = std::fs::write(&bopts_path, json);
+            }
+        }
         // `.bdat` (BTree disk-first data), deliberately NOT `.dat` — the engine
         // treats bare `.dat` as the legacy append-only `Collection` format and
         // refuses to open it.
@@ -401,7 +526,7 @@ impl BTreeStorage {
         let data = crate::storage::Storage::open_with_options(
             &data_path,
             encryption.clone(),
-            disk_compress_enabled(),
+            opts.compress,
         )?;
 
         let index: SccMap<u64, crate::storage::DocLocation> = SccMap::new();
@@ -431,6 +556,7 @@ impl BTreeStorage {
                 index,
                 data: crate::locks::RwLock::new(Arc::new(data)),
             }),
+            opts,
         })
     }
 
@@ -704,7 +830,7 @@ impl BTreeStorage {
         let fresh = crate::storage::Storage::open_with_options(
             &tmp,
             self.encryption.clone(),
-            disk_compress_enabled(),
+            self.opts.compress,
         )?;
         let mut new_entries: Vec<(u64, crate::storage::DocLocation)> =
             Vec::with_capacity(entries.len());
@@ -725,7 +851,7 @@ impl BTreeStorage {
         let reopened = crate::storage::Storage::open_with_options(
             &live,
             self.encryption.clone(),
-            disk_compress_enabled(),
+            self.opts.compress,
         )?;
         *data_guard = Arc::new(reopened); // old Storage drops → old fd/mmap freed
         d.index.clear_sync();
@@ -742,7 +868,7 @@ impl BTreeStorage {
     /// in in-RAM mode or when auto-compaction is disabled.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn should_compact(&self) -> bool {
-        if !auto_compact_enabled() {
+        if !self.opts.auto_compact {
             return false;
         }
         let d = match &self.disk {
@@ -750,14 +876,14 @@ impl BTreeStorage {
             None => return false,
         };
         let file = d.data.read().file_size();
-        if file < compact_min_bytes() {
+        if file < self.opts.compact_min_bytes {
             return false;
         }
         // Fraction of the file that is dead (overwritten/deleted records plus
         // framing). `total_bytes` tracks the live payload.
         let live = self.total_bytes();
         let dead_ratio = 1.0 - (live as f64 / file as f64);
-        dead_ratio >= compact_dead_ratio()
+        dead_ratio >= self.opts.compact_dead_ratio
     }
     #[cfg(target_arch = "wasm32")]
     pub fn is_disk_first(&self) -> bool {

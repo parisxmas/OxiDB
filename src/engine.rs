@@ -809,6 +809,50 @@ impl OxiDb {
         Ok(())
     }
 
+    /// Create a new collection with **explicit** per-collection
+    /// [`StorageOptions`](crate::btree_storage::StorageOptions) — disk-first vs
+    /// in-RAM, `.bdat` compression, and the compaction policy — instead of the
+    /// process-wide env defaults. For disk-first collections the options are
+    /// persisted (`<name>.bopts`) so reopens are consistent regardless of the
+    /// environment. On an in-memory engine the storage shape is forced to
+    /// in-RAM and `opts` is ignored.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_collection_with_options(
+        &self,
+        name: &str,
+        opts: crate::btree_storage::StorageOptions,
+    ) -> Result<()> {
+        {
+            let cols = self.collections.read();
+            if cols.contains_key(name) {
+                return Err(Error::CollectionAlreadyExists(name.to_string()));
+            }
+        }
+
+        let col = if self.in_memory {
+            BTreeCollection::open_in_memory(name)
+        } else {
+            BTreeCollection::open_with_options(
+                name,
+                &self.data_dir,
+                self.encryption.clone(),
+                self.archive_sequencer.clone(),
+                opts,
+            )?
+        };
+        if self.lazy_sync.load(Ordering::Acquire) {
+            col.set_lazy_sync(true);
+        }
+        col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
+
+        let mut cols = self.collections.write();
+        if cols.contains_key(name) {
+            return Err(Error::CollectionAlreadyExists(name.to_string()));
+        }
+        cols.insert(name.to_string(), Arc::new(col));
+        Ok(())
+    }
+
     /// List all collection names (both in-memory and on disk).
     pub fn list_collections(&self) -> Vec<String> {
         let mut names: std::collections::HashSet<String> = {

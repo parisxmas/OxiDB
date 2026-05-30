@@ -170,6 +170,28 @@ A 1M-doc benchmark in disk-first mode surfaced three issues — fixed in server
   re-decompresses) — the in-RAM store keeps raw bytes resident and pays none of
   this. **Resolved** by the uncompressed `.bdat` mode below.
 
+### Per-collection storage options (2026-05-30)
+
+The disk-first knobs started as process-wide env vars (`OXIDB_DISK_FIRST`,
+`OXIDB_DISK_UNCOMPRESSED`, `OXIDB_AUTO_COMPACT`/`OXIDB_COMPACT_*`). They are now
+per-collection: a `StorageOptions { disk_first, compress, auto_compact,
+compact_min_bytes, compact_dead_ratio }` carried on `BTreeStorage`, set via
+`OxiDb::create_collection_with_options`. `should_compact`/`compact` and the
+`.bdat` compress flag read it instead of the env helpers. `StorageOptions::
+from_env()` reproduces the env-var behavior and stays the default for
+collections opened/created without explicit options, so nothing about the
+existing workflow changes.
+
+For disk-first collections the resolved options are persisted as `<name>.bopts`
+and read back on open — a collection's on-disk format is now authoritative
+across reopens regardless of the environment (flipping `OXIDB_DISK_FIRST`
+between runs can no longer mismatch an existing collection). Collections with no
+`.bopts` (created before this change) resolve by detecting the on-disk format
+(`.bdat` → disk-first, `.btree` → in-RAM), so old data dirs open unchanged.
+This lets one engine mix storage shapes — e.g. a disk-first *uncompressed*
+scan/aggregation-heavy collection next to a default in-RAM one. Tested in
+`tests/per_collection_options.rs`.
+
 ### Uncompressed `.bdat` mode — closes the scan/insert gap (2026-05-30)
 
 `OXIDB_DISK_UNCOMPRESSED=1` (with `OXIDB_DISK_FIRST=1`) writes the data file

@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Per-collection storage options (server 0.30.0)
+
+The disk-first storage knobs — disk-first vs in-RAM, `.bdat` compression, and
+the compaction policy (auto/min-bytes/dead-ratio) — were process-wide
+`OXIDB_*` env vars: every collection in an engine shared one setting. They are
+now **per-collection**, via a new `StorageOptions` struct and
+`OxiDb::create_collection_with_options(name, opts)`. One engine can now host,
+say, a disk-first *uncompressed* analytics collection next to a default in-RAM
+one.
+
+- `StorageOptions { disk_first, compress, auto_compact, compact_min_bytes,
+  compact_dead_ratio }` — `Default` is in-RAM/compressed; `StorageOptions::
+  from_env()` reproduces the old env-var behavior and remains the default for
+  collections created without explicit options. The env vars are unchanged and
+  still act as the default, so existing deployments and the env-var workflow
+  behave exactly as before.
+- For disk-first collections the resolved options are **persisted** next to the
+  data as `<name>.bopts`. On reopen they are read back, so a collection's
+  on-disk format is consistent regardless of the current environment —
+  previously, flipping `OXIDB_DISK_FIRST` between runs could mismatch an
+  existing collection. When no `.bopts` is present (collections created before
+  this change), the format is detected from the on-disk files (`.bdat` →
+  disk-first, `.btree` → in-RAM), so old data dirs open correctly.
+- `BTreeStorage` now carries a resolved `StorageOptions` instead of reading the
+  env helpers ad hoc; `should_compact` and `compact` consult it.
+
+Tests: `tests/per_collection_options.rs` (a disk-first-uncompressed collection
+alongside an in-RAM one in one engine; env-independent reopen; compressed vs
+uncompressed `.bdat` sizes). Full lib (801) + soak suites pass in all configs
+(default / disk-first / disk-first-uncompressed); server suite green.
+
 ### Uncompressed `.bdat` mode for disk-first storage (server 0.29.3)
 
 New opt-in `OXIDB_DISK_UNCOMPRESSED=1` (only meaningful with
