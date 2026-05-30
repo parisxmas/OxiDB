@@ -63,7 +63,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 14. Güvenlik: kimlik doğrulama, yetkilendirme, şifreleme, denetim ✅
 
 ### Kısım III — OxiDB Adım Adım
-15. OxiDB'ye genel bakış ve mimari
+15. OxiDB'ye genel bakış ve mimari ✅
 16. Depolama katmanı: in-RAM ve disk-first, mmap, .bdat / .btree
 17. WAL, dayanıklılık ve kurtarma; katı ve gevşek senkronizasyon
 18. İndeksler: alan, bileşik ve mmap tabanlı disk indeksleri
