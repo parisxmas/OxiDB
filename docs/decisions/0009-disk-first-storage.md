@@ -112,9 +112,20 @@ tracked separately).
   doc_id-keyed so the store rewrite doesn't touch them; their `.mfidx` is
   rewritten cleanly by the overlay merge on persist. Soak-verified: 167 KB →
   34 KB (~5×) after heavy update churn, with all live data + indexed queries
-  intact through compact and a reopen. **Still TODO:** an *automatic* trigger
-  (run compaction on a dead-space ratio/size threshold) — today it's an explicit
-  `compact` call.
+  intact through compact and a reopen.
+- **Automatic compaction trigger — implemented**
+  (`BTreeStorage::should_compact`): the periodic maintenance path
+  (`sync_writes`, after `persist`) checks a cheap dead-space heuristic and
+  compacts when the `.bdat` is both at least `OXIDB_COMPACT_MIN_BYTES`
+  (default 4 MiB) **and** at least `OXIDB_COMPACT_DEAD_RATIO` (default 0.5, i.e.
+  ≥50%) dead — `dead_ratio = 1 − live_bytes/file_size`. That maintenance point
+  doesn't hold the data lock, so it can safely take compaction's exclusive write
+  lock; a compaction resets dead space, so the trigger self-rate-limits. Set
+  `OXIDB_AUTO_COMPACT=0` to disable. Field indexes are doc_id-keyed, so the store
+  rewrite leaves them valid (no re-index). Soak-verified
+  (`auto_compaction_bounds_file_size`, `#[ignore]`d): under 2400 updates to 800
+  docs with an *incompressible* ~2 KiB payload, the `.bdat` settles at ~2.8 MiB
+  versus ~6.4 MiB uncompacted, with live count + point reads intact.
 - Lazy cursors (stream values instead of materializing the snapshot) to also cut
   the transient per-sorted-query spike.
 - A 1M-doc bench run in disk mode on a quiet box to confirm the RSS win and
@@ -136,3 +147,9 @@ the disk engine; `SOAK_ROUNDS=N` to lengthen):
   crash) → reopen; committed writes recovered via WAL replay.
 - `bdat_growth_under_update_churn` — correctness under heavy update churn +
   reports `.bdat` growth (the compaction motivation above).
+- `compaction_reclaims_space_and_preserves_data` — explicit `compact()` shrinks
+  the `.bdat` and keeps all data + indexed queries intact through a reopen.
+- `auto_compaction_bounds_file_size` (`#[ignore]`d, timing-based) — with the
+  periodic sync thread running, the `.bdat` stays bounded near the live size
+  under sustained update churn instead of growing with the write count. Run:
+  `OXIDB_DISK_FIRST=1 cargo test --test disk_first_soak auto_compaction -- --ignored --nocapture`.

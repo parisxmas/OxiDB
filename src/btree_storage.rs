@@ -120,6 +120,47 @@ fn disk_first_enabled() -> bool {
     })
 }
 
+/// Auto-compaction tuning (read once). The periodic sync path calls
+/// [`BTreeStorage::should_compact`] and compacts when the disk-first data file
+/// is at least `OXIDB_COMPACT_MIN_BYTES` (default 4 MiB) AND at least
+/// `OXIDB_COMPACT_DEAD_RATIO` (default 0.5) dead. Disable with
+/// `OXIDB_AUTO_COMPACT=0`.
+#[cfg(not(target_arch = "wasm32"))]
+fn auto_compact_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("OXIDB_AUTO_COMPACT")
+            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+            .unwrap_or(true)
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn compact_min_bytes() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("OXIDB_COMPACT_MIN_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4 * 1024 * 1024)
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn compact_dead_ratio() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("OXIDB_COMPACT_DEAD_RATIO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|r: &f64| *r > 0.0 && *r < 1.0)
+            .unwrap_or(0.5)
+    })
+}
+
 /// A cursor for iterating through the storage in ascending key order.
 /// Wraps a collected snapshot of entries for stable iteration.
 pub struct Cursor {
@@ -662,6 +703,30 @@ impl BTreeStorage {
         }
         self.total_bytes.store(total, Ordering::Release);
         Ok((old_size, new_size))
+    }
+
+    /// Whether the disk-first data file has accumulated enough dead space to be
+    /// worth compacting. Cheap to call (one file-size read + one atomic load);
+    /// the periodic sync path checks it and compacts when true. Always `false`
+    /// in in-RAM mode or when auto-compaction is disabled.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn should_compact(&self) -> bool {
+        if !auto_compact_enabled() {
+            return false;
+        }
+        let d = match &self.disk {
+            Some(d) => d,
+            None => return false,
+        };
+        let file = d.data.read().file_size();
+        if file < compact_min_bytes() {
+            return false;
+        }
+        // Fraction of the file that is dead (overwritten/deleted records plus
+        // framing). `total_bytes` tracks the live payload.
+        let live = self.total_bytes();
+        let dead_ratio = 1.0 - (live as f64 / file as f64);
+        dead_ratio >= compact_dead_ratio()
     }
     #[cfg(target_arch = "wasm32")]
     pub fn is_disk_first(&self) -> bool {

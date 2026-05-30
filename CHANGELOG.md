@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Automatic compaction trigger for disk-first storage (server 0.28.29)
+
+Compaction no longer has to be invoked by hand. The periodic maintenance path
+(`sync_writes`, right after `persist`) now calls `BTreeStorage::should_compact`
+— a cheap check (one file-size read + one atomic load) that compacts when the
+`.bdat` is both at least `OXIDB_COMPACT_MIN_BYTES` (default 4 MiB) **and** at
+least `OXIDB_COMPACT_DEAD_RATIO` (default 0.5, i.e. ≥50%) dead, where
+`dead_ratio = 1 − live_bytes/file_size`. That maintenance point doesn't hold the
+data lock, so it can safely take compaction's exclusive write lock; a compaction
+resets dead space, so the trigger self-rate-limits. Set `OXIDB_AUTO_COMPACT=0`
+to disable. No-op in in-RAM mode. Field indexes are doc_id-keyed, so the store
+rewrite leaves them valid — no re-index.
+
+Soak-verified (`tests/disk_first_soak.rs::auto_compaction_bounds_file_size`,
+`#[ignore]`d, timing-based): with the periodic sync thread running, 2400 updates
+to 800 docs carrying an *incompressible* ~2 KiB payload settle the `.bdat` at
+~2.8 MiB versus ~6.4 MiB uncompacted, with live count + point reads intact. Run:
+`OXIDB_DISK_FIRST=1 cargo test --test disk_first_soak auto_compaction -- --ignored --nocapture`.
+
 ### Compaction for disk-first storage (server 0.28.28)
 
 The disk-first store is append-only, so updates/deletes leave dead records that
@@ -18,9 +37,8 @@ cleanly by the overlay-merge on persist.
 Soak-verified (`tests/disk_first_soak.rs::compaction_reclaims_space_and_preserves_data`):
 167 KB → 34 KB (~5×) after heavy update churn, with all live values + indexed
 queries intact through compaction *and* a clean reopen. In-RAM `compact()` is
-unchanged (persists the snapshot — no dead space to reclaim). An automatic
-trigger (compact on a dead-space threshold) remains a follow-up; today it's an
-explicit `compact` call.
+unchanged (persists the snapshot — no dead space to reclaim). (An automatic
+dead-space trigger landed next — see 0.28.29 above.)
 
 ### Byte-level post-filter find — no Value materialization (server 0.28.27)
 

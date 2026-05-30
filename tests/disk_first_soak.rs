@@ -58,6 +58,35 @@ fn doc(k: u64, v: u64) -> Value {
     })
 }
 
+/// Document with a ~2 KiB **incompressible** payload (high-entropy printable
+/// ASCII derived from k,v) so the data file's size reflects real writes —
+/// a compressible payload (zstd) would never reach the compaction floor.
+fn big_doc(k: u64, v: u64) -> Value {
+    let mut s = String::with_capacity(2048);
+    let mut x = k
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(v)
+        .wrapping_add(1);
+    for _ in 0..2048 {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        s.push((b'!' + ((x >> 33) % 90) as u8) as char);
+    }
+    json!({ "k": k, "v": v, "payload": s })
+}
+
+fn bdat_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("bdat"))
+                .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
 /// Sustained insert/update/delete churn, model-checked after every round.
 #[test]
 fn churn_integrity_model_checked() {
@@ -337,5 +366,69 @@ fn compaction_reclaims_space_and_preserves_data() {
     for (&k, &v) in model.iter().take(50) {
         let got = db.find_one("c", &json!({ "k": k })).unwrap();
         assert_eq!(got.and_then(|d| d["v"].as_u64()), Some(v), "k={k} after compact+reopen");
+    }
+}
+
+/// Auto-compaction: with the periodic sync thread running and heavy update
+/// churn, the `.bdat` must stay bounded near the live size instead of growing
+/// with the number of writes. Heavy + timing-based, so `#[ignore]`d:
+///
+/// ```sh
+/// OXIDB_DISK_FIRST=1 cargo test --test disk_first_soak auto_compaction -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "heavy + timing-based; run explicitly"]
+fn auto_compaction_bounds_file_size() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(OxiDb::open(dir.path()).unwrap());
+    // Fast periodic maintenance so auto-compaction fires during churn.
+    db.enable_periodic_snapshot(Duration::from_millis(40));
+
+    let keys = 800u64;
+    for k in 0..keys {
+        db.insert("c", big_doc(k, 0)).unwrap();
+    }
+    let live_est = keys * 2048; // ~1.6 MiB of live (incompressible) payload
+    let mut rng = Lcg(77);
+    // Enough that, uncompacted, the file would far exceed the bound below.
+    let churn = (rounds() * 60).max(2400) as u64;
+    for _ in 0..churn {
+        let k = rng.below(keys);
+        db.update("c", &json!({ "k": k }), &json!({ "$set": { "v": rng.next() } })).unwrap();
+    }
+
+    // Let the periodic thread settle any pending compaction. Uncompacted, the
+    // file would be ~live + churn*2 KiB (~6.4 MiB); auto-compaction must keep it
+    // bounded well below that.
+    let bound = live_est * 3;
+    let mut bdat = bdat_bytes(dir.path());
+    for _ in 0..60 {
+        bdat = bdat_bytes(dir.path());
+        if !disk_first() || bdat == 0 || bdat < bound {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Correctness holds regardless of compaction.
+    assert_eq!(db.count("c", &json!({})).unwrap() as u64, keys, "live count");
+
+    if disk_first() {
+        println!(
+            "\n[soak] auto-compaction: .bdat = {} KiB after {churn} updates (live ~{} KiB); \
+             uncompacted would be ~{} KiB",
+            bdat / 1024,
+            live_est / 1024,
+            (live_est + churn * 2048) / 1024
+        );
+        assert!(
+            bdat < bound,
+            "auto-compaction should keep .bdat near the live size; got {} KiB (bound {} KiB)",
+            bdat / 1024,
+            bound / 1024
+        );
     }
 }

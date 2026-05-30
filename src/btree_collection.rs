@@ -666,6 +666,14 @@ impl BTreeCollection {
         self.storage.persist()?;
         #[cfg(not(target_arch = "wasm32"))]
         self.persist_disk_indexes();
+        // Auto-compaction: this periodic maintenance point isn't holding the
+        // data lock, so it can safely take compaction's exclusive write lock.
+        // Only fires once the data file is past the dead-space threshold;
+        // after a compaction dead space resets, so it self-rate-limits.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.storage.should_compact() {
+            let _ = self.storage.compact();
+        }
         Ok(())
     }
 
