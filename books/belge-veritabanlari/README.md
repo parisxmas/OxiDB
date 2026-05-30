@@ -41,7 +41,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 
 ### Kısım II — Bir Belge Veritabanı İçeride Nasıl Çalışır
 5. Depolama motorları: sayfa tabanlı, append-only, LSM ve B-ağaçları ✅
-6. Dayanıklılık: write-ahead log, fsync ve çökmeden kurtarma
+6. Dayanıklılık: write-ahead log, fsync ve çökmeden kurtarma ✅
 7. İndeksleme: B-ağacı indeksleri, bileşik indeksler, ters indeks
 8. Sorgu işleme: ayrıştırma, planlama, indeks seçimi
 9. Toplama (aggregation): pipeline modeli, gruplama, pencere fonksiyonları
