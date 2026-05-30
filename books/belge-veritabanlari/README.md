@@ -65,7 +65,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 ### Kısım III — OxiDB Adım Adım
 15. OxiDB'ye genel bakış ve mimari ✅
 16. Depolama katmanı: in-RAM ve disk-first, mmap, .bdat / .btree ✅
-17. WAL, dayanıklılık ve kurtarma; katı ve gevşek senkronizasyon
+17. WAL, dayanıklılık ve kurtarma; katı ve gevşek senkronizasyon ✅
 18. İndeksler: alan, bileşik ve mmap tabanlı disk indeksleri
 19. Sorgu motoru: operatörler, indeks destekli yollar, byte düzeyinde filtreleme
 20. Toplama pipeline'ı: gruplama, $facet, pencere fonksiyonları
