@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="380" font-family="Georgia, serif">
+  <rect width="720" height="380" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Fiziksel plan, bir yineleyici ağacıdır: her düğüm üstündekine birer belge "çeker"</text>
+  <!-- root: limit -->
+  <g font-size="11.5" text-anchor="middle">
+    <rect x="285" y="56" width="150" height="44" rx="8" fill="#eef0f5" stroke="#555"/><text x="360" y="76">Sınırla (limit 10)</text><text x="360" y="92" font-size="9.5">10. belgede dur</text>
+    <rect x="285" y="138" width="150" height="44" rx="8" fill="#e8f3ea" stroke="#3a8a52"/><text x="360" y="158">Süzgeç (yaş 30–40)</text><text x="360" y="174" font-size="9.5">post-filtre, indekssiz</text>
+    <rect x="240" y="220" width="240" height="44" rx="8" fill="#fdeee0" stroke="#c97b2c" stroke-width="2"/><text x="360" y="240">İndeks taraması (bölge = "Ege")</text><text x="360" y="256" font-size="9.5">B-ağacı eşitlik araması → aday ID'ler</text>
+    <rect x="240" y="302" width="240" height="44" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="360" y="322">Belge getir (ID → belge)</text><text x="360" y="338" font-size="9.5">yalnız hayatta kalan adaylar için</text>
+  </g>
+  <!-- pull arrows (data flows up; demand flows down) -->
+  <g stroke="#888" stroke-width="1.6" marker-end="url(#a)">
+    <line x1="360" y1="138" x2="360" y2="102"/>
+    <line x1="360" y1="220" x2="360" y2="184"/>
+    <line x1="360" y1="302" x2="360" y2="266"/>
+  </g>
+  <text x="455" y="124" font-size="9.5" fill="#999" text-anchor="start">↑ belge akışı</text>
+  <text x="150" y="124" font-size="9.5" fill="#999" text-anchor="end">talep (next) ↓</text>
+  <!-- side note -->
+  <line x1="40" y1="360" x2="680" y2="360" stroke="#ddd"/>
+  <text x="360" y="376" font-size="10.5" text-anchor="middle" fill="#666">İndeks daraltır (1M → birkaç bin), süzgeç inceltir, sınırla erken durdurur: hiçbir aşama gereğinden fazla belge üretmez</text>
+</svg>

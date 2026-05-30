@@ -19,10 +19,36 @@ uygular. Her koleksiyonun, yalnızca sona eklenerek büyüyen bir yazma-öncesi
 günlüğü vardır.
 
 Bu günlüğe yazılan her kayıt, altıncı bölümde anlattığımız iki korumayı taşır.
-Birincisi, kaydın içeriğinden hesaplanan bir **sağlama toplamıdır** (CRC); bu,
+Birincisi, kaydın içeriğinden hesaplanan bir **sağlama toplamıdır** (CRC32); bu,
 kurtarma sırasında yarım kalmış ya da bozulmuş bir kaydı yakalamayı sağlar.
 İkincisi, kaydın hangi işleme ait olduğunu belirten bir **işlem kimliğidir**; bu,
-ileride işlemleri ele alırken önemli olacak. Bir yazma geldiğinde, OxiDB önce bu
+ileride işlemleri ele alırken önemli olacak.
+
+Bu iki korumayı kaydın bayt düzeyindeki biçiminde somut görmek öğreticidir, çünkü
+kurtarmanın neden güvenli olduğunu bu biçim açıklar. Her kayıt iki katmandan
+oluşur: bir dış **çerçeve** ve onun içindeki **yük**. Dış çerçeve, önce dört
+baytlık sağlama toplamını, sonra dört baytlık bir uzunluk alanını taşır; böylece
+okuyucu, yükün kaç bayt olduğunu ve onu okuduktan sonra hesapladığı sağlamanın
+beklenen değere uyup uymadığını bilir. Yükün kendisi ise, ne tür bir işlem
+olduğunu söyleyen tek baytlık bir işlem koduyla (insert, update ya da delete)
+başlar; ardından işlem kimliği ve belge kimliği — her ikisi de sekizer bayt —
+gelir; en sonda da, ekleme ve güncellemelerde belgenin kodlanmış baytları durur.
+Silme kayıtlarında belge baytı yoktur; yalnızca hangi kimliğin silindiği yazılır.
+Dosyanın en başında ise, sekiz baytlık küçük bir başlık — bir tanıtıcı imza, bir
+sürüm numarası ve bayraklar — durur; bu başlık, OxiDB'nin tanımadığı bir
+biçimdeki dosyayı sessizce yanlış okumak yerine açıkça reddetmesini sağlar.
+
+![WAL kaydının bayt düzeni.](sekiller/17b-wal-kayit.svg){width=80%}
+
+Bu biçimin zarif bir ayrıntısı, **noktasal kurtarma** (PITR) ile ilgilidir; ona
+yirmi ikinci bölümde döneceğiz, ama tohumu burada atılır. İşlem kodunun en üst
+biti, kaydın daha zengin bir ikinci sürüm (v2) olup olmadığını ayırır: v2
+kayıtları, işlem ve belge kimliğinin ardına, kayda küresel ve tekel olarak artan
+bir sıra numarası (GSN) ile bir duvar-saati zaman damgası ekler. Bu üst-bit
+hilesi sayesinde, aynı dosyada hem eski (v1) hem de yeni (v2) kayıtlar karışık
+bulunabilir ve hepsi tek bir geçişte doğru oynatılabilir; noktasal kurtarma
+kapalıyken yazılan dosya, eskisiyle bayt bayt aynı kalır. Yani bu yetenek,
+kapalıyken hiçbir maliyet getirmeyecek biçimde tasarlanmıştır. Bir yazma geldiğinde, OxiDB önce bu
 kaydı günlüğe ekler ve onu dayanıklı kılar; ancak ondan sonra, değişikliği bir
 önceki bölümdeki depolama katmanına — belleğe öncelikli kipte bellekteki
 eşlemeye, disk-öncelikli kipte `.bdat` dosyasına — ve indekslere uygular. Yani
@@ -31,11 +57,13 @@ bile, niyet günlükte kayıtlıdır.
 
 Burada altıncı bölümün bir inceliğini somut görürüz. Bir kaydı "dayanıklı kılmak",
 yalnızca diske göndermek değil, oraya gerçekten oturduğundan emin olmaktır;
-altıncı bölümde, bazı sistemlerde sıradan boşaltmanın veriyi yalnızca disk
-denetleyicisinin önbelleğine bıraktığını söylemiştik. OxiDB bu konuda tavizsizdir:
-dayanıklılık gerektiğinde, veriyi fiziksel ortama gerçekten işleyen, tam bir
-boşaltma kullanır. Bu güçlü garanti, az sonra göreceğimiz gibi, bir hız bedeli
-taşır — ama verdiği söz de o kadar güçlüdür.
+altıncı bölümde, bazı sistemlerde sıradan bir yazmanın veriyi yalnızca işletim
+sisteminin ya da disk denetleyicisinin önbelleğine bıraktığını söylemiştik. OxiDB
+bu konuda tavizsizdir: dayanıklılık gerektiğinde, yazdığı veriyi fiziksel ortama
+gerçekten işleyen bir **boşaltma** çağrısı (fsync ailesinden) yapar ve o çağrı
+dönene kadar bekler — ancak ondan sonra işlemi "tamamlandı" sayar.^[POSIX `fsync`/`fdatasync` — bir dosyaya yazılan verinin işletim sistemi önbelleğinden çıkıp fiziksel saklama ortamına işlendiğini garantileyen çağrılar. Donanım önbellekleri devredeyken tam dayanıklılık için ek platform tedbirleri gerekebilir.] Bu güçlü
+garanti, az sonra göreceğimiz gibi, bir hız bedeli taşır — ama verdiği söz de o
+kadar güçlüdür.
 
 ## Katı dayanıklılık: varsayılan tercih
 
@@ -60,6 +88,8 @@ dayanıklılık karşılığında daha hızlı görünür.
 
 ## Grup commit: bedeli toplu yazmada eritmek
 
+![Katı kipte tekil yazma ile grup commit’in karşılaştırması.](sekiller/17c-fsync-zaman.svg){width=80%}
+
 Peki OxiDB, her yazma için bir tam boşaltma ödüyorsa, çok sayıda belge eklerken
 nasıl hızlı kalır? Yanıt, altıncı bölümde tanıttığımız grup commit fikrindedir.
 Bir tam boşaltma, ister bir kaydı ister binlerce kaydı diske işlesin, kabaca aynı
@@ -77,14 +107,33 @@ hiç ödün vermeden maliyeti eritiyordu. Tek tek yazmada görünen dört milisa
 fark, toplu yazmada kayboluyordu; çünkü orada amorti edilecek bir parti vardı,
 tek tek güncellemede ise yoktu.
 
+## Üç aşamalı dayanıklılık: günlük, veri, denetim noktası
+
+Bir yazmanın katı kipte izlediği yolu, dayanıklılık adımlarına ayırarak görmek,
+OxiDB'nin verdiği güvencenin tam olarak ne olduğunu netleştirir. Sıra üç durakta
+işler. Önce değişiklik **günlüğe** yazılır ve diske boşaltılır; bu boşaltma,
+dayanıklılığın asıl çıpasıdır — bu noktadan sonra çökme olsa bile niyet
+kaybolmaz. Ardından değişiklik **asıl depoya** uygulanır: belleğe öncelikli
+kipte bellekteki eşlemeye, disk-öncelikli kipte `.bdat` dosyasına. Son olarak,
+asıl depoya güvenle yansımış değişikliklere karşılık gelen günlük kayıtları, bir
+**denetim noktasında** (checkpoint) geri kazanılır; böylece günlük baştan
+büyümeye devam edebilir. Bu üç durağın her biri, gerektiğinde diskle uzlaşmayı —
+boşaltmayı — içerir; bu yüzden bu düzene üç aşamalı dayanıklılık demek doğru
+olur. Ama bu üç adımın hepsinin her yazmada baştan sona, ayrı ayrı boşaltma
+yapması gerekmez: kritik olan, ilk adımın — günlüğe yazıp boşaltmanın — asıl
+veriden önce gelmesidir; sonraki adımlar, hızı için, gruplanıp tembelce
+yapılabilir.
+
 ## Gevşek senkronizasyon: hızı seçmek
 
 OxiDB, katı dayanıklılığı varsayılan yapar, ama bunu zorunlu kılmaz. Altıncı
-bölümdeki tayfın gevşek ucu da, isteğe bağlı bir ayarla — bir ortam değişkeniyle
-— açılabilir. Gevşek kipte, bir yazma günlüğe yazılır ama hemen diske
-boşaltılmaz; boşaltma, her commit'te değil, arka planda çalışan bir iş parçacığı
-tarafından belirli aralıklarla, toplu olarak yapılır. Yazma, bellekten onaylanır
-ve hemen geri döner.
+bölümdeki tayfın gevşek ucu da, isteğe bağlı bir ortam değişkeniyle açılabilir.
+Gevşek kipte, bir yazma günlüğe yazılır ama hemen diske boşaltılmaz; boşaltma,
+her commit'te değil, arka planda çalışan bir iş parçacığı tarafından belirli
+aralıklarla — bu makinede milisaniyeler mertebesinde bir cadansla — toplu olarak
+yapılır. Yazma, bellekten onaylanır ve hemen geri döner; günlük kaydı diske
+gerçekten oturana kadarki o kısa pencere, gevşek kipin satın aldığı hızın
+karşılığında ödediği risk penceresidir.
 
 Bu kipin hızı, ölçümlerde net biçimde görülür: gevşek kipte, tek bir belge
 güncellemesi, katı kipteki yaklaşık dört milisaniyeden, yaklaşık seksen yedi
@@ -122,9 +171,13 @@ Kurtarmanın yarım kalmış son kaydı nasıl ele aldığı, altıncı bölümd
 toplamı mekanizmasının doğrudan uygulamasıdır. Çökme, en son günlük kaydının
 yazılmasının ortasında olmuş olabilir; o kayıt yarım kalmış, bozulmuş olabilir.
 OxiDB, her kaydı oynatırken sağlama toplamını yeniden hesaplar; uyuşmuyorsa, o
-kaydın yarım kaldığını anlar, onu güvenle atar ve ondan önceki son sağlam
-noktadan devam eder. Böylece yarım yazma, sessizce bozuk veriye dönüşmek yerine,
-açıkça fark edilip temizlenir.
+kaydın yarım kaldığını anlar, onu güvenle atar ve oynatmayı orada durdurur. Bu
+duruma, dosyanın sonundaki yarım kalmış kayıt anlamında **yırtık kuyruk** (torn
+tail) denir; kurtarma, yırtık kuyruğa rastladığı an, ondan önceki son sağlam
+kayda kadar olan her şeyi geçerli sayar ve geri kalanını atar. Bu davranışın
+doğru olması, günlüğün yalnızca sona eklenerek büyümesine dayanır: bozulma her
+zaman dosyanın en sonundadır, ortasında değil. Böylece yarım yazma, sessizce
+bozuk veriye dönüşmek yerine, açıkça fark edilip temizlenir.
 
 ## Denetim noktası ve günlüğün dizginlenmesi
 
@@ -143,6 +196,25 @@ zorundadır. OxiDB'nin geliştirilmesinde, bu inceliğin gözden kaçtığı bir
 durumun nasıl bir kurtarma hatasına yol açtığı ve nasıl düzeltildiği, dayanıklılık
 mantığının ne kadar dikkat gerektirdiğinin iyi bir örneğidir.
 
+## Günlüğün döndürülmesi ve mühürlü segmentler
+
+Denetim noktası, günlüğü çökmeye karşı dizginlemenin bir yoludur; ama OxiDB,
+noktasal kurtarmayı açan kullanıcılar için günlüğü silmek yerine **arşivlemek**
+ister. Bu durumda devreye, günlüğün döndürülmesi (rotation) girer. Canlı günlük
+belli bir boyuta ulaştığında, OxiDB onu güvenli bir biçimde kapatır: günlük
+kilidini tutarken, canlı dosyayı atomik bir yeniden adlandırma ile numaralı bir
+**mühürlü segmente** (sealed segment) çevirir ve yerine boş, taze bir canlı
+günlük açar. Bu atomikliğin önemi şudur: onaylanmış hiçbir yazma, mühürlenen
+segment ile yeni canlı günlük arasındaki çatlağa düşemez; her kayıt ya birinde ya
+ötekindedir. Arka planda çalışan bir arşivleyici, bu mühürlü segmentleri verbatim
+olarak — baytı baytına — bir arşiv alanına kopyalar ve kendini onaran bir kayıt
+dosyasıyla (manifest) izler. Daha önce gördüğümüz, kayıtların taşıdığı küresel
+sıra numarası (GSN) ve zaman damgası, işte burada anlam kazanır: bir yedeğin
+üstüne, bu segmentleri belirli bir sıra numarasına ya da zaman noktasına kadar
+yeniden oynatarak, geçmişin tutarlı bir kesitine dönmek mümkün olur. Bu, yirmi
+ikinci bölümün konusudur; burada yalnızca, günlüğün bu kurtarma yeteneğinin de
+temeli olduğunu görmek yeterli.
+
 ## WAL her iki kibin de önünde durur
 
 Altıncı bölümde, yazma-öncesi günlüğün depolama felsefesinin bir alternatifi
@@ -158,12 +230,16 @@ dayanıklılık, depolama kipinden bağımsız, ortak bir güvence olarak kalır
 Bu bölümde, OxiDB'nin dayanıklılık mekanizmasını yakın plana aldık. Her
 koleksiyonun, sağlama toplamlı ve işlem kimlikli kayıtlardan oluşan bir
 yazma-öncesi günlük tuttuğunu; her yazmanın önce bu günlüğe gidip dayanıklı
-kılındığını, sonra depoya uygulandığını gördük. Katı dayanıklılığın varsayılan
-olduğunu ve bunun tek tek güncellemelerde bir hız bedeli taşıdığını, ama grup
-commit sayesinde toplu yazmalarda bu bedelin eridiğini; gevşek kipin ise hızı bir
-kayıp riski karşılığında nasıl artırdığını ölçümlerle gördük. Kurtarmanın taban
-kurma, günlük oynatma, etkisiz tekrarlanabilirlik ve yarım-kayıt temizleme
-adımlarını ve denetim noktasının günlüğü nasıl dizginlediğini inceledik.
+kılındığını, sonra depoya uygulandığını gördük. Kaydın bayt düzeyindeki biçimini —
+sağlama toplamlı çerçeve, işlem kodlu yük, ve noktasal kurtarmayı açan v2
+uzantısı — yakından gördük. Katı dayanıklılığın varsayılan olduğunu ve bunun tek
+tek güncellemelerde bir hız bedeli taşıdığını, ama grup commit sayesinde toplu
+yazmalarda bu bedelin eridiğini; gevşek kipin ise hızı bir kayıp riski
+karşılığında nasıl artırdığını ölçümlerle gördük. Kurtarmanın taban kurma,
+günlük oynatma, etkisiz tekrarlanabilirlik ve yırtık-kuyruk temizleme adımlarını;
+üç aşamalı dayanıklılık sırasını (günlük, veri, denetim noktası); ve günlüğün
+mühürlü segmentlere döndürülerek noktasal kurtarmaya nasıl zemin hazırladığını
+inceledik.
 
 Artık verimiz hem kalıcı hem de çökmeye dayanıklı biçimde duruyor. Ama yedinci
 bölümde gördüğümüz gibi, veriyi güvenle saklamak yetmez; onu taramadan hızla

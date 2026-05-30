@@ -55,6 +55,33 @@ başka biri değiştirmiş ve onun sürüm numarasını artırmışsa? O zaman b
 "çatışmada iptal et ve yeniden dene" davranışının tam karşılığıdır; sürüm
 numaraları, çatışmayı saptamanın aracıdır.
 
+![Okuduğun sürüm hâlâ aynı mı? Eşitse uygula, farklıysa çatışma.](sekiller/21b-surum-dogrulama.svg){width=85%}
+
+## Doğrulama ile uygulamanın bölünmezliği
+
+Burada, OCC'nin kâğıt üzerinde basit görünen ama gerçek bir uygulamada en kolay
+yanlış yapılan yerine gelmemiz gerekir: doğrulama ile uygulamanın **kendi
+arasında atomik** olması. Düşünün ki iki işlem aynı belgeye dokunuyor ve her ikisi
+de neredeyse aynı anda tamamlanmaya çalışıyor. Birinci işlem belgenin sürümünü
+okuyup "hâlâ aynı, çatışma yok" diyor; tam uygulamaya geçecekken, ikinci işlem de
+aynı sürümü okuyup aynı kararı veriyor. Sonra ikisi de yazıyor. İkisi de
+doğrulamayı geçti, ama biri diğerinin yazdığının üzerine yazdı — bu, onuncu
+bölümde "kayıp güncelleme" (lost update) dediğimiz tam da o çatışmadır ve OCC'nin
+önlemek için var olduğu şeydir. Eğer doğrulama ve uygulama arasında bir boşluk
+kalırsa, OCC kendi amacını ıskalar.
+
+OxiDB bunu, tüm tamamlamaları seri hale getiren tek bir **tamamlama kilidiyle**
+(commit lock) çözer. Bir işlem tamamlanmaya başladığında bu kilidi alır ve onu
+doğrulamanın **ve** uygulamanın sonuna dek tutar; ancak işin bütünü bitince
+bırakır. Böylece "sürümleri kontrol et, değişiklikleri uygula, sürümleri
+artır" üçlüsü, başka hiçbir tamamlamanın araya giremeyeceği, bölünmez bir kritik
+kesit (critical section) haline gelir. İki işlem aynı belgeye yarışsa bile, biri
+kilidi tutarken öteki bekler; bekleyen işlem sırası geldiğinde sürümü yeniden
+okur, bu kez artmış bulur ve usulünce çatışma verir. Bu, iyimser bir sistemde
+bile, tamamlama anının neden küçük bir seri kesit gerektirdiğini gösteren güzel
+bir örnektir: işlemler boyunca kimse beklemez — yalnızca son, kısacık tamamlama
+adımı seriye alınır.
+
 ## Dayanıklılıkla bağ
 
 İşlemler, on yedinci bölümdeki dayanıklılık mekanizmasıyla doğrudan bütünleşir.
@@ -68,6 +95,31 @@ anında, hep birlikte uygulanması ve bunların günlükle dayanıklı kılınma
 geri getirir; yarım kalmış, hiç tamamlanmamış bir işlemin biriktirilmiş ama
 uygulanmamış değişiklikleri ise zaten depoya hiç inmediği için kaybolur — ki bu
 da istenen davranıştır.
+
+Bu mekanizmanın iki ince ayrıntısı, tamamlamanın gerçekte nasıl işlediğini
+aydınlatır. Birincisi, üçüncü fazda değişiklikler doğrudan depoya yazılmaz; önce
+**hazırlanmış mutasyonlar** (prepared mutations) olarak somutlaştırılırlar. Yani
+işlemin "şu sorguya uyan belgeyi güncelle" gibi yüksek seviyeli niyeti, tamamlama
+anında, hangi belgenin hangi yeni baytlarla yazılacağına dair somut bir işlemler
+listesine çevrilir; bu liste hem yazma-öncesi günlüğe yazılan kayıtları hem de
+asıl depo değişikliklerini içerir. Böylece günlüğe yazılan ile depoya uygulanan
+şey, birbirinin tıpatıp karşılığı olur — kurtarmada birinin ötekini eksiksiz
+yeniden üretebilmesi tam da buna dayanır.
+
+İkincisi, işlemin "tamamlandı" sayıldığı kesin an — yani **tamamlama noktası**
+(commit point) — belgeler asıl depoya uygulanmadan **önce**, işlemin kimliğinin
+küresel bir tamamlama günlüğüne (commit log) dayanıklı biçimde işlendiği andır.
+Bu sıralama bilinçlidir ve kurtarmanın anlamını belirler. Bir işlemin kayıtları
+yazma-öncesi günlüğe inmiş ama tamamlama noktası daha aşılmamışken sistem
+çökerse, kurtarma o işlemi tamamlanmamış sayar ve değişikliklerini geri getirmez —
+çünkü kullanıcıya "tamamlandı" yanıtı hiç verilmemiştir. Tamamlama noktası
+aşıldıktan sonra çökme olursa, kurtarma işlemi tamamlanmış sayar ve günlükteki
+kayıtlarından eksiksiz yeniden uygular. Bu küresel tamamlama günlüğü, ayrıca aynı
+anda tamamlanan birçok işlemi tek bir disk eşitlemesinde (fsync) toplayan bir
+**grup tamamlama** (group commit) düzeniyle çalışır: N eşzamanlı tamamlama, N ayrı
+diske-yazma yerine tek bir paylaşılan eşitlemeyle dayanıklı kılınır; bu, on yedinci
+bölümde değindiğimiz, dayanıklılığın en pahalı adımını — fsync'i — amorti etme
+fikrinin işlem katmanındaki yankısıdır.
 
 ## Kilitlenmeye karşı tasarımla bağışıklık
 
@@ -87,6 +139,19 @@ kilitlenme **tasarım gereği imkânsızdır** — onu sezip çözmeye çalışa
 mekanizmaya bile gerek kalmaz. Bu, onuncu bölümdeki soyut "sıralı kilit
 disiplini" fikrinin, gerçek bir sistemde bir kilitlenme sınıfını tümüyle ortadan
 kaldıran somut bir uygulamasıdır.
+
+Bu disiplinin OxiDB'deki uygulaması, küçük ama öğretici bir veri yapısı seçimine
+dayanır. Bir işlem boyunca, dokunduğu koleksiyonların adları **sıralı bir kümede**
+biriktirilir — adların kendiliğinden alfabetik düzende tutulduğu bir yapıda. Bu
+seçim, kilit sırasını ayrıca hesaplamayı gereksiz kılar: işlem tamamlanırken
+kümeyi gezmek, koleksiyon adlarını zaten her zaman aynı, belirli (alfabetik)
+düzende ziyaret etmek demektir. Hangi işlem hangi koleksiyonlara dokunmuş olursa
+olsun, hepsi aynı adı aynı sırada görür; dolayısıyla biri "A sonra B", öteki "B
+sonra A" sırasıyla kilit almaya asla çalışmaz. Döngüsel beklemenin önkoşulu —
+kilitlerin farklı işlemlerde farklı sırayla istenmesi — ortadan kaldırılmıştır.
+Sıralı kümenin değerinin "her zaman düzenli" oluşu, kilitlenmesizliği bir koşul
+değil, veri yapısının doğal bir sonucu haline getirir; bu, doğru veri yapısının
+bir doğruluk güvencesini nasıl bedavaya çevirebildiğinin zarif bir örneğidir.
 
 ## Tek belge ile çok belge
 
@@ -130,10 +195,14 @@ seçim her zaman iş yüküne bağlıdır.
 Bu bölümde, OxiDB'nin işlem mekanizmasını yakın plana aldık. OxiDB'nin iyimser
 eşzamanlılık denetimini neden seçtiğini; değişiklikleri biriktirip, tamamlama
 anında üç fazlı bir düzenle — hazırlık, sürüm doğrulama ve tamamlama — işleyişini;
-çatışmanın sürüm numaralarıyla nasıl saptanıp iptale yol açtığını; işlemlerin
-dayanıklılıkla nasıl bütünleştiğini; kilitlenmenin sıralı kilit disipliniyle nasıl
-tasarımdan dışlandığını; tek belge ile çok belge ayrımını; küme durumundaki
-davranışı; ve iyimserliğin bedelini gördük.
+çatışmanın sürüm numaralarıyla nasıl saptanıp iptale yol açtığını; doğrulama ile
+uygulamanın bir tamamlama kilidiyle bölünmez kılınarak kayıp güncellemenin nasıl
+önlendiğini; işlemlerin, hazırlanmış mutasyonlar ve diske-uygulamadan-önce gelen
+bir tamamlama noktası aracılığıyla dayanıklılıkla nasıl bütünleştiğini ve grup
+tamamlamanın fsync'i nasıl amorti ettiğini; kilitlenmenin, sıralı bir kümenin
+doğal düzeninden gelen kilit disipliniyle nasıl tasarımdan dışlandığını; tek belge
+ile çok belge ayrımını; küme durumundaki davranışı; ve iyimserliğin bedelini
+gördük.
 
 İşlemleri ele alırken, OxiDB'nin disk-öncelikli kipinin append-only doğasına
 birkaç kez değindik. Beşinci ve on altıncı bölümlerde söylediğimiz gibi,

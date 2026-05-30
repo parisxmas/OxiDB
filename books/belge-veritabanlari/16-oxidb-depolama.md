@@ -33,6 +33,16 @@ hem yer açısından daha tutumludur hem de bir alana, tüm belgeyi baştan
 ayrıştırmadan doğrudan erişmeye olanak tanır. Bu inceliğin sorgu hızına katkısını,
 ileride sorgu motorunu ele alırken yeniden göreceğiz.
 
+Bu çekirdeğe eşlik eden ikinci bir bellek yapısı daha vardır: bir **belge
+önbelleği** (document cache). Bir belgenin baytları okunduğunda, OxiDB onları her
+seferinde yeniden çözmek yerine, bir kez çözüp sonucu paylaşımlı, sayılı bir
+göstericinin (refcounted pointer) ardında tutar; aynı belgeye sonradan dokunan
+istekler, çözülmüş bu temsili kopyalamadan paylaşır. Böylece sık erişilen bir
+belge için ayrıştırma maliyeti yalnızca bir kez ödenir. Bu önbellek, iki depolama
+kipinin de üzerinde durur; ama özellikle disk-öncelikli kipte değerlidir, çünkü
+orada bir okuma diske gidebilir ve önbellek bu maliyeti tekrar tekrar ödemeyi
+önler.
+
 ## İki kip, iki felsefe
 
 OxiDB'nin depolama katmanının en belirleyici özelliği, on üçüncü bölümde
@@ -63,10 +73,12 @@ bir kısıt haline gelir.
 İkinci kip, on üçüncü bölümün diske öncelikli felsefesini hayata geçirir ve
 isteğe bağlı olarak açılır. Bu kipte, bellekte tüm belgeler değil, yalnızca
 küçük bir **kimlik-konum dizini** durur: her belgenin kimliğinden, o belgenin
-disk üzerindeki yerine giden, belge başına yalnızca birkaç düzine bayt tutan
-kompakt bir eşleme. Belgelerin asıl baytları ise, beşinci bölümdeki append-only
-felsefeyle yazılan bir veri dosyasında — `.bdat` dosyasında — durur ve gerektiğinde
-oradan okunur.
+disk üzerindeki yerine — yani başlangıç konumu (offset) ve uzunluğa — giden,
+belge başına yalnızca birkaç düzine bayt tutan kompakt bir eşleme. Belgelerin
+asıl baytları ise, beşinci bölümdeki append-only felsefeyle yazılan bir veri
+dosyasında — `.bdat` dosyasında — durur ve gerektiğinde oradan okunur.
+
+![Disk-first: kimlik-konum dizini ve mmap'li veri dosyası.](sekiller/16c-diskfirst-dizin.svg){width=80%}
 
 Bu kararın bellek üzerindeki etkisi çarpıcıdır. Yerleşik bellek artık veriyle
 birlikte büyümez; yalnızca o küçük dizin kadar yer kaplar. Milyon belgelik bir
@@ -87,22 +99,38 @@ farklıdır: veritabanı açıldığında, bir koleksiyonun yanında hangi dosya
 gördüğüne bakarak onun hangi kipte olduğunu anlar.
 
 Buna eşlik eden üçüncü bir dosya, `.bopts`, on ikinci bölümde tanıdığımız
-per-koleksiyon seçeneklerini kalıcı kılar. OxiDB, depolama kipini ve sıkıştırma
-gibi tercihleri her koleksiyon için ayrı ayrı belirlemeye izin verir; ve bu
-tercihleri `.bopts` dosyasına yazar. Böylece bir koleksiyon, hangi tercihle
+per-koleksiyon seçeneklerini kalıcı kılar. OxiDB, bir koleksiyon için tek tek şu
+tercihleri saklar: koleksiyonun disk-öncelikli mi yoksa belleğe öncelikli mi
+olduğu; kayıtların sıkıştırılarak mı yoksa ham mı yazılacağı; otomatik sıkıştırmanın
+(yani ölü alanı geri kazanan bakımın) açık olup olmadığı; ve bu otomatik bakımın
+ne zaman tetikleneceğini belirleyen iki eşik — dosyanın en az ne kadar büyümesi
+gerektiği ve ölü alanın oranının hangi yüzdeyi aşması gerektiği. Bu beş tercih,
+bir koleksiyon ilk oluşturulurken seçilir ve `.bopts` dosyasına yazılır.
+
+Bu kalıcılığın incelikli ama önemli bir sonucu vardır. OxiDB'nin ilk
+sürümlerinde, disk-öncelik gibi tercihler yalnızca ortam değişkenleriyle, yani
+süreç düzeyinde belirleniyordu; bu da bir veritabanını farklı bir ortamda yeniden
+açtığınızda koleksiyonların beklenmedik bir kipe düşmesi anlamına gelebilirdi.
+`.bopts` dosyası bu kırılganlığı giderir: bir koleksiyon hangi tercihle
 oluşturulduysa, yeniden açıldığında o tercihle açılır — sistemin o anki ortam
-ayarlarından bağımsız olarak. Bu, on ikinci bölümdeki "per-koleksiyon ayar"
-fikrinin somut bir uygulamasıdır: aynı veritabanında, bir koleksiyon belleğe
-öncelikli, başka biri disk-öncelikli olabilir ve her biri kendi kimliğini
-korur.
+ayarlarından bağımsız olarak. Ortam değişkenleri artık yalnızca, açıkça bir tercih
+belirtilmemiş yeni koleksiyonlar için bir **varsayılan** rolü oynar. Böylece aynı
+veritabanında, bir koleksiyon belleğe öncelikli ve sıkıştırmalı, başka biri
+disk-öncelikli ve sıkıştırmasız olabilir; her biri kendi kimliğini, taşındığı her
+ortamda korur. Bu, on ikinci bölümdeki "per-koleksiyon ayar" fikrinin somut bir
+uygulamasıdır.
 
 ## Belleğe yansıtmanın somut etkisi
 
 Disk-öncelikli kipte, `.bdat` veri dosyası belleğe yansıtılır — on üçüncü
-bölümde değindiğimiz mmap tekniği. Bir belge okumak, kimlik-konum dizininden
+bölümde değindiğimiz mmap tekniği.^[Bellek-eşleme (memory-mapped files) — bir dosyayı sürecin adres uzayına yansıtarak, okuma/yazmayı sayfa hatalarıyla (page fault) işletim sisteminin sayfa önbelleğine devreden bir mekanizma. POSIX `mmap` çağrısı bunu standartlaştırır.] Bir belge okumak, kimlik-konum dizininden
 konumu bulmak ve ardından belleğe yansıtılmış dosyanın o konumundan baytları
 okumaktır. Veri zaten bellekteyse bu çok hızlıdır; değilse, işletim sistemi onu
-diskten getirir ve bellek baskı altındayken yine sessizce geri atabilir.
+diskten getirir ve bellek baskı altındayken yine sessizce geri atabilir. Bu
+"sessizce geri atma" yeteneği, disk-öncelikli kipin yerleşik bellek vaadinin
+özüdür: işletim sistemi, başka bir şey için yer açması gerektiğinde, mmap'li
+sayfaları diskte zaten bir kopyası olduğu için doğrudan serbest bırakabilir;
+çünkü bu sayfalar, değiştirilmemiş, diskle birebir aynı veridir.
 
 Bunun somut sonucu, on üçüncü bölümde tartıştığımız bellek ölçümü inceliğinin
 canlı bir örneğidir. Disk-öncelikli kipte, beş yüz bin belgelik bir koleksiyonu
@@ -119,6 +147,30 @@ dokunan büyük bir taramadan sonra, disk-öncelikli kipin belleği de yükselir
 alınabilir bir bellektir; baskı altında işletim sistemi onu serbest bırakır. Bu
 yüzden disk-öncelik, çalışma kümesi tüm veriden küçük olan yükler için en çok
 kazandırır; tüm veriyi sürekli baştan sona tarayan yükler için kazancı azalır.
+
+## Bir kaydın anatomisi: status, uzunluk, yük
+
+Disk-öncelikli `.bdat` dosyasındaki bir kaydın bayt düzeyindeki yapısını yakından
+görmek, hem append-only doğanın hem de soft-delete'in neden bu kadar ucuz
+olduğunu açıklar. Her kayıt üç parçadan oluşur: tek baytlık bir **durum baytı**
+(status), ardından dört baytlık bir **uzunluk alanı** ve en sonda **yük**
+(payload) — yani belgenin asıl, kodlanmış baytları. Uzunluk alanı, yükün kaç bayt
+olduğunu küçük-uçtan-büyüğe (little-endian) düzende söyler; böylece okuyucu, bir
+kaydın nerede bitip bir sonrakinin nerede başladığını, içeriği çözmeden bilir.
+
+![.bdat kaydının bayt düzeni.](sekiller/16b-bdat-kayit.svg){width=80%}
+
+Bu basit düzen, beşinci bölümde tanıdığımız iki mekanizmayı doğrudan mümkün
+kılar. Bir belgeyi okumak için sistem, kimlik-konum dizininden başlangıç konumunu
+alır, beş baytlık başlığı (bir durum baytı artı dört baytlık uzunluk) atlar ve
+uzunluğun söylediği kadar yükü okur. **Soft-delete** ise yalnızca durum baytını
+"canlı"dan "silinmiş"e çevirmektir: gövdeye hiç dokunulmaz, dosya yeniden
+yazılmaz: tek bir bayt yerinde değişir. Bu yüzden silme neredeyse bedavadır;
+bedeli, silinen kaydın yerinin bir süre ölü alan olarak kalmasıdır. Yükün
+sıkıştırılmış mı yoksa ham mı olduğu, ayrı bir bayrağa gerek kalmadan, yükün ilk
+baytlarındaki sıkıştırma biçiminin sihirli imzasından (magic bytes) anlaşılır;
+böylece sıkıştırılmış ve sıkıştırılmamış kayıtlar aynı dosyada karışık durabilir
+ve doğru okunabilir.
 
 ## Append-only olmanın sonuçları
 
@@ -139,7 +191,7 @@ biçimde yapıldığında oldukça verimlidir.
 
 On üçüncü bölümde sıkıştırmanın yer-işlemci-sıfırkopya üçgenini tanıtmıştık;
 OxiDB'nin disk-öncelikli kipi, bu üçgenin tam bir uygulamasını sunar. `.bdat`
-dosyasındaki kayıtlar, sıkıştırılmış olarak ya da — isteğe bağlı bir tercihle —
+dosyasındaki kayıtlar, hızlı ve dengeli bir sıkıştırma algoritmasıyla^[zstd (Zstandard) — Facebook tarafından geliştirilen, yüksek sıkıştırma oranını düşük işlemci maliyetiyle birleştiren, kayıpsız bir sıkıştırma algoritması; RFC 8878 olarak standartlaştırılmıştır.] sıkıştırılmış olarak ya da — isteğe bağlı bir tercihle —
 sıkıştırılmadan saklanabilir. Sıkıştırılmış saklama, diskte daha az yer kaplar,
 ama her okumada baytların açılmasını gerektirir. Sıkıştırılmamış saklama daha
 çok yer kaplar, ama on üçüncü bölümde tanıttığımız sıfır-kopya erişimi mümkün

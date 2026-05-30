@@ -46,6 +46,22 @@ zamanlı ilerleyebilir. Koleksiyonlar, ilk yazma geldiğinde kendiliğinden olu�
 önceden tanımlanmaları gerekmez — dördüncü bölümdeki şema esnekliğinin bir
 yansımasıdır bu.
 
+Bu eşzamanlılık modelinin somut yapısına bakmaya değer, çünkü kitap boyunca
+döneceğimiz "eş zamanlı okuma" yeteneğinin kaynağı budur. Motor, koleksiyon
+adından koleksiyona giden bir eşlemeyi, bir **okuma-yazma kilidi** (read-write
+lock) ardında tutar: koleksiyon **listesini** değiştiren ender bir işlem —
+örneğin yeni bir koleksiyonun ilk kez oluşması — bu kilidi yazma kipinde, kısa
+bir an için tutar; oysa var olan bir koleksiyona erişen sıradan isteklerin ezici
+çoğunluğu, kilidi yalnızca okuma kipinde tutup koleksiyonu işaret eden paylaşımlı
+bir tutamak (handle) alır ve hemen bırakır. Böylece dış kilit, neredeyse hiçbir
+zaman bir darboğaza dönüşmez. Asıl eşzamanlılık ise koleksiyonun **içinde**
+yaşar: belge baytları, kova düzeyinde (bucket-level) kilitlenen, kilitsiz okumaya
+yakın davranan eş zamanlı bir hash eşlemesinde tutulur. Bu yapı sayesinde aynı
+koleksiyonun farklı belgelerine dokunan birçok iş parçacığı, tek bir büyük kilidi
+sırayla beklemek yerine paralel ilerler.^[scc (Scalable Concurrent Containers) — kova düzeyinde kilitleme ve atomik göstericilerle eş zamanlı okuma/yazmayı tek bir dış kilit darboğazı olmadan destekleyen Rust veri yapıları kütüphanesi.] Bu, on
+beşinci bölümde değindiğimiz "koleksiyon içinde eş zamanlı erişim" yeteneğinin
+mimari temelidir.
+
 Her **koleksiyon**, kendi içinde, ikinci kısımda tanıdığımız bileşenleri
 barındırır: belge baytlarını tutan bir depolama katmanı; dayanıklılığı sağlayan
 bir yazma-öncesi günlük; sık erişilen veriyi bellekte tutan önbellekler; aramayı
@@ -112,11 +128,29 @@ kavramlar — koleksiyonlar, sorgular, indeksler, işlemler — bu istemcilerin
 hepsinde aynı biçimde karşımıza çıkar; çünkü hepsi, aynı çekirdek motorun farklı
 kapılarıdır.
 
+Bu bölünmeyi somut adlarıyla anmak yararlıdır, çünkü kod tabanını gezerken bu
+adlarla karşılaşırsınız. Çekirdek motor, kendi içinde bağımsız bir kütüphane
+(`oxidb` paketi) olarak yaşar; ikinci kısımda tek tek anlattığımız tüm
+mekanizmalar — depolama, yazma-öncesi günlük, indeksler, sorgu ve toplama, işlem
+yöneticisi, sıkıştırma, şifreleme — bu çekirdeğin parçalarıdır ve hiçbiri ağ ya
+da kimlik doğrulama hakkında bir şey bilmez. Bunun üzerine oturan **sunucu
+bileşeni** (`oxidb-server`), ağ protokolünü, kimlik doğrulamayı, rol tabanlı
+erişim denetimini, aktarım şifrelemesini ve denetim günlüğünü ekler; çekirdeği
+bir kütüphane olarak çağırır. Üçüncü parça, **C uyumlu köprü katmanıdır**
+(`oxidb-client-ffi`): çekirdeği, hemen her dilin konuşabildiği sade bir C
+arayüzü ardına koyar; Python, Go, .NET ve diğer istemciler bu köprü üzerinden
+gömülü kipte çekirdeğe doğrudan bağlanabilir. Bu üçlü ayrım rastgele değildir;
+"çekirdek hiçbir taşıma katmanını tanımaz" ilkesi sayesinde aynı motor, gömülü
+bir kütüphane, ağ sunucusu ya da tarayıcıdaki bir wasm modülü olarak, kodun
+tekrarlanmasına gerek kalmadan çalışabilir.
+
 ## Bir isteğin yaşam döngüsü
 
 Tüm bu parçaların nasıl birlikte çalıştığını görmek için, bir isteğin sistemden
 nasıl geçtiğini kabaca izleyelim; bu izlek, üçüncü kısmın geri kalanının yol
 haritası gibidir.
+
+![Bir isteğin iki kapısı ve ortak çekirdek.](sekiller/15b-istek-akisi.svg){width=80%}
 
 Bir istek iki yoldan gelebilir. Gömülü kipte, doğrudan bir işlev çağrısı olarak;
 sunucu kipinde ise ağ üzerinden, OxiDB'nin kendi ikili protokolüyle çerçevelenmiş
@@ -129,6 +163,19 @@ yazmaysa, önce yazma-öncesi günlüğe kaydedilir ve dayanıklı kılınır, s
 depolama katmanına ve indekslere uygulanır. Sonuç, geldiği yoldan geri döner.
 Kümeleme kipinde, bir yazma ek olarak konsensüs katmanından, sharding'de ise
 yönlendiriciden geçer.
+
+İki kapı arasındaki fark, yalnızca isteğin nasıl çerçevelendiğindedir; çekirdeğe
+indikten sonra izlenen yol aynıdır. Gömülü kipte istek, bir işlev çağrısı olarak
+gelir ve hiçbir ağ ya da güvenlik katmanına uğramadan doğrudan motora ulaşır;
+güvenlik denetimi, gömülü kipi kullanan uygulamanın kendi sorumluluğundadır.
+Sunucu kipinde ise istek, ağ üzerinden, OxiDB'nin uzunluk-önekli ikili
+protokolüyle çerçevelenmiş bir mesaj olarak gelir: her mesajın başında, gövdenin
+uzunluğunu bildiren bir önek vardır; böylece sunucu, bir mesajın nerede bitip
+diğerinin nerede başladığını, akışı çözmeye çalışmadan bilir. Bu mesaj önce
+güvenlik süzgecinden geçer — kimlik doğrulanır, rolün bu işleme izni denetlenir —
+ardından çekirdeğe, gömülü kiptekiyle aynı kapıdan girer. Bu yüzden sunucu
+katmanı, çekirdeğin üzerinde ince bir kabuktur: ona bir ağ yüzü ve bir güvenlik
+kapısı ekler, ama veritabanı işinin kendisini değiştirmez.
 
 Bu kısa izlek, aslında bu kitabın bir özetidir: bir istek, ikinci kısımda tek tek
 anlattığımız tüm katmanlardan sırayla geçer. Üçüncü kısmın geri kalanı, bu

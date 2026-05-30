@@ -90,16 +90,72 @@ yapraklar arasında yan yana ilerlemek yeterlidir. B-ağacı, hem tekil hem aral
 okumalarında olağanüstü iyidir; bu yüzden okuma-yoğun, sorgu-zengin sistemlerin
 gözdesi olmuştur.
 
+### Düğümün içi: fanout, dolum oranı, dallanma derinliği
+
+Bu dosyalama dolabı benzetmesinin altındaki sayısal davranışı görmek, B-ağacının
+neden bu kadar etkili olduğunu açıklar. Her düğüm bir diske bir sayfaya, yani
+sabit boyutlu bir bloğa karşılık gelir — tipik olarak dört ya da sekiz
+kilobaytlık bir blok. Bir iç (ara) düğümün içine, mümkün olduğunca çok sayıda
+**ayrıcı anahtar** (separator key) ve onlara karşılık gelen çocuk işaretçisi
+sığdırılır. Bir düğümün kaç çocuğa dallandığı sayısına o ağacın **fanout'u**
+(çıkış genişliği) denir. Anahtarlar küçük olduğunda, tek bir sayfaya yüzlerce
+ayrıcı sığabilir; yani fanout yüzlerle ölçülür. Bunun derinliğe etkisi
+çarpıcıdır: fanout'u iki yüz olan bir ağaç, tek seviyede iki yüz, iki seviyede
+kırk bin, üç seviyede sekiz milyon, dört seviyede bir buçuk milyar kaydı kapsar.
+Yani milyarlarca kayıt arasında bile, kök düğümden bir yaprağa inmek topu topu
+üç-dört sayfa erişimi alır. B-ağacının vaadi tam da budur: derinliği, veri
+miktarının **logaritması** kadar yavaş büyür ve fanout büyük olduğu için bu
+logaritmanın tabanı büyüktür — yani ağaç şaşırtıcı derecede sığ kalır.
+
+Burada çoğu modern veritabanının kullandığı belirli bir biçimi anmak gerekir:
+**B+ağacı**. Saf B-ağacında veri her düğümde bulunabilirken, B+ağacında tüm
+gerçek kayıtlar yalnızca **yapraklarda** durur; iç düğümler yalnızca yol
+gösteren ayrıcı anahtarları taşır. Bu ayrımın iki büyük getirisi vardır.
+Birincisi, iç düğümler veri taşımadığı için daha çok ayrıcı sığdırır, fanout
+artar, ağaç daha da sığ olur. İkincisi — ve aralık sorguları için kritik olanı —
+yapraklar bir **bağlı liste** ile soldan sağa birbirine zincirlenir. Bir
+aralığın başını bir kez bulduktan sonra, ağaca tekrar tepeden inmeden, yapraktan
+yaprağa yürüyerek tüm aralığı sırayla okursunuz. Bu, "şu tarihten bu tarihe kadar
+tüm siparişler" gibi sorguları neredeyse ardışık bir okuma hızına indirir.
+
+Düğümlerin ne kadar dolu tutulacağı da bir tasarım kararıdır ve buna **dolum
+oranı** (fill factor) denir. Bir düğüm asla tamamen boş ya da tamamen dolu
+tutulmaz; tipik olarak yarısıyla tamamı arasında bir doluluk hedeflenir. Çok dolu
+tutmak, her küçük eklemede taşma ve bölünme riskini artırır; çok boş tutmak ise
+yer israf eder ve ağacı gereksiz şişirir. Rastgele anahtar ekleme örüntülerinde
+ağaçlar pratikte yaklaşık yüzde yetmiş civarı dolulukta dengelenir; oysa
+anahtarlar hep artan sırada (örneğin zaman damgası ya da otomatik kimlik)
+geliyorsa, ekleme hep en sağdaki yaprağa düşer ve sayfalar neredeyse tamamen
+doldurulabilir — bu, depolamayı sıkılaştıran, bilinçli olarak istenen bir
+örüntüdür.
+
+### Bölme ve birleştirme: dengeyi korumanın bedeli
+
+B-ağacının "dengeli" kalması, yani her yaprağa aynı sayıda adımda inilmesi, kendi
+kendine olmaz; ekleme ve silme sırasında ağacın kendini onarmasıyla sağlanır.
+Bir yaprağa yeni bir anahtar eklemek istediğinizde ve o yaprak zaten doluysa,
+yaprak **bölünür** (split): içindeki anahtarlar kabaca ikiye ayrılır, yarısı
+yeni bir sayfada kalır, ortadaki ayrıcı anahtar bir üst düğüme **yükselir**. Eğer
+o üst düğüm de doluysa, bölünme yukarı doğru zincirleme yayılır; en kötü durumda
+köke kadar çıkar ve kök bölündüğünde ağacın boyu bir artar. Tersine, silmeler bir
+yaprağı belirli bir alt eşiğin altına düşürürse, o yaprak bir komşusuyla
+**birleştirilir** (merge) ya da komşusundan anahtar **ödünç alır** (rebalance);
+böylece hiçbir düğüm fazla seyrek kalmaz. Bu bölme-birleştirme dansı, ağacın hep
+dengeli ve sığ kalmasının bedelidir.
+
+![Yaprak dolunca bölünür; ortadaki ayrıcı anahtar üst düğüme yükselir.](sekiller/05b-btree-bolme.svg){width=80%}
+
 Bedeli ise yazmada ortaya çıkar. Bir kaydı değiştirdiğinizde, B-ağacı onu diskte
 ait olduğu sayfada, **yerinde** günceller. Bu, az önce diskin en sevmediği şey
 dediğimiz rastgele yazma demektir: değiştirilecek sayfa diskin neresindeyse,
-oraya gidilip o sayfa okunur, değiştirilir, geri yazılır. Dahası, ağaç dengesini
-korumak için sayfaların ara sıra bölünmesi ya da birleşmesi gerekir; bu da ek
-yazmalar doğurur. Tek bir küçük değişikliğin diske birden çok blok yazılmasına yol
-açmasına **yazma büyütmesi** (write amplification) denir ve B-ağaçlarının doğal
-bir maliyetidir. Bir de eşzamanlılık zorluğu vardır: birçok işlem aynı sayfalara
-aynı anda dokunabileceği için, sayfaların dikkatlice kilitlenmesi gerekir;
-bunun inceliklerine on birinci bölümde döneceğiz.
+oraya gidilip o sayfa okunur, değiştirilir, geri yazılır. Dahası, az önceki
+bölme-birleştirme dansı her seferinde birden çok sayfaya dokunur; üstelik
+çoğu sistem bir sayfanın yarısını değil **tüm sayfayı** yeniden yazar. Tek bir
+küçük değişikliğin diske birden çok blok, hatta kilobaytlarca veri yazılmasına
+yol açmasına **yazma büyütmesi** (write amplification) denir ve B-ağaçlarının
+doğal bir maliyetidir. Bir de eşzamanlılık zorluğu vardır: birçok işlem aynı
+sayfalara aynı anda dokunabileceği için, sayfaların dikkatlice kilitlenmesi
+gerekir; bunun inceliklerine on birinci bölümde döneceğiz.
 
 Özetle B-ağacı yaklaşımı, okumayı en üst düzeye çıkarmak için veriyi düzenli ve
 yerinde tutar; bunun karşılığında rastgele yazma ve yazma büyütmesi maliyetini
@@ -123,11 +179,18 @@ Ama bedava öğle yemeği yoktur; bu yaklaşım iki yeni sorun doğurur. Birinci
 **okuma sorunudur**. Bir kaydın en güncel hâli defterin neresinde diye, dosyayı
 baştan sona taramak kabul edilemez. Bu yüzden append-only motorlar, ayrı bir
 **dizin** tutar: her kaydın kimliğinden, o kaydın en güncel hâlinin dosyada
-durduğu konuma bir eşleme. Yazarken bu dizini güncellersiniz; okurken önce dizine
-bakıp konumu öğrenir, sonra doğrudan o konuma gidersiniz. Yani append-only motor,
-veriyi düzensiz yazmanın getirdiği okuma zorluğunu, ayrı bir dizinle telafi eder.
-(Bu dizinin kendisi de bellekte ya da diskte tutulabilir; üçüncü kısımda OxiDB'nin
-tam olarak böyle bir kimlik-konum dizini kullandığını göreceğiz.)
+durduğu konuma — yani dosya başından kaç bayt ilerideki ofsete — bir eşleme.
+Yazarken bu dizini güncellersiniz; okurken önce dizine bakıp konumu öğrenir, sonra
+doğrudan o konuma gidersiniz. Bu dizin, bir karma tablo (hash) biçiminde bellekte
+tutulabilir — ki o zaman kimlikten konuma erişim sabit zamanlıdır, ama tüm
+anahtarların belleğe sığması gerekir — ya da diskte sıralı bir yapıda tutulabilir.
+Önemli bir özellik şudur: bu yaklaşımda **veri kaydının kendisi** kimlik, uzunluk
+ve içeriği gömülü olarak taşıyabilir; böylece dizin çökmede kaybolsa bile, dosyayı
+baştan sona bir kez tarayarak yeniden inşa edilebilir. Yani dizin, hızlandırıcı
+bir kestirmedir; gerçeğin tek kaynağı her zaman append-only veri dosyasının
+kendisidir. (Üçüncü kısımda OxiDB'nin tam olarak böyle bir kimlik-konum dizini
+kullandığını ve her kaydı bir durum baytı, uzunluk alanı ve yük olarak nasıl
+sakladığını göreceğiz.)
 
 İkincisi **ölü alan sorunudur**. Madem eski kayıtların üzerine yazmıyoruz, onlar
 dosyada öylece durmaya devam eder. Bir kaydı yüz kez güncellerseniz, dosyada o
@@ -149,22 +212,77 @@ birleştirmeli ağaç".^[P. O'Neil, E. Cheng, D. Gawlick ve E. O'Neil, "The Log-
 zorluğunu, akıllıca bir düzenlemeyle hafifletir.
 
 LSM'nin fikri şudur: gelen yazmaları önce **bellekte**, sıralı bir yapıda
-biriktir. Bellek hızlı olduğu için bu yazmalar anında kabul edilir. Bellekteki
-bu tampon dolduğunda, içerik tek seferde, **sıralı** biçimde diske bir
-"parça" olarak yazılır — yine ardışık yazma, yine diskin sevdiği biçim. Zamanla
-diskte böyle birçok sıralı parça birikir. Arka planda çalışan bir süreç, bu
-parçaları periyodik olarak **birleştirir** (merge): birkaç sıralı parçayı tek bir
-büyük sıralı parçaya kaynaştırır, bu sırada ölü kayıtları da ayıklar. Bu
-birleştirme, append-only modelin sıkıştırmasının daha düzenli, kademeli bir
-biçimidir.
+biriktir. Bu bellek içi sıralı tampona **memtable** denir; genellikle hızlı
+eklemeye ve sıralı taramaya elveren bir ağaç ya da atlama listesi olarak tutulur.
+Bellek hızlı olduğu için bu yazmalar anında kabul edilir. (Bu noktada akla bir
+soru gelir: memtable bellektedir, peki çökerse ne olur? Yanıt, bir sonraki
+bölümün konusu olan yazma-öncesi günlüktür; LSM her yazmayı memtable'a koymadan
+önce ayrıca bir günlüğe ekler, böylece çökmede memtable yeniden inşa edilebilir.)
+
+Memtable belirli bir boyuta ulaştığında, salt-okunur kılınır ve içeriği tek
+seferde, baştan sona **sıralı** biçimde diske bir dosya olarak boşaltılır. Bu
+sıralı, değişmez disk dosyasına **SSTable** (sıralı-dizili tablo) denir — yine
+ardışık yazma, yine diskin sevdiği biçim, üstelik bir kez yazıldıktan sonra asla
+değiştirilmez. Zamanla diskte böyle birçok SSTable birikir. Arka planda çalışan
+bir süreç, bu dosyaları periyodik olarak **birleştirir** (merge): birkaç sıralı
+dosyayı, sıralı listeleri birleştirme tekniğiyle tek bir büyük sıralı dosyaya
+kaynaştırır, bu sırada bir anahtarın eski sürümlerini ve silinmiş kayıtları
+ayıklar. Buna **sıkıştırma** (compaction) denir ve append-only modelin
+temizliğinin daha düzenli, kademeli bir biçimidir.
+
+### İki birleştirme stratejisi: leveled ve size-tiered
+
+Sıkıştırmanın *nasıl* düzenleneceği, LSM motorlarının ödünleşim eğrisini büyük
+ölçüde belirleyen iki ana okula ayrılır. Birincisi **seviyeli sıkıştırma**
+(leveled compaction): SSTable'lar seviyelere yerleştirilir ve her seviye, bir
+öncekinden kabaca on kat daha büyüktür. En alttaki seviye (L0) dışında, her
+seviyenin içindeki dosyaların anahtar aralıkları **birbiriyle çakışmaz**; yani
+bir seviyede belirli bir anahtarı tutabilecek en fazla bir dosya vardır. Bu,
+okumayı keskinleştirir — bir kaydı bulmak için seviye başına en fazla bir dosyaya
+bakılır — ama bir bedeli vardır: üst seviyeye boşaltılan veri, alt seviyenin
+çakışan dosyalarıyla sürekli yeniden birleştirildiği için, aynı veri ömrü boyunca
+defalarca yeniden yazılır; yani yazma büyütmesi yüksektir.
+
+İkincisi **boyut katmanlı sıkıştırma** (size-tiered compaction): benzer boyuttaki
+SSTable'lar bir araya biriktirilir ve yeterince birikince hepsi tek seferde tek
+bir büyük dosyaya birleştirilir. Bu, her veriyi daha az kez yeniden yazdığı için
+yazma büyütmesini düşürür; karşılığında aynı anahtarın birden çok katmanda kopyası
+bulunabildiği için hem yer büyütmesi hem okuma büyütmesi artar. Kabaca: seviyeli
+strateji okuma-yoğun yükleri, boyut katmanlı strateji yazma-yoğun yükleri
+kayırır. Bu seçim, bir önceki bölümdeki "okumaya mı yazmaya mı eniyilemek"
+gerilimini, tek bir motorun içinde ayarlanabilir bir kadrana dönüştürür.
+
+![LSM: memtable'dan SSTable'a boşaltma, seviyeler ve sıkıştırma.](sekiller/05c-lsm-seviye.svg){width=80%}
+
+### Okuma yolunu kurtaran iki yardımcı: bloom filtresi ve fence pointer
 
 LSM, yazmada olağanüstü hızlıdır, çünkü her yazma önce belleğe gider ve diske hep
-ardışık yazılır. Okumada ise bir bedel vardır: bir kaydı ararken, en güncel
-hâli hangi parçada diye birden çok parçaya bakmak gerekebilir. Bu maliyeti
-azaltmak için LSM motorları, "bu kayıt bu parçada **kesinlikle yok**" sorusunu
-diske hiç bakmadan, çok ucuza yanıtlayan olasılıksal yardımcı yapılar kullanır;
-böylece çoğu boşa aramadan kurtulur. Yine de LSM, doğası gereği, yazmayı
-okumanın ve arka plan birleştirme yükünün önüne koyan bir tasarımdır.
+ardışık yazılır. Okumada ise doğal bir bedel vardır: bir kaydı ararken, en güncel
+hâli hangi dosyada diye, memtable'dan başlayıp seviye seviye birçok SSTable'a
+bakmak gerekebilir. Bu maliyeti iki ayrı yardımcı yapı dramatik biçimde düşürür.
+
+Birincisi **bloom filtresi** (bloom filter): her SSTable'ın yanına iliştirilen,
+çok küçük, olasılıksal bir üyelik testidir.^[B. H. Bloom, "Space/Time Trade-offs
+in Hash Coding with Allowable Errors," *Communications of the ACM* 13(7), 1970.]
+Bir anahtarın o dosyada olup olmadığını sorduğunuzda, bloom filtresi iki yanıttan
+birini verir: "kesinlikle yok" ya da "belki var". "Kesinlikle yok" yanıtı asla
+yanlış olmaz; bu yüzden, dosyadaki anahtarların büyük çoğunluğu için, diske hiç
+dokunmadan o dosyayı atlayabilirsiniz. "Belki var" yanıtı ise bazen yanlış
+alarm (false positive) olabilir — filtre bazen "belki var" der ama anahtar
+aslında yoktur — ancak bu yanlış alarm oranı, filtreye ayrılan bellek miktarıyla
+ayarlanabilir; tipik olarak yüzde bir dolayında tutulur. Böylece bir LSM araması,
+anahtarı içermeyen onlarca dosyayı, her biri için yalnızca birkaç bayttan
+hesaplanan bir sınama ile eler.
+
+İkincisi **fence pointer** (sınır işaretçileri, ya da seyrek indeks): bir SSTable
+sıralı olduğu için, motor o dosyanın her N kilobaytlık bloğunun başındaki anahtarı
+küçük bir tabloda saklar. Bloom filtresi "belki var" dediğinde, fence pointer'lar
+hangi bloğun aranan anahtarı içerebileceğini söyler; böylece koca dosyayı
+taramak yerine, tek bir bloğu okumak yeterli olur. Bloom filtresi *hangi dosyaya
+hiç bakmayacağını*, fence pointer *bir dosyanın neresine bakacağını* söyler;
+ikisi birlikte, LSM'nin okuma yolunu bir tam taramadan birkaç hedefli blok
+okumasına indirir. Yine de LSM, doğası gereği, yazmayı okumanın ve arka plan
+sıkıştırma yükünün önüne koyan bir tasarımdır.
 
 ## Üç büyütme: kaçınılmaz üçgen
 
@@ -182,11 +300,50 @@ ise birden çok parçaya bakmak zorunda kalabildiği için daha kötüdür. **Ye
 büyütmesi**, verinin diskte mantıksal boyutunun kaç katı yer kapladığıdır;
 append-only ve LSM'de biriken ölü kayıtlar bunu artırır, sıkıştırma azaltır.
 
+Bu üçgenin sayısal davranışını bir an somutlaştırmak öğreticidir. Seviyeli
+sıkıştırmalı bir LSM'de, her seviye bir öncekinin on katıysa ve veri en üst
+seviyeye ulaşana dek her seviyede yaklaşık bir kez yeniden yazılıyorsa, on bir
+seviyelik bir ağaçta tek bir mantıksal yazma, ömrü boyunca diske onlarca kez
+yazılabilir — yazma büyütmesi on katı aşar. B-ağacında ise yazma büyütmesi,
+genellikle değiştirilen kaydın boyutu ile tüm sayfanın boyutu arasındaki orana
+bağlıdır: yüz baytlık bir kaydı değiştirmek için sekiz kilobaytlık bir sayfayı
+yeniden yazmak, seksen katlık bir büyütme demektir. Yer büyütmesi tarafında ise
+LSM ve append-only motorlarda biriken ölü kayıtlar, sıkıştırma yetişemediğinde
+veriyi mantıksal boyutunun iki-üç katına çıkarabilir; B-ağacında ise dolum oranı
+yüzde yetmiş dolayındaysa, sayfaların boş kalan üçte biri kalıcı bir yer büyütmesi
+olarak durur.
+
 Bu üçgen, neden tek bir "en iyi" depolama motoru olmadığını net biçimde gösterir.
 B-ağaçları okuma büyütmesini en aza indirir, yazma ve belirli durumlarda yer
 büyütmesini öder; LSM ve append-only yaklaşımlar yazmayı en aza indirir, okuma ve
 yer büyütmesini öder. Hangisinin doğru olduğu, üçüncü bölümdeki o değişmez ilkeye
 geri döner: iş yükünüze, yani okuma mı yoksa yazma mı baskın olduğuna bağlıdır.
+
+## Anahtar ile değeri ayırmak: yazma büyütmesini kırmak
+
+LSM'nin yazma büyütmesinin asıl kaynağına yakından bakınca, ince bir israf görülür.
+Sıkıştırma sırasında, motor bir SSTable'ı yeniden yazarken hem anahtarları hem de
+onlara bağlı **tüm değerleri** taşır. Oysa sıralamanın, birleştirmenin ve aramanın
+yalnızca **anahtarlara** ihtiyacı vardır; değerler — ki belge veritabanlarında
+bunlar koca koca belgelerdir — yalnızca taşınmak zorunda kalan ölü ağırlıktır. Bir
+kilobaytlık bir belge, anahtarı hiç değişmese bile, ağaçta yukarı taşındığı her
+seferde yeniden kopyalanır. Yazma büyütmesinin aslan payı buradan gelir.
+
+Bu gözlemden doğan zarif bir fikir, **anahtar-değer ayrımıdır** (key-value
+separation): değerleri LSM ağacının içinde tutmak yerine, ayrı bir append-only
+**değer günlüğüne** yazmak ve ağaçta her anahtarın yanında yalnızca o değere bir
+işaretçi — küçük bir ofset — saklamak.^[L. Lu, T. S. Pillai, A. C.
+Arpaci-Dusseau ve R. H. Arpaci-Dusseau, "WiscKey: Separating Keys from Values in
+SSD-Conscious Storage," *14th USENIX Conference on File and Storage Technologies
+(FAST '16)*, 2016.] Bu sayede sıkıştırma yalnızca küçük anahtar-işaretçi
+çiftlerini taşır; ağır değerler yerinde durur ve hiç yeniden yazılmaz. Yazma
+büyütmesi çarpıcı biçimde düşer. Karşılığında iki yeni maliyet doğar: bir okuma
+artık önce ağaçtan işaretçiyi, sonra değer günlüğünden değeri okuduğu için iki
+adım gerektirir (katı hal sürücülerinde bu fazladan dağınık okuma ucuzdur, ama
+bedavadır da denemez); ve değer günlüğü de zamanla ölü değerlerle dolacağı için
+ona ayrı bir çöp toplama süreci gerekir. Bu fikir, depolama motoru tasarımının
+hâlâ canlı bir araştırma alanı olduğunu ve üçgenin köşelerinin sürekli yeniden
+müzakere edildiğini gösteren iyi bir örnektir.
 
 ## Belleğin rolü ve veriyi belleğe yansıtmak
 

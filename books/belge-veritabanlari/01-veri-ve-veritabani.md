@@ -48,6 +48,75 @@ sorudur. İkinci kısımda bu inceliğin üzerine uzun uzun eğileceğiz; şimdi
 şunu aklınızda tutun: veriyi kalıcı kılmak, onu yalnızca diske göndermek değil,
 oraya **gerçekten ulaştığından emin olmaktır**.
 
+### Depolama hiyerarşisi: hızın ve unutkanlığın katmanları
+
+Bellek ile disk arasındaki bu uçurum, aslında izole iki nokta değil; bir
+**depolama hiyerarşisinin** (storage hierarchy) iki ucudur. Bir bilgisayarda
+veri, bir piramidin katmanlarında yaşar ve her katman, hız ile kalıcılık,
+maliyet ile kapasite arasında farklı bir denge tutar. En tepede, işlemcinin
+içindeki yazmaçlar (register) ve önbellekler (cache) durur; bunlara erişim
+nanosaniyenin de altındadır, ama kapasiteleri kilobaytlar mertebesindedir ve
+uçucudurlar. Bir basamak aşağıda ana bellek (RAM) vardır: yine nanosaniyeler
+mertebesinde, gigabaytlar kapasiteyle, ama yine uçucu. Onun altında, ilk kalıcı
+katman olarak katı hal sürücüsü gelir; erişimi onlarca mikrosaniye sürer.
+En altta dönen disk (manyetik HDD) ve ondan da uzakta ağ üzerindeki ya da soğuk
+arşivdeki depolama bulunur; bunların erişimi milisaniyeler, hatta saniyeler
+alabilir.
+
+![Depolama hiyerarşisi: yukarı çıktıkça hız artar, aşağı indikçe kalıcılık ve kapasite.](sekiller/01b-depolama-hiyerarsi.svg){width=80%}
+
+Bu hiyerarşinin değişmez kuralı şudur: bir katman ne kadar hızlıysa, o kadar
+pahalı, o kadar küçük ve neredeyse her zaman o kadar uçucudur. Hız ile kalıcılık
+doğada birbirine düşmandır. İşte bir VTYS'nin işinin büyük kısmı, bu düşmanlığı
+yönetmektir: veriyi kalıcı olması için yavaş katmana yazmak, ama erişimi hızlı
+olsun diye sık kullanılanları hızlı katmanda **önbelleğe almak**. Bir
+veritabanının iç mimarisinde tekrar tekrar göreceğimiz örüntü budur; sıcak
+veriyi bellekte tutmak, soğuk veriyi diske bırakmak, ve ikisi arasında doğru
+sınırı çizmek.
+
+Erişim **gecikmesinin** (latency) bu katmanlar arasında milyonlarca kat
+değişmesinin somut bir sonucu vardır: bir veritabanının performansını belirleyen
+şey, ham hesaplama gücünden çok, **veriye nereden ve kaç kez erişildiğidir**. Bir
+sorgunun bir milyon kez belleğe mi yoksa bin kez diske mi gittiği, çoğu zaman
+saniyelerle mikrosaniyeler arasındaki farktır. Bu yüzden veritabanı tasarımının
+neredeyse tüm sanatı, yavaş katmana yapılan erişimleri azaltmaya — indekslerle,
+önbelleklerle, veriyi bir arada tutmakla — adanmıştır.
+
+### Diskin acımasız kuralları: blok, sayfa ve sıralı erişim
+
+Diskin belleğe benzemeyişi yalnızca yavaşlığından ibaret değildir; çalışma
+**granülerliği** de farklıdır. Bellekte tek bir baytı okuyup yazabilirsiniz.
+Disk ise veriyi yalnızca sabit boyutlu **bloklar** (block) ya da **sayfalar**
+(page) halinde — tipik olarak dört kilobaytlık birimlerle — okur ve yazar. Tek
+bir baytı değiştirmek isteseniz bile, donanım o baytın içinde bulunduğu tüm bloğu
+okur, değiştirir ve geri yazar. Buna **oku-değiştir-yaz** (read-modify-write)
+döngüsü denir ve küçük, dağınık güncellemelerin neden bu kadar pahalı olduğunun
+kökünde bu yatar.
+
+Buradan iki temel ders çıkar; ikinci kısımdaki depolama motoru tasarımı baştan
+sona bu iki derse dayanır. Birincisi, **sıralı erişim, rastgele erişimden kat
+kat hızlıdır**. Diskte arka arkaya duran blokları okumak, oraya buraya
+sıçrayarak okumaktan çok daha ucuzdur; dönen disklerde okuma kafasının fiziksel
+hareketi yüzünden, SSD'lerde ise iç paralelliğin ancak ardışık erişimde
+doyurulabilmesi yüzünden. Bu yüzden iyi bir depolama motoru, veriyi mümkün
+olduğunca **ardışık** yazmaya çalışır; altıncı bölümde göreceğimiz "ekleme-only"
+(append-only) günlük yapısının arkasındaki sezgi tam olarak budur. İkincisi,
+yazmaları **gruplamak** (batching) tek tek yazmaktan ucuzdur, çünkü blok başına
+düşen sabit maliyet birçok kayda bölünür.
+
+Bütün bunların üstüne bir de bellekle disk arasında oturan birçok ara katman
+biner: işletim sisteminin sayfa önbelleği, diskin kendi tampon belleği, hatta
+sürücünün üzerindeki uçucu önbellek. Bu katmanlar performansa yardım eder ama
+dayanıklılık açısından bir tuzak kurar: "diske yaz" dediğinizde veri çoğu zaman
+yalnızca bu uçucu tamponlardan birine ulaşır, henüz kalıcı yüzeye işlenmemiştir.
+Veriyi gerçekten kalıcı kılmak için, sistemden bu tüm tamponları kalıcı katmana
+**boşaltmasını** açıkça istemek gerekir — bu isteğe genellikle `fsync` denir ve
+pahalıdır, çünkü tüm o hızlı ara katmanları atlayıp en yavaş, en kalıcı yüzeye
+inmeyi zorlar. Altıncı bölümde dayanıklılığın bedelinin neden büyük ölçüde bu tek
+çağrıda toplandığını ayrıntısıyla göreceğiz; şimdilik şunu aklınızda tutun:
+veriyi kalıcı kılmak, onu yalnızca diske göndermek değil, oraya **gerçekten
+ulaştığından emin olmaktır**.
+
 ## Neden sadece dosya kullanmıyoruz
 
 Mademki veriyi diske yazacağız, neden bir veritabanına ihtiyaç duyalım? Sonuçta
@@ -85,9 +154,19 @@ işlem (transaction) kavramıyla bunu sistematik biçimde sağlar.
 
 **Çökmeden kurtulma sorunu.** Sistem tam bir yazma işleminin ortasında çökerse
 ne olur? Dosyanın yarısı yeni, yarısı eski veriyle, belki de bir kısmı bozuk
-kalabilir. Yeniden açıldığında veritabanı, kendisini tutarlı bir duruma
-getirmeyi bilmek zorundadır. Bunu, yazma-öncesi günlük (write-ahead log) gibi
-tekniklerle yapar; altıncı bölümün konusu budur.
+kalabilir. Bu, soyut bir kaygı değil; somut bir başarısızlık kipidir. Diskin
+yalnızca tam bloklar halinde yazdığını söylemiştik; bir kayıt birden fazla bloğa
+yayılıyorsa ve elektrik tam ikinci blok yazılmadan kesilirse, ortaya **kısmi
+yazma** (torn write) çıkar: kaydın ilk yarısı yeni, ikinci yarısı eski veriden
+oluşan, hiçbir zaman var olmamış, anlamsız bir melez. Düz bir dosyayla çalışan
+bir program, yeniden açıldığında bu melezi sağlam bir kayıt sanır ve onun
+üzerinden işlem yapmaya kalkar. Daha sinsi bir kip, işletim sisteminin yazmaları
+**yeniden sıralamasıdır**: programınız önce veriyi, sonra "veri geçerli" işaretini
+yazsa bile, sistem bunları diske ters sırada işleyebilir; o aralıkta bir çökme,
+geçerli işareti taşıdığı halde içeriği yazılmamış bir kayıt bırakır. Yeniden
+açıldığında veritabanı, kendisini tutarlı bir duruma getirmeyi bilmek zorundadır.
+Bunu, yazma-öncesi günlük (write-ahead log) ve bütünlük sağlamaları
+(checksum) gibi tekniklerle yapar; altıncı bölümün konusu budur.
 
 **Soyutlama sorunu.** Son olarak, düz bir dosyayla çalışırken verinin diskte
 tam olarak nasıl yerleştiğini — hangi baytın nerede durduğunu, kayıtların nasıl
@@ -99,6 +178,16 @@ veritabanının altta yerleşimi değiştirip eniyileme yapmasına olanak tanır
 İşte bir veritabanını basit bir dosyadan ayıran şey budur: bu beş sorunu —
 arama, eşzamanlılık, bütünlük, kurtarma ve soyutlama — sizin yerinize, sistemli
 ve güvenilir biçimde çözmesidir.
+
+Bu sorunların birbiriyle örülü olduğunu görmek önemlidir; tek tek
+çözülemezler. Çökmeden kurtulma, yazmaların hangi sırayla diske indiğine
+bağlıdır; eşzamanlılık denetimi, iki yazmanın birbirinin günlüğünü bozmamasını
+gerektirir; bütünlük güvencesi, hem eşzamanlı erişime hem de çökmeye karşı aynı
+anda ayakta kalmak zorundadır. Düz dosyayla çalışan bir geliştirici, bu
+sorunların her birini ayrı ayrı çözmeye kalktığında, çözümlerin birbirini
+bozduğunu keşfeder; çünkü doğru çözüm, hepsini birlikte ele alan bütünleşik bir
+tasarımdır. Bir VTYS'nin asıl değeri de buradadır: bu beş sorunu birbirini
+gözeterek, tek bir tutarlı mimari içinde çözer.
 
 ## Veritabanı ile veritabanı yönetim sistemi
 
@@ -118,6 +207,34 @@ bulmanızı sağlayan katalog (indeks), aynı kitabı iki kişiye birden vermeme
 sağlayan ödünç defteri (eşzamanlılık denetimi), yangın çıktığında en değerli
 ciltleri koruyan yedekleme düzeni (dayanıklılık ve kurtarma). VTYS, tüm bu
 işleyişi yürüten görünmez kütüphanecidir.
+
+### Soyutlama katmanları: mantıksal, fiziksel ve aradaki perde
+
+Bir VTYS'nin en kalıcı katkılarından biri, veriyi birden çok **soyutlama
+katmanında** (abstraction layer) sunmasıdır. Bu katmanlı düşünce, ilişkisel
+modeli ortaya koyan çalışmada açıkça dile getirilmiş ve sonraki tüm veritabanı
+tasarımına sinmiştir.^[E. F. Codd, "A Relational Model of Data for Large Shared Data Banks," *Communications of the ACM* 13(6), 1970.] En üstte **mantıksal katman** durur: verinin
+sizin gözünüzde aldığı biçim — tablolar, belgeler, alanlar. Bu, "veri neye
+benziyor" sorusunun yanıtıdır ve bir önceki bölümün, daha doğrusu bir sonraki
+bölümün konusu olan veri modelidir. En altta **fiziksel katman** vardır:
+baytların diskte tam olarak nasıl yerleştiği, hangi bloğun nerede durduğu, hangi
+indeks yapısının kullanıldığı. Bu, "veri nasıl saklanıyor" sorusunun yanıtıdır.
+
+Bu iki katmanı birbirinden ayırmanın gücü, **bağımsızlık** sağlamasıdır.
+Fiziksel katmanı — diskteki yerleşimi, kullanılan indeksleri, sıkıştırma
+biçimini — tümüyle değiştirebilirsiniz ve mantıksal katmanda hiçbir şey
+değişmez; sorgularınız aynı kalır. Veritabanı, "şu koşula uyan kayıtları getir"
+isteğini, altta veriyi nasıl tuttuğundan bağımsız olarak yanıtlar. Bu ayrım,
+ikinci ve üçüncü kısımda OxiDB'nin aynı mantıksal belge modelini hem bellek
+ağırlıklı hem disk öncelikli bir fiziksel yerleşimle nasıl sunabildiğini
+gördüğümüzde somutlaşacak: dışarıdan bakan için belge aynıdır, içeride yerleşim
+bambaşkadır.
+
+Bu kitabın yapısı da bu katmanlara göre kurulmuştur. Kısım I, mantıksal katmanda
+kalır: veriyi nasıl düşündüğümüzü konuşur. Kısım II, perdeyi aralayıp fiziksel
+katmana iner: belgenin diske nasıl yazıldığını, indekslendiğini, çökmeden nasıl
+korunduğunu anlatır. Soyutlama, ikisi arasındaki perdedir; ve bir VTYS, o
+perdeyi sizin yerinize gergin tutan yazılımdır.
 
 ## Gömülü kütüphane mi, sunucu mu
 

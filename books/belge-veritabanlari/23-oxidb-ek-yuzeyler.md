@@ -33,12 +33,61 @@ tutarlılık fikrinin, bir alt sistem düzeyindeki küçük bir yankısıdır: h
 anlık tutarlılıktan biraz ödün verilir.
 
 Üçüncüsü, **alaka puanlamasıdır**. Yedinci bölümde, bir sözcüğü içeren yüzlerce
-belgenin hepsinin aynı ölçüde ilgili olmadığını söylemiştik. OxiDB, sonuçları,
-bir sözcüğün belgede ne sıklıkta geçtiğine ve genel olarak ne kadar yaygın bir
-sözcük olduğuna bakan, klasik terim-sıklığı yaklaşımının olgunlaşmış bir biçimini
-kullanarak puanlar. Böylece, sözcüğün yoğun geçtiği kısa bir belge, onu bir kez
-içeren uzun bir belgenin önüne çıkar. Bu, yedinci bölümün "alaka düzeyi"
-kavramının somut karşılığıdır.
+belgenin hepsinin aynı ölçüde ilgili olmadığını söylemiş, terim sıklığı ile ters
+belge sıklığını birleştiren puanlamayı tanımıştık. OxiDB, sonuçları, o yaklaşımın
+bugünkü olgun biçimiyle — arama motorlarında fiilen standart haline gelmiş bir
+puanlama yöntemiyle — sıralar. Bu yöntem, klasik terim-sıklığı fikrinin iki
+önemli iyileştirmesini içerir. Birincisi **doygunluktur**: bir sözcüğün belgede
+on kez yerine yüz kez geçmesi, alakayı on kat artırmaz; katkı, bir eğriyle yavaşça
+doyuma ulaşır, böylece bir sözcüğü saplantılı biçimde tekrarlayarak puanı
+şişirmek mümkün olmaz. İkincisi **uzunluk normalleştirmesidir**: bir sözcüğün uzun
+bir belgede geçmesi, kısa bir belgede geçmesinden daha az şey ifade eder; çünkü
+uzun belgede her sözcüğün geçme olasılığı zaten yüksektir. Puanlama, belge
+uzunluğunu, koleksiyondaki ortalama belge uzunluğuna göre tartar. Bu iki ayarın
+da, davranışı belirleyen iki katsayısı vardır; OxiDB bunları, yaygın arama
+motorlarıyla aynı varsayılan değerlere ayarlar ve gerektiğinde ortam
+değişkenleriyle değiştirilebilir kılar. Sonuç olarak, sözcüğün yoğun geçtiği kısa
+bir belge, onu bir kez içeren uzun bir belgenin önüne çıkar. Bu, yedinci bölümün
+"alaka düzeyi" kavramının somut, ince ayarlanmış karşılığıdır.
+
+Bir ayrıntı daha, çok dilli metin için önemlidir: indeksleme, sözcükleri
+**köklerine indirger** (stemming). Yani "kitaplar", "kitabı" ve "kitap"
+gibi biçimler, ortak bir köke eşlenerek aynı sözcükmüş gibi aranabilir hale
+gelir. OxiDB, aralarında Türkçenin de bulunduğu pek çok dil için kök bulma
+desteği taşır ve dili bir ortam değişkeniyle seçtirir; yapısı bakımından
+Türkçe gibi sondan eklemeli diller için bu, doğru sonuçların ön koşuludur.
+
+## Tam metin aramanın iç mekaniği
+
+Bu yüzeyin nasıl çalıştığını biraz daha yakından görelim; çünkü ayrıntıları,
+yedinci bölümün soyut ters indeksini somuta bağlar. İndeksin kalbinde iki eşleme
+durur. Birincisi, her sözcük için, o sözcüğü içeren belgelerin **gönderim
+listesidir** (posting list): her gönderim, hangi belgede sözcüğün kaç kez geçtiğini
+ve hangi konumlarda geçtiğini tutar. Konum bilgisini saklamak, ileride sözcüklerin
+ardışıklığına bakan tümce aramalarını mümkün kılar; sıklık ise alaka puanlamasının
+girdisidir. İkinci eşleme, her belge için, ait olduğu kova ve anahtar ile toplam
+terim sayısını tutar; toplam terim sayısı, az önce anlattığımız uzunluk
+normalleştirmesinin paydası olur. İndeks ayrıca, koleksiyon genelindeki toplam
+terim sayısını da tutar, ki ortalama belge uzunluğu hesaplanabilsin.
+
+Arka plandaki çalışma modeli, dürüstçe söylenmesi gereken nihai tutarlılığın
+kaynağıdır. İndeksleme istekleri, sınırlı kapasiteli — en fazla iki yüz elli altı
+işlik — bir kuyruğa konur; ayrı bir çalışan iş parçacığı bu kuyruğu boşaltır.
+Kuyruğun **sınırlı** olması bilinçli bir tercihtir: yazmalar indekslemeden çok
+daha hızlı gelirse, kuyruk dolar ve yazma yolu kısa süreliğine bekler. Böylece
+sınırsız büyüyen, belleği tüketen bir birikim önlenir; geri-basınç (back-pressure)
+ile sistem kendini dengeler. Çalışan iş parçacığı, her belgeyi alır, içeriğinden
+metni çıkarır, sözcüklere ayırır, köklerine indirger ve gönderim listelerini
+günceller. Bu işin yazma yolunun dışında olması, asıl ekleme işleminin hızlı
+kalmasını sağlar; bedeli, yeni belgenin aranabilir olmasındaki küçük gecikmedir.
+
+İndeksin **kalıcılığı** da kayda değerdir. Ters indeks, veri dizini altında ayrı
+bir dosyaya yazılır; böylece sunucu yeniden başladığında indeks sıfırdan
+kurulmak zorunda kalmaz. Çok sayıda yazma ardı ardına geldiğinde, indeksi her
+güncellemede baştan sona diske dökmek savurgan olurdu; bu yüzden OxiDB,
+güncellemeleri toplu hale getirip belirli aralıklarla bir kez yazar. Bu, on
+altıncı ve on yedinci bölümlerde gördüğümüz "yazmayı toplulaştır, sonra topluca
+boşalt" örüntüsünün, bu alt sistemdeki yankısıdır.
 
 ## Blob depolama: büyük ikili nesnelere yer açmak
 
@@ -49,15 +98,31 @@ megabaytlık bir görüntüyü bir belgenin içine gömmek, o belgeyi her okudu�
 megabaytı da taşımak demektir.
 
 OxiDB, bu ihtiyaca ayrı bir **blob depolama** yüzeyiyle yanıt verir. Bu yüzey,
-büyük ikili nesneleri belgelerin dışında, kovalar halinde düzenlenmiş bir nesne
-deposunda tutar; her nesnenin yanında, ona dair üst veriler ve içeriğinin
-bozulmadığını doğrulayan bir bütünlük damgası bulunur. Bu, yaygın bir bulut
-nesne deposu arayüzüne benzer ve onunla aynı mantığı izler: yapılandırılmış belge
-verisini bir yerde, büyük opak baytları başka bir yerde tutmak. Dördüncü bölümün
-ilkesiyle tam örtüşür: belgeleri yalın ve hızlı okunur tutmak için, büyük ve
-gömülmesi sakıncalı veriyi belgeden ayırıp ona referansla işaret etmek. Böylece
-belgeleriniz küçük kalır, büyük nesneler ise onlara uygun, ayrı bir depoda
-verimli biçimde yönetilir.
+büyük ikili nesneleri belgelerin dışında, kovalar (bucket) halinde düzenlenmiş bir
+nesne deposunda tutar; her nesne, içeriği taşıyan bir veri dosyası ile onu betimleyen
+ayrı bir üst veri dosyasından oluşur. Üst veri dosyası, nesnenin anahtarını, ait
+olduğu kovayı, boyutunu, içerik türünü, oluşturulma zamanını, kullanıcı tanımlı
+etiketlerini ve içeriğin bozulmadığını doğrulayan bir **bütünlük damgasını** (etag)
+tutar. Damga, bir sağlama toplamıdır (checksum): nesne okunduğunda yeniden
+hesaplanıp saklananla karşılaştırılarak, baytların yolda ya da diskte sessizce
+bozulmadığı doğrulanabilir. Bu, yaygın bir bulut nesne deposu arayüzüyle aynı
+mantığı izler: yapılandırılmış belge verisini bir yerde, büyük opak baytları başka
+bir yerde tutmak.^[Bu model, S3 tarzı nesne depolama arayüzlerini izler: kova,
+anahtar, üst veri ve etag kavramları aynı soydan gelir.]
+
+İki ince mühendislik kararı bu yüzeyi pratikte verimli kılar. Birincisi,
+**seçici sıkıştırmadır**: blob deposu, on altıncı bölümde gördüğümüz sıkıştırmayı
+nesnelere de uygulayabilir, ama görüntü, ses, video ya da sıkıştırılmış ofis
+belgeleri gibi zaten doygun-entropili türleri tanır ve onları yeniden sıkıştırmaya
+kalkmaz; çünkü böyle veride sıkıştırma neredeyse hiç yer kazandırmaz, yalnızca
+işlemci harcar. İkincisi, **biçim sürümlemesidir**: her üst veri dosyası bir
+sürüm numarası taşır ve eski bir motor, tanımadığı daha yeni bir sürümü okumayı
+reddeder. Bu, ileriye dönük bir emniyet supabıdır — yeni alanlar ekleyen bir motorun
+yazdığı veriyi, eski bir ikili dosyanın yanlış yorumlayıp sessizce bozmasını önler.
+Tüm bunlar, dördüncü bölümün ilkesiyle tam örtüşür: belgeleri yalın ve hızlı
+okunur tutmak için, büyük ve gömülmesi sakıncalı veriyi belgeden ayırıp ona
+referansla işaret etmek. Böylece belgeleriniz küçük kalır, büyük nesneler ise
+onlara uygun, ayrı bir depoda verimli biçimde yönetilir.
 
 ## Dururken şifreleme: depolama sınırında koruma
 
@@ -69,6 +134,17 @@ inmeden hemen önce ve diskten okunduktan hemen sonra, depolama sınırında dev
 girer. On altıncı bölümde, baytların diske yazılmadan önce bir hazırlık
 adımından — sıkıştırma ve ardından şifreleme — geçtiğine değinmiştik; işte
 dururken şifreleme tam o adımda yapılır.
+
+Kullanılan şifreleme, kimliği doğrulanmış bir simetrik şifredir: yani yalnızca
+veriyi gizlemekle kalmaz, aynı zamanda her şifreli parçanın yanına, onun
+değiştirilmediğini doğrulayan bir doğrulama etiketi koyar. Bu önemlidir, çünkü
+gizlilik ile bütünlük ayrı şeylerdir: birincisi baytların okunamamasını, ikincisi
+ise baytlarla oynanmadığını güvence altına alır. Diskteki şifreli veriyi gizlice
+değiştirmeye kalkan bir saldırgan, bu etiket sayesinde yakalanır; çözme sırasında
+etiket tutmazsa, veri kabul edilmez. Şifreleme, on altıncı bölümde değindiğimiz
+hazırlık adımında, sıkıştırmadan **sonra** uygulanır; bu sıra anlamlıdır, çünkü
+şifrelenmiş veri rastgeleye yakın görünür ve sonradan sıkıştırılamaz — bu yüzden
+önce sıkıştırılır, sonra şifrelenir.
 
 Bu yetenek isteğe bağlıdır: motora bir şifreleme anahtarı verirseniz açılır,
 vermezseniz hiçbir bedeli olmaz. Açıldığında, diske yazılan her şey şifrelenir;
@@ -91,15 +167,45 @@ zaman-noktasına kurtarma yeteneği — kısaca PITR — tam da bunu sağlar.
 
 Bu yeteneğin nasıl çalıştığını kavramsal olarak görelim. OxiDB, bu yetenek
 açıkken, dayanıklı kılınan her yazmaya **küresel, sürekli artan ve duvar saatiyle
-damgalanmış** bir sıra numarası verir. Yazma-öncesi günlük dolup döndükçe, eski
-bölümleri silinmek yerine **arşivlenir** — yani mühürlenmiş parçalar halinde
-saklanır. Bir yedek alındığında, o yedek bir taban anlık görüntüsü ile birlikte,
-"bu yedek şu sıra numarasına kadarki durumu içerir" diyen bir su damgası taşır.
-Belirli bir noktaya geri dönmek istediğinizde, OxiDB bu tabandan başlar ve
+damgalanmış** bir sıra numarası verir; buna küresel sıra numarası (GSN, *global
+sequence number*) diyelim. Bu numaranın çözdüğü ince bir sorun vardır.
+Koleksiyonların her birinin kendi yazma-öncesi günlüğü ayrı bir bayt akışıdır;
+aralarında doğal bir küresel sıra yoktur. Belirli bir ana geri dönebilmek için
+ise, tüm koleksiyonlar boyunca **tek bir zaman ekseni** gerekir. GSN, bu ekseni
+sağlar: hangi koleksiyona ait olursa olsun, her dayanıklı yazma, bu tek sayaçtan
+artan bir numara alır.
+
+Bu sayacın **çökmeler boyunca da artan kalması** gerekir; aksi halde pazartesi
+günkü 5 numara ile salı günkü 5 numara karışır. Ama canlı günlük temiz kapanışta
+kırpıldığı için, en yüksek değeri ondan okuyamayız. OxiDB bu yüzden, sayacın
+tavanını küçük bir dosyaya **kira (lease) bloklarıyla** yazar: açılışta, tek bir
+disk eşitlemesiyle on binlik bir blok rezerve eder ve numaraları bellekten dağıtır;
+blok tükenince dosyaya yeniden dokunur. Böylece numara başına değil, on bin yazma
+başına bir disk eşitlemesi yapılır. Bir çökme, en fazla bir blok kadar numarayı
+boşa harcar — bu zararsızdır, çünkü ileride göreceğimiz oynatma, atlanan numaralara
+tahammül eder.
+
+Yazma-öncesi günlük dolup döndükçe, eski bölümleri silinmek yerine
+**mühürlenir** (seal): canlı günlük belirli bir boyuta ulaştığında, OxiDB onu kilit
+altında, atomik bir yeniden adlandırmayla numaralı bir mühürlü parçaya çevirir ve
+yepyeni bir canlı günlük açar. Arka planda çalışan bir **arşivci**, bu mühürlü
+parçaları, baytları birebir kopyalayarak — sonlarına bir doğrulama eki ekleyerek —
+arşiv dizinine taşır. Arşivin dizini, parçaların kendi eklerinden **yeniden
+türetilebilir**: yani dizin dosyası bozulsa bile, parçalar tarandığında kendini
+onarır. Bu, altıncı bölümdeki "asıl gerçek günlüktedir, türetilenler ondan yeniden
+kurulur" ilkesinin bir başka uygulamasıdır.
+
+Bir yedek alındığında, o yedek bir taban anlık görüntüsü ile birlikte, "bu yedek
+şu sıra numarasına kadarki durumu içerir" diyen bir **su damgası** (watermark)
+taşır. Belirli bir noktaya geri dönmek istediğinizde, OxiDB bu tabandan başlar ve
 arşivlenmiş günlüğü, seçtiğiniz ana — bir sıra numarasına, bir zaman damgasına ya
-da "en sona" — kadar ileri **oynatır**. Üstelik bu oynatma, işlem sınırlarına
-saygı gösteren, tutarlı kesim noktalarında durur; yani yarım kalmış bir işlemin
-ortasında değil, temiz bir noktada geri dönersiniz.
+da "en sona" — kadar ileri **oynatır**. Su damgası ile hedef arasında kalan
+parçalar sırayla uygulanır; tabandan önceki numaraları taşıyan girdiler atlanır.
+Üstelik bu oynatma, işlem sınırlarına saygı gösteren, tutarlı kesim noktalarında
+durur; yani yarım kalmış bir işlemin ortasında değil, temiz bir noktada geri
+dönersiniz.
+
+![GSN'den arşive ve oynatmaya: zaman-noktasına kurtarma yolu.](sekiller/23b-pitr-arsiv.svg){width=85%}
 
 Bu model — küresel sıra numarası, arşivlenen günlük, taban yedek ve ileri
 oynatma — altıncı bölümdeki dayanıklılık fikrinin zengin bir uzantısıdır.

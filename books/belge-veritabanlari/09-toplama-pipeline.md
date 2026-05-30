@@ -131,6 +131,55 @@ okumak yeterlidir. Üçüncü kısımda OxiDB'nin, indeksli bir alana göre yaln
 sayan gruplamaları, hiç belge okumadan, doğrudan indeksten yanıtladığını
 göreceğiz.
 
+## Gruplamanın iki gerçekleştirme yolu
+
+Yukarıda gruplamayı "her belgeyi kendi kovasına ekle" diye anlattık; ama bu
+"kova" mecazının altında iki gerçek strateji yatar ve aralarındaki seçim, büyük
+veride performansı belirler.
+
+Birincisi **hash-tabanlı gruplamadır** (hash-based grouping). Sistem, bellekte,
+grup anahtarından kovaya eşleyen bir **hash tablosu** tutar. Her belge geldiğinde,
+anahtarının hash'i hesaplanır, ilgili kova bulunur ve o kovanın biriktiricileri
+yerinde güncellenir — say bir artar, toplam değere eklenir, en büyük gerekirse
+yenilenir. Belgeleri önceden sıralamaya gerek yoktur; tek bir geçiş yeter. Bu
+yöntem hızlıdır, ama bir koşulu vardır: tüm grupların kovaları belleğe sığmalıdır.
+Ayrık grup sayısı çok büyükse — milyonlarca farklı anahtar — hash tablosu belleğe
+sığmaz ve sistemin kovaları diske taşıması gerekir ki bu maliyeti ciddi biçimde
+artırır.
+
+![Hash-tabanlı gruplama.](sekiller/09b-hash-gruplama.svg){width=85%}
+
+İkincisi **sıralama-tabanlı gruplamadır** (sort-based grouping). Sistem önce tüm
+belgeleri grup anahtarına göre **sıralar**; sıralandıktan sonra, aynı anahtara
+sahip belgeler arka arkaya dizilmiş olur. Artık tek bir geçişle akarsınız: anahtar
+değiştiği an, biten grubu çıktıya verir, biriktiricileri sıfırlar, yeni gruba
+başlarsınız. Bu yöntemin bedeli sıralamadır; ama iki büyük avantajı vardır. Birincisi,
+herhangi bir anda yalnızca **tek bir grubun** durumunu bellekte tutarsınız — milyonlarca
+grup olsa bile bellek sabit kalır. İkincisi, eğer veri zaten o anahtara göre sıralı
+geliyorsa — örneğin gruplama anahtarının sıralı bir indeksi varsa — sıralama bedavaya
+gelir ve sıralama-tabanlı gruplama, tek bir akış geçişine indirgenir. Bir önceki
+bölümdeki sırala-birleştir birleştirmesiyle aynı sezgi burada da iş başındadır:
+sıralı düzen, gruplamayı ucuzlatır.
+
+Eniyileyici, ikisi arasında, beklenen ayrık grup sayısına ve girdinin zaten sıralı
+olup olmadığına bakarak seçim yapar: az sayıda grup ve sıralanmamış girdi varsa
+hash; çok sayıda grup ya da zaten sıralı girdi varsa sıralama.
+
+## Birleştirme aşaması, perde arkasında bir hash birleştirmesidir
+
+Yukarıda birleştirme aşamasının başka bir koleksiyondan ilişkili belgeleri
+getirdiğini söyledik. Bunun nasıl yapıldığı, bir önceki bölümdeki birleştirme
+algoritmalarına doğrudan bağlanır. En saf gerçekleştirme, dış akıştaki her belge
+için ilgili koleksiyonu baştan sona taramaktır — yani bir iç içe döngü
+birleştirmesi; bu, dış akış uzunsa felaket olur. Verimli motorlar bunun yerine,
+ilgili koleksiyondan eşleştirme anahtarı üzerinde bir **hash tablosu** kurar ve
+dış akışı bir kez gezip her belgenin eşleşenini bu tablodan anlık olarak çeker —
+yani bir hash birleştirmesi. Daha da iyisi, eşleştirme anahtarının hedef
+koleksiyonda bir **indeksi** varsa, indeksli iç içe döngüyle her dış belge için
+eşleşen doğrudan indeksten bulunur ve hiçbir tam tarama gerekmez. Belge dünyasında
+birleştirmenin "pahalı" diye anılmasının nedeni, çoğu zaman bu indeksin eksik
+olması ve aşamanın saf, taramalı biçime düşmesidir.
+
 ## Pencere fonksiyonları: satırı yok etmeden hesaplamak
 
 Toplamanın bir de bambaşka bir yüzü vardır ve onu gruplamayla karşılaştırarak
@@ -157,6 +206,31 @@ olan pencereyi toplar; hareketli ortalama, son birkaç satırın penceresini
 ortalar; sıralama ise satırın bölüm içindeki yerini söyler. Üçüncü kısımda
 OxiDB'nin pencere fonksiyonlarını tam da böyle — bölümle, sırala, pencere üzerinde
 hesapla — gerçekleştirdiğini göreceğiz.
+
+Bu üç adımın — bölümle, sırala, çerçeveyi hesapla — en ince yeri sonuncusudur ve
+biraz daha açmayı hak eder. "Çerçeve" (frame), her satır için tam olarak hangi
+komşu satırların hesaba katılacağını söyler ve iki farklı biçimde tanımlanabilir.
+
+![Pencere çerçevesi.](sekiller/09c-pencere-cerceve.svg){width=85%}
+
+Birincisi **satır çerçevesidir** (row frame): çerçeve, geçerli satıra göre
+**konumla** belirlenir — "baştan bu satıra kadar olan tüm satırlar" (kümülatif
+toplam böyle hesaplanır) ya da "bu satır ve ondan önceki altı satır" (yedi günlük
+hareketli ortalama böyle olur). Burada önemli olan, satırların sıradaki *yeridir*;
+değerleri ne olursa olsun, sayılarına göre çerçeveye girer ya da girmezler.
+
+İkincisi **aralık çerçevesidir** (range frame): çerçeve, satırların **değerine**
+göre belirlenir — "sıralama anahtarı, geçerli satırınkine belirli bir aralık
+içinde yakın olan tüm satırlar." Burada kaç satır olduğu değil, hangi değerlere
+sahip oldukları önemlidir; aynı sıralama değerine sahip satırlar (örneğin aynı
+güne ait birden çok kayıt) hep birlikte çerçeveye girer ya da girmez. Aralık
+çerçeveleri özellikle zaman temelli analizlerde — "son 30 günün penceresi" gibi,
+satır sayısı değil takvim aralığı tanımlandığında — gereklidir. Bu ayrım,
+gerçekleştirimi de etkiler: satır çerçevesi basit konum aritmetiğiyle, aralık
+çerçevesi ise değer karşılaştırmasıyla yürütülür ve sıralama anahtarına erişim
+gerektirir. Üçüncü kısımda OxiDB'nin pencere fonksiyonlarını şimdilik satır temelli
+çerçevelerle gerçekleştirdiğini, aralık ve zaman temelli çerçeveleri ise henüz
+açık bir eksik olarak dürüstçe ele alacağız.
 
 Gruplama ile pencere fonksiyonu, analitik soruların iki büyük ailesidir.
 Gruplama "her grup için tek bir özet ver" derken, pencere fonksiyonu "her satırı

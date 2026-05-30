@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="300" font-family="Georgia, serif">
+  <rect width="720" height="300" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Rol tabanlı erişim: kullanıcı → rol → izin</text>
+  <text x="120" y="58" font-size="11.5" font-weight="bold" text-anchor="middle">Kullanıcılar</text>
+  <text x="360" y="58" font-size="11.5" font-weight="bold" text-anchor="middle">Roller</text>
+  <text x="600" y="58" font-size="11.5" font-weight="bold" text-anchor="middle">İzinler</text>
+  <!-- users -->
+  <g font-size="10.5" text-anchor="middle">
+    <rect x="60" y="80" width="120" height="34" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="120" y="102">Ayşe</text>
+    <rect x="60" y="135" width="120" height="34" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="120" y="157">Mehmet</text>
+    <rect x="60" y="190" width="120" height="34" rx="8" fill="#e8eef7" stroke="#2b6cb0"/><text x="120" y="212">Zeynep</text>
+  </g>
+  <!-- roles -->
+  <g font-size="10.5" text-anchor="middle">
+    <rect x="300" y="80" width="120" height="34" rx="8" fill="#f3eef7" stroke="#7a4fa0" stroke-width="2"/><text x="360" y="102">Yönetici</text>
+    <rect x="300" y="135" width="120" height="34" rx="8" fill="#f3eef7" stroke="#7a4fa0" stroke-width="2"/><text x="360" y="157">Oku-Yaz</text>
+    <rect x="300" y="190" width="120" height="34" rx="8" fill="#f3eef7" stroke="#7a4fa0" stroke-width="2"/><text x="360" y="212">Salt-Oku</text>
+  </g>
+  <!-- permissions -->
+  <g font-size="10" text-anchor="middle">
+    <rect x="540" y="74" width="120" height="28" rx="6" fill="#e8f3ea" stroke="#3a8a52"/><text x="600" y="92">koleksiyon yönet</text>
+    <rect x="540" y="110" width="120" height="28" rx="6" fill="#e8f3ea" stroke="#3a8a52"/><text x="600" y="128">belge yaz</text>
+    <rect x="540" y="146" width="120" height="28" rx="6" fill="#e8f3ea" stroke="#3a8a52"/><text x="600" y="164">belge oku</text>
+  </g>
+  <!-- user->role edges -->
+  <g stroke="#888" stroke-width="1.4" marker-end="url(#a)">
+    <line x1="180" y1="97" x2="298" y2="97"/>
+    <line x1="180" y1="152" x2="298" y2="152"/>
+    <line x1="180" y1="207" x2="298" y2="207"/>
+  </g>
+  <!-- role->permission edges -->
+  <g stroke="#7a4fa0" stroke-width="1.3" marker-end="url(#a)">
+    <line x1="420" y1="92" x2="538" y2="88"/>
+    <line x1="420" y1="97" x2="538" y2="124"/>
+    <line x1="420" y1="102" x2="538" y2="158"/>
+    <line x1="420" y1="148" x2="538" y2="124"/>
+    <line x1="420" y1="155" x2="538" y2="158"/>
+    <line x1="420" y1="207" x2="538" y2="162"/>
+  </g>
+  <text x="360" y="262" font-size="10.5" text-anchor="middle" fill="#666">En az ayrıcalık: her kullanıcıya yalnızca işini yapacak rol verilir</text>
+  <text x="360" y="282" font-size="10.5" text-anchor="middle" fill="#999">Yetki tek tek kullanıcıya değil, rol düzeyinde yönetilir → basit ve az hatalı</text>
+</svg>

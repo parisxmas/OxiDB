@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="300" font-family="Georgia, serif">
+  <rect width="720" height="300" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">SCRAM-SHA-256: parola hattan geçmeden kimlik kanıtı</text>
+  <!-- two columns -->
+  <rect x="60" y="50" width="140" height="34" rx="8" fill="#e8eef7" stroke="#2b6cb0" stroke-width="2"/><text x="130" y="72" font-size="12" text-anchor="middle">İstemci</text>
+  <rect x="520" y="50" width="140" height="34" rx="8" fill="#e8f3ea" stroke="#3a8a52" stroke-width="2"/><text x="590" y="72" font-size="12" text-anchor="middle">Sunucu</text>
+  <line x1="130" y1="86" x2="130" y2="280" stroke="#ccc" stroke-dasharray="4"/>
+  <line x1="590" y1="86" x2="590" y2="280" stroke="#ccc" stroke-dasharray="4"/>
+  <g font-size="10.5">
+    <!-- 1 -->
+    <line x1="132" y1="108" x2="588" y2="108" stroke="#888" stroke-width="1.5" marker-end="url(#a)"/>
+    <text x="360" y="102" text-anchor="middle">1) kullanıcı + istemci tek-kullanım değeri (client nonce)</text>
+    <!-- 2 -->
+    <line x1="588" y1="148" x2="132" y2="148" stroke="#888" stroke-width="1.5" marker-end="url(#a)"/>
+    <text x="360" y="142" text-anchor="middle">2) birleşik nonce + tuz (salt) + yineleme sayısı</text>
+    <!-- 3 -->
+    <line x1="132" y1="200" x2="588" y2="200" stroke="#888" stroke-width="1.5" marker-end="url(#a)"/>
+    <text x="360" y="178" text-anchor="middle">3) istemci kanıtı (client proof)</text>
+    <text x="360" y="194" text-anchor="middle" fill="#666" font-size="9.5">— parola tuz+yinelemeyle anahtara, anahtar imzaya dönüşür —</text>
+    <!-- 4 -->
+    <line x1="588" y1="240" x2="132" y2="240" stroke="#3a8a52" stroke-width="1.5" marker-end="url(#a)"/>
+    <text x="360" y="234" text-anchor="middle" fill="#3a8a52">4) sunucu imzası (karşılıklı doğrulama)</text>
+  </g>
+  <text x="360" y="276" font-size="10" text-anchor="middle" fill="#999">Parola ve ondan türeyen anahtar hattan hiç geçmez; her el sıkışma benzersizdir (replay önlenir)</text>
+</svg>

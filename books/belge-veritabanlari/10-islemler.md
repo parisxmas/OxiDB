@@ -82,9 +82,24 @@ gözünde dünya, kendi ortasında değişmiştir.
 bir işlem o koşula uyan yeni bir kayıt ekler; ilk işlem aynı sayımı tekrarladığında
 farklı bir sonuç görür — sanki bir hayalet belirmiştir.
 
+**Yazma eğriltme**: Daha sinsi bir anormalliktir; çünkü iki işlem **farklı**
+kayıtlara yazsa bile, birlikte ortak bir kuralı bozabilirler. Klasik örnek: en az
+bir doktorun nöbette kalması gereken bir hastane. İki nöbetçi doktor vardır; ikisi
+de aynı anda izne çıkmak ister. Her işlem, kendi anlık görüntüsünde "öteki doktor
+hâlâ nöbette" diye görür, kuralın sağlandığını sanır ve kendi doktorunu izne
+çıkarır. İkisi de ayrı kayıtlara yazdığı için doğrudan çakışmazlar; ama ikisi
+birden tamamlandığında, kimse nöbette kalmaz — kural, ne birinin ne ötekinin
+yazdığına bakılarak değil, ancak ikisi birlikte düşünüldüğünde ihlal edilmiş olur.
+
 Bu anormalliklerin hepsinin ortak kökü, işlemlerin birbirinin yarım kalmış ya da
 eşzamanlı çalışmasını "görebilmesidir". Mükemmel yalıtım, her işleme sanki
-veritabanında **yalnız kendisi varmış** gibi bir dünya sunmayı amaçlar.
+veritabanında **yalnız kendisi varmış** gibi bir dünya sunmayı amaçlar. Bu
+anormalliklerin uzun yıllar gevşek, ürüne-bağımlı tariflerle anlatıldığını;
+bunların gerçekten kesin, gerçekleştirimden bağımsız bir biçimselleştirmesinin —
+işlemlerin okuma-yazma bağımlılıklarından kurulan bir çizge üzerinde — ancak
+sonraki araştırmalarla geldiğini belirtmek gerekir.^[A. Adya, B. Liskov ve P. O'Neil, "Generalized Isolation Level Definitions," *Proc. IEEE ICDE*, 2000.] Bu biçimsel bakış,
+hangi yalıtım düzeyinin tam olarak hangi anormalliği engellediğini ürün
+broşürlerinin gevşek diline başvurmadan söyleyebilmemizi sağlar.
 
 ## Yalıtım düzeyleri: bir tayf
 
@@ -121,24 +136,54 @@ tutabilir, ama bir yazıcıyı bekletir) ve yazma kilidi (yalnızca bir işleme 
 herkesi bekletir). Bunu tek şeritli bir köprüye benzetebilirsiniz: köprüde bir
 anda yalnızca bir araç geçebilir, gerisi bekler.
 
+Ne var ki kilit almak ve bırakmak tek başına serileştirilebilirliği garanti
+etmez; kilitlerin **ne zaman** alınıp bırakıldığı da önemlidir. Bunu güvence
+altına alan klasik disipline **iki fazlı kilitleme** (two-phase locking, 2PL)
+denir. Adı, her işlemin yaşamının iki keskin faza ayrılmasından gelir. Önce bir
+**büyüme fazı** (growing phase) gelir: işlem yalnızca kilit *alır*, hiç
+bırakmaz; ihtiyaç duydukça kilit kümesi büyür. Bir kez ilk kilidini bıraktığı an,
+geri dönüşü olmayan biçimde **küçülme fazına** (shrinking phase) geçer: artık
+yalnızca kilit *bırakabilir*, yeni hiçbir kilit alamaz. Bu basit kuralın —
+"bıraktıktan sonra bir daha alma" — şaşırtıcı bir sonucu vardır: işlemlerin
+serileştirilebilir bir sırada çalışmasını matematiksel olarak garanti eder.
+
+Pratikte çoğu sistem bunun daha güçlü bir biçimini, **katı iki fazlı kilitlemeyi**
+(strict 2PL) kullanır: işlem, *yazma* kilitlerini büyüme fazında bırakmaz,
+tamamlanana (ya da geri alınana) kadar **hepsini sonuna dek tutar**. Bunun nedeni
+kirli okumayı ve karmaşık geri-alma sorunlarını da önlemektir: bir işlem henüz
+tamamlanmadan kilidini bıraksaydı, başkası onun geçici değişikliğini okuyabilir ve
+o işlem sonradan geri alınınca ortalık karışırdı. Katı 2PL, "kilitleri commit'e
+kadar tut" diyerek bu kapıyı tümüyle kapatır.
+
 Kilitleme, güvenliği kesin biçimde sağlar; ama eşzamanlılığı kısıtlar — herkes
 sırada beklediği için. Üstelik kendine özgü bir tehlike doğurur: **kilitlenme**
 (deadlock). İki işlem düşünün; birincisi A verisinin kilidini almış, B'yi
 bekliyor; ikincisi B'nin kilidini almış, A'yı bekliyor. İkisi de ötekinin
 bırakmasını bekler ve hiçbiri bırakmaz; sonsuza dek donup kalırlar. Veritabanları
-bu tehlikeyle iki yolla baş eder: ya kilitlenmeyi sezip işlemlerden birini iptal
-ederek düğümü çözer, ya da kilitlenmenin **hiç oluşmamasını** sağlayacak bir
-disiplin uygular. En zarif disiplin, kilitleri her zaman aynı, belirli bir sırada
-almaktır; herkes kilitleri aynı sırayla alırsa, o döngüsel bekleme hiç oluşmaz.
-Üçüncü kısımda OxiDB'nin tam da böyle, kilitleri sıralı bir düzende alarak
-kilitlenmeyi baştan imkânsız kıldığını göreceğiz.
+bu tehlikeyle iki yolla baş eder. Birincisi **saptamadır** (deadlock detection):
+sistem, "kim kimi bekliyor" ilişkisini bir **bekleme çizgesi** (wait-for graph)
+olarak tutar; bu çizgede bir **döngü** belirdiği an, bir kilitlenme oluşmuş
+demektir. Sistem döngüyü kıracak bir "kurban" işlem seçer (genellikle en az iş
+yapmış olanı), onu iptal eder, kilitlerini bıraktırır ve sonra yeniden denemesine
+izin verir. Bazı sistemler çizgeyi sürekli izlemek yerine daha ucuz bir
+**zaman aşımı** (timeout) yaklaşımı kullanır: bir kilit için fazla bekleyen işlemi
+kilitlenmiş varsayıp iptal eder — basit ama bazen suçsuz işlemleri de iptal eder.
+
+İkinci ve daha zarif yol, kilitlenmenin **hiç oluşmamasını** sağlayacak bir
+disiplin uygulamaktır (deadlock prevention). En temiz örnek, kilitleri her zaman
+aynı, belirli bir **toplam sıraya** göre almaktır; herkes kilitleri aynı sırayla
+alırsa, "A'yı tutup B'yi, B'yi tutup A'yı bekleme" döngüsü mantıken oluşamaz.
+Üçüncü kısımda OxiDB'nin tam da böyle, dokunacağı koleksiyonların kilitlerini
+sıralı bir düzende alarak kilitlenmeyi baştan imkânsız kıldığını — yani saptama
+yerine önlemeyi seçtiğini — göreceğiz.
 
 ### MVCC: çok sürümlü eşzamanlılık
 
 İkinci felsefe, kilitlemenin "okuyucular ve yazıcılar birbirini bekler" sorununa
-zarif bir çözüm getirir ve adı **çok sürümlü eşzamanlılık denetimidir** (MVCC).
-Fikri şudur: bir veriyi değiştirirken eski sürümün üzerine yazma; onun **yeni bir
-sürümünü** oluştur, eskisini bir süre koru.
+zarif bir çözüm getirir ve adı **çok sürümlü eşzamanlılık denetimidir** (MVCC) —
+fikrin kuramsal temelleri, eşzamanlılık denetimi araştırmasının kurucu
+metinlerinden birine uzanır.^[P. Bernstein ve N. Goodman, "Multiversion Concurrency Control—Theory and Algorithms," *ACM TODS* 8(4), 1983.] Fikri şudur: bir veriyi değiştirirken eski sürümün
+üzerine yazma; onun **yeni bir sürümünü** oluştur, eskisini bir süre koru.
 
 Bunun sonucu çarpıcıdır. Bir işlem okumaya başladığında, ona o an'ın bir
 **anlık görüntüsü** verilir — sanki o an bir fotoğraf çekilmiş gibi. İşlem,
@@ -148,11 +193,48 @@ gördüğü eski sürüm olduğu gibi durur. Böylece okuyucular yazıcıları, 
 okuyucuları beklemez: **okuyucu yazıcıyı bloke etmez, yazıcı okuyucuyu bloke
 etmez.** Bu, kilitlemenin en büyük darboğazını ortadan kaldırır.
 
-MVCC'nin bedeli, eski sürümleri saklamaktır; ve artık hiçbir işlemin görmediği
-eski sürümleri ara sıra temizlemek gerekir. Burada beşinci bölümle güzel bir bağ
-kurulur: append-only depolama motorları, veriyi zaten asla üzerine yazmadan, hep
-yeni sürümler ekleyerek tuttuğu için, MVCC'ye doğal bir zemin sunar — eski
-sürümler orada zaten vardır.
+Bu mekanizmayı biraz daha somutlaştıralım. Her belge, artık tek bir değer değil,
+zamanda arkaya doğru uzanan bir **sürüm zinciridir** (version chain): her sürüm,
+onu yazan işlemin bir zaman damgasını ya da numarasını taşır ve bir önceki sürüme
+işaret eder. Bir işlem başladığında ona bir **anlık görüntü** (snapshot) —
+gerçekte, "şu numaraya kadar tamamlanmış işlemleri görebilirsin" diyen bir
+görünürlük ölçütü — atanır. Bir belgeyi okurken, sistem o belgenin sürüm
+zincirini en yeniden eskiye tarar ve işlemin anlık görüntüsüne **uyan** ilk sürümü
+döndürür: kendi anlık görüntüsünden sonra tamamlanmış sürümleri atlar, ondan önce
+tamamlanmış en yeni sürümü seçer. Bu kurala **anlık görüntü yalıtımı** (snapshot
+isolation) denir ve MVCC'nin sunduğu yalıtım düzeyinin adıdır.
+
+![MVCC sürüm zinciri.](sekiller/10b-mvcc-zincir.svg){width=85%}
+
+MVCC'nin bedeli, eski sürümleri saklamaktır; ve artık hiçbir aktif anlık
+görüntünün göremeyeceği eski sürümleri ara sıra temizlemek gerekir. Bu temizliğe
+**çöp toplama** (garbage collection) denir: sistem, en eski hâlâ açık anlık
+görüntünün gerisinde kalan, yani artık hiçbir işlemin asla göremeyeceği sürümleri
+saptayıp geri kazanır. Bu yüzden çok uzun süre açık kalan bir işlem, gizli bir
+maliyet doğurur: arkasında, temizlenemeyen bir sürüm yığını birikir ve hem disk
+hem de okuma maliyeti şişer. Burada beşinci bölümle güzel bir bağ kurulur:
+append-only depolama motorları, veriyi zaten asla üzerine yazmadan, hep yeni
+sürümler ekleyerek tuttuğu için, MVCC'ye doğal bir zemin sunar — eski sürümler
+orada zaten vardır.
+
+Anlık görüntü yalıtımının önemli bir inceliği vardır: kayıp güncellemeyi,
+kirli okumayı ve tekrarlanamayan okumayı temiz biçimde önler; ama tek başına
+**serileştirilebilir değildir**. Az önce gördüğümüz yazma eğriltme anormalliği,
+tam da anlık görüntü yalıtımının yakalayamadığı boşluktur: iki işlem ayrı
+kayıtlara yazdığı için sürüm çakışması olmaz, doğrulamadan geçerler, ama ortak
+kuralı birlikte bozarlar.
+
+![Yazma eğriltme.](sekiller/10c-yazma-egriltme.svg){width=85%}
+
+Bu boşluğu kapatmak için geliştirilen yöntem, **serileştirilebilir anlık görüntü
+yalıtımıdır** (serializable snapshot isolation, SSI).^[M. Cahill, U. Röhm ve A. Fekete, "Serializable Isolation for Snapshot Databases," *Proc. ACM SIGMOD*, 2008.] SSI, anlık görüntü
+yalıtımının üzerine ince bir izleme katmanı ekler: işlemler arasındaki
+okuma-yazma bağımlılıklarını gözler ve serileştirilebilirliği bozabilecek bir
+**tehlikeli yapı** — kabaca, eşzamanlı iki işlem arasında belirli bir bağımlılık
+örüntüsü — belirdiğinde, işlemlerden birini iptal eder. Böylece anlık görüntü
+yalıtımının okuyucu-yazıcı çakışmasızlığını korur, ama yazma eğriltme gibi son
+anormallikleri de eler. Bedeli, bu bağımlılıkları izlemenin getirdiği ek defter
+tutma yüküdür.
 
 ### OCC: iyimser yaklaşım
 
@@ -225,9 +307,12 @@ anormallikleri gerçekten önlemeniz gerekiyor?
 Bu bölümde, veritabanının eşzamanlı yazmalar ve yarım kalmalar karşısında düzeni
 nasıl koruduğunu gördük. İşlemin bölünmez bir bütün olduğunu; ACID'in dört
 güvencesini; yalıtımın engellediği anormallikleri ve yalıtım düzeyleri tayfını;
-ve yalıtımı sağlamanın üç felsefesini — kötümser kilitlemeyi, çok sürümlü
-MVCC'yi ve iyimser OCC'yi — tanıdık. Tek belgeli işlemlerin kolay, çok belgeli ve
-dağıtık işlemlerin zor olduğunu ve her güvencenin bir bedeli olduğunu gördük.
+ve yalıtımı sağlamanın üç felsefesini — kötümser kilitlemeyi (iki fazlı
+kilitleme, kilitlenme saptama ve önleme), çok sürümlü MVCC'yi (sürüm zinciri,
+anlık görüntü yalıtımı, çöp toplama ve onun yazma eğriltmeye karşı SSI ile
+güçlendirilmesi) ve iyimser OCC'yi — tanıdık. Tek belgeli işlemlerin kolay, çok
+belgeli ve dağıtık işlemlerin zor olduğunu ve her güvencenin bir bedeli olduğunu
+gördük.
 
 Yalıtım, eşzamanlılığın yalnızca bir yüzüdür. Veri tek bir makinede dururken bu
 kavramlar yeterince zorludur; ama veri birden çok makineye yayıldığında,

@@ -80,6 +80,66 @@ olayların herkese aynı sırada görünmesini sağlar — bir soruya verilen ya
 soruyu görmeden görünmez. Bu ara modeller, güçlü tutarlılığın tüm maliyetini
 ödemeden, çıplak nihai tutarlılığın en can sıkıcı tuhaflıklarını giderir.
 
+## Güçlü tutarlılığı kesinleştirmek: doğrusallaştırılabilirlik
+
+"Güçlü tutarlılık" dediğimiz şeyi sezgisel bıraktık; oysa onun kesin bir adı ve
+tanımı vardır: **doğrusallaştırılabilirlik** (linearizability). Bir sistemin
+doğrusallaştırılabilir olması şu demektir: her işlem, başladığı an ile bittiği an
+arasında **bir noktada**, anlık olarak gerçekleşmiş gibi davranır; ve bu anlık
+gerçekleşme noktaları, işlemlerin **gerçek-zaman** sırasına saygı gösterir. Yani
+A işlemi, B başlamadan önce bitmişse, A'nın etkisi B'nin etkisinden önce gelmek
+zorundadır. Sezgisel söylenişi şudur: sistem, sanki tek bir kopya varmış ve tüm
+işlemler tek bir sıraya diziliyormuş gibi davranır — üstelik bu sıra, dışarıdan
+gözlenen zaman akışıyla çelişmez. Bu kavramın eşzamanlı nesneler için kesin
+biçimselleştirmesi, eşzamanlılık kuramının kurucu metinlerinden birinde
+verilmiştir.^[M. Herlihy ve J. Wing, "Linearizability: A Correctness Condition for Concurrent Objects," *ACM TOPLAS* 12(3), 1990.]
+
+![Doğrusallaştırılabilirlik zaman çizgisi.](sekiller/11b-dogrusallastirilabilirlik.svg){width=85%}
+
+Doğrusallaştırılabilirliğin gerçek-zaman koşulu, onu daha gevşek bir akrabasından
+ayırır: **ardışık tutarlılık** (sequential consistency). Ardışık tutarlılık da
+işlemlerin tek bir ortak sıraya dizilmesini ister; ama bu sıranın gerçek-zaman
+akışına uymasını **şart koşmaz**. Yani A, B'den önce bitmiş olsa bile, ardışık
+tutarlı bir sistem onları sanki ters sırada olmuş gibi gösterebilir — yeter ki
+herkes *aynı* sırayı görsün ve her istemcinin kendi işlemleri kendi içinde sırada
+kalsın. Aradaki fark inceliklidir ama önemlidir: doğrusallaştırılabilirlik
+"global bir saatle uyumlu tek sıra" derken, ardışık tutarlılık yalnızca "tutarlı
+tek sıra" der. Bu yüzden doğrusallaştırılabilirlik daha güçlü, ama daha pahalıdır;
+çünkü gerçek-zaman sırasını korumak, kopyalar arasında daha sıkı koordinasyon
+ister.
+
+Tüm bu modelleri bir merdiven gibi düşünebiliriz: en üstte
+doğrusallaştırılabilirlik, altında ardışık tutarlılık, onun altında nedensel
+tutarlılık, sonra oturum güvenceleri, en altta nihai tutarlılık. Yukarı çıktıkça
+güvence güçlenir ama gereken koordinasyon ve dolayısıyla maliyet artar; aşağı
+indikçe sistem hızlanır ve bölünmelere dayanıklılaşır, ama uygulamanın katlanması
+gereken tuhaflıklar çoğalır.
+
+![Tutarlılık modelleri hiyerarşisi.](sekiller/11c-tutarlilik-hiyerarsi.svg){width=85%}
+
+## Neden mutlak güçlü tutarlılık her zaman mümkün değil: FLP
+
+Bu noktada doğal bir soru belirir: madem güçlü tutarlılık bu kadar arzu edilir,
+neden onu her zaman, koşulsuz garanti edemiyoruz? Yanıtın derininde, dağıtık
+hesaplama kuramının en ünlü imkânsızlık sonucu yatar. Birden çok makinenin bir
+değer üzerinde **anlaşması** — buna mutabakat (consensus) denir — problemini
+düşünün. Şu olumsuz teorem kanıtlanmıştır: tümüyle eşzamansız bir ağda — yani
+mesajların ne zaman ulaşacağına dair hiçbir üst sınırın olmadığı, bir makinenin
+yavaş mı yoksa çökmüş mü olduğunu kesin ayırt edemediğiniz bir ortamda — tek bir
+makine bile çökebiliyorsa, her zaman sonlanacağı **garanti edilen** bir mutabakat
+algoritması **yoktur**.^[M. Fischer, N. Lynch ve M. Paterson, "Impossibility of Distributed Consensus with One Faulty Process," *Journal of the ACM* 32(2), 1985.]
+
+Bunun pratik anlamı şudur: "her zaman doğru karara varan ve her zaman da yanıt
+veren" bir sistem, eşzamansız bir dünyada matematiksel olarak imkânsızdır. Gerçek
+sistemler bu duvarı, varsayımları gevşeterek aşar: ya zaman aşımları gibi gevşek
+zamanlama varsayımları ekler (yavaşı çökmüşten ayırt etmeye çalışır), ya da kesin
+sonlanma yerine "neredeyse her zaman sonlanır" gibi olasılıksal güvencelerle
+yetinir. Bir sonraki bölümde göreceğimiz çoğunluk-tabanlı mutabakat protokolleri,
+işte bu gevşetmeleri kullanarak pratikte çalışır. FLP, bu protokollerin neden
+karmaşık olmak ve neden uç durumlarda "ilerleyememe" pahasına güvenliği korumak
+zorunda olduğunu açıklar — ve neden güçlü tutarlılığın hep bir bedeli olduğunu
+en derin düzeyde gösterir.
+
 ## Bölünme anı ve kaçınılmaz seçim
 
 Dağıtık sistemlerde tutarlılığı anlamanın kalbinde, sade ama derin bir gerçek
@@ -151,6 +211,39 @@ her yazmada diske zorlayan katı kip ile arada bir zorlayan gevşek kip arasınd
 bir seçim — sunduğunu, ama okuma tarafındaki ince ayar düğmelerinin henüz
 sınırlı olduğunu dürüstçe ele alacağız.
 
+## Olayları sıralamak: mantıksal saatler
+
+Buraya kadar hep "önce", "sonra", "aynı anda" gibi sözcükler kullandık; ama
+dağıtık bir sistemde bu sözcükler sandığımızdan çok daha kaygandır. Farklı
+makinelerin duvar saatleri tam olarak senkron değildir; biri ötekinden birkaç
+milisaniye ileride ya da geride olabilir. O zaman, iki ayrı makinede olan iki
+olaydan hangisinin "önce" olduğunu, duvar saatlerine bakarak güvenle söyleyemeyiz.
+Bu sorunun çözümü, fiziksel zamanı bir kenara bırakıp olayları **nedensellik**
+üzerinden sıralamaktır ve temeli, dağıtık sistemler kuramının kurucu metnine
+dayanır.^[L. Lamport, "Time, Clocks, and the Ordering of Events in a Distributed System," *Communications of the ACM* 21(7), 1978.]
+
+Buradaki anahtar kavram, **"önce-olur" ilişkisidir** (happened-before): bir olay,
+ya aynı makinede ondan önce geldiyse, ya da ona bir mesaj gönderdiyse, "önce
+olmuş" sayılır; ve bu ilişki geçişlidir. İki olay bu zincirle birbirine
+bağlanamıyorsa, onlar **eşzamanlıdır** (concurrent) — nedensel olarak
+ilişkisizdirler ve aralarında "doğru" bir sıra yoktur. Bu ilişkiyi sayılarla
+yakalamak için **mantıksal saatler** (logical clocks) kullanılır: her makine bir
+sayaç tutar, her olayda artırır, gönderdiği her mesaja sayacını iliştirir ve bir
+mesaj aldığında kendi sayacını gelen değerle uyumlu hale getirir. Böylece, fiziksel
+saatlere hiç güvenmeden, nedensel olarak bağlı olayların doğru sırada numaralanması
+sağlanır.
+
+Mantıksal saatlerin tek bir sayaçlı temel biçiminin bir sınırı vardır: iki olayın
+*eşzamanlı* mı yoksa nedensel olarak bağlı mı olduğunu kesin ayırt edemez. Bunu
+yapabilmek için **vektör saatleri** (vector clocks) kullanılır: tek bir sayaç
+yerine, her makine *tüm* makinelerin sayaçlarından oluşan bir vektör tutar. İki
+olayın vektörlerini karşılaştırarak, birinin ötekinden kesin olarak önce mi
+geldiğini, yoksa gerçekten eşzamanlı mı olduklarını ayırt edebilirsiniz. İşte
+nedensel tutarlılığı — neden-sonuç ilişkili olayların herkese aynı sırada
+görünmesini — pratikte gerçekleştiren mekanizma, çoğu zaman bu vektör saatleridir;
+çünkü "hangi yazma hangisinden nedensel olarak önce geldi" sorusunu, fiziksel
+saatlere hiç güvenmeden, kesin yanıtlamayı sağlar.
+
 ## Tutarlılık ihtiyacı doğruluktan doğar
 
 Bu bölümü bir ilkeyle toparlayalım. Üçüncü bölümde "veri modeli erişim
@@ -169,11 +262,14 @@ ve gerisinde performansı kazanırsınız.
 Bu bölümde, eşzamanlılığı tek makinenin ötesine taşıdık ve birden çok kopyayla
 birlikte gelen tutarlılık sorununu inceledik. Veriyi neden çoğalttığımızı;
 kopyaların neden anlaşmazlığa düşebildiğini; güçlü tutarlılıktan nihai
-tutarlılığa uzanan tayfı ve aradaki pratik durakları; ağ bölündüğünde tutarlılık
-ile erişilebilirlik arasındaki kaçınılmaz seçimi; güçlü tutarlılığın otorite ve
-çoğunluk mutabakatıyla nasıl sağlandığını; tutarlılığın işlem başına nasıl
-ayarlanabildiğini; ve tutarlılık ihtiyacının doğruluk gereksiniminden doğduğunu
-gördük.
+tutarlılığa uzanan tayfı ve aradaki pratik durakları; güçlü tutarlılığın kesin
+adı olan doğrusallaştırılabilirliği ve onu ardışık tutarlılıktan ayıran
+gerçek-zaman koşulunu; mutabakatın eşzamansız bir dünyada neden koşulsuz garanti
+edilemediğini (FLP); ağ bölündüğünde tutarlılık ile erişilebilirlik arasındaki
+kaçınılmaz seçimi; güçlü tutarlılığın otorite ve çoğunluk mutabakatıyla nasıl
+sağlandığını; olayları fiziksel saate güvenmeden sıralamamızı sağlayan mantıksal
+ve vektör saatlerini; tutarlılığın işlem başına nasıl ayarlanabildiğini; ve
+tutarlılık ihtiyacının doğruluk gereksiniminden doğduğunu gördük.
 
 Şimdiye dek hep tutarlılığın **anlamı** üzerinde durduk: kopyalar varken "doğru"
 ne demektir, hangi güvenceleri seçebiliriz. Henüz konuşmadığımız şey,

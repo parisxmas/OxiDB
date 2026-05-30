@@ -51,6 +51,23 @@ koşullarını yalnızca bu adaylar üzerinde dener. Bir milyon belgeyi taramak
 yerine, indeksin daralttığı küçük aday kümesini süzmek, sekizinci bölümde
 gördüğümüz gibi kıyaslanamayacak kadar ucuzdur.
 
+Bu ikili sınıflandırmayı somutlaştırmakta yarar var; çünkü hangi operatörün
+hangi sınıfa düştüğü, OxiDB'nin yürütme planını doğrudan belirler. **İndeksli**
+sınıfa şunlar girer: eşitlik, eşitsizlik, dört yönlü aralık (büyük/büyük-eşit/
+küçük/küçük-eşit) ve üyelik. Bunların ortak yanı, bir alanın **tek bir değerine**
+ya da **bitişik bir değer aralığına** karşılık gelmeleri, yani bir B-ağacı
+indeksinde tek bir nokta ya da tek bir aralık olarak ifade edilebilmeleridir.
+**Süzgeç-yalnız** sınıfa ise listeye-koşullu-öğe-arama, "tümünü içerir", liste
+uzunluğu, alan türü, bölme kalanı, olumsuzlama, ne...ne bağı ve alanlar arası
+karşılaştırma girer. Bunların ortak yanı da, bir indeksin verdiği "şu değer şu
+belgelerde" eşlemesiyle yanıtlanamamalarıdır: bir liste uzunluğu indekste
+tutulmaz; bir olumsuzlama, indeksin sıralı yapısından yararlanamaz; alanlar arası
+bir karşılaştırma, tek bir alanın indeksiyle değil, belgenin iki alanının aynı
+anda görülmesiyle çözülür. Varlık koşulu da, kavramsal olarak indekslenebilir
+görünse de, OxiDB onu bu sürümde süzgeç tarafında değerlendirir. Bu ayrım keyfi
+değildir; her operatörün doğasından çıkar ve sorgu motorunun bütün plan mantığı
+bunun üzerine oturur.
+
 ## Yürütme: indeks, süzgeç ve tarama
 
 Bu ayrımdan, sekizinci bölümdeki yürütme mantığının somut karşılığı doğar.
@@ -65,6 +82,76 @@ gördüğümüz son çare devreye girer: tarama. OxiDB tüm belgeleri gezer ve h
 birinde süzgeç koşullarını dener. Bu, kaçınılması istenen tam tarama
 maliyetidir; ama uygun bir indeks yoksa başka yol yoktur. İşte tam burada,
 OxiDB'nin en ayırt edici tekniği devreye girer.
+
+## Seçicilik temelli koşul sıralaması
+
+Bir VE (AND) sorgusunda birden çok koşulun, üstelik birden çoğunun indeksli
+olduğu sık görülen bir durumdur — örneğin "şehri Ankara olan, yaşı 30'dan büyük
+ve aktif olan kullanıcılar". Her üç alanın da bir indeksi varsa, OxiDB hangisini
+kullanmalıdır? Bu seçim, sorgunun hızını kat kat değiştirebilir; çünkü amaç,
+**en az sayıda aday** üreten koşulu sürücü (driving) yapmaktır. Eğer "aktif=true"
+bir milyon kullanıcının altı yüz binini, "şehir=Ankara" ise yalnızca binini
+döndürüyorsa, şehir indeksini sürmek bin adayla başlamak, aktiflik indeksini
+sürmek ise altı yüz bin adayla başlamak demektir. İlki, ikincisinden yüzlerce kat
+daha az iş yapar.
+
+OxiDB bu kararı, **seçicilik** (selectivity) temelinde verir. Her indeksli alt
+koşul için, indeks meta verisinden ucuz bir **kardinalite tahmini** (cardinality
+estimate) çıkarır: bir eşitlik koşulu için, o değere kaç belgenin denk geldiğini
+indeksten sayar; bir aralık koşulu için, aralığın iki ucu arasına kaç belgenin
+düştüğünü, B-ağacının sıralı yapısından yararlanarak sayar; bir üyelik koşulu için
+ise kümedeki her değerin sayımlarını toplar. Bu sayımlar, belgeleri hiç çözmeden,
+yalnızca indeksin kendi sayaçlarından elde edilir; dolayısıyla tahmin neredeyse
+bedavadır. OxiDB, tahmini en küçük olan — yani en az aday döndüren — koşulu
+**sürücü** seçer ve onu tembel (lazy) biçimde, aday kimliklerini akış halinde
+üreterek gezer.
+
+Kalan indeksli koşullar ise birer **kesişim süzgeci** olarak iş görür. OxiDB, bu
+diğer koşulları kendi indekslerinden kimlik kümeleri olarak çıkarır; sonra,
+sürücü koşulun ürettiği her aday kimliğini bu kümelerde sorgular: aday tüm
+kümelerde varsa kesişime girer ve sonuca alınır, yoksa atlanır. Önemli olan şudur:
+bu kesişim sınaması, tam tarama değildir — yalnızca sürücünün ürettiği az sayıdaki
+aday üzerinde, küme üyelik testleriyle yapılır. Böylece toplam iş, koşulların
+**en seçicisi** kadar küçük kalır.
+
+Bir özel durum, bu mekanizmayı daha da keskinleştirir. Eğer bir VE sorgusunda
+**aynı alanın** hem alt hem üst sınırı verilmişse — örneğin "yaş 25 ile 35
+arasında" — OxiDB bunu iki ayrı koşul olarak değil, tek bir birleşik aralık
+taraması olarak tanır ve indeksin o aralığını bir kerede gezer. Bu, aynı alana
+iki kez bakıp sonuçları kesiştirmekten daha doğrudan ve hızlıdır.
+
+![En seçici koşulu sürücü seçmek ve diğerlerini kesişim süzgeci yapmak.](sekiller/19b-secicilik.svg){width=85%}
+
+Burada, sekizinci bölümün bir sorgu eniyileyicisi (query optimizer) için
+çizdiği soyut resmin somut bir köşesini görürüz: motor, kullanıcının yazdığı
+koşul sırasına körü körüne uymaz; koşulları, beklenen maliyetlerine göre kendisi
+yeniden sıralar. OxiDB'nin bu yeniden sıralaması, klasik bir maliyet temelli
+eniyileyicinin (cost-based optimizer) sade ama etkili bir biçimidir: tek bir
+ölçüt — beklenen aday sayısı — üzerinden, en ucuz başlangıç noktasını seçer.
+
+## İki indekssiz hızlı yol: sayım ve indeks destekli sıralama
+
+Tarama her zaman son çare değildir; bazı sorgular, belgelere hiç dokunmadan,
+yalnızca indeksin yapısından yanıtlanabilir. Bunun en saf örneği **sayımdır**.
+"Şu koşula uyan kaç belge var?" sorusu, eğer koşul indeksliyse, belgelerin
+içeriğine bakmayı hiç gerektirmez: OxiDB, indeksteki ilgili nokta ya da aralığa
+düşen kimliklerin **sayısını** doğrudan okur. Bu, az önceki kardinalite tahmininin
+aynı mekanizmasıdır — ama burada tahmin değil, kesin yanıttır. Bir milyon belgeli
+bir koleksiyonda "kaç tane aktif kullanıcı var?" sorusu, tek bir belge çözülmeden,
+indeksin sayacından milisaniyenin altında yanıtlanabilir.
+
+İkinci hızlı yol, **indeks destekli sıralamadır**. Sekizinci bölümde, sıralamanın
+doğası gereği pahalı — tüm sonucu toplayıp karşılaştırarak dizmeyi gerektiren —
+bir iş olduğunu söylemiştik. Ama eğer sıralama alanının bir indeksi varsa, OxiDB
+sıralamayı hiç yapmaz: indeksin kendisi zaten o alana göre sıralı tutulduğu için,
+indeksi baştan (artan) ya da sondan (azalan) gezmek, belgeleri doğrudan sıralı
+düzende verir. Üstelik bir üst sınır (limit) verilmişse, OxiDB indeksi yalnızca
+o sınır kadar ilerletir ve durur. Yani "en yeni 20 kayıt" gibi bir sorgu, bir
+milyon belgeyi sıralamak yerine, indeksin yalnızca ilk 20 girdisine dokunur. Bu,
+sekizinci bölümde değindiğimiz, sıralama maliyetini belge sayısından (n log n)
+yalnızca istenen sonuç sayısına (sınır kadar) indiren önemli bir eniyilemedir.
+OxiDB hem tekil alan indekslerinde hem de bileşik (composite) indekslerde bu
+sıralı-gezinme yolunu kullanır.
 
 ## Bayt düzeyinde süzme: çözmeden elemek
 
@@ -85,6 +172,27 @@ değindiğimiz, JSON'un daha zengin akrabası — bir alanın değerine, tüm be
 yalnızca baytlarına bakılarak elenir. Yalnızca koşula **uyan** belgeler, sonuç
 için gereken biçime dönüştürülür. Yani sistem, sonunda atacağı belgeler için
 çözme emeğini hiç harcamaz.
+
+Bu yolun teknik kalbi, ikili biçimin **kısmi çıkarım** (partial extraction)
+yeteneğidir. JSON'un düz metin biçiminde bir alanın değerine ulaşmak için, metni
+baştan sona ayrıştırmak gerekir; çünkü alanların nerede başlayıp bittiği ancak
+okunarak anlaşılır. OxiDB'nin kullandığı ikili biçim ise — JSON'un yapılandırılmış
+ikili bir akrabası — bir belgenin hangi alanı nerede tuttuğunu, baytlar üzerinde
+gezilerek bulunabilir biçimde kodlar. Böylece motor, bir koşulun ilgilendiği
+**yalnızca o alanın** değerini, belgenin geri kalanına hiç dokunmadan, doğrudan
+baytlardan okuyabilir. Bir koşul "yaş > 30" diyorsa, motor belgenin baytlarında
+"yaş" alanına gider, oradaki sayısal değeri çıkarır ve karşılaştırır; belgenin
+adresi, sipariş geçmişi, iç içe nesneleri — hiçbiri çözülmez. Aranan alan belgede
+yoksa, bu da baytlardan anlaşılır ve belge yine çözülmeden elenir.
+
+Bu kısmi çıkarımın bir sınırı, OxiDB'nin onu yürütme planına ne zaman
+yerleştirdiğini de belirler. Bayt düzeyinde süzgeç, ancak süzme yolunun belgeleri
+sırayla taradığı ve her belgenin baytlarına eriştiği durumlarda işler — yani
+indeksin tek başına yetmediği, kalan koşulların bayt üzerinden sınanacağı tarama
+ya da aday-süzme adımlarında. Eğer bayt yolu bir belge için kesin bir karar
+veremezse — örneğin koşul, ikili biçimde doğrudan değerlendirilemeyecek kadar
+karmaşıksa — motor o belge için nesne yoluna geri düşer; ama bu, kuralın değil
+istisnanın yoludur.
 
 Bunun somut etkisi, OxiDB üzerinde yapılan ölçümlerde çarpıcı biçimde görülür.
 İndeksin yardım edemediği, çok sayıda belgeyi süzen bir sorgu düşünün — örneğin
@@ -150,9 +258,12 @@ gösterir.
 
 Bu bölümde, OxiDB'nin sorgu motorunu yakın plana aldık. Sorgunun zengin operatör
 dağarcığını ve nasıl bir koşul ağacına ayrıştırıldığını; koşulların indeksli ve
-süzgeç sınıflarına ayrılmasını ve "indeks daraltır, süzgeç inceltir" iş bölümünün
-bu ayrım üzerine kurulduğunu; yürütmenin indeks, süzgeç ve tarama yollarını; ve
-OxiDB'nin vitrin tekniği olan bayt düzeyinde süzmeyi — eşleşmeyen belgeleri hiç
+süzgeç sınıflarına — operatör operatör — ayrılmasını ve "indeks daraltır, süzgeç
+inceltir" iş bölümünün bu ayrım üzerine kurulduğunu; bir VE sorgusunda en seçici
+koşulu kardinalite tahminiyle sürücü seçip ötekileri kesişim süzgecine çeviren
+seçicilik temelli sıralamayı; indeks destekli sayım ve sıralamanın belgelere hiç
+dokunmadan yanıt veren iki hızlı yolunu; ve OxiDB'nin vitrin tekniği olan bayt
+düzeyinde süzmeyi — ikili biçimin kısmi çıkarımıyla eşleşmeyen belgeleri hiç
 çözmeden eleyerek hem belleği hem hızı iyileştiren yaklaşımı — gördük. Tekil
 işlemlerdeki erken sonlanmayı, sunucu yoluyla bütünleşmeyi ve bildirimsel
 özgürlüğün bu motordaki yansımasını izledik.

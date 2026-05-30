@@ -16,19 +16,29 @@ ilkeleriyle bağlayarak ele alıyor.
 
 Bir ağ bağlantısı, özünde, kesintisiz bir bayt akışıdır; mesajlar arasında doğal
 bir sınır yoktur. Bu yüzden bir protokolün çözmesi gereken ilk sorun,
-**çerçevelemedir**: alıcının, bir mesajın nerede bitip diğerinin nerede
-başladığını bilmesi. OxiDB bunu, her mesajın önüne onun uzunluğunu yazarak çözer:
-alıcı önce uzunluğu okur, sonra tam o kadar bayt okuyarak mesajı bütün olarak
-alır, ardından bir sonraki mesajın uzunluğunu bekler. Bu basit ama sağlam
-çerçeveleme, akış üzerinde mesajları net biçimde ayırır.
+**çerçevelemedir** (framing): alıcının, bir mesajın nerede bitip diğerinin nerede
+başladığını bilmesi. OxiDB bunu, her mesajın önüne onun uzunluğunu dört baytlık
+bir tamsayı olarak yazarak çözer: alıcı önce bu dört baytı okuyup uzunluğu öğrenir,
+sonra tam o kadar bayt okuyarak mesajı bütün olarak alır, ardından bir sonraki
+mesajın uzunluğunu bekler. Uzunluğun bir **üst sınırı** vardır — on altı mebibayt;
+bu sınırı aşan bir uzunluk bildirimi, daha bir bayt yük okunmadan reddedilir. Bu,
+güvenlik açısından önemlidir: kötü niyetli ya da bozuk bir istemcinin, "şu kadar
+gigabayt gelecek" diyerek sunucuyu o kadar bellek ayırmaya zorlamasını ve böylece
+bir hizmet engelleme saldırısı düzenlemesini önler. Bu basit ama sağlam çerçeveleme,
+akış üzerinde mesajları net biçimde ayırır.
 
-Mesajın içeriği iki biçimde kodlanabilir. Birincisi, insan tarafından okunabilir,
+Mesajın içeriği iki biçimde kodlanabilir ve sunucu, gelen mesajın ilk baytına
+bakarak hangisinin kullanıldığını anlar. Birincisi, insan tarafından okunabilir,
 JSON tabanlı bir biçimdir; hata ayıklamak ve basit istemciler yazmak kolaydır.
-İkincisi, **OxiWire** adı verilen, daha hızlı bir ikili biçimdir. İkili biçimin
-avantajı, on dokuzuncu bölümdeki bayt düzeyinde fikirle bağlanır: bir sorgu yanıtı,
-belgeleri nesnelere çevirip yeniden metne dökmek zorunda kalmadan, doğrudan ikili
-biçimde gönderilebilir. Böylece sunucu yolu, yalnızca sorgu işlemede değil, ağ
-üzerinden yanıt göndermede de gereksiz dönüşümlerden kaçınır.
+İkincisi, **OxiWire** adı verilen, sıkı paketlenmiş bir ikili biçimdir; bu biçim,
+bir baytlık ayırt edici bir önek ile başlar ve gövdesini, yaygın bir ikili
+serileştirme biçimiyle kodlar. İkili biçimin avantajı, JSON'un metinsel ağırlığını
+taşımamasıdır: alanları çift tırnak, virgül ve boşlukla işaretlemek yerine,
+değerleri kompakt ikili etiketlerle kodlar; böylece hem hat üzerinde daha az bayt
+gider, hem de ayrıştırma daha ucuzdur. Burada dürüst bir nitelik gerekir: ikili
+biçim, hattaki bayt sayısını ve ayrıştırma maliyetini azaltır, ama yine de değerleri
+kodlayıp çözmek için bir dönüşüm adımı içerir; sıfır-kopya bir aktarım değildir.
+Kazanç, biçimin metinden kompaktlığında ve ucuz ayrıştırılabilirliğindedir.
 
 Bir istek, özünde, bir **komut** ve onun argümanlarından oluşur: ne yapılacağı
 (ekle, bul, güncelle, topla...) ve hangi koleksiyon üzerinde, hangi sorguyla.
@@ -62,14 +72,35 @@ asla düz metin saklanmaz, yavaş ve tuzlanmış bir özetle tutulur; ve parolan
 kendisi ağ üzerinden gönderilmez, bir meydan-okuma yanıt yöntemiyle bilindiği
 kanıtlanır. OxiDB, sunucu kimlik doğrulamasında tam olarak bu iki kuralı uygular.
 
-OxiDB, parolaları doğrularken bir meydan-okuma yanıt protokolü kullanır: sunucu
-bir meydan okuma gönderir, istemci parolasını kullanarak ona doğru yanıtı üretir, ama
-parolanın kendisi hattan hiç geçmez. Böylece bağlantıyı dinleyen biri, parolayı
-yakalayamaz. Parolaların kendisi ise, on dördüncü bölümün ilk kuralına uygun
-olarak, yavaş ve tuzlanmış bir özetle saklanır; böylece veritabanı sızsa bile
-parolalar geri elde edilemez ve kaba kuvvet saldırıları pratikte imkânsız hale
-gelir. Bu, on dördüncü bölümdeki soyut güvenlik ilkelerinin gerçek bir sistemde
-nasıl somutlaştığının net bir örneğidir.
+OxiDB, parolaları doğrularken **SCRAM-SHA-256** adlı, yaygın olarak kullanılan,
+standartlaştırılmış bir meydan-okuma yanıt protokolü kullanır.^[A. Menon-Sen, A.
+Melnikov, C. Newman ve N. Williams, "Salted Challenge Response Authentication
+Mechanism (SCRAM) SASL and GSS-API Mechanisms," RFC 5802, 2010.] Bu protokolün iç
+işleyişi, on dördüncü bölümdeki iki kuralın zarif bir somutlaşmasıdır; adımlarını
+görelim.
+
+İstemci, kullanıcı adıyla birlikte rastgele bir sayı — bir **istemci tek-kullanım
+değeri** (client nonce) — gönderir. Sunucu yanıtında, istemci tek-kullanım değerine
+kendi rastgele sayısını — **sunucu tek-kullanım değerini** ekler, ayrıca bu
+kullanıcıya ait **tuzu** (salt) ve özet için kaç yineleme yapılacağını bildirir.
+İki tarafın da birleşik tek-kullanım değerini paylaşması, her el sıkışmayı benzersiz
+kılar ve daha önce yakalanmış bir yanıtın yeniden oynatılmasını (replay) önler.
+İstemci, parolasını tuz ve yineleme sayısıyla yavaş bir özete sokarak bir anahtar
+türetir; bu anahtarla, el sıkışmanın tüm mesajlarını kapsayan bir imza — bir
+**istemci kanıtı** (client proof) — hesaplar ve yalnızca bu kanıtı gönderir.
+Parolanın kendisi de, ondan doğrudan türetilen anahtar da hattan hiç geçmez.
+Sunucu, kendi sakladığı doğrulayıcıdan aynı hesabı yaparak kanıtı denetler;
+isterse, istemcinin de sunucuyu doğrulayabilmesi için karşılık bir imza döndürür,
+böylece doğrulama **karşılıklı** olur.
+
+Sunucunun sakladığı şey de önemlidir: parolanın kendisi değil, tuz, yineleme sayısı
+ve ondan türetilen anahtarlardır. Tuzlama, aynı parolayı kullanan iki kullanıcının
+diskte aynı görünmesini önler; yüksek yineleme sayısı, özetlemeyi kasıtlı olarak
+yavaşlatarak kaba kuvvet (brute force) denemelerini pahalı kılar. Böylece veritabanı
+sızsa bile parolalar geri elde edilemez. Bu, on dördüncü bölümdeki soyut güvenlik
+ilkelerinin gerçek bir sistemde nasıl somutlaştığının net bir örneğidir.
+
+![SCRAM el sıkışması: tek-kullanım değerleri ve kanıtın akışı.](sekiller/24b-scram-akis.svg){width=85%}
 
 ## Yetkilendirme: rol tabanlı geçit
 

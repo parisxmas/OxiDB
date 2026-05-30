@@ -31,6 +31,24 @@ hızlısını seçer ve sizi adım adım yönlendirir. Sorgu işleyici de tıpk�
 olası yürütme yollarını tartar ve en ucuzunu seçer. Bu işi üç aşamada yapar:
 ayrıştırma, planlama ve yürütme.
 
+Bu üç aşamanın altında, profesyonel veritabanı motorlarının onlarca yıldır
+biriktirdiği daha ince bir katmanlama yatar. Ham istek önce bir **soyut sözdizimi
+ağacına** (abstract syntax tree, AST) dönüşür — sorgunun saf yapısal iskeleti.
+Bu iskelet, ardından bir **mantıksal plana** (logical plan) çevrilir: hangi
+işlemlerin hangi sırayla yapılacağını, ama *nasıl* yapılacağını henüz söylemeyen,
+cebirsel bir akış. Mantıksal plan, "şu koşulla süz, sonra şuna göre sırala, sonra
+ilk onu al" der; ama süzmenin indeksle mi taramayla mı, sıralamanın bellekte mi
+indeksle mi yapılacağını belirtmez. Son adımda mantıksal plan bir ya da daha çok
+**fiziksel plana** (physical plan) somutlaşır: her mantıksal işlem, onu gerçekten
+yürütecek somut bir algoritmaya — indeks taraması, tam tarama, bellekte sıralama,
+şu birleştirme algoritması — bağlanır. Eniyileyicinin asıl işi, aynı mantıksal
+planı karşılayan birçok olası fiziksel plan arasından en ucuzunu seçmektir. Bu
+katmanlı ayrım — soru, cebirsel akış, somut algoritma — modern eniyileyicinin
+omurgasıdır ve ilk olarak IBM'in System R araştırma sisteminde, bugün hâlâ
+kullandığımız biçimiyle ortaya konmuştur.^[P. Selinger, M. Astrahan, D. Chamberlin, R. Lorie ve T. Price, "Access Path Selection in a Relational Database Management System," *Proc. ACM SIGMOD*, 1979.]
+
+![Fiziksel plan, bir yineleyici ağacıdır.](sekiller/08b-sorgu-plan.svg){width=85%}
+
 ## Birinci aşama: ayrıştırma
 
 İlk adım **ayrıştırmadır** (parsing). Kullanıcının sorgusu, sisteme bir biçimde
@@ -99,6 +117,68 @@ ederse, sistem kötü bir plan seçip yavaşlayabilir. İyi bir sorgu işleyici,
 tahminlerini olabildiğince isabetli tutmaya çalışır, ama tahminin doğası gereği
 hata payı her zaman vardır.
 
+## Kardinalite, seçicilik ve histogramlar
+
+Yukarıda durmadan "seçici" sözcüğünü kullandık; şimdi onu sayısal bir zemine
+oturtalım, çünkü eniyileyicinin tüm kararları bu kavramın üzerine kuruludur. Bir
+koşulun **seçiciliği** (selectivity), o koşulun belgelerin ne kadar küçük bir
+oranını geçirdiğidir: sıfıra yakınsa çok seçici (az belge geçer), bire yakınsa
+seçici değil (çoğu belge geçer). Bir koşulun, bir koleksiyona uygulandığında kaç
+belge döndüreceğinin tahminine ise **kardinalite tahmini** (cardinality
+estimation) denir. Seçicilik ile koleksiyon boyutunun çarpımı, beklenen sonuç
+kardinalitesini verir; eniyileyici planındaki her aşamanın çıktı boyutunu işte bu
+çarpımla kestirir.
+
+Peki sistem, bir belgeyi okumadan, "bölge = Ege" koşulunun bir milyon belgeden
+kaçını geçireceğini nasıl tahmin eder? Bunu **istatistikler** aracılığıyla yapar.
+En kaba istatistik, bir alandaki **ayrık değer sayısıdır** (distinct değer): eğer
+bölge alanı yedi farklı değer alıyorsa, eşitlik koşulunun kabaca belgelerin
+yedide birini geçireceği varsayılır — buna *tekdüze dağılım varsayımı* denir.
+Ama gerçek veri nadiren tekdüzedir; bir bölgede nüfusun yarısı, ötekinde yüzde
+biri yaşayabilir. Bu çarpıklığı yakalamak için sistemler **histogram** tutar:
+alanın değer aralığını kovalara böler ve her kovaya kaç belgenin düştüğünü sayar.
+Bir aralık koşulunun ("yaş 30 ile 40 arası") seçiciliği, o aralığa düşen kovaların
+sayımlarının toplamından kestirilir. Sık görülen birkaç değerin tek başına büyük
+yer kapladığı çarpık alanlarda, sistemler ayrıca bu **uç değerleri** (most common
+values) tek tek listeleyip geri kalanı histogramla modelleyebilir; böylece hem
+çarpıklık hem de kuyruk birlikte yakalanır.
+
+Birden çok koşulun birleşik seçiciliğini tahmin etmek daha da çetrefildir. En
+yaygın varsayım, koşulların **bağımsız** olduğudur: "bölge = Ege" belgelerin
+yüzde onunu, "yaş < 40" yüzde yarısını geçiriyorsa, ikisinin birden seçiciliği
+0,10 ile 0,50'nin çarpımı olan 0,05 sayılır. Bu varsayım pratik olsa da tehlikelidir; çünkü gerçek
+alanlar çoğu zaman **bağımlıdır** (örneğin posta kodu ile şehir). Bağımlılık
+göz ardı edilince tahmin gerçeğin çok altına ya da üstüne düşebilir, ve kötü
+kardinalite tahmini, kötü plan seçiminin bir numaralı nedenidir. İyi
+eniyileyiciler bu yüzden, birden çok alan üzerinde birlikte istatistik tutmaya ya
+da çalışma anında ölçüm yapıp planı düzeltmeye çalışır; ama tahmin hatası, sorgu
+eniyilemesinin kalıcı ve çözülmemiş zorluğudur.
+
+## Maliyet modeli: planları sayıya dökmek
+
+Kardinalite tahmini, "her aşamadan kaç belge çıkar" sorusunu yanıtlar; ama
+eniyileyicinin asıl sorusu, "bu planı yürütmek ne kadar **iş** gerektirir"dir.
+Bu işi ölçen şey, **maliyet modelidir** (cost model). Maliyet modeli, bir planın
+tahmini bedelini soyut bir sayıya indirger ve genellikle iki tür temel işi
+ağırlıklandırarak toplar: **disk erişimi** (sayfa okuma/yazma) ve **işlemci işi**
+(belge çözme, koşul değerlendirme, karşılaştırma). Klasik System R modeli, bir
+erişim yolunun maliyetini "okunan sayfa sayısı + bir ağırlık çarpı işlenen kayıt
+sayısı" gibi bir formülle hesaplar; çünkü diskten bir sayfa getirmek, bellekte
+bir karşılaştırma yapmaktan kat kat pahalıdır.
+
+Bu modelin neden bu kadar önemli olduğunu somut bir örnekle görelim. Diyelim
+bir koşul belgelerin yüzde otuzunu geçiriyor. Bunun için bir indeks var; ama
+indeksi kullanmak, eşleşen her belgenin kimliğini bulup sonra her birini diskten
+ayrı ayrı getirmek demektir — ve bu ayrı ayrı getirmeler, diskte dağınık,
+**rastgele** erişimlerdir. Oysa tam tarama, tüm belgeleri diskten **sıralı**
+okur; sıralı okuma, rastgele okumadan kat kat hızlıdır. İşte bu yüzden, bir
+koşul yeterince seçici *değilse*, indeksli olsa bile tam tarama daha ucuz
+olabilir: yüzde otuzu rastgele toplamaktansa, yüzde yüzü sıralı okuyup süzmek
+daha hızlı çıkar. Maliyet modeli, tam da bu sezgiyi sayıya döker ve eniyileyicinin
+"indeksi kullanmamak" gibi ilk bakışta tuhaf görünen, ama doğru kararları
+vermesini sağlar. Bu "her erişim yolunu maliyetlendir, en ucuzunu seç" yaklaşımı,
+System R'den bu yana maliyet-tabanlı eniyilemenin temelidir.
+
 ## İndeks yoksa: tarama ve süzgeç
 
 Bazen, sorgudaki hiçbir koşul indeksli bir alana denk gelmez. O zaman sistemin
@@ -155,6 +235,69 @@ indirgeme işine **izdüşüm** (projection) denir. İzdüşüm, hem ağ üzerin
 veriyi azaltır hem de — yedinci bölümdeki kapsayan indeksleri hatırlayın — eğer
 istenen alanların hepsi zaten bir indekste varsa, belgeye hiç dokunmadan yanıt
 üretmeyi mümkün kılar.
+
+## İki kümeyi eşleştirmek: birleştirme algoritmaları
+
+Şimdiye dek tek bir koleksiyondan belge süzmeyi konuştuk. Ama kimi sorular, iki
+ayrı kümeyi bir anahtar üzerinden **eşleştirmeyi** gerektirir: bir sipariş
+listesini, o siparişlerin sahibi kullanıcılarla buluşturmak gibi. Belge
+dünyasında bu, çoğu zaman bir sonraki bölümdeki birleştirme aşamasıyla yapılır;
+ama altta yatan algoritmalar, ilişkisel dünyadan ödünç alınmış üç klasik
+yöntemdir ve her birinin maliyet profili farklıdır.
+
+![Üç birleştirme algoritması, üç maliyet profili.](sekiller/08c-birlestirme.svg){width=85%}
+
+Birincisi **iç içe döngü birleştirmesidir** (nested-loop join). En sezgisel
+olanıdır: dış kümedeki her belge için, iç kümenin tamamını gezip eşleşeni arar.
+İki küme N ve M boyutundaysa, maliyeti kabaca N çarpı M'dir — yani küçük kümelerde
+ucuz, büyük kümelerde felakettir. Ama bir incelik vardır: eğer iç küme tarafında,
+eşleştirme anahtarı üzerinde bir indeks varsa, her dış belge için tüm iç kümeyi
+taramak yerine indeksten doğrudan eşleşeni bulabiliriz; maliyet N çarpı M'den
+N çarpı (M'nin logaritması)'na iner. Bu "indeksli iç içe döngü", iç tarafta
+seçici bir indeks olduğunda hâlâ çok kullanışlıdır.
+
+İkincisi **hash birleştirmesidir** (hash join). Fikri zariftir: önce iki kümeden
+**küçük** olanını gezip, eşleştirme anahtarına göre bir **hash tablosu** kurarsın;
+sonra büyük kümeyi bir kez gezip, her belgenin anahtarını bu hash tablosunda
+ararsın. Her arama neredeyse anlık olduğu için, toplam maliyet kabaca N artı
+M'dir — iç içe döngünün çarpımsal maliyetine kıyasla çok daha iyi. Hash
+birleştirmesi, eşitlik üzerinden yapılan birleştirmelerde ve hash tablosu belleğe
+sığdığında en hızlı seçenektir. Bir sonraki bölümdeki birleştirme aşamasının
+verimli gerçekleştirimleri, çoğu zaman tam olarak bir hash birleştirmesidir.
+
+Üçüncüsü **sırala-birleştir birleştirmesidir** (sort-merge join). İki kümeyi de
+eşleştirme anahtarına göre sıralar, sonra ikisini bir fermuar gibi yan yana
+yürüterek eşleşenleri çıkarır. Sıralama maliyetlidir; ama kümeler zaten sıralıysa
+— örneğin bir indeks onları zaten sıralı veriyorsa — sıralama bedavaya gelir ve
+yürüme adımı yalnızca N artı M'dir. Sırala-birleştir, eşitlik dışındaki
+karşılaştırmalarda (örneğin aralık birleştirmesi) ve sonucun da sıralı olması
+istendiğinde özellikle değerlidir. Eniyileyici, bu üç algoritma arasından, az
+önceki kardinalite tahminine ve maliyet modeline bakarak — kümeler ne kadar
+büyük, anahtarda indeks var mı, çıktının sıralı olması gerekiyor mu — birini
+seçer.
+
+## Yineleyici modeli: planı çalıştıran iskelet
+
+Bir fiziksel plan seçildikten sonra, onu *çalıştıran* mekanizma da en az planın
+kendisi kadar zariftir. Yaygın yaklaşım, **yineleyici modeli** (iterator model)
+ya da kâşifinin adıyla **Volcano modelidir**.^[G. Graefe, "Volcano—An Extensible and Parallel Query Evaluation System," *IEEE Trans. Knowledge and Data Engineering* 6(1), 1994.] Bu modelde plan, bir
+**yineleyici ağacı** olarak kurulur: her aşama — indeks taraması, süzgeç,
+sıralama, sınırlama — aynı basit arayüzü konuşan bir düğümdür ve bu arayüzün özü
+tek bir işlemdir: "bana bir sonraki belgeyi ver."
+
+İş, yukarıdan aşağı bir **talep** olarak akar. En üstteki düğüme (diyelim
+sınırlama) "bir belge ver" denir; o, hemen altındaki düğümden (süzgeç) bir belge
+ister; süzgeç de altındaki indeks taramasından ister; indeks taraması bir aday
+üretir, süzgeç onu koşula göre kabul ya da reddeder, kabul edilen yukarı çıkar.
+Belgeler aşağıdan yukarı **birer birer** akar; hiçbir aşama, tüm belgeleri belleğe
+yığmak zorunda değildir. Bu modelin iki büyük erdemi vardır. Birincisi
+**bileşilebilirliktir**: her aşama aynı arayüzü konuştuğu için, onları lego gibi
+serbestçe üst üste dizebilirsiniz. İkincisi ise **akış halinde
+çalışabilmesidir**: sınırlama düğümü onuncu belgeyi aldığında "yeter" der ve
+talep akışını durdurur; alttaki indeks taraması da o anda durur, geri kalan
+milyonlarca belgeyi hiç üretmez. İşte erken sonlanma, yineleyici modelinin
+talep-güdümlü doğasından kendiliğinden doğar. Bu birer-birer çekme modeli, modern
+sorgu motorlarının büyük çoğunluğunun iskeletidir.
 
 ## Bildirimsel olmanın asıl kazancı
 

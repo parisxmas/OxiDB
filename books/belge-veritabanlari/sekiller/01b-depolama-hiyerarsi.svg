@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="320" font-family="Georgia, serif">
+  <rect width="720" height="320" fill="#fbfbf8"/>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Depolama hiyerarşisi: hız ile kalıcılık birbirine düşmandır</text>
+  <g text-anchor="middle">
+    <rect x="270" y="50" width="180" height="34" rx="6" fill="#fdeee0" stroke="#c97b2c"/><text x="360" y="72" font-size="12">Yazmaç / önbellek</text>
+    <rect x="240" y="92" width="240" height="34" rx="6" fill="#fdeee0" stroke="#c97b2c"/><text x="360" y="114" font-size="12">Ana bellek (RAM)</text>
+    <rect x="200" y="134" width="320" height="34" rx="6" fill="#e8f3ea" stroke="#3a8a52"/><text x="360" y="156" font-size="12">Katı hal sürücüsü (SSD)</text>
+    <rect x="150" y="176" width="420" height="34" rx="6" fill="#e8f3ea" stroke="#3a8a52"/><text x="360" y="198" font-size="12">Dönen disk (HDD)</text>
+    <rect x="100" y="218" width="520" height="34" rx="6" fill="#eef0f5" stroke="#555"/><text x="360" y="240" font-size="12">Ağ / soğuk arşiv</text>
+  </g>
+  <!-- left axis: speed -->
+  <text x="60" y="56" font-size="10.5" fill="#c97b2c">hızlı</text>
+  <text x="48" y="246" font-size="10.5" fill="#555">yavaş</text>
+  <text x="40" y="150" font-size="11" fill="#888" transform="rotate(-90 40 150)" text-anchor="middle">erişim hızı ↑</text>
+  <!-- right axis: capacity / durability -->
+  <text x="668" y="56" font-size="10.5" fill="#888" text-anchor="end">uçucu · küçük</text>
+  <text x="690" y="246" font-size="10.5" fill="#888" text-anchor="end">kalıcı · büyük</text>
+  <text x="700" y="150" font-size="11" fill="#888" transform="rotate(90 700 150)" text-anchor="middle">kapasite · kalıcılık ↑</text>
+  <line x1="660" y1="62" x2="660" y2="234" stroke="#ccc"/>
+  <line x1="63" y1="62" x2="63" y2="234" stroke="#ccc"/>
+  <text x="360" y="282" font-size="11" text-anchor="middle" fill="#666">Üst katmanlar nanosaniye, alt katmanlar milisaniye — milyonlarca kat fark</text>
+  <text x="360" y="304" font-size="10.5" text-anchor="middle" fill="#999">VTYS'nin işi: kalıcıyı yavaş katmana yazmak, sıcağı hızlı katmanda önbelleğe almak</text>
+</svg>

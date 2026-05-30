@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="310" font-family="Georgia, serif">
+  <rect width="720" height="310" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="26" font-size="14" font-weight="bold" text-anchor="middle">Seçicilik temelli VE: en dar koşulu sür, ötekileri kümede sına</text>
+
+  <!-- query -->
+  <rect x="20" y="50" width="220" height="64" rx="8" fill="#eef0f5" stroke="#555"/>
+  <text x="130" y="72" font-size="11.5" text-anchor="middle" font-style="italic">VE { sehir=Ankara,</text>
+  <text x="130" y="90" font-size="11.5" text-anchor="middle" font-style="italic">yas &gt; 30,</text>
+  <text x="130" y="108" font-size="11.5" text-anchor="middle" font-style="italic">aktif = true }</text>
+
+  <!-- estimate column -->
+  <text x="370" y="46" font-size="11" text-anchor="middle" fill="#666">indeks meta verisinden kardinalite tahmini</text>
+  <g font-size="11" text-anchor="middle">
+    <rect x="300" y="54" width="200" height="24" rx="5" fill="#fdeee0" stroke="#c97b2c"/><text x="400" y="70">sehir: count_eq → ~1.200</text>
+    <rect x="300" y="84" width="200" height="24" rx="5" fill="#fdeee0" stroke="#c97b2c"/><text x="400" y="100">yas: count_range → ~480.000</text>
+    <rect x="300" y="114" width="200" height="24" rx="5" fill="#fdeee0" stroke="#c97b2c"/><text x="400" y="130">aktif: count_eq → ~620.000</text>
+  </g>
+  <line x1="240" y1="82" x2="298" y2="66" stroke="#888" stroke-width="1.4" marker-end="url(#a)"/>
+
+  <!-- winner -->
+  <rect x="540" y="54" width="160" height="24" rx="5" fill="#cde8d3" stroke="#3a8a52" stroke-width="2"/>
+  <text x="620" y="70" font-size="11" text-anchor="middle" font-weight="bold">en dar → sür</text>
+  <line x1="500" y1="66" x2="538" y2="66" stroke="#3a8a52" stroke-width="1.6" marker-end="url(#a)"/>
+
+  <!-- driving iteration -->
+  <rect x="40" y="170" width="250" height="56" rx="8" fill="#cde8d3" stroke="#3a8a52"/>
+  <text x="165" y="192" font-size="11.5" text-anchor="middle" font-weight="bold">sehir indeksini tembel gez</text>
+  <text x="165" y="210" font-size="10.5" text-anchor="middle">~1.200 aday kimlik (akış halinde)</text>
+  <line x1="620" y1="78" x2="200" y2="168" stroke="#3a8a52" stroke-width="1.4" marker-end="url(#a)"/>
+
+  <!-- intersection check -->
+  <rect x="350" y="170" width="320" height="56" rx="8" fill="#fdeee0" stroke="#c97b2c"/>
+  <text x="510" y="190" font-size="11" text-anchor="middle">her aday için: öteki indeks kümelerinde mi?</text>
+  <text x="510" y="208" font-size="10.5" text-anchor="middle">yoksa atla — yoksa kesişim, sonuca al</text>
+  <line x1="290" y1="198" x2="348" y2="198" stroke="#888" stroke-width="1.6" marker-end="url(#a)"/>
+
+  <text x="360" y="262" font-size="11" text-anchor="middle" fill="#666">İş, koşulların en seçicisi (en az satır döndüren) kadar; ötekiler tam tarama değil, küme üyelik testi</text>
+  <text x="360" y="286" font-size="10.5" text-anchor="middle" fill="#999">Aynı alanda alt/üst sınır birleşirse ({yas: {$gte,$lte}}) tek bir aralık taramasına indirgenir</text>
+</svg>

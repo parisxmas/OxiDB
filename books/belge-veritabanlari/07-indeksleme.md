@@ -85,13 +85,40 @@ sıralamak yerine, indeksin başından on adım yürüyerek yanıtlanabilir. Ü�
 kısımda OxiDB'nin sıralamayı tam da böyle, indeks üzerinden, taramadan
 yaptığını göreceğiz.
 
+Bir önceki bölümde B+ağacının iç yapısını gördük; bir indeks olarak
+kullanıldığında o yapı neredeyse aynı kalır, yalnızca yapraklarda asıl belge
+yerine **anahtar artı belge konumu** çiftleri durur. Yüksek fanout sayesinde
+indeks ağacı da sığ kalır: milyonlarca farklı değer arasında bile, aranan değere
+ya da bir aralığın başına üç-dört düğüm erişimiyle ulaşılır. Yaprakların bağlı
+liste ile zincirlenmesi, "şu değerden büyük ilk yüz kayıt" ya da "şu iki tarih
+arası tüm kayıtlar" gibi sorguları, ağaca tekrar tepeden inmeden, yapraktan
+yaprağa yürüyerek yanıtlamayı sağlar. Aynı yapı, "sıralı getirme"nin bedava
+gelmesinin de nedenidir: indeks zaten sıralı olduğu için, sıralı sonuç istemek
+ek bir sıralama işi doğurmaz.
+
 Sıralı indeksin bir alternatifi, değerleri sıralı tutmayan ama eşitlik aramasını
-çok hızlı yapan **karma (hash) indekstir**. Karma indeks, bir değeri doğrudan
-konumuna eşler; eşitlik aramasında çok hızlıdır ama değerleri sıralı tutmadığı
-için aralık sorgularını ya da sıralı getirmeyi yapamaz. Yalnızca tam eşleşme
-aradığınız ve aralık ya da sıralama gerekmediği durumlarda yeterlidir. Sıralı
-indeksler ise daha genel amaçlıdır; bu yüzden veritabanlarının çoğunlukla
-yaslandığı yapı onlardır.
+çok hızlı yapan **karma (hash) indekstir**. Karma indeks, bir değeri bir karma
+işleviyle doğrudan bir konuma eşler; eşitlik aramasında ortalama sabit zamanda —
+ağaçtaki gibi birkaç düğüm inişi bile gerekmeden — sonuca varır. Bedeli, sıranın
+tümüyle kaybolmasıdır: karma, yakın değerleri diskte yakın yerlere koymaz, tam
+tersine bilerek dağıtır; bu yüzden aralık sorgusunu ya da sıralı getirmeyi hiç
+yapamaz. Yalnızca tam eşleşme aradığınız ve aralık ya da sıralama gerekmediği
+durumlarda yeterlidir. Sıralı indeksler ise daha genel amaçlıdır; bu yüzden
+veritabanlarının çoğunlukla yaslandığı yapı onlardır.
+
+Sıralı indeksi gerçeklemenin ağaca rakip, zarif bir başka yolu daha vardır:
+**atlama listesi** (skip list).^[W. Pugh, "Skip Lists: A Probabilistic
+Alternative to Balanced Trees," *Communications of the ACM* 33(6), 1990.] Atlama
+listesi, sıralı bir bağlı liste üzerine, rastgele yükseklikte "ekspres
+şeritler" kuran bir yapıdır. En alt şerit tüm öğeleri sırayla içerir; her üst
+şerit, alttakinin öğelerinden yalnızca bir kısmını — yazı-tura atar gibi
+olasılıkla seçilmiş bir alt kümesini — atlamalı biçimde tutar. Bir değer ararken
+en üst, en seyrek şeritten başlar, mümkün olduğunca uzağa zıplar, gerektiğinde bir
+alt şeride iner ve böylece hedefe ağaçtakine benzer logaritmik adımda ulaşırsınız.
+Atlama listesinin çekiciliği, dengeli bir ağacın bölme-birleştirme dansının
+karmaşık kilitleme mantığını gerektirmemesi, buna karşın benzer arama
+başarımını olasılıksal olarak sunmasıdır; bu yüzden eşzamanlı, bellek-içi sıralı
+yapılarda — örneğin bir önceki bölümün LSM memtable'ında — sık tercih edilir.
 
 ## Seçicilik: her indeks aynı ölçüde işe yaramaz
 
@@ -105,9 +132,19 @@ Ama bir alanın yalnızca birkaç farklı değeri varsa, indeksin yararı azalı
 "aktif mi" alanını düşünün: değeri ya doğru ya yanlıştır. Bu alanı indekslerseniz,
 "aktif olanları getir" sorgusu, belki belgelerin yarısını seçer; yarım milyon
 belgeyi getirmek için indeksten geçmek, neredeyse tüm veriyi taramaktan pek
-de hızlı değildir. Düşük seçicilikli alanları indekslemek, çoğu zaman bedelini
-hak etmez. İyi bir indeks, çok sayıda belge arasından **azını** ayıklayan
-alanlar üzerine kurulur.
+de hızlı değildir.
+
+Bu sezginin altında somut bir maliyet vardır ve onu görmek önemlidir. Bir indeks,
+size eşleşen belgelerin konumlarını verir; ama o konumlar diskte dağınıksa, her
+birine gitmek ayrı bir rastgele okuma demektir. Eşleşen belge sayısı arttıkça, bu
+dağınık okumaların toplamı, dosyayı baştan sona ardışık okumaktan — ki disk
+ardışık okumayı çok daha iyi yapar — daha pahalı hale gelebilir. İşte bu yüzden,
+sorgunun verinin yaklaşık yüzde beş-onundan fazlasını seçtiği noktada, sorgu
+işleyiciler çoğu zaman indeksi bilerek bırakıp tam taramayı seçer; çünkü ardışık
+bir tarama, binlerce dağınık atlamadan ucuzdur. Bu eşiğe ne kadar yaklaşıldığı,
+tam da alanın seçiciliğine bağlıdır. Düşük seçicilikli alanları indekslemek, çoğu
+zaman bedelini hak etmez. İyi bir indeks, çok sayıda belge arasından **azını**
+ayıklayan alanlar üzerine kurulur.
 
 ## Bileşik indeksler: birden çok alan birlikte
 
@@ -125,9 +162,18 @@ olanlar" sorularını kolayca yanıtlar; çünkü sıralama önce soyada göredi
 (bölge, yaş) üzerine kurulu bir indeks, yalnızca bölgeye göre ya da bölge artı
 yaşa göre aramayı hızlandırır; ama yalnızca yaşa göre aramaya pek yaramaz. Buna
 **önek kuralı** denir: bileşik indeks, alan sırasının baştan başlayan bir
-önekini kullanan sorgulara yarar. Bu yüzden bileşik indekste alanları hangi
-sırayla dizeceğiniz, hangi sorguları hızlandıracağınızı belirleyen önemli bir
-tasarım kararıdır.
+önekini kullanan sorgulara yarar.
+
+![Bileşik indeks (bölge, yaş) ve önek kuralının işleyişi.](sekiller/07c-bilesik-onek.svg){width=80%}
+
+Önek kuralının pratik bir uzantısı, **eşitlik-sonra-aralık** dizilimidir.
+Bileşik indeks, önekteki alanlar üzerinde **eşitlik** koşulu olduğu sürece, sonraki
+alanlardaki **aralık** koşullarını da verimli süzebilir; ama bir alanda aralık
+koşuluna girer girmez, ondan sonraki alanlar artık sıralı dilim içinde
+dağıldığından, indeks onları aynı verimle süzemez. Bu yüzden iyi bir kural, eşitlikle
+sınanan alanları indeksin başına, aralıkla sınananı sona koymaktır. Bu yüzden
+bileşik indekste alanları hangi sırayla dizeceğiniz, hangi sorguları
+hızlandıracağınızı belirleyen önemli bir tasarım kararıdır.
 
 ## Kapsayan indeksler: belgeye hiç dokunmamak
 
@@ -150,6 +196,33 @@ güvencesi**. Bir alanı "benzersiz indeks" olarak işaretlerseniz, indeks o ala
 aynı değerin iki kez yazılmasını engeller. Böylece indeks yalnızca aramayı
 hızlandırmakla kalmaz, bir veri bütünlüğü kuralını da dayatmış olur.
 
+## Kısmi ve seyrek indeksler: yalnızca işe yarayanı indeksle
+
+İndeksin yazma ve yer maliyetini hatırlayalım: her indeks, indekslenen her belge
+için bir giriş tutar ve her yazmada güncellenmek zorundadır. Peki bir
+koleksiyondaki belgelerin yalnızca küçük bir bölümü bir sorgu için anlamlıysa,
+neden hepsini indeksleyelim? Bu gözlem, iki akraba inceltmeye yol açar.
+
+Belge veritabanlarının esnek şemasından doğan ilki **seyrek indekstir** (sparse
+index). Belgeler birbirinden farklı alanlara sahip olabildiği için, bir alan
+belgelerin yalnızca bir kısmında bulunabilir — örneğin yalnızca premium
+kullanıcıların bir "abonelik bitiş tarihi" alanı vardır. Seyrek indeks, o alanı
+**içermeyen** belgeleri indekse hiç koymaz; yalnızca alanın gerçekten var olduğu
+belgeler için giriş tutar. Böylece indeks, ilgisiz milyonlarca belgenin "yok"
+girişiyle şişmez; hem küçük kalır hem de o alanı içeren azınlığı sorgularken
+keskin olur.
+
+İkincisi, daha genel olan **kısmi indekstir** (partial index): yalnızca belirli
+bir **koşulu** sağlayan belgeleri indeksler. Örneğin yalnızca "durum = açık" olan
+siparişleri indekslemek; kapanmış, arşivlenmiş siparişler — ki çoğunluk onlardır
+ve onlar üzerinde nadiren arama yaparsınız — indekse hiç girmez. Kısmi indeksin
+kazancı çift yönlüdür: indeks çok daha küçük olduğu için hem yer kazanırsınız hem
+de bu küçük indekse yazmak daha ucuz olur; üstelik koşulu sağlamayan belgelerin
+yazılması indeksi hiç meşgul etmez. Karşılığında, kısmi indeks yalnızca koşuluyla
+örtüşen sorguları hızlandırır; "kapalı siparişleri ara" derseniz bu indeks işe
+yaramaz. Hem seyrek hem kısmi indeks, aynı sağduyunun farklı yüzleridir: indeksi
+yalnızca onu gerçekten kullanacak sorguların kapsadığı veriyle sınırlamak.
+
 ## Ters indeks: metni aranabilir kılmak
 
 Şimdiye dek anlattığımız indeksler, bir alanın **tam değeriyle** çalışır: e-posta
@@ -163,21 +236,50 @@ Ters indeksin fikri, sıradan indeksin tersini yapmaktır. Sıradan indeks
 "belgeden, içindeki değere" giden ilişkiyi tutarken, ters indeks "sözcükten, o
 sözcüğü içeren belgelere" giden ilişkiyi tutar. Bir kitabın arkasındaki dizine yine
 dönelim; orada her kavramın yanında, o kavramın geçtiği sayfaların listesi
-vardır. Ters indeks tam olarak budur, ama metindeki her anlamlı sözcük için.
-Bir belge eklendiğinde, metni anlamlı sözcüklere ayrılır (buna parçalama denir)
-ve her sözcüğün altına o belge eklenir. Bir sözcüğü aradığınızda, ters indeks
-size o sözcüğü içeren tüm belgelerin listesini doğrudan verir — metinleri
-taramadan.
+vardır. Ters indeks tam olarak budur, ama metindeki her anlamlı sözcük için. Bu
+yapıda her sözcüğe — daha doğrusu her **terime** — karşılık gelen, o terimi
+içeren belgelerin listesine **gönderim listesi** (posting list) denir. Gönderim
+listesi yalnızca belge kimliklerini değil, çoğu zaman terimin o belgede kaç kez
+geçtiğini ve hangi konumlarda durduğunu da tutar; bu ek bilgi, hem birazdan
+göreceğimiz alaka puanlamasını hem de "şu iki sözcük yan yana geçsin" gibi öbek
+aramalarını mümkün kılar.
+
+![Ters indeks: terimden gönderim listesine, ve alaka puanlaması.](sekiller/07b-ters-indeks.svg){width=80%}
+
+Bir belge eklendiğinde, metni anlamlı sözcüklere ayrılır — buna **parçalama**
+(tokenization) denir — ve genellikle bir dizi normalleştirme adımından geçer:
+büyük-küçük harf birleştirilir, çekim ekleri budanarak sözcükler köklerine
+indirgenebilir, "ve", "bir", "ile" gibi her belgede geçen ve ayırt edici değeri
+olmayan **durak sözcükler** (stop words) atılabilir. Bu işlenmiş terimlerin her
+birinin gönderim listesine o belge eklenir. Bir sözcüğü aradığınızda, ters
+indeks size o sözcüğün gönderim listesini doğrudan verir; birden çok sözcüklü bir
+sorguda ise, ilgili gönderim listeleri kesiştirilerek (hepsini içeren belgeler)
+ya da birleştirilerek (herhangi birini içeren belgeler) sonuç kümesi üretilir —
+hiçbir metni baştan sona taramadan.
 
 Metin aramanın sıradan aramadan bir farkı daha vardır: **alaka düzeyi**. Bir
-sözcüğü içeren yüzlerce belge olabilir, ama hepsi aynı ölçüde ilgili değildir.
-O sözcüğün sık geçtiği, kısa bir belge, o sözcüğün bir kez geçtiği uzun bir
-belgeden büyük olasılıkla daha ilgilidir. Bu yüzden metin arama sistemleri,
-sonuçları yalnızca bulmakla kalmaz, **sıralar** da: hangi belgenin sorguya daha
-alakalı olduğunu, sözcüğün belgede ne sıklıkta geçtiği ve genel olarak ne kadar
-yaygın bir sözcük olduğu gibi ölçütlere bakarak puanlar. Bu sezginin olgun
-biçimleri — terim sıklığına dayalı puanlama ve onun olasılıksal akrabası — bilgi
-erişimi alanının temel konularıdır.^[C. D. Manning, P. Raghavan ve H. Schütze, *Introduction to Information Retrieval*, Cambridge University Press, 2008; S. Robertson ve H. Zaragoza, "The Probabilistic Relevance Framework: BM25 and Beyond," *Foundations and Trends in Information Retrieval* 3(4), 2009.] Üçüncü kısımda OxiDB'nin tam metin aramayı, böyle bir ters indeks ve alaka
+sözcüğü içeren yüzlerce belge olabilir, ama hepsi aynı ölçüde ilgili değildir; bu
+yüzden metin arama, sonuçları yalnızca bulmakla kalmaz, en alakalıdan en alakasıza
+**sıralar** da. Bu sıralamanın klasik sezgisi iki ölçütü birleştirir. Birincisi
+**terim sıklığıdır** (term frequency): bir sözcük bir belgede ne kadar çok
+geçiyorsa, o belge o sözcükle muhtemelen o kadar ilgilidir. İkincisi **ters belge
+sıklığıdır** (inverse document frequency): bir sözcük tüm koleksiyonda ne kadar
+*nadir* geçiyorsa, geçtiği yerde o kadar ayırt edicidir — "veritabanı" gibi nadir
+bir terim, "için" gibi her yerde geçen bir terimden çok daha fazla bilgi taşır.
+Bu ikisinin çarpımı, terim sıklığı-ters belge sıklığı (TF-IDF) puanlamasının
+özüdür: nadir bir terimin yoğun geçtiği belge en yükseğe çıkar.
+
+Bu sezginin olgunlaşmış, olasılıksal akrabası **BM25** olarak bilinir ve iki ince
+düzeltme getirir. Birincisi **doygunluktur** (saturation): terim sıklığının katkısı
+sonsuza dek artmaz; bir sözcük belgede beş kez yerine elli kez geçtiğinde, bu
+ondan elli kat daha alakalı sayılmaz — katkı bir tavana doğru yumuşakça doyar.
+İkincisi **uzunluk normalizasyonudur** (length normalization): uzun bir belgede
+bir sözcüğün geçmesi, kısa bir belgede geçmesinden daha az şey ifade eder, çünkü
+uzun belge zaten her sözcüğü barındırma eğilimindedir; BM25, belge uzunluğunu
+koleksiyon ortalamasıyla kıyaslayarak uzun belgeleri hafifçe cezalandırır. Bu iki
+düzeltme, çıplak TF-IDF'in fazla bağırdığı durumları yumuşatır ve pratikte daha
+isabetli bir sıralama üretir. Bu konular bilgi erişimi alanının
+temel taşlarıdır.^[C. D. Manning, P. Raghavan ve H. Schütze, *Introduction to Information Retrieval*, Cambridge University Press, 2008; S. Robertson ve H. Zaragoza, "The Probabilistic Relevance Framework: BM25 and Beyond," *Foundations and Trends in Information Retrieval* 3(4), 2009.] Üçüncü kısımda OxiDB'nin tam metin aramayı, böyle bir ters indeks ve alaka
 puanlaması üzerine kurduğunu göreceğiz.
 
 ## İndeksler de dayanıklı olmalı
@@ -196,12 +298,16 @@ sağlam bir veritabanının sessiz ama kritik bir görevidir.
 Bu bölümde, veritabanlarını taramaya mahkûm olmaktan kurtaran indeksleri
 tanıdık. Bir indeksin, asıl veriden türetilmiş, aramayı hızlandıran ayrı bir
 yapı olduğunu; bunun karşılığında yazmayı yavaşlatıp yer kapladığını; bu yüzden
-seçici biçimde, erişim örüntülerine göre kurulduğunu gördük. Sıralı indekslerin
-eşitlik, aralık ve sıralı getirmeyi birden desteklediğini; karma indekslerin
-yalnızca eşitlikte hızlı olduğunu; seçiciliğin bir indeksin yararını belirlediğini;
-bileşik indekslerin alan sırasıyla birden çok koşulu hızlandırdığını; kapsayan
-indekslerin belgeye hiç dokunmadan yanıt üretebildiğini; ve ters indekslerin
-metni sözcük düzeyinde aranabilir kıldığını öğrendik.
+seçici biçimde, erişim örüntülerine göre kurulduğunu gördük. Sıralı indekslerin —
+ister B+ağacı ister atlama listesi biçiminde olsun — eşitlik, aralık ve sıralı
+getirmeyi birden desteklediğini; karma indekslerin yalnızca eşitlikte hızlı
+olduğunu; seçiciliğin bir indeksin yararını belirlediğini ve bir eşik aşıldığında
+tam taramanın indeksten ucuza gelebildiğini; bileşik indekslerin önek kuralıyla,
+eşitlik-sonra-aralık dizilimiyle birden çok koşulu hızlandırdığını; kapsayan
+indekslerin belgeye hiç dokunmadan yanıt üretebildiğini; kısmi ve seyrek
+indekslerin indeksi yalnızca işe yarar veriyle sınırlayarak maliyeti düşürdüğünü;
+ve ters indekslerin, gönderim listeleri ve TF-IDF'ten BM25'e uzanan alaka
+puanlamasıyla metni sözcük düzeyinde aranabilir kıldığını öğrendik.
 
 Ama bir indeks, tek başına, yalnızca bir araçtır. Bir kullanıcının sorusunu —
 "şu bölgedeki, şu yaş aralığındaki, adında şu geçen kullanıcıları, şuna göre

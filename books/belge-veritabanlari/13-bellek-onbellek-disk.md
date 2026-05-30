@@ -32,6 +32,19 @@ uçar; yanlış veri bellekteyse ve aradığınız sürekli diskten getirilmek
 zorundaysa, sistem sürünür. Bütün mesele, sınırlı belleği en çok işe yarayacak
 veriyle doldurmaktır.
 
+Bu kademelerin ne kadar farklı hızlarda olduğunu somutlaştırmak, sezgiyi keskinleştirir.
+İşlemcinin yanındaki birinci düzey önbellekten bir değer okumak, nanosaniyenin
+küçük bir kesri sürer; ana bellekten bir okuma, bunun yaklaşık iki yüz katıdır
+ama yine de yüz nanosaniye mertebesindedir. Buradan sonra uçurum başlar: katı
+hal diskinden (SSD) rastgele bir blok okumak mikrosaniyeler — yani ana bellekten
+yüzlerce kat yavaş — alır; dönen bir sabit diskten (HDD) rastgele bir okuma ise
+milisaniyeler, yani ana bellekten **on binlerce** kat yavaştır, çünkü disk
+kafasının doğru iza kayması fiziksel zaman ister. Bu büyüklük farklarını
+ölçeklendirmek için sık kullanılan bir benzetme şudur: bellek erişimini bir
+saniye sayarsak, bir SSD okuması birkaç dakika, bir HDD okuması ise saatler
+mertebesine karşılık gelir. Bir veritabanı tasarımının neredeyse her kararı,
+işte bu uçurumun yanlış tarafına düşmemek üzerine kuruludur.
+
 ## Çalışma kümesi ve uçurum etkisi
 
 Bu kararı anlamanın anahtarı, **çalışma kümesi** (working set) kavramıdır.
@@ -39,6 +52,20 @@ Herhangi bir anda, verinin yalnızca bir kısmı "sıcaktır" — yani etkin bi�
 kullanılmaktadır. Bir e-ticaret sitesinde, o anki kampanyadaki ürünler, son
 siparişler, aktif kullanıcılar sıcaktır; yıllar önceki kayıtlar ise soğuk,
 nadiren dokunulan veridir. Çalışma kümesi, işte bu sıcak kısımdır.
+
+Bu sezgisel "sıcak veri" kavramının arkasında, biçimsel bir kuram vardır.
+Çalışma kümesi, aslında belirli bir zaman penceresi içinde bir sürecin
+dokunduğu farklı veri birimlerinin (sayfaların) kümesi olarak tanımlanır ve bu
+tanım, bellek yönetimi literatürünün temel taşlarından birinde ortaya
+konmuştur.^[Peter J. Denning, "The Working Set Model for Program Behavior," *Communications of the ACM*, 11(5), 1968.]
+Bu kuramın can alıcı gözlemi, çoğu iş yükünün **yerellik** (locality)
+sergilediğidir: programlar gelişigüzel her yere değil, belirli bir süre boyunca
+verinin dar bir bölgesine yoğunlaşır. Bu yüzden çalışma kümesi genelde tüm
+veriden çok daha küçüktür ve belleğe sığma şansı yüksektir. Pencere ne kadar
+geniş seçilirse çalışma kümesi o kadar büyür; doğru pencere, "şu an gerçekten
+gerekli olanı" yakalayacak kadar geniş ama soğuk geçmişi kapsayacak kadar geniş
+olmayandır. Bir sistemi boyutlandırmak, aslında bu çalışma kümesini ölçüp ona
+yetecek belleği sağlamak demektir.
 
 Buradan çarpıcı bir gerçek doğar: performans, kademeli bir eğim değil, bir
 **uçurumdur**. Çalışma kümeniz belleğe sığdığı sürece, sistem hızlıdır — ihtiyaç
@@ -84,16 +111,52 @@ boşta duranı kurban seçer. Bir kütüphanecinin, sık istenen kitapları el
 arabasında yakınında tutup, aylardır kimsenin sormadıklarını rafa kaldırmasına
 benzer.
 
-LRU çoğu zaman iyi çalışır, ama bir zayıflığı vardır. Büyük bir tarama düşünün —
+LRU'nun saf hali, gerçekte küçük bir maliyet taşır: her erişimde, dokunulan
+öğeyi "en yeni" konuma taşımak için bir kayıt güncellenmelidir. Bunu ucuzlatan
+zarif bir yaklaşım, **CLOCK** (saat) algoritmasıdır. CLOCK, öğeleri bir halka
+üzerinde dizer ve her birine tek bitlik bir "kullanıldı" işareti verir. Bir öğeye
+dokunulduğunda yalnızca bu bit 1 yapılır — sıralamayı yeniden düzenlemek
+gerekmez. Yer açmak gerektiğinde, bir ibre halka üzerinde döner: bitini 1 bulduğu
+öğeyi atmaz, ona bir şans daha tanıyıp bitini sıfırlar ve ilerler; bitini 0
+bulduğu ilk öğeyi kurban seçer. Böylece CLOCK, LRU'nun davranışını yaklaşık
+olarak taklit eder ama erişim başına neredeyse hiç maliyet taşımaz; bu yüzden
+işletim sistemlerinin sayfa değiştirme mekanizmalarında yaygın biçimde kullanılır.
+
+LRU'nun ölçtüğü tek şey **yakınlıktır** — bir öğeye en son ne zaman dokunulduğu.
+Buna karşı duran felsefe **LFU**'dur (least frequently used, en az sıklıkla
+kullanılan): her öğenin **kaç kez** istendiğini sayar ve en seyrek isteneni atar.
+LFU, gerçekten popüler olan ama her an dokunulmayan veriyi korumakta iyidir; ama
+iki zayıflığı vardır. Birincisi, bir zamanlar çok istenip artık soğumuş bir öğe,
+geçmiş sayacı yüksek olduğu için önbellekte gereksiz yere tutunabilir. İkincisi,
+sıklığı saymanın LRU'dan daha pahalı bir defter tutması vardır. İşte buradan,
+ikisini birleştirme arayışı doğar.
+
+Bu arayışın olgun bir ürünü, **ARC** (adaptive replacement cache, uyarlamalı
+değiştirme önbelleği) adlı politikadır.^[Nimrod Megiddo ve Dharmendra S. Modha, "ARC: A Self-Tuning, Low Overhead Replacement Cache," *Proceedings of the 2nd USENIX Conference on File and Storage Technologies (FAST)*, 2003.]
+ARC'ın inceliği, yakınlık ile sıklığı **uyarlamalı** olarak dengelemesidir.
+Önbelleği zihinsel olarak iki listeye böler: yalnızca bir kez görülen
+("yeni gelen") öğeler ve birden çok kez görülen ("kanıtlanmış sıcak") öğeler.
+Dahası, yakın geçmişte attığı öğelerin kimliklerini — verisini değil, yalnızca
+hangi öğe olduğunu — bir "hayalet liste"de tutar. Az önce attığı bir öğe hemen
+geri istenirse, bunu bir hata olarak algılar ve ilgili listeye ayırdığı payı
+büyütür. Böylece ARC, iş yükü sıklık-ağırlıklıysa o yöne, yakınlık-ağırlıklıysa
+diğer yöne kendiliğinden kayar; hiçbir elle ayar gerektirmez. Bunun bir yan
+faydası, ARC'ın **tarama-dirençli** olmasıdır — çünkü büyük bir taramanın
+ürettiği "yalnızca bir kez görülen" öğeler, kanıtlanmış sıcak öğeleri tutan
+listeye hiç dokunamaz.
+
+Bu, doğrudan LRU'nun en bilinen zayıflığına götürür. Büyük bir tarama düşünün —
 örneğin tüm koleksiyonu bir kez baştan sona okuyan bir toplama sorgusu. Bu tarama,
 gerçekte sıcak olmayan bir sürü veriyi önbelleğe doldurur ve bu sırada asıl sıcak
 veriyi dışarı atar. Tarama bittiğinde önbellek, bir daha kullanılmayacak soğuk
 veriyle dolu, asıl ihtiyaç duyulan sıcak veriden ise yoksun kalmıştır. Buna
-**önbellek kirlenmesi** denir. Bu yüzden olgun sistemler, büyük taramaların
-önbelleği kirletmesini önleyen, "tarama-dirençli" politikalar kullanır. Bunun
-çeşitli incelikleri vardır; ama temel ders şudur: iyi bir tahliye politikası,
+**önbellek kirlenmesi** denir. ARC gibi politikaların tarama-direnci, tam da bu
+kirlenmeyi önlemeyi hedefler: bir kez görülen tarama verisini, kanıtlanmış sıcak
+veriyi koruyan bölmeden ayrı tutar. Temel ders şudur: iyi bir tahliye politikası,
 yalnızca "ne zaman kullanıldı" değil, "gerçekten sıcak mı" sorusunu da gözetmeye
 çalışır.
+
+![Önbellek tahliyesi: LRU sıralamayı yeniden düzenler; CLOCK ise tek bitlik "kullanıldı" işaretiyle ucuza yaklaştırır.](sekiller/13b-onbellek-tahliye.svg){width=80%}
 
 ## Önbelleğin kendi maliyeti ve sınırlama zorunluluğu
 
@@ -134,6 +197,29 @@ OxiDB'nin "disk-öncelikli" kipinin tam olarak bunu yaptığını — taze açı
 veri yerine yalnızca küçük bir dizinin bellekte durduğunu — ve bunun bellek ayak
 izini nasıl dramatik biçimde küçülttüğünü ayrıntısıyla göreceğiz.
 
+## Tampon havuzu: veriyi sayfa sayfa yönetmek
+
+Önbelleğin klasik, açıkça yönetilen biçimine veritabanı dünyasında **tampon
+havuzu** (buffer pool) denir. Mantığı, diski sabit boyutlu bloklara —
+**sayfalara** (page) — bölmek ve bellekte bu sayfalardan belirli bir sayıda
+tutabilen bir havuz ayırmaktır. Bir sayfa istendiğinde, havuzda varsa doğrudan
+oradan verilir; yoksa diskten okunup havuzdaki bir çerçeveye yerleştirilir, gerekiyorsa
+bir başka sayfa tahliye edilerek. Tampon havuzunun sayfa temelli olması bir
+tesadüf değildir: disk zaten blok blok okunup yazıldığı için, önbelleği de aynı
+birimle yönetmek, getirme ve geri yazma işlemlerini doğal olarak hizalar.
+
+Tampon havuzunun, bizi altıncı bölüme bağlayan kritik bir görevi vardır:
+**kirli** (dirty) sayfaları yönetmek. Bellekte değiştirilmiş ama henüz diske
+yazılmamış bir sayfa kirlidir. Tampon havuzu, bu sayfayı hemen diske yazmaz —
+çünkü aynı sayfa kısa süre içinde tekrar değişebilir; bunun yerine yazmaları
+biriktirip toptan, verimli biçimde diske akıtır. Ama bir kirli sayfayı tahliye
+etmeden önce mutlaka diske yazması gerekir, yoksa değişiklik kaybolur. Burada
+önce-yaz günlüğüyle (WAL) ince bir kural devreye girer: bir veri sayfası diske
+yazılmadan önce, onu tarif eden günlük kaydının diske inmiş olması gerekir —
+böylece çökme sonrası kurtarma her zaman tutarlı bir noktadan başlayabilir. Yani
+tampon havuzunun tahliye kararı, yalnızca bir performans meselesi değil, aynı
+zamanda dayanıklılığın bir parçasıdır.
+
 ## İşletim sistemine güvenmek: belleğe yansıtma
 
 Bellek yönetimini elle yapmanın zarif bir alternatifi vardır ve beşinci bölümde
@@ -141,6 +227,18 @@ ona değinmiştik: bir dosyayı **belleğe yansıtmak** (mmap). Bu teknikte, dos
 erişmek bellekteki bir adrese erişmek kadar basit hale gelir ve verinin diskten
 belleğe ne zaman getirileceğine, bellek darda kaldığında neyin geri atılacağına
 işletim sistemi karar verir.
+
+Bu sihrin altındaki düzenek, **sayfa hatasıdır** (page fault). Dosya belleğe
+yansıtıldığında, aslında hiçbir veri hemen okunmaz; yalnızca bir adres aralığı
+"söz verilmiş" olur. Programınız bu aralıktan henüz bellekte olmayan bir adrese
+ilk kez dokunduğunda, işlemci bunu fark eder ve denetimi işletim sistemine
+devreder — işte bu kesintiye sayfa hatası denir. İşletim sistemi sessizce devreye
+girer, ilgili sayfayı diskten okuyup belleğe yerleştirir ve programınız hiçbir
+şey olmamış gibi kaldığı yerden devam eder. İlk dokunuş, gizliden gizliye bir
+disk okuması ödetir; sonraki dokunuşlar ise, sayfa artık bellekte olduğu için,
+sıradan bellek hızındadır. Bu mekanizma, "lazım olduğunda getir" (demand paging)
+ilkesinin ta kendisidir ve veritabanının açıkça hiçbir okuma çağrısı yapmadan
+diski tembelce, erişim düzenine göre belleğe çekmesini sağlar.
 
 Bunun güzelliği, önbellek yönetiminin büyük bölümünü işletim sistemine
 **devretmesidir**. İşletim sistemi zaten dosya sayfalarını bellekte tutan,
@@ -187,12 +285,14 @@ yüklerde sıkıştırmayı kapatmanın taramaları nasıl hızlandırdığını
 
 Bu bölümde, tek bir düğümün performansını belirleyen sessiz dengeyi — bellek,
 önbellek ve disk arasındaki ödünleşimi — inceledik. Bellek ile diskin temel
-asimetrisini; çalışma kümesi kavramını ve onun belleğe sığıp sığmamasının yarattığı
-uçurum etkisini; önbelleğin nasıl çalıştığını ve tahliye politikalarının (özellikle
-LRU'nun ve önbellek kirlenmesinin) inceliklerini; önbelleğin kendi maliyetini ve
-sınırlama zorunluluğunu; belleğe öncelikli ve diske öncelikli iki felsefeyi;
-belleğe yansıtmanın işletim sistemine devrettiği kolaylığı ve bellek ölçümünün
-inceliğini; ve sıkıştırmanın yer-işlemci-sıfırkopya üçgenini gördük.
+asimetrisini ve kademeler arasındaki büyüklük farklarını; çalışma kümesi kavramını,
+onun biçimsel tanımını ve belleğe sığıp sığmamasının yarattığı uçurum etkisini;
+önbelleğin nasıl çalıştığını ve tahliye politikalarının (LRU, CLOCK, LFU, ARC ve
+önbellek kirlenmesinin) inceliklerini; tampon havuzunun sayfa temelli yönetimini
+ve kirli sayfa kuralını; önbelleğin kendi maliyetini ve sınırlama zorunluluğunu;
+belleğe öncelikli ve diske öncelikli iki felsefeyi; belleğe yansıtmayı, sayfa
+hatası düzeneğini ve bellek ölçümünün inceliğini; ve sıkıştırmanın
+yer-işlemci-sıfırkopya üçgenini gördük.
 
 Böylece Kısım II'nin neredeyse tamamını — bir belge veritabanının içeride nasıl
 çalıştığını — tamamlamış olduk: veriyi sakladık, dayanıklı kıldık, indeksledik,

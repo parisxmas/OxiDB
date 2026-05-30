@@ -79,6 +79,19 @@ olabilmesi sayesinde JSON, tıpkı belgeler gibi, istenildiği kadar iç içe
 geçebilir. Yani JSON'un dilbilgisi, belge modelinin yapısının yazıya dökülmüş
 hâlinden başka bir şey değildir.
 
+JSON'un dilbilgisini bu denli sağlam kılan şey, **özyinelemeli** (recursive)
+olarak tanımlanmış olmasıdır. Tüm dilbilgisi tek bir başlangıç kavramına, yani
+"değer"e dayanır; ve bir değer ya bir yaprak (metin, sayı, doğru/yanlış,
+null) ya da içinde yine değerler barındıran bir dal (nesne ya da dizi) olabilir.
+Bu özyineleme sayesinde, yalnızca bir avuç kuralla sınırsız derinlikte iç içe
+yapılar tanımlanabilir; dilbilgisinin tamamı tek bir sayfaya sığar, ama ürettiği
+yapıların çeşitliliği sonsuzdur. Sadeliğin ardındaki güç budur. Bu sadeliğin
+bir bedeli de vardır ve farkında olmak gerekir: JSON, kendi içinde yalnızca bu
+birkaç türü tanır; örneğin tam olarak hangi sayısal kesinliğin korunacağı —
+çok büyük tamsayıların ya da ondalıkların bit bit aynı kalıp kalmayacağı —
+biçimin kendisinde değil, onu okuyan tarafın yorumuna bırakılmıştır. Bu küçük
+boşluk, birazdan göreceğimiz ikili biçimlerin doğmasının nedenlerinden biridir.
+
 JSON'un kökeni öğreticidir. JavaScript dili 1990'ların ortasında, web
 tarayıcılarında çalışmak üzere doğdu ve bu dilin, nesneleri ve listeleri kısaca
 yazmaya yarayan kendine özgü bir sözdizimi vardı — buna nesne ve dizi "değişmez
@@ -128,14 +141,40 @@ metin olarak yazıp yeniden okumak zorundadır.
 
 Bu yüzden ciddi belge veritabanları, JSON'u dışarıya — kullanıcıyla iletişimde —
 kullanırken, **içeride** daha zengin ve daha verimli bir **ikili gösterime**
-çevirir. Bu ikili biçimler, JSON'un tanımadığı türleri (tarih, ikili veri,
-kesin sayılar) ekler ve veriyi, ayrıştırmadan doğrudan üzerinde işlem
+(binary encoding) çevirir. Bu ikili biçimler, JSON'un tanımadığı türleri (tarih,
+ikili veri, kesin sayılar) ekler ve veriyi, ayrıştırmadan doğrudan üzerinde işlem
 yapılabilecek şekilde kodlar; örneğin bir alanın değerine, tüm belgeyi metin
-olarak okumadan, doğrudan atlayabilirsiniz. Üçüncü kısımda OxiDB'nin tam olarak
-böyle bir iç ikili gösterim kullandığını ve bunun sorgu hızına nasıl katkı
-sağladığını göreceğiz. Şimdilik akılda tutulacak nokta şu: JSON belge modelinin
-yüzüdür, ama bir veritabanının içinde yaşayan biçim genellikle JSON'un daha
-zengin, daha sıkı bir akrabasıdır.
+olarak okumadan, doğrudan atlayabilirsiniz.
+
+Bu ailenin nasıl çalıştığını anlamak öğreticidir, çünkü hepsi aynı temel hileyi
+kullanır: **uzunluk öneki** (length prefix). Düz metin JSON'da bir değerin nerede
+bittiğini bulmanın tek yolu, onu karakter karakter okuyup kapanış parantezini ya
+da tırnağı görmektir; yani bir alanı atlamak için bile onu baştan sona
+ayrıştırmanız gerekir. İkili biçimler ise her değerin önüne, türünü ve baytça
+uzunluğunu yazar. Böylece bir alanı atlamak isteyen okuyucu, uzunluğu okur ve o
+kadar baytı bir çırpıda atlar — değeri hiç ayrıştırmadan. Bir milyon belgenin
+yalnızca tek bir alanını okuyan bir sorguda bu farkın somut anlamı, gereksiz
+ayrıştırmadan tümüyle kurtulmaktır; yedinci ve sekizinci bölümlerde sorgu hızının
+büyük bölümünün böyle "atlamalardan" geldiğini göreceğiz.
+
+![Uzunluk öneki sayesinde ikili biçim, atlanacak alanı hiç ayrıştırmadan geçer.](sekiller/04b-ikili-uzunluk-oneki.svg){width=80%}
+
+Bu ikili biçimlerin en bilinenleri öğretici biçimde farklı dengeler tutar. BSON
+(Binary JSON), belge veritabanları dünyasında yaygınlaşan biçimdir; JSON'a tarih,
+ikili veri ve farklı tamsayı türleri ekler ve belge ile dizi uzunluklarını öne
+yazarak alan atlamayı kolaylaştırır — yer açısından metin JSON'dan her zaman daha
+küçük değildir, ama gezilmesi ucuzdur.^[*BSON (Binary JSON) Specification*, MongoDB Inc., bsonspec.org.] MessagePack, asıl amacı en küçük baytı
+sıkıştırmak olan, ağ üzerinde yer kazanmaya odaklı bir biçimdir; aynı veriyi
+JSON'dan belirgin biçimde daha az baytla taşır. CBOR (Concise Binary Object
+Representation), benzer bir hedefi bir internet standardı titizliğiyle izler ve
+kısıtlı, gömülü aygıtlarda bile güvenle ayrıştırılabilecek, genişletilebilir bir
+biçim olarak tanımlanmıştır.^[C. Bormann ve P. Hoffman, *RFC 8949: Concise Binary Object Representation (CBOR)*, IETF, 2020.] Bu üçü, "JSON'un kavramsal modelini koru, ama
+metnin verimsizliğini at" fikrinin üç ayrı yorumudur.
+
+Üçüncü kısımda OxiDB'nin tam olarak böyle bir iç ikili gösterim kullandığını ve
+bunun sorgu hızına nasıl katkı sağladığını göreceğiz. Şimdilik akılda tutulacak
+nokta şu: JSON belge modelinin yüzüdür, ama bir veritabanının içinde yaşayan
+biçim genellikle JSON'un daha zengin, daha sıkı bir akrabasıdır.
 
 ## Belgeler ve koleksiyonlar
 
@@ -188,6 +227,21 @@ olmak zorunda kalır. "Şemasızlık", "şema düşünmek gerekmiyor" demek değ
 tersine, şema disiplinini veritabanı yerine sizin taşımanız gerektiği anlamına
 gelir. İyi kullanılan belge veritabanlarında bu disiplin yok olmaz; uygulama
 katmanında, bilinçli biçimde sürdürülür.
+
+Bu yüzden belge dünyası, şemayı tümüyle terk etmek yerine, onu **isteğe bağlı**
+ve **kademeli** kılan bir orta yol geliştirdi. Bunun en yaygın aracı, JSON Schema
+adlı, bir belgenin uyması beklenen biçimi yine JSON'la tanımlayan bir
+betimleme dilidir: hangi alanların zorunlu olduğunu, bir alanın hangi türde
+olması gerektiğini, bir sayının hangi aralıkta kalacağını ya da bir metnin hangi
+örüntüye uyacağını ifade eder.^[*JSON Schema: A Media Type for Describing JSON Documents*, JSON Schema Org., taslak spesifikasyon, json-schema.org.] Bu yaklaşımın inceliği, şemanın
+**ne zaman** dayatılacağını seçilebilir kılmasıdır. İsterseniz onu yazma anında
+bir doğrulama (validation) kuralı olarak veritabanına bağlar, kurala uymayan
+belgeleri reddedersiniz — böylece ilişkisel modelin şema-yazmada güvencesine
+yaklaşırsınız. İsterseniz şemayı yalnızca okuma anında, gelen veriyi denetlemek
+için kullanırsınız. Önemli olan kavrayış şudur: belge modelinde şema yok olmaz,
+yalnızca **zorlama anı ve yeri seçime bırakılır**. Olgun bir belge sisteminde
+tasarımcı, bu seçimi her koleksiyon için bilinçli olarak yapar: kararlı, kritik
+veride şemayı sıkar; deneysel, hızla evrilen veride gevşek bırakır.
 
 ## Belge modelinin kalbindeki karar: gömmek mi, atıfta bulunmak mı
 

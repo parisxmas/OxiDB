@@ -55,6 +55,19 @@ bir açıdan — diyelim ki "şu dersi alan tüm öğrenciler" yerine "şu öğr
 aldığı tüm dersler" — bakmak isterseniz, ya çok dolambaçlı bir yol izlersiniz ya
 da hiç yapamazsınız. Sorgu, verinin fiziksel yapısına tutsaktır.
 
+Hiyerarşik modelin en bilinen somut örneği, IBM'in 1960'ların sonunda Apollo
+uzay programı için geliştirdiği ve onlarca yıl boyunca büyük kuruluşların
+belkemiği olan IMS (Information Management System) adlı sistemdir. IMS'te veri,
+**bölümlenmiş ağaçlar** (segment) halinde tutulur ve bir kayda erişmek için
+ağacın yukarıdan aşağıya **önsıra** (preorder) gezinme düzeninde ilerlenir; yani
+fiziksel disk yerleşimi, ağacın gezinme sırasını birebir izler. Bu, ağacın
+"doğru" ucundan girip aradığı yaprağa inen bir sorgu için son derece hızlıdır —
+erişim, ağaç derinliği kadar adımda, yani veri büyüklüğünün logaritması
+mertebesinde tamamlanır. Ama yanlış uçtan, örneğin bir yaprağın tüm "kardeş"
+ebeveynlerini bulmak isteyen bir sorgu için, tüm ağacı baştan sona taramaktan
+başka çare yoktur. Maliyet, sorgunun ağacın doğal yönüyle ne kadar uyuştuğuna
+bağlıdır; bu da modelin katılığının doğrudan bir sonucudur.
+
 Hiyerarşik modelin bize öğrettiği ders şudur: iç içe geçmiş, ağaç biçimli veriyi
 bir arada tutmak güçlü ve doğaldır — bu fikri belge modelinde yeniden
 göreceğiz — ama tek bir katı hiyerarşiye mahkûm olmak ve gezinme yolunu yapıya
@@ -63,19 +76,35 @@ bağlamak, esnekliği öldürür.
 ## Ağ modeli: bağlantılar her yöne
 
 Hiyerarşik modelin çoktan-çoğa ilişkilerdeki sıkıntısına bir yanıt olarak **ağ
-modeli** doğdu. Buradaki fikir, kayıtları katı bir ağaca hapsetmek yerine,
-aralarına istenen her yöne **işaretçiler** koymaktır. Bir öğrenci kaydı,
-aldığı her derse bir bağlantı taşır; bir ders kaydı, kendisini alan her
-öğrenciye. Böylece çoktan-çoğa ilişkiler veriyi çoğaltmadan ifade edilebilir.
+modeli** doğdu. Bu modelin kuramsal çerçevesini ve adlandırmasını, 1960'ların
+sonunda CODASYL adlı komitenin standartlaştırdığı veri tabanı görev grubu
+ortaya koydu; modelin fikir babası sayılan Charles Bachman, bu katkısıyla 1973
+Turing Ödülü'nü alacak ve ders konuşmasında veritabanını "programcının
+gezindiği bir uzay" olarak tarif edecekti.^[Charles W. Bachman, "The Programmer as Navigator," *Communications of the ACM* 16(11), 1973.] Bu "gezgin programcı" eğretilemesi,
+ağ modelinin hem gücünü hem de lanetini özetler. Buradaki fikir, kayıtları katı
+bir ağaca hapsetmek yerine, aralarına istenen her yöne **işaretçiler**
+koymaktır. Bir öğrenci kaydı, aldığı her derse bir bağlantı taşır; bir ders
+kaydı, kendisini alan her öğrenciye. Bağlantılar, "set" denilen, bir
+sahip-kayıttan birçok üye-kayda uzanan adlandırılmış zincirler halinde
+düzenlenir. Böylece çoktan-çoğa ilişkiler veriyi çoğaltmadan ifade edilebilir.
 
 Bu, ifade gücü açısından bir ilerlemeydi, ama ağır bir bedelle geldi:
 **karmaşıklık**. Veriye erişmek, artık zihinde tuttuğunuz bir bağlantı
 labirentinde tek tek işaretçileri izlemek demekti. Programcı, aradığı veriye
 ulaşmak için "şu kayıttan şu bağlantıyı izle, oradan şuna geç" diye, adım adım
-bir gezinme yolu yazmak zorundaydı. Veri yapısı değiştiğinde, bu gezinme
-kodunun büyük bölümü kırılırdı. Veriye nasıl ulaşılacağı bilgisi, uygulamanın
-içine derinlemesine gömülmüştü; mantıksal yapı ile fiziksel yapı birbirine
-kenetlenmişti.
+bir gezinme yolu yazmak zorundaydı; üstelik bu gezinme, bir imleç gibi davranan
+"geçerli kayıt" işaretçisini elle ileri geri taşıyarak yürütülürdü. Bir işaretçiyi
+izlemek tek başına ucuzdur — diskte bir konuma doğrudan atlamaktır — ama bir
+sorgu yüzlerce kaydı dolaşmayı gerektirdiğinde, bu yüzlerce **rastgele** disk
+erişimine dönüşür; ve birinci bölümde gördüğümüz gibi, rastgele erişim diskin en
+sevmediği şeydir. Maliyet, gezilen bağlantı sayısına doğrudan bağlıdır ve sorguyu
+yazan programcının seçtiği yola tabidir; sistemin daha akıllı bir yol bulma
+imkânı yoktur, çünkü yolu seçen programcının kendisidir.
+
+Daha derin sorun ise bakımdı. Veri yapısı değiştiğinde — yeni bir bağlantı türü
+eklendiğinde ya da bir set'in yönü değiştiğinde — bu gezinme kodunun büyük bölümü
+kırılırdı. Veriye nasıl ulaşılacağı bilgisi, uygulamanın içine derinlemesine
+gömülmüştü; mantıksal yapı ile fiziksel yapı birbirine kenetlenmişti.
 
 Hem hiyerarşik hem de ağ modelinin ortak kusuru buydu: ikisinde de **veriye
 erişim yolu, verinin yapısına sıkıca bağlıydı**. Ne sorabileceğiniz ve nasıl
@@ -161,13 +190,24 @@ bakalım. **Anahtar-değer modeli**, bir veritabanını dev bir sözlük gibi d�
 her verinin bir **anahtarı** vardır ve o anahtarla, ona bağlı **değeri** geri
 alırsınız. Tıpkı bir vestiyer fişi gibi — fişi verirsin, paltonu alırsın.
 
-Bu modelin gücü sadeliğindedir. Anahtarla erişim son derece hızlıdır ve böyle
-bir sistemi çok büyük ölçeklere yaymak görece kolaydır. Ama bir kısıtı vardır:
-sistem, değerin **içine bakmaz**. Değer, sistem açısından anlamsız bir bayt
-yığınıdır. Bu yüzden "değeri şu koşula uyan kayıtları getir" diyemezsiniz;
-yalnızca anahtarını bildiğiniz kaydı alabilirsiniz. Değerin içeriğine göre
-arama, filtreleme ya da gruplama yapmak mümkün değildir, çünkü sistem o içeriğin
-yapısından habersizdir.
+Bu modelin gücü sadeliğindedir. Anahtarla erişim son derece hızlıdır: çoğu
+anahtar-değer sistemi, anahtarı bir özet (hash) işlevinden geçirip değerin
+yerine neredeyse doğrudan ulaşır, yani erişim, veri ne kadar büyürse büyüsün
+sabit zamanda — büyüklükten bağımsız olarak — tamamlanır. Bu sabit-zamanlı
+erişim, modelin damgasıdır. Aynı sadelik, dağıtmayı da kolaylaştırır: anahtarın
+özetine bakarak bir kaydın hangi makineye düşeceğine tek başına karar
+verilebilir, başka hiçbir kayda danışmaya gerek yoktur; on ikinci bölümde
+göreceğimiz parçalama (sharding) fikrinin en temiz hali budur.
+
+Ama bunun bir kısıtı vardır: sistem, değerin **içine bakmaz**. Değer, sistem
+açısından anlamsız bir bayt yığınıdır. Bu yüzden "değeri şu koşula uyan kayıtları
+getir" diyemezsiniz; yalnızca anahtarını bildiğiniz kaydı alabilirsiniz. Değerin
+içeriğine göre arama, filtreleme ya da gruplama yapmak mümkün değildir, çünkü
+sistem o içeriğin yapısından habersizdir. İçeriğe göre arama tek seçenek
+olduğunda, geriye tüm kayıtları baştan sona taramak kalır — yani veri
+büyüklüğüyle doğru orantılı, doğrusal bir maliyet. Anahtar-değer modeli, hızı bu
+takastan kazanır: içeriği görmezden gelmeyi kabul ettiği için, gördüğü tek şey
+olan anahtarda kusursuz olur.
 
 Anahtar-değer modeli, "anahtarıyla tek kayıt al" ihtiyacının baskın olduğu
 durumlarda kusursuzdur. Ama çoğu uygulama, verinin içeriğine göre de soru sormak
@@ -213,14 +253,39 @@ ayıracağız.
 
 ## Diğer modeller ve manzaranın bütünü
 
-Tamlık için, manzaranın iki parçasından daha kısaca söz edelim. **Graf modeli**,
-ilişkilerin kendisini birinci sınıf bir varlık haline getirir; verinin değil,
-veriler arasındaki **bağlantıların** ön planda olduğu durumlar için — sosyal
-ağlar, öneri sistemleri, yol haritaları gibi — biçilmiş kaftandır. Bir bakıma
-ağ modelinin, bildirimsel sorgu gücüyle yeniden doğmuş, olgun halidir.
+Tamlık için, manzaranın birkaç parçasından daha söz edelim. **Nesne-yönelimli**
+(object-oriented) model, 1980'lerde, programlama dillerindeki nesneleri hiçbir
+çeviri yapmadan, olduğu gibi diske kalıcı kılma vaadiyle ortaya çıktı; iç içe
+nesneleri, hatta nesneler arası işaretçileri doğrudan saklardı. Birazdan
+göreceğimiz nesne-ilişkisel uyumsuzluğa en doğrudan saldırı buydu, ama
+işaretçiye dayalı yapısı onu ağ modelinin bazı katılıklarına geri sürükledi ve
+geniş çapta tutunamadı; yine de bıraktığı fikir — veriyi uygulamanın düşündüğü
+biçimde saklamak — belge modelinde yeniden hayat bulacaktı.
+
+**Graf modeli**, ilişkilerin kendisini birinci sınıf bir varlık haline getirir;
+verinin değil, veriler arasındaki **bağlantıların** ön planda olduğu durumlar
+için — sosyal ağlar, öneri sistemleri, yol haritaları gibi — biçilmiş kaftandır.
+Bir bakıma ağ modelinin, bildirimsel sorgu gücüyle yeniden doğmuş, olgun
+halidir. Ayırt edici gücü şudur: "şu kişinin arkadaşlarının arkadaşları" gibi,
+ilişki zincirlerinde derinlemesine yürüyen sorgular, graf modelinde her adımda
+yalnızca komşu düğümlere bakarak ucuzca ilerler. Aynı sorgu, ilişkisel modelde
+her derinlik düzeyi için yeni bir birleştirme gerektirir ve maliyet zincir
+uzadıkça katlanarak artar; çünkü ilişkisel model, ilişkiyi değerle ifade ettiği
+için her sıçramada o değeri yeniden eşleştirmek zorundadır. Graf modeli ilişkiyi
+fiziksel bir bağ olarak tuttuğundan, sıçrama doğrudan bir işaretçi izlemeye
+indirgenir.
+
 **Geniş-sütun** (wide-column) modeli ise, çok büyük ölçekli ve yazma-yoğun
 yükler için, tabloları satır yerine sütun grupları halinde düzenleyerek farklı
-bir ödünleşim sunar.
+bir ödünleşim sunar. Veriyi satır satır değil, sütun sütun bir arada tutmanın
+somut kazancı, yalnızca birkaç sütuna bakan toplama (aggregation) sorgularında
+ortaya çıkar: bir milyon kaydın yalnızca "tutar" sütununu toplamak isterken,
+satır temelli bir yerleşim her kaydın tüm sütunlarını diskten okumaya zorlar;
+sütun temelli yerleşimde ise yalnızca tutar sütunu, diskte yan yana, ardışık
+okunur. Birinci bölümdeki sıralı erişim kuralı sayesinde bu, kat kat ucuzdur.
+Karşılığında, tek bir kaydın tüm alanlarını birlikte okumak — satır temelli
+yerleşimin kolayca yaptığı şey — geniş-sütun modelinde dağınık sütunları
+toplamayı gerektirir.
 
 Bütün bu modeller arasında "en iyi" yoktur; yalnızca **farklı ödünleşimler**
 vardır. Hiyerarşik ve ağ modelleri, veriye erişimi yapıya kenetleyerek esneklik

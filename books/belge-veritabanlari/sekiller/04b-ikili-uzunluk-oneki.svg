@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="300" font-family="Georgia, serif">
+  <rect width="720" height="300" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Bir alanı atlamak: düz metin baştan ayrıştırır, ikili biçim sıçrar</text>
+
+  <!-- text JSON -->
+  <text x="40" y="70" font-size="12" font-weight="bold" fill="#c0392b">Düz metin (JSON)</text>
+  <g font-size="11" text-anchor="middle">
+    <rect x="40" y="82" width="200" height="34" fill="#fff5f5" stroke="#c0392b"/><text x="140" y="104">ad: "uzun bir metin"</text>
+    <rect x="240" y="82" width="120" height="34" fill="#eef0f5" stroke="#888"/><text x="300" y="104">yas: 37</text>
+  </g>
+  <g stroke="#c0392b" stroke-width="1.4" marker-end="url(#a)" fill="none">
+    <path d="M50,128 q90,26 180,0"/>
+  </g>
+  <text x="140" y="166" font-size="10.5" text-anchor="middle" fill="#c0392b">"yas"a ulaşmak için tüm "ad" değeri karakter karakter okunur</text>
+
+  <!-- binary -->
+  <text x="40" y="206" font-size="12" font-weight="bold" fill="#3a8a52">İkili biçim (uzunluk önekli)</text>
+  <g font-size="10.5" text-anchor="middle">
+    <rect x="40" y="218" width="56" height="34" fill="#e8f3ea" stroke="#3a8a52"/><text x="68" y="234">tür</text><text x="68" y="247">+uz=14</text>
+    <rect x="96" y="218" width="144" height="34" fill="#e8f3ea" stroke="#3a8a52"/><text x="168" y="239">uzun bir metin</text>
+    <rect x="240" y="218" width="56" height="34" fill="#e8eef7" stroke="#2b6cb0"/><text x="268" y="234">tür</text><text x="268" y="247">+uz=4</text>
+    <rect x="296" y="218" width="64" height="34" fill="#e8eef7" stroke="#2b6cb0"/><text x="328" y="239">37</text>
+  </g>
+  <g stroke="#3a8a52" stroke-width="1.6" marker-end="url(#a)" fill="none">
+    <path d="M68,260 q100,22 200,-4"/>
+  </g>
+  <text x="180" y="288" font-size="10.5" text-anchor="middle" fill="#3a8a52">uzunluğu oku (14), o kadar baytı bir çırpıda atla → değer hiç ayrıştırılmaz</text>
+</svg>

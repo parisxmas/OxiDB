@@ -80,6 +80,20 @@ oraya bir yan etki — örneğin başka bir koleksiyona yazma — sığdırmak e
 çünkü bunlar, çok-yönlü analizin "aynı veriyi birden çok açıdan özetle" amacına
 aykırıdır.
 
+Bu sadeliğin altında öğretici bir uygulama ayrıntısı yatar. Çok-yönlü analiz, her
+alt-pipeline'ı yürütürken, ona aynı girdi belgelerinin **kendi kopyasını** verir;
+çünkü her alt-pipeline veriyi kendince dönüştürecek — biri sayıp gruplayacak, biri
+sıralayıp ilk birkaçını alacak — ve bu dönüşümler birbirine karışmamalıdır. OxiDB
+küçük ama hoş bir tasarrufla, son alt-pipeline'a kopya yerine asıl girdiyi
+**taşıyarak** (move) verir; böylece N alt-pipeline için yalnızca N−1 kopya yapılır,
+sonuncusu için gereksiz bir kopya hiç çıkarılmaz. Daha temel olansa, çok-yönlü
+analizin **ayrı bir motor gibi davranmayıp**, kitabın bu bölümünde anlattığımız
+pipeline yürütücüsünü olduğu gibi yeniden çağırmasıdır: her alt-pipeline, sıradan
+bir pipeline'ın "şu aşamadan itibaren şu belgeler üzerinde çalış" çağrısıyla
+yürütülür. Yani çok-yönlü analiz, yeni bir yetenek eklemekten çok, var olan
+yürütücüyü kendi üzerine katlayan bir bileşendir — dokuzuncu bölümdeki
+bileşilebilirlik ilkesinin, motorun kendi iç tasarımına yansımış halidir bu.
+
 ## Pencere fonksiyonları
 
 Dokuzuncu bölümde, gruplamanın yanında ikinci büyük analitik biçimi —
@@ -101,6 +115,50 @@ da sonraki satırın değerini getirir. Dokuzuncu bölümde söylediğimiz gibi,
 gruplama "her grup için tek özet ver", pencere fonksiyonu ise "her satırı koru,
 ona komşularından bir değer ekle" der; OxiDB bu ikisini ayrı ama bütünleyici
 araçlar olarak sunar.
+
+![Bölümle, kararlı sırala, çerçeve üzerinde biriktir.](sekiller/20b-pencere-cerceve.svg){width=85%}
+
+Bu üç adımın her birinde, dikkat edilmesi gereken mühendislik incelikleri vardır.
+**Sıralamanın kararlı (stable) olması** kritiktir: aynı sıralama anahtarına sahip
+iki belge, sıralamadan önceki göreli düzenlerini korumalıdır. Bu, sıralama
+işlevleri ve özellikle kaydırma için belirleyicidir — "bir önceki satır" ancak
+"önceki"nin iyi tanımlı olmasıyla anlam taşır; kararsız bir sıralama, eşit
+anahtarlı satırlarda "öncesi"ni belirsiz bırakırdı.
+
+Asıl ayrıntı ise **çerçevededir** (window frame). Her satır için "çevresindeki
+pencere" dediğimiz şey, OxiDB'de belge sayısıyla tanımlanan bir çerçevedir:
+örneğin "kendisi ve önceki iki belge" ya da "bölümün başından bu satıra kadar".
+Çerçeve belirtilmezse varsayılan, bölümün tamamıdır. Motor, her satır için bu
+çerçevenin kapsadığı belgeleri belirler ve biriktiriciyi yalnızca o aralık
+üzerinde çalıştırır. "Bölümün başından bu satıra kadar" çerçevesiyle bir toplam,
+kümülatif toplamı; "kendisi ve önceki k belge" çerçevesiyle bir ortalama,
+k+1 genişliğinde bir hareketli ortalamayı verir. Sıralama ve kaydırma işlevleri
+ise çerçeveye değil, satırın bölüm içindeki sıralı konumuna bakar.
+
+Burada dürüst bir sınır belirtmek gerekir: OxiDB'nin pencere çerçevesi **yalnızca
+belge sayısıyla** tanımlanır. Yani "son 7 günlük pencere" ya da "değeri şu aralıkta
+olan satırlar" gibi, çerçeveyi sıralama değerinin kendisine (zamana ya da bir
+büyüklüğe) göre tanımlayan **aralık ve zaman tabanlı çerçeveler** bu sürümde
+desteklenmez. Bunlar, belge-tabanlı çerçevenin doğal uzantılarıdır ve gelecekteki
+bir genişlemenin konusudur; ama kümülatif toplamdan hareketli ortalamaya, sıralama
+ve kaydırmaya kadar pencere fonksiyonlarının en sık kullanılan biçimleri,
+belge-tabanlı çerçeveyle bugün eksiksiz karşılanır.
+
+## Dürüst bir envanter: henüz olmayan aşamalar
+
+Dokuzuncu bölümde toplamanın zenginliğini överken, bir kitabın görevinin yalnızca
+var olanı anlatmak değil, sınırları da dürüstçe çizmek olduğunu söylemiştik.
+OxiDB'nin toplama dağarcığı geniştir; ama olgun, yıllar içinde büyümüş belge
+veritabanlarının sunduğu her aşamayı henüz kapsamaz. Otomatik aralıklara
+bölme, çizge biçiminde özyinelemeli ilişki gezme, iki koleksiyonun sonuçlarını
+birleştirme, kök belgeyi bir alt-belgeyle değiştirme, sonucu doğrudan bir
+koleksiyona yazma ve rastgele örnekleme gibi aşamalar, bu sürümün toplama
+motorunda henüz yoktur. Bunları saymak, OxiDB'yi küçümsemek değil; bir mühendisin
+bir aracı seçerken neyi sayıp neyi sayamayacağını bilmesini sağlamaktır. Var olan
+aşamalar — süzme, gruplama, sıralama, yeniden şekillendirme, listeyi açma,
+ilişkili veri getirme, çok-yönlü analiz ve pencere fonksiyonları — analitik
+sorguların büyük çoğunluğunu karşılar; eksik olanlar, çoğunlukla bu yapı
+taşlarının dışarıdan birkaç adımla kurulabildiği, daha özel ihtiyaçlardır.
 
 ## Toplamanın performans gerçeği: disk-öncelikli durum
 
@@ -140,10 +198,13 @@ dokuzuncu bölümdeki montaj hattını nasıl somutlaştırdığını; baştaki 
 çekilip indeksle daraltıldığını; gruplamanın akış halinde, yalnızca gereken
 alanları çözerek çalıştığını; sayma gruplamalarının indeksten doğrudan
 yanıtlandığını; çok-yönlü analizin aynı girdiyi birkaç açıdan tek geçişte
-özetlediğini; ve pencere fonksiyonlarının satırları koruyarak komşulardan değer
-türettiğini gördük. Ayrıca disk-öncelikli kipte toplamanın performans gerçeğini
-ve onu iyileştiren iki düzeltmeyi — bu kitap yazılırken yapılan iki işi — dürüstçe
-izledik.
+özetlediğini; ve pencere fonksiyonlarının üç adımla — bölümle, kararlı sırala,
+belge-tabanlı çerçeve üzerinde biriktir — satırları koruyarak komşulardan değer
+türettiğini gördük. Çok-yönlü analizin pipeline yürütücüsünü kendi üzerine
+katlayan zarif uygulamasını, pencere çerçevesinin belge-tabanlı oluşunu ve henüz
+olmayan aşamaların dürüst envanterini izledik. Ayrıca disk-öncelikli kipte
+toplamanın performans gerçeğini ve onu iyileştiren iki düzeltmeyi — bu kitap
+yazılırken yapılan iki işi — dürüstçe gördük.
 
 Buraya kadar, Kısım III boyunca hep okuma tarafıyla — saklama, bulma, süzme,
 özetleme — ilgilendik. Ama onuncu bölümde gördüğümüz gibi, bir veritabanının asıl

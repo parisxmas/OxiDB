@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="320" font-family="Georgia, serif">
+  <rect width="720" height="320" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="26" font-size="14" font-weight="bold" text-anchor="middle">Doğrusallaştırılabilirlik: her işlem, başlangıcı ile bitişi arasında bir anda "olmuş" gibi</text>
+  <!-- timeline axis -->
+  <line x1="60" y1="270" x2="680" y2="270" stroke="#888" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="680" y="290" font-size="10" text-anchor="end" fill="#888">zaman</text>
+  <!-- W(x=1) interval -->
+  <g font-size="10.5">
+    <rect x="100" y="80" width="200" height="28" rx="6" fill="#e8eef7" stroke="#2b6cb0"/><text x="200" y="99" text-anchor="middle">A: yaz(x=1)</text>
+    <line x1="100" y1="108" x2="100" y2="270" stroke="#2b6cb0" stroke-dasharray="3"/>
+    <line x1="300" y1="108" x2="300" y2="270" stroke="#2b6cb0" stroke-dasharray="3"/>
+  </g>
+  <!-- linearization point W -->
+  <circle cx="240" cy="270" r="5" fill="#2b6cb0"/><text x="240" y="258" font-size="9.5" text-anchor="middle" fill="#2b6cb0">etki anı</text>
+  <!-- R returns 0 (before) -->
+  <g font-size="10.5">
+    <rect x="120" y="130" width="120" height="28" rx="6" fill="#e8f3ea" stroke="#3a8a52"/><text x="180" y="149" text-anchor="middle">B: oku → 0</text>
+  </g>
+  <text x="180" y="176" font-size="9.5" text-anchor="middle" fill="#3a8a52">A henüz etki etmeden bitti: 0 geçerli</text>
+  <!-- R returns 1 (after) -->
+  <g font-size="10.5">
+    <rect x="360" y="130" width="120" height="28" rx="6" fill="#e8f3ea" stroke="#3a8a52"/><text x="420" y="149" text-anchor="middle">C: oku → 1</text>
+  </g>
+  <text x="420" y="176" font-size="9.5" text-anchor="middle" fill="#3a8a52">A etki ettikten sonra başladı: 1 zorunlu</text>
+  <!-- forbidden: read 0 after C saw 1 -->
+  <g font-size="10.5">
+    <rect x="520" y="200" width="140" height="28" rx="6" fill="#fff5f5" stroke="#c0392b" stroke-width="2"/><text x="590" y="219" text-anchor="middle">D: oku → 0 ✗</text>
+  </g>
+  <text x="590" y="246" font-size="9.5" text-anchor="middle" fill="#c0392b">yasak: zaman geri sarılamaz</text>
+  <text x="360" y="310" font-size="10.5" text-anchor="middle" fill="#666">Bir kez yeni değer görüldükten sonra hiçbir okuma eskiye dönemez; gerçek-zaman sırası korunur.</text>
+</svg>

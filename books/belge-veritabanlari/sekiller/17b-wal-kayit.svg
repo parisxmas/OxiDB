@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="270" font-family="Georgia, serif">
+  <rect width="720" height="270" fill="#fbfbf8"/>
+  <text x="360" y="26" font-size="14" font-weight="bold" text-anchor="middle">WAL kaydının bayt düzeni (çerçeve + yük)</text>
+  <!-- frame -->
+  <text x="360" y="52" font-size="10.5" text-anchor="middle" fill="#666">dış çerçeve</text>
+  <g font-size="10.5" text-anchor="middle">
+    <rect x="90" y="60" width="120" height="44" fill="#fdeee0" stroke="#c97b2c"/><text x="150" y="80">CRC32</text><text x="150" y="96" font-size="9" fill="#666">u32 LE</text>
+    <rect x="210" y="60" width="120" height="44" fill="#e8eef7" stroke="#2b6cb0"/><text x="270" y="80">payload_len</text><text x="270" y="96" font-size="9" fill="#666">u32 LE</text>
+    <rect x="330" y="60" width="300" height="44" fill="#e8f3ea" stroke="#3a8a52"/><text x="480" y="83">payload (yük)</text>
+  </g>
+  <!-- payload detail -->
+  <text x="360" y="132" font-size="10.5" text-anchor="middle" fill="#666">yük içeriği</text>
+  <g font-size="9.5" text-anchor="middle">
+    <rect x="40" y="140" width="70" height="44" fill="#eef0f5" stroke="#555"/><text x="75" y="160">op</text><text x="75" y="174" font-size="8.5" fill="#666">1 bayt</text>
+    <rect x="110" y="140" width="110" height="44" fill="#eef0f5" stroke="#555"/><text x="165" y="160">tx_id</text><text x="165" y="174" font-size="8.5" fill="#666">u64 LE</text>
+    <rect x="220" y="140" width="110" height="44" fill="#eef0f5" stroke="#555"/><text x="275" y="160">doc_id</text><text x="275" y="174" font-size="8.5" fill="#666">u64 LE</text>
+    <rect x="330" y="140" width="150" height="44" fill="#fbeec8" stroke="#c0a020" stroke-dasharray="4"/><text x="405" y="158">gsn + zaman</text><text x="405" y="172" font-size="8.5" fill="#666">v2: 2× u64 (PITR)</text>
+    <rect x="480" y="140" width="190" height="44" fill="#e8f3ea" stroke="#3a8a52"/><text x="575" y="160">doc_bytes</text><text x="575" y="174" font-size="8.5" fill="#666">(şifreli olabilir)</text>
+  </g>
+  <text x="360" y="212" font-size="10" text-anchor="middle" fill="#999">op’un yüksek biti v2’yi ayırır → tek dosyada v1 ve v2 kayıtları karışık oynatılabilir</text>
+  <text x="360" y="236" font-size="10" text-anchor="middle" fill="#999">kurtarmada her kaydın CRC’si yeniden hesaplanır; uyuşmazsa yırtık-kuyruk sayılıp atılır</text>
+  <text x="360" y="258" font-size="10" text-anchor="middle" fill="#999">dosya başında 8 baytlık başlık: "OXWA" + sürüm + bayraklar</text>
+</svg>

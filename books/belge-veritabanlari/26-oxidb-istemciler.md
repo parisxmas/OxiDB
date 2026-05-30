@@ -29,12 +29,25 @@ bölümde söylediğimiz gibi, aynı çekirdek motorun farklı kapılarıdır.
 ## Diğer dillere köprü: FFI
 
 OxiDB'nin çekirdeği Rust dilinde yazılmıştır; peki başka dillerden nasıl
-kullanılır? Yanıt, **C uyumlu bir köprü** katmanındadır. Çekirdek, C dilinin
-çağırma kurallarına uyan bir arayüz sunar; ve neredeyse her programlama dili, C
-ile konuşabildiği için, bu köprü sayesinde OxiDB'yi gömülü olarak çağırabilir. Bu,
-yaygın bir tekniktir: düşük seviyeli, performans-kritik bir çekirdeği bir kez
-yazmak ve onu, bu C köprüsü üzerinden, birçok yüksek seviyeli dile açmak. Böylece
-OxiDB'nin gömülü hızı, yalnızca Rust'a değil, başka dillere de sunulur.
+kullanılır? Yanıt, **C uyumlu bir köprü** — yabancı işlev arayüzü (FFI, *foreign
+function interface*) — katmanındadır. Çekirdek, C dilinin çağırma kurallarına ve
+bellek düzenine uyan bir arayüz sunar; ve neredeyse her programlama dili, C ile
+konuşabildiği için, bu köprü sayesinde OxiDB'yi gömülü olarak çağırabilir. Bu
+köprünün neden C üzerinden kurulduğu öğreticidir: C, kırk yılı aşkın süredir
+işletim sistemlerinin ortak dilidir ve hemen her dil, C işlevlerini çağırmanın bir
+yolunu taşır — Python'da ctypes, Go'da cgo, .NET'te P/Invoke gibi. C, bir tür
+**evrensel ara katman** işlevi görür; her dilin her dile ayrı köprü yazması yerine,
+herkes ortak C zeminine konuşur.
+
+Köprünün taşıdığı tek yük, dillerin **belleği farklı yönetmesidir**: Rust'ın
+sahiplik kuralları ile bir çağıran dilin çöp toplayıcısı birbirini tanımaz. Bu
+yüzden FFI sınırında bir disiplin gerekir — dizgeler ve tamponlar, bir tarafın
+ayırıp diğerinin serbest bıraktığı sızıntılara yol açmayacak biçimde, açık
+kurallarla devredilir. Bu disiplin bir kez doğru kurulduğunda, sonuç şudur:
+düşük seviyeli, performans-kritik bir çekirdek bir kez yazılır ve bu C köprüsü
+üzerinden birçok yüksek seviyeli dile açılır. Böylece OxiDB'nin gömülü hızı,
+yalnızca Rust'a değil, başka dillere de — ağ aradan geçmeden, doğrudan işlev
+çağrısıyla — sunulur.
 
 ## İstemci kütüphaneleri
 
@@ -66,25 +79,50 @@ katmanları devreye girer: OxiDB'yi, var olan araçların ve istemcilerin tanıd
 yüzlerle sunarak, onların az değişiklikle ya da hiç değişmeden çalışmasını sağlar.
 
 Birinci uyumluluk yüzü, bir **bellek-içi anahtar-değer katmanıdır**. Bu katman,
-yaygın bir önbellek protokolüyle uyumlu çalışır; böylece o protokolü konuşan
-mevcut önbellek istemcileri ve araçları, OxiDB'ye doğrudan bağlanabilir. İkinci
-bölümde tanıdığımız anahtar-değer modelini hatırlayın; OxiDB, kendi belge
-motorunun üzerine, bu sade ve yaygın anahtar-değer yüzünü de giydirir ve sıralı
-kümeler, yayınla-abone ol gibi tanıdık yetenekleri sunar.
+yaygın bir önbellek protokolüyle — RESP adıyla bilinen, satır tabanlı, basit bir
+istek-yanıt biçimiyle — uyumlu çalışır; böylece o protokolü konuşan mevcut önbellek
+istemcileri ve komut satırı araçları, hiç değişmeden OxiDB'ye bağlanabilir. İkinci
+bölümde tanıdığımız anahtar-değer modelini hatırlayın; OxiDB, kendi belge motorunun
+üzerine, bu sade ve yaygın anahtar-değer yüzünü de giydirir. Katman yalnızca düz
+anahtar-değer ile sınırlı değildir: **sıralı kümeler** (her üyenin bir puanla
+sıralandığı yapılar) ve **yayınla-abone ol** (publish/subscribe) gibi, o
+ekosistemin tanıdık yeteneklerini de taşır. Burada dürüst bir nitelik gerekir: amaç,
+o önbellek sisteminin birebir kopyası olmak değil, en yaygın komutlarını
+desteklemektir; yani protokolün her inceliği değil, pratikte en çok kullanılan
+altkümesi karşılanır.
 
-İkinci uyumluluk yüzü, bir **mesajlaşma protokolü** desteğidir. Bu, nesnelerin
-interneti gibi, çok sayıda aygıtın yayınla-abone ol biçiminde haberleştiği
-senaryolar içindir; ve anahtar-değer katmanının yayınla-abone ol kanallarıyla
-çapraz çalışabilir, yani bir protokolden yayınlanan bir mesaj diğerinden
-dinlenebilir.
+İkinci uyumluluk yüzü, bir **mesajlaşma protokolü** — MQTT'nin yaygın bir
+sürümü — desteğidir. Bu, nesnelerin interneti gibi, çok sayıda aygıtın yayınla-abone
+ol biçiminde, az bant genişliğiyle haberleştiği senaryolar içindir. En zarif yanı,
+bu mesajlaşma yüzünün, az önceki anahtar-değer katmanının yayınla-abone ol
+kanallarıyla **çapraz çalışmasıdır**: aynı kanal havuzunu paylaştıkları için, MQTT
+ile bir konuya yayınlanan bir mesaj, anahtar-değer protokolünden o konuya abone
+olan bir istemci tarafından dinlenebilir; tersi de geçerlidir. Böylece bir sıcaklık
+sensörü MQTT ile veri yayınlarken, bir gösterge paneli aynı veriyi önbellek
+protokolüyle dinleyebilir — ikisi arasında köprü kuran ayrı bir bileşene gerek
+kalmadan.
 
-Üçüncü ve belki en geniş uyumluluk yüzü, **web yüzeyidir**: doğrudan bir HTTP
-arayüzü, gerçek zamanlı bir abonelik kanalı, bir kimlik sistemi ve belge düzeyinde
-kurallar. Yirmi üçüncü ve on beşinci bölümlerde değindiğimiz bu Firebase benzeri
-yüz, web ve mobil uygulamaların, araya bir sunucu katmanı koymadan, doğrudan
+Üçüncü ve belki en geniş uyumluluk yüzü, **web yüzeyidir** ve dört parçadan
+oluşur. Birincisi, doğrudan bir **HTTP arayüzüdür**: belge ekleme, bulma, güncelleme,
+silme ve toplama işlemleri, tarayıcıların ve web araçlarının doğal dili olan
+istek-yanıt biçimiyle yapılabilir. İkincisi, **gerçek zamanlı bir abonelik
+kanalıdır** (WebSocket): bir istemci bir sorguya abone olur ve eşleşen belgeler her
+değiştiğinde sunucu ona bir değişiklik olayı iter; böylece istemci sürekli
+sormak (polling) zorunda kalmaz. Üçüncüsü, bir **kimlik sistemidir**: kayıt, giriş
+ve oturum doğrulama; parolalar, on dördüncü bölümün kuralına uygun olarak yavaş ve
+tuzlanmış bir özetle saklanır ve oturumlar, kendi içinde imzalı, durum tutmayan
+belirteçlerle (JWT) taşınır. Dördüncüsü, **belge düzeyinde güvenlik kurallarıdır**:
+"bir kullanıcı yalnızca sahibi olduğu belgeyi güncelleyebilir" gibi koşullar, ayrı
+bir kurallar koleksiyonunda tanımlanır ve her erişimde değerlendirilir.
+
+Yirmi üçüncü ve on beşinci bölümlerde değindiğimiz bu Firebase benzeri yüz, web ve
+mobil uygulamaların, araya kendi yazdıkları bir sunucu katmanı koymadan, doğrudan
 OxiDB ile — gerçek zamanlı güncellemeler, kimlik doğrulama ve belge başına erişim
-kurallarıyla — çalışmasını mümkün kılar. JavaScript istemcisi, tam da bu web
-yüzeyi üzerinden konuşur.
+kurallarıyla — çalışmasını mümkün kılar. JavaScript istemcisi, tam da bu web yüzeyi
+üzerinden konuşur ve bağımlılıksız olacak biçimde, hem tarayıcıda hem sunucu
+tarafı çalışma ortamında çalışır.
+
+![Tek çekirdeğin üstündeki erişim katmanları: gömülü FFI, OxiWire ve uyumluluk yüzleri.](sekiller/26b-protokol-katmanlari.svg){width=85%}
 
 ## Tek çekirdek, çok yüz
 

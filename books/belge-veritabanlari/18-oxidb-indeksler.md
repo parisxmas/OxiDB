@@ -19,14 +19,34 @@ yedinci bölümdeki üç armağanı birden getirir: belirli bir değere sahip ka
 bulmak (eşitlik), bir değer aralığındaki kayıtları bulmak (aralık) ve sonuçları o
 alana göre sıralı vermek (sıralı getirme).
 
-OxiDB, bu sıralı yapıyı, bellekte verimli çalışacak biçimde tasarlar. Değerleri,
-işaretçilerle birbirine bağlı dağınık bir ağaç yerine, bitişik ve sıralı bir
-düzende tutar; böylece bir değeri ararken, belleğin oraya buraya sıçramadan,
-birbirine yakın bölgelerde ikili arama yapması yeterli olur. Bu, büyük
-indekslerde, modern işlemcilerin bellek erişim biçiminden en iyi şekilde
-yararlanmayı sağlar. Yeni yazmalar ise, her seferinde bu sıralı düzeni baştan
-bozmamak için, önce küçük bir tampona alınır ve periyodik olarak sıralı yapıya
-katılır; böylece eklemeler amorti edilmiş biçimde ucuz kalır.
+OxiDB, bu sıralı yapıyı, bellekte verimli çalışacak biçimde tasarlar — ve burada
+bilinçli bir mühendislik tercihi vardır. Bu indeks, adı çoğu sistemde anılan
+düğüm-ve-işaretçi ağacı (B-ağacı ya da denge ağacı) **değildir**. OxiDB, indeks
+değerlerini, işaretçilerle birbirine bağlı dağınık bir ağaç yerine, tek bir
+bitişik ve sıralı dizide tutar: her girdi bir değer ile o değere sahip belgelerin
+kimlik kümesidir, ve bu girdiler değere göre sıralı, yan yana, aynı bellek
+bölgesinde durur. Böylece bir değeri ararken, OxiDB bu dizide **ikili arama**
+(binary search) yapar; belleğin oraya buraya sıçramadan, birbirine yakın
+bölgelerde ilerlemesi yeterli olur. Bunun neden önemli olduğu, ölçeği büyütünce
+ortaya çıkar: bir milyon girdilik bir indekste ikili arama, yalnızca yirmi
+mertebesinde adım atar ve bu adımlar, dağınık bir ağacın işaretçi zincirini
+kovalamasının aksine, modern işlemcilerin önbellek satırlarına çok daha iyi
+oturur. Bu yapıya, içeride sayfa-dostu alan indeksi (PagedFieldIndex) denir.
+
+Ama bitişik ve sıralı bir dizinin bir zayıf noktası vardır: araya tek bir yeni
+değer sokmak, kötü durumda dizinin yarısını kaydırmayı gerektirebilir. OxiDB bunu,
+ikinci kısımda LSM ağaçlarında gördüğümüz fikrin küçük bir akrabasıyla çözer:
+yeni yazmalar doğrudan sıralı diziye işlenmez, önce küçük bir **yazma tamponuna**
+(write buffer) alınır. Tampon, sırasız ve küçüktür; ekleme ona bedavaya yakın bir
+maliyetle düşer. Tampon belli bir doluluğa — birkaç yüz ila bin mertebesinde bir
+eşiğe — ulaştığında, OxiDB onu bir kerede sıralı diziye **birleştirir** (merge):
+bekleyen tüm ekleme ve silmeleri tek geçişte uygular. Böylece her ekleme tek tek
+diziyi kaydırmaz; maliyet, birleştirmeyi bekleyen birçok yazmaya bölünür ve
+ekleme, amorti edilmiş biçimde ucuz kalır. Bir değer ararken hem sıralı diziye
+hem de küçük tampona bakılır; bu yüzden tampondaki güncel yazmalar da sonuçlara
+yansır.
+
+![Yazma tamponunun sıralı diziye birleşmesi.](sekiller/18b-writebuffer.svg){width=80%}
 
 ## Türler arası sıralama: IndexValue inceliği
 
@@ -37,15 +57,24 @@ farklı belgelerde farklı türde değerler taşıyabilir — birinde sayı, bir
 birinde tarih. Sıralı bir indeks kurabilmek için, OxiDB'nin bu **farklı türleri
 bile tek bir bütünsel sıraya** koyabilmesi gerekir.
 
-OxiDB bunu, türler arasında sabit bir sıralama tanımlayarak çözer: boş değerler en
-önce, sonra mantıksal değerler, sayılar, tarihler ve metinler belirli bir düzende
-gelir. Böylece tür karışık olsa bile, indeks tutarlı bir sıra koruyabilir.
-Özellikle zarif bir ayrıntı, tarihlerle ilgilidir. Tarihler belgelerde çoğu zaman
+OxiDB bunu, türler arasında sabit ve kesin bir sıralama tanımlayarak çözer: en
+önce boş değerler (null), sonra mantıksal değerler (bool), sonra sayılar — tam ve
+ondalık sayılar kendi aralarında doğal sayısal sıralarıyla — sonra tarihler ve en
+sonda metinler gelir. Bu sıra, indeksin iç değer türünde (IndexValue) gömülüdür:
+iki değer karşılaştırılırken önce türleri bu basamağa göre, tür aynıysa
+değerleri kendi içinde kıyaslanır. Böylece tür karışık olsa bile — aynı alan bir
+belgede sayı, başkasında metin olsa bile — indeks tutarlı, tek bir bütünsel sıra
+koruyabilir ve aralık sorguları anlamını yitirmez. Özellikle zarif bir ayrıntı,
+tarihlerle ilgilidir. Tarihler belgelerde çoğu zaman
 metin olarak — yaygın tarih biçimlerinde — yazılır; ama metin olarak
 sıralandığında, tarihler doğru kronolojik sıraya girmeyebilir. OxiDB, yaygın
-biçimlerdeki tarih metinlerini **otomatik olarak tanır** ve onları sayısal bir
-zaman damgasına çevirip öyle indeksler; böylece tarih aralığı sorguları doğru
-biçimde sıralanır. Bu, yedinci bölümün soyut "sıralı indeks" fikrini, belge
+biçimlerdeki — ISO 8601 / RFC 3339 ya da yıl-ay-gün gibi — tarih metinlerini
+**otomatik olarak tanır** ve onları, dönemden bu yana geçen milisaniye sayısına
+(epoch-ms) çevirip bir tam sayı olarak indeksler. Bunun iki kazancı vardır: tarih
+karşılaştırması artık metin karşılaştırması değil, çok daha hızlı bir tam sayı
+karşılaştırmasıdır; ve tarihler, metin olarak yan yana dizildiğinde bozulabilecek
+kronolojik sıraya, sayısal değerleriyle her zaman doğru girer. Böylece tarih
+aralığı sorguları doğru biçimde sıralanır. Bu, yedinci bölümün soyut "sıralı indeks" fikrini, belge
 verisinin tür çeşitliliğine uydurmak için yapılmış somut bir mühendislik
 tercihidir.
 
@@ -107,10 +136,16 @@ incelik kalmıştı: indeksler de bellekte yer kaplar ve büyük bir koleksiyond
 birçok indeks, kayda değer bir bellek tüketebilir. OxiDB, disk-öncelikli kipte bu
 sorunu da çözer: indeksleri de diske taşır.
 
-Bu kipte, indeksler kendi belleğe yansıtılmış dosyalarında — uzantısıyla anılırsa
-`.mfidx` dosyalarında — durur ve gerektiğinde sayfa sayfa belleğe getirilir;
-yalnızca son yazmaları tutan küçük bir bellek-içi tampon kalır. Daha da önemlisi,
-veritabanı yeniden açıldığında, bu indeksler baştan kurulmaz; belleğe yansıtılarak
+Önemli olan, bunun yeni bir indeks türü olmamasıdır: az önce tanıdığımız aynı
+bitişik-sıralı-dizi artı yazma-tamponu tasarımı, yalnızca farklı bir yerde yaşar.
+Bu kipte, indeksin sıralı dizisi bellekte değil, kendi belleğe yansıtılmış
+dosyasında — uzantısıyla anılırsa `.mfidx` dosyasında — durur ve gerektiğinde
+sayfa sayfa belleğe getirilir; bellekte yerleşik kalan tek şey, son yazmaları
+tutan o küçük yazma tamponudur. İkili arama, artık bu yansıtılmış dosya üzerinde
+yürür; aranan değerin bulunduğu sayfalar işletim sistemi tarafından getirilir,
+bellek baskı altındayken yine sessizce geri atılabilir — tıpkı bir önceki bölümde
+belge gövdeleri için gördüğümüz gibi. Daha da önemlisi, veritabanı yeniden
+açıldığında, bu indeksler baştan kurulmaz; dosya doğrudan belleğe yansıtılarak
 neredeyse anında yüklenir. Bunun sonucu, on üçüncü bölümün disk-öncelikli
 felsefesinin indekslere kadar uzanmasıdır: beş yüz bin belgelik ve birkaç indeksli
 bir koleksiyonu taze açan bir süreç, yalnızca birkaç megabayt yerleşik bellekle
@@ -157,9 +192,11 @@ veriyle tutarlı kalması — bir çökme sonrası bile — sessiz ama kritik bi
 ## Bu bölümün bıraktığı yer
 
 Bu bölümde, OxiDB'nin aramayı hızlandıran yapılarını yakın plana aldık. Alan
-indekslerinin, sıralı ve bellek-dostu bir yapıyla eşitlik, aralık ve sıralı
-getirmeyi birden desteklediğini; türler arası sıralamanın ve otomatik tarih
-tanımanın bu sıralamayı belge verisine nasıl uyarladığını; bileşik indekslerin
+indekslerinin, bitişik-sıralı bir dizi, ikili arama ve birleştirilen bir yazma
+tamponundan oluşan bellek-dostu bir yapıyla eşitlik, aralık ve sıralı getirmeyi
+birden desteklediğini; türler arası kesin sıralamanın ve tarihleri epoch-ms tam
+sayısına çeviren otomatik tanımanın bu sıralamayı belge verisine nasıl
+uyarladığını; bileşik indekslerin
 önek kuralını; indeksten doğrudan saymanın gücünü; indeks destekli sıralamayı ve
 erken sonlanmayı; disk-öncelikli kipte indekslerin de belleğe yansıtılarak
 bellekten çıkarıldığını; ve diğer indeks türlerini gördük. Bu arada, OxiDB'nin

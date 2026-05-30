@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="310" font-family="Georgia, serif">
+  <rect width="720" height="310" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="26" font-size="14" font-weight="bold" text-anchor="middle">Bileşik indeks (bölge, yaş): önek kuralı</text>
+  <text x="360" y="46" font-size="11" text-anchor="middle" fill="#666">Anahtarlar önce bölgeye, aynı bölge içinde yaşa göre sıralı</text>
+  <!-- sorted composite keys -->
+  <g font-size="10.5" text-anchor="middle">
+    <rect x="60" y="64" width="120" height="30" rx="4" fill="#e8eef7" stroke="#2b6cb0"/><text x="120" y="84">(Ege, 24)</text>
+    <rect x="186" y="64" width="120" height="30" rx="4" fill="#e8eef7" stroke="#2b6cb0"/><text x="246" y="84">(Ege, 31)</text>
+    <rect x="312" y="64" width="120" height="30" rx="4" fill="#e8eef7" stroke="#2b6cb0"/><text x="372" y="84">(Ege, 47)</text>
+    <rect x="438" y="64" width="120" height="30" rx="4" fill="#e8eef7" stroke="#2b6cb0"/><text x="498" y="84">(Marmara, 22)</text>
+    <rect x="564" y="64" width="120" height="30" rx="4" fill="#e8eef7" stroke="#2b6cb0"/><text x="624" y="84">(Marmara, 39)</text>
+  </g>
+  <!-- query rows -->
+  <g font-size="11">
+    <text x="60" y="140" font-weight="bold">Sorgu</text>
+    <text x="430" y="140" font-weight="bold">İndeks işe yarar mı?</text>
+    <text x="60" y="170">bölge = Ege</text>
+    <text x="430" y="170" fill="#3a8a52">✓ ardışık dilim (önek tam)</text>
+    <text x="60" y="200">bölge = Ege ve yaş = 31</text>
+    <text x="430" y="200" fill="#3a8a52">✓ önce bölge dilimi, içinde yaş aramasıdır</text>
+    <text x="60" y="230">bölge = Ege ve yaş 20–40 arası</text>
+    <text x="430" y="230" fill="#3a8a52">✓ önek + son alanda aralık taraması</text>
+    <text x="60" y="260">yaş = 31 (bölgesiz)</text>
+    <text x="430" y="260" fill="#c0392b">✗ yaşlar tüm bölgelere dağılmış → tarama</text>
+  </g>
+  <line x1="40" y1="278" x2="680" y2="278" stroke="#ddd"/>
+  <text x="360" y="298" font-size="10.5" text-anchor="middle" fill="#999">Kural: bileşik indeks, alan sırasının baştan başlayan bir önekini süzen sorguları hızlandırır</text>
+</svg>

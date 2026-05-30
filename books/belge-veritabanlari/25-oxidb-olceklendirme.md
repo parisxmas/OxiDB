@@ -72,21 +72,38 @@ istenirse o parça kendi içinde bir Raft kümesi de olabilir; bu, on ikinci bö
 "shard'la, sonra her shard'ı replikasyonla çoğalt" topolojisidir.
 
 OxiPool, on ikinci bölümdeki sharding mekaniğini doğrudan uygular. Bir **parça
-anahtarı** belirlenir ve anahtarlar, doğrudan parçalara değil, çok sayıda **sanal
-parçaya** eşlenir; sanal parçalar da parçalara dağıtılır. Bu dolaylama, on ikinci
-bölümde gördüğümüz yeniden dengeleme kolaylığını sağlar: bir parça eklendiğinde,
-anahtarları tek tek taşımak yerine, yalnızca birkaç sanal parçayı kaydırmak
-yeterlidir.
+anahtarı** (shard key) belirlenir — örneğin "müşteri kimliği" gibi bir alan — ve
+anahtarlar, doğrudan parçalara değil, çok sayıda **sanal parçaya** (virtual chunk)
+eşlenir; sanal parçalar da parçalara dağıtılır. Eşleme şöyle işler: bir belgenin
+parça anahtarı alanının değeri alınır, hızlı bir sağlama toplamı işlevinden
+geçirilir ve çıkan sayının, sanal parça sayısına göre modülü alınarak bir sanal
+parça numarası elde edilir; küçük bir tablo da her sanal parçanın hangi gerçek
+parçaya ait olduğunu söyler. Sanal parça sayısının ikinin bir kuvveti seçilmesi,
+modül işleminin tek bir bit maskeleme adımına inmesini sağlar — yani çok ucuzdur.
+Bu iki kademeli dolaylama, on ikinci bölümde gördüğümüz yeniden dengeleme
+kolaylığını sağlar: bir parça eklendiğinde, anahtarları tek tek taşımak yerine,
+yalnızca birkaç sanal parçanın gerçek parçaya bağlanmasını değiştirmek yeterlidir;
+böylece taşınması gereken veri, toplam verinin yalnızca küçük bir oranıdır.
 
 Yönlendirme şöyle işler. Parça anahtarını taşıyan bir istek — örneğin o anahtara
-göre bir sorgu ya da o anahtarı içeren bir belge ekleme — doğrudan o anahtarın ait
-olduğu tek parçaya gönderilir. Anahtarı içermeyen bir istek ya da bir toplama
-sorgusu ise, on ikinci bölümdeki **dağıt-topla** örüntüsünü tetikler: istek tüm
-parçalara gönderilir, her birinden kısmi yanıt alınır ve bunlar birleştirilir. Bir
-sayım, parçaların sayılarını toplar; bir bulma, parçaların sonuçlarını birleştirir;
-bir gruplama ise, on ikinci bölümde anlattığımız gibi, parça-yerel bir hesaba ve
-bir birleştirme hesabına bölünerek, tek-düğümle birebir aynı sonucu üretecek
-biçimde yürütülür.
+göre bir sorgu ya da o anahtarı içeren bir belge ekleme — değer önce sanal parçaya,
+sonra gerçek parçaya çözülerek doğrudan o tek parçaya gönderilir; başka parçalara
+hiç dokunulmaz. Anahtarı içermeyen bir istek ya da bir toplama sorgusu ise, on
+ikinci bölümdeki **dağıt-topla** (scatter-gather) örüntüsünü tetikler: istek tüm
+parçalara koşut olarak gönderilir, her birinden kısmi yanıt alınır ve bunlar
+birleştirilir. Birleştirme, isteğin türüne göre değişir ve burada incelik vardır.
+Bir sayım, parçaların sayılarını toplar. Bir bulma, parçaların belge listelerini
+art arda ekler. Bir toplama (aggregate) ise en zorudur: gruplamayı saf biçimde her
+parçada ayrı yapıp sonuçları yan yana koymak yanlış olurdu — aynı grup birden çok
+parçada belirip iki kez sayılırdı. OxiPool bu yüzden, on ikinci bölümde
+anlattığımız gibi, toplama boru hattını ikiye böler: her parçada çalıştırılan bir
+**parça-yerel** evre ile, parçaların kısmi sonuçlarını tek bir doğru sonuçta
+birleştiren bir **birleştirme** evresi. Örneğin bir toplam, parçaların kısmi
+toplamlarının toplamına; bir ortalama, kısmi toplam ile sayının ayrı ayrı taşınıp
+sonda bölünmesine dönüşür. Sonuç, tek bir düğümde çalıştırılmış gibi birebir aynı
+çıkar; hem küresel hem de anahtar başına gruplamalar için.
+
+![OxiPool: anahtarlı sorgunun hedefli yönü ve anahtarsız sorgunun dağıt-topla yolu.](sekiller/25b-oxipool-yonlendirme.svg){width=85%}
 
 Bu cross-shard toplama birleştirmesi de bu kitap yazılırken uçtan uca bir testle
 doğrulandı. Gerçek bir OxiPool yönlendiricisi, üç bağımsız parçanın önüne kuruldu;

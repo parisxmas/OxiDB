@@ -58,6 +58,18 @@ küçük olan yükler için en büyüktür; tüm veriyi sürekli tarayan yükler
 kazanç azalır. Bu, bir zayıflık değil, on üçüncü bölümde tarif ettiğimiz çalışma
 kümesi gerçeğinin doğal bir sonucudur.
 
+Aynı dürüstlük, **kalıcı bellek tüketimi** için de gereklidir; çünkü buradaki tablo
+tek yönlü değildir. Bu kitap yazılırken alınan ölçümlerde, bir milyon belgelik bir
+yük işlendikten sonraki an incelendiğinde, OxiDB'nin yerleşik belleği emsalininkinden
+bir miktar **yüksekti**; buna karşılık diskte kapladığı yer daha **azdı**. İlk bakışta
+çelişkili gibi görünen bu, aslında bu kitabın anlattığı iki ödünleşimin aynı anda
+çalışmasıdır: OxiDB'nin belleğe öncelikli varsayılan kipi hızı belleğe yaslar — bu
+yüzden o ölçümde bellek yüksekti — ama on altıncı bölümün sıkıştırması ve kompakt
+depolaması, diskte yer kazandırır. Yani "OxiDB daha az bellek kullanır" gibi tek
+cümlelik bir iddia, koşulları söylenmeden eksiktir: hangi kip, hangi iş yükü,
+ölçümün hangi anı? Bu sorular yanıtlanmadan, bir bellek sayısı tek başına bir şey
+söylemez.
+
 ## Karşılaştırmanın felsefesi
 
 Bir karşılaştırmalı değerlendirme, koşulları açıkça belirtilmedikçe, bir yalandan
@@ -78,6 +90,21 @@ tam tersine onu hemen ardından nitelemek: bu sonuç belirli koşullara — ayn�
 makine, aynı veri, emsalin belleğinin sınırlandığı bir kurulum — bağlıdır ve asıl
 değeri, "kim kazandı" değil, "her bir sonucun altında hangi tercih yatıyor"
 sorusundadır.
+
+Bu sonucun bir geçmişi olduğunu da söylemek, "anlattığını gösterme" sözüne sadık
+kalmak için gereklidir. Aynı test paketi, bu kitabın anlattığı bellek ve hız
+çalışmaları yapılmadan önce daha dengeli bir tabloya işaret ediyordu; OxiDB bazı
+testlerde önde, bazılarında geride gidiyordu. Birbirini izleyen birkaç bilinçli
+mühendislik adımı — disk-öncelikli kipin perdesini aralayan sıkıştırmasız
+seçenek, indeksli saymanın disk indekslerinde yeniden etkinleştirilmesi, bayt
+düzeyinde süzme ve toplu boşaltmalı ekleme — geride kalınan testleri tek tek öne
+çevirdi. Yani bu temiz sonuç bir başlangıç hali değil, bu kitapta anlatılan
+ilkelerin ölçülebilir bir sonucudur; ve bir emsali ölçütle test etmenin asıl
+değeri de buradadır: nereye yatırım yapılacağını söyleyen bir pusula olması.
+Ölçütün ayrıca, ağ üzerinden değil, aynı ağ içinden — bağlantı maliyeti her iki
+taraf için de eşitlenecek biçimde — koşturulduğunu da belirtmek gerekir; çünkü tek
+bir belgeyi uzaktan ekleme gibi mikro işlemlerde, ölçülen sürenin büyük kısmı ağ
+gidiş-dönüşü olabilir ve bu, ölçülmek istenen şeyi gölgeler.
 
 ## OxiDB nerede kazanır
 

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="330" font-family="Georgia, serif">
+  <rect width="720" height="330" fill="#fbfbf8"/>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Tutarlı karma halkası: anahtar saat yönünde ilk makineye ait</text>
+  <!-- ring -->
+  <circle cx="225" cy="195" r="105" fill="none" stroke="#bbb" stroke-width="2"/>
+  <!-- virtual nodes: A=blue, B=green, C=purple, scattered -->
+  <g font-size="10" text-anchor="middle">
+    <!-- node markers on ring (angle-based positions) -->
+    <circle cx="225" cy="90" r="7" fill="#2b6cb0"/><text x="225" y="78" font-size="9">A1</text>
+    <circle cx="305" cy="125" r="7" fill="#3a8a52"/><text x="322" y="120" font-size="9">B1</text>
+    <circle cx="330" cy="195" r="7" fill="#7a4fa0"/><text x="348" y="199" font-size="9">C1</text>
+    <circle cx="300" cy="265" r="7" fill="#2b6cb0"/><text x="318" y="278" font-size="9">A2</text>
+    <circle cx="225" cy="300" r="7" fill="#3a8a52"/><text x="225" y="318" font-size="9">B2</text>
+    <circle cx="148" cy="265" r="7" fill="#7a4fa0"/><text x="130" y="278" font-size="9">C2</text>
+    <circle cx="120" cy="195" r="7" fill="#2b6cb0"/><text x="100" y="199" font-size="9">A3</text>
+    <circle cx="145" cy="125" r="7" fill="#3a8a52"/><text x="128" y="120" font-size="9">B3</text>
+  </g>
+  <!-- key on ring -->
+  <circle cx="270" cy="103" r="5" fill="#c0392b"/>
+  <text x="270" y="95" font-size="9" fill="#c0392b" text-anchor="middle">anahtar</text>
+  <!-- clockwise arrow from key to B1 -->
+  <path d="M276,107 Q300,108 301,120" fill="none" stroke="#c0392b" stroke-width="1.6" marker-end="url(#a)" stroke-dasharray="3"/>
+  <text x="225" y="200" font-size="10" text-anchor="middle" fill="#999">saat yönü →</text>
+  <!-- legend -->
+  <g font-size="11">
+    <rect x="430" y="70" width="14" height="14" fill="#2b6cb0"/><text x="452" y="82">Makine A (sanal düğümler A1–A3)</text>
+    <rect x="430" y="96" width="14" height="14" fill="#3a8a52"/><text x="452" y="108">Makine B (B1–B3)</text>
+    <rect x="430" y="122" width="14" height="14" fill="#7a4fa0"/><text x="452" y="134">Makine C (C1–C2)</text>
+  </g>
+  <text x="430" y="172" font-size="11" font-weight="bold">Neden sanal düğüm?</text>
+  <text x="430" y="192" font-size="10.5">• Her makine halkaya çok noktayla serpilir →</text>
+  <text x="442" y="208" font-size="10.5">yük istatistiksel olarak dengeli dağılır.</text>
+  <text x="430" y="232" font-size="10.5">• Makine çıkınca yalnızca onun dilimleri,</text>
+  <text x="442" y="248" font-size="10.5">halkada bir sonrakine devredilir (~1/N göç).</text>
+  <text x="430" y="272" font-size="10.5">• Makine girince birçok komşudan azar azar</text>
+  <text x="442" y="288" font-size="10.5">dilim devralır → göç dengeli ve paralel.</text>
+</svg>

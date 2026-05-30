@@ -28,6 +28,44 @@ sık hangi sorguları soruyorum? Bir şeyi değiştirdiğimde nereleri güncelle
 gerekiyor? Bir işlem, kaç farklı varlığa birden dokunuyor? Bu bölümün geri kalanı,
 bu soruların yanıtlarının modeli nasıl belirlediğini gösteriyor.
 
+## Normalleştirme: bilgiyi nereye koyacağının disiplini
+
+İlişkisel modelle belge modeli arasındaki ödünleşimi gerçekten anlamak için,
+ilişkisel dünyanın "doğru tasarım" anlayışının kalbindeki kavrama —
+**normalleştirmeye** (normalization) — biraz daha yakından bakmak gerekir. Bu
+kavramı ortaya koyan da, modelin kendisini öneren araştırmacıydı; bir dizi
+**normal form** (normal form) tanımlayarak, bir tablonun ne zaman "iyi
+biçimlenmiş" sayılacağını matematiksel bir kesinliğe bağladı.^[E. F. Codd, "Further Normalization of the Data Base Relational Model," *Data Base Systems, Courant Computer Science Symposia Series* 6, Prentice-Hall, 1972.] Bu formların
+arkasındaki sezgiyi kavramak, belge modelinde gömme-referans kararını verirken
+neyi tarttığınızı görmenizi sağlar; çünkü gömmek, çoğu zaman bu disiplini
+bilinçli olarak gevşetmektir.
+
+Birinci normal form (1NF), en temel kuralı koyar: her hücre **tek bir atomik
+değer** taşımalı; bir hücrenin içine virgülle ayrılmış bir liste ya da iç içe
+bir yapı tıkıştırılmamalıdır. İlişkisel modelin düz, ızgaramsı doğası tam da
+buradan gelir — ve dikkat edin, bu kural belge modelinin en temel özelliğini,
+yani bir alanın bir liste ya da iç içe bir belge olabilmesini, doğrudan
+yasaklar. Belge modeli, bir anlamda, 1NF'yi bilinçli olarak terk etmektir.
+
+İkinci ve üçüncü normal formlar (2NF, 3NF) ile onların daha sıkı kuzeni
+Boyce-Codd normal formu (BCNF), tek bir ortak sezgiyi farklı keskinliklerle
+ifade eder: **her olgu tam olarak bir kez, ait olduğu yerde yazılmalıdır.** Bir
+sipariş satırına müşterinin adresini de yazarsanız, o adres o müşterinin her
+siparişinde tekrarlanır; oysa adres, siparişin değil müşterinin bir olgusudur.
+Bu formlar, böyle "yanlış yere konmuş" olguları ayıklayıp her birini yalnızca
+kendi tablosuna yerleştirmeyi buyurur. Sonuç, az önce gördüğümüz çoğaltmasız
+dünyadır: adres değişince tek bir satır güncellenir, tutarsızlık doğamaz.
+
+Normalleştirmenin armağanı budur — güncelleme tutarlılığı ve çoğaltmasızlık. Ama
+bedeli, bu bölümün baştan beri işaret ettiği şeydir: bilgi ne kadar çok ayrı
+tabloya bölünürse, onu bütün olarak geri toplamak için o kadar çok birleştirme
+gerekir. Belge modeli, tam da bu noktada normalleştirmeye karşı bir bahis
+oynar: bazı olguları bilinçli olarak çoğaltıp ait oldukları varlığın içine
+gömerek, okuma için ödenen birleştirme bedelini, yazma için ödenen çoğaltma
+bedeline takas eder. Bu yüzden belge modelini "normalleştirilmemiş"
+(denormalized) tasarımın doğal evi olarak düşünmek yerinde olur — yeter ki bu
+gevşetmenin bilinçli bir karar olduğu, bir ihmal değil, akılda tutulsun.
+
 ## Belge modeline geçişin dört itici gücü
 
 Ekipleri ilişkisel modelden belge modeline yönelten gerekçeler, genellikle dört
@@ -40,9 +78,23 @@ zaman tek bir varlığı bütün olarak okumaktır: bir kullanıcının profilin
 birçok tabloya dağılmıştır ve onu bütün olarak getirmek birleştirme gerektirir.
 Belge modelinde ise o varlık tek bir belgede, yan yana durur; bir okuma
 işlemiyle, dağınık parçaları toplamadan elinize gelir. Veriyi bir arada tutmaya
-**yerellik** denir ve okuma-yoğun uygulamalarda en büyük kazançlardan biridir;
-çünkü tek bir yerden okumak, birçok yerden toplayıp birleştirmekten neredeyse
-her zaman hızlıdır.
+**yerellik** (locality) denir ve okuma-yoğun uygulamalarda en büyük
+kazançlardan biridir; çünkü tek bir yerden okumak, birçok yerden toplayıp
+birleştirmekten neredeyse her zaman hızlıdır.
+
+Bu kazancın kökü, birinci bölümdeki disk kurallarına dayanır. Bir belge diske
+**ardışık** baytlar halinde yazıldığında, onu okumak tek bir sıralı erişimdir —
+diskin en sevdiği erişim biçimi. Buna karşılık bir birleştirme, doğası gereği,
+bir tablodaki satırı bulup, taşıdığı kimlikle başka bir tablodaki ilgili satıra
+**atlamayı** gerektirir; ve bu atlama, çoğu zaman diskte bambaşka bir yere
+yapılan rastgele bir erişimdir. Bir siparişi altı tablodan toplamak, en kötü
+durumda her kalem için ürün tablosuna ayrı bir rastgele sıçrama demektir.
+Birleştirme algoritmalarının kendisi de bedavadan gelmez: iki kümeyi eşleştirmek
+için ya her iki tarafı da birleştirme alanına göre sıralamak (sıralama maliyeti
+veri büyüklüğünün logaritmasıyla çarpımı kadar) ya da bir tarafın tamamını
+bellekte bir özet tablosuna kurmak (bellek maliyeti) gerekir. Yerellik bu
+maliyetlerin hepsini birden ortadan kaldırır: birleştirilecek bir şey
+olmadığında, birleştirmenin algoritmik bedeli de yoktur.
 
 **İkincisi, geliştirme hızıdır.** İlişkisel bir tabloda yeni bir alan eklemek ya
 da yapıyı değiştirmek, önceden tanımlı bir şemayı değiştirmeyi gerektirir; bu,
@@ -55,10 +107,21 @@ yalnızca itici gücün ne olduğunu saptıyoruz.)
 
 **Üçüncüsü, nesne uyumsuzluğunun azalmasıdır.** Önceki bölümde, programlardaki
 iç içe nesnelerle ilişkisel tablolar arasındaki sürekli çeviri yükünden söz
-etmiştik. Belge modeli, veriyi tam da uygulamanın düşündüğü biçimde — iç içe
-geçmiş bütünler olarak — sakladığı için bu çeviri büyük ölçüde ortadan kalkar.
+etmiştik. Bu uyumsuzluğun kökü yüzeysel bir biçim farkı değil; iki dünyanın
+veriyi temelden farklı **şekillerde** düşünmesidir. Bir programlama dilindeki
+nesne, doğası gereği bir ağaçtır — hatta işaretçilerle bir grafiktir: içinde
+başka nesneler, listeler, listelerin içinde başka nesneler barındırır. İlişkisel
+model ise, az önce gördüğümüz birinci normal form yüzünden, düzdür: iç içelik
+yasaktır, her şey ızgaraya serilmek zorundadır. Bir ağacı düz bir ızgaraya
+sığdırmak için onu parçalara ayırmak, parçalara yapay kimlikler vermek ve
+ilişkileri yabancı anahtarlarla kurmak gerekir; geri okurken de bu parçaları
+toplayıp ağacı yeniden örmek. Bu iki yönlü çeviriyi otomatikleştirmek için
+geliştirilen nesne-ilişkisel eşleyici (object-relational mapper) katmanları,
+sorunu gizler ama yok etmez; çünkü kök, iki veri şeklinin yapısal uyuşmazlığında
+yatar. Belge modeli, veriyi tam da uygulamanın düşündüğü biçimde — iç içe geçmiş
+bütünler olarak — sakladığı için bu çeviri büyük ölçüde ortadan kalkar.
 Programdaki nesne ile veritabanındaki belge neredeyse aynı şekle sahip olur;
-aradaki sürtünme erir.
+ağaç, ağaç olarak saklanır ve aradaki sürtünme erir.
 
 **Dördüncüsü, dağıtıma yatkınlıktır.** Veri tek bir makineye sığmaz hale
 geldiğinde, onu birden çok makineye bölmek gerekir; on ikinci bölümde bunu

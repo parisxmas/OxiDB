@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="300" font-family="Georgia, serif">
+  <rect width="720" height="300" fill="#fbfbf8"/>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Yetersayı: W + R &gt; N ise yazma ve okuma kümeleri kesişir</text>
+  <text x="360" y="50" font-size="11" text-anchor="middle" fill="#666">N = 5 kopya, W = 3, R = 3  →  3 + 3 = 6 &gt; 5  ✓</text>
+  <!-- 5 replicas in a row -->
+  <g font-size="11" text-anchor="middle">
+    <rect x="80" y="120" width="90" height="56" rx="8" fill="#fdeee0" stroke="#c97b2c" stroke-width="2"/><text x="125" y="143">Kopya 1</text><text x="125" y="160" font-size="9">yeni değer</text>
+    <rect x="190" y="120" width="90" height="56" rx="8" fill="#fdeee0" stroke="#c97b2c" stroke-width="2"/><text x="235" y="143">Kopya 2</text><text x="235" y="160" font-size="9">yeni değer</text>
+    <rect x="300" y="120" width="90" height="56" rx="8" fill="#e8eef7" stroke="#2b6cb0" stroke-width="2.5"/><text x="345" y="143">Kopya 3</text><text x="345" y="160" font-size="9">yeni değer</text>
+    <rect x="410" y="120" width="90" height="56" rx="8" fill="#eef0f5" stroke="#555"/><text x="455" y="143">Kopya 4</text><text x="455" y="160" font-size="9">eski değer</text>
+    <rect x="520" y="120" width="90" height="56" rx="8" fill="#eef0f5" stroke="#555"/><text x="565" y="143">Kopya 5</text><text x="565" y="160" font-size="9">eski değer</text>
+  </g>
+  <!-- W bracket over 1-3 -->
+  <path d="M80,108 L80,96 L390,96 L390,108" fill="none" stroke="#c97b2c" stroke-width="1.8"/>
+  <text x="235" y="88" font-size="11.5" text-anchor="middle" fill="#c97b2c" font-weight="bold">Yazma kümesi (W=3): kopya 1,2,3</text>
+  <!-- R bracket under 3-5 -->
+  <path d="M300,188 L300,200 L610,200 L610,188" fill="none" stroke="#2b6cb0" stroke-width="1.8"/>
+  <text x="455" y="220" font-size="11.5" text-anchor="middle" fill="#2b6cb0" font-weight="bold">Okuma kümesi (R=3): kopya 3,4,5</text>
+  <!-- intersection note -->
+  <text x="345" y="252" font-size="11" text-anchor="middle" font-weight="bold" fill="#3a8a52">Kesişim: Kopya 3</text>
+  <text x="360" y="276" font-size="10.5" text-anchor="middle" fill="#999">Okuma, en güncel sürümü taşıyan en az bir kopyaya muhakkak değer → doğru değeri döndürür</text>
+</svg>
