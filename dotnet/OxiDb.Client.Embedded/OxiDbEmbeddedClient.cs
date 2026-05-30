@@ -103,6 +103,17 @@ public sealed class OxiDbEmbeddedClient : IOxiDbClient
         return Task.CompletedTask;
     }
 
+    public Task CreateCollectionWithOptionsAsync(string name, StorageOptions options, CancellationToken ct = default)
+    {
+        Execute(new()
+        {
+            ["cmd"] = "create_collection_with_options",
+            ["collection"] = name,
+            ["options"] = options.ToWire(),
+        });
+        return Task.CompletedTask;
+    }
+
     public Task<List<string>> ListCollectionsAsync(CancellationToken ct = default)
     {
         var data = Execute(new() { ["cmd"] = "list_collections" });

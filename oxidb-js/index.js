@@ -376,8 +376,22 @@ class OxiDB {
     return res.collections;
   }
 
-  async createCollection(name) {
-    return this._post("/api/collections", { name });
+  /**
+   * Create a collection. Optionally pass per-collection storage options
+   * (disk-first, compression, compaction policy); omitted fields fall back to
+   * the server defaults (in-RAM, compressed, auto-compaction). The chosen shape
+   * is persisted, so the collection reopens the same way regardless of the
+   * server's environment.
+   *
+   * @param {string} name
+   * @param {{disk_first?: boolean, compress?: boolean, auto_compact?: boolean,
+   *          compact_min_bytes?: number, compact_dead_ratio?: number}} [options]
+   * @example db.createCollection("events", { disk_first: true, compress: false })
+   */
+  async createCollection(name, options) {
+    const body = { name };
+    if (options && Object.keys(options).length > 0) body.options = options;
+    return this._post("/api/collections", body);
   }
 
   async dropCollection(name) {

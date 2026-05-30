@@ -359,10 +359,24 @@ fn handle_create_collection(
 ) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
     let name = body["name"].as_str().ok_or((400, "missing 'name'"))?;
-    state
-        .db
-        .create_collection(name)
-        .map_err(|_| (409, "collection already exists"))?;
+    // Optional per-collection storage options (disk-first, compression,
+    // compaction policy). Omitted fields fall back to server defaults.
+    match body.get("options") {
+        Some(opts_val) if !opts_val.is_null() => {
+            let opts: oxidb::StorageOptions = serde_json::from_value(opts_val.clone())
+                .map_err(|_| (400, "invalid 'options'"))?;
+            state
+                .db
+                .create_collection_with_options(name, opts)
+                .map_err(|_| (409, "collection already exists"))?;
+        }
+        _ => {
+            state
+                .db
+                .create_collection(name)
+                .map_err(|_| (409, "collection already exists"))?;
+        }
+    }
     Ok(json!({"created": name}))
 }
 

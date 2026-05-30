@@ -15,6 +15,7 @@ public interface IOxiDbClient : IAsyncDisposable, IDisposable
 
     // Collection management
     Task CreateCollectionAsync(string name, CancellationToken ct = default);
+    Task CreateCollectionWithOptionsAsync(string name, StorageOptions options, CancellationToken ct = default);
     Task<List<string>> ListCollectionsAsync(CancellationToken ct = default);
     Task DropCollectionAsync(string name, CancellationToken ct = default);
 

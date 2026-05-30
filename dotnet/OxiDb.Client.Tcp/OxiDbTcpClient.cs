@@ -250,6 +250,16 @@ public sealed class OxiDbTcpClient : IOxiDbClient
         await RequestAsync(new() { ["cmd"] = "create_collection", ["collection"] = name }, ct);
     }
 
+    public async Task CreateCollectionWithOptionsAsync(string name, StorageOptions options, CancellationToken ct = default)
+    {
+        await RequestAsync(new()
+        {
+            ["cmd"] = "create_collection_with_options",
+            ["collection"] = name,
+            ["options"] = options.ToWire(),
+        }, ct);
+    }
+
     public async Task<List<string>> ListCollectionsAsync(CancellationToken ct = default)
     {
         var data = await RequestAsync(new() { ["cmd"] = "list_collections" }, ct);

@@ -3,6 +3,21 @@ export interface OxiDBOptions {
   wsUrl?: string;
 }
 
+/** Per-collection storage options for {@link OxiDB.createCollection}. Omitted
+ *  fields fall back to the server defaults (in-RAM, compressed, auto-compaction). */
+export interface StorageOptions {
+  /** Store documents on disk (mmap'd) keeping only the offset index resident. */
+  disk_first?: boolean;
+  /** zstd-compress on-disk records (ignored unless disk_first). */
+  compress?: boolean;
+  /** Reclaim dead space automatically (disk-first only). */
+  auto_compact?: boolean;
+  /** Never auto-compact a data file smaller than this many bytes. */
+  compact_min_bytes?: number;
+  /** Dead-space fraction (0..1) that triggers compaction. */
+  compact_dead_ratio?: number;
+}
+
 export interface FindOptions {
   sort?: Record<string, 1 | -1>;
   skip?: number;
@@ -89,7 +104,7 @@ export class OxiDB {
   collection(name: string): OxiDBCollection;
   ping(): Promise<{ status: string; data: string }>;
   listCollections(): Promise<string[]>;
-  createCollection(name: string): Promise<any>;
+  createCollection(name: string, options?: StorageOptions): Promise<any>;
   dropCollection(name: string): Promise<any>;
   sql(query: string): Promise<any>;
 

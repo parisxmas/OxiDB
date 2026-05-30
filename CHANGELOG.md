@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### `create_collection_with_options` in the .NET and JS clients (server 0.30.3)
+
+Mirrors the Python/Go helpers in the remaining first-party clients.
+
+- **.NET** (`OxiDb.Client.Tcp` + `OxiDb.Client.Embedded`, both via the shared
+  `IOxiDbClient`): `CreateCollectionWithOptionsAsync(name, StorageOptions, ct)`.
+  New `StorageOptions` class with nullable properties (`DiskFirst`, `Compress`,
+  `AutoCompact`, `CompactMinBytes`, `CompactDeadRatio`); `ToWire()` emits a
+  string-keyed map omitting unset fields (so it serializes correctly over both
+  JSON and OxiWire, and the server fills defaults via `#[serde(default)]`).
+  .NET packages → 0.29.0.
+- **JS** (`oxidb-js`, REST SDK): `createCollection(name, options?)` gains an
+  optional storage-options object (`{disk_first, compress, ...}`); `StorageOptions`
+  added to the TypeScript types. Backward compatible — `createCollection(name)`
+  is unchanged. npm package → 0.24.0.
+- **Server (REST)**: `POST /api/collections` now accepts an optional `options`
+  object and routes to `create_collection_with_options` (invalid options → 400),
+  which is what the JS client uses. The TCP-based clients (.NET) use the existing
+  wire command unchanged.
+
+Validated end-to-end: the JS client over REST and a server-side check both
+confirm the on-disk shape (`.bdat` + persisted `.bopts` with the exact options;
+plain collections stay in-RAM). Full server suite green.
+
 ### Raft replication for `create_collection_with_options` (server 0.30.2)
 
 Completes the cluster story for the per-collection-options wire command (0.30.1

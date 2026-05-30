@@ -1,6 +1,6 @@
 {
   "name": "oxidb",
-  "version": "0.23.2",
+  "version": "0.24.0",
   "description": "OxiDB client for JavaScript/TypeScript — REST API, WebSocket real-time subscriptions, authentication",
   "main": "index.js",
   "types": "index.d.ts",
