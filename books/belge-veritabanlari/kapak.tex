@@ -1,0 +1,10 @@
+% PDF kapak sayfası: `kapak.png` görselini tek başına, sayfanın tamamına
+% sığacak biçimde (oranı koruyarak) ilk sayfaya basar. build.sh, kapak.png
+% mevcutsa bu dosyayı `--include-before-body` ile ekler.
+\thispagestyle{empty}
+\begin{center}
+\vspace*{\fill}
+\includegraphics[width=\linewidth,height=\textheight,keepaspectratio]{kapak.png}
+\vspace*{\fill}
+\end{center}
+\clearpage

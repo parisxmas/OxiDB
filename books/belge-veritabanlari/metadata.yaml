@@ -1,7 +1,9 @@
 ---
-title: "Belge Veritabanları"
-subtitle: "Temellerden OxiDB'ye"
-author: "OxiDB Projesi"
+title: "OxiDB Doküman Veritabanı"
+subtitle: "Ölçeklenebilir, NoSQL Doküman Tabanlı Çözümler Rehberi"
+author: "Barış AKIN ve Anthropic"
+date: "2026"
+rights: "© 2026 Barış AKIN ve Anthropic. Tüm hakları saklıdır."
 lang: tr-TR
 toc: true
 toc-depth: 2
@@ -10,4 +12,7 @@ documentclass: book
 geometry: "margin=2.5cm"
 fontsize: 11pt
 linkcolor: black
+# EPUB/HTML kapağı pandoc tarafından otomatik kullanılır; dosya dizinde
+# `kapak.png` olarak bulunmalıdır (PDF kapağı build.sh içinde eklenir).
+cover-image: kapak.png
 ---

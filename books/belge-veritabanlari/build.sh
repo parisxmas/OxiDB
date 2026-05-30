@@ -20,16 +20,28 @@ out="belge-veritabanlari"
 
 case "$fmt" in
   pdf)
+    # Kapak: kapak.png varsa ilk sayfaya tam-sayfa görsel olarak eklenir.
+    cover_opt=()
+    if [[ -f kapak.png ]]; then
+      cover_opt=(--include-before-body=kapak.tex)
+    else
+      echo "uyarı: kapak.png bulunamadı; kapaksız üretiliyor." >&2
+    fi
     pandoc metadata.yaml "${chapters[@]}" \
       --toc --number-sections --top-level-division=chapter \
       --pdf-engine=xelatex \
+      "${cover_opt[@]}" \
       -V mainfont="DejaVu Serif" \
       -V monofont="DejaVu Sans Mono" \
       -o "${out}.pdf"
     echo "yazıldı: ${out}.pdf"
     ;;
   epub)
-    pandoc metadata.yaml "${chapters[@]}" --toc --top-level-division=chapter -o "${out}.epub"
+    # EPUB kapağı metadata.yaml'daki cover-image (kapak.png) ile gelir.
+    cover_opt=()
+    [[ -f kapak.png ]] && cover_opt=(--epub-cover-image=kapak.png)
+    pandoc metadata.yaml "${chapters[@]}" --toc --top-level-division=chapter \
+      "${cover_opt[@]}" -o "${out}.epub"
     echo "yazıldı: ${out}.epub"
     ;;
   html)

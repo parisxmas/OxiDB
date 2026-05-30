@@ -1,9 +1,20 @@
-# Belge Veritabanları — Temellerden OxiDB'ye
+# OxiDB Doküman Veritabanı
 
-Bu dizin, belge veritabanlarını **sıfırdan** anlatan, ardından OxiDB'nin nasıl
-çalıştığını **adım adım** açıklayan Türkçe bir kitabın kaynağıdır. Kitap düz
-metindir (örnek kod içermez); O'Reilly tarzında, kavramları temelden kurarak
-ilerler.
+**Ölçeklenebilir, NoSQL Doküman Tabanlı Çözümler Rehberi** — Barış AKIN ve
+Anthropic (2026).
+
+Bu dizin, belge (doküman) veritabanlarını **sıfırdan** anlatan, ardından
+OxiDB'nin nasıl çalıştığını **adım adım** açıklayan Türkçe bir kitabın
+kaynağıdır. Kitap düz metindir (örnek kod içermez); O'Reilly tarzında,
+kavramları temelden kurarak ilerler.
+
+## Kapak
+
+Kapak görseli, bu dizinde **`kapak.png`** olarak bulunmalıdır. Dosya mevcutsa
+`build.sh` onu otomatik kullanır: PDF'te tam-sayfa ilk sayfa olarak
+(`kapak.tex` aracılığıyla), EPUB/HTML'de kapak görseli olarak. Dosya yoksa kitap
+kapaksız üretilir (uyarı verilir). Kapak/başlık meta bilgisi `metadata.yaml`
+içindedir.
 
 ## Biçim ve düzen
 
