@@ -23,6 +23,7 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "create_unique_index"
                 | "create_composite_index"
                 | "create_collection"
+                | "create_collection_with_options"
                 | "list_collections"
                 | "compact"
                 | "aggregate"

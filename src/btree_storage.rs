@@ -196,6 +196,7 @@ fn compact_dead_ratio() -> f64 {
 /// current environment — flipping `OXIDB_DISK_FIRST` between runs can no longer
 /// mismatch an existing collection's on-disk format.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct StorageOptions {
     /// Disk-first mode: only the offset index is resident and document bytes
     /// live in an mmap'd `.bdat`. `false` = the default in-RAM `.btree` store.

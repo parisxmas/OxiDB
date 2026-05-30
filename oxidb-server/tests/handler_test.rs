@@ -50,11 +50,13 @@ impl TestServer {
         for _ in 0..4 {
             let rx = Arc::clone(&rx);
             let db = Arc::clone(&db);
-            std::thread::spawn(move || loop {
-                let stream = rx.lock().unwrap().recv();
-                match stream {
-                    Ok(stream) => handle_client(stream, &db),
-                    Err(_) => break,
+            std::thread::spawn(move || {
+                loop {
+                    let stream = rx.lock().unwrap().recv();
+                    match stream {
+                        Ok(stream) => handle_client(stream, &db),
+                        Err(_) => break,
+                    }
                 }
             });
         }
@@ -249,6 +251,43 @@ fn test_create_collection() {
 }
 
 #[test]
+fn test_create_collection_with_options_disk_first() {
+    // Meaningful only when the process default is in-RAM, so the disk-first
+    // behavior is attributable to the wire option, not the environment.
+    if std::env::var("OXIDB_DISK_FIRST").is_ok() {
+        return;
+    }
+    let server = TestServer::start();
+    let mut c = Client::connect(server.addr);
+
+    // Create a disk-first, uncompressed collection over the wire.
+    let resp = c.send(&json!({
+        "cmd": "create_collection_with_options",
+        "collection": "wire_fast",
+        "options": { "disk_first": true, "compress": false }
+    }));
+    assert_ok(&resp);
+
+    for i in 0..50u64 {
+        let r = c.send(&json!({"cmd": "insert", "collection": "wire_fast", "doc": {"k": i, "v": i * 2}}));
+        assert_ok(&r);
+    }
+    let resp = c.send(&json!({"cmd": "count", "collection": "wire_fast"}));
+    assert_ok(&resp);
+    assert_eq!(resp["data"]["count"], 50);
+
+    let resp = c.send(&json!({"cmd": "find_one", "collection": "wire_fast", "query": {"k": 7}}));
+    assert_ok(&resp);
+    assert_eq!(resp["data"]["v"], 14);
+
+    // The wire option (not the env) made this collection disk-first: a `.bdat`
+    // plus a persisted `.bopts` exist, and there is no in-RAM `.btree`.
+    assert!(server.data_dir.join("wire_fast.bdat").exists(), "disk-first .bdat created via wire");
+    assert!(server.data_dir.join("wire_fast.bopts").exists(), "options persisted (.bopts)");
+    assert!(!server.data_dir.join("wire_fast.btree").exists(), "not in-RAM");
+}
+
+#[test]
 fn test_drop_collection() {
     let server = TestServer::start();
     let mut c = Client::connect(server.addr);
@@ -316,7 +355,11 @@ fn test_create_and_list_indexes() {
     }));
     assert_ok(&resp);
     let indexes = resp["data"].as_array().unwrap();
-    assert!(indexes.iter().any(|v| v.as_str() == Some("name") || v.to_string().contains("name")));
+    assert!(
+        indexes
+            .iter()
+            .any(|v| v.as_str() == Some("name") || v.to_string().contains("name"))
+    );
 }
 
 #[test]
@@ -371,7 +414,9 @@ fn test_create_text_index() {
     let server = TestServer::start();
     let mut c = Client::connect(server.addr);
 
-    c.send(&json!({"cmd": "insert", "collection": "text", "doc": {"title": "hello", "body": "world"}}));
+    c.send(
+        &json!({"cmd": "insert", "collection": "text", "doc": {"title": "hello", "body": "world"}}),
+    );
 
     let resp = c.send(&json!({
         "cmd": "create_text_index", "collection": "text", "fields": ["title", "body"]
@@ -751,7 +796,9 @@ fn test_user_store_persistence() {
 
     {
         let mut store = UserStore::open(dir.path()).unwrap();
-        store.create_user("persist_user", "pass", Role::ReadWrite).unwrap();
+        store
+            .create_user("persist_user", "pass", Role::ReadWrite)
+            .unwrap();
     }
 
     // Reopen
@@ -775,7 +822,9 @@ fn test_user_store_update() {
     assert_eq!(store.authenticate("updatable", "old"), None);
 
     // Update role
-    store.update_user("updatable", None, Some(Role::Admin)).unwrap();
+    store
+        .update_user("updatable", None, Some(Role::Admin))
+        .unwrap();
     assert_eq!(store.authenticate("updatable", "new"), Some(Role::Admin));
 
     // Update nonexistent
@@ -792,11 +841,22 @@ fn test_rbac_admin_all_permitted() {
     use oxidb_server::rbac::is_permitted;
 
     let cmds = [
-        "ping", "insert", "find", "update", "delete", "count",
-        "create_index", "create_user", "drop_user", "drop_collection",
+        "ping",
+        "insert",
+        "find",
+        "update",
+        "delete",
+        "count",
+        "create_index",
+        "create_user",
+        "drop_user",
+        "drop_collection",
     ];
     for cmd in cmds {
-        assert!(is_permitted(Role::Admin, cmd), "Admin should be permitted: {cmd}");
+        assert!(
+            is_permitted(Role::Admin, cmd),
+            "Admin should be permitted: {cmd}"
+        );
     }
 }
 
@@ -807,18 +867,42 @@ fn test_rbac_readwrite_permissions() {
 
     // Allowed
     let allowed = [
-        "ping", "insert", "insert_many", "find", "find_one", "update",
-        "delete", "count", "create_index", "aggregate", "begin_tx",
-        "commit_tx", "rollback_tx", "create_bucket", "put_object",
+        "ping",
+        "insert",
+        "insert_many",
+        "find",
+        "find_one",
+        "update",
+        "delete",
+        "count",
+        "create_index",
+        "aggregate",
+        "begin_tx",
+        "commit_tx",
+        "rollback_tx",
+        "create_bucket",
+        "put_object",
     ];
     for cmd in allowed {
-        assert!(is_permitted(Role::ReadWrite, cmd), "ReadWrite should permit: {cmd}");
+        assert!(
+            is_permitted(Role::ReadWrite, cmd),
+            "ReadWrite should permit: {cmd}"
+        );
     }
 
     // Denied
-    let denied = ["create_user", "drop_user", "update_user", "list_users", "drop_collection"];
+    let denied = [
+        "create_user",
+        "drop_user",
+        "update_user",
+        "list_users",
+        "drop_collection",
+    ];
     for cmd in denied {
-        assert!(!is_permitted(Role::ReadWrite, cmd), "ReadWrite should deny: {cmd}");
+        assert!(
+            !is_permitted(Role::ReadWrite, cmd),
+            "ReadWrite should deny: {cmd}"
+        );
     }
 }
 
@@ -829,8 +913,16 @@ fn test_rbac_read_permissions() {
 
     // Allowed
     let allowed = [
-        "ping", "find", "find_one", "count", "aggregate",
-        "list_collections", "list_buckets", "get_object", "head_object", "search",
+        "ping",
+        "find",
+        "find_one",
+        "count",
+        "aggregate",
+        "list_collections",
+        "list_buckets",
+        "get_object",
+        "head_object",
+        "search",
     ];
     for cmd in allowed {
         assert!(is_permitted(Role::Read, cmd), "Read should permit: {cmd}");
@@ -838,8 +930,13 @@ fn test_rbac_read_permissions() {
 
     // Denied
     let denied = [
-        "insert", "update", "delete", "create_index",
-        "create_user", "drop_collection", "put_object",
+        "insert",
+        "update",
+        "delete",
+        "create_index",
+        "create_user",
+        "drop_collection",
+        "put_object",
     ];
     for cmd in denied {
         assert!(!is_permitted(Role::Read, cmd), "Read should deny: {cmd}");
@@ -950,12 +1047,17 @@ fn test_link_collection_registry_roundtrip() {
     }));
     assert_ok(&resp);
     assert_eq!(resp["data"]["name"], "remote_users");
-    assert_eq!(resp["data"]["url"], "oxidb://central.example.com:4444/users");
+    assert_eq!(
+        resp["data"]["url"],
+        "oxidb://central.example.com:4444/users"
+    );
 
     // list_links sees it.
     let resp = c.send(&json!({"cmd": "list_links"}));
     assert_ok(&resp);
-    let list = resp["data"].as_array().expect("list_links data is an array");
+    let list = resp["data"]
+        .as_array()
+        .expect("list_links data is an array");
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["name"], "remote_users");
 
@@ -1034,11 +1136,17 @@ fn test_linked_collection_proxies_reads() {
     }));
     assert_ok(&resp);
     let resp = aclient.send(&json!({"cmd": "count", "collection": "remote_users", "query": {}}));
-    assert_eq!(resp["data"]["count"], 3, "remote count incremented via the link");
+    assert_eq!(
+        resp["data"]["count"], 3,
+        "remote count incremented via the link"
+    );
     let resp = bclient.send(&json!({"cmd": "find", "collection": "users",
         "query": {"name": "Carol"}}));
-    assert_eq!(resp["data"].as_array().unwrap().len(), 1,
-        "Carol exists on the remote when read directly — proves the proxy WROTE");
+    assert_eq!(
+        resp["data"].as_array().unwrap().len(),
+        1,
+        "Carol exists on the remote when read directly — proves the proxy WROTE"
+    );
 
     // Non-CRUD commands (schema / transactional / admin) MUST still
     // refuse through a link — those would either mutate remote schema
@@ -1074,7 +1182,11 @@ fn test_linked_collection_unreachable_remote_errors_cleanly() {
     let resp = c.send(&json!({"cmd": "find", "collection": "unreachable", "query": {}}));
     assert_eq!(resp["ok"], false);
     let err = resp["error"].as_str().unwrap();
-    assert!(err.contains("unreachable"), "error mentions link name: {}", err);
+    assert!(
+        err.contains("unreachable"),
+        "error mentions link name: {}",
+        err
+    );
     assert!(
         err.contains("connect") || err.contains("refused") || err.contains("127.0.0.1:1"),
         "error mentions transport: {}",
@@ -1148,8 +1260,11 @@ fn test_linked_collection_write_proxy_full_crud() {
     let docs = resp["data"].as_array().unwrap();
     assert_eq!(docs.len(), 2);
     let qtys: Vec<i64> = docs.iter().map(|d| d["qty"].as_i64().unwrap()).collect();
-    assert!(qtys.contains(&1) && qtys.contains(&20),
-        "post-mutation state visible through the link: {:?}", qtys);
+    assert!(
+        qtys.contains(&1) && qtys.contains(&20),
+        "post-mutation state visible through the link: {:?}",
+        qtys
+    );
 }
 
 /// Write proxy reuses the same pool as the read proxy — interleaved
@@ -1256,7 +1371,11 @@ fn test_linked_collection_csv_adapter_full_crud() {
     let resp = c.send(&json!({"cmd": "count", "collection": "people", "query": {}}));
     assert_eq!(resp["data"]["count"], 3);
     let raw = std::fs::read_to_string(&csv_path).unwrap();
-    assert!(raw.contains("carol,22"), "insert landed in the CSV: {:?}", raw);
+    assert!(
+        raw.contains("carol,22"),
+        "insert landed in the CSV: {:?}",
+        raw
+    );
 
     // update_one with $set.
     assert_ok(&c.send(&json!({
@@ -1276,7 +1395,10 @@ fn test_linked_collection_csv_adapter_full_crud() {
         "query": {"name": "bob"},
     })));
     let resp = c.send(&json!({"cmd": "count", "collection": "people", "query": {}}));
-    assert_eq!(resp["data"]["count"], 2, "bob removed; alice + carol remain");
+    assert_eq!(
+        resp["data"]["count"], 2,
+        "bob removed; alice + carol remain"
+    );
 
     // Schema commands must still be refused on a linked collection
     // regardless of the underlying adapter — the policy lives in the
@@ -1313,25 +1435,36 @@ impl WireHttpMock {
                 let resps = responses.clone();
                 std::thread::spawn(move || {
                     let mut stream = stream;
-                    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .ok();
                     let mut buf = [0u8; 8192];
                     let mut total = Vec::new();
                     loop {
                         let n = stream.read(&mut buf).unwrap_or(0);
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         total.extend_from_slice(&buf[..n]);
                         if let Some(idx) = total.windows(4).position(|w| w == b"\r\n\r\n") {
                             let head = std::str::from_utf8(&total[..idx]).unwrap_or("");
                             let cl = head
                                 .lines()
-                                .find_map(|l| l.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
                                 .unwrap_or(0);
-                            if total.len() >= idx + 4 + cl { break; }
+                            if total.len() >= idx + 4 + cl {
+                                break;
+                            }
                         }
                     }
-                    let head_end = total.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(total.len());
+                    let head_end = total
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .unwrap_or(total.len());
                     let head_str = std::str::from_utf8(&total[..head_end]).unwrap_or("");
                     let line = head_str.lines().next().unwrap_or("");
                     let mut parts = line.split(' ');
@@ -1345,7 +1478,8 @@ impl WireHttpMock {
                     let body_bytes = payload.as_bytes();
                     let resp = format!(
                         "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        status, body_bytes.len()
+                        status,
+                        body_bytes.len()
                     );
                     let _ = stream.write_all(resp.as_bytes());
                     let _ = stream.write_all(body_bytes);
@@ -1364,10 +1498,20 @@ impl WireHttpMock {
 #[test]
 fn test_linked_collection_rest_adapter_full_crud() {
     let mock = WireHttpMock::start(vec![
-        ("GET", "/users", 200, r#"[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]"#),
+        (
+            "GET",
+            "/users",
+            200,
+            r#"[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]"#,
+        ),
         ("GET", "/users/1", 200, r#"{"id":1,"name":"alice"}"#),
         ("POST", "/users", 201, r#"{"id":3,"name":"carol"}"#),
-        ("PATCH", "/users/1", 200, r#"{"id":1,"name":"alice-updated"}"#),
+        (
+            "PATCH",
+            "/users/1",
+            200,
+            r#"{"id":1,"name":"alice-updated"}"#,
+        ),
         ("DELETE", "/users/2", 204, ""),
     ]);
 
@@ -1437,8 +1581,11 @@ fn test_linked_collection_rest_unreachable_endpoint_errors_cleanly() {
     })));
     let resp = c.send(&json!({"cmd": "find", "collection": "dead_api", "query": {}}));
     assert_eq!(resp["ok"], false);
-    assert!(resp["error"].as_str().unwrap().contains("connect"),
-        "{:?}", resp["error"]);
+    assert!(
+        resp["error"].as_str().unwrap().contains("connect"),
+        "{:?}",
+        resp["error"]
+    );
 }
 
 /// A CSV link to a file:// URL with the wrong extension MUST be
@@ -1498,7 +1645,11 @@ fn test_linked_collection_pool_reuses_connection() {
     let p = remote_client::pool();
     let port = remote.addr.port();
     let idle = p.idle_count("127.0.0.1", port, None);
-    assert_eq!(idle, 1, "pool idle_count after 5 sequential calls = {}, want 1", idle);
+    assert_eq!(
+        idle, 1,
+        "pool idle_count after 5 sequential calls = {}, want 1",
+        idle
+    );
 }
 
 /// When a pooled connection has been killed by the remote (e.g.
@@ -1529,7 +1680,9 @@ fn test_linked_collection_pool_retries_when_pooled_conn_is_dead() {
 
     // Forcibly close the pooled conn by taking it out and dropping it.
     // (Simulates the remote killing it while we held it idle.)
-    let dead = remote_client::pool().take("127.0.0.1", port, None).expect("had idle conn");
+    let dead = remote_client::pool()
+        .take("127.0.0.1", port, None)
+        .expect("had idle conn");
     // Half-close so the next write/read on it errors out. shutdown()
     // is the most realistic stand-in for a server-side close.
     let _ = dead.shutdown(std::net::Shutdown::Both);
@@ -1566,11 +1719,10 @@ fn test_linked_collection_pool_retries_when_pooled_conn_is_dead() {
 #[test]
 fn test_scram_rfc7677_roundtrip_against_stored_verifier() {
     use hmac::{Hmac, Mac};
-    use oxidb_server::auth::{Role, UserStore, SCRAM_ITER_COUNT};
+    use oxidb_server::auth::{Role, SCRAM_ITER_COUNT, UserStore};
     use oxidb_server::scram::{
-        base64_decode_simple_pub as b64dec, base64_encode_simple_pub as b64enc,
+        ScramState, base64_decode_simple_pub as b64dec, base64_encode_simple_pub as b64enc,
         hmac_sha256_pub as hmac256, pbkdf2_sha256_pub as pbkdf2, sha256_hash_pub as sha256,
-        ScramState,
     };
     type HmacSha256 = Hmac<sha2::Sha256>;
 
@@ -1579,11 +1731,16 @@ fn test_scram_rfc7677_roundtrip_against_stored_verifier() {
     // the plaintext password at creation time.
     let dir = tempfile::tempdir().unwrap();
     let mut store = UserStore::open(dir.path()).unwrap();
-    store.create_user("scramuser", "correct-horse-battery", Role::Admin).unwrap();
+    store
+        .create_user("scramuser", "correct-horse-battery", Role::Admin)
+        .unwrap();
 
     // Sanity: the on-record user has the four scram_* fields set.
     let user = store.get_user("scramuser").expect("user exists");
-    assert!(user.scram_salt.is_some(), "create_user must populate scram_salt");
+    assert!(
+        user.scram_salt.is_some(),
+        "create_user must populate scram_salt"
+    );
     assert!(user.scram_iter_count.is_some());
     assert!(user.scram_stored_key.is_some());
     assert!(user.scram_server_key.is_some());
@@ -1602,12 +1759,21 @@ fn test_scram_rfc7677_roundtrip_against_stored_verifier() {
     let mut server_salt_b64 = String::new();
     let mut iter_count: u32 = 0;
     for part in server_first.split(',') {
-        if let Some(r) = part.strip_prefix("r=") { combined_nonce = r.to_string(); }
-        if let Some(s) = part.strip_prefix("s=") { server_salt_b64 = s.to_string(); }
-        if let Some(i) = part.strip_prefix("i=") { iter_count = i.parse().unwrap(); }
+        if let Some(r) = part.strip_prefix("r=") {
+            combined_nonce = r.to_string();
+        }
+        if let Some(s) = part.strip_prefix("s=") {
+            server_salt_b64 = s.to_string();
+        }
+        if let Some(i) = part.strip_prefix("i=") {
+            iter_count = i.parse().unwrap();
+        }
     }
-    assert!(combined_nonce.starts_with(client_nonce),
-        "combined nonce must extend client_nonce: {}", combined_nonce);
+    assert!(
+        combined_nonce.starts_with(client_nonce),
+        "combined nonce must extend client_nonce: {}",
+        combined_nonce
+    );
     // Salt + iter_count match what the server stored, not a fresh
     // per-call random — this is the whole point of the refactor.
     assert_eq!(iter_count, SCRAM_ITER_COUNT);
@@ -1621,10 +1787,16 @@ fn test_scram_rfc7677_roundtrip_against_stored_verifier() {
 
     let channel_binding_b64 = "biws"; // base64 of "n,,"
     let client_final_no_proof = format!("c={},r={}", channel_binding_b64, combined_nonce);
-    let auth_message = format!("{},{},{}", client_first_bare, server_first, client_final_no_proof);
+    let auth_message = format!(
+        "{},{},{}",
+        client_first_bare, server_first, client_final_no_proof
+    );
     let client_signature = hmac256(&stored_key_client, auth_message.as_bytes());
-    let client_proof: Vec<u8> = client_key.iter().zip(client_signature.iter())
-        .map(|(a, b)| a ^ b).collect();
+    let client_proof: Vec<u8> = client_key
+        .iter()
+        .zip(client_signature.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
     let client_final = format!("{},p={}", client_final_no_proof, b64enc(&client_proof));
 
     // --- SERVER: process_client_final ---
@@ -1645,8 +1817,10 @@ fn test_scram_rfc7677_roundtrip_against_stored_verifier() {
         mac.finalize().into_bytes().to_vec()
     };
     let server_sig_from_client = hmac256(&server_key_client, auth_message.as_bytes());
-    assert_eq!(server_sig_from_server, server_sig_from_client,
-        "server-final signature must verify against client-derived server_key");
+    assert_eq!(
+        server_sig_from_server, server_sig_from_client,
+        "server-final signature must verify against client-derived server_key"
+    );
 }
 
 /// Wrong-password attempt produces "authentication failed", not a
@@ -1655,14 +1829,15 @@ fn test_scram_rfc7677_roundtrip_against_stored_verifier() {
 fn test_scram_rfc7677_wrong_password_is_rejected() {
     use oxidb_server::auth::{Role, UserStore};
     use oxidb_server::scram::{
-        base64_decode_simple_pub as b64dec, base64_encode_simple_pub as b64enc,
+        ScramState, base64_decode_simple_pub as b64dec, base64_encode_simple_pub as b64enc,
         hmac_sha256_pub as hmac256, pbkdf2_sha256_pub as pbkdf2, sha256_hash_pub as sha256,
-        ScramState,
     };
 
     let dir = tempfile::tempdir().unwrap();
     let mut store = UserStore::open(dir.path()).unwrap();
-    store.create_user("baduser", "right-password", Role::Read).unwrap();
+    store
+        .create_user("baduser", "right-password", Role::Read)
+        .unwrap();
 
     // Client-first
     let client_nonce = "abcdefghijklmnop";
@@ -1676,9 +1851,15 @@ fn test_scram_rfc7677_wrong_password_is_rejected() {
     let mut salt_b64 = String::new();
     let mut iter_count: u32 = 0;
     for part in server_first.split(',') {
-        if let Some(r) = part.strip_prefix("r=") { combined_nonce = r.to_string(); }
-        if let Some(s) = part.strip_prefix("s=") { salt_b64 = s.to_string(); }
-        if let Some(i) = part.strip_prefix("i=") { iter_count = i.parse().unwrap(); }
+        if let Some(r) = part.strip_prefix("r=") {
+            combined_nonce = r.to_string();
+        }
+        if let Some(s) = part.strip_prefix("s=") {
+            salt_b64 = s.to_string();
+        }
+        if let Some(i) = part.strip_prefix("i=") {
+            iter_count = i.parse().unwrap();
+        }
     }
     let salt = b64dec(&salt_b64).unwrap();
 
@@ -1687,12 +1868,21 @@ fn test_scram_rfc7677_wrong_password_is_rejected() {
     let client_key = hmac256(&salted, b"Client Key");
     let stored_key_c = sha256(&client_key);
     let client_final_no_proof = format!("c=biws,r={}", combined_nonce);
-    let auth_message = format!("{},{},{}", client_first_bare, server_first, client_final_no_proof);
+    let auth_message = format!(
+        "{},{},{}",
+        client_first_bare, server_first, client_final_no_proof
+    );
     let client_signature = hmac256(&stored_key_c, auth_message.as_bytes());
-    let proof: Vec<u8> = client_key.iter().zip(client_signature.iter()).map(|(a,b)| a^b).collect();
+    let proof: Vec<u8> = client_key
+        .iter()
+        .zip(client_signature.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
     let client_final = format!("{},p={}", client_final_no_proof, b64enc(&proof));
 
-    let err = scram_state.process_client_final(&client_final, &store).expect_err("must fail");
+    let err = scram_state
+        .process_client_final(&client_final, &store)
+        .expect_err("must fail");
     assert!(
         err.contains("authentication failed"),
         "wrong-password error must say 'authentication failed': {}",
@@ -1806,10 +1996,7 @@ impl AuthTestServer {
             }
         });
 
-        Self {
-            addr,
-            _dir: dir,
-        }
+        Self { addr, _dir: dir }
     }
 
     fn serve(
@@ -1836,14 +2023,18 @@ impl AuthTestServer {
                 Ok(v) => v,
                 Err(_) => break,
             };
-            let cmd = request.get("command")
+            let cmd = request
+                .get("command")
                 .or_else(|| request.get("cmd"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
             let resp = match cmd {
                 "authenticate" => {
-                    let payload = request.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+                    let payload = request
+                        .get("payload")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let store = user_store.lock().unwrap();
                     match ScramState::process_client_first(payload, &store) {
                         Ok((server_first, state)) => {
@@ -1854,7 +2045,10 @@ impl AuthTestServer {
                     }
                 }
                 "authenticate_continue" => {
-                    let payload = request.get("payload").and_then(|v| v.as_str()).unwrap_or("");
+                    let payload = request
+                        .get("payload")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     match scram_state.take() {
                         Some(state) => {
                             let store = user_store.lock().unwrap();
@@ -1876,7 +2070,8 @@ impl AuthTestServer {
                     if authed.is_none() {
                         json!({"ok": false, "error": "authentication required"})
                     } else {
-                        let bytes = oxidb_server::handler::handle_request(&db, request, &mut active_tx);
+                        let bytes =
+                            oxidb_server::handler::handle_request(&db, request, &mut active_tx);
                         serde_json::from_slice::<Value>(&bytes).unwrap()
                     }
                 }
@@ -1900,31 +2095,44 @@ fn test_fdw_authenticate_helper_unlocks_a_remote_session() {
     // through a privileged side channel (the remote DB is shared with
     // the mock listener; we open it directly to insert without going
     // through the wire).
-    let remote = AuthTestServer::start(vec![
-        ("fdw_user", "s3cret-pass", oxidb_server::auth::Role::Admin),
-    ]);
+    let remote = AuthTestServer::start(vec![(
+        "fdw_user",
+        "s3cret-pass",
+        oxidb_server::auth::Role::Admin,
+    )]);
     {
         let db = OxiDb::open(remote._dir.path()).unwrap();
-        db.insert("people", json!({"name": "alice", "age": 30})).unwrap();
-        db.insert("people", json!({"name": "bob", "age": 25})).unwrap();
+        db.insert("people", json!({"name": "alice", "age": 30}))
+            .unwrap();
+        db.insert("people", json!({"name": "bob", "age": 25}))
+            .unwrap();
     }
 
     // Confirm the gate: an unauthenticated socket gets refused.
     let stream = RawStream::connect(remote.addr).unwrap();
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
     let req = json!({"cmd": "find", "collection": "people", "query": {}});
     write_message(&mut (&stream), &req.to_string().into_bytes()).unwrap();
     let resp_bytes = read_message(&mut (&stream)).unwrap();
     let resp: Value = serde_json::from_slice(&resp_bytes).unwrap();
     assert_eq!(resp["ok"], false, "must refuse unauthed find: {resp}");
-    assert!(resp["error"].as_str().unwrap().contains("authentication required"));
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap()
+            .contains("authentication required")
+    );
     drop(stream);
 
     // Now: a freshly-dialed socket, after authenticate(), services the
     // same find — proves the helper actually moved the session state
     // from "anonymous" to "authed".
     let stream = RawStream::connect(remote.addr).unwrap();
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
     remote_client::authenticate(&stream, "fdw_user", "s3cret-pass")
         .expect("authenticate must succeed against a real remote");
 
@@ -1939,7 +2147,9 @@ fn test_fdw_authenticate_helper_unlocks_a_remote_session() {
     // And: a wrong password makes the helper return the SCRAM-level
     // error verbatim — useful for ops debugging.
     let stream2 = RawStream::connect(remote.addr).unwrap();
-    stream2.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+    stream2
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
     let err = remote_client::authenticate(&stream2, "fdw_user", "WRONG").unwrap_err();
     assert!(
         err.contains("authentication failed"),
@@ -1953,7 +2163,8 @@ fn test_fdw_authenticate_helper_unlocks_a_remote_session() {
     let parsed = parse_remote(&format!(
         "oxidb://fdw_user:s3cret-pass@127.0.0.1:{}/people",
         remote.addr.port()
-    )).unwrap();
+    ))
+    .unwrap();
     assert_eq!(parsed.user.as_deref(), Some("fdw_user"));
     assert_eq!(parsed.password.as_deref(), Some("s3cret-pass"));
 }
@@ -1963,9 +2174,7 @@ fn test_fdw_proxy_command_authenticates_and_pools_per_user() {
     use oxidb::links::parse_remote;
     use oxidb_server::remote_client;
 
-    let remote = AuthTestServer::start(vec![
-        ("p_user", "pw-A", oxidb_server::auth::Role::Admin),
-    ]);
+    let remote = AuthTestServer::start(vec![("p_user", "pw-A", oxidb_server::auth::Role::Admin)]);
     {
         let db = OxiDb::open(remote._dir.path()).unwrap();
         db.insert("items", json!({"sku": "x"})).unwrap();
@@ -2019,9 +2228,11 @@ fn test_fdw_proxy_command_authenticates_and_pools_per_user() {
     // user has authed, the pool happily reuses that session — the
     // pool key is `(host, port, user)`, deliberately not including
     // the password.)
-    let remote2 = AuthTestServer::start(vec![
-        ("bad_pw_user", "the-real-pw", oxidb_server::auth::Role::Admin),
-    ]);
+    let remote2 = AuthTestServer::start(vec![(
+        "bad_pw_user",
+        "the-real-pw",
+        oxidb_server::auth::Role::Admin,
+    )]);
     let bad_url = format!(
         "oxidb://bad_pw_user:WRONG@127.0.0.1:{}/items",
         remote2.addr.port()

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### `create_collection_with_options` over the wire (server 0.30.1)
+
+The per-collection `StorageOptions` API (0.30.0) is now reachable over the
+length-prefixed JSON wire protocol, so remote clients — not just embedded
+callers — can choose a collection's storage shape:
+
+```json
+{"cmd": "create_collection_with_options",
+ "collection": "events",
+ "options": {"disk_first": true, "compress": false}}
+```
+
+The `options` object maps to `StorageOptions`; omitted fields fall back to the
+defaults (in-RAM, compressed, auto-compaction on) — `StorageOptions` is now
+`#[serde(default)]`, so partial option objects (and forward-compatible `.bopts`
+files) deserialize cleanly. The command requires the **ReadWrite** role (same as
+`create_collection`) and is handled by `handler::handle_request`, the universal
+execution path for both the standalone server and the cluster build. Tested in
+`oxidb-server/tests/handler_test.rs` (create disk-first+uncompressed over the
+wire, insert/read back, assert the `.bdat`/`.bopts` exist and no `.btree`).
+
+Note: in a Raft cluster the command currently executes on the receiving node
+(it is not yet in the Raft write-replication set); a follow-up will add an
+`OxiDbRequest` variant so collection-option creates replicate. Standalone
+servers are unaffected.
+
 ### Per-collection storage options (server 0.30.0)
 
 The disk-first storage knobs — disk-first vs in-RAM, `.bdat` compression, and

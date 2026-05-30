@@ -675,6 +675,27 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
+        "create_collection_with_options" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            // `options` is a JSON object; missing fields fall back to the
+            // `StorageOptions` defaults (in-RAM, compressed, auto-compaction).
+            // e.g. {"disk_first":true,"compress":false}.
+            let opts = match request.get("options") {
+                Some(v) => match serde_json::from_value::<oxidb::StorageOptions>(v.clone()) {
+                    Ok(o) => o,
+                    Err(e) => return err_bytes(&format!("invalid 'options': {e}")),
+                },
+                None => oxidb::StorageOptions::default(),
+            };
+            match db.create_collection_with_options(col, opts) {
+                Ok(()) => ok_bytes(json!("collection created")),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         "list_collections" => {
             let names = db.list_collections();
             ok_bytes(json!(names))
