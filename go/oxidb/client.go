@@ -337,6 +337,50 @@ func (c *Client) DropCollection(name string) error {
 	return err
 }
 
+// StorageOption configures a collection's storage shape for
+// CreateCollectionWithOptions. Any option left unset falls back to the server
+// default (in-RAM, compressed, auto-compaction on).
+type StorageOption func(map[string]any)
+
+// DiskFirst stores documents on disk (an mmap'd .bdat) keeping only the offset
+// index resident, instead of the default in-RAM store.
+func DiskFirst(v bool) StorageOption { return func(o map[string]any) { o["disk_first"] = v } }
+
+// Compress zstd-compresses on-disk records. Ignored unless DiskFirst is set.
+func Compress(v bool) StorageOption { return func(o map[string]any) { o["compress"] = v } }
+
+// AutoCompact reclaims dead space automatically (disk-first only).
+func AutoCompact(v bool) StorageOption { return func(o map[string]any) { o["auto_compact"] = v } }
+
+// CompactMinBytes sets the floor below which a data file is never auto-compacted.
+func CompactMinBytes(v uint64) StorageOption {
+	return func(o map[string]any) { o["compact_min_bytes"] = v }
+}
+
+// CompactDeadRatio sets the dead-space fraction (0..1) that triggers compaction.
+func CompactDeadRatio(v float64) StorageOption {
+	return func(o map[string]any) { o["compact_dead_ratio"] = v }
+}
+
+// CreateCollectionWithOptions creates a collection with explicit per-collection
+// storage options. The chosen shape is persisted, so the collection reopens the
+// same way regardless of the server's environment. Unset options use the server
+// defaults.
+//
+//	db.CreateCollectionWithOptions("events", oxidb.DiskFirst(true), oxidb.Compress(false))
+func (c *Client) CreateCollectionWithOptions(name string, opts ...StorageOption) error {
+	options := map[string]any{}
+	for _, o := range opts {
+		o(options)
+	}
+	_, err := c.checked(map[string]any{
+		"cmd":        "create_collection_with_options",
+		"collection": name,
+		"options":    options,
+	})
+	return err
+}
+
 // ------------------------------------------------------------------
 // CRUD
 // ------------------------------------------------------------------

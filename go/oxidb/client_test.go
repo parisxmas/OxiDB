@@ -517,3 +517,35 @@ func TestCleanup(t *testing.T) {
 	_ = c.DropCollection("go_tx")
 	_ = c.DeleteBucket("go-bucket")
 }
+
+func TestCreateCollectionWithOptions(t *testing.T) {
+	c := getClient(t)
+	defer c.Close()
+
+	const col = "go_opts"
+	_ = c.DropCollection(col) // start clean; ignore "not found"
+
+	if err := c.CreateCollectionWithOptions(col, oxidb.DiskFirst(true), oxidb.Compress(false)); err != nil {
+		t.Fatalf("create with options: %v", err)
+	}
+	for i := 0; i < 25; i++ {
+		if _, err := c.Insert(col, map[string]any{"k": i, "v": i * 2}); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+	}
+	n, err := c.Count(col, map[string]any{})
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 25 {
+		t.Fatalf("expected 25 docs, got %d", n)
+	}
+	doc, err := c.FindOne(col, map[string]any{"k": 7})
+	if err != nil {
+		t.Fatalf("find_one: %v", err)
+	}
+	if doc["v"] != float64(14) {
+		t.Fatalf("expected v=14, got %v (%T)", doc["v"], doc["v"])
+	}
+	_ = c.DropCollection(col)
+}
