@@ -70,7 +70,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 19. Sorgu motoru: operatörler, indeks destekli yollar, byte düzeyinde filtreleme ✅
 20. Toplama pipeline'ı: gruplama, $facet, pencere fonksiyonları ✅
 21. İşlemler: iyimser eşzamanlılık ve üç fazlı commit ✅
-22. Sıkıştırma (compaction): ölü alan ve otomatik tetikleme
+22. Sıkıştırma (compaction): ölü alan ve otomatik tetikleme ✅
 23. Tam metin arama, blob depolama, şifreleme ve zaman-noktasına kurtarma
 24. Sunucu: OxiWire protokolü, kimlik doğrulama, RBAC, denetim
 25. Ölçeklendirme: Raft kümesi ve OxiPool ile sharding
