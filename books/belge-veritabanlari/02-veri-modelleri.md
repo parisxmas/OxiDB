@@ -39,7 +39,7 @@ altında torunlar uzanır. Her kaydın tek bir ebeveyni vardır ve veriye erişm
 bu ağaçta kökten yapraklara doğru ilerlemek demektir.
 
 Bu model, hiyerarşik olan veriyi temsil etmekte zarif ve hızlıdır. Ama gerçek
-dünya her zaman temiz bir ağaç değildir, işte tam da burada zorlanır. İki tür
+dünya her zaman temiz bir ağaç değildir; model işte tam da burada zorlanır. İki tür
 sıkıntı ortaya çıkar. Birincisi **çoktan-çoğa ilişkilerdir**. Bir öğrencinin
 birçok dersi, bir dersin birçok öğrencisi vardır. Bunu bir ağaçla temsil etmek
 için ya öğrencileri derslerin altına ya da dersleri öğrencilerin altına
@@ -98,7 +98,7 @@ söyleriz? İşaretçiyle değil — bir **değerle**. Sipariş satırında, ait
 müşterinin kimliğini taşıyan bir alan bulunur. İlişki, fiziksel bir bağlantı
 değil, paylaşılan bir değerdir. Bu inceliğin sonuçları derindir: ilişkiler
 veriye gömülü işaretçilerden kurtulduğu için, veriyi istediğiniz gibi yeniden
-düzenleyeb, yeni ilişkiler keşfedebilirsiniz.
+düzenleyebilir, yeni ilişkiler keşfedebilirsiniz.
 
 Bu ayrışmanın iki büyük armağanı oldu. Birincisi, sorguların **bildirimsel**
 hale gelmesidir. Artık veriye nasıl ulaşılacağını adım adım tarif etmek yerine,
@@ -199,7 +199,7 @@ Belge modelinde ise her belge kendi alanlarını taşıyabilir. Aynı koleksiyon
 iki belgenin alanları farklı olabilir; bir belgeye yeni bir alan eklemek için
 önceden bir tanım değiştirmeniz gerekmez. Bu esneklik, verinin biçiminin zamanla
 geliştiği, her kaydın birbirinin aynı olmadığı durumlarda büyük rahatlık sağlar.
-Üçüncü bölümde bu esnekliğin hem armağanlarını hem de tuzaklarını ayrıntısıyla
+Dördüncü bölümde bu esnekliğin hem armağanlarını hem de tuzaklarını ayrıntısıyla
 ele alacağız; çünkü "şema yok" demek, "şema düşünmek gerekmiyor" demek değildir.
 
 Belge modelinin ödünleşimi de tam buradan doğar. İlişkisel modelin her bilgiyi

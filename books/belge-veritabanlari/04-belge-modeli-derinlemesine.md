@@ -172,7 +172,7 @@ ilgilendiren bir değişiklik gerektirir.
 Belge modelinde ise şema tipik olarak **okuma anında** anlam kazanır: veritabanı,
 yazdığınız belgenin biçimine karışmaz; biçimi yorumlama işi, veriyi okuyan
 uygulamaya düşer. Buna "şema-okumada" denir. Şema kaybolmamıştır; yalnızca
-veritabanından uygulamaya, açıktan örtüğe taşınmıştır. Avantajı esnekliktir:
+veritabanından uygulamaya, açıktan örtüye taşınmıştır. Avantajı esnekliktir:
 biçimi değiştirmek için merkezi bir tanım güncellemek gerekmez; farklı belgeler
 farklı biçimlerde olabilir; veri zamanla evrilebilir. Dezavantajı, şemayı
 zorlama sorumluluğunun uygulamaya geçmesidir.

@@ -25,7 +25,7 @@ alır, ardından bir sonraki mesajın uzunluğunu bekler. Bu basit ama sağlam
 Mesajın içeriği iki biçimde kodlanabilir. Birincisi, insan tarafından okunabilir,
 JSON tabanlı bir biçimdir; hata ayıklamak ve basit istemciler yazmak kolaydır.
 İkincisi, **OxiWire** adı verilen, daha hızlı bir ikili biçimdir. İkili biçimin
-avantajı, on dokuzuncu bölümdeki bayt düzeyinde fikrle bağlanır: bir sorgu yanıtı,
+avantajı, on dokuzuncu bölümdeki bayt düzeyinde fikirle bağlanır: bir sorgu yanıtı,
 belgeleri nesnelere çevirip yeniden metne dökmek zorunda kalmadan, doğrudan ikili
 biçimde gönderilebilir. Böylece sunucu yolu, yalnızca sorgu işlemede değil, ağ
 üzerinden yanıt göndermede de gereksiz dönüşümlerden kaçınır.
@@ -43,7 +43,7 @@ istemci, kendine en uygun kapıdan girer.
 
 Bir sunucu, aynı anda birçok istemci bağlantısını karşılamak zorundadır. OxiDB,
 gelen istekleri işlemek için bir çalışan havuzu kullanır: belirli sayıda iş
-parçacığı, gelen isteklere paralel olarak hizmet verir. Uzun süre boştа kalan
+parçacığı, gelen isteklere paralel olarak hizmet verir. Uzun süre boşta kalan
 bağlantılar, kaynakları boşa tutmamak için bir süre sonra kapatılır. Bu
 ayarlar — kaç çalışan, ne kadar boşta kalma süresi, hangi adres ve veri dizini —
 ortam değişkenleriyle yapılandırılır; sunucuyu işletmenin pratik düğmeleridir
@@ -63,7 +63,7 @@ kendisi ağ üzerinden gönderilmez, bir meydan-okuma yanıt yöntemiyle bilindi
 kanıtlanır. OxiDB, sunucu kimlik doğrulamasında tam olarak bu iki kuralı uygular.
 
 OxiDB, parolaları doğrularken bir meydan-okuma yanıt protokolü kullanır: sunucu
-bir soru gönderir, istemci parolasını kullanarak ona doğru yanıtı üretir, ama
+bir meydan okuma gönderir, istemci parolasını kullanarak ona doğru yanıtı üretir, ama
 parolanın kendisi hattan hiç geçmez. Böylece bağlantıyı dinleyen biri, parolayı
 yakalayamaz. Parolaların kendisi ise, on dördüncü bölümün ilk kuralına uygun
 olarak, yavaş ve tuzlanmış bir özetle saklanır; böylece veritabanı sızsa bile

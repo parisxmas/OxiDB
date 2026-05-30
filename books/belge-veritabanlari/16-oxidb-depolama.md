@@ -106,7 +106,7 @@ diskten getirir ve bellek baskı altındayken yine sessizce geri atabilir.
 
 Bunun somut sonucu, on üçüncü bölümde tartıştığımız bellek ölçümü inceliğinin
 canlı bir örneğidir. Disk-öncelikli kipte, beş yüz bin belgelik bir koleksiyonu
-taze açtığınızda, sistemin yerleşik belleği yalnızca birkaç on megabayt
+taze açtığınızda, sistemin yerleşik belleği yalnızca birkaç düzine megabayt
 mertebesindedir — çünkü henüz yalnızca o küçük dizin bellektedir, belgelerin
 gövdesi diskte beklemektedir. Buna karşılık aynı veriyi belleğe öncelikli kipte
 açtığınızda, tüm belgeler belleğe yüklendiği için yerleşik bellek kat kat

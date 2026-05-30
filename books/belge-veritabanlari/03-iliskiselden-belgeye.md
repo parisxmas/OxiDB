@@ -12,7 +12,7 @@ iştir.
 
 ![Şekil 3 — Aynı sipariş verisi: ilişkisel parçalama (join) ile belge gömme yan yana.](sekiller/03-gomme-referans.svg){width=80%}
 
-## Modelin kralı değil, hizmetkârı: erişim örüntüleri
+## Kral değil hizmetkâr: modeli erişim örüntüleri belirler
 
 Bu bölümün üzerine kurulu olduğu tek bir fikir vardır ve onu en baştan
 söylemek gerekir: **veri modeli, erişim örüntülerini izler.** Yani veriyi nasıl

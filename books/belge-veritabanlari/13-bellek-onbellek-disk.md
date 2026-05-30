@@ -18,7 +18,12 @@ bölümdeki her şey ondan doğar. Bellek çok hızlıdır ama pahalıdır, sın
 elektrik gidince içeriğini kaybeder. Disk çok yavaştır ama ucuzdur, büyüktür ve
 kalıcıdır. Bu ikisini, bir masa ile bir depoya benzetebilirsiniz: masanız (bellek)
 küçüktür ama üzerindeki her şeye anında uzanırsınız; depo (disk) kocamandır ama
-oradan bir şey getirmek zaman alır.
+oradan bir şey getirmek zaman alır. Gerçekte bu hiyerarşi iki katmandan da
+ibaret değildir: en tepede, işlemcinin hemen yanındaki çok küçük ama nanosaniye
+ölçeğinde hızlı önbellekler (CPU önbelleği) bulunur; altında ana bellek, en
+altta da disk gelir. Her kademede, bir öncekine göre daha büyük ama daha yavaş
+bir depolama vardır. Bizim için asıl belirleyici olan, bu hiyerarşinin bellek
+ile disk arasındaki en keskin basamağıdır.
 
 Oyunun özü şudur: çalışmak için ihtiyaç duyduğunuz şeyleri masanın üstünde
 tutmak, gerisini depoda bırakmak. Bir veritabanının tek bir düğümdeki hızı, asıl
@@ -39,8 +44,8 @@ Buradan çarpıcı bir gerçek doğar: performans, kademeli bir eğim değil, bi
 **uçurumdur**. Çalışma kümeniz belleğe sığdığı sürece, sistem hızlıdır — ihtiyaç
 duyduğunuz her şey zaten masanın üstündedir. Ama çalışma kümesi belleği biraz
 olsun aşmaya başladığında, sistem aniden çöker; çünkü artık sürekli olarak depoya
-koşmak, bir şeyi getirip masaya koymak için başka bir şeyi geri kaldırmak,
-sonra onu da geri istemek zorunda kalırsınız. Bu sürekli oraya buraya taşıma
+koşmak, bir şeyi getirip masaya koymak için başka bir şeyi kaldırmak,
+sonra onu da yeniden istemek zorunda kalırsınız. Bu sürekli oraya buraya taşıma
 durumuna **debelenme** (thrashing) denir ve performansı dramatik biçimde düşürür.
 Bu yüzden bir veritabanını boyutlandırırken sorulacak en kritik soru, "tüm verim
 belleğe sığar mı" değil, "**çalışma kümem** belleğe sığar mı" sorusudur.
@@ -71,8 +76,8 @@ için eskilerden birini **atmak** (tahliye etmek) gerekir. Hangi verinin
 atılacağına karar veren kurala **tahliye politikası** denir ve bu, önbelleğin ne
 kadar işe yarayacağını doğrudan belirler.
 
-En yaygın politika, "en uzun süredir dokunulmayanı at" ilkesidir — kısaca LRU.
-Mantığı bir bahse dayanır: yakın zamanda kullandığınız bir şeyi, yine yakında
+En yaygın politika, "en uzun süredir dokunulmayanı at" ilkesidir — kısaca LRU
+(least recently used). Mantığı bir bahse dayanır: yakın zamanda kullandığınız bir şeyi, yine yakında
 kullanma olasılığınız yüksektir; çok uzun süredir dokunmadığınız bir şeyi ise
 muhtemelen bir süre daha kullanmayacaksınız. Bu yüzden LRU, en uzun süredir
 boşta duranı kurban seçer. Bir kütüphanecinin, sık istenen kitapları el

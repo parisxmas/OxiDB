@@ -23,6 +23,6 @@
   <path d="M423,114 q90,30 175,2" fill="none" stroke="#c97b2c" stroke-width="1.4"/>
   <text x="540" y="155" font-size="11" text-anchor="middle" fill="#c97b2c">çok commit tek fsync'te toplanır</text>
   <text x="540" y="180" font-size="11" text-anchor="middle" fill="#666">çok daha hızlı · küçük pencere riski</text>
-  <text x="360" y="250" font-size="11" text-anchor="middle" fill="#666">Kurtarma her iki kipte de WAL'ı oynatır; base yedek + segment tekrarı (PITR)</text>
+  <text x="360" y="250" font-size="11" text-anchor="middle" fill="#666">Kurtarma her iki kipte de son denetim noktasından WAL kayıtlarını yeniden oynatır</text>
   <text x="360" y="272" font-size="10.5" text-anchor="middle" fill="#999">Seçim: ne kadar veri kaybını tolere edersin? (dayanıklılık ↔ gecikme)</text>
 </svg>

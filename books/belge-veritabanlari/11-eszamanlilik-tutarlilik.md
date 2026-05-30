@@ -71,10 +71,11 @@ devam edebilir; bedeli, okuyucuların ara sıra eski (bayat) veri görmesi ve
 uygulamanın buna katlanmak zorunda olmasıdır.
 
 İki uç arasında, pratikte çok işe yarayan ara duraklar vardır. "Kendi yazdığını
-oku" güvencesi, en azından sizin yaptığınız bir değişikliği sonradan kendinizin
-göreceğini söyler — başkaları henüz görmese bile. "Tekdüze okuma", zamanı geriye
-sarmamayı, yani bir kez yeni bir değer gördükten sonra tekrar eskisine
-düşmemeyi garanti eder. "Nedensel tutarlılık", neden-sonuç ilişkisi olan
+oku" (read-your-writes) güvencesi, en azından sizin yaptığınız bir değişikliği
+sonradan kendinizin göreceğini söyler — başkaları henüz görmese bile. "Tekdüze
+okuma" (monotonic reads), zamanı geriye sarmamayı, yani bir kez yeni bir değer
+gördükten sonra tekrar eskisine düşmemeyi garanti eder. "Nedensel tutarlılık"
+(causal consistency), neden-sonuç ilişkisi olan
 olayların herkese aynı sırada görünmesini sağlar — bir soruya verilen yanıt,
 soruyu görmeden görünmez. Bu ara modeller, güçlü tutarlılığın tüm maliyetini
 ödemeden, çıplak nihai tutarlılığın en can sıkıcı tuhaflıklarını giderir.

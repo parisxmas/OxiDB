@@ -58,7 +58,7 @@ numaraları, çatışmayı saptamanın aracıdır.
 ## Dayanıklılıkla bağ
 
 İşlemler, on yedinci bölümdeki dayanıklılık mekanizmasıyla doğrudan bütünleşir.
-Bir işlem tamamlandığında, biriktirilmiş değişiklikleri tek seferde yazma-öncesi
+Bir işlem tamamlandığında, biriktirilmiş değişiklikler tek seferde yazma-öncesi
 günlüğe yazılır; on yedinci bölümde, her günlük kaydının bir işlem kimliği
 taşıdığını söylemiştik — işte o kimlik, bir kaydın hangi işleme ait olduğunu
 belirtir ve kurtarmada işlemleri bir bütün olarak ele almayı sağlar. İşlemin

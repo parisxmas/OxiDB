@@ -53,7 +53,7 @@ Bu yüzden iki sistemi yalnızca bir andaki bellek sayısıyla karşılaştırma
 yanıltıcıdır. OxiDB, taze açılışta emsalinden kat kat az bellek kullanır; ama tüm
 veriyi baştan sona tarayan bir iş yükünden sonra, iki sistemin yerleşik belleği
 birbirine yakınsar — çünkü her ikisi de dokunulan veriyi belleğe çeker. Dürüst
-sonuç şudur: disk-öncelik kipinin bellek kazancı, çalışma kümesi tüm veriden
+sonuç şudur: disk-öncelikli kipin bellek kazancı, çalışma kümesi tüm veriden
 küçük olan yükler için en büyüktür; tüm veriyi sürekli tarayan yükler için ise bu
 kazanç azalır. Bu, bir zayıflık değil, on üçüncü bölümde tarif ettiğimiz çalışma
 kümesi gerçeğinin doğal bir sonucudur.
@@ -70,6 +70,14 @@ kolaydır; zor ve dürüst olan, o sayının hangi tercihten doğduğunu söylem
 Aşağıda, OxiDB'nin nerede kazandığını, nerede berabere kaldığını ve nerede
 kaybettiğini — ve her birinin **neden** öyle olduğunu — bu kitabın anlattığı
 mekanizmalara bağlayarak göreceğiz.
+
+Sayısal sonucu da açıkça söyleyelim: bir milyon belgelik bu yirmi dört testlik
+karşılaştırmada, bu bölümün başındaki şekilde özetlendiği gibi, OxiDB testlerin
+tamamını önde kapattı. Ama bu rakamı baştan vurgulamamızın nedeni övünmek değil,
+tam tersine onu hemen ardından nitelemek: bu sonuç belirli koşullara — aynı
+makine, aynı veri, emsalin belleğinin sınırlandığı bir kurulum — bağlıdır ve asıl
+değeri, "kim kazandı" değil, "her bir sonucun altında hangi tercih yatıyor"
+sorusundadır.
 
 ## OxiDB nerede kazanır
 
@@ -115,8 +123,8 @@ yetersizliği değil, bir güvenlik tercihinin görünür maliyetidir.
 On üçüncü bölümde gördüğümüz gibi, çalışma kümesi belleği aştığında, rastgele
 tekil okumalar diske fault eder ve yavaşlar. Milyon belgelik bir veride, çok
 sayıda eşzamanlı rastgele okuma, disk-öncelikli kipte belirgin biçimde yavaştı;
-çünkü belge gövdeleri diskte, belleğe yansıtılmış halde duruyordu. Bu, disk-öncelik
-tercihinin beklenen bedelidir — bellek kazancının karşılığında, soğuk veriye
+çünkü belge gövdeleri diskte, belleğe yansıtılmış halde duruyordu. Bu, disk-öncelikli
+tercihin beklenen bedelidir — bellek kazancının karşılığında, soğuk veriye
 erişimin gecikmesi.
 
 Üçüncüsü, **disk-öncelikli, sıkıştırılmış kipte tüm koleksiyonu tarayan
@@ -148,7 +156,7 @@ Bu son bölüm, aslında tüm kitabın bir özetidir. OxiDB'nin her kazancı, he
 beraberliği ve her kaybı, bu kitabın ilk iki kısmında öğrendiğimiz bir ilkeye ve
 bir ödünleşime kadar izlenebilir. Sıralı indeksler tam eşleşmeyi ve saymayı
 hızlandırır; katı dayanıklılık tekil yazmaları yavaşlatır ama güvenceyi güçlendirir;
-disk-öncelik belleği kurtarır ama soğuk okumayı yavaşlatır; sıkıştırma yer
+disk-öncelikli kip belleği kurtarır ama soğuk okumayı yavaşlatır; sıkıştırma yer
 kazandırır ama tarama işlemcisini artırır. Karşılaştırmalı ölçümler, bu kitabın
 soyut ilkelerinin **ölçülebilir** hale gelmiş halidir.
 

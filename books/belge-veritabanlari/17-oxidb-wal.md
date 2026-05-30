@@ -29,7 +29,7 @@ eşlemeye, disk-öncelikli kipte `.bdat` dosyasına — ve indekslere uygular. Y
 günlük her zaman asıl veriden **önce** dayanıklı olur; çökme tam o sırada olsa
 bile, niyet günlükte kayıtlıdır.
 
-Burada altıncı bölümün bir incelğini somut görürüz. Bir kaydı "dayanıklı kılmak",
+Burada altıncı bölümün bir inceliğini somut görürüz. Bir kaydı "dayanıklı kılmak",
 yalnızca diske göndermek değil, oraya gerçekten oturduğundan emin olmaktır;
 altıncı bölümde, bazı sistemlerde sıradan boşaltmanın veriyi yalnızca disk
 denetleyicisinin önbelleğine bıraktığını söylemiştik. OxiDB bu konuda tavizsizdir:

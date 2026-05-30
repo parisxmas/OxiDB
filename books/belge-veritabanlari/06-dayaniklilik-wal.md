@@ -118,12 +118,12 @@ tam olarak yazılmamış, yani yarım kalmış kayıtlar atılır; çünkü onla
 ettiği değişiklikler hiçbir zaman "tamamlandı" sayılmamıştı.
 
 Bu kurtarma sürecinin güvenilir olması için bir özellik şarttır: yeniden uygulama
-**zararsız tekrarlanabilir** olmalıdır. Yani aynı değişikliği bir kez ya da iki
-kez uygulamak, sonucu değiştirmemelidir. Çünkü kurtarma sırasında, bir
+**etkisiz tekrarlanabilir (idempotent)** olmalıdır. Yani aynı değişikliği bir kez
+ya da iki kez uygulamak, sonucu değiştirmemelidir. Çünkü kurtarma sırasında, bir
 değişikliğin asıl veriye zaten yansıyıp yansımadığından her zaman emin olamayız;
 bu yüzden onu yeniden uygulamak, eğer zaten uygulanmışsa bile, bir zarar
-vermemelidir. Bu özelliğe sahip işlemlere "etkisiz tekrarlanabilir" denir ve
-sağlam bir kurtarma tasarımının temelinde yatar.
+vermemelidir. İşte bu etkisiz tekrarlanabilirlik, sağlam bir kurtarma tasarımının
+temelinde yatar.
 
 ## Yarım yazmayı yakalamak: sağlama toplamları
 

@@ -114,8 +114,8 @@ hızlı bir hatırlatma olarak düşünülmüştür.
     veriden türetilmiş yardımcı yapı.
 
 **İşlem (transaction)**
-:   Birçok işlemi tek bir bölünmez birim olarak ele alan, "ya hep ya hiç"
-    güvencesi veren kavram.
+:   Birçok okuma-yazma adımını tek bir bölünmez birim olarak ele alan, "ya hep ya
+    hiç" güvencesi veren kavram.
 
 **İyimser eşzamanlılık denetimi (OCC)**
 :   Çatışmaların nadir olduğunu varsayan, kilit almadan çalışıp tamamlama anında
@@ -164,6 +164,15 @@ hızlı bir hatırlatma olarak düşünülmüştür.
 **Normalleştirme**
 :   Her bilgiyi tek bir yerde tutarak çoğaltmayı önleme; ilişkisel modelin
     güncellemeyi ucuzlatan ilkesi.
+
+**OxiPool**
+:   OxiDB'nin sharding (parçalama) katmanı; bir koleksiyonu parça anahtarına göre
+    birden çok bağımsız OxiDB düğümüne dağıtan ve sorguları dağıt-topla yöntemiyle
+    yanıtlayan ön yüz.
+
+**OxiWire**
+:   OxiDB'nin sunucu iletişiminde kullandığı, uzunluk önekli, JSON ve daha hızlı
+    bir ikili biçimi destekleyen tel protokolü.
 
 **Ölü alan**
 :   Append-only depolamada, güncellenen ya da silinen kayıtların geride bıraktığı,

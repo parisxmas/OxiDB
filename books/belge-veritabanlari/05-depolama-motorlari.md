@@ -46,7 +46,7 @@ Diskten art arda gelen bir bölgeyi okumak ya da dosyanın sonuna eklemeye devam
 etmek hızlıdır; oysa diskin orasından burasından, rastgele konumlara erişmek çok
 daha yavaştır. Bu fark, geleneksel dönen disklerde uçurum kadar büyüktü; katı hal
 sürücülerinde daralsa da hâlâ önemlidir. Üçüncüsü, disk veriyi **bloklar halinde**
-okuyup yazar: tek bir baytı bile değiştirmek istes., sistem o baytı içeren koca
+okuyup yazar: tek bir baytı bile değiştirmek isteseniz, sistem o baytı içeren koca
 bir bloğu okuyup, değiştirip, geri yazar. Yani küçük, dağınık değişiklikler
 diskte orantısız bir maliyet taşır.
 
@@ -150,7 +150,7 @@ düzenlemeyle hafifletir.
 
 LSM'nin fikri şudur: gelen yazmaları önce **bellekte**, sıralı bir yapıda
 biriktir. Bellek hızlı olduğu için bu yazmalar anında kabul edilir. Bellekteki
-bu tampon dolduğunda, içeriği tek seferde, **sıralı** biçimde diske bir
+bu tampon dolduğunda, içerik tek seferde, **sıralı** biçimde diske bir
 "parça" olarak yazılır — yine ardışık yazma, yine diskin sevdiği biçim. Zamanla
 diskte böyle birçok sıralı parça birikir. Arka planda çalışan bir süreç, bu
 parçaları periyodik olarak **birleştirir** (merge): birkaç sıralı parçayı tek bir

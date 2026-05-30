@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="720" height="270" font-family="Georgia, serif">
   <rect width="720" height="270" fill="#fbfbf8"/>
   <defs><marker id="a" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#888"/></marker></defs>
-  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Byte düzeyinde ön-süzme: eşleşmeyeni çözmeden ele</text>
+  <text x="360" y="28" font-size="14" font-weight="bold" text-anchor="middle">Bayt düzeyinde ön-süzme: eşleşmeyeni çözmeden ele</text>
   <g font-size="11" text-anchor="middle">
     <rect x="30" y="80" width="120" height="50" rx="8" fill="#eef0f5" stroke="#555"/><text x="90" y="100">ham bayt</text><text x="90" y="118" font-size="9.5">(disk/.bdat)</text>
     <rect x="200" y="80" width="150" height="50" rx="8" fill="#fdeee0" stroke="#c97b2c" stroke-width="2"/><text x="275" y="100">bayt taraması</text><text x="275" y="118" font-size="9.5">alan var mı / eşleşir mi?</text>
