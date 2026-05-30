@@ -35,7 +35,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 
 ### Kısım I — Temeller
 1. Veri, veritabanı ve veritabanı yönetim sistemleri ✅
-2. Veri modelleri: hiyerarşikten belgeye
+2. Veri modelleri: hiyerarşikten belgeye ✅
 3. İlişkisel modelden belge modeline: neden ve ne zaman
 4. Belge modeli derinlemesine: JSON, şema esnekliği, gömme ve referans
 
