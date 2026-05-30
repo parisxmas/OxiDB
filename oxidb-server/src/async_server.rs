@@ -420,6 +420,7 @@ fn is_write_command(cmd: &str) -> bool {
             | "delete"
             | "delete_one"
             | "create_collection"
+            | "create_collection_with_options"
             | "drop_collection"
             | "compact"
             | "create_index"
@@ -469,6 +470,20 @@ fn build_raft_request(cmd: &str, request: &Value) -> Option<OxiDbRequest> {
             query: request.get("query")?.clone(),
         }),
         "create_collection" => Some(OxiDbRequest::CreateCollection { name: collection? }),
+        "create_collection_with_options" => {
+            // Parse the options up front so the leader validates before
+            // replicating. On a parse error return `None` → the caller falls
+            // through to local execution, which reports the invalid-options
+            // error to the client (rather than replicating a doomed entry).
+            let options = match request.get("options") {
+                Some(v) => serde_json::from_value::<oxidb::StorageOptions>(v.clone()).ok()?,
+                None => oxidb::StorageOptions::default(),
+            };
+            Some(OxiDbRequest::CreateCollectionWithOptions {
+                name: collection?,
+                options,
+            })
+        }
         "drop_collection" => Some(OxiDbRequest::DropCollection { name: collection? }),
         "compact" => Some(OxiDbRequest::Compact {
             collection: collection?,
@@ -629,5 +644,58 @@ fn log_audit(
             result,
             detail,
         });
+    }
+}
+
+#[cfg(test)]
+mod create_with_options_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn build_raft_request_parses_options() {
+        assert!(is_write_command("create_collection_with_options"));
+
+        let req = build_raft_request(
+            "create_collection_with_options",
+            &json!({"collection": "c", "options": {"disk_first": true, "compress": false}}),
+        )
+        .expect("should build a raft request");
+        match req {
+            OxiDbRequest::CreateCollectionWithOptions { name, options } => {
+                assert_eq!(name, "c");
+                assert!(options.disk_first);
+                assert!(!options.compress);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_raft_request_defaults_when_options_absent() {
+        let req = build_raft_request(
+            "create_collection_with_options",
+            &json!({"collection": "c"}),
+        )
+        .expect("should build with default options");
+        match req {
+            OxiDbRequest::CreateCollectionWithOptions { options, .. } => {
+                // Defaults: in-RAM, compressed.
+                assert!(!options.disk_first);
+                assert!(options.compress);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_raft_request_invalid_options_falls_through() {
+        // Wrong type for a field → parse fails → None (caller runs locally and
+        // returns the error to the client instead of replicating a bad entry).
+        let req = build_raft_request(
+            "create_collection_with_options",
+            &json!({"collection": "c", "options": {"disk_first": "yes"}}),
+        );
+        assert!(req.is_none());
     }
 }

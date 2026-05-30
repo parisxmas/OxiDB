@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Raft replication for `create_collection_with_options` (server 0.30.2)
+
+Completes the cluster story for the per-collection-options wire command (0.30.1
+noted it executed only on the receiving node). In the `cluster` build it now
+replicates through Raft like every other write:
+
+- New `OxiDbRequest::CreateCollectionWithOptions { name, options:
+  StorageOptions }` variant; applied by the state machine
+  (`raft::log_store::apply_request`) via `db.create_collection_with_options`, so
+  every node creates the collection with the same storage shape.
+- `is_write_command` includes the command, and `build_raft_request` parses the
+  `options` object **on the leader** before proposing — invalid options return
+  `None`, falling through to local execution which reports the error to the
+  client instead of replicating a doomed entry.
+
+Tests: `async_server` unit tests for the build path (options parsed, defaults
+when absent, invalid-options → fall-through). Full server suite green with
+`--features cluster` (raft suites included) and in the default build.
+
 ### `create_collection_with_options` over the wire (server 0.30.1)
 
 The per-collection `StorageOptions` API (0.30.0) is now reachable over the
@@ -23,10 +42,8 @@ execution path for both the standalone server and the cluster build. Tested in
 `oxidb-server/tests/handler_test.rs` (create disk-first+uncompressed over the
 wire, insert/read back, assert the `.bdat`/`.bopts` exist and no `.btree`).
 
-Note: in a Raft cluster the command currently executes on the receiving node
-(it is not yet in the Raft write-replication set); a follow-up will add an
-`OxiDbRequest` variant so collection-option creates replicate. Standalone
-servers are unaffected.
+Note: in a Raft cluster this initially executed only on the receiving node;
+0.30.2 (above) adds the `OxiDbRequest` variant so it replicates through Raft.
 
 ### Per-collection storage options (server 0.30.0)
 

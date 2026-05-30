@@ -89,10 +89,10 @@ pub struct OxiDbStore {
 
 #[derive(Clone)]
 struct RaftPaths {
-    meta:     PathBuf,
-    log:      PathBuf,
+    meta: PathBuf,
+    log: PathBuf,
     meta_tmp: PathBuf,
-    log_tmp:  PathBuf,
+    log_tmp: PathBuf,
 }
 
 impl Clone for OxiDbStore {
@@ -132,10 +132,10 @@ impl OxiDbStore {
             eprintln!("raft: failed to create data dir {data_dir:?}: {e}");
         }
         let paths = RaftPaths {
-            meta:     data_dir.join("raft_meta.json"),
-            log:      data_dir.join("raft_log.jsonl"),
+            meta: data_dir.join("raft_meta.json"),
+            log: data_dir.join("raft_log.jsonl"),
             meta_tmp: data_dir.join("raft_meta.json.tmp"),
-            log_tmp:  data_dir.join("raft_log.jsonl.tmp"),
+            log_tmp: data_dir.join("raft_log.jsonl.tmp"),
         };
 
         // Migrate old single-file format if present.
@@ -145,11 +145,14 @@ impl OxiDbStore {
             if let Ok(bytes) = fs::read(&legacy) {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     let mut meta = PersistedMeta::default();
-                    meta.last_purged_log_id = v.get("last_purged_log_id")
+                    meta.last_purged_log_id = v
+                        .get("last_purged_log_id")
                         .and_then(|x| serde_json::from_value(x.clone()).ok());
-                    meta.vote = v.get("vote")
+                    meta.vote = v
+                        .get("vote")
                         .and_then(|x| serde_json::from_value(x.clone()).ok());
-                    meta.committed = v.get("committed")
+                    meta.committed = v
+                        .get("committed")
                         .and_then(|x| serde_json::from_value(x.clone()).ok());
                     if let Some(sm) = v.get("sm_data") {
                         if let Ok(s) = serde_json::from_value::<StateMachineData>(sm.clone()) {
@@ -158,7 +161,8 @@ impl OxiDbStore {
                     }
                     let _ = fs::write(&paths.meta, serde_json::to_vec(&meta).unwrap_or_default());
                     if let Some(arr) = v.get("log").and_then(|x| x.as_object()) {
-                        let mut sorted: Vec<(u64, &serde_json::Value)> = arr.iter()
+                        let mut sorted: Vec<(u64, &serde_json::Value)> = arr
+                            .iter()
                             .filter_map(|(k, v)| k.parse::<u64>().ok().map(|i| (i, v)))
                             .collect();
                         sorted.sort_by_key(|(i, _)| *i);
@@ -247,10 +251,14 @@ impl OxiDbStore {
         let meta = self.inner.read().unwrap().to_meta();
         let bytes = match serde_json::to_vec(&meta) {
             Ok(b) => b,
-            Err(e) => { eprintln!("raft persist_meta: serialize: {e}"); return; }
+            Err(e) => {
+                eprintln!("raft persist_meta: serialize: {e}");
+                return;
+            }
         };
         if let Err(e) = fs::write(&paths.meta_tmp, &bytes) {
-            eprintln!("raft persist_meta: write tmp: {e}"); return;
+            eprintln!("raft persist_meta: write tmp: {e}");
+            return;
         }
         if let Err(e) = fs::rename(&paths.meta_tmp, &paths.meta) {
             eprintln!("raft persist_meta: rename: {e}");
@@ -265,7 +273,10 @@ impl OxiDbStore {
         };
         let line = match serde_json::to_string(entry) {
             Ok(s) => s,
-            Err(e) => { eprintln!("raft append_log: serialize: {e}"); return; }
+            Err(e) => {
+                eprintln!("raft append_log: serialize: {e}");
+                return;
+            }
         };
         let _guard = self.log_writer.lock().unwrap();
         let res = std::fs::OpenOptions::new()
@@ -302,7 +313,8 @@ impl OxiDbStore {
         };
         let _guard = self.log_writer.lock().unwrap();
         if let Err(e) = fs::write(&paths.log_tmp, buf.as_bytes()) {
-            eprintln!("raft rewrite_log: write tmp: {e}"); return;
+            eprintln!("raft rewrite_log: write tmp: {e}");
+            return;
         }
         if let Err(e) = fs::rename(&paths.log_tmp, &paths.log) {
             eprintln!("raft rewrite_log: rename: {e}");
@@ -315,101 +327,218 @@ fn apply_request(db: &OxiDb, req: OxiDbRequest) -> OxiDbResponse {
     use std::collections::HashMap;
 
     match req {
-        OxiDbRequest::Insert { collection, document } => match db.insert(&collection, document) {
-            Ok(id) => OxiDbResponse::Ok { data: json!({ "id": id }) },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+        OxiDbRequest::Insert {
+            collection,
+            document,
+        } => match db.insert(&collection, document) {
+            Ok(id) => OxiDbResponse::Ok {
+                data: json!({ "id": id }),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
-        OxiDbRequest::InsertMany { collection, documents } => match db.insert_many(&collection, documents) {
+        OxiDbRequest::InsertMany {
+            collection,
+            documents,
+        } => match db.insert_many(&collection, documents) {
             Ok(ids) => OxiDbResponse::Ok { data: json!(ids) },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
-        OxiDbRequest::Update { collection, query, update } => match db.update(&collection, &query, &update) {
-            Ok(count) => OxiDbResponse::Ok { data: json!({ "modified": count }) },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+        OxiDbRequest::Update {
+            collection,
+            query,
+            update,
+        } => match db.update(&collection, &query, &update) {
+            Ok(count) => OxiDbResponse::Ok {
+                data: json!({ "modified": count }),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
-        OxiDbRequest::UpdateOne { collection, query, update } => match db.update_one(&collection, &query, &update) {
-            Ok(count) => OxiDbResponse::Ok { data: json!({ "modified": count }) },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+        OxiDbRequest::UpdateOne {
+            collection,
+            query,
+            update,
+        } => match db.update_one(&collection, &query, &update) {
+            Ok(count) => OxiDbResponse::Ok {
+                data: json!({ "modified": count }),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
         OxiDbRequest::Delete { collection, query } => match db.delete(&collection, &query) {
-            Ok(count) => OxiDbResponse::Ok { data: json!({ "deleted": count }) },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Ok(count) => OxiDbResponse::Ok {
+                data: json!({ "deleted": count }),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
         OxiDbRequest::DeleteOne { collection, query } => match db.delete_one(&collection, &query) {
-            Ok(count) => OxiDbResponse::Ok { data: json!({ "deleted": count }) },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Ok(count) => OxiDbResponse::Ok {
+                data: json!({ "deleted": count }),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
         OxiDbRequest::CreateCollection { name } => match db.create_collection(&name) {
-            Ok(()) => OxiDbResponse::Ok { data: json!("collection created") },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Ok(()) => OxiDbResponse::Ok {
+                data: json!("collection created"),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
+        OxiDbRequest::CreateCollectionWithOptions { name, options } => {
+            match db.create_collection_with_options(&name, options) {
+                Ok(()) => OxiDbResponse::Ok {
+                    data: json!("collection created"),
+                },
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
         OxiDbRequest::DropCollection { name } => match db.drop_collection(&name) {
-            Ok(()) => OxiDbResponse::Ok { data: json!("collection dropped") },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Ok(()) => OxiDbResponse::Ok {
+                data: json!("collection dropped"),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
         OxiDbRequest::Compact { collection } => match db.compact(&collection) {
             Ok(stats) => OxiDbResponse::Ok {
                 data: json!({ "old_size": stats.old_size, "new_size": stats.new_size, "docs_kept": stats.docs_kept }),
             },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
-        OxiDbRequest::CreateIndex { collection, field } => match db.create_index(&collection, &field) {
-            Ok(()) => OxiDbResponse::Ok { data: json!("index created") },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
-        },
-        OxiDbRequest::CreateUniqueIndex { collection, field } => match db.create_unique_index(&collection, &field) {
-            Ok(()) => OxiDbResponse::Ok { data: json!("unique index created") },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
-        },
-        OxiDbRequest::CreateCompositeIndex { collection, fields } => match db.create_composite_index(&collection, fields) {
-            Ok(name) => OxiDbResponse::Ok { data: json!({ "index": name }) },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
-        },
-        OxiDbRequest::CreateTextIndex { collection, fields } => match db.create_text_index(&collection, fields) {
-            Ok(()) => OxiDbResponse::Ok { data: json!("text index created") },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
-        },
+        OxiDbRequest::CreateIndex { collection, field } => {
+            match db.create_index(&collection, &field) {
+                Ok(()) => OxiDbResponse::Ok {
+                    data: json!("index created"),
+                },
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        OxiDbRequest::CreateUniqueIndex { collection, field } => {
+            match db.create_unique_index(&collection, &field) {
+                Ok(()) => OxiDbResponse::Ok {
+                    data: json!("unique index created"),
+                },
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        OxiDbRequest::CreateCompositeIndex { collection, fields } => {
+            match db.create_composite_index(&collection, fields) {
+                Ok(name) => OxiDbResponse::Ok {
+                    data: json!({ "index": name }),
+                },
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        OxiDbRequest::CreateTextIndex { collection, fields } => {
+            match db.create_text_index(&collection, fields) {
+                Ok(()) => OxiDbResponse::Ok {
+                    data: json!("text index created"),
+                },
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
         OxiDbRequest::DropIndex { collection, index } => match db.drop_index(&collection, &index) {
-            Ok(()) => OxiDbResponse::Ok { data: json!("index dropped") },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Ok(()) => OxiDbResponse::Ok {
+                data: json!("index dropped"),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
         OxiDbRequest::CreateBucket { bucket } => match db.create_bucket(&bucket) {
-            Ok(()) => OxiDbResponse::Ok { data: json!("bucket created") },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Ok(()) => OxiDbResponse::Ok {
+                data: json!("bucket created"),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
         OxiDbRequest::DeleteBucket { bucket } => match db.delete_bucket(&bucket) {
-            Ok(()) => OxiDbResponse::Ok { data: json!("bucket deleted") },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Ok(()) => OxiDbResponse::Ok {
+                data: json!("bucket deleted"),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
-        OxiDbRequest::PutObject { bucket, key, data_b64, content_type, metadata } => {
-            let data = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data_b64) {
-                Ok(d) => d,
-                Err(e) => return OxiDbResponse::Error { message: format!("invalid base64: {e}") },
-            };
+        OxiDbRequest::PutObject {
+            bucket,
+            key,
+            data_b64,
+            content_type,
+            metadata,
+        } => {
+            let data =
+                match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data_b64)
+                {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return OxiDbResponse::Error {
+                            message: format!("invalid base64: {e}"),
+                        };
+                    }
+                };
             let meta_map: HashMap<String, String> = metadata
                 .as_object()
-                .map(|obj| obj.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
                 .unwrap_or_default();
             match db.put_object(&bucket, &key, &data, &content_type, meta_map) {
                 Ok(meta) => OxiDbResponse::Ok { data: meta },
-                Err(e) => OxiDbResponse::Error { message: e.to_string() },
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
             }
         }
         OxiDbRequest::DeleteObject { bucket, key } => match db.delete_object(&bucket, &key) {
-            Ok(()) => OxiDbResponse::Ok { data: json!("object deleted") },
-            Err(e) => OxiDbResponse::Error { message: e.to_string() },
+            Ok(()) => OxiDbResponse::Ok {
+                data: json!("object deleted"),
+            },
+            Err(e) => OxiDbResponse::Error {
+                message: e.to_string(),
+            },
         },
         OxiDbRequest::CommitTransaction { write_ops } => {
             // Apply all buffered transaction writes atomically
             let mut errors = Vec::new();
             for op in write_ops {
                 let result = match op {
-                    TransactionWriteOp::Insert { collection, document } => {
-                        db.insert(&collection, document).map(|_| ())
-                    }
-                    TransactionWriteOp::Update { collection, query, update } => {
-                        db.update(&collection, &query, &update).map(|_| ())
-                    }
+                    TransactionWriteOp::Insert {
+                        collection,
+                        document,
+                    } => db.insert(&collection, document).map(|_| ()),
+                    TransactionWriteOp::Update {
+                        collection,
+                        query,
+                        update,
+                    } => db.update(&collection, &query, &update).map(|_| ()),
                     TransactionWriteOp::Delete { collection, query } => {
                         db.delete(&collection, &query).map(|_| ())
                     }
@@ -419,16 +548,22 @@ fn apply_request(db: &OxiDb, req: OxiDbRequest) -> OxiDbResponse {
                 }
             }
             if errors.is_empty() {
-                OxiDbResponse::Ok { data: json!("transaction committed") }
+                OxiDbResponse::Ok {
+                    data: json!("transaction committed"),
+                }
             } else {
-                OxiDbResponse::Error { message: format!("partial commit errors: {}", errors.join("; ")) }
+                OxiDbResponse::Error {
+                    message: format!("partial commit errors: {}", errors.join("; ")),
+                }
             }
-        },
+        }
     }
 }
 
 impl RaftLogReader<TypeConfig> for OxiDbStore {
-    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + Send>(
+    async fn try_get_log_entries<
+        RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + Send,
+    >(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
@@ -446,7 +581,9 @@ impl RaftSnapshotBuilder<TypeConfig> for OxiDbStore {
 
         let snapshot_id = format!(
             "{}-{}",
-            data.last_applied_log.map(|l| l.index.to_string()).unwrap_or_default(),
+            data.last_applied_log
+                .map(|l| l.index.to_string())
+                .unwrap_or_default(),
             chrono::Utc::now().timestamp_millis()
         );
 
@@ -482,7 +619,10 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
         Ok(self.inner.read().unwrap().vote)
     }
 
-    async fn save_committed(&mut self, committed: Option<LogId<u64>>) -> Result<(), StorageError<u64>> {
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogId<u64>>,
+    ) -> Result<(), StorageError<u64>> {
         self.inner.write().unwrap().committed = committed;
         self.persist_meta();
         Ok(())
@@ -525,7 +665,10 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
         Ok(())
     }
 
-    async fn delete_conflict_logs_since(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
+    async fn delete_conflict_logs_since(
+        &mut self,
+        log_id: LogId<u64>,
+    ) -> Result<(), StorageError<u64>> {
         {
             let mut inner = self.inner.write().unwrap();
             let keys: Vec<u64> = inner.log.range(log_id.index..).map(|(k, _)| *k).collect();
@@ -555,9 +698,18 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
 
     async fn last_applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<u64>>, StoredMembership<u64, openraft::BasicNode>), StorageError<u64>> {
+    ) -> Result<
+        (
+            Option<LogId<u64>>,
+            StoredMembership<u64, openraft::BasicNode>,
+        ),
+        StorageError<u64>,
+    > {
         let inner = self.inner.read().unwrap();
-        Ok((inner.sm_data.last_applied_log, inner.sm_data.last_membership.clone()))
+        Ok((
+            inner.sm_data.last_applied_log,
+            inner.sm_data.last_membership.clone(),
+        ))
     }
 
     async fn apply_to_state_machine(
@@ -580,7 +732,9 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
                     openraft::EntryPayload::Membership(mem) => {
                         inner.sm_data.last_membership =
                             StoredMembership::new(Some(entry.log_id), mem.clone());
-                        out.push(OxiDbResponse::Ok { data: json!("membership updated") });
+                        out.push(OxiDbResponse::Ok {
+                            data: json!("membership updated"),
+                        });
                     }
                 }
             }
@@ -595,7 +749,9 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<u64>> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
@@ -617,7 +773,9 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
         Ok(())
     }
 
-    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
         let inner = self.inner.read().unwrap();
         match &inner.current_snapshot {
             Some(snap) => Ok(Some(Snapshot {
