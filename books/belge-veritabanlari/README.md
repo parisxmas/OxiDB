@@ -74,7 +74,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 23. Tam metin arama, blob depolama, şifreleme ve zaman-noktasına kurtarma ✅
 24. Sunucu: OxiWire protokolü, kimlik doğrulama, RBAC, denetim ✅
 25. Ölçeklendirme: Raft kümesi ve OxiPool ile sharding ✅
-26. Uyumluluk katmanları ve istemciler
+26. Uyumluluk katmanları ve istemciler ✅
 27. Bellek optimizasyonu ve karşılaştırmalı değerlendirme
 
 **Ek A** — Sözlük · **Ek B** — Kaynaklar
