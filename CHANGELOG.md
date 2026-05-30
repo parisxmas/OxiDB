@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Automatic compaction trigger for disk-first storage (server 0.28.29)
+### Automatic compaction trigger for disk-first storage (server 0.29.0)
 
 Compaction no longer has to be invoked by hand. The periodic maintenance path
 (`sync_writes`, right after `persist`) now calls `BTreeStorage::should_compact`
