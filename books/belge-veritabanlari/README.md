@@ -43,7 +43,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 5. Depolama motorları: sayfa tabanlı, append-only, LSM ve B-ağaçları ✅
 6. Dayanıklılık: write-ahead log, fsync ve çökmeden kurtarma ✅
 7. İndeksleme: B-ağacı indeksleri, bileşik indeksler, ters indeks ✅
-8. Sorgu işleme: ayrıştırma, planlama, indeks seçimi
+8. Sorgu işleme: ayrıştırma, planlama, indeks seçimi ✅
 9. Toplama (aggregation): pipeline modeli, gruplama, pencere fonksiyonları
 10. İşlemler: ACID, izolasyon, kilitleme, MVCC ve OCC
 11. Eşzamanlılık ve tutarlılık
