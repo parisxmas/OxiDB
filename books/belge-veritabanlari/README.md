@@ -40,7 +40,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 4. Belge modeli derinlemesine: JSON, şema esnekliği, gömme ve referans ✅
 
 ### Kısım II — Bir Belge Veritabanı İçeride Nasıl Çalışır
-5. Depolama motorları: sayfa tabanlı, append-only, LSM ve B-ağaçları
+5. Depolama motorları: sayfa tabanlı, append-only, LSM ve B-ağaçları ✅
 6. Dayanıklılık: write-ahead log, fsync ve çökmeden kurtarma
 7. İndeksleme: B-ağacı indeksleri, bileşik indeksler, ters indeks
 8. Sorgu işleme: ayrıştırma, planlama, indeks seçimi
