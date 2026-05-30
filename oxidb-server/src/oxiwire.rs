@@ -148,21 +148,6 @@ pub fn ok_docs_bytes_response(docs: &[Arc<[u8]>]) -> Vec<u8> {
     buf
 }
 
-/// Frame an already-concatenated buffer of `count` self-delimiting OxiWire
-/// document encodings into an array response. Pairs with
-/// `OxiDb::find_oxiwire_concat`, which encodes all matches into one buffer —
-/// so the whole result is framed with a single `Vec` extension, never a
-/// per-document `Arc` collection.
-pub fn ok_docs_concat_response(count: usize, doc_bytes: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(doc_bytes.len() + 8);
-    buf.push(MAGIC);
-    buf.push(0x00);
-    buf.push(TAG_ARRAY);
-    buf.extend_from_slice(&(count as u32).to_le_bytes());
-    buf.extend_from_slice(doc_bytes);
-    buf
-}
-
 /// Parallel serialization path for large result sets.
 /// Splits doc slice into chunks, each thread serializes into one contiguous buffer.
 fn ok_docs_response_parallel(docs: &[Arc<Value>]) -> Vec<u8> {
@@ -300,7 +285,8 @@ pub fn decode_value(buf: &[u8], pos: &mut usize) -> Result<Value, String> {
                 if *pos + 4 > buf.len() {
                     return Err("truncated map key length".to_string());
                 }
-                let key_len = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
+                let key_len =
+                    u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
                 *pos += 4;
                 if *pos + key_len > buf.len() {
                     return Err("truncated map key data".to_string());
@@ -454,9 +440,7 @@ mod tests {
     fn fuzz_regression_array_with_honest_count_still_works() {
         // Sanity: the alloc-guard must NOT break the happy path. An
         // array of 3 nulls is 1 (MAGIC) + 1 (TAG_ARRAY) + 4 (count=3) + 3 (NULLs)
-        let input = [
-            0xDBu8, TAG_ARRAY, 3u8, 0u8, 0u8, 0u8, TAG_NULL, TAG_NULL, TAG_NULL,
-        ];
+        let input = [0xDBu8, TAG_ARRAY, 3u8, 0u8, 0u8, 0u8, TAG_NULL, TAG_NULL, TAG_NULL];
         let decoded = decode_request(&input).expect("honest 3-element array");
         match decoded {
             Value::Array(a) => {
