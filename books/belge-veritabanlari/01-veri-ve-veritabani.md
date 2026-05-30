@@ -9,7 +9,7 @@ ayıran şeyin ne olduğunu temelden kuracağız. Henüz "belge" veritabanından
 etmeyeceğiz; önce her veritabanının çözmek zorunda olduğu evrensel sorunları
 anlamamız gerekiyor.
 
-![Şekil 1 — Bir VTYS'nin düz dosyadan farkı: sistemli biçimde çözdüğü beş temel sorun.](sekiller/01-vtys-sorunlar.svg){width=80%}
+![Bir VTYS'nin düz dosyadan farkı: sistemli biçimde çözdüğü beş temel sorun.](sekiller/01-vtys-sorunlar.svg){width=80%}
 
 ## Veri nedir, enformasyon nedir
 

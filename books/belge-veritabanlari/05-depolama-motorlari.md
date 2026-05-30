@@ -10,7 +10,7 @@ sayfa tabanlı B-ağaçlarını ve append-only/log-yapılı yaklaşımları —
 inceleyeceğiz. Buradan sonraki birkaç bölüm daha teknik olacak, ama yöntemimiz
 aynı: her tasarımı, çözmeye çalıştığı somut sorundan başlayarak anlamak.
 
-![Şekil 5 — Yerinde güncelleme ile ekle-only depolamanın temel ödünleşimi.](sekiller/05-depolama-motorlari.svg){width=80%}
+![Yerinde güncelleme ile ekle-only depolamanın temel ödünleşimi.](sekiller/05-depolama-motorlari.svg){width=80%}
 
 ## Depolama motoru ne yapar
 
@@ -77,7 +77,7 @@ Birinci felsefe, veriyi **düzenli tutmayı** önceler ve onlarca yıl boyunca
 veritabanı dünyasına egemen oldu. Bu yaklaşımda disk, sabit boyutlu **sayfalara**
 bölünür — her sayfa, belirli sayıda kaydı tutan, diskten tek seferde okunup
 yazılan bir blok. Veri, bu sayfalar üzerinde **B-ağacı** denen bir yapıyla
-düzenlenir (Bayer ve McCreight, 1972).
+düzenlenir.^[R. Bayer ve E. M. McCreight, "Organization and Maintenance of Large Ordered Indexes," *Acta Informatica* 1(3), 1972.]
 
 B-ağacını, devasa, çok katmanlı bir dosyalama dolabı gibi düşünebilirsiniz. En
 üstte, "A–M arası şu çekmecede, N–Z arası bu çekmecede" diyen bir yönlendirme
@@ -127,7 +127,7 @@ durduğu konuma bir eşleme. Yazarken bu dizini güncellersiniz; okurken önce d
 bakıp konumu öğrenir, sonra doğrudan o konuma gidersiniz. Yani append-only motor,
 veriyi düzensiz yazmanın getirdiği okuma zorluğunu, ayrı bir dizinle telafi eder.
 (Bu dizinin kendisi de bellekte ya da diskte tutulabilir; üçüncü kısımda OxiDB'nin
-tam olarak böyle bir kimlik→konum dizini kullandığını göreceğiz.)
+tam olarak böyle bir kimlik-konum dizini kullandığını göreceğiz.)
 
 İkincisi **ölü alan sorunudur**. Madem eski kayıtların üzerine yazmıyoruz, onlar
 dosyada öylece durmaya devam eder. Bir kaydı yüz kez güncellerseniz, dosyada o
@@ -145,7 +145,7 @@ ayıracağız.)
 
 Append-only fikrini bir adım ileri taşıyan ve birçok modern belge ve geniş-sütun
 veritabanının kalbinde yatan tasarıma **LSM ağacı** denir — açılımı "log-yapılı
-birleştirmeli ağaç" (O'Neil vd., 1996). Saf append-only yaklaşımının okuma
+birleştirmeli ağaç".^[P. O'Neil, E. Cheng, D. Gawlick ve E. O'Neil, "The Log-Structured Merge-Tree (LSM-Tree)," *Acta Informatica* 33(4), 1996.] Saf append-only yaklaşımının okuma
 zorluğunu, akıllıca bir düzenlemeyle hafifletir.
 
 LSM'nin fikri şudur: gelen yazmaları önce **bellekte**, sıralı bir yapıda

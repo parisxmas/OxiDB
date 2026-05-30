@@ -7,7 +7,7 @@ zorlu sınavı, eşzamanlı yazmalar ve "ya hep ya hiç" güvencesidir. Bu böl�
 OxiDB'nin işlem mekanizmasını — onuncu bölümde tanıdığımız iyimser eşzamanlılık
 denetimini ve onun üç fazlı tamamlama düzenini — somut olarak ele alıyor.
 
-![Şekil 21 — Üç fazlı commit ve kilitlenmeyi önleyen sıralı kilitleme.](sekiller/21-oxidb-islemler.svg){width=80%}
+![Üç fazlı commit ve kilitlenmeyi önleyen sıralı kilitleme.](sekiller/21-oxidb-islemler.svg){width=80%}
 
 ## OxiDB neden iyimser yolu seçti
 

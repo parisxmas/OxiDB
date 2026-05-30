@@ -1,0 +1,5 @@
+% PDF (xelatex): pandoc'un otomatik metin başlık sayfasını iptal eder; böylece
+% `--include-before-body=kapak.tex` ile eklenen tam-sayfa kapak görseli kitabın
+% ilk sayfası olur. build.sh, kapak.png mevcutsa hem bu başlığı hem kapak.tex'i
+% ekler.
+\renewcommand{\maketitle}{}

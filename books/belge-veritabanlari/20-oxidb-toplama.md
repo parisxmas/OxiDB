@@ -9,7 +9,7 @@ alıyor. Bu bölümün ayrı bir özelliği var: anlatacağımız yeteneklerin b
 eklendi; bu yüzden onları yalnızca bir kullanıcı olarak değil, gelişim öyküleriyle
 birlikte anlatabiliyoruz.
 
-![Şekil 20 — $facet: tek girdi üzerinde paralel alt-boru hatları.](sekiller/20-oxidb-toplama.svg){width=80%}
+![$facet: tek girdi üzerinde paralel alt-boru hatları.](sekiller/20-oxidb-toplama.svg){width=80%}
 
 ## Pipeline ve aşamaları
 

@@ -8,7 +8,7 @@ bölüm, veritabanlarını taramaya mahkûm olmaktan kurtaran o yardımcı yapı
 indekslere — eğiliyor. İndeksler, bir veritabanının hızının büyük bölümünün
 geldiği yerdir; onlarsız her soru, tüm veriyi okumayı gerektirirdi.
 
-![Şekil 7 — Tam tarama ile sıralı indeks erişiminin karşılaştırması.](sekiller/07-indeksleme.svg){width=80%}
+![Tam tarama ile sıralı indeks erişiminin karşılaştırması.](sekiller/07-indeksleme.svg){width=80%}
 
 ## Tarama sorunu
 
@@ -160,8 +160,8 @@ tam eşleşme değil, metnin içinde geçen bir sözcüğü arıyorsunuz. Bu iht
 tasarlanmış, tümüyle farklı bir yapı vardır: **ters indeks** (inverted index).
 
 Ters indeksin fikri, sıradan indeksin tersini yapmaktır. Sıradan indeks
-"belge → içindeki değer" ilişkisini tutarken, ters indeks "sözcük → o sözcüğü
-içeren belgeler" ilişkisini tutar. Bir kitabın arkasındaki dizine yine
+"belgeden, içindeki değere" giden ilişkiyi tutarken, ters indeks "sözcükten, o
+sözcüğü içeren belgelere" giden ilişkiyi tutar. Bir kitabın arkasındaki dizine yine
 dönelim; orada her kavramın yanında, o kavramın geçtiği sayfaların listesi
 vardır. Ters indeks tam olarak budur, ama metindeki her anlamlı sözcük için.
 Bir belge eklendiğinde, metni anlamlı sözcüklere ayrılır (buna parçalama denir)
@@ -177,8 +177,7 @@ sonuçları yalnızca bulmakla kalmaz, **sıralar** da: hangi belgenin sorguya d
 alakalı olduğunu, sözcüğün belgede ne sıklıkta geçtiği ve genel olarak ne kadar
 yaygın bir sözcük olduğu gibi ölçütlere bakarak puanlar. Bu sezginin olgun
 biçimleri — terim sıklığına dayalı puanlama ve onun olasılıksal akrabası — bilgi
-erişimi alanının temel konularıdır (Manning vd., 2008; Robertson ve Zaragoza,
-2009). Üçüncü kısımda OxiDB'nin tam metin aramayı, böyle bir ters indeks ve alaka
+erişimi alanının temel konularıdır.^[C. D. Manning, P. Raghavan ve H. Schütze, *Introduction to Information Retrieval*, Cambridge University Press, 2008; S. Robertson ve H. Zaragoza, "The Probabilistic Relevance Framework: BM25 and Beyond," *Foundations and Trends in Information Retrieval* 3(4), 2009.] Üçüncü kısımda OxiDB'nin tam metin aramayı, böyle bir ters indeks ve alaka
 puanlaması üzerine kurduğunu göreceğiz.
 
 ## İndeksler de dayanıklı olmalı

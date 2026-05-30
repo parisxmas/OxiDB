@@ -9,7 +9,7 @@ bölümü, tek bir karara dayanır: hangi verinin bellekte tutulacağı, hangisi
 diske bırakılacağı. Bu bölüm, o sessiz ama belirleyici dengeyi — bellek, önbellek
 ve disk arasındaki ödünleşimi — ele alıyor.
 
-![Şekil 13 — Bellek hiyerarşisi ve çalışma kümesi: hız ile boyutun ödünleşimi.](sekiller/13-bellek-onbellek-disk.svg){width=80%}
+![Bellek hiyerarşisi ve çalışma kümesi: hız ile boyutun ödünleşimi.](sekiller/13-bellek-onbellek-disk.svg){width=80%}
 
 ## Temel asimetri ve oyunun özü
 

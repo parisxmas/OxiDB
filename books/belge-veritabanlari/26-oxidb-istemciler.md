@@ -8,7 +8,7 @@ kütüphanelerine ve OxiDB'yi başka ekosistemlerin protokolleriyle konuşturan
 uyumluluk katmanlarına. Bu bölüm, on beşinci bölümde tanıttığımız "tek çekirdek,
 çok yüz" felsefesinin en somut görünümüdür.
 
-![Şekil 26 — Tek çekirdek, birçok istemci ve protokol yüzü.](sekiller/26-oxidb-istemciler.svg){width=80%}
+![Tek çekirdek, birçok istemci ve protokol yüzü.](sekiller/26-oxidb-istemciler.svg){width=80%}
 
 ## Çekirdeğe iki kapı
 

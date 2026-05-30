@@ -10,7 +10,7 @@ o an, sandığımızdan çok daha derin bir soru belirir: birden çok kopya vark
 Bu bölüm, bu soruyu ele alıyor ve bizi, verinin nasıl dağıtıldığını anlatacak bir
 sonraki bölüme hazırlıyor.
 
-![Şekil 11 — Tutarlılık bir spektrumdur; bölünme anında CAP seçimi dayatılır.](sekiller/11-tutarlilik-cap.svg){width=80%}
+![Tutarlılık bir spektrumdur; bölünme anında CAP seçimi dayatılır.](sekiller/11-tutarlilik-cap.svg){width=80%}
 
 ## Neden birden çok kopya
 
@@ -96,13 +96,13 @@ olamadığım bir yanıtı vermem" dersiniz — ama o zaman erişilebilirlikten 
 verirsiniz. Bölünme sırasında, **tutarlılık ile erişilebilirlik arasında**
 seçim yapmak zorundasınızdır; ikisine birden sahip olamazsınız. Bu içgörü,
 dağıtık sistemler kuramının en bilinen sonucudur ve genellikle "CAP" adıyla
-anılır (Gilbert ve Lynch, 2002). Önemli olan, onu doğru anlamaktır: bu bir "her
+anılır.^[S. Gilbert ve N. Lynch, "Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services," *ACM SIGACT News* 33(2), 2002.] Önemli olan, onu doğru anlamaktır: bu bir "her
 zaman üçten ikisini seç" sloganı değildir; özellikle ağ bölündüğünde, tutarlılık
 ile erişilebilirlik arasında yapılması gereken bir tercihtir — ilkenin kâşifi de
-yıllar sonra bu inceliğin altını özellikle çizmiştir (Brewer, 2012).
+yıllar sonra bu inceliğin altını özellikle çizmiştir.^[E. Brewer, "CAP Twelve Years Later: How the 'Rules' Have Changed," *Computer (IEEE)* 45(2), 2012.]
 
 Daha az bilinen ama eşit derecede önemli bir incelik vardır: ağ hiç bölünmese
-bile, tutarlılık bir gecikme bedeliyle gelir (Abadi, 2012). Güçlü tutarlılık daha
+bile, tutarlılık bir gecikme bedeliyle gelir.^[D. J. Abadi, "Consistency Tradeoffs in Modern Distributed Database System Design: CAP is Only Part of the Story," *Computer (IEEE)* 45(2), 2012.] Güçlü tutarlılık daha
 fazla koordinasyon, koordinasyon da daha fazla bekleme demektir. Yani
 seçim yalnızca felaket anında değil, sıradan zamanda da karşınızdadır: ne kadar
 güçlü tutarlılık isterseniz, her işlem o kadar yavaşlar. Tutarlılık, bedava

@@ -9,7 +9,7 @@ somutlaştığını gösteriyor: OxiDB belgeleri tam olarak nasıl saklar, neden
 ayrı depolama kipi sunar ve bu seçimin bellek ile hız üzerindeki sonuçları
 nelerdir?
 
-![Şekil 16 — in-RAM ile disk-first depolama kiplerinin karşılaştırması.](sekiller/16-depolama-katmani.svg){width=80%}
+![in-RAM ile disk-first depolama kiplerinin karşılaştırması.](sekiller/16-depolama-katmani.svg){width=80%}
 
 ## Çekirdek: kimlikten baytlara
 

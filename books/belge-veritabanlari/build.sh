@@ -28,16 +28,23 @@ case "$fmt" in
     # Kapak: kapak.png varsa ilk sayfaya tam-sayfa görsel olarak eklenir.
     cover_opt=()
     if [[ -f kapak.png ]]; then
-      cover_opt=(--include-before-body=kapak.tex)
+      # Metin başlık sayfasını iptal et + kapak görselini ilk sayfa olarak ekle.
+      cover_opt=(--include-in-header=kapak-header.tex --include-before-body=kapak.tex)
     else
       echo "uyarı: kapak.png bulunamadı; kapaksız üretiliyor." >&2
     fi
+    # Yazı tipleri: sistemde kurulu, Türkçe gliflerini içeren tipler. macOS'ta
+    # Georgia + Menlo her zaman vardır ve kitabın HTML tasarımıyla eşleşir.
+    # Linux'ta BOOK_MAINFONT/BOOK_MONOFONT ile (örn. "DejaVu Serif") değiştirin.
+    # SVG şekiller için `rsvg-convert` (librsvg) gerekir; xelatex SVG basamaz.
+    mainfont="${BOOK_MAINFONT:-Georgia}"; monofont="${BOOK_MONOFONT:-Menlo}"
     pandoc metadata.yaml "${chapters[@]}" \
       --toc --number-sections --top-level-division=chapter \
       --pdf-engine=xelatex \
       "${cover_opt[@]}" \
-      -V mainfont="DejaVu Serif" \
-      -V monofont="DejaVu Sans Mono" \
+      -V classoption=oneside \
+      -V mainfont="$mainfont" \
+      -V monofont="$monofont" \
       -o "${out}.pdf"
     echo "yazıldı: ${out}.pdf"
     ;;

@@ -9,7 +9,7 @@ inceleyeceğiz. Bu bölüm, Kısım I'in son durağı; onu bitirdiğimizde belge
 olduğunu tam olarak bilecek ve Kısım II'de bir veritabanının bu belgeleri içeride
 *nasıl* sakladığına geçmeye hazır olacağız.
 
-![Şekil 4 — Belge, alanlardan oluşan ve iç içe geçebilen bir ağaçtır.](sekiller/04-belge-agaci.svg){width=80%}
+![Belge, alanlardan oluşan ve iç içe geçebilen bir ağaçtır.](sekiller/04-belge-agaci.svg){width=80%}
 
 ## Bir belge neyden yapılır
 
@@ -89,7 +89,7 @@ Crockford adlı bir mühendis, JavaScript'in zaten var olan o sade nesne
 gösteriminin, veri aktarımı için XML'den çok daha hafif ve kullanışlı bir
 biçim olarak kullanılabileceğini fark etti; bu fikri derleyip toparlayarak,
 ona bir ad (JSON) ve açık bir tanım kazandırdı ve `json.org` adresinde
-yayımladı (Crockford, json.org). Yani JSON icat edilmedi denebilir; daha çok, JavaScript'in içinde
+yayımladı.^[Douglas Crockford, "Introducing JSON," json.org, <https://www.json.org/>.] Yani JSON icat edilmedi denebilir; daha çok, JavaScript'in içinde
 zaten saklı duran sade bir alt küme keşfedilip bağımsız bir biçim olarak öne
 çıkarıldı. JSON'un nesnelere bu kadar doğal uymasının nedeni de budur: o, bir
 programlama dilinin nesne yazma biçiminin doğrudan kendisinden türemiştir.
@@ -100,7 +100,7 @@ yaygınlaşmasıyla, bu alışverişte taşınacak hafif bir biçime ihtiyaç do
 JSON, ağır XML'in yerini hızla aldı. Zamanla, biçimin herkesçe aynı yorumlanması
 için resmî standartlara da bağlandı: hem yazılım endüstrisi standartları hem de
 internet standartları, JSON'un dilbilgisini kesin biçimde tanımlayan belgeler
-yayımladı (ECMA-404, 2017; RFC 8259, 2017). Böylece JSON, bir kişinin derlediği pratik bir fikirden, tüm
+yayımladı.^[*ECMA-404: The JSON Data Interchange Syntax*, Ecma International, 2. baskı, 2017; T. Bray (ed.), *RFC 8259: The JavaScript Object Notation (JSON) Data Interchange Format*, IETF, 2017.] Böylece JSON, bir kişinin derlediği pratik bir fikirden, tüm
 dünyanın üzerinde anlaştığı resmî bir veri değiş-tokuş biçimine dönüştü ve bugün
 web servislerinden yapılandırma dosyalarına, kayıt sistemlerinden — bu kitabın
 konusu olan — belge veritabanlarına kadar her yerde karşımıza çıkıyor.

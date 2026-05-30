@@ -9,7 +9,7 @@ korunur; sistem, bir avuç kullanıcının veriyi kaosa sürüklemesine izin ver
 düzeni nasıl sürdürür? Bu bölüm, veritabanının belki de en zarif kavramına —
 işlemlere — ve onların verdiği güvencelere eğiliyor.
 
-![Şekil 10 — İyimser eşzamanlılıkta üç fazlı commit.](sekiller/10-islemler.svg){width=80%}
+![İyimser eşzamanlılıkta üç fazlı commit.](sekiller/10-islemler.svg){width=80%}
 
 ## İşlem nedir: bölünmez bir bütün
 
@@ -26,7 +26,7 @@ bakıldığında, tek bir an'da, bölünmeden gerçekleşmiş gibi görünür. Y
 yarısı olmuş bir durum asla görünmez. Bu söz, sandığınızdan çok daha zor tutulur;
 çünkü hem çökmeyle hem de aynı anda çalışan diğer işlemlerle baş etmek gerekir.
 İşlem kavramının erdemleri ve sınırları, veritabanı kuramında klasik bir
-incelemenin konusudur (Gray, 1981). Bu güvencelerin tümü, geleneksel olarak dört
+incelemenin konusudur.^[Jim Gray, "The Transaction Concept: Virtues and Limitations," *Proc. VLDB*, 1981.] Bu güvencelerin tümü, geleneksel olarak dört
 harfle özetlenir: ACID.
 
 ## Dört güvence: ACID
@@ -103,8 +103,8 @@ olur. Bir veritabanı tasarımcısının ya da kullanıcısının seçimi, çoğ
 tayf üzerinde "ne kadar güvence, ne kadar hız" sorusunu yanıtlamaktır. Mutlak
 doğru bir nokta yoktur; uygulamanın ne kadar güçlü bir güvenceye gerçekten
 ihtiyaç duyduğuna bağlıdır. Bu standart yalıtım düzeylerinin tam olarak neyi
-garanti edip neyi etmediği, ünlü bir eleştiride titizlikle çözümlenmiştir
-(Berenson vd., 1995).
+garanti edip neyi etmediği, ünlü bir eleştiride titizlikle
+çözümlenmiştir.^[H. Berenson, P. Bernstein, J. Gray, J. Melton, E. O'Neil ve P. O'Neil, "A Critique of ANSI SQL Isolation Levels," *Proc. ACM SIGMOD*, 1995.]
 
 ## Yalıtımı sağlamanın üç felsefesi
 
@@ -158,7 +158,7 @@ sürümler orada zaten vardır.
 
 Üçüncü felsefe, kilitlemenin tam tersi bir ruh hâliyle yaklaşır ve adı **iyimser
 eşzamanlılık denetimidir** (OCC) — fikri ilk kez resmî biçimde ortaya koyan
-çalışmaya kadar uzanır (Kung ve Robinson, 1981). Varsayımı şudur: çatışmalar
+çalışmaya kadar uzanır.^[H. T. Kung ve J. T. Robinson, "On Optimistic Methods for Concurrency Control," *ACM TODS* 6(2), 1981.] Varsayımı şudur: çatışmalar
 aslında nadirdir;
 çoğu zaman iki işlem aynı veriye aynı anda dokunmaz. Madem öyle, neden baştan
 kilitleyip herkesi bekletelim?

@@ -8,7 +8,7 @@ OxiDB'nin sorgu motorunu — desteklediği operatörleri, indeks destekli yürü
 yollarını ve eşleşmeyen belgeleri hiç çözmeden atlayan o ince bayt düzeyinde süzme
 tekniğini — sekizinci bölümdeki ilkelerle bağlayarak ele alıyor.
 
-![Şekil 19 — Byte düzeyinde ön-süzme: eşleşmeyeni çözmeden eleme.](sekiller/19-oxidb-sorgu.svg){width=80%}
+![Byte düzeyinde ön-süzme: eşleşmeyeni çözmeden eleme.](sekiller/19-oxidb-sorgu.svg){width=80%}
 
 ## Sorgunun ayrıştırılması ve operatör dağarcığı
 

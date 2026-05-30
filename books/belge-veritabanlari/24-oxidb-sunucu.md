@@ -10,7 +10,7 @@ sunucu katmanını — kendi iletişim protokolünü, kimlik doğrulamasını, r
 erişim denetimini ve denetim günlüğünü — on dördüncü bölümdeki güvenlik
 ilkeleriyle bağlayarak ele alıyor.
 
-![Şekil 24 — Bir isteğin sunucu katmanlarından geçişi.](sekiller/24-oxidb-sunucu.svg){width=80%}
+![Bir isteğin sunucu katmanlarından geçişi.](sekiller/24-oxidb-sunucu.svg){width=80%}
 
 ## Çerçeveleme sorunu ve OxiWire protokolü
 

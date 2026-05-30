@@ -9,7 +9,7 @@ kendinden öncekinin acı veren bir eksiğine yanıt olarak doğduğunu görmek,
 modelinin neden ortaya çıktığını ve hangi sorunları çözmeyi vaat ettiğini
 anlamanın en sağlam yoludur.
 
-![Şekil 2 — Veri modellerinin evrimi; her biri bir öncekinin eksiğine yanıt olarak doğdu.](sekiller/02-veri-modelleri.svg){width=80%}
+![Veri modellerinin evrimi; her biri bir öncekinin eksiğine yanıt olarak doğdu.](sekiller/02-veri-modelleri.svg){width=80%}
 
 ## Veri modeli neyi belirler
 
@@ -85,7 +85,7 @@ Bu kenetlenmeyi kırmak, bir sonraki büyük fikrin işi olacaktı.
 ## İlişkisel model: büyük ayrışma
 
 1970'te, bu kenetlenmeden rahatsız olan bir araştırmacı — E. F. Codd — radikal
-bir öneri getirdi (Codd, 1970). Verinin fiziksel olarak nasıl saklandığı ile
+bir öneri getirdi.^[E. F. Codd, "A Relational Model of Data for Large Shared Data Banks," *Communications of the ACM* 13(6), 1970.] Verinin fiziksel olarak nasıl saklandığı ile
 mantıksal olarak nasıl düşünüldüğünü birbirinden tamamen **ayırmayı** önerdi. Bu
 fikir, **ilişkisel model** olarak bilinir ve onlarca yıl boyunca veritabanı
 dünyasına egemen oldu.

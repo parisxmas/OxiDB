@@ -43,9 +43,15 @@ başına `# Bölüm Başlığı` koyun. Numaralandırma ve içindekiler otomatik
 ./build.sh html      # belge-veritabanlari.html
 ```
 
-Gereksinim: `pandoc`. PDF için ya `xelatex` (varsayılan yol) ya da Google Chrome
-(`pdf-html` yolu, LaTeX'siz; `print.css` ile sayfa düzeni, kapak ilk sayfada).
-Depodaki `belge-veritabanlari.pdf`, `pdf-html` yoluyla üretilmiştir (137 sayfa).
+Gereksinim: `pandoc`. Varsayılan `pdf` yolu **xelatex** (LaTeX) kullanır ve
+kaynak künyelerini **sayfa altında gerçek dipnotlar** olarak basar; bunun için
+bir TeX dağıtımı (örn. TinyTeX ya da TeX Live; Türkçe için `babel-turkish`),
+SVG şekilleri çevirmek için `rsvg-convert` (librsvg) ve Türkçe gliflerini içeren
+bir yazı tipi (macOS'ta Georgia + Menlo; Linux'ta `BOOK_MAINFONT`/`BOOK_MONOFONT`
+ile DejaVu) gerekir. LaTeX istemiyorsanız `./build.sh pdf-html` yolu yalnızca
+pandoc + Google Chrome ister (dipnotlar sayfa altı yerine belge sonunda toplanır).
+Depodaki `belge-veritabanlari.pdf`, varsayılan **xelatex** yoluyla üretilmiştir
+(~124 sayfa, kapak ilk sayfada, sayfa-altı dipnotlu).
 
 ## İçindekiler (plan)
 

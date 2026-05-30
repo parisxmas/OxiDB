@@ -10,7 +10,7 @@ toc-depth: 2
 numbersections: true
 documentclass: book
 geometry: "margin=2.5cm"
-fontsize: 11pt
+fontsize: 10pt
 linkcolor: black
 # EPUB/HTML kapağı pandoc tarafından otomatik kullanılır; dosya dizinde
 # `kapak.png` olarak bulunmalıdır (PDF kapağı build.sh içinde eklenir).

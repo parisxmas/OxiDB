@@ -11,14 +11,14 @@ kısmının bu kitap yazılırken çok-düğümlü testlerle **doğrulanmış** 
 böylece on ikinci bölümün vaatlerini yalnızca tarif etmekle kalmayıp, gösterilmiş
 davranışlarla bağlayabiliyoruz.
 
-![Şekil 25 — Raft çoğunluk onayı ve OxiPool dağıt-topla.](sekiller/25-oxidb-olceklendirme.svg){width=80%}
+![Raft çoğunluk onayı ve OxiPool dağıt-topla.](sekiller/25-oxidb-olceklendirme.svg){width=80%}
 
 ## Raft kümesi: replikasyon ve konsensüs
 
 On ikinci bölümde, güçlü tutarlı bir replikasyonun iki fikirden — tek bir otorite
 ve çoğunluk mutabakatı — beslendiğini görmüştük. OxiDB'nin küme kipi, tam da bunu
 yapan, **Raft** adlı anlaşılır olmaya özen göstererek tasarlanmış bir
-çoğunluk-konsensüs protokolüne dayanır (Ongaro ve Ousterhout, 2014). Bir grup düğüm vardır; biri
+çoğunluk-konsensüs protokolüne dayanır.^[D. Ongaro ve J. Ousterhout, "In Search of an Understandable Consensus Algorithm," *Proc. USENIX ATC*, 2014.] Bir grup düğüm vardır; biri
 **lider** olur; tüm yazmalar liderden geçer ve bir yazma, düğümlerin **çoğunluğu**
 onu kalıcı kıldığında "tamamlanmış" sayılır.
 

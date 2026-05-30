@@ -7,8 +7,9 @@ içerdikleriyle ve hangi yöne baktıklarıyla temalara göre tanıtıyoruz; ard
 bu bölümün sonundaki **Kaynakça**'da, metin boyunca atıfta bulunduğumuz eserlerin
 tam künyelerini ve erişim bağlantılarını (URL/DOI) topluyoruz. Böylece hem bir
 pusula hem de doğrudan başvurabileceğiniz kesin bir referans listesi elinizde
-olur. Gövde metnindeki **(yazar, yıl)** biçimindeki kısa atıflar, bu listedeki
-maddelere işaret eder.
+olur. Kitap boyunca, bir eserden ilk söz edilen sayfada onun künyesi **sayfa
+altındaki dipnotta** verilir; aşağıdaki Kaynakça ise bu eserleri tek bir yerde,
+erişim bağlantılarıyla birlikte toplar.
 
 ## Genel: veri-yoğun sistemlerin temelleri
 

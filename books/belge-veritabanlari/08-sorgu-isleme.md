@@ -11,7 +11,7 @@ istediğinizi söyleyip *nasıl* sorusunu sisteme bırakmak olduğunu — söyle
 kadar iyi yaptığı, bir veritabanının hızını belirleyen en kritik etkenlerden
 biridir.
 
-![Şekil 8 — Bir sorgunun yaşam döngüsü: ayrıştır, planla, çalıştır.](sekiller/08-sorgu-isleme.svg){width=80%}
+![Bir sorgunun yaşam döngüsü: ayrıştır, planla, çalıştır.](sekiller/08-sorgu-isleme.svg){width=80%}
 
 ## Soru ile yol arasındaki fark
 

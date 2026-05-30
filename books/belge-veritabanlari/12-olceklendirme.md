@@ -9,7 +9,7 @@ sharding'i — ve bir önceki bölümde tanıdığımız tutarlılık tercihleri
 geçiren düzenekleri. Bu, bir veritabanını tek bir makinenin sınırlarının ötesine
 taşıyan yetenektir.
 
-![Şekil 12 — Replikasyon ve sharding: dayanıklılık ile kapasitenin iki ayrı ekseni.](sekiller/12-olceklendirme.svg){width=80%}
+![Replikasyon ve sharding: dayanıklılık ile kapasitenin iki ayrı ekseni.](sekiller/12-olceklendirme.svg){width=80%}
 
 ## Neden tek makine yetmez
 

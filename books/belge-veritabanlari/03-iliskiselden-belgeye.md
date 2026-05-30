@@ -10,7 +10,7 @@ modeli yüceltmek değil; ne zaman hangisinin doğru araç olduğunu görebilece
 muhakeme kazandırmaktır. Çünkü yanlış araçla iyi yapılmış bir iş, yine de yanlış
 iştir.
 
-![Şekil 3 — Aynı sipariş verisi: ilişkisel parçalama (join) ile belge gömme yan yana.](sekiller/03-gomme-referans.svg){width=80%}
+![Aynı sipariş verisi: ilişkisel parçalama (join) ile belge gömme yan yana.](sekiller/03-gomme-referans.svg){width=80%}
 
 ## Kral değil hizmetkâr: modeli erişim örüntüleri belirler
 

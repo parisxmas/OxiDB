@@ -8,7 +8,7 @@ alır: bir yazmanın gerçekten dayanıklı olduğundan emin olmak ve sistem en
 beklenmedik anda çökerse, enkazın içinden tutarlı biçimde geri dönmek. Bu,
 veritabanını basit bir dosyadan ayıran en derin farklardan biridir.
 
-![Şekil 6 — Önce-yaz günlüğü (WAL) akışı ve çökmeden kurtarma.](sekiller/06-wal.svg){width=80%}
+![Önce-yaz günlüğü (WAL) akışı ve çökmeden kurtarma.](sekiller/06-wal.svg){width=80%}
 
 ## "Yazdım" demek neden yetmez
 
@@ -109,7 +109,7 @@ WAL'ın asıl sınavı, çökmeden sonra verdiği vaattir. Sistem yeniden açıl
 veritabanı kendini tutarlı bir duruma getirmek zorundadır ve bunu günlüğü
 **okuyarak** yapar. Bu sürece **kurtarma** (recovery) denir. Bu kurtarma
 düzeninin klasik, etkili biçimi, veritabanı literatüründe ARIES yöntemi olarak
-bilinir (Mohan vd., 1992).
+bilinir.^[C. Mohan, D. Haderle, B. Lindsay, H. Pirahesh ve P. Schwarz, "ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging," *ACM TODS* 17(1), 1992.]
 
 Kurtarma şöyle ilerler. Veritabanı, günlüğü baştan tarar ve her kaydı inceler.
 Günlükte dayanıklı biçimde yer alan ama asıl veri dosyalarına henüz yansımamış

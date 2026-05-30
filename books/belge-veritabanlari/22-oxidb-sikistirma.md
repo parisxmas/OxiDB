@@ -8,7 +8,7 @@ kazanmak gerekir. Bu bölüm, OxiDB'nin bu temizlik işini — sıkıştırmayı
 güvenle nasıl yaptığını ve bu kitap yazılırken eklenen otomatik tetikleyicisini —
 ele alıyor. Sıkıştırma, append-only bir motorun ayrılmaz, sessiz bakım işidir.
 
-![Şekil 22 — Sıkıştırma: ölü alanın taze dosyaya kopyalanarak geri kazanılması.](sekiller/22-oxidb-sikistirma.svg){width=80%}
+![Sıkıştırma: ölü alanın taze dosyaya kopyalanarak geri kazanılması.](sekiller/22-oxidb-sikistirma.svg){width=80%}
 
 ## Ölü alan nereden gelir
 
