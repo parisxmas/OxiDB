@@ -45,7 +45,7 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 7. İndeksleme: B-ağacı indeksleri, bileşik indeksler, ters indeks ✅
 8. Sorgu işleme: ayrıştırma, planlama, indeks seçimi ✅
 9. Toplama (aggregation): pipeline modeli, gruplama, pencere fonksiyonları ✅
-10. İşlemler: ACID, izolasyon, kilitleme, MVCC ve OCC
+10. İşlemler: ACID, izolasyon, kilitleme, MVCC ve OCC ✅
 11. Eşzamanlılık ve tutarlılık
 12. Ölçeklendirme: replikasyon, konsensüs ve sharding
 13. Bellek, önbellek ve disk ödünleşimi
