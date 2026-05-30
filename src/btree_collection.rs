@@ -1292,9 +1292,13 @@ impl BTreeCollection {
                         true
                     };
 
+                    // `for_each_entry_*` (not `iter_asc`/`iter_desc`) so this
+                    // works in disk-first mode too — a disk-backed index's
+                    // `iter_asc` yields nothing, which previously made
+                    // index-backed sort silently return an empty result set.
                     match sort_order {
                         SortOrder::Asc => {
-                            'outer_asc: for (_value, doc_ids) in field_idx.iter_asc() {
+                            field_idx.for_each_entry_asc(|_value, doc_ids| {
                                 for &id in doc_ids {
                                     if use_index_check && !check_id(id) {
                                         continue;
@@ -1306,15 +1310,16 @@ impl BTreeCollection {
                                         {
                                             results.push(arc);
                                             if results.len() >= need {
-                                                break 'outer_asc;
+                                                return false;
                                             }
                                         }
                                     }
                                 }
-                            }
+                                true
+                            });
                         }
                         SortOrder::Desc => {
-                            'outer_desc: for (_value, doc_ids) in field_idx.iter_desc() {
+                            field_idx.for_each_entry_desc(|_value, doc_ids| {
                                 for &id in doc_ids.iter().rev() {
                                     if use_index_check && !check_id(id) {
                                         continue;
@@ -1326,12 +1331,13 @@ impl BTreeCollection {
                                         {
                                             results.push(arc);
                                             if results.len() >= need {
-                                                break 'outer_desc;
+                                                return false;
                                             }
                                         }
                                     }
                                 }
-                            }
+                                true
+                            });
                         }
                     }
 

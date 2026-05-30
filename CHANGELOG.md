@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Disk-first aggregation/scan/sort fixes (server 0.29.1)
+
+Profiling the 1M-doc benchmark in disk-first mode (`OXIDB_DISK_FIRST=1`) found
+three issues, all rooted in the same point — neither documents nor the
+index-only shortcut are resident, so each full scan re-materializes every doc
+from the mmap and the index-iteration fast paths were disabled.
+
+- **Index-only count `$group` restored on disk** (`pipeline::try_index_only_count`,
+  `PagedFieldIndex::for_each_entry_asc`). A count-only group-by on an indexed
+  field is near-instant in-RAM (reads posting-list sizes, zero doc reads) but
+  disk-backed indexes bailed (`if fi.is_disk() { return None }`) to a full
+  document scan. The fast path now iterates the mmap index via a
+  backend-agnostic callback. Measured: count-only group-by on a 200K disk-first
+  collection **1.56s → 86ms (~18×)**, matching the in-RAM path.
+
+- **Index-backed sort fixed on disk** (`btree_collection::find_with_options`).
+  `iter_asc`/`iter_desc` yield nothing for a disk-backed `PagedFieldIndex` (the
+  in-RAM `entries` Vec is empty), so `sort + limit` on an indexed field
+  **silently returned an empty result set** in disk-first mode. It now uses the
+  `for_each_entry_asc`/`for_each_entry_desc` callbacks (which read the mmap),
+  preserving early termination. Regression test:
+  `disk_first_soak::disk_first_indexed_sort_and_count_group` (runs in both modes).
+
+- **Zero-copy + sequential full-collection scan** (`Storage::for_each_payload`,
+  used by `BTreeStorage::for_each_value`). The scan now locks the read mmap once
+  and reads records in **data-file (offset) order** — a sequential,
+  readahead-friendly sweep instead of random index-order page faults — and for
+  records needing no decode (no encryption *and* not compressed) hands the
+  callback a slice **borrowed straight from the mmap** (no per-record `Vec`
+  allocation or memcpy). This benefits incompressible/large-doc and cold-cache
+  workloads; for collections of small *compressible* documents the scan stays
+  decompression-bound (every record carries a zstd frame, so the zero-copy path
+  doesn't apply) — closing that gap (uncompressed `.bdat` or a decoded-bytes
+  cache) is a tracked follow-up in ADR-0009.
+
 ### Automatic compaction trigger for disk-first storage (server 0.29.0)
 
 Compaction no longer has to be invoked by hand. The periodic maintenance path

@@ -1011,18 +1011,30 @@ impl BTreeStorage {
         if let Some(d) = &self.disk {
             let data = d.data.read();
             // Collect (key, loc) first — we can't read `data` while holding an
-            // index bucket guard. Order is arbitrary (matches in-RAM semantics).
+            // index bucket guard.
             let mut items: Vec<(u64, crate::storage::DocLocation)> = Vec::new();
             d.index.iter_sync(|k, loc| {
                 items.push((*k, *loc));
                 true
             });
-            for (key, loc) in items {
-                if let Ok(value) = data.read_lockfree(loc) {
-                    if !f(key, &value)? {
-                        return Ok(());
-                    }
+            // Read in data-file (offset) order so the scan is a sequential,
+            // readahead-friendly sweep rather than random index-order page
+            // faults. `for_each_payload` borrows directly from the mmap for
+            // records needing no decode (zero-copy) and locks the mmap once.
+            items.sort_unstable_by_key(|(_, loc)| loc.offset);
+            let locs: Vec<crate::storage::DocLocation> =
+                items.iter().map(|(_, loc)| *loc).collect();
+            let mut cb_err: Option<Error> = None;
+            data.for_each_payload(&locs, |i, bytes| match f(items[i].0, bytes) {
+                Ok(true) => Ok(true),
+                Ok(false) => Ok(false),
+                Err(e) => {
+                    cb_err = Some(e);
+                    Ok(false)
                 }
+            })?;
+            if let Some(e) = cb_err {
+                return Err(e);
             }
             return Ok(());
         }

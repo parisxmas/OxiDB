@@ -68,10 +68,12 @@ pub struct PagedFieldIndex {
     /// Disk-first backing (opt-in via `OXIDB_DISK_FIRST`). When `Some`, the
     /// index entries live in an mmap'd `.mfidx` file (paged in on demand) with
     /// a small in-memory write overlay, instead of the resident `entries` Vec.
-    /// Every method delegates to it; the public API is unchanged. `iter_asc`/
-    /// `iter_desc` are the exception — their borrow-vs-owned item types can't be
-    /// unified, so the count-only `$group` fast paths skip disk-backed indexes
-    /// (`is_disk()`) and fall back to the hashing path.
+    /// Every method delegates to it; the public API is unchanged. The borrowed
+    /// `iter_asc`/`iter_desc` iterators are in-RAM-only (their borrow-vs-owned
+    /// item types can't be unified with the mmap backend); the backend-agnostic
+    /// `for_each_entry_asc`/`for_each_entry_desc` callbacks work for both and
+    /// are what disk-first consumers (index-backed sort, count-only `$group`)
+    /// use.
     disk: Option<crate::mmap_field_index::MmapFieldIndex>,
 }
 
@@ -609,13 +611,64 @@ impl PagedFieldIndex {
     // -- Sorted iteration -----------------------------------------------------
 
     /// Iterate (value, doc_ids) in ascending order.
+    ///
+    /// In-RAM only — yields borrowed references into `entries`. For a
+    /// disk-backed index this yields nothing (`entries` is empty); use
+    /// [`for_each_entry_asc`](Self::for_each_entry_asc) instead, which works
+    /// for both backends.
     pub fn iter_asc(&self) -> impl Iterator<Item = (&IndexValue, &DocIdSet)> {
         self.entries.iter().map(|(k, v)| (k, v))
     }
 
-    /// Iterate (value, doc_ids) in descending order.
+    /// Iterate (value, doc_ids) in descending order. In-RAM only — see
+    /// [`iter_asc`](Self::iter_asc).
     pub fn iter_desc(&self) -> impl Iterator<Item = (&IndexValue, &DocIdSet)> {
         self.entries.iter().rev().map(|(k, v)| (k, v))
+    }
+
+    /// Iterate `(value, doc_ids)` in ascending order via a callback, working
+    /// for **both** the in-RAM and disk-backed backends. The in-RAM path lends
+    /// references straight from `entries` (no clone); the disk path reads the
+    /// mmap (merged with the write overlay) and lends references to each
+    /// materialized entry. The callback returns `false` to stop early.
+    ///
+    /// This is the backend-agnostic replacement for `iter_asc`/`iter_desc` —
+    /// consumers that must work in disk-first mode (index-backed sort, the
+    /// count-only `$group` fast path) use these.
+    pub fn for_each_entry_asc<F: FnMut(&IndexValue, &DocIdSet) -> bool>(&self, mut f: F) {
+        if let Some(m) = &self.disk {
+            for (val, ids) in m.iter_asc() {
+                if !f(&val, &ids) {
+                    return;
+                }
+            }
+            return;
+        }
+        for (k, v) in &self.entries {
+            if !f(k, v) {
+                return;
+            }
+        }
+    }
+
+    /// Iterate `(value, doc_ids)` in descending order via a callback. See
+    /// [`for_each_entry_asc`](Self::for_each_entry_asc). The disk path's
+    /// descending iterator is lazy (reads mmap entries from the end), so this
+    /// supports genuine early termination for `sort DESC + limit` queries.
+    pub fn for_each_entry_desc<F: FnMut(&IndexValue, &DocIdSet) -> bool>(&self, mut f: F) {
+        if let Some(m) = &self.disk {
+            for (val, ids) in m.iter_desc() {
+                if !f(&val, &ids) {
+                    return;
+                }
+            }
+            return;
+        }
+        for (k, v) in self.entries.iter().rev() {
+            if !f(k, v) {
+                return;
+            }
+        }
     }
 
     // -- Unique constraint check ---------------------------------------------

@@ -131,6 +131,34 @@ tracked separately).
 - A 1M-doc bench run in disk mode on a quiet box to confirm the RSS win and
   measure the read-latency trade-off end to end.
 
+### Aggregation / scan / sort fixes (2026-05-30)
+
+A 1M-doc benchmark in disk-first mode surfaced three issues — fixed in server
+0.29.1:
+
+- **Index-only count `$group`** bailed for disk-backed indexes
+  (`try_index_only_count` returned `None` on `is_disk()`), turning a zero-doc
+  index read into a full document scan. `PagedFieldIndex` gained backend-
+  agnostic `for_each_entry_asc`/`for_each_entry_desc` callbacks (the borrowed
+  `iter_asc`/`iter_desc` are in-RAM-only — a disk-backed index yields nothing
+  from them), and the fast path now uses them. Count-only group-by on a 200K
+  disk-first collection: **1.56s → 86ms (~18×)**.
+- **Index-backed sort silently returned empty in disk-first mode** — it used
+  `iter_asc`/`iter_desc`, which yield nothing for a disk-backed index, with no
+  fallback. Now uses the `for_each_entry_*` callbacks (mmap-reading,
+  early-terminating). Regressioned by
+  `disk_first_soak::disk_first_indexed_sort_and_count_group`.
+- **Full-collection scans** (`Storage::for_each_payload`) now lock the read mmap
+  once, read in **offset order** (sequential sweep, not random index-order
+  faults), and **borrow mmap bytes zero-copy** for records needing no decode.
+  Caveat: small *compressible* documents stay decompression-bound (each record
+  carries a zstd frame, so the zero-copy borrow doesn't trigger and every scan
+  re-decompresses) — the in-RAM store keeps raw bytes resident and pays none of
+  this. **Still TODO:** for the compressible-doc full-scan path, either store the
+  disk-first `.bdat` uncompressed (trade disk for scan speed — aligned with the
+  mode's low-*memory* goal) or keep a decoded-bytes cache, so `$avg`/`$sum`/full
+  group-bys stop re-decompressing the whole collection on every scan.
+
 ### Soak tests (done)
 
 `tests/disk_first_soak.rs` runs in both modes (set `OXIDB_DISK_FIRST=1` to soak

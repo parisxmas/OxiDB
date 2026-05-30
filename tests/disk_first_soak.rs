@@ -432,3 +432,72 @@ fn auto_compaction_bounds_file_size() {
         );
     }
 }
+
+/// Regression: index-backed sort + the index-only count `$group` fast path must
+/// work in **disk-first** mode. Before disk-backed indexes delegated iteration
+/// (`for_each_entry_asc`/`desc`), `iter_asc` returned nothing for a disk-backed
+/// `PagedFieldIndex`, so index-backed sort silently returned an empty result
+/// set and the count-only group fast path bailed to a full scan. Both are
+/// exercised here; this test runs in whichever mode the suite is launched in.
+#[test]
+fn disk_first_indexed_sort_and_count_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+    db.create_index("c", "score").unwrap();
+    db.create_index("c", "bucket").unwrap();
+
+    let n = 500u64;
+    let mut rng = Lcg(99);
+    let mut by_bucket: HashMap<i64, usize> = HashMap::new();
+    let mut all_scores: Vec<u64> = Vec::new();
+    for k in 0..n {
+        let score = rng.below(1000);
+        let bucket = (score % 8) as i64;
+        all_scores.push(score);
+        *by_bucket.entry(bucket).or_default() += 1;
+        db.insert("c", json!({ "k": k, "score": score as i64, "bucket": bucket }))
+            .unwrap();
+    }
+
+    // --- index-backed sort ASC + limit ---
+    let opts = serde_json::json!({ "sort": { "score": 1 }, "limit": 10 });
+    let opts = oxidb::query::parse_find_options(&opts).unwrap();
+    let asc = db.find_with_options("c", &json!({}), &opts).unwrap();
+    assert_eq!(asc.len(), 10, "indexed ASC sort must return results (not empty)");
+    let mut prev = i64::MIN;
+    for d in &asc {
+        let s = d["score"].as_i64().unwrap();
+        assert!(s >= prev, "ASC order violated: {s} after {prev}");
+        prev = s;
+    }
+    let mut sorted = all_scores.clone();
+    sorted.sort_unstable();
+    assert_eq!(asc[0]["score"].as_i64().unwrap() as u64, sorted[0], "smallest score first");
+
+    // --- index-backed sort DESC + limit ---
+    let opts = serde_json::json!({ "sort": { "score": -1 }, "limit": 10 });
+    let opts = oxidb::query::parse_find_options(&opts).unwrap();
+    let desc = db.find_with_options("c", &json!({}), &opts).unwrap();
+    assert_eq!(desc.len(), 10, "indexed DESC sort must return results (not empty)");
+    let mut prev = i64::MAX;
+    for d in &desc {
+        let s = d["score"].as_i64().unwrap();
+        assert!(s <= prev, "DESC order violated: {s} after {prev}");
+        prev = s;
+    }
+    assert_eq!(
+        desc[0]["score"].as_i64().unwrap() as u64,
+        *sorted.last().unwrap(),
+        "largest score first"
+    );
+
+    // --- index-only count $group (count-only on an indexed field) ---
+    let pipe = json!([{ "$group": { "_id": "$bucket", "n": { "$sum": 1 } } }]);
+    let groups = db.aggregate("c", &pipe).unwrap();
+    assert_eq!(groups.len(), by_bucket.len(), "one group per distinct bucket");
+    for g in &groups {
+        let b = g["_id"].as_i64().unwrap();
+        let n = g["n"].as_u64().unwrap() as usize;
+        assert_eq!(n, by_bucket[&b], "count-only group mismatch for bucket={b}");
+    }
+}

@@ -49,6 +49,15 @@ const LZ4_MAGIC: [u8; 4] = [0x04, 0x22, 0x4D, 0x18];
 #[cfg(not(target_arch = "wasm32"))]
 const ZSTD_LEVEL: i32 = 3;
 
+/// Whether a stored payload carries a zstd/lz4 frame header — i.e. it was
+/// stored compressed and must be decompressed on read. Used by the zero-copy
+/// scan path to decide whether it can borrow the mmap bytes directly.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn payload_is_compressed(data: &[u8]) -> bool {
+    data.len() >= 4 && (data[..4] == ZSTD_MAGIC || data[..4] == LZ4_MAGIC)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 thread_local! {
     static ZSTD_COMPRESSOR: std::cell::RefCell<zstd::bulk::Compressor<'static>> = std::cell::RefCell::new(
@@ -262,6 +271,84 @@ impl Storage {
         {
             self.read(loc)
         }
+    }
+
+    /// Scan the payloads at `locs` **in the given order**, locking the read
+    /// mmap once for the whole scan and invoking `f(index, bytes)` per record
+    /// (`index` is the position in `locs`). `f` returns `false` to stop early.
+    ///
+    /// Two wins over a per-record `read_lockfree` loop, which is why the
+    /// full-collection scan path (aggregation, unindexed find) uses this:
+    ///
+    /// - **Zero-copy** for records that need no decode (no encryption *and* not
+    ///   compressed): `f` receives a slice **borrowed straight from the mmap**,
+    ///   with no per-record `Vec` allocation or memcpy. Compressed/encrypted
+    ///   records are still decoded into an owned buffer.
+    /// - **Sequential access**: callers pass `locs` sorted by offset, turning
+    ///   the random per-record page faults of index-order traversal into a
+    ///   readahead-friendly forward sweep of the data file.
+    ///
+    /// Records past the live mmap (recent appends) fall back to `pread` into a
+    /// reused scratch buffer.
+    pub fn for_each_payload<F>(&self, locs: &[DocLocation], mut f: F) -> Result<()>
+    where
+        F: FnMut(usize, &[u8]) -> Result<bool>,
+    {
+        let guard = self.read_mmap.read();
+        let mmap = guard.as_ref();
+        let mmap_len = mmap.map_or(0u64, |m| m.len() as u64);
+        let encrypted = self.encryption.is_some();
+        let mut scratch: Vec<u8> = Vec::new();
+
+        for (i, loc) in locs.iter().enumerate() {
+            let data_start = loc
+                .offset
+                .checked_add(5)
+                .ok_or_else(|| storage_corrupt("document offset overflow"))?;
+            let data_end = data_start
+                .checked_add(loc.length as u64)
+                .ok_or_else(|| storage_corrupt("document length overflow"))?;
+
+            // Fast path: data is within the mmap.
+            if let Some(m) = mmap {
+                if data_end <= mmap_len {
+                    let raw = &m[data_start as usize..data_end as usize];
+                    if !encrypted && !payload_is_compressed(raw) {
+                        // Zero-copy: hand the mmap slice straight to the caller.
+                        if !f(i, raw)? {
+                            return Ok(());
+                        }
+                    } else {
+                        let decoded = self.decode_payload(raw)?;
+                        if !f(i, &decoded)? {
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Slow path: recent append beyond the mmap — pread into scratch.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                scratch.clear();
+                scratch.resize(loc.length as usize, 0);
+                self.read_file.read_at(&mut scratch, loc.offset + 5)?;
+                let decoded = self.decode_payload(&scratch)?;
+                if !f(i, &decoded)? {
+                    return Ok(());
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let decoded = self.read(*loc)?;
+                if !f(i, &decoded)? {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Batch-read multiple documents without the Mutex.

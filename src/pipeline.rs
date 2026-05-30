@@ -1809,12 +1809,6 @@ pub(crate) fn try_index_only_count(
     };
 
     let fi = field_indexes.get(group_field)?;
-    // The count-only fast path reads posting-list sizes via `iter_asc`, which
-    // a disk-backed index doesn't support transparently — fall back to the
-    // hashing group path for those.
-    if fi.is_disk() {
-        return None;
-    }
 
     // All accumulators must be count-only
     let is_count_only = accumulators.iter().all(|(_, acc)| {
@@ -1827,7 +1821,9 @@ pub(crate) fn try_index_only_count(
         return None;
     }
 
-    // Sum the per-key counts and, at the same time, count the *distinct*
+    // Single pass over the index entries (`for_each_entry_asc` works for both
+    // the in-RAM and disk-backed backends — disk-first no longer bails here).
+    // Collect the per-key counts and, at the same time, count the *distinct*
     // document ids. Each document should appear under exactly one key (the
     // index is single-key: arrays are stored as one stringified value, not
     // multikey). If `distinct < total_indexed`, some document is indexed under
@@ -1837,12 +1833,17 @@ pub(crate) fn try_index_only_count(
     // index-only fast path, so fall back to the hashing group path.
     let mut distinct_ids: std::collections::HashSet<DocumentId> = std::collections::HashSet::new();
     let mut total_indexed: usize = 0;
-    for (_, ids) in fi.iter_asc() {
-        total_indexed += ids.len();
-        for id in ids.iter() {
-            distinct_ids.insert(*id);
+    let mut per_key: Vec<(Value, u64)> = Vec::new();
+    fi.for_each_entry_asc(|idx_val, doc_ids| {
+        if !doc_ids.is_empty() {
+            total_indexed += doc_ids.len();
+            for id in doc_ids.iter() {
+                distinct_ids.insert(*id);
+            }
+            per_key.push((idx_val.to_json(), doc_ids.len() as u64));
         }
-    }
+        true
+    });
     if distinct_ids.len() != total_indexed {
         return None;
     }
@@ -1853,12 +1854,7 @@ pub(crate) fn try_index_only_count(
     }
 
     let mut results = Vec::new();
-    for (idx_val, doc_ids) in fi.iter_asc() {
-        if doc_ids.is_empty() {
-            continue;
-        }
-        let group_count = doc_ids.len() as u64;
-        let key_val = idx_val.to_json();
+    for (key_val, group_count) in per_key {
         let mut doc = Map::new();
         doc.insert("_id".to_string(), key_val);
         for (name, acc) in accumulators {
