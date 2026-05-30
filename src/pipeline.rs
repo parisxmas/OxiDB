@@ -229,6 +229,11 @@ enum Stage {
         extra_pairs: Vec<(String, String)>,
     },
     Out(String),
+    /// `$facet`: run several independent sub-pipelines over the **same** input
+    /// documents and emit one document whose fields are each sub-pipeline's
+    /// result array. Used for one-pass multi-faceted analytics (faceted search,
+    /// dashboards). Each entry is `(output_field, sub_pipeline)`.
+    Facet(Vec<(String, Pipeline)>),
     /// Synthetic post-processing stage emitted by `$dateHistogram` when
     /// the user requests `min_doc_count: 0`. Walks the bucket list
     /// output by the preceding `$group`, parses each `_id` as a date,
@@ -246,6 +251,7 @@ enum Stage {
 // Pipeline
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 pub struct Pipeline {
     stages: Vec<Stage>,
 }
@@ -1698,6 +1704,32 @@ fn exec_count(docs: Vec<Value>, field_name: &str) -> Vec<Value> {
     vec![json!({ field_name: docs.len() })]
 }
 
+/// `$facet`: run each sub-pipeline over the same input documents and emit a
+/// single document mapping each field name to its sub-pipeline's result array.
+/// The input is buffered (it's already an in-memory `Vec<Value>` at this point),
+/// so the sub-pipelines re-process it without re-scanning storage; each gets its
+/// own clone of the input.
+fn exec_facet<F>(docs: Vec<Value>, facets: &[(String, Pipeline)], lookup_fn: &F) -> Result<Vec<Value>>
+where
+    F: Fn(&str, &Value) -> Result<Vec<Value>>,
+{
+    let mut out = Map::new();
+    let n = facets.len();
+    let mut docs = Some(docs);
+    for (i, (name, sub)) in facets.iter().enumerate() {
+        // Each sub-pipeline gets its own copy of the input; move it into the
+        // last one to avoid a final needless clone.
+        let input = if i + 1 == n {
+            docs.take().unwrap()
+        } else {
+            docs.as_ref().unwrap().clone()
+        };
+        let result = sub.execute_from(0, input, lookup_fn)?;
+        out.insert(name.clone(), Value::Array(result));
+    }
+    Ok(vec![Value::Object(out)])
+}
+
 fn exec_unwind(docs: Vec<Value>, path: &str, preserve_null: bool) -> Vec<Value> {
     let mut result = Vec::new();
     for doc in docs {
@@ -2762,6 +2794,35 @@ impl Pipeline {
                     })?;
                     Stage::Out(coll.to_string())
                 }
+                "$facet" => {
+                    let obj = stage_body.as_object().ok_or_else(|| {
+                        Error::InvalidPipeline("$facet must be an object of sub-pipelines".into())
+                    })?;
+                    if obj.is_empty() {
+                        return Err(Error::InvalidPipeline(
+                            "$facet must define at least one field".into(),
+                        ));
+                    }
+                    let mut facets = Vec::with_capacity(obj.len());
+                    for (name, sub_arr) in obj {
+                        if !sub_arr.is_array() {
+                            return Err(Error::InvalidPipeline(format!(
+                                "$facet field '{name}' must be an array of stages"
+                            )));
+                        }
+                        let sub = Pipeline::parse(sub_arr)?;
+                        // A facet sub-pipeline operates on a buffered, in-memory
+                        // document set; $facet (nesting) and $out (side effect)
+                        // are disallowed inside it, matching MongoDB.
+                        if sub.contains_facet_or_out() {
+                            return Err(Error::InvalidPipeline(format!(
+                                "$facet sub-pipeline '{name}' may not contain $facet or $out"
+                            )));
+                        }
+                        facets.push((name.clone(), sub));
+                    }
+                    Stage::Facet(facets)
+                }
                 _ => {
                     return Err(Error::InvalidPipeline(format!(
                         "unknown stage: {}",
@@ -2925,6 +2986,7 @@ impl Pipeline {
                     // The pipeline returns the docs; the engine writes them to the target collection.
                     current
                 }
+                Stage::Facet(facets) => exec_facet(current, facets, lookup_fn)?,
                 Stage::DateBucketFill {
                     interval,
                     count_field,
@@ -2933,6 +2995,14 @@ impl Pipeline {
             };
         }
         Ok(current)
+    }
+
+    /// Whether the pipeline contains a `$facet` or `$out` stage (used to reject
+    /// these inside a `$facet` sub-pipeline).
+    fn contains_facet_or_out(&self) -> bool {
+        self.stages
+            .iter()
+            .any(|s| matches!(s, Stage::Facet(_) | Stage::Out(_)))
     }
 
     /// If the last stage is $out, return the target collection name.
@@ -2956,6 +3026,58 @@ mod tests {
     /// Helper: no-op lookup function for tests that don't use $lookup
     fn no_lookup(_col: &str, _q: &Value) -> Result<Vec<Value>> {
         Ok(vec![])
+    }
+
+    #[test]
+    fn facet_runs_subpipelines_over_same_input() {
+        let docs = vec![
+            json!({"cat": "a", "price": 10}),
+            json!({"cat": "b", "price": 20}),
+            json!({"cat": "a", "price": 30}),
+            json!({"cat": "c", "price": 40}),
+        ];
+        let p = Pipeline::parse(&json!([
+            { "$facet": {
+                "byCat": [
+                    { "$group": { "_id": "$cat", "n": { "$sum": 1 } } },
+                    { "$sort": { "_id": 1 } }
+                ],
+                "total": [ { "$count": "n" } ],
+                "top2": [ { "$sort": { "price": -1 } }, { "$limit": 2 } ]
+            } }
+        ]))
+        .unwrap();
+
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out.len(), 1, "$facet emits exactly one document");
+        let d = &out[0];
+
+        // byCat: a=2, b=1, c=1, sorted by _id
+        let by = d["byCat"].as_array().unwrap();
+        assert_eq!(by.len(), 3);
+        assert_eq!(by[0]["_id"], "a");
+        assert_eq!(by[0]["n"], 2);
+
+        // total.n = 4
+        assert_eq!(d["total"][0]["n"], 4);
+
+        // top2: highest two prices
+        let top = d["top2"].as_array().unwrap();
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0]["price"], 40);
+        assert_eq!(top[1]["price"], 30);
+    }
+
+    #[test]
+    fn facet_rejects_nesting_and_out_and_bad_shape() {
+        // nested $facet
+        assert!(Pipeline::parse(&json!([{ "$facet": { "x": [{ "$facet": { "y": [] } }] } }])).is_err());
+        // $out inside a facet
+        assert!(Pipeline::parse(&json!([{ "$facet": { "x": [{ "$out": "z" }] } }])).is_err());
+        // empty $facet
+        assert!(Pipeline::parse(&json!([{ "$facet": {} }])).is_err());
+        // non-array sub-pipeline
+        assert!(Pipeline::parse(&json!([{ "$facet": { "x": 5 } }])).is_err());
     }
 
     // -----------------------------------------------------------------------

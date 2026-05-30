@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Aggregation: `$facet` stage (server 0.30.4)
+
+New `$facet` aggregation stage — runs several independent sub-pipelines over the
+**same** input documents in one pass and emits a single document whose fields
+are each sub-pipeline's result array. The one-pass primitive behind faceted
+search and dashboards (e.g. results + per-category counts + price buckets +
+top-N from a single query, instead of N separate scans):
+
+```json
+[{ "$match": { "inStock": true } },
+ { "$facet": {
+     "byCategory": [{ "$group": { "_id": "$category", "n": { "$sum": 1 } } }],
+     "top5":       [{ "$sort": { "rating": -1 } }, { "$limit": 5 } ],
+     "total":      [{ "$count": "n" }]
+ } }]
+```
+
+Each sub-pipeline is parsed/executed by the existing pipeline engine over a copy
+of the (already-buffered, in-memory) input — no extra storage scans; the input
+is moved into the last sub-pipeline to avoid one clone. Nested `$facet` and
+`$out` inside a sub-pipeline are rejected (as in MongoDB), as are empty/non-array
+specs. Works on every aggregation path (the Arc executor delegates `$facet` to
+the owned-value executor). Tested at the pipeline level and end-to-end over the
+wire (`$match` → `$facet` with group/count/sort+limit sub-pipelines).
+
 ### `create_collection_with_options` in the .NET and JS clients (server 0.30.3)
 
 Mirrors the Python/Go helpers in the remaining first-party clients.
