@@ -54,6 +54,33 @@ kavrayamazsınız. Bu yüzden bölümleri sırayla okumanız önerilir. Yine de 
 bölüm, kendi başına da anlamlı olacak şekilde, gerektiğinde önceki kavramları
 kısaca hatırlatarak yazılmıştır.
 
+## Yazardan bir not: OxiDB ve bu kitap {-}
+
+Bu kitabın üçüncü kısmında adım adım incelenen sistem, OxiDB, benim — Barış
+AKIN'ın — sıfırdan tasarlayıp yazmaya başladığım bir belge veritabanı motorudur.
+OxiDB'yi yazmaya başladığım günden bu yana, bir veritabanının içinde verdiğim her
+kararın — verinin diske nasıl yerleştiğinden bir çökmeden nasıl geri dönüleceğine,
+bir indeksin nasıl yapılandırılacağından bir işlemin tutarlılığının nasıl
+korunacağına kadar — kitabın ikinci kısmında anlatılan o soyut ilkelerin somut
+bir karşılığı olduğunu gördüm. Bu kitap, işte o deneyimden doğdu.
+
+OxiDB'nin geliştirilmesi, yalnız bir uğraş da değildi. Sistemin kodu, Anthropic'in
+yapay zekâ modelleriyle — Claude'un Opus serisiyle — birlikte, bir eşlik ve
+yardımlaşma içinde yazıldı. Mimari kararlar tartışıldı, ödünleşimler birlikte
+değerlendirildi, kod birlikte üretildi ve sınandı. Bu kitabın iki yazarlı oluşu
+(Barış AKIN ve Anthropic) da bu ortak çalışmanın doğal bir yansımasıdır.
+
+Önemli bir noktanın altını çizmek isterim: bu kitap, OxiDB'nin **gerçek kod
+tabanına** (codebase) dayanılarak yazılmıştır. Üçüncü kısımda OxiDB hakkında
+okuyacağınız her mekanizma — depolama biçimleri, yazma-öncesi günlüğün kayıt
+düzeni, indeks yapıları, iyimser eşzamanlılık denetimi, sıkıştırma, küme
+replikasyonu — bir tasarım niyetinden ya da tanıtım metninden değil, sistemin o an
+çalışan kaynağından alınmış ve ona karşı doğrulanmıştır. Bir ödünleşim
+anlatıldığında o ödünleşim gerçekten verilmiştir; bir sayı verildiğinde o sayı
+gerçekten ölçülmüştür. Amacım, kavram ile çalışan kod arasındaki mesafeyi tümüyle
+kapatmaktı — okuduğunuz ilke ile onu hayata geçiren satırlar arasında hiçbir
+kopukluk kalmasın diye.
+
 ## Kitabın düzeni {-}
 
 Kitap üç kısma ayrılır. **Birinci Kısım** temelleri kurar: veri ve veritabanı
