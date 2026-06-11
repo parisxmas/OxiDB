@@ -15,7 +15,7 @@
 //! }
 //! ```
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ─── Tokens ─────────────────────────────────────────────────────────
 
@@ -242,7 +242,10 @@ impl Lexer {
                     self.advance();
                     Ok(Token::And)
                 } else {
-                    Err(format!("line {}: unexpected '&', did you mean '&&'?", self.line))
+                    Err(format!(
+                        "line {}: unexpected '&', did you mean '&&'?",
+                        self.line
+                    ))
                 }
             }
             '|' => {
@@ -250,7 +253,10 @@ impl Lexer {
                     self.advance();
                     Ok(Token::Or)
                 } else {
-                    Err(format!("line {}: unexpected '|', did you mean '||'?", self.line))
+                    Err(format!(
+                        "line {}: unexpected '|', did you mean '||'?",
+                        self.line
+                    ))
                 }
             }
             _ => Err(format!("line {}: unexpected character '{}'", self.line, ch)),
@@ -508,10 +514,7 @@ impl Parser {
 
     fn parse_return(&mut self) -> Result<Stmt, String> {
         self.advance(); // return
-        if matches!(
-            self.peek(),
-            Token::RBrace | Token::Semicolon | Token::Eof
-        ) {
+        if matches!(self.peek(), Token::RBrace | Token::Semicolon | Token::Eof) {
             Ok(Stmt::Return(None))
         } else {
             Ok(Stmt::Return(Some(self.parse_expr()?)))
@@ -520,10 +523,7 @@ impl Parser {
 
     fn parse_abort(&mut self) -> Result<Stmt, String> {
         self.advance(); // abort
-        if matches!(
-            self.peek(),
-            Token::RBrace | Token::Semicolon | Token::Eof
-        ) {
+        if matches!(self.peek(), Token::RBrace | Token::Semicolon | Token::Eof) {
             Ok(Stmt::Abort(None))
         } else {
             Ok(Stmt::Abort(Some(self.parse_expr()?)))
@@ -925,7 +925,12 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_let(&mut self, name: &str, expr: &Expr, steps: &mut Vec<Value>) -> Result<(), String> {
+    fn compile_let(
+        &mut self,
+        name: &str,
+        expr: &Expr,
+        steps: &mut Vec<Value>,
+    ) -> Result<(), String> {
         match expr {
             Expr::Call(func, args) if DB_FUNCTIONS.contains(&func.as_str()) => {
                 let mut step = self.compile_db_call(func, args)?;
@@ -1007,7 +1012,9 @@ impl Compiler {
                 }
                 let query = self.compile_expr(&args[1])?;
                 let update = self.compile_expr(&args[2])?;
-                Ok(json!({"step": func, "collection": collection, "query": query, "update": update}))
+                Ok(
+                    json!({"step": func, "collection": collection, "query": query, "update": update}),
+                )
             }
             "delete" | "delete_one" => {
                 let collection = self.expect_string_arg(args, 0, func)?;
@@ -1089,7 +1096,10 @@ impl Compiler {
     fn expect_string_arg(&self, args: &[Expr], idx: usize, func: &str) -> Result<String, String> {
         match args.get(idx) {
             Some(Expr::Str(s)) => Ok(s.clone()),
-            Some(_) => Err(format!("{}: argument {} must be a string literal", func, idx)),
+            Some(_) => Err(format!(
+                "{}: argument {} must be a string literal",
+                func, idx
+            )),
             None => Err(format!("{}: missing argument {}", func, idx)),
         }
     }
@@ -1238,16 +1248,26 @@ impl Compiler {
                     BinOp::GtEq => "$gte",
                     BinOp::Eq => "$eq",
                     BinOp::Neq => "$ne",
-                    BinOp::And => return Ok(json!({"$and": [self.compile_condition(left)?, self.compile_condition(right)?]})),
-                    BinOp::Or => return Ok(json!({"$or": [self.compile_condition(left)?, self.compile_condition(right)?]})),
-                    _ => return Ok(json!({"$expr": {match op {
+                    BinOp::And => {
+                        return Ok(
+                            json!({"$and": [self.compile_condition(left)?, self.compile_condition(right)?]}),
+                        );
+                    }
+                    BinOp::Or => {
+                        return Ok(
+                            json!({"$or": [self.compile_condition(left)?, self.compile_condition(right)?]}),
+                        );
+                    }
+                    _ => {
+                        return Ok(json!({"$expr": {match op {
                         BinOp::Add => "$add",
                         BinOp::Sub => "$subtract",
                         BinOp::Mul => "$multiply",
                         BinOp::Div => "$divide",
                         BinOp::Mod => "$mod",
                         _ => unreachable!(),
-                    }: [l, r]}})),
+                    }: [l, r]}}));
+                    }
                 };
                 Ok(json!({"$expr": {op_str: [l, r]}}))
             }
@@ -1681,7 +1701,11 @@ mod tests {
         assert_eq!(tokens[1], Token::DollarIdent("$set".into()));
         assert_eq!(tokens[2], Token::Colon);
         assert_eq!(tokens[3], Token::LBrace);
-        assert!(tokens.iter().any(|t| *t == Token::DollarIdent("$inc".into())));
+        assert!(
+            tokens
+                .iter()
+                .any(|t| *t == Token::DollarIdent("$inc".into()))
+        );
     }
 
     #[test]

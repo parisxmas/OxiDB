@@ -132,7 +132,10 @@ impl ArchiveSequencer {
         while gsn >= self.leased_through.load(Ordering::Acquire) {
             self.extend_lease()?;
         }
-        Ok(WalMeta { gsn, wall_clock_micros: now_micros() })
+        Ok(WalMeta {
+            gsn,
+            wall_clock_micros: now_micros(),
+        })
     }
 
     /// Persist a higher ceiling. Serialized by `state`; idempotent — a
@@ -202,7 +205,11 @@ pub struct BaseMeta {
 impl BaseMeta {
     /// A fresh watermark for `base_gsn`, stamped with the current wall-clock.
     pub fn new(base_gsn: u64) -> Self {
-        Self { format_version: BASE_META_VERSION, base_gsn, base_wall_clock: now_micros() }
+        Self {
+            format_version: BASE_META_VERSION,
+            base_gsn,
+            base_wall_clock: now_micros(),
+        }
     }
 
     /// Write `base.meta` into `dir`, atomically (`tmp -> fsync -> rename
@@ -274,7 +281,10 @@ mod tests {
         // block, so the next run starts past it).
         let seq2 = ArchiveSequencer::open(dir.path()).unwrap();
         let g = seq2.next().unwrap().gsn;
-        assert!(g > GSN_LEASE, "expected resume past the reserved lease, got {g}");
+        assert!(
+            g > GSN_LEASE,
+            "expected resume past the reserved lease, got {g}"
+        );
     }
 
     #[test]
@@ -298,10 +308,15 @@ mod tests {
         for _ in 0..8 {
             let seq = Arc::clone(&seq);
             handles.push(std::thread::spawn(move || {
-                (0..500).map(|_| seq.next().unwrap().gsn).collect::<Vec<_>>()
+                (0..500)
+                    .map(|_| seq.next().unwrap().gsn)
+                    .collect::<Vec<_>>()
             }));
         }
-        let mut all: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        let mut all: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
         all.sort_unstable();
         let before = all.len();
         all.dedup();

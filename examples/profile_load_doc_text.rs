@@ -28,11 +28,15 @@ fn gen_medium(i: usize) -> serde_json::Value {
     })
 }
 fn gen_large(i: usize) -> serde_json::Value {
-    let events: Vec<_> = (0..50).map(|k| json!({
-        "type": "click", "ts": 1715000000000_i64 + k as i64 * 1000,
-        "url": format!("/page/{}", k), "duration_ms": (k as f64) * 1.7,
-        "user_agent": "Mozilla/5.0",
-    })).collect();
+    let events: Vec<_> = (0..50)
+        .map(|k| {
+            json!({
+                "type": "click", "ts": 1715000000000_i64 + k as i64 * 1000,
+                "url": format!("/page/{}", k), "duration_ms": (k as f64) * 1.7,
+                "user_agent": "Mozilla/5.0",
+            })
+        })
+        .collect();
     json!({
         "_id": i as u64,
         "user": format!("user-{}", i),
@@ -84,7 +88,9 @@ fn run(label: &str, n_docs: usize, mut make: impl FnMut(usize) -> serde_json::Va
     let cold_b = t0.elapsed().as_nanos() as f64 / (iters * n_docs) as f64;
 
     // Strategy A-HOT: cache warm + load_doc_arc + serialize
-    for &id in &ids { let _ = col.load_doc_arc(id); }
+    for &id in &ids {
+        let _ = col.load_doc_arc(id);
+    }
     let t0 = Instant::now();
     for _ in 0..iters {
         for &id in &ids {
@@ -105,10 +111,22 @@ fn run(label: &str, n_docs: usize, mut make: impl FnMut(usize) -> serde_json::Va
     }
     let hot_b = t0.elapsed().as_nanos() as f64 / (iters * n_docs) as f64;
 
-    println!("  {:<35} {:>10} {:>10} {:>10}", "strategy", "cold ns/op", "hot ns/op", "(cold ×)");
+    println!(
+        "  {:<35} {:>10} {:>10} {:>10}",
+        "strategy", "cold ns/op", "hot ns/op", "(cold ×)"
+    );
     println!("  {}", "-".repeat(70));
-    println!("  {:<35} {:>10.0} {:>10.0} {:>10}", "A: load_doc_arc + to_string", cold_a, hot_a, "1.00x");
-    println!("  {:<35} {:>10.0} {:>10.0} {:>10.2}x", "B: load_doc_text (new)", cold_b, hot_b, cold_a / cold_b);
+    println!(
+        "  {:<35} {:>10.0} {:>10.0} {:>10}",
+        "A: load_doc_arc + to_string", cold_a, hot_a, "1.00x"
+    );
+    println!(
+        "  {:<35} {:>10.0} {:>10.0} {:>10.2}x",
+        "B: load_doc_text (new)",
+        cold_b,
+        hot_b,
+        cold_a / cold_b
+    );
 }
 
 fn main() {

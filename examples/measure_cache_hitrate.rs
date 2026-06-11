@@ -126,7 +126,11 @@ fn run_workload(
 
     let stats = col.doc_cache_stats();
     let total = stats.hits + stats.misses;
-    let hit_ratio = if total == 0 { 0.0 } else { stats.hits as f64 / total as f64 };
+    let hit_ratio = if total == 0 {
+        0.0
+    } else {
+        stats.hits as f64 / total as f64
+    };
     let ns_per_op = elapsed_ns / queries as f64;
     (hit_ratio, ns_per_op)
 }
@@ -143,8 +147,16 @@ fn main() {
     let configs: &[(usize, usize, &str)] = &[
         (1_000, 10_000, "working set << cache (1K docs, cap 10K)"),
         (10_000, 10_000, "working set ~ cache (10K docs, cap 10K)"),
-        (100_000, 10_000, "working set 10× cache (100K docs, cap 10K)"),
-        (1_000_000, 10_000, "working set 100× cache (1M docs, cap 10K)"),
+        (
+            100_000,
+            10_000,
+            "working set 10× cache (100K docs, cap 10K)",
+        ),
+        (
+            1_000_000,
+            10_000,
+            "working set 100× cache (1M docs, cap 10K)",
+        ),
     ];
 
     let skews = [0.7, 1.0, 1.2, 1.5];
@@ -162,7 +174,11 @@ fn main() {
         col.set_cache_capacity(*cache_cap);
         let t_pop = Instant::now();
         let ids = populate_collection(&col, *n_docs);
-        println!("  populated {} docs in {:.1}s", n_docs, t_pop.elapsed().as_secs_f64());
+        println!(
+            "  populated {} docs in {:.1}s",
+            n_docs,
+            t_pop.elapsed().as_secs_f64()
+        );
         std::io::stdout().flush().ok();
         // Force cold cache for the actual measurement.
         col.doc_cache_clear();

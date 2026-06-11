@@ -72,10 +72,8 @@ pub fn deserialize_message(msg: &[u8]) -> Result<(serde_json::Value, WireFormat)
         WireFormat::MsgPack => {
             rmp_serde::from_slice(msg).map_err(|e| format!("invalid MsgPack: {e}"))?
         }
-        WireFormat::OxiWire => {
-            crate::oxiwire::decode_request(msg)
-                .map_err(|e| format!("invalid OxiWire request: {e}"))?
-        }
+        WireFormat::OxiWire => crate::oxiwire::decode_request(msg)
+            .map_err(|e| format!("invalid OxiWire request: {e}"))?,
     };
     Ok((value, format))
 }

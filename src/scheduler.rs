@@ -1,7 +1,7 @@
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::engine::OxiDb;
 use crate::error::{Error, Result};
@@ -13,11 +13,11 @@ use crate::error::{Error, Result};
 /// A parsed 5-field cron expression.
 /// Each field holds the sorted set of allowed values.
 pub struct CronExpr {
-    pub minutes: Vec<u8>,  // 0-59
-    pub hours: Vec<u8>,    // 0-23
-    pub doms: Vec<u8>,     // 1-31  (day of month)
-    pub months: Vec<u8>,   // 1-12
-    pub dows: Vec<u8>,     // 0-6   (0 = Sunday)
+    pub minutes: Vec<u8>, // 0-59
+    pub hours: Vec<u8>,   // 0-23
+    pub doms: Vec<u8>,    // 1-31  (day of month)
+    pub months: Vec<u8>,  // 1-12
+    pub dows: Vec<u8>,    // 0-6   (0 = Sunday)
 }
 
 /// Parse a 5-field cron expression string.
@@ -234,7 +234,7 @@ pub fn scheduler_loop(db: Arc<OxiDb>, rx: mpsc::Receiver<()>) {
     loop {
         // Sleep 1 second, checking for shutdown
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(()) => break,   // explicit shutdown signal
+            Ok(()) => break,                                    // explicit shutdown signal
             Err(mpsc::RecvTimeoutError::Disconnected) => break, // sender dropped
             Err(mpsc::RecvTimeoutError::Timeout) => {}          // normal tick
         }
@@ -278,11 +278,7 @@ pub fn scheduler_loop(db: Arc<OxiDb>, rx: mpsc::Receiver<()>) {
             let last_run_iso = epoch_to_iso(now_epoch);
 
             // Update the schedule record
-            let run_count = sched
-                .get("run_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-                + 1;
+            let run_count = sched.get("run_count").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
 
             let _ = db.update(
                 "_schedules",
@@ -457,8 +453,8 @@ mod tests {
     fn cron_matches_weekday() {
         // Only Monday (1) through Friday (5)
         let expr = parse_cron("0 9 * * 1-5").unwrap();
-        assert!(cron_matches(&expr, 0, 9, 1, 1, 1));  // Monday
-        assert!(cron_matches(&expr, 0, 9, 1, 1, 5));  // Friday
+        assert!(cron_matches(&expr, 0, 9, 1, 1, 1)); // Monday
+        assert!(cron_matches(&expr, 0, 9, 1, 1, 5)); // Friday
         assert!(!cron_matches(&expr, 0, 9, 1, 1, 0)); // Sunday
         assert!(!cron_matches(&expr, 0, 9, 1, 1, 6)); // Saturday
     }
@@ -557,7 +553,7 @@ mod tests {
         assert_eq!(parts.0, 30); // minute
         assert_eq!(parts.1, 15); // hour
         assert_eq!(parts.2, 20); // day
-        assert_eq!(parts.3, 2);  // month
+        assert_eq!(parts.3, 2); // month
         // 2026-02-20 is a Friday => dow = 5
         assert_eq!(parts.4, 5);
     }
@@ -571,10 +567,10 @@ mod tests {
     #[test]
     fn epoch_unix_epoch() {
         let parts = epoch_to_parts(0);
-        assert_eq!(parts.0, 0);  // minute
-        assert_eq!(parts.1, 0);  // hour
-        assert_eq!(parts.2, 1);  // Jan 1
-        assert_eq!(parts.3, 1);  // January
-        assert_eq!(parts.4, 4);  // Thursday
+        assert_eq!(parts.0, 0); // minute
+        assert_eq!(parts.1, 0); // hour
+        assert_eq!(parts.2, 1); // Jan 1
+        assert_eq!(parts.3, 1); // January
+        assert_eq!(parts.4, 4); // Thursday
     }
 }

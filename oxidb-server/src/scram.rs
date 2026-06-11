@@ -115,10 +115,10 @@ impl ScramState {
             .ok_or_else(|| "user has SCRAM salt but no server_key".to_string())?;
 
         let salt = base64_decode_simple(salt_b64).map_err(|e| format!("decode salt: {}", e))?;
-        let stored_key =
-            base64_decode_simple(stored_key_b64).map_err(|e| format!("decode stored_key: {}", e))?;
-        let server_key =
-            base64_decode_simple(server_key_b64).map_err(|e| format!("decode server_key: {}", e))?;
+        let stored_key = base64_decode_simple(stored_key_b64)
+            .map_err(|e| format!("decode stored_key: {}", e))?;
+        let server_key = base64_decode_simple(server_key_b64)
+            .map_err(|e| format!("decode server_key: {}", e))?;
 
         // Generate server nonce
         let server_nonce = generate_nonce();
@@ -127,10 +127,7 @@ impl ScramState {
         // client-first-message-bare (without GS2 header)
         let client_first_bare = msg.to_string();
 
-        let server_first = format!(
-            "r={},s={},i={}",
-            combined_nonce, salt_b64, iter_count
-        );
+        let server_first = format!("r={},s={},i={}", combined_nonce, salt_b64, iter_count);
 
         let auth_message = format!(
             "{},{},c=biws,r={}",

@@ -29,8 +29,8 @@ impl OxiDbAdapter {
     /// fails fast at `link_collection` time rather than at the first
     /// query.
     pub fn from_url(url: &str) -> Result<Self, String> {
-        let remote = remote_client::parse_remote(url)
-            .map_err(|e| format!("parse oxidb link URL: {}", e))?;
+        let remote =
+            remote_client::parse_remote(url).map_err(|e| format!("parse oxidb link URL: {}", e))?;
         Ok(Self { remote })
     }
 }

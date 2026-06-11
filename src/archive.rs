@@ -159,9 +159,13 @@ pub fn archive_pass(
 /// Load the archive manifest, or an empty one if it does not exist yet.
 pub fn load_manifest(archive_dir: &Path) -> Result<Manifest> {
     match fs::read(archive_dir.join(MANIFEST_FILE)) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map_err(|e| Error::Io(std::io::Error::other(e))),
-        Err(_) => Ok(Manifest { format_version: MANIFEST_VERSION, segments: Vec::new() }),
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).map_err(|e| Error::Io(std::io::Error::other(e)))
+        }
+        Err(_) => Ok(Manifest {
+            format_version: MANIFEST_VERSION,
+            segments: Vec::new(),
+        }),
     }
 }
 
@@ -188,7 +192,9 @@ pub fn prune_archive(archive_dir: &Path, retention_hours: u64) -> Result<usize> 
     }
     let segments_dir = archive_dir.join(SEGMENTS_DIR);
     let cutoff = crate::pitr::now_micros().saturating_sub(
-        retention_hours.saturating_mul(3600).saturating_mul(1_000_000),
+        retention_hours
+            .saturating_mul(3600)
+            .saturating_mul(1_000_000),
     );
     let mut pruned = 0;
     if let Ok(rd) = fs::read_dir(&segments_dir) {
@@ -294,7 +300,9 @@ pub fn replay_into(
 ) -> Result<ReplayOutcome> {
     // The base's GSN watermark — 0 / absent means the base predates PITR;
     // the restore then degrades to whatever the base + archive hold.
-    let _base_gsn = BaseMeta::read_from(target_dir)?.map(|m| m.base_gsn).unwrap_or(0);
+    let _base_gsn = BaseMeta::read_from(target_dir)?
+        .map(|m| m.base_gsn)
+        .unwrap_or(0);
 
     // 1. Gather every WAL record per collection: from the base's own WAL
     //    files in target_dir, and from the archived sealed segments.
@@ -382,7 +390,12 @@ pub fn replay_into(
     // 5. Drop derived/stale state so `OxiDb::open` rebuilds it cleanly.
     drop_derived_state(target_dir);
 
-    Ok(ReplayOutcome { target_gsn, records_applied, records_skipped, collections })
+    Ok(ReplayOutcome {
+        target_gsn,
+        records_applied,
+        records_skipped,
+        collections,
+    })
 }
 
 // -----------------------------------------------------------------------
@@ -502,8 +515,13 @@ fn archive_one(
     let (start_gsn, end_gsn, start_wc, end_wc) = gsn_time_range(&records);
     let content_crc = crc32(&wal_bytes);
     let trailer = build_trailer(
-        start_gsn, end_gsn, start_wc, end_wc,
-        records.len() as u64, wal_bytes.len() as u64, content_crc,
+        start_gsn,
+        end_gsn,
+        start_wc,
+        end_wc,
+        records.len() as u64,
+        wal_bytes.len() as u64,
+        content_crc,
     );
 
     let tmp_path = segments_dir.join(format!("{name}.seg.tmp"));
@@ -537,11 +555,18 @@ fn rebuild_manifest(archive_dir: &Path, segments_dir: &Path) -> Result<()> {
             }
         }
     }
-    segments.sort_by(|a, b| a.start_gsn.cmp(&b.start_gsn).then(a.original.cmp(&b.original)));
+    segments.sort_by(|a, b| {
+        a.start_gsn
+            .cmp(&b.start_gsn)
+            .then(a.original.cmp(&b.original))
+    });
 
-    let manifest = Manifest { format_version: MANIFEST_VERSION, segments };
-    let json = serde_json::to_vec_pretty(&manifest)
-        .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    let manifest = Manifest {
+        format_version: MANIFEST_VERSION,
+        segments,
+    };
+    let json =
+        serde_json::to_vec_pretty(&manifest).map_err(|e| Error::Io(std::io::Error::other(e)))?;
 
     let tmp = archive_dir.join(format!("{MANIFEST_FILE}.tmp"));
     {
@@ -650,7 +675,14 @@ fn build_trailer(
     content_crc: u32,
 ) -> Vec<u8> {
     let mut t = Vec::with_capacity(TRAILER_SIZE as usize);
-    for v in [start_gsn, end_gsn, start_wc, end_wc, record_count, wal_byte_len] {
+    for v in [
+        start_gsn,
+        end_gsn,
+        start_wc,
+        end_wc,
+        record_count,
+        wal_byte_len,
+    ] {
         t.extend_from_slice(&v.to_le_bytes());
     }
     t.extend_from_slice(&content_crc.to_le_bytes());
@@ -787,9 +819,16 @@ mod tests {
 
         // The archived file is the verbatim WAL bytes + a 56-byte trailer.
         assert_eq!(&archived[..original_bytes.len()], &original_bytes[..]);
-        assert_eq!(archived.len() as u64, original_bytes.len() as u64 + TRAILER_SIZE);
+        assert_eq!(
+            archived.len() as u64,
+            original_bytes.len() as u64 + TRAILER_SIZE
+        );
         // ...and the trailer's wal_byte_len points exactly at the boundary.
-        let entry = load_manifest(archive.path()).unwrap().segments.pop().unwrap();
+        let entry = load_manifest(archive.path())
+            .unwrap()
+            .segments
+            .pop()
+            .unwrap();
         assert_eq!(entry.wal_byte_len, original_bytes.len() as u64);
     }
 
@@ -824,7 +863,9 @@ mod tests {
 
         // Archive: one sealed segment, GSNs 1..=10 for collection "c".
         let seq = Arc::new(ArchiveSequencer::open(src.path()).unwrap());
-        let wal = Wal::open(&src.path().join("c.wal")).unwrap().with_sequencer(Some(seq));
+        let wal = Wal::open(&src.path().join("c.wal"))
+            .unwrap()
+            .with_sequencer(Some(seq));
         for i in 1..=10u64 {
             wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap();
         }
@@ -832,8 +873,7 @@ mod tests {
         archive_pass(src.path(), archive.path(), None).unwrap();
 
         fake_extracted_base(target.path(), 1);
-        let outcome =
-            replay_into(target.path(), archive.path(), PitrTarget::Gsn(6), None).unwrap();
+        let outcome = replay_into(target.path(), archive.path(), PitrTarget::Gsn(6), None).unwrap();
         assert_eq!(outcome.target_gsn, 6);
         assert_eq!(outcome.records_applied, 6);
         assert_eq!(restored_gsns(target.path()), vec![1, 2, 3, 4, 5, 6]);
@@ -846,7 +886,9 @@ mod tests {
         let archive = TempDir::new().unwrap();
 
         let seq = Arc::new(ArchiveSequencer::open(src.path()).unwrap());
-        let wal = Wal::open(&src.path().join("c.wal")).unwrap().with_sequencer(Some(seq));
+        let wal = Wal::open(&src.path().join("c.wal"))
+            .unwrap()
+            .with_sequencer(Some(seq));
         for i in 1..=7u64 {
             wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap();
         }
@@ -854,8 +896,7 @@ mod tests {
         archive_pass(src.path(), archive.path(), None).unwrap();
 
         fake_extracted_base(target.path(), 1);
-        let outcome =
-            replay_into(target.path(), archive.path(), PitrTarget::Latest, None).unwrap();
+        let outcome = replay_into(target.path(), archive.path(), PitrTarget::Latest, None).unwrap();
         assert_eq!(outcome.target_gsn, 7);
         assert_eq!(restored_gsns(target.path()), vec![1, 2, 3, 4, 5, 6, 7]);
     }
@@ -868,12 +909,24 @@ mod tests {
 
         // GSN 1-5 non-transactional, 6 & 7 belong to tx 99, 8 non-transactional.
         let seq = Arc::new(ArchiveSequencer::open(src.path()).unwrap());
-        let wal = Wal::open(&src.path().join("c.wal")).unwrap().with_sequencer(Some(seq));
+        let wal = Wal::open(&src.path().join("c.wal"))
+            .unwrap()
+            .with_sequencer(Some(seq));
         for i in 1..=5u64 {
             wal.log(&WalEntry::insert(i, b"x".to_vec())).unwrap();
         }
-        wal.log(&WalEntry::Insert { doc_id: 6, doc_bytes: b"x".to_vec(), tx_id: 99 }).unwrap();
-        wal.log(&WalEntry::Insert { doc_id: 7, doc_bytes: b"x".to_vec(), tx_id: 99 }).unwrap();
+        wal.log(&WalEntry::Insert {
+            doc_id: 6,
+            doc_bytes: b"x".to_vec(),
+            tx_id: 99,
+        })
+        .unwrap();
+        wal.log(&WalEntry::Insert {
+            doc_id: 7,
+            doc_bytes: b"x".to_vec(),
+            tx_id: 99,
+        })
+        .unwrap();
         wal.log(&WalEntry::insert(8, b"x".to_vec())).unwrap();
         wal.seal().unwrap();
         archive_pass(src.path(), archive.path(), None).unwrap();
@@ -881,8 +934,7 @@ mod tests {
         fake_extracted_base(target.path(), 1);
         // Cut at GSN 6: tx 99 reaches GSN 7 > 6, so the whole tx is dropped —
         // GSN 6 is excluded even though 6 <= 6.
-        let outcome =
-            replay_into(target.path(), archive.path(), PitrTarget::Gsn(6), None).unwrap();
+        let outcome = replay_into(target.path(), archive.path(), PitrTarget::Gsn(6), None).unwrap();
         assert_eq!(restored_gsns(target.path()), vec![1, 2, 3, 4, 5]);
         assert!(outcome.records_skipped >= 1);
     }
@@ -898,7 +950,10 @@ mod tests {
         for i in 1..=5u64 {
             wal.log_with_meta(
                 &WalEntry::insert(i, b"x".to_vec()),
-                WalMeta { gsn: i, wall_clock_micros: i * 1_000_000 },
+                WalMeta {
+                    gsn: i,
+                    wall_clock_micros: i * 1_000_000,
+                },
             )
             .unwrap();
         }
@@ -934,7 +989,10 @@ mod tests {
         let old = Wal::open(&data.path().join("old.wal")).unwrap();
         old.log_with_meta(
             &WalEntry::insert(1, b"x".to_vec()),
-            WalMeta { gsn: 1, wall_clock_micros: 1_000_000 },
+            WalMeta {
+                gsn: 1,
+                wall_clock_micros: 1_000_000,
+            },
         )
         .unwrap();
         old.seal().unwrap();
@@ -942,7 +1000,10 @@ mod tests {
         recent
             .log_with_meta(
                 &WalEntry::insert(2, b"x".to_vec()),
-                WalMeta { gsn: 2, wall_clock_micros: crate::pitr::now_micros() },
+                WalMeta {
+                    gsn: 2,
+                    wall_clock_micros: crate::pitr::now_micros(),
+                },
             )
             .unwrap();
         recent.seal().unwrap();

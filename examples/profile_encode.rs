@@ -121,7 +121,11 @@ fn bench<F: FnMut() -> usize>(label: &'static str, iters: usize, mut f: F) -> Sa
     }
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = samples[samples.len() / 2];
-    Sample { label, ns_per_op: median, bytes_out }
+    Sample {
+        label,
+        ns_per_op: median,
+        bytes_out,
+    }
 }
 
 fn run_shape(label: &str, val: &Value, iters: usize) {
@@ -129,62 +133,95 @@ fn run_shape(label: &str, val: &Value, iters: usize) {
     let jsonb_bytes = codec::encode_doc(val).unwrap();
     println!(
         "\n=== {}  (json_text={} B  jsonb={} B) ===",
-        label, json_text.len(), jsonb_bytes.len()
+        label,
+        json_text.len(),
+        jsonb_bytes.len()
     );
 
     let mut results: Vec<Sample> = Vec::new();
 
     // A) CURRENT: serde_json::Value → jsonb::to_owned_jsonb (our codec::encode_doc)
-    results.push(bench("CURRENT: codec::encode_doc (serde Value→JSONB)", iters, || {
-        let v = codec::encode_doc(black_box(val)).unwrap();
-        v.len()
-    }));
+    results.push(bench(
+        "CURRENT: codec::encode_doc (serde Value→JSONB)",
+        iters,
+        || {
+            let v = codec::encode_doc(black_box(val)).unwrap();
+            v.len()
+        },
+    ));
 
     // B) ALT: parse_owned_jsonb from JSON text — skips serde Serialize, builds JSONB
     //    from the raw JSON parser. Requires that we have JSON text (we'd have to
     //    serialize the Value first), so we measure two sub-flows:
 
     // B1) JSON text → jsonb::parse_owned_jsonb (assuming we already have text)
-    results.push(bench("ALT-B1: parse_owned_jsonb(json_text) — already have text", iters, || {
-        let v: OwnedJsonb = parse_owned_jsonb(black_box(&json_text)).unwrap();
-        v.len()
-    }));
+    results.push(bench(
+        "ALT-B1: parse_owned_jsonb(json_text) — already have text",
+        iters,
+        || {
+            let v: OwnedJsonb = parse_owned_jsonb(black_box(&json_text)).unwrap();
+            v.len()
+        },
+    ));
 
     // B2) Combined: Value → JSON text → JSONB
-    results.push(bench("ALT-B2: Value→to_vec→parse_owned_jsonb (combined)", iters, || {
-        let text = serde_json::to_vec(black_box(val)).unwrap();
-        let v: OwnedJsonb = parse_owned_jsonb(&text).unwrap();
-        v.len()
-    }));
+    results.push(bench(
+        "ALT-B2: Value→to_vec→parse_owned_jsonb (combined)",
+        iters,
+        || {
+            let text = serde_json::to_vec(black_box(val)).unwrap();
+            let v: OwnedJsonb = parse_owned_jsonb(&text).unwrap();
+            v.len()
+        },
+    ));
 
     // C) Reference: just JSON text encode (no JSONB at all)
-    results.push(bench("REF: serde_json::to_vec (JSON text only)", iters, || {
-        let v = serde_json::to_vec(black_box(val)).unwrap();
-        v.len()
-    }));
+    results.push(bench(
+        "REF: serde_json::to_vec (JSON text only)",
+        iters,
+        || {
+            let v = serde_json::to_vec(black_box(val)).unwrap();
+            v.len()
+        },
+    ));
 
     // D) The "to_vec()" step at the end of encode_doc
-    results.push(bench("REF: jsonb::to_owned_jsonb only (no .to_vec)", iters, || {
-        let v: OwnedJsonb = jsonb::to_owned_jsonb(black_box(val)).unwrap();
-        v.len()
-    }));
+    results.push(bench(
+        "REF: jsonb::to_owned_jsonb only (no .to_vec)",
+        iters,
+        || {
+            let v: OwnedJsonb = jsonb::to_owned_jsonb(black_box(val)).unwrap();
+            v.len()
+        },
+    ));
 
     // E) Roundtrip: parse_owned_jsonb of an existing JSONB binary (sanity / lower bound)
     //    Not what we'd actually do, but bounds parser cost.
     let pretty_json = serde_json::to_string(val).unwrap();
     let pretty_bytes = pretty_json.as_bytes().to_vec();
-    results.push(bench("REF: parse_owned_jsonb(pretty_json_string)", iters, || {
-        let v: OwnedJsonb = parse_owned_jsonb(black_box(&pretty_bytes)).unwrap();
-        v.len()
-    }));
+    results.push(bench(
+        "REF: parse_owned_jsonb(pretty_json_string)",
+        iters,
+        || {
+            let v: OwnedJsonb = parse_owned_jsonb(black_box(&pretty_bytes)).unwrap();
+            v.len()
+        },
+    ));
 
     let baseline = results[0].ns_per_op;
-    println!("{:<55} {:>11} {:>9} {:>9}",
-             "step", "ns/op (med)", "bytes", "vs CURR");
+    println!(
+        "{:<55} {:>11} {:>9} {:>9}",
+        "step", "ns/op (med)", "bytes", "vs CURR"
+    );
     println!("{}", "-".repeat(90));
     for r in &results {
-        println!("{:<55} {:>11.0} {:>9} {:>9.2}x",
-                 r.label, r.ns_per_op, r.bytes_out, r.ns_per_op / baseline);
+        println!(
+            "{:<55} {:>11.0} {:>9} {:>9.2}x",
+            r.label,
+            r.ns_per_op,
+            r.bytes_out,
+            r.ns_per_op / baseline
+        );
     }
 }
 

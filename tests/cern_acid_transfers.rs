@@ -21,7 +21,7 @@
 //! rather see it fail loudly the next time it happens than have a
 //! looser invariant paper over the signal.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::thread;
 use tempfile::tempdir;

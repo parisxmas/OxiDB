@@ -91,7 +91,10 @@ fn audit_log_unbounded_by_default() {
         "legacy AuditLog::open must NOT rotate — caller didn't opt in"
     );
     let entries = count_total_entries(&audit_dir);
-    assert_eq!(entries, 5_000, "all 5000 entries must be in the single audit.log");
+    assert_eq!(
+        entries, 5_000,
+        "all 5000 entries must be in the single audit.log"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -179,7 +182,11 @@ fn audit_log_many_consecutive_rotations() {
         rotated >= 10,
         "expected many rotations with max={max} and {N} entries, got {rotated}"
     );
-    assert_eq!(count_total_entries(&audit_dir), N, "no loss across {rotated} rotations");
+    assert_eq!(
+        count_total_entries(&audit_dir),
+        N,
+        "no loss across {rotated} rotations"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -193,9 +200,7 @@ fn audit_log_many_consecutive_rotations() {
 #[test]
 fn audit_log_rotation_concurrent_safe() {
     let dir = tempdir().unwrap();
-    let log = Arc::new(
-        AuditLog::open_with_rotation(dir.path(), Some(2048)).unwrap(),
-    );
+    let log = Arc::new(AuditLog::open_with_rotation(dir.path(), Some(2048)).unwrap());
 
     const THREADS: usize = 4;
     const PER_THREAD: usize = 250;

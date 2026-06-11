@@ -1,6 +1,6 @@
-use std::time::Instant;
-use std::sync::Arc;
 use serde_json::json;
+use std::sync::Arc;
+use std::time::Instant;
 
 fn main() {
     let dir = tempfile::tempdir().unwrap();
@@ -33,7 +33,8 @@ fn main() {
         }
 
         if use_btree {
-            let mut col = oxidb::btree_collection::BTreeCollection::open("bench", &sub, None).unwrap();
+            let mut col =
+                oxidb::btree_collection::BTreeCollection::open("bench", &sub, None).unwrap();
 
             let t0 = Instant::now();
             col.insert_many(docs).unwrap();
@@ -53,7 +54,11 @@ fn main() {
                 col.find_one(&json!({"region": "US-EAST"})).unwrap();
             }
             let d = t0.elapsed();
-            println!("  1000x find_one: {:?} ({:.1}µs/op)", d, d.as_micros() as f64 / 1000.0);
+            println!(
+                "  1000x find_one: {:?} ({:.1}µs/op)",
+                d,
+                d.as_micros() as f64 / 1000.0
+            );
             all_results.push((label, "find_one", d));
 
             let t0 = Instant::now();
@@ -63,10 +68,15 @@ fn main() {
                     skip: None,
                     limit: Some(10),
                 };
-                col.find_with_options(&json!({"region": "EU-WEST"}), &opts).unwrap();
+                col.find_with_options(&json!({"region": "EU-WEST"}), &opts)
+                    .unwrap();
             }
             let d = t0.elapsed();
-            println!("  100x sort+limit(10): {:?} ({:.1}µs/op)", d, d.as_micros() as f64 / 100.0);
+            println!(
+                "  100x sort+limit(10): {:?} ({:.1}µs/op)",
+                d,
+                d.as_micros() as f64 / 100.0
+            );
             all_results.push((label, "sort+limit", d));
 
             let t0 = Instant::now();
@@ -74,7 +84,11 @@ fn main() {
                 col.count_matching(&json!({"region": "APAC"})).unwrap();
             }
             let d = t0.elapsed();
-            println!("  1000x count: {:?} ({:.1}µs/op)", d, d.as_micros() as f64 / 1000.0);
+            println!(
+                "  1000x count: {:?} ({:.1}µs/op)",
+                d,
+                d.as_micros() as f64 / 1000.0
+            );
             all_results.push((label, "count", d));
 
             // Unindexed scan
@@ -83,7 +97,6 @@ fn main() {
             let d = t0.elapsed();
             println!("  Unindexed scan: {:?}", d);
             all_results.push((label, "unindexed scan", d));
-
         } else {
             let mut col = oxidb::collection::Collection::open("bench", &sub).unwrap();
 
@@ -105,7 +118,11 @@ fn main() {
                 col.find_one(&json!({"region": "US-EAST"})).unwrap();
             }
             let d = t0.elapsed();
-            println!("  1000x find_one: {:?} ({:.1}µs/op)", d, d.as_micros() as f64 / 1000.0);
+            println!(
+                "  1000x find_one: {:?} ({:.1}µs/op)",
+                d,
+                d.as_micros() as f64 / 1000.0
+            );
             all_results.push((label, "find_one", d));
 
             let t0 = Instant::now();
@@ -115,10 +132,15 @@ fn main() {
                     skip: None,
                     limit: Some(10),
                 };
-                col.find_with_options(&json!({"region": "EU-WEST"}), &opts).unwrap();
+                col.find_with_options(&json!({"region": "EU-WEST"}), &opts)
+                    .unwrap();
             }
             let d = t0.elapsed();
-            println!("  100x sort+limit(10): {:?} ({:.1}µs/op)", d, d.as_micros() as f64 / 100.0);
+            println!(
+                "  100x sort+limit(10): {:?} ({:.1}µs/op)",
+                d,
+                d.as_micros() as f64 / 100.0
+            );
             all_results.push((label, "sort+limit", d));
 
             let t0 = Instant::now();
@@ -126,7 +148,11 @@ fn main() {
                 col.count_matching(&json!({"region": "APAC"})).unwrap();
             }
             let d = t0.elapsed();
-            println!("  1000x count: {:?} ({:.1}µs/op)", d, d.as_micros() as f64 / 1000.0);
+            println!(
+                "  1000x count: {:?} ({:.1}µs/op)",
+                d,
+                d.as_micros() as f64 / 1000.0
+            );
             all_results.push((label, "count", d));
 
             // Unindexed scan
@@ -141,16 +167,39 @@ fn main() {
 
     // Summary
     println!("═══════════════════════════════════════════════════════════");
-    println!("{:<20} {:>15} {:>15} {:>10}", "Operation", "Append-only", "BTree", "Winner");
+    println!(
+        "{:<20} {:>15} {:>15} {:>10}",
+        "Operation", "Append-only", "BTree", "Winner"
+    );
     println!("───────────────────────────────────────────────────────────");
-    let ops = ["Insert", "Create indexes", "find_one", "sort+limit", "count", "unindexed scan"];
+    let ops = [
+        "Insert",
+        "Create indexes",
+        "find_one",
+        "sort+limit",
+        "count",
+        "unindexed scan",
+    ];
     for op in ops {
-        let ao = all_results.iter().find(|r| r.0 == "Append-only" && r.1 == op).map(|r| r.2);
-        let bt = all_results.iter().find(|r| r.0 == "BTreeCollection" && r.1 == op).map(|r| r.2);
+        let ao = all_results
+            .iter()
+            .find(|r| r.0 == "Append-only" && r.1 == op)
+            .map(|r| r.2);
+        let bt = all_results
+            .iter()
+            .find(|r| r.0 == "BTreeCollection" && r.1 == op)
+            .map(|r| r.2);
         if let (Some(a), Some(b)) = (ao, bt) {
             let winner = if a < b { "Append" } else { "BTree" };
-            let ratio = if a < b { b.as_micros() as f64 / a.as_micros() as f64 } else { a.as_micros() as f64 / b.as_micros() as f64 };
-            println!("{:<20} {:>15?} {:>15?} {:>6} {:.1}x", op, a, b, winner, ratio);
+            let ratio = if a < b {
+                b.as_micros() as f64 / a.as_micros() as f64
+            } else {
+                a.as_micros() as f64 / b.as_micros() as f64
+            };
+            println!(
+                "{:<20} {:>15?} {:>15?} {:>6} {:.1}x",
+                op, a, b, winner, ratio
+            );
         }
     }
     println!("═══════════════════════════════════════════════════════════");

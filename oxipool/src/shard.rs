@@ -46,7 +46,10 @@ impl ShardConfig {
             return None;
         }
 
-        let shards: Vec<String> = shards_str.split(',').map(|s| s.trim().to_string()).collect();
+        let shards: Vec<String> = shards_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
         if shards.len() < 2 {
             return None; // Need at least 2 shards
         }
@@ -360,9 +363,7 @@ pub async fn parse_and_route(
         "text_search" | "vector_search" | "search" => CommandRouting::ScatterGather,
 
         // Blob operations — always shard 0
-        "put_object" | "get_object" | "delete_object" | "head_object" => {
-            CommandRouting::Primary
-        }
+        "put_object" | "get_object" | "delete_object" | "head_object" => CommandRouting::Primary,
 
         _ => CommandRouting::Primary,
     };

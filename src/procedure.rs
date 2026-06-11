@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::engine::OxiDb;
 use crate::error::{Error, Result};
@@ -63,7 +63,11 @@ pub fn parse_procedure(value: &Value) -> Result<Procedure> {
         return Err(Error::ProcedureError("'steps' must not be empty".into()));
     }
 
-    Ok(Procedure { name, params, steps })
+    Ok(Procedure {
+        name,
+        params,
+        steps,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -203,17 +207,21 @@ fn eval_expr(expr: &Value) -> Result<bool> {
 
     let obj = expr.as_object().unwrap();
     if obj.len() != 1 {
-        return Err(Error::ProcedureError("$expr must have exactly one operator".into()));
+        return Err(Error::ProcedureError(
+            "$expr must have exactly one operator".into(),
+        ));
     }
 
     let (op, args) = obj.iter().next().unwrap();
     match op.as_str() {
         "$eq" | "$ne" | "$gt" | "$gte" | "$lt" | "$lte" => {
-            let arr = args
-                .as_array()
-                .ok_or_else(|| Error::ProcedureError(format!("{op} requires an array of 2 elements")))?;
+            let arr = args.as_array().ok_or_else(|| {
+                Error::ProcedureError(format!("{op} requires an array of 2 elements"))
+            })?;
             if arr.len() != 2 {
-                return Err(Error::ProcedureError(format!("{op} requires exactly 2 arguments")));
+                return Err(Error::ProcedureError(format!(
+                    "{op} requires exactly 2 arguments"
+                )));
             }
             let a = &arr[0];
             let b = &arr[1];
@@ -251,7 +259,9 @@ fn eval_expr(expr: &Value) -> Result<bool> {
             Ok(false)
         }
         "$not" => Ok(!eval_expr(args)?),
-        _ => Err(Error::ProcedureError(format!("unknown condition operator: {op}"))),
+        _ => Err(Error::ProcedureError(format!(
+            "unknown condition operator: {op}"
+        ))),
     }
 }
 
@@ -315,7 +325,9 @@ fn execute_step(
         "call_procedure" => step_call_procedure(step, ctx, db),
         "abort" => step_abort(step, ctx),
         "return" => step_return(step, ctx),
-        _ => Err(Error::ProcedureError(format!("unknown step type: {step_type}"))),
+        _ => Err(Error::ProcedureError(format!(
+            "unknown step type: {step_type}"
+        ))),
     }
 }
 
@@ -372,7 +384,8 @@ fn step_insert(
     let doc = resolve_vars(doc, ctx);
     db.tx_insert(tx_id, &col, doc)?;
     if let Some(alias) = step.get("as").and_then(|v| v.as_str()) {
-        ctx.vars.insert(alias.to_string(), json!({"inserted": true}));
+        ctx.vars
+            .insert(alias.to_string(), json!({"inserted": true}));
     }
     Ok(StepResult::Continue)
 }
@@ -391,7 +404,8 @@ fn step_update(
     let update = resolve_vars(update, ctx);
     db.tx_update(tx_id, &col, &query, &update)?;
     if let Some(alias) = step.get("as").and_then(|v| v.as_str()) {
-        ctx.vars.insert(alias.to_string(), json!({"modified": true}));
+        ctx.vars
+            .insert(alias.to_string(), json!({"modified": true}));
     }
     Ok(StepResult::Continue)
 }
@@ -427,11 +441,7 @@ fn step_count(
     Ok(StepResult::Continue)
 }
 
-fn step_aggregate(
-    step: &Value,
-    ctx: &mut ProcedureContext,
-    db: &OxiDb,
-) -> Result<StepResult> {
+fn step_aggregate(step: &Value, ctx: &mut ProcedureContext, db: &OxiDb) -> Result<StepResult> {
     let col = get_collection(step, ctx)?;
     let pipeline = step
         .get("pipeline")
@@ -506,11 +516,7 @@ fn step_return(step: &Value, ctx: &ProcedureContext) -> Result<StepResult> {
     Ok(StepResult::Return(value))
 }
 
-fn step_call_procedure(
-    step: &Value,
-    ctx: &mut ProcedureContext,
-    db: &OxiDb,
-) -> Result<StepResult> {
+fn step_call_procedure(step: &Value, ctx: &mut ProcedureContext, db: &OxiDb) -> Result<StepResult> {
     let resolved = resolve_vars(step, ctx);
     let name = resolved
         .get("name")
@@ -551,7 +557,9 @@ pub fn execute_procedure(db: &OxiDb, proc_def: &Value, params: &Value) -> Result
         }
         _ => {
             if !procedure.params.is_empty() {
-                return Err(Error::ProcedureError("params must be an object or array".into()));
+                return Err(Error::ProcedureError(
+                    "params must be an object or array".into(),
+                ));
             }
         }
     }
@@ -642,7 +650,9 @@ mod tests {
     #[test]
     fn test_resolve_nested_param() {
         let ctx = ProcedureContext {
-            params: [("user".into(), json!({"name": "Bob", "age": 30}))].into_iter().collect(),
+            params: [("user".into(), json!({"name": "Bob", "age": 30}))]
+                .into_iter()
+                .collect(),
             vars: HashMap::new(),
         };
         let result = resolve_vars(&json!("$param.user.name"), &ctx);
@@ -653,7 +663,9 @@ mod tests {
     fn test_resolve_var() {
         let ctx = ProcedureContext {
             params: HashMap::new(),
-            vars: [("result".into(), json!({"balance": 100}))].into_iter().collect(),
+            vars: [("result".into(), json!({"balance": 100}))]
+                .into_iter()
+                .collect(),
         };
         let result = resolve_vars(&json!("$result.balance"), &ctx);
         assert_eq!(result, json!(100));
@@ -857,7 +869,8 @@ mod tests {
     #[test]
     fn test_execute_update() {
         let db = temp_db();
-        db.insert("items", json!({"name": "Alice", "score": 10})).unwrap();
+        db.insert("items", json!({"name": "Alice", "score": 10}))
+            .unwrap();
 
         let def = json!({
             "name": "update_test",
@@ -871,7 +884,10 @@ mod tests {
         let result = execute_procedure(&db, &def, &json!({})).unwrap();
         assert_eq!(result, json!({"old_score": 10}));
         // Verify the update was committed
-        let doc = db.find_one("items", &json!({"name": "Alice"})).unwrap().unwrap();
+        let doc = db
+            .find_one("items", &json!({"name": "Alice"}))
+            .unwrap()
+            .unwrap();
         assert_eq!(doc["score"], 99);
     }
 
@@ -895,8 +911,10 @@ mod tests {
     #[test]
     fn test_execute_transfer_funds() {
         let db = temp_db();
-        db.insert("accounts", json!({"account_id": "A", "balance": 100})).unwrap();
-        db.insert("accounts", json!({"account_id": "B", "balance": 50})).unwrap();
+        db.insert("accounts", json!({"account_id": "A", "balance": 100}))
+            .unwrap();
+        db.insert("accounts", json!({"account_id": "B", "balance": 50}))
+            .unwrap();
 
         let def = json!({
             "name": "transfer",
@@ -918,11 +936,18 @@ mod tests {
             ]
         });
 
-        let result = execute_procedure(&db, &def, &json!({"from": "A", "to": "B", "amount": 30})).unwrap();
+        let result =
+            execute_procedure(&db, &def, &json!({"from": "A", "to": "B", "amount": 30})).unwrap();
         assert_eq!(result, json!({"status": "ok"}));
 
-        let a = db.find_one("accounts", &json!({"account_id": "A"})).unwrap().unwrap();
-        let b = db.find_one("accounts", &json!({"account_id": "B"})).unwrap().unwrap();
+        let a = db
+            .find_one("accounts", &json!({"account_id": "A"}))
+            .unwrap()
+            .unwrap();
+        let b = db
+            .find_one("accounts", &json!({"account_id": "B"}))
+            .unwrap()
+            .unwrap();
         assert_eq!(a["balance"], 70);
         assert_eq!(b["balance"], 80);
     }
@@ -930,8 +955,10 @@ mod tests {
     #[test]
     fn test_execute_transfer_insufficient() {
         let db = temp_db();
-        db.insert("accounts", json!({"account_id": "A", "balance": 10})).unwrap();
-        db.insert("accounts", json!({"account_id": "B", "balance": 50})).unwrap();
+        db.insert("accounts", json!({"account_id": "A", "balance": 10}))
+            .unwrap();
+        db.insert("accounts", json!({"account_id": "B", "balance": 50}))
+            .unwrap();
 
         let def = json!({
             "name": "transfer",
@@ -949,7 +976,12 @@ mod tests {
 
         let result = execute_procedure(&db, &def, &json!({"from": "A", "to": "B", "amount": 100}));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("insufficient funds"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("insufficient funds")
+        );
     }
 
     #[test]
@@ -972,8 +1004,7 @@ mod tests {
 
     /// Helper: compile OxiScript source and execute with params
     fn run_oxiscript(db: &OxiDb, src: &str, params: Value) -> Result<Value> {
-        let compiled = crate::oxiscript::compile(src)
-            .map_err(|e| Error::ProcedureError(e))?;
+        let compiled = crate::oxiscript::compile(src).map_err(|e| Error::ProcedureError(e))?;
         // Register procedure so call_procedure can find it
         let name = compiled["name"].as_str().unwrap().to_string();
         db.create_procedure(&name, compiled)?;
@@ -982,8 +1013,7 @@ mod tests {
 
     /// Helper: compile multiple procs, register all, call the last one
     fn run_oxiscript_multi(db: &OxiDb, src: &str, call_name: &str, params: Value) -> Result<Value> {
-        let procs = crate::oxiscript::compile_all(src)
-            .map_err(|e| Error::ProcedureError(e))?;
+        let procs = crate::oxiscript::compile_all(src).map_err(|e| Error::ProcedureError(e))?;
         for p in &procs {
             let name = p["name"].as_str().unwrap().to_string();
             db.create_procedure(&name, p.clone())?;
@@ -1002,7 +1032,11 @@ mod tests {
         let result = run_oxiscript(&db, src, json!({"a": 10, "b": 25})).unwrap();
         // OxiScript arithmetic compiles to $expr wrapper — engine evaluates it
         let sum = &result["sum"];
-        let val = if sum.is_object() { sum["$expr"].as_i64().unwrap() } else { sum.as_i64().unwrap() };
+        let val = if sum.is_object() {
+            sum["$expr"].as_i64().unwrap()
+        } else {
+            sum.as_i64().unwrap()
+        };
         assert_eq!(val, 35);
     }
 
@@ -1039,9 +1073,12 @@ mod tests {
     #[test]
     fn e2e_aggregate_result_access() {
         let db = temp_db();
-        db.insert("sales", json!({"product": "A", "amount": 100})).unwrap();
-        db.insert("sales", json!({"product": "A", "amount": 200})).unwrap();
-        db.insert("sales", json!({"product": "B", "amount": 50})).unwrap();
+        db.insert("sales", json!({"product": "A", "amount": 100}))
+            .unwrap();
+        db.insert("sales", json!({"product": "A", "amount": 200}))
+            .unwrap();
+        db.insert("sales", json!({"product": "B", "amount": 50}))
+            .unwrap();
 
         // Aggregate with $count stage (avoids $field ref conflict with $var resolution)
         let def = json!({
@@ -1083,7 +1120,8 @@ mod tests {
     #[test]
     fn e2e_multi_collection_abort_rollback() {
         let db = temp_db();
-        db.insert("accounts", json!({"id": "A", "balance": 100})).unwrap();
+        db.insert("accounts", json!({"id": "A", "balance": 100}))
+            .unwrap();
         db.insert("ledger", json!({"entries": 0})).unwrap();
 
         let src = r#"
@@ -1103,7 +1141,10 @@ mod tests {
         assert!(err.is_err());
 
         // Balance should be unchanged
-        let acc = db.find_one("accounts", &json!({"id": "A"})).unwrap().unwrap();
+        let acc = db
+            .find_one("accounts", &json!({"id": "A"}))
+            .unwrap()
+            .unwrap();
         assert_eq!(acc["balance"], 100);
 
         // No new ledger entry should exist
@@ -1114,7 +1155,11 @@ mod tests {
     #[test]
     fn e2e_update_with_multiple_operators() {
         let db = temp_db();
-        db.insert("users", json!({"name": "Alice", "score": 10, "active": false})).unwrap();
+        db.insert(
+            "users",
+            json!({"name": "Alice", "score": 10, "active": false}),
+        )
+        .unwrap();
 
         let src = r#"
             proc activate_and_bump(name, bonus) {
@@ -1126,7 +1171,10 @@ mod tests {
         assert_eq!(result["status"], "ok");
 
         // Verify after commit — the update is now visible
-        let user = db.find_one("users", &json!({"name": "Alice"})).unwrap().unwrap();
+        let user = db
+            .find_one("users", &json!({"name": "Alice"}))
+            .unwrap()
+            .unwrap();
         assert_eq!(user["active"], true);
         assert_eq!(user["score"], 15);
     }
@@ -1134,9 +1182,12 @@ mod tests {
     #[test]
     fn e2e_delete_and_verify() {
         let db = temp_db();
-        db.insert("logs", json!({"level": "error", "msg": "fail"})).unwrap();
-        db.insert("logs", json!({"level": "info", "msg": "ok"})).unwrap();
-        db.insert("logs", json!({"level": "error", "msg": "crash"})).unwrap();
+        db.insert("logs", json!({"level": "error", "msg": "fail"}))
+            .unwrap();
+        db.insert("logs", json!({"level": "info", "msg": "ok"}))
+            .unwrap();
+        db.insert("logs", json!({"level": "error", "msg": "crash"}))
+            .unwrap();
 
         let src = r#"
             proc clear_errors() {
@@ -1156,7 +1207,8 @@ mod tests {
     #[test]
     fn e2e_call_chain_with_return_value() {
         let db = temp_db();
-        db.insert("accounts", json!({"account_id": "X", "balance": 500})).unwrap();
+        db.insert("accounts", json!({"account_id": "X", "balance": 500}))
+            .unwrap();
 
         let src = r#"
             proc get_balance(account_id) {
@@ -1172,16 +1224,30 @@ mod tests {
                 return {affordable: true, remaining: balance - price}
             }
         "#;
-        let result = run_oxiscript_multi(&db, src, "can_afford",
-            json!({"account_id": "X", "price": 200})).unwrap();
+        let result = run_oxiscript_multi(
+            &db,
+            src,
+            "can_afford",
+            json!({"account_id": "X", "price": 200}),
+        )
+        .unwrap();
         assert_eq!(result["affordable"], true);
         // Arithmetic returns $expr wrapper
         let remaining = &result["remaining"];
-        let val = if remaining.is_object() { remaining["$expr"].as_i64().unwrap() } else { remaining.as_i64().unwrap() };
+        let val = if remaining.is_object() {
+            remaining["$expr"].as_i64().unwrap()
+        } else {
+            remaining.as_i64().unwrap()
+        };
         assert_eq!(val, 300);
 
-        let result = run_oxiscript_multi(&db, src, "can_afford",
-            json!({"account_id": "X", "price": 999})).unwrap();
+        let result = run_oxiscript_multi(
+            &db,
+            src,
+            "can_afford",
+            json!({"account_id": "X", "price": 999}),
+        )
+        .unwrap();
         assert_eq!(result["affordable"], false);
     }
 }

@@ -58,10 +58,18 @@ fn build_fixture(db: &OxiDb) {
 
     // Transactional write — exercises _tx_commit_log (OXTX) gating.
     let tx = db.begin_transaction();
-    db.tx_insert(tx, "meta", json!({"key": "build_id", "value": "fixture-v1"}))
-        .expect("tx_insert");
-    db.tx_insert(tx, "meta", json!({"key": "purpose", "value": "upgrade-chain"}))
-        .expect("tx_insert");
+    db.tx_insert(
+        tx,
+        "meta",
+        json!({"key": "build_id", "value": "fixture-v1"}),
+    )
+    .expect("tx_insert");
+    db.tx_insert(
+        tx,
+        "meta",
+        json!({"key": "purpose", "value": "upgrade-chain"}),
+    )
+    .expect("tx_insert");
     db.commit_transaction(tx).expect("commit");
 
     // Blob — exercises .meta JSON `format_version`.
@@ -88,9 +96,7 @@ fn verify_fixture_shape(db: &OxiDb, fixture_label: &str) {
     );
 
     // 2. Index-backed point query works.
-    let by_n = db
-        .find("events", &json!({ "n": 35 }))
-        .expect("index query");
+    let by_n = db.find("events", &json!({ "n": 35 })).expect("index query");
     assert_eq!(
         by_n.len(),
         1,
@@ -113,9 +119,7 @@ fn verify_fixture_shape(db: &OxiDb, fixture_label: &str) {
     assert_eq!(build_id["value"].as_str(), Some("fixture-v1"));
 
     // 4. Blob survives + readable + content unchanged.
-    let (bytes, _meta) = db
-        .get_object("audit", "handover.txt")
-        .expect("get blob");
+    let (bytes, _meta) = db.get_object("audit", "handover.txt").expect("get blob");
     assert_eq!(
         bytes,
         b"upgrade-chain fixture: signed by the test that built me"
@@ -160,7 +164,11 @@ fn read_all_committed_fixtures() {
         dir.display()
     );
 
-    eprintln!("[upgrade] reading {} fixture(s) from {}", fixtures.len(), dir.display());
+    eprintln!(
+        "[upgrade] reading {} fixture(s) from {}",
+        fixtures.len(),
+        dir.display()
+    );
 
     for fixture in &fixtures {
         let label = fixture.file_name().unwrap().to_string_lossy().to_string();
@@ -176,7 +184,10 @@ fn read_all_committed_fixtures() {
         eprintln!("[upgrade]   ✓ {label}");
     }
 
-    eprintln!("[upgrade] ALL FIXTURES READ CLEANLY — {} version(s)", fixtures.len());
+    eprintln!(
+        "[upgrade] ALL FIXTURES READ CLEANLY — {} version(s)",
+        fixtures.len()
+    );
 }
 
 /// Bootstrap helper — only run when adding a new version's fixture.

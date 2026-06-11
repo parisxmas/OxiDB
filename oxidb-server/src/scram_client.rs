@@ -22,8 +22,8 @@
 
 use crate::scram::{
     base64_decode_simple_pub as b64dec, base64_encode_simple_pub as b64enc,
-    generate_salt_pub as random_bytes, hmac_sha256_pub as hmac256,
-    pbkdf2_sha256_pub as pbkdf2, sha256_hash_pub as sha256,
+    generate_salt_pub as random_bytes, hmac_sha256_pub as hmac256, pbkdf2_sha256_pub as pbkdf2,
+    sha256_hash_pub as sha256,
 };
 
 /// ScramClient owns the plaintext password until consumed in
@@ -90,7 +90,9 @@ impl ScramClient {
             } else if let Some(s) = part.strip_prefix("s=") {
                 salt_b64 = s.to_string();
             } else if let Some(i) = part.strip_prefix("i=") {
-                iter_count = i.parse().map_err(|e| format!("bad i= in server-first: {}", e))?;
+                iter_count = i
+                    .parse()
+                    .map_err(|e| format!("bad i= in server-first: {}", e))?;
             }
         }
         if combined_nonce.is_empty() || salt_b64.is_empty() || iter_count == 0 {
@@ -182,7 +184,9 @@ mod tests {
     fn client_and_server_complete_a_full_exchange() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = UserStore::open(dir.path()).unwrap();
-        store.create_user("alice", "wonderland", Role::Admin).unwrap();
+        store
+            .create_user("alice", "wonderland", Role::Admin)
+            .unwrap();
 
         let mut client = ScramClient::new("alice", "wonderland");
         let client_first_msg = client.client_first();
@@ -204,14 +208,15 @@ mod tests {
     fn wrong_password_makes_server_reject_proof() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = UserStore::open(dir.path()).unwrap();
-        store.create_user("bob", "right-password", Role::Read).unwrap();
+        store
+            .create_user("bob", "right-password", Role::Read)
+            .unwrap();
 
         let mut client = ScramClient::new("bob", "WRONG-password");
         let client_first_msg = client.client_first();
         let (server_first, scram_state) =
             ScramState::process_client_first(&client_first_msg, &store).unwrap();
-        let (client_final_msg, _expected_sig) =
-            client.client_final(&server_first).unwrap();
+        let (client_final_msg, _expected_sig) = client.client_final(&server_first).unwrap();
 
         let err = match scram_state.process_client_final(&client_final_msg, &store) {
             Ok(_) => panic!("must fail"),
@@ -228,7 +233,9 @@ mod tests {
         // our client_nonce. Either a MITM or a buggy server; we
         // refuse without sending the proof.
         let server_first = "r=COMPLETELY-DIFFERENT,s=ZGVhZGJlZWY=,i=4096";
-        let err = client.client_final(server_first).expect_err("nonce mismatch must error");
+        let err = client
+            .client_final(server_first)
+            .expect_err("nonce mismatch must error");
         assert!(err.contains("does not extend client_nonce"), "got: {}", err);
     }
 
@@ -240,8 +247,7 @@ mod tests {
 
         let mut client = ScramClient::new("carol", "pw");
         let cf = client.client_first();
-        let (server_first, scram_state) =
-            ScramState::process_client_first(&cf, &store).unwrap();
+        let (server_first, scram_state) = ScramState::process_client_first(&cf, &store).unwrap();
         let (cf2, expected) = client.client_final(&server_first).unwrap();
         let (server_final, _) = scram_state.process_client_final(&cf2, &store).unwrap();
 

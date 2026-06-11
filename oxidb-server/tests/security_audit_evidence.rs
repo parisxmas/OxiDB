@@ -39,9 +39,7 @@ fn read_audit_log(dir: &std::path::Path) -> Vec<Value> {
         .enumerate()
         .map(|(i, line)| {
             serde_json::from_str(line).unwrap_or_else(|e| {
-                panic!(
-                    "audit log line {i} is not parseable JSON: {e}\n  line = {line:?}"
-                )
+                panic!("audit log line {i} is not parseable JSON: {e}\n  line = {line:?}")
             })
         })
         .collect()
@@ -81,10 +79,19 @@ fn audit_evidence_rbac_denial_shape() {
         },
         dir.path(),
     );
-    assert_eq!(entry["result"], "denied", "RBAC denial must record result=denied");
+    assert_eq!(
+        entry["result"], "denied",
+        "RBAC denial must record result=denied"
+    );
     assert_eq!(entry["user"], "alice", "must preserve attacking user");
-    assert_eq!(entry["cmd"], "drop_collection", "must preserve attempted command");
-    assert_eq!(entry["collection"], "orders", "must preserve target collection");
+    assert_eq!(
+        entry["cmd"], "drop_collection",
+        "must preserve attempted command"
+    );
+    assert_eq!(
+        entry["collection"], "orders",
+        "must preserve target collection"
+    );
     assert!(entry["ts"].is_string(), "must have a timestamp");
 }
 
@@ -110,7 +117,11 @@ fn audit_evidence_jwt_failure_shape() {
     );
     assert_eq!(entry["result"], "denied");
     assert_eq!(entry["user"], "anonymous");
-    assert_eq!(entry["collection"], Value::Null, "no collection on auth failure");
+    assert_eq!(
+        entry["collection"],
+        Value::Null,
+        "no collection on auth failure"
+    );
     assert_eq!(entry["detail"], "invalid signature");
 }
 
@@ -155,7 +166,10 @@ fn audit_evidence_unknown_command_shape() {
         },
         dir.path(),
     );
-    assert_eq!(entry["cmd"], "INSERT", "must preserve the EXACT attempted cmd (incl case)");
+    assert_eq!(
+        entry["cmd"], "INSERT",
+        "must preserve the EXACT attempted cmd (incl case)"
+    );
     assert!(entry["detail"].as_str().unwrap().contains("INSERT"));
 }
 

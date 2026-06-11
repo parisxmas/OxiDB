@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
 use serde::{Deserialize, Serialize};
 use serde_json;
 
@@ -89,8 +89,7 @@ impl UserStore {
     /// and prints the random password to stderr.
     pub fn open(data_dir: &Path) -> Result<Self, String> {
         let auth_dir = data_dir.join("_auth");
-        fs::create_dir_all(&auth_dir)
-            .map_err(|e| format!("failed to create auth dir: {e}"))?;
+        fs::create_dir_all(&auth_dir).map_err(|e| format!("failed to create auth dir: {e}"))?;
 
         let store_path = auth_dir.join("users.json");
         let mut users = HashMap::new();
@@ -136,7 +135,12 @@ impl UserStore {
         self.users.get(username)
     }
 
-    pub fn create_user(&mut self, username: &str, password: &str, role: Role) -> Result<(), String> {
+    pub fn create_user(
+        &mut self,
+        username: &str,
+        password: &str,
+        role: Role,
+    ) -> Result<(), String> {
         if self.users.contains_key(username) {
             return Err(format!("user '{}' already exists", username));
         }
@@ -157,7 +161,9 @@ impl UserStore {
         password: Option<&str>,
         role: Option<Role>,
     ) -> Result<(), String> {
-        let record = self.users.get_mut(username)
+        let record = self
+            .users
+            .get_mut(username)
             .ok_or_else(|| format!("user '{}' not found", username))?;
 
         if let Some(pw) = password {
@@ -178,27 +184,43 @@ impl UserStore {
     }
 
     pub fn list_users(&self) -> Vec<serde_json::Value> {
-        self.users.values().map(|r| {
-            let mut user = serde_json::json!({
-                "username": r.username,
-                "role": r.role.as_str(),
-            });
-            if !r.db_roles.is_empty() {
-                let db_roles: serde_json::Map<String, serde_json::Value> = r.db_roles.iter()
-                    .map(|(db, role)| (db.clone(), serde_json::Value::String(role.as_str().to_string())))
-                    .collect();
-                user.as_object_mut().unwrap().insert(
-                    "db_roles".to_string(),
-                    serde_json::Value::Object(db_roles),
-                );
-            }
-            user
-        }).collect()
+        self.users
+            .values()
+            .map(|r| {
+                let mut user = serde_json::json!({
+                    "username": r.username,
+                    "role": r.role.as_str(),
+                });
+                if !r.db_roles.is_empty() {
+                    let db_roles: serde_json::Map<String, serde_json::Value> = r
+                        .db_roles
+                        .iter()
+                        .map(|(db, role)| {
+                            (
+                                db.clone(),
+                                serde_json::Value::String(role.as_str().to_string()),
+                            )
+                        })
+                        .collect();
+                    user.as_object_mut()
+                        .unwrap()
+                        .insert("db_roles".to_string(), serde_json::Value::Object(db_roles));
+                }
+                user
+            })
+            .collect()
     }
 
     /// Grant a per-database role override for a user.
-    pub fn grant_db_role(&mut self, username: &str, database: &str, role: Role) -> Result<(), String> {
-        let record = self.users.get_mut(username)
+    pub fn grant_db_role(
+        &mut self,
+        username: &str,
+        database: &str,
+        role: Role,
+    ) -> Result<(), String> {
+        let record = self
+            .users
+            .get_mut(username)
             .ok_or_else(|| format!("user '{}' not found", username))?;
         record.db_roles.insert(database.to_string(), role);
         self.save()
@@ -206,10 +228,15 @@ impl UserStore {
 
     /// Revoke a per-database role override, reverting to the global role.
     pub fn revoke_db_role(&mut self, username: &str, database: &str) -> Result<(), String> {
-        let record = self.users.get_mut(username)
+        let record = self
+            .users
+            .get_mut(username)
             .ok_or_else(|| format!("user '{}' not found", username))?;
         if !record.db_roles.contains_key(database) {
-            return Err(format!("user '{}' has no role override for database '{}'", username, database));
+            return Err(format!(
+                "user '{}' has no role override for database '{}'",
+                username, database
+            ));
         }
         record.db_roles.remove(database);
         self.save()
@@ -219,10 +246,21 @@ impl UserStore {
     /// Returns the database-specific role if set, otherwise the global role.
     pub fn effective_role(&self, username: &str, database: &str) -> Option<Role> {
         let record = self.users.get(username)?;
-        Some(record.db_roles.get(database).copied().unwrap_or(record.role))
+        Some(
+            record
+                .db_roles
+                .get(database)
+                .copied()
+                .unwrap_or(record.role),
+        )
     }
 
-    fn create_user_internal(&mut self, username: &str, password: &str, role: Role) -> Result<(), String> {
+    fn create_user_internal(
+        &mut self,
+        username: &str,
+        password: &str,
+        role: Role,
+    ) -> Result<(), String> {
         let password_hash = hash_password(password)?;
         let verifier = derive_scram_verifier(password);
         let record = UserRecord {

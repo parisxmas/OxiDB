@@ -59,7 +59,9 @@ fn hep_workload_scale_invariants_hold() {
     let insert_batch = env_usize("OXIDB_SCALE_INSERT_BATCH", 1_000);
     let min_insert_dps = env_usize("OXIDB_MIN_INSERT_DPS", 50_000);
 
-    eprintln!("[scale] total_docs={total_docs} insert_batch={insert_batch} min_dps={min_insert_dps}");
+    eprintln!(
+        "[scale] total_docs={total_docs} insert_batch={insert_batch} min_dps={min_insert_dps}"
+    );
 
     let dir = tempdir().expect("data dir");
     let db = OxiDb::open(dir.path()).expect("open");
@@ -96,9 +98,7 @@ fn hep_workload_scale_invariants_hold() {
     }
     let insert_elapsed = insert_t0.elapsed();
     let insert_dps = (total_docs as f64) / insert_elapsed.as_secs_f64();
-    eprintln!(
-        "[scale] insert: {total_docs} docs in {insert_elapsed:?} ({insert_dps:.0} docs/sec)"
-    );
+    eprintln!("[scale] insert: {total_docs} docs in {insert_elapsed:?} ({insert_dps:.0} docs/sec)");
 
     assert!(
         insert_dps >= min_insert_dps as f64,
@@ -141,7 +141,11 @@ fn hep_workload_scale_invariants_hold() {
     );
 
     // Both queries return the same docs (modulo logic).
-    assert_eq!(idx_hits.len(), scan_hits.len(), "index vs scan disagreed on result size");
+    assert_eq!(
+        idx_hits.len(),
+        scan_hits.len(),
+        "index vs scan disagreed on result size"
+    );
 
     // Sub-linearity: index must be meaningfully faster than scan.
     // We bound at 2× rather than asserting strict orders-of-magnitude

@@ -22,9 +22,20 @@ pub enum WriteOp {
     /// keys: e.g. inserting a parent doc and its child rows in one tx
     /// where the child carries the parent's id). Falls back to None for
     /// legacy callers; commit-time prepare assigns one then.
-    Insert { collection: String, data: Value, id: Option<DocumentId> },
-    Update { collection: String, query: Value, update: Value },
-    Delete { collection: String, query: Value },
+    Insert {
+        collection: String,
+        data: Value,
+        id: Option<DocumentId>,
+    },
+    Update {
+        collection: String,
+        query: Value,
+        update: Value,
+    },
+    Delete {
+        collection: String,
+        query: Value,
+    },
 }
 
 /// An active transaction holding its read set, write set, and involved collections.

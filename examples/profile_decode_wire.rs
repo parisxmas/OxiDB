@@ -97,18 +97,26 @@ fn run_shape(label: &str, val: &Value, iters: usize) {
     }));
 
     // ALT-A: JSONB → JSON text directly via RawJsonb::to_string
-    r.push(bench("ALT-A: RawJsonb::to_string (skip Value)", iters, || {
-        let raw = RawJsonb::new(black_box(&jsonb_bytes));
-        let text = raw.to_string();
-        text.len()
-    }));
+    r.push(bench(
+        "ALT-A: RawJsonb::to_string (skip Value)",
+        iters,
+        || {
+            let raw = RawJsonb::new(black_box(&jsonb_bytes));
+            let text = raw.to_string();
+            text.len()
+        },
+    ));
 
     // ALT-B: just full-decode to Value (no re-serialize) — for reference
-    r.push(bench("REF: JSONB→Value only (no re-serialize)", iters, || {
-        let v = codec::decode_doc(black_box(&jsonb_bytes)).unwrap();
-        let _ = v;
-        jsonb_bytes.len()
-    }));
+    r.push(bench(
+        "REF: JSONB→Value only (no re-serialize)",
+        iters,
+        || {
+            let v = codec::decode_doc(black_box(&jsonb_bytes)).unwrap();
+            let _ = v;
+            jsonb_bytes.len()
+        },
+    ));
 
     // ALT-C: re-serialize Value→JSON text only (cost of just the back half)
     let val_owned = codec::decode_doc(&jsonb_bytes).unwrap();
@@ -119,18 +127,29 @@ fn run_shape(label: &str, val: &Value, iters: usize) {
 
     // ALT-D: pre-decoded Value sitting in memory (cached doc) → JSON text
     //   This models the in-memory document cache path that doesn't pay decode.
-    r.push(bench("REF: cached Value → JSON text (no decode)", iters, || {
-        let text = serde_json::to_vec(black_box(&val_owned)).unwrap();
-        text.len()
-    }));
+    r.push(bench(
+        "REF: cached Value → JSON text (no decode)",
+        iters,
+        || {
+            let text = serde_json::to_vec(black_box(&val_owned)).unwrap();
+            text.len()
+        },
+    ));
 
     let baseline = r[0].ns_per_op;
-    println!("{:<48} {:>11} {:>9} {:>9}",
-             "step", "ns/op (med)", "bytes", "vs CURR");
+    println!(
+        "{:<48} {:>11} {:>9} {:>9}",
+        "step", "ns/op (med)", "bytes", "vs CURR"
+    );
     println!("{}", "-".repeat(85));
     for s in &r {
-        println!("{:<48} {:>11.0} {:>9} {:>9.2}x",
-                 s.label, s.ns_per_op, s.bytes_out, s.ns_per_op / baseline);
+        println!(
+            "{:<48} {:>11.0} {:>9} {:>9.2}x",
+            s.label,
+            s.ns_per_op,
+            s.bytes_out,
+            s.ns_per_op / baseline
+        );
     }
 }
 

@@ -19,7 +19,7 @@
 //!     5. Hand the now-authed stream to `round_trip` for the user's
 //!        actual command, then return it to the user-keyed pool.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use oxidb::links::ParsedRemote;
 
 use crate::protocol::{read_message, write_message};
-use crate::scram_client::{verify_server_final, ScramClient};
+use crate::scram_client::{ScramClient, verify_server_final};
 
 /// Default connect + read timeout for proxy calls. Linked collections
 /// are usually on a fast LAN, but we don't want a wedged remote to
@@ -67,8 +67,7 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Pooled conns are user-keyed so a take() never returns an
 /// unauthenticated conn for a user-bound request (or vice versa).
 pub fn proxy_command(remote: &ParsedRemote, command: &Value) -> Result<Value, String> {
-    let payload = serde_json::to_vec(command)
-        .map_err(|e| format!("encode command: {}", e))?;
+    let payload = serde_json::to_vec(command).map_err(|e| format!("encode command: {}", e))?;
 
     let user_key = remote.user.as_deref();
 
@@ -121,8 +120,8 @@ pub fn authenticate(stream: &TcpStream, username: &str, password: &str) -> Resul
         "command": "authenticate",
         "payload": client_first_msg,
     });
-    let req1_bytes = serde_json::to_vec(&req1)
-        .map_err(|e| format!("encode authenticate: {}", e))?;
+    let req1_bytes =
+        serde_json::to_vec(&req1).map_err(|e| format!("encode authenticate: {}", e))?;
     let resp1 = round_trip(stream, &req1_bytes)?;
     let server_first = extract_payload(&resp1, "authenticate")?;
 
@@ -134,8 +133,8 @@ pub fn authenticate(stream: &TcpStream, username: &str, password: &str) -> Resul
         "command": "authenticate_continue",
         "payload": client_final_msg,
     });
-    let req2_bytes = serde_json::to_vec(&req2)
-        .map_err(|e| format!("encode authenticate_continue: {}", e))?;
+    let req2_bytes =
+        serde_json::to_vec(&req2).map_err(|e| format!("encode authenticate_continue: {}", e))?;
     let resp2 = round_trip(stream, &req2_bytes)?;
     let server_final = extract_payload(&resp2, "authenticate_continue")?;
 
@@ -293,7 +292,7 @@ pub fn pool() -> &'static Pool {
 
 // Re-export so handler.rs can construct one without a fresh import
 // chain. The proxy code lives entirely in this module.
-pub use oxidb::links::{parse_remote, LinkConfig, ParsedRemote as Remote};
+pub use oxidb::links::{LinkConfig, ParsedRemote as Remote, parse_remote};
 
 // Convenience: io::Error -> String for the call sites that prefer
 // String-typed errors (matching the handler's `{"ok": false,

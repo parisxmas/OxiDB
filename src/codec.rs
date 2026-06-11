@@ -25,10 +25,9 @@ use crate::error::{Error, Result};
 /// literals, or empty array elements to accommodate.
 pub fn encode_doc(value: &Value) -> Result<Vec<u8>> {
     let mut text = Vec::with_capacity(64);
-    serde_json::to_writer(&mut text, value)
-        .map_err(|e| Error::Codec(e.to_string()))?;
-    let owned = jsonb::parse_owned_jsonb_standard_mode(&text)
-        .map_err(|e| Error::Codec(e.to_string()))?;
+    serde_json::to_writer(&mut text, value).map_err(|e| Error::Codec(e.to_string()))?;
+    let owned =
+        jsonb::parse_owned_jsonb_standard_mode(&text).map_err(|e| Error::Codec(e.to_string()))?;
     Ok(owned.to_vec())
 }
 
@@ -62,7 +61,8 @@ pub fn extract_fields(bytes: &[u8], fields: &[&str]) -> Vec<(String, Value)> {
     match bytes[0] {
         b'{' | b'[' => {
             if let Ok(doc) = serde_json::from_slice::<Value>(bytes) {
-                fields.iter()
+                fields
+                    .iter()
                     .filter_map(|f| doc.get(*f).map(|v| (f.to_string(), v.clone())))
                     .collect()
             } else {
@@ -71,7 +71,8 @@ pub fn extract_fields(bytes: &[u8], fields: &[&str]) -> Vec<(String, Value)> {
         }
         _ => {
             let raw = jsonb::RawJsonb::new(bytes);
-            fields.iter()
+            fields
+                .iter()
                 .filter_map(|f| {
                     let owned = raw.get_by_name(f, false).ok()??;
                     let val = jsonb::from_raw_jsonb(&owned.as_raw()).ok()?;
@@ -125,8 +126,7 @@ pub fn decode_doc_to_text(bytes: &[u8]) -> Result<String> {
     match bytes[0] {
         b'{' | b'[' => {
             // Legacy JSON text — the bytes are already the answer.
-            String::from_utf8(bytes.to_vec())
-                .map_err(|e| Error::Codec(e.to_string()))
+            String::from_utf8(bytes.to_vec()).map_err(|e| Error::Codec(e.to_string()))
         }
         _ => {
             // JSONB binary — walk once, emit text.

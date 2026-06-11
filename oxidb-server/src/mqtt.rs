@@ -39,7 +39,10 @@ fn read_remaining_length(reader: &mut impl Read) -> io::Result<usize> {
         }
         multiplier *= 128;
         if multiplier > 128 * 128 * 128 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "malformed remaining length"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed remaining length",
+            ));
         }
     }
 }
@@ -60,12 +63,18 @@ fn write_remaining_length(writer: &mut impl Write, mut len: usize) -> io::Result
 
 fn read_utf8(data: &[u8], offset: &mut usize) -> io::Result<String> {
     if *offset + 2 > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short string length"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short string length",
+        ));
     }
     let len = u16::from_be_bytes([data[*offset], data[*offset + 1]]) as usize;
     *offset += 2;
     if *offset + len > data.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short string data"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short string data",
+        ));
     }
     let s = String::from_utf8_lossy(&data[*offset..*offset + len]).to_string();
     *offset += len;
@@ -78,7 +87,12 @@ fn write_utf8(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(bytes);
 }
 
-fn write_packet(writer: &mut impl Write, pkt_type: u8, flags: u8, payload: &[u8]) -> io::Result<()> {
+fn write_packet(
+    writer: &mut impl Write,
+    pkt_type: u8,
+    flags: u8,
+    payload: &[u8],
+) -> io::Result<()> {
     writer.write_all(&[(pkt_type << 4) | (flags & 0x0F)])?;
     write_remaining_length(writer, payload.len())?;
     writer.write_all(payload)?;
@@ -91,7 +105,10 @@ fn write_packet(writer: &mut impl Write, pkt_type: u8, flags: u8, payload: &[u8]
 
 /// Handle a single MQTT client connection.
 pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let mut reader = BufReader::new(&stream);
     let mut writer = BufWriter::new(&stream);
 
@@ -115,11 +132,19 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
     // Parse variable header: protocol name, level, flags, keepalive
     let mut off = 0;
     let _protocol = read_utf8(&payload, &mut off).unwrap_or_default();
-    if off >= payload.len() { return; }
-    let _level = payload[off]; off += 1; // 4 = MQTT 3.1.1
-    if off >= payload.len() { return; }
-    let _conn_flags = payload[off]; off += 1;
-    if off + 1 >= payload.len() { return; }
+    if off >= payload.len() {
+        return;
+    }
+    let _level = payload[off];
+    off += 1; // 4 = MQTT 3.1.1
+    if off >= payload.len() {
+        return;
+    }
+    let _conn_flags = payload[off];
+    off += 1;
+    if off + 1 >= payload.len() {
+        return;
+    }
     let _keepalive = u16::from_be_bytes([payload[off], payload[off + 1]]);
     off += 2;
     let client_id = read_utf8(&payload, &mut off).unwrap_or_default();
@@ -129,8 +154,12 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
     }
 
     // CONNACK: session_present=0, return_code=0 (accepted)
-    if write_packet(&mut writer, CONNACK, 0, &[0x00, 0x00]).is_err() { return; }
-    if writer.flush().is_err() { return; }
+    if write_packet(&mut writer, CONNACK, 0, &[0x00, 0x00]).is_err() {
+        return;
+    }
+    if writer.flush().is_err() {
+        return;
+    }
 
     // --- Main loop ---
     let mut receivers: Vec<(String, std::sync::mpsc::Receiver<(String, String)>)> = Vec::new();
@@ -144,21 +173,28 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                 let mut buf = Vec::new();
                 write_utf8(&mut buf, &topic);
                 buf.extend_from_slice(message.as_bytes());
-                if write_packet(&mut writer, PUBLISH, 0, &buf).is_err() { return; }
+                if write_packet(&mut writer, PUBLISH, 0, &buf).is_err() {
+                    return;
+                }
                 if log {
                     eprintln!("[mqtt] >> PUBLISH topic=\"{topic}\" len={}", message.len());
                 }
                 wrote = true;
             }
         }
-        if wrote && writer.flush().is_err() { return; }
+        if wrote && writer.flush().is_err() {
+            return;
+        }
 
         // Try to read next packet (non-blocking via read timeout)
         let mut hdr = [0u8; 1];
         match reader.read_exact(&mut hdr) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                || e.kind() == io::ErrorKind::TimedOut => continue,
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
             Err(_) => break,
         }
 
@@ -168,7 +204,9 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
             Err(_) => break,
         };
         let mut payload = vec![0u8; remaining];
-        if remaining > 0 && reader.read_exact(&mut payload).is_err() { break; }
+        if remaining > 0 && reader.read_exact(&mut payload).is_err() {
+            break;
+        }
 
         match pkt_type {
             PUBLISH => {
@@ -194,7 +232,9 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
             }
 
             SUBSCRIBE => {
-                if payload.len() < 2 { continue; }
+                if payload.len() < 2 {
+                    continue;
+                }
                 let pkt_id = u16::from_be_bytes([payload[0], payload[1]]);
                 let mut off = 2;
                 let mut return_codes = Vec::new();
@@ -203,7 +243,13 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                         Ok(t) => t,
                         Err(_) => break,
                     };
-                    let _qos = if off < payload.len() { let q = payload[off]; off += 1; q } else { 0 };
+                    let _qos = if off < payload.len() {
+                        let q = payload[off];
+                        off += 1;
+                        q
+                    } else {
+                        0
+                    };
                     if log {
                         eprintln!("[mqtt] << SUBSCRIBE topic=\"{topic}\"");
                     }
@@ -219,7 +265,9 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
             }
 
             UNSUBSCRIBE => {
-                if payload.len() < 2 { continue; }
+                if payload.len() < 2 {
+                    continue;
+                }
                 let pkt_id = u16::from_be_bytes([payload[0], payload[1]]);
                 let mut off = 2;
                 while off < payload.len() {

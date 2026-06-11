@@ -75,9 +75,10 @@ impl HttpResponse {
             status: 206,
             status_text: "Partial Content",
             content_type: content_type.to_string(),
-            headers: vec![
-                ("Content-Range".to_string(), format!("bytes {range}/{total}")),
-            ],
+            headers: vec![(
+                "Content-Range".to_string(),
+                format!("bytes {range}/{total}"),
+            )],
             body,
             content_length_override: None,
         }
@@ -111,8 +112,8 @@ impl HttpResponse {
 
     pub fn write_to_keepalive(self, stream: &mut TcpStream, keep_alive: bool) {
         let conn = if keep_alive { "keep-alive" } else { "close" };
-        let use_chunked = self.content_length_override.is_none()
-            && self.body.len() > Self::CHUNK_THRESHOLD;
+        let use_chunked =
+            self.content_length_override.is_none() && self.body.len() > Self::CHUNK_THRESHOLD;
 
         let mut resp = format!(
             "HTTP/1.1 {} {}\r\nConnection: {}\r\nServer: OxiDB-S3\r\n",
@@ -122,7 +123,9 @@ impl HttpResponse {
         if use_chunked {
             resp.push_str("Transfer-Encoding: chunked\r\n");
         } else {
-            let content_length = self.content_length_override.unwrap_or(self.body.len() as u64);
+            let content_length = self
+                .content_length_override
+                .unwrap_or(self.body.len() as u64);
             resp.push_str(&format!("Content-Length: {content_length}\r\n"));
         }
 
@@ -133,7 +136,9 @@ impl HttpResponse {
             resp.push_str(&format!("{k}: {v}\r\n"));
         }
         resp.push_str("\r\n");
-        if stream.write_all(resp.as_bytes()).is_err() { return; }
+        if stream.write_all(resp.as_bytes()).is_err() {
+            return;
+        }
 
         if self.body.is_empty() {
             let _ = stream.flush();
@@ -144,13 +149,23 @@ impl HttpResponse {
             // Stream body in chunks — avoids holding entire response in one write buffer
             for chunk in self.body.chunks(Self::CHUNK_SIZE) {
                 let header = format!("{:x}\r\n", chunk.len());
-                if stream.write_all(header.as_bytes()).is_err() { return; }
-                if stream.write_all(chunk).is_err() { return; }
-                if stream.write_all(b"\r\n").is_err() { return; }
+                if stream.write_all(header.as_bytes()).is_err() {
+                    return;
+                }
+                if stream.write_all(chunk).is_err() {
+                    return;
+                }
+                if stream.write_all(b"\r\n").is_err() {
+                    return;
+                }
             }
-            if stream.write_all(b"0\r\n\r\n").is_err() { return; }
+            if stream.write_all(b"0\r\n\r\n").is_err() {
+                return;
+            }
         } else {
-            if stream.write_all(&self.body).is_err() { return; }
+            if stream.write_all(&self.body).is_err() {
+                return;
+            }
         }
         let _ = stream.flush();
     }
@@ -189,21 +204,28 @@ fn read_line_bounded(reader: &mut BufReader<impl Read>, limit: usize) -> Option<
         // Find newline in the buffered data
         if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let to_consume = pos + 1;
-            if count + to_consume > limit { return None; }
+            if count + to_consume > limit {
+                return None;
+            }
             line.push_str(&String::from_utf8_lossy(&buf[..to_consume]));
             reader.consume(to_consume);
             return Some(line);
         }
         // No newline yet — consume entire buffer
         let len = buf.len();
-        if count + len > limit { return None; }
+        if count + len > limit {
+            return None;
+        }
         line.push_str(&String::from_utf8_lossy(&buf[..len]));
         count += len;
         reader.consume(len);
     }
 }
 
-pub fn parse_request_from_reader(reader: &mut BufReader<impl Read>, writer: &TcpStream) -> Option<HttpRequest> {
+pub fn parse_request_from_reader(
+    reader: &mut BufReader<impl Read>,
+    writer: &TcpStream,
+) -> Option<HttpRequest> {
     let line = read_line_bounded(reader, MAX_LINE_SIZE)?;
     let parts: Vec<&str> = line.trim().splitn(3, ' ').collect();
     if parts.len() < 2 {
@@ -233,7 +255,10 @@ pub fn parse_request_from_reader(reader: &mut BufReader<impl Read>, writer: &Tcp
     }
 
     // Handle Expect: 100-continue
-    if headers.get("expect").is_some_and(|v| v.contains("100-continue")) {
+    if headers
+        .get("expect")
+        .is_some_and(|v| v.contains("100-continue"))
+    {
         let cont = b"HTTP/1.1 100 Continue\r\n\r\n";
         let _ = writer.try_clone().ok()?.write_all(cont);
     }
@@ -246,13 +271,22 @@ pub fn parse_request_from_reader(reader: &mut BufReader<impl Read>, writer: &Tcp
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf).ok()?;
         buf
-    } else if headers.get("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+    } else if headers
+        .get("transfer-encoding")
+        .is_some_and(|v| v.contains("chunked"))
+    {
         read_chunked(reader).unwrap_or_default()
     } else {
         Vec::new()
     };
 
-    Some(HttpRequest { method, path, query, headers, body })
+    Some(HttpRequest {
+        method,
+        path,
+        query,
+        headers,
+        body,
+    })
 }
 
 fn read_chunked(reader: &mut BufReader<impl Read>) -> Option<Vec<u8>> {

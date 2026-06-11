@@ -216,16 +216,24 @@ fn main() {
         let mut results = Vec::new();
 
         // 1) serde_json text → Value (for reference: legacy .dat path)
-        results.push(bench("serde_json::from_slice → Value (legacy text)", iters_per_strategy, || {
-            let v: Value = serde_json::from_slice(black_box(json_bytes)).unwrap();
-            black_box(v);
-        }));
+        results.push(bench(
+            "serde_json::from_slice → Value (legacy text)",
+            iters_per_strategy,
+            || {
+                let v: Value = serde_json::from_slice(black_box(json_bytes)).unwrap();
+                black_box(v);
+            },
+        ));
 
         // 2) jsonb full decode → Value (current decode_doc path)
-        results.push(bench("JSONB decode → Value (full)", iters_per_strategy, || {
-            let v = codec::decode_doc(black_box(jsonb_bytes)).unwrap();
-            black_box(v);
-        }));
+        results.push(bench(
+            "JSONB decode → Value (full)",
+            iters_per_strategy,
+            || {
+                let v = codec::decode_doc(black_box(jsonb_bytes)).unwrap();
+                black_box(v);
+            },
+        ));
 
         // 3) Encode: serde_json::Value → JSONB bytes
         results.push(bench("encode: Value → JSONB", iters_per_strategy, || {
@@ -234,10 +242,14 @@ fn main() {
         }));
 
         // 4) Encode: serde_json::Value → JSON text (for ref)
-        results.push(bench("encode: Value → JSON text", iters_per_strategy, || {
-            let b = serde_json::to_vec(black_box(val)).unwrap();
-            black_box(b);
-        }));
+        results.push(bench(
+            "encode: Value → JSON text",
+            iters_per_strategy,
+            || {
+                let b = serde_json::to_vec(black_box(val)).unwrap();
+                black_box(b);
+            },
+        ));
 
         // 5) Partial extract → Value (extract_field)
         results.push(bench("extract_field → Value", iters_per_strategy, || {
@@ -246,29 +258,43 @@ fn main() {
         }));
 
         // 6) Current index hot path: partial → Value → IndexValue
-        results.push(bench("CURRENT: extract → Value → IndexValue", iters_per_strategy, || {
-            let raw = RawJsonb::new(black_box(jsonb_bytes));
-            let iv = current_extract_indexvalue(&raw, black_box(field));
-            black_box(iv);
-        }));
+        results.push(bench(
+            "CURRENT: extract → Value → IndexValue",
+            iters_per_strategy,
+            || {
+                let raw = RawJsonb::new(black_box(jsonb_bytes));
+                let iv = current_extract_indexvalue(&raw, black_box(field));
+                black_box(iv);
+            },
+        ));
 
         // 7) Custom: partial → IndexValue directly (no serde Value)
-        results.push(bench("CUSTOM: extract → IndexValue (no serde)", iters_per_strategy, || {
-            let raw = RawJsonb::new(black_box(jsonb_bytes));
-            let iv = custom_extract_indexvalue(&raw, black_box(field));
-            black_box(iv);
-        }));
+        results.push(bench(
+            "CUSTOM: extract → IndexValue (no serde)",
+            iters_per_strategy,
+            || {
+                let raw = RawJsonb::new(black_box(jsonb_bytes));
+                let iv = custom_extract_indexvalue(&raw, black_box(field));
+                black_box(iv);
+            },
+        ));
 
         // 8) Full decode + IndexValue::from_json (worst case — what older callers do)
-        results.push(bench("FULL decode → IndexValue", iters_per_strategy, || {
-            let v = codec::decode_doc(black_box(jsonb_bytes)).unwrap();
-            let iv = v.get(field).map(oxidb::value::IndexValue::from_json);
-            black_box(iv);
-        }));
+        results.push(bench(
+            "FULL decode → IndexValue",
+            iters_per_strategy,
+            || {
+                let v = codec::decode_doc(black_box(jsonb_bytes)).unwrap();
+                let iv = v.get(field).map(oxidb::value::IndexValue::from_json);
+                black_box(iv);
+            },
+        ));
 
         print_results(label, &results);
     }
 
-    println!("\nNote: median of {} runs, {} ops each, warmup={}.",
-             BENCH_ITERS, iters_per_strategy, WARMUP_ITERS);
+    println!(
+        "\nNote: median of {} runs, {} ops each, warmup={}.",
+        BENCH_ITERS, iters_per_strategy, WARMUP_ITERS
+    );
 }

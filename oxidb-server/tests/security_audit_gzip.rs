@@ -207,9 +207,7 @@ fn rotation_compress_gzip_stream_is_valid_and_parseable() {
             continue;
         }
         serde_json::from_str::<serde_json::Value>(line).unwrap_or_else(|e| {
-            panic!(
-                "decompressed line {lineno} not valid JSON: {e}\n  line = {line:?}"
-            )
+            panic!("decompressed line {lineno} not valid JSON: {e}\n  line = {line:?}")
         });
         event_count += 1;
     }

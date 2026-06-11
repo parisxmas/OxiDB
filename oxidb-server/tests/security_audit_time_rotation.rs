@@ -77,8 +77,8 @@ fn audit_log_rotates_when_age_exceeds_threshold() {
     let policy = RotationPolicy {
         max_bytes: None,
         max_age: Some(Duration::from_millis(300)),
-    calendar: None,
-    compress: false,
+        calendar: None,
+        compress: false,
     };
     let log = AuditLog::open_with_policy(dir.path(), policy).unwrap();
 
@@ -111,7 +111,7 @@ fn audit_log_no_rotation_below_age_threshold() {
         max_bytes: None,
         max_age: Some(Duration::from_secs(60)), // 60 seconds — well above test runtime
         calendar: None,
-    compress: false,
+        compress: false,
     };
     let log = AuditLog::open_with_policy(dir.path(), policy).unwrap();
 
@@ -139,8 +139,8 @@ fn audit_log_age_resets_on_rotation() {
     let policy = RotationPolicy {
         max_bytes: None,
         max_age: Some(Duration::from_millis(250)),
-    calendar: None,
-    compress: false,
+        calendar: None,
+        compress: false,
     };
     let log = AuditLog::open_with_policy(dir.path(), policy).unwrap();
     let audit_dir = dir.path().join("_audit");
@@ -149,7 +149,10 @@ fn audit_log_age_resets_on_rotation() {
     write_event(&log);
     thread::sleep(Duration::from_millis(350));
     write_event(&log);
-    assert!(count_rotated_files(&audit_dir) >= 1, "expected first rotation");
+    assert!(
+        count_rotated_files(&audit_dir) >= 1,
+        "expected first rotation"
+    );
     let after_first = count_rotated_files(&audit_dir);
 
     // Right after rotation, the clock just reset. A write NOW
@@ -189,8 +192,8 @@ fn audit_log_age_fires_independently_of_size() {
     let policy = RotationPolicy {
         max_bytes: Some(512 * 1024),
         max_age: Some(Duration::from_millis(300)),
-    calendar: None,
-    compress: false,
+        calendar: None,
+        compress: false,
     };
     let log = AuditLog::open_with_policy(dir.path(), policy).unwrap();
     let audit_dir = dir.path().join("_audit");
@@ -216,8 +219,8 @@ fn audit_log_size_fires_independently_of_age() {
     let policy = RotationPolicy {
         max_bytes: Some(1024),
         max_age: Some(Duration::from_secs(60)),
-    calendar: None,
-    compress: false,
+        calendar: None,
+        compress: false,
     };
     let log = AuditLog::open_with_policy(dir.path(), policy).unwrap();
     let audit_dir = dir.path().join("_audit");
@@ -286,8 +289,8 @@ fn audit_log_age_rotation_concurrent_safe() {
     let policy = RotationPolicy {
         max_bytes: None,
         max_age: Some(Duration::from_millis(200)),
-    calendar: None,
-    compress: false,
+        calendar: None,
+        compress: false,
     };
     let log = Arc::new(AuditLog::open_with_policy(dir.path(), policy).unwrap());
 

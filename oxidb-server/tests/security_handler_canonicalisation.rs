@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::tempdir;
 
 use oxidb::OxiDb;
@@ -61,7 +61,8 @@ fn parse_resp(bytes: &[u8]) -> Value {
 fn expect_err(resp: Value, hint: &str) {
     let ok = resp.get("ok").and_then(|v| v.as_bool());
     assert_eq!(
-        ok, Some(false),
+        ok,
+        Some(false),
         "{hint}: expected ok=false, got resp = {resp}",
     );
     let err = resp.get("error").and_then(|v| v.as_str());
@@ -227,7 +228,8 @@ fn handler_lowercase_insert_works_baseline() {
     let resp = parse_resp(&handler::handle_request(&db, req, &mut tx));
     let ok = resp.get("ok").and_then(|v| v.as_bool());
     assert_eq!(
-        ok, Some(true),
+        ok,
+        Some(true),
         "lowercase insert MUST succeed (this baseline test failing means \
          the whole corpus is suspect): resp = {resp}"
     );

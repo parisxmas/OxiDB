@@ -179,7 +179,9 @@ fn write_cache_file(
 ) -> io::Result<()> {
     // Encrypt body if key is available
     let final_body = match encryption {
-        Some(key) => key.encrypt(body).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?,
+        Some(key) => key
+            .encrypt(body)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?,
         None => body.to_vec(),
     };
 
@@ -219,27 +221,39 @@ fn validate_cache_file(
         return None;
     }
 
-    if &data[0..4] != MAGIC { return None; }
+    if &data[0..4] != MAGIC {
+        return None;
+    }
 
     let version = u32::from_le_bytes(data[4..8].try_into().ok()?);
-    if version != VERSION { return None; }
+    if version != VERSION {
+        return None;
+    }
 
     let doc_count = u64::from_le_bytes(data[8..16].try_into().ok()?);
-    if doc_count != expected_doc_count { return None; }
+    if doc_count != expected_doc_count {
+        return None;
+    }
 
     let next_id = u64::from_le_bytes(data[16..24].try_into().ok()?);
-    if next_id != expected_next_id { return None; }
+    if next_id != expected_next_id {
+        return None;
+    }
 
     let stored_crc = u32::from_le_bytes(data[24..28].try_into().ok()?);
     let body_len = u64::from_le_bytes(data[28..36].try_into().ok()?) as usize;
-    if data.len() < HEADER_SIZE + body_len { return None; }
+    if data.len() < HEADER_SIZE + body_len {
+        return None;
+    }
 
     let body = &data[HEADER_SIZE..HEADER_SIZE + body_len];
 
     // Verify CRC (on encrypted body — CRC was computed on encrypted data)
     let mut h = Hasher::new();
     h.update(body);
-    if h.finalize() != stored_crc { return None; }
+    if h.finalize() != stored_crc {
+        return None;
+    }
 
     // Decrypt if encryption key is present
     match encryption {

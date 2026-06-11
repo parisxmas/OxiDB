@@ -32,7 +32,7 @@
 //! client does. Pinning / custom roots is out of scope here — a
 //! follow-up could add it if some operator needs it.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, OnceLock};
@@ -249,12 +249,8 @@ impl Adapter for RestAdapter {
                 Ok(ok_envelope(json!({ "count": n })))
             }
             "insert" => {
-                let doc = request
-                    .get("doc")
-                    .ok_or("missing 'doc'")?
-                    .clone();
-                let body = serde_json::to_vec(&doc)
-                    .map_err(|e| format!("encode doc: {}", e))?;
+                let doc = request.get("doc").ok_or("missing 'doc'")?.clone();
+                let body = serde_json::to_vec(&doc).map_err(|e| format!("encode doc: {}", e))?;
                 let resp = self.http_request("POST", &self.base_path, Some(&body))?;
                 let parsed = parse_json_body(&resp)?;
                 // Echo back what the server returned in the standard
@@ -264,24 +260,23 @@ impl Adapter for RestAdapter {
                 Ok(ok_envelope(parsed))
             }
             "update_one" => {
-                let id = self.id_from_query(&query)?.ok_or(
-                    "REST FDW update_one requires a query selecting by the id field",
-                )?;
+                let id = self
+                    .id_from_query(&query)?
+                    .ok_or("REST FDW update_one requires a query selecting by the id field")?;
                 let update = request.get("update").ok_or("missing 'update'")?;
                 let set = update
                     .get("$set")
                     .ok_or("REST FDW supports only the $set update operator")?;
-                let body = serde_json::to_vec(set)
-                    .map_err(|e| format!("encode $set: {}", e))?;
+                let body = serde_json::to_vec(set).map_err(|e| format!("encode $set: {}", e))?;
                 let path = format!("{}/{}", self.base_path, id);
                 let resp = self.http_request("PATCH", &path, Some(&body))?;
                 let parsed = parse_json_body(&resp).unwrap_or(Value::Null);
                 Ok(ok_envelope(json!({ "modified": 1, "doc": parsed })))
             }
             "delete_one" => {
-                let id = self.id_from_query(&query)?.ok_or(
-                    "REST FDW delete_one requires a query selecting by the id field",
-                )?;
+                let id = self
+                    .id_from_query(&query)?
+                    .ok_or("REST FDW delete_one requires a query selecting by the id field")?;
                 let path = format!("{}/{}", self.base_path, id);
                 // Many APIs return empty body on DELETE — that's fine,
                 // we don't try to parse the response.
@@ -322,11 +317,8 @@ impl RestAdapter {
         body: Option<&[u8]>,
     ) -> Result<Vec<u8>, String> {
         let addr = format!("{}:{}", self.host, self.port);
-        let tcp = TcpStream::connect_timeout(
-            &addr.to_socket_addrs_first()?,
-            HTTP_TIMEOUT,
-        )
-        .map_err(|e| format!("connect {}: {}", addr, e))?;
+        let tcp = TcpStream::connect_timeout(&addr.to_socket_addrs_first()?, HTTP_TIMEOUT)
+            .map_err(|e| format!("connect {}: {}", addr, e))?;
         tcp.set_read_timeout(Some(HTTP_TIMEOUT))
             .map_err(|e| format!("set read timeout: {}", e))?;
         tcp.set_write_timeout(Some(HTTP_TIMEOUT))
@@ -474,10 +466,7 @@ fn parse_http_response(raw: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("response head not UTF-8: {}", e))?;
     let body = &raw[split + 4..];
 
-    let status_line = head
-        .lines()
-        .next()
-        .ok_or("response has no status line")?;
+    let status_line = head.lines().next().ok_or("response has no status line")?;
     let mut parts = status_line.splitn(3, ' ');
     let _version = parts.next();
     let code: u16 = parts
@@ -620,7 +609,9 @@ mod tests {
             log: Arc<Mutex<Vec<(String, String, Vec<u8>)>>>,
             responses: Vec<(&'static str, &'static str, u16, &'static str)>,
         ) {
-            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut buf = vec![0u8; 8192];
             let mut total = Vec::new();
             // Read until we see the full headers + body. A real HTTP
@@ -650,7 +641,10 @@ mod tests {
                 }
             }
 
-            let head_end = total.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(total.len());
+            let head_end = total
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .unwrap_or(total.len());
             let head_str = std::str::from_utf8(&total[..head_end]).unwrap();
             let body = if head_end + 4 <= total.len() {
                 total[head_end + 4..].to_vec()
@@ -662,7 +656,9 @@ mod tests {
             let method = parts.next().unwrap_or("").to_string();
             let path = parts.next().unwrap_or("").to_string();
 
-            log.lock().unwrap().push((method.clone(), path.clone(), body));
+            log.lock()
+                .unwrap()
+                .push((method.clone(), path.clone(), body));
 
             let (status, payload) = responses
                 .iter()
@@ -737,9 +733,12 @@ mod tests {
 
     #[test]
     fn find_returns_array_from_endpoint() {
-        let srv = MockHttpServer::start(vec![
-            ("GET", "/users", 200, r#"[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]"#),
-        ]);
+        let srv = MockHttpServer::start(vec![(
+            "GET",
+            "/users",
+            200,
+            r#"[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]"#,
+        )]);
         let a = adapter(srv.port, "/users");
         let resp = a.execute("find", &json!({"query": {}})).unwrap();
         let rows = resp["data"].as_array().unwrap();
@@ -749,11 +748,16 @@ mod tests {
 
     #[test]
     fn find_filters_array_client_side_with_equality_predicate() {
-        let srv = MockHttpServer::start(vec![
-            ("GET", "/users", 200, r#"[{"id":1,"role":"admin"},{"id":2,"role":"user"}]"#),
-        ]);
+        let srv = MockHttpServer::start(vec![(
+            "GET",
+            "/users",
+            200,
+            r#"[{"id":1,"role":"admin"},{"id":2,"role":"user"}]"#,
+        )]);
         let a = adapter(srv.port, "/users");
-        let resp = a.execute("find", &json!({"query": {"role": "admin"}})).unwrap();
+        let resp = a
+            .execute("find", &json!({"query": {"role": "admin"}}))
+            .unwrap();
         let rows = resp["data"].as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["id"], 1);
@@ -761,11 +765,11 @@ mod tests {
 
     #[test]
     fn find_one_with_id_query_uses_path_segment() {
-        let srv = MockHttpServer::start(vec![
-            ("GET", "/users/42", 200, r#"{"id":42,"name":"x"}"#),
-        ]);
+        let srv = MockHttpServer::start(vec![("GET", "/users/42", 200, r#"{"id":42,"name":"x"}"#)]);
         let a = adapter(srv.port, "/users");
-        let resp = a.execute("find_one", &json!({"query": {"id": 42}})).unwrap();
+        let resp = a
+            .execute("find_one", &json!({"query": {"id": 42}}))
+            .unwrap();
         assert_eq!(resp["data"]["name"], "x");
         // Confirm we hit /users/42, not /users.
         let log = srv.requests.lock().unwrap();
@@ -775,9 +779,12 @@ mod tests {
 
     #[test]
     fn count_uses_filtered_array_length() {
-        let srv = MockHttpServer::start(vec![
-            ("GET", "/things", 200, r#"[{"x":1},{"x":1},{"x":2}]"#),
-        ]);
+        let srv = MockHttpServer::start(vec![(
+            "GET",
+            "/things",
+            200,
+            r#"[{"x":1},{"x":1},{"x":2}]"#,
+        )]);
         let a = adapter(srv.port, "/things");
         let resp = a.execute("count", &json!({"query": {"x": 1}})).unwrap();
         assert_eq!(resp["data"]["count"], 2);
@@ -787,9 +794,12 @@ mod tests {
     fn unwraps_data_envelope_from_apis_that_wrap() {
         // Many REST APIs return `{"data": [...]}` instead of a bare
         // array. The adapter must accept that shape transparently.
-        let srv = MockHttpServer::start(vec![
-            ("GET", "/items", 200, r#"{"data":[{"x":1},{"x":2}]}"#),
-        ]);
+        let srv = MockHttpServer::start(vec![(
+            "GET",
+            "/items",
+            200,
+            r#"{"data":[{"x":1},{"x":2}]}"#,
+        )]);
         let a = adapter(srv.port, "/items");
         let resp = a.execute("find", &json!({"query": {}})).unwrap();
         assert_eq!(resp["data"].as_array().unwrap().len(), 2);
@@ -797,11 +807,11 @@ mod tests {
 
     #[test]
     fn insert_posts_doc_and_returns_server_payload() {
-        let srv = MockHttpServer::start(vec![
-            ("POST", "/users", 201, r#"{"id":99,"name":"new"}"#),
-        ]);
+        let srv = MockHttpServer::start(vec![("POST", "/users", 201, r#"{"id":99,"name":"new"}"#)]);
         let a = adapter(srv.port, "/users");
-        let resp = a.execute("insert", &json!({"doc": {"name": "new"}})).unwrap();
+        let resp = a
+            .execute("insert", &json!({"doc": {"name": "new"}}))
+            .unwrap();
         assert_eq!(resp["data"]["id"], 99);
 
         let log = srv.requests.lock().unwrap();
@@ -814,14 +824,22 @@ mod tests {
 
     #[test]
     fn update_one_patches_by_id_and_sends_only_set_body() {
-        let srv = MockHttpServer::start(vec![
-            ("PATCH", "/users/7", 200, r#"{"id":7,"name":"updated"}"#),
-        ]);
+        let srv = MockHttpServer::start(vec![(
+            "PATCH",
+            "/users/7",
+            200,
+            r#"{"id":7,"name":"updated"}"#,
+        )]);
         let a = adapter(srv.port, "/users");
-        let resp = a.execute("update_one", &json!({
-            "query": {"id": 7},
-            "update": {"$set": {"name": "updated"}},
-        })).unwrap();
+        let resp = a
+            .execute(
+                "update_one",
+                &json!({
+                    "query": {"id": 7},
+                    "update": {"$set": {"name": "updated"}},
+                }),
+            )
+            .unwrap();
         assert_eq!(resp["data"]["modified"], 1);
 
         let log = srv.requests.lock().unwrap();
@@ -836,10 +854,15 @@ mod tests {
     fn update_one_without_id_query_is_rejected() {
         let srv = MockHttpServer::start(vec![]);
         let a = adapter(srv.port, "/users");
-        let err = a.execute("update_one", &json!({
-            "query": {},
-            "update": {"$set": {"name": "x"}},
-        })).unwrap_err();
+        let err = a
+            .execute(
+                "update_one",
+                &json!({
+                    "query": {},
+                    "update": {"$set": {"name": "x"}},
+                }),
+            )
+            .unwrap_err();
         assert!(err.contains("id field"));
     }
 
@@ -847,40 +870,42 @@ mod tests {
     fn update_one_without_set_operator_is_rejected() {
         let srv = MockHttpServer::start(vec![]);
         let a = adapter(srv.port, "/users");
-        let err = a.execute("update_one", &json!({
-            "query": {"id": 1},
-            "update": {"$inc": {"x": 1}},
-        })).unwrap_err();
+        let err = a
+            .execute(
+                "update_one",
+                &json!({
+                    "query": {"id": 1},
+                    "update": {"$inc": {"x": 1}},
+                }),
+            )
+            .unwrap_err();
         assert!(err.contains("$set"));
     }
 
     #[test]
     fn delete_one_deletes_by_id() {
-        let srv = MockHttpServer::start(vec![
-            ("DELETE", "/items/abc", 204, ""),
-        ]);
+        let srv = MockHttpServer::start(vec![("DELETE", "/items/abc", 204, "")]);
         let a = adapter(srv.port, "/items");
-        let resp = a.execute("delete_one", &json!({"query": {"id": "abc"}})).unwrap();
+        let resp = a
+            .execute("delete_one", &json!({"query": {"id": "abc"}}))
+            .unwrap();
         assert_eq!(resp["data"]["deleted"], 1);
     }
 
     #[test]
     fn id_field_override_via_url_fragment() {
-        let srv = MockHttpServer::start(vec![
-            ("GET", "/items/sku-9", 200, r#"{"sku":"sku-9"}"#),
-        ]);
-        let a = RestAdapter::from_url(
-            &format!("http://127.0.0.1:{}/items#id_field=sku", srv.port)
-        ).unwrap();
-        let resp = a.execute("find_one", &json!({"query": {"sku": "sku-9"}})).unwrap();
+        let srv = MockHttpServer::start(vec![("GET", "/items/sku-9", 200, r#"{"sku":"sku-9"}"#)]);
+        let a = RestAdapter::from_url(&format!("http://127.0.0.1:{}/items#id_field=sku", srv.port))
+            .unwrap();
+        let resp = a
+            .execute("find_one", &json!({"query": {"sku": "sku-9"}}))
+            .unwrap();
         assert_eq!(resp["data"]["sku"], "sku-9");
     }
 
     #[test]
     fn non_2xx_response_surfaces_as_error_with_status() {
-        let srv = MockHttpServer::start(vec![
-            ("GET", "/oops", 500, r#"{"error":"boom"}"#),
-        ]);
+        let srv = MockHttpServer::start(vec![("GET", "/oops", 500, r#"{"error":"boom"}"#)]);
         let a = adapter(srv.port, "/oops");
         let err = a.execute("find", &json!({"query": {}})).unwrap_err();
         assert!(err.contains("500"));
@@ -889,9 +914,12 @@ mod tests {
 
     #[test]
     fn non_json_response_surfaces_with_body_snippet() {
-        let srv = MockHttpServer::start(vec![
-            ("GET", "/html", 200, "<html><body>not json</body></html>"),
-        ]);
+        let srv = MockHttpServer::start(vec![(
+            "GET",
+            "/html",
+            200,
+            "<html><body>not json</body></html>",
+        )]);
         let a = adapter(srv.port, "/html");
         let err = a.execute("find", &json!({"query": {}})).unwrap_err();
         assert!(err.contains("not JSON"));
@@ -929,7 +957,7 @@ mod tests {
             "localhost".to_string(),
             "127.0.0.1".to_string(),
         ])
-            .expect("generate self-signed cert");
+        .expect("generate self-signed cert");
         let cert_der = rustls::pki_types::CertificateDer::from(ck.cert.der().to_vec());
         let key_der = PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der());
 
@@ -984,7 +1012,9 @@ mod tests {
                             }
                         }
                     }
-                    let head_end = total.windows(4).position(|w| w == b"\r\n\r\n")
+                    let head_end = total
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
                         .unwrap_or(total.len());
                     let head_str = std::str::from_utf8(&total[..head_end]).unwrap_or("");
                     let line = head_str.lines().next().unwrap_or("");
@@ -1000,7 +1030,8 @@ mod tests {
                     let body_bytes = payload.as_bytes();
                     let resp = format!(
                         "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        status, body_bytes.len()
+                        status,
+                        body_bytes.len()
                     );
                     let _ = s.write_all(resp.as_bytes());
                     let _ = s.write_all(body_bytes);
@@ -1036,9 +1067,7 @@ mod tests {
 
         // Build adapter pointing at https://localhost:<port>/users,
         // with the test cert injected as the trusted root.
-        let mut a = RestAdapter::from_url(&format!(
-            "https://127.0.0.1:{}/users", port
-        )).unwrap();
+        let mut a = RestAdapter::from_url(&format!("https://127.0.0.1:{}/users", port)).unwrap();
         a.tls_config_override = Some(build_trusting_config(cert));
 
         // find — exercises TLS handshake + GET + JSON parse.
@@ -1049,7 +1078,9 @@ mod tests {
         assert_eq!(rows[0]["name"], "alice");
 
         // insert — exercises TLS handshake + POST with body.
-        let resp = a.execute("insert", &json!({"doc": {"name": "bob"}})).unwrap();
+        let resp = a
+            .execute("insert", &json!({"doc": {"name": "bob"}}))
+            .unwrap();
         assert_eq!(resp["data"]["id"], 2);
     }
 
@@ -1058,12 +1089,8 @@ mod tests {
         // Use the DEFAULT tls_config (webpki-roots) against a server
         // presenting a self-signed cert — the handshake must fail,
         // and the failure must surface as an error rather than a panic.
-        let (port, _untrusted_cert) = start_tls_mock(vec![
-            ("GET", "/users", 200, r#"[]"#),
-        ]);
-        let a = RestAdapter::from_url(&format!(
-            "https://127.0.0.1:{}/users", port
-        )).unwrap();
+        let (port, _untrusted_cert) = start_tls_mock(vec![("GET", "/users", 200, r#"[]"#)]);
+        let a = RestAdapter::from_url(&format!("https://127.0.0.1:{}/users", port)).unwrap();
         // tls_config_override stays None → production trust path.
         let err = a.execute("find", &json!({"query": {}})).unwrap_err();
         // The exact error message comes from rustls and may vary by
@@ -1071,9 +1098,7 @@ mod tests {
         // either "unknown" CA, "certificate", or "trust" in the message.
         let lower = err.to_lowercase();
         assert!(
-            lower.contains("certificate")
-                || lower.contains("unknown")
-                || lower.contains("trust"),
+            lower.contains("certificate") || lower.contains("unknown") || lower.contains("trust"),
             "rustls error should mention cert/trust failure: {err}"
         );
     }

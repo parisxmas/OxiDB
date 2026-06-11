@@ -5,7 +5,11 @@ pub fn crc32(data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB88320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB88320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -92,19 +96,26 @@ pub fn iso_to_httpdate(iso: &str) -> String {
     let day: u32 = iso[8..10].parse().unwrap_or(1);
     let time_part = &iso[11..19]; // "HH:MM:SS"
 
-    let month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-    let day_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+    let month_names = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
     // Zeller-like day-of-week (Tomohiko Sakamoto's algorithm)
     let t = [0i32, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
     let mut y = year;
-    if month < 3 { y -= 1; }
-    let dow = ((y + y/4 - y/100 + y/400 + t[(month - 1) as usize] + day as i32) % 7) as usize;
+    if month < 3 {
+        y -= 1;
+    }
+    let dow = ((y + y / 4 - y / 100 + y / 400 + t[(month - 1) as usize] + day as i32) % 7) as usize;
     // dow: 0=Sun, 1=Mon, ..., 6=Sat → remap to our day_names (Mon=0)
     let dow_idx = if dow == 0 { 6 } else { dow - 1 };
 
     let m_idx = (month - 1).min(11) as usize;
-    format!("{}, {:02} {} {} {} GMT", day_names[dow_idx], day, month_names[m_idx], year, time_part)
+    format!(
+        "{}, {:02} {} {} {} GMT",
+        day_names[dow_idx], day, month_names[m_idx], year, time_part
+    )
 }
 
 pub fn parse_range(header: &str, total: u64) -> Option<(u64, u64)> {
@@ -113,18 +124,24 @@ pub fn parse_range(header: &str, total: u64) -> Option<(u64, u64)> {
 
     if start_s.is_empty() {
         let suffix: u64 = end_s.parse().ok()?;
-        if suffix > total { return None; }
+        if suffix > total {
+            return None;
+        }
         Some((total - suffix, total - 1))
     } else {
         let start: u64 = start_s.parse().ok()?;
-        if start >= total { return None; }
+        if start >= total {
+            return None;
+        }
         let end = if end_s.is_empty() {
             total - 1
         } else {
             let e: u64 = end_s.parse().ok()?;
             e.min(total - 1)
         };
-        if start > end { return None; }
+        if start > end {
+            return None;
+        }
         Some((start, end))
     }
 }
@@ -152,9 +169,18 @@ mod tests {
 
     #[test]
     fn test_iso_to_httpdate() {
-        assert_eq!(iso_to_httpdate("2026-03-17T17:03:25Z"), "Tue, 17 Mar 2026 17:03:25 GMT");
-        assert_eq!(iso_to_httpdate("2024-01-01T00:00:00Z"), "Mon, 01 Jan 2024 00:00:00 GMT");
-        assert_eq!(iso_to_httpdate("2025-12-25T12:30:00Z"), "Thu, 25 Dec 2025 12:30:00 GMT");
+        assert_eq!(
+            iso_to_httpdate("2026-03-17T17:03:25Z"),
+            "Tue, 17 Mar 2026 17:03:25 GMT"
+        );
+        assert_eq!(
+            iso_to_httpdate("2024-01-01T00:00:00Z"),
+            "Mon, 01 Jan 2024 00:00:00 GMT"
+        );
+        assert_eq!(
+            iso_to_httpdate("2025-12-25T12:30:00Z"),
+            "Thu, 25 Dec 2025 12:30:00 GMT"
+        );
     }
 
     #[test]

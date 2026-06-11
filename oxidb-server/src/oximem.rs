@@ -26,7 +26,10 @@ struct KvEntry {
 
 impl KvEntry {
     fn new(value: String) -> Self {
-        Self { value, expires_at: None }
+        Self {
+            value,
+            expires_at: None,
+        }
     }
     fn with_ttl(value: String, secs: u64) -> Self {
         Self {
@@ -35,13 +38,19 @@ impl KvEntry {
         }
     }
     fn is_expired(&self) -> bool {
-        self.expires_at.map(|e| Instant::now() >= e).unwrap_or(false)
+        self.expires_at
+            .map(|e| Instant::now() >= e)
+            .unwrap_or(false)
     }
     fn ttl_secs(&self) -> i64 {
         match self.expires_at {
             Some(e) => {
                 let now = Instant::now();
-                if now >= e { -2 } else { (e - now).as_secs() as i64 }
+                if now >= e {
+                    -2
+                } else {
+                    (e - now).as_secs() as i64
+                }
             }
             None => -1,
         }
@@ -71,7 +80,10 @@ struct SortedSet {
 
 impl SortedSet {
     fn new() -> Self {
-        Self { scores: HashMap::new(), tree: BTreeSet::new() }
+        Self {
+            scores: HashMap::new(),
+            tree: BTreeSet::new(),
+        }
     }
     fn insert(&mut self, member: String, score: f64) -> bool {
         if let Some(&old) = self.scores.get(&member) {
@@ -106,12 +118,25 @@ impl SortedSet {
     }
     fn range_by_rank(&self, start: isize, stop: isize) -> Vec<(&str, f64)> {
         let len = self.tree.len() as isize;
-        let s = if start < 0 { (len + start).max(0) as usize } else { start as usize };
-        let e = if stop < 0 { (len + stop).max(0) as usize } else { stop as usize };
+        let s = if start < 0 {
+            (len + start).max(0) as usize
+        } else {
+            start as usize
+        };
+        let e = if stop < 0 {
+            (len + stop).max(0) as usize
+        } else {
+            stop as usize
+        };
         if s > e || s >= len as usize {
             return vec![];
         }
-        self.tree.iter().skip(s).take(e - s + 1).map(|(sc, m)| (m.as_str(), sc.0)).collect()
+        self.tree
+            .iter()
+            .skip(s)
+            .take(e - s + 1)
+            .map(|(sc, m)| (m.as_str(), sc.0))
+            .collect()
     }
     fn range_by_score(&self, min: f64, max: f64) -> Vec<(&str, f64)> {
         self.tree
@@ -271,7 +296,7 @@ pub fn execute_pipeline(store: &OxiMemStore, commands: &[RespValue]) -> Vec<Resp
                 return args_list
                     .iter()
                     .map(|_| RespValue::SimpleString("PONG".to_string()))
-                    .collect()
+                    .collect();
             }
             _ => {}
         }
@@ -652,11 +677,17 @@ fn cmd_set(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         match flag.as_deref() {
             Some("EX") => {
                 i += 1;
-                ttl_secs = args.get(i).and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
+                ttl_secs = args
+                    .get(i)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok());
             }
             Some("PX") => {
                 i += 1;
-                let ms: Option<u64> = args.get(i).and_then(|v| v.as_str()).and_then(|s| s.parse().ok());
+                let ms: Option<u64> = args
+                    .get(i)
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok());
                 ttl_secs = ms.map(|ms| (ms + 999) / 1000);
             }
             Some("NX") => nx = true,
@@ -768,7 +799,11 @@ fn cmd_setex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     };
     let value = args[2].as_str().unwrap_or("").to_string();
 
-    store.strings.write().unwrap().insert(key.to_string(), KvEntry::with_ttl(value.clone(), seconds));
+    store
+        .strings
+        .write()
+        .unwrap()
+        .insert(key.to_string(), KvEntry::with_ttl(value.clone(), seconds));
     mirror_kv_set(store, key, &value, Some(seconds));
     resp::ok()
 }
@@ -788,7 +823,11 @@ fn cmd_psetex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let value = args[2].as_str().unwrap_or("").to_string();
     let secs = (ms + 999) / 1000;
 
-    store.strings.write().unwrap().insert(key.to_string(), KvEntry::with_ttl(value.clone(), secs));
+    store
+        .strings
+        .write()
+        .unwrap()
+        .insert(key.to_string(), KvEntry::with_ttl(value.clone(), secs));
     mirror_kv_set(store, key, &value, Some(secs));
     resp::ok()
 }
@@ -868,7 +907,10 @@ fn cmd_incr(store: &OxiMemStore, args: &[RespValue], delta: i64) -> RespValue {
     let val_str = new_val.to_string();
     // Preserve TTL if existing
     let entry = match map.get(key).and_then(|e| e.expires_at) {
-        Some(exp) => KvEntry { value: val_str.clone(), expires_at: Some(exp) },
+        Some(exp) => KvEntry {
+            value: val_str.clone(),
+            expires_at: Some(exp),
+        },
         None => KvEntry::new(val_str.clone()),
     };
     map.insert(key.to_string(), entry);
@@ -978,8 +1020,16 @@ fn cmd_getrange(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     };
 
     let len = val.len() as i64;
-    let s = if start < 0 { (len + start).max(0) as usize } else { start as usize };
-    let e = if end < 0 { (len + end).max(0) as usize } else { end.min(len - 1) as usize };
+    let s = if start < 0 {
+        (len + start).max(0) as usize
+    } else {
+        start as usize
+    };
+    let e = if end < 0 {
+        (len + end).max(0) as usize
+    } else {
+        end.min(len - 1) as usize
+    };
     if s > e || s >= val.len() {
         return resp::bulk_string("");
     }
@@ -1000,11 +1050,17 @@ fn cmd_del(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         let mut zsets = store.sorted_sets.write().unwrap();
         for arg in args {
             if let Some(key) = arg.as_str() {
-                if strings.remove(key).is_some() { count += 1; }
-                else if hashes.remove(key).is_some() { count += 1; }
-                else if lists.remove(key).is_some() { count += 1; }
-                else if sets.remove(key).is_some() { count += 1; }
-                else if zsets.remove(key).is_some() { count += 1; }
+                if strings.remove(key).is_some() {
+                    count += 1;
+                } else if hashes.remove(key).is_some() {
+                    count += 1;
+                } else if lists.remove(key).is_some() {
+                    count += 1;
+                } else if sets.remove(key).is_some() {
+                    count += 1;
+                } else if zsets.remove(key).is_some() {
+                    count += 1;
+                }
             }
         }
     }
@@ -1160,19 +1216,17 @@ fn cmd_pttl(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let key = args[0].as_str().unwrap_or("");
     let map = store.strings.read().unwrap();
     match map.get(key) {
-        Some(entry) if !entry.is_expired() => {
-            match entry.expires_at {
-                Some(exp) => {
-                    let now = Instant::now();
-                    if now >= exp {
-                        resp::integer(-2)
-                    } else {
-                        resp::integer((exp - now).as_millis() as i64)
-                    }
+        Some(entry) if !entry.is_expired() => match entry.expires_at {
+            Some(exp) => {
+                let now = Instant::now();
+                if now >= exp {
+                    resp::integer(-2)
+                } else {
+                    resp::integer((exp - now).as_millis() as i64)
                 }
-                None => resp::integer(-1),
             }
-        }
+            None => resp::integer(-1),
+        },
         _ => resp::integer(-2),
     }
 }
@@ -1183,7 +1237,14 @@ fn cmd_type(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     }
     let key = args[0].as_str().unwrap_or("");
 
-    if store.strings.read().unwrap().get(key).map(|e| !e.is_expired()).unwrap_or(false) {
+    if store
+        .strings
+        .read()
+        .unwrap()
+        .get(key)
+        .map(|e| !e.is_expired())
+        .unwrap_or(false)
+    {
         return RespValue::SimpleString("string".to_string());
     }
     if store.hashes.read().unwrap().contains_key(key) {
@@ -1267,7 +1328,13 @@ fn cmd_randomkey(store: &OxiMemStore) -> RespValue {
 }
 
 fn cmd_dbsize(store: &OxiMemStore) -> RespValue {
-    let count = store.strings.read().unwrap().iter().filter(|(_, e)| !e.is_expired()).count();
+    let count = store
+        .strings
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|(_, e)| !e.is_expired())
+        .count();
     resp::integer(count as i64)
 }
 
@@ -1661,15 +1728,28 @@ fn cmd_lrange(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     };
 
     let len = list.len() as i64;
-    let s = if start < 0 { (len + start).max(0) as usize } else { start as usize };
-    let e = if stop < 0 { (len + stop).max(0) as usize } else { stop as usize };
+    let s = if start < 0 {
+        (len + start).max(0) as usize
+    } else {
+        start as usize
+    };
+    let e = if stop < 0 {
+        (len + stop).max(0) as usize
+    } else {
+        stop as usize
+    };
 
     if s >= list.len() || s > e {
         return resp::array(vec![]);
     }
     let end = (e + 1).min(list.len());
 
-    let result: Vec<RespValue> = list.iter().skip(s).take(end - s).map(|v| resp::bulk_string(v)).collect();
+    let result: Vec<RespValue> = list
+        .iter()
+        .skip(s)
+        .take(end - s)
+        .map(|v| resp::bulk_string(v))
+        .collect();
     resp::array(result)
 }
 
@@ -1686,7 +1766,11 @@ fn cmd_lindex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         None => return resp::null(),
     };
     let len = list.len() as i64;
-    let idx = if index < 0 { (len + index) as usize } else { index as usize };
+    let idx = if index < 0 {
+        (len + index) as usize
+    } else {
+        index as usize
+    };
 
     match list.get(idx) {
         Some(v) => resp::bulk_string(v),
@@ -1799,7 +1883,13 @@ fn cmd_scard(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 
 fn cmd_info(store: &OxiMemStore) -> RespValue {
     let mode = if store.sql_enabled() { "sql" } else { "raw" };
-    let kv_count = store.strings.read().unwrap().iter().filter(|(_, e)| !e.is_expired()).count();
+    let kv_count = store
+        .strings
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|(_, e)| !e.is_expired())
+        .count();
 
     let info = format!(
         "# Server\r\n\
@@ -1830,10 +1920,21 @@ fn cmd_zadd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str().unwrap_or("").to_uppercase().as_str() {
-            "NX" => { nx = true; i += 1; }
-            "XX" => { xx = true; i += 1; }
-            "CH" => { ch = true; i += 1; }
-            "GT" | "LT" => { i += 1; } // accepted but not enforced for simplicity
+            "NX" => {
+                nx = true;
+                i += 1;
+            }
+            "XX" => {
+                xx = true;
+                i += 1;
+            }
+            "CH" => {
+                ch = true;
+                i += 1;
+            }
+            "GT" | "LT" => {
+                i += 1;
+            } // accepted but not enforced for simplicity
             _ => break,
         }
     }
@@ -1856,8 +1957,12 @@ fn cmd_zadd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         i += 2;
 
         let exists = zset.scores.contains_key(&member);
-        if nx && exists { continue; }
-        if xx && !exists { continue; }
+        if nx && exists {
+            continue;
+        }
+        if xx && !exists {
+            continue;
+        }
 
         let was_new = zset.insert(member, score);
         if was_new {
@@ -1944,7 +2049,9 @@ fn cmd_zrange(store: &OxiMemStore, args: &[RespValue], rev: bool) -> RespValue {
     let key = args[0].as_str().unwrap_or("");
     let start: isize = args[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
     let stop: isize = args[2].as_str().and_then(|s| s.parse().ok()).unwrap_or(-1);
-    let withscores = args.get(3).and_then(|a| a.as_str())
+    let withscores = args
+        .get(3)
+        .and_then(|a| a.as_str())
         .map(|s| s.eq_ignore_ascii_case("WITHSCORES"))
         .unwrap_or(false);
 
@@ -1978,16 +2085,24 @@ fn cmd_zrangebyscore(store: &OxiMemStore, args: &[RespValue], rev: bool) -> Resp
     let key = args[0].as_str().unwrap_or("");
 
     let (min_s, max_s) = if rev {
-        (args[2].as_str().unwrap_or(""), args[1].as_str().unwrap_or(""))
+        (
+            args[2].as_str().unwrap_or(""),
+            args[1].as_str().unwrap_or(""),
+        )
     } else {
-        (args[1].as_str().unwrap_or(""), args[2].as_str().unwrap_or(""))
+        (
+            args[1].as_str().unwrap_or(""),
+            args[2].as_str().unwrap_or(""),
+        )
     };
 
     let min = parse_score_bound(min_s, f64::NEG_INFINITY);
     let max = parse_score_bound(max_s, f64::INFINITY);
 
     let withscores = args[3..].iter().any(|a| {
-        a.as_str().map(|s| s.eq_ignore_ascii_case("WITHSCORES")).unwrap_or(false)
+        a.as_str()
+            .map(|s| s.eq_ignore_ascii_case("WITHSCORES"))
+            .unwrap_or(false)
     });
 
     let map = store.sorted_sets.read().unwrap();
@@ -2032,7 +2147,10 @@ fn cmd_zcount(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let max = parse_score_bound(args[2].as_str().unwrap_or("+inf"), f64::INFINITY);
 
     let map = store.sorted_sets.read().unwrap();
-    let count = map.get(key).map(|z| z.count_by_score(min, max)).unwrap_or(0);
+    let count = map
+        .get(key)
+        .map(|z| z.count_by_score(min, max))
+        .unwrap_or(0);
     resp::integer(count as i64)
 }
 
@@ -2059,7 +2177,11 @@ fn cmd_zpopmin(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         return resp::err("wrong number of arguments for 'zpopmin' command");
     }
     let key = args[0].as_str().unwrap_or("");
-    let count: usize = args.get(1).and_then(|a| a.as_str()).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let count: usize = args
+        .get(1)
+        .and_then(|a| a.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     let mut map = store.sorted_sets.write().unwrap();
     let zset = match map.get_mut(key) {
@@ -2073,7 +2195,7 @@ fn cmd_zpopmin(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
             zset.tree.remove(&entry);
             zset.scores.remove(&entry.1);
             result.push(resp::bulk_string(&entry.1));
-            result.push(resp::bulk_string(&format_score(entry.0 .0)));
+            result.push(resp::bulk_string(&format_score(entry.0.0)));
         } else {
             break;
         }
@@ -2089,7 +2211,11 @@ fn cmd_zpopmax(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         return resp::err("wrong number of arguments for 'zpopmax' command");
     }
     let key = args[0].as_str().unwrap_or("");
-    let count: usize = args.get(1).and_then(|a| a.as_str()).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let count: usize = args
+        .get(1)
+        .and_then(|a| a.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     let mut map = store.sorted_sets.write().unwrap();
     let zset = match map.get_mut(key) {
@@ -2103,7 +2229,7 @@ fn cmd_zpopmax(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
             zset.tree.remove(&entry);
             zset.scores.remove(&entry.1);
             result.push(resp::bulk_string(&entry.1));
-            result.push(resp::bulk_string(&format_score(entry.0 .0)));
+            result.push(resp::bulk_string(&format_score(entry.0.0)));
         } else {
             break;
         }

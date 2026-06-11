@@ -21,7 +21,10 @@ pub async fn read_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result
 }
 
 /// Write a length-prefixed message: [u32 LE length][payload bytes].
-pub async fn write_message<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> io::Result<()> {
+pub async fn write_message<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> io::Result<()> {
     let len = (data.len() as u32).to_le_bytes();
     writer.write_all(&len).await?;
     writer.write_all(data).await?;

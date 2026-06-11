@@ -15,8 +15,10 @@ fn encryption_at_rest_roundtrip() {
     // Write data with encryption
     {
         let db = OxiDb::open_with_options(dir.path(), Some(key.clone())).unwrap();
-        db.insert("users", json!({"name": "Alice", "age": 30})).unwrap();
-        db.insert("users", json!({"name": "Bob", "age": 25})).unwrap();
+        db.insert("users", json!({"name": "Alice", "age": 30}))
+            .unwrap();
+        db.insert("users", json!({"name": "Bob", "age": 25}))
+            .unwrap();
     }
 
     // Reopen with same key — data should be accessible
@@ -39,7 +41,8 @@ fn encrypted_data_not_plain_text() {
     let key = EncryptionKey::load_from_file(&key_path).unwrap();
 
     let db = OxiDb::open_with_options(dir.path(), Some(key)).unwrap();
-    db.insert("secrets", json!({"password": "super_secret_123"})).unwrap();
+    db.insert("secrets", json!({"password": "super_secret_123"}))
+        .unwrap();
     drop(db);
 
     // Read the raw .dat file — it should NOT contain the plaintext
@@ -75,8 +78,14 @@ fn encrypted_blob_store() {
     let key = EncryptionKey::load_from_file(&key_path).unwrap();
 
     let db = OxiDb::open_with_options(dir.path(), Some(key.clone())).unwrap();
-    db.put_object("docs", "hello.txt", b"Hello World", "text/plain", HashMap::new())
-        .unwrap();
+    db.put_object(
+        "docs",
+        "hello.txt",
+        b"Hello World",
+        "text/plain",
+        HashMap::new(),
+    )
+    .unwrap();
 
     let (data, _meta) = db.get_object("docs", "hello.txt").unwrap();
     assert_eq!(data, b"Hello World");
@@ -97,7 +106,8 @@ fn encrypted_compaction() {
 
     let db = OxiDb::open_with_options(dir.path(), Some(key)).unwrap();
     for i in 0..10 {
-        db.insert("coll", json!({"n": i, "pad": "x".repeat(100)})).unwrap();
+        db.insert("coll", json!({"n": i, "pad": "x".repeat(100)}))
+            .unwrap();
     }
     db.delete("coll", &json!({"n": {"$lt": 7}})).unwrap();
 
@@ -122,7 +132,9 @@ fn user_store_basic() {
     assert_eq!(users[0]["username"], "admin");
 
     // Create a new user
-    store.create_user("alice", "pass123", Role::ReadWrite).unwrap();
+    store
+        .create_user("alice", "pass123", Role::ReadWrite)
+        .unwrap();
     assert!(store.authenticate("alice", "pass123").is_some());
     assert!(store.authenticate("alice", "wrongpass").is_none());
 
@@ -216,7 +228,8 @@ fn encrypted_transactions() {
     let db = OxiDb::open_with_options(dir.path(), Some(key)).unwrap();
 
     let tx_id = db.begin_transaction();
-    db.tx_insert(tx_id, "test", json!({"name": "TxDoc"})).unwrap();
+    db.tx_insert(tx_id, "test", json!({"name": "TxDoc"}))
+        .unwrap();
     db.commit_transaction(tx_id).unwrap();
 
     let docs = db.find("test", &json!({})).unwrap();

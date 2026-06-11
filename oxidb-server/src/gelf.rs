@@ -43,12 +43,7 @@ impl GelfLogger {
 
     /// Send a GELF message. Extra fields are added as `_key` entries.
     /// This is fire-and-forget: errors are silently ignored.
-    pub fn send(
-        &self,
-        level: GelfLevel,
-        short_message: &str,
-        extra: &[(&str, &str)],
-    ) {
+    pub fn send(&self, level: GelfLevel, short_message: &str, extra: &[(&str, &str)]) {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())

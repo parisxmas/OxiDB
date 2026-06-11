@@ -12,9 +12,9 @@ use oxidb_server::audit::{self, AuditEvent, AuditLog};
 use oxidb_server::auth::UserStore;
 use oxidb_server::gelf::{GelfLevel, GelfLogger};
 use oxidb_server::handler;
+use oxidb_server::oximem;
 use oxidb_server::protocol;
 use oxidb_server::rbac;
-use oxidb_server::oximem;
 use oxidb_server::scram::ScramState;
 use oxidb_server::session::Session;
 use oxidb_server::tls;
@@ -142,8 +142,7 @@ fn dispatch_request(
                     .unwrap_or("");
 
                 if let Some(scram_state) = session.scram_state.take() {
-                    let user_store_guard =
-                        state.user_store.as_ref().unwrap().lock().unwrap();
+                    let user_store_guard = state.user_store.as_ref().unwrap().lock().unwrap();
                     match scram_state.process_client_final(client_final, &user_store_guard) {
                         Ok((server_final, role)) => {
                             let username = scram_state.username().to_string();
@@ -196,16 +195,22 @@ fn dispatch_request(
         if let Some(role) = session.role() {
             let is_user_cmd = matches!(
                 cmd.as_str(),
-                "create_user" | "drop_user" | "update_user" | "list_users"
-                    | "grant_db_role" | "revoke_db_role"
+                "create_user"
+                    | "drop_user"
+                    | "update_user"
+                    | "list_users"
+                    | "grant_db_role"
+                    | "revoke_db_role"
             );
 
             // Resolve the effective role for the target database.
             // For user management and database-level commands, use the global role.
             // For all other commands, use the per-database effective role.
             let effective_role = if is_user_cmd
-                || matches!(cmd.as_str(), "create_database" | "drop_database" | "list_databases" | "use_db")
-            {
+                || matches!(
+                    cmd.as_str(),
+                    "create_database" | "drop_database" | "list_databases" | "use_db"
+                ) {
                 role
             } else if let Some(ref user_store) = state.user_store {
                 let target_db = request
@@ -249,7 +254,9 @@ fn dispatch_request(
             match state.db_manager.create_database(name) {
                 Ok(()) => {
                     log_audit(state, session, &cmd, None, "ok", name);
-                    return handler::ok_bytes(serde_json::json!(format!("database '{name}' created")));
+                    return handler::ok_bytes(serde_json::json!(format!(
+                        "database '{name}' created"
+                    )));
                 }
                 Err(e) => return handler::err_bytes(&e.to_string()),
             }
@@ -262,7 +269,9 @@ fn dispatch_request(
             match state.db_manager.drop_database(name) {
                 Ok(()) => {
                     log_audit(state, session, &cmd, None, "ok", name);
-                    return handler::ok_bytes(serde_json::json!(format!("database '{name}' dropped")));
+                    return handler::ok_bytes(serde_json::json!(format!(
+                        "database '{name}' dropped"
+                    )));
                 }
                 Err(e) => return handler::err_bytes(&e.to_string()),
             }
@@ -292,9 +301,7 @@ fn dispatch_request(
     // Handle user management commands
     // ---------------------------------------------------------------
     if let Some(user_store) = &state.user_store {
-        if let Some(resp_bytes) =
-            handler::handle_user_command(&cmd, request, user_store)
-        {
+        if let Some(resp_bytes) = handler::handle_user_command(&cmd, request, user_store) {
             log_audit(state, session, &cmd, None, "ok", "");
             return resp_bytes;
         }
@@ -359,7 +366,10 @@ fn try_watch_request(
         None => oxidb::WatchFilter::All,
     };
     let resume_after = request.get("resume_after").and_then(|v| v.as_u64());
-    Ok(Some(WatchRequest { filter, resume_after }))
+    Ok(Some(WatchRequest {
+        filter,
+        resume_after,
+    }))
 }
 
 /// Watch mode loop: push change events to the client and listen for `unwatch`.
@@ -464,11 +474,7 @@ fn handle_watch_mode<R: Read + Send + 'static, W: Write>(
 }
 
 /// Generic message loop for split reader/writer (plain TCP).
-fn handle_connection(
-    stream: &TcpStream,
-    state: &ServerState,
-    peer: &str,
-) {
+fn handle_connection(stream: &TcpStream, state: &ServerState, peer: &str) {
     let mut active_tx: Option<u64> = None;
     let mut session = Session::new();
 
@@ -497,8 +503,7 @@ fn handle_connection(
         let (request, wire_fmt) = match protocol::deserialize_message(&msg) {
             Ok(v) => v,
             Err(e) => {
-                let resp =
-                    serde_json::json!({"ok": false, "error": e});
+                let resp = serde_json::json!({"ok": false, "error": e});
                 let resp_bytes = protocol::serialize_response(&resp, protocol::WireFormat::Json);
                 let _ = protocol::write_message(&mut writer, &resp_bytes);
                 continue;
@@ -635,11 +640,7 @@ fn handle_pipeline(
 }
 
 /// Variant for streams that are a single Read+Write object (e.g. TLS).
-fn handle_connection_single<S: Read + Write>(
-    stream: &mut S,
-    state: &ServerState,
-    peer: &str,
-) {
+fn handle_connection_single<S: Read + Write>(stream: &mut S, state: &ServerState, peer: &str) {
     let mut active_tx: Option<u64> = None;
     let mut session = Session::new();
 
@@ -665,8 +666,7 @@ fn handle_connection_single<S: Read + Write>(
         let (request, wire_fmt) = match protocol::deserialize_message(&msg) {
             Ok(v) => v,
             Err(e) => {
-                let resp =
-                    serde_json::json!({"ok": false, "error": e});
+                let resp = serde_json::json!({"ok": false, "error": e});
                 let resp_bytes = protocol::serialize_response(&resp, protocol::WireFormat::Json);
                 let _ = protocol::write_message(stream, &resp_bytes);
                 continue;
@@ -684,13 +684,7 @@ fn handle_connection_single<S: Read + Write>(
         let resp_bytes = if request.get("cmd").and_then(|v| v.as_str()) == Some("pipeline") {
             handle_pipeline(&request, state, &mut session, &mut active_tx, peer)
         } else {
-            dispatch_request(
-                &request,
-                state,
-                &mut session,
-                &mut active_tx,
-                peer,
-            )
+            dispatch_request(&request, state, &mut session, &mut active_tx, peer)
         };
 
         if let Err(e) = protocol::write_message(stream, &resp_bytes) {
@@ -724,7 +718,12 @@ fn log_audit(
     }
 }
 
-fn handle_client(stream: TcpStream, state: &Arc<ServerState>, idle_timeout: Duration, tls_config: Option<&Arc<rustls::ServerConfig>>) {
+fn handle_client(
+    stream: TcpStream,
+    state: &Arc<ServerState>,
+    idle_timeout: Duration,
+    tls_config: Option<&Arc<rustls::ServerConfig>>,
+) {
     configure_stream(&stream, idle_timeout);
 
     let peer = stream
@@ -778,7 +777,10 @@ fn log_resp_value(value: &oxidb_server::resp::RespValue) {
 fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: bool) {
     use oxidb_server::resp;
 
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     let mut reader = BufReader::new(&stream);
     let mut writer = BufWriter::new(&stream);
 
@@ -800,7 +802,8 @@ fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: boo
             if let Some(cmd) = items.first().and_then(|a| a.as_str()) {
                 if cmd.eq_ignore_ascii_case("SUBSCRIBE") {
                     if log {
-                        let channels: Vec<&str> = items[1..].iter().filter_map(|a| a.as_str()).collect();
+                        let channels: Vec<&str> =
+                            items[1..].iter().filter_map(|a| a.as_str()).collect();
                         eprintln!("[oximem] << SUBSCRIBE {}", channels.join(" "));
                     }
                     handle_oximem_subscribe(&stream, store, &mut reader, &mut writer, &items[1..]);
@@ -978,10 +981,13 @@ fn handle_oximem_subscribe(
                                 return; // Exit subscription mode
                             }
                         } else if cmd.eq_ignore_ascii_case("PING") {
-                            let _ = resp::write_value(writer, &resp::array(vec![
-                                resp::bulk_string("pong"),
-                                resp::bulk_string(""),
-                            ]));
+                            let _ = resp::write_value(
+                                writer,
+                                &resp::array(vec![
+                                    resp::bulk_string("pong"),
+                                    resp::bulk_string(""),
+                                ]),
+                            );
                             let _ = writer.flush();
                         }
                     }
@@ -1027,7 +1033,11 @@ fn main() {
             let logger = GelfLogger::new(&gelf_addr).expect("failed to create GELF logger");
             eprintln!("GELF logging: enabled ({gelf_addr})");
             let logger = Arc::new(logger);
-            logger.send(GelfLevel::Informational, &format!("GELF logging: enabled ({gelf_addr})"), &[]);
+            logger.send(
+                GelfLevel::Informational,
+                &format!("GELF logging: enabled ({gelf_addr})"),
+                &[],
+            );
             Some(logger)
         }
         Err(_) => None,
@@ -1071,16 +1081,10 @@ fn main() {
         if let Some(g) = &gelf {
             g.send(GelfLevel::Informational, "mode: in-memory", &[]);
         }
-        DatabaseManager::open_in_memory()
-            .expect("failed to open in-memory database manager")
+        DatabaseManager::open_in_memory().expect("failed to open in-memory database manager")
     } else {
-        DatabaseManager::open(
-            Path::new(&data_dir),
-            encryption_key,
-            verbose,
-            log_callback,
-        )
-        .expect("failed to open database manager")
+        DatabaseManager::open(Path::new(&data_dir), encryption_key, verbose, log_callback)
+            .expect("failed to open database manager")
     };
     let db = db_manager
         .get_default_database()
@@ -1092,7 +1096,9 @@ fn main() {
         );
     }
     let db_manager = Arc::new(db_manager);
-    db_manager.start_scheduler().expect("failed to start scheduler");
+    db_manager
+        .start_scheduler()
+        .expect("failed to start scheduler");
 
     // Lazy sync mode: defer per-write fsync to a background thread.
     //
@@ -1128,12 +1134,16 @@ fn main() {
         };
         if lazy_sync {
             db.enable_lazy_sync(Duration::from_millis(sync_interval_ms));
-            eprintln!("lazy sync: ENABLED (interval={}ms) — writes durable up to {}ms after commit",
-                sync_interval_ms, sync_interval_ms);
+            eprintln!(
+                "lazy sync: ENABLED (interval={}ms) — writes durable up to {}ms after commit",
+                sync_interval_ms, sync_interval_ms
+            );
         } else {
             db.enable_periodic_snapshot(Duration::from_millis(sync_interval_ms));
-            eprintln!("lazy sync: DISABLED — every commit fsync'd (strict ACID-D); snapshot every {}ms",
-                sync_interval_ms);
+            eprintln!(
+                "lazy sync: DISABLED — every commit fsync'd (strict ACID-D); snapshot every {}ms",
+                sync_interval_ms
+            );
         }
     }
 
@@ -1145,7 +1155,10 @@ fn main() {
         Duration::from_secs(1)
     };
     db.start_ttl_thread(ttl_interval);
-    eprintln!("TTL eviction: enabled (interval={}ms)", ttl_interval.as_millis());
+    eprintln!(
+        "TTL eviction: enabled (interval={}ms)",
+        ttl_interval.as_millis()
+    );
 
     // Alert evaluator thread (evaluates alert rules periodically)
     let alert_interval_secs: u64 = env::var("OXIDB_ALERT_INTERVAL")
@@ -1172,7 +1185,9 @@ fn main() {
 
     // Document cache capacity per collection (default: 100,000).
     if let Ok(cap_str) = env::var("OXIDB_CACHE_SIZE") {
-        let cap: usize = cap_str.parse().expect("OXIDB_CACHE_SIZE must be a valid usize");
+        let cap: usize = cap_str
+            .parse()
+            .expect("OXIDB_CACHE_SIZE must be a valid usize");
         db.set_cache_capacity(cap);
         eprintln!("doc cache capacity: {cap} per collection");
     }
@@ -1196,8 +1211,7 @@ fn main() {
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
     let user_store = if auth_enabled {
-        let store =
-            UserStore::open(Path::new(&data_dir)).expect("failed to open user store");
+        let store = UserStore::open(Path::new(&data_dir)).expect("failed to open user store");
         eprintln!("authentication: enabled");
         if let Some(g) = &gelf {
             g.send(GelfLevel::Informational, "authentication: enabled", &[]);
@@ -1284,7 +1298,13 @@ fn main() {
     }
 
     let listener = TcpListener::bind(&addr).expect("failed to bind TCP listener");
-    server_log!(state, GelfLevel::Notice, format!("oxidb-server listening on {addr} (pool_size={pool_size}, data_dir={data_dir}, idle_timeout={idle_timeout_secs}s)"));
+    server_log!(
+        state,
+        GelfLevel::Notice,
+        format!(
+            "oxidb-server listening on {addr} (pool_size={pool_size}, data_dir={data_dir}, idle_timeout={idle_timeout_secs}s)"
+        )
+    );
 
     // (PostgreSQL wire protocol listener removed alongside the SQL surface.)
 
@@ -1298,7 +1318,9 @@ fn main() {
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false);
     let shared_store = if oximem_sql {
-        Arc::new(oxidb_server::oximem::OxiMemStore::new_with_sql(Arc::clone(&state.db)))
+        Arc::new(oxidb_server::oximem::OxiMemStore::new_with_sql(Arc::clone(
+            &state.db,
+        )))
     } else {
         Arc::new(oxidb_server::oximem::OxiMemStore::new())
     };
@@ -1314,8 +1336,16 @@ fn main() {
         let oximem_listener =
             TcpListener::bind(&oximem_addr).expect("failed to bind OxiMem RESP listener");
 
-        let mode_label = if oximem_sql { "SQL mirroring" } else { "fast mode" };
-        server_log!(state, GelfLevel::Notice, format!("OxiMem RESP listening on {oximem_addr} ({mode_label})"));
+        let mode_label = if oximem_sql {
+            "SQL mirroring"
+        } else {
+            "fast mode"
+        };
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            format!("OxiMem RESP listening on {oximem_addr} ({mode_label})")
+        );
 
         let state_oximem = Arc::clone(&state);
         let oximem_store = Arc::clone(&shared_store);
@@ -1327,9 +1357,10 @@ fn main() {
                         let _ = s.set_nodelay(true);
                         let store = Arc::clone(&oximem_store);
                         std::thread::spawn(move || {
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                handle_oximem_client(s, &store, oximem_log);
-                            }));
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    handle_oximem_client(s, &store, oximem_log);
+                                }));
                             if let Err(e) = result {
                                 let msg = if let Some(s) = e.downcast_ref::<&str>() {
                                     s.to_string()
@@ -1343,7 +1374,11 @@ fn main() {
                         });
                     }
                     Err(e) => {
-                        server_log!(state_oximem, GelfLevel::Error, format!("[oximem] accept error: {e}"));
+                        server_log!(
+                            state_oximem,
+                            GelfLevel::Error,
+                            format!("[oximem] accept error: {e}")
+                        );
                     }
                 }
             }
@@ -1358,9 +1393,12 @@ fn main() {
 
     if mqtt_port > 0 {
         let mqtt_addr = format!("0.0.0.0:{mqtt_port}");
-        let mqtt_listener =
-            TcpListener::bind(&mqtt_addr).expect("failed to bind MQTT listener");
-        server_log!(state, GelfLevel::Notice, format!("MQTT listening on {mqtt_addr}"));
+        let mqtt_listener = TcpListener::bind(&mqtt_addr).expect("failed to bind MQTT listener");
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            format!("MQTT listening on {mqtt_addr}")
+        );
 
         let state_mqtt = Arc::clone(&state);
         let mqtt_store = Arc::clone(&shared_store);
@@ -1372,9 +1410,10 @@ fn main() {
                         let _ = s.set_nodelay(true);
                         let store = Arc::clone(&mqtt_store);
                         std::thread::spawn(move || {
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                oxidb_server::mqtt::handle_client(s, &store, mqtt_log);
-                            }));
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    oxidb_server::mqtt::handle_client(s, &store, mqtt_log);
+                                }));
                             if let Err(e) = result {
                                 let msg = if let Some(s) = e.downcast_ref::<&str>() {
                                     s.to_string()
@@ -1388,7 +1427,11 @@ fn main() {
                         });
                     }
                     Err(e) => {
-                        server_log!(state_mqtt, GelfLevel::Error, format!("[mqtt] accept error: {e}"));
+                        server_log!(
+                            state_mqtt,
+                            GelfLevel::Error,
+                            format!("[mqtt] accept error: {e}")
+                        );
                     }
                 }
             }
@@ -1407,8 +1450,11 @@ fn main() {
             let s3_addr = format!("0.0.0.0:{s3_port}");
             let s3_db = Arc::clone(&state.db);
             oxidb_server::s3::start_s3_listener(&s3_addr, s3_db);
-            server_log!(state, GelfLevel::Notice,
-                format!("S3-compatible API listening on {s3_addr}"));
+            server_log!(
+                state,
+                GelfLevel::Notice,
+                format!("S3-compatible API listening on {s3_addr}")
+            );
         }
     }
 
@@ -1425,8 +1471,11 @@ fn main() {
         let http_addr = format!("0.0.0.0:{http_port}");
         let http_db = Arc::clone(&state.db);
         oxidb_server::rest::start_rest_listener(&http_addr, http_db, jwt_secret.clone());
-        server_log!(state, GelfLevel::Notice,
-            format!("REST HTTP API listening on {http_addr}"));
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            format!("REST HTTP API listening on {http_addr}")
+        );
     }
 
     // WebSocket listener (optional, enabled via OXIDB_WS_PORT)
@@ -1439,8 +1488,11 @@ fn main() {
         let ws_addr = format!("0.0.0.0:{ws_port}");
         let ws_db = Arc::clone(&state.db);
         oxidb_server::ws::start_ws_listener(&ws_addr, ws_db, jwt_secret.clone());
-        server_log!(state, GelfLevel::Notice,
-            format!("WebSocket API listening on {ws_addr}"));
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            format!("WebSocket API listening on {ws_addr}")
+        );
     }
 
     // UDP log ingestion listener (optional, enabled via OXIDB_UDP_PORT)
@@ -1451,12 +1503,15 @@ fn main() {
 
     if udp_port > 0 {
         let udp_addr = format!("0.0.0.0:{udp_port}");
-        let udp_collection = env::var("OXIDB_UDP_COLLECTION")
-            .unwrap_or_else(|_| "_udp_logs".to_string());
+        let udp_collection =
+            env::var("OXIDB_UDP_COLLECTION").unwrap_or_else(|_| "_udp_logs".to_string());
         let udp_db = Arc::clone(&state.db);
         oxidb_server::udp_ingest::start_udp_listener(&udp_addr, udp_db, udp_collection.clone());
-        server_log!(state, GelfLevel::Notice,
-            format!("UDP log ingestion listening on {udp_addr} → collection '{udp_collection}'"));
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            format!("UDP log ingestion listening on {udp_addr} → collection '{udp_collection}'")
+        );
     }
 
     // GELF UDP ingestion listener (optional, enabled via OXIDB_GELF_PORT)
@@ -1467,17 +1522,28 @@ fn main() {
 
     if gelf_port > 0 {
         let gelf_addr = format!("0.0.0.0:{gelf_port}");
-        let gelf_collection = env::var("OXIDB_GELF_COLLECTION")
-            .unwrap_or_else(|_| "_gelf_logs".to_string());
+        let gelf_collection =
+            env::var("OXIDB_GELF_COLLECTION").unwrap_or_else(|_| "_gelf_logs".to_string());
         let gelf_db = Arc::clone(&state.db);
-        oxidb_server::gelf_ingest::start_gelf_listener(&gelf_addr, gelf_db, gelf_collection.clone());
-        server_log!(state, GelfLevel::Notice,
-            format!("GELF ingestion listening on {gelf_addr} → collection '{gelf_collection}'"));
+        oxidb_server::gelf_ingest::start_gelf_listener(
+            &gelf_addr,
+            gelf_db,
+            gelf_collection.clone(),
+        );
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            format!("GELF ingestion listening on {gelf_addr} → collection '{gelf_collection}'")
+        );
     }
 
     // MQTT-only mode: skip the main OxiDB TCP listener
     if mqtt_only_mode {
-        server_log!(state, GelfLevel::Notice, "MQTT-only mode — OxiDB TCP listener disabled".to_string());
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            "MQTT-only mode — OxiDB TCP listener disabled".to_string()
+        );
         // Block forever (MQTT listener runs in its own thread)
         loop {
             std::thread::park();
@@ -1486,7 +1552,9 @@ fn main() {
 
     // Accept loop — spawn a thread per connection.
     // No fixed pool_size limit: concurrent connections scale with OS thread capacity.
-    listener.set_nonblocking(false).expect("failed to set blocking");
+    listener
+        .set_nonblocking(false)
+        .expect("failed to set blocking");
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {

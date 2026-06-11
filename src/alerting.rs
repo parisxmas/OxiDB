@@ -5,11 +5,11 @@
 
 use std::io::Write;
 use std::net::TcpStream;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::engine::OxiDb;
 use crate::scheduler::{epoch_now, epoch_to_iso, parse_interval};
@@ -77,15 +77,13 @@ fn check_condition(db: &OxiDb, alert: &Value, now: i64) -> Option<i64> {
 }
 
 /// Count-based threshold: count docs matching query within window, compare to threshold.
-fn check_count_threshold(
-    db: &OxiDb,
-    collection: &str,
-    condition: &Value,
-    now: i64,
-) -> Option<i64> {
+fn check_count_threshold(db: &OxiDb, collection: &str, condition: &Value, now: i64) -> Option<i64> {
     let query = build_windowed_query(condition, now)?;
     let threshold = condition.get("threshold")?.as_i64()?;
-    let operator = condition.get("operator").and_then(|v| v.as_str()).unwrap_or("gte");
+    let operator = condition
+        .get("operator")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gte");
 
     let count = db.count(collection, &query).ok()? as i64;
 
@@ -105,7 +103,10 @@ fn check_aggregation_threshold(
 ) -> Option<i64> {
     let pipeline = condition.get("pipeline")?.as_array()?;
     let threshold = condition.get("threshold")?.as_i64()?;
-    let operator = condition.get("operator").and_then(|v| v.as_str()).unwrap_or("gte");
+    let operator = condition
+        .get("operator")
+        .and_then(|v| v.as_str())
+        .unwrap_or("gte");
     let result_field = condition
         .get("result_field")
         .and_then(|v| v.as_str())
@@ -167,10 +168,19 @@ fn compare(value: i64, threshold: i64, operator: &str) -> bool {
 
 /// Execute all actions for a fired alert.
 fn execute_actions(db: &OxiDb, alert: &Value, result_value: i64, now: i64) {
-    let name = alert.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let collection = alert.get("collection").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let name = alert
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let collection = alert
+        .get("collection")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     let condition = alert.get("condition").cloned().unwrap_or(json!({}));
-    let threshold = condition.get("threshold").and_then(|v| v.as_i64()).unwrap_or(0);
+    let threshold = condition
+        .get("threshold")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let operator = condition
         .get("operator")
         .and_then(|v| v.as_str())
@@ -212,9 +222,7 @@ fn execute_actions(db: &OxiDb, alert: &Value, result_value: i64, now: i64) {
                 }
             }
             "stderr" => {
-                eprintln!(
-                    "[ALERT] {name}: {collection} — {result_value} {operator} {threshold}"
-                );
+                eprintln!("[ALERT] {name}: {collection} — {result_value} {operator} {threshold}");
                 executed_actions.push("stderr");
             }
             "log" => {
@@ -227,14 +235,8 @@ fn execute_actions(db: &OxiDb, alert: &Value, result_value: i64, now: i64) {
     // Always write to _alert_history
     let mut history = history_doc;
     if let Some(obj) = history.as_object_mut() {
-        obj.insert(
-            "actions_executed".to_string(),
-            json!(executed_actions),
-        );
-        obj.insert(
-            "_ts".to_string(),
-            Value::String(epoch_to_iso(now)),
-        );
+        obj.insert("actions_executed".to_string(), json!(executed_actions));
+        obj.insert("_ts".to_string(), Value::String(epoch_to_iso(now)));
     }
     let _ = db.insert(HISTORY_COLLECTION, history);
 }
@@ -260,9 +262,9 @@ fn webhook_post(url: &str, payload: &Value) -> std::io::Result<()> {
     let body = serde_json::to_vec(payload).unwrap_or_default();
 
     let mut stream = TcpStream::connect_timeout(
-        &format!("{host}:{port}").parse().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}"))
-        })?,
+        &format!("{host}:{port}")
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?,
         Duration::from_secs(5),
     )?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -282,9 +284,12 @@ fn webhook_post(url: &str, payload: &Value) -> std::io::Result<()> {
 
 /// Parse a simple HTTP URL into (host, port, path).
 fn parse_http_url(url: &str) -> std::io::Result<(String, u16, String)> {
-    let url = url
-        .strip_prefix("http://")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "only http:// URLs supported"))?;
+    let url = url.strip_prefix("http://").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "only http:// URLs supported",
+        )
+    })?;
 
     let (host_port, path) = match url.find('/') {
         Some(i) => (&url[..i], &url[i..]),
@@ -294,9 +299,9 @@ fn parse_http_url(url: &str) -> std::io::Result<(String, u16, String)> {
     let (host, port) = match host_port.rfind(':') {
         Some(i) => (
             &host_port[..i],
-            host_port[i + 1..]
-                .parse::<u16>()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?,
+            host_port[i + 1..].parse::<u16>().map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}"))
+            })?,
         ),
         None => (host_port, 80),
     };

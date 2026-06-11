@@ -70,8 +70,11 @@ fn soak_keeps_doc_count_bounded() {
         // Insert a batch.
         for k in 0..batch {
             let id_field = base + k as u64;
-            db.insert("soak", json!({"id": id_field, "iter": iter, "payload": "p"}))
-                .unwrap();
+            db.insert(
+                "soak",
+                json!({"id": id_field, "iter": iter, "payload": "p"}),
+            )
+            .unwrap();
             inserted += 1;
         }
 
@@ -133,9 +136,7 @@ fn soak_keeps_doc_count_bounded() {
     // disables rotation entirely.
     let wal_path = dir.path().join("soak.wal");
     if wal_path.exists() {
-        let wal_size = std::fs::metadata(&wal_path)
-            .expect("stat soak.wal")
-            .len();
+        let wal_size = std::fs::metadata(&wal_path).expect("stat soak.wal").len();
         let bound = 64 * 1024 * 1024;
         eprintln!(
             "[soak] WAL size at end of run: {wal_size} bytes ({:.2} MiB)",

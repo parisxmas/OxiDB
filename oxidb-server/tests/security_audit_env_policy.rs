@@ -90,7 +90,14 @@ fn env_policy_max_age_malformed_panics() {
 
 #[test]
 fn env_policy_calendar_hourly_aliases_all_parse() {
-    for input in &["hourly", "hourly-utc", "hourlyutc", "Hourly", "HOURLY", "Hourly-UTC"] {
+    for input in &[
+        "hourly",
+        "hourly-utc",
+        "hourlyutc",
+        "Hourly",
+        "HOURLY",
+        "Hourly-UTC",
+    ] {
         let p = RotationPolicy::from_env_strs(None, None, Some(input), None);
         assert_eq!(
             p.calendar,
@@ -103,7 +110,14 @@ fn env_policy_calendar_hourly_aliases_all_parse() {
 
 #[test]
 fn env_policy_calendar_daily_aliases_all_parse() {
-    for input in &["daily", "daily-utc", "dailyutc", "Daily", "DAILY", "Daily-UTC"] {
+    for input in &[
+        "daily",
+        "daily-utc",
+        "dailyutc",
+        "Daily",
+        "DAILY",
+        "Daily-UTC",
+    ] {
         let p = RotationPolicy::from_env_strs(None, None, Some(input), None);
         assert_eq!(
             p.calendar,
@@ -149,7 +163,10 @@ fn env_policy_all_three_set_compose_correctly() {
     let desc = p.describe();
     assert!(desc.contains("size=2048B"), "describe missing size: {desc}");
     assert!(desc.contains("age=60s"), "describe missing age: {desc}");
-    assert!(desc.contains("calendar="), "describe missing calendar: {desc}");
+    assert!(
+        desc.contains("calendar="),
+        "describe missing calendar: {desc}"
+    );
 }
 
 #[test]
@@ -158,8 +175,14 @@ fn env_policy_describe_unbounded_does_not_say_size_zero() {
     // that would silently change unbounded → "rotate-every-write".
     let p = RotationPolicy::from_env_strs(None, None, None, None);
     let d = p.describe();
-    assert!(!d.contains("size=0"), "unbounded must NOT describe as size=0: {d}");
-    assert!(!d.contains("age=0"), "unbounded must NOT describe as age=0: {d}");
+    assert!(
+        !d.contains("size=0"),
+        "unbounded must NOT describe as size=0: {d}"
+    );
+    assert!(
+        !d.contains("age=0"),
+        "unbounded must NOT describe as age=0: {d}"
+    );
     assert_eq!(d, "unbounded");
 }
 

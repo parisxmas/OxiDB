@@ -174,7 +174,8 @@ impl ChangeStreamBroker {
         subs.retain(|s| s.id != id);
         let removed = before - subs.len();
         if removed > 0 {
-            self.subscriber_count.fetch_sub(removed as u64, Ordering::Relaxed);
+            self.subscriber_count
+                .fetch_sub(removed as u64, Ordering::Relaxed);
         }
     }
 
@@ -223,7 +224,8 @@ impl ChangeStreamBroker {
             subs.retain(|s| !dead_ids.contains(&s.id));
             let removed = before - subs.len();
             if removed > 0 {
-                self.subscriber_count.fetch_sub(removed as u64, Ordering::Relaxed);
+                self.subscriber_count
+                    .fetch_sub(removed as u64, Ordering::Relaxed);
             }
         }
     }
@@ -278,7 +280,9 @@ mod tests {
     #[test]
     fn collection_filter() {
         let broker = ChangeStreamBroker::new();
-        let handle = broker.subscribe(WatchFilter::Collection("orders".to_string()), 16, None).unwrap();
+        let handle = broker
+            .subscribe(WatchFilter::Collection("orders".to_string()), 16, None)
+            .unwrap();
 
         // Emit to "users" — should NOT be received
         broker.emit(ChangeEvent {

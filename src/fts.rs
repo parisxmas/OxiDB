@@ -181,9 +181,9 @@ const STOP_WORDS_EN: &[&str] = &[
 
 /// Turkish stop words.
 const STOP_WORDS_TR: &[&str] = &[
-    "bir", "ve", "bu", "da", "de", "ile", "mi", "mu", "ne", "o", "ya", "ben", "sen",
-    "biz", "siz", "ama", "her", "ki", "en", "var", "yok", "olan", "gibi", "daha",
-    "icin", "kadar", "sonra", "once", "ise", "hem", "veya", "sadece",
+    "bir", "ve", "bu", "da", "de", "ile", "mi", "mu", "ne", "o", "ya", "ben", "sen", "biz", "siz",
+    "ama", "her", "ki", "en", "var", "yok", "olan", "gibi", "daha", "icin", "kadar", "sonra",
+    "once", "ise", "hem", "veya", "sadece",
 ];
 
 /// Check if a word is a stop word (English or Turkish).
@@ -295,9 +295,7 @@ impl FtsIndex {
         // Count term frequencies and positions
         let mut term_freq: HashMap<String, (u32, Vec<u32>)> = HashMap::new();
         for (pos, token) in tokens.iter().enumerate() {
-            let entry = term_freq
-                .entry(token.clone())
-                .or_insert((0, Vec::new()));
+            let entry = term_freq.entry(token.clone()).or_insert((0, Vec::new()));
             entry.0 += 1;
             entry.1.push(pos as u32);
         }
@@ -309,11 +307,7 @@ impl FtsIndex {
                 frequency: freq,
                 positions,
             };
-            self.data
-                .postings
-                .entry(term)
-                .or_default()
-                .push(posting);
+            self.data.postings.entry(term).or_default().push(posting);
         }
 
         // Maintain total_term_count cache for BM25 avgdl: subtract old
@@ -400,12 +394,7 @@ impl FtsIndex {
         }
     }
 
-    pub fn search(
-        &self,
-        bucket: Option<&str>,
-        query: &str,
-        limit: usize,
-    ) -> Vec<SearchResult> {
+    pub fn search(&self, bucket: Option<&str>, query: &str, limit: usize) -> Vec<SearchResult> {
         let query_terms = tokenize(query);
         if query_terms.is_empty() || self.data.docs.is_empty() {
             return Vec::new();
@@ -451,7 +440,11 @@ impl FtsIndex {
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }
@@ -548,10 +541,10 @@ impl CollectionTextIndex {
 
         // Add postings
         for (term, freq) in term_freq {
-            self.postings
-                .entry(term)
-                .or_default()
-                .push(DocPosting { doc_id, frequency: freq });
+            self.postings.entry(term).or_default().push(DocPosting {
+                doc_id,
+                frequency: freq,
+            });
         }
 
         self.doc_term_counts.insert(doc_id, total_terms);
@@ -609,7 +602,11 @@ impl CollectionTextIndex {
             .map(|(doc_id, score)| DocSearchResult { doc_id, score })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }
@@ -645,8 +642,20 @@ pub struct HighlightSnippet {
 /// Returns up to `max_snippets` snippets, each at most `snippet_chars`
 /// long, ordered by descending match density. Tags default to `<mark>`
 /// / `</mark>` when called via `highlight()`.
-pub fn highlight(text: &str, query: &str, snippet_chars: usize, max_snippets: usize) -> Vec<HighlightSnippet> {
-    highlight_with_tags(text, query, snippet_chars, max_snippets, "<mark>", "</mark>")
+pub fn highlight(
+    text: &str,
+    query: &str,
+    snippet_chars: usize,
+    max_snippets: usize,
+) -> Vec<HighlightSnippet> {
+    highlight_with_tags(
+        text,
+        query,
+        snippet_chars,
+        max_snippets,
+        "<mark>",
+        "</mark>",
+    )
 }
 
 pub fn highlight_with_tags(
@@ -685,7 +694,9 @@ pub fn highlight_with_tags(
         } else if let Some(start) = cur_start.take() {
             let end = idx;
             let word = &text[start..end];
-            let is_hit = if word.chars().count() > 1 && !is_stop_word(&strip_accents(&word.to_lowercase())) {
+            let is_hit = if word.chars().count() > 1
+                && !is_stop_word(&strip_accents(&word.to_lowercase()))
+            {
                 let stemmed = stem(&strip_accents(&word.to_lowercase()));
                 query_stems.contains(&stemmed)
             } else {
@@ -697,12 +708,13 @@ pub fn highlight_with_tags(
     if let Some(start) = cur_start {
         let end = bytes_seen;
         let word = &text[start..end];
-        let is_hit = if word.chars().count() > 1 && !is_stop_word(&strip_accents(&word.to_lowercase())) {
-            let stemmed = stem(&strip_accents(&word.to_lowercase()));
-            query_stems.contains(&stemmed)
-        } else {
-            false
-        };
+        let is_hit =
+            if word.chars().count() > 1 && !is_stop_word(&strip_accents(&word.to_lowercase())) {
+                let stemmed = stem(&strip_accents(&word.to_lowercase()));
+                query_stems.contains(&stemmed)
+            } else {
+                false
+            };
         spans.push(Span { start, end, is_hit });
     }
 
@@ -780,7 +792,9 @@ pub fn highlight_with_tags(
 
     // Order by match density (more matches first), then by position.
     snippets.sort_by(|a, b| {
-        b.matched_terms.cmp(&a.matched_terms).then(a.offset.cmp(&b.offset))
+        b.matched_terms
+            .cmp(&a.matched_terms)
+            .then(a.offset.cmp(&b.offset))
     });
     snippets.truncate(max_snippets);
     snippets
@@ -839,11 +853,7 @@ pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
     } else {
         #[cfg(feature = "ocr")]
         {
-            if ct == "image/png"
-                || ct == "image/jpeg"
-                || ct == "image/tiff"
-                || ct == "image/bmp"
-            {
+            if ct == "image/png" || ct == "image/jpeg" || ct == "image/tiff" || ct == "image/bmp" {
                 return extract_image_ocr(data);
             }
         }
@@ -855,7 +865,11 @@ pub fn extract_text(data: &[u8], content_type: &str) -> Option<String> {
 fn extract_pdf(data: &[u8]) -> Option<String> {
     pdf_extract::extract_text_from_mem(data).ok().and_then(|s| {
         let trimmed = s.trim().to_string();
-        if trimmed.is_empty() { None } else { Some(trimmed) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
     })
 }
 
@@ -870,7 +884,11 @@ fn extract_docx(data: &[u8]) -> Option<String> {
     }
     let text = strip_html_tags(&xml);
     let trimmed = text.trim().to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 #[cfg(feature = "ocr")]
@@ -890,14 +908,22 @@ fn extract_image_ocr(data: &[u8]) -> Option<String> {
     let preprocess = std::env::var("OXIDB_OCR_PREPROCESS")
         .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
-    let cooked = if preprocess { preprocess_for_ocr(data) } else { None };
+    let cooked = if preprocess {
+        preprocess_for_ocr(data)
+    } else {
+        None
+    };
     let to_feed: &[u8] = cooked.as_deref().unwrap_or(data);
 
     let mut lt = leptess::LepTess::new(None, &langs).ok()?;
     lt.set_image_from_mem(to_feed).ok()?;
     let text = lt.get_utf8_text().ok()?;
     let trimmed = text.trim().to_string();
-    if trimmed.is_empty() { None } else { Some(trimmed) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 /// Photo-friendly OCR pre-processing pipeline:
@@ -914,7 +940,10 @@ fn preprocess_for_ocr(data: &[u8]) -> Option<Vec<u8>> {
     // ship at ~600 px wide where text glyphs are 8-12 px tall — too
     // small for Tesseract's LSTM. Upscale before threshold so the
     // binarization operates on smoother input.
-    let (w, h) = (gray.width().saturating_mul(2), gray.height().saturating_mul(2));
+    let (w, h) = (
+        gray.width().saturating_mul(2),
+        gray.height().saturating_mul(2),
+    );
     if w == 0 || h == 0 {
         return None;
     }
@@ -924,8 +953,7 @@ fn preprocess_for_ocr(data: &[u8]) -> Option<Vec<u8>> {
     // between-class variance — great for bimodal histograms (dark
     // text on light-ish background or vice versa).
     let threshold = otsu_threshold(&upscaled);
-    let mut binary: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
-        image::ImageBuffer::new(w, h);
+    let mut binary: image::ImageBuffer<image::Luma<u8>, Vec<u8>> = image::ImageBuffer::new(w, h);
     for (x, y, p) in upscaled.enumerate_pixels() {
         let v = if p[0] >= threshold { 255 } else { 0 };
         binary.put_pixel(x, y, image::Luma([v]));
@@ -996,7 +1024,11 @@ fn extract_xlsx(data: &[u8]) -> Option<String> {
             }
         }
     }
-    if parts.is_empty() { None } else { Some(parts.join(" ")) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1110,8 +1142,7 @@ mod tests {
     #[test]
     fn remove_document_then_search() {
         let (_dir, mut idx) = temp_index();
-        idx.index_document("docs", "a.txt", "hello world")
-            .unwrap();
+        idx.index_document("docs", "a.txt", "hello world").unwrap();
         idx.remove_document("docs", "a.txt").unwrap();
         let results = idx.search(None, "hello", 10);
         assert!(results.is_empty());
@@ -1171,8 +1202,7 @@ mod tests {
     #[test]
     fn search_no_matching_terms() {
         let (_dir, mut idx) = temp_index();
-        idx.index_document("docs", "a.txt", "hello world")
-            .unwrap();
+        idx.index_document("docs", "a.txt", "hello world").unwrap();
         let results = idx.search(None, "xyznonexistent", 10);
         assert!(results.is_empty());
     }
@@ -1398,7 +1428,10 @@ startxref
     fn collection_text_index_limit() {
         let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
         for i in 1..=10 {
-            idx.index_doc(i, &serde_json::json!({"text": format!("document about databases {}", i)}));
+            idx.index_doc(
+                i,
+                &serde_json::json!({"text": format!("document about databases {}", i)}),
+            );
         }
         let results = idx.search("databases", 3);
         assert_eq!(results.len(), 3);
@@ -1426,8 +1459,14 @@ startxref
     #[test]
     fn stemming_search_finds_variants() {
         let mut idx = CollectionTextIndex::new(vec!["text".to_string()]);
-        idx.index_doc(1, &serde_json::json!({"text": "the server is running smoothly"}));
-        idx.index_doc(2, &serde_json::json!({"text": "database connections are stable"}));
+        idx.index_doc(
+            1,
+            &serde_json::json!({"text": "the server is running smoothly"}),
+        );
+        idx.index_doc(
+            2,
+            &serde_json::json!({"text": "database connections are stable"}),
+        );
 
         // Searching for "runs" should find doc containing "running" (both stem to "run")
         let results = idx.search("runs", 10);
@@ -1486,7 +1525,10 @@ startxref
 
         let results = idx.search("rust", 10);
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].doc_id, 1, "shorter doc should rank higher under BM25");
+        assert_eq!(
+            results[0].doc_id, 1,
+            "shorter doc should rank higher under BM25"
+        );
         assert!(results[0].score > results[1].score);
     }
 
@@ -1505,7 +1547,10 @@ startxref
         );
         // corpus padding so IDF is non-trivial
         for i in 3..=10 {
-            idx.index_doc(i, &serde_json::json!({"text": format!("filler{} content", i)}));
+            idx.index_doc(
+                i,
+                &serde_json::json!({"text": format!("filler{} content", i)}),
+            );
         }
 
         let r = idx.search("rust", 10);
@@ -1528,7 +1573,10 @@ startxref
         idx.index_doc(1, &serde_json::json!({"text": "rust language guide"}));
         idx.index_doc(2, &serde_json::json!({"text": "go language guide"}));
         idx.remove_doc(1);
-        idx.index_doc(1, &serde_json::json!({"text": "rust performance optimization manual"}));
+        idx.index_doc(
+            1,
+            &serde_json::json!({"text": "rust performance optimization manual"}),
+        );
 
         // Cache must equal the sum of remaining doc lengths.
         let expected: u64 = idx.doc_term_counts.values().map(|&n| n as u64).sum();

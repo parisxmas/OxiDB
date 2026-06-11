@@ -115,9 +115,15 @@ async fn start_node(
     let (log_store, state_machine) = Adaptor::new(store);
     let network_factory = OxiDbNetworkFactory;
 
-    let raft = openraft::Raft::new(node_id, openraft_cfg, network_factory, log_store, state_machine)
-        .await
-        .expect("failed to create raft node");
+    let raft = openraft::Raft::new(
+        node_id,
+        openraft_cfg,
+        network_factory,
+        log_store,
+        state_machine,
+    )
+    .await
+    .expect("failed to create raft node");
     let raft = Arc::new(raft);
 
     let state = Arc::new(ServerState {
@@ -132,7 +138,9 @@ async fn start_node(
 
     // Spawn Raft RPC listener
     let raft_clone = Arc::clone(&raft);
-    let raft_listener = TcpListener::bind(raft_addr).await.expect("bind raft listener");
+    let raft_listener = TcpListener::bind(raft_addr)
+        .await
+        .expect("bind raft listener");
     let raft_handle = tokio::spawn(async move {
         loop {
             match raft_listener.accept().await {
@@ -150,7 +158,9 @@ async fn start_node(
 
     // Spawn client listener
     let state_clone = Arc::clone(&state);
-    let client_listener = TcpListener::bind(client_addr).await.expect("bind client listener");
+    let client_listener = TcpListener::bind(client_addr)
+        .await
+        .expect("bind client listener");
     let client_handle = tokio::spawn(async move {
         loop {
             match client_listener.accept().await {
@@ -212,7 +222,10 @@ async fn form_cluster(count: u64) -> (Vec<TestNode>, Vec<AsyncClient>) {
 
     // Initialize cluster on node 1
     let resp = clients[0].send(&json!({"cmd": "raft_init"})).await;
-    assert!(resp["ok"].as_bool().unwrap_or(false), "raft_init failed: {resp}");
+    assert!(
+        resp["ok"].as_bool().unwrap_or(false),
+        "raft_init failed: {resp}"
+    );
 
     // Add learners 2..=count
     for id in 2..=count {
@@ -224,7 +237,10 @@ async fn form_cluster(count: u64) -> (Vec<TestNode>, Vec<AsyncClient>) {
                 "addr": nodes[idx]._raft_addr.to_string(),
             }))
             .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "add_learner {id} failed: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "add_learner {id} failed: {resp}"
+        );
     }
 
     // Promote all to voters
@@ -235,7 +251,10 @@ async fn form_cluster(count: u64) -> (Vec<TestNode>, Vec<AsyncClient>) {
             "members": members,
         }))
         .await;
-    assert!(resp["ok"].as_bool().unwrap_or(false), "change_membership failed: {resp}");
+    assert!(
+        resp["ok"].as_bool().unwrap_or(false),
+        "change_membership failed: {resp}"
+    );
 
     // Wait for a leader to be elected
     wait_for_leader(&mut clients, Duration::from_secs(15)).await;
@@ -385,7 +404,10 @@ async fn test_write_replication() {
             }),
         )
         .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "insert {i} failed: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "insert {i} failed: {resp}"
+        );
     }
 
     // Wait for replication to all 4 nodes
@@ -400,9 +422,17 @@ async fn test_write_replication() {
                 "query": {},
             }))
             .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "find on node {idx} failed: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "find on node {idx} failed: {resp}"
+        );
         let docs = resp["data"].as_array().expect("data should be array");
-        assert_eq!(docs.len(), 10, "node {idx} has {} docs, expected 10", docs.len());
+        assert_eq!(
+            docs.len(),
+            10,
+            "node {idx} has {} docs, expected 10",
+            docs.len()
+        );
     }
 
     for node in &mut nodes {
@@ -417,7 +447,10 @@ async fn test_leader_kill_and_failover() {
     // Find current leader
     let leader_idx = find_leader(&mut clients).await.expect("no leader");
     let leader_node_id = leader_idx as u64 + 1;
-    eprintln!("initial leader: node {} (index {})", leader_node_id, leader_idx);
+    eprintln!(
+        "initial leader: node {} (index {})",
+        leader_node_id, leader_idx
+    );
 
     // Insert 5 docs via leader
     for i in 0..5 {
@@ -428,7 +461,10 @@ async fn test_leader_kill_and_failover() {
                 "doc": {"i": i, "phase": "before_kill"},
             }))
             .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "insert {i} failed: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "insert {i} failed: {resp}"
+        );
     }
 
     // Wait for replication
@@ -451,7 +487,10 @@ async fn test_leader_kill_and_failover() {
     let new_leader_rel = wait_for_leader(&mut surviving_clients, Duration::from_secs(15)).await;
     let new_leader_abs = surviving_indices[new_leader_rel];
     let new_leader_node_id = new_leader_abs as u64 + 1;
-    eprintln!("new leader: node {} (index {})", new_leader_node_id, new_leader_abs);
+    eprintln!(
+        "new leader: node {} (index {})",
+        new_leader_node_id, new_leader_abs
+    );
     assert_ne!(
         new_leader_abs, leader_idx,
         "new leader should be different from killed leader"
@@ -466,7 +505,10 @@ async fn test_leader_kill_and_failover() {
                 "doc": {"i": i, "phase": "after_kill"},
             }))
             .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "insert {i} failed: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "insert {i} failed: {resp}"
+        );
     }
 
     // Wait for replication on survivors
@@ -511,7 +553,10 @@ async fn test_data_consistency_after_failover() {
                 "doc": {"key": format!("key_{i}"), "value": i},
             }))
             .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "insert {i} failed: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "insert {i} failed: {resp}"
+        );
     }
 
     // Wait for full replication
@@ -559,7 +604,10 @@ async fn test_data_consistency_after_failover() {
                 "doc": {"key": format!("key_{i}"), "value": i},
             }))
             .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "insert {i} failed: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "insert {i} failed: {resp}"
+        );
     }
 
     // Wait for replication on survivors
@@ -598,7 +646,10 @@ async fn test_kill_two_nodes() {
                 "doc": {"i": i},
             }))
             .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "insert {i} failed: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "insert {i} failed: {resp}"
+        );
     }
 
     // Wait for replication
@@ -612,9 +663,7 @@ async fn test_kill_two_nodes() {
     }
 
     // Remaining: 3 nodes including the leader
-    let surviving_indices: Vec<usize> = (0..5)
-        .filter(|i| !kill_indices.contains(i))
-        .collect();
+    let surviving_indices: Vec<usize> = (0..5).filter(|i| !kill_indices.contains(i)).collect();
 
     let mut surviving_clients: Vec<AsyncClient> = Vec::new();
     for &idx in &surviving_indices {
@@ -625,7 +674,9 @@ async fn test_kill_two_nodes() {
     wait_for_leader(&mut surviving_clients, Duration::from_secs(15)).await;
 
     // Insert 5 more docs via leader of surviving cluster
-    let leader_rel = find_leader(&mut surviving_clients).await.expect("no leader among survivors");
+    let leader_rel = find_leader(&mut surviving_clients)
+        .await
+        .expect("no leader among survivors");
     for i in 10..15 {
         let resp = surviving_clients[leader_rel]
             .send(&json!({
@@ -634,7 +685,10 @@ async fn test_kill_two_nodes() {
                 "doc": {"i": i},
             }))
             .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "insert {i} failed: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "insert {i} failed: {resp}"
+        );
     }
 
     // Wait for replication on survivors

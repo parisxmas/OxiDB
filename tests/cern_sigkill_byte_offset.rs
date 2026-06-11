@@ -76,7 +76,8 @@ fn run_victim() -> ! {
     let mut out = stdout.lock();
     let mut i: u64 = 0;
     loop {
-        db.insert("byteoff", json!({"i": i})).expect("victim: insert");
+        db.insert("byteoff", json!({"i": i}))
+            .expect("victim: insert");
         writeln!(out, "{i}").expect("victim: ack");
         out.flush().expect("victim: flush");
         i += 1;

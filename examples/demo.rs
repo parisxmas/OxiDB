@@ -62,7 +62,10 @@ fn main() -> oxidb::Result<()> {
     let deleted = db.delete("events", &json!({"type": "view"}))?;
     println!("=== Deleted {} view events ===", deleted);
 
-    println!("\n=== Remaining: {} events ===", db.find("events", &json!({}))?.len());
+    println!(
+        "\n=== Remaining: {} events ===",
+        db.find("events", &json!({}))?.len()
+    );
 
     Ok(())
 }

@@ -12,15 +12,15 @@ use crate::error::{Error, Result};
 use crate::fts::CollectionTextIndex;
 use crate::in_memory::{InMemStorage, StorageBackend, WalBackend};
 use crate::index::CompositeIndex;
-use crate::paged_field_index::PagedFieldIndex;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::index_persist;
-use crate::vector::{DistanceMetric, VectorIndex};
+use crate::paged_field_index::PagedFieldIndex;
 use crate::query::{self, FindOptions, Query, SortOrder};
 use crate::storage::DocLocation;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::storage::Storage;
 use crate::value::IndexValue;
+use crate::vector::{DistanceMetric, VectorIndex};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::wal::Wal;
 use crate::wal::WalEntry;
@@ -174,22 +174,37 @@ impl Collection {
         let enc = self.encryption.as_ref();
         let fidx_path = self.data_dir.join(format!("{}.fidx", self.name));
         let field_refs: Vec<&PagedFieldIndex> = self.field_indexes.values().collect();
-        if let Err(e) = index_persist::save_field_indexes(&fidx_path, &field_refs, doc_count, next_id, enc) {
-            eprintln!("[warn] {}: failed to save field index cache: {}", self.name, e);
+        if let Err(e) =
+            index_persist::save_field_indexes(&fidx_path, &field_refs, doc_count, next_id, enc)
+        {
+            eprintln!(
+                "[warn] {}: failed to save field index cache: {}",
+                self.name, e
+            );
         }
 
         // Save composite indexes (.cidx)
         let cidx_path = self.data_dir.join(format!("{}.cidx", self.name));
         let comp_refs: Vec<&CompositeIndex> = self.composite_indexes.iter().collect();
-        if let Err(e) = index_persist::save_composite_indexes(&cidx_path, &comp_refs, doc_count, next_id, enc) {
-            eprintln!("[warn] {}: failed to save composite index cache: {}", self.name, e);
+        if let Err(e) =
+            index_persist::save_composite_indexes(&cidx_path, &comp_refs, doc_count, next_id, enc)
+        {
+            eprintln!(
+                "[warn] {}: failed to save composite index cache: {}",
+                self.name, e
+            );
         }
 
         // Save vector indexes (.vidx)
         let vidx_path = self.data_dir.join(format!("{}.vidx", self.name));
         let vec_refs: Vec<&VectorIndex> = self.vector_indexes.values().collect();
-        if let Err(e) = index_persist::save_vector_indexes(&vidx_path, &vec_refs, doc_count, next_id, enc) {
-            eprintln!("[warn] {}: failed to save vector index cache: {}", self.name, e);
+        if let Err(e) =
+            index_persist::save_vector_indexes(&vidx_path, &vec_refs, doc_count, next_id, enc)
+        {
+            eprintln!(
+                "[warn] {}: failed to save vector index cache: {}",
+                self.name, e
+            );
         }
     }
 
@@ -233,12 +248,18 @@ impl Collection {
 
         let data_path = data_dir.join(format!("{}.dat", name));
         let wal_path = data_dir.join(format!("{}.wal", name));
-        let storage = StorageBackend::File(Storage::open_with_encryption(&data_path, encryption.clone())?);
+        let storage = StorageBackend::File(Storage::open_with_encryption(
+            &data_path,
+            encryption.clone(),
+        )?);
         let wal = WalBackend::File(Wal::open_with_encryption(&wal_path, encryption.clone())?);
 
         if verbose {
             let file_size = storage.file_size();
-            vlog(&format!("[verbose] {}: storage file {} bytes", name, file_size));
+            vlog(&format!(
+                "[verbose] {}: storage file {} bytes",
+                name, file_size
+            ));
         }
 
         // Load persisted index definitions (if any)
@@ -255,10 +276,8 @@ impl Collection {
         for info in &persisted_indexes {
             match info.index_type.as_str() {
                 "field" => {
-                    field_indexes.insert(
-                        info.name.clone(),
-                        PagedFieldIndex::new(info.name.clone()),
-                    );
+                    field_indexes
+                        .insert(info.name.clone(), PagedFieldIndex::new(info.name.clone()));
                 }
                 "unique" => {
                     field_indexes.insert(
@@ -273,13 +292,11 @@ impl Collection {
                     text_index = Some(CollectionTextIndex::new(info.fields.clone()));
                 }
                 "vector" => {
-                    if let (Some(dim), Some(metric_str)) = (info.dimension, info.metric.as_deref()) {
+                    if let (Some(dim), Some(metric_str)) = (info.dimension, info.metric.as_deref())
+                    {
                         let field = info.fields.first().cloned().unwrap_or_default();
                         let metric = VectorIndex::parse_metric(metric_str);
-                        vector_indexes.insert(
-                            field.clone(),
-                            VectorIndex::new(field, dim, metric),
-                        );
+                        vector_indexes.insert(field.clone(), VectorIndex::new(field, dim, metric));
                     }
                 }
                 _ => {}
@@ -359,24 +376,12 @@ impl Collection {
             let vidx_path = data_dir.join(format!("{}.vidx", name));
 
             let enc = encryption.as_ref();
-            let cached_field = index_persist::load_field_indexes(
-                &fidx_path,
-                doc_count,
-                next_id,
-                enc,
-            );
-            let cached_composite = index_persist::load_composite_indexes(
-                &cidx_path,
-                doc_count,
-                next_id,
-                enc,
-            );
-            let cached_vector = index_persist::load_vector_indexes(
-                &vidx_path,
-                doc_count,
-                next_id,
-                enc,
-            );
+            let cached_field =
+                index_persist::load_field_indexes(&fidx_path, doc_count, next_id, enc);
+            let cached_composite =
+                index_persist::load_composite_indexes(&cidx_path, doc_count, next_id, enc);
+            let cached_vector =
+                index_persist::load_vector_indexes(&vidx_path, doc_count, next_id, enc);
 
             // Both must succeed for the cache to be valid
             let field_ok = cached_field.is_some() || field_indexes.is_empty();
@@ -721,7 +726,11 @@ impl Collection {
             if verbose && count % 500_000 == 0 {
                 eprintln!(
                     "[verbose] {}: index '{}' scanned {} / {} docs ({:.1}s)",
-                    name, field, count, total, start.elapsed().as_secs_f64()
+                    name,
+                    field,
+                    count,
+                    total,
+                    start.elapsed().as_secs_f64()
                 );
             }
             Ok(true)
@@ -730,7 +739,10 @@ impl Collection {
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: index '{}' ready ({} docs in {:.2}s)",
-                self.name, field, count, start.elapsed().as_secs_f64()
+                self.name,
+                field,
+                count,
+                start.elapsed().as_secs_f64()
             ));
         }
         self.field_indexes.insert(field.to_string(), idx);
@@ -801,7 +813,11 @@ impl Collection {
             if verbose && count % 500_000 == 0 {
                 eprintln!(
                     "[verbose] {}: unique index '{}' scanned {} / {} docs ({:.1}s)",
-                    name, field_owned, count, total, start.elapsed().as_secs_f64()
+                    name,
+                    field_owned,
+                    count,
+                    total,
+                    start.elapsed().as_secs_f64()
                 );
             }
             Ok(true)
@@ -814,7 +830,10 @@ impl Collection {
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: unique index '{}' ready ({} docs in {:.2}s)",
-                self.name, field, count, start.elapsed().as_secs_f64()
+                self.name,
+                field,
+                count,
+                start.elapsed().as_secs_f64()
             ));
         }
         self.field_indexes.insert(field.to_string(), idx);
@@ -854,7 +873,11 @@ impl Collection {
                 if verbose && count % 500_000 == 0 {
                     eprintln!(
                         "[verbose] {}: composite index '{}' scanned {} / {} docs ({:.1}s)",
-                        col_name, name, count, total, start.elapsed().as_secs_f64()
+                        col_name,
+                        name,
+                        count,
+                        total,
+                        start.elapsed().as_secs_f64()
                     );
                 }
             }
@@ -864,7 +887,10 @@ impl Collection {
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: composite index '{}' ready ({} docs in {:.2}s)",
-                self.name, name, count, start.elapsed().as_secs_f64()
+                self.name,
+                name,
+                count,
+                start.elapsed().as_secs_f64()
             ));
         }
         let idx_name = idx.name();
@@ -905,7 +931,10 @@ impl Collection {
                 if verbose && count % 500_000 == 0 {
                     eprintln!(
                         "[verbose] {}: text index scanned {} / {} docs ({:.1}s)",
-                        name, count, total, start.elapsed().as_secs_f64()
+                        name,
+                        count,
+                        total,
+                        start.elapsed().as_secs_f64()
                     );
                 }
             }
@@ -915,7 +944,9 @@ impl Collection {
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: text index ready ({} docs in {:.2}s)",
-                self.name, count, start.elapsed().as_secs_f64()
+                self.name,
+                count,
+                start.elapsed().as_secs_f64()
             ));
         }
         self.text_index = Some(idx);
@@ -929,7 +960,11 @@ impl Collection {
         for idx in self.field_indexes.values() {
             indexes.push(IndexInfo {
                 name: idx.field.clone(),
-                index_type: if idx.unique { "unique".to_string() } else { "field".to_string() },
+                index_type: if idx.unique {
+                    "unique".to_string()
+                } else {
+                    "field".to_string()
+                },
                 fields: vec![idx.field.clone()],
                 unique: idx.unique,
                 dimension: None,
@@ -1002,7 +1037,9 @@ impl Collection {
     /// Full-text search on collection documents. Returns matching documents with `_score` field.
     pub fn text_search(&self, query: &str, limit: usize) -> Result<Vec<Value>> {
         let idx = self.text_index.as_ref().ok_or_else(|| {
-            Error::InvalidQuery("no text index on this collection; create one with create_text_index".into())
+            Error::InvalidQuery(
+                "no text index on this collection; create one with create_text_index".into(),
+            )
         })?;
 
         let search_results = idx.search(query, limit);
@@ -1033,7 +1070,9 @@ impl Collection {
         max_snippets: usize,
     ) -> Result<Vec<Value>> {
         let idx = self.text_index.as_ref().ok_or_else(|| {
-            Error::InvalidQuery("no text index on this collection; create one with create_text_index".into())
+            Error::InvalidQuery(
+                "no text index on this collection; create one with create_text_index".into(),
+            )
         })?;
 
         let indexed_fields: Vec<String> = idx.fields().to_vec();
@@ -1045,12 +1084,8 @@ impl Collection {
                 if max_snippets > 0 && snippet_chars > 0 {
                     for field in &indexed_fields {
                         for text in collect_field_strings(&doc, field) {
-                            let snippets = crate::fts::highlight(
-                                &text,
-                                query,
-                                snippet_chars,
-                                max_snippets,
-                            );
+                            let snippets =
+                                crate::fts::highlight(&text, query, snippet_chars, max_snippets);
                             if !snippets.is_empty() {
                                 let arr: Vec<Value> = snippets
                                     .into_iter()
@@ -1085,7 +1120,12 @@ impl Collection {
     /// Create a vector index on the specified field.
     /// Rebuilds from existing documents in doc cache.
     /// If an index already exists on this field, returns Ok immediately (idempotent).
-    pub fn create_vector_index(&mut self, field: &str, dimension: usize, metric: DistanceMetric) -> Result<()> {
+    pub fn create_vector_index(
+        &mut self,
+        field: &str,
+        dimension: usize,
+        metric: DistanceMetric,
+    ) -> Result<()> {
         if self.vector_indexes.contains_key(field) {
             return Ok(());
         }
@@ -1094,7 +1134,11 @@ impl Collection {
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: creating vector index on '{}' (dim={}, metric={}, {} docs to scan)",
-                self.name, field, dimension, metric.as_str(), total
+                self.name,
+                field,
+                dimension,
+                metric.as_str(),
+                total
             ));
         }
         let start = std::time::Instant::now();
@@ -1111,17 +1155,18 @@ impl Collection {
                 let arc = Arc::new(doc);
                 if let Err(e) = idx.insert(id, &arc) {
                     if verbose {
-                        eprintln!(
-                            "[verbose] {}: vector index skip doc {}: {}",
-                            name, id, e
-                        );
+                        eprintln!("[verbose] {}: vector index skip doc {}: {}", name, id, e);
                     }
                 }
                 count += 1;
                 if verbose && count % 500_000 == 0 {
                     eprintln!(
                         "[verbose] {}: vector index '{}' scanned {} / {} docs ({:.1}s)",
-                        name, field_owned, count, total, start.elapsed().as_secs_f64()
+                        name,
+                        field_owned,
+                        count,
+                        total,
+                        start.elapsed().as_secs_f64()
                     );
                 }
             }
@@ -1131,7 +1176,11 @@ impl Collection {
         if self.verbose {
             self.vlog(&format!(
                 "[verbose] {}: vector index '{}' ready ({} vectors from {} docs in {:.2}s)",
-                self.name, field, idx.len(), count, start.elapsed().as_secs_f64()
+                self.name,
+                field,
+                idx.len(),
+                count,
+                start.elapsed().as_secs_f64()
             ));
         }
         self.vector_indexes.insert(field.to_string(), idx);
@@ -1141,7 +1190,13 @@ impl Collection {
     }
 
     /// Perform vector similarity search. Returns matching documents with `_similarity` score.
-    pub fn vector_search(&self, field: &str, query_vector: &[f32], limit: usize, ef_search: Option<usize>) -> Result<Vec<Value>> {
+    pub fn vector_search(
+        &self,
+        field: &str,
+        query_vector: &[f32],
+        limit: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<Value>> {
         let idx = self.vector_indexes.get(field).ok_or_else(|| {
             Error::InvalidQuery(format!(
                 "no vector index on field '{}'; create one with create_vector_index",
@@ -1149,14 +1204,18 @@ impl Collection {
             ))
         })?;
 
-        let search_results = idx.search(query_vector, limit, ef_search)
+        let search_results = idx
+            .search(query_vector, limit, ef_search)
             .map_err(|e| Error::InvalidQuery(e))?;
 
         let mut docs = Vec::with_capacity(search_results.len());
         for result in search_results {
             if let Some(mut doc) = self.read_doc(result.doc_id)? {
                 if let Some(obj) = doc.as_object_mut() {
-                    obj.insert("_similarity".to_string(), serde_json::json!(result.similarity));
+                    obj.insert(
+                        "_similarity".to_string(),
+                        serde_json::json!(result.similarity),
+                    );
                     obj.insert("_distance".to_string(), serde_json::json!(result.distance));
                 }
                 docs.push(doc);
@@ -1313,7 +1372,10 @@ impl Collection {
         }
 
         // Phase 3: append all to .dat (single write_all via buffered method)
-        let byte_slices: Vec<&[u8]> = prepared.iter().map(|(_, _, bytes)| bytes.as_slice()).collect();
+        let byte_slices: Vec<&[u8]> = prepared
+            .iter()
+            .map(|(_, _, bytes)| bytes.as_slice())
+            .collect();
         let batch_locs = self.storage.append_batch_no_sync_buffered(&byte_slices)?;
         if !self.lazy_sync {
             self.storage.sync()?;
@@ -1397,7 +1459,10 @@ impl Collection {
         }
 
         // Append to storage (single write_all)
-        let byte_slices: Vec<&[u8]> = prepared.iter().map(|(_, _, bytes)| bytes.as_slice()).collect();
+        let byte_slices: Vec<&[u8]> = prepared
+            .iter()
+            .map(|(_, _, bytes)| bytes.as_slice())
+            .collect();
         let batch_locs = self.storage.append_batch_no_sync_buffered(&byte_slices)?;
         if !self.lazy_sync {
             self.storage.sync()?;
@@ -1441,13 +1506,12 @@ impl Collection {
     }
 
     /// Find documents matching a query with sort/skip/limit options.
-    pub fn find_with_options(
-        &self,
-        query_json: &Value,
-        opts: &FindOptions,
-    ) -> Result<Vec<Value>> {
+    pub fn find_with_options(&self, query_json: &Value, opts: &FindOptions) -> Result<Vec<Value>> {
         let arcs = self.find_with_options_arcs(query_json, opts)?;
-        Ok(arcs.into_iter().map(|a| Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone())).collect())
+        Ok(arcs
+            .into_iter()
+            .map(|a| Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()))
+            .collect())
     }
 
     /// Find documents matching a query with sort/skip/limit options,
@@ -1485,7 +1549,8 @@ impl Collection {
             if sort_fields.len() == 1 {
                 let (sort_field, sort_order) = &sort_fields[0];
                 if let Some(field_idx) = self.field_indexes.get(sort_field) {
-                    let need = opts.skip.unwrap_or(0) as usize + opts.limit.unwrap_or(u64::MAX) as usize;
+                    let need =
+                        opts.skip.unwrap_or(0) as usize + opts.limit.unwrap_or(u64::MAX) as usize;
                     let mut results = Vec::new();
                     // In index-backed sort we iterate the SORT field's index,
                     // NOT the query fields' indexes — so we can only skip filtering
@@ -1630,31 +1695,24 @@ impl Collection {
         // Fast path: lazy index iteration for limit queries without sort/skip.
         // Avoids materializing full BTreeSet of IDs.
         if let Some(limit) = early_limit {
-            let lazy_result = query::execute_indexed_lazy(
-                &query,
-                &self.field_indexes,
-                &mut |id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            results.push(arc);
-                            if results.len() >= limit {
-                                return false;
-                            }
+            let lazy_result = query::execute_indexed_lazy(&query, &self.field_indexes, &mut |id| {
+                if let Some(arc) = self.load_doc_arc(id) {
+                    if skip_post_filter || query::matches_value(&query, &arc) {
+                        results.push(arc);
+                        if results.len() >= limit {
+                            return false;
                         }
                     }
-                    true
-                },
-            );
+                }
+                true
+            });
             if lazy_result.is_some() {
                 return Ok(results);
             }
         }
 
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &self.field_indexes,
-            &self.composite_indexes,
-        );
+        let candidate_ids =
+            query::execute_indexed(&query, &self.field_indexes, &self.composite_indexes);
 
         if let Some(ref indexed_ids) = candidate_ids {
             const BATCH_THRESHOLD: usize = 1024;
@@ -1682,8 +1740,7 @@ impl Collection {
                     let batch = self.storage.read_batch_lockfree(&mut miss_locs)?;
 
                     // Phase 4: decode and batch-populate cache
-                    let mut cache_entries: Vec<(u64, Arc<Value>)> =
-                        Vec::with_capacity(batch.len());
+                    let mut cache_entries: Vec<(u64, Arc<Value>)> = Vec::with_capacity(batch.len());
                     for (i, bytes) in batch {
                         let doc = crate::codec::decode_doc(&bytes)?;
                         let arc = Arc::new(doc);
@@ -1788,9 +1845,7 @@ impl Collection {
             if !miss_indices.is_empty() && !at_limit {
                 let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = miss_indices
                     .iter()
-                    .filter_map(|&i| {
-                        self.primary_index.get(&ids[i]).map(|&loc| (i, loc))
-                    })
+                    .filter_map(|&i| self.primary_index.get(&ids[i]).map(|&loc| (i, loc)))
                     .collect();
 
                 if !miss_locs.is_empty() {
@@ -1862,19 +1917,15 @@ impl Collection {
         // Try lazy index path first — avoids materializing full BTreeSet
         if !matches!(query, Query::All) {
             let mut found: Option<Value> = None;
-            let lazy_result = query::execute_indexed_lazy(
-                &query,
-                &self.field_indexes,
-                &mut |id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            found = Some((*arc).clone());
-                            return false;
-                        }
+            let lazy_result = query::execute_indexed_lazy(&query, &self.field_indexes, &mut |id| {
+                if let Some(arc) = self.load_doc_arc(id) {
+                    if skip_post_filter || query::matches_value(&query, &arc) {
+                        found = Some((*arc).clone());
+                        return false;
                     }
-                    true
-                },
-            );
+                }
+                true
+            });
             if lazy_result.is_some() {
                 return Ok(found);
             }
@@ -1882,11 +1933,7 @@ impl Collection {
 
         // Fallback: full materialization path
         let candidate_ids = if !matches!(query, Query::All) {
-            query::execute_indexed(
-                &query,
-                &self.field_indexes,
-                &self.composite_indexes,
-            )
+            query::execute_indexed(&query, &self.field_indexes, &self.composite_indexes)
         } else {
             None
         };
@@ -1967,7 +2014,11 @@ impl Collection {
             let match_query = match match_query_json {
                 Some(match_val) => {
                     let q = query::parse_query(match_val)?;
-                    if matches!(q, Query::All) { None } else { Some(q) }
+                    if matches!(q, Query::All) {
+                        None
+                    } else {
+                        Some(q)
+                    }
                 }
                 None => None,
             };
@@ -1978,16 +2029,17 @@ impl Collection {
             // whenever candidates < 50% of collection. This avoids scanning
             // the entire collection when an index can skip most documents.
             if let Some(ref query) = match_query {
-                let candidate_ids = query::execute_indexed(
-                    query,
-                    &self.field_indexes,
-                    &self.composite_indexes,
-                );
+                let candidate_ids =
+                    query::execute_indexed(query, &self.field_indexes, &self.composite_indexes);
                 if let Some(ref ids) = candidate_ids {
                     if ids.len() <= doc_count / 2 {
                         // Small candidate set — indexed random-read is faster
                         return self.aggregate_streaming_indexed(
-                            query, ids, group_key, accumulators, use_raw,
+                            query,
+                            ids,
+                            group_key,
+                            accumulators,
+                            use_raw,
                         );
                     }
                 }
@@ -2008,24 +2060,26 @@ impl Collection {
                             let mut local_group =
                                 crate::pipeline::StreamingGroup::new(group_key, accumulators);
                             if let Some(ref query) = *match_query_ref {
-                                self.storage.scan_segment_readonly_while(start, end, |bytes| {
-                                    match query::matches_raw_jsonb(query, bytes) {
-                                        Some(true) => local_group.feed_raw(bytes),
-                                        Some(false) => {}
-                                        None => {
-                                            let doc = crate::codec::decode_doc(bytes)?;
-                                            if query::matches_value(query, &doc) {
-                                                local_group.feed(&doc);
+                                self.storage
+                                    .scan_segment_readonly_while(start, end, |bytes| {
+                                        match query::matches_raw_jsonb(query, bytes) {
+                                            Some(true) => local_group.feed_raw(bytes),
+                                            Some(false) => {}
+                                            None => {
+                                                let doc = crate::codec::decode_doc(bytes)?;
+                                                if query::matches_value(query, &doc) {
+                                                    local_group.feed(&doc);
+                                                }
                                             }
                                         }
-                                    }
-                                    Ok(true)
-                                })?;
+                                        Ok(true)
+                                    })?;
                             } else {
-                                self.storage.scan_segment_readonly_while(start, end, |bytes| {
-                                    local_group.feed_raw(bytes);
-                                    Ok(true)
-                                })?;
+                                self.storage
+                                    .scan_segment_readonly_while(start, end, |bytes| {
+                                        local_group.feed_raw(bytes);
+                                        Ok(true)
+                                    })?;
                             }
                             Ok::<_, crate::error::Error>(local_group)
                         })
@@ -2040,16 +2094,13 @@ impl Collection {
                         Some(ref mut m) => m.merge(local_group),
                     }
                 }
-                Ok(merged
-                    .map(|g| g.finalize())
-                    .unwrap_or_default())
+                Ok(merged.map(|g| g.finalize()).unwrap_or_default())
             });
             return result;
         }
 
         // ── Sequential path (small collection or non-raw) ───────────────
-        let mut group =
-            crate::pipeline::StreamingGroup::new(group_key, accumulators);
+        let mut group = crate::pipeline::StreamingGroup::new(group_key, accumulators);
 
         match match_query_json {
             None => {
@@ -2086,8 +2137,7 @@ impl Collection {
                         &self.field_indexes,
                         &self.composite_indexes,
                     );
-                    let skip_post_filter =
-                        query::is_fully_indexed(&query, &self.field_indexes);
+                    let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
                     if let Some(ref ids) = candidate_ids {
                         // Indexed match — batch pread + raw JSONB path
                         let id_vec: Vec<u64> = ids.iter().copied().collect();
@@ -2096,8 +2146,7 @@ impl Collection {
                         let cached = self.doc_cache.get_many(&id_vec);
 
                         // Phase 2: collect cache misses with storage locations
-                        let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> =
-                            Vec::new();
+                        let mut miss_locs: Vec<(usize, crate::storage::DocLocation)> = Vec::new();
                         for (i, opt) in cached.iter().enumerate() {
                             if opt.is_none() {
                                 if let Some(&loc) = self.primary_index.get(&id_vec[i]) {
@@ -2116,9 +2165,7 @@ impl Collection {
                         // Phase 4: feed cache hits
                         for opt in cached.iter() {
                             if let Some(arc) = opt {
-                                if skip_post_filter
-                                    || query::matches_value(&query, arc)
-                                {
+                                if skip_post_filter || query::matches_value(&query, arc) {
                                     group.feed(arc);
                                 }
                             }
@@ -2135,9 +2182,7 @@ impl Collection {
                             for (i, bytes) in batch_raw {
                                 let doc = crate::codec::decode_doc(&bytes)?;
                                 let arc = Arc::new(doc);
-                                if skip_post_filter
-                                    || query::matches_value(&query, &arc)
-                                {
+                                if skip_post_filter || query::matches_value(&query, &arc) {
                                     group.feed(&arc);
                                 }
                                 cache_entries.push((id_vec[i], arc));
@@ -2216,8 +2261,7 @@ impl Collection {
                 group.feed_raw(bytes);
             }
         } else {
-            let mut cache_entries: Vec<(u64, Arc<Value>)> =
-                Vec::with_capacity(batch_raw.len());
+            let mut cache_entries: Vec<(u64, Arc<Value>)> = Vec::with_capacity(batch_raw.len());
             for (i, bytes) in batch_raw {
                 let doc = crate::codec::decode_doc(&bytes)?;
                 let arc = Arc::new(doc);
@@ -2244,7 +2288,12 @@ impl Collection {
     /// Update documents matching a query atomically. Returns IDs of updated documents.
     /// If any unique constraint is violated, no documents are modified.
     /// `limit` caps the number of documents to update (e.g. `Some(1)` for update_one).
-    pub fn update(&mut self, query_json: &Value, update_json: &Value, limit: Option<usize>) -> Result<Vec<DocumentId>> {
+    pub fn update(
+        &mut self,
+        query_json: &Value,
+        update_json: &Value,
+        limit: Option<usize>,
+    ) -> Result<Vec<DocumentId>> {
         // Validate update document has at least one operator
         let update_obj = update_json
             .as_object()
@@ -2266,34 +2315,27 @@ impl Collection {
             let primary_index = &self.primary_index;
             let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
             let lim = limit.unwrap();
-            let lazy_result = query::execute_indexed_lazy(
-                &query,
-                &self.field_indexes,
-                &mut |id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            if let Some(&old_loc) = primary_index.get(&id) {
-                                matches.push((id, (*arc).clone(), old_loc));
-                                if matches.len() >= lim {
-                                    return false;
-                                }
+            let lazy_result = query::execute_indexed_lazy(&query, &self.field_indexes, &mut |id| {
+                if let Some(arc) = self.load_doc_arc(id) {
+                    if skip_post_filter || query::matches_value(&query, &arc) {
+                        if let Some(&old_loc) = primary_index.get(&id) {
+                            matches.push((id, (*arc).clone(), old_loc));
+                            if matches.len() >= lim {
+                                return false;
                             }
                         }
                     }
-                    true
-                },
-            );
+                }
+                true
+            });
             if lazy_result.is_some() {
                 lazy_handled = true;
             }
         }
 
         if !lazy_handled {
-            let candidate_ids = query::execute_indexed(
-                &query,
-                &self.field_indexes,
-                &self.composite_indexes,
-            );
+            let candidate_ids =
+                query::execute_indexed(&query, &self.field_indexes, &self.composite_indexes);
 
             if let Some(ref indexed_ids) = candidate_ids {
                 for &id in indexed_ids {
@@ -2301,7 +2343,9 @@ impl Collection {
                         if let Some(data) = self.read_doc(id)? {
                             if query::matches_value(&query, &data) {
                                 matches.push((id, data, old_loc));
-                                if limit.is_some_and(|l| matches.len() >= l) { break; }
+                                if limit.is_some_and(|l| matches.len() >= l) {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -2312,7 +2356,9 @@ impl Collection {
                     if query::matches_value(&query, arc) {
                         if let Some(&old_loc) = self.primary_index.get(&id) {
                             matches.push((id, (**arc).clone(), old_loc));
-                            if limit.is_some_and(|l| matches.len() >= l) { return Ok(false); }
+                            if limit.is_some_and(|l| matches.len() >= l) {
+                                return Ok(false);
+                            }
                         }
                     }
                     Ok(true)
@@ -2339,7 +2385,10 @@ impl Collection {
 
             crate::update::apply_update(&mut mutable_data, update_json)?;
 
-            let old_version = mutable_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+            let old_version = mutable_data
+                .get("_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let new_version = old_version + 1;
             if let Some(obj) = mutable_data.as_object_mut() {
                 obj.insert("_version".to_string(), Value::Number(new_version.into()));
@@ -2388,7 +2437,11 @@ impl Collection {
         for (op, new_loc) in ops.into_iter().zip(new_locs) {
             updated_ids.push(op.id);
             self.primary_index.insert(op.id, new_loc);
-            let new_version = op.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
+            let new_version = op
+                .new_data
+                .get("_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1);
             self.version_index.insert(op.id, new_version);
             for idx in self.field_indexes.values_mut() {
                 idx.remove_value(op.id, &op.old_data);
@@ -2430,34 +2483,31 @@ impl Collection {
             let primary_index = &self.primary_index;
             let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
             let lim = limit.unwrap();
-            let lazy_result = query::execute_indexed_lazy(
-                &query,
-                &self.field_indexes,
-                &mut |id| {
-                    if let Some(arc) = self.load_doc_arc(id) {
-                        if skip_post_filter || query::matches_value(&query, &arc) {
-                            if let Some(&loc) = primary_index.get(&id) {
-                                ops.push(DeleteOp { id, loc, data: (*arc).clone() });
-                                if ops.len() >= lim {
-                                    return false;
-                                }
+            let lazy_result = query::execute_indexed_lazy(&query, &self.field_indexes, &mut |id| {
+                if let Some(arc) = self.load_doc_arc(id) {
+                    if skip_post_filter || query::matches_value(&query, &arc) {
+                        if let Some(&loc) = primary_index.get(&id) {
+                            ops.push(DeleteOp {
+                                id,
+                                loc,
+                                data: (*arc).clone(),
+                            });
+                            if ops.len() >= lim {
+                                return false;
                             }
                         }
                     }
-                    true
-                },
-            );
+                }
+                true
+            });
             if lazy_result.is_some() {
                 lazy_handled = true;
             }
         }
 
         if !lazy_handled {
-            let candidate_ids = query::execute_indexed(
-                &query,
-                &self.field_indexes,
-                &self.composite_indexes,
-            );
+            let candidate_ids =
+                query::execute_indexed(&query, &self.field_indexes, &self.composite_indexes);
 
             if let Some(ref indexed_ids) = candidate_ids {
                 for &id in indexed_ids {
@@ -2465,7 +2515,9 @@ impl Collection {
                         if let Some(data) = self.read_doc(id)? {
                             if query::matches_value(&query, &data) {
                                 ops.push(DeleteOp { id, loc, data });
-                                if limit.is_some_and(|l| ops.len() >= l) { break; }
+                                if limit.is_some_and(|l| ops.len() >= l) {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -2475,8 +2527,14 @@ impl Collection {
                 self.for_each_doc_arc_while(|id, arc| {
                     if query::matches_value(&query, arc) {
                         if let Some(&loc) = self.primary_index.get(&id) {
-                            ops.push(DeleteOp { id, loc, data: (**arc).clone() });
-                            if limit.is_some_and(|l| ops.len() >= l) { return Ok(false); }
+                            ops.push(DeleteOp {
+                                id,
+                                loc,
+                                data: (**arc).clone(),
+                            });
+                            if limit.is_some_and(|l| ops.len() >= l) {
+                                return Ok(false);
+                            }
                         }
                     }
                     Ok(true)
@@ -2489,10 +2547,7 @@ impl Collection {
         }
 
         // Phase 2: WAL log all deletes (no fsync — storage fsync provides durability)
-        let wal_entries: Vec<WalEntry> = ops
-            .iter()
-            .map(|op| WalEntry::delete(op.id))
-            .collect();
+        let wal_entries: Vec<WalEntry> = ops.iter().map(|op| WalEntry::delete(op.id)).collect();
         self.wal.log_batch_no_sync(&wal_entries)?;
 
         // Phase 3: mark all deleted in .dat
@@ -2546,11 +2601,8 @@ impl Collection {
         }
 
         // Slow path: need to scan docs
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &self.field_indexes,
-            &self.composite_indexes,
-        );
+        let candidate_ids =
+            query::execute_indexed(&query, &self.field_indexes, &self.composite_indexes);
 
         let skip_post_filter = query::is_fully_indexed(&query, &self.field_indexes);
 
@@ -2642,115 +2694,140 @@ impl Collection {
             // Fall through to index rebuild below
             self.version_index.clear();
             self.doc_cache.clear();
-            for idx in self.field_indexes.values_mut() { idx.clear(); }
-            for idx in &mut self.composite_indexes { idx.clear(); }
-            if let Some(ref mut text_idx) = self.text_index { text_idx.clear(); }
-            for idx in self.vector_indexes.values_mut() { idx.clear(); }
+            for idx in self.field_indexes.values_mut() {
+                idx.clear();
+            }
+            for idx in &mut self.composite_indexes {
+                idx.clear();
+            }
+            if let Some(ref mut text_idx) = self.text_index {
+                text_idx.clear();
+            }
+            for idx in self.vector_indexes.values_mut() {
+                idx.clear();
+            }
             for (&id, &loc) in &self.primary_index.clone() {
                 let bytes = self.storage.read(loc)?;
                 let data: Value = crate::codec::decode_doc(&bytes)?;
                 let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
                 self.version_index.insert(id, ver);
                 let data_arc = Arc::new(data);
-                for idx in self.field_indexes.values_mut() { idx.insert_value(id, &data_arc); }
-                for idx in &mut self.composite_indexes { idx.insert_value(id, &data_arc); }
-                if let Some(ref mut text_idx) = self.text_index { text_idx.index_doc(id, &data_arc); }
-                for idx in self.vector_indexes.values_mut() { let _ = idx.insert(id, &data_arc); }
+                for idx in self.field_indexes.values_mut() {
+                    idx.insert_value(id, &data_arc);
+                }
+                for idx in &mut self.composite_indexes {
+                    idx.insert_value(id, &data_arc);
+                }
+                if let Some(ref mut text_idx) = self.text_index {
+                    text_idx.index_doc(id, &data_arc);
+                }
+                for idx in self.vector_indexes.values_mut() {
+                    let _ = idx.insert(id, &data_arc);
+                }
                 self.doc_cache.put(id, data_arc);
             }
 
-            return Ok(CompactStats { old_size, new_size, docs_kept });
+            return Ok(CompactStats {
+                old_size,
+                new_size,
+                docs_kept,
+            });
         }
 
         // File mode: create temp storage, copy, rename
         #[cfg(not(target_arch = "wasm32"))]
         {
-        let tmp_path = self.data_dir.join(format!("{}.dat.tmp", self.name));
-        let new_storage = Storage::open_with_encryption(&tmp_path, self.encryption.clone())?;
+            let tmp_path = self.data_dir.join(format!("{}.dat.tmp", self.name));
+            let new_storage = Storage::open_with_encryption(&tmp_path, self.encryption.clone())?;
 
-        // Copy active records to new file
-        let active_records = self.storage.iter_active()?;
-        let mut new_primary_index = HashMap::new();
-        let mut next_id: DocumentId = 1;
+            // Copy active records to new file
+            let active_records = self.storage.iter_active()?;
+            let mut new_primary_index = HashMap::new();
+            let mut next_id: DocumentId = 1;
 
-        for (_old_loc, bytes) in &active_records {
-            let doc: Value = crate::codec::decode_doc(bytes)?;
-            let id = doc.get("_id").and_then(|v| v.as_u64()).ok_or_else(|| {
-                Error::InvalidQuery("document missing _id during compaction".into())
-            })?;
+            for (_old_loc, bytes) in &active_records {
+                let doc: Value = crate::codec::decode_doc(bytes)?;
+                let id = doc.get("_id").and_then(|v| v.as_u64()).ok_or_else(|| {
+                    Error::InvalidQuery("document missing _id during compaction".into())
+                })?;
 
-            // Re-encode as JSONB (converts legacy JSON records on compact)
-            let new_bytes = crate::codec::encode_doc(&doc)?;
-            let loc = new_storage.append_no_sync(&new_bytes)?;
-            new_primary_index.insert(id, loc);
-            if id >= next_id {
-                next_id = id + 1;
+                // Re-encode as JSONB (converts legacy JSON records on compact)
+                let new_bytes = crate::codec::encode_doc(&doc)?;
+                let loc = new_storage.append_no_sync(&new_bytes)?;
+                new_primary_index.insert(id, loc);
+                if id >= next_id {
+                    next_id = id + 1;
+                }
             }
-        }
-        new_storage.sync()?;
+            new_storage.sync()?;
 
-        let docs_kept = new_primary_index.len();
-        let new_size = new_storage.file_size();
+            let docs_kept = new_primary_index.len();
+            let new_size = new_storage.file_size();
 
-        // Atomic swap: rename tmp → original
-        let dat_path = self.data_dir.join(format!("{}.dat", self.name));
-        std::fs::rename(&tmp_path, &dat_path)?;
+            // Atomic swap: rename tmp → original
+            let dat_path = self.data_dir.join(format!("{}.dat", self.name));
+            std::fs::rename(&tmp_path, &dat_path)?;
 
-        // Replace storage with new instance pointing to the renamed file
-        self.storage = StorageBackend::File(Storage::open_with_encryption(&dat_path, self.encryption.clone())?);
-        self.primary_index = new_primary_index;
-        self.next_id = next_id;
+            // Replace storage with new instance pointing to the renamed file
+            self.storage = StorageBackend::File(Storage::open_with_encryption(
+                &dat_path,
+                self.encryption.clone(),
+            )?);
+            self.primary_index = new_primary_index;
+            self.next_id = next_id;
 
-        // Rebuild all indexes and version_index; clear LRU cache
-        self.version_index.clear();
-        self.doc_cache.clear();
-        for idx in self.field_indexes.values_mut() {
-            idx.clear();
-        }
-        for idx in &mut self.composite_indexes {
-            idx.clear();
-        }
-        if let Some(ref mut text_idx) = self.text_index {
-            text_idx.clear();
-        }
-        for idx in self.vector_indexes.values_mut() {
-            idx.clear();
-        }
-        for (&id, &loc) in &self.primary_index.clone() {
-            let bytes = self.storage.read(loc)?;
-            let data: Value = crate::codec::decode_doc(&bytes)?;
-            let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-            self.version_index.insert(id, ver);
-            let data_arc = Arc::new(data);
+            // Rebuild all indexes and version_index; clear LRU cache
+            self.version_index.clear();
+            self.doc_cache.clear();
             for idx in self.field_indexes.values_mut() {
-                idx.insert_value(id, &data_arc);
+                idx.clear();
             }
             for idx in &mut self.composite_indexes {
-                idx.insert_value(id, &data_arc);
+                idx.clear();
             }
             if let Some(ref mut text_idx) = self.text_index {
-                text_idx.index_doc(id, &data_arc);
+                text_idx.clear();
             }
             for idx in self.vector_indexes.values_mut() {
-                let _ = idx.insert(id, &data_arc);
+                idx.clear();
             }
-            self.doc_cache.put(id, data_arc);
-        }
+            for (&id, &loc) in &self.primary_index.clone() {
+                let bytes = self.storage.read(loc)?;
+                let data: Value = crate::codec::decode_doc(&bytes)?;
+                let ver = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.version_index.insert(id, ver);
+                let data_arc = Arc::new(data);
+                for idx in self.field_indexes.values_mut() {
+                    idx.insert_value(id, &data_arc);
+                }
+                for idx in &mut self.composite_indexes {
+                    idx.insert_value(id, &data_arc);
+                }
+                if let Some(ref mut text_idx) = self.text_index {
+                    text_idx.index_doc(id, &data_arc);
+                }
+                for idx in self.vector_indexes.values_mut() {
+                    let _ = idx.insert(id, &data_arc);
+                }
+                self.doc_cache.put(id, data_arc);
+            }
 
-        // Save index data cache after compaction (indexes are fresh)
-        self.save_index_data();
+            // Save index data cache after compaction (indexes are fresh)
+            self.save_index_data();
 
-        Ok(CompactStats {
-            old_size,
-            new_size,
-            docs_kept,
-        })
+            Ok(CompactStats {
+                old_size,
+                new_size,
+                docs_kept,
+            })
         } // end #[cfg(not(target_arch = "wasm32"))]
 
         #[cfg(target_arch = "wasm32")]
         {
             // On wasm32, compact is only meaningful for in-memory mode (handled above).
-            Err(Error::InvalidQuery("compact: not supported on wasm32 for file-backed storage".into()))
+            Err(Error::InvalidQuery(
+                "compact: not supported on wasm32 for file-backed storage".into(),
+            ))
         }
     }
 
@@ -2798,11 +2875,7 @@ impl Collection {
             .as_millis() as u64;
 
         // Collect expired doc IDs
-        let expired_keys: Vec<u64> = self
-            .ttl_index
-            .range(..=now_ms)
-            .map(|(k, _)| *k)
-            .collect();
+        let expired_keys: Vec<u64> = self.ttl_index.range(..=now_ms).map(|(k, _)| *k).collect();
 
         if expired_keys.is_empty() {
             return 0;
@@ -2906,7 +2979,11 @@ impl Collection {
         let bytes = crate::codec::encode_doc(&data)?;
 
         Ok(PreparedMutation {
-            wal_entry: WalEntry::Insert { doc_id: id, doc_bytes: bytes.clone(), tx_id },
+            wal_entry: WalEntry::Insert {
+                doc_id: id,
+                doc_bytes: bytes.clone(),
+                tx_id,
+            },
             doc_id: id,
             new_bytes: bytes,
             old_loc: None,
@@ -2934,43 +3011,45 @@ impl Collection {
 
         // Single-pass scan with cache
         let query = query::parse_query(query_json)?;
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &self.field_indexes,
-            &self.composite_indexes,
-        );
+        let candidate_ids =
+            query::execute_indexed(&query, &self.field_indexes, &self.composite_indexes);
 
         let mut mutations = Vec::new();
 
-        let mut process_candidate = |id: DocumentId, cached: &Value, old_loc: DocLocation| -> Result<()> {
-            if !query::matches_value(&query, cached) {
-                return Ok(());
-            }
-            let old_data = cached.clone();
-            let mut data = cached.clone();
+        let mut process_candidate =
+            |id: DocumentId, cached: &Value, old_loc: DocLocation| -> Result<()> {
+                if !query::matches_value(&query, cached) {
+                    return Ok(());
+                }
+                let old_data = cached.clone();
+                let mut data = cached.clone();
 
-            crate::update::apply_update(&mut data, update_json)?;
+                crate::update::apply_update(&mut data, update_json)?;
 
-            let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-            let new_version = old_version + 1;
-            data.as_object_mut()
-                .unwrap()
-                .insert("_version".to_string(), Value::Number(new_version.into()));
+                let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                let new_version = old_version + 1;
+                data.as_object_mut()
+                    .unwrap()
+                    .insert("_version".to_string(), Value::Number(new_version.into()));
 
-            self.check_unique_constraints(&data, Some(id))?;
+                self.check_unique_constraints(&data, Some(id))?;
 
-            let new_bytes = crate::codec::encode_doc(&data)?;
-            mutations.push(PreparedMutation {
-                wal_entry: WalEntry::Update { doc_id: id, doc_bytes: new_bytes.clone(), tx_id },
-                doc_id: id,
-                new_bytes,
-                old_loc: Some(old_loc),
-                old_data: Some(old_data),
-                new_data: data,
-                is_delete: false,
-            });
-            Ok(())
-        };
+                let new_bytes = crate::codec::encode_doc(&data)?;
+                mutations.push(PreparedMutation {
+                    wal_entry: WalEntry::Update {
+                        doc_id: id,
+                        doc_bytes: new_bytes.clone(),
+                        tx_id,
+                    },
+                    doc_id: id,
+                    new_bytes,
+                    old_loc: Some(old_loc),
+                    old_data: Some(old_data),
+                    new_data: data,
+                    is_delete: false,
+                });
+                Ok(())
+            };
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
@@ -3005,29 +3084,27 @@ impl Collection {
     ) -> Result<Vec<PreparedMutation>> {
         // Single-pass scan with cache
         let query = query::parse_query(query_json)?;
-        let candidate_ids = query::execute_indexed(
-            &query,
-            &self.field_indexes,
-            &self.composite_indexes,
-        );
+        let candidate_ids =
+            query::execute_indexed(&query, &self.field_indexes, &self.composite_indexes);
 
         let mut mutations = Vec::new();
 
-        let mut process_candidate = |id: DocumentId, cached: &Value, loc: DocLocation| -> Result<()> {
-            if !query::matches_value(&query, cached) {
-                return Ok(());
-            }
-            mutations.push(PreparedMutation {
-                wal_entry: WalEntry::Delete { doc_id: id, tx_id },
-                doc_id: id,
-                new_bytes: vec![],
-                old_loc: Some(loc),
-                old_data: Some(cached.clone()),
-                new_data: Value::Null,
-                is_delete: true,
-            });
-            Ok(())
-        };
+        let mut process_candidate =
+            |id: DocumentId, cached: &Value, loc: DocLocation| -> Result<()> {
+                if !query::matches_value(&query, cached) {
+                    return Ok(());
+                }
+                mutations.push(PreparedMutation {
+                    wal_entry: WalEntry::Delete { doc_id: id, tx_id },
+                    doc_id: id,
+                    new_bytes: vec![],
+                    old_loc: Some(loc),
+                    old_data: Some(cached.clone()),
+                    new_data: Value::Null,
+                    is_delete: true,
+                });
+                Ok(())
+            };
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
@@ -3103,7 +3180,11 @@ impl Collection {
                 }
             } else if let Some(loc) = new_locs[i] {
                 self.primary_index.insert(m.doc_id, loc);
-                let ver = m.new_data.get("_version").and_then(|v| v.as_u64()).unwrap_or(1);
+                let ver = m
+                    .new_data
+                    .get("_version")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
                 self.version_index.insert(m.doc_id, ver);
                 if let Some(ref old_data) = m.old_data {
                     for idx in self.field_indexes.values_mut() {
@@ -3197,7 +3278,8 @@ mod tests {
         let (_dir, mut col) = temp_collection("test");
         let id = col.insert(json!({"name": "Alice"})).unwrap();
         assert_eq!(col.get_version(id), 1);
-        col.update(&json!({"_id": id}), &json!({"$set": {"name": "Bob"}}), None).unwrap();
+        col.update(&json!({"_id": id}), &json!({"$set": {"name": "Bob"}}), None)
+            .unwrap();
         let doc = col.get(id).unwrap().unwrap();
         assert_eq!(doc["_version"], 2);
         assert_eq!(col.get_version(id), 2);
@@ -3245,7 +3327,11 @@ mod tests {
         let id = col.insert(json!({"name": "Alice", "age": 30})).unwrap();
 
         let ids = col
-            .update(&json!({"name": "Alice"}), &json!({"$set": {"age": 31}}), None)
+            .update(
+                &json!({"name": "Alice"}),
+                &json!({"$set": {"age": 31}}),
+                None,
+            )
             .unwrap();
         assert_eq!(ids.len(), 1);
 
@@ -3382,12 +3468,9 @@ mod tests {
     #[test]
     fn atomic_multi_doc_delete() {
         let (_dir, mut col) = temp_collection("test");
-        col.insert(json!({"status": "old", "title": "A"}))
-            .unwrap();
-        col.insert(json!({"status": "old", "title": "B"}))
-            .unwrap();
-        col.insert(json!({"status": "new", "title": "C"}))
-            .unwrap();
+        col.insert(json!({"status": "old", "title": "A"})).unwrap();
+        col.insert(json!({"status": "old", "title": "B"})).unwrap();
+        col.insert(json!({"status": "new", "title": "C"})).unwrap();
 
         let ids = col.delete(&json!({"status": "old"}), None).unwrap();
         assert_eq!(ids.len(), 2);
@@ -3437,10 +3520,14 @@ mod tests {
     #[test]
     fn sort_multi_field() {
         let (_dir, mut col) = temp_collection("test");
-        col.insert(json!({"dept": "eng", "age": 30, "name": "Bob"})).unwrap();
-        col.insert(json!({"dept": "eng", "age": 25, "name": "Alice"})).unwrap();
-        col.insert(json!({"dept": "sales", "age": 28, "name": "Charlie"})).unwrap();
-        col.insert(json!({"dept": "eng", "age": 35, "name": "Dave"})).unwrap();
+        col.insert(json!({"dept": "eng", "age": 30, "name": "Bob"}))
+            .unwrap();
+        col.insert(json!({"dept": "eng", "age": 25, "name": "Alice"}))
+            .unwrap();
+        col.insert(json!({"dept": "sales", "age": 28, "name": "Charlie"}))
+            .unwrap();
+        col.insert(json!({"dept": "eng", "age": 35, "name": "Dave"}))
+            .unwrap();
 
         let opts = FindOptions {
             sort: Some(vec![
@@ -3526,7 +3613,8 @@ mod tests {
 
         // Insert 10 docs
         for i in 0..10 {
-            col.insert(json!({"n": i, "payload": "x".repeat(100)})).unwrap();
+            col.insert(json!({"n": i, "payload": "x".repeat(100)}))
+                .unwrap();
         }
 
         let size_before = col.storage.file_size();
@@ -3561,11 +3649,16 @@ mod tests {
             .unwrap();
 
         // Insert docs with different formIds and createdAt dates
-        col.insert(json!({"formId": "1", "createdAt": "2024-01-01T00:00:00Z", "name": "a"})).unwrap();
-        col.insert(json!({"formId": "1", "createdAt": "2024-06-01T00:00:00Z", "name": "b"})).unwrap();
-        col.insert(json!({"formId": "1", "createdAt": "2025-01-01T00:00:00Z", "name": "c"})).unwrap();
-        col.insert(json!({"formId": "2", "createdAt": "2024-03-01T00:00:00Z", "name": "d"})).unwrap();
-        col.insert(json!({"formId": "1", "createdAt": "2024-03-01T00:00:00Z", "name": "e"})).unwrap();
+        col.insert(json!({"formId": "1", "createdAt": "2024-01-01T00:00:00Z", "name": "a"}))
+            .unwrap();
+        col.insert(json!({"formId": "1", "createdAt": "2024-06-01T00:00:00Z", "name": "b"}))
+            .unwrap();
+        col.insert(json!({"formId": "1", "createdAt": "2025-01-01T00:00:00Z", "name": "c"}))
+            .unwrap();
+        col.insert(json!({"formId": "2", "createdAt": "2024-03-01T00:00:00Z", "name": "d"}))
+            .unwrap();
+        col.insert(json!({"formId": "1", "createdAt": "2024-03-01T00:00:00Z", "name": "e"}))
+            .unwrap();
 
         // Sort DESC by createdAt for formId=1, limit 2
         let opts = FindOptions {
@@ -3573,7 +3666,9 @@ mod tests {
             skip: None,
             limit: Some(2),
         };
-        let results = col.find_with_options(&json!({"formId": "1"}), &opts).unwrap();
+        let results = col
+            .find_with_options(&json!({"formId": "1"}), &opts)
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["name"], "c"); // 2025-01-01 (newest)
         assert_eq!(results[1]["name"], "b"); // 2024-06-01
@@ -3584,7 +3679,9 @@ mod tests {
             skip: None,
             limit: Some(2),
         };
-        let results_asc = col.find_with_options(&json!({"formId": "1"}), &opts_asc).unwrap();
+        let results_asc = col
+            .find_with_options(&json!({"formId": "1"}), &opts_asc)
+            .unwrap();
         assert_eq!(results_asc.len(), 2);
         assert_eq!(results_asc[0]["name"], "a"); // 2024-01-01 (oldest)
         assert_eq!(results_asc[1]["name"], "e"); // 2024-03-01
@@ -3595,13 +3692,17 @@ mod tests {
             skip: Some(1),
             limit: Some(2),
         };
-        let results_skip = col.find_with_options(&json!({"formId": "1"}), &opts_skip).unwrap();
+        let results_skip = col
+            .find_with_options(&json!({"formId": "1"}), &opts_skip)
+            .unwrap();
         assert_eq!(results_skip.len(), 2);
         assert_eq!(results_skip[0]["name"], "b"); // skipped "c", so start from "b"
         assert_eq!(results_skip[1]["name"], "e"); // 2024-03-01
 
         // formId=2 should only return its own doc
-        let results_f2 = col.find_with_options(&json!({"formId": "2"}), &opts).unwrap();
+        let results_f2 = col
+            .find_with_options(&json!({"formId": "2"}), &opts)
+            .unwrap();
         assert_eq!(results_f2.len(), 1);
         assert_eq!(results_f2[0]["name"], "d");
     }
@@ -3612,20 +3713,26 @@ mod tests {
         col.create_composite_index(vec!["status".into(), "score".into()])
             .unwrap();
 
-        col.insert(json!({"status": "active", "score": 50, "name": "mid"})).unwrap();
-        col.insert(json!({"status": "active", "score": 10, "name": "low"})).unwrap();
-        col.insert(json!({"status": "active", "score": 90, "name": "high"})).unwrap();
-        col.insert(json!({"status": "closed", "score": 30, "name": "other"})).unwrap();
+        col.insert(json!({"status": "active", "score": 50, "name": "mid"}))
+            .unwrap();
+        col.insert(json!({"status": "active", "score": 10, "name": "low"}))
+            .unwrap();
+        col.insert(json!({"status": "active", "score": 90, "name": "high"}))
+            .unwrap();
+        col.insert(json!({"status": "closed", "score": 30, "name": "other"}))
+            .unwrap();
 
         let opts = FindOptions {
             sort: Some(vec![("score".into(), SortOrder::Asc)]),
             skip: None,
             limit: Some(2),
         };
-        let results = col.find_with_options(&json!({"status": "active"}), &opts).unwrap();
+        let results = col
+            .find_with_options(&json!({"status": "active"}), &opts)
+            .unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0]["name"], "low");  // score 10
-        assert_eq!(results[1]["name"], "mid");  // score 50
+        assert_eq!(results[0]["name"], "low"); // score 10
+        assert_eq!(results[1]["name"], "mid"); // score 50
     }
 
     #[test]
@@ -3636,12 +3743,18 @@ mod tests {
         col.create_composite_index(vec!["formId".into(), "createdAt".into()])
             .unwrap();
 
-        col.insert(json!({"formId": "1", "createdAt": "2024-01-01", "data": {"level": "Junior"}})).unwrap();
-        col.insert(json!({"formId": "1", "createdAt": "2024-01-02", "data": {"level": "Senior"}})).unwrap();
-        col.insert(json!({"formId": "1", "createdAt": "2024-01-03", "data": {"level": "Junior"}})).unwrap();
-        col.insert(json!({"formId": "1", "createdAt": "2024-01-04", "data": {"level": "Senior"}})).unwrap();
-        col.insert(json!({"formId": "1", "createdAt": "2024-01-05", "data": {"level": "Junior"}})).unwrap();
-        col.insert(json!({"formId": "2", "createdAt": "2024-01-06", "data": {"level": "Junior"}})).unwrap();
+        col.insert(json!({"formId": "1", "createdAt": "2024-01-01", "data": {"level": "Junior"}}))
+            .unwrap();
+        col.insert(json!({"formId": "1", "createdAt": "2024-01-02", "data": {"level": "Senior"}}))
+            .unwrap();
+        col.insert(json!({"formId": "1", "createdAt": "2024-01-03", "data": {"level": "Junior"}}))
+            .unwrap();
+        col.insert(json!({"formId": "1", "createdAt": "2024-01-04", "data": {"level": "Senior"}}))
+            .unwrap();
+        col.insert(json!({"formId": "1", "createdAt": "2024-01-05", "data": {"level": "Junior"}}))
+            .unwrap();
+        col.insert(json!({"formId": "2", "createdAt": "2024-01-06", "data": {"level": "Junior"}}))
+            .unwrap();
 
         // Query: formId="1" AND data.level="Junior", sort by createdAt DESC, limit 2
         let opts = FindOptions {

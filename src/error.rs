@@ -38,7 +38,9 @@ pub enum Error {
     #[error("bucket not found: {0}")]
     BucketNotFound(String),
 
-    #[error("transaction conflict on '{collection}' doc {doc_id}: expected version {expected_version}, found {actual_version}")]
+    #[error(
+        "transaction conflict on '{collection}' doc {doc_id}: expected version {expected_version}, found {actual_version}"
+    )]
     TransactionConflict {
         collection: String,
         doc_id: u64,
@@ -102,7 +104,9 @@ pub enum Error {
     /// application-level WORMViolation that DMS surfaces from
     /// CheckMutation; this one fires regardless of whether the
     /// caller is the DMS API or a direct admin connection.
-    #[error("document is WORM-locked on '{collection}' doc {doc_id} until {locked_until_micros} (now {now_micros})")]
+    #[error(
+        "document is WORM-locked on '{collection}' doc {doc_id} until {locked_until_micros} (now {now_micros})"
+    )]
     DocumentWormLocked {
         collection: String,
         doc_id: u64,

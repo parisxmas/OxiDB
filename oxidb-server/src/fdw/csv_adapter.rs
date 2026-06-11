@@ -21,7 +21,7 @@
 //! requests against the same file can't interleave mid-rewrite and
 //! corrupt the file. Different files share nothing.
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -125,10 +125,7 @@ impl Adapter for CsvAdapter {
                 Ok(envelope_data(json!({ "ids": ids })))
             }
             "update_one" => {
-                let update = request
-                    .get("update")
-                    .ok_or("missing 'update'")?
-                    .clone();
+                let update = request.get("update").ok_or("missing 'update'")?.clone();
                 let modified = update_one_row(&self.path, &query, &update)?;
                 Ok(envelope_data(json!({ "modified": modified })))
             }
@@ -166,7 +163,9 @@ fn load_rows(path: &Path) -> Result<Vec<Value>, String> {
         Some(h) => parse_simple_csv_line(h),
         None => return Ok(Vec::new()),
     };
-    let rows = lines.map(|l| row_to_json(&header, &parse_simple_csv_line(l))).collect();
+    let rows = lines
+        .map(|l| row_to_json(&header, &parse_simple_csv_line(l)))
+        .collect();
     Ok(rows)
 }
 
@@ -177,7 +176,10 @@ fn load_rows(path: &Path) -> Result<Vec<Value>, String> {
 fn row_to_json(header: &[String], fields: &[String]) -> Value {
     let mut obj = Map::new();
     for (i, name) in header.iter().enumerate() {
-        let v = fields.get(i).map(|s| Value::String(s.clone())).unwrap_or(Value::Null);
+        let v = fields
+            .get(i)
+            .map(|s| Value::String(s.clone()))
+            .unwrap_or(Value::Null);
         obj.insert(name.clone(), v);
     }
     Value::Object(obj)
@@ -393,7 +395,8 @@ fn write_table(path: &Path, header: &[String], rows: &[Value]) -> Result<(), Str
         path.extension().and_then(|e| e.to_str()).unwrap_or("csv")
     ));
     fs::write(&tmp, out).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
-    fs::rename(&tmp, path).map_err(|e| format!("rename {} → {}: {}", tmp.display(), path.display(), e))?;
+    fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} → {}: {}", tmp.display(), path.display(), e))?;
     Ok(())
 }
 
@@ -462,16 +465,18 @@ mod tests {
         let path = dir.path().join("data.csv");
         let a = CsvAdapter::from_url(path.to_str().unwrap()).unwrap();
 
-        let resp = a.execute(
-            "insert",
-            &json!({"doc": {"name": "alice", "age": "30"}}),
-        ).unwrap();
+        let resp = a
+            .execute("insert", &json!({"doc": {"name": "alice", "age": "30"}}))
+            .unwrap();
         assert_eq!(resp["ok"], true);
         assert_eq!(resp["data"]["id"], 1, "first row gets id 1");
 
         let content = fs::read_to_string(&path).unwrap();
-        assert!(content.starts_with("name,age\n") || content.starts_with("age,name\n"),
-            "header inferred from doc keys: {:?}", content);
+        assert!(
+            content.starts_with("name,age\n") || content.starts_with("age,name\n"),
+            "header inferred from doc keys: {:?}",
+            content
+        );
     }
 
     #[test]
@@ -481,14 +486,15 @@ mod tests {
         write_csv(&path, "name,age\nalice,30\n");
         let a = CsvAdapter::from_url(path.to_str().unwrap()).unwrap();
 
-        let resp = a.execute(
-            "insert",
-            &json!({"doc": {"name": "bob", "age": "25"}}),
-        ).unwrap();
+        let resp = a
+            .execute("insert", &json!({"doc": {"name": "bob", "age": "25"}}))
+            .unwrap();
         assert_eq!(resp["data"]["id"], 2);
 
-        let rows = a.execute("find", &json!({"query": {}})).unwrap()
-            ["data"].as_array().unwrap().clone();
+        let rows = a.execute("find", &json!({"query": {}})).unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(rows.len(), 2);
     }
 
@@ -497,10 +503,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("data.csv");
         let a = CsvAdapter::from_url(path.to_str().unwrap()).unwrap();
-        let resp = a.execute(
-            "insert_many",
-            &json!({"docs": [{"x": "1"}, {"x": "2"}, {"x": "3"}]}),
-        ).unwrap();
+        let resp = a
+            .execute(
+                "insert_many",
+                &json!({"docs": [{"x": "1"}, {"x": "2"}, {"x": "3"}]}),
+            )
+            .unwrap();
         let ids = resp["data"]["ids"].as_array().unwrap();
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[0], 1);
@@ -514,10 +522,15 @@ mod tests {
         write_csv(&path, "name,age\nalice,30\nbob,30\ncarol,25\n");
         let a = CsvAdapter::from_url(path.to_str().unwrap()).unwrap();
 
-        let resp = a.execute("update_one", &json!({
-            "query": {"age": "30"},
-            "update": {"$set": {"age": "31"}},
-        })).unwrap();
+        let resp = a
+            .execute(
+                "update_one",
+                &json!({
+                    "query": {"age": "30"},
+                    "update": {"$set": {"age": "31"}},
+                }),
+            )
+            .unwrap();
         assert_eq!(resp["data"]["modified"], 1);
 
         let content = fs::read_to_string(&path).unwrap();
@@ -534,10 +547,15 @@ mod tests {
         write_csv(&path, "x\na\n");
         let a = CsvAdapter::from_url(path.to_str().unwrap()).unwrap();
 
-        let err = a.execute("update_one", &json!({
-            "query": {},
-            "update": {"$inc": {"x": 1}},
-        })).unwrap_err();
+        let err = a
+            .execute(
+                "update_one",
+                &json!({
+                    "query": {},
+                    "update": {"$inc": {"x": 1}},
+                }),
+            )
+            .unwrap_err();
         assert!(err.contains("$set"), "{err}");
     }
 
@@ -548,11 +566,15 @@ mod tests {
         write_csv(&path, "name\na\nb\na\n");
         let a = CsvAdapter::from_url(path.to_str().unwrap()).unwrap();
 
-        let resp = a.execute("delete_one", &json!({"query": {"name": "a"}})).unwrap();
+        let resp = a
+            .execute("delete_one", &json!({"query": {"name": "a"}}))
+            .unwrap();
         assert_eq!(resp["data"]["deleted"], 1);
 
-        let rows = a.execute("find", &json!({"query": {}})).unwrap()
-            ["data"].as_array().unwrap().clone();
+        let rows = a.execute("find", &json!({"query": {}})).unwrap()["data"]
+            .as_array()
+            .unwrap()
+            .clone();
         // First 'a' gone, 'b' and second 'a' remain.
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["name"], "b");

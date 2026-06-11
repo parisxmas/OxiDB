@@ -1,12 +1,21 @@
 use std::collections::HashMap;
 
-use super::encryption::{parse_sse_headers, encrypt_data, add_encryption_headers, sse_metadata_marker, SseMode};
-use super::helpers::{xml_escape, crc32};
-use super::http::{HttpRequest, HttpResponse, error_response};
 use super::S3State;
+use super::encryption::{
+    SseMode, add_encryption_headers, encrypt_data, parse_sse_headers, sse_metadata_marker,
+};
+use super::helpers::{crc32, xml_escape};
+use super::http::{HttpRequest, HttpResponse, error_response};
 
-pub fn handle_create_multipart(state: &S3State, bucket: &str, key: &str, req: &HttpRequest) -> HttpResponse {
-    let content_type = req.headers.get("content-type")
+pub fn handle_create_multipart(
+    state: &S3State,
+    bucket: &str,
+    key: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let content_type = req
+        .headers
+        .get("content-type")
         .cloned()
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -45,17 +54,29 @@ pub fn handle_create_multipart(state: &S3State, bucket: &str, key: &str, req: &H
         sse_marker,
     };
 
-    state.uploads.lock().unwrap().insert(upload_id.clone(), upload);
+    state
+        .uploads
+        .lock()
+        .unwrap()
+        .insert(upload_id.clone(), upload);
 
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <UploadId>{}</UploadId>\n</InitiateMultipartUploadResult>",
-        xml_escape(bucket), xml_escape(key), xml_escape(&upload_id)
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(&upload_id)
     );
     let resp = HttpResponse::ok_xml(xml);
     add_encryption_headers(resp, &sse_mode)
 }
 
-pub fn handle_upload_part(state: &S3State, _bucket: &str, _key: &str, req: &HttpRequest, params: &HashMap<String, String>) -> HttpResponse {
+pub fn handle_upload_part(
+    state: &S3State,
+    _bucket: &str,
+    _key: &str,
+    req: &HttpRequest,
+    params: &HashMap<String, String>,
+) -> HttpResponse {
     let upload_id = params.get("uploadId").unwrap();
     let part_number: u32 = match params.get("partNumber").and_then(|v| v.parse().ok()) {
         Some(n) => n,
@@ -63,8 +84,15 @@ pub fn handle_upload_part(state: &S3State, _bucket: &str, _key: &str, req: &Http
     };
 
     if part_number > super::MAX_MULTIPART_PARTS {
-        return error_response(400, "InvalidArgument",
-            &format!("Part number exceeds maximum ({})", super::MAX_MULTIPART_PARTS), "");
+        return error_response(
+            400,
+            "InvalidArgument",
+            &format!(
+                "Part number exceeds maximum ({})",
+                super::MAX_MULTIPART_PARTS
+            ),
+            "",
+        );
     }
 
     // Decode aws-chunked framing here too — multipart uploads stream
@@ -83,27 +111,47 @@ pub fn handle_upload_part(state: &S3State, _bucket: &str, _key: &str, req: &Http
         Some(upload) => {
             let new_total = upload.total_bytes + part_bytes.len();
             if new_total > super::MAX_MULTIPART_TOTAL {
-                return error_response(400, "EntityTooLarge",
-                    "Multipart upload exceeds maximum total size", "");
+                return error_response(
+                    400,
+                    "EntityTooLarge",
+                    "Multipart upload exceeds maximum total size",
+                    "",
+                );
             }
             let etag = format!("{:08x}", crc32(&part_bytes));
             upload.total_bytes = new_total;
             upload.parts.insert(part_number, part_bytes);
-            HttpResponse::ok_xml(String::new())
-                .with_header("ETag", &format!("\"{etag}\""))
+            HttpResponse::ok_xml(String::new()).with_header("ETag", &format!("\"{etag}\""))
         }
-        None => error_response(404, "NoSuchUpload", "The specified upload does not exist", upload_id),
+        None => error_response(
+            404,
+            "NoSuchUpload",
+            "The specified upload does not exist",
+            upload_id,
+        ),
     }
 }
 
-pub fn handle_complete_multipart(state: &S3State, _bucket: &str, _key: &str, params: &HashMap<String, String>) -> HttpResponse {
+pub fn handle_complete_multipart(
+    state: &S3State,
+    _bucket: &str,
+    _key: &str,
+    params: &HashMap<String, String>,
+) -> HttpResponse {
     let upload_id = params.get("uploadId").unwrap();
 
     let mut upload = {
         let mut uploads = state.uploads.lock().unwrap();
         match uploads.remove(upload_id.as_str()) {
             Some(u) => u,
-            None => return error_response(404, "NoSuchUpload", "The specified upload does not exist", upload_id),
+            None => {
+                return error_response(
+                    404,
+                    "NoSuchUpload",
+                    "The specified upload does not exist",
+                    upload_id,
+                );
+            }
         }
     };
 
@@ -123,18 +171,41 @@ pub fn handle_complete_multipart(state: &S3State, _bucket: &str, _key: &str, par
         Some(marker) if marker == "AES256" => {
             match encrypt_data(&assembled, &SseMode::S3, state.encryption.as_deref()) {
                 Ok(d) => (SseMode::S3, d),
-                Err(e) => return error_response(500, "InternalError", &format!("encryption failed: {e}"), &upload.key),
+                Err(e) => {
+                    return error_response(
+                        500,
+                        "InternalError",
+                        &format!("encryption failed: {e}"),
+                        &upload.key,
+                    );
+                }
             }
         }
         Some(marker) if marker.starts_with("SSE-C:") => {
             let key_b64 = &marker[6..];
             if let Some(key_bytes) = super::encryption::base64_decode_key(key_b64) {
-                match encrypt_data(&assembled, &SseMode::CustomerKey(key_bytes.clone()), state.encryption.as_deref()) {
+                match encrypt_data(
+                    &assembled,
+                    &SseMode::CustomerKey(key_bytes.clone()),
+                    state.encryption.as_deref(),
+                ) {
                     Ok(d) => (SseMode::CustomerKey(key_bytes), d),
-                    Err(e) => return error_response(500, "InternalError", &format!("encryption failed: {e}"), &upload.key),
+                    Err(e) => {
+                        return error_response(
+                            500,
+                            "InternalError",
+                            &format!("encryption failed: {e}"),
+                            &upload.key,
+                        );
+                    }
                 }
             } else {
-                return error_response(500, "InternalError", "Failed to recover SSE-C key for multipart", &upload.key);
+                return error_response(
+                    500,
+                    "InternalError",
+                    "Failed to recover SSE-C key for multipart",
+                    &upload.key,
+                );
             }
         }
         _ => (SseMode::None, assembled),
@@ -149,24 +220,41 @@ pub fn handle_complete_multipart(state: &S3State, _bucket: &str, _key: &str, par
         metadata.insert(mk, mv);
     }
 
-    match state.db.put_object(&upload.bucket, &upload.key, &data_to_store, &upload.content_type, metadata) {
+    match state.db.put_object(
+        &upload.bucket,
+        &upload.key,
+        &data_to_store,
+        &upload.content_type,
+        metadata,
+    ) {
         Ok(meta) => {
             let etag = meta.get("etag").and_then(|v| v.as_str()).unwrap_or("");
             let xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Bucket>{}</Bucket>\n  <Key>{}</Key>\n  <ETag>\"{}\"</ETag>\n</CompleteMultipartUploadResult>",
-                xml_escape(&upload.bucket), xml_escape(&upload.key), xml_escape(etag)
+                xml_escape(&upload.bucket),
+                xml_escape(&upload.key),
+                xml_escape(etag)
             );
             let resp = HttpResponse::ok_xml(xml);
             add_encryption_headers(resp, &sse_mode)
         }
         Err(e) => {
             eprintln!("[s3] complete_multipart put_object error: {e}");
-            error_response(500, "InternalError", "Failed to store multipart object", &upload.key)
+            error_response(
+                500,
+                "InternalError",
+                "Failed to store multipart object",
+                &upload.key,
+            )
         }
     }
 }
 
-pub fn handle_abort_multipart(state: &S3State, _key: &str, params: &HashMap<String, String>) -> HttpResponse {
+pub fn handle_abort_multipart(
+    state: &S3State,
+    _key: &str,
+    params: &HashMap<String, String>,
+) -> HttpResponse {
     let upload_id = params.get("uploadId").unwrap();
     let mut uploads = state.uploads.lock().unwrap();
     if let Some(mut upload) = uploads.remove(upload_id.as_str()) {

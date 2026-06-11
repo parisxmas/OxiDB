@@ -376,10 +376,7 @@ fn committer_loop(
                 let kind = e.kind();
                 let msg = format!("tx_log persist: {e}");
                 for tx in mutating_replies.drain(..) {
-                    let _ = tx.send(Err(Error::Io(std::io::Error::new(
-                        kind,
-                        msg.clone(),
-                    ))));
+                    let _ = tx.send(Err(Error::Io(std::io::Error::new(kind, msg.clone()))));
                 }
             }
         }

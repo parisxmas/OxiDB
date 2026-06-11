@@ -232,17 +232,21 @@ impl GpuCompute {
         };
 
         // Create GPU buffers
-        let query_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("query"),
-            contents: bytemuck::cast_slice(query),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let query_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("query"),
+                contents: bytemuck::cast_slice(query),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
 
-        let vectors_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("vectors"),
-            contents: bytemuck::cast_slice(vectors),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let vectors_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("vectors"),
+                contents: bytemuck::cast_slice(vectors),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
 
         let distances_size = (count as u64) * 4; // f32 = 4 bytes
         let distances_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -253,11 +257,13 @@ impl GpuCompute {
         });
 
         let params = [count, dimension];
-        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("params"),
-            contents: bytemuck::cast_slice(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("params"),
+                contents: bytemuck::cast_slice(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         // Staging buffer to read results back to CPU
         let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -271,10 +277,22 @@ impl GpuCompute {
             label: Some("vector_bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: query_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: vectors_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: distances_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: query_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: vectors_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: distances_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
             ],
         });
 

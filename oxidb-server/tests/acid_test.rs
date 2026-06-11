@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use oxidb::OxiDb;
@@ -44,8 +44,7 @@ impl TestServer {
         let db = OxiDb::open(data_dir).expect("failed to open database");
         let db = Arc::new(db);
 
-        let listener =
-            TcpListener::bind("127.0.0.1:0").expect("failed to bind");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind");
         let addr = listener.local_addr().unwrap();
 
         let (tx, rx) = mpsc::channel::<TcpStream>();
@@ -55,11 +54,13 @@ impl TestServer {
         for _ in 0..4 {
             let rx = Arc::clone(&rx);
             let db = Arc::clone(&db);
-            std::thread::spawn(move || loop {
-                let stream = rx.lock().unwrap().recv();
-                match stream {
-                    Ok(stream) => handle_client(stream, &db),
-                    Err(_) => break,
+            std::thread::spawn(move || {
+                loop {
+                    let stream = rx.lock().unwrap().recv();
+                    match stream {
+                        Ok(stream) => handle_client(stream, &db),
+                        Err(_) => break,
+                    }
                 }
             });
         }
@@ -111,8 +112,7 @@ fn handle_client(mut stream: TcpStream, db: &Arc<OxiDb>) {
             }
         };
 
-        let resp_bytes =
-            oxidb_server::handler::handle_request(db, request, &mut active_tx);
+        let resp_bytes = oxidb_server::handler::handle_request(db, request, &mut active_tx);
 
         if write_message(&mut stream, &resp_bytes).is_err() {
             break;
@@ -190,17 +190,11 @@ impl Client {
 // ---------------------------------------------------------------------------
 
 fn assert_ok(resp: &Value) {
-    assert_eq!(
-        resp["ok"], true,
-        "expected ok response, got: {resp}"
-    );
+    assert_eq!(resp["ok"], true, "expected ok response, got: {resp}");
 }
 
 fn assert_err(resp: &Value) {
-    assert_eq!(
-        resp["ok"], false,
-        "expected error response, got: {resp}"
-    );
+    assert_eq!(resp["ok"], false, "expected error response, got: {resp}");
 }
 
 fn find_docs(client: &mut Client, col: &str, query: Value) -> Vec<Value> {
@@ -315,10 +309,7 @@ fn test_consistency_version_conflict() {
     let commit_resp = c1.commit_tx();
     assert_err(&commit_resp);
     assert!(
-        commit_resp["error"]
-            .as_str()
-            .unwrap()
-            .contains("conflict"),
+        commit_resp["error"].as_str().unwrap().contains("conflict"),
         "expected TransactionConflict error, got: {}",
         commit_resp["error"]
     );
@@ -434,11 +425,7 @@ fn test_tx_insert_update_delete_commit() {
     let mut c = Client::connect(server.addr);
     assert_ok(&c.begin_tx());
     assert_ok(&c.insert("multi", json!({"name": "Gamma", "v": 1})));
-    assert_ok(&c.update(
-        "multi",
-        json!({"name": "Alpha"}),
-        json!({"$set": {"v": 2}}),
-    ));
+    assert_ok(&c.update("multi", json!({"name": "Alpha"}), json!({"$set": {"v": 2}})));
     assert_ok(&c.delete("multi", json!({"name": "Beta"})));
     assert_ok(&c.commit_tx());
 
@@ -447,10 +434,16 @@ fn test_tx_insert_update_delete_commit() {
     let docs = find_docs(&mut reader, "multi", json!({}));
     assert_eq!(docs.len(), 2, "expected Alpha + Gamma, got: {docs:?}");
 
-    let alpha = docs.iter().find(|d| d["name"] == "Alpha").expect("Alpha missing");
+    let alpha = docs
+        .iter()
+        .find(|d| d["name"] == "Alpha")
+        .expect("Alpha missing");
     assert_eq!(alpha["v"], 2);
 
-    let gamma = docs.iter().find(|d| d["name"] == "Gamma").expect("Gamma missing");
+    let gamma = docs
+        .iter()
+        .find(|d| d["name"] == "Gamma")
+        .expect("Gamma missing");
     assert_eq!(gamma["v"], 1);
 
     assert!(
@@ -469,10 +462,7 @@ fn test_double_begin_rejected() {
     let resp = c.begin_tx();
     assert_err(&resp);
     assert!(
-        resp["error"]
-            .as_str()
-            .unwrap()
-            .contains("already active"),
+        resp["error"].as_str().unwrap().contains("already active"),
         "expected 'already active' error, got: {}",
         resp["error"]
     );

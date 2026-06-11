@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use flate2::write::GzEncoder;
 use flate2::Compression;
+use flate2::write::GzEncoder;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -204,7 +204,11 @@ impl RotationPolicy {
                 .expect("OXIDB_AUDIT_MAX_AGE_SECS must be a valid u64");
             Duration::from_secs(secs)
         });
-        let calendar = match calendar.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        let calendar = match calendar
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             None | Some("") | Some("none") => None,
             Some("hourly") | Some("hourly-utc") | Some("hourlyutc") => {
                 Some(CalendarBoundary::HourlyUtc)
@@ -212,11 +216,15 @@ impl RotationPolicy {
             Some("daily") | Some("daily-utc") | Some("dailyutc") => {
                 Some(CalendarBoundary::DailyUtc)
             }
-            Some(other) => panic!(
-                "OXIDB_AUDIT_CALENDAR must be 'hourly' / 'daily' / 'none', got {other:?}"
-            ),
+            Some(other) => {
+                panic!("OXIDB_AUDIT_CALENDAR must be 'hourly' / 'daily' / 'none', got {other:?}")
+            }
         };
-        let compress = match compress.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        let compress = match compress
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             // Common bool-shaped opt-ins. Mirrors OXIDB_AUDIT itself.
             Some("true") | Some("1") | Some("yes") | Some("on") => true,
             // Explicit-off, blank, or unset all disable.
@@ -309,10 +317,7 @@ impl AuditLog {
 
     /// Open or create the audit log with **size-based rotation only**
     /// (backwards-compat shim for the PR #70 API).
-    pub fn open_with_rotation(
-        data_dir: &Path,
-        max_bytes: Option<u64>,
-    ) -> Result<Self, String> {
+    pub fn open_with_rotation(data_dir: &Path, max_bytes: Option<u64>) -> Result<Self, String> {
         let policy = match max_bytes {
             Some(n) => RotationPolicy::size(n),
             None => RotationPolicy::unbounded(),
@@ -330,13 +335,9 @@ impl AuditLog {
     /// logging is fire-and-forget, and silently continuing to
     /// append to the existing file is preferable to dropping
     /// events.
-    pub fn open_with_policy(
-        data_dir: &Path,
-        policy: RotationPolicy,
-    ) -> Result<Self, String> {
+    pub fn open_with_policy(data_dir: &Path, policy: RotationPolicy) -> Result<Self, String> {
         let audit_dir = data_dir.join("_audit");
-        fs::create_dir_all(&audit_dir)
-            .map_err(|e| format!("failed to create audit dir: {e}"))?;
+        fs::create_dir_all(&audit_dir).map_err(|e| format!("failed to create audit dir: {e}"))?;
 
         let path = audit_dir.join("audit.log");
         let file = OpenOptions::new()
@@ -424,8 +425,7 @@ impl AuditLog {
         // the open file handle in `state.file` continues to point
         // at the original inode (now reachable only via the new
         // name), but we close it next anyway.
-        fs::rename(&self.path, &rotated_path)
-            .map_err(|e| format!("rotate rename failed: {e}"))?;
+        fs::rename(&self.path, &rotated_path).map_err(|e| format!("rotate rename failed: {e}"))?;
 
         // Open a fresh `audit.log` and replace the held file.
         let new_file = OpenOptions::new()

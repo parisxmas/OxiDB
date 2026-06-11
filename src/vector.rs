@@ -76,10 +76,10 @@ pub struct VectorSearchResult {
 /// HNSW configuration parameters.
 #[derive(Debug, Clone)]
 struct HnswConfig {
-    m: usize,              // Max connections per node per layer
-    m_max0: usize,         // Max connections at layer 0
+    m: usize,               // Max connections per node per layer
+    m_max0: usize,          // Max connections at layer 0
     ef_construction: usize, // Search width during construction
-    ml: f64,               // Level multiplier: 1/ln(M)
+    ml: f64,                // Level multiplier: 1/ln(M)
 }
 
 impl Default for HnswConfig {
@@ -130,7 +130,13 @@ impl HnswGraph {
     }
 
     /// Compute distance between a query vector and a node (by index).
-    fn distance(&self, query: &[f32], node_idx: usize, vectors: &HashMap<DocumentId, Vec<f32>>, metric: DistanceMetric) -> f32 {
+    fn distance(
+        &self,
+        query: &[f32],
+        node_idx: usize,
+        vectors: &HashMap<DocumentId, Vec<f32>>,
+        metric: DistanceMetric,
+    ) -> f32 {
         let doc_id = self.nodes[node_idx].doc_id;
         match vectors.get(&doc_id) {
             Some(v) => compute_distance(query, v, metric),
@@ -217,11 +223,20 @@ impl HnswGraph {
             }
         }
 
-        results.into_sorted_vec().into_iter().map(|r| (r.0, r.1)).collect()
+        results
+            .into_sorted_vec()
+            .into_iter()
+            .map(|r| (r.0, r.1))
+            .collect()
     }
 
     /// Insert a node into the HNSW graph.
-    fn insert(&mut self, doc_id: DocumentId, vectors: &HashMap<DocumentId, Vec<f32>>, metric: DistanceMetric) {
+    fn insert(
+        &mut self,
+        doc_id: DocumentId,
+        vectors: &HashMap<DocumentId, Vec<f32>>,
+        metric: DistanceMetric,
+    ) {
         let node_idx = self.nodes.len();
         let level = self.random_level();
 
@@ -258,11 +273,23 @@ impl HnswGraph {
         // Search and connect at each layer from level down to 0
         let mut entry_points = vec![current_ep];
         for l in (0..=level.min(self.max_layer)).rev() {
-            let m_max = if l == 0 { self.config.m_max0 } else { self.config.m };
-            let neighbors = self.search_layer(&vec, &entry_points, self.config.ef_construction, l, vectors, metric);
+            let m_max = if l == 0 {
+                self.config.m_max0
+            } else {
+                self.config.m
+            };
+            let neighbors = self.search_layer(
+                &vec,
+                &entry_points,
+                self.config.ef_construction,
+                l,
+                vectors,
+                metric,
+            );
 
             // Select M nearest neighbors, excluding self
-            let selected: Vec<usize> = neighbors.iter()
+            let selected: Vec<usize> = neighbors
+                .iter()
                 .filter(|(_, idx)| *idx != node_idx)
                 .take(self.config.m)
                 .map(|(_, idx)| *idx)
@@ -286,23 +313,25 @@ impl HnswGraph {
                                 .iter()
                                 .filter_map(|&ni| {
                                     let nd = self.nodes[ni].doc_id;
-                                    let d = vectors.get(&nd)
+                                    let d = vectors
+                                        .get(&nd)
                                         .map(|v| compute_distance(nv, v, metric))
                                         .unwrap_or(f32::INFINITY);
                                     Some((d, ni))
                                 })
                                 .collect();
-                            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                            self.nodes[neighbor_idx].layers[l] = scored.into_iter()
-                                .take(m_max)
-                                .map(|(_, idx)| idx)
-                                .collect();
+                            scored.sort_by(|a, b| {
+                                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            self.nodes[neighbor_idx].layers[l] =
+                                scored.into_iter().take(m_max).map(|(_, idx)| idx).collect();
                         }
                     }
                 }
             }
 
-            entry_points = neighbors.iter()
+            entry_points = neighbors
+                .iter()
                 .filter(|(_, idx)| *idx != node_idx)
                 .map(|(_, idx)| *idx)
                 .collect();
@@ -321,7 +350,8 @@ impl HnswGraph {
     fn remove(&mut self, doc_id: DocumentId) {
         if let Some(&node_idx) = self.doc_to_node.get(&doc_id) {
             // Collect all neighbors first to avoid borrowing conflict
-            let neighbor_list: Vec<usize> = self.nodes[node_idx].layers
+            let neighbor_list: Vec<usize> = self.nodes[node_idx]
+                .layers
                 .iter()
                 .flat_map(|layer| layer.iter().copied())
                 .collect();
@@ -373,7 +403,8 @@ impl HnswGraph {
         // ef-bounded search at layer 0
         let results = self.search_layer(query, &[nearest], ef_search.max(k), 0, vectors, metric);
 
-        results.into_iter()
+        results
+            .into_iter()
             .filter(|(_, idx)| {
                 // Only return nodes that are still live (have an entry in doc_to_node)
                 *idx < self.nodes.len() && self.doc_to_node.contains_key(&self.nodes[*idx].doc_id)
@@ -410,7 +441,9 @@ impl PartialOrd for OrdF32Idx {
 
 impl Ord for OrdF32Idx {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| self.1.cmp(&other.1))
     }
 }
@@ -428,11 +461,7 @@ fn compute_distance(a: &[f32], b: &[f32], metric: DistanceMetric) -> f32 {
                 norm_b += b[i] * b[i];
             }
             let denom = norm_a.sqrt() * norm_b.sqrt();
-            if denom == 0.0 {
-                1.0
-            } else {
-                1.0 - dot / denom
-            }
+            if denom == 0.0 { 1.0 } else { 1.0 - dot / denom }
         }
         DistanceMetric::Euclidean => {
             let mut sum = 0.0f32;
@@ -608,7 +637,12 @@ impl VectorIndex {
     }
 
     /// Search for the k nearest neighbors to the query vector.
-    pub fn search(&self, query: &[f32], k: usize, ef_search: Option<usize>) -> Result<Vec<VectorSearchResult>, String> {
+    pub fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_search: Option<usize>,
+    ) -> Result<Vec<VectorSearchResult>, String> {
         if query.len() != self.dimension {
             return Err(format!(
                 "query vector dimension mismatch: expected {}, got {}",
@@ -656,7 +690,8 @@ impl VectorIndex {
             }
         }
 
-        let mut results: Vec<VectorSearchResult> = heap.into_sorted_vec()
+        let mut results: Vec<VectorSearchResult> = heap
+            .into_sorted_vec()
             .into_iter()
             .map(|OrdF32Id(dist, doc_id)| VectorSearchResult {
                 doc_id,
@@ -664,7 +699,11 @@ impl VectorIndex {
                 similarity: self.metric.to_similarity(dist),
             })
             .collect();
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 
@@ -726,7 +765,11 @@ impl VectorIndex {
                 similarity: self.metric.to_similarity(dist),
             })
             .collect();
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results
     }
 
@@ -738,7 +781,8 @@ impl VectorIndex {
         };
 
         let results = hnsw.search(query, k, ef_search, &self.vectors, self.metric);
-        results.into_iter()
+        results
+            .into_iter()
             .map(|(dist, doc_id)| VectorSearchResult {
                 doc_id,
                 distance: dist,
@@ -874,7 +918,9 @@ impl PartialOrd for OrdF32Id {
 
 impl Ord for OrdF32Id {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| self.1.cmp(&other.1))
     }
 }
@@ -893,11 +939,17 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0];
         let d = compute_distance(&a, &b, DistanceMetric::Cosine);
-        assert!((d - 1.0).abs() < 1e-6, "orthogonal vectors should have cosine distance ~1.0");
+        assert!(
+            (d - 1.0).abs() < 1e-6,
+            "orthogonal vectors should have cosine distance ~1.0"
+        );
 
         let c = vec![1.0, 0.0, 0.0];
         let d2 = compute_distance(&a, &c, DistanceMetric::Cosine);
-        assert!(d2.abs() < 1e-6, "identical vectors should have cosine distance ~0.0");
+        assert!(
+            d2.abs() < 1e-6,
+            "identical vectors should have cosine distance ~0.0"
+        );
     }
 
     #[test]
@@ -913,16 +965,25 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![4.0, 5.0, 6.0];
         let d = compute_distance(&a, &b, DistanceMetric::DotProduct);
-        assert!((d - (-32.0)).abs() < 1e-6, "dot product distance should be -dot(a,b)");
+        assert!(
+            (d - (-32.0)).abs() < 1e-6,
+            "dot product distance should be -dot(a,b)"
+        );
     }
 
     #[test]
     fn test_similarity_conversion() {
         let sim = DistanceMetric::Cosine.to_similarity(0.0);
-        assert!((sim - 1.0).abs() < 1e-6, "cosine distance 0 should give similarity 1");
+        assert!(
+            (sim - 1.0).abs() < 1e-6,
+            "cosine distance 0 should give similarity 1"
+        );
 
         let sim = DistanceMetric::Euclidean.to_similarity(0.0);
-        assert!((sim - 1.0).abs() < 1e-6, "euclidean distance 0 should give similarity 1");
+        assert!(
+            (sim - 1.0).abs() < 1e-6,
+            "euclidean distance 0 should give similarity 1"
+        );
     }
 
     #[test]
@@ -1029,17 +1090,26 @@ mod tests {
         let k = 10;
 
         let hnsw_results = idx.search(&query, k, Some(200)).unwrap();
-        assert!(!hnsw_results.is_empty(), "HNSW search should return results");
+        assert!(
+            !hnsw_results.is_empty(),
+            "HNSW search should return results"
+        );
         assert!(hnsw_results.len() <= k, "should return at most k results");
 
         // Results should be sorted by distance
         for w in hnsw_results.windows(2) {
-            assert!(w[0].distance <= w[1].distance, "results should be sorted by distance");
+            assert!(
+                w[0].distance <= w[1].distance,
+                "results should be sorted by distance"
+            );
         }
 
         // The closest result should be reasonably near our query vector
         // (query is at 500.0, so doc 500 should be nearby)
-        assert!(hnsw_results[0].distance < 10.0, "closest result should be near the query");
+        assert!(
+            hnsw_results[0].distance < 10.0,
+            "closest result should be near the query"
+        );
     }
 
     #[test]
@@ -1051,10 +1121,22 @@ mod tests {
 
     #[test]
     fn test_metric_from_str() {
-        assert_eq!(DistanceMetric::from_str("cosine"), Some(DistanceMetric::Cosine));
-        assert_eq!(DistanceMetric::from_str("euclidean"), Some(DistanceMetric::Euclidean));
-        assert_eq!(DistanceMetric::from_str("dotproduct"), Some(DistanceMetric::DotProduct));
-        assert_eq!(DistanceMetric::from_str("dot_product"), Some(DistanceMetric::DotProduct));
+        assert_eq!(
+            DistanceMetric::from_str("cosine"),
+            Some(DistanceMetric::Cosine)
+        );
+        assert_eq!(
+            DistanceMetric::from_str("euclidean"),
+            Some(DistanceMetric::Euclidean)
+        );
+        assert_eq!(
+            DistanceMetric::from_str("dotproduct"),
+            Some(DistanceMetric::DotProduct)
+        );
+        assert_eq!(
+            DistanceMetric::from_str("dot_product"),
+            Some(DistanceMetric::DotProduct)
+        );
         assert_eq!(DistanceMetric::from_str("invalid"), None);
     }
 }

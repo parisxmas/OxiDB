@@ -27,9 +27,8 @@ impl EncryptionKey {
                 key_bytes.len()
             )));
         }
-        let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| {
-            Error::Encryption(format!("invalid encryption key: {e}"))
-        })?;
+        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
+            .map_err(|e| Error::Encryption(format!("invalid encryption key: {e}")))?;
         Ok(Arc::new(Self { cipher }))
     }
 
@@ -39,9 +38,10 @@ impl EncryptionKey {
         rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
 
-        let ciphertext = self.cipher.encrypt(nonce, plaintext).map_err(|e| {
-            Error::Encryption(format!("encryption failed: {e}"))
-        })?;
+        let ciphertext = self
+            .cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| Error::Encryption(format!("encryption failed: {e}")))?;
 
         let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         sealed.extend_from_slice(&nonce_bytes);
@@ -57,17 +57,17 @@ impl EncryptionKey {
         let nonce = Nonce::from_slice(&sealed[..NONCE_LEN]);
         let ciphertext = &sealed[NONCE_LEN..];
 
-        self.cipher.decrypt(nonce, ciphertext).map_err(|e| {
-            Error::Decryption(format!("decryption failed: {e}"))
-        })
+        self.cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| Error::Decryption(format!("decryption failed: {e}")))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn encrypt_decrypt_roundtrip() {

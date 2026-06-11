@@ -165,12 +165,9 @@ impl InMemStorage {
 
         while pos + 5 <= data_len {
             let status = data[pos];
-            let length = u32::from_le_bytes([
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-            ]) as usize;
+            let length =
+                u32::from_le_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                    as usize;
 
             if pos + 5 + length > data_len {
                 break;

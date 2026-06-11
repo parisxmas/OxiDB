@@ -252,10 +252,13 @@ impl MmapPrimaryIndex {
             for i in 0..base.entry_count as usize {
                 let entry = Self::read_entry_from(mmap, i);
                 if !deleted.contains(&entry.0) && !overlay.contains_key(&entry.0) {
-                    result.push((entry.0, DocLocation {
-                        offset: entry.1,
-                        length: entry.2,
-                    }));
+                    result.push((
+                        entry.0,
+                        DocLocation {
+                            offset: entry.1,
+                            length: entry.2,
+                        },
+                    ));
                 }
             }
         }
@@ -407,7 +410,8 @@ impl MmapPrimaryIndex {
         }
         self.overlay.write().clear();
         self.deleted.write().clear();
-        self.dat_file_size.store(current_dat_size, Ordering::Release);
+        self.dat_file_size
+            .store(current_dat_size, Ordering::Release);
         self.doc_count.store(entry_count, Ordering::Relaxed);
 
         Ok(())
@@ -482,7 +486,8 @@ impl MmapPrimaryIndex {
             let ver = versions.get(&id).copied().unwrap_or(1);
             overlay.insert(id, (loc, ver));
         }
-        self.doc_count.store(primary.len() as u64, Ordering::Relaxed);
+        self.doc_count
+            .store(primary.len() as u64, Ordering::Relaxed);
     }
 
     // ─── Internal ──────────────────────────────────────────────────
@@ -576,9 +581,30 @@ mod tests {
         assert_eq!(idx.len(), 0);
 
         // Insert some entries
-        idx.insert(1, DocLocation { offset: 0, length: 100 }, 1);
-        idx.insert(5, DocLocation { offset: 100, length: 200 }, 1);
-        idx.insert(3, DocLocation { offset: 300, length: 150 }, 1);
+        idx.insert(
+            1,
+            DocLocation {
+                offset: 0,
+                length: 100,
+            },
+            1,
+        );
+        idx.insert(
+            5,
+            DocLocation {
+                offset: 100,
+                length: 200,
+            },
+            1,
+        );
+        idx.insert(
+            3,
+            DocLocation {
+                offset: 300,
+                length: 150,
+            },
+            1,
+        );
 
         assert_eq!(idx.len(), 3);
         assert!(idx.contains(1));
@@ -603,8 +629,22 @@ mod tests {
         let path = dir.path().join("test.pidx");
 
         let idx = MmapPrimaryIndex::open(&path)?;
-        idx.insert(1, DocLocation { offset: 0, length: 100 }, 1);
-        idx.insert(2, DocLocation { offset: 100, length: 100 }, 1);
+        idx.insert(
+            1,
+            DocLocation {
+                offset: 0,
+                length: 100,
+            },
+            1,
+        );
+        idx.insert(
+            2,
+            DocLocation {
+                offset: 100,
+                length: 100,
+            },
+            1,
+        );
         idx.persist()?;
 
         let idx = MmapPrimaryIndex::open(&path)?;
@@ -617,7 +657,14 @@ mod tests {
         assert!(idx.contains(2));
 
         // Add new
-        idx.insert(3, DocLocation { offset: 200, length: 50 }, 1);
+        idx.insert(
+            3,
+            DocLocation {
+                offset: 200,
+                length: 50,
+            },
+            1,
+        );
         assert_eq!(idx.len(), 2);
 
         Ok(())
@@ -631,7 +678,13 @@ mod tests {
         let mut primary = HashMap::new();
         let mut versions = HashMap::new();
         for i in 0..10000u64 {
-            primary.insert(i, DocLocation { offset: i * 100, length: 90 });
+            primary.insert(
+                i,
+                DocLocation {
+                    offset: i * 100,
+                    length: 90,
+                },
+            );
             versions.insert(i, 1u64);
         }
 
@@ -655,8 +708,22 @@ mod tests {
         let idx = MmapPrimaryIndex::new_in_memory();
         assert_eq!(idx.len(), 0);
 
-        idx.insert(1, DocLocation { offset: 0, length: 100 }, 1);
-        idx.insert(2, DocLocation { offset: 100, length: 200 }, 1);
+        idx.insert(
+            1,
+            DocLocation {
+                offset: 0,
+                length: 100,
+            },
+            1,
+        );
+        idx.insert(
+            2,
+            DocLocation {
+                offset: 100,
+                length: 200,
+            },
+            1,
+        );
         assert_eq!(idx.len(), 2);
         assert!(idx.contains(1));
 
@@ -675,8 +742,22 @@ mod tests {
         let path = dir.path().join("test.pidx");
 
         let idx = MmapPrimaryIndex::open(&path)?;
-        idx.insert(1, DocLocation { offset: 0, length: 100 }, 1);
-        idx.insert(2, DocLocation { offset: 100, length: 200 }, 1);
+        idx.insert(
+            1,
+            DocLocation {
+                offset: 0,
+                length: 100,
+            },
+            1,
+        );
+        idx.insert(
+            2,
+            DocLocation {
+                offset: 100,
+                length: 200,
+            },
+            1,
+        );
         idx.persist()?;
 
         // Overlay should be empty after persist
@@ -685,7 +766,14 @@ mod tests {
         assert!(idx.contains(2));
 
         // Add more
-        idx.insert(3, DocLocation { offset: 200, length: 50 }, 1);
+        idx.insert(
+            3,
+            DocLocation {
+                offset: 200,
+                length: 50,
+            },
+            1,
+        );
         assert_eq!(idx.len(), 3);
         idx.persist()?;
 

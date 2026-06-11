@@ -16,9 +16,9 @@
 
 use std::fmt;
 
-use jsonb::{from_raw_jsonb, RawJsonb};
-use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use jsonb::{RawJsonb, from_raw_jsonb};
 use serde::Deserialize;
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 
 // OxiWire tag constants — keep in lock-step with `wire_oxiwire.rs`.
 const TAG_NULL: u8 = 0x00;
@@ -34,8 +34,7 @@ const TAG_MAP: u8 = 0x08;
 /// Convert JSONB bytes to OxiWire bytes, appending to `out`.
 pub fn jsonb_to_oxiwire(jsonb_bytes: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
     let raw = RawJsonb::new(jsonb_bytes);
-    let owned: OxiWireOutput =
-        from_raw_jsonb(&raw).map_err(|e| format!("jsonb→oxiwire: {e}"))?;
+    let owned: OxiWireOutput = from_raw_jsonb(&raw).map_err(|e| format!("jsonb→oxiwire: {e}"))?;
     out.extend_from_slice(&owned.0);
     Ok(())
 }
@@ -43,8 +42,7 @@ pub fn jsonb_to_oxiwire(jsonb_bytes: &[u8], out: &mut Vec<u8>) -> Result<(), Str
 /// Convenience that allocates a fresh `Vec<u8>` for the OxiWire output.
 pub fn jsonb_to_oxiwire_owned(jsonb_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let raw = RawJsonb::new(jsonb_bytes);
-    let owned: OxiWireOutput =
-        from_raw_jsonb(&raw).map_err(|e| format!("jsonb→oxiwire: {e}"))?;
+    let owned: OxiWireOutput = from_raw_jsonb(&raw).map_err(|e| format!("jsonb→oxiwire: {e}"))?;
     Ok(owned.0)
 }
 
@@ -181,7 +179,7 @@ impl<'de, 'a> Visitor<'de> for Vis<'a> {
 mod tests {
     use super::*;
     use crate::codec::encode_doc;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::io::Read;
 
     fn jsonb_from(v: &Value) -> Vec<u8> {
@@ -220,9 +218,7 @@ mod tests {
             TAG_FLOAT => {
                 let mut b = [0u8; 8];
                 cur.read_exact(&mut b).unwrap();
-                Value::Number(
-                    serde_json::Number::from_f64(f64::from_le_bytes(b)).unwrap(),
-                )
+                Value::Number(serde_json::Number::from_f64(f64::from_le_bytes(b)).unwrap())
             }
             TAG_STRING => {
                 let mut len_buf = [0u8; 4];

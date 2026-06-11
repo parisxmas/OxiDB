@@ -56,9 +56,18 @@ fn scram_happy_path_completes() {
         ScramState::process_client_first(&client_first("client-nonce-1"), &store)
             .expect("client-first should succeed for known user");
     // The server-first response carries the combined nonce + salt + iterations.
-    assert!(server_first.contains("r="), "server-first must echo a nonce");
-    assert!(server_first.contains("s="), "server-first must include salt");
-    assert!(server_first.contains("i="), "server-first must include iter count");
+    assert!(
+        server_first.contains("r="),
+        "server-first must echo a nonce"
+    );
+    assert!(
+        server_first.contains("s="),
+        "server-first must include salt"
+    );
+    assert!(
+        server_first.contains("i="),
+        "server-first must include iter count"
+    );
 
     // Compute a real client-final by replaying SCRAM math against
     // the server's salt/iterations.
@@ -90,11 +99,11 @@ fn scram_happy_path_completes() {
 fn scram_client_first_missing_gs2_header_rejected() {
     let (_dir, store) = make_user_store();
     for bad in &[
-        "n=alice,r=xyz",        // missing n,,
-        "y,,n=alice,r=xyz",     // y instead of n
+        "n=alice,r=xyz",              // missing n,,
+        "y,,n=alice,r=xyz",           // y instead of n
         "p=tls-unique,n=alice,r=xyz", // wrong gs2 form
-        "",                     // empty
-        "garbage",              // not even close
+        "",                           // empty
+        "garbage",                    // not even close
     ] {
         let r = ScramState::process_client_first(bad, &store);
         assert!(
@@ -194,7 +203,12 @@ fn scram_nonce_mismatch_rejected() {
         ScramState::process_client_first(&client_first("nonce-A"), &store).unwrap();
     let (combined_nonce, salt_b64, iters) = parse_server_first(&server_first);
     let proof_b64 = compute_client_proof(
-        TEST_USER, TEST_PASSWORD, "nonce-A", &combined_nonce, &salt_b64, iters,
+        TEST_USER,
+        TEST_PASSWORD,
+        "nonce-A",
+        &combined_nonce,
+        &salt_b64,
+        iters,
     );
 
     // Substitute a wrong nonce in client-final — proof is still
@@ -220,12 +234,12 @@ fn scram_proof_length_mismatch_does_not_panic() {
     let (combined_nonce, _, _) = parse_server_first(&server_first);
 
     for bad_proof_b64 in &[
-        "",                          // empty
-        "AAAA",                      // way too short
+        "",     // empty
+        "AAAA", // way too short
         // 200 bytes — well past the 32-byte SHA-256 output length
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "@@@@@@@@",                  // invalid base64
-        "===",                       // base64 padding only
+        "@@@@@@@@", // invalid base64
+        "===",      // base64 padding only
     ] {
         let client_final = format!("c=biws,r={combined_nonce},p={bad_proof_b64}");
         let r = state.process_client_final(&client_final, &store);
@@ -266,11 +280,11 @@ fn scram_client_final_missing_fields_rejected() {
     let (combined_nonce, _, _) = parse_server_first(&server_first);
 
     for bad in &[
-        format!("c=biws,r={combined_nonce}"),         // no proof
-        "c=biws,p=AAAA".to_string(),                  // no nonce
-        String::new(),                                // empty
-        "garbage".to_string(),                        // no fields
-        format!("r={combined_nonce}"),                // proof missing, c= missing
+        format!("c=biws,r={combined_nonce}"), // no proof
+        "c=biws,p=AAAA".to_string(),          // no nonce
+        String::new(),                        // empty
+        "garbage".to_string(),                // no fields
+        format!("r={combined_nonce}"),        // proof missing, c= missing
     ] {
         let r = state.process_client_final(bad, &store);
         assert!(
@@ -298,7 +312,12 @@ fn scram_cross_session_replay_rejected() {
     let (combined_b, salt_b, iters_b) = parse_server_first(&server_first_b);
     // Genuine proof for session B (correct password).
     let proof_for_b = compute_client_proof(
-        TEST_USER, TEST_PASSWORD, "nonce-session-B", &combined_b, &salt_b, iters_b,
+        TEST_USER,
+        TEST_PASSWORD,
+        "nonce-session-B",
+        &combined_b,
+        &salt_b,
+        iters_b,
     );
 
     // Send it to state_a — the nonce + proof both belong to session
@@ -365,11 +384,8 @@ fn compute_client_proof(
     let client_first_bare = format!("n={username},r={client_nonce}");
     // "c=biws" is base64("n,,") — channel-binding-not-supported.
     let client_final_no_proof = format!("c=biws,r={combined_nonce}");
-    let server_first =
-        format!("r={combined_nonce},s={salt_b64},i={iterations}");
-    let auth_message = format!(
-        "{client_first_bare},{server_first},{client_final_no_proof}"
-    );
+    let server_first = format!("r={combined_nonce},s={salt_b64},i={iterations}");
+    let auth_message = format!("{client_first_bare},{server_first},{client_final_no_proof}");
 
     let client_signature = hmac_sha256_pub(&stored_key, auth_message.as_bytes());
     let client_proof: Vec<u8> = client_key

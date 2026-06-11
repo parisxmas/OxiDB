@@ -1,6 +1,6 @@
-use std::time::Instant;
-use serde_json::json;
 use oxidb::collection::Collection;
+use serde_json::json;
+use std::time::Instant;
 
 fn main() {
     let dir = tempfile::tempdir().unwrap();
@@ -42,7 +42,11 @@ fn main() {
     for _ in 0..1000 {
         col.find_one(&json!({"region": "US-EAST"})).unwrap();
     }
-    println!("  1000x find_one: {:?} ({:.1}µs/op)", t0.elapsed(), t0.elapsed().as_micros() as f64 / 1000.0);
+    println!(
+        "  1000x find_one: {:?} ({:.1}µs/op)",
+        t0.elapsed(),
+        t0.elapsed().as_micros() as f64 / 1000.0
+    );
 
     let t0 = Instant::now();
     for _ in 0..100 {
@@ -51,21 +55,31 @@ fn main() {
             skip: None,
             limit: Some(10),
         };
-        col.find_with_options(&json!({"region": "EU-WEST"}), &opts).unwrap();
+        col.find_with_options(&json!({"region": "EU-WEST"}), &opts)
+            .unwrap();
     }
-    println!("  100x sort+limit(10): {:?} ({:.1}µs/op)", t0.elapsed(), t0.elapsed().as_micros() as f64 / 100.0);
+    println!(
+        "  100x sort+limit(10): {:?} ({:.1}µs/op)",
+        t0.elapsed(),
+        t0.elapsed().as_micros() as f64 / 100.0
+    );
 
     let t0 = Instant::now();
     for _ in 0..1000 {
         col.count_matching(&json!({"region": "APAC"})).unwrap();
     }
-    println!("  1000x count: {:?} ({:.1}µs/op)", t0.elapsed(), t0.elapsed().as_micros() as f64 / 1000.0);
+    println!(
+        "  1000x count: {:?} ({:.1}µs/op)",
+        t0.elapsed(),
+        t0.elapsed().as_micros() as f64 / 1000.0
+    );
 
     drop(col);
 
     // ── B-tree ──
     println!("\n--- B-tree storage ---");
-    let mut col_bt = oxidb::btree_collection::BTreeCollection::open("bench_btree", data_dir, None).unwrap();
+    let mut col_bt =
+        oxidb::btree_collection::BTreeCollection::open("bench_btree", data_dir, None).unwrap();
 
     let t0 = Instant::now();
     let mut docs = Vec::with_capacity(n);
@@ -93,7 +107,11 @@ fn main() {
     for _ in 0..1000 {
         col_bt.find_one(&json!({"region": "US-EAST"})).unwrap();
     }
-    println!("  1000x find_one: {:?} ({:.1}µs/op)", t0.elapsed(), t0.elapsed().as_micros() as f64 / 1000.0);
+    println!(
+        "  1000x find_one: {:?} ({:.1}µs/op)",
+        t0.elapsed(),
+        t0.elapsed().as_micros() as f64 / 1000.0
+    );
 
     let t0 = Instant::now();
     for _ in 0..100 {
@@ -102,15 +120,25 @@ fn main() {
             skip: None,
             limit: Some(10),
         };
-        col_bt.find_with_options(&json!({"region": "EU-WEST"}), &opts).unwrap();
+        col_bt
+            .find_with_options(&json!({"region": "EU-WEST"}), &opts)
+            .unwrap();
     }
-    println!("  100x sort+limit(10): {:?} ({:.1}µs/op)", t0.elapsed(), t0.elapsed().as_micros() as f64 / 100.0);
+    println!(
+        "  100x sort+limit(10): {:?} ({:.1}µs/op)",
+        t0.elapsed(),
+        t0.elapsed().as_micros() as f64 / 100.0
+    );
 
     let t0 = Instant::now();
     for _ in 0..1000 {
         col_bt.count_matching(&json!({"region": "APAC"})).unwrap();
     }
-    println!("  1000x count: {:?} ({:.1}µs/op)", t0.elapsed(), t0.elapsed().as_micros() as f64 / 1000.0);
+    println!(
+        "  1000x count: {:?} ({:.1}µs/op)",
+        t0.elapsed(),
+        t0.elapsed().as_micros() as f64 / 1000.0
+    );
 
     println!("\nDone.");
 }

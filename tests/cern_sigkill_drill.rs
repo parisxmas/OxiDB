@@ -45,20 +45,16 @@ const ACK_DEADLINE: Duration = Duration::from_secs(30);
 /// Victim loop — open the DB, insert forever, ack each insert's
 /// application-level id to stdout. Never returns.
 fn run_victim() -> ! {
-    let path = std::env::var("OXIDB_VICTIM_DATA")
-        .expect("victim role: OXIDB_VICTIM_DATA must be set");
-    let db = OxiDb::open(std::path::Path::new(&path))
-        .expect("victim role: open db");
+    let path =
+        std::env::var("OXIDB_VICTIM_DATA").expect("victim role: OXIDB_VICTIM_DATA must be set");
+    let db = OxiDb::open(std::path::Path::new(&path)).expect("victim role: open db");
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut i: u64 = 0;
     loop {
-        db.insert(
-            "sigkill_test",
-            json!({"i": i, "payload": "x".repeat(64)}),
-        )
-        .expect("victim role: insert");
+        db.insert("sigkill_test", json!({"i": i, "payload": "x".repeat(64)}))
+            .expect("victim role: insert");
         // Ack ONLY after insert() returns — by then the WAL fsync has
         // completed, so the parent reading this ack means the record
         // is durable. If we crash before the next write to stdout, the

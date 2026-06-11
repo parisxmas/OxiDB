@@ -30,9 +30,12 @@ impl RaftConfig {
                 }
                 if let Some((id_str, addr)) = entry.split_once('=') {
                     if let Ok(id) = id_str.trim().parse::<u64>() {
-                        peers.insert(id, BasicNode {
-                            addr: addr.trim().to_string(),
-                        });
+                        peers.insert(
+                            id,
+                            BasicNode {
+                                addr: addr.trim().to_string(),
+                            },
+                        );
                     }
                 }
             }

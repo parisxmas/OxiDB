@@ -60,12 +60,22 @@ fn full_backup_wipe_restore_preserves_everything() {
         }
 
         // Blob bucket so we exercise the _blobs/ path too.
-        db.put_object("dr-bucket", "evidence.txt", b"if you see this, restore worked",
-                      "text/plain", std::collections::HashMap::new())
-            .expect("put_object");
-        db.put_object("dr-bucket", "binary.bin", &[0xDE, 0xAD, 0xBE, 0xEF],
-                      "application/octet-stream", std::collections::HashMap::new())
-            .expect("put_object");
+        db.put_object(
+            "dr-bucket",
+            "evidence.txt",
+            b"if you see this, restore worked",
+            "text/plain",
+            std::collections::HashMap::new(),
+        )
+        .expect("put_object");
+        db.put_object(
+            "dr-bucket",
+            "binary.bin",
+            &[0xDE, 0xAD, 0xBE, 0xEF],
+            "application/octet-stream",
+            std::collections::HashMap::new(),
+        )
+        .expect("put_object");
     }
     eprintln!("[dr] phase 1: built DB ({:?})", build_t0.elapsed());
 
@@ -81,7 +91,10 @@ fn full_backup_wipe_restore_preserves_everything() {
             info.collections,
         );
     }
-    assert!(archive_path.exists(), "backup file must exist after backup()");
+    assert!(
+        archive_path.exists(),
+        "backup file must exist after backup()"
+    );
     let archive_size = std::fs::metadata(&archive_path).unwrap().len();
     assert!(archive_size > 0, "archive must be non-empty");
 
@@ -104,8 +117,7 @@ fn full_backup_wipe_restore_preserves_everything() {
 
     // ── Phase 4: restore ─────────────────────────────────────────────
     let restore_t0 = Instant::now();
-    let info = OxiDb::restore(&archive_path, restored_dir.path())
-        .expect("restore from archive");
+    let info = OxiDb::restore(&archive_path, restored_dir.path()).expect("restore from archive");
     eprintln!(
         "[dr] phase 4: restored to {} ({:?}, archive size {} bytes)",
         restored_dir.path().display(),
@@ -219,11 +231,7 @@ fn encrypted_backup_wipe_restore_round_trip() {
         "correct.key",
         [0x42; 32], // deterministic — easy to reason about in failure logs
     );
-    let wrong_key_path = write_key_file(
-        key_dir.path(),
-        "wrong.key",
-        [0xA5; 32],
-    );
+    let wrong_key_path = write_key_file(key_dir.path(), "wrong.key", [0xA5; 32]);
 
     let correct_key: Arc<EncryptionKey> =
         EncryptionKey::load_from_file(&correct_key_path).expect("load correct key");
@@ -231,21 +239,22 @@ fn encrypted_backup_wipe_restore_round_trip() {
         EncryptionKey::load_from_file(&wrong_key_path).expect("load wrong key");
 
     // ── Phase 1: build encrypted DB + sentinel data ─────────────────
-    let secret = "if this string survives the restore + correct-key reopen, encryption is reversible";
+    let secret =
+        "if this string survives the restore + correct-key reopen, encryption is reversible";
     let build_t0 = Instant::now();
     {
         let db = OxiDb::open_with_options(original_dir.path(), Some(correct_key.clone()))
             .expect("open encrypted original");
         for i in 0..50i64 {
-            db.insert(
-                "audit",
-                json!({"i": i, "secret": format!("{secret}-{i}")}),
-            )
-            .expect("insert");
+            db.insert("audit", json!({"i": i, "secret": format!("{secret}-{i}")}))
+                .expect("insert");
         }
         db.create_index("audit", "i").ok();
     }
-    eprintln!("[encrypted-dr] phase 1: built encrypted DB ({:?})", build_t0.elapsed());
+    eprintln!(
+        "[encrypted-dr] phase 1: built encrypted DB ({:?})",
+        build_t0.elapsed()
+    );
 
     // ── Phase 2: backup the encrypted DB ────────────────────────────
     let backup_t0 = Instant::now();
@@ -265,14 +274,21 @@ fn encrypted_backup_wipe_restore_round_trip() {
     // ── Phase 4: restore into the (fresh) restored_dir ──────────────
     let restore_t0 = Instant::now();
     OxiDb::restore(&archive_path, restored_dir.path()).expect("restore");
-    eprintln!("[encrypted-dr] phase 4: restored ({:?})", restore_t0.elapsed());
+    eprintln!(
+        "[encrypted-dr] phase 4: restored ({:?})",
+        restore_t0.elapsed()
+    );
 
     // ── Sub-case 1: CORRECT KEY → recoverable ───────────────────────
     {
         let db = OxiDb::open_with_options(restored_dir.path(), Some(correct_key.clone()))
             .expect("reopen with correct key");
         let docs = db.find("audit", &json!({})).expect("find");
-        assert_eq!(docs.len(), 50, "all 50 docs must be recoverable with correct key");
+        assert_eq!(
+            docs.len(),
+            50,
+            "all 50 docs must be recoverable with correct key"
+        );
         // Spot-check the actual secret payload (not just count) — proves
         // the ciphertext was decryptable, not just that 50 doc IDs survived.
         let d0 = db
@@ -280,7 +296,10 @@ fn encrypted_backup_wipe_restore_round_trip() {
             .expect("find_one")
             .expect("doc i=0 present");
         assert_eq!(d0["secret"].as_str(), Some(&*format!("{secret}-0")));
-        eprintln!("[encrypted-dr] sub-case 1 ✓ correct key recovered {} docs", docs.len());
+        eprintln!(
+            "[encrypted-dr] sub-case 1 ✓ correct key recovered {} docs",
+            docs.len()
+        );
     }
 
     // ── Sub-case 2: WRONG KEY → reads must NOT return plaintext ─────
@@ -323,8 +342,10 @@ fn encrypted_backup_wipe_restore_round_trip() {
                      Encryption is not actually gating reads.",
                     docs.iter().filter(|d| d["secret"].is_string()).count()
                 );
-                eprintln!("[encrypted-dr] sub-case 2 ✓ wrong key returned {} docs, none with original plaintext",
-                          docs.len());
+                eprintln!(
+                    "[encrypted-dr] sub-case 2 ✓ wrong key returned {} docs, none with original plaintext",
+                    docs.len()
+                );
             }
         }
     }
@@ -354,8 +375,10 @@ fn encrypted_backup_wipe_restore_round_trip() {
                      returned {} docs containing the original plaintext secret.",
                     docs.iter().filter(|d| d["secret"].is_string()).count()
                 );
-                eprintln!("[encrypted-dr] sub-case 3 ✓ no key returned {} docs, none with original plaintext",
-                          docs.len());
+                eprintln!(
+                    "[encrypted-dr] sub-case 3 ✓ no key returned {} docs, none with original plaintext",
+                    docs.len()
+                );
             }
         }
     }

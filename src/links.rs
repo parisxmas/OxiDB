@@ -145,9 +145,8 @@ impl LinksTable {
             None => return Ok(()), // in-memory mode (tests)
         };
         let list = self.list();
-        let bytes = serde_json::to_vec_pretty(&list).map_err(|e| {
-            Error::Io(std::io::Error::other(format!("serialize links: {}", e)))
-        })?;
+        let bytes = serde_json::to_vec_pretty(&list)
+            .map_err(|e| Error::Io(std::io::Error::other(format!("serialize links: {}", e))))?;
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, &bytes)?;
         // best-effort fsync — losing this on a crash is recoverable
@@ -218,11 +217,9 @@ pub struct ParsedRemote {
 /// Returns a typed view or a clear error string the handler can
 /// surface as `{"ok": false, "error": ...}`.
 pub fn parse_remote(url: &str) -> Result<ParsedRemote> {
-    let rest = url
-        .strip_prefix("oxidb://")
-        .ok_or_else(|| Error::InvalidQuery(format!(
-            "link URL must start with oxidb:// — got {:?}", url
-        )))?;
+    let rest = url.strip_prefix("oxidb://").ok_or_else(|| {
+        Error::InvalidQuery(format!("link URL must start with oxidb:// — got {:?}", url))
+    })?;
 
     // Split off the userinfo (if any).
     let (userinfo, host_path) = match rest.find('@') {
@@ -240,22 +237,25 @@ pub fn parse_remote(url: &str) -> Result<ParsedRemote> {
     // host:port / collection
     let (hostport, coll) = host_path.split_once('/').ok_or_else(|| {
         Error::InvalidQuery(format!(
-            "link URL must include /<remote_collection> after host:port — got {:?}", url
+            "link URL must include /<remote_collection> after host:port — got {:?}",
+            url
         ))
     })?;
     if coll.is_empty() || coll.contains('/') {
         return Err(Error::InvalidQuery(format!(
-            "link URL collection path must be a single segment — got {:?}", coll
+            "link URL collection path must be a single segment — got {:?}",
+            coll
         )));
     }
 
     let (host, port_str) = hostport.rsplit_once(':').ok_or_else(|| {
-        Error::InvalidQuery(format!(
-            "link URL must include :port — got {:?}", hostport
-        ))
+        Error::InvalidQuery(format!("link URL must include :port — got {:?}", hostport))
     })?;
     let port: u16 = port_str.parse().map_err(|_| {
-        Error::InvalidQuery(format!("link URL port must be a number — got {:?}", port_str))
+        Error::InvalidQuery(format!(
+            "link URL port must be a number — got {:?}",
+            port_str
+        ))
     })?;
     if host.is_empty() {
         return Err(Error::InvalidQuery("link URL host is empty".to_string()));

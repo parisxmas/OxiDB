@@ -339,16 +339,26 @@ impl MmapFieldIndex {
     /// Check if a doc_id exists in a mmap entry's docid list using binary search.
     /// O(log n) — does NOT load all doc_ids into memory.
     fn mmap_entry_contains_docid(&self, idx: usize, doc_id: DocumentId) -> bool {
-        let Some(mmap) = self.mmap.as_ref() else { return false };
-        let Some(layout) = self.layout.as_ref() else { return false };
+        let Some(mmap) = self.mmap.as_ref() else {
+            return false;
+        };
+        let Some(layout) = self.layout.as_ref() else {
+            return false;
+        };
         let buf = &mmap[..];
         let eoff = layout.entry_table_offset + idx * ENTRY_HEADER_SIZE;
-        if eoff + ENTRY_HEADER_SIZE > buf.len() { return false }
+        if eoff + ENTRY_HEADER_SIZE > buf.len() {
+            return false;
+        }
         let docid_offset = read_u64(buf, eoff + 13) as usize;
         let docid_count = read_u32(buf, eoff + 21) as usize;
-        if docid_count == 0 { return false }
+        if docid_count == 0 {
+            return false;
+        }
         let abs_offset = layout.docid_section_offset + docid_offset;
-        if abs_offset + docid_count * 8 > buf.len() { return false }
+        if abs_offset + docid_count * 8 > buf.len() {
+            return false;
+        }
 
         // Binary search on sorted u64 array in mmap
         let mut lo = 0usize;
@@ -356,7 +366,9 @@ impl MmapFieldIndex {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let v = read_u64(buf, abs_offset + mid * 8);
-            if v == doc_id { return true }
+            if v == doc_id {
+                return true;
+            }
             if v < doc_id { lo = mid + 1 } else { hi = mid }
         }
         false
@@ -452,11 +464,7 @@ impl MmapFieldIndex {
     }
 
     /// Iterate mmap entries in a range [start_idx..end_idx), filtering tombstones.
-    fn mmap_range_entries(
-        &self,
-        start_idx: usize,
-        end_idx: usize,
-    ) -> Vec<(IndexValue, DocIdSet)> {
+    fn mmap_range_entries(&self, start_idx: usize, end_idx: usize) -> Vec<(IndexValue, DocIdSet)> {
         let mut result = Vec::new();
         for i in start_idx..end_idx {
             let Some(val) = self.mmap_entry_value(i) else {
@@ -804,12 +812,8 @@ impl MmapFieldIndex {
     }
 
     /// Iterate IDs in a range, calling `f` per ID. Stops when `f` returns false.
-    pub fn for_each_in_range<F>(
-        &self,
-        start: Bound<&IndexValue>,
-        end: Bound<&IndexValue>,
-        mut f: F,
-    ) where
+    pub fn for_each_in_range<F>(&self, start: Bound<&IndexValue>, end: Bound<&IndexValue>, mut f: F)
+    where
         F: FnMut(DocumentId) -> bool,
     {
         // Collect all entries from both sources, merged and sorted
@@ -853,10 +857,7 @@ impl MmapFieldIndex {
     /// Number of unique values in the index (mmap + overlay, approximate).
     pub fn len(&self) -> usize {
         // This is approximate because overlay values may overlap with mmap
-        let mmap_count = self
-            .layout
-            .as_ref()
-            .map_or(0, |l| l.entry_count as usize);
+        let mmap_count = self.layout.as_ref().map_or(0, |l| l.entry_count as usize);
         mmap_count + self.overlay.len()
     }
 
@@ -1168,10 +1169,8 @@ fn merge_sorted_entries(
             }
             std::cmp::Ordering::Equal => {
                 // Merge doc ID sets
-                let (val, mut mmap_ids) = std::mem::replace(
-                    &mut mmap_entries[mi],
-                    (IndexValue::Null, DocIdSet::Empty),
-                );
+                let (val, mut mmap_ids) =
+                    std::mem::replace(&mut mmap_entries[mi], (IndexValue::Null, DocIdSet::Empty));
                 for &id in &overlay_entries[oi].1 {
                     mmap_ids.insert(id);
                 }
@@ -1253,7 +1252,12 @@ impl<'a> MmapFieldIndexIterDesc<'a> {
         // Overlay is typically small (recent writes only) — safe to clone + reverse
         let overlay_rev: Vec<(IndexValue, DocIdSet)> = index.overlay.clone().into_iter().collect();
         let overlay_pos = overlay_rev.len();
-        Self { index, mmap_pos: mmap_count, overlay_rev, overlay_pos }
+        Self {
+            index,
+            mmap_pos: mmap_count,
+            overlay_rev,
+            overlay_pos,
+        }
     }
 }
 
@@ -1277,7 +1281,9 @@ impl<'a> Iterator for MmapFieldIndexIterDesc<'a> {
                 if ov >= &mv {
                     self.overlay_pos -= 1;
                     let (v, ids) = self.overlay_rev[self.overlay_pos].clone();
-                    if ov == &mv { self.mmap_pos -= 1; } // skip dup
+                    if ov == &mv {
+                        self.mmap_pos -= 1;
+                    } // skip dup
                     Some((v, ids))
                 } else {
                     self.mmap_pos -= 1;
@@ -1361,8 +1367,14 @@ mod tests {
         fi.insert(&make_doc(3, json!({"score": 100})));
 
         let mmap_idx = MmapFieldIndex::rebuild_from(&fi, &path).unwrap();
-        assert_eq!(mmap_idx.find_eq(&IndexValue::Integer(100)), BTreeSet::from([1, 3]));
-        assert_eq!(mmap_idx.find_eq(&IndexValue::Integer(200)), BTreeSet::from([2]));
+        assert_eq!(
+            mmap_idx.find_eq(&IndexValue::Integer(100)),
+            BTreeSet::from([1, 3])
+        );
+        assert_eq!(
+            mmap_idx.find_eq(&IndexValue::Integer(200)),
+            BTreeSet::from([2])
+        );
     }
 
     #[test]
@@ -1418,11 +1430,14 @@ mod tests {
         idx.insert_value(2, &json!({"n": 20}));
 
         let vals: Vec<IndexValue> = idx.iter_asc().map(|(v, _)| v).collect();
-        assert_eq!(vals, vec![
-            IndexValue::Integer(10),
-            IndexValue::Integer(20),
-            IndexValue::Integer(30),
-        ]);
+        assert_eq!(
+            vals,
+            vec![
+                IndexValue::Integer(10),
+                IndexValue::Integer(20),
+                IndexValue::Integer(30),
+            ]
+        );
     }
 
     #[test]
@@ -1451,8 +1466,14 @@ mod tests {
 
         let reopened = MmapFieldIndex::open(&path).unwrap();
         assert_eq!(reopened.count_all(), 6);
-        assert_eq!(reopened.find_eq(&IndexValue::Integer(42)), BTreeSet::from([3]));
-        assert_eq!(reopened.find_eq(&IndexValue::String("hello".into())), BTreeSet::from([6]));
+        assert_eq!(
+            reopened.find_eq(&IndexValue::Integer(42)),
+            BTreeSet::from([3])
+        );
+        assert_eq!(
+            reopened.find_eq(&IndexValue::String("hello".into())),
+            BTreeSet::from([6])
+        );
         assert_eq!(reopened.find_eq(&IndexValue::Null), BTreeSet::from([1]));
     }
 }

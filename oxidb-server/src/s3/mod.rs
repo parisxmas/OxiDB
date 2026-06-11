@@ -40,7 +40,7 @@ use oxidb::OxiDb;
 
 use auth::{S3Auth, verify_auth};
 use encryption::S3Encryption;
-use helpers::{url_decode, parse_query};
+use helpers::{parse_query, url_decode};
 use http::{HttpRequest, HttpResponse, error_response, parse_request_from_reader};
 
 // ---------------------------------------------------------------------------
@@ -74,7 +74,9 @@ impl MultipartUpload {
             if marker.starts_with("SSE-C:") {
                 let bytes = unsafe { marker.as_bytes_mut() };
                 for b in bytes.iter_mut() {
-                    unsafe { std::ptr::write_volatile(b, 0); }
+                    unsafe {
+                        std::ptr::write_volatile(b, 0);
+                    }
                 }
             }
         }
@@ -99,12 +101,17 @@ pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<
 
     let auth = match S3Auth::from_env() {
         Some(a) => {
-            eprintln!("[s3] authentication enabled ({} credential(s))", a.credentials.len());
+            eprintln!(
+                "[s3] authentication enabled ({} credential(s))",
+                a.credentials.len()
+            );
             Some(Arc::new(a))
         }
         None => {
             eprintln!("[s3] WARNING: authentication DISABLED — S3 API is open to anyone!");
-            eprintln!("[s3] Set OXIDB_S3_ACCESS_KEY/OXIDB_S3_SECRET_KEY or OXIDB_S3_CREDENTIALS to enable auth.");
+            eprintln!(
+                "[s3] Set OXIDB_S3_ACCESS_KEY/OXIDB_S3_SECRET_KEY or OXIDB_S3_CREDENTIALS to enable auth."
+            );
             None
         }
     };
@@ -117,7 +124,14 @@ pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<
         Ok(hex_key) if !hex_key.is_empty() => {
             match S3Encryption::from_hex_key(&hex_key, default_enc) {
                 Some(enc) => {
-                    eprintln!("[s3] server-side encryption enabled (SSE-S3){}", if default_enc { " [default for all objects]" } else { "" });
+                    eprintln!(
+                        "[s3] server-side encryption enabled (SSE-S3){}",
+                        if default_enc {
+                            " [default for all objects]"
+                        } else {
+                            ""
+                        }
+                    );
                     Some(enc)
                 }
                 None => {
@@ -128,7 +142,9 @@ pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<
         }
         _ => {
             if default_enc {
-                eprintln!("[s3] WARNING: OXIDB_S3_DEFAULT_ENCRYPTION=true but no OXIDB_S3_ENCRYPTION_KEY set");
+                eprintln!(
+                    "[s3] WARNING: OXIDB_S3_DEFAULT_ENCRYPTION=true but no OXIDB_S3_ENCRYPTION_KEY set"
+                );
             }
             None
         }
@@ -147,14 +163,16 @@ pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<
         let state_cleanup = Arc::clone(&state);
         std::thread::Builder::new()
             .name("s3-upload-gc".into())
-            .spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(3600)); // check every hour
-                let mut uploads = state_cleanup.uploads.lock().unwrap();
-                let before = uploads.len();
-                uploads.retain(|_, u| u.created_at.elapsed().as_secs() < UPLOAD_TTL_SECS);
-                let removed = before - uploads.len();
-                if removed > 0 {
-                    eprintln!("[s3] cleaned up {removed} abandoned multipart uploads");
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600)); // check every hour
+                    let mut uploads = state_cleanup.uploads.lock().unwrap();
+                    let before = uploads.len();
+                    uploads.retain(|_, u| u.created_at.elapsed().as_secs() < UPLOAD_TTL_SECS);
+                    let removed = before - uploads.len();
+                    if removed > 0 {
+                        eprintln!("[s3] cleaned up {removed} abandoned multipart uploads");
+                    }
                 }
             })
             .expect("failed to spawn s3-upload-gc");
@@ -169,25 +187,27 @@ pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<
         let state = Arc::clone(&state);
         std::thread::Builder::new()
             .name(format!("s3-worker-{i}"))
-            .spawn(move || loop {
-                let stream = match rx.lock().unwrap().recv() {
-                    Ok(s) => s,
-                    Err(_) => return, // channel closed
-                };
-                state.active_connections.fetch_add(1, Ordering::Relaxed);
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handle_connection(stream, &state);
-                }));
-                state.active_connections.fetch_sub(1, Ordering::Relaxed);
-                if let Err(e) = result {
-                    let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else if let Some(s) = e.downcast_ref::<String>() {
-                        s.clone()
-                    } else {
-                        "unknown panic".to_string()
+            .spawn(move || {
+                loop {
+                    let stream = match rx.lock().unwrap().recv() {
+                        Ok(s) => s,
+                        Err(_) => return, // channel closed
                     };
-                    eprintln!("[s3] connection handler panicked: {msg}");
+                    state.active_connections.fetch_add(1, Ordering::Relaxed);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle_connection(stream, &state);
+                    }));
+                    state.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    if let Err(e) = result {
+                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        eprintln!("[s3] connection handler panicked: {msg}");
+                    }
                 }
             })
             .expect("failed to spawn s3 worker");
@@ -225,14 +245,20 @@ fn handle_connection(mut stream: TcpStream, state: &S3State) {
             None => return, // connection closed or timeout
         };
 
-        let wants_close = req.headers.get("connection")
+        let wants_close = req
+            .headers
+            .get("connection")
             .map(|v| v.eq_ignore_ascii_case("close"))
             .unwrap_or(false);
 
         // CORS preflight
         if req.method == "OPTIONS" {
-            HttpResponse::no_content().with_cors().write_to_keepalive(&mut stream, !wants_close);
-            if wants_close { return; }
+            HttpResponse::no_content()
+                .with_cors()
+                .write_to_keepalive(&mut stream, !wants_close);
+            if wants_close {
+                return;
+            }
             continue;
         }
 
@@ -242,7 +268,9 @@ fn handle_connection(mut stream: TcpStream, state: &S3State) {
                 error_response(403, "AccessDenied", "Access Denied", &req.path)
                     .with_cors()
                     .write_to_keepalive(&mut stream, !wants_close);
-                if wants_close { return; }
+                if wants_close {
+                    return;
+                }
                 continue;
             }
         }
@@ -252,9 +280,12 @@ fn handle_connection(mut stream: TcpStream, state: &S3State) {
         let params = parse_query(&req.query);
 
         let resp = route_request(&req, &segments, &params, state);
-        resp.with_cors().write_to_keepalive(&mut stream, !wants_close);
+        resp.with_cors()
+            .write_to_keepalive(&mut stream, !wants_close);
 
-        if wants_close { return; }
+        if wants_close {
+            return;
+        }
     }
 }
 
@@ -273,12 +304,16 @@ fn route_request(
 
         // --- Bucket-level ---
         ("PUT", 1) => bucket::handle_create_bucket(db, segments[0]),
-        ("DELETE", 1) if !params.contains_key("delete") => bucket::handle_delete_bucket(db, segments[0]),
+        ("DELETE", 1) if !params.contains_key("delete") => {
+            bucket::handle_delete_bucket(db, segments[0])
+        }
         ("HEAD", 1) => bucket::handle_head_bucket(db, segments[0]),
         ("GET", 1) => bucket::handle_list_objects(db, segments[0], params),
 
         // Batch delete: POST /bucket?delete
-        ("POST", 1) if params.contains_key("delete") => batch::handle_batch_delete(db, segments[0], req),
+        ("POST", 1) if params.contains_key("delete") => {
+            batch::handle_batch_delete(db, segments[0], req)
+        }
 
         // --- Object-level ---
 
@@ -289,7 +324,9 @@ fn route_request(
         }
 
         // Multipart: PUT /bucket/key?partNumber=N&uploadId=ID → upload part
-        ("PUT", n) if n >= 2 && params.contains_key("partNumber") && params.contains_key("uploadId") => {
+        ("PUT", n)
+            if n >= 2 && params.contains_key("partNumber") && params.contains_key("uploadId") =>
+        {
             let key = segments[1..].join("/");
             multipart::handle_upload_part(state, segments[0], &key, req, params)
         }

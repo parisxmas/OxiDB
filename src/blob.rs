@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 use crate::crypto::EncryptionKey;
 use crate::error::{Error, Result};
@@ -199,7 +199,10 @@ impl DirSyncer {
     fn sync(&self, dir: &Path) -> Result<()> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(1);
         self.tx
-            .send(DirSyncReq { dir: dir.to_path_buf(), reply: reply_tx })
+            .send(DirSyncReq {
+                dir: dir.to_path_buf(),
+                reply: reply_tx,
+            })
             .map_err(|_| Error::Io(std::io::Error::other("blob dir-syncer thread is gone")))?;
         match reply_rx.recv() {
             Ok(Ok(())) => Ok(()),
@@ -247,7 +250,10 @@ impl BlobStore {
         Self::open_with_encryption(data_dir, None)
     }
 
-    pub fn open_with_encryption(data_dir: &Path, encryption: Option<Arc<EncryptionKey>>) -> Result<Self> {
+    pub fn open_with_encryption(
+        data_dir: &Path,
+        encryption: Option<Arc<EncryptionKey>>,
+    ) -> Result<Self> {
         let base_dir = data_dir.join("_blobs");
         std::fs::create_dir_all(&base_dir)?;
 
@@ -288,13 +294,15 @@ impl BlobStore {
             let root = base_dir.clone();
             std::thread::Builder::new()
                 .name("blob-sync".into())
-                .spawn(move || loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    let _ = fsync_dir(&root);
-                    if let Ok(entries) = std::fs::read_dir(&root) {
-                        for entry in entries.flatten() {
-                            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                                let _ = fsync_dir(&entry.path());
+                .spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let _ = fsync_dir(&root);
+                        if let Ok(entries) = std::fs::read_dir(&root) {
+                            for entry in entries.flatten() {
+                                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                    let _ = fsync_dir(&entry.path());
+                                }
                             }
                         }
                     }
@@ -347,7 +355,10 @@ impl BlobStore {
         }
     }
 
-    fn scan_bucket(bucket_path: &Path, encryption: &Option<Arc<EncryptionKey>>) -> Result<BucketState> {
+    fn scan_bucket(
+        bucket_path: &Path,
+        encryption: &Option<Arc<EncryptionKey>>,
+    ) -> Result<BucketState> {
         let mut keys = HashMap::new();
         let mut metas = HashMap::new();
         let mut max_id: u64 = 0;
@@ -422,7 +433,10 @@ impl BlobStore {
             }
         }
         if orphans > 0 {
-            eprintln!("[blob] cleaned {orphans} orphan/temp files from {}", bucket_path.display());
+            eprintln!(
+                "[blob] cleaned {orphans} orphan/temp files from {}",
+                bucket_path.display()
+            );
         }
 
         Ok(BucketState {
@@ -446,13 +460,25 @@ impl BlobStore {
 
     fn validate_bucket_name(name: &str) -> Result<()> {
         if name.is_empty() || name.len() > 63 {
-            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bucket name must be 1-63 characters")));
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bucket name must be 1-63 characters",
+            )));
         }
         if name.contains("..") || name.contains('/') || name.contains('\\') || name.contains('\0') {
-            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bucket name contains invalid characters")));
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bucket name contains invalid characters",
+            )));
         }
-        if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_') {
-            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "bucket name must be alphanumeric, hyphens, dots, or underscores")));
+        if !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bucket name must be alphanumeric, hyphens, dots, or underscores",
+            )));
         }
         Ok(())
     }
@@ -461,11 +487,13 @@ impl BlobStore {
         Self::validate_bucket_name(name)?;
         std::fs::create_dir_all(self.bucket_path(name))?;
         let mut buckets = self.buckets.write().unwrap();
-        buckets.entry(name.to_string()).or_insert_with(|| Arc::new(RwLock::new(BucketState {
-            keys: HashMap::new(),
-            metas: HashMap::new(),
-            next_id: 0,
-        })));
+        buckets.entry(name.to_string()).or_insert_with(|| {
+            Arc::new(RwLock::new(BucketState {
+                keys: HashMap::new(),
+                metas: HashMap::new(),
+                next_id: 0,
+            }))
+        });
         Ok(())
     }
 
@@ -507,11 +535,13 @@ impl BlobStore {
         let bucket_lock = {
             let mut map = self.buckets.write().unwrap();
             map.entry(bucket.to_string())
-                .or_insert_with(|| Arc::new(RwLock::new(BucketState {
-                    keys: HashMap::new(),
-                    metas: HashMap::new(),
-                    next_id: 0,
-                })))
+                .or_insert_with(|| {
+                    Arc::new(RwLock::new(BucketState {
+                        keys: HashMap::new(),
+                        metas: HashMap::new(),
+                        next_id: 0,
+                    }))
+                })
                 .clone()
         }; // outer lock released — only this bucket is locked below
 
@@ -624,7 +654,8 @@ impl BlobStore {
     pub fn get_object(&self, bucket: &str, key: &str) -> Result<(Vec<u8>, ObjectMeta)> {
         let (id, cached_meta, bucket_lock) = {
             let map = self.buckets.read().unwrap();
-            let bl = map.get(bucket)
+            let bl = map
+                .get(bucket)
                 .ok_or_else(|| Error::BucketNotFound(bucket.to_string()))?
                 .clone();
             let state = bl.read().unwrap();
@@ -668,7 +699,8 @@ impl BlobStore {
     pub fn head_object(&self, bucket: &str, key: &str) -> Result<ObjectMeta> {
         let (id, cached, bucket_lock) = {
             let map = self.buckets.read().unwrap();
-            let bl = map.get(bucket)
+            let bl = map
+                .get(bucket)
                 .ok_or_else(|| Error::BucketNotFound(bucket.to_string()))?
                 .clone();
             let state = bl.read().unwrap();
@@ -699,17 +731,15 @@ impl BlobStore {
         // Hold bucket write lock only for in-memory removal
         let (data_path, meta_path) = {
             let map = self.buckets.read().unwrap();
-            let bl = map.get(bucket)
+            let bl = map
+                .get(bucket)
                 .ok_or_else(|| Error::BucketNotFound(bucket.to_string()))?
                 .clone();
             let mut state = bl.write().unwrap();
-            let id = state
-                .keys
-                .remove(key)
-                .ok_or_else(|| Error::BlobNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                })?;
+            let id = state.keys.remove(key).ok_or_else(|| Error::BlobNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
             state.metas.remove(&id);
             (self.data_path(bucket, id), self.meta_path(bucket, id))
         }; // all locks released here
@@ -746,7 +776,8 @@ impl BlobStore {
         limit: Option<usize>,
     ) -> Result<Vec<ObjectMeta>> {
         let map = self.buckets.read().unwrap();
-        let bl = map.get(bucket)
+        let bl = map
+            .get(bucket)
             .ok_or_else(|| Error::BucketNotFound(bucket.to_string()))?
             .clone();
         let state = bl.read().unwrap();
@@ -1022,7 +1053,13 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let body = format!("body-{i}").into_bytes();
                 store
-                    .put_object("mail", &format!("msg-{i}"), &body, "message/rfc822", HashMap::new())
+                    .put_object(
+                        "mail",
+                        &format!("msg-{i}"),
+                        &body,
+                        "message/rfc822",
+                        HashMap::new(),
+                    )
                     .unwrap();
             }));
         }
@@ -1084,11 +1121,7 @@ mod tests {
         let raw = std::fs::read(meta_file.path()).unwrap();
         let mut parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         parsed.as_object_mut().unwrap().remove("format_version");
-        std::fs::write(
-            meta_file.path(),
-            serde_json::to_vec(&parsed).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(meta_file.path(), serde_json::to_vec(&parsed).unwrap()).unwrap();
 
         // Reopen — must succeed (default = v1).
         drop(store);
@@ -1117,11 +1150,7 @@ mod tests {
         let raw = std::fs::read(meta_file.path()).unwrap();
         let mut parsed: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         parsed["format_version"] = serde_json::json!(CURRENT_BLOB_META_VERSION + 1);
-        std::fs::write(
-            meta_file.path(),
-            serde_json::to_vec(&parsed).unwrap(),
-        )
-        .unwrap();
+        std::fs::write(meta_file.path(), serde_json::to_vec(&parsed).unwrap()).unwrap();
 
         drop(store);
         let res = BlobStore::open(dir.path());

@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use hmac::{Hmac, Mac};
+use serde_json::{Value, json};
 use sha2::Sha256;
-use serde_json::{json, Value};
 
 use oxidb::OxiDb;
 
@@ -23,10 +23,10 @@ const TOKEN_EXPIRY_SECS: u64 = 86400; // 24 hours
 /// JWT claims payload.
 #[derive(Debug, Clone)]
 pub struct Claims {
-    pub sub: String,     // user ID / username
-    pub role: String,    // "admin", "readwrite", "read"
-    pub iat: u64,        // issued at (unix timestamp)
-    pub exp: u64,        // expiry (unix timestamp)
+    pub sub: String,  // user ID / username
+    pub role: String, // "admin", "readwrite", "read"
+    pub iat: u64,     // issued at (unix timestamp)
+    pub exp: u64,     // expiry (unix timestamp)
 }
 
 // ---------------------------------------------------------------------------
@@ -38,7 +38,9 @@ fn b64url_encode(data: &[u8]) -> String {
 }
 
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).ok()
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -106,7 +108,8 @@ pub fn decode_jwt(token: &str, secret: &str) -> Result<Claims, &'static str> {
 
 pub fn signup(db: &OxiDb, username: &str, password: &str, role: &str) -> Result<Value, String> {
     // Check if user already exists
-    let existing = db.find_one(AUTH_COLLECTION, &json!({"username": username}))
+    let existing = db
+        .find_one(AUTH_COLLECTION, &json!({"username": username}))
         .map_err(|e| e.to_string())?;
     if existing.is_some() {
         return Err("username already exists".to_string());
@@ -130,7 +133,8 @@ pub fn signup(db: &OxiDb, username: &str, password: &str, role: &str) -> Result<
         "role": role,
         "created_at": chrono::Utc::now().to_rfc3339(),
     });
-    db.insert(AUTH_COLLECTION, user_doc).map_err(|e| e.to_string())?;
+    db.insert(AUTH_COLLECTION, user_doc)
+        .map_err(|e| e.to_string())?;
 
     // Create index on username for fast lookups
     let _ = db.create_unique_index(AUTH_COLLECTION, "username");
@@ -139,11 +143,14 @@ pub fn signup(db: &OxiDb, username: &str, password: &str, role: &str) -> Result<
 }
 
 pub fn login(db: &OxiDb, username: &str, password: &str, secret: &str) -> Result<String, String> {
-    let user = db.find_one(AUTH_COLLECTION, &json!({"username": username}))
+    let user = db
+        .find_one(AUTH_COLLECTION, &json!({"username": username}))
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "invalid credentials".to_string())?;
 
-    let stored_hash = user["password_hash"].as_str().ok_or("corrupt user record")?;
+    let stored_hash = user["password_hash"]
+        .as_str()
+        .ok_or("corrupt user record")?;
     let salt = user["salt"].as_str().ok_or("corrupt user record")?;
 
     // Verify password
@@ -176,7 +183,9 @@ pub fn verify(token: &str, secret: &str) -> Result<Claims, &'static str> {
 
 /// Extract Bearer token from Authorization header value.
 pub fn extract_bearer(auth_header: &str) -> Option<&str> {
-    auth_header.strip_prefix("Bearer ").or_else(|| auth_header.strip_prefix("bearer "))
+    auth_header
+        .strip_prefix("Bearer ")
+        .or_else(|| auth_header.strip_prefix("bearer "))
 }
 
 // ---------------------------------------------------------------------------

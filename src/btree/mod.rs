@@ -81,10 +81,7 @@ impl BTreeStorage {
     }
 
     fn open_existing(path: &Path) -> Result<(fs::File, BTreeMap<u64, (u64, u32)>, u64)> {
-        let mut file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
 
         // Read and validate header
         let mut header = [0u8; HEADER_SIZE];

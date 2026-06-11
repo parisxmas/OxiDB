@@ -16,8 +16,8 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use md5::Md5;
 use md5::Digest as Md5Digest;
+use md5::Md5;
 use rand::RngCore;
 
 use super::http::HttpResponse;
@@ -47,7 +47,10 @@ impl S3Encryption {
     pub fn from_hex_key(hex_key: &str, default_encryption: bool) -> Option<Arc<Self>> {
         let key_bytes = hex_decode(hex_key)?;
         if key_bytes.len() != 32 {
-            eprintln!("[s3] encryption key must be 64 hex chars (32 bytes), got {} bytes", key_bytes.len());
+            eprintln!(
+                "[s3] encryption key must be 64 hex chars (32 bytes), got {} bytes",
+                key_bytes.len()
+            );
             return None;
         }
         let cipher = Aes256Gcm::new_from_slice(&key_bytes).ok()?;
@@ -91,24 +94,36 @@ pub fn parse_sse_headers(
     if let Some(algo) = headers.get("x-amz-server-side-encryption-customer-algorithm") {
         if algo != "AES256" {
             return Err(super::http::error_response(
-                400, "InvalidEncryptionAlgorithmError",
-                "Only AES256 is supported for SSE-C", "",
+                400,
+                "InvalidEncryptionAlgorithmError",
+                "Only AES256 is supported for SSE-C",
+                "",
             ));
         }
-        let key_b64 = headers.get("x-amz-server-side-encryption-customer-key")
-            .ok_or_else(|| super::http::error_response(
-                400, "InvalidArgument",
-                "x-amz-server-side-encryption-customer-key header is required for SSE-C", "",
-            ))?;
-        let key_bytes = base64_decode(key_b64)
-            .ok_or_else(|| super::http::error_response(
-                400, "InvalidArgument",
-                "Invalid base64 in x-amz-server-side-encryption-customer-key", "",
-            ))?;
+        let key_b64 = headers
+            .get("x-amz-server-side-encryption-customer-key")
+            .ok_or_else(|| {
+                super::http::error_response(
+                    400,
+                    "InvalidArgument",
+                    "x-amz-server-side-encryption-customer-key header is required for SSE-C",
+                    "",
+                )
+            })?;
+        let key_bytes = base64_decode(key_b64).ok_or_else(|| {
+            super::http::error_response(
+                400,
+                "InvalidArgument",
+                "Invalid base64 in x-amz-server-side-encryption-customer-key",
+                "",
+            )
+        })?;
         if key_bytes.len() != 32 {
             return Err(super::http::error_response(
-                400, "InvalidArgument",
-                "SSE-C key must be exactly 32 bytes (256 bits)", "",
+                400,
+                "InvalidArgument",
+                "SSE-C key must be exactly 32 bytes (256 bits)",
+                "",
             ));
         }
         // Verify MD5 if provided
@@ -116,8 +131,10 @@ pub fn parse_sse_headers(
             let actual_md5 = base64_encode(&md5_hash(&key_bytes));
             if actual_md5 != *expected_md5 {
                 return Err(super::http::error_response(
-                    400, "InvalidArgument",
-                    "SSE-C key MD5 does not match", "",
+                    400,
+                    "InvalidArgument",
+                    "SSE-C key MD5 does not match",
+                    "",
                 ));
             }
         }
@@ -129,15 +146,19 @@ pub fn parse_sse_headers(
         if algo == "AES256" {
             if server_encryption.is_none() {
                 return Err(super::http::error_response(
-                    400, "InvalidArgument",
-                    "SSE-S3 requested but no server encryption key configured (set OXIDB_S3_ENCRYPTION_KEY)", "",
+                    400,
+                    "InvalidArgument",
+                    "SSE-S3 requested but no server encryption key configured (set OXIDB_S3_ENCRYPTION_KEY)",
+                    "",
                 ));
             }
             return Ok(SseMode::S3);
         }
         return Err(super::http::error_response(
-            400, "InvalidEncryptionAlgorithmError",
-            "Only AES256 is supported", "",
+            400,
+            "InvalidEncryptionAlgorithmError",
+            "Only AES256 is supported",
+            "",
         ));
     }
 
@@ -186,8 +207,9 @@ pub fn add_encryption_headers(resp: HttpResponse, mode: &SseMode) -> HttpRespons
     match mode {
         SseMode::None => resp,
         SseMode::S3 => resp.with_header("x-amz-server-side-encryption", "AES256"),
-        SseMode::CustomerKey(_) => resp
-            .with_header("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        SseMode::CustomerKey(_) => {
+            resp.with_header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+        }
     }
 }
 
@@ -212,7 +234,8 @@ pub fn base64_decode_key(encoded: &str) -> Option<Vec<u8>> {
 
 /// Check stored metadata to determine if an object was encrypted with SSE-S3.
 pub fn is_sse_s3(metadata: &serde_json::Value) -> bool {
-    metadata.get("metadata")
+    metadata
+        .get("metadata")
         .and_then(|m| m.get("_sse"))
         .and_then(|v| v.as_str())
         == Some("AES256")
@@ -220,7 +243,8 @@ pub fn is_sse_s3(metadata: &serde_json::Value) -> bool {
 
 /// Check stored metadata to determine if an object was encrypted with SSE-C.
 pub fn is_sse_c(metadata: &serde_json::Value) -> bool {
-    metadata.get("metadata")
+    metadata
+        .get("metadata")
         .and_then(|m| m.get("_sse"))
         .and_then(|v| v.as_str())
         == Some("SSE-C")
@@ -235,7 +259,8 @@ fn encrypt_aes256gcm(cipher: &Aes256Gcm, plaintext: &[u8]) -> Result<Vec<u8>, St
     rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, plaintext)
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext)
         .map_err(|e| format!("encryption failed: {e}"))?;
 
     let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext.len());
@@ -251,7 +276,8 @@ fn decrypt_aes256gcm(cipher: &Aes256Gcm, sealed: &[u8]) -> Result<Vec<u8>, Strin
     let nonce = Nonce::from_slice(&sealed[..NONCE_LEN]);
     let ciphertext = &sealed[NONCE_LEN..];
 
-    cipher.decrypt(nonce, ciphertext)
+    cipher
+        .decrypt(nonce, ciphertext)
         .map_err(|e| format!("decryption failed: {e}"))
 }
 
@@ -287,7 +313,8 @@ mod tests {
 
     #[test]
     fn hex_roundtrip() {
-        let bytes = hex_decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
+        let bytes =
+            hex_decode("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef").unwrap();
         assert_eq!(bytes.len(), 32);
     }
 
@@ -345,7 +372,10 @@ mod tests {
     #[test]
     fn parse_sse_s3() {
         let mut headers = HashMap::new();
-        headers.insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+        headers.insert(
+            "x-amz-server-side-encryption".to_string(),
+            "AES256".to_string(),
+        );
         let key_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let enc = S3Encryption::from_hex_key(key_hex, false).unwrap();
         let mode = parse_sse_headers(&headers, Some(&enc)).unwrap();
@@ -358,9 +388,18 @@ mod tests {
         let key_b64 = base64_encode(&key);
         let key_md5 = base64_encode(&md5_hash(&key));
         let mut headers = HashMap::new();
-        headers.insert("x-amz-server-side-encryption-customer-algorithm".to_string(), "AES256".to_string());
-        headers.insert("x-amz-server-side-encryption-customer-key".to_string(), key_b64);
-        headers.insert("x-amz-server-side-encryption-customer-key-md5".to_string(), key_md5);
+        headers.insert(
+            "x-amz-server-side-encryption-customer-algorithm".to_string(),
+            "AES256".to_string(),
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key".to_string(),
+            key_b64,
+        );
+        headers.insert(
+            "x-amz-server-side-encryption-customer-key-md5".to_string(),
+            key_md5,
+        );
         let mode = parse_sse_headers(&headers, None).unwrap();
         assert!(matches!(mode, SseMode::CustomerKey(_)));
     }

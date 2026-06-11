@@ -51,7 +51,10 @@ pub fn read_value<R: BufRead>(reader: &mut R) -> io::Result<RespValue> {
     let mut line = String::new();
     let n = reader.read_line(&mut line)?;
     if n == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "client disconnected"));
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "client disconnected",
+        ));
     }
     // Strip exactly one trailing CRLF (or bare LF for tolerance),
     // preserving any embedded CR in the payload. The old
@@ -86,9 +89,9 @@ pub fn read_value<R: BufRead>(reader: &mut R) -> io::Result<RespValue> {
         b'+' => Ok(RespValue::SimpleString(rest.to_string())),
         b'-' => Ok(RespValue::Error(rest.to_string())),
         b':' => {
-            let n: i64 = rest.parse().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid integer")
-            })?;
+            let n: i64 = rest
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid integer"))?;
             Ok(RespValue::Integer(n))
         }
         b'$' => {
@@ -111,9 +114,9 @@ pub fn read_value<R: BufRead>(reader: &mut R) -> io::Result<RespValue> {
             Ok(RespValue::BulkString(buf))
         }
         b'*' => {
-            let count: i64 = rest.parse().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid array length")
-            })?;
+            let count: i64 = rest
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid array length"))?;
             if count < 0 {
                 return Ok(RespValue::Null);
             }
@@ -138,7 +141,10 @@ pub fn read_value<R: BufRead>(reader: &mut R) -> io::Result<RespValue> {
                 .map(|s| RespValue::BulkString(s.as_bytes().to_vec()))
                 .collect();
             if parts.is_empty() {
-                Err(io::Error::new(io::ErrorKind::InvalidData, "empty inline command"))
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "empty inline command",
+                ))
             } else {
                 Ok(RespValue::Array(parts))
             }
@@ -287,7 +293,9 @@ mod tests {
     fn fuzz_regression_simple_string_preserves_embedded_cr() {
         let mut reader = Cursor::new(&b"+\r\r\n"[..]);
         match read_value(&mut reader).expect("must parse") {
-            RespValue::SimpleString(s) => assert_eq!(s, "\r", "SimpleString must preserve embedded CR, got {s:?}"),
+            RespValue::SimpleString(s) => {
+                assert_eq!(s, "\r", "SimpleString must preserve embedded CR, got {s:?}")
+            }
             other => panic!("expected SimpleString, got {other:?}"),
         }
     }

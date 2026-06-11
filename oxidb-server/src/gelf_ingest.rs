@@ -78,7 +78,12 @@ impl ChunkBuffer {
 
     /// Reassemble all chunks into a single byte buffer.
     fn reassemble(&self) -> Vec<u8> {
-        let total_len: usize = self.chunks.iter().filter_map(|c| c.as_ref()).map(|c| c.len()).sum();
+        let total_len: usize = self
+            .chunks
+            .iter()
+            .filter_map(|c| c.as_ref())
+            .map(|c| c.len())
+            .sum();
         let mut buf = Vec::with_capacity(total_len);
         for chunk in &self.chunks {
             if let Some(data) = chunk {
@@ -95,7 +100,12 @@ impl ChunkBuffer {
 
 /// Standard GELF fields that are always present and always indexed.
 const STANDARD_FIELDS: &[&str] = &[
-    "host", "short_message", "level", "facility", "timestamp", "_ts",
+    "host",
+    "short_message",
+    "level",
+    "facility",
+    "timestamp",
+    "_ts",
 ];
 
 /// Tracks which fields have already been indexed for a collection.
@@ -178,8 +188,7 @@ pub fn start_gelf_listener(
                             {
                                 // Chunked GELF message
                                 let message_id = u64::from_be_bytes([
-                                    buf[2], buf[3], buf[4], buf[5],
-                                    buf[6], buf[7], buf[8], buf[9],
+                                    buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
                                 ]);
                                 let seq_num = buf[10];
                                 let seq_count = buf[11];
@@ -446,9 +455,7 @@ fn bind_reuseport(addr: &str) -> UdpSocket {
     )
     .expect("failed to create GELF UDP socket");
 
-    socket
-        .set_reuse_address(true)
-        .expect("SO_REUSEADDR failed");
+    socket.set_reuse_address(true).expect("SO_REUSEADDR failed");
 
     #[cfg(unix)]
     {
@@ -550,12 +557,13 @@ mod tests {
 
         let doc = parse_gelf_message(data).unwrap();
         assert_eq!(doc.get("short_message").unwrap(), "error occurred");
-        assert!(doc
-            .get("full_message")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .contains("stack trace"));
+        assert!(
+            doc.get("full_message")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("stack trace")
+        );
     }
 
     #[test]
@@ -665,8 +673,7 @@ mod tests {
         assert_eq!(packet[0], 0x1e);
         assert_eq!(packet[1], 0x0f);
         let parsed_id = u64::from_be_bytes([
-            packet[2], packet[3], packet[4], packet[5],
-            packet[6], packet[7], packet[8], packet[9],
+            packet[2], packet[3], packet[4], packet[5], packet[6], packet[7], packet[8], packet[9],
         ]);
         assert_eq!(parsed_id, message_id);
         assert_eq!(packet[10], seq_num);

@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use oxidb::OxiDb;
 use oxidb::error::Error as OxiError;
+use std::collections::HashMap;
 
 /// Detects aws-chunked / streaming PUT bodies. AWS CLI / boto3 send
 /// these by default; the chunk envelope hides the real payload behind
@@ -83,7 +83,10 @@ mod chunked_tests {
     #[test]
     fn detects_via_streaming_header() {
         let mut h = HashMap::new();
-        h.insert("x-amz-content-sha256".to_string(), "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string());
+        h.insert(
+            "x-amz-content-sha256".to_string(),
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
+        );
         assert!(is_aws_chunked(&h));
     }
 
@@ -95,13 +98,23 @@ mod chunked_tests {
     }
 }
 
-use super::encryption::{SseMode, parse_sse_headers, encrypt_data, decrypt_data, add_encryption_headers, sse_metadata_marker, is_sse_s3, is_sse_c};
-use super::helpers::{xml_escape, url_decode, parse_range, iso_to_httpdate};
-use super::http::{HttpRequest, HttpResponse, error_response};
 use super::S3State;
+use super::encryption::{
+    SseMode, add_encryption_headers, decrypt_data, encrypt_data, is_sse_c, is_sse_s3,
+    parse_sse_headers, sse_metadata_marker,
+};
+use super::helpers::{iso_to_httpdate, parse_range, url_decode, xml_escape};
+use super::http::{HttpRequest, HttpResponse, error_response};
 
-pub fn handle_put_object(state: &S3State, bucket: &str, key: &str, req: &HttpRequest) -> HttpResponse {
-    let content_type = req.headers.get("content-type")
+pub fn handle_put_object(
+    state: &S3State,
+    bucket: &str,
+    key: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let content_type = req
+        .headers
+        .get("content-type")
         .cloned()
         .unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -128,7 +141,14 @@ pub fn handle_put_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
     // Encrypt data if needed
     let data_to_store = match encrypt_data(body_ref, &sse_mode, state.encryption.as_deref()) {
         Ok(d) => d,
-        Err(e) => return error_response(500, "InternalError", &format!("encryption failed: {e}"), key),
+        Err(e) => {
+            return error_response(
+                500,
+                "InternalError",
+                &format!("encryption failed: {e}"),
+                key,
+            );
+        }
     };
 
     let mut metadata = HashMap::new();
@@ -143,11 +163,14 @@ pub fn handle_put_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
         metadata.insert(mk, mv);
     }
 
-    match state.db.put_object(bucket, key, &data_to_store, &content_type, metadata) {
+    match state
+        .db
+        .put_object(bucket, key, &data_to_store, &content_type, metadata)
+    {
         Ok(meta) => {
             let etag = meta.get("etag").and_then(|v| v.as_str()).unwrap_or("");
-            let resp = HttpResponse::ok_xml(String::new())
-                .with_header("ETag", &format!("\"{etag}\""));
+            let resp =
+                HttpResponse::ok_xml(String::new()).with_header("ETag", &format!("\"{etag}\""));
             add_encryption_headers(resp, &sse_mode)
         }
         Err(e) => {
@@ -157,10 +180,17 @@ pub fn handle_put_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
     }
 }
 
-pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpRequest) -> HttpResponse {
+pub fn handle_get_object(
+    state: &S3State,
+    bucket: &str,
+    key: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
     match state.db.get_object(bucket, key) {
         Ok((raw_data, meta)) => {
-            let content_type = meta["content_type"].as_str().unwrap_or("application/octet-stream");
+            let content_type = meta["content_type"]
+                .as_str()
+                .unwrap_or("application/octet-stream");
             let etag_val = meta["etag"].as_str().unwrap_or("");
             let created = meta["created_at"].as_str().unwrap_or("");
             let etag_quoted = format!("\"{etag_val}\"");
@@ -170,8 +200,14 @@ pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
                 // SSE-C: need customer key from request headers
                 match parse_sse_headers(&req.headers, state.encryption.as_deref()) {
                     Ok(m @ SseMode::CustomerKey(_)) => m,
-                    _ => return error_response(400, "InvalidRequest",
-                        "This object was encrypted with SSE-C. Provide the customer encryption key.", key),
+                    _ => {
+                        return error_response(
+                            400,
+                            "InvalidRequest",
+                            "This object was encrypted with SSE-C. Provide the customer encryption key.",
+                            key,
+                        );
+                    }
                 }
             } else if is_sse_s3(&meta) {
                 SseMode::S3
@@ -182,7 +218,14 @@ pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
             // Decrypt
             let data = match decrypt_data(&raw_data, &sse_mode, state.encryption.as_deref()) {
                 Ok(d) => d,
-                Err(e) => return error_response(500, "InternalError", &format!("decryption failed: {e}"), key),
+                Err(e) => {
+                    return error_response(
+                        500,
+                        "InternalError",
+                        &format!("decryption failed: {e}"),
+                        key,
+                    );
+                }
             };
 
             // Conditional: If-None-Match
@@ -195,7 +238,8 @@ pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
                         headers: Vec::new(),
                         body: Vec::new(),
                         content_length_override: None,
-                    }.with_header("ETag", &etag_quoted);
+                    }
+                    .with_header("ETag", &etag_quoted);
                 }
             }
 
@@ -217,7 +261,8 @@ pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
                         headers: Vec::new(),
                         body: Vec::new(),
                         content_length_override: None,
-                    }.with_header("ETag", &etag_quoted);
+                    }
+                    .with_header("ETag", &etag_quoted);
                 }
             }
 
@@ -242,7 +287,9 @@ pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
                     resp = add_encryption_headers(resp, &sse_mode);
                     if let Some(user_meta) = meta.get("metadata").and_then(|v| v.as_object()) {
                         for (k, v) in user_meta {
-                            if k == "_sse" { continue; }
+                            if k == "_sse" {
+                                continue;
+                            }
                             if let Some(val) = v.as_str() {
                                 resp = resp.with_header(&format!("x-amz-meta-{k}"), val);
                             }
@@ -250,7 +297,12 @@ pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
                     }
                     return resp;
                 }
-                return error_response(416, "InvalidRange", "The requested range is not satisfiable", key);
+                return error_response(
+                    416,
+                    "InvalidRange",
+                    "The requested range is not satisfiable",
+                    key,
+                );
             }
 
             // Full response
@@ -263,7 +315,9 @@ pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
 
             if let Some(user_meta) = meta.get("metadata").and_then(|v| v.as_object()) {
                 for (k, v) in user_meta {
-                    if k == "_sse" { continue; }
+                    if k == "_sse" {
+                        continue;
+                    }
                     if let Some(val) = v.as_str() {
                         resp = resp.with_header(&format!("x-amz-meta-{k}"), val);
                     }
@@ -274,9 +328,12 @@ pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
         Err(OxiError::BlobNotFound { .. }) => {
             error_response(404, "NoSuchKey", "The specified key does not exist", key)
         }
-        Err(OxiError::BucketNotFound(_)) => {
-            error_response(404, "NoSuchBucket", "The specified bucket does not exist", bucket)
-        }
+        Err(OxiError::BucketNotFound(_)) => error_response(
+            404,
+            "NoSuchBucket",
+            "The specified bucket does not exist",
+            bucket,
+        ),
         Err(e) => {
             eprintln!("[s3] get_object error: {e}");
             error_response(500, "InternalError", "Failed to retrieve object", key)
@@ -287,7 +344,9 @@ pub fn handle_get_object(state: &S3State, bucket: &str, key: &str, req: &HttpReq
 pub fn handle_head_object(state: &S3State, bucket: &str, key: &str) -> HttpResponse {
     match state.db.head_object(bucket, key) {
         Ok(meta) => {
-            let content_type = meta["content_type"].as_str().unwrap_or("application/octet-stream");
+            let content_type = meta["content_type"]
+                .as_str()
+                .unwrap_or("application/octet-stream");
             let etag = meta["etag"].as_str().unwrap_or("");
             let size = meta["size"].as_u64().unwrap_or(0);
             let created = meta["created_at"].as_str().unwrap_or("");
@@ -316,7 +375,9 @@ pub fn handle_head_object(state: &S3State, bucket: &str, key: &str) -> HttpRespo
 
             if let Some(user_meta) = meta.get("metadata").and_then(|v| v.as_object()) {
                 for (k, v) in user_meta {
-                    if k == "_sse" { continue; }
+                    if k == "_sse" {
+                        continue;
+                    }
                     if let Some(val) = v.as_str() {
                         resp = resp.with_header(&format!("x-amz-meta-{k}"), val);
                     }
@@ -329,7 +390,12 @@ pub fn handle_head_object(state: &S3State, bucket: &str, key: &str) -> HttpRespo
         }
         Err(e) => {
             eprintln!("[s3] head_object error: {e}");
-            error_response(500, "InternalError", "Failed to retrieve object metadata", key)
+            error_response(
+                500,
+                "InternalError",
+                "Failed to retrieve object metadata",
+                key,
+            )
         }
     }
 }
@@ -337,7 +403,9 @@ pub fn handle_head_object(state: &S3State, bucket: &str, key: &str) -> HttpRespo
 pub fn handle_delete_object(db: &OxiDb, bucket: &str, key: &str) -> HttpResponse {
     match db.delete_object(bucket, key) {
         Ok(_) => HttpResponse::no_content(),
-        Err(OxiError::BlobNotFound { .. } | OxiError::BucketNotFound(_)) => HttpResponse::no_content(),
+        Err(OxiError::BlobNotFound { .. } | OxiError::BucketNotFound(_)) => {
+            HttpResponse::no_content()
+        }
         Err(e) => {
             eprintln!("[s3] delete_object error: {e}");
             error_response(500, "InternalError", "Failed to delete object", key)
@@ -345,13 +413,23 @@ pub fn handle_delete_object(db: &OxiDb, bucket: &str, key: &str) -> HttpResponse
     }
 }
 
-pub fn handle_copy_object(state: &S3State, dest_bucket: &str, dest_key: &str, req: &HttpRequest) -> HttpResponse {
+pub fn handle_copy_object(
+    state: &S3State,
+    dest_bucket: &str,
+    dest_key: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
     let copy_source = req.headers.get("x-amz-copy-source").unwrap();
     let source = url_decode(copy_source);
     let source = source.strip_prefix('/').unwrap_or(&source);
     let source_parts: Vec<&str> = source.splitn(2, '/').collect();
     if source_parts.len() < 2 {
-        return error_response(400, "InvalidArgument", "Invalid x-amz-copy-source", dest_key);
+        return error_response(
+            400,
+            "InvalidArgument",
+            "Invalid x-amz-copy-source",
+            dest_key,
+        );
     }
     let src_bucket = source_parts[0];
     let src_key = source_parts[1];
@@ -376,7 +454,9 @@ pub fn handle_copy_object(state: &S3State, dest_bucket: &str, dest_key: &str, re
 
     match state.db.get_object(src_bucket, src_key) {
         Ok((raw_data, src_meta)) => {
-            let content_type = src_meta["content_type"].as_str().unwrap_or("application/octet-stream");
+            let content_type = src_meta["content_type"]
+                .as_str()
+                .unwrap_or("application/octet-stream");
 
             // Decrypt source if encrypted
             let src_sse = if is_sse_s3(&src_meta) {
@@ -386,8 +466,14 @@ pub fn handle_copy_object(state: &S3State, dest_bucket: &str, dest_key: &str, re
                 // For simplicity, use the same SSE-C headers from the request
                 match parse_sse_headers(&req.headers, state.encryption.as_deref()) {
                     Ok(m @ SseMode::CustomerKey(_)) => m,
-                    _ => return error_response(400, "InvalidRequest",
-                        "Source object is SSE-C encrypted. Provide customer key.", src_key),
+                    _ => {
+                        return error_response(
+                            400,
+                            "InvalidRequest",
+                            "Source object is SSE-C encrypted. Provide customer key.",
+                            src_key,
+                        );
+                    }
                 }
             } else {
                 SseMode::None
@@ -395,7 +481,14 @@ pub fn handle_copy_object(state: &S3State, dest_bucket: &str, dest_key: &str, re
 
             let plaintext = match decrypt_data(&raw_data, &src_sse, state.encryption.as_deref()) {
                 Ok(d) => d,
-                Err(e) => return error_response(500, "InternalError", &format!("decryption failed: {e}"), src_key),
+                Err(e) => {
+                    return error_response(
+                        500,
+                        "InternalError",
+                        &format!("decryption failed: {e}"),
+                        src_key,
+                    );
+                }
             };
 
             // Determine destination encryption
@@ -404,12 +497,25 @@ pub fn handle_copy_object(state: &S3State, dest_bucket: &str, dest_key: &str, re
                 Err(resp) => return resp,
             };
 
-            let data_to_store = match encrypt_data(&plaintext, &dest_sse, state.encryption.as_deref()) {
-                Ok(d) => d,
-                Err(e) => return error_response(500, "InternalError", &format!("encryption failed: {e}"), dest_key),
-            };
+            let data_to_store =
+                match encrypt_data(&plaintext, &dest_sse, state.encryption.as_deref()) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        return error_response(
+                            500,
+                            "InternalError",
+                            &format!("encryption failed: {e}"),
+                            dest_key,
+                        );
+                    }
+                };
 
-            let metadata = if req.headers.get("x-amz-metadata-directive").map(|v| v.as_str()) == Some("REPLACE") {
+            let metadata = if req
+                .headers
+                .get("x-amz-metadata-directive")
+                .map(|v| v.as_str())
+                == Some("REPLACE")
+            {
                 let mut m = HashMap::new();
                 for (k, v) in &req.headers {
                     if let Some(mk) = k.strip_prefix("x-amz-meta-") {
@@ -421,9 +527,14 @@ pub fn handle_copy_object(state: &S3State, dest_bucket: &str, dest_key: &str, re
                 }
                 m
             } else {
-                let mut m: HashMap<String, String> = src_meta.get("metadata")
+                let mut m: HashMap<String, String> = src_meta
+                    .get("metadata")
                     .and_then(|v| v.as_object())
-                    .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+                    .map(|obj| {
+                        obj.iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 // Update SSE marker for destination
                 m.remove("_sse");
@@ -433,31 +544,54 @@ pub fn handle_copy_object(state: &S3State, dest_bucket: &str, dest_key: &str, re
                 m
             };
 
-            let ct = req.headers.get("content-type").map(|s| s.as_str()).unwrap_or(content_type);
+            let ct = req
+                .headers
+                .get("content-type")
+                .map(|s| s.as_str())
+                .unwrap_or(content_type);
 
-            match state.db.put_object(dest_bucket, dest_key, &data_to_store, ct, metadata) {
+            match state
+                .db
+                .put_object(dest_bucket, dest_key, &data_to_store, ct, metadata)
+            {
                 Ok(new_meta) => {
                     let etag = new_meta.get("etag").and_then(|v| v.as_str()).unwrap_or("");
                     let xml = format!(
                         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CopyObjectResult>\n  <ETag>\"{}\"</ETag>\n  <LastModified>{}</LastModified>\n</CopyObjectResult>",
                         xml_escape(etag),
-                        new_meta.get("created_at").and_then(|v| v.as_str()).unwrap_or("")
+                        new_meta
+                            .get("created_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
                     );
                     let resp = HttpResponse::ok_xml(xml);
                     add_encryption_headers(resp, &dest_sse)
                 }
                 Err(e) => {
                     eprintln!("[s3] copy put_object error: {e}");
-                    error_response(500, "InternalError", "Failed to store copied object", dest_key)
+                    error_response(
+                        500,
+                        "InternalError",
+                        "Failed to store copied object",
+                        dest_key,
+                    )
                 }
             }
         }
-        Err(OxiError::BlobNotFound { .. } | OxiError::BucketNotFound(_)) => {
-            error_response(404, "NoSuchKey", "The specified key does not exist", src_key)
-        }
+        Err(OxiError::BlobNotFound { .. } | OxiError::BucketNotFound(_)) => error_response(
+            404,
+            "NoSuchKey",
+            "The specified key does not exist",
+            src_key,
+        ),
         Err(e) => {
             eprintln!("[s3] copy get_object error: {e}");
-            error_response(500, "InternalError", "Failed to read source object", src_key)
+            error_response(
+                500,
+                "InternalError",
+                "Failed to read source object",
+                src_key,
+            )
         }
     }
 }

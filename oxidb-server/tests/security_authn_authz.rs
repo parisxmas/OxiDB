@@ -12,10 +12,10 @@
 //! at P0. Run as part of `cargo test -p oxidb-server`.
 
 use base64::Engine as _;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use oxidb_server::auth::Role;
-use oxidb_server::jwt::{decode_jwt, encode_jwt, Claims};
+use oxidb_server::jwt::{Claims, decode_jwt, encode_jwt};
 use oxidb_server::rbac;
 
 const TEST_SECRET: &str = "test-secret-NOT-FOR-PRODUCTION";
@@ -187,14 +187,14 @@ fn jwt_missing_exp_claim_rejected() {
 #[test]
 fn jwt_malformed_structure_rejected() {
     let cases = [
-        "",                       // empty
-        "x",                      // 1 part
-        "x.y",                    // 2 parts
-        "x.y.z.w",                // 4 parts
-        "...",                    // 3 empty parts
-        "header.payload.",        // signature missing
-        ".payload.sig",           // header missing
-        "header..sig",            // payload missing
+        "",                // empty
+        "x",               // 1 part
+        "x.y",             // 2 parts
+        "x.y.z.w",         // 4 parts
+        "...",             // 3 empty parts
+        "header.payload.", // signature missing
+        ".payload.sig",    // header missing
+        "header..sig",     // payload missing
     ];
     for token in &cases {
         let result = decode_jwt(token, TEST_SECRET);
@@ -231,11 +231,11 @@ fn jwt_empty_string_secret_does_not_universally_unlock() {
 fn rbac_unknown_command_denied_for_non_admin() {
     let novel_commands = [
         "RANDOM_NEW_ADMIN_THING",
-        "drop_database",      // not in current vocab
-        "grant_role",         // hypothetical
+        "drop_database", // not in current vocab
+        "grant_role",    // hypothetical
         "set_password",
         "configure_replication",
-        "",                   // empty string — degenerate input
+        "", // empty string — degenerate input
     ];
     for cmd in &novel_commands {
         assert!(
@@ -265,9 +265,14 @@ fn rbac_unknown_command_denied_for_non_admin() {
 #[test]
 fn rbac_uppercase_commands_fail_closed_for_non_admin() {
     let uppercased = [
-        "INSERT", "UPDATE", "DELETE", "FIND",
-        "CREATE_COLLECTION", "DROP_COLLECTION",
-        "CREATE_USER", "DELETE_USER",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "FIND",
+        "CREATE_COLLECTION",
+        "DROP_COLLECTION",
+        "CREATE_USER",
+        "DELETE_USER",
     ];
     for cmd in &uppercased {
         assert!(
@@ -288,12 +293,24 @@ fn rbac_uppercase_commands_fail_closed_for_non_admin() {
 #[test]
 fn rbac_read_role_locked_down() {
     let forbidden_for_read = [
-        "insert", "update", "delete", "upsert",
-        "drop_collection", "create_collection", "rename_collection",
-        "create_user", "delete_user", "set_role",
-        "create_index", "drop_index",
-        "begin_tx", "commit_tx", "rollback_tx",
-        "snapshot", "restore", "compact",
+        "insert",
+        "update",
+        "delete",
+        "upsert",
+        "drop_collection",
+        "create_collection",
+        "rename_collection",
+        "create_user",
+        "delete_user",
+        "set_role",
+        "create_index",
+        "drop_index",
+        "begin_tx",
+        "commit_tx",
+        "rollback_tx",
+        "snapshot",
+        "restore",
+        "compact",
     ];
     for cmd in &forbidden_for_read {
         assert!(
@@ -316,7 +333,7 @@ fn rbac_readwrite_cannot_admin() {
         "delete_user",
         "set_role",
         "grant_role",
-        "drop_collection",   // explicitly NOT in the ReadWrite arm
+        "drop_collection", // explicitly NOT in the ReadWrite arm
     ];
     for cmd in &admin_only {
         assert!(

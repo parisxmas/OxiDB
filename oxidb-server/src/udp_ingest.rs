@@ -13,7 +13,7 @@
 use std::net::UdpSocket;
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use oxidb::OxiDb;
 
@@ -29,7 +29,9 @@ pub fn start_udp_listener(
         .map(|n| n.get().min(8))
         .unwrap_or(4);
 
-    eprintln!("UDP log ingestion: listening on {addr} → collection '{collection}' ({num_threads} threads)");
+    eprintln!(
+        "UDP log ingestion: listening on {addr} → collection '{collection}' ({num_threads} threads)"
+    );
 
     let mut handles = Vec::with_capacity(num_threads);
 
@@ -47,7 +49,9 @@ pub fn start_udp_listener(
                 loop {
                     match socket.recv_from(&mut buf) {
                         Ok((len, _)) => {
-                            if len == 0 { continue; }
+                            if len == 0 {
+                                continue;
+                            }
                             let doc = parse_log_message(&buf[..len]);
                             let _ = db.insert(&collection, doc);
                         }
@@ -66,16 +70,22 @@ pub fn start_udp_listener(
 fn bind_reuseport(addr: &str) -> UdpSocket {
     use std::net::ToSocketAddrs;
 
-    let sock_addr = addr.to_socket_addrs()
+    let sock_addr = addr
+        .to_socket_addrs()
         .expect("invalid UDP address")
         .next()
         .expect("no socket address resolved");
 
     let socket = socket2::Socket::new(
-        if sock_addr.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 },
+        if sock_addr.is_ipv4() {
+            socket2::Domain::IPV4
+        } else {
+            socket2::Domain::IPV6
+        },
         socket2::Type::DGRAM,
         Some(socket2::Protocol::UDP),
-    ).expect("failed to create UDP socket");
+    )
+    .expect("failed to create UDP socket");
 
     socket.set_reuse_address(true).expect("SO_REUSEADDR failed");
 
@@ -96,7 +106,9 @@ fn bind_reuseport(addr: &str) -> UdpSocket {
 
     let _ = socket.set_recv_buffer_size(8 * 1024 * 1024); // 8MB recv buffer
 
-    socket.bind(&sock_addr.into()).expect(&format!("failed to bind UDP on {addr}"));
+    socket
+        .bind(&sock_addr.into())
+        .expect(&format!("failed to bind UDP on {addr}"));
 
     UdpSocket::from(socket)
 }

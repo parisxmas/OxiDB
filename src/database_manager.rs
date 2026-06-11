@@ -92,7 +92,11 @@ impl DatabaseManager {
     /// Get or lazily open a database by name. Uses double-check locking.
     pub fn get_database(&self, name: &str) -> Result<Arc<OxiDb>> {
         // Normalize: "postgres" is an alias for "oxidb"
-        let name = if name == "postgres" { DEFAULT_DATABASE } else { name };
+        let name = if name == "postgres" {
+            DEFAULT_DATABASE
+        } else {
+            name
+        };
 
         // Fast path: read lock
         {
@@ -220,7 +224,11 @@ impl DatabaseManager {
 
     /// Check if a database exists.
     pub fn database_exists(&self, name: &str) -> bool {
-        let name = if name == "postgres" { DEFAULT_DATABASE } else { name };
+        let name = if name == "postgres" {
+            DEFAULT_DATABASE
+        } else {
+            name
+        };
         self.data_dir.join(name).is_dir()
     }
 
@@ -260,21 +268,14 @@ impl DatabaseManager {
     fn maybe_migrate(&self) -> Result<()> {
         let has_dat_files = std::fs::read_dir(&self.data_dir)?
             .filter_map(|e| e.ok())
-            .any(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    == Some("dat")
-            });
+            .any(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("dat"));
 
         if !has_dat_files {
             return Ok(());
         }
 
         if self.verbose {
-            eprintln!(
-                "[database_manager] migrating flat layout to multi-database layout"
-            );
+            eprintln!("[database_manager] migrating flat layout to multi-database layout");
         }
 
         let target = self.data_dir.join(DEFAULT_DATABASE);
@@ -285,10 +286,7 @@ impl DatabaseManager {
             let path = entry.path();
 
             if path.is_file() {
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if COLLECTION_EXTENSIONS.contains(&ext) {
                     let file_name = path.file_name().unwrap();
                     let dest = target.join(file_name);

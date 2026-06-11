@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Process-wide singleton. Cheap to construct, no work happens until
 /// `snapshot()` is first called.
@@ -85,7 +85,9 @@ fn clk_tck() -> f64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn clk_tck() -> f64 { 100.0 }
+fn clk_tck() -> f64 {
+    100.0
+}
 
 #[cfg(target_os = "linux")]
 fn read_cpu_ticks() -> Option<u64> {
@@ -202,10 +204,16 @@ fn read_threads() -> Option<u32> {
 // Other non-Linux/non-macOS targets — keeping these lets `cargo check`
 // pass on Windows / wasm / freebsd.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_cpu_ticks() -> Option<u64> { None }
+fn read_cpu_ticks() -> Option<u64> {
+    None
+}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_vm_rss_kb() -> Option<u64> { None }
+fn read_vm_rss_kb() -> Option<u64> {
+    None
+}
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_threads() -> Option<u32> { None }
+fn read_threads() -> Option<u32> {
+    None
+}

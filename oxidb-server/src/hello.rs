@@ -9,7 +9,7 @@
 //! is **idempotent** (can be sent at any point in the connection). It does
 //! NOT change session auth state.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::handler;
 use crate::session::Session;
@@ -119,8 +119,7 @@ pub fn handle(request: &Value, session: &mut Session, auth_enabled: bool) -> Vec
             "auth_methods": auth_methods,
         },
     });
-    serde_json::to_vec(&resp)
-        .unwrap_or_else(|_| handler::err_bytes("hello serialization failed"))
+    serde_json::to_vec(&resp).unwrap_or_else(|_| handler::err_bytes("hello serialization failed"))
 }
 
 #[cfg(test)]
@@ -144,11 +143,18 @@ mod tests {
         assert_eq!(resp["server"]["wire_version"], json!(1));
         assert_eq!(resp["server"]["stable_surface_version"], json!("1.0"));
         assert_eq!(resp["server"]["auth_methods"], json!(["anonymous"]));
-        assert!(resp["server"]["features"].as_array().unwrap().contains(&json!("fts")));
-        assert!(resp["server"]["experimental_features"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("raft")));
+        assert!(
+            resp["server"]["features"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("fts"))
+        );
+        assert!(
+            resp["server"]["experimental_features"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("raft"))
+        );
         assert_eq!(session.wire_version, 1);
     }
 
@@ -174,7 +180,12 @@ mod tests {
         );
         let resp: Value = serde_json::from_slice(&resp_bytes).expect("valid JSON");
         assert_eq!(resp["ok"], json!(false));
-        assert!(resp["error"].as_str().unwrap().contains("no compatible wire version"));
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap()
+                .contains("no compatible wire version")
+        );
     }
 
     #[test]

@@ -23,8 +23,8 @@
 //! {"cmd": "delete_rules", "collection": "posts"}
 //! ```
 
-use serde_json::{json, Value};
 use oxidb::OxiDb;
+use serde_json::{Value, json};
 
 const RULES_COLLECTION: &str = "_security_rules";
 
@@ -37,7 +37,10 @@ pub struct AuthContext {
 
 impl AuthContext {
     pub fn anonymous() -> Self {
-        Self { username: None, role: None }
+        Self {
+            username: None,
+            role: None,
+        }
     }
 
     pub fn from_claims(username: &str, role: &str) -> Self {
@@ -96,13 +99,15 @@ pub fn set_rules(db: &OxiDb, collection: &str, rules: &Value) -> Result<(), Stri
 
     // Upsert: delete existing rule then insert new one
     let _ = db.delete(RULES_COLLECTION, &json!({"collection": collection}));
-    db.insert(RULES_COLLECTION, rule_doc).map_err(|e| e.to_string())?;
+    db.insert(RULES_COLLECTION, rule_doc)
+        .map_err(|e| e.to_string())?;
     let _ = db.create_index(RULES_COLLECTION, "collection");
     Ok(())
 }
 
 pub fn get_rules(db: &OxiDb, collection: &str) -> Option<RuleSet> {
-    let doc = db.find_one(RULES_COLLECTION, &json!({"collection": collection}))
+    let doc = db
+        .find_one(RULES_COLLECTION, &json!({"collection": collection}))
         .ok()??;
     Some(RuleSet {
         read: doc["read"].as_str().unwrap_or("true").to_string(),
@@ -157,7 +162,11 @@ pub fn check_access(
     if eval_rule_expr(expr, auth, doc, new_doc) {
         Ok(())
     } else {
-        Err(format!("access denied: {} on '{}' not allowed", op.as_str(), collection))
+        Err(format!(
+            "access denied: {} on '{}' not allowed",
+            op.as_str(),
+            collection
+        ))
     }
 }
 
@@ -171,8 +180,12 @@ fn eval_rule_expr(
     let expr = expr.trim();
 
     // Literals
-    if expr == "true" { return true; }
-    if expr == "false" { return false; }
+    if expr == "true" {
+        return true;
+    }
+    if expr == "false" {
+        return false;
+    }
 
     // Logical OR (lowest precedence) — split on ||
     if let Some((left, right)) = split_logical(expr, "||") {
@@ -193,7 +206,7 @@ fn eval_rule_expr(
 
     // Parenthesized expression
     if expr.starts_with('(') && expr.ends_with(')') {
-        return eval_rule_expr(&expr[1..expr.len()-1], auth, doc, new_doc);
+        return eval_rule_expr(&expr[1..expr.len() - 1], auth, doc, new_doc);
     }
 
     // Comparison operators
@@ -232,10 +245,17 @@ fn split_logical<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
             i += 1;
             continue;
         }
-        if bytes[i] == b'(' { depth += 1; }
-        if bytes[i] == b')' { depth -= 1; }
-        if depth == 0 && i + op_bytes.len() <= bytes.len() && &bytes[i..i+op_bytes.len()] == op_bytes {
-            return Some((&expr[..i], &expr[i+op_bytes.len()..]));
+        if bytes[i] == b'(' {
+            depth += 1;
+        }
+        if bytes[i] == b')' {
+            depth -= 1;
+        }
+        if depth == 0
+            && i + op_bytes.len() <= bytes.len()
+            && &bytes[i..i + op_bytes.len()] == op_bytes
+        {
+            return Some((&expr[..i], &expr[i + op_bytes.len()..]));
         }
         i += 1;
     }
@@ -255,7 +275,7 @@ fn resolve_value(
     if (token.starts_with('\'') && token.ends_with('\''))
         || (token.starts_with('"') && token.ends_with('"'))
     {
-        return Value::String(token[1..token.len()-1].to_string());
+        return Value::String(token[1..token.len() - 1].to_string());
     }
 
     // Numeric literal
@@ -281,7 +301,11 @@ fn resolve_value(
     }
     if let Some(field) = token.strip_prefix("auth.") {
         return match field {
-            "username" => auth.username.as_ref().map(|s| json!(s)).unwrap_or(Value::Null),
+            "username" => auth
+                .username
+                .as_ref()
+                .map(|s| json!(s))
+                .unwrap_or(Value::Null),
             "role" => auth.role.as_ref().map(|s| json!(s)).unwrap_or(Value::Null),
             _ => Value::Null,
         };
@@ -314,8 +338,12 @@ fn resolve_dotted_field(doc: &Value, path: &str) -> Option<Value> {
 
 fn values_equal(a: &Value, b: &Value) -> bool {
     // Handle null comparisons
-    if a.is_null() && b.is_null() { return true; }
-    if a.is_null() || b.is_null() { return false; }
+    if a.is_null() && b.is_null() {
+        return true;
+    }
+    if a.is_null() || b.is_null() {
+        return false;
+    }
     a == b
 }
 
@@ -359,20 +387,40 @@ mod tests {
 
     #[test]
     fn rule_auth_not_null() {
-        assert!(eval_rule_expr("auth != null", &user_auth("alice"), None, None));
+        assert!(eval_rule_expr(
+            "auth != null",
+            &user_auth("alice"),
+            None,
+            None
+        ));
         assert!(!eval_rule_expr("auth != null", &anon(), None, None));
     }
 
     #[test]
     fn rule_auth_null() {
         assert!(eval_rule_expr("auth == null", &anon(), None, None));
-        assert!(!eval_rule_expr("auth == null", &user_auth("alice"), None, None));
+        assert!(!eval_rule_expr(
+            "auth == null",
+            &user_auth("alice"),
+            None,
+            None
+        ));
     }
 
     #[test]
     fn rule_role_check() {
-        assert!(eval_rule_expr("auth.role == 'admin'", &admin_auth(), None, None));
-        assert!(!eval_rule_expr("auth.role == 'admin'", &user_auth("bob"), None, None));
+        assert!(eval_rule_expr(
+            "auth.role == 'admin'",
+            &admin_auth(),
+            None,
+            None
+        ));
+        assert!(!eval_rule_expr(
+            "auth.role == 'admin'",
+            &user_auth("bob"),
+            None,
+            None
+        ));
     }
 
     #[test]
@@ -380,11 +428,15 @@ mod tests {
         let doc = json!({"owner": "alice", "title": "My Post"});
         assert!(eval_rule_expr(
             "auth.username == doc.owner",
-            &user_auth("alice"), Some(&doc), None
+            &user_auth("alice"),
+            Some(&doc),
+            None
         ));
         assert!(!eval_rule_expr(
             "auth.username == doc.owner",
-            &user_auth("bob"), Some(&doc), None
+            &user_auth("bob"),
+            Some(&doc),
+            None
         ));
     }
 
@@ -394,15 +446,21 @@ mod tests {
         // admin OR owner
         assert!(eval_rule_expr(
             "auth.role == 'admin' || auth.username == doc.owner",
-            &admin_auth(), Some(&doc), None
+            &admin_auth(),
+            Some(&doc),
+            None
         ));
         assert!(eval_rule_expr(
             "auth.role == 'admin' || auth.username == doc.owner",
-            &user_auth("alice"), Some(&doc), None
+            &user_auth("alice"),
+            Some(&doc),
+            None
         ));
         assert!(!eval_rule_expr(
             "auth.role == 'admin' || auth.username == doc.owner",
-            &user_auth("bob"), Some(&doc), None
+            &user_auth("bob"),
+            Some(&doc),
+            None
         ));
     }
 
@@ -410,11 +468,15 @@ mod tests {
     fn rule_logical_and() {
         assert!(eval_rule_expr(
             "auth != null && auth.role == 'admin'",
-            &admin_auth(), None, None
+            &admin_auth(),
+            None,
+            None
         ));
         assert!(!eval_rule_expr(
             "auth != null && auth.role == 'admin'",
-            &user_auth("bob"), None, None
+            &user_auth("bob"),
+            None,
+            None
         ));
     }
 
@@ -429,7 +491,9 @@ mod tests {
         let new_doc = json!({"author": "alice", "status": "draft"});
         assert!(eval_rule_expr(
             "auth.username == newDoc.author",
-            &user_auth("alice"), None, Some(&new_doc)
+            &user_auth("alice"),
+            None,
+            Some(&new_doc)
         ));
     }
 
@@ -438,7 +502,9 @@ mod tests {
         let doc = json!({"meta": {"created_by": "alice"}});
         assert!(eval_rule_expr(
             "auth.username == doc.meta.created_by",
-            &user_auth("alice"), Some(&doc), None
+            &user_auth("alice"),
+            Some(&doc),
+            None
         ));
     }
 
@@ -462,23 +528,42 @@ mod tests {
         let db = oxidb::OxiDb::open_in_memory().unwrap();
 
         // Set rules: only authenticated users can read
-        set_rules(&db, "secrets", &json!({
-            "read": "auth != null",
-            "create": "auth.role == 'admin'",
-            "update": "false",
-            "delete": "false"
-        })).unwrap();
+        set_rules(
+            &db,
+            "secrets",
+            &json!({
+                "read": "auth != null",
+                "create": "auth.role == 'admin'",
+                "update": "false",
+                "delete": "false"
+            }),
+        )
+        .unwrap();
 
         // Anonymous read → denied
         let result = check_access(&db, "secrets", Operation::Read, &anon(), None, None);
         assert!(result.is_err());
 
         // Authenticated read → allowed
-        let result = check_access(&db, "secrets", Operation::Read, &user_auth("alice"), None, None);
+        let result = check_access(
+            &db,
+            "secrets",
+            Operation::Read,
+            &user_auth("alice"),
+            None,
+            None,
+        );
         assert!(result.is_ok());
 
         // Non-admin create → denied
-        let result = check_access(&db, "secrets", Operation::Create, &user_auth("alice"), None, None);
+        let result = check_access(
+            &db,
+            "secrets",
+            Operation::Create,
+            &user_auth("alice"),
+            None,
+            None,
+        );
         assert!(result.is_err());
 
         // Admin create → allowed
@@ -494,12 +579,17 @@ mod tests {
     fn rule_ownership_enforcement() {
         let db = oxidb::OxiDb::open_in_memory().unwrap();
 
-        set_rules(&db, "posts", &json!({
-            "read": "true",
-            "create": "auth != null",
-            "update": "auth.username == doc.author",
-            "delete": "auth.role == 'admin' || auth.username == doc.author"
-        })).unwrap();
+        set_rules(
+            &db,
+            "posts",
+            &json!({
+                "read": "true",
+                "create": "auth != null",
+                "update": "auth.username == doc.author",
+                "delete": "auth.role == 'admin' || auth.username == doc.author"
+            }),
+        )
+        .unwrap();
 
         let post = json!({"author": "alice", "title": "Hello"});
 
@@ -507,13 +597,63 @@ mod tests {
         assert!(check_access(&db, "posts", Operation::Read, &anon(), Some(&post), None).is_ok());
 
         // Only author can update
-        assert!(check_access(&db, "posts", Operation::Update, &user_auth("alice"), Some(&post), None).is_ok());
-        assert!(check_access(&db, "posts", Operation::Update, &user_auth("bob"), Some(&post), None).is_err());
+        assert!(
+            check_access(
+                &db,
+                "posts",
+                Operation::Update,
+                &user_auth("alice"),
+                Some(&post),
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            check_access(
+                &db,
+                "posts",
+                Operation::Update,
+                &user_auth("bob"),
+                Some(&post),
+                None
+            )
+            .is_err()
+        );
 
         // Author or admin can delete
-        assert!(check_access(&db, "posts", Operation::Delete, &user_auth("alice"), Some(&post), None).is_ok());
-        assert!(check_access(&db, "posts", Operation::Delete, &admin_auth(), Some(&post), None).is_ok());
-        assert!(check_access(&db, "posts", Operation::Delete, &user_auth("bob"), Some(&post), None).is_err());
+        assert!(
+            check_access(
+                &db,
+                "posts",
+                Operation::Delete,
+                &user_auth("alice"),
+                Some(&post),
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            check_access(
+                &db,
+                "posts",
+                Operation::Delete,
+                &admin_auth(),
+                Some(&post),
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            check_access(
+                &db,
+                "posts",
+                Operation::Delete,
+                &user_auth("bob"),
+                Some(&post),
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]

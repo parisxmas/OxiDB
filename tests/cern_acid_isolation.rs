@@ -14,7 +14,7 @@
 //! Run with:
 //!   cargo test --test cern_acid_isolation -- --ignored --nocapture
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::thread;
@@ -45,7 +45,8 @@ fn dirty_read_does_not_occur() {
     // still buffered in tx and haven't reached the data file.
     let auto = db.find("secret", &json!({})).unwrap();
     assert_eq!(
-        auto.len(), 0,
+        auto.len(),
+        0,
         "DIRTY READ: auto-commit find() saw {} uncommitted records",
         auto.len()
     );
@@ -54,7 +55,8 @@ fn dirty_read_does_not_occur() {
     let tx2 = db.begin_transaction();
     let other = db.tx_find(tx2, "secret", &json!({})).unwrap();
     assert_eq!(
-        other.len(), 0,
+        other.len(),
+        0,
         "DIRTY READ: a different tx saw {} uncommitted records from tx1",
         other.len()
     );
@@ -84,7 +86,8 @@ fn phantom_read_pinned_behaviour() {
     let dir = tempdir().unwrap();
     let db = OxiDb::open(dir.path()).unwrap();
 
-    db.insert("items", json!({"id": "a", "price": 100})).unwrap();
+    db.insert("items", json!({"id": "a", "price": 100}))
+        .unwrap();
 
     let tx1 = db.begin_transaction();
     let before = db
@@ -149,8 +152,10 @@ fn write_skew_pinned_behaviour() {
     let dir = tempdir().unwrap();
     let db = Arc::new(OxiDb::open(dir.path()).unwrap());
 
-    db.insert("accounts", json!({"id": "x", "balance": 50i64})).unwrap();
-    db.insert("accounts", json!({"id": "y", "balance": 50i64})).unwrap();
+    db.insert("accounts", json!({"id": "x", "balance": 50i64}))
+        .unwrap();
+    db.insert("accounts", json!({"id": "y", "balance": 50i64}))
+        .unwrap();
 
     // Coordinate the two threads so they overlap in time — both must
     // open their tx and read the world BEFORE either commits.
@@ -168,7 +173,8 @@ fn write_skew_pinned_behaviour() {
     let initial = total_balance(&db);
     assert_eq!(initial, 100);
 
-    let worker = |from: &'static str, db: Arc<OxiDb>,
+    let worker = |from: &'static str,
+                  db: Arc<OxiDb>,
                   read_done: Arc<AtomicI64>,
                   commit_ok: Arc<AtomicI64>,
                   proceed: Arc<AtomicBool>| {
@@ -201,8 +207,20 @@ fn write_skew_pinned_behaviour() {
         })
     };
 
-    let h1 = worker("x", db.clone(), barrier_read_done.clone(), barrier_commit_ok.clone(), proceed_to_commit.clone());
-    let h2 = worker("y", db.clone(), barrier_read_done.clone(), barrier_commit_ok.clone(), proceed_to_commit.clone());
+    let h1 = worker(
+        "x",
+        db.clone(),
+        barrier_read_done.clone(),
+        barrier_commit_ok.clone(),
+        proceed_to_commit.clone(),
+    );
+    let h2 = worker(
+        "y",
+        db.clone(),
+        barrier_read_done.clone(),
+        barrier_commit_ok.clone(),
+        proceed_to_commit.clone(),
+    );
 
     // Wait for both reads to land, then release both threads to commit.
     while barrier_read_done.load(Ordering::SeqCst) < 2 {
@@ -264,14 +282,14 @@ fn read_skew_pinned_behaviour() {
     let dir = tempdir().unwrap();
     let db = OxiDb::open(dir.path()).unwrap();
 
-    db.insert("accts", json!({"id": "x", "balance": 50i64})).unwrap();
-    db.insert("accts", json!({"id": "y", "balance": 50i64})).unwrap();
+    db.insert("accts", json!({"id": "x", "balance": 50i64}))
+        .unwrap();
+    db.insert("accts", json!({"id": "y", "balance": 50i64}))
+        .unwrap();
 
     // tx1 begins. First half of a read-only consistency check.
     let tx1 = db.begin_transaction();
-    let x_seen_by_tx1 = db
-        .tx_find(tx1, "accts", &json!({"id": "x"}))
-        .unwrap()[0]["balance"]
+    let x_seen_by_tx1 = db.tx_find(tx1, "accts", &json!({"id": "x"})).unwrap()[0]["balance"]
         .as_i64()
         .unwrap();
     assert_eq!(x_seen_by_tx1, 50, "setup precondition");
@@ -297,9 +315,7 @@ fn read_skew_pinned_behaviour() {
 
     // tx1 reads Y. Under read-committed it'll see tx2's update;
     // under snapshot isolation it'd see the pre-tx2 value.
-    let y_seen_by_tx1 = db
-        .tx_find(tx1, "accts", &json!({"id": "y"}))
-        .unwrap()[0]["balance"]
+    let y_seen_by_tx1 = db.tx_find(tx1, "accts", &json!({"id": "y"})).unwrap()[0]["balance"]
         .as_i64()
         .unwrap();
 
@@ -361,12 +377,12 @@ fn read_skew_pinned_behaviour() {
     // After everything settles, the REAL state still satisfies the
     // invariant — read skew is a per-transaction-perception bug,
     // not a state-corruption one.
-    let final_x = db
-        .find_one("accts", &json!({"id": "x"}))
-        .unwrap().unwrap()["balance"].as_i64().unwrap();
-    let final_y = db
-        .find_one("accts", &json!({"id": "y"}))
-        .unwrap().unwrap()["balance"].as_i64().unwrap();
+    let final_x = db.find_one("accts", &json!({"id": "x"})).unwrap().unwrap()["balance"]
+        .as_i64()
+        .unwrap();
+    let final_y = db.find_one("accts", &json!({"id": "y"})).unwrap().unwrap()["balance"]
+        .as_i64()
+        .unwrap();
     assert_eq!(final_x + final_y, 100, "real state invariant must hold");
     assert_eq!(final_x, 20);
     assert_eq!(final_y, 80);

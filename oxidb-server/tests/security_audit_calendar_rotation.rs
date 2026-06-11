@@ -30,9 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tempfile::tempdir;
 
-use oxidb_server::audit::{
-    AuditEvent, AuditLog, CalendarBoundary, RotationPolicy,
-};
+use oxidb_server::audit::{AuditEvent, AuditLog, CalendarBoundary, RotationPolicy};
 
 /// Build a `SystemTime` representing the given unix-seconds value.
 fn at_unix_secs(secs: u64) -> SystemTime {
@@ -186,7 +184,7 @@ fn audit_log_calendar_does_not_disable_size_trigger() {
         max_bytes: Some(1024),
         max_age: None,
         calendar: Some(CalendarBoundary::HourlyUtc),
-    compress: false,
+        compress: false,
     };
     let log = AuditLog::open_with_policy(dir.path(), policy).unwrap();
     // ~10 events at ~120 bytes each comfortably crosses 1 KiB.
