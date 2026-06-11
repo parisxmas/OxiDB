@@ -1,6 +1,6 @@
-use wasm_bindgen::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
+use wasm_bindgen::prelude::*;
 
 use oxidb::OxiDb;
 use oxidb::locks::RwLock;
@@ -46,8 +46,7 @@ pub fn insert_many(collection: &str, json_docs: &str) -> Result<String, JsValue>
 /// Find documents matching a query. Returns JSON array string.
 #[wasm_bindgen]
 pub fn find(collection: &str, query: &str) -> Result<String, JsValue> {
-    let q: Value =
-        serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let q: Value = serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let results = with_db(|db| db.find(collection, &q))?;
     serde_json::to_string(&results).map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -55,8 +54,7 @@ pub fn find(collection: &str, query: &str) -> Result<String, JsValue> {
 /// Find a single document matching a query. Returns JSON string or "null".
 #[wasm_bindgen]
 pub fn find_one(collection: &str, query: &str) -> Result<String, JsValue> {
-    let q: Value =
-        serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let q: Value = serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let result = with_db(|db| db.find_one(collection, &q))?;
     serde_json::to_string(&result).map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -64,8 +62,7 @@ pub fn find_one(collection: &str, query: &str) -> Result<String, JsValue> {
 /// Update documents matching a query. Returns number of modified documents.
 #[wasm_bindgen]
 pub fn update(collection: &str, query: &str, update_doc: &str) -> Result<u32, JsValue> {
-    let q: Value =
-        serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let q: Value = serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let u: Value =
         serde_json::from_str(update_doc).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let count = with_db(|db| db.update(collection, &q, &u))?;
@@ -75,8 +72,7 @@ pub fn update(collection: &str, query: &str, update_doc: &str) -> Result<u32, Js
 /// Delete documents matching a query. Returns number of deleted documents.
 #[wasm_bindgen]
 pub fn delete(collection: &str, query: &str) -> Result<u32, JsValue> {
-    let q: Value =
-        serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let q: Value = serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let count = with_db(|db| db.delete(collection, &q))?;
     Ok(count as u32)
 }
@@ -84,8 +80,7 @@ pub fn delete(collection: &str, query: &str) -> Result<u32, JsValue> {
 /// Count documents matching a query.
 #[wasm_bindgen]
 pub fn count(collection: &str, query: &str) -> Result<u32, JsValue> {
-    let q: Value =
-        serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let q: Value = serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;
     let n = with_db(|db| db.count(collection, &q))?;
     Ok(n as u32)
 }

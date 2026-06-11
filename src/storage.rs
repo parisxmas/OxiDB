@@ -896,13 +896,20 @@ mod tests {
         let loc = raw.append(&payload).unwrap();
         assert_eq!(raw.read(loc).unwrap(), payload, "uncompressed round-trip");
         // On-disk length == payload length (+ no shrink), i.e. not compressed.
-        assert_eq!(loc.length as usize, payload.len(), "stored raw, not zstd-shrunk");
+        assert_eq!(
+            loc.length as usize,
+            payload.len(),
+            "stored raw, not zstd-shrunk"
+        );
 
         // A compressed store shrinks the same payload.
         let cpath = dir.path().join("zstd.dat");
         let comp = Storage::open_with_options(&cpath, None, true).unwrap();
         let cloc = comp.append(&payload).unwrap();
-        assert!((cloc.length as usize) < payload.len(), "compressed store shrinks it");
+        assert!(
+            (cloc.length as usize) < payload.len(),
+            "compressed store shrinks it"
+        );
 
         // Reads are adaptive: an uncompressed-mode handle still decodes a
         // previously-compressed file correctly (mixed files need no migration).

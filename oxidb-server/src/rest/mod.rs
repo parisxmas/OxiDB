@@ -363,8 +363,8 @@ fn handle_create_collection(
     // compaction policy). Omitted fields fall back to server defaults.
     match body.get("options") {
         Some(opts_val) if !opts_val.is_null() => {
-            let opts: oxidb::StorageOptions = serde_json::from_value(opts_val.clone())
-                .map_err(|_| (400, "invalid 'options'"))?;
+            let opts: oxidb::StorageOptions =
+                serde_json::from_value(opts_val.clone()).map_err(|_| (400, "invalid 'options'"))?;
             state
                 .db
                 .create_collection_with_options(name, opts)

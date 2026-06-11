@@ -292,6 +292,7 @@ fn unsupported_pipelines_are_reported() {
     let push = vec![json!({"$group": {"_id": "$c", "items": {"$push": "$amt"}}})];
     assert!(matches!(split_pipeline(&push), SplitPlan::Unsupported(_)));
 
-    let lookup = vec![json!({"$lookup": {"from": "x", "localField": "a", "foreignField": "b", "as": "j"}})];
+    let lookup =
+        vec![json!({"$lookup": {"from": "x", "localField": "a", "foreignField": "b", "as": "j"}})];
     assert!(matches!(split_pipeline(&lookup), SplitPlan::Unsupported(_)));
 }

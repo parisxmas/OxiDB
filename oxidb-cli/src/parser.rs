@@ -92,7 +92,9 @@ fn try_parse_db_method(input: &str) -> Result<Option<Value>, String> {
     match method {
         "createCollection" => {
             let name = parse_string_arg(args_str)?;
-            Ok(Some(json!({"cmd": "create_collection", "collection": name})))
+            Ok(Some(
+                json!({"cmd": "create_collection", "collection": name}),
+            ))
         }
         "createBucket" => {
             let name = parse_string_arg(args_str)?;
@@ -135,7 +137,9 @@ fn try_parse_db_method(input: &str) -> Result<Option<Value>, String> {
             } else {
                 10
             };
-            Ok(Some(json!({"cmd": "search", "query": query, "limit": limit})))
+            Ok(Some(
+                json!({"cmd": "search", "query": query, "limit": limit}),
+            ))
         }
         _ => Ok(None),
     }
@@ -173,11 +177,7 @@ fn parse_collection_method(input: &str) -> Result<Value, String> {
 }
 
 /// Build a JSON command from collection, method name, and argument string.
-fn build_method_command(
-    collection: &str,
-    method: &str,
-    args_str: &str,
-) -> Result<Value, String> {
+fn build_method_command(collection: &str, method: &str, args_str: &str) -> Result<Value, String> {
     match method {
         "insert" => {
             let doc: Value = parse_json_arg(args_str)?;
@@ -221,7 +221,9 @@ fn build_method_command(
             }
             let query: Value = parse_json_arg(args[0])?;
             let update: Value = parse_json_arg(args[1])?;
-            Ok(json!({"cmd": "update_one", "collection": collection, "query": query, "update": update}))
+            Ok(
+                json!({"cmd": "update_one", "collection": collection, "query": query, "update": update}),
+            )
         }
         "delete" => {
             let args = split_args(args_str)?;
@@ -280,15 +282,15 @@ fn build_method_command(
             } else {
                 10
             };
-            Ok(json!({"cmd": "text_search", "collection": collection, "query": query, "limit": limit}))
+            Ok(
+                json!({"cmd": "text_search", "collection": collection, "query": query, "limit": limit}),
+            )
         }
         "aggregate" => {
             let pipeline: Value = parse_json_arg(args_str)?;
             Ok(json!({"cmd": "aggregate", "collection": collection, "pipeline": pipeline}))
         }
-        "listIndexes" => {
-            Ok(json!({"cmd": "list_indexes", "collection": collection}))
-        }
+        "listIndexes" => Ok(json!({"cmd": "list_indexes", "collection": collection})),
         "dropIndex" => {
             let index = parse_string_arg(args_str)?;
             Ok(json!({"cmd": "drop_index", "collection": collection, "index": index}))
@@ -308,7 +310,9 @@ fn build_method_command(
             } else {
                 "cosine".to_string()
             };
-            Ok(json!({"cmd": "create_vector_index", "collection": collection, "field": field, "dimension": dimension, "metric": metric}))
+            Ok(
+                json!({"cmd": "create_vector_index", "collection": collection, "field": field, "dimension": dimension, "metric": metric}),
+            )
         }
         "vectorSearch" => {
             let args = split_args(args_str)?;
@@ -325,7 +329,9 @@ fn build_method_command(
             } else {
                 10
             };
-            Ok(json!({"cmd": "vector_search", "collection": collection, "field": field, "vector": vector, "limit": limit}))
+            Ok(
+                json!({"cmd": "vector_search", "collection": collection, "field": field, "vector": vector, "limit": limit}),
+            )
         }
         "compact" => Ok(json!({"cmd": "compact", "collection": collection})),
         "drop" => Ok(json!({"cmd": "drop_collection", "collection": collection})),
@@ -557,8 +563,7 @@ mod tests {
 
     #[test]
     fn test_update() {
-        let cmd =
-            parse(r#"db.users.update({"name": "Alice"}, {"$set": {"age": 31}})"#).unwrap();
+        let cmd = parse(r#"db.users.update({"name": "Alice"}, {"$set": {"age": 31}})"#).unwrap();
         assert_eq!(cmd["cmd"], "update");
         assert_eq!(cmd["query"]["name"], "Alice");
         assert_eq!(cmd["update"]["$set"]["age"], 31);
@@ -566,8 +571,7 @@ mod tests {
 
     #[test]
     fn test_update_one() {
-        let cmd =
-            parse(r#"db.users.updateOne({"name": "Alice"}, {"$set": {"age": 31}})"#).unwrap();
+        let cmd = parse(r#"db.users.updateOne({"name": "Alice"}, {"$set": {"age": 31}})"#).unwrap();
         assert_eq!(cmd["cmd"], "update_one");
     }
 
@@ -633,10 +637,9 @@ mod tests {
 
     #[test]
     fn test_aggregate() {
-        let cmd = parse(
-            r#"db.users.aggregate([{"$group": {"_id": "$city", "n": {"$count": true}}}])"#,
-        )
-        .unwrap();
+        let cmd =
+            parse(r#"db.users.aggregate([{"$group": {"_id": "$city", "n": {"$count": true}}}])"#)
+                .unwrap();
         assert_eq!(cmd["cmd"], "aggregate");
         assert_eq!(cmd["collection"], "users");
     }

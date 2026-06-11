@@ -60,7 +60,9 @@ fn ok_docs_bytes(docs: &[Arc<Value>]) -> Vec<u8> {
             let mut buf = Vec::with_capacity(docs.len() * 200 + 64);
             buf.extend_from_slice(b"{\"ok\":true,\"data\":[");
             for (i, doc) in docs.iter().enumerate() {
-                if i > 0 { buf.push(b','); }
+                if i > 0 {
+                    buf.push(b',');
+                }
                 doc_to_json(doc, &mut buf);
             }
             buf.extend_from_slice(b"]}");
@@ -84,12 +86,17 @@ fn ok_docs_bytes(docs: &[Arc<Value>]) -> Vec<u8> {
 
 /// Handle a single JSON request and return pre-serialized JSON response bytes.
 pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) -> Vec<u8> {
-    let cmd = match request.get("cmd").and_then(|v| v.as_str().map(|s| s.to_string())) {
+    let cmd = match request
+        .get("cmd")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+    {
         Some(c) => c,
         None => return err_bytes("missing or invalid 'cmd' field"),
     };
 
-    let collection: Option<String> = request.get("collection").and_then(|v| v.as_str().map(|s| s.to_string()));
+    let collection: Option<String> = request
+        .get("collection")
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
 
     // Take ownership of mutable request for extracting fields without cloning
     let mut request = request;
@@ -119,7 +126,6 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         // -------------------------------------------------------------------
         // Linked collections (FDW v1)
         // -------------------------------------------------------------------
-
         "link_collection" => {
             let name = match collection.as_deref() {
                 Some(c) if !c.is_empty() => c,
@@ -150,7 +156,6 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         // -------------------------------------------------------------------
         // Transaction commands
         // -------------------------------------------------------------------
-
         "begin_tx" => {
             if active_tx.is_some() {
                 return err_bytes("transaction already active");
@@ -160,30 +165,25 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             ok_bytes(json!({ "tx_id": tx_id }))
         }
 
-        "commit_tx" => {
-            match active_tx.take() {
-                Some(tx_id) => match db.commit_transaction(tx_id) {
-                    Ok(()) => ok_bytes(json!("committed")),
-                    Err(e) => err_bytes(&e.to_string()),
-                },
-                None => err_bytes("no active transaction"),
-            }
-        }
+        "commit_tx" => match active_tx.take() {
+            Some(tx_id) => match db.commit_transaction(tx_id) {
+                Ok(()) => ok_bytes(json!("committed")),
+                Err(e) => err_bytes(&e.to_string()),
+            },
+            None => err_bytes("no active transaction"),
+        },
 
-        "rollback_tx" => {
-            match active_tx.take() {
-                Some(tx_id) => {
-                    let _ = db.rollback_transaction(tx_id);
-                    ok_bytes(json!("rolled back"))
-                }
-                None => err_bytes("no active transaction"),
+        "rollback_tx" => match active_tx.take() {
+            Some(tx_id) => {
+                let _ = db.rollback_transaction(tx_id);
+                ok_bytes(json!("rolled back"))
             }
-        }
+            None => err_bytes("no active transaction"),
+        },
 
         // -------------------------------------------------------------------
         // CRUD commands (tx-aware)
         // -------------------------------------------------------------------
-
         "insert" => {
             let col = match collection.as_deref() {
                 Some(c) => c,
@@ -259,7 +259,9 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 if protocol::wire_format() == WireFormat::OxiWire {
                     if let Some(result) = db.find_oxiwire_bytes(col, query, &opts) {
                         match result {
-                            Ok(byte_arcs) => return crate::oxiwire::ok_docs_bytes_response(&byte_arcs),
+                            Ok(byte_arcs) => {
+                                return crate::oxiwire::ok_docs_bytes_response(&byte_arcs);
+                            }
                             Err(e) => return err_bytes(&e.to_string()),
                         }
                     }
@@ -268,7 +270,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                     if let Some(result) = db.find_oxiwire_postfilter(col, query, &opts) {
                         match result {
                             Ok((count, doc_bytes)) => {
-                                return crate::oxiwire::ok_docs_concat_response(count, &doc_bytes)
+                                return crate::oxiwire::ok_docs_concat_response(count, &doc_bytes);
                             }
                             Err(e) => return err_bytes(&e.to_string()),
                         }
@@ -385,7 +387,9 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 None => return err_bytes("missing or invalid 'locked_until_micros' (u64)"),
             };
             match db.worm_lock(col, doc_id, until) {
-                Ok(()) => ok_bytes(json!({"locked": true, "doc_id": doc_id, "locked_until_micros": until})),
+                Ok(()) => ok_bytes(
+                    json!({"locked": true, "doc_id": doc_id, "locked_until_micros": until}),
+                ),
                 Err(e) => err_bytes(&e.to_string()),
             }
         }
@@ -632,10 +636,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 Some(q) => q,
                 None => return err_bytes("missing 'query' string"),
             };
-            let limit = request
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as usize;
+            let limit = request.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
             // Optional highlight: client passes
             //   { "highlight": true } for defaults, or
@@ -644,10 +645,14 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 if h.as_bool() == Some(true) {
                     Some((80usize, 3usize))
                 } else if let Some(obj) = h.as_object() {
-                    let snippet_chars =
-                        obj.get("snippet_chars").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
-                    let max_snippets =
-                        obj.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+                    let snippet_chars = obj
+                        .get("snippet_chars")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(80) as usize;
+                    let max_snippets = obj
+                        .get("max_snippets")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(3) as usize;
                     Some((snippet_chars, max_snippets))
                 } else {
                     None
@@ -764,7 +769,6 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         // -------------------------------------------------------------------
         // Blob storage + FTS commands
         // -------------------------------------------------------------------
-
         "create_bucket" => {
             let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
                 Some(b) => b,
@@ -925,10 +929,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 None => return err_bytes("missing 'query'"),
             };
             let bucket = request.get("bucket").and_then(|v| v.as_str());
-            let limit = request
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as usize;
+            let limit = request.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
             // Optional highlight: `{ "highlight": true }` for defaults, or
             // `{ "highlight": { "snippet_chars": N, "max_snippets": M } }`.
@@ -938,10 +939,14 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 if h.as_bool() == Some(true) {
                     Some((80usize, 3usize))
                 } else if let Some(obj) = h.as_object() {
-                    let snippet_chars =
-                        obj.get("snippet_chars").and_then(|v| v.as_u64()).unwrap_or(80) as usize;
-                    let max_snippets =
-                        obj.get("max_snippets").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+                    let snippet_chars = obj
+                        .get("snippet_chars")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(80) as usize;
+                    let max_snippets = obj
+                        .get("max_snippets")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(3) as usize;
                     Some((snippet_chars, max_snippets))
                 } else {
                     None
@@ -973,7 +978,6 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         // -------------------------------------------------------------------
         // Backup & Restore (admin-only via RBAC)
         // -------------------------------------------------------------------
-
         "backup" => {
             let path = match request.get("path").and_then(|v| v.as_str()) {
                 Some(p) => p,
@@ -998,10 +1002,8 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 Some(t) => t,
                 None => return err_bytes("missing 'target'"),
             };
-            match oxidb::OxiDb::restore(
-                std::path::Path::new(archive),
-                std::path::Path::new(target),
-            ) {
+            match oxidb::OxiDb::restore(std::path::Path::new(archive), std::path::Path::new(target))
+            {
                 Ok(info) => ok_bytes(json!({
                     "path": info.path,
                     "collections": info.collections,
@@ -1070,7 +1072,6 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         // -------------------------------------------------------------------
         // Stored procedures
         // -------------------------------------------------------------------
-
         "create_procedure" => {
             // Check if this is an OxiScript source (has "script" field)
             if let Some(script) = request.get("script").and_then(|v| v.as_str()) {
@@ -1149,7 +1150,6 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         // -------------------------------------------------------------------
         // Cron schedules
         // -------------------------------------------------------------------
-
         "create_schedule" => {
             let name = match request.get("name").and_then(|v| v.as_str()) {
                 Some(n) => n.to_string(),
@@ -1213,7 +1213,6 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
         // -------------------------------------------------------------------
         // Retention policies
         // -------------------------------------------------------------------
-
         "set_retention" => {
             let col = match collection.as_deref() {
                 Some(c) => c,
@@ -1251,17 +1250,14 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
-        "list_retentions" => {
-            match db.list_retentions() {
-                Ok(policies) => ok_bytes(json!(policies)),
-                Err(e) => err_bytes(&e.to_string()),
-            }
-        }
+        "list_retentions" => match db.list_retentions() {
+            Ok(policies) => ok_bytes(json!(policies)),
+            Err(e) => err_bytes(&e.to_string()),
+        },
 
         // -------------------------------------------------------------------
         // Alerting
         // -------------------------------------------------------------------
-
         "create_alert" => {
             let name = match request.get("name").and_then(|v| v.as_str()) {
                 Some(n) => n,
@@ -1285,12 +1281,10 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
-        "list_alerts" => {
-            match db.list_alerts() {
-                Ok(alerts) => ok_bytes(json!(alerts)),
-                Err(e) => err_bytes(&e.to_string()),
-            }
-        }
+        "list_alerts" => match db.list_alerts() {
+            Ok(alerts) => ok_bytes(json!(alerts)),
+            Err(e) => err_bytes(&e.to_string()),
+        },
 
         "get_alert" => {
             let name = match request.get("name").and_then(|v| v.as_str()) {
@@ -1314,17 +1308,14 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             }
         }
 
-        "list_alert_history" => {
-            match db.list_alert_history() {
-                Ok(history) => ok_bytes(json!(history)),
-                Err(e) => err_bytes(&e.to_string()),
-            }
-        }
+        "list_alert_history" => match db.list_alert_history() {
+            Ok(history) => ok_bytes(json!(history)),
+            Err(e) => err_bytes(&e.to_string()),
+        },
 
         // -------------------------------------------------------------------
         // Vector index commands
         // -------------------------------------------------------------------
-
         "create_vector_index" => {
             let col = match collection.as_deref() {
                 Some(c) => c,
@@ -1360,7 +1351,8 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
             };
             let vector = match request.get("vector").and_then(|v| v.as_array()) {
                 Some(arr) => {
-                    let floats: Option<Vec<f32>> = arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
+                    let floats: Option<Vec<f32>> =
+                        arr.iter().map(|v| v.as_f64().map(|f| f as f32)).collect();
                     match floats {
                         Some(f) => f,
                         None => return err_bytes("'vector' must be an array of numbers"),
@@ -1368,10 +1360,7 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
                 }
                 None => return err_bytes("missing 'vector' array"),
             };
-            let limit = request
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as usize;
+            let limit = request.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
             let ef_search = request
                 .get("ef_search")
                 .and_then(|v| v.as_u64())
@@ -1467,7 +1456,10 @@ pub fn handle_user_command(
                 Some(p) => p,
                 None => return Some(err_bytes("missing 'password'")),
             };
-            let role_str = request.get("role").and_then(|v| v.as_str()).unwrap_or("read");
+            let role_str = request
+                .get("role")
+                .and_then(|v| v.as_str())
+                .unwrap_or("read");
             let role = match Role::from_str(role_str) {
                 Some(r) => r,
                 None => return Some(err_bytes(&format!("invalid role: {role_str}"))),
@@ -1495,7 +1487,10 @@ pub fn handle_user_command(
                 None => return Some(err_bytes("missing 'username'")),
             };
             let password = request.get("password").and_then(|v| v.as_str());
-            let role = request.get("role").and_then(|v| v.as_str()).and_then(Role::from_str);
+            let role = request
+                .get("role")
+                .and_then(|v| v.as_str())
+                .and_then(Role::from_str);
             if password.is_none() && role.is_none() {
                 return Some(err_bytes("must specify 'password' or 'role' to update"));
             }
@@ -1531,7 +1526,9 @@ pub fn handle_user_command(
             match store.grant_db_role(username, database, role) {
                 Ok(()) => Some(ok_bytes(json!(format!(
                     "granted role '{}' on database '{}' to user '{}'",
-                    role.as_str(), database, username
+                    role.as_str(),
+                    database,
+                    username
                 )))),
                 Err(e) => Some(err_bytes(&e)),
             }

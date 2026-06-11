@@ -298,8 +298,7 @@ pub fn decode_value(buf: &[u8], pos: &mut usize) -> Result<Value, String> {
                 if *pos + 4 > buf.len() {
                     return Err("truncated map key length".to_string());
                 }
-                let key_len =
-                    u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
+                let key_len = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
                 *pos += 4;
                 if *pos + key_len > buf.len() {
                     return Err("truncated map key data".to_string());
@@ -453,7 +452,9 @@ mod tests {
     fn fuzz_regression_array_with_honest_count_still_works() {
         // Sanity: the alloc-guard must NOT break the happy path. An
         // array of 3 nulls is 1 (MAGIC) + 1 (TAG_ARRAY) + 4 (count=3) + 3 (NULLs)
-        let input = [0xDBu8, TAG_ARRAY, 3u8, 0u8, 0u8, 0u8, TAG_NULL, TAG_NULL, TAG_NULL];
+        let input = [
+            0xDBu8, TAG_ARRAY, 3u8, 0u8, 0u8, 0u8, TAG_NULL, TAG_NULL, TAG_NULL,
+        ];
         let decoded = decode_request(&input).expect("honest 3-element array");
         match decoded {
             Value::Array(a) => {

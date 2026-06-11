@@ -29,8 +29,16 @@ use oxidb_server::protocol::{read_message, write_message};
 
 const N_SHARDS: usize = 3;
 const REGIONS: &[&str] = &[
-    "us-east", "us-west", "eu-west", "eu-central", "ap-south", "ap-north",
-    "sa-east", "af-south", "me-central", "oce",
+    "us-east",
+    "us-west",
+    "eu-west",
+    "eu-central",
+    "ap-south",
+    "ap-north",
+    "sa-east",
+    "af-south",
+    "me-central",
+    "oce",
 ];
 const DOCS: usize = 120; // 12 per region
 
@@ -107,7 +115,9 @@ fn wait_connectable(addr: &str, timeout: Duration) {
     loop {
         match TcpStream::connect(addr) {
             Ok(_) => return,
-            Err(e) if e.kind() == ErrorKind::ConnectionRefused || e.kind() == ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == ErrorKind::ConnectionRefused || e.kind() == ErrorKind::TimedOut =>
+            {
                 if start.elapsed() > timeout {
                     panic!("address {addr} not connectable within {timeout:?}");
                 }
@@ -190,17 +200,29 @@ fn oxipool_cross_shard_routing_and_merge() {
         shard_counts.push(ok_data(&resp)["count"].as_u64().unwrap());
     }
     let summed: u64 = shard_counts.iter().sum();
-    assert_eq!(summed, DOCS as u64, "per-shard counts must sum to all docs: {shard_counts:?}");
+    assert_eq!(
+        summed, DOCS as u64,
+        "per-shard counts must sum to all docs: {shard_counts:?}"
+    );
     let non_empty = shard_counts.iter().filter(|&&n| n > 0).count();
-    assert!(non_empty >= 2, "data should span >=2 shards, got {shard_counts:?}");
+    assert!(
+        non_empty >= 2,
+        "data should span >=2 shards, got {shard_counts:?}"
+    );
 
     // 6. count through the pool fans out and SUMS.
     let resp = pool.send(&json!({ "cmd": "count", "collection": "accounts" }));
-    assert_eq!(ok_data(&resp)["count"].as_u64(), Some(DOCS as u64), "pool count != DOCS");
+    assert_eq!(
+        ok_data(&resp)["count"].as_u64(),
+        Some(DOCS as u64),
+        "pool count != DOCS"
+    );
 
     // 7. find through the pool fans out and CONCATENATES.
     let resp = pool.send(&json!({ "cmd": "find", "collection": "accounts", "query": {} }));
-    let docs = ok_data(&resp).as_array().expect("find data must be an array");
+    let docs = ok_data(&resp)
+        .as_array()
+        .expect("find data must be an array");
     assert_eq!(docs.len(), DOCS, "pool find must return every doc");
 
     // 8. Global aggregate ($group _id:null sum) — the strongest cross-shard
@@ -210,10 +232,20 @@ fn oxipool_cross_shard_routing_and_merge() {
         "collection": "accounts",
         "pipeline": [ { "$group": { "_id": null, "total": { "$sum": "$bal" }, "n": { "$sum": 1 } } } ]
     }));
-    let arr = ok_data(&resp).as_array().expect("aggregate data must be an array");
+    let arr = ok_data(&resp)
+        .as_array()
+        .expect("aggregate data must be an array");
     assert_eq!(arr.len(), 1, "global group yields one doc: {arr:?}");
-    assert_eq!(arr[0]["total"].as_i64(), Some(expected_total_bal), "cross-shard $sum mismatch");
-    assert_eq!(arr[0]["n"].as_i64(), Some(DOCS as i64), "cross-shard count mismatch");
+    assert_eq!(
+        arr[0]["total"].as_i64(),
+        Some(expected_total_bal),
+        "cross-shard $sum mismatch"
+    );
+    assert_eq!(
+        arr[0]["n"].as_i64(),
+        Some(DOCS as i64),
+        "cross-shard count mismatch"
+    );
 
     // 9. Per-key aggregate ($group by region) — merged across shards.
     let resp = pool.send(&json!({
@@ -221,7 +253,9 @@ fn oxipool_cross_shard_routing_and_merge() {
         "collection": "accounts",
         "pipeline": [ { "$group": { "_id": "$region", "total": { "$sum": "$bal" }, "n": { "$sum": 1 } } } ]
     }));
-    let arr = ok_data(&resp).as_array().expect("aggregate data must be an array");
+    let arr = ok_data(&resp)
+        .as_array()
+        .expect("aggregate data must be an array");
     assert_eq!(arr.len(), per_region.len(), "one group per region");
     let mut got: std::collections::BTreeMap<String, (i64, i64)> = Default::default();
     for g in arr {
@@ -238,5 +272,9 @@ fn oxipool_cross_shard_routing_and_merge() {
     let resp = pool.send(&json!({
         "cmd": "count", "collection": "accounts", "query": { "region": "us-east" }
     }));
-    assert_eq!(ok_data(&resp)["count"].as_i64(), Some(exp_n), "targeted count mismatch");
+    assert_eq!(
+        ok_data(&resp)["count"].as_i64(),
+        Some(exp_n),
+        "targeted count mismatch"
+    );
 }

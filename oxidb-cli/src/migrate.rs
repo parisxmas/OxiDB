@@ -187,7 +187,10 @@ fn walk(dir: &Path, out: &mut Vec<FileReport>) -> Result<(), String> {
 
 pub fn inspect(data_dir: &Path) -> Result<Vec<FileReport>, String> {
     if !data_dir.exists() {
-        return Err(format!("data directory does not exist: {}", data_dir.display()));
+        return Err(format!(
+            "data directory does not exist: {}",
+            data_dir.display()
+        ));
     }
     let mut reports = Vec::new();
     walk(data_dir, &mut reports)?;
@@ -281,7 +284,11 @@ pub fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn print_inspect(reports: &[FileReport], json: bool, out: &mut impl Write) -> std::io::Result<()> {
+pub fn print_inspect(
+    reports: &[FileReport],
+    json: bool,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     if json {
         let arr: Vec<serde_json::Value> = reports
             .iter()
@@ -317,7 +324,13 @@ pub fn print_inspect(reports: &[FileReport], json: bool, out: &mut impl Write) -
             FormatStatus::Legacy => "legacy".to_string(),
             FormatStatus::Unreadable(_) => "unreadable".to_string(),
         };
-        writeln!(out, "{:<14}  {:<10}  {}", r.kind.label(), status, r.path.display())?;
+        writeln!(
+            out,
+            "{:<14}  {:<10}  {}",
+            r.kind.label(),
+            status,
+            r.path.display()
+        )?;
     }
     Ok(())
 }
@@ -329,11 +342,26 @@ mod tests {
     #[test]
     fn classify_known_extensions() {
         assert_eq!(classify(Path::new("/tmp/x/data.wal")), Some(FileKind::Wal));
-        assert_eq!(classify(Path::new("/tmp/x/data.wal.000123")), Some(FileKind::Wal));
-        assert_eq!(classify(Path::new("/tmp/x/_tx_commit_log")), Some(FileKind::TxCommitLog));
-        assert_eq!(classify(Path::new("/tmp/x/users.btree")), Some(FileKind::BTree));
-        assert_eq!(classify(Path::new("/tmp/x/users.fidx")), Some(FileKind::Index));
-        assert_eq!(classify(Path::new("/tmp/x/users.cidx")), Some(FileKind::Index));
+        assert_eq!(
+            classify(Path::new("/tmp/x/data.wal.000123")),
+            Some(FileKind::Wal)
+        );
+        assert_eq!(
+            classify(Path::new("/tmp/x/_tx_commit_log")),
+            Some(FileKind::TxCommitLog)
+        );
+        assert_eq!(
+            classify(Path::new("/tmp/x/users.btree")),
+            Some(FileKind::BTree)
+        );
+        assert_eq!(
+            classify(Path::new("/tmp/x/users.fidx")),
+            Some(FileKind::Index)
+        );
+        assert_eq!(
+            classify(Path::new("/tmp/x/users.cidx")),
+            Some(FileKind::Index)
+        );
         assert_eq!(
             classify(Path::new("/tmp/x/_blobs/audit/abc.meta")),
             Some(FileKind::BlobMeta)
@@ -380,8 +408,10 @@ mod tests {
 
         {
             let db = OxiDb::open(&dir).expect("open engine");
-            db.insert("events", json!({"name": "alpha", "n": 1})).expect("insert");
-            db.insert("events", json!({"name": "beta", "n": 2})).expect("insert");
+            db.insert("events", json!({"name": "alpha", "n": 1}))
+                .expect("insert");
+            db.insert("events", json!({"name": "beta", "n": 2}))
+                .expect("insert");
         }
 
         let reports = inspect(&dir).expect("inspect");

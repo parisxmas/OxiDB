@@ -7,15 +7,20 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, Cell};
-use ratatui::Terminal;
-use serde_json::{json, Value};
+use ratatui::widgets::{
+    Block, Borders, Cell, List, ListItem, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table,
+};
+use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(
@@ -50,7 +55,10 @@ use serde_json::{json, Value};
 )]
 struct Cli {
     /// OxiDB server hostname or IP address
-    #[arg(long, help = "OxiDB server hostname or IP address (e.g. 127.0.0.1, db.example.com)")]
+    #[arg(
+        long,
+        help = "OxiDB server hostname or IP address (e.g. 127.0.0.1, db.example.com)"
+    )]
     host: String,
 
     /// OxiDB server TCP port
@@ -58,13 +66,20 @@ struct Cli {
     port: u16,
 
     /// Name of the collection to stream logs from
-    #[arg(long, short, default_value = "_gelf_logs",
-          help = "Collection to tail [default: _gelf_logs]")]
+    #[arg(
+        long,
+        short,
+        default_value = "_gelf_logs",
+        help = "Collection to tail [default: _gelf_logs]"
+    )]
     collection: String,
 
     /// How often to poll the server for new logs, in milliseconds
-    #[arg(long, default_value_t = 500,
-          help = "Poll interval in milliseconds [default: 500]")]
+    #[arg(
+        long,
+        default_value_t = 500,
+        help = "Poll interval in milliseconds [default: 500]"
+    )]
     interval: u64,
 }
 
@@ -81,7 +96,8 @@ fn send_recv(stream: &mut TcpStream, payload: &Value) -> std::io::Result<Value> 
     let resp_len = u32::from_le_bytes(len_buf) as usize;
     let mut buf = vec![0u8; resp_len];
     stream.read_exact(&mut buf)?;
-    serde_json::from_slice(&buf).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 // ─── Log entry ──────────────────────────────────────────────
@@ -101,9 +117,21 @@ impl LogEntry {
     fn from_doc(doc: &Value) -> Option<Self> {
         let id = doc.get("_id")?.as_u64()?;
         let level = doc.get("level").and_then(|v| v.as_u64()).unwrap_or(6) as u8;
-        let host = doc.get("host").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-        let message = doc.get("short_message").and_then(|v| v.as_str()).unwrap_or("-").to_string();
-        let facility = doc.get("facility").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let host = doc
+            .get("host")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let message = doc
+            .get("short_message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-")
+            .to_string();
+        let facility = doc
+            .get("facility")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
         let timestamp = if let Some(ts) = doc.get("_ts").and_then(|v| v.as_str()) {
             if let Ok(dt) = ts.parse::<DateTime<Utc>>() {
@@ -115,7 +143,17 @@ impl LogEntry {
             "??:??:??".to_string()
         };
 
-        let skip = ["_id", "_ts", "_version", "timestamp", "host", "short_message", "full_message", "level", "facility"];
+        let skip = [
+            "_id",
+            "_ts",
+            "_version",
+            "timestamp",
+            "host",
+            "short_message",
+            "full_message",
+            "level",
+            "facility",
+        ];
         let mut extra = Vec::new();
         if let Some(obj) = doc.as_object() {
             for (k, v) in obj {
@@ -132,13 +170,28 @@ impl LogEntry {
             }
         }
 
-        Some(Self { id, timestamp, level, host, message, facility, extra })
+        Some(Self {
+            id,
+            timestamp,
+            level,
+            host,
+            message,
+            facility,
+            extra,
+        })
     }
 
     fn level_label(&self) -> &'static str {
         match self.level {
-            0 => "EMR", 1 => "ALR", 2 => "CRT", 3 => "ERR",
-            4 => "WRN", 5 => "NTC", 6 => "INF", 7 => "DBG", _ => "???",
+            0 => "EMR",
+            1 => "ALR",
+            2 => "CRT",
+            3 => "ERR",
+            4 => "WRN",
+            5 => "NTC",
+            6 => "INF",
+            7 => "DBG",
+            _ => "???",
         }
     }
 
@@ -204,24 +257,29 @@ impl App {
     }
 
     fn filtered_logs(&self) -> Vec<&LogEntry> {
-        self.logs.iter().filter(|log| {
-            if let Some(max_level) = self.level_filter {
-                if log.level > max_level {
-                    return false;
+        self.logs
+            .iter()
+            .filter(|log| {
+                if let Some(max_level) = self.level_filter {
+                    if log.level > max_level {
+                        return false;
+                    }
                 }
-            }
-            if !self.filter_text.is_empty() {
-                let ft = self.filter_text.to_lowercase();
-                let matches = log.message.to_lowercase().contains(&ft)
-                    || log.host.to_lowercase().contains(&ft)
-                    || log.facility.to_lowercase().contains(&ft)
-                    || log.extra.iter().any(|(k, v)| k.to_lowercase().contains(&ft) || v.to_lowercase().contains(&ft));
-                if !matches {
-                    return false;
+                if !self.filter_text.is_empty() {
+                    let ft = self.filter_text.to_lowercase();
+                    let matches = log.message.to_lowercase().contains(&ft)
+                        || log.host.to_lowercase().contains(&ft)
+                        || log.facility.to_lowercase().contains(&ft)
+                        || log.extra.iter().any(|(k, v)| {
+                            k.to_lowercase().contains(&ft) || v.to_lowercase().contains(&ft)
+                        });
+                    if !matches {
+                        return false;
+                    }
                 }
-            }
-            true
-        }).collect()
+                true
+            })
+            .collect()
     }
 
     fn add_log(&mut self, entry: LogEntry) {
@@ -272,7 +330,13 @@ impl App {
 
 // ─── UI rendering ───────────────────────────────────────────
 
-fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App, collection: &str, host: &str, port: u16) {
+fn render(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &App,
+    collection: &str,
+    host: &str,
+    port: u16,
+) {
     let _ = terminal.draw(|frame| {
         let size = frame.area();
 
@@ -280,7 +344,7 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),  // header
+                Constraint::Length(3), // header
                 Constraint::Min(5),    // body
                 Constraint::Length(3), // footer
             ])
@@ -288,25 +352,50 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
 
         // Header
         let header_spans = vec![
-            Span::styled(" oxidb-tail ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " oxidb-tail ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(format!("{host}:{port}"), Style::default().fg(Color::Cyan)),
             Span::raw("  "),
             Span::styled(collection, Style::default().fg(Color::Yellow)),
             Span::raw("  │  "),
-            Span::styled(format!("{}", app.total_count), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}", app.total_count),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" total", Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
-            Span::styled(format!("{}", app.error_count), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}", app.error_count),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" err", Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
-            Span::styled(format!("{}", app.warn_count), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}", app.warn_count),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" wrn", Style::default().fg(Color::DarkGray)),
             Span::raw("  │  "),
-            Span::styled(format!("{:.0}/s", app.msg_per_sec), Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{:.0}/s", app.msg_per_sec),
+                Style::default().fg(Color::Green),
+            ),
         ];
-        let header = Paragraph::new(Line::from(header_spans))
-            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(Color::DarkGray)));
+        let header = Paragraph::new(Line::from(header_spans)).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
         frame.render_widget(header, main_chunks[0]);
 
         // Body: vertical split if detail open, otherwise horizontal
@@ -314,35 +403,26 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
             Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Percentage(55),  // logs + stats
-                    Constraint::Percentage(45),  // detail panel
+                    Constraint::Percentage(55), // logs + stats
+                    Constraint::Percentage(45), // detail panel
                 ])
                 .split(main_chunks[1])
         } else {
             Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(0),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(0)])
                 .split(main_chunks[1])
         };
 
         let body_chunks = if app.show_stats {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Min(60),
-                    Constraint::Length(30),
-                ])
+                .constraints([Constraint::Min(60), Constraint::Length(30)])
                 .split(body_with_detail[0])
         } else {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(100),
-                    Constraint::Length(0),
-                ])
+                .constraints([Constraint::Percentage(100), Constraint::Length(0)])
                 .split(body_with_detail[0])
         };
 
@@ -354,50 +434,85 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
         let scroll = if app.auto_scroll {
             0
         } else {
-            app.scroll_offset.min(filtered.len().saturating_sub(visible_height))
+            app.scroll_offset
+                .min(filtered.len().saturating_sub(visible_height))
         };
 
         // Use locked columns
         let common_extra_keys = app.extra_columns.clone();
 
-        let rows: Vec<Row> = filtered.iter().rev().skip(scroll).take(visible_height).enumerate().map(|(i, log)| {
-            let idx = scroll + i;
-            let level_style = Style::default().fg(log.level_color()).add_modifier(Modifier::BOLD);
-            let is_selected = !app.auto_scroll && idx == app.selected;
+        let rows: Vec<Row> = filtered
+            .iter()
+            .rev()
+            .skip(scroll)
+            .take(visible_height)
+            .enumerate()
+            .map(|(i, log)| {
+                let idx = scroll + i;
+                let level_style = Style::default()
+                    .fg(log.level_color())
+                    .add_modifier(Modifier::BOLD);
+                let is_selected = !app.auto_scroll && idx == app.selected;
 
-            let mut cells = vec![
-                Cell::from(log.timestamp.clone()).style(Style::default().fg(Color::DarkGray)),
-                Cell::from(log.level_label()).style(level_style),
-                Cell::from(log.host.clone()).style(Style::default().fg(Color::Blue)),
-                Cell::from(truncate_str(&log.message, 50)).style(Style::default().fg(Color::White)),
-            ];
+                let mut cells = vec![
+                    Cell::from(log.timestamp.clone()).style(Style::default().fg(Color::DarkGray)),
+                    Cell::from(log.level_label()).style(level_style),
+                    Cell::from(log.host.clone()).style(Style::default().fg(Color::Blue)),
+                    Cell::from(truncate_str(&log.message, 50))
+                        .style(Style::default().fg(Color::White)),
+                ];
 
-            // Dynamic extra columns
-            for key in &common_extra_keys {
-                let val = log.extra.iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| truncate_str(v, 18))
-                    .unwrap_or_default();
-                cells.push(Cell::from(val).style(Style::default().fg(Color::Cyan)));
-            }
+                // Dynamic extra columns
+                for key in &common_extra_keys {
+                    let val = log
+                        .extra
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| truncate_str(v, 18))
+                        .unwrap_or_default();
+                    cells.push(Cell::from(val).style(Style::default().fg(Color::Cyan)));
+                }
 
-            let row = Row::new(cells);
-            if is_selected {
-                row.style(Style::default().bg(Color::DarkGray))
-            } else {
-                row
-            }
-        }).collect();
+                let row = Row::new(cells);
+                if is_selected {
+                    row.style(Style::default().bg(Color::DarkGray))
+                } else {
+                    row
+                }
+            })
+            .collect();
 
         // Build header
         let mut header_cells = vec![
-            Cell::from("Time").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Cell::from("Lvl").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Cell::from("Host").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Cell::from("Message").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Cell::from("Time").style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Cell::from("Lvl").style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Cell::from("Host").style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Cell::from("Message").style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ];
         for key in &common_extra_keys {
-            header_cells.push(Cell::from(key.as_str()).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+            header_cells.push(
+                Cell::from(key.as_str()).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            );
         }
         let header = Row::new(header_cells)
             .style(Style::default().bg(Color::Rgb(30, 30, 30)))
@@ -405,10 +520,10 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
 
         // Column widths
         let mut widths = vec![
-            Constraint::Length(12),  // Time
-            Constraint::Length(3),   // Lvl
-            Constraint::Length(18),  // Host
-            Constraint::Min(30),     // Message (flexible)
+            Constraint::Length(12), // Time
+            Constraint::Length(3),  // Lvl
+            Constraint::Length(18), // Host
+            Constraint::Min(30),    // Message (flexible)
         ];
         for _ in &common_extra_keys {
             widths.push(Constraint::Length(19));
@@ -440,29 +555,48 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
         // Stats sidebar (toggle with Tab)
         if app.show_stats {
             let mut stats_lines: Vec<Line> = Vec::new();
-            stats_lines.push(Line::from(vec![
-                Span::styled("Hosts", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            ]));
+            stats_lines.push(Line::from(vec![Span::styled(
+                "Hosts",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )]));
 
             let mut sorted_hosts: Vec<(&String, &u64)> = app.host_counts.iter().collect();
             sorted_hosts.sort_by(|a, b| b.1.cmp(a.1));
             for (host, count) in sorted_hosts.iter().take(8) {
                 stats_lines.push(Line::from(vec![
                     Span::styled(format!("{:>6} ", count), Style::default().fg(Color::White)),
-                    Span::styled(if host.len() > 18 { &host[..18] } else { host }, Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        if host.len() > 18 { &host[..18] } else { host },
+                        Style::default().fg(Color::Cyan),
+                    ),
                 ]));
             }
 
             stats_lines.push(Line::raw(""));
             stats_lines.push(Line::from(vec![
                 Span::styled("Level Filter: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(app.level_filter_label(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    app.level_filter_label(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]));
 
             if app.auto_scroll {
-                stats_lines.push(Line::from(Span::styled("● LIVE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
+                stats_lines.push(Line::from(Span::styled(
+                    "● LIVE",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                )));
             } else {
-                stats_lines.push(Line::from(Span::styled("○ PAUSED", Style::default().fg(Color::Yellow))));
+                stats_lines.push(Line::from(Span::styled(
+                    "○ PAUSED",
+                    Style::default().fg(Color::Yellow),
+                )));
             }
 
             let stats_block = Block::default()
@@ -475,13 +609,21 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
 
         // Detail panel (full width, below logs)
         if app.show_detail && app.selected < filtered.len() {
-            let sel = &filtered[filtered.len().saturating_sub(1).saturating_sub(app.selected)];
+            let sel = &filtered[filtered
+                .len()
+                .saturating_sub(1)
+                .saturating_sub(app.selected)];
             let mut detail_lines: Vec<Line> = Vec::new();
 
             // Message line
             detail_lines.push(Line::from(vec![
                 Span::styled("  Message   ", Style::default().fg(Color::DarkGray)),
-                Span::styled(&sel.message, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    &sel.message,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]));
 
             // Host + facility + level
@@ -491,12 +633,20 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
                 Span::styled("    Facility  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(&sel.facility, Style::default().fg(Color::Cyan)),
                 Span::styled("    Level  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(sel.level_label(), Style::default().fg(sel.level_color()).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    sel.level_label(),
+                    Style::default()
+                        .fg(sel.level_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("    Time  ", Style::default().fg(Color::DarkGray)),
                 Span::styled(&sel.timestamp, Style::default().fg(Color::White)),
             ]));
 
-            detail_lines.push(Line::from(Span::styled("  ─────────────────────────────────────────", Style::default().fg(Color::DarkGray))));
+            detail_lines.push(Line::from(Span::styled(
+                "  ─────────────────────────────────────────",
+                Style::default().fg(Color::DarkGray),
+            )));
 
             // All extra fields — two columns
             let extras = &sel.extra;
@@ -507,13 +657,22 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
 
                 // First column
                 let (k1, v1) = &extras[i];
-                spans.push(Span::styled(format!("{:<20}", k1), Style::default().fg(Color::Cyan)));
-                spans.push(Span::styled(format!("{:<30}", v1), Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    format!("{:<20}", k1),
+                    Style::default().fg(Color::Cyan),
+                ));
+                spans.push(Span::styled(
+                    format!("{:<30}", v1),
+                    Style::default().fg(Color::White),
+                ));
 
                 // Second column
                 if i + 1 < extras.len() {
                     let (k2, v2) = &extras[i + 1];
-                    spans.push(Span::styled(format!("{:<20}", k2), Style::default().fg(Color::Cyan)));
+                    spans.push(Span::styled(
+                        format!("{:<20}", k2),
+                        Style::default().fg(Color::Cyan),
+                    ));
                     spans.push(Span::styled(v2.as_str(), Style::default().fg(Color::White)));
                 }
 
@@ -539,25 +698,63 @@ fn render(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &App,
         };
 
         let footer_spans = vec![
-            Span::styled(" q", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " q",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("/", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" filter  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("l", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "l",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" level  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↑↓", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "↑↓",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("↵", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "↵",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" detail  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Tab", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" stats  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("f", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "f",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" follow  ", Style::default().fg(Color::DarkGray)),
             Span::raw("  "),
             Span::styled(&filter_display, Style::default().fg(Color::White)),
         ];
-        let footer = Paragraph::new(Line::from(footer_spans))
-            .block(Block::default().borders(Borders::TOP).border_style(Style::default().fg(Color::DarkGray)));
+        let footer = Paragraph::new(Line::from(footer_spans)).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
         frame.render_widget(footer, main_chunks[2]);
     });
 }
@@ -595,13 +792,16 @@ fn fetch_new_logs(stream: &mut TcpStream, collection: &str, last_id: u64) -> Vec
     };
     let limit = if last_id > 0 { 200 } else { 100 };
 
-    let resp = match send_recv(stream, &json!({
-        "cmd": "find",
-        "collection": collection,
-        "query": query,
-        "sort": {"_id": 1},
-        "limit": limit,
-    })) {
+    let resp = match send_recv(
+        stream,
+        &json!({
+            "cmd": "find",
+            "collection": collection,
+            "query": query,
+            "sort": {"_id": 1},
+            "limit": limit,
+        }),
+    ) {
         Ok(r) => r,
         Err(_) => return Vec::new(),
     };
@@ -676,7 +876,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Char('Q') => break,
-                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break;
+                        }
                         KeyCode::Char('/') => {
                             app.filter_active = true;
                         }

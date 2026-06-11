@@ -210,8 +210,7 @@ pub unsafe extern "C" fn oxidb_update_one(
         Ok(v) => v,
         Err(_) => return ptr::null_mut(),
     };
-    let req =
-        serde_json::json!({"cmd": "update_one", "collection": col, "query": query, "update": update});
+    let req = serde_json::json!({"cmd": "update_one", "collection": col, "query": query, "update": update});
     unsafe { send_request(conn, &req) }
 }
 
@@ -362,8 +361,7 @@ pub unsafe extern "C" fn oxidb_create_text_index(
         Ok(v) => v,
         Err(_) => return ptr::null_mut(),
     };
-    let req =
-        serde_json::json!({"cmd": "create_text_index", "collection": col, "fields": fields});
+    let req = serde_json::json!({"cmd": "create_text_index", "collection": col, "fields": fields});
     unsafe { send_request(conn, &req) }
 }
 
@@ -470,8 +468,7 @@ pub unsafe extern "C" fn oxidb_aggregate(
         Ok(v) => v,
         Err(_) => return ptr::null_mut(),
     };
-    let req =
-        serde_json::json!({"cmd": "aggregate", "collection": col, "pipeline": pipeline});
+    let req = serde_json::json!({"cmd": "aggregate", "collection": col, "pipeline": pipeline});
     unsafe { send_request(conn, &req) }
 }
 
@@ -667,10 +664,7 @@ pub unsafe extern "C" fn oxidb_rollback_tx(conn: *mut OxiDbConn) -> *mut c_char 
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn oxidb_sql(
-    conn: *mut OxiDbConn,
-    query: *const c_char,
-) -> *mut c_char {
+pub unsafe extern "C" fn oxidb_sql(conn: *mut OxiDbConn, query: *const c_char) -> *mut c_char {
     let q = match unsafe { cstr_to_str(query) } {
         Some(s) => s,
         None => return ptr::null_mut(),

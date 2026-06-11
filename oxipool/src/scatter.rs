@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -38,21 +38,16 @@ async fn forward_and_read(
     pool: &Arc<Pool>,
     payload: &[u8],
 ) -> Result<(Vec<u8>, Arc<Pool>), String> {
-    let mut backend = pool
-        .get()
-        .await
-        .map_err(|e| format!("pool get: {}", e))?;
+    let mut backend = pool.get().await.map_err(|e| format!("pool get: {}", e))?;
 
     write_frame(&mut backend, payload)
         .await
         .map_err(|e| format!("write: {}", e))?;
 
-    let response = read_frame(&mut backend)
-        .await
-        .map_err(|e| {
-            Pool::spawn_replace(Arc::clone(pool));
-            format!("read: {}", e)
-        })?;
+    let response = read_frame(&mut backend).await.map_err(|e| {
+        Pool::spawn_replace(Arc::clone(pool));
+        format!("read: {}", e)
+    })?;
 
     pool.put(backend).await;
     Ok((response, Arc::clone(pool)))
@@ -234,8 +229,10 @@ pub async fn scatter_insert_many(
     let json: Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(e) => {
-            return serde_json::to_vec(&json!({"ok": false, "error": format!("invalid JSON: {}", e)}))
-                .unwrap();
+            return serde_json::to_vec(
+                &json!({"ok": false, "error": format!("invalid JSON: {}", e)}),
+            )
+            .unwrap();
         }
     };
 
@@ -359,7 +356,8 @@ fn merge_doc_arrays(responses: Vec<Vec<u8>>) -> Vec<u8> {
         return serde_json::to_vec(&json!({
             "ok": false,
             "error": format!("scatter-gather find failed on one or more shards: {}", err),
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     let mut all_docs: Vec<Value> = Vec::new();
@@ -381,7 +379,8 @@ fn merge_counts(responses: Vec<Vec<u8>>) -> Vec<u8> {
         return serde_json::to_vec(&json!({
             "ok": false,
             "error": format!("scatter-gather count failed on one or more shards: {}", err),
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     let mut total: u64 = 0;
@@ -406,7 +405,8 @@ fn merge_modified(responses: Vec<Vec<u8>>) -> Vec<u8> {
         return serde_json::to_vec(&json!({
             "ok": false,
             "error": format!("scatter-gather update/delete failed on one or more shards: {}", err),
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     let mut total_modified: u64 = 0;
@@ -445,9 +445,13 @@ fn merge_first_match(responses: Vec<Vec<u8>>) -> Vec<u8> {
                         if data.is_object() {
                             // update_one/delete_one with 0 modifications — skip
                             if let Some(m) = data.get("modified").and_then(|v| v.as_u64()) {
-                                if m > 0 { return resp_bytes.clone(); }
+                                if m > 0 {
+                                    return resp_bytes.clone();
+                                }
                             } else if let Some(d) = data.get("deleted").and_then(|v| v.as_u64()) {
-                                if d > 0 { return resp_bytes.clone(); }
+                                if d > 0 {
+                                    return resp_bytes.clone();
+                                }
                             } else {
                                 // Regular document (find_one)
                                 return resp_bytes.clone();

@@ -269,7 +269,9 @@ fn test_create_collection_with_options_disk_first() {
     assert_ok(&resp);
 
     for i in 0..50u64 {
-        let r = c.send(&json!({"cmd": "insert", "collection": "wire_fast", "doc": {"k": i, "v": i * 2}}));
+        let r = c.send(
+            &json!({"cmd": "insert", "collection": "wire_fast", "doc": {"k": i, "v": i * 2}}),
+        );
         assert_ok(&r);
     }
     let resp = c.send(&json!({"cmd": "count", "collection": "wire_fast"}));
@@ -282,9 +284,18 @@ fn test_create_collection_with_options_disk_first() {
 
     // The wire option (not the env) made this collection disk-first: a `.bdat`
     // plus a persisted `.bopts` exist, and there is no in-RAM `.btree`.
-    assert!(server.data_dir.join("wire_fast.bdat").exists(), "disk-first .bdat created via wire");
-    assert!(server.data_dir.join("wire_fast.bopts").exists(), "options persisted (.bopts)");
-    assert!(!server.data_dir.join("wire_fast.btree").exists(), "not in-RAM");
+    assert!(
+        server.data_dir.join("wire_fast.bdat").exists(),
+        "disk-first .bdat created via wire"
+    );
+    assert!(
+        server.data_dir.join("wire_fast.bopts").exists(),
+        "options persisted (.bopts)"
+    );
+    assert!(
+        !server.data_dir.join("wire_fast.btree").exists(),
+        "not in-RAM"
+    );
 }
 
 #[test]

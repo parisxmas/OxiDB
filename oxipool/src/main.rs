@@ -1,6 +1,6 @@
 use std::env;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,7 +31,10 @@ impl Config {
         let replicas: Vec<String> = if replicas_str.is_empty() {
             vec![]
         } else {
-            replicas_str.split(',').map(|s| s.trim().to_string()).collect()
+            replicas_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect()
         };
 
         Self {
@@ -184,7 +187,10 @@ impl Pool {
                         return;
                     }
                     Err(e) => {
-                        eprintln!("[oxipool] {} reconnect failed (retry in {:?}): {}", label, delay, e);
+                        eprintln!(
+                            "[oxipool] {} reconnect failed (retry in {:?}): {}",
+                            label, delay, e
+                        );
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(max_delay);
                     }
@@ -258,11 +264,11 @@ async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), std::
 
 #[derive(PartialEq)]
 enum CmdRoute {
-    Write,       // → master
-    Read,        // → replica (or master if no replicas)
-    TxBegin,     // → master (pin)
-    TxCommit,    // → pinned master
-    TxRollback,  // → pinned master
+    Write,      // → master
+    Read,       // → replica (or master if no replicas)
+    TxBegin,    // → master (pin)
+    TxCommit,   // → pinned master
+    TxRollback, // → pinned master
 }
 
 fn classify_command(payload: &[u8]) -> CmdRoute {
@@ -538,9 +544,7 @@ async fn handle_client_sharded(
                         Ok(mut backend) => {
                             match forward(&mut backend, &mut client, &payload).await {
                                 Ok(()) => {
-                                    stats
-                                        .active_transactions
-                                        .fetch_add(1, Ordering::Relaxed);
+                                    stats.active_transactions.fetch_add(1, Ordering::Relaxed);
                                     pinned = Some((0, backend));
                                     Ok(())
                                 }
@@ -563,21 +567,13 @@ async fn handle_client_sharded(
                                 Ok(())
                             }
                             Err(e) => {
-                                Pool::spawn_replace(Arc::clone(
-                                    &shard_pools[shard_id as usize],
-                                ));
+                                Pool::spawn_replace(Arc::clone(&shard_pools[shard_id as usize]));
                                 Err(e)
                             }
                         }
                     } else {
                         // Not in a transaction — send to shard 0
-                        forward_to_pool(
-                            &shard_pools[0],
-                            &mut client,
-                            &payload,
-                            &stats,
-                        )
-                        .await
+                        forward_to_pool(&shard_pools[0], &mut client, &payload, &stats).await
                     }
                 }
             }
@@ -588,18 +584,14 @@ async fn handle_client_sharded(
                     if pinned_shard != shard_id {
                         // Cross-shard transaction — reject
                         let resp = b"{\"ok\":false,\"error\":\"cross-shard transactions not supported; use the same shard key within a transaction\"}";
-                        write_frame(&mut client, resp)
-                            .await
-                            .map_err(|e| e)
+                        write_frame(&mut client, resp).await.map_err(|e| e)
                     } else {
                         stats.shard_requests.fetch_add(1, Ordering::Relaxed);
                         match forward(backend, &mut client, &payload).await {
                             Ok(()) => Ok(()),
                             Err(e) => {
                                 let s = pinned.take().unwrap().0;
-                                stats
-                                    .active_transactions
-                                    .fetch_sub(1, Ordering::Relaxed);
+                                stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
                                 Pool::spawn_replace(Arc::clone(&shard_pools[s as usize]));
                                 Err(e)
                             }
@@ -753,7 +745,10 @@ async fn main() {
         // ─── Sharded mode ───────────────────────────────────────────
         let shard_cfg = shard_config.unwrap();
         let num_shards = shard_cfg.num_shards();
-        eprintln!("  mode:         SHARDED ({} shards, {} chunks)", num_shards, shard_cfg.num_chunks);
+        eprintln!(
+            "  mode:         SHARDED ({} shards, {} chunks)",
+            num_shards, shard_cfg.num_chunks
+        );
         for (i, addr) in shard_cfg.shards.iter().enumerate() {
             eprintln!("  shard[{}]:     {}", i, addr);
         }
@@ -762,7 +757,11 @@ async fn main() {
                 eprintln!("  shard_key:    {} → {}", coll, key.field);
             }
         }
-        eprintln!("  shard_pool:   {} per shard ({} total)", config.shard_pool_size, config.shard_pool_size * num_shards);
+        eprintln!(
+            "  shard_pool:   {} per shard ({} total)",
+            config.shard_pool_size,
+            config.shard_pool_size * num_shards
+        );
         eprintln!("  max_clients:  {}", config.max_clients);
 
         // Create per-shard pools
@@ -822,12 +821,10 @@ async fn main() {
 
         let client_limit = Arc::new(Semaphore::new(config.max_clients));
 
-        let listener = TcpListener::bind(&config.listen)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("FATAL: bind {}: {}", config.listen, e);
-                std::process::exit(1);
-            });
+        let listener = TcpListener::bind(&config.listen).await.unwrap_or_else(|e| {
+            eprintln!("FATAL: bind {}: {}", config.listen, e);
+            std::process::exit(1);
+        });
         eprintln!("OxiPool listening on {} (sharded)", config.listen);
 
         loop {
@@ -905,7 +902,13 @@ async fn main() {
             let mut pools = Vec::new();
             for (i, addr) in config.replicas.iter().enumerate() {
                 let label = format!("replica[{}]", i);
-                match Pool::new(addr, config.replica_pool_size, config.connect_timeout, &label).await
+                match Pool::new(
+                    addr,
+                    config.replica_pool_size,
+                    config.connect_timeout,
+                    &label,
+                )
+                .await
                 {
                     Ok(p) => {
                         eprintln!(
@@ -968,12 +971,10 @@ async fn main() {
 
         let client_limit = Arc::new(Semaphore::new(config.max_clients));
 
-        let listener = TcpListener::bind(&config.listen)
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("FATAL: bind {}: {}", config.listen, e);
-                std::process::exit(1);
-            });
+        let listener = TcpListener::bind(&config.listen).await.unwrap_or_else(|e| {
+            eprintln!("FATAL: bind {}: {}", config.listen, e);
+            std::process::exit(1);
+        });
         eprintln!("OxiPool listening on {}", config.listen);
 
         loop {

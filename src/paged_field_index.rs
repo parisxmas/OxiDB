@@ -17,6 +17,8 @@ use serde_json::Value;
 
 use crate::document::DocumentId;
 use crate::index::DocIdSet;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::mmap_field_index::MmapFieldIndex;
 use crate::value::IndexValue;
 
 // ---------------------------------------------------------------------------
@@ -74,7 +76,7 @@ pub struct PagedFieldIndex {
     /// `for_each_entry_asc`/`for_each_entry_desc` callbacks work for both and
     /// are what disk-first consumers (index-backed sort, count-only `$group`)
     /// use.
-    disk: Option<crate::mmap_field_index::MmapFieldIndex>,
+    disk: Option<MmapFieldIndex>,
 }
 
 impl PagedFieldIndex {
@@ -104,9 +106,9 @@ impl PagedFieldIndex {
     /// mmap'd `.mfidx` file). Used in disk-first mode.
     pub fn new_disk(field: String, unique: bool, path: PathBuf) -> Self {
         let mut m = if unique {
-            crate::mmap_field_index::MmapFieldIndex::new_unique(field.clone())
+            MmapFieldIndex::new_unique(field.clone())
         } else {
-            crate::mmap_field_index::MmapFieldIndex::new(field.clone())
+            MmapFieldIndex::new(field.clone())
         };
         m.set_path(path);
         Self {
@@ -123,7 +125,7 @@ impl PagedFieldIndex {
     /// instant, no deserialization, empty write overlay (small resident
     /// memory). Used on reopen so the index isn't rebuilt from a full scan.
     pub fn open_disk(path: PathBuf) -> io::Result<Self> {
-        let m = crate::mmap_field_index::MmapFieldIndex::open(&path)?;
+        let m = MmapFieldIndex::open(&path)?;
         Ok(Self {
             field: m.field.clone(),
             unique: m.unique,
@@ -302,7 +304,9 @@ impl PagedFieldIndex {
     // -- Query helpers -------------------------------------------------------
 
     pub fn find_eq(&self, value: &IndexValue) -> BTreeSet<DocumentId> {
-        if let Some(m) = &self.disk { return m.find_eq(value); }
+        if let Some(m) = &self.disk {
+            return m.find_eq(value);
+        }
         // Check write buffer
         if !self.write_buffer.is_empty() {
             let mut result = BTreeSet::new();
@@ -330,7 +334,9 @@ impl PagedFieldIndex {
     }
 
     pub fn count_eq(&self, value: &IndexValue) -> usize {
-        if let Some(m) = &self.disk { return m.count_eq(value); }
+        if let Some(m) = &self.disk {
+            return m.count_eq(value);
+        }
         if !self.write_buffer.is_empty() {
             return self.find_eq(value).len();
         }
@@ -341,7 +347,9 @@ impl PagedFieldIndex {
     }
 
     pub fn count_range(&self, start: Bound<&IndexValue>, end: Bound<&IndexValue>) -> usize {
-        if let Some(m) = &self.disk { return m.count_range(start, end); }
+        if let Some(m) = &self.disk {
+            return m.count_range(start, end);
+        }
         if !self.write_buffer.is_empty() {
             return self.find_range(start, end).len();
         }
@@ -354,7 +362,9 @@ impl PagedFieldIndex {
     }
 
     pub fn count_in(&self, values: &[IndexValue]) -> usize {
-        if let Some(m) = &self.disk { return m.count_in(values); }
+        if let Some(m) = &self.disk {
+            return m.count_in(values);
+        }
         if !self.write_buffer.is_empty() {
             return self.find_in(values).len();
         }
@@ -368,7 +378,9 @@ impl PagedFieldIndex {
     }
 
     pub fn count_all(&self) -> usize {
-        if let Some(m) = &self.disk { return m.count_all(); }
+        if let Some(m) = &self.disk {
+            return m.count_all();
+        }
         if !self.write_buffer.is_empty() {
             return self.all_ids().len();
         }
@@ -380,7 +392,9 @@ impl PagedFieldIndex {
     }
 
     pub fn find_ne(&self, value: &IndexValue) -> BTreeSet<DocumentId> {
-        if let Some(m) = &self.disk { return m.find_ne(value); }
+        if let Some(m) = &self.disk {
+            return m.find_ne(value);
+        }
         if !self.write_buffer.is_empty() {
             let mut result = BTreeSet::new();
             for (k, ids) in &self.entries {
@@ -420,7 +434,9 @@ impl PagedFieldIndex {
         start: Bound<&IndexValue>,
         end: Bound<&IndexValue>,
     ) -> BTreeSet<DocumentId> {
-        if let Some(m) = &self.disk { return m.find_range(start, end); }
+        if let Some(m) = &self.disk {
+            return m.find_range(start, end);
+        }
         if !self.write_buffer.is_empty() {
             let mut result = BTreeSet::new();
             let (lo, hi) = self.range_positions(start, end);
@@ -457,7 +473,9 @@ impl PagedFieldIndex {
     }
 
     pub fn find_in(&self, values: &[IndexValue]) -> BTreeSet<DocumentId> {
-        if let Some(m) = &self.disk { return m.find_in(values); }
+        if let Some(m) = &self.disk {
+            return m.find_in(values);
+        }
         if !self.write_buffer.is_empty() {
             let mut result = BTreeSet::new();
             for v in values {
@@ -493,7 +511,9 @@ impl PagedFieldIndex {
     }
 
     pub fn all_ids(&self) -> BTreeSet<DocumentId> {
-        if let Some(m) = &self.disk { return m.all_ids(); }
+        if let Some(m) = &self.disk {
+            return m.all_ids();
+        }
         let mut result = BTreeSet::new();
         for (_, ids) in &self.entries {
             for &id in ids {
@@ -519,7 +539,10 @@ impl PagedFieldIndex {
     where
         F: FnMut(DocumentId) -> bool,
     {
-        if let Some(m) = &self.disk { m.for_each_eq(value, f); return; }
+        if let Some(m) = &self.disk {
+            m.for_each_eq(value, f);
+            return;
+        }
         if !self.write_buffer.is_empty() {
             for id in self.find_eq(value) {
                 if !f(id) {
@@ -541,7 +564,10 @@ impl PagedFieldIndex {
     where
         F: FnMut(DocumentId) -> bool,
     {
-        if let Some(m) = &self.disk { m.for_each_ne(value, f); return; }
+        if let Some(m) = &self.disk {
+            m.for_each_ne(value, f);
+            return;
+        }
         if !self.write_buffer.is_empty() {
             for id in self.find_ne(value) {
                 if !f(id) {
@@ -565,7 +591,10 @@ impl PagedFieldIndex {
     where
         F: FnMut(DocumentId) -> bool,
     {
-        if let Some(m) = &self.disk { m.for_each_in_range(start, end, f); return; }
+        if let Some(m) = &self.disk {
+            m.for_each_in_range(start, end, f);
+            return;
+        }
         if !self.write_buffer.is_empty() {
             for id in self.find_range(start, end) {
                 if !f(id) {
@@ -588,7 +617,10 @@ impl PagedFieldIndex {
     where
         F: FnMut(DocumentId) -> bool,
     {
-        if let Some(m) = &self.disk { m.for_each_in(values, f); return; }
+        if let Some(m) = &self.disk {
+            m.for_each_in(values, f);
+            return;
+        }
         if !self.write_buffer.is_empty() {
             for id in self.find_in(values) {
                 if !f(id) {
@@ -675,7 +707,9 @@ impl PagedFieldIndex {
 
     /// Check if a doc_id exists under a given index value. O(log n) binary search.
     pub fn contains_doc_id(&self, value: &IndexValue, doc_id: DocumentId) -> bool {
-        if let Some(m) = &self.disk { return m.contains_doc_id(value, doc_id); }
+        if let Some(m) = &self.disk {
+            return m.contains_doc_id(value, doc_id);
+        }
         let idx = self.entries.partition_point(|(k, _)| k < value);
         if idx < self.entries.len() && &self.entries[idx].0 == value {
             return self.entries[idx].1.contains(&doc_id);
@@ -684,7 +718,9 @@ impl PagedFieldIndex {
     }
 
     pub fn check_unique(&self, value: &IndexValue, exclude_id: Option<DocumentId>) -> bool {
-        if let Some(m) = &self.disk { return m.check_unique(value, exclude_id); }
+        if let Some(m) = &self.disk {
+            return m.check_unique(value, exclude_id);
+        }
         if !self.write_buffer.is_empty() {
             let ids = self.find_eq(value);
             return match exclude_id {
@@ -711,7 +747,9 @@ impl PagedFieldIndex {
     }
 
     pub fn len(&self) -> usize {
-        if let Some(m) = &self.disk { return m.len(); }
+        if let Some(m) = &self.disk {
+            return m.len();
+        }
         self.entries.len()
     }
 
@@ -720,7 +758,9 @@ impl PagedFieldIndex {
     /// Excludes the (usually small) pending write buffer's heap beyond its
     /// inline slots.
     pub fn memory_bytes(&self) -> usize {
-        if let Some(m) = &self.disk { return m.len() * 24; }
+        if let Some(m) = &self.disk {
+            return m.len() * 24;
+        }
         let slot = std::mem::size_of::<(IndexValue, DocIdSet)>();
         let mut total = self.entries.capacity() * slot;
         for (iv, ids) in &self.entries {
@@ -732,7 +772,9 @@ impl PagedFieldIndex {
     }
 
     pub fn is_empty(&self) -> bool {
-        if let Some(m) = &self.disk { return m.is_empty(); }
+        if let Some(m) = &self.disk {
+            return m.is_empty();
+        }
         self.entries.is_empty() && self.write_buffer.is_empty()
     }
 
@@ -873,6 +915,118 @@ fn in_bounds(key: &IndexValue, start: Bound<&IndexValue>, end: Bound<&IndexValue
         Bound::Unbounded => true,
     };
     lo_ok && hi_ok
+}
+
+// ---------------------------------------------------------------------------
+// wasm32 stub for the disk-first (mmap) backend
+// ---------------------------------------------------------------------------
+
+/// Disk-first indexes live in mmap'd files, which don't exist on
+/// wasm32-unknown-unknown (in-memory engine only). This stub mirrors the
+/// `MmapFieldIndex` surface used above so the `disk` fast paths type-check;
+/// `disk` is always `None` on wasm32, so none of these bodies can run — the
+/// constructors panic with a clear message in case a disk-first option ever
+/// reaches a wasm build.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug)]
+struct MmapFieldIndex {
+    pub field: String,
+    pub unique: bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code, clippy::unused_self)]
+impl MmapFieldIndex {
+    pub fn new(_field: String) -> Self {
+        panic!("disk-first field indexes are not supported on wasm32");
+    }
+    pub fn new_unique(_field: String) -> Self {
+        panic!("disk-first field indexes are not supported on wasm32");
+    }
+    pub fn open(_path: &std::path::Path) -> io::Result<Self> {
+        panic!("disk-first field indexes are not supported on wasm32");
+    }
+    pub fn set_path(&mut self, _path: PathBuf) {
+        unreachable!()
+    }
+    pub fn persist(&mut self) -> io::Result<()> {
+        unreachable!()
+    }
+    pub fn insert_value(&mut self, _id: DocumentId, _data: &Value) {
+        unreachable!()
+    }
+    pub fn insert_raw(&mut self, _id: DocumentId, _key: IndexValue) {
+        unreachable!()
+    }
+    pub fn remove_value(&mut self, _id: DocumentId, _data: &Value) {
+        unreachable!()
+    }
+    pub fn check_unique(&self, _value: &IndexValue, _exclude_id: Option<DocumentId>) -> bool {
+        unreachable!()
+    }
+    pub fn find_eq(&self, _value: &IndexValue) -> BTreeSet<DocumentId> {
+        unreachable!()
+    }
+    pub fn contains_doc_id(&self, _value: &IndexValue, _doc_id: DocumentId) -> bool {
+        unreachable!()
+    }
+    pub fn count_eq(&self, _value: &IndexValue) -> usize {
+        unreachable!()
+    }
+    pub fn find_ne(&self, _value: &IndexValue) -> BTreeSet<DocumentId> {
+        unreachable!()
+    }
+    pub fn find_range(
+        &self,
+        _start: Bound<&IndexValue>,
+        _end: Bound<&IndexValue>,
+    ) -> BTreeSet<DocumentId> {
+        unreachable!()
+    }
+    pub fn count_range(&self, _start: Bound<&IndexValue>, _end: Bound<&IndexValue>) -> usize {
+        unreachable!()
+    }
+    pub fn count_in(&self, _values: &[IndexValue]) -> usize {
+        unreachable!()
+    }
+    pub fn count_all(&self) -> usize {
+        unreachable!()
+    }
+    pub fn find_in(&self, _values: &[IndexValue]) -> BTreeSet<DocumentId> {
+        unreachable!()
+    }
+    pub fn all_ids(&self) -> BTreeSet<DocumentId> {
+        unreachable!()
+    }
+    pub fn for_each_eq<F: FnMut(DocumentId) -> bool>(&self, _value: &IndexValue, _f: F) {
+        unreachable!()
+    }
+    pub fn for_each_ne<F: FnMut(DocumentId) -> bool>(&self, _value: &IndexValue, _f: F) {
+        unreachable!()
+    }
+    pub fn for_each_in_range<F: FnMut(DocumentId) -> bool>(
+        &self,
+        _start: Bound<&IndexValue>,
+        _end: Bound<&IndexValue>,
+        _f: F,
+    ) {
+        unreachable!()
+    }
+    pub fn for_each_in<F: FnMut(DocumentId) -> bool>(&self, _values: &[IndexValue], _f: F) {
+        unreachable!()
+    }
+    pub fn iter_asc(&self) -> std::iter::Empty<(IndexValue, DocIdSet)> {
+        unreachable!()
+    }
+    pub fn iter_desc(&self) -> std::iter::Empty<(IndexValue, DocIdSet)> {
+        unreachable!()
+    }
+    pub fn len(&self) -> usize {
+        unreachable!()
+    }
+    pub fn is_empty(&self) -> bool {
+        unreachable!()
+    }
 }
 
 // ---------------------------------------------------------------------------

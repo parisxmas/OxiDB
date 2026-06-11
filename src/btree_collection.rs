@@ -76,7 +76,10 @@ impl CollectionMemory {
     /// Total resident bytes attributable to this collection's primary store
     /// plus indexes (excludes the LRU caches).
     pub fn total(&self) -> usize {
-        self.storage_payload + self.storage_overhead + self.field_index_bytes + self.composite_index_bytes
+        self.storage_payload
+            + self.storage_overhead
+            + self.field_index_bytes
+            + self.composite_index_bytes
     }
 }
 
@@ -443,10 +446,18 @@ impl BTreeCollection {
         // 24-byte Vec header stored in the slot, plus bucket bookkeeping.
         let storage_overhead = storage_entries * (8 + 24 + 16);
 
-        let field_index_bytes: usize =
-            self.field_indexes.read().values().map(|i| i.memory_bytes()).sum();
-        let composite_index_bytes: usize =
-            self.composite_indexes.read().iter().map(|c| c.memory_bytes()).sum();
+        let field_index_bytes: usize = self
+            .field_indexes
+            .read()
+            .values()
+            .map(|i| i.memory_bytes())
+            .sum();
+        let composite_index_bytes: usize = self
+            .composite_indexes
+            .read()
+            .iter()
+            .map(|c| c.memory_bytes())
+            .sum();
 
         CollectionMemory {
             storage_entries,
@@ -1759,7 +1770,12 @@ impl BTreeCollection {
             Some(w) => w,
             None => return Ok(()),
         };
+        #[cfg(not(target_arch = "wasm32"))]
         let now = crate::pitr::now_micros();
+        // No wall clock on wasm32 (pitr is native-only); 0 treats any WORM
+        // lock as still active, which is the conservative direction.
+        #[cfg(target_arch = "wasm32")]
+        let now = 0u64;
         for id in ids {
             if worm.is_locked(id, now) {
                 return Err(Error::DocumentWormLocked {

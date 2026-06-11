@@ -51,13 +51,17 @@ fn ok_docs_bytes(docs: &[Arc<Value>]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) -> Vec<u8> {
-    let cmd = match request.get("cmd").and_then(|v| v.as_str().map(|s| s.to_string())) {
+    let cmd = match request
+        .get("cmd")
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+    {
         Some(c) => c,
         None => return err_bytes("missing or invalid 'cmd' field"),
     };
 
-    let collection: Option<String> =
-        request.get("collection").and_then(|v| v.as_str().map(|s| s.to_string()));
+    let collection: Option<String> = request
+        .get("collection")
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
 
     let mut request = request;
 
@@ -65,7 +69,6 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
         "ping" => ok_bytes(json!("pong")),
 
         // --- Transactions ---
-
         "begin_tx" => {
             if active_tx.is_some() {
                 return err_bytes("transaction already active");
@@ -92,7 +95,6 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
         },
 
         // --- CRUD ---
-
         "insert" => {
             let col = match collection.as_deref() {
                 Some(c) => c,
@@ -274,7 +276,6 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
         }
 
         // --- Indexes ---
-
         "create_index" => {
             let col = match collection.as_deref() {
                 Some(c) => c,
@@ -384,10 +385,7 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
                 Some(q) => q,
                 None => return err_bytes("missing 'query' string"),
             };
-            let limit = request
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as usize;
+            let limit = request.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
             match db.text_search(col, query, limit) {
                 Ok(results) => ok_bytes(json!(results)),
                 Err(e) => err_bytes(&e.to_string()),
@@ -395,7 +393,6 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
         }
 
         // --- Collections ---
-
         "create_collection" => {
             let col = match collection.as_deref() {
                 Some(c) => c,
@@ -454,7 +451,6 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
         }
 
         // --- Blob storage + FTS ---
-
         "create_bucket" => {
             let bucket = match request.get("bucket").and_then(|v| v.as_str()) {
                 Some(b) => b,
@@ -591,10 +587,7 @@ fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) 
                 None => return err_bytes("missing 'query'"),
             };
             let bucket = request.get("bucket").and_then(|v| v.as_str());
-            let limit = request
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(10) as usize;
+            let limit = request.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
             match db.search(bucket, query, limit) {
                 Ok(results) => ok_bytes(json!(results)),
                 Err(e) => err_bytes(&e.to_string()),
@@ -812,14 +805,16 @@ mod android_jni {
         let cmd: String = match env.get_string(&jcmd) {
             Ok(s) => s.into(),
             Err(_) => {
-                return env.new_string("{\"ok\":false,\"error\":\"invalid command string\"}")
+                return env
+                    .new_string("{\"ok\":false,\"error\":\"invalid command string\"}")
                     .unwrap_or_else(|_| JString::default());
             }
         };
         let c_cmd = match CString::new(cmd) {
             Ok(c) => c,
             Err(_) => {
-                return env.new_string("{\"ok\":false,\"error\":\"null byte in command\"}")
+                return env
+                    .new_string("{\"ok\":false,\"error\":\"null byte in command\"}")
                     .unwrap_or_else(|_| JString::default());
             }
         };
@@ -828,7 +823,9 @@ mod android_jni {
         let result_str = if result_ptr.is_null() {
             "{\"ok\":false,\"error\":\"null response\"}".to_string()
         } else {
-            let s = unsafe { CStr::from_ptr(result_ptr) }.to_string_lossy().into_owned();
+            let s = unsafe { CStr::from_ptr(result_ptr) }
+                .to_string_lossy()
+                .into_owned();
             unsafe { oxidb_free_string(result_ptr) };
             s
         };

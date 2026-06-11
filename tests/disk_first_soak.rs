@@ -111,8 +111,12 @@ fn churn_integrity_model_checked() {
             for _ in 0..4 {
                 let k = keys[rng.below(keys.len() as u64) as usize];
                 let v = rng.next();
-                db.update("c", &json!({ "k": k }), &json!({ "$set": { "v": v, "bucket": (v % 8) as i64 } }))
-                    .unwrap();
+                db.update(
+                    "c",
+                    &json!({ "k": k }),
+                    &json!({ "$set": { "v": v, "bucket": (v % 8) as i64 } }),
+                )
+                .unwrap();
                 model.insert(k, v);
             }
         }
@@ -172,8 +176,12 @@ fn index_consistency_under_churn() {
             for _ in 0..5 {
                 let k = keys[rng.below(keys.len() as u64) as usize];
                 let v = rng.next(); // changes bucket → must move in the index
-                db.update("c", &json!({ "k": k }), &json!({ "$set": { "v": v, "bucket": (v % 8) as i64 } }))
-                    .unwrap();
+                db.update(
+                    "c",
+                    &json!({ "k": k }),
+                    &json!({ "$set": { "v": v, "bucket": (v % 8) as i64 } }),
+                )
+                .unwrap();
                 model.insert(k, v);
             }
         }
@@ -189,7 +197,10 @@ fn index_consistency_under_churn() {
                 let expected = model.values().filter(|v| (*v % 8) as i64 == bucket).count();
                 // Indexed equality query must match the model exactly.
                 let got = db.count("c", &json!({ "bucket": bucket })).unwrap();
-                assert_eq!(got, expected, "index count mismatch bucket={bucket} round={round}");
+                assert_eq!(
+                    got, expected,
+                    "index count mismatch bucket={bucket} round={round}"
+                );
             }
         }
     }
@@ -224,7 +235,11 @@ fn churn_then_clean_reopen() {
     }
     // Reopen and reconcile.
     let db = OxiDb::open(dir.path()).unwrap();
-    assert_eq!(db.count("c", &json!({})).unwrap(), model.len(), "count after reopen");
+    assert_eq!(
+        db.count("c", &json!({})).unwrap(),
+        model.len(),
+        "count after reopen"
+    );
     for bucket in 0..8i64 {
         let expected = model.values().filter(|v| (*v % 8) as i64 == bucket).count();
         assert_eq!(
@@ -236,7 +251,11 @@ fn churn_then_clean_reopen() {
     // Spot-check point reads.
     for (&k, &v) in model.iter().take(50) {
         let got = db.find_one("c", &json!({ "k": k })).unwrap();
-        assert_eq!(got.and_then(|d| d["v"].as_u64()), Some(v), "k={k} after reopen");
+        assert_eq!(
+            got.and_then(|d| d["v"].as_u64()),
+            Some(v),
+            "k={k} after reopen"
+        );
     }
 }
 
@@ -255,11 +274,19 @@ fn crash_recovery_committed_survives() {
         // retains the committed records (not truncated).
     }
     let db = OxiDb::open(dir.path()).unwrap();
-    assert_eq!(db.count("c", &json!({})).unwrap() as u64, n, "all committed docs recovered");
+    assert_eq!(
+        db.count("c", &json!({})).unwrap() as u64,
+        n,
+        "all committed docs recovered"
+    );
     // Verify a sample round-trips correctly.
     for k in (0..n).step_by(137) {
         let got = db.find_one("c", &json!({ "k": k })).unwrap();
-        assert_eq!(got.and_then(|d| d["v"].as_u64()), Some(k * 2), "k={k} after crash recovery");
+        assert_eq!(
+            got.and_then(|d| d["v"].as_u64()),
+            Some(k * 2),
+            "k={k} after crash recovery"
+        );
     }
 }
 
@@ -279,10 +306,15 @@ fn bdat_growth_under_update_churn() {
     for _ in 0..updates {
         let k = rng.below(keys);
         let v = rng.next();
-        db.update("c", &json!({ "k": k }), &json!({ "$set": { "v": v } })).unwrap();
+        db.update("c", &json!({ "k": k }), &json!({ "$set": { "v": v } }))
+            .unwrap();
     }
     // Correctness: the live set is unchanged by updates.
-    assert_eq!(db.count("c", &json!({})).unwrap() as u64, keys, "live count stable under update churn");
+    assert_eq!(
+        db.count("c", &json!({})).unwrap() as u64,
+        keys,
+        "live count stable under update churn"
+    );
     db.shutdown();
 
     if disk_first() {
@@ -305,7 +337,11 @@ fn bdat_growth_under_update_churn() {
     // Reopen must still reconcile to the live set regardless of dead space.
     drop(db);
     let db = OxiDb::open(dir.path()).unwrap();
-    assert_eq!(db.count("c", &json!({})).unwrap() as u64, keys, "live count after reopen");
+    assert_eq!(
+        db.count("c", &json!({})).unwrap() as u64,
+        keys,
+        "live count after reopen"
+    );
 }
 
 /// Compaction reclaims the dead space left by update churn, and the live data
@@ -327,13 +363,20 @@ fn compaction_reclaims_space_and_preserves_data() {
     for _ in 0..(rounds() * 30) {
         let k = rng.below(keys);
         let v = rng.next();
-        db.update("c", &json!({ "k": k }), &json!({ "$set": { "v": v, "bucket": (v % 8) as i64 } }))
-            .unwrap();
+        db.update(
+            "c",
+            &json!({ "k": k }),
+            &json!({ "$set": { "v": v, "bucket": (v % 8) as i64 } }),
+        )
+        .unwrap();
         model.insert(k, v);
     }
 
     let stats = db.compact("c").unwrap();
-    assert_eq!(stats.docs_kept as u64, keys, "compaction keeps the live set");
+    assert_eq!(
+        stats.docs_kept as u64, keys,
+        "compaction keeps the live set"
+    );
     if disk_first() {
         assert!(
             stats.new_size < stats.old_size,
@@ -351,21 +394,37 @@ fn compaction_reclaims_space_and_preserves_data() {
     assert_eq!(db.count("c", &json!({})).unwrap() as u64, keys);
     for (&k, &v) in model.iter().take(50) {
         let got = db.find_one("c", &json!({ "k": k })).unwrap();
-        assert_eq!(got.and_then(|d| d["v"].as_u64()), Some(v), "k={k} after compact");
+        assert_eq!(
+            got.and_then(|d| d["v"].as_u64()),
+            Some(v),
+            "k={k} after compact"
+        );
     }
     for bucket in 0..8i64 {
         let expected = model.values().filter(|v| (*v % 8) as i64 == bucket).count();
-        assert_eq!(db.count("c", &json!({ "bucket": bucket })).unwrap(), expected, "indexed after compact");
+        assert_eq!(
+            db.count("c", &json!({ "bucket": bucket })).unwrap(),
+            expected,
+            "indexed after compact"
+        );
     }
 
     // And after a clean reopen (compacted file must be readable + correct).
     db.shutdown();
     drop(db);
     let db = OxiDb::open(dir.path()).unwrap();
-    assert_eq!(db.count("c", &json!({})).unwrap() as u64, keys, "live count after compact+reopen");
+    assert_eq!(
+        db.count("c", &json!({})).unwrap() as u64,
+        keys,
+        "live count after compact+reopen"
+    );
     for (&k, &v) in model.iter().take(50) {
         let got = db.find_one("c", &json!({ "k": k })).unwrap();
-        assert_eq!(got.and_then(|d| d["v"].as_u64()), Some(v), "k={k} after compact+reopen");
+        assert_eq!(
+            got.and_then(|d| d["v"].as_u64()),
+            Some(v),
+            "k={k} after compact+reopen"
+        );
     }
 }
 
@@ -397,7 +456,12 @@ fn auto_compaction_bounds_file_size() {
     let churn = (rounds() * 60).max(2400) as u64;
     for _ in 0..churn {
         let k = rng.below(keys);
-        db.update("c", &json!({ "k": k }), &json!({ "$set": { "v": rng.next() } })).unwrap();
+        db.update(
+            "c",
+            &json!({ "k": k }),
+            &json!({ "$set": { "v": rng.next() } }),
+        )
+        .unwrap();
     }
 
     // Let the periodic thread settle any pending compaction. Uncompacted, the
@@ -414,7 +478,11 @@ fn auto_compaction_bounds_file_size() {
     }
 
     // Correctness holds regardless of compaction.
-    assert_eq!(db.count("c", &json!({})).unwrap() as u64, keys, "live count");
+    assert_eq!(
+        db.count("c", &json!({})).unwrap() as u64,
+        keys,
+        "live count"
+    );
 
     if disk_first() {
         println!(
@@ -455,15 +523,22 @@ fn disk_first_indexed_sort_and_count_group() {
         let bucket = (score % 8) as i64;
         all_scores.push(score);
         *by_bucket.entry(bucket).or_default() += 1;
-        db.insert("c", json!({ "k": k, "score": score as i64, "bucket": bucket }))
-            .unwrap();
+        db.insert(
+            "c",
+            json!({ "k": k, "score": score as i64, "bucket": bucket }),
+        )
+        .unwrap();
     }
 
     // --- index-backed sort ASC + limit ---
     let opts = serde_json::json!({ "sort": { "score": 1 }, "limit": 10 });
     let opts = oxidb::query::parse_find_options(&opts).unwrap();
     let asc = db.find_with_options("c", &json!({}), &opts).unwrap();
-    assert_eq!(asc.len(), 10, "indexed ASC sort must return results (not empty)");
+    assert_eq!(
+        asc.len(),
+        10,
+        "indexed ASC sort must return results (not empty)"
+    );
     let mut prev = i64::MIN;
     for d in &asc {
         let s = d["score"].as_i64().unwrap();
@@ -472,13 +547,21 @@ fn disk_first_indexed_sort_and_count_group() {
     }
     let mut sorted = all_scores.clone();
     sorted.sort_unstable();
-    assert_eq!(asc[0]["score"].as_i64().unwrap() as u64, sorted[0], "smallest score first");
+    assert_eq!(
+        asc[0]["score"].as_i64().unwrap() as u64,
+        sorted[0],
+        "smallest score first"
+    );
 
     // --- index-backed sort DESC + limit ---
     let opts = serde_json::json!({ "sort": { "score": -1 }, "limit": 10 });
     let opts = oxidb::query::parse_find_options(&opts).unwrap();
     let desc = db.find_with_options("c", &json!({}), &opts).unwrap();
-    assert_eq!(desc.len(), 10, "indexed DESC sort must return results (not empty)");
+    assert_eq!(
+        desc.len(),
+        10,
+        "indexed DESC sort must return results (not empty)"
+    );
     let mut prev = i64::MAX;
     for d in &desc {
         let s = d["score"].as_i64().unwrap();
@@ -494,7 +577,11 @@ fn disk_first_indexed_sort_and_count_group() {
     // --- index-only count $group (count-only on an indexed field) ---
     let pipe = json!([{ "$group": { "_id": "$bucket", "n": { "$sum": 1 } } }]);
     let groups = db.aggregate("c", &pipe).unwrap();
-    assert_eq!(groups.len(), by_bucket.len(), "one group per distinct bucket");
+    assert_eq!(
+        groups.len(),
+        by_bucket.len(),
+        "one group per distinct bucket"
+    );
     for g in &groups {
         let b = g["_id"].as_i64().unwrap();
         let n = g["n"].as_u64().unwrap() as usize;

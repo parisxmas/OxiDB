@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::document::DocumentId;
 use crate::error::{Error, Result};
@@ -1191,9 +1191,7 @@ fn parse_window_frame(w: &Value) -> Result<WindowFrame> {
         .get("documents")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            Error::InvalidPipeline(
-                "window currently supports only { documents: [lo, hi] }".into(),
-            )
+            Error::InvalidPipeline("window currently supports only { documents: [lo, hi] }".into())
         })?;
     if docs.len() != 2 {
         return Err(Error::InvalidPipeline(
@@ -1206,13 +1204,11 @@ fn parse_window_frame(w: &Value) -> Result<WindowFrame> {
     })
 }
 
-fn parse_window_op(
-    field: &str,
-    spec: &Value,
-    has_sort: bool,
-) -> Result<WindowOp> {
+fn parse_window_op(field: &str, spec: &Value, has_sort: bool) -> Result<WindowOp> {
     let obj = spec.as_object().ok_or_else(|| {
-        Error::InvalidPipeline(format!("$setWindowFields output '{field}' must be an object"))
+        Error::InvalidPipeline(format!(
+            "$setWindowFields output '{field}' must be an object"
+        ))
     })?;
     let frame = match obj.get("window") {
         Some(w) => parse_window_frame(w)?,
@@ -1264,7 +1260,11 @@ fn parse_window_op(
                 .and_then(|v| v.as_i64())
                 .ok_or_else(|| Error::InvalidPipeline("$shift requires integer 'by'".into()))?;
             let default = so.get("default").cloned().unwrap_or(Value::Null);
-            Ok(WindowOp::Shift { output, by, default })
+            Ok(WindowOp::Shift {
+                output,
+                by,
+                default,
+            })
         }
         _ => {
             // Anything else must be an accumulator; reuse the $group parser by
@@ -1291,7 +1291,9 @@ fn parse_set_window_fields(body: &Value) -> Result<Stage> {
     let out_obj = obj
         .get("output")
         .and_then(|v| v.as_object())
-        .ok_or_else(|| Error::InvalidPipeline("$setWindowFields requires an 'output' object".into()))?;
+        .ok_or_else(|| {
+            Error::InvalidPipeline("$setWindowFields requires an 'output' object".into())
+        })?;
     if out_obj.is_empty() {
         return Err(Error::InvalidPipeline(
             "$setWindowFields 'output' must define at least one field".into(),
@@ -1917,7 +1919,11 @@ fn exec_count(docs: Vec<Value>, field_name: &str) -> Vec<Value> {
 /// The input is buffered (it's already an in-memory `Vec<Value>` at this point),
 /// so the sub-pipelines re-process it without re-scanning storage; each gets its
 /// own clone of the input.
-fn exec_facet<F>(docs: Vec<Value>, facets: &[(String, Pipeline)], lookup_fn: &F) -> Result<Vec<Value>>
+fn exec_facet<F>(
+    docs: Vec<Value>,
+    facets: &[(String, Pipeline)],
+    lookup_fn: &F,
+) -> Result<Vec<Value>>
 where
     F: Fn(&str, &Value) -> Result<Vec<Value>>,
 {
@@ -2066,7 +2072,11 @@ fn exec_set_window_fields(
                     WindowOp::DocumentNumber => json!(i as u64 + 1),
                     WindowOp::Rank => json!(ranks[i]),
                     WindowOp::DenseRank => json!(dense[i]),
-                    WindowOp::Shift { output, by, default } => {
+                    WindowOp::Shift {
+                        output,
+                        by,
+                        default,
+                    } => {
                         let j = i as i64 + by;
                         if j >= 0 && (j as usize) < n {
                             output.eval(&part[j as usize])
@@ -3470,7 +3480,10 @@ mod tests {
         let mut m = std::collections::HashMap::new();
         for d in &out {
             m.insert(
-                (d["region"].as_str().unwrap().to_string(), d["date"].as_i64().unwrap()),
+                (
+                    d["region"].as_str().unwrap().to_string(),
+                    d["date"].as_i64().unwrap(),
+                ),
                 d.clone(),
             );
         }
@@ -3544,13 +3557,17 @@ mod tests {
             .is_err()
         );
         // 'output' is required.
-        assert!(Pipeline::parse(&json!([{ "$setWindowFields": { "sortBy": { "x": 1 } } }])).is_err());
+        assert!(
+            Pipeline::parse(&json!([{ "$setWindowFields": { "sortBy": { "x": 1 } } }])).is_err()
+        );
     }
 
     #[test]
     fn facet_rejects_nesting_and_out_and_bad_shape() {
         // nested $facet
-        assert!(Pipeline::parse(&json!([{ "$facet": { "x": [{ "$facet": { "y": [] } }] } }])).is_err());
+        assert!(
+            Pipeline::parse(&json!([{ "$facet": { "x": [{ "$facet": { "y": [] } }] } }])).is_err()
+        );
         // $out inside a facet
         assert!(Pipeline::parse(&json!([{ "$facet": { "x": [{ "$out": "z" }] } }])).is_err());
         // empty $facet

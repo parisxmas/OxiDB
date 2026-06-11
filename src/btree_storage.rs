@@ -153,7 +153,9 @@ fn auto_compact_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("OXIDB_AUTO_COMPACT")
-            .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")))
+            .map(|v| {
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            })
             .unwrap_or(true)
     })
 }
@@ -1301,7 +1303,9 @@ mod tests {
 
     #[test]
     fn persistence_roundtrip() {
-        if disk_first_enabled() { return; } // tests the in-RAM .btree format
+        if disk_first_enabled() {
+            return;
+        } // tests the in-RAM .btree format
         let dir = tempfile::tempdir().unwrap();
         {
             let storage = BTreeStorage::new("test_persist", dir.path(), None);
@@ -1352,7 +1356,9 @@ mod tests {
     /// migration window is exactly "first persist after upgrade".
     #[test]
     fn reads_legacy_header_less_btree() {
-        if disk_first_enabled() { return; } // tests the in-RAM .btree format
+        if disk_first_enabled() {
+            return;
+        } // tests the in-RAM .btree format
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.btree");
 
@@ -1390,7 +1396,9 @@ mod tests {
     /// would let WAL replay paper over a real data loss).
     #[test]
     fn refuses_newer_btree_version() {
-        if disk_first_enabled() { return; } // tests the in-RAM .btree format
+        if disk_first_enabled() {
+            return;
+        } // tests the in-RAM .btree format
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.btree");
 

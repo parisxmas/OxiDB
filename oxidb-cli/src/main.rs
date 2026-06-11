@@ -118,13 +118,28 @@ fn run_migrate(args: MigrateArgs) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        MigrateAction::Run { data, dry_run, no_backup, in_place, out } => {
-            let opts = migrate::RunOptions { dry_run, no_backup, in_place, out };
+        MigrateAction::Run {
+            data,
+            dry_run,
+            no_backup,
+            in_place,
+            out,
+        } => {
+            let opts = migrate::RunOptions {
+                dry_run,
+                no_backup,
+                in_place,
+                out,
+            };
             match migrate::run(&data, &opts) {
                 Ok(result) => {
                     println!(
                         "migrate: current={} older={} newer={} legacy={} unreadable={}",
-                        result.current, result.older, result.newer, result.legacy, result.unreadable
+                        result.current,
+                        result.older,
+                        result.newer,
+                        result.legacy,
+                        result.unreadable
                     );
                     if result.older == 0 && result.newer == 0 {
                         println!("no migration needed");
@@ -166,7 +181,9 @@ fn run_shell(cli: Cli) -> ExitCode {
             }
         }
     } else {
-        eprintln!("Error: specify --data <PATH> (embedded), --host <HOST> (client), or a subcommand (try `oxidb migrate --help`)");
+        eprintln!(
+            "Error: specify --data <PATH> (embedded), --host <HOST> (client), or a subcommand (try `oxidb migrate --help`)"
+        );
         return ExitCode::from(1);
     };
 
@@ -215,7 +232,9 @@ fn run_repl(executor: &mut dyn CommandExecutor, raw_json: bool) {
         let prompt = "oxidb> ";
         let line = match rl.readline(prompt) {
             Ok(line) => line,
-            Err(rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof) => {
+            Err(
+                rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof,
+            ) => {
                 break;
             }
             Err(e) => {

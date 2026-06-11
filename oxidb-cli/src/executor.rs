@@ -24,7 +24,10 @@ pub struct EmbeddedExecutor {
 }
 
 impl EmbeddedExecutor {
-    pub fn open(data_dir: &Path, encryption_key: Option<Arc<oxidb::EncryptionKey>>) -> Result<Self, String> {
+    pub fn open(
+        data_dir: &Path,
+        encryption_key: Option<Arc<oxidb::EncryptionKey>>,
+    ) -> Result<Self, String> {
         let db = OxiDb::open_with_options(data_dir, encryption_key)
             .map_err(|e| format!("failed to open database: {e}"))?;
         Ok(Self {
@@ -49,8 +52,9 @@ impl CommandExecutor for EmbeddedExecutor {
             None => return err_val("missing or invalid 'cmd' field"),
         };
 
-        let collection: Option<String> =
-            request.get("collection").and_then(|v| v.as_str().map(|s| s.to_string()));
+        let collection: Option<String> = request
+            .get("collection")
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
 
         match cmd.as_str() {
             "ping" => ok_val(json!("pong")),
@@ -359,10 +363,7 @@ impl CommandExecutor for EmbeddedExecutor {
                     Some(q) => q,
                     None => return err_val("missing 'query' string"),
                 };
-                let limit = request
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10) as usize;
+                let limit = request.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
                 match self.db.text_search(col, query, limit) {
                     Ok(results) => ok_val(json!(results)),
                     Err(e) => err_val(&e.to_string()),
@@ -478,7 +479,10 @@ impl CommandExecutor for EmbeddedExecutor {
                             .collect()
                     })
                     .unwrap_or_default();
-                match self.db.put_object(bucket, key, &data, content_type, metadata) {
+                match self
+                    .db
+                    .put_object(bucket, key, &data, content_type, metadata)
+                {
                     Ok(meta) => ok_val(meta),
                     Err(e) => err_val(&e.to_string()),
                 }
@@ -549,10 +553,7 @@ impl CommandExecutor for EmbeddedExecutor {
                     None => return err_val("missing 'query'"),
                 };
                 let bucket = request.get("bucket").and_then(|v| v.as_str());
-                let limit = request
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10) as usize;
+                let limit = request.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
                 match self.db.search(bucket, query, limit) {
                     Ok(results) => ok_val(json!(results)),
                     Err(e) => err_val(&e.to_string()),
@@ -606,10 +607,7 @@ impl CommandExecutor for EmbeddedExecutor {
                         .collect::<Vec<f32>>(),
                     None => return err_val("missing 'vector' array"),
                 };
-                let limit = request
-                    .get("limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(10) as usize;
+                let limit = request.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
                 match self.db.vector_search(col, field, &vector, limit, None) {
                     Ok(results) => ok_val(json!(results)),
                     Err(e) => err_val(&e.to_string()),

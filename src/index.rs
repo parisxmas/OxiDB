@@ -535,9 +535,7 @@ impl CompositeIndex {
     /// large doc-id sets.
     pub fn memory_bytes(&self) -> usize {
         // Per-entry B-tree overhead: key + value inline sizes + node bookkeeping.
-        let per_entry = std::mem::size_of::<CompositeKey>()
-            + std::mem::size_of::<DocIdSet>()
-            + 24;
+        let per_entry = std::mem::size_of::<CompositeKey>() + std::mem::size_of::<DocIdSet>() + 24;
         let mut total = self.tree.len() * per_entry;
         for (key, ids) in &self.tree {
             total += key.0.capacity() * std::mem::size_of::<IndexValue>();

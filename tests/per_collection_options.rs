@@ -57,23 +57,48 @@ fn mixed_disk_first_and_in_ram_collections_in_one_engine() {
     // On disk: "fast" is disk-first (.bdat + persisted .bopts), "small" is
     // in-RAM (.btree, no .bdat). This is the whole point — the storage shape is
     // per-collection, not a process-wide switch.
-    assert!(file(dir.path(), "fast.bdat"), "fast must be disk-first (.bdat)");
-    assert!(file(dir.path(), "fast.bopts"), "fast options must persist (.bopts)");
-    assert!(!file(dir.path(), "fast.btree"), "fast must NOT have a .btree");
-    assert!(file(dir.path(), "small.btree"), "small must be in-RAM (.btree)");
-    assert!(!file(dir.path(), "small.bdat"), "small must NOT have a .bdat");
+    assert!(
+        file(dir.path(), "fast.bdat"),
+        "fast must be disk-first (.bdat)"
+    );
+    assert!(
+        file(dir.path(), "fast.bopts"),
+        "fast options must persist (.bopts)"
+    );
+    assert!(
+        !file(dir.path(), "fast.btree"),
+        "fast must NOT have a .btree"
+    );
+    assert!(
+        file(dir.path(), "small.btree"),
+        "small must be in-RAM (.btree)"
+    );
+    assert!(
+        !file(dir.path(), "small.bdat"),
+        "small must NOT have a .bdat"
+    );
 
     // The uncompressed .bdat: a highly-repetitive payload would shrink under
     // zstd; here the file should be at least the raw live-bytes size.
-    let bdat = std::fs::metadata(dir.path().join("fast.bdat")).unwrap().len();
+    let bdat = std::fs::metadata(dir.path().join("fast.bdat"))
+        .unwrap()
+        .len();
     assert!(bdat > 0);
 
     // Reopen with NO env vars: "fast" must still come up disk-first (resolved
     // from .bopts, not the environment) with all data intact.
     {
         let db = OxiDb::open(dir.path()).unwrap();
-        assert_eq!(db.count("fast", &json!({})).unwrap(), 500, "fast survives reopen");
-        assert_eq!(db.count("small", &json!({})).unwrap(), 500, "small survives reopen");
+        assert_eq!(
+            db.count("fast", &json!({})).unwrap(),
+            500,
+            "fast survives reopen"
+        );
+        assert_eq!(
+            db.count("small", &json!({})).unwrap(),
+            500,
+            "small survives reopen"
+        );
         assert_eq!(
             db.find_one("fast", &json!({ "k": 100 }))
                 .unwrap()
@@ -85,7 +110,10 @@ fn mixed_disk_first_and_in_ram_collections_in_one_engine() {
         db.insert("fast", json!({ "k": 9999, "v": 1 })).unwrap();
         db.shutdown();
     }
-    assert!(!file(dir.path(), "fast.btree"), "fast stays disk-first across reopen");
+    assert!(
+        !file(dir.path(), "fast.btree"),
+        "fast stays disk-first across reopen"
+    );
 }
 
 #[test]
@@ -98,12 +126,20 @@ fn compressed_vs_uncompressed_disk_first_same_engine() {
 
     db.create_collection_with_options(
         "zc",
-        StorageOptions { disk_first: true, compress: true, ..StorageOptions::default() },
+        StorageOptions {
+            disk_first: true,
+            compress: true,
+            ..StorageOptions::default()
+        },
     )
     .unwrap();
     db.create_collection_with_options(
         "raw",
-        StorageOptions { disk_first: true, compress: false, ..StorageOptions::default() },
+        StorageOptions {
+            disk_first: true,
+            compress: false,
+            ..StorageOptions::default()
+        },
     )
     .unwrap();
 
@@ -117,7 +153,9 @@ fn compressed_vs_uncompressed_disk_first_same_engine() {
     db.shutdown();
 
     let zc = std::fs::metadata(dir.path().join("zc.bdat")).unwrap().len();
-    let raw = std::fs::metadata(dir.path().join("raw.bdat")).unwrap().len();
+    let raw = std::fs::metadata(dir.path().join("raw.bdat"))
+        .unwrap()
+        .len();
     assert!(
         zc < raw / 2,
         "compressed .bdat ({zc}) should be far smaller than uncompressed ({raw})"

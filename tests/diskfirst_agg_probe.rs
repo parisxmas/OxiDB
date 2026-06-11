@@ -32,7 +32,9 @@ fn agg_cost_breakdown() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(200_000);
 
-    let depts = ["eng", "sales", "ops", "hr", "finance", "legal", "support", "mktg"];
+    let depts = [
+        "eng", "sales", "ops", "hr", "finance", "legal", "support", "mktg",
+    ];
     let cities = ["NYC", "LON", "SF", "BER", "TOK", "PAR"];
 
     let dir = tempfile::tempdir().unwrap();
@@ -76,8 +78,7 @@ fn agg_cost_breakdown() {
     let count_only = t.elapsed();
 
     // B) full scan: group by same field, avg(salary) -> reads every doc.
-    let avg_pipe =
-        json!([{ "$group": { "_id": "$department", "avg": { "$avg": "$salary" }, "n": { "$sum": 1 } } }]);
+    let avg_pipe = json!([{ "$group": { "_id": "$department", "avg": { "$avg": "$salary" }, "n": { "$sum": 1 } } }]);
     let _ = db.aggregate("c", &avg_pipe).unwrap();
     let t = Instant::now();
     let b = db.aggregate("c", &avg_pipe).unwrap();
@@ -86,14 +87,27 @@ fn agg_cost_breakdown() {
     // C) for reference: an unindexed full-scan count (also reads every doc) so we
     //    can see the same per-doc read cost outside aggregation.
     let t = Instant::now();
-    let cnt = db.count("c", &json!({ "rating": { "$gte": 0.0 } })).unwrap();
+    let cnt = db
+        .count("c", &json!({ "rating": { "$gte": 0.0 } }))
+        .unwrap();
     let unindexed_scan = t.elapsed();
 
     println!("\n=== disk_first={} | n={} ===", disk_first(), n);
     println!("insert                 : {:>9.2?}", insert);
-    println!("A) group count-only    : {:>9.2?}  ({} groups) [index-only, 0 doc reads]", count_only, a.len());
-    println!("B) group avg(salary)   : {:>9.2?}  ({} groups) [reads every doc]", avg_scan, b.len());
-    println!("C) unindexed scan count: {:>9.2?}  ({} matched) [reads every doc]", unindexed_scan, cnt);
+    println!(
+        "A) group count-only    : {:>9.2?}  ({} groups) [index-only, 0 doc reads]",
+        count_only,
+        a.len()
+    );
+    println!(
+        "B) group avg(salary)   : {:>9.2?}  ({} groups) [reads every doc]",
+        avg_scan,
+        b.len()
+    );
+    println!(
+        "C) unindexed scan count: {:>9.2?}  ({} matched) [reads every doc]",
+        unindexed_scan, cnt
+    );
     println!(
         "ratio B/A              : {:>6.1}x   (how much the per-doc read+decode adds)",
         avg_scan.as_secs_f64() / count_only.as_secs_f64().max(1e-9)

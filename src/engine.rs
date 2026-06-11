@@ -2872,7 +2872,10 @@ would silently shadow the old data with empty collections. Migrate or delete the
             // ran), or a legacy `.dat` file. A single collection can have
             // several of these, so the HashSet dedups them. Sealed WAL segments
             // `<name>.wal.<seq>` have a numeric extension and are skipped.
-            if matches!(ext, Some("btree") | Some("bdat") | Some("wal") | Some("dat")) {
+            if matches!(
+                ext,
+                Some("btree") | Some("bdat") | Some("wal") | Some("dat")
+            ) {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     names.insert(stem.to_string());
                 }

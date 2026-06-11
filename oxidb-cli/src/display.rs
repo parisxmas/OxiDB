@@ -8,7 +8,10 @@ pub fn format_response(response: &Value, raw_json: bool) -> String {
         return response.to_string();
     }
 
-    let ok = response.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    let ok = response
+        .get("ok")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if !ok {
         let error = response
