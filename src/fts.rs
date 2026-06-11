@@ -29,6 +29,13 @@ struct DocInfo {
     /// estimate via FtsIndex::bucket_text_size.
     #[serde(default)]
     text_bytes: u64,
+    /// The distinct terms this doc contributed postings for. Lets
+    /// remove/re-index touch only those posting lists instead of sweeping
+    /// the entire inverted index per document. Default-empty for indexes
+    /// written before the field existed — those docs fall back to the full
+    /// sweep once, then carry the list after re-indexing.
+    #[serde(default)]
+    terms: Vec<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -245,7 +252,22 @@ impl FtsIndex {
 
         let mut data: IndexData = if index_path.exists() {
             let bytes = std::fs::read(&index_path)?;
-            serde_json::from_slice(&bytes)?
+            // The FTS index is DERIVED data — a torn/corrupt index.json
+            // (e.g. from a crash mid-write before the atomic-rename persist
+            // existed) must not brick `OxiDb::open`. Start empty and warn;
+            // documents/blobs are intact and can be reindexed.
+            match serde_json::from_slice(&bytes) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    eprintln!(
+                        "[fts] {} is corrupt ({e}); starting with an empty FTS index",
+                        index_path.display()
+                    );
+                    let quarantine = index_path.with_extension("json.corrupt");
+                    let _ = std::fs::rename(&index_path, &quarantine);
+                    IndexData::default()
+                }
+            }
         } else {
             IndexData::default()
         };
@@ -300,7 +322,8 @@ impl FtsIndex {
             entry.1.push(pos as u32);
         }
 
-        // Add postings
+        // Add postings (keep the distinct-term list for targeted removal)
+        let doc_terms: Vec<String> = term_freq.keys().cloned().collect();
         for (term, (freq, positions)) in term_freq {
             let posting = Posting {
                 doc_id: doc_id.clone(),
@@ -328,6 +351,7 @@ impl FtsIndex {
                 key: key.to_string(),
                 total_terms,
                 text_bytes: text.len() as u64,
+                terms: doc_terms,
             },
         );
 
@@ -382,15 +406,36 @@ impl FtsIndex {
     }
 
     fn remove_postings(&mut self, doc_id: &str) {
-        let mut empty_terms = Vec::new();
-        for (term, postings) in self.data.postings.iter_mut() {
-            postings.retain(|p| p.doc_id != doc_id);
-            if postings.is_empty() {
-                empty_terms.push(term.clone());
+        // Targeted removal: only the posting lists of the doc's own terms
+        // are touched — O(doc terms) instead of a sweep over the ENTIRE
+        // inverted index per document update/remove.
+        match self.data.docs.get(doc_id) {
+            None => {} // never indexed — nothing to remove
+            Some(info) if !info.terms.is_empty() || info.total_terms == 0 => {
+                let terms = info.terms.clone();
+                for term in &terms {
+                    if let Some(postings) = self.data.postings.get_mut(term) {
+                        postings.retain(|p| p.doc_id != doc_id);
+                        if postings.is_empty() {
+                            self.data.postings.remove(term);
+                        }
+                    }
+                }
             }
-        }
-        for term in empty_terms {
-            self.data.postings.remove(&term);
+            Some(_) => {
+                // Legacy DocInfo written before the per-doc term list
+                // existed: full sweep, once — re-indexing stores the list.
+                let mut empty_terms = Vec::new();
+                for (term, postings) in self.data.postings.iter_mut() {
+                    postings.retain(|p| p.doc_id != doc_id);
+                    if postings.is_empty() {
+                        empty_terms.push(term.clone());
+                    }
+                }
+                for term in empty_terms {
+                    self.data.postings.remove(&term);
+                }
+            }
         }
     }
 
@@ -451,7 +496,17 @@ impl FtsIndex {
 
     fn persist(&self) -> Result<()> {
         let json = serde_json::to_vec(&self.data)?;
-        std::fs::write(&self.index_path, json)?;
+        // tmp + fsync + atomic rename: this file is rewritten every flush
+        // tick under write load, and the previous truncate-in-place
+        // `fs::write` left a torn index.json when a crash hit mid-write.
+        let tmp = self.index_path.with_extension("json.tmp");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.sync_data()?;
+        }
+        std::fs::rename(&tmp, &self.index_path)?;
         Ok(())
     }
 }
@@ -477,6 +532,9 @@ pub struct CollectionTextIndex {
     postings: HashMap<String, Vec<DocPosting>>,
     /// doc_id → total indexed terms count
     doc_term_counts: HashMap<DocumentId, u32>,
+    /// doc_id → the distinct terms it contributed, so removal touches only
+    /// those posting lists instead of sweeping the whole inverted index.
+    doc_terms: HashMap<DocumentId, Vec<String>>,
     /// Sum of all per-doc term counts; cached for BM25 avgdl.
     total_term_count: u64,
 }
@@ -492,6 +550,7 @@ impl CollectionTextIndex {
             fields,
             postings: HashMap::new(),
             doc_term_counts: HashMap::new(),
+            doc_terms: HashMap::new(),
             total_term_count: 0,
         }
     }
@@ -539,7 +598,8 @@ impl CollectionTextIndex {
             *term_freq.entry(token.clone()).or_insert(0) += 1;
         }
 
-        // Add postings
+        // Add postings (keep the distinct-term list for targeted removal)
+        let terms: Vec<String> = term_freq.keys().cloned().collect();
         for (term, freq) in term_freq {
             self.postings.entry(term).or_default().push(DocPosting {
                 doc_id,
@@ -547,6 +607,7 @@ impl CollectionTextIndex {
             });
         }
 
+        self.doc_terms.insert(doc_id, terms);
         self.doc_term_counts.insert(doc_id, total_terms);
         self.total_term_count += total_terms as u64;
     }
@@ -558,15 +619,33 @@ impl CollectionTextIndex {
             None => return, // not indexed
         };
         self.total_term_count = self.total_term_count.saturating_sub(removed_terms as u64);
-        let mut empty_terms = Vec::new();
-        for (term, postings) in self.postings.iter_mut() {
-            postings.retain(|p| p.doc_id != doc_id);
-            if postings.is_empty() {
-                empty_terms.push(term.clone());
+        match self.doc_terms.remove(&doc_id) {
+            Some(terms) => {
+                // Targeted: only the doc's own posting lists — O(doc terms)
+                // instead of a sweep over the whole inverted index.
+                for term in &terms {
+                    if let Some(postings) = self.postings.get_mut(term) {
+                        postings.retain(|p| p.doc_id != doc_id);
+                        if postings.is_empty() {
+                            self.postings.remove(term);
+                        }
+                    }
+                }
             }
-        }
-        for term in empty_terms {
-            self.postings.remove(&term);
+            None => {
+                // Shouldn't happen (both maps are written together), but a
+                // full sweep keeps the index consistent if it ever does.
+                let mut empty_terms = Vec::new();
+                for (term, postings) in self.postings.iter_mut() {
+                    postings.retain(|p| p.doc_id != doc_id);
+                    if postings.is_empty() {
+                        empty_terms.push(term.clone());
+                    }
+                }
+                for term in empty_terms {
+                    self.postings.remove(&term);
+                }
+            }
         }
     }
 

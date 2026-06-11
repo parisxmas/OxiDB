@@ -288,15 +288,23 @@ fn parse_op(
             let arr = op_val
                 .as_array()
                 .ok_or_else(|| Error::InvalidQuery("$in must be an array".into()))?;
-            Ok(QueryOp::In(arr.iter().map(IndexValue::from_json).collect()))
+            // Sorted + deduped at parse time: the post-filter can then
+            // binary-search instead of scanning the whole operand list per
+            // document (large $in lists were O(n·k)), and `count_in` no
+            // longer double-counts duplicated operand values.
+            let mut vals: Vec<IndexValue> = arr.iter().map(IndexValue::from_json).collect();
+            vals.sort();
+            vals.dedup();
+            Ok(QueryOp::In(vals))
         }
         "$nin" => {
             let arr = op_val
                 .as_array()
                 .ok_or_else(|| Error::InvalidQuery("$nin must be an array".into()))?;
-            Ok(QueryOp::Nin(
-                arr.iter().map(IndexValue::from_json).collect(),
-            ))
+            let mut vals: Vec<IndexValue> = arr.iter().map(IndexValue::from_json).collect();
+            vals.sort();
+            vals.dedup();
+            Ok(QueryOp::Nin(vals))
         }
         "$exists" => {
             let b = op_val
@@ -576,8 +584,111 @@ fn array_any_matches(arr: &[JsonValue], inner: &Query) -> bool {
 // Lazy index execution — callback-based with early termination
 // ---------------------------------------------------------------------------
 
+/// Tightest-bound accumulator for an AND of range conditions on one field.
+/// Each `$gt/$gte/$lt/$lte` narrows the range: the highest lower bound and
+/// lowest upper bound win, with the exclusive form winning ties (it is
+/// strictly tighter). Last-wins slot assignment — the previous behavior —
+/// silently *widened* ranges (`{$gt:10, $gte:5}` started at 5), and the
+/// callers skip the post-filter for these queries, so the widened range
+/// went straight into results.
+struct MergedRange<'a> {
+    /// (value, exclusive) — exclusive means `$gt` / `$lt`.
+    lower: Option<(&'a IndexValue, bool)>,
+    upper: Option<(&'a IndexValue, bool)>,
+}
+
+impl<'a> MergedRange<'a> {
+    fn new() -> Self {
+        Self {
+            lower: None,
+            upper: None,
+        }
+    }
+
+    fn add_lower(&mut self, v: &'a IndexValue, exclusive: bool) {
+        let tighter = match self.lower {
+            None => true,
+            Some((cur, cur_ex)) => match v.cmp(cur) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => exclusive && !cur_ex,
+                std::cmp::Ordering::Less => false,
+            },
+        };
+        if tighter {
+            self.lower = Some((v, exclusive));
+        }
+    }
+
+    fn add_upper(&mut self, v: &'a IndexValue, exclusive: bool) {
+        let tighter = match self.upper {
+            None => true,
+            Some((cur, cur_ex)) => match v.cmp(cur) {
+                std::cmp::Ordering::Less => true,
+                std::cmp::Ordering::Equal => exclusive && !cur_ex,
+                std::cmp::Ordering::Greater => false,
+            },
+        };
+        if tighter {
+            self.upper = Some((v, exclusive));
+        }
+    }
+
+    /// True when no value can satisfy the merged bounds (lower > upper, or
+    /// equal with either side exclusive). Callers must not feed such a
+    /// range to a BTree range iterator — std panics on start > end.
+    fn is_empty(&self) -> bool {
+        if let (Some((lo, lo_ex)), Some((hi, hi_ex))) = (self.lower, self.upper) {
+            match lo.cmp(hi) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => lo_ex || hi_ex,
+                std::cmp::Ordering::Less => false,
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Whether a single value satisfies the merged bounds.
+    fn contains(&self, v: &IndexValue) -> bool {
+        if let Some((lo, lo_ex)) = self.lower {
+            match v.cmp(lo) {
+                std::cmp::Ordering::Less => return false,
+                std::cmp::Ordering::Equal if lo_ex => return false,
+                _ => {}
+            }
+        }
+        if let Some((hi, hi_ex)) = self.upper {
+            match v.cmp(hi) {
+                std::cmp::Ordering::Greater => return false,
+                std::cmp::Ordering::Equal if hi_ex => return false,
+                _ => {}
+            }
+        }
+        true
+    }
+
+    fn start(&self) -> Bound<&'a IndexValue> {
+        match self.lower {
+            Some((v, true)) => Bound::Excluded(v),
+            Some((v, false)) => Bound::Included(v),
+            None => Bound::Unbounded,
+        }
+    }
+
+    fn end(&self) -> Bound<&'a IndexValue> {
+        match self.upper {
+            Some((v, true)) => Bound::Excluded(v),
+            Some((v, false)) => Bound::Included(v),
+            None => Bound::Unbounded,
+        }
+    }
+}
+
 /// Try to merge an AND of conditions on the same indexed field into a single
 /// range. Returns the merged (start, end) bounds and the field index, or None.
+/// A contradictory range (e.g. `{$gt: 10, $lt: 5}`) returns None so the
+/// caller falls back to the post-filter scan, which yields the correct empty
+/// result without risking a reversed-bounds range iteration.
 fn try_merge_range_and<'a>(
     subs: &'a [Query],
     field_indexes: &'a std::collections::HashMap<String, PagedFieldIndex>,
@@ -587,10 +698,7 @@ fn try_merge_range_and<'a>(
     Bound<&'a IndexValue>,
 )> {
     let mut field_name: Option<&str> = None;
-    let mut gte_bound: Option<&IndexValue> = None;
-    let mut gt_bound: Option<&IndexValue> = None;
-    let mut lt_bound: Option<&IndexValue> = None;
-    let mut lte_bound: Option<&IndexValue> = None;
+    let mut range = MergedRange::new();
 
     for sub in subs {
         match sub {
@@ -603,10 +711,10 @@ fn try_merge_range_and<'a>(
                     field_name = Some(field);
                 }
                 match op {
-                    QueryOp::Gte(v) => gte_bound = Some(v),
-                    QueryOp::Gt(v) => gt_bound = Some(v),
-                    QueryOp::Lt(v) => lt_bound = Some(v),
-                    QueryOp::Lte(v) => lte_bound = Some(v),
+                    QueryOp::Gte(v) => range.add_lower(v, false),
+                    QueryOp::Gt(v) => range.add_lower(v, true),
+                    QueryOp::Lt(v) => range.add_upper(v, true),
+                    QueryOp::Lte(v) => range.add_upper(v, false),
                     _ => return None,
                 }
             }
@@ -617,23 +725,11 @@ fn try_merge_range_and<'a>(
     let field = field_name?;
     let idx = field_indexes.get(field)?;
 
-    let start = if let Some(v) = gte_bound {
-        Bound::Included(v)
-    } else if let Some(v) = gt_bound {
-        Bound::Excluded(v)
-    } else {
-        Bound::Unbounded
-    };
+    if range.is_empty() {
+        return None;
+    }
 
-    let end = if let Some(v) = lt_bound {
-        Bound::Excluded(v)
-    } else if let Some(v) = lte_bound {
-        Bound::Included(v)
-    } else {
-        Bound::Unbounded
-    };
-
-    Some((idx, start, end))
+    Some((idx, range.start(), range.end()))
 }
 
 /// Execute a query lazily against indexes, calling `callback` for each matching
@@ -844,8 +940,9 @@ fn eval_field_op(op: &QueryOp, field_val: Option<&JsonValue>) -> bool {
                 QueryOp::Gte(v) => iv >= *v,
                 QueryOp::Lt(v) => iv < *v,
                 QueryOp::Lte(v) => iv <= *v,
-                QueryOp::In(vals) => vals.contains(&iv),
-                QueryOp::Nin(vals) => !vals.contains(&iv),
+                // The operand list is sorted+deduped at parse time.
+                QueryOp::In(vals) => vals.binary_search(&iv).is_ok(),
+                QueryOp::Nin(vals) => vals.binary_search(&iv).is_err(),
                 _ => unreachable!(),
             }
         }
@@ -996,10 +1093,7 @@ fn count_single_field_and(
     field_indexes: &std::collections::HashMap<String, PagedFieldIndex>,
 ) -> Option<usize> {
     let mut field_name: Option<&str> = None;
-    let mut gte_bound: Option<&IndexValue> = None;
-    let mut gt_bound: Option<&IndexValue> = None;
-    let mut lt_bound: Option<&IndexValue> = None;
-    let mut lte_bound: Option<&IndexValue> = None;
+    let mut range = MergedRange::new();
     let mut eq_value: Option<&IndexValue> = None;
 
     for sub in subs {
@@ -1013,11 +1107,16 @@ fn count_single_field_and(
                     field_name = Some(field);
                 }
                 match op {
-                    QueryOp::Gte(v) => gte_bound = Some(v),
-                    QueryOp::Gt(v) => gt_bound = Some(v),
-                    QueryOp::Lt(v) => lt_bound = Some(v),
-                    QueryOp::Lte(v) => lte_bound = Some(v),
-                    QueryOp::Eq(v) => eq_value = Some(v),
+                    QueryOp::Gte(v) => range.add_lower(v, false),
+                    QueryOp::Gt(v) => range.add_lower(v, true),
+                    QueryOp::Lt(v) => range.add_upper(v, true),
+                    QueryOp::Lte(v) => range.add_upper(v, false),
+                    QueryOp::Eq(v) => match eq_value {
+                        // Two different $eq values on the same field can never
+                        // both hold — the count is exactly 0.
+                        Some(prev) if prev != v => return Some(0),
+                        _ => eq_value = Some(v),
+                    },
                     _ => return None,
                 }
             }
@@ -1028,28 +1127,20 @@ fn count_single_field_and(
     let field = field_name?;
     let idx = field_indexes.get(field)?;
 
-    // If there's an eq value, the range constraints must also be satisfied
+    // An $eq must also satisfy every range constraint in the same AND —
+    // `{x: {$eq: 5, $gt: 10}}` matches nothing.
     if let Some(eq_val) = eq_value {
+        if !range.contains(eq_val) {
+            return Some(0);
+        }
         return Some(idx.count_eq(eq_val));
     }
 
-    let start = if let Some(v) = gte_bound {
-        Bound::Included(v)
-    } else if let Some(v) = gt_bound {
-        Bound::Excluded(v)
-    } else {
-        Bound::Unbounded
-    };
+    if range.is_empty() {
+        return Some(0);
+    }
 
-    let end = if let Some(v) = lt_bound {
-        Bound::Excluded(v)
-    } else if let Some(v) = lte_bound {
-        Bound::Included(v)
-    } else {
-        Bound::Unbounded
-    };
-
-    Some(idx.count_range(start, end))
+    Some(idx.count_range(range.start(), range.end()))
 }
 
 /// Extract equality conditions from a query as a field→value map.
@@ -1166,8 +1257,9 @@ fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
                         QueryOp::Gte(v) => iv >= *v,
                         QueryOp::Lt(v) => iv < *v,
                         QueryOp::Lte(v) => iv <= *v,
-                        QueryOp::In(vals) => vals.contains(&iv),
-                        QueryOp::Nin(vals) => !vals.contains(&iv),
+                        // Sorted+deduped at parse time — binary search.
+                        QueryOp::In(vals) => vals.binary_search(&iv).is_ok(),
+                        QueryOp::Nin(vals) => vals.binary_search(&iv).is_err(),
                         _ => unreachable!(),
                     })
                 }

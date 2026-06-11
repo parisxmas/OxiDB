@@ -144,7 +144,7 @@ impl BTreeCollection {
         encryption: Option<std::sync::Arc<crate::EncryptionKey>>,
         sequencer: Option<std::sync::Arc<crate::pitr::ArchiveSequencer>>,
     ) -> Result<Self> {
-        Self::open_resolved(name, data_dir, encryption, sequencer, None)
+        Self::open_resolved(name, data_dir, encryption, sequencer, None, None)
     }
 
     /// Open a collection with **explicit** per-collection
@@ -159,7 +159,32 @@ impl BTreeCollection {
         sequencer: Option<std::sync::Arc<crate::pitr::ArchiveSequencer>>,
         opts: crate::btree_storage::StorageOptions,
     ) -> Result<Self> {
-        Self::open_resolved(name, data_dir, encryption, sequencer, Some(opts))
+        Self::open_resolved(name, data_dir, encryption, sequencer, Some(opts), None)
+    }
+
+    /// Open a collection with crash-recovery filtering: WAL entries that
+    /// belong to a transaction (`tx_id != 0`) are replayed only if that
+    /// transaction reached its commit point — i.e. its id is in
+    /// `committed_txs`, the set read from the engine's global commit log.
+    /// Entries of transactions that died between their WAL fsync and
+    /// `mark_committed` are discarded instead of being resurrected.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_recovering(
+        name: &str,
+        data_dir: &Path,
+        encryption: Option<std::sync::Arc<crate::EncryptionKey>>,
+        sequencer: Option<std::sync::Arc<crate::pitr::ArchiveSequencer>>,
+        storage_opts: Option<crate::btree_storage::StorageOptions>,
+        committed_txs: &std::collections::HashSet<u64>,
+    ) -> Result<Self> {
+        Self::open_resolved(
+            name,
+            data_dir,
+            encryption,
+            sequencer,
+            storage_opts,
+            Some(committed_txs),
+        )
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -169,6 +194,7 @@ impl BTreeCollection {
         encryption: Option<std::sync::Arc<crate::EncryptionKey>>,
         sequencer: Option<std::sync::Arc<crate::pitr::ArchiveSequencer>>,
         storage_opts: Option<crate::btree_storage::StorageOptions>,
+        committed_txs: Option<&std::collections::HashSet<u64>>,
     ) -> Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let storage = match storage_opts {
@@ -178,10 +204,16 @@ impl BTreeCollection {
 
         let wal_path = data_dir.join(format!("{}.wal", name));
         let wal = Wal::open(&wal_path)?.with_sequencer(sequencer);
-        let replayed = Self::replay_wal(&wal, &storage)?;
+        let (applied, skipped) = Self::replay_wal(&wal, &storage, committed_txs)?;
         let wal_backend = WalBackend::File(wal);
-        if replayed > 0 {
+        if applied > 0 {
             storage.persist()?;
+        }
+        if applied + skipped > 0 {
+            // Checkpoint even when every entry was skipped: skipped entries
+            // belong to transactions that never committed, and leaving them
+            // in the WAL would let a later run — whose fresh commit log can
+            // contain a colliding tx id — resurrect them on replay.
             if let WalBackend::File(ref w) = wal_backend {
                 w.checkpoint_no_sync()?;
             }
@@ -346,8 +378,12 @@ impl BTreeCollection {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn replay_wal(wal: &Wal, storage: &BTreeStorage) -> Result<usize> {
-        let mut count = 0usize;
+    fn replay_wal(
+        wal: &Wal,
+        storage: &BTreeStorage,
+        committed_txs: Option<&std::collections::HashSet<u64>>,
+    ) -> Result<(usize, usize)> {
+        let (mut applied, mut skipped) = (0usize, 0usize);
         // With PITR enabled the history since the last snapshot is split
         // across sealed segments (`<name>.wal.<seq>`) plus the live
         // `<name>.wal`. Replay the sealed segments oldest-first, then the
@@ -359,17 +395,42 @@ impl BTreeCollection {
         // (Phase 3) to consume; until then they are re-replayed each open.
         for seg_path in wal.list_sealed_segments() {
             let seg = Wal::open(&seg_path)?;
-            count += Self::replay_entries(&seg.read_entries()?, storage);
+            let (a, s) = Self::replay_entries(&seg.read_entries()?, storage, committed_txs);
+            applied += a;
+            skipped += s;
         }
-        count += Self::replay_entries(&wal.read_entries()?, storage);
-        Ok(count)
+        let (a, s) = Self::replay_entries(&wal.read_entries()?, storage, committed_txs);
+        applied += a;
+        skipped += s;
+        Ok((applied, skipped))
     }
 
     /// Apply a batch of WAL entries to `storage` idempotently, returning
-    /// how many were applied.
-    fn replay_entries(entries: &[WalEntry], storage: &BTreeStorage) -> usize {
-        let mut count = 0usize;
+    /// `(applied, skipped)` counts. When `committed_txs` is `Some`,
+    /// transactional entries (`tx_id != 0`) whose transaction is absent
+    /// from the set are skipped — they were fsync'd at commit step 5 but
+    /// the transaction never reached its commit point (`mark_committed`),
+    /// so applying them would resurrect an aborted transaction or
+    /// half-apply a multi-collection one. Non-transactional entries
+    /// (`tx_id == 0`) always apply.
+    fn replay_entries(
+        entries: &[WalEntry],
+        storage: &BTreeStorage,
+        committed_txs: Option<&std::collections::HashSet<u64>>,
+    ) -> (usize, usize) {
+        let (mut applied, mut skipped) = (0usize, 0usize);
         for entry in entries {
+            let tx_id = match entry {
+                WalEntry::Insert { tx_id, .. }
+                | WalEntry::Update { tx_id, .. }
+                | WalEntry::Delete { tx_id, .. } => *tx_id,
+            };
+            if let Some(committed) = committed_txs {
+                if tx_id != 0 && !committed.contains(&tx_id) {
+                    skipped += 1;
+                    continue;
+                }
+            }
             match entry {
                 WalEntry::Insert {
                     doc_id, doc_bytes, ..
@@ -378,15 +439,15 @@ impl BTreeCollection {
                     doc_id, doc_bytes, ..
                 } => {
                     storage.insert(*doc_id, doc_bytes.clone());
-                    count += 1;
+                    applied += 1;
                 }
                 WalEntry::Delete { doc_id, .. } => {
                     storage.remove(*doc_id);
-                    count += 1;
+                    applied += 1;
                 }
             }
         }
-        count
+        (applied, skipped)
     }
 
     // -----------------------------------------------------------------------
@@ -1064,8 +1125,15 @@ impl BTreeCollection {
         let has_indexes = has_field_indexes || has_composite || has_text || has_vector;
 
         // Phase 1: assign IDs and prepare docs (parallel JSONB encode)
-        let first_id = self.next_id.load(Ordering::SeqCst);
+        // fetch_add reserves the whole block atomically. The previous
+        // load → use → store sequence raced with concurrent `insert()`
+        // (whose fetch_add happens before it takes the index locks held
+        // here): both sides could be handed the same id — one document
+        // silently overwriting the other via the storage upsert — and the
+        // trailing store could roll `next_id` backwards past other
+        // allocations.
         let doc_count = docs.len();
+        let first_id = self.next_id.fetch_add(doc_count as u64, Ordering::SeqCst);
 
         // Assign IDs first
         let mut docs_with_ids: Vec<(u64, Value)> = Vec::with_capacity(doc_count);
@@ -1104,24 +1172,27 @@ impl BTreeCollection {
             }
         }
 
-        // Parallel JSONB encode (sequential on wasm32)
+        // Parallel JSONB encode (sequential on wasm32). Encode errors must
+        // fail the batch — `unwrap_or_default()` here used to persist an
+        // EMPTY byte vector to the WAL and storage: an acknowledged write
+        // that every later decode silently skips, i.e. a lost document.
         #[cfg(not(target_arch = "wasm32"))]
         let btree_entries: Vec<(u64, Vec<u8>)> = if doc_count > 500 {
             docs_with_ids
                 .par_iter()
-                .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
-                .collect()
+                .map(|(id, data)| Ok((*id, codec::encode_doc(data)?)))
+                .collect::<Result<Vec<_>>>()?
         } else {
             docs_with_ids
                 .iter()
-                .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
-                .collect()
+                .map(|(id, data)| Ok((*id, codec::encode_doc(data)?)))
+                .collect::<Result<Vec<_>>>()?
         };
         #[cfg(target_arch = "wasm32")]
         let btree_entries: Vec<(u64, Vec<u8>)> = docs_with_ids
             .iter()
-            .map(|(id, data)| (*id, codec::encode_doc(data).unwrap_or_default()))
-            .collect();
+            .map(|(id, data)| Ok((*id, codec::encode_doc(data)?)))
+            .collect::<Result<Vec<_>>>()?;
 
         // Phase 2: bulk insert into B-tree
         // Pre-reserve full capacity to avoid incremental reallocation across batches
@@ -1175,9 +1246,6 @@ impl BTreeCollection {
                 }
             }
         }
-
-        self.next_id
-            .store(first_id + doc_count as u64, Ordering::SeqCst);
 
         Ok(ids)
     }
@@ -1326,8 +1394,11 @@ impl BTreeCollection {
             if sort_fields.len() == 1 {
                 let (sort_field, sort_order) = &sort_fields[0];
                 if let Some(field_idx) = fi.get(sort_field) {
-                    let need =
-                        opts.skip.unwrap_or(0) as usize + opts.limit.unwrap_or(u64::MAX) as usize;
+                    // saturating_add: with skip set and no limit this was
+                    // `skip + usize::MAX`, which wraps in release builds and
+                    // silently truncated the scan to `skip - 1` rows.
+                    let need = (opts.skip.unwrap_or(0) as usize)
+                        .saturating_add(opts.limit.map(|l| l as usize).unwrap_or(usize::MAX));
                     let mut results = Vec::new();
                     let skip_filter = matches!(query, Query::All);
 
@@ -1344,6 +1415,15 @@ impl BTreeCollection {
                         Vec::new()
                     };
                     let use_index_check = !eq_checks.is_empty();
+                    // The containment pre-filter decides the query on its own
+                    // only when EVERY condition is an $eq on one of the
+                    // checked indexed fields. Any other condition ($gt,
+                    // $regex, an eq on an unindexed field, ...) must still
+                    // pass the real post-filter — previously matches_value
+                    // was skipped whenever one indexed eq existed, silently
+                    // dropping the remaining predicates from the query.
+                    let eq_fields: Vec<String> = eq_checks.iter().map(|(f, _)| f.clone()).collect();
+                    let fully_covered = use_index_check && query::is_eq_only_on(&query, &eq_fields);
 
                     let check_id = |id: DocumentId| -> bool {
                         for (field, value) in &eq_checks {
@@ -1356,12 +1436,60 @@ impl BTreeCollection {
                         true
                     };
 
+                    // Docs that lack the sort field are absent from this
+                    // index but must still be returned — they sort as null,
+                    // exactly like the comparator fallback (and MongoDB), so
+                    // creating an index must not change the result set. Zero
+                    // extra cost when the index covers every doc.
+                    let missing_ids: Vec<DocumentId> = {
+                        let with_field = field_idx.count_all();
+                        if with_field >= self.storage.count() {
+                            Vec::new()
+                        } else {
+                            let mut indexed: std::collections::HashSet<DocumentId> =
+                                std::collections::HashSet::with_capacity(with_field);
+                            field_idx.for_each_entry_asc(|_value, doc_ids| {
+                                for &id in doc_ids {
+                                    indexed.insert(id);
+                                }
+                                true
+                            });
+                            let mut missing = Vec::new();
+                            self.storage.scan_keys(|id| {
+                                if !indexed.contains(&id) {
+                                    missing.push(id);
+                                }
+                            });
+                            missing
+                        }
+                    };
+                    let push_missing = |results: &mut Vec<Arc<Value>>| {
+                        for &id in &missing_ids {
+                            if results.len() >= need {
+                                break;
+                            }
+                            if use_index_check && !check_id(id) {
+                                continue;
+                            }
+                            if let Some(arc) = self.read_doc_arc(id) {
+                                if skip_filter
+                                    || fully_covered
+                                    || query::matches_value(&query, &arc)
+                                {
+                                    results.push(arc);
+                                }
+                            }
+                        }
+                    };
+
                     // `for_each_entry_*` (not `iter_asc`/`iter_desc`) so this
                     // works in disk-first mode too — a disk-backed index's
                     // `iter_asc` yields nothing, which previously made
                     // index-backed sort silently return an empty result set.
                     match sort_order {
                         SortOrder::Asc => {
+                            // Null group (missing sort field) sorts first.
+                            push_missing(&mut results);
                             field_idx.for_each_entry_asc(|_value, doc_ids| {
                                 for &id in doc_ids {
                                     if use_index_check && !check_id(id) {
@@ -1369,7 +1497,7 @@ impl BTreeCollection {
                                     }
                                     if let Some(arc) = self.read_doc_arc(id) {
                                         if skip_filter
-                                            || use_index_check
+                                            || fully_covered
                                             || query::matches_value(&query, &arc)
                                         {
                                             results.push(arc);
@@ -1390,7 +1518,7 @@ impl BTreeCollection {
                                     }
                                     if let Some(arc) = self.read_doc_arc(id) {
                                         if skip_filter
-                                            || use_index_check
+                                            || fully_covered
                                             || query::matches_value(&query, &arc)
                                         {
                                             results.push(arc);
@@ -1402,6 +1530,8 @@ impl BTreeCollection {
                                 }
                                 true
                             });
+                            // Null group (missing sort field) sorts last.
+                            push_missing(&mut results);
                         }
                     }
 
@@ -1445,8 +1575,9 @@ impl BTreeCollection {
                                 .map(|f| eq_conds[f.as_str()].clone())
                                 .collect();
 
-                            let need = opts.skip.unwrap_or(0) as usize
-                                + opts.limit.unwrap_or(u64::MAX) as usize;
+                            let need = (opts.skip.unwrap_or(0) as usize).saturating_add(
+                                opts.limit.map(|l| l as usize).unwrap_or(usize::MAX),
+                            );
 
                             let mut results: Vec<Arc<Value>> = Vec::new();
 
@@ -3310,12 +3441,18 @@ impl BTreeCollection {
             // cutoff = now - expire_after_seconds (documents with datetime <= cutoff are expired)
             let cutoff_ms = now_ms.saturating_sub(cfg.expire_after_seconds * 1000);
             let cutoff_val = IndexValue::DateTime(cutoff_ms as i64);
+            // The lower bound must be the DateTime type floor, NOT Unbounded:
+            // IndexValue orders Null < Bool < Num < DateTime < String, so an
+            // unbounded-below range would sweep in every null/bool/number
+            // entry (e.g. a numeric epoch `created_at`) and the TTL thread
+            // would delete those documents regardless of expiry.
+            let floor_val = IndexValue::DateTime(i64::MIN);
 
             // Use the field index for an efficient range scan
             let fi = self.field_indexes.read();
             if let Some(idx) = fi.get(&cfg.field) {
                 let expired_ids = idx.find_range(
-                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Included(&floor_val),
                     std::ops::Bound::Included(&cutoff_val),
                 );
                 to_delete.extend(expired_ids);
@@ -4201,12 +4338,49 @@ mod tests {
         wal.log(&WalEntry::insert(3, b"c".to_vec())).unwrap();
 
         let storage = BTreeStorage::open("rs", dir.path(), None).unwrap();
-        let replayed = BTreeCollection::replay_wal(&wal, &storage).unwrap();
+        let (applied, skipped) = BTreeCollection::replay_wal(&wal, &storage, None).unwrap();
         assert_eq!(
-            replayed, 3,
+            applied, 3,
             "every sealed segment's entries must be replayed"
         );
+        assert_eq!(skipped, 0);
         assert_eq!(storage.count(), 3);
+    }
+
+    #[test]
+    fn replay_wal_skips_uncommitted_tx_entries() {
+        // A transaction whose WAL entries were fsync'd (commit step 5) but
+        // that never reached its commit point (step 6) must NOT be
+        // resurrected by replay; non-transactional and committed-tx entries
+        // must still apply.
+        let dir = tempfile::tempdir().unwrap();
+        let wal = Wal::open(&dir.path().join("txf.wal")).unwrap();
+        wal.log(&WalEntry::insert(1, b"plain".to_vec())).unwrap(); // tx_id 0
+        wal.log(&WalEntry::Insert {
+            doc_id: 2,
+            doc_bytes: b"committed".to_vec(),
+            tx_id: 7,
+        })
+        .unwrap();
+        wal.log(&WalEntry::Insert {
+            doc_id: 3,
+            doc_bytes: b"uncommitted".to_vec(),
+            tx_id: 9,
+        })
+        .unwrap();
+
+        let committed: std::collections::HashSet<u64> = [7u64].into_iter().collect();
+        let storage = BTreeStorage::open("txf", dir.path(), None).unwrap();
+        let (applied, skipped) =
+            BTreeCollection::replay_wal(&wal, &storage, Some(&committed)).unwrap();
+        assert_eq!(applied, 2, "non-tx + committed-tx entries apply");
+        assert_eq!(skipped, 1, "uncommitted tx entry is discarded");
+        assert!(storage.contains_key(1));
+        assert!(storage.contains_key(2));
+        assert!(
+            !storage.contains_key(3),
+            "uncommitted tx must not resurrect"
+        );
     }
 
     #[test]

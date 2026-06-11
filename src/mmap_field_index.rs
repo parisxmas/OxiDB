@@ -217,14 +217,29 @@ impl MmapFieldIndex {
         let doc_count = read_u64(buf, after_name + 8);
 
         let entry_table_offset = after_name + 16;
-        let entry_table_size = entry_count as usize * ENTRY_HEADER_SIZE;
+        // entry_count comes from the file and is untrusted: a torn `.mfidx`
+        // (short file after a crash) must surface as InvalidData — which the
+        // caller answers by rebuilding the index from a scan — not as an
+        // out-of-bounds slice panic or an overflowing multiplication that
+        // takes the opening thread down.
+        let entry_table_size = (entry_count as usize)
+            .checked_mul(ENTRY_HEADER_SIZE)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "fidx v2 entry count overflow")
+            })?;
+        let entries_end = entry_table_offset
+            .checked_add(entry_table_size)
+            .filter(|&end| end <= buf.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "fidx v2 truncated entry table")
+            })?;
 
         // Compute string table offset: after entry table.
         // We need to scan entries to find total string bytes for the string table,
         // but we stored it implicitly. The string table starts right after the entry table,
         // and the docid section starts after the string table.
         // To find the string table size, we look at the max (offset + len) in entries.
-        let string_table_offset = entry_table_offset + entry_table_size;
+        let string_table_offset = entries_end;
 
         // Find the end of the string table by scanning entries for max string offset+len
         let mut string_table_end: usize = 0;
@@ -234,14 +249,21 @@ impl MmapFieldIndex {
             if vtype == TAG_STRING {
                 let str_offset = read_i64(buf, eoff + 1) as usize;
                 let str_len = read_u32(buf, eoff + 9) as usize;
-                let end = str_offset + str_len;
+                let end = str_offset.checked_add(str_len).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "fidx v2 string range overflow")
+                })?;
                 if end > string_table_end {
                     string_table_end = end;
                 }
             }
         }
 
-        let docid_section_offset = string_table_offset + string_table_end;
+        let docid_section_offset = string_table_offset
+            .checked_add(string_table_end)
+            .filter(|&off| off <= buf.len())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "fidx v2 truncated string table")
+            })?;
 
         let layout = MmapLayout {
             entry_table_offset,
@@ -1136,6 +1158,13 @@ fn write_fidx_v2(
     file.sync_data()?;
     drop(file);
     fs::rename(&tmp_path, path)?;
+    // Make the rename itself durable — without the parent-dir fsync a power
+    // loss can leave the directory entry pointing at a short/absent file.
+    if let Some(parent) = path.parent() {
+        if let Ok(dirf) = fs::File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+    }
 
     Ok(())
 }

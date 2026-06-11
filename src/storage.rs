@@ -75,6 +75,32 @@ struct StorageInner {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+impl StorageInner {
+    /// Append one framed record at the current end of the file. On any write
+    /// error (e.g. ENOSPC mid-`write_all`), roll the file back to
+    /// `current_offset` so partial bytes can't survive between records —
+    /// leftover tail garbage would desync every later `DocLocation` from the
+    /// physical file and corrupt the framing for the next open.
+    fn write_record(&mut self, payload: &[u8]) -> Result<DocLocation> {
+        let offset = self.current_offset;
+        let length = payload.len() as u32;
+        let res = (|| -> Result<()> {
+            self.file.seek(SeekFrom::End(0))?;
+            self.file.write_all(&[RECORD_ACTIVE])?;
+            self.file.write_all(&length.to_le_bytes())?;
+            self.file.write_all(payload)?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            let _ = self.file.set_len(self.current_offset);
+            return Err(e);
+        }
+        self.current_offset += 1 + 4 + length as u64;
+        Ok(DocLocation { offset, length })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Storage {
     _path: PathBuf,
     inner: Mutex<StorageInner>,
@@ -126,7 +152,26 @@ impl Storage {
             .truncate(false)
             .open(path)?;
 
-        let current_offset = file.metadata()?.len();
+        // A crash mid-append can leave a torn record at the tail. Every scan
+        // stops at it, but appends go to the physical end of the file — so if
+        // the torn bytes were left in place, WAL replay would re-append the
+        // acknowledged writes *after* the garbage and the next open's scan
+        // would stop before ever reaching them (silent data loss once the WAL
+        // is checkpointed). Truncate to the last valid record boundary before
+        // accepting any appends; the dropped tail was never a complete record
+        // and is covered by the WAL.
+        let file_len = file.metadata()?.len();
+        let current_offset = Self::scan_valid_len(&file, file_len)?;
+        if current_offset < file_len {
+            eprintln!(
+                "[oxidb] {}: truncating torn tail at byte {} (file was {} bytes)",
+                path.display(),
+                current_offset,
+                file_len
+            );
+            file.set_len(current_offset)?;
+            file.sync_data()?;
+        }
 
         // Separate read-only handle for lockfree pread operations.
         let read_file = File::open(path)?;
@@ -151,6 +196,32 @@ impl Storage {
             read_mmap: parking_lot::RwLock::new(mmap),
             mmap_len: std::sync::atomic::AtomicU64::new(mmap_len),
         })
+    }
+
+    /// Walk the `[status:u8][len:u32 LE][payload]` framing from the start and
+    /// return the byte length of the longest prefix made of complete records.
+    /// Used at open to detect (and truncate) a torn tail left by a crash
+    /// mid-append. Payloads are skipped, not read, so this is one buffered
+    /// header read + seek per record.
+    fn scan_valid_len(file: &File, file_len: u64) -> Result<u64> {
+        use std::io::BufReader;
+        let mut reader = BufReader::with_capacity(256 * 1024, file);
+        reader.seek(SeekFrom::Start(0))?;
+        let mut pos = 0u64;
+        loop {
+            if pos + 5 > file_len {
+                break;
+            }
+            let mut header = [0u8; 5];
+            reader.read_exact(&mut header)?;
+            let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as u64;
+            if pos + 5 + length > file_len {
+                break; // torn payload — boundary is just before this record
+            }
+            reader.seek_relative(length as i64)?;
+            pos += 5 + length;
+        }
+        Ok(pos)
     }
 
     /// Compress with zstd using a reusable thread-local compressor.
@@ -231,18 +302,9 @@ impl Storage {
     pub fn append(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
         let payload = self.prepare_payload(doc_bytes)?;
         let mut inner = self.inner.lock();
-        let offset = inner.current_offset;
-        let length = payload.len() as u32;
-
-        inner.file.seek(SeekFrom::End(0))?;
-        inner.file.write_all(&[RECORD_ACTIVE])?;
-        inner.file.write_all(&length.to_le_bytes())?;
-        inner.file.write_all(&payload)?;
+        let loc = inner.write_record(&payload)?;
         inner.file.sync_data()?;
-
-        inner.current_offset += 1 + 4 + length as u64;
-
-        Ok(DocLocation { offset, length })
+        Ok(loc)
     }
 
     /// Read a document's bytes from the data file.
@@ -287,7 +349,10 @@ impl Storage {
         {
             use std::os::unix::fs::FileExt;
             let mut buf = vec![0u8; loc.length as usize];
-            self.read_file.read_at(&mut buf, loc.offset + 5)?;
+            // read_exact_at, not read_at: a short read (stale DocLocation past
+            // EOF) must error, not hand zero-filled bytes to the decoder —
+            // the data file has no per-record CRC to catch it downstream.
+            self.read_file.read_exact_at(&mut buf, loc.offset + 5)?;
             self.decode_payload(&buf)
         }
         #[cfg(not(unix))]
@@ -357,7 +422,7 @@ impl Storage {
                 use std::os::unix::fs::FileExt;
                 scratch.clear();
                 scratch.resize(loc.length as usize, 0);
-                self.read_file.read_at(&mut scratch, loc.offset + 5)?;
+                self.read_file.read_exact_at(&mut scratch, loc.offset + 5)?;
                 let decoded = self.decode_payload(&scratch)?;
                 if !f(i, &decoded)? {
                     return Ok(());
@@ -418,7 +483,7 @@ impl Storage {
         {
             use std::os::unix::fs::FileExt;
             let mut buf = vec![0u8; loc.length as usize];
-            self.read_file.read_at(&mut buf, loc.offset + 5)?;
+            self.read_file.read_exact_at(&mut buf, loc.offset + 5)?;
             self.decode_payload(&buf)
         }
         #[cfg(not(unix))]
@@ -461,17 +526,7 @@ impl Storage {
     pub fn append_no_sync(&self, doc_bytes: &[u8]) -> Result<DocLocation> {
         let payload = self.prepare_payload(doc_bytes)?;
         let mut inner = self.inner.lock();
-        let offset = inner.current_offset;
-        let length = payload.len() as u32;
-
-        inner.file.seek(SeekFrom::End(0))?;
-        inner.file.write_all(&[RECORD_ACTIVE])?;
-        inner.file.write_all(&length.to_le_bytes())?;
-        inner.file.write_all(&payload)?;
-
-        inner.current_offset += 1 + 4 + length as u64;
-
-        Ok(DocLocation { offset, length })
+        inner.write_record(&payload)
     }
 
     /// Append multiple documents without fsync, acquiring the mutex only once.
@@ -484,19 +539,11 @@ impl Storage {
             .collect::<Result<Vec<_>>>()?;
 
         let mut inner = self.inner.lock();
-        inner.file.seek(SeekFrom::End(0))?;
-
         let mut locations = Vec::with_capacity(payloads.len());
         for payload in &payloads {
-            let offset = inner.current_offset;
-            let length = payload.len() as u32;
-
-            inner.file.write_all(&[RECORD_ACTIVE])?;
-            inner.file.write_all(&length.to_le_bytes())?;
-            inner.file.write_all(payload)?;
-
-            inner.current_offset += 1 + 4 + length as u64;
-            locations.push(DocLocation { offset, length });
+            // write_record rolls back to the last completed record on error,
+            // so a failed batch leaves the file at a clean record boundary.
+            locations.push(inner.write_record(payload)?);
         }
 
         Ok(locations)
@@ -590,7 +637,12 @@ impl Storage {
         let mut inner = self.inner.lock();
         let base_offset = inner.current_offset;
         inner.file.seek(SeekFrom::End(0))?;
-        inner.file.write_all(&buf)?;
+        if let Err(e) = inner.file.write_all(&buf) {
+            // Partial batch write (e.g. ENOSPC): roll the file back to the
+            // last record boundary so no tail garbage desyncs later offsets.
+            let _ = inner.file.set_len(base_offset);
+            return Err(e.into());
+        }
         inner.current_offset = base_offset + rel_offset;
 
         let locations = relative_locations
@@ -954,6 +1006,48 @@ mod tests {
         );
         assert_eq!(active[0].1, b"first");
         assert_eq!(active[1].1, b"second");
+    }
+
+    #[test]
+    fn torn_tail_truncated_on_open_so_appends_stay_reachable() {
+        // The torn tail must be physically TRUNCATED at open, not just
+        // skipped by scans: appends go to the physical end of the file, so
+        // leaving the garbage in place would put every post-crash write
+        // *behind* it — invisible to the next open's scan (silent data loss
+        // once the WAL is checkpointed).
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.dat");
+        let good_len;
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.append(b"first").unwrap();
+            storage.append(b"second").unwrap();
+            good_len = std::fs::metadata(&path).unwrap().len();
+        }
+        // Crash mid-append: header claims 65535 bytes, only 2 are on disk.
+        {
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&[RECORD_ACTIVE]).unwrap();
+            f.write_all(&65535u32.to_le_bytes()).unwrap();
+            f.write_all(b"xx").unwrap();
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            good_len,
+            "torn tail truncated at open"
+        );
+        // A post-recovery append must land at a clean boundary and be
+        // visible to a subsequent full scan.
+        let loc = storage.append(b"third").unwrap();
+        assert_eq!(storage.read(loc).unwrap(), b"third");
+        drop(storage);
+
+        let reopened = Storage::open(&path).unwrap();
+        let active = reopened.iter_active().unwrap();
+        assert_eq!(active.len(), 3, "post-crash append must survive reopen");
+        assert_eq!(active[2].1, b"third");
     }
 
     #[test]

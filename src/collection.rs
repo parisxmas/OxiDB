@@ -1549,8 +1549,9 @@ impl Collection {
             if sort_fields.len() == 1 {
                 let (sort_field, sort_order) = &sort_fields[0];
                 if let Some(field_idx) = self.field_indexes.get(sort_field) {
-                    let need =
-                        opts.skip.unwrap_or(0) as usize + opts.limit.unwrap_or(u64::MAX) as usize;
+                    // saturating_add: skip set + no limit must not wrap.
+                    let need = (opts.skip.unwrap_or(0) as usize)
+                        .saturating_add(opts.limit.map(|l| l as usize).unwrap_or(usize::MAX));
                     let mut results = Vec::new();
                     // In index-backed sort we iterate the SORT field's index,
                     // NOT the query fields' indexes — so we can only skip filtering
@@ -1633,8 +1634,9 @@ impl Collection {
                                 .map(|f| eq_conds[f.as_str()].clone())
                                 .collect();
 
-                            let need = opts.skip.unwrap_or(0) as usize
-                                + opts.limit.unwrap_or(u64::MAX) as usize;
+                            let need = (opts.skip.unwrap_or(0) as usize).saturating_add(
+                                opts.limit.map(|l| l as usize).unwrap_or(usize::MAX),
+                            );
 
                             // Read + filter docs inline during composite index iteration.
                             let mut results: Vec<Arc<Value>> = Vec::new();

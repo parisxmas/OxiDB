@@ -83,6 +83,10 @@ enum Cmd {
         tx_id: TransactionId,
         done: SyncSender<Result<()>>,
     },
+    RemoveMany {
+        tx_ids: Vec<TransactionId>,
+        done: SyncSender<Result<()>>,
+    },
     Clear {
         done: SyncSender<Result<()>>,
     },
@@ -154,6 +158,27 @@ impl TxCommitLog {
         self.submit
             .send(Cmd::Remove {
                 tx_id,
+                done: done_tx,
+            })
+            .map_err(|_| committer_gone())?;
+        match done_rx.recv() {
+            Ok(r) => r,
+            Err(_) => Err(committer_gone()),
+        }
+    }
+
+    /// Remove a batch of tx_ids in one submission — one channel round-trip
+    /// and at most one fsync for the whole batch, unlike a loop over
+    /// `remove_committed` which pays a batch wait per id. Used by the
+    /// background sync thread to prune ids whose data has been persisted.
+    pub fn remove_committed_many(&self, tx_ids: &[TransactionId]) -> Result<()> {
+        if tx_ids.is_empty() {
+            return Ok(());
+        }
+        let (done_tx, done_rx) = mpsc::sync_channel::<Result<()>>(1);
+        self.submit
+            .send(Cmd::RemoveMany {
+                tx_ids: tx_ids.to_vec(),
                 done: done_tx,
             })
             .map_err(|_| committer_gone())?;
@@ -335,6 +360,13 @@ fn committer_loop(
                 }
                 Cmd::Remove { tx_id, done } => {
                     committed.remove(&tx_id);
+                    mutating_replies.push(done);
+                    mutated = true;
+                }
+                Cmd::RemoveMany { tx_ids, done } => {
+                    for id in tx_ids {
+                        committed.remove(&id);
+                    }
                     mutating_replies.push(done);
                     mutated = true;
                 }

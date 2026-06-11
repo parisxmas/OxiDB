@@ -371,11 +371,57 @@ impl BlobStore {
             if let Some(id_str) = name.strip_suffix(".meta") {
                 if let Ok(id) = id_str.parse::<u64>() {
                     let raw_meta = std::fs::read(entry.path())?;
+                    // A single torn/undecryptable .meta (crash mid-write in
+                    // non-sync mode, bit rot) must not brick the whole
+                    // database open. Quarantine it and keep going — only
+                    // that one object becomes unavailable.
                     let meta_bytes = match encryption {
-                        Some(key) => key.decrypt(&raw_meta)?,
+                        Some(key) => match key.decrypt(&raw_meta) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!(
+                                    "[blob] {}: undecryptable meta ({e}); quarantining",
+                                    entry.path().display()
+                                );
+                                let _ = std::fs::rename(
+                                    entry.path(),
+                                    entry.path().with_extension("meta.corrupt"),
+                                );
+                                // Keep the .data file out of the orphan sweep —
+                                // the payload may still be recoverable — and
+                                // keep the id allocated so a future put can't
+                                // reuse it and overwrite the payload.
+                                valid_ids.insert(id);
+                                if id >= max_id {
+                                    max_id = id + 1;
+                                }
+                                continue;
+                            }
+                        },
                         None => raw_meta,
                     };
-                    let mut meta: ObjectMeta = serde_json::from_slice(&meta_bytes)?;
+                    let mut meta: ObjectMeta = match serde_json::from_slice(&meta_bytes) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!(
+                                "[blob] {}: corrupt meta ({e}); quarantining",
+                                entry.path().display()
+                            );
+                            let _ = std::fs::rename(
+                                entry.path(),
+                                entry.path().with_extension("meta.corrupt"),
+                            );
+                            // Keep the .data file out of the orphan sweep —
+                            // the payload may still be recoverable — and keep
+                            // the id allocated so a future put can't reuse it
+                            // and overwrite the quarantined payload.
+                            valid_ids.insert(id);
+                            if id >= max_id {
+                                max_id = id + 1;
+                            }
+                            continue;
+                        }
+                    };
                     // Forward-compat tripwire: refuse meta files
                     // written by a future engine with a schema
                     // version we don't recognise. `serde(default)`
@@ -469,6 +515,19 @@ impl BlobStore {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "bucket name contains invalid characters",
+            )));
+        }
+        // "." passes every check above yet resolves to the _blobs root
+        // itself: create_bucket(".") registers the root as a bucket and
+        // delete_bucket(".") would remove_dir_all the ENTIRE blob store.
+        // S3-style: require the name to start and end alphanumeric.
+        if name == "."
+            || !name.as_bytes()[0].is_ascii_alphanumeric()
+            || !name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "bucket name must start and end with an alphanumeric character",
             )));
         }
         if !name

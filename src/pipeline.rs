@@ -1822,14 +1822,29 @@ fn exec_group<D: DocRef>(
     Ok(results)
 }
 
-fn exec_sort(mut docs: Vec<Value>, sort_fields: &[(String, SortOrder)]) -> Vec<Value> {
-    docs.sort_by(|a, b| {
-        for (field, order) in sort_fields {
-            let av = resolve_field_ref(a, field);
-            let bv = resolve_field_ref(b, field);
-            let aiv = av.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
-            let biv = bv.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
-            let cmp = aiv.cmp(&biv);
+fn exec_sort(docs: Vec<Value>, sort_fields: &[(String, SortOrder)]) -> Vec<Value> {
+    // Decorate–sort–undecorate: compute each doc's sort keys ONCE instead of
+    // inside the comparator. `IndexValue::from_json` allocates for strings
+    // and runs up to four chrono date-parse attempts — paying that O(n log n)
+    // times per field made string/date sorts the aggregation hot spot.
+    let mut decorated: Vec<(Vec<IndexValue>, Value)> = docs
+        .into_iter()
+        .map(|doc| {
+            let keys: Vec<IndexValue> = sort_fields
+                .iter()
+                .map(|(field, _)| {
+                    resolve_field_ref(&doc, field)
+                        .map(IndexValue::from_json)
+                        .unwrap_or(IndexValue::Null)
+                })
+                .collect();
+            (keys, doc)
+        })
+        .collect();
+
+    decorated.sort_by(|(a_keys, _), (b_keys, _)| {
+        for (i, (_, order)) in sort_fields.iter().enumerate() {
+            let cmp = a_keys[i].cmp(&b_keys[i]);
             let cmp = match order {
                 SortOrder::Asc => cmp,
                 SortOrder::Desc => cmp.reverse(),
@@ -1840,7 +1855,8 @@ fn exec_sort(mut docs: Vec<Value>, sort_fields: &[(String, SortOrder)]) -> Vec<V
         }
         std::cmp::Ordering::Equal
     });
-    docs
+
+    decorated.into_iter().map(|(_, doc)| doc).collect()
 }
 
 fn exec_skip(docs: Vec<Value>, n: u64) -> Vec<Value> {
@@ -2165,15 +2181,53 @@ fn exec_lookup<F>(
 where
     F: Fn(&str, &Value) -> Result<Vec<Value>>,
 {
+    // Hash join: ONE `$in` query over the distinct local values, then
+    // bucket the foreign docs by join key. The previous per-input-document
+    // query was O(N) foreign-collection queries — O(N·M) full scans when
+    // `foreign_field` is unindexed. Keys are normalized through
+    // `IndexValue::from_json`, the same conversion the query engine's `$eq`
+    // uses, so the bucket match is semantically identical to the per-doc
+    // `{foreign_field: local_val}` query it replaces.
+    use std::collections::BTreeMap;
+
+    if docs.is_empty() {
+        return Ok(docs);
+    }
+
+    // Distinct local join values (raw JSON for the $in operand, IndexValue
+    // for the bucket key). Missing local fields join as null, matching the
+    // previous `{foreign_field: null}` behavior.
+    let mut seen: std::collections::BTreeSet<IndexValue> = std::collections::BTreeSet::new();
+    let mut in_list: Vec<Value> = Vec::new();
+    for doc in &docs {
+        let local_val = resolve_field(doc, local_field);
+        let key = IndexValue::from_json(&local_val);
+        if seen.insert(key) {
+            in_list.push(local_val);
+        }
+    }
+
+    let query = json!({ foreign_field: { "$in": in_list } });
+    let foreign_docs = lookup_fn(from, &query)?;
+
+    let mut buckets: BTreeMap<IndexValue, Vec<Value>> = BTreeMap::new();
+    for fdoc in foreign_docs {
+        let fval = resolve_field(&fdoc, foreign_field);
+        buckets
+            .entry(IndexValue::from_json(&fval))
+            .or_default()
+            .push(fdoc);
+    }
+
     let mut result = Vec::new();
     for mut doc in docs {
         let local_val = resolve_field(&doc, local_field);
-        let query = json!({ foreign_field: local_val });
-        let mut foreign_docs = lookup_fn(from, &query)?;
+        let key = IndexValue::from_json(&local_val);
+        let mut matched: Vec<Value> = buckets.get(&key).cloned().unwrap_or_default();
 
         // Filter by additional field pairs (composite join)
         if !extra_pairs.is_empty() {
-            foreign_docs.retain(|foreign_doc| {
+            matched.retain(|foreign_doc| {
                 extra_pairs.iter().all(|(local_f, foreign_f)| {
                     let lv = resolve_field(&doc, local_f);
                     let fv = resolve_field(foreign_doc, foreign_f);
@@ -2182,7 +2236,7 @@ where
             });
         }
 
-        set_field(&mut doc, as_field, Value::Array(foreign_docs));
+        set_field(&mut doc, as_field, Value::Array(matched));
         result.push(doc);
     }
     Ok(result)
@@ -3278,13 +3332,25 @@ impl Pipeline {
                     return self.execute_from(start + i + 1, result, lookup_fn);
                 }
                 Stage::Sort(fields) => {
-                    docs.sort_by(|a, b| {
-                        for (field, order) in fields {
-                            let av = resolve_field_ref(a, field);
-                            let bv = resolve_field_ref(b, field);
-                            let aiv = av.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
-                            let biv = bv.map(IndexValue::from_json).unwrap_or(IndexValue::Null);
-                            let cmp = aiv.cmp(&biv);
+                    // Decorate–sort–undecorate, same rationale as exec_sort:
+                    // sort keys are computed once per doc, not per comparison.
+                    let mut decorated: Vec<(Vec<IndexValue>, Arc<Value>)> = docs
+                        .into_iter()
+                        .map(|doc| {
+                            let keys: Vec<IndexValue> = fields
+                                .iter()
+                                .map(|(field, _)| {
+                                    resolve_field_ref(&doc, field)
+                                        .map(IndexValue::from_json)
+                                        .unwrap_or(IndexValue::Null)
+                                })
+                                .collect();
+                            (keys, doc)
+                        })
+                        .collect();
+                    decorated.sort_by(|(a_keys, _), (b_keys, _)| {
+                        for (i, (_, order)) in fields.iter().enumerate() {
+                            let cmp = a_keys[i].cmp(&b_keys[i]);
                             let cmp = match order {
                                 SortOrder::Asc => cmp,
                                 SortOrder::Desc => cmp.reverse(),
@@ -3295,6 +3361,7 @@ impl Pipeline {
                         }
                         std::cmp::Ordering::Equal
                     });
+                    docs = decorated.into_iter().map(|(_, doc)| doc).collect();
                 }
                 Stage::Skip(n) => {
                     docs = docs.into_iter().skip(*n as usize).collect();
@@ -4487,16 +4554,19 @@ mod tests {
             json!({"_id": 1, "item": "abc"}),
             json!({"_id": 2, "item": "xyz"}),
         ];
+        // exec_lookup issues ONE `{sku: {$in: [..distinct locals..]}}` query
+        // (hash join) instead of a per-document equality query.
         let mock_lookup = |_col: &str, query: &Value| -> Result<Vec<Value>> {
-            let item = query.get("sku").and_then(|v| v.as_str()).unwrap_or("");
-            match item {
-                "abc" => Ok(vec![json!({"sku": "abc", "qty": 100})]),
-                "xyz" => Ok(vec![
-                    json!({"sku": "xyz", "qty": 50}),
-                    json!({"sku": "xyz", "qty": 25}),
-                ]),
-                _ => Ok(vec![]),
-            }
+            let inventory = vec![
+                json!({"sku": "abc", "qty": 100}),
+                json!({"sku": "xyz", "qty": 50}),
+                json!({"sku": "xyz", "qty": 25}),
+            ];
+            let wanted = query["sku"]["$in"].as_array().cloned().unwrap_or_default();
+            Ok(inventory
+                .into_iter()
+                .filter(|d| wanted.contains(&d["sku"]))
+                .collect())
         };
 
         let result = exec_lookup(
@@ -4745,9 +4815,10 @@ mod tests {
         ]))
         .unwrap();
 
+        // $lookup issues a single `{id: {$in: [..]}}` hash-join query.
         let mock_lookup = |_col: &str, query: &Value| -> Result<Vec<Value>> {
-            let id = query.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
-            if id == 1 {
+            let wanted = query["id"]["$in"].as_array().cloned().unwrap_or_default();
+            if wanted.contains(&json!(1)) {
                 Ok(vec![json!({"id": 1, "name": "Widget"})])
             } else {
                 Ok(vec![])

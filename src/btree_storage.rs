@@ -700,7 +700,6 @@ impl BTreeStorage {
     pub fn insert(&self, key: u64, value: Vec<u8>) -> Option<Vec<u8>> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
-            let new_len = value.len() as u64;
             // Read guard: shared with other readers/writers, excluded only by
             // compaction's write lock. `_no_sync`: durability for this write
             // comes from the WAL (fsynced per commit). The data file is flushed
@@ -716,7 +715,14 @@ impl BTreeStorage {
                         self.total_bytes
                             .fetch_sub(old.length as u64, Ordering::AcqRel);
                     }
-                    self.total_bytes.fetch_add(new_len, Ordering::AcqRel);
+                    // Account in on-disk (compressed) units — `open_disk` and
+                    // `compact` rebuild this counter from `loc.length`, and
+                    // `should_compact` compares it against the physical file
+                    // size. Mixing in the uncompressed `value.len()` here
+                    // overstated live bytes and could pin the dead ratio at
+                    // ≤ 0, permanently suppressing auto-compaction.
+                    self.total_bytes
+                        .fetch_add(new_loc.length as u64, Ordering::AcqRel);
                 }
                 Err(e) => {
                     // The WAL still holds this write; recovery will reconcile.
@@ -839,11 +845,22 @@ impl BTreeStorage {
             Vec::with_capacity(entries.len());
         let mut total = 0u64;
         for (id, old_loc) in &entries {
-            if let Ok(bytes) = data_guard.read_lockfree(*old_loc) {
-                let new_loc = fresh.append_no_sync(&bytes)?;
-                new_entries.push((*id, new_loc));
-                total += new_loc.length as u64;
-            }
+            // Compaction must be all-or-nothing: a read error here is a LIVE
+            // document we cannot copy. Silently skipping it would make the
+            // swap below destroy that document permanently — and this runs
+            // unattended from the auto-compaction path. Abort and leave the
+            // original file untouched instead.
+            let bytes = match data_guard.read_lockfree(*old_loc) {
+                Ok(b) => b,
+                Err(e) => {
+                    drop(fresh);
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
+            };
+            let new_loc = fresh.append_no_sync(&bytes)?;
+            new_entries.push((*id, new_loc));
+            total += new_loc.length as u64;
         }
         fresh.sync()?;
         let new_size = fresh.file_size();
@@ -851,6 +868,12 @@ impl BTreeStorage {
         // Atomic swap: replace the live file, reopen, swap the handle, remap.
         let live = self.data_dir.join(format!("{}.bdat", self.name));
         std::fs::rename(&tmp, &live)?;
+        // Make the rename durable: without the parent-dir fsync a power loss
+        // can revive the pre-compaction file after the in-memory index has
+        // been rebuilt for the new one (same protocol as `persist()`).
+        if let Ok(dirf) = std::fs::File::open(&self.data_dir) {
+            let _ = dirf.sync_all();
+        }
         let reopened = crate::storage::Storage::open_with_options(
             &live,
             self.encryption.clone(),
@@ -1089,9 +1112,10 @@ impl BTreeStorage {
             match data.append_batch_no_sync_buffered(&slices) {
                 Ok(locs) => {
                     let mut added = 0u64;
-                    for ((key, value), loc) in entries.iter().zip(locs.iter()) {
+                    for ((key, _value), loc) in entries.iter().zip(locs.iter()) {
                         let _ = d.index.upsert_sync(*key, *loc);
-                        added += value.len() as u64;
+                        // On-disk units, like `insert()` — see comment there.
+                        added += loc.length as u64;
                     }
                     self.total_bytes.fetch_add(added, Ordering::AcqRel);
                 }

@@ -515,7 +515,11 @@ impl Wal {
                         }
                         doc_cache.put(doc_id, Arc::new(doc));
                     }
-                    let loc = storage.append(&doc_bytes)?;
+                    // _no_sync: one storage.sync() covers the whole replay
+                    // (see below) — a per-entry fsync made recovering large
+                    // WALs take minutes. Crash-safety is unchanged: the WAL
+                    // holds every entry until the checkpoint at the end.
+                    let loc = storage.append_no_sync(&doc_bytes)?;
                     primary_index.insert(doc_id, loc);
                     if doc_id >= *next_id {
                         *next_id = doc_id + 1;
@@ -527,8 +531,10 @@ impl Wal {
                 } => {
                     if let Some(&old_loc) = primary_index.get(&doc_id) {
                         // Existing doc — remove old index values, then replace
-                        // storage if the bytes actually changed.
-                        if let Ok(old_doc) = crate::codec::decode_doc(&storage.read(old_loc)?) {
+                        // storage if the bytes actually changed. One read
+                        // serves both the index removal and the comparison.
+                        let current_bytes = storage.read(old_loc)?;
+                        if let Ok(old_doc) = crate::codec::decode_doc(&current_bytes) {
                             for idx in field_indexes.values_mut() {
                                 idx.remove_value(doc_id, &old_doc);
                             }
@@ -536,10 +542,9 @@ impl Wal {
                                 idx.remove_value(doc_id, &old_doc);
                             }
                         }
-                        let current_bytes = storage.read(old_loc)?;
                         if current_bytes != doc_bytes {
-                            let new_loc = storage.append(&doc_bytes)?;
-                            storage.mark_deleted(old_loc)?;
+                            let new_loc = storage.append_no_sync(&doc_bytes)?;
+                            storage.mark_deleted_no_sync(old_loc)?;
                             primary_index.insert(doc_id, new_loc);
                         }
                     } else {
@@ -551,7 +556,7 @@ impl Wal {
                         // with the field/composite indexes and doc cache updated
                         // below — otherwise those would reference a doc with no
                         // storage location or primary-index entry.
-                        let loc = storage.append(&doc_bytes)?;
+                        let loc = storage.append_no_sync(&doc_bytes)?;
                         primary_index.insert(doc_id, loc);
                         if doc_id >= *next_id {
                             *next_id = doc_id + 1;
@@ -584,7 +589,7 @@ impl Wal {
                                 idx.remove_value(doc_id, &old_doc);
                             }
                         }
-                        storage.mark_deleted(loc)?;
+                        storage.mark_deleted_no_sync(loc)?;
                         primary_index.remove(&doc_id);
                     }
                     doc_cache.remove(doc_id);
@@ -599,6 +604,12 @@ impl Wal {
                 "[verbose] WAL: replayed {} inserts, {} updates, {} deletes, {} skipped",
                 inserts, updates, deletes, skipped
             ));
+        }
+
+        // Single fsync for the whole replay — the data file must be durable
+        // BEFORE the checkpoint truncates the WAL that could re-create it.
+        if inserts > 0 || updates > 0 || deletes > 0 {
+            storage.sync()?;
         }
 
         self.checkpoint()?;

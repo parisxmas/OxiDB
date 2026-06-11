@@ -343,9 +343,18 @@ fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> (FtsDispatcher, Arc<F
                     } => {
                         runtime_w.start(worker_id, &bucket, &key);
                         // CPU-bound extraction happens BEFORE the lock so
-                        // workers parallelize across cores.
-                        match fts::extract_text(&data, &content_type) {
-                            Some(text) => {
+                        // workers parallelize across cores. catch_unwind:
+                        // the extractors (pdf_extract, zip, image decoding)
+                        // can panic on malformed input — one bad upload must
+                        // not kill the worker thread, which (with the default
+                        // single worker) would silently freeze FTS indexing
+                        // for the rest of the process lifetime.
+                        let extracted =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                fts::extract_text(&data, &content_type)
+                            }));
+                        match extracted {
+                            Ok(Some(text)) => {
                                 runtime_w.advance_to_indexing(worker_id);
                                 match fts_worker.write().index_document(&bucket, &key, &text) {
                                     Ok(()) => runtime_w.finish(worker_id, JobOutcome::Indexed),
@@ -353,10 +362,21 @@ fn setup_fts_workers(fts_index: &Arc<RwLock<FtsIndex>>) -> (FtsDispatcher, Arc<F
                                         .finish(worker_id, JobOutcome::Failed(e.to_string())),
                                 }
                             }
-                            None => runtime_w.finish(
+                            Ok(None) => runtime_w.finish(
                                 worker_id,
                                 JobOutcome::Skipped("no extractor for content type"),
                             ),
+                            Err(_) => {
+                                eprintln!(
+                                    "[fts] text extractor panicked on {bucket}/{key} — skipping"
+                                );
+                                runtime_w.finish(
+                                    worker_id,
+                                    JobOutcome::Failed(
+                                        "text extractor panicked on malformed input".to_string(),
+                                    ),
+                                );
+                            }
                         }
                     }
                     FtsJob::Remove { bucket, key } => {
@@ -407,6 +427,13 @@ pub struct OxiDb {
     fts_runtime: Arc<FtsRuntime>,
     #[cfg(not(target_arch = "wasm32"))]
     tx_log: TxCommitLog,
+    /// Snapshot of the commit log taken at startup, retained for the life
+    /// of the process. Collection opens pass it to WAL replay so entries of
+    /// transactions that crashed between WAL fsync and `mark_committed` are
+    /// discarded instead of resurrected. Pre-startup state only — new
+    /// commits in this run go to `tx_log`, not here.
+    #[cfg(not(target_arch = "wasm32"))]
+    recovered_tx_ids: std::collections::HashSet<u64>,
     /// PITR archive sequencer — `Some` when `OXIDB_PITR` is enabled. Shared
     /// (`Arc`) by every collection's WAL to stamp records with a global GSN.
     #[cfg(not(target_arch = "wasm32"))]
@@ -436,6 +463,13 @@ pub struct OxiDb {
     /// apply guarantees the loser observes the winner's new version and
     /// aborts with a `TransactionConflict`, as OCC requires.
     commit_lock: Mutex<()>,
+    /// Per-name serialization of collection opens. Opening a pre-existing
+    /// collection replays its WAL, persists a snapshot, and truncates the
+    /// WAL; two threads doing that concurrently for the SAME name could
+    /// have the loser persist a stale snapshot over the winner's freshly
+    /// accepted writes and truncate the WAL that held them. The map is
+    /// bounded by the number of distinct collection names ever touched.
+    open_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Linked-collection registry (FDW-style remote proxies). Reads
     /// of every collection-targeting command consult this table; a
     /// hit means proxy to the remote OxiDB instead of touching the
@@ -503,6 +537,7 @@ impl OxiDb {
             fts_tx,
             fts_runtime,
             tx_log,
+            recovered_tx_ids: std::collections::HashSet::new(),
             archive_sequencer: None,
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
@@ -517,6 +552,7 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
             commit_lock: Mutex::new(()),
+            open_locks: Mutex::new(HashMap::new()),
             links: LinksTable::in_memory(),
             ttl_shutdown: Mutex::new(None),
             alert_shutdown: Mutex::new(None),
@@ -542,6 +578,7 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
             commit_lock: Mutex::new(()),
+            open_locks: Mutex::new(HashMap::new()),
             links: LinksTable::in_memory(),
         })
     }
@@ -633,11 +670,6 @@ impl OxiDb {
             vlog("[verbose] FTS worker threads started");
         }
 
-        // After recovery, clear the commit log (all committed txns are now applied)
-        if !committed_tx_ids.is_empty() {
-            tx_log.clear()?;
-        }
-
         // PITR: when OXIDB_PITR is enabled, open the archive sequencer so
         // every collection's WAL stamps its records with a global GSN +
         // wall-clock. Disabled by default — zero cost when off.
@@ -657,7 +689,17 @@ impl OxiDb {
             None
         };
 
-        Ok(Self {
+        // Names gathered (and logged) before `Self {}` moves `log_callback`.
+        let pending_recovery = Self::collections_with_wal_data(data_dir);
+        if verbose && !pending_recovery.is_empty() {
+            vlog(&format!(
+                "[verbose] recovering {} collection(s) with pending WAL data: {:?}",
+                pending_recovery.len(),
+                pending_recovery
+            ));
+        }
+
+        let db = Self {
             data_dir: data_dir.to_path_buf(),
             collections: RwLock::new(HashMap::new()),
             blob_store,
@@ -665,6 +707,7 @@ impl OxiDb {
             fts_tx,
             fts_runtime,
             tx_log,
+            recovered_tx_ids: committed_tx_ids.clone(),
             archive_sequencer,
             next_tx_id: AtomicU64::new(1),
             active_transactions: RwLock::new(HashMap::new()),
@@ -679,12 +722,66 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: false,
             commit_lock: Mutex::new(()),
+            open_locks: Mutex::new(HashMap::new()),
             links: LinksTable::open(data_dir)?,
             ttl_shutdown: Mutex::new(None),
             alert_shutdown: Mutex::new(None),
             #[cfg(feature = "gpu")]
             gpu: Mutex::new(None),
-        })
+        };
+
+        // Crash recovery: eagerly open every collection that still has WAL
+        // data, so its entries are replayed — filtered through the commit
+        // log — and checkpointed NOW, while the commit log still records
+        // which transactions reached their commit point. If this were left
+        // to lazy opens, a collection first touched in a *later* run would
+        // see an already-cleared commit log and misclassify committed
+        // entries as uncommitted (or vice versa). After a clean shutdown
+        // every WAL is empty and this loop opens nothing.
+        for name in &pending_recovery {
+            db.get_or_create_collection(name)?;
+        }
+
+        // All pending WALs are replayed and checkpointed; the commit log
+        // entries have served their purpose.
+        if !committed_tx_ids.is_empty() {
+            db.tx_log.clear()?;
+        }
+
+        Ok(db)
+    }
+
+    /// Names of collections whose live WAL holds records (length beyond the
+    /// 8-byte header) or that have sealed WAL segments (`<name>.wal.<seq>`)
+    /// — i.e. collections with state to recover at startup.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn collections_with_wal_data(data_dir: &Path) -> Vec<String> {
+        let mut names = std::collections::BTreeSet::new();
+        let Ok(rd) = std::fs::read_dir(data_dir) else {
+            return Vec::new();
+        };
+        for entry in rd.flatten() {
+            let fname = entry.file_name();
+            let Some(fname) = fname.to_str() else {
+                continue;
+            };
+            if let Some(stem) = fname.strip_suffix(".wal") {
+                // Live WAL: 0 bytes after checkpoint, 8 bytes when only the
+                // OXWA header was written; any record makes it longer.
+                if entry.metadata().map(|m| m.len() > 8).unwrap_or(false) {
+                    names.insert(stem.to_string());
+                }
+            } else if let Some((stem, seq)) = fname.rsplit_once('.') {
+                // Sealed segment `<name>.wal.<seq>` (PITR).
+                if !seq.is_empty()
+                    && seq.bytes().all(|b| b.is_ascii_digit())
+                    && stem.ends_with(".wal")
+                {
+                    names.insert(stem.trim_end_matches(".wal").to_string());
+                }
+            }
+        }
+        names.into_iter().collect()
     }
 
     // -----------------------------------------------------------------------
@@ -731,8 +828,30 @@ impl OxiDb {
         self.links.get(name)
     }
 
+    /// Take (creating if needed) the per-name open lock for `name`. Callers
+    /// hold the returned guard's Arc across the open so two threads can never
+    /// run `open_resolved` for the same collection concurrently.
+    fn open_lock_for(&self, name: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.open_locks.lock();
+        Arc::clone(
+            locks
+                .entry(name.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
     /// Return an Arc to a collection, auto-creating if needed.
     fn get_or_create_collection(&self, name: &str) -> Result<Arc<BTreeCollection>> {
+        {
+            let cols = self.collections.read();
+            if let Some(col) = cols.get(name) {
+                return Ok(Arc::clone(col));
+            }
+        }
+        // Serialize the open per name; re-check the map once the lock is
+        // held — the previous holder usually inserted the collection.
+        let name_lock = self.open_lock_for(name);
+        let _open_guard = name_lock.lock();
         {
             let cols = self.collections.read();
             if let Some(col) = cols.get(name) {
@@ -743,11 +862,13 @@ impl OxiDb {
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
-            BTreeCollection::open_with_sequencer(
+            BTreeCollection::open_recovering(
                 name,
                 &self.data_dir,
                 self.encryption.clone(),
                 self.archive_sequencer.clone(),
+                None,
+                &self.recovered_tx_ids,
             )?
         };
         #[cfg(target_arch = "wasm32")]
@@ -780,16 +901,28 @@ impl OxiDb {
         }
 
         // Open without holding the write lock — concurrent creates of distinct
-        // collections proceed in parallel here.
+        // collections proceed in parallel here; same-name opens serialize on
+        // the per-name lock (a concurrent double-open replays/persists/
+        // truncates the same WAL twice and can lose accepted writes).
+        let name_lock = self.open_lock_for(name);
+        let _open_guard = name_lock.lock();
+        {
+            let cols = self.collections.read();
+            if cols.contains_key(name) {
+                return Err(Error::CollectionAlreadyExists(name.to_string()));
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
-            BTreeCollection::open_with_sequencer(
+            BTreeCollection::open_recovering(
                 name,
                 &self.data_dir,
                 self.encryption.clone(),
                 self.archive_sequencer.clone(),
+                None,
+                &self.recovered_tx_ids,
             )?
         };
         #[cfg(target_arch = "wasm32")]
@@ -829,15 +962,25 @@ impl OxiDb {
             }
         }
 
+        // Per-name open serialization — see `create_collection`.
+        let name_lock = self.open_lock_for(name);
+        let _open_guard = name_lock.lock();
+        {
+            let cols = self.collections.read();
+            if cols.contains_key(name) {
+                return Err(Error::CollectionAlreadyExists(name.to_string()));
+            }
+        }
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
-            BTreeCollection::open_with_options(
+            BTreeCollection::open_recovering(
                 name,
                 &self.data_dir,
                 self.encryption.clone(),
                 self.archive_sequencer.clone(),
-                opts,
+                Some(opts),
+                &self.recovered_tx_ids,
             )?
         };
         if self.lazy_sync.load(Ordering::Acquire) {
@@ -924,8 +1067,19 @@ impl OxiDb {
                 }
             }
             let cols = self.collections.read();
+            let mut all_checkpointed = true;
             for col_arc in cols.values() {
-                let _ = col_arc.final_checkpoint();
+                if col_arc.final_checkpoint().is_err() {
+                    all_checkpointed = false;
+                }
+            }
+            drop(cols);
+            // Every WAL is persisted + truncated; the commit log has no
+            // entries left to vouch for. Only clear when every checkpoint
+            // succeeded — a failed persist means its WAL (and the ids
+            // vouching for its tx entries) are still needed for recovery.
+            if all_checkpointed {
+                let _ = self.tx_log.clear();
             }
         }
         self.flush_indexes();
@@ -981,11 +1135,33 @@ impl OxiDb {
                 loop {
                     match rx.recv_timeout(interval) {
                         Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // Snapshot the commit log BEFORE persisting.
+                            // Under the commit lock no transaction sits
+                            // between its commit point and apply, so every
+                            // id in the snapshot is fully applied in memory;
+                            // the persist pass below then makes that data
+                            // durable, after which the ids (and their WAL
+                            // entries) are redundant and can be pruned. Ids
+                            // marked after the snapshot stay — their data may
+                            // post-date this persist.
+                            let prune: Vec<u64> = {
+                                let _commit_guard = db.commit_lock.lock();
+                                db.tx_log
+                                    .read_committed()
+                                    .map(|s| s.into_iter().collect())
+                                    .unwrap_or_default()
+                            };
+                            let mut all_persisted = true;
                             let cols = db.collections.read();
                             for col_arc in cols.values() {
-                                let _ = col_arc.sync_writes();
+                                if col_arc.sync_writes().is_err() {
+                                    all_persisted = false;
+                                }
                             }
                             drop(cols);
+                            if all_persisted && !prune.is_empty() {
+                                let _ = db.tx_log.remove_committed_many(&prune);
+                            }
                             flush_counter += 1;
                             // Persist field indexes roughly every 10s
                             // regardless of cadence — they're small and
@@ -1240,7 +1416,11 @@ impl OxiDb {
         // encoding to reduce allocator churn.
         let keep_values = need_values || emit || docs.len() <= 1000;
 
-        // Assign IDs and prepare docs
+        // Assign IDs and prepare docs. The intra-batch uniqueness map lives
+        // OUTSIDE the per-document loop — declared inside it (as before) it
+        // was recreated empty for every doc, so two documents in the same
+        // batch carrying the same unique value both sailed through.
+        let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> = HashMap::new();
         let mut docs_with_ids: Vec<(u64, Value)> = Vec::with_capacity(docs.len());
         for (i, mut data) in docs.into_iter().enumerate() {
             if !data.is_object() {
@@ -1253,8 +1433,6 @@ impl OxiDb {
 
             // Intra-batch uniqueness check
             if has_unique_indexes {
-                let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> =
-                    HashMap::new();
                 for field in &unique_fields {
                     if let Some(value) = resolve_field_in_value(&data, field) {
                         let iv = IndexValue::from_json(value);
@@ -1279,14 +1457,16 @@ impl OxiDb {
                 docs_with_ids
                     .into_par_iter()
                     .map(|(id, data)| {
-                        let bytes = crate::codec::encode_doc(&data).unwrap_or_default();
+                        // Propagate encode errors — defaulting to empty bytes
+                        // persisted an undecodable document (acked, then lost).
+                        let bytes = crate::codec::encode_doc(&data)?;
                         if keep_values {
-                            (id, data, bytes)
+                            Ok((id, data, bytes))
                         } else {
-                            (id, Value::Null, bytes)
+                            Ok((id, Value::Null, bytes))
                         }
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()?
             } else {
                 let mut prepared = Vec::with_capacity(docs_with_ids.len());
                 for (id, data) in docs_with_ids {
@@ -2061,9 +2241,13 @@ impl OxiDb {
             col.checkpoint_wal()?;
         }
 
-        // 10. Cleanup: remove tx_id from commit log
-        #[cfg(not(target_arch = "wasm32"))]
-        self.tx_log.remove_committed(tx_id)?;
+        // 10. The tx_id intentionally STAYS in the commit log here. WAL
+        //     replay skips transactional entries whose id is absent from the
+        //     log, and this transaction's WAL entries outlive this function
+        //     (the WAL is only truncated at checkpoint). Removing the id now
+        //     would make a crash-before-snapshot-persist silently drop the
+        //     committed writes on recovery. The background sync thread prunes
+        //     the log after each snapshot persist; shutdown clears it.
 
         // 11. Emit change events after successful commit
         for event in pending_events {
