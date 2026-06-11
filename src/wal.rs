@@ -438,6 +438,15 @@ impl Wal {
         let file = self.inner.lock();
         file.set_len(0)?;
         file.sync_data()?;
+        // The truncate removed the OXWA header along with the records; the
+        // next append must rewrite it. Leaving the state PRESENT made the
+        // first post-checkpoint record land at offset 0 while in-process
+        // readers still skipped 8 header bytes — and silently degraded the
+        // file to the legacy header-less format on every checkpoint+append
+        // cycle. Store while still holding the inner lock so it can't race
+        // a concurrent append's `ensure_header_locked`.
+        self.header_state
+            .store(header_state::NEEDED, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -445,6 +454,9 @@ impl Wal {
     pub fn checkpoint_no_sync(&self) -> Result<()> {
         let file = self.inner.lock();
         file.set_len(0)?;
+        // See `checkpoint` — the header must be rewritten on next append.
+        self.header_state
+            .store(header_state::NEEDED, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 

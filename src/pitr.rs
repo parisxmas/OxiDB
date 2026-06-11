@@ -86,11 +86,28 @@ impl ArchiveSequencer {
             .truncate(false)
             .open(&path)?;
 
-        // A short/empty/torn file means "no GSN ever reserved" → start at 1.
-        let mut buf = [0u8; 8];
-        let prev_ceiling = match file.read_exact(&mut buf) {
-            Ok(()) => u64::from_le_bytes(buf),
-            Err(_) => 0,
+        // Distinguish "fresh database" (empty file → start at 1) from a
+        // SHORT or unreadable file (torn in-place write, I/O error). The
+        // latter must fail loudly: silently restarting the sequence at 1
+        // would hand out duplicate GSNs, breaking the archive's global
+        // ordering and the `(gsn, doc_id)` dedup in `replay_into`.
+        let file_len = file.metadata()?.len();
+        let prev_ceiling = if file_len == 0 {
+            0
+        } else if file_len < 8 {
+            return Err(crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} is truncated ({file_len} bytes); refusing to restart the \
+                     GSN sequence — restore the file or delete it ONLY if no \
+                     archive segments exist",
+                    path.display()
+                ),
+            )));
+        } else {
+            let mut buf = [0u8; 8];
+            file.read_exact(&mut buf)?;
+            u64::from_le_bytes(buf)
         };
 
         let start = prev_ceiling + 1;

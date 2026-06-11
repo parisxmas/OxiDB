@@ -956,9 +956,15 @@ impl BTreeCollection {
         F: FnMut(DocumentId, &Arc<Value>) -> Result<bool>,
     {
         self.storage.scan_all_while(|key, bytes| {
+            // Serve from cache when present, but do NOT insert on a miss: a
+            // full-collection scan that `put`s every doc evicts the entire
+            // hot working set (and pays an LRU write per document) for
+            // entries that are typically never read again.
+            if let Some(arc) = self.doc_cache.get(key) {
+                return f(key, &arc);
+            }
             let doc = codec::decode_doc(bytes)?;
             let arc = Arc::new(doc);
-            self.doc_cache.put(key, Arc::clone(&arc));
             f(key, &arc)
         })
     }
@@ -1052,19 +1058,46 @@ impl BTreeCollection {
         obj.insert("_id".to_string(), Value::Number(id.into()));
         obj.insert("_version".to_string(), Value::Number(1.into()));
 
-        // Check unique constraints BEFORE any mutation
-        let mut fi = self.field_indexes.write();
-        Self::check_unique_constraints_with(&fi, &data, None)?;
-
         let bytes = codec::encode_doc(&data)?;
-
-        // WAL log before mutation. Single-doc insert uses the helper
-        // so per-commit fsync follows the lazy_sync flag.
-        self.wal_log(&WalEntry::Insert {
+        let entry = WalEntry::Insert {
             doc_id: id,
             doc_bytes: bytes.clone(),
             tx_id: 0,
-        })?;
+        };
+
+        // Lock strategy: the WAL write below can carry a per-commit fsync,
+        // and holding the field-index write lock across it stalls every
+        // reader on this collection for the fsync's duration (~ms). With NO
+        // unique indexes (the common case) validation cannot reject the
+        // insert, so the WAL entry is logged BEFORE the write lock — the
+        // same ordering `delete` uses. With unique indexes the
+        // validate→WAL→apply order must hold: a WAL entry must never exist
+        // for a rejected insert (replay would resurrect it).
+        let has_unique = {
+            let fi = self.field_indexes.read();
+            fi.values().any(|idx| idx.unique)
+        };
+        let mut fi;
+        if has_unique {
+            fi = self.field_indexes.write();
+            Self::check_unique_constraints_with(&fi, &data, None)?;
+            self.wal_log(&entry)?;
+        } else {
+            self.wal_log(&entry)?;
+            fi = self.field_indexes.write();
+            // A unique index created between the peek and this lock:
+            // re-validate, and neutralize the already-logged insert with a
+            // tombstone if it now violates (so replay can't resurrect it).
+            if fi.values().any(|idx| idx.unique) {
+                if let Err(e) = Self::check_unique_constraints_with(&fi, &data, None) {
+                    let _ = self.wal_log(&WalEntry::Delete {
+                        doc_id: id,
+                        tx_id: 0,
+                    });
+                    return Err(e);
+                }
+            }
+        }
 
         // Insert directly into B-tree (the B-tree IS the storage)
         self.storage.insert(id, bytes);
@@ -1366,13 +1399,16 @@ impl BTreeCollection {
     ) -> Result<Vec<Arc<Value>>> {
         let query = query::parse_query(query_json)?;
 
-        // Fast path: Query::All with no sort — use B-tree cursor scan
+        // Fast path: Query::All with no sort — use B-tree cursor scan.
+        // Decodes straight into the returned Arc (cache hits are reused);
+        // the previous `Arc::new(doc.clone())` paid a full deep clone per
+        // returned document on top of the decode.
         if matches!(query, Query::All) && opts.sort.is_none() {
             let skip = opts.skip.unwrap_or(0) as usize;
             let limit = opts.limit.map(|l| l as usize).unwrap_or(usize::MAX);
             let mut results = Vec::new();
             let mut skipped = 0;
-            self.for_each_doc_streaming(|doc| {
+            self.storage.scan_all_while(|key, bytes| {
                 if skipped < skip {
                     skipped += 1;
                     return Ok(true);
@@ -1380,7 +1416,11 @@ impl BTreeCollection {
                 if results.len() >= limit {
                     return Ok(false);
                 }
-                results.push(Arc::new(doc.clone()));
+                let arc = match self.doc_cache.get(key) {
+                    Some(arc) => arc,
+                    None => Arc::new(codec::decode_doc(bytes)?),
+                };
+                results.push(arc);
                 Ok(true)
             })?;
             return Ok(results);
@@ -2012,8 +2052,17 @@ impl BTreeCollection {
         // write so the rejection is clean and atomic — no partial
         // application.
         self.check_worm_for_ids(matches.iter().map(|(id, _)| *id))?;
+        let matched_ids: Vec<DocumentId> = matches.into_iter().map(|(id, _)| id).collect();
 
-        // Phase 2: Prepare and validate updates (no lock needed)
+        // Phase 2+3 (merged): take the write locks, then RE-READ each
+        // matched doc and compute the update against its CURRENT content.
+        // Between phase 1's read locks and here a concurrent writer can
+        // update or delete the doc; computing from the phase-1 snapshot
+        // used to (a) leave stale index entries keyed by snapshot values
+        // the doc no longer has, (b) resurrect a concurrently-deleted doc
+        // via the blind storage insert, and (c) silently lose the
+        // concurrent update's changes. The recompute under exclusive
+        // locks also makes the `_version` bump a true atomic RMW.
         struct UpdateOp {
             id: DocumentId,
             old_data: Value,
@@ -2021,37 +2070,42 @@ impl BTreeCollection {
             new_bytes: Vec<u8>,
         }
 
-        let mut ops = Vec::with_capacity(matches.len());
+        let mut fi = self.field_indexes.write();
+        let mut ci = self.composite_indexes.write();
+        let mut ti = self.text_index.write();
+        let mut vi = self.vector_indexes.write();
 
-        // We need to check if we have indexes for old_data tracking — peek under a brief read lock
-        let need_old_data = {
-            let fi = self.field_indexes.read();
-            let ci = self.composite_indexes.read();
-            !fi.is_empty() || !ci.is_empty()
-        };
-
-        for (id, mut data) in matches {
-            // Save old data BEFORE mutation for index removal (avoids a second load_doc_arc call)
-            let old_data = if need_old_data {
-                data.clone()
-            } else {
-                Value::Null
+        let mut ops = Vec::with_capacity(matched_ids.len());
+        for id in matched_ids {
+            // Re-read under the write locks; storage is the source of truth.
+            let Some(cur_bytes) = self.storage.get(id) else {
+                continue; // deleted since phase 1 — do not resurrect
             };
+            let current = codec::decode_doc(&cur_bytes)?;
+            // Re-check the predicate: a concurrent update may have moved
+            // the doc out of the query's result set.
+            if !query::matches_value(&query, &current) {
+                continue;
+            }
 
-            crate::update::apply_update(&mut data, update_json)?;
+            let mut new_data = current.clone();
+            crate::update::apply_update(&mut new_data, update_json)?;
 
-            let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+            let old_version = current
+                .get("_version")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             let new_version = old_version + 1;
-            if let Some(obj) = data.as_object_mut() {
+            if let Some(obj) = new_data.as_object_mut() {
                 obj.insert("_version".to_string(), Value::Number(new_version.into()));
             }
 
-            let new_bytes = codec::encode_doc(&data)?;
+            let new_bytes = codec::encode_doc(&new_data)?;
 
             ops.push(UpdateOp {
                 id,
-                old_data,
-                new_data: data,
+                old_data: current,
+                new_data,
                 new_bytes,
             });
         }
@@ -2060,17 +2114,30 @@ impl BTreeCollection {
             return Ok(Vec::new());
         }
 
-        // Phase 3: Apply to B-tree and update indexes (write locks)
-        let mut fi = self.field_indexes.write();
-        let mut ci = self.composite_indexes.write();
-        let mut ti = self.text_index.write();
-        let mut vi = self.vector_indexes.write();
-
-        // Unique constraint check under write lock
+        // Unique constraint check under write lock — against the index AND
+        // across the batch itself: two ops in one update() setting the same
+        // unique value each pass the index check (the other's OLD value is
+        // what's indexed) and used to both go through.
         let has_unique = fi.values().any(|idx| idx.unique);
         if has_unique {
+            let mut pending_unique: HashMap<String, HashMap<IndexValue, DocumentId>> =
+                HashMap::new();
             for op in &ops {
                 Self::check_unique_constraints_with(&fi, &op.new_data, Some(op.id))?;
+                for idx in fi.values().filter(|i| i.unique) {
+                    if let Some(value) = resolve_field_in_value(&op.new_data, &idx.field) {
+                        let iv = IndexValue::from_json(value);
+                        let field_map = pending_unique.entry(idx.field.clone()).or_default();
+                        if let Some(&other) = field_map.get(&iv) {
+                            if other != op.id {
+                                return Err(Error::UniqueViolation {
+                                    field: idx.field.clone(),
+                                });
+                            }
+                        }
+                        field_map.insert(iv, op.id);
+                    }
+                }
             }
         }
 

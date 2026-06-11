@@ -169,6 +169,7 @@ pub(crate) enum Accumulator {
     Percentile(Expression, Vec<f64>),
 }
 
+#[derive(Clone)]
 enum AccumulatorState {
     Sum(f64),
     Avg {
@@ -1479,36 +1480,48 @@ fn hash_json_value<H: Hasher>(val: &Value, state: &mut H) {
 
 /// Fast group key hash computed directly from &Value references (zero allocation
 /// for common cases like string/number group keys).
-#[derive(Clone)]
-struct FastGroupKey(u64);
-
-impl PartialEq for FastGroupKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl Eq for FastGroupKey {}
-
-impl Hash for FastGroupKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-fn compute_fast_key_single(val: &Value) -> FastGroupKey {
+///
+/// The hash is a BUCKET selector only — never an identity. Group lookups
+/// must verify the materialized key value on every bucket hit: DefaultHasher
+/// is deterministic SipHash, so two distinct keys colliding (by birthday
+/// bound at high cardinality, or adversarially precomputed) used to be
+/// silently merged into one group when the u64 alone was the map key.
+fn compute_fast_key_single(val: &Value) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     1usize.hash(&mut hasher);
     hash_json_value(val, &mut hasher);
-    FastGroupKey(hasher.finish())
+    hasher.finish()
 }
 
-fn compute_fast_key_multi<'a>(vals: impl Iterator<Item = &'a Value>, len: usize) -> FastGroupKey {
+fn compute_fast_key_multi<'a>(vals: impl Iterator<Item = &'a Value>, len: usize) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     len.hash(&mut hasher);
     for val in vals {
         hash_json_value(val, &mut hasher);
     }
-    FastGroupKey(hasher.finish())
+    hasher.finish()
+}
+
+/// Fresh per-group accumulator states for a `$group` stage.
+fn initial_accumulator_states(accumulators: &[(String, Accumulator)]) -> Vec<AccumulatorState> {
+    accumulators
+        .iter()
+        .map(|(_, acc)| match acc {
+            Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
+            Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
+            Accumulator::Min(_) => AccumulatorState::Min(None),
+            Accumulator::Max(_) => AccumulatorState::Max(None),
+            Accumulator::Count => AccumulatorState::Count(0),
+            Accumulator::First(_) => AccumulatorState::First(None),
+            Accumulator::Last(_) => AccumulatorState::Last(None),
+            Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
+            Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
+            Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
+                percentiles: percentiles.clone(),
+                values: Vec::new(),
+            },
+        })
+        .collect()
 }
 
 #[inline(always)]
@@ -1719,75 +1732,86 @@ fn exec_group<D: DocRef>(
 ) -> Result<Vec<Value>> {
     // Pre-size with a reasonable estimate: sqrt(n) for typical cardinality
     let estimated_groups = (docs.len() as f64).sqrt() as usize + 1;
-    let mut groups: HashMap<FastGroupKey, (Value, Vec<AccumulatorState>)> =
-        HashMap::with_capacity(estimated_groups);
-    let mut insertion_order: Vec<FastGroupKey> = Vec::with_capacity(estimated_groups);
+    // `group_data` holds the groups in insertion order; `buckets` maps the
+    // key hash to indexes into it. Bucket hits are verified against the
+    // stored key value — see `compute_fast_key_single` for why hash-only
+    // identity was wrong.
+    let mut group_data: Vec<(Value, Vec<AccumulatorState>)> = Vec::with_capacity(estimated_groups);
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::with_capacity(estimated_groups);
+
+    enum KeyEval<'a> {
+        Null,
+        Single(ValRef<'a>),
+        Compound(Vec<ValRef<'a>>),
+    }
 
     for doc in docs {
         let doc = doc.as_value();
 
-        // Compute group key hash directly from references — zero allocation
-        let key_hash = match key {
-            GroupKey::Null => FastGroupKey(0),
-            GroupKey::Single(expr) => {
-                let vr = expr.eval_ref(doc);
-                compute_fast_key_single(vr.as_value())
-            }
+        // Evaluate the key expressions once; reused for hash, bucket
+        // verification, and (for new groups) materialization.
+        let key_eval = match key {
+            GroupKey::Null => KeyEval::Null,
+            GroupKey::Single(expr) => KeyEval::Single(expr.eval_ref(doc)),
             GroupKey::Compound(fields) => {
-                // Evaluate all field refs first, then hash
-                let vals: Vec<ValRef> = fields.iter().map(|(_, expr)| expr.eval_ref(doc)).collect();
+                KeyEval::Compound(fields.iter().map(|(_, expr)| expr.eval_ref(doc)).collect())
+            }
+        };
+        let key_hash = match &key_eval {
+            KeyEval::Null => 0u64,
+            KeyEval::Single(vr) => compute_fast_key_single(vr.as_value()),
+            KeyEval::Compound(vals) => {
                 compute_fast_key_multi(vals.iter().map(|vr| vr.as_value()), vals.len())
             }
         };
 
-        // Fast path: get_mut avoids key_hash clone for existing groups (99%+ of iterations)
-        if let Some((_, states)) = groups.get_mut(&key_hash) {
-            for (i, (_, acc)) in accumulators.iter().enumerate() {
-                update_accumulator(&mut states[i], acc, doc);
-            }
-            continue;
-        }
-
-        // New group — materialize key Value only once per group
-        let key_val = match key {
-            GroupKey::Null => Value::Null,
-            GroupKey::Single(expr) => expr.eval_ref(doc).into_owned(),
-            GroupKey::Compound(fields) => {
-                let mut map = Map::new();
-                for (name, expr) in fields {
-                    map.insert(name.clone(), expr.eval_ref(doc).into_owned());
-                }
-                Value::Object(map)
-            }
-        };
-        let mut initial: Vec<AccumulatorState> = accumulators
-            .iter()
-            .map(|(_, acc)| match acc {
-                Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
-                Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
-                Accumulator::Min(_) => AccumulatorState::Min(None),
-                Accumulator::Max(_) => AccumulatorState::Max(None),
-                Accumulator::Count => AccumulatorState::Count(0),
-                Accumulator::First(_) => AccumulatorState::First(None),
-                Accumulator::Last(_) => AccumulatorState::Last(None),
-                Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
-                Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
-                Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
-                    percentiles: percentiles.clone(),
-                    values: Vec::new(),
+        let found = buckets.get(&key_hash).and_then(|idxs| {
+            idxs.iter().copied().find(|&i| match &key_eval {
+                KeyEval::Null => true,
+                KeyEval::Single(vr) => vr.as_value() == &group_data[i].0,
+                KeyEval::Compound(vals) => match (key, group_data[i].0.as_object()) {
+                    (GroupKey::Compound(fields), Some(obj)) => fields
+                        .iter()
+                        .zip(vals)
+                        .all(|((name, _), vr)| obj.get(name.as_str()) == Some(vr.as_value())),
+                    _ => false,
                 },
             })
-            .collect();
+        });
+
+        let gi = match found {
+            Some(i) => i,
+            None => {
+                // New group — materialize key Value only once per group
+                let key_val = match key_eval {
+                    KeyEval::Null => Value::Null,
+                    KeyEval::Single(vr) => vr.into_owned(),
+                    KeyEval::Compound(vals) => {
+                        let GroupKey::Compound(fields) = key else {
+                            unreachable!()
+                        };
+                        let mut map = Map::new();
+                        for ((name, _), vr) in fields.iter().zip(vals) {
+                            map.insert(name.clone(), vr.into_owned());
+                        }
+                        Value::Object(map)
+                    }
+                };
+                group_data.push((key_val, initial_accumulator_states(accumulators)));
+                let i = group_data.len() - 1;
+                buckets.entry(key_hash).or_default().push(i);
+                i
+            }
+        };
+
+        let states = &mut group_data[gi].1;
         for (i, (_, acc)) in accumulators.iter().enumerate() {
-            update_accumulator(&mut initial[i], acc, doc);
+            update_accumulator(&mut states[i], acc, doc);
         }
-        insertion_order.push(key_hash.clone());
-        groups.insert(key_hash, (key_val, initial));
     }
 
-    let mut results = Vec::with_capacity(insertion_order.len());
-    for key_hash in &insertion_order {
-        let (key_val, states) = groups.remove(key_hash).unwrap();
+    let mut results = Vec::with_capacity(group_data.len());
+    for (key_val, states) in group_data {
         let mut doc = Map::new();
         doc.insert("_id".to_string(), key_val);
 
@@ -1867,6 +1891,23 @@ fn exec_limit(docs: Vec<Value>, n: u64) -> Vec<Value> {
     docs.into_iter().take(n as usize).collect()
 }
 
+/// Remove a (possibly dotted) path from a projected document, descending
+/// through intermediate objects. Used by `$project` exclusion mode — a flat
+/// `map.remove("a.b")` can never remove a nested field, which silently
+/// turned nested exclusions into no-ops.
+fn remove_projected_path(map: &mut Map<String, Value>, path: &str) {
+    match path.split_once('.') {
+        None => {
+            map.remove(path);
+        }
+        Some((head, rest)) => {
+            if let Some(Value::Object(child)) = map.get_mut(head) {
+                remove_projected_path(child, rest);
+            }
+        }
+    }
+}
+
 fn exec_project(docs: Vec<Value>, fields: &[(String, ProjectionField)]) -> Vec<Value> {
     let has_include = fields
         .iter()
@@ -1878,16 +1919,18 @@ fn exec_project(docs: Vec<Value>, fields: &[(String, ProjectionField)]) -> Vec<V
 
     docs.into_iter()
         .map(|doc| {
-            let mut result = Map::new();
-
             if inclusion_mode {
                 let id_excluded = fields
                     .iter()
                     .any(|(name, pf)| name == "_id" && matches!(pf, ProjectionField::Exclude));
 
+                // Build via set_field so a dotted name like "address.city"
+                // produces the nested {"address": {"city": ..}} structure
+                // (MongoDB), not a flattened literal "address.city" key.
+                let mut out = Value::Object(Map::new());
                 if !id_excluded {
                     if let Some(id_val) = doc.as_object().and_then(|m| m.get("_id")) {
-                        result.insert("_id".to_string(), id_val.clone());
+                        set_field(&mut out, "_id", id_val.clone());
                     }
                 }
 
@@ -1900,28 +1943,31 @@ fn exec_project(docs: Vec<Value>, fields: &[(String, ProjectionField)]) -> Vec<V
                             // means a present-but-null nested path like
                             // `address.zip` is kept rather than silently dropped.
                             if let Some(val) = resolve_field_ref(&doc, name) {
-                                result.insert(name.clone(), val.clone());
+                                let val = val.clone();
+                                set_field(&mut out, name, val);
                             }
                         }
                         ProjectionField::Compute(expr) => {
-                            result.insert(name.clone(), expr.eval(&doc));
+                            let val = expr.eval(&doc);
+                            set_field(&mut out, name, val);
                         }
                         ProjectionField::Exclude => {}
                     }
                 }
+                out
             } else {
                 // Exclusion mode
-                if let Value::Object(map) = &doc {
-                    result = map.clone();
-                }
+                let mut result = match &doc {
+                    Value::Object(map) => map.clone(),
+                    _ => Map::new(),
+                };
                 for (name, pf) in fields {
                     if matches!(pf, ProjectionField::Exclude) {
-                        result.remove(name.as_str());
+                        remove_projected_path(&mut result, name);
                     }
                 }
+                Value::Object(result)
             }
-
-            Value::Object(result)
         })
         .collect()
 }
@@ -2004,7 +2050,9 @@ fn resolve_window_frame(frame: &WindowFrame, i: usize, n: usize) -> Option<(usiz
                 }
             }
             WindowBound::Current => i as i64,
-            WindowBound::Offset(o) => i as i64 + o,
+            // saturating: the offset is user-supplied (can be i64::MIN/MAX)
+            // and would wrap in release / panic in debug builds.
+            WindowBound::Offset(o) => (i as i64).saturating_add(*o),
         }
     };
     let lo_raw = bound(&frame.lo, false);
@@ -2078,12 +2126,50 @@ fn exec_set_window_fields(
             (Vec::new(), Vec::new())
         };
 
+        // Precompute accumulators whose frame is the whole partition or a
+        // running prefix. The generic path below re-accumulates the frame
+        // for every row — O(n × frame), which turns the canonical running
+        // total `[unbounded, current]` into O(n²) per partition. These two
+        // shapes fold the partition exactly once.
+        let mut precomputed: HashMap<usize, Vec<Value>> = HashMap::new();
+        for (oi, out) in output.iter().enumerate() {
+            if let WindowOp::Accum(acc, frame) = &out.op {
+                if n == 0 {
+                    continue;
+                }
+                match (&frame.lo, &frame.hi) {
+                    (WindowBound::Unbounded, WindowBound::Unbounded) => {
+                        let mut state = init_accumulator_state(acc);
+                        for d in &part {
+                            update_accumulator_state(&mut state, acc, d);
+                        }
+                        let v = finalize_accumulator(state);
+                        precomputed.insert(oi, vec![v; n]);
+                    }
+                    (WindowBound::Unbounded, WindowBound::Current) => {
+                        let mut state = init_accumulator_state(acc);
+                        let mut vals = Vec::with_capacity(n);
+                        for d in &part {
+                            update_accumulator_state(&mut state, acc, d);
+                            vals.push(finalize_accumulator(state.clone()));
+                        }
+                        precomputed.insert(oi, vals);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Compute all additions from the immutable partition first, then apply,
         // so output fields never feed into each other within this stage.
         let mut additions: Vec<Vec<(String, Value)>> = Vec::with_capacity(n);
         for i in 0..n {
             let mut row = Vec::with_capacity(output.len());
-            for out in output {
+            for (oi, out) in output.iter().enumerate() {
+                if let Some(vals) = precomputed.get(&oi) {
+                    row.push((out.field.clone(), vals[i].clone()));
+                    continue;
+                }
                 let val = match &out.op {
                     WindowOp::DocumentNumber => json!(i as u64 + 1),
                     WindowOp::Rank => json!(ranks[i]),
@@ -2093,11 +2179,12 @@ fn exec_set_window_fields(
                         by,
                         default,
                     } => {
-                        let j = i as i64 + by;
-                        if j >= 0 && (j as usize) < n {
-                            output.eval(&part[j as usize])
-                        } else {
-                            default.clone()
+                        // checked_add: `by` is user-supplied and can be
+                        // i64::MIN/MAX — debug builds would panic on wrap.
+                        let j = (i as i64).checked_add(*by);
+                        match j {
+                            Some(j) if j >= 0 && (j as usize) < n => output.eval(&part[j as usize]),
+                            _ => default.clone(),
                         }
                     }
                     WindowOp::Accum(acc, frame) => match resolve_window_frame(frame, i, n) {
@@ -2382,7 +2469,16 @@ fn try_index_group(
     docs: &[Arc<Value>],
     field_indexes: Option<&HashMap<String, PagedFieldIndex>>,
     doc_lookup: Option<&dyn Fn(DocumentId) -> Option<Arc<Value>>>,
+    is_full_scan: bool,
 ) -> Result<Option<Vec<Value>>> {
+    // Both fast paths read groups straight from the INDEX, which covers the
+    // whole collection — they are only correct when `docs` is the whole
+    // collection too. The previous `docs.len() >= total_indexed` size
+    // heuristic let a $match-filtered subset through whenever the group
+    // field was sparse enough, silently emitting unfiltered groups.
+    if !is_full_scan {
+        return Ok(None);
+    }
     // Only optimize single-field group key
     let group_field = match key {
         GroupKey::Single(Expression::FieldRef(field)) => field.as_str(),
@@ -2870,8 +2966,11 @@ pub(crate) fn is_raw_eligible(key: &GroupKey, accumulators: &[(String, Accumulat
 pub(crate) struct StreamingGroup {
     key: GroupKey,
     accumulators: Vec<(String, Accumulator)>,
-    groups: HashMap<FastGroupKey, (Value, Vec<AccumulatorState>)>,
-    insertion_order: Vec<FastGroupKey>,
+    /// Groups in insertion order; `buckets` maps key hash → indexes here.
+    /// Bucket hits are verified against the stored key value — the hash is
+    /// a bucket selector, never an identity (see `compute_fast_key_single`).
+    group_data: Vec<(Value, Vec<AccumulatorState>)>,
+    buckets: HashMap<u64, Vec<usize>>,
 }
 
 impl StreamingGroup {
@@ -2879,68 +2978,79 @@ impl StreamingGroup {
         Self {
             key: key.clone(),
             accumulators: accumulators.to_vec(),
-            groups: HashMap::new(),
-            insertion_order: Vec::new(),
+            group_data: Vec::new(),
+            buckets: HashMap::new(),
         }
     }
 
     /// Feed a single document into the group accumulators.
     pub(crate) fn feed(&mut self, doc: &Value) {
-        let key_hash = match &self.key {
-            GroupKey::Null => FastGroupKey(0),
-            GroupKey::Single(expr) => {
-                let vr = expr.eval_ref(doc);
-                compute_fast_key_single(vr.as_value())
-            }
+        enum KeyEval<'a> {
+            Null,
+            Single(ValRef<'a>),
+            Compound(Vec<ValRef<'a>>),
+        }
+        // Evaluate once; reused for hash, bucket verification, and (new
+        // groups only) materialization — no per-doc allocation on hits.
+        let key_eval = match &self.key {
+            GroupKey::Null => KeyEval::Null,
+            GroupKey::Single(expr) => KeyEval::Single(expr.eval_ref(doc)),
             GroupKey::Compound(fields) => {
-                let vals: Vec<ValRef> = fields.iter().map(|(_, expr)| expr.eval_ref(doc)).collect();
+                KeyEval::Compound(fields.iter().map(|(_, expr)| expr.eval_ref(doc)).collect())
+            }
+        };
+        let key_hash = match &key_eval {
+            KeyEval::Null => 0u64,
+            KeyEval::Single(vr) => compute_fast_key_single(vr.as_value()),
+            KeyEval::Compound(vals) => {
                 compute_fast_key_multi(vals.iter().map(|vr| vr.as_value()), vals.len())
             }
         };
 
-        if let Some((_, states)) = self.groups.get_mut(&key_hash) {
-            for (i, (_, acc)) in self.accumulators.iter().enumerate() {
-                update_accumulator(&mut states[i], acc, doc);
-            }
-            return;
-        }
-
-        // New group — materialize key Value only once
-        let key_val = match &self.key {
-            GroupKey::Null => Value::Null,
-            GroupKey::Single(expr) => expr.eval_ref(doc).into_owned(),
-            GroupKey::Compound(fields) => {
-                let mut map = Map::new();
-                for (name, expr) in fields {
-                    map.insert(name.clone(), expr.eval_ref(doc).into_owned());
-                }
-                Value::Object(map)
-            }
-        };
-        let mut initial: Vec<AccumulatorState> = self
-            .accumulators
-            .iter()
-            .map(|(_, acc)| match acc {
-                Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
-                Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
-                Accumulator::Min(_) => AccumulatorState::Min(None),
-                Accumulator::Max(_) => AccumulatorState::Max(None),
-                Accumulator::Count => AccumulatorState::Count(0),
-                Accumulator::First(_) => AccumulatorState::First(None),
-                Accumulator::Last(_) => AccumulatorState::Last(None),
-                Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
-                Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
-                Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
-                    percentiles: percentiles.clone(),
-                    values: Vec::new(),
+        let group_data = &self.group_data;
+        let found = self.buckets.get(&key_hash).and_then(|idxs| {
+            idxs.iter().copied().find(|&i| match &key_eval {
+                KeyEval::Null => true,
+                KeyEval::Single(vr) => vr.as_value() == &group_data[i].0,
+                KeyEval::Compound(vals) => match (&self.key, group_data[i].0.as_object()) {
+                    (GroupKey::Compound(fields), Some(obj)) => fields
+                        .iter()
+                        .zip(vals)
+                        .all(|((name, _), vr)| obj.get(name.as_str()) == Some(vr.as_value())),
+                    _ => false,
                 },
             })
-            .collect();
+        });
+
+        let gi = match found {
+            Some(i) => i,
+            None => {
+                let key_val = match key_eval {
+                    KeyEval::Null => Value::Null,
+                    KeyEval::Single(vr) => vr.into_owned(),
+                    KeyEval::Compound(vals) => {
+                        let GroupKey::Compound(fields) = &self.key else {
+                            unreachable!()
+                        };
+                        let mut map = Map::new();
+                        for ((name, _), vr) in fields.iter().zip(vals) {
+                            map.insert(name.clone(), vr.into_owned());
+                        }
+                        Value::Object(map)
+                    }
+                };
+                self.group_data
+                    .push((key_val, initial_accumulator_states(&self.accumulators)));
+                let i = self.group_data.len() - 1;
+                self.buckets.entry(key_hash).or_default().push(i);
+                i
+            }
+        };
+
+        let states = &mut self.group_data[gi].1;
         for (i, (_, acc)) in self.accumulators.iter().enumerate() {
-            update_accumulator(&mut initial[i], acc, doc);
+            update_accumulator(&mut states[i], acc, doc);
         }
-        self.insertion_order.push(key_hash.clone());
-        self.groups.insert(key_hash, (key_val, initial));
     }
 
     /// Feed directly from raw JSONB bytes — extracts only the fields needed
@@ -2957,36 +3067,45 @@ impl StreamingGroup {
 
         let raw = jsonb::RawJsonb::new(raw_bytes);
 
-        // Compute group key hash directly from raw JSONB
-        let key_hash = match &self.key {
-            GroupKey::Null => FastGroupKey(0),
+        // Extract the key fields ONCE for both the hash and the materialized
+        // key value. The materialized form (just the key, not the document)
+        // is needed to verify bucket hits — the hash is a bucket selector,
+        // never an identity.
+        let (key_hash, key_val) = match &self.key {
+            GroupKey::Null => (0u64, Value::Null),
             GroupKey::Single(expr) => {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 1usize.hash(&mut hasher);
-                match expr {
+                let kv = match expr {
                     Expression::FieldRef(path) => {
                         if let Some(owned) = extract_raw_field(&raw, path) {
                             if !hash_raw_owned(&owned, &mut hasher) {
                                 let doc: Value = jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
                                 return self.feed(&doc);
                             }
+                            raw_owned_to_value(&owned)
                         } else {
                             std::mem::discriminant(&IndexValue::Null).hash(&mut hasher);
+                            Value::Null
                         }
                     }
-                    Expression::Literal(v) => hash_json_value(v, &mut hasher),
+                    Expression::Literal(v) => {
+                        hash_json_value(v, &mut hasher);
+                        v.clone()
+                    }
                     _ => {
                         let doc: Value = jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
                         return self.feed(&doc);
                     }
-                }
-                FastGroupKey(hasher.finish())
+                };
+                (hasher.finish(), kv)
             }
             GroupKey::Compound(fields) => {
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
                 fields.len().hash(&mut hasher);
-                for (_, expr) in fields {
-                    match expr {
+                let mut map = Map::new();
+                for (name, expr) in fields {
+                    let v = match expr {
                         Expression::FieldRef(path) => {
                             if let Some(owned) = extract_raw_field(&raw, path) {
                                 if !hash_raw_owned(&owned, &mut hasher) {
@@ -2994,106 +3113,95 @@ impl StreamingGroup {
                                         jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
                                     return self.feed(&doc);
                                 }
+                                raw_owned_to_value(&owned)
                             } else {
                                 std::mem::discriminant(&IndexValue::Null).hash(&mut hasher);
+                                Value::Null
                             }
                         }
-                        Expression::Literal(v) => hash_json_value(v, &mut hasher),
+                        Expression::Literal(v) => {
+                            hash_json_value(v, &mut hasher);
+                            v.clone()
+                        }
                         _ => {
                             let doc: Value = jsonb::from_raw_jsonb(&raw).unwrap_or(Value::Null);
                             return self.feed(&doc);
                         }
-                    }
-                }
-                FastGroupKey(hasher.finish())
-            }
-        };
-
-        // Fast path: existing group — update accumulators from raw JSONB
-        if let Some((_, states)) = self.groups.get_mut(&key_hash) {
-            for (i, (_, acc)) in self.accumulators.iter().enumerate() {
-                update_accumulator_raw(&mut states[i], acc, &raw);
-            }
-            return;
-        }
-
-        // New group — materialize key Value (happens only a few times)
-        let key_val = match &self.key {
-            GroupKey::Null => Value::Null,
-            GroupKey::Single(expr) => match expr {
-                Expression::FieldRef(path) => extract_raw_field(&raw, path)
-                    .as_ref()
-                    .map(raw_owned_to_value)
-                    .unwrap_or(Value::Null),
-                Expression::Literal(v) => v.clone(),
-                _ => Value::Null,
-            },
-            GroupKey::Compound(fields) => {
-                let mut map = Map::new();
-                for (name, expr) in fields {
-                    let v = match expr {
-                        Expression::FieldRef(path) => extract_raw_field(&raw, path)
-                            .as_ref()
-                            .map(raw_owned_to_value)
-                            .unwrap_or(Value::Null),
-                        Expression::Literal(v) => v.clone(),
-                        _ => Value::Null,
                     };
                     map.insert(name.clone(), v);
                 }
-                Value::Object(map)
+                (hasher.finish(), Value::Object(map))
             }
         };
-        let mut initial: Vec<AccumulatorState> = self
-            .accumulators
-            .iter()
-            .map(|(_, acc)| match acc {
-                Accumulator::Sum(_) => AccumulatorState::Sum(0.0),
-                Accumulator::Avg(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
-                Accumulator::Min(_) => AccumulatorState::Min(None),
-                Accumulator::Max(_) => AccumulatorState::Max(None),
-                Accumulator::Count => AccumulatorState::Count(0),
-                Accumulator::First(_) => AccumulatorState::First(None),
-                Accumulator::Last(_) => AccumulatorState::Last(None),
-                Accumulator::Push(_) => AccumulatorState::Push(Vec::new()),
-                Accumulator::AddToSet(_) => AccumulatorState::AddToSet(Vec::new()),
-                Accumulator::Percentile(_, percentiles) => AccumulatorState::Percentile {
-                    percentiles: percentiles.clone(),
-                    values: Vec::new(),
-                },
-            })
-            .collect();
+
+        // Verified lookup: equality on the key value, not just the hash.
+        let group_data = &self.group_data;
+        let found = self
+            .buckets
+            .get(&key_hash)
+            .and_then(|idxs| idxs.iter().copied().find(|&i| group_data[i].0 == key_val));
+        let gi = match found {
+            Some(i) => i,
+            None => {
+                self.group_data
+                    .push((key_val, initial_accumulator_states(&self.accumulators)));
+                let i = self.group_data.len() - 1;
+                self.buckets.entry(key_hash).or_default().push(i);
+                i
+            }
+        };
+        let states = &mut self.group_data[gi].1;
         for (i, (_, acc)) in self.accumulators.iter().enumerate() {
-            update_accumulator_raw(&mut initial[i], acc, &raw);
+            update_accumulator_raw(&mut states[i], acc, &raw);
         }
-        self.insertion_order.push(key_hash.clone());
-        self.groups.insert(key_hash, (key_val, initial));
     }
 
     /// Merge another StreamingGroup into this one (for combining parallel results).
     /// The `other` group should come from a later segment so that First/Last
     /// semantics are preserved (self = earlier, other = later).
-    pub(crate) fn merge(&mut self, mut other: Self) {
-        for key_hash in other.insertion_order {
-            let (key_val, other_states) = other.groups.remove(&key_hash).unwrap();
-            if let Some((_, self_states)) = self.groups.get_mut(&key_hash) {
-                // Merge accumulator states pairwise
-                for (s, o) in self_states.iter_mut().zip(other_states) {
-                    merge_accumulator_state(s, o);
+    pub(crate) fn merge(&mut self, other: Self) {
+        for (key_val, other_states) in other.group_data {
+            // Recompute the hash from the materialized key — both sides
+            // derived their hashes from the same value representations.
+            let key_hash = match &self.key {
+                GroupKey::Null => 0u64,
+                GroupKey::Single(_) => compute_fast_key_single(&key_val),
+                GroupKey::Compound(fields) => {
+                    let obj = key_val.as_object();
+                    compute_fast_key_multi(
+                        fields.iter().map(|(name, _)| {
+                            obj.and_then(|o| o.get(name.as_str()))
+                                .unwrap_or(&Value::Null)
+                        }),
+                        fields.len(),
+                    )
                 }
-            } else {
-                // New group key from other — insert it
-                self.insertion_order.push(key_hash.clone());
-                self.groups.insert(key_hash, (key_val, other_states));
+            };
+            let group_data = &self.group_data;
+            let found = self
+                .buckets
+                .get(&key_hash)
+                .and_then(|idxs| idxs.iter().copied().find(|&i| group_data[i].0 == key_val));
+            match found {
+                Some(i) => {
+                    // Merge accumulator states pairwise
+                    for (s, o) in self.group_data[i].1.iter_mut().zip(other_states) {
+                        merge_accumulator_state(s, o);
+                    }
+                }
+                None => {
+                    self.group_data.push((key_val, other_states));
+                    let i = self.group_data.len() - 1;
+                    self.buckets.entry(key_hash).or_default().push(i);
+                }
             }
         }
     }
 
     /// Finalize and return the grouped results.
-    pub(crate) fn finalize(mut self) -> Vec<Value> {
-        let mut results = Vec::with_capacity(self.insertion_order.len());
-        for key_hash in &self.insertion_order {
-            let (key_val, states) = self.groups.remove(key_hash).unwrap();
+    pub(crate) fn finalize(self) -> Vec<Value> {
+        let mut results = Vec::with_capacity(self.group_data.len());
+        for (key_val, states) in self.group_data {
             let mut doc = Map::new();
             doc.insert("_id".to_string(), key_val);
             for ((name, _), state) in self.accumulators.iter().zip(states) {
@@ -3309,21 +3417,32 @@ impl Pipeline {
         lookup_fn: &F,
         field_indexes: Option<&HashMap<String, PagedFieldIndex>>,
         doc_lookup: Option<&dyn Fn(DocumentId) -> Option<Arc<Value>>>,
+        is_full_scan: bool,
     ) -> Result<Vec<Value>>
     where
         F: Fn(&str, &Value) -> Result<Vec<Value>>,
     {
+        // Tracks whether `docs` is still the ENTIRE collection — required by
+        // the index-accelerated $group, which reads groups from the index.
+        // Any membership-changing stage before the $group clears it.
+        let mut full_scan = is_full_scan;
         for (i, stage) in self.stages[start..].iter().enumerate() {
             match stage {
                 Stage::Match(val) => {
                     let query = query::parse_query(val)?;
                     docs.retain(|doc| query::matches_value(&query, doc));
+                    full_scan = false;
                 }
                 Stage::Group { key, accumulators } => {
                     // Try index-accelerated group path
-                    if let Some(result) =
-                        try_index_group(key, accumulators, &docs, field_indexes, doc_lookup)?
-                    {
+                    if let Some(result) = try_index_group(
+                        key,
+                        accumulators,
+                        &docs,
+                        field_indexes,
+                        doc_lookup,
+                        full_scan,
+                    )? {
                         return self.execute_from(start + i + 1, result, lookup_fn);
                     }
                     // $group reads by reference → produces small owned Vec<Value>
@@ -3365,8 +3484,14 @@ impl Pipeline {
                 }
                 Stage::Skip(n) => {
                     docs = docs.into_iter().skip(*n as usize).collect();
+                    if *n > 0 {
+                        full_scan = false;
+                    }
                 }
                 Stage::Limit(n) => {
+                    if (*n as usize) < docs.len() {
+                        full_scan = false;
+                    }
                     docs.truncate(*n as usize);
                 }
                 Stage::Count(field) => {

@@ -59,50 +59,74 @@ fn apply_unset(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
+/// Integer-exact arithmetic when both sides are i64 — checked, an overflow
+/// is an error like MongoDB's, never a wrapped or lossy value. Falls back to
+/// f64 when either side is a float, erroring on a non-finite result:
+/// `number_to_value` would map an overflowed f64 (±inf) to `Value::Null`,
+/// silently turning a counter into null (and making the NEXT $inc fail).
+fn numeric_apply(
+    cur: &Value,
+    operand: &Value,
+    path: &str,
+    op: &str,
+    int_op: fn(i64, i64) -> Option<i64>,
+    float_op: fn(f64, f64) -> f64,
+) -> Result<Value> {
+    if let (Some(a), Some(b)) = (cur.as_i64(), operand.as_i64()) {
+        return int_op(a, b)
+            .map(|n| Value::Number(n.into()))
+            .ok_or_else(|| {
+                Error::InvalidQuery(format!("{op} on '{path}' overflows a 64-bit integer"))
+            });
+    }
+    let (Some(a), Some(b)) = (cur.as_f64(), operand.as_f64()) else {
+        return Err(Error::InvalidQuery(format!(
+            "{op} cannot be applied to non-numeric field '{path}'"
+        )));
+    };
+    let r = float_op(a, b);
+    if !r.is_finite() {
+        return Err(Error::InvalidQuery(format!(
+            "{op} on '{path}' produced a non-finite number"
+        )));
+    }
+    Ok(number_to_value(r))
+}
+
 fn apply_inc(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     for (path, inc_val) in fields {
-        let inc = inc_val.as_f64().ok_or_else(|| {
-            Error::InvalidQuery(format!("$inc value for '{path}' must be numeric"))
-        })?;
-        // Distinguish a missing field (initialize to `inc`) from a field that
-        // is present but non-numeric — including an explicit `null` — which is
-        // an error. `resolve_field` collapses both into `Null`, so use
-        // `resolve_field_ref` to tell them apart.
+        if !inc_val.is_number() {
+            return Err(Error::InvalidQuery(format!(
+                "$inc value for '{path}' must be numeric"
+            )));
+        }
+        // Distinguish a missing field (initialize to the operand) from a
+        // field that is present but non-numeric — including an explicit
+        // `null` — which is an error. `resolve_field` collapses both into
+        // `Null`, so use `resolve_field_ref` to tell them apart.
         let new_val = match resolve_field_ref(doc, path) {
-            None => inc,
-            Some(v) => {
-                let cur = v.as_f64().ok_or_else(|| {
-                    Error::InvalidQuery(format!(
-                        "$inc cannot be applied to non-numeric field '{path}'"
-                    ))
-                })?;
-                cur + inc
-            }
+            None => inc_val.clone(),
+            Some(v) => numeric_apply(v, inc_val, path, "$inc", i64::checked_add, |a, b| a + b)?,
         };
-        set_field(doc, path, number_to_value(new_val));
+        set_field(doc, path, new_val);
     }
     Ok(())
 }
 
 fn apply_mul(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     for (path, mul_val) in fields {
-        let mul = mul_val.as_f64().ok_or_else(|| {
-            Error::InvalidQuery(format!("$mul value for '{path}' must be numeric"))
-        })?;
+        if !mul_val.is_number() {
+            return Err(Error::InvalidQuery(format!(
+                "$mul value for '{path}' must be numeric"
+            )));
+        }
         // Missing field → initialize to 0 (MongoDB semantics). A present but
         // non-numeric field (including explicit `null`) is an error.
         let new_val = match resolve_field_ref(doc, path) {
-            None => 0.0,
-            Some(v) => {
-                let cur = v.as_f64().ok_or_else(|| {
-                    Error::InvalidQuery(format!(
-                        "$mul cannot be applied to non-numeric field '{path}'"
-                    ))
-                })?;
-                cur * mul
-            }
+            None => Value::Number(0.into()),
+            Some(v) => numeric_apply(v, mul_val, path, "$mul", i64::checked_mul, |a, b| a * b)?,
         };
-        set_field(doc, path, number_to_value(new_val));
+        set_field(doc, path, new_val);
     }
     Ok(())
 }
@@ -151,8 +175,10 @@ fn apply_rename(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
         let new_path = new_path_val.as_str().ok_or_else(|| {
             Error::InvalidQuery(format!("$rename target for '{old_path}' must be a string"))
         })?;
-        let val = resolve_field(doc, old_path);
-        if !val.is_null() {
+        // resolve_field_ref (not resolve_field): a field holding an explicit
+        // `null` must still be renamed — only a MISSING field is a no-op.
+        let val = resolve_field_ref(doc, old_path).cloned();
+        if let Some(val) = val {
             remove_field(doc, old_path);
             set_field(doc, new_path, val);
         }
@@ -172,16 +198,43 @@ fn apply_current_date(doc: &mut Value, fields: &Map<String, Value>) -> Result<()
 // Array operators
 // ---------------------------------------------------------------------------
 
+/// Resolve a `$push` / `$addToSet` operand into the values to append.
+/// `{$each: [..]}` splices its elements (MongoDB); any other `$`-modifier
+/// in the operand object is rejected rather than silently stored as a
+/// literal `{"$each": ...}` element — which is what used to happen.
+fn push_operand_values(value: &Value, path: &str, op: &str) -> Result<Vec<Value>> {
+    if let Some(obj) = value.as_object() {
+        if obj.contains_key("$each") {
+            let each = obj["$each"].as_array().ok_or_else(|| {
+                Error::InvalidQuery(format!("{op} $each for '{path}' must be an array"))
+            })?;
+            if let Some(other) = obj.keys().find(|k| *k != "$each") {
+                return Err(Error::InvalidQuery(format!(
+                    "{op} modifier '{other}' for '{path}' is not supported"
+                )));
+            }
+            return Ok(each.clone());
+        }
+        if let Some(modifier) = obj.keys().find(|k| k.starts_with('$')) {
+            return Err(Error::InvalidQuery(format!(
+                "{op} modifier '{modifier}' for '{path}' requires $each"
+            )));
+        }
+    }
+    Ok(vec![value.clone()])
+}
+
 fn apply_push(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     for (path, value) in fields {
+        let values = push_operand_values(value, path, "$push")?;
         let current = resolve_field(doc, path);
         match &current {
             Value::Null => {
-                set_field(doc, path, Value::Array(vec![value.clone()]));
+                set_field(doc, path, Value::Array(values));
             }
             Value::Array(arr) => {
                 let mut new_arr = arr.clone();
-                new_arr.push(value.clone());
+                new_arr.extend(values);
                 set_field(doc, path, Value::Array(new_arr));
             }
             _ => {
@@ -196,12 +249,28 @@ fn apply_push(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
 
 fn apply_pull(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     for (path, match_val) in fields {
+        // An object operand is a per-element CONDITION, exactly the shape
+        // $elemMatch takes: `{$gte: 80}` applies operators to the element
+        // itself, `{score: {$gte: 8}}` queries element fields. Comparing
+        // the operand literally (the old behavior) made every conditional
+        // $pull a silent no-op. Non-object operands stay literal equality.
+        let condition = if match_val.is_object() {
+            Some(crate::query::parse_elem_match_inner(match_val)?)
+        } else {
+            None
+        };
         let current = resolve_field(doc, path);
         match &current {
             Value::Null => {} // no-op
             Value::Array(arr) => {
-                let new_arr: Vec<Value> =
-                    arr.iter().filter(|el| *el != match_val).cloned().collect();
+                let new_arr: Vec<Value> = match &condition {
+                    Some(q) => arr
+                        .iter()
+                        .filter(|el| !crate::query::matches_value(q, el))
+                        .cloned()
+                        .collect(),
+                    None => arr.iter().filter(|el| *el != match_val).cloned().collect(),
+                };
                 set_field(doc, path, Value::Array(new_arr));
             }
             _ => {
@@ -216,17 +285,26 @@ fn apply_pull(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
 
 fn apply_add_to_set(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     for (path, value) in fields {
+        let values = push_operand_values(value, path, "$addToSet")?;
         let current = resolve_field(doc, path);
         match &current {
             Value::Null => {
-                set_field(doc, path, Value::Array(vec![value.clone()]));
+                let mut new_arr: Vec<Value> = Vec::with_capacity(values.len());
+                for v in values {
+                    if !new_arr.contains(&v) {
+                        new_arr.push(v);
+                    }
+                }
+                set_field(doc, path, Value::Array(new_arr));
             }
             Value::Array(arr) => {
-                if !arr.contains(value) {
-                    let mut new_arr = arr.clone();
-                    new_arr.push(value.clone());
-                    set_field(doc, path, Value::Array(new_arr));
+                let mut new_arr = arr.clone();
+                for v in values {
+                    if !new_arr.contains(&v) {
+                        new_arr.push(v);
+                    }
                 }
+                set_field(doc, path, Value::Array(new_arr));
             }
             _ => {
                 return Err(Error::InvalidQuery(format!(
@@ -240,6 +318,15 @@ fn apply_add_to_set(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> 
 
 fn apply_pop(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
     for (path, dir_val) in fields {
+        // Validate the operand FIRST: `{$pop: {arr: 99}}` must error even
+        // when the array happens to be empty or missing — operand validity
+        // should not depend on the document's current state.
+        let dir = dir_val
+            .as_i64()
+            .filter(|d| *d == 1 || *d == -1)
+            .ok_or_else(|| {
+                Error::InvalidQuery(format!("$pop value for '{path}' must be 1 or -1"))
+            })?;
         let current = resolve_field(doc, path);
         match &current {
             Value::Null => {} // no-op
@@ -247,21 +334,13 @@ fn apply_pop(doc: &mut Value, fields: &Map<String, Value>) -> Result<()> {
                 if arr.is_empty() {
                     continue;
                 }
-                let dir = dir_val.as_i64().ok_or_else(|| {
-                    Error::InvalidQuery(format!("$pop value for '{path}' must be 1 or -1"))
-                })?;
                 let mut new_arr = arr.clone();
                 match dir {
                     1 => {
                         new_arr.pop();
                     }
-                    -1 => {
-                        new_arr.remove(0);
-                    }
                     _ => {
-                        return Err(Error::InvalidQuery(format!(
-                            "$pop value for '{path}' must be 1 or -1"
-                        )));
+                        new_arr.remove(0);
                     }
                 }
                 set_field(doc, path, Value::Array(new_arr));
@@ -309,9 +388,13 @@ fn remove_field(doc: &mut Value, path: &str) {
             map.remove(last);
         }
         Value::Array(arr) => {
+            // MongoDB sets the element to null rather than removing it —
+            // removal shifts every later index, corrupting concurrent
+            // positional logic ($set "arr.2", etc.) written against the
+            // original positions.
             if let Ok(idx) = last.parse::<usize>() {
                 if idx < arr.len() {
-                    arr.remove(idx);
+                    arr[idx] = Value::Null;
                 }
             }
         }
@@ -678,6 +761,83 @@ mod tests {
         assert!(doc.get("arr").is_none());
     }
 
+    #[test]
+    fn pop_invalid_operand_errors_even_on_empty_array() {
+        let mut doc = json!({"arr": []});
+        assert!(apply_update(&mut doc, &json!({"$pop": {"arr": 99}})).is_err());
+    }
+
+    #[test]
+    fn pull_with_operator_condition() {
+        let mut doc = json!({"scores": [55, 80, 95, 60]});
+        apply_update(&mut doc, &json!({"$pull": {"scores": {"$gte": 80}}})).unwrap();
+        assert_eq!(doc["scores"], json!([55, 60]));
+    }
+
+    #[test]
+    fn pull_with_field_condition_on_subdocs() {
+        let mut doc = json!({"results": [{"item": "A", "score": 5}, {"item": "B", "score": 8}]});
+        apply_update(
+            &mut doc,
+            &json!({"$pull": {"results": {"score": {"$gte": 8}}}}),
+        )
+        .unwrap();
+        assert_eq!(doc["results"], json!([{"item": "A", "score": 5}]));
+    }
+
+    #[test]
+    fn push_with_each_splices_elements() {
+        let mut doc = json!({"tags": ["a"]});
+        apply_update(&mut doc, &json!({"$push": {"tags": {"$each": ["b", "c"]}}})).unwrap();
+        assert_eq!(doc["tags"], json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn add_to_set_with_each_dedups() {
+        let mut doc = json!({"tags": ["a", "b"]});
+        apply_update(
+            &mut doc,
+            &json!({"$addToSet": {"tags": {"$each": ["b", "c", "c"]}}}),
+        )
+        .unwrap();
+        assert_eq!(doc["tags"], json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn push_unknown_modifier_errors() {
+        let mut doc = json!({"tags": ["a"]});
+        assert!(
+            apply_update(&mut doc, &json!({"$push": {"tags": {"$slice": 2}}})).is_err(),
+            "$-modifier without $each must error, not be stored literally"
+        );
+    }
+
+    #[test]
+    fn inc_integer_overflow_errors_instead_of_corrupting() {
+        let mut doc = json!({"n": i64::MAX});
+        assert!(apply_update(&mut doc, &json!({"$inc": {"n": 1}})).is_err());
+        // The field is untouched, not null.
+        assert_eq!(doc["n"], json!(i64::MAX));
+    }
+
+    #[test]
+    fn inc_preserves_big_integer_precision() {
+        // 2^53 + 1 is not representable in f64 — the old f64 round-trip
+        // silently corrupted counters above 2^53.
+        let big = (1i64 << 53) + 1;
+        let mut doc = json!({"n": big});
+        apply_update(&mut doc, &json!({"$inc": {"n": 1}})).unwrap();
+        assert_eq!(doc["n"], json!(big + 1));
+    }
+
+    #[test]
+    fn rename_null_valued_field() {
+        let mut doc = json!({"old": null, "x": 1});
+        apply_update(&mut doc, &json!({"$rename": {"old": "new"}})).unwrap();
+        assert!(doc.get("old").is_none());
+        assert_eq!(doc["new"], Value::Null);
+    }
+
     // -----------------------------------------------------------------------
     // Multiple operators in one update
     // -----------------------------------------------------------------------
@@ -795,10 +955,12 @@ mod tests {
     }
 
     #[test]
-    fn unset_array_element_removes_from_array() {
+    fn unset_array_element_nulls_in_place() {
+        // MongoDB semantics: $unset on an array element sets it to null —
+        // it must NOT remove it and shift the later indices.
         let mut doc = json!({"tags": ["a", "b", "c"]});
         apply_update(&mut doc, &json!({"$unset": {"tags.1": ""}})).unwrap();
-        assert_eq!(doc["tags"], json!(["a", "c"]));
+        assert_eq!(doc["tags"], json!(["a", null, "c"]));
     }
 
     #[test]

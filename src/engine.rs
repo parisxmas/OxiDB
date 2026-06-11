@@ -462,7 +462,15 @@ pub struct OxiDb {
     /// first (a lost update). Holding this lock from validation through
     /// apply guarantees the loser observes the winner's new version and
     /// aborts with a `TransactionConflict`, as OCC requires.
-    commit_lock: Mutex<()>,
+    ///
+    /// RwLock, not Mutex: transaction commits take WRITE; direct
+    /// (non-transactional) update/delete/find_and_modify take READ. A
+    /// direct write that bumped a validated document's version between a
+    /// commit's validation and its apply used to be silently overwritten —
+    /// OCC never saw the conflict. Direct writes stay concurrent with each
+    /// other (shared lock; per-document atomicity is the collection's
+    /// job), they only exclude in-flight commits.
+    commit_lock: RwLock<()>,
     /// Per-name serialization of collection opens. Opening a pre-existing
     /// collection replays its WAL, persists a snapshot, and truncates the
     /// WAL; two threads doing that concurrently for the SAME name could
@@ -551,7 +559,7 @@ impl OxiDb {
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
-            commit_lock: Mutex::new(()),
+            commit_lock: RwLock::new(()),
             open_locks: Mutex::new(HashMap::new()),
             links: LinksTable::in_memory(),
             ttl_shutdown: Mutex::new(None),
@@ -577,7 +585,7 @@ impl OxiDb {
             lazy_sync: AtomicBool::new(false),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
-            commit_lock: Mutex::new(()),
+            commit_lock: RwLock::new(()),
             open_locks: Mutex::new(HashMap::new()),
             links: LinksTable::in_memory(),
         })
@@ -721,7 +729,7 @@ impl OxiDb {
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: false,
-            commit_lock: Mutex::new(()),
+            commit_lock: RwLock::new(()),
             open_locks: Mutex::new(HashMap::new()),
             links: LinksTable::open(data_dir)?,
             ttl_shutdown: Mutex::new(None),
@@ -1145,7 +1153,7 @@ impl OxiDb {
                             // marked after the snapshot stay — their data may
                             // post-date this persist.
                             let prune: Vec<u64> = {
-                                let _commit_guard = db.commit_lock.lock();
+                                let _commit_guard = db.commit_lock.write();
                                 db.tx_log
                                     .read_committed()
                                     .map(|s| s.into_iter().collect())
@@ -1240,8 +1248,11 @@ impl OxiDb {
                         eprintln!("[archiver] {label} archive pass failed: {e}");
                     }
                     if retention_hours > 0 {
-                        if let Err(e) = crate::archive::prune_archive(&archive_dir, retention_hours)
-                        {
+                        if let Err(e) = crate::archive::prune_archive(
+                            &archive_dir,
+                            Some(&db.data_dir),
+                            retention_hours,
+                        ) {
                             eprintln!("[archiver] {label} prune failed: {e}");
                         }
                     }
@@ -1305,11 +1316,22 @@ impl OxiDb {
     /// with the collection's bookkeeping already cleared from the
     /// in-memory map (leaving the data files orphaned on disk).
     pub fn drop_collection(&self, name: &str) -> Result<()> {
+        // Hold the per-name open lock so a concurrent first-touch open can't
+        // be mid-`open_resolved` while files disappear underneath it.
+        let name_lock = self.open_lock_for(name);
+        let _open_guard = name_lock.lock();
         let mut cols = self.collections.write();
         cols.remove(name);
         #[cfg(not(target_arch = "wasm32"))]
         if !self.in_memory {
-            for ext in &["dat", "wal", "idx", "fidx", "cidx", "vidx"] {
+            for ext in &[
+                "dat", "wal", "idx", "fidx", "cidx", "vidx",
+                // Previously leaked, with concrete consequences for a
+                // re-created collection of the same name:
+                "bdat",  // disk-first data file (old documents)
+                "bopts", // persisted storage options (silently inherited)
+                "worm",  // WORM locks (applied to reused doc ids)
+            ] {
                 let path = self.data_dir.join(format!("{}.{}", name, ext));
                 if path.exists() {
                     std::fs::remove_file(path)?;
@@ -1320,6 +1342,27 @@ impl OxiDb {
                 std::fs::remove_dir_all(&btree_path)?;
             } else if btree_path.exists() {
                 std::fs::remove_file(&btree_path)?;
+            }
+            // Pattern-matched leftovers: sealed WAL segments
+            // (`<name>.wal.<seq>` — replayed on the next open of a same-named
+            // collection, resurrecting dropped documents) and disk-first
+            // field-index files (`<name>.<field>.mfidx`).
+            if let Ok(rd) = std::fs::read_dir(&self.data_dir) {
+                let wal_prefix = format!("{}.wal.", name);
+                let mfidx_prefix = format!("{}.", name);
+                for entry in rd.flatten() {
+                    let fname = entry.file_name();
+                    let Some(fname) = fname.to_str() else {
+                        continue;
+                    };
+                    let is_sealed_segment = fname.strip_prefix(&wal_prefix).is_some_and(|seq| {
+                        !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())
+                    });
+                    let is_mfidx = fname.starts_with(&mfidx_prefix) && fname.ends_with(".mfidx");
+                    if is_sealed_segment || is_mfidx {
+                        std::fs::remove_file(entry.path())?;
+                    }
+                }
             }
         }
         Ok(())
@@ -1593,6 +1636,11 @@ impl OxiDb {
 
     pub fn update(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
+        // Shared commit lock: direct writes run concurrently with each
+        // other but never inside a transaction commit's validate→apply
+        // window (which holds the write side) — otherwise the version this
+        // bumps could be blindly overwritten by the commit's apply.
+        let _occ_guard = self.commit_lock.read();
         let ids = col.update(query, update, None)?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
@@ -1611,6 +1659,7 @@ impl OxiDb {
 
     pub fn update_one(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
+        let _occ_guard = self.commit_lock.read(); // see update()
         let ids = col.update(query, update, Some(1))?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
@@ -1662,6 +1711,7 @@ impl OxiDb {
         update: &Value,
     ) -> Result<Option<Value>> {
         let col = self.get_or_create_collection(collection)?;
+        let _occ_guard = self.commit_lock.read(); // see update()
         let result = col.find_and_modify(query, update)?;
         if let Some(ref doc) = result {
             if self.change_broker.has_subscribers() {
@@ -1681,6 +1731,7 @@ impl OxiDb {
 
     pub fn delete(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
+        let _occ_guard = self.commit_lock.read(); // see update()
         let ids = col.delete(query, None)?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
@@ -1699,6 +1750,7 @@ impl OxiDb {
 
     pub fn delete_one(&self, collection: &str, query: &Value) -> Result<u64> {
         let col = self.get_or_create_collection(collection)?;
+        let _occ_guard = self.commit_lock.read(); // see update()
         let ids = col.delete(query, Some(1))?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
@@ -1861,7 +1913,17 @@ impl OxiDb {
             let arcs = col.find_arcs(&query)?;
             let doc_lookup = |id: DocumentId| col.load_doc_arc(id);
             let fi = col.field_indexes();
-            pipeline.execute_from_arcs(start_idx, arcs, &lookup_fn, Some(&fi), Some(&doc_lookup))?
+            // `arcs` is the full collection only when there was no leading
+            // $match — the flag gates the index-accelerated $group, which
+            // reads groups straight from the index.
+            pipeline.execute_from_arcs(
+                start_idx,
+                arcs,
+                &lookup_fn,
+                Some(&fi),
+                Some(&doc_lookup),
+                leading_match.is_none(),
+            )?
         };
 
         // Handle $out: write results to the target collection
@@ -2078,12 +2140,14 @@ impl OxiDb {
             locked_collections.push((col_name.clone(), col));
         }
 
-        // Serialize the validate→apply critical section across all committers.
-        // Held until the end of the function so that version validation (step
-        // 3) and the corresponding apply (step 8) are atomic with respect to
-        // other commits — preventing the lost-update race where two commits
-        // both validate the same version and both write.
-        let _commit_guard = self.commit_lock.lock();
+        // Serialize the validate→apply critical section across all committers
+        // AND against direct (non-transactional) writes, which hold the read
+        // side. Held until the end of the function so that version validation
+        // (step 3) and the corresponding apply (step 8) are atomic with
+        // respect to every other writer — preventing the lost-update race
+        // where a commit validates version N and a concurrent writer bumps
+        // the doc before the apply blindly overwrites it.
+        let _commit_guard = self.commit_lock.write();
 
         // 3. OCC validation: verify all recorded versions match current versions
         for record in &tx.read_set {

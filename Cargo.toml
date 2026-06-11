@@ -64,10 +64,6 @@ oxidb-agg-merge = { path = "oxidb-agg-merge" }
 name = "demo"
 path = "examples/demo.rs"
 
-[[example]]
-name = "bench_vs_sqlite"
-path = "examples/bench_vs_sqlite.rs"
-
 [profile.release]
 opt-level = 3
 lto = "fat"

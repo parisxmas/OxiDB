@@ -401,7 +401,10 @@ fn parse_op(
 /// 1. Scalar value: `{"$elemMatch": 5}` → implicit $eq on element value
 /// 2. Operator object: `{"$elemMatch": {"$gt": 80, "$lt": 85}}` → operators on element value
 /// 3. Field-level sub-query: `{"$elemMatch": {"price": {"$gt": 100}}}` → query on element fields
-fn parse_elem_match_inner(val: &JsonValue) -> Result<Query> {
+///
+/// Also used by `$pull`, whose operand is the same per-element condition
+/// shape (MongoDB semantics).
+pub(crate) fn parse_elem_match_inner(val: &JsonValue) -> Result<Query> {
     if !val.is_object() {
         // Scalar: implicit $eq on element value
         return Ok(Query::Field {

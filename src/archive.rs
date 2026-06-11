@@ -151,8 +151,18 @@ pub fn archive_pass(
         stats.archived += 1;
     }
 
-    // Rebuild the manifest from the .seg trailers (self-healing index).
-    rebuild_manifest(archive_dir, &segments_dir)?;
+    // Rebuild the manifest from the .seg trailers (self-healing index) —
+    // but only when this pass changed something or the existing manifest
+    // is missing/unreadable. The rebuild re-opens every archived segment
+    // and rewrites + fsyncs manifest.json; doing that on every idle tick
+    // made the archiver's steady-state cost O(archive size) forever.
+    let manifest_ok = fs::read(archive_dir.join(MANIFEST_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
+        .is_some();
+    if stats.archived > 0 || stats.empty_removed > 0 || !manifest_ok {
+        rebuild_manifest(archive_dir, &segments_dir)?;
+    }
     Ok(stats)
 }
 
@@ -185,8 +195,22 @@ pub fn archive_dir_for(data_dir: &Path) -> PathBuf {
 /// Age-based only: the operator must keep a base backup at least as old
 /// as the retention window, or PITR cannot restore through the pruned
 /// range (the standard base-backup + WAL-retention operational contract).
+///
+/// When `data_dir` is given, the pruned segment's ORIGINAL sealed file
+/// (`<collection>.wal.<seq>`) is deleted with it. Without this, the next
+/// `archive_pass` finds the original, sees the `.seg` is gone, and
+/// re-archives it — retention never freed space, it just set up an
+/// archive→prune→re-archive I/O ping-pong every tick. Deleting the
+/// original is safe at retention age: its records have long since been
+/// persisted into the collection's snapshot (every open and background
+/// sync does so), so the segment is not needed for crash recovery.
+///
 /// Returns the number of segments pruned.
-pub fn prune_archive(archive_dir: &Path, retention_hours: u64) -> Result<usize> {
+pub fn prune_archive(
+    archive_dir: &Path,
+    data_dir: Option<&Path>,
+    retention_hours: u64,
+) -> Result<usize> {
     if retention_hours == 0 {
         return Ok(0);
     }
@@ -208,6 +232,15 @@ pub fn prune_archive(archive_dir: &Path, retention_hours: u64) -> Result<usize> 
                 // (no timestamp to age it against) — keep it, to be safe.
                 if meta.end_wall_clock != 0 && meta.end_wall_clock < cutoff {
                     let _ = fs::remove_file(&p);
+                    // Drop the data-dir original too (see doc comment).
+                    if let (Some(dd), Some(stem)) =
+                        (data_dir, p.file_stem().and_then(|s| s.to_str()))
+                    {
+                        let original = dd.join(stem);
+                        if original.exists() {
+                            let _ = fs::remove_file(original);
+                        }
+                    }
                     pruned += 1;
                 }
             }
@@ -300,7 +333,7 @@ pub fn replay_into(
 ) -> Result<ReplayOutcome> {
     // The base's GSN watermark — 0 / absent means the base predates PITR;
     // the restore then degrades to whatever the base + archive hold.
-    let _base_gsn = BaseMeta::read_from(target_dir)?
+    let base_gsn = BaseMeta::read_from(target_dir)?
         .map(|m| m.base_gsn)
         .unwrap_or(0);
 
@@ -333,6 +366,32 @@ pub fn replay_into(
 
     // 2. Resolve target_gsn from the full record set.
     let target_gsn = resolve_target_gsn(&by_collection, target);
+
+    // Coverage check against the base watermark: the earliest stamped
+    // record we can replay should not sit far above the base's GSN —
+    // a gap means history between the base backup and the surviving
+    // archive was pruned (or segments are missing), and the restore
+    // would silently skip it. Advisory, not fatal: GSN sequences have
+    // legitimate holes (the lease jumps ahead on every restart), so a
+    // gap cannot be proven to contain records.
+    if base_gsn > 0 {
+        let min_stamped = by_collection
+            .values()
+            .flatten()
+            .map(|r| r.meta.gsn)
+            .filter(|&g| g != 0)
+            .min();
+        if let Some(min_gsn) = min_stamped {
+            if min_gsn > base_gsn + 1 && target_gsn >= min_gsn {
+                eprintln!(
+                    "[pitr] WARNING: base backup watermark is GSN {base_gsn} but the \
+                     earliest replayable record is GSN {min_gsn} — history in between \
+                     (if any) is not in the archive (pruned or missing segments); the \
+                     restored state may silently skip it"
+                );
+            }
+        }
+    }
 
     // 3. Two-pass transaction filter across ALL collections (a tx may span
     //    collections). Pass 1: the max GSN each tx touches. Pass 2 admits
@@ -1011,12 +1070,29 @@ mod tests {
         assert_eq!(load_manifest(archive.path()).unwrap().segments.len(), 2);
 
         // Retention 0 is disabled — a no-op.
-        assert_eq!(prune_archive(archive.path(), 0).unwrap(), 0);
+        assert_eq!(
+            prune_archive(archive.path(), Some(data.path()), 0).unwrap(),
+            0
+        );
         // Retention 1h prunes the 1970 segment, keeps the recent one.
-        assert_eq!(prune_archive(archive.path(), 1).unwrap(), 1);
+        assert_eq!(
+            prune_archive(archive.path(), Some(data.path()), 1).unwrap(),
+            1
+        );
         let m = load_manifest(archive.path()).unwrap();
         assert_eq!(m.segments.len(), 1);
         assert_eq!(m.segments[0].original, "recent.wal.0");
+
+        // The pruned segment's data-dir original must be gone too —
+        // otherwise the next archive_pass would re-archive it, undoing the
+        // prune every tick.
+        assert!(!data.path().join("old.wal.0").exists());
+        archive_pass(data.path(), archive.path(), None).unwrap();
+        assert_eq!(
+            load_manifest(archive.path()).unwrap().segments.len(),
+            1,
+            "pruned segment must not be resurrected by the next pass"
+        );
     }
 
     #[test]
