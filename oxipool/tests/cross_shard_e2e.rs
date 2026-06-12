@@ -158,7 +158,7 @@ fn oxipool_cross_shard_routing_and_merge() {
         Command::new(env!("CARGO_BIN_EXE_oxipool"))
             .env("OXIPOOL_LISTEN", &pool_addr)
             .env("OXIPOOL_SHARDS", &shard_list)
-            .env("OXIPOOL_SHARD_KEYS", "accounts:region")
+            .env("OXIPOOL_SHARD_KEYS", "accounts:region,metrics:region")
             .env("OXIPOOL_NUM_CHUNKS", "256")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -276,5 +276,111 @@ fn oxipool_cross_shard_routing_and_merge() {
         ok_data(&resp)["count"].as_i64(),
         Some(exp_n),
         "targeted count mismatch"
+    );
+
+    // 11. Operator-shaped shard-key queries. `{"$eq": v}` must hash like the
+    //     bare value (same single shard); `{"$in": [...]}` cannot target one
+    //     shard and must scatter. Both used to hash the operator object's
+    //     JSON text and silently miss documents on the other shards.
+    let resp = pool.send(&json!({
+        "cmd": "count", "collection": "accounts",
+        "query": { "region": { "$eq": "us-east" } }
+    }));
+    assert_eq!(
+        ok_data(&resp)["count"].as_i64(),
+        Some(exp_n),
+        "$eq-form shard-key count mismatch"
+    );
+    let exp_in = per_region["us-east"].0 + per_region["eu-west"].0;
+    let resp = pool.send(&json!({
+        "cmd": "count", "collection": "accounts",
+        "query": { "region": { "$in": ["us-east", "eu-west"] } }
+    }));
+    assert_eq!(
+        ok_data(&resp)["count"].as_i64(),
+        Some(exp_in),
+        "$in shard-key count must scatter across shards"
+    );
+
+    // 12. Cross-shard find with sort + skip + limit: the window must be the
+    //     GLOBAL one (bal desc: 119,118,... → skip 5, take 10 = 114..=105),
+    //     not a concat of per-shard windows (and per-shard skip must not
+    //     silently drop documents).
+    let resp = pool.send(&json!({
+        "cmd": "find", "collection": "accounts", "query": {},
+        "sort": { "bal": -1 }, "skip": 5, "limit": 10
+    }));
+    let docs = ok_data(&resp).as_array().expect("sorted find data");
+    let got_bals: Vec<i64> = docs.iter().map(|d| d["bal"].as_i64().unwrap()).collect();
+    let want_bals: Vec<i64> = (0..10).map(|k| (DOCS as i64 - 6) - k).collect();
+    assert_eq!(
+        got_bals, want_bals,
+        "global sort+skip+limit window mismatch"
+    );
+
+    // 13. update_one WITHOUT a shard key must modify exactly ONE document
+    //     cluster-wide. The old concurrent fan-out applied it on every shard
+    //     (up to one doc per shard) while reporting modified:1.
+    let resp = pool.send(&json!({
+        "cmd": "update_one", "collection": "accounts",
+        "query": { "bal": { "$gte": 0 } },
+        "update": { "$set": { "one_marker": true } }
+    }));
+    assert_eq!(resp["ok"], true, "update_one failed: {resp}");
+    let mut marked_total = 0i64;
+    for s in &shards {
+        let mut c = Client::connect(&s.addr.to_string());
+        let resp = c.send(&json!({
+            "cmd": "count", "collection": "accounts", "query": { "one_marker": true }
+        }));
+        marked_total += ok_data(&resp)["count"].as_i64().unwrap();
+    }
+    assert_eq!(
+        marked_total, 1,
+        "update_one must modify exactly one document across ALL shards"
+    );
+
+    // 14. insert_many through the pool: every input doc gets an id, in input
+    //     order (one id slot per doc, none missing after the per-shard split).
+    let many: Vec<Value> = (0..10)
+        .map(|i| json!({ "region": REGIONS[i % REGIONS.len()], "bulk": i }))
+        .collect();
+    let resp = pool.send(&json!({
+        "cmd": "insert_many", "collection": "accounts", "docs": many
+    }));
+    let ids = ok_data(&resp).as_array().expect("insert_many ids");
+    assert_eq!(ids.len(), 10, "one id per input doc");
+    assert!(
+        ids.iter().all(|id| !id.is_null()),
+        "every input doc must have an id: {ids:?}"
+    );
+
+    // 15. Cross-shard $avg must weight by the NUMERIC-value count: half the
+    //     docs lack the field entirely, and the merged average must match
+    //     the average over only the docs that have it (the old {$sum:1}
+    //     weight counted every doc and deflated the result).
+    for i in 0..30 {
+        let region = REGIONS[i % REGIONS.len()];
+        let doc = if i % 2 == 0 {
+            json!({ "region": region, "v": (i as i64) * 10 })
+        } else {
+            json!({ "region": region }) // no "v"
+        };
+        let resp = pool.send(&json!({
+            "cmd": "insert", "collection": "metrics", "doc": doc
+        }));
+        assert_eq!(resp["ok"], true, "metrics insert failed: {resp}");
+    }
+    // v values: 0,20,40,...,280 → avg = 140.
+    let resp = pool.send(&json!({
+        "cmd": "aggregate", "collection": "metrics",
+        "pipeline": [ { "$group": { "_id": null, "avg_v": { "$avg": "$v" } } } ]
+    }));
+    let arr = ok_data(&resp).as_array().expect("avg aggregate data");
+    assert_eq!(arr.len(), 1);
+    let avg = arr[0]["avg_v"].as_f64().unwrap();
+    assert!(
+        (avg - 140.0).abs() < 1e-9,
+        "cross-shard $avg must ignore docs missing the field, got {avg}"
     );
 }

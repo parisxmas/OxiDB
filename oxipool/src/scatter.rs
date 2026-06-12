@@ -34,35 +34,128 @@ async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), std::
 
 // ─── Forward to one shard and read response ─────────────────────────
 
-async fn forward_and_read(
-    pool: &Arc<Pool>,
-    payload: &[u8],
-) -> Result<(Vec<u8>, Arc<Pool>), String> {
+async fn forward_and_read(pool: &Arc<Pool>, payload: &[u8]) -> Result<Vec<u8>, String> {
     let mut backend = pool.get().await.map_err(|e| format!("pool get: {}", e))?;
 
-    write_frame(&mut backend, payload)
-        .await
-        .map_err(|e| format!("write: {}", e))?;
+    let exchange = async {
+        write_frame(&mut backend, payload)
+            .await
+            .map_err(|e| format!("write: {}", e))?;
+        read_frame(&mut backend)
+            .await
+            .map_err(|e| format!("read: {}", e))
+    };
+    let result = match crate::request_timeout() {
+        Some(d) => match tokio::time::timeout(d, exchange).await {
+            Ok(r) => r,
+            Err(_) => Err(format!("request timed out after {:?}", d)),
+        },
+        None => exchange.await,
+    };
 
-    let response = read_frame(&mut backend).await.map_err(|e| {
-        Pool::spawn_replace(Arc::clone(pool));
-        format!("read: {}", e)
-    })?;
+    match result {
+        Ok(response) => {
+            pool.put(backend).await;
+            Ok(response)
+        }
+        Err(e) => {
+            // The connection's framing state is unknown after ANY failure
+            // (partial write, timeout mid-response) — never return it to the
+            // pool. This must run for write errors too: `Pool::get` forgets
+            // a semaphore permit, so a dropped-without-replace connection
+            // permanently shrank the pool until it drained to zero and every
+            // request to this shard blocked forever.
+            Pool::spawn_replace(Arc::clone(pool));
+            Err(e)
+        }
+    }
+}
 
-    pool.put(backend).await;
-    Ok((response, Arc::clone(pool)))
+/// Forward a request to a specific shard pool. Returns the raw response bytes.
+pub async fn forward_to_shard(pool: &Arc<Pool>, payload: &[u8]) -> Result<Vec<u8>, String> {
+    forward_and_read(pool, payload).await
+}
+
+// ─── Concurrent fan-out (parse once) ────────────────────────────────
+
+/// Fan a request out to every pool concurrently. Returns one entry per
+/// shard, in shard order: the PARSED response, or an error string. Parsing
+/// once here means the merge strategies move values out instead of
+/// re-parsing (and deep-cloning) every response a second time.
+async fn gather_all(pools: &[Arc<Pool>], payload: &[u8]) -> Vec<Result<Value, String>> {
+    let shared: Arc<[u8]> = Arc::from(payload);
+    let handles: Vec<_> = pools
+        .iter()
+        .map(|pool| {
+            let pool = Arc::clone(pool);
+            let payload = Arc::clone(&shared);
+            tokio::spawn(async move {
+                let bytes = forward_and_read(&pool, &payload).await?;
+                serde_json::from_slice::<Value>(&bytes)
+                    .map_err(|e| format!("malformed shard response: {}", e))
+            })
+        })
+        .collect();
+
+    let mut results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        results.push(match handle.await {
+            Ok(r) => r,
+            Err(e) => Err(format!("task error: {}", e)),
+        });
+    }
+    results
+}
+
+/// First shard-side failure (transport error, malformed response, or
+/// `ok:false`), if any. The aggregating merges fail fast on it — silently
+/// dropping a shard's contribution would produce a truthy-but-incomplete
+/// result, which is worse than a clear error.
+fn first_shard_error(results: &[Result<Value, String>]) -> Option<String> {
+    for r in results {
+        match r {
+            Err(e) => return Some(e.clone()),
+            Ok(v) => {
+                if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+                    let msg = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("shard returned ok:false without an error message");
+                    return Some(msg.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Move each successful response's `data` array out (no clones).
+fn take_doc_arrays(results: Vec<Result<Value, String>>) -> Vec<Value> {
+    let mut all_docs = Vec::new();
+    for r in results.into_iter().flatten() {
+        let mut r = r;
+        if let Some(Value::Array(arr)) = r.get_mut("data").map(Value::take) {
+            all_docs.extend(arr);
+        }
+    }
+    all_docs
+}
+
+fn error_response(msg: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({"ok": false, "error": msg})).unwrap()
 }
 
 // ─── Merge Strategy ─────────────────────────────────────────────────
 
 pub enum MergeStrategy {
-    /// Concatenate document arrays from all shards (find, aggregate).
+    /// Concatenate document arrays from all shards.
     ConcatDocs,
     /// Sum count values from all shards.
     SumCounts,
     /// Sum modified/deleted counts from all shards.
     SumModified,
-    /// Take first successful response (find_one, delete_one, update_one).
+    /// First shard with a matching document (find_one — reads only; the
+    /// `_one` WRITES must never use this, see `scatter_one_write`).
     FirstMatch,
     /// Collect all responses for broadcast (DDL) — return last ok.
     BroadcastAll,
@@ -71,12 +164,10 @@ pub enum MergeStrategy {
 impl MergeStrategy {
     pub fn for_command(cmd: &str) -> Self {
         match cmd {
-            "find" | "aggregate" | "text_search" | "vector_search" | "search" => {
-                MergeStrategy::ConcatDocs
-            }
+            "find" | "aggregate" | "search" => MergeStrategy::ConcatDocs,
             "count" => MergeStrategy::SumCounts,
             "update" | "delete" => MergeStrategy::SumModified,
-            "find_one" | "update_one" | "delete_one" => MergeStrategy::FirstMatch,
+            "find_one" => MergeStrategy::FirstMatch,
             // DDL / broadcast
             _ => MergeStrategy::BroadcastAll,
         }
@@ -91,31 +182,8 @@ pub async fn scatter_gather(
     payload: &[u8],
     strategy: MergeStrategy,
 ) -> Vec<u8> {
-    let handles: Vec<_> = pools
-        .iter()
-        .map(|pool| {
-            let pool = Arc::clone(pool);
-            let payload = payload.to_vec();
-            tokio::spawn(async move { forward_and_read(&pool, &payload).await })
-        })
-        .collect();
-
-    let mut responses = Vec::with_capacity(handles.len());
-    for handle in handles {
-        match handle.await {
-            Ok(Ok((data, _))) => responses.push(data),
-            Ok(Err(e)) => {
-                let err = json!({"ok": false, "error": format!("shard error: {}", e)});
-                responses.push(serde_json::to_vec(&err).unwrap());
-            }
-            Err(e) => {
-                let err = json!({"ok": false, "error": format!("task error: {}", e)});
-                responses.push(serde_json::to_vec(&err).unwrap());
-            }
-        }
-    }
-
-    merge_responses(responses, strategy)
+    let results = gather_all(pools, payload).await;
+    merge_responses(results, strategy)
 }
 
 /// Broadcast a request to all shard pools. Returns the last successful response.
@@ -123,11 +191,178 @@ pub async fn broadcast(pools: &[Arc<Pool>], payload: &[u8]) -> Vec<u8> {
     scatter_gather(pools, payload, MergeStrategy::BroadcastAll).await
 }
 
-/// Forward a request to a specific shard pool. Returns the raw response bytes.
-#[allow(dead_code)]
-pub async fn forward_to_shard(pool: &Arc<Pool>, payload: &[u8]) -> Result<Vec<u8>, String> {
-    let (response, _) = forward_and_read(pool, payload).await?;
-    Ok(response)
+// ─── update_one / delete_one ────────────────────────────────────────
+
+/// `update_one` / `delete_one` without a shard key: probe the shards
+/// SERIALLY and stop at the first one that actually modified or deleted a
+/// document, so at most one document changes cluster-wide. The old
+/// concurrent fan-out sent the write to EVERY shard — each shard applied it
+/// to one local document (up to N modifications for a `_one` command) and
+/// the merge merely picked which response to show the client.
+pub async fn scatter_one_write(pools: &[Arc<Pool>], payload: &[u8]) -> Vec<u8> {
+    let mut first_error: Option<String> = None;
+    let mut last_ok: Option<Vec<u8>> = None;
+
+    for pool in pools {
+        match forward_and_read(pool, payload).await {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(v) => {
+                    if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+                        let n = v
+                            .get("data")
+                            .map(|d| {
+                                d.get("modified").and_then(|x| x.as_u64()).unwrap_or(0)
+                                    + d.get("deleted").and_then(|x| x.as_u64()).unwrap_or(0)
+                            })
+                            .unwrap_or(0);
+                        if n > 0 {
+                            return bytes;
+                        }
+                        last_ok = Some(bytes);
+                    } else if first_error.is_none() {
+                        first_error = Some(
+                            v.get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("shard returned ok:false")
+                                .to_string(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(format!("malformed shard response: {}", e));
+                    }
+                }
+            },
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+
+    // Nothing modified. If a shard errored, IT might have held the match —
+    // surface the error instead of a clean "0 modified".
+    if let Some(e) = first_error {
+        return error_response(&format!("single-document write failed on a shard: {}", e));
+    }
+    last_ok.unwrap_or_else(|| error_response("no shards configured"))
+}
+
+// ─── find with sort/skip/limit ──────────────────────────────────────
+
+/// Scatter a `find`, honoring `sort` / `skip` / `limit` globally.
+///
+/// Per-shard rewrite: `skip` is removed (a per-shard skip silently DROPS up
+/// to `skip × (shards − 1)` documents that belong in the result) and `limit`
+/// becomes `skip + limit` (the global window is a subset of the union of
+/// per-shard windows). The merge re-sorts globally — through a shard's
+/// executor via `aggregate_docs`, so the comparator (including date-string
+/// ordering) is byte-identical to a single node's — then applies the global
+/// skip/limit. Without sort/skip/limit this is plain concatenation.
+pub async fn scatter_find(pools: &[Arc<Pool>], payload: &[u8]) -> Vec<u8> {
+    let req: Value = match serde_json::from_slice(payload) {
+        Ok(v) => v,
+        Err(_) => return scatter_gather(pools, payload, MergeStrategy::ConcatDocs).await,
+    };
+
+    let sort = req
+        .get("sort")
+        .filter(|s| s.as_object().is_some_and(|o| !o.is_empty()))
+        .cloned();
+    let skip = req.get("skip").and_then(|v| v.as_u64()).unwrap_or(0);
+    let limit = req.get("limit").and_then(|v| v.as_u64());
+
+    if sort.is_none() && skip == 0 && limit.is_none() {
+        return scatter_gather(pools, payload, MergeStrategy::ConcatDocs).await;
+    }
+
+    let mut shard_req = req;
+    if let Some(obj) = shard_req.as_object_mut() {
+        obj.remove("skip");
+        match limit {
+            Some(n) => {
+                obj.insert("limit".to_string(), json!(skip.saturating_add(n)));
+            }
+            None => {
+                obj.remove("limit");
+            }
+        }
+    }
+    let shard_payload = match serde_json::to_vec(&shard_req) {
+        Ok(b) => b,
+        Err(e) => return error_response(&format!("failed to encode shard find: {}", e)),
+    };
+
+    let results = gather_all(pools, &shard_payload).await;
+    if let Some(err) = first_shard_error(&results) {
+        return error_response(&format!(
+            "scatter-gather find failed on one or more shards: {}",
+            err
+        ));
+    }
+    let all_docs = take_doc_arrays(results);
+
+    match sort {
+        Some(sort_spec) => {
+            let mut pipeline = vec![json!({ "$sort": sort_spec })];
+            if skip > 0 {
+                pipeline.push(json!({ "$skip": skip }));
+            }
+            if let Some(n) = limit {
+                pipeline.push(json!({ "$limit": n }));
+            }
+            run_merge_docs(pools, all_docs, pipeline).await
+        }
+        None => {
+            // No ordering requested — apply the global window locally.
+            let docs: Vec<Value> = all_docs
+                .into_iter()
+                .skip(skip as usize)
+                .take(limit.map(|n| n as usize).unwrap_or(usize::MAX))
+                .collect();
+            serde_json::to_vec(&json!({"ok": true, "data": docs})).unwrap()
+        }
+    }
+}
+
+// ─── text_search / vector_search ────────────────────────────────────
+
+/// Ranked searches: each shard returns its local top-N with a score field
+/// injected by the engine (`_score` for text, `_similarity` for vector).
+/// Merge by score descending and re-apply the global limit — naive concat
+/// returned shard0's block before shard1's regardless of rank, and up to
+/// N × shards results.
+pub async fn scatter_search(pools: &[Arc<Pool>], payload: &[u8], cmd: &str) -> Vec<u8> {
+    let req: Value = match serde_json::from_slice(payload) {
+        Ok(v) => v,
+        Err(_) => return scatter_gather(pools, payload, MergeStrategy::ConcatDocs).await,
+    };
+    // Default limit mirrors the server's (10).
+    let limit = req.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let score_key = if cmd == "vector_search" {
+        "_similarity"
+    } else {
+        "_score"
+    };
+
+    let results = gather_all(pools, payload).await;
+    if let Some(err) = first_shard_error(&results) {
+        return error_response(&format!(
+            "scatter-gather {} failed on one or more shards: {}",
+            cmd, err
+        ));
+    }
+    let mut all_docs = take_doc_arrays(results);
+    all_docs.sort_by(|a, b| {
+        let sa = a.get(score_key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let sb = b.get(score_key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    all_docs.truncate(limit);
+
+    serde_json::to_vec(&json!({"ok": true, "data": all_docs})).unwrap()
 }
 
 // ─── cross-shard aggregation ────────────────────────────────────────
@@ -167,55 +402,65 @@ pub async fn scatter_aggregate(pools: &[Arc<Pool>], payload: &[u8]) -> Vec<u8> {
             shard_pipeline,
             merge_pipeline,
         } => {
-            // 1. Run the shard pipeline on every shard, gather concatenated partials.
+            // 1. Run the shard pipeline on every shard, gather the partials.
             let mut shard_req = req.clone();
             shard_req["pipeline"] = Value::Array(shard_pipeline);
             let shard_payload = match serde_json::to_vec(&shard_req) {
                 Ok(b) => b,
                 Err(e) => return error_response(&format!("failed to encode shard pipeline: {e}")),
             };
-            let concat = scatter_gather(pools, &shard_payload, MergeStrategy::ConcatDocs).await;
-
-            // Propagate a shard-side error verbatim (ConcatDocs fails fast).
-            let concat_val: Value = match serde_json::from_slice(&concat) {
-                Ok(v) => v,
-                Err(e) => return error_response(&format!("malformed shard response: {e}")),
-            };
-            if concat_val.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-                return concat;
+            let results = gather_all(pools, &shard_payload).await;
+            if let Some(err) = first_shard_error(&results) {
+                return error_response(&format!(
+                    "cross-shard aggregation failed on one or more shards: {}",
+                    err
+                ));
             }
-            let partials = concat_val
-                .get("data")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
+            let partials = take_doc_arrays(results);
 
             // 2. Run the merge pipeline once over the partials, on one shard's
             //    executor (aggregate_docs touches no stored collection).
-            let merge_req = json!({
-                "cmd": "aggregate_docs",
-                "pipeline": Value::Array(merge_pipeline),
-                "docs": partials,
-            });
-            let merge_payload = match serde_json::to_vec(&merge_req) {
-                Ok(b) => b,
-                Err(e) => return error_response(&format!("failed to encode merge pipeline: {e}")),
-            };
-
-            // Try shards in order so a single down node doesn't fail the merge.
-            for pool in pools {
-                match forward_to_shard(pool, &merge_payload).await {
-                    Ok(resp) => return resp,
-                    Err(_) => continue,
-                }
-            }
-            error_response("cross-shard aggregation merge failed: no shard available")
+            run_merge_docs(pools, partials, merge_pipeline).await
         }
     }
 }
 
-fn error_response(msg: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({"ok": false, "error": msg})).unwrap()
+/// Run a pipeline over `docs` on one shard's executor (`aggregate_docs`).
+/// Used as the merge step for cross-shard aggregations and sorted finds.
+async fn run_merge_docs(pools: &[Arc<Pool>], docs: Vec<Value>, pipeline: Vec<Value>) -> Vec<u8> {
+    let merge_req = json!({
+        "cmd": "aggregate_docs",
+        "pipeline": Value::Array(pipeline),
+        "docs": docs,
+    });
+    let merge_payload = match serde_json::to_vec(&merge_req) {
+        Ok(b) => b,
+        Err(e) => return error_response(&format!("failed to encode merge request: {e}")),
+    };
+    // Check the size up-front: an oversized frame would be rejected by EVERY
+    // shard — the old code retried the identical payload on each one (losing
+    // a pooled connection per attempt) and then reported a misleading "no
+    // shard available".
+    if merge_payload.len() > MAX_FRAME {
+        return error_response(&format!(
+            "cross-shard merge input is {} bytes, over the {} byte frame limit; \
+             narrow the query (add a $match / $limit) or target a single shard",
+            merge_payload.len(),
+            MAX_FRAME
+        ));
+    }
+
+    // Try shards in order so a single down node doesn't fail the merge.
+    let mut last_err = String::from("no shards configured");
+    for pool in pools {
+        match forward_to_shard(pool, &merge_payload).await {
+            Ok(resp) => return resp,
+            Err(e) => last_err = e,
+        }
+    }
+    error_response(&format!(
+        "cross-shard merge failed on every shard: {last_err}"
+    ))
 }
 
 // ─── insert_many splitting ──────────────────────────────────────────
@@ -228,12 +473,7 @@ pub async fn scatter_insert_many(
 ) -> Vec<u8> {
     let json: Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
-        Err(e) => {
-            return serde_json::to_vec(
-                &json!({"ok": false, "error": format!("invalid JSON: {}", e)}),
-            )
-            .unwrap();
-        }
+        Err(e) => return error_response(&format!("invalid JSON: {}", e)),
     };
 
     let collection = json
@@ -242,252 +482,259 @@ pub async fn scatter_insert_many(
         .unwrap_or("");
     let docs = match json.get("docs").and_then(|v| v.as_array()) {
         Some(d) => d,
-        None => {
-            return serde_json::to_vec(&json!({"ok": false, "error": "missing docs array"}))
-                .unwrap();
-        }
+        None => return error_response("missing docs array"),
     };
+    let doc_count = docs.len();
 
-    // Group docs by target shard
+    // Group docs by target shard, remembering each doc's ORIGINAL index so
+    // the returned ids can be put back in input order — clients map
+    // `ids[i]` to `docs[i]` positionally, exactly like the single-node
+    // response, and shard-completion order scrambled that mapping.
     let num_shards = pools.len();
-    let mut shard_docs: Vec<Vec<&Value>> = vec![vec![]; num_shards];
+    let mut shard_docs: Vec<Vec<(usize, &Value)>> = vec![vec![]; num_shards];
 
-    for doc in docs {
-        let shard_id = router.route_insert(collection, doc).await as usize;
-        if shard_id < num_shards {
-            shard_docs[shard_id].push(doc);
-        } else {
-            shard_docs[0].push(doc); // fallback to shard 0
+    // Take the router lock ONCE for the whole batch (it was previously
+    // acquired per document).
+    {
+        let config = router.config.read().await;
+        for (i, doc) in docs.iter().enumerate() {
+            let shard_id = config.route_value(collection, doc).unwrap_or(0) as usize;
+            let target = if shard_id < num_shards { shard_id } else { 0 };
+            shard_docs[target].push((i, doc));
         }
     }
 
-    // Send to each shard that has docs
+    // Send to each shard that has docs.
     let mut handles = Vec::new();
-    for (shard_id, docs) in shard_docs.into_iter().enumerate() {
-        if docs.is_empty() {
+    for (shard_id, entries) in shard_docs.into_iter().enumerate() {
+        if entries.is_empty() {
             continue;
         }
         let pool = Arc::clone(&pools[shard_id]);
+        let indices: Vec<usize> = entries.iter().map(|(i, _)| *i).collect();
         let mut req = json.clone();
-        req["docs"] = Value::Array(docs.into_iter().cloned().collect());
+        req["docs"] = Value::Array(entries.into_iter().map(|(_, d)| d.clone()).collect());
         let payload = serde_json::to_vec(&req).unwrap();
 
         handles.push(tokio::spawn(async move {
-            forward_and_read(&pool, &payload).await
+            (indices, forward_and_read(&pool, &payload).await)
         }));
     }
 
-    // Collect results — sum inserted counts
-    let mut total_inserted = 0u64;
-    let mut all_ids: Vec<Value> = Vec::new();
-    let mut last_error: Option<String> = None;
+    // Collect results — ids placed by original index; ANY shard failure
+    // fails the whole call (the old code returned ok:true whenever at least
+    // one shard succeeded, hiding the failed half from the client).
+    let mut ids_by_index: Vec<Value> = vec![Value::Null; doc_count];
+    let mut inserted = 0usize;
+    let mut first_error: Option<String> = None;
 
     for handle in handles {
         match handle.await {
-            Ok(Ok((data, _))) => {
-                if let Ok(resp) = serde_json::from_slice::<Value>(&data) {
+            Ok((indices, Ok(data))) => match serde_json::from_slice::<Value>(&data) {
+                Ok(resp) => {
                     if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                        // OxiDB returns {"ok": true, "data": [ids]} for insert_many
-                        if let Some(data) = resp.get("data") {
-                            if let Some(ids) = data.as_array() {
-                                total_inserted += ids.len() as u64;
-                                all_ids.extend(ids.iter().cloned());
+                        if let Some(ids) = resp.get("data").and_then(|v| v.as_array()) {
+                            for (idx, id) in indices.iter().zip(ids.iter()) {
+                                ids_by_index[*idx] = id.clone();
+                                inserted += 1;
                             }
                         }
-                    } else if let Some(e) = resp.get("error").and_then(|v| v.as_str()) {
-                        last_error = Some(e.to_string());
+                    } else if first_error.is_none() {
+                        first_error = Some(
+                            resp.get("error")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("shard returned ok:false")
+                                .to_string(),
+                        );
                     }
                 }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(format!("malformed shard response: {}", e));
+                    }
+                }
+            },
+            Ok((_, Err(e))) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
-            Ok(Err(e)) => last_error = Some(e),
-            Err(e) => last_error = Some(e.to_string()),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+            }
         }
     }
 
-    if total_inserted > 0 {
-        serde_json::to_vec(&json!({"ok": true, "data": all_ids})).unwrap()
-    } else if let Some(err) = last_error {
-        serde_json::to_vec(&json!({"ok": false, "error": err})).unwrap()
-    } else {
-        serde_json::to_vec(&json!({"ok": true, "data": []})).unwrap()
+    if let Some(err) = first_error {
+        return error_response(&format!(
+            "insert_many failed on one or more shards ({} of {} documents inserted): {}",
+            inserted, doc_count, err
+        ));
     }
+    serde_json::to_vec(&json!({"ok": true, "data": ids_by_index})).unwrap()
 }
 
 // ─── Response Merging ───────────────────────────────────────────────
 
-fn merge_responses(responses: Vec<Vec<u8>>, strategy: MergeStrategy) -> Vec<u8> {
+fn merge_responses(results: Vec<Result<Value, String>>, strategy: MergeStrategy) -> Vec<u8> {
     match strategy {
-        MergeStrategy::ConcatDocs => merge_doc_arrays(responses),
-        MergeStrategy::SumCounts => merge_counts(responses),
-        MergeStrategy::SumModified => merge_modified(responses),
-        MergeStrategy::FirstMatch => merge_first_match(responses),
-        MergeStrategy::BroadcastAll => merge_broadcast(responses),
+        MergeStrategy::ConcatDocs => merge_doc_arrays(results),
+        MergeStrategy::SumCounts => merge_counts(results),
+        MergeStrategy::SumModified => merge_modified(results),
+        MergeStrategy::FirstMatch => merge_first_match(results),
+        MergeStrategy::BroadcastAll => merge_broadcast(results),
     }
 }
 
-/// If any shard returned `ok:false` (or a malformed response), return the
-/// first such error message. Used by the merge strategies that aggregate
-/// across shards (`SumCounts`, `ConcatDocs`, `SumModified`) so that a partial
-/// failure surfaces as a real error to the client instead of being silently
-/// excluded from the aggregate.
-fn first_partial_error(responses: &[Vec<u8>]) -> Option<String> {
-    for resp_bytes in responses {
-        match serde_json::from_slice::<Value>(resp_bytes) {
-            Ok(resp) => {
-                if !resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    let msg = resp
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("shard returned ok:false without an error message");
-                    return Some(msg.to_string());
-                }
-            }
-            Err(e) => return Some(format!("shard returned malformed response: {}", e)),
-        }
-    }
-    None
-}
-
-/// Merge "find" responses: concatenate the "docs" arrays. Fails fast if any
+/// Merge "find" responses: concatenate the "data" arrays. Fails fast if any
 /// shard errored — silently dropping a shard's docs would produce a
 /// truthy-but-incomplete result set, which is worse than a clear error.
-fn merge_doc_arrays(responses: Vec<Vec<u8>>) -> Vec<u8> {
-    if let Some(err) = first_partial_error(&responses) {
-        return serde_json::to_vec(&json!({
-            "ok": false,
-            "error": format!("scatter-gather find failed on one or more shards: {}", err),
-        }))
-        .unwrap();
+fn merge_doc_arrays(results: Vec<Result<Value, String>>) -> Vec<u8> {
+    if let Some(err) = first_shard_error(&results) {
+        return error_response(&format!(
+            "scatter-gather find failed on one or more shards: {}",
+            err
+        ));
     }
-
-    let mut all_docs: Vec<Value> = Vec::new();
-    for resp_bytes in &responses {
-        if let Ok(resp) = serde_json::from_slice::<Value>(resp_bytes) {
-            if let Some(data) = resp.get("data").and_then(|v| v.as_array()) {
-                all_docs.extend(data.iter().cloned());
-            }
-        }
-    }
-
+    let all_docs = take_doc_arrays(results);
     serde_json::to_vec(&json!({"ok": true, "data": all_docs})).unwrap()
 }
 
 /// Merge "count" responses: sum all counts. Fails fast if any shard errored
 /// (otherwise a stale/down shard would silently undercount the total).
-fn merge_counts(responses: Vec<Vec<u8>>) -> Vec<u8> {
-    if let Some(err) = first_partial_error(&responses) {
-        return serde_json::to_vec(&json!({
-            "ok": false,
-            "error": format!("scatter-gather count failed on one or more shards: {}", err),
-        }))
-        .unwrap();
+fn merge_counts(results: Vec<Result<Value, String>>) -> Vec<u8> {
+    if let Some(err) = first_shard_error(&results) {
+        return error_response(&format!(
+            "scatter-gather count failed on one or more shards: {}",
+            err
+        ));
     }
 
     let mut total: u64 = 0;
-    for resp_bytes in &responses {
-        if let Ok(resp) = serde_json::from_slice::<Value>(resp_bytes) {
-            if let Some(data) = resp.get("data") {
-                if let Some(n) = data.get("count").and_then(|v| v.as_u64()) {
-                    total += n;
-                }
-            }
+    for resp in results.into_iter().flatten() {
+        if let Some(n) = resp
+            .get("data")
+            .and_then(|d| d.get("count"))
+            .and_then(|v| v.as_u64())
+        {
+            total += n;
         }
     }
-
     serde_json::to_vec(&json!({"ok": true, "data": {"count": total}})).unwrap()
 }
 
 /// Merge update/delete responses: sum modified/deleted counts. Fails fast
 /// on any shard error — partial application would leave the client with no
-/// way to detect that some shards didn't apply the update.
-fn merge_modified(responses: Vec<Vec<u8>>) -> Vec<u8> {
-    if let Some(err) = first_partial_error(&responses) {
-        return serde_json::to_vec(&json!({
-            "ok": false,
-            "error": format!("scatter-gather update/delete failed on one or more shards: {}", err),
-        }))
-        .unwrap();
+/// way to detect that some shards didn't apply the update. `deleted` keeps
+/// its own key: the server answers `delete` with `{"deleted": n}` and
+/// folding it into `modified` was observably different from a single node.
+fn merge_modified(results: Vec<Result<Value, String>>) -> Vec<u8> {
+    if let Some(err) = first_shard_error(&results) {
+        return error_response(&format!(
+            "scatter-gather update/delete failed on one or more shards: {}",
+            err
+        ));
     }
 
     let mut total_modified: u64 = 0;
+    let mut total_deleted: u64 = 0;
     let mut total_matched: u64 = 0;
-    for resp_bytes in &responses {
-        if let Ok(resp) = serde_json::from_slice::<Value>(resp_bytes) {
-            let src = resp.get("data").unwrap_or(&resp);
-            if let Some(n) = src.get("modified").and_then(|v| v.as_u64()) {
-                total_modified += n;
-            }
-            if let Some(n) = src.get("deleted").and_then(|v| v.as_u64()) {
-                total_modified += n;
-            }
-            if let Some(n) = src.get("matched").and_then(|v| v.as_u64()) {
-                total_matched += n;
-            }
+    let mut saw_modified = false;
+    let mut saw_deleted = false;
+    for resp in results.into_iter().flatten() {
+        let src = resp.get("data").unwrap_or(&resp);
+        if let Some(n) = src.get("modified").and_then(|v| v.as_u64()) {
+            total_modified += n;
+            saw_modified = true;
+        }
+        if let Some(n) = src.get("deleted").and_then(|v| v.as_u64()) {
+            total_deleted += n;
+            saw_deleted = true;
+        }
+        if let Some(n) = src.get("matched").and_then(|v| v.as_u64()) {
+            total_matched += n;
         }
     }
 
-    let mut data = json!({"modified": total_modified});
-    if total_matched > 0 {
-        data["matched"] = json!(total_matched);
+    let mut data = serde_json::Map::new();
+    if saw_modified || !saw_deleted {
+        data.insert("modified".to_string(), json!(total_modified));
     }
-    serde_json::to_vec(&json!({"ok": true, "data": data})).unwrap()
+    if saw_deleted {
+        data.insert("deleted".to_string(), json!(total_deleted));
+    }
+    if total_matched > 0 {
+        data.insert("matched".to_string(), json!(total_matched));
+    }
+    serde_json::to_vec(&json!({"ok": true, "data": Value::Object(data)})).unwrap()
 }
 
-/// For find_one/update_one/delete_one: return the first successful match.
-fn merge_first_match(responses: Vec<Vec<u8>>) -> Vec<u8> {
-    for resp_bytes in &responses {
-        if let Ok(resp) = serde_json::from_slice::<Value>(resp_bytes) {
-            if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                // OxiDB returns {"ok": true, "data": <doc|result>}
-                if let Some(data) = resp.get("data") {
-                    if !data.is_null() {
-                        // find_one: data is a document (object)
-                        if data.is_object() {
-                            // update_one/delete_one with 0 modifications — skip
-                            if let Some(m) = data.get("modified").and_then(|v| v.as_u64()) {
-                                if m > 0 {
-                                    return resp_bytes.clone();
-                                }
-                            } else if let Some(d) = data.get("deleted").and_then(|v| v.as_u64()) {
-                                if d > 0 {
-                                    return resp_bytes.clone();
-                                }
-                            } else {
-                                // Regular document (find_one)
-                                return resp_bytes.clone();
-                            }
-                        }
-                        // data is array or other non-null — return it
-                        if data.is_array() {
-                            return resp_bytes.clone();
+/// find_one: return the first shard whose response carries a non-null
+/// document. This merge serves READS only — see `scatter_one_write` for the
+/// `_one` writes — so it no longer sniffs `modified`/`deleted` keys out of
+/// the document (a user doc containing a field literally named `modified`
+/// used to be misread as a write response and dropped).
+fn merge_first_match(results: Vec<Result<Value, String>>) -> Vec<u8> {
+    let mut first_error: Option<String> = None;
+    for r in &results {
+        match r {
+            Ok(v) => {
+                if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+                    if let Some(data) = v.get("data") {
+                        if !data.is_null() {
+                            return serde_json::to_vec(v).unwrap();
                         }
                     }
+                } else if first_error.is_none() {
+                    first_error = Some(
+                        v.get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("shard returned ok:false")
+                            .to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e.clone());
                 }
             }
         }
     }
 
-    // No match found — return first response (or a not-found)
-    responses
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| serde_json::to_vec(&json!({"ok": true, "doc": null})).unwrap())
+    // No match anywhere. If a shard failed, the document might live exactly
+    // there — surface the error instead of a clean "not found".
+    if let Some(err) = first_error {
+        return error_response(&format!(
+            "find_one failed on one or more shards (the document may be on the failed shard): {}",
+            err
+        ));
+    }
+    serde_json::to_vec(&json!({"ok": true, "data": Value::Null})).unwrap()
 }
 
 /// For broadcast (DDL): return last ok, or first error.
-fn merge_broadcast(responses: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut last_ok: Option<Vec<u8>> = None;
+fn merge_broadcast(results: Vec<Result<Value, String>>) -> Vec<u8> {
+    let mut last_ok: Option<Value> = None;
 
-    for resp_bytes in &responses {
-        if let Ok(resp) = serde_json::from_slice::<Value>(resp_bytes) {
-            if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
-                last_ok = Some(resp_bytes.clone());
-            } else {
-                // Return first error immediately
-                return resp_bytes.clone();
+    for r in results {
+        match r {
+            Ok(resp) => {
+                if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    last_ok = Some(resp);
+                } else {
+                    // Return first error immediately.
+                    return serde_json::to_vec(&resp).unwrap();
+                }
             }
+            Err(e) => return error_response(&format!("shard error: {}", e)),
         }
     }
 
-    last_ok.unwrap_or_else(|| serde_json::to_vec(&json!({"ok": true})).unwrap())
+    match last_ok {
+        Some(v) => serde_json::to_vec(&v).unwrap(),
+        None => serde_json::to_vec(&json!({"ok": true})).unwrap(),
+    }
 }

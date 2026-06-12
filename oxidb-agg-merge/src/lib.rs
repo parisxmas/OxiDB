@@ -78,6 +78,23 @@ fn stage_parts(stage: &Value) -> Option<(&str, &Value)> {
     Some((k.as_str(), v))
 }
 
+/// The per-shard superset bound for a `$sort` whose tail begins with a
+/// window: `[$limit N]` → N, `[$skip S, $limit N]` → S+N. `None` when the
+/// tail doesn't start with a window (shards must return everything).
+fn window_bound(tail: &[Value]) -> Option<u64> {
+    match tail.first().and_then(stage_parts) {
+        Some(("$limit", b)) => b.as_u64(),
+        Some(("$skip", s)) => {
+            let s = s.as_u64()?;
+            match tail.get(1).and_then(stage_parts) {
+                Some(("$limit", n)) => Some(s.saturating_add(n.as_u64()?)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Compute the shard/merge split for an aggregation `pipeline`.
 ///
 /// `pipeline` is the array of stage objects (the value of the `pipeline`
@@ -119,8 +136,24 @@ pub fn split_pipeline(pipeline: &[Value]) -> SplitPlan {
         .position(|s| stage_parts(s).map(|(n, _)| is_reducing(n)).unwrap_or(false));
 
     let boundary = match boundary {
-        // Purely per-document pipeline → concatenation is exact.
-        None => return SplitPlan::Passthrough,
+        None => {
+            // No reducing boundary. Concatenation is exact ONLY when every
+            // stage is a known per-document stage — a WHITELIST, so stages
+            // this library doesn't know about fail closed. The previous
+            // blacklist let `$setWindowFields` (and any future whole-dataset
+            // stage) fall through to Passthrough, concatenating per-shard
+            // ranks/running totals as if they were global.
+            for stage in pipeline {
+                if let Some((name, _)) = stage_parts(stage) {
+                    if !is_streaming_safe(name) {
+                        return SplitPlan::Unsupported(format!(
+                            "stage {name} is not supported in cross-shard aggregation"
+                        ));
+                    }
+                }
+            }
+            return SplitPlan::Passthrough;
+        }
         Some(b) => b,
     };
 
@@ -151,15 +184,15 @@ pub fn split_pipeline(pipeline: &[Value]) -> SplitPlan {
             Err(reason) => return SplitPlan::Unsupported(reason),
         },
         "$sort" => {
-            // Each shard sorts; if the very next stage is a $limit, push it down
-            // as a per-shard top-k optimization (the global top-k is a subset of
-            // the union of per-shard top-ks). The merge re-sorts and re-applies
-            // the limit (it stays in `tail`).
+            // Each shard sorts; if the tail starts with a window
+            // ($limit, or $skip + $limit), push the superset bound S+N down
+            // as a per-shard top-k optimization — the global window is a
+            // subset of the union of per-shard top-(S+N)s. The merge
+            // re-sorts and the tail re-applies the real skip/limit.
             let mut shard = vec![blocker.clone()];
-            if let Some((tn, tb)) = tail.first().and_then(stage_parts) {
-                if tn == "$limit" {
-                    shard.push(json!({ "$limit": tb.clone() }));
-                }
+            match window_bound(tail) {
+                Some(bound) => shard.push(json!({ "$limit": bound })),
+                None => {}
             }
             (shard, vec![blocker.clone()])
         }
@@ -168,8 +201,19 @@ pub fn split_pipeline(pipeline: &[Value]) -> SplitPlan {
             (vec![blocker.clone()], vec![blocker.clone()])
         }
         "$skip" => {
-            // Skipping per shard is wrong; only the merge skips.
-            (vec![], vec![blocker.clone()])
+            // Skipping per shard is wrong (each shard would drop documents
+            // that belong in the global result); only the merge skips. But a
+            // following $limit bounds what each shard needs to return: the
+            // global [S, S+N) window is contained in each shard's first S+N.
+            let mut shard = vec![];
+            if let (Some(s), Some(("$limit", tb))) =
+                (body.as_u64(), tail.first().and_then(stage_parts))
+            {
+                if let Some(n) = tb.as_u64() {
+                    shard.push(json!({ "$limit": s.saturating_add(n) }));
+                }
+            }
+            (shard, vec![blocker.clone()])
         }
         "$count" => {
             // Each shard counts its docs into `field`; the merge sums those
@@ -260,10 +304,22 @@ fn split_group(body: &Value) -> Result<GroupSplit, String> {
             }
             "$avg" => {
                 // Ship partial {sum, count}; finalize as Σsum / Σcount.
+                //
+                // The count must be the NUMERIC-value count, exactly what the
+                // engine's `$avg` divides by — `{"$sum": 1}` counted every doc
+                // in the group, so documents missing the field (or holding a
+                // non-numeric value) deflated the merged average vs a single
+                // node. `(arg * 0) + 1` evaluates to 1 when `arg` is numeric
+                // and to Null otherwise (the engine's arithmetic propagates
+                // Null, and `$sum` skips Null) — i.e. exactly 1 per
+                // numerically-countable document.
                 let sum_f = format!("{TMP_PREFIX}sum_{out_name}");
                 let cnt_f = format!("{TMP_PREFIX}cnt_{out_name}");
-                shard_accs.insert(sum_f.clone(), json!({ "$sum": arg }));
-                shard_accs.insert(cnt_f.clone(), json!({ "$sum": 1 }));
+                shard_accs.insert(sum_f.clone(), json!({ "$sum": arg.clone() }));
+                shard_accs.insert(
+                    cnt_f.clone(),
+                    json!({ "$sum": { "$add": [ { "$multiply": [arg, 0] }, 1 ] } }),
+                );
                 merge_accs.insert(sum_f.clone(), json!({ "$sum": format!("${sum_f}") }));
                 merge_accs.insert(cnt_f.clone(), json!({ "$sum": format!("${cnt_f}") }));
                 finalize_add.insert(
@@ -416,13 +472,15 @@ mod tests {
                 shard_pipeline,
                 merge_pipeline,
             } => {
-                // Shard emits sum + count temps.
+                // Shard emits sum + NUMERIC-count temps. The count expression
+                // `(arg*0)+1` is Null (→ skipped by $sum) for docs where the
+                // field is missing/non-numeric, matching the engine's $avg.
                 assert_eq!(
                     shard_pipeline,
                     pipe(json!([{"$group": {
                         "_id": "$city",
                         "__oxm_sum_avg_amt": {"$sum": "$amt"},
-                        "__oxm_cnt_avg_amt": {"$sum": 1}
+                        "__oxm_cnt_avg_amt": {"$sum": {"$add": [{"$multiply": ["$amt", 0]}, 1]}}
                     }}]))
                 );
                 // Merge sums the temps, divides, drops them.
@@ -542,6 +600,73 @@ mod tests {
             }
             other => panic!("expected Split, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn split_skip_limit_pushes_bound_to_shard() {
+        // [$skip S, $limit N]: shards must NOT skip, but only need to return
+        // their first S+N docs; the merge applies the real skip + limit.
+        let p = pipe(json!([{"$skip": 20}, {"$limit": 5}]));
+        match split_pipeline(&p) {
+            SplitPlan::Split {
+                shard_pipeline,
+                merge_pipeline,
+            } => {
+                assert_eq!(shard_pipeline, pipe(json!([{"$limit": 25}])));
+                assert_eq!(merge_pipeline, pipe(json!([{"$skip": 20}, {"$limit": 5}])));
+            }
+            other => panic!("expected Split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_sort_skip_limit_pushes_superset_topk() {
+        let p = pipe(json!([
+            {"$sort": {"score": -1}},
+            {"$skip": 10},
+            {"$limit": 5}
+        ]));
+        match split_pipeline(&p) {
+            SplitPlan::Split {
+                shard_pipeline,
+                merge_pipeline,
+            } => {
+                // Shard returns its top-15; merge re-sorts, skips 10, takes 5.
+                assert_eq!(
+                    shard_pipeline,
+                    pipe(json!([{"$sort": {"score": -1}}, {"$limit": 15}]))
+                );
+                assert_eq!(
+                    merge_pipeline,
+                    pipe(json!([
+                        {"$sort": {"score": -1}},
+                        {"$skip": 10},
+                        {"$limit": 5}
+                    ]))
+                );
+            }
+            other => panic!("expected Split, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_set_window_fields_passthrough() {
+        // $setWindowFields computes whole-dataset ranks/running totals — a
+        // per-shard Passthrough would concatenate LOCAL window results as if
+        // global. Must be rejected, not passed through.
+        let p = pipe(json!([
+            {"$match": {"a": 1}},
+            {"$setWindowFields": {"sortBy": {"x": 1}, "output": {"r": {"$rank": {}}}}}
+        ]));
+        assert!(matches!(split_pipeline(&p), SplitPlan::Unsupported(_)));
+    }
+
+    #[test]
+    fn unsupported_unknown_stage_fails_closed() {
+        // The Passthrough decision is a whitelist: a stage this library
+        // doesn't know about must be rejected, not concatenated.
+        let p = pipe(json!([{"$someFutureStage": {}}]));
+        assert!(matches!(split_pipeline(&p), SplitPlan::Unsupported(_)));
     }
 
     #[test]

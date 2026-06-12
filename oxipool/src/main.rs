@@ -23,6 +23,23 @@ struct Config {
     max_clients: usize,
     connect_timeout: Duration,
     stats_interval: Duration,
+    /// Deadline for a full backend exchange (write request + read response).
+    /// 0 disables. Without it, a shard that accepts a request but never
+    /// answers hangs the client forever AND permanently eats the borrowed
+    /// pooled connection — repeated against a hung shard, the whole pool.
+    request_timeout: Duration,
+    /// Client inactivity deadline. 0 (default) disables. An idle client
+    /// holding a pinned transaction otherwise keeps a pooled connection out
+    /// of circulation indefinitely.
+    idle_timeout: Duration,
+}
+
+/// Request timeout shared with `scatter.rs` (set once at startup).
+static REQUEST_TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
+pub(crate) fn request_timeout() -> Option<Duration> {
+    let d = *REQUEST_TIMEOUT.get_or_init(|| Duration::from_secs(30));
+    if d.is_zero() { None } else { Some(d) }
 }
 
 impl Config {
@@ -75,6 +92,18 @@ impl Config {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(60),
+            ),
+            request_timeout: Duration::from_secs(
+                env::var("OXIPOOL_REQUEST_TIMEOUT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(30),
+            ),
+            idle_timeout: Duration::from_secs(
+                env::var("OXIPOOL_IDLE_TIMEOUT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
             ),
         }
     }
@@ -260,6 +289,25 @@ async fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<(), std::
     stream.flush().await
 }
 
+/// Read a frame from a CLIENT, bounded by the idle timeout (0 = unbounded).
+/// On expiry the caller drops the client; any pinned transaction is rolled
+/// back by the disconnect cleanup, returning its connection to the pool.
+async fn read_client_frame(
+    stream: &mut TcpStream,
+    idle: Duration,
+) -> Result<Vec<u8>, std::io::Error> {
+    if idle.is_zero() {
+        return read_frame(stream).await;
+    }
+    match timeout(idle, read_frame(stream)).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "client idle timeout",
+        )),
+    }
+}
+
 // ─── Command Classification (non-sharded fallback) ──────────────────
 
 #[derive(PartialEq)]
@@ -269,101 +317,137 @@ enum CmdRoute {
     TxBegin,    // → master (pin)
     TxCommit,   // → pinned master
     TxRollback, // → pinned master
+    /// Authentication — rejected: sessions are per-connection on the server
+    /// while oxipool multiplexes pooled connections across clients.
+    Auth,
 }
 
+/// Classify by PARSING the request's actual `cmd` field. The old substring
+/// scan ran over the whole payload INCLUDING user data: a find whose
+/// document contained the string "begin_tx" was classified as a transaction
+/// begin — pinning (and leaking) a master pool connection per occurrence —
+/// and any value containing "update"/"insert" silently rerouted reads to
+/// the master.
 fn classify_command(payload: &[u8]) -> CmdRoute {
-    let s = match std::str::from_utf8(payload) {
-        Ok(s) => s,
+    let json: serde_json::Value = match serde_json::from_slice(payload) {
+        Ok(v) => v,
         Err(_) => return CmdRoute::Write, // binary/unknown → master (safe default)
     };
+    let cmd = json.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Transaction commands
-    if s.contains("\"begin_tx\"") {
-        return CmdRoute::TxBegin;
-    }
-    if s.contains("\"commit_tx\"") {
-        return CmdRoute::TxCommit;
-    }
-    if s.contains("\"rollback_tx\"") {
-        return CmdRoute::TxRollback;
-    }
+    match cmd {
+        "begin_tx" => CmdRoute::TxBegin,
+        "commit_tx" => CmdRoute::TxCommit,
+        "rollback_tx" => CmdRoute::TxRollback,
+        "auth_simple" | "authenticate" | "auth" => CmdRoute::Auth,
 
-    // Write commands → master
-    if s.contains("\"insert\"")
-        || s.contains("\"insert_many\"")
-        || s.contains("\"update\"")
-        || s.contains("\"update_one\"")
-        || s.contains("\"delete\"")
-        || s.contains("\"delete_one\"")
-        || s.contains("\"create_collection\"")
-        || s.contains("\"drop_collection\"")
-        || s.contains("\"create_index\"")
-        || s.contains("\"create_unique_index\"")
-        || s.contains("\"create_composite_index\"")
-        || s.contains("\"create_text_index\"")
-        || s.contains("\"create_vector_index\"")
-        || s.contains("\"drop_index\"")
-        || s.contains("\"compact\"")
-        || s.contains("\"create_bucket\"")
-        || s.contains("\"delete_bucket\"")
-        || s.contains("\"put_object\"")
-        || s.contains("\"delete_object\"")
-        || s.contains("\"create_database\"")
-        || s.contains("\"drop_database\"")
-        || s.contains("\"create_user\"")
-        || s.contains("\"drop_user\"")
-        || s.contains("\"update_user\"")
-        || s.contains("\"grant_db_role\"")
-        || s.contains("\"revoke_db_role\"")
-        || s.contains("\"create_schedule\"")
-        || s.contains("\"delete_schedule\"")
-        || s.contains("\"enable_schedule\"")
-        || s.contains("\"disable_schedule\"")
-        || s.contains("\"pipeline\"")
-    {
-        return CmdRoute::Write;
-    }
+        "insert"
+        | "insert_many"
+        | "update"
+        | "update_one"
+        | "find_and_modify"
+        | "delete"
+        | "delete_one"
+        | "create_collection"
+        | "create_collection_with_options"
+        | "drop_collection"
+        | "create_index"
+        | "create_unique_index"
+        | "create_composite_index"
+        | "create_text_index"
+        | "create_vector_index"
+        | "create_ttl_index"
+        | "drop_index"
+        | "compact"
+        | "create_bucket"
+        | "delete_bucket"
+        | "put_object"
+        | "delete_object"
+        | "create_database"
+        | "drop_database"
+        | "create_user"
+        | "drop_user"
+        | "update_user"
+        | "grant_db_role"
+        | "revoke_db_role"
+        | "create_schedule"
+        | "delete_schedule"
+        | "enable_schedule"
+        | "disable_schedule" => CmdRoute::Write,
 
-    // SQL: detect if it's a write or read
-    if s.contains("\"sql\"") {
-        return classify_sql(s);
-    }
-
-    CmdRoute::Read
-}
-
-fn classify_sql(s: &str) -> CmdRoute {
-    if let Some(pos) = s.find("\"query\"") {
-        let after = &s[pos..];
-        if let Some(colon) = after.find(':') {
-            let value_part = after[colon + 1..].trim_start();
-            let upper = value_part.to_uppercase();
-            if upper.starts_with('"') {
-                let inner = &upper[1..];
-                let trimmed = inner.trim_start();
-                if trimmed.starts_with("SELECT")
-                    || trimmed.starts_with("SHOW")
-                    || trimmed.starts_with("DESCRIBE")
-                    || trimmed.starts_with("EXPLAIN")
-                {
-                    return CmdRoute::Read;
-                }
+        // Aggregations write only when the pipeline ends in $out / $merge.
+        "aggregate" => {
+            let writes = json
+                .get("pipeline")
+                .and_then(|p| p.as_array())
+                .is_some_and(|stages| {
+                    stages.iter().any(|s| {
+                        s.as_object()
+                            .is_some_and(|o| o.contains_key("$out") || o.contains_key("$merge"))
+                    })
+                });
+            if writes {
+                CmdRoute::Write
+            } else {
+                CmdRoute::Read
             }
         }
+
+        "sql" => classify_sql(&json),
+
+        _ => CmdRoute::Read,
     }
-    CmdRoute::Write
+}
+
+fn classify_sql(json: &serde_json::Value) -> CmdRoute {
+    let query = json.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let trimmed = query.trim_start().to_uppercase();
+    if trimmed.starts_with("SELECT")
+        || trimmed.starts_with("SHOW")
+        || trimmed.starts_with("DESCRIBE")
+        || trimmed.starts_with("EXPLAIN")
+    {
+        CmdRoute::Read
+    } else {
+        CmdRoute::Write
+    }
 }
 
 // ─── Request Forwarding ─────────────────────────────────────────────
+
+/// Which side of a proxied exchange failed. The distinction matters for
+/// connection hygiene: a BACKEND failure means the pooled connection's
+/// framing state is unknown (replace it), while a CLIENT-write failure
+/// happens after a complete backend exchange — the backend connection is
+/// perfectly healthy and must go back to the pool, not be discarded.
+enum ForwardError {
+    Backend(std::io::Error),
+    Client(std::io::Error),
+}
 
 async fn forward(
     backend: &mut TcpStream,
     client: &mut TcpStream,
     request: &[u8],
-) -> Result<(), std::io::Error> {
-    write_frame(backend, request).await?;
-    let response = read_frame(backend).await?;
-    write_frame(client, &response).await
+) -> Result<(), ForwardError> {
+    let exchange = async {
+        write_frame(backend, request).await?;
+        read_frame(backend).await
+    };
+    let response = match request_timeout() {
+        Some(d) => match timeout(d, exchange).await {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("backend request timed out after {:?}", d),
+            )),
+        },
+        None => exchange.await,
+    }
+    .map_err(ForwardError::Backend)?;
+    write_frame(client, &response)
+        .await
+        .map_err(ForwardError::Client)
 }
 
 // ─── Client Handler (non-sharded — original behavior) ───────────────
@@ -373,6 +457,7 @@ async fn handle_client(
     master: Arc<Pool>,
     replicas: Option<Arc<ReplicaRouter>>,
     stats: Arc<Stats>,
+    idle_timeout: Duration,
 ) {
     let addr = client.peer_addr().ok();
     stats.active_clients.fetch_add(1, Ordering::Relaxed);
@@ -380,7 +465,7 @@ async fn handle_client(
     let mut pinned: Option<TcpStream> = None;
 
     loop {
-        let payload = match read_frame(&mut client).await {
+        let payload = match read_client_frame(&mut client, idle_timeout).await {
             Ok(p) => p,
             Err(_) => break,
         };
@@ -388,7 +473,12 @@ async fn handle_client(
         stats.total_requests.fetch_add(1, Ordering::Relaxed);
         let route = classify_command(&payload);
 
-        let result = match route {
+        let result: Result<(), std::io::Error> = match route {
+            CmdRoute::Auth => {
+                let resp = b"{\"ok\":false,\"error\":\"authentication through oxipool is not supported: sessions are per-connection and oxipool multiplexes pooled connections; run backends with auth disabled\"}";
+                write_frame(&mut client, resp).await
+            }
+
             CmdRoute::TxBegin => {
                 stats.master_requests.fetch_add(1, Ordering::Relaxed);
                 match master.get().await {
@@ -398,12 +488,20 @@ async fn handle_client(
                             pinned = Some(backend);
                             Ok(())
                         }
-                        Err(e) => {
+                        Err(ForwardError::Backend(e)) => {
                             Pool::spawn_replace(Arc::clone(&master));
                             Err(e)
                         }
+                        Err(ForwardError::Client(e)) => {
+                            // Backend exchange completed — the connection is
+                            // healthy and the tx is live on it; pin it so the
+                            // disconnect cleanup below rolls it back.
+                            stats.active_transactions.fetch_add(1, Ordering::Relaxed);
+                            pinned = Some(backend);
+                            Err(e)
+                        }
                     },
-                    Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                    Err(e) => Err(std::io::Error::other(e)),
                 }
             }
 
@@ -416,8 +514,13 @@ async fn handle_client(
                             master.put(backend).await;
                             Ok(())
                         }
-                        Err(e) => {
+                        Err(ForwardError::Backend(e)) => {
                             Pool::spawn_replace(Arc::clone(&master));
+                            Err(e)
+                        }
+                        Err(ForwardError::Client(e)) => {
+                            // Commit/rollback reached the backend — done.
+                            master.put(backend).await;
                             Err(e)
                         }
                     }
@@ -431,12 +534,13 @@ async fn handle_client(
                 if let Some(ref mut backend) = pinned {
                     match forward(backend, &mut client, &payload).await {
                         Ok(()) => Ok(()),
-                        Err(e) => {
+                        Err(ForwardError::Backend(e)) => {
                             pinned = None;
                             stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
                             Pool::spawn_replace(Arc::clone(&master));
                             Err(e)
                         }
+                        Err(ForwardError::Client(e)) => Err(e),
                     }
                 } else {
                     forward_to_pool(&master, &mut client, &payload, &stats).await
@@ -448,12 +552,13 @@ async fn handle_client(
                     stats.master_requests.fetch_add(1, Ordering::Relaxed);
                     match forward(backend, &mut client, &payload).await {
                         Ok(()) => Ok(()),
-                        Err(e) => {
+                        Err(ForwardError::Backend(e)) => {
                             pinned = None;
                             stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
                             Pool::spawn_replace(Arc::clone(&master));
                             Err(e)
                         }
+                        Err(ForwardError::Client(e)) => Err(e),
                     }
                 } else if let Some(ref router) = replicas {
                     stats.replica_requests.fetch_add(1, Ordering::Relaxed);
@@ -499,20 +604,69 @@ async fn handle_client(
 
 // ─── Sharded Client Handler ─────────────────────────────────────────
 
+/// Open a transaction on `shard_id`: borrow a connection and run `begin_tx`
+/// on it. Returns the pinned connection with the tx live.
+async fn pin_transaction(
+    shard_pools: &[Arc<Pool>],
+    shard_id: u32,
+) -> Result<TcpStream, std::io::Error> {
+    let pool = &shard_pools[shard_id as usize];
+    let mut backend = pool.get().await.map_err(std::io::Error::other)?;
+    let begin = b"{\"cmd\":\"begin_tx\"}";
+    let exchange = async {
+        write_frame(&mut backend, begin).await?;
+        read_frame(&mut backend).await
+    };
+    let resp = match request_timeout() {
+        Some(d) => match timeout(d, exchange).await {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "begin_tx timed out",
+            )),
+        },
+        None => exchange.await,
+    };
+    match resp {
+        Ok(bytes) => {
+            let ok = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+                .unwrap_or(false);
+            if ok {
+                Ok(backend)
+            } else {
+                pool.put(backend).await;
+                Err(std::io::Error::other("shard refused begin_tx"))
+            }
+        }
+        Err(e) => {
+            Pool::spawn_replace(Arc::clone(pool));
+            Err(e)
+        }
+    }
+}
+
 async fn handle_client_sharded(
     mut client: TcpStream,
     shard_pools: Arc<Vec<Arc<Pool>>>,
     router: Arc<shard::ShardRouter>,
     stats: Arc<Stats>,
+    idle_timeout: Duration,
 ) {
     let addr = client.peer_addr().ok();
     stats.active_clients.fetch_add(1, Ordering::Relaxed);
 
-    // Transaction pinning: (shard_id, connection)
+    // Transaction pinning: (shard_id, connection). `tx_pending` means the
+    // client sent begin_tx but no shard has been chosen yet — pinning is
+    // DEFERRED to the first statement that routes to a shard. The old code
+    // pinned shard 0 blindly at begin_tx, which rejected every transaction
+    // whose data lives on any other shard as "cross-shard".
     let mut pinned: Option<(u32, TcpStream)> = None;
+    let mut tx_pending = false;
 
     loop {
-        let payload = match read_frame(&mut client).await {
+        let payload = match read_client_frame(&mut client, idle_timeout).await {
             Ok(p) => p,
             Err(_) => break,
         };
@@ -534,31 +688,27 @@ async fn handle_client_sharded(
             }
         };
 
+        // Resolve where a statement inside a transaction must run, pinning
+        // lazily on first use. Returns None when the statement conflicts
+        // with the pinned shard.
         let result: Result<(), std::io::Error> = match parsed.routing {
             shard::CommandRouting::Transaction => {
+                stats.master_requests.fetch_add(1, Ordering::Relaxed);
                 if parsed.cmd == "begin_tx" {
-                    // Pin to shard 0 for transactions (single-shard only)
-                    stats.master_requests.fetch_add(1, Ordering::Relaxed);
-                    let pool = &shard_pools[0];
-                    match pool.get().await {
-                        Ok(mut backend) => {
-                            match forward(&mut backend, &mut client, &payload).await {
-                                Ok(()) => {
-                                    stats.active_transactions.fetch_add(1, Ordering::Relaxed);
-                                    pinned = Some((0, backend));
-                                    Ok(())
-                                }
-                                Err(e) => {
-                                    Pool::spawn_replace(Arc::clone(pool));
-                                    Err(e)
-                                }
-                            }
-                        }
-                        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::Other, e)),
+                    if pinned.is_some() || tx_pending {
+                        let resp = b"{\"ok\":false,\"error\":\"transaction already active\"}";
+                        write_frame(&mut client, resp).await
+                    } else {
+                        // Defer the shard choice; reply with a synthetic ok.
+                        // (The real tx_id is allocated when the first keyed
+                        // statement pins a shard; the server tracks the tx
+                        // per connection, so clients never echo the id back.)
+                        tx_pending = true;
+                        let resp = b"{\"ok\":true,\"data\":{\"tx_id\":0}}";
+                        write_frame(&mut client, resp).await
                     }
                 } else {
                     // commit_tx / rollback_tx
-                    stats.master_requests.fetch_add(1, Ordering::Relaxed);
                     if let Some((shard_id, mut backend)) = pinned.take() {
                         stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
                         match forward(&mut backend, &mut client, &payload).await {
@@ -566,35 +716,72 @@ async fn handle_client_sharded(
                                 shard_pools[shard_id as usize].put(backend).await;
                                 Ok(())
                             }
-                            Err(e) => {
+                            Err(ForwardError::Backend(e)) => {
                                 Pool::spawn_replace(Arc::clone(&shard_pools[shard_id as usize]));
                                 Err(e)
                             }
+                            Err(ForwardError::Client(e)) => {
+                                shard_pools[shard_id as usize].put(backend).await;
+                                Err(e)
+                            }
                         }
+                    } else if tx_pending {
+                        // Transaction never touched a shard — nothing to do.
+                        tx_pending = false;
+                        let resp: &[u8] = if parsed.cmd == "commit_tx" {
+                            b"{\"ok\":true,\"data\":\"committed\"}"
+                        } else {
+                            b"{\"ok\":true,\"data\":\"rolled back\"}"
+                        };
+                        write_frame(&mut client, resp).await
                     } else {
-                        // Not in a transaction — send to shard 0
+                        // Not in a transaction — let shard 0 produce the
+                        // server's own "no active transaction" error.
                         forward_to_pool(&shard_pools[0], &mut client, &payload, &stats).await
                     }
                 }
             }
 
             shard::CommandRouting::Targeted(shard_id) => {
+                if tx_pending && pinned.is_none() {
+                    // First keyed statement of the transaction → pin here.
+                    match pin_transaction(&shard_pools, shard_id).await {
+                        Ok(backend) => {
+                            stats.active_transactions.fetch_add(1, Ordering::Relaxed);
+                            pinned = Some((shard_id, backend));
+                            tx_pending = false;
+                        }
+                        Err(e) => {
+                            tx_pending = false;
+                            let msg = format!("oxipool: failed to start transaction: {}", e);
+                            let resp = format!(
+                                "{{\"ok\":false,\"error\":\"{}\"}}",
+                                msg.replace('\\', "\\\\").replace('"', "\\\"")
+                            );
+                            if write_frame(&mut client, resp.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 if let Some((pinned_shard, ref mut backend)) = pinned {
                     // Inside transaction — must use pinned connection
                     if pinned_shard != shard_id {
                         // Cross-shard transaction — reject
                         let resp = b"{\"ok\":false,\"error\":\"cross-shard transactions not supported; use the same shard key within a transaction\"}";
-                        write_frame(&mut client, resp).await.map_err(|e| e)
+                        write_frame(&mut client, resp).await
                     } else {
                         stats.shard_requests.fetch_add(1, Ordering::Relaxed);
                         match forward(backend, &mut client, &payload).await {
                             Ok(()) => Ok(()),
-                            Err(e) => {
+                            Err(ForwardError::Backend(e)) => {
                                 let s = pinned.take().unwrap().0;
                                 stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
                                 Pool::spawn_replace(Arc::clone(&shard_pools[s as usize]));
                                 Err(e)
                             }
+                            Err(ForwardError::Client(e)) => Err(e),
                         }
                     }
                 } else {
@@ -605,60 +792,114 @@ async fn handle_client_sharded(
             }
 
             shard::CommandRouting::ScatterGather => {
+                if tx_pending && pinned.is_none() {
+                    // Un-keyed statement first — preserve the legacy
+                    // single-shard behavior by pinning shard 0.
+                    match pin_transaction(&shard_pools, 0).await {
+                        Ok(backend) => {
+                            stats.active_transactions.fetch_add(1, Ordering::Relaxed);
+                            pinned = Some((0, backend));
+                            tx_pending = false;
+                        }
+                        Err(e) => {
+                            tx_pending = false;
+                            let msg = format!("oxipool: failed to start transaction: {}", e);
+                            let resp = format!(
+                                "{{\"ok\":false,\"error\":\"{}\"}}",
+                                msg.replace('\\', "\\\\").replace('"', "\\\"")
+                            );
+                            if write_frame(&mut client, resp.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 if let Some((_, ref mut backend)) = pinned {
                     // Inside transaction — scatter-gather not allowed, send to pinned shard
                     stats.master_requests.fetch_add(1, Ordering::Relaxed);
                     match forward(backend, &mut client, &payload).await {
                         Ok(()) => Ok(()),
-                        Err(e) => {
+                        Err(ForwardError::Backend(e)) => {
                             let s = pinned.take().unwrap().0;
                             stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
                             Pool::spawn_replace(Arc::clone(&shard_pools[s as usize]));
                             Err(e)
                         }
+                        Err(ForwardError::Client(e)) => Err(e),
                     }
                 } else {
                     stats.scatter_requests.fetch_add(1, Ordering::Relaxed);
 
-                    // Special case: insert_many needs doc splitting; aggregate
-                    // needs a pipeline-aware split+merge (correct cross-shard
-                    // $group/$sort/$limit/$count) instead of naive concat.
+                    // Command-aware fan-out: insert_many splits docs by
+                    // shard; aggregate gets a pipeline-aware split+merge;
+                    // find honors sort/skip/limit globally; ranked searches
+                    // merge by score; the `_one` writes probe serially so at
+                    // most ONE document changes cluster-wide.
                     let response = if parsed.cmd == "insert_many" {
                         scatter::scatter_insert_many(&shard_pools, &payload, &router).await
                     } else if parsed.cmd == "aggregate" {
                         scatter::scatter_aggregate(&shard_pools, &payload).await
+                    } else if parsed.cmd == "find" {
+                        scatter::scatter_find(&shard_pools, &payload).await
+                    } else if parsed.cmd == "text_search" || parsed.cmd == "vector_search" {
+                        scatter::scatter_search(&shard_pools, &payload, &parsed.cmd).await
+                    } else if parsed.cmd == "update_one" || parsed.cmd == "delete_one" {
+                        scatter::scatter_one_write(&shard_pools, &payload).await
                     } else {
                         let strategy = scatter::MergeStrategy::for_command(&parsed.cmd);
                         scatter::scatter_gather(&shard_pools, &payload, strategy).await
                     };
 
-                    write_frame(&mut client, &response).await.map_err(|e| e)
+                    write_frame(&mut client, &response).await
                 }
             }
 
             shard::CommandRouting::Broadcast => {
-                if pinned.is_some() {
+                if pinned.is_some() || tx_pending {
                     // Inside transaction — DDL not allowed
                     let resp = b"{\"ok\":false,\"error\":\"DDL commands not allowed inside transactions\"}";
-                    write_frame(&mut client, resp).await.map_err(|e| e)
+                    write_frame(&mut client, resp).await
                 } else {
                     stats.scatter_requests.fetch_add(1, Ordering::Relaxed);
                     let response = scatter::broadcast(&shard_pools, &payload).await;
-                    write_frame(&mut client, &response).await.map_err(|e| e)
+                    write_frame(&mut client, &response).await
                 }
             }
 
             shard::CommandRouting::Primary => {
+                if tx_pending && pinned.is_none() {
+                    match pin_transaction(&shard_pools, 0).await {
+                        Ok(backend) => {
+                            stats.active_transactions.fetch_add(1, Ordering::Relaxed);
+                            pinned = Some((0, backend));
+                            tx_pending = false;
+                        }
+                        Err(e) => {
+                            tx_pending = false;
+                            let msg = format!("oxipool: failed to start transaction: {}", e);
+                            let resp = format!(
+                                "{{\"ok\":false,\"error\":\"{}\"}}",
+                                msg.replace('\\', "\\\\").replace('"', "\\\"")
+                            );
+                            if write_frame(&mut client, resp.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 if let Some((_, ref mut backend)) = pinned {
                     stats.master_requests.fetch_add(1, Ordering::Relaxed);
                     match forward(backend, &mut client, &payload).await {
                         Ok(()) => Ok(()),
-                        Err(e) => {
+                        Err(ForwardError::Backend(e)) => {
                             let s = pinned.take().unwrap().0;
                             stats.active_transactions.fetch_sub(1, Ordering::Relaxed);
                             Pool::spawn_replace(Arc::clone(&shard_pools[s as usize]));
                             Err(e)
                         }
+                        Err(ForwardError::Client(e)) => Err(e),
                     }
                 } else {
                     stats.master_requests.fetch_add(1, Ordering::Relaxed);
@@ -712,19 +953,53 @@ async fn forward_to_pool(
         stats.pool_waits.fetch_add(1, Ordering::Relaxed);
     }
 
-    let mut backend = pool
-        .get()
-        .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut backend = pool.get().await.map_err(std::io::Error::other)?;
 
     match forward(&mut backend, client, payload).await {
         Ok(()) => {
             pool.put(backend).await;
             Ok(())
         }
-        Err(e) => {
+        Err(ForwardError::Backend(e)) => {
+            // Backend framing state unknown — replace the connection.
             Pool::spawn_replace(Arc::clone(pool));
             Err(e)
+        }
+        Err(ForwardError::Client(e)) => {
+            // The backend exchange completed cleanly; only the client write
+            // failed. The pooled connection is healthy — return it instead
+            // of discarding it and paying a reconnect.
+            pool.put(backend).await;
+            Err(e)
+        }
+    }
+}
+
+/// Startup probe: backends must run with authentication DISABLED — oxipool
+/// multiplexes pooled connections across clients, which is incompatible
+/// with the server's per-connection (SCRAM) sessions. A data command on a
+/// fresh connection answers "authentication required" on an auth-enabled
+/// server (`ping` is exempt from auth, so it can't detect this).
+async fn verify_backend_auth_disabled(pool: &Arc<Pool>, label: &str) {
+    let probe = b"{\"cmd\":\"list_collections\"}";
+    match scatter::forward_to_shard(pool, probe).await {
+        Ok(resp) => {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&resp) {
+                let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                if v.get("ok").and_then(|b| b.as_bool()) != Some(true)
+                    && err.to_ascii_lowercase().contains("auth")
+                {
+                    eprintln!(
+                        "FATAL: backend {label} requires authentication ({err}); oxipool \
+                         cannot proxy per-connection auth sessions over pooled connections. \
+                         Run the backend with auth disabled and secure the network path."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[oxipool] warning: startup probe of {label} failed: {e}");
         }
     }
 }
@@ -734,12 +1009,24 @@ async fn forward_to_pool(
 #[tokio::main]
 async fn main() {
     let config = Config::from_env();
+    let _ = REQUEST_TIMEOUT.set(config.request_timeout);
     let shard_config = shard::ShardConfig::from_env();
     let has_replicas = !config.replicas.is_empty();
     let is_sharded = shard_config.is_some();
 
-    eprintln!("OxiPool v0.3.0 — connection pooler for OxiDB");
+    eprintln!(
+        "OxiPool v{} — connection pooler for OxiDB",
+        env!("CARGO_PKG_VERSION")
+    );
     eprintln!("  listen:       {}", config.listen);
+    if config.request_timeout.is_zero() {
+        eprintln!("  req_timeout:  disabled");
+    } else {
+        eprintln!("  req_timeout:  {:?}", config.request_timeout);
+    }
+    if !config.idle_timeout.is_zero() {
+        eprintln!("  idle_timeout: {:?}", config.idle_timeout);
+    }
 
     if is_sharded {
         // ─── Sharded mode ───────────────────────────────────────────
@@ -785,6 +1072,19 @@ async fn main() {
         let shard_pools = Arc::new(shard_pools);
         let router = shard::ShardRouter::new(shard_cfg);
 
+        // Fail fast on auth-enabled shards (incompatible with pooling).
+        for (i, pool) in shard_pools.iter().enumerate() {
+            verify_backend_auth_disabled(pool, &format!("shard[{i}]")).await;
+        }
+
+        // Cross-shard _id uniqueness depends on each shard running with a
+        // DISTINCT OXIDB_SHARD_ID (disjoint 2^48 id ranges). oxipool cannot
+        // verify it remotely — make the requirement impossible to miss.
+        eprintln!(
+            "  NOTE: each shard MUST run with a distinct OXIDB_SHARD_ID, or _id values \
+             collide across shards and _id lookups through the pool return arbitrary documents"
+        );
+
         let stats = Arc::new(Stats::new());
 
         // Periodic stats
@@ -828,11 +1128,17 @@ async fn main() {
         eprintln!("OxiPool listening on {} (sharded)", config.listen);
 
         loop {
-            let (client, addr) = match listener.accept().await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[oxipool] accept error: {}", e);
-                    continue;
+            let (client, addr) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[oxipool] accept error: {}", e);
+                        continue;
+                    }
+                },
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!("[oxipool] shutdown signal — no longer accepting clients");
+                    return;
                 }
             };
             let _ = client.set_nodelay(true);
@@ -849,9 +1155,10 @@ async fn main() {
             let shard_pools = Arc::clone(&shard_pools);
             let router = Arc::clone(&router);
             let stats = Arc::clone(&stats);
+            let idle = config.idle_timeout;
 
             tokio::spawn(async move {
-                handle_client_sharded(client, shard_pools, router, stats).await;
+                handle_client_sharded(client, shard_pools, router, stats, idle).await;
                 drop(permit);
             });
         }
@@ -896,6 +1203,7 @@ async fn main() {
             "  master pool:  {} connections to {}",
             config.master_pool_size, config.master
         );
+        verify_backend_auth_disabled(&master, "master").await;
 
         // Create replica pools
         let replicas = if has_replicas {
@@ -978,11 +1286,17 @@ async fn main() {
         eprintln!("OxiPool listening on {}", config.listen);
 
         loop {
-            let (client, addr) = match listener.accept().await {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[oxipool] accept error: {}", e);
-                    continue;
+            let (client, addr) = tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("[oxipool] accept error: {}", e);
+                        continue;
+                    }
+                },
+                _ = tokio::signal::ctrl_c() => {
+                    eprintln!("[oxipool] shutdown signal — no longer accepting clients");
+                    return;
                 }
             };
             let _ = client.set_nodelay(true);
@@ -999,9 +1313,10 @@ async fn main() {
             let master = Arc::clone(&master);
             let replicas = replicas.clone();
             let stats = Arc::clone(&stats);
+            let idle = config.idle_timeout;
 
             tokio::spawn(async move {
-                handle_client(client, master, replicas, stats).await;
+                handle_client(client, master, replicas, stats, idle).await;
                 drop(permit);
             });
         }

@@ -79,17 +79,72 @@ impl ShardConfig {
             }
         }
 
-        Some(Self {
+        let cfg = Self {
             num_chunks,
             chunk_map,
             shards,
             collection_keys,
-        })
+        };
+        if let Err(e) = cfg.validate() {
+            eprintln!("FATAL: OXIPOOL_SHARDS config: {e}");
+            std::process::exit(1);
+        }
+        Some(cfg)
     }
 
+    /// Load and VALIDATE the config file. An explicitly-configured file that
+    /// is unreadable, malformed, or internally inconsistent is fatal: the old
+    /// silent `None` fallback made oxipool quietly start in NON-sharded mode
+    /// against the default master on a typo'd config, and an out-of-range
+    /// `chunk_map` entry would index-panic the router on every keyed request.
     fn load_from_file(path: &str) -> Option<Self> {
-        let data = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&data).ok()
+        let data = match std::fs::read_to_string(path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("FATAL: OXIPOOL_SHARD_CONFIG {path}: {e}");
+                std::process::exit(1);
+            }
+        };
+        let cfg: Self = match serde_json::from_str(&data) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("FATAL: OXIPOOL_SHARD_CONFIG {path}: invalid JSON: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = cfg.validate() {
+            eprintln!("FATAL: OXIPOOL_SHARD_CONFIG {path}: {e}");
+            std::process::exit(1);
+        }
+        Some(cfg)
+    }
+
+    /// Internal-consistency check for a shard config.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.shards.is_empty() {
+            return Err("'shards' must not be empty".into());
+        }
+        if self.num_chunks == 0 {
+            return Err("'num_chunks' must be > 0".into());
+        }
+        if self.chunk_map.len() != self.num_chunks as usize {
+            return Err(format!(
+                "'chunk_map' has {} entries but 'num_chunks' is {}",
+                self.chunk_map.len(),
+                self.num_chunks
+            ));
+        }
+        if let Some(bad) = self
+            .chunk_map
+            .iter()
+            .find(|&&s| s as usize >= self.shards.len())
+        {
+            return Err(format!(
+                "'chunk_map' references shard {bad} but only {} shard(s) are configured",
+                self.shards.len()
+            ));
+        }
+        Ok(())
     }
 
     /// Save current config to a JSON file.
@@ -101,6 +156,16 @@ impl ShardConfig {
 
     pub fn num_shards(&self) -> usize {
         self.shards.len()
+    }
+
+    /// Route a payload by shard key against THIS config snapshot — lets bulk
+    /// callers (insert_many) take the router lock once instead of per doc.
+    pub fn route_value(&self, collection: &str, payload: &serde_json::Value) -> Option<u32> {
+        let key_config = self.collection_keys.get(collection)?;
+        let shard_key_value = resolve_field(payload, &key_config.field)?;
+        let hash = crc32fast::hash(shard_key_value.as_bytes());
+        let chunk_id = hash % self.num_chunks;
+        Some(self.chunk_map[chunk_id as usize])
     }
 }
 
@@ -123,14 +188,7 @@ impl ShardRouter {
     /// Returns `Some(shard_id)` for targeted routing, `None` for scatter-gather.
     pub async fn route(&self, collection: &str, payload: &serde_json::Value) -> Option<u32> {
         let config = self.config.read().await;
-
-        let key_config = config.collection_keys.get(collection)?;
-        let shard_key_value = resolve_field(payload, &key_config.field)?;
-
-        let hash = crc32fast::hash(shard_key_value.as_bytes());
-        let chunk_id = hash % config.num_chunks;
-
-        Some(config.chunk_map[chunk_id as usize])
+        config.route_value(collection, payload)
     }
 
     /// Route a document for insertion — always has the shard key in the doc.
@@ -174,13 +232,55 @@ fn resolve_field(value: &serde_json::Value, path: &str) -> Option<String> {
     for part in path.split('.') {
         current = current.get(part)?;
     }
-    Some(match current {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Null => "null".to_string(),
-        other => other.to_string(),
-    })
+    shard_key_string(current)
+}
+
+/// Canonical hash string for a shard-key value. Returns `None` for anything
+/// that cannot legitimately target a single shard:
+///
+/// - Only SCALARS hash. An operator object like `{"$in": [...]}` or
+///   `{"$gt": ...}` used to be hashed as its JSON text — which routed the
+///   request `Targeted` at one (wrong) shard, silently missing every
+///   matching document on the others. Those must scatter-gather.
+/// - The exact-match form `{"$eq": scalar}` unwraps to the scalar — it is
+///   semantically identical to the bare value and must hash identically.
+fn shard_key_string(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(canonical_number(n)),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Null => Some("null".to_string()),
+        serde_json::Value::Object(obj) => {
+            if obj.len() == 1 {
+                if let Some(eq) = obj.get("$eq") {
+                    if !eq.is_object() && !eq.is_array() {
+                        return shard_key_string(eq);
+                    }
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(_) => None,
+    }
+}
+
+/// Canonical numeric form: an insert with integer `5` and a query with float
+/// `5.0` must hash to the same shard. (Float-typed shard keys placed by a
+/// pre-canonicalization oxipool may re-route; integer keys are unchanged.)
+fn canonical_number(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() {
+        return i.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return u.to_string();
+    }
+    if let Some(f) = n.as_f64() {
+        if f.fract() == 0.0 && f >= i64::MIN as f64 && f <= i64::MAX as f64 {
+            return (f as i64).to_string();
+        }
+        return f.to_string();
+    }
+    n.to_string()
 }
 
 // ─── Command Parsing ────────────────────────────────────────────────
@@ -243,7 +343,6 @@ const PRIMARY_ONLY_COMMANDS: &[&str] = &[
     "enable_schedule",
     "disable_schedule",
     "ping",
-    "auth_simple",
 ];
 
 /// Parse a command payload and determine routing.
@@ -264,6 +363,22 @@ pub async fn parse_and_route(
         .get("collection")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+
+    // Authentication cannot work through the pool: OxiDB sessions are bound
+    // to one TCP connection (multi-round SCRAM), while oxipool multiplexes
+    // many clients over shared pooled connections. Routing an auth to one
+    // pooled socket would either fail mid-handshake or — worse — leave an
+    // authenticated socket to be handed to a DIFFERENT client later.
+    // Backends must run auth-disabled (verified at startup); reject client
+    // auth attempts with a clear message instead of half-working.
+    if cmd == "auth_simple" || cmd == "authenticate" || cmd == "auth" {
+        return Err(
+            "authentication through oxipool is not supported: sessions are per-connection \
+             and oxipool multiplexes pooled connections across clients; run shards with \
+             auth disabled and secure the network path to oxipool instead"
+                .to_string(),
+        );
+    }
 
     // Transaction commands
     if cmd == "begin_tx" || cmd == "commit_tx" || cmd == "rollback_tx" {
