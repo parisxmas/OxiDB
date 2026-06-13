@@ -135,6 +135,13 @@ func (p *Pool) checkout(c *Client) (*Client, error) {
 	c.Close()
 	fresh, derr := p.dial()
 	if derr != nil {
+		// Return the (closed) conn to the channel so the slot is not leaked.
+		// Without this, every failed checkout during an outage permanently
+		// shrinks the pool: once all slots are consumed, Get() blocks forever
+		// even after the backend recovers. The dead conn fails its next ping
+		// instantly and triggers another dial attempt, so capacity is kept
+		// and the pool self-heals as soon as the backend is reachable again.
+		p.Put(c)
 		return nil, fmt.Errorf("oxidb pool: reconnect: %w", derr)
 	}
 	return fresh, nil
