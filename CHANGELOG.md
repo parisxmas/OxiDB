@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.31.0
+
 ### Go connection pool: no slot leak on failed reconnect (server 0.31.0)
 
 `Pool.checkout` closed a stale connection and dialed a replacement, but on a
