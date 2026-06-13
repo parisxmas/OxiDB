@@ -11,12 +11,109 @@ failed checkout permanently shrank the pool until all slots were gone and
 now returned to the channel, so capacity is preserved and the pool self-heals as
 soon as the backend is reachable again (`go/oxidb/pool.go`).
 
-### Engine audit fixes — concurrency, durability, correctness, Mongo-compat (server 0.30.7–0.30.8)
+### Engine audit, round 2 — concurrency, `$group` identity, PITR, Mongo-compat operators (server 0.30.8)
 
-Two rounds of full-engine audit fixes (commits `2fa7b7d4`, `95e50670`):
-durability and concurrency hardening, `$group` identity correctness, PITR fixes,
-and additional Mongo-compatible operator behaviour. See the commit messages for
-the per-fix detail.
+Closes the remaining findings from the full-engine audit (commit `95e50670`).
+
+**Concurrency / transactions**
+- `update()` merges its prepare phase into the write-locked apply: each matched
+  doc is re-read and the update recomputed against current content, closing the
+  read→apply gap that left stale index entries, resurrected concurrently-deleted
+  docs, and lost concurrent updates. The `_version` bump is now an atomic RMW,
+  with an intra-batch unique check.
+- `commit_lock` is now an `RwLock`: tx commits take the write lock, direct
+  `update`/`delete`/`find_and_modify` take the read lock — a direct write can no
+  longer slip into a commit's validate→apply window and be blindly overwritten
+  (OCC now observes every writer), while direct writes stay concurrent with each
+  other.
+
+**Aggregation correctness**
+- `$group` keys are no longer identified by their 64-bit hash alone: groups live
+  in an insertion-ordered vec with hash→index buckets and every hit verifies the
+  materialized key, so SipHash collisions can no longer silently merge distinct
+  groups (`exec_group`, `StreamingGroup`).
+- `try_index_group` is gated on an explicit full-scan flag from the engine
+  instead of a docs-count heuristic — a `$match`-filtered subset can no longer
+  fall through to index-read groups that ignore the filter.
+
+**Lifecycle / PITR**
+- `drop_collection` now removes `.bdat`/`.bopts`/`.worm`, sealed `.wal.<seq>`
+  segments (previously replayed into a re-created collection, resurrecting
+  dropped docs), and `.mfidx` files.
+- `Wal::checkpoint` resets the header so the next append rewrites the `OXWA`
+  header instead of degrading to legacy format; a truncated `_gsn` lease file is
+  now a hard error instead of silently restarting GSNs at 1 (duplicate GSNs
+  corrupted replay dedup); `prune_archive` deletes the data-dir original with the
+  `.seg`; `replay_into` warns when the earliest replayable GSN is above the base
+  watermark.
+
+**MongoDB-compatible update operators**
+- `$pull` with an operator/condition object actually pulls (was a literal
+  no-op); `$push`/`$addToSet` support `{$each: [..]}`; `$inc`/`$mul` do checked
+  integer arithmetic (overflow errors, exact above 2^53, never write null from a
+  non-finite f64); dotted `$project` inclusion/exclusion builds/removes nested
+  structure; `$unset` on an array element nulls in place; `$rename` moves
+  explicit-null fields; `$pop` validates its operand on empty/missing arrays.
+
+**Performance**
+- `insert()` logs+fsyncs the WAL before taking the index write lock when there
+  are no unique indexes (readers no longer stall behind every insert's fsync);
+  full scans no longer flood the LRU; `find({})` decodes straight into the
+  returned `Arc`; `$setWindowFields` running totals and whole-partition frames
+  fold once instead of O(n²); `archive_pass` skips the manifest rebuild on idle
+  ticks.
+
+### Engine audit, round 1 — durability, correctness, perf (server 0.30.7)
+
+Durability, correctness and performance fixes from the full-engine audit
+(commit `2fa7b7d4`).
+
+**Durability (silent data loss)**
+- `storage`: torn tail truncated at open — post-crash WAL replay used to
+  re-append acknowledged writes *behind* the garbage, where the next open's scan
+  never reached them (lost once the WAL was checkpointed). `read_exact_at`
+  replaces `read_at` (short reads had returned zero-filled buffers); failed
+  appends roll the file back to the last record boundary so an ENOSPC mid-write
+  no longer desyncs every later `DocLocation`.
+- WAL replay filters transactional entries through the tx commit log — a tx that
+  died between its WAL fsync and `mark_committed` is no longer resurrected or
+  half-applied across collections; the engine eagerly recovers collections with
+  pending WAL at startup.
+- `btree_storage`: compaction aborts on a read error instead of silently
+  dropping the live document from the rewritten file, with a dir-fsync after the
+  rename.
+
+**Wrong results**
+- Index-backed sort no longer drops non-eq predicates (`matches_value` was
+  skipped whenever one indexed eq existed) — creating an index no longer changes
+  result sets; `skip`+`limit` uses saturating arithmetic (skip with no limit had
+  wrapped and returned `[]`).
+- `query`: AND range merge keeps the **tightest** bounds instead of last-wins
+  (`{a:{$gt:10,$gte:5}}` had returned the unfiltered superset); contradictory
+  ranges count 0.
+- TTL eviction range-scans from `DateTime(i64::MIN)`, not `Unbounded` — numeric/
+  null/bool values in a TTL field are no longer evicted regardless of expiry.
+
+**Concurrency**
+- Per-name open locks (concurrent first-touch opens of the same collection could
+  persist a stale snapshot and truncate the winner's WAL); `insert_many` reserves
+  its id block with `fetch_add`; the intra-batch unique map is hoisted out of the
+  per-doc loop (it was recreated empty per doc, so duplicates sailed through);
+  encode errors fail the batch instead of persisting empty documents.
+
+**Resilience at open**
+- `fts` index written via tmp+fsync+rename, corrupt index quarantined and
+  rebuilt instead of bricking `open`, extractor panics no longer kill the worker;
+  `blob` rejects bucket `"."` and quarantines torn/undecryptable `.meta`;
+  `mmap_field_index` bounds-checks an untrusted `entry_count`; compressed
+  collections account `total_bytes` in on-disk units so auto-compaction can
+  trigger.
+
+**Performance**
+- `$lookup` is now a hash join (one `$in` query instead of one query per input
+  doc); `$sort` decorates once per doc; `$in`/`$nin` operands are sorted+deduped
+  at parse and binary-searched; per-doc FTS term lists make re-index O(doc terms)
+  instead of a full inverted-index sweep.
 
 ### OxiPool: routing, fan-out and merge correctness + availability (server 0.30.8)
 
