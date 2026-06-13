@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Go connection pool: no slot leak on failed reconnect (server 0.31.0)
+
+`Pool.checkout` closed a stale connection and dialed a replacement, but on a
+failed dial it dropped the slot on the floor. During a backend outage every
+failed checkout permanently shrank the pool until all slots were gone and
+`Get()` blocked forever — even after the backend recovered. The closed conn is
+now returned to the channel, so capacity is preserved and the pool self-heals as
+soon as the backend is reachable again (`go/oxidb/pool.go`).
+
+### Engine audit fixes — concurrency, durability, correctness, Mongo-compat (server 0.30.7–0.30.8)
+
+Two rounds of full-engine audit fixes (commits `2fa7b7d4`, `95e50670`):
+durability and concurrency hardening, `$group` identity correctness, PITR fixes,
+and additional Mongo-compatible operator behaviour. See the commit messages for
+the per-fix detail.
+
+### OxiPool: routing, fan-out and merge correctness + availability (server 0.30.8)
+
+Hardening pass on the sharding proxy (commit `14fddd14`): shard-key resolution
+only hashes scalars (operator objects scatter instead of targeting one wrong
+shard), `update_one`/`delete_one` probe serially and stop at the first match,
+`find` applies sort/skip/limit globally, split-aggregation passthrough is a
+fail-closed whitelist, backend write failures `spawn_replace` instead of leaking
+connections, and `OXIPOOL_REQUEST_TIMEOUT`/`OXIPOOL_IDLE_TIMEOUT` bound hung and
+idle shards. Command classification now parses the real `cmd` field instead of
+substring-scanning the payload.
+
 ### Aggregation: window functions (`$setWindowFields`) (server 0.30.5)
 
 Adds SQL-style window functions — compute a value for each document from a
