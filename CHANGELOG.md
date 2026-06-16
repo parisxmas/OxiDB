@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+## v0.31.1
+
+### `$ne` / `$nin` now match documents that lack the field (server 0.31.1)
+
+OxiDB was **excluding** documents that don't contain the queried field from
+`$ne`/`$nin` results — the opposite of MongoDB, where an absent field is "not
+equal to" any concrete value and therefore matches. The practical impact was a
+data-loss-shaped bug: a filter like `{owner_banned: {$ne: true}}` over a
+collection where most documents simply omit `owner_banned` returned almost
+nothing instead of every non-banned document.
+
+The wrong behavior lived in four places in `src/query.rs`:
+
+- **Post-filter paths** (`eval_field_op` in-memory, `matches_raw_inner`
+  byte-level/disk-first) treated a missing field as a non-match for every
+  comparison operator, including `$ne`/`$nin`.
+- **Index-backed paths** (`execute_field_op`, `execute_indexed_lazy`) served
+  `$ne` from `find_ne`/`for_each_ne`, which only iterate documents that *have*
+  the field — so missing-field documents could never be returned.
+
+The fix:
+
+- A missing field now **matches** `$ne`/`$nin`, **unless** the operand is
+  `null` — MongoDB treats an absent field as `null` for these comparisons, so
+  `{f: {$ne: null}}` and `{f: {$nin: [null]}}` still exclude it.
+- `$ne` is no longer served by the field index (which can't enumerate
+  missing-field documents); it falls through to a full scan + corrected
+  post-filter, matching how `count_indexed` already handled it. `estimate_rows`
+  no longer produces an index estimate for `$ne`.
+
+Regression coverage: `collection::tests::ne_and_nin_include_missing_field`
+exercises indexed and non-indexed collections plus the `$ne: null` edge case.
+
 ## v0.31.0
 
 ### Go connection pool: no slot leak on failed reconnect (server 0.31.0)

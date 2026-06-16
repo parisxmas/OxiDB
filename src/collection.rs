@@ -3302,6 +3302,49 @@ mod tests {
         assert_eq!(results.len(), 2);
     }
 
+    /// A document that lacks the queried field MUST match `$ne`/`$nin`
+    /// (MongoDB semantics: an absent field is "not equal to" any concrete
+    /// value). Regression for the bug where missing-field docs were silently
+    /// excluded — both on the indexed and the full-scan path.
+    #[test]
+    fn ne_and_nin_include_missing_field() {
+        for indexed in [false, true] {
+            let (_dir, mut col) = temp_collection("test");
+            if indexed {
+                col.create_index("owner_banned").unwrap();
+            }
+            // Two normal docs WITHOUT the field, one banned, one explicitly false.
+            let a = col.insert(json!({"name": "Alice"})).unwrap();
+            let b = col.insert(json!({"name": "Bob"})).unwrap();
+            col.insert(json!({"name": "Mallory", "owner_banned": true}))
+                .unwrap();
+            let d = col
+                .insert(json!({"name": "Dan", "owner_banned": false}))
+                .unwrap();
+
+            // $ne: true → everyone except the banned doc (incl. missing-field docs).
+            let ne = col.find(&json!({"owner_banned": {"$ne": true}})).unwrap();
+            let ne_ids: std::collections::BTreeSet<_> =
+                ne.iter().map(|d| d["_id"].as_u64().unwrap()).collect();
+            assert_eq!(
+                ne_ids,
+                [a, b, d].into_iter().collect(),
+                "indexed={indexed}: $ne must include docs missing the field"
+            );
+
+            // $nin: [true] behaves the same.
+            let nin = col
+                .find(&json!({"owner_banned": {"$nin": [true]}}))
+                .unwrap();
+            assert_eq!(nin.len(), 3, "indexed={indexed}: $nin missing-field");
+
+            // $ne: null EXCLUDES missing-field docs (absent ≡ null) — only the
+            // two docs that explicitly carry a non-null value match.
+            let ne_null = col.find(&json!({"owner_banned": {"$ne": null}})).unwrap();
+            assert_eq!(ne_null.len(), 2, "indexed={indexed}: $ne null excludes absent");
+        }
+    }
+
     #[test]
     fn date_range_query() {
         let (_dir, mut col) = temp_collection("test");

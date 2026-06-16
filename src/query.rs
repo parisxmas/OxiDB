@@ -27,13 +27,15 @@ pub fn estimate_rows(
             let idx = field_indexes.get(field.as_str())?;
             match op {
                 QueryOp::Eq(v) => Some(idx.count_eq(v)),
-                QueryOp::Ne(v) => Some(idx.count_all().saturating_sub(idx.count_eq(v))),
                 QueryOp::Gt(v) => Some(idx.count_range(Bound::Excluded(v), Bound::Unbounded)),
                 QueryOp::Gte(v) => Some(idx.count_range(Bound::Included(v), Bound::Unbounded)),
                 QueryOp::Lt(v) => Some(idx.count_range(Bound::Unbounded, Bound::Excluded(v))),
                 QueryOp::Lte(v) => Some(idx.count_range(Bound::Unbounded, Bound::Included(v))),
                 QueryOp::In(vals) => Some(idx.count_in(vals)),
-                QueryOp::Nin(_)
+                // `$ne` is no longer index-served (it must include missing-field
+                // docs the index doesn't hold), so it has no index estimate.
+                QueryOp::Ne(_)
+                | QueryOp::Nin(_)
                 | QueryOp::Exists(_)
                 | QueryOp::Regex(_)
                 | QueryOp::ElemMatch(_)
@@ -559,13 +561,16 @@ fn execute_field_op(
 
     Some(match op {
         QueryOp::Eq(v) => idx.find_eq(v),
-        QueryOp::Ne(v) => idx.find_ne(v),
         QueryOp::Gt(v) => idx.find_range(Bound::Excluded(v), Bound::Unbounded),
         QueryOp::Gte(v) => idx.find_range(Bound::Included(v), Bound::Unbounded),
         QueryOp::Lt(v) => idx.find_range(Bound::Unbounded, Bound::Excluded(v)),
         QueryOp::Lte(v) => idx.find_range(Bound::Unbounded, Bound::Included(v)),
         QueryOp::In(vals) => idx.find_in(vals),
-        QueryOp::Nin(_)
+        // `$ne` can't be served by the field index alone: the index omits
+        // documents that lack the field, but those MUST match `$ne` (MongoDB
+        // semantics). Fall through to a full scan + post-filter.
+        QueryOp::Ne(_)
+        | QueryOp::Nin(_)
         | QueryOp::Exists(_)
         | QueryOp::Regex(_)
         | QueryOp::ElemMatch(_)
@@ -757,14 +762,6 @@ pub fn execute_indexed_lazy(
                     });
                     cont
                 }
-                QueryOp::Ne(v) => {
-                    let mut cont = true;
-                    idx.for_each_ne(v, |id| {
-                        cont = callback(id);
-                        cont
-                    });
-                    cont
-                }
                 QueryOp::Gt(v) => {
                     let mut cont = true;
                     idx.for_each_in_range(Bound::Excluded(v), Bound::Unbounded, |id| {
@@ -805,7 +802,10 @@ pub fn execute_indexed_lazy(
                     });
                     cont
                 }
-                QueryOp::Nin(_)
+                // `$ne` omits missing-field docs in the index — fall through to
+                // a full scan + post-filter (see execute_field_op).
+                QueryOp::Ne(_)
+                | QueryOp::Nin(_)
                 | QueryOp::Exists(_)
                 | QueryOp::Regex(_)
                 | QueryOp::ElemMatch(_)
@@ -933,7 +933,15 @@ fn eval_field_op(op: &QueryOp, field_val: Option<&JsonValue>) -> bool {
         }
         _ => {
             let Some(val) = field_val else {
-                return false;
+                // A missing field is "not equal to" any concrete value, so
+                // `$ne`/`$nin` MATCH a missing field (MongoDB semantics) —
+                // except when the operand is null, since MongoDB treats an
+                // absent field as null for these comparisons.
+                return match op {
+                    QueryOp::Ne(v) => *v != IndexValue::Null,
+                    QueryOp::Nin(vals) => vals.binary_search(&IndexValue::Null).is_err(),
+                    _ => false,
+                };
             };
             let iv = IndexValue::from_json(val);
             match op {
@@ -1251,7 +1259,15 @@ fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
                 QueryOp::Exists(expected) => Some(field_val.is_some() == *expected),
                 _ => {
                     let Some(iv) = field_val else {
-                        return Some(false);
+                        // Missing field matches `$ne`/`$nin` (MongoDB semantics),
+                        // unless the operand is null (absent ≡ null here).
+                        return Some(match op {
+                            QueryOp::Ne(v) => *v != IndexValue::Null,
+                            QueryOp::Nin(vals) => {
+                                vals.binary_search(&IndexValue::Null).is_err()
+                            }
+                            _ => false,
+                        });
                     };
                     Some(match op {
                         QueryOp::Eq(v) => iv == *v,
@@ -1448,9 +1464,15 @@ mod tests {
 
     #[test]
     fn nin_missing_field() {
+        // MongoDB treats an absent field as null; null is not in the operand
+        // list, so a missing field MATCHES `$nin` (and would match `$ne` too).
         let q = parse_query(&json!({"color": {"$nin": ["red", "blue"]}})).unwrap();
         let doc_no_field = Document::new(1, json!({"name": "test"})).unwrap();
-        assert!(!matches_doc(&q, &doc_no_field)); // missing field → false
+        assert!(matches_doc(&q, &doc_no_field));
+
+        // …but if null is one of the operands, the absent field is excluded.
+        let q_null = parse_query(&json!({"color": {"$nin": ["red", null]}})).unwrap();
+        assert!(!matches_doc(&q_null, &doc_no_field));
     }
 
     #[test]
