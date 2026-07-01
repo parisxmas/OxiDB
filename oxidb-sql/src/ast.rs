@@ -79,11 +79,22 @@ impl TableRef {
     }
 }
 
-/// An INNER JOIN clause (the only join kind supported in Phase 2).
+/// A JOIN clause with its kind and `ON` predicate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Join {
     pub table: TableRef,
+    pub kind: JoinKind,
     pub on: Expr,
+}
+
+/// The kind of join. `Right` is executed by swapping sides and running a
+/// `Left`; `Full` is a `Left` plus the unmatched right rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
 }
 
 /// One item in a SELECT projection.

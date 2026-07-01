@@ -10,7 +10,8 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::ast::{
-    AggFunc, BinOp, Expr, Join, QueryResult, SelectItem, SelectStmt, Statement, TableRef, UnOp,
+    AggFunc, BinOp, Expr, Join, JoinKind, QueryResult, SelectItem, SelectStmt, Statement, TableRef,
+    UnOp,
 };
 use crate::error::{Result, SqlError};
 use crate::store::Store;
@@ -316,19 +317,47 @@ fn join_into<S: Store>(
         .map(|(_, c)| c)
         .collect();
 
+    let left_width = schema.len();
+    let right_width = right_schema.len();
     let mut combined_schema = schema.clone();
     combined_schema.extend(right_schema);
 
+    let want_left = matches!(join.kind, JoinKind::Left | JoinKind::Full);
+    let want_right = matches!(join.kind, JoinKind::Right | JoinKind::Full);
+
     let mut out = Vec::new();
+    // Track which right rows matched at least once (for RIGHT/FULL padding).
+    let mut right_matched = vec![false; right_rows.len()];
+
     for left in rows.iter() {
-        for right in &right_rows {
+        let mut left_matched = false;
+        for (ri, right) in right_rows.iter().enumerate() {
             let mut combined = left.clone();
             combined.extend(right.clone());
             if truthy(&eval_scalar(&join.on, &combined_schema, &combined, params)?) {
+                left_matched = true;
+                right_matched[ri] = true;
+                out.push(combined);
+            }
+        }
+        // LEFT/FULL: emit an unmatched left row padded with NULLs on the right.
+        if want_left && !left_matched {
+            let mut combined = left.clone();
+            combined.extend(std::iter::repeat_n(Value::Null, right_width));
+            out.push(combined);
+        }
+    }
+    // RIGHT/FULL: emit unmatched right rows padded with NULLs on the left.
+    if want_right {
+        for (ri, right) in right_rows.iter().enumerate() {
+            if !right_matched[ri] {
+                let mut combined = vec![Value::Null; left_width];
+                combined.extend(right.clone());
                 out.push(combined);
             }
         }
     }
+
     *schema = combined_schema;
     *rows = out;
     Ok(())

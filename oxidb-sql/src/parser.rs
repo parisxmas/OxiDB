@@ -7,7 +7,9 @@ use sqlparser::ast as sp;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
-use crate::ast::{AggFunc, BinOp, Expr, Join, SelectItem, SelectStmt, Statement, TableRef, UnOp};
+use crate::ast::{
+    AggFunc, BinOp, Expr, Join, JoinKind, SelectItem, SelectStmt, Statement, TableRef, UnOp,
+};
 use crate::catalog::{Column, Table};
 use crate::error::{Result, SqlError};
 use crate::types::{SqlType, Value};
@@ -225,22 +227,30 @@ fn translate_select(query: sp::Query, p: &mut usize) -> Result<Statement> {
 
     let from = table_ref_from_factor(&select.from[0].relation)?;
 
-    // JOINs (inner only).
+    // JOINs: INNER / LEFT / RIGHT / FULL, all with an ON predicate.
     let mut joins = Vec::new();
     for j in &select.from[0].joins {
         let table = table_ref_from_factor(&j.relation)?;
-        let on = match &j.join_operator {
-            sp::JoinOperator::Inner(sp::JoinConstraint::On(expr))
-            | sp::JoinOperator::Join(sp::JoinConstraint::On(expr)) => {
-                translate_expr(expr.clone(), p)?
-            }
+        let (kind, constraint) = match &j.join_operator {
+            sp::JoinOperator::Inner(c) | sp::JoinOperator::Join(c) => (JoinKind::Inner, c),
+            sp::JoinOperator::Left(c) | sp::JoinOperator::LeftOuter(c) => (JoinKind::Left, c),
+            sp::JoinOperator::Right(c) | sp::JoinOperator::RightOuter(c) => (JoinKind::Right, c),
+            sp::JoinOperator::FullOuter(c) => (JoinKind::Full, c),
             other => {
                 return Err(SqlError::Unsupported(format!(
-                    "join type {other:?} (only INNER JOIN ... ON in Phase 2)"
+                    "join type {other:?} (INNER/LEFT/RIGHT/FULL ... ON only)"
                 )));
             }
         };
-        joins.push(Join { table, on });
+        let on = match constraint {
+            sp::JoinConstraint::On(expr) => translate_expr(expr.clone(), p)?,
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "join constraint {other:?} (only ON <expr> is supported)"
+                )));
+            }
+        };
+        joins.push(Join { table, kind, on });
     }
 
     let projection = select
