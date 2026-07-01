@@ -22,9 +22,100 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// On native targets the storage map is `scc::HashMap` (lock-free, per-bucket
+// locking). On `wasm32-unknown-unknown` scc is unusable: its first bucket-array
+// resize (load factor 13/16 of the 64-slot minimum, i.e. ~52 entries) hands the
+// retired array to `sdd`'s epoch-based reclamation, whose reclamation path traps
+// (`RuntimeError: unreachable`) under wasm — aborting every insert past ~52 docs
+// per collection. wasm is single-threaded, so a plain `BTreeMap` behind a
+// `Mutex` is correct, simpler, and never enters that path. See `wasm_map`.
+#[cfg(not(target_arch = "wasm32"))]
 use scc::HashMap as SccMap;
+#[cfg(target_arch = "wasm32")]
+use wasm_map::WasmMap as SccMap;
 
 use crate::error::{Error, Result};
+
+/// Single-threaded stand-in for `scc::HashMap` on `wasm32-unknown-unknown`.
+///
+/// Implements only the `*_sync` surface `BTreeStorage` uses, mirroring scc's
+/// signatures so the call sites are identical across targets. Backed by a
+/// `Mutex<BTreeMap>` — `Send + Sync` with no `unsafe`, and iteration is in key
+/// order (the cursors sort anyway, so behaviour is unchanged).
+#[cfg(target_arch = "wasm32")]
+mod wasm_map {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    pub struct WasmMap<K, V> {
+        inner: Mutex<BTreeMap<K, V>>,
+    }
+
+    impl<K: Ord + Clone, V: Clone> WasmMap<K, V> {
+        pub fn new() -> Self {
+            Self {
+                inner: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<K, V>> {
+            // Single-threaded: the lock is uncontended and can't be poisoned in
+            // practice; recover the guard if it ever is rather than panicking.
+            self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// Insert or replace, returning the previous value (scc `upsert_sync`).
+        pub fn upsert_sync(&self, key: K, val: V) -> Option<V> {
+            self.lock().insert(key, val)
+        }
+
+        /// Insert only if absent; on conflict return the rejected `(key, val)`
+        /// (scc `insert_sync`).
+        pub fn insert_sync(&self, key: K, val: V) -> Result<(), (K, V)> {
+            let mut map = self.lock();
+            if map.contains_key(&key) {
+                return Err((key, val));
+            }
+            map.insert(key, val);
+            Ok(())
+        }
+
+        /// Read a present entry through `reader` (scc `read_sync`).
+        pub fn read_sync<R, F: FnOnce(&K, &V) -> R>(&self, key: &K, reader: F) -> Option<R> {
+            self.lock().get_key_value(key).map(|(k, v)| reader(k, v))
+        }
+
+        /// Remove and return the entry (scc `remove_sync`).
+        pub fn remove_sync(&self, key: &K) -> Option<(K, V)> {
+            self.lock().remove_entry(key)
+        }
+
+        pub fn contains_sync(&self, key: &K) -> bool {
+            self.lock().contains_key(key)
+        }
+
+        /// Visit every entry until `f` returns `false`; returns `false` if it
+        /// stopped early, `true` if it ran to completion (scc `iter_sync`).
+        pub fn iter_sync<F: FnMut(&K, &V) -> bool>(&self, mut f: F) -> bool {
+            let map = self.lock();
+            for (k, v) in map.iter() {
+                if !f(k, v) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        pub fn clear_sync(&self) {
+            self.lock().clear();
+        }
+
+        pub fn len(&self) -> usize {
+            self.lock().len()
+        }
+    }
+}
 
 /// Disk-first value store (opt-in via `OXIDB_DISK_FIRST`). Instead of holding
 /// every document's bytes resident in RAM, the in-memory map keeps only a
