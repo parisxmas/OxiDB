@@ -11,6 +11,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 crc32fast = "1"
 thiserror = "2"
+sqlparser = "0.59"
 
 [dev-dependencies]
 tempfile = "3"

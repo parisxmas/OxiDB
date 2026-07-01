@@ -11,8 +11,11 @@
 //! `insert`, `delete`, `scan`, `checkpoint`) sufficient to prove durability and
 //! independent crash-replay.
 
+mod ast;
 mod catalog;
 mod error;
+mod executor;
+mod parser;
 mod storage;
 mod types;
 mod wal;
@@ -21,6 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+pub use ast::QueryResult;
 pub use catalog::{Column, Table};
 pub use error::{Result, SqlError};
 pub use types::{SqlType, Value};
@@ -193,6 +197,47 @@ impl SqlEngine {
         Ok(row_id)
     }
 
+    /// Overwrite the cells of an existing row, keeping its `row_id`. The new
+    /// cells are validated against the schema before being logged. Errors if the
+    /// table or the row does not exist.
+    ///
+    /// This is logged as an idempotent `Insert` record for `row_id` — replaying
+    /// it re-establishes exactly this row image, which is why an update never
+    /// needs a distinct WAL op.
+    pub fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let def = inner
+            .tables
+            .get(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?
+            .def
+            .clone();
+        def.validate_row(&cells)?;
+        if !inner
+            .tables
+            .get(table)
+            .expect("table state present")
+            .rows
+            .contains_key(&row_id)
+        {
+            return Err(SqlError::SchemaMismatch(format!(
+                "row {row_id} does not exist in {table:?}"
+            )));
+        }
+        inner.wal.append(&WalRecord::Insert {
+            table: table.to_string(),
+            row_id,
+            cells: cells.clone(),
+        })?;
+        inner
+            .tables
+            .get_mut(table)
+            .expect("table state present")
+            .rows
+            .insert(row_id, cells);
+        Ok(())
+    }
+
     /// Delete a row by `row_id`. Returns whether a row was removed.
     pub fn delete(&self, table: &str, row_id: u64) -> Result<bool> {
         let mut inner = self.inner.lock().unwrap();
@@ -288,6 +333,17 @@ impl SqlEngine {
         catalog.save(dir)?;
         wal.truncate()?;
         Ok(())
+    }
+
+    /// Parse and execute a SQL string, returning one [`QueryResult`] per
+    /// statement (a single string may contain several `;`-separated statements).
+    pub fn execute(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        let statements = parser::parse(sql)?;
+        let mut results = Vec::with_capacity(statements.len());
+        for stmt in statements {
+            results.push(executor::execute(self, stmt)?);
+        }
+        Ok(results)
     }
 
     /// Path to the SQL root directory.

@@ -2301,6 +2301,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxidb-sql"
+version = "0.31.1"
+dependencies = [
+ "crc32fast",
+ "serde",
+ "serde_json",
+ "sqlparser",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "oxidb-tail"
 version = "0.28.0"
 dependencies = [

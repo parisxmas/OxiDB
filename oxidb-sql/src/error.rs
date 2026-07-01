@@ -26,6 +26,22 @@ pub enum SqlError {
     /// A row's cell count or a cell's type does not match the table schema.
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),
+
+    /// The SQL text could not be parsed.
+    #[error("sql parse error: {0}")]
+    Parse(String),
+
+    /// The SQL is valid but uses a feature this engine does not (yet) support.
+    #[error("unsupported sql: {0}")]
+    Unsupported(String),
+
+    /// A referenced column does not exist in the table.
+    #[error("no such column: {0}")]
+    NoSuchColumn(String),
+
+    /// An expression could not be evaluated (type error, etc.).
+    #[error("evaluation error: {0}")]
+    Eval(String),
 }
 
 /// Convenience result alias for the SQL engine.
