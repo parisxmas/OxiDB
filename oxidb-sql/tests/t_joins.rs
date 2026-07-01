@@ -146,3 +146,68 @@ fn cross_join_style_unsupported_without_on() {
     // CROSS JOIN (no ON) is not supported -> clean error, not a panic.
     assert!(db.execute("SELECT c.id FROM c CROSS JOIN o").is_err());
 }
+
+/// Composite equi-join key (`a.k1 = b.k1 AND a.k2 = b.k2`) — exercises the
+/// multi-column hash-join key.
+#[test]
+fn composite_key_hash_join() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE a (k1 INT, k2 INT, v INT)")
+        .unwrap();
+    db.execute("CREATE TABLE b (k1 INT, k2 INT, w INT)")
+        .unwrap();
+    db.execute("INSERT INTO a VALUES (1,1,10),(1,2,20),(2,1,30)")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (1,1,100),(2,1,300),(1,2,200),(9,9,999)")
+        .unwrap();
+    let rws = rows(
+        &db,
+        "SELECT a.v, b.w FROM a JOIN b ON a.k1 = b.k1 AND a.k2 = b.k2 ORDER BY a.v",
+    );
+    assert_eq!(
+        rws,
+        vec![
+            vec![i(10), i(100)],
+            vec![i(20), i(200)],
+            vec![i(30), i(300)]
+        ]
+    );
+}
+
+/// Equi-join with a residual (non-equi) conjunct — the hash join must re-check
+/// the full ON so the extra `b.w > 150` filters candidates correctly.
+#[test]
+fn equi_join_with_residual_predicate() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE a (k INT, v INT)").unwrap();
+    db.execute("CREATE TABLE b (k INT, w INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1,10),(2,20)").unwrap();
+    db.execute("INSERT INTO b VALUES (1,100),(1,200),(2,50)")
+        .unwrap();
+    let rws = rows(
+        &db,
+        "SELECT a.v, b.w FROM a JOIN b ON a.k = b.k AND b.w > 150 ORDER BY a.v",
+    );
+    assert_eq!(rws, r1(vec![i(10), i(200)]));
+}
+
+/// Left join whose key is NULL on some left rows: NULL never equi-matches, so
+/// those rows are padded (LEFT semantics), not dropped.
+#[test]
+fn hash_join_null_keys_do_not_match() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE a (id INT, k INT)").unwrap();
+    db.execute("CREATE TABLE b (k INT, w INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1,10),(2,NULL),(3,10)")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (10,99)").unwrap();
+    let rws = rows(
+        &db,
+        "SELECT a.id, b.w FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id",
+    );
+    // id 1 and 3 match (k=10); id 2 has NULL key -> padded.
+    assert_eq!(
+        rws,
+        vec![vec![i(1), i(99)], vec![i(2), NULL], vec![i(3), i(99)]]
+    );
+}

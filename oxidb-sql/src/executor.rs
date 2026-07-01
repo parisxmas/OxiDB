@@ -314,6 +314,21 @@ fn build_source<S: Store>(
     Ok((schema, rows))
 }
 
+/// Combine a left and right row into one.
+fn combine(left: &[Value], right: &[Value]) -> Vec<Value> {
+    let mut c = Vec::with_capacity(left.len() + right.len());
+    c.extend_from_slice(left);
+    c.extend_from_slice(right);
+    c
+}
+
+/// Join the next table into the accumulated (schema, rows).
+///
+/// Simple planner: if the `ON` predicate contains at least one equi-join key
+/// (`left_col = right_col`), use a **hash join** (O(N+M)); otherwise fall back
+/// to a nested-loop join (O(N·M)). Both re-evaluate the full `ON` on candidate
+/// pairs, so results are identical either way — the hash table only avoids the
+/// full cross product.
 fn join_into<S: Store>(
     store: &S,
     join: &Join,
@@ -334,40 +349,74 @@ fn join_into<S: Store>(
     let left_width = schema.len();
     let right_width = right_schema.len();
     let mut combined_schema = schema.clone();
-    combined_schema.extend(right_schema);
+    combined_schema.extend(right_schema.clone());
 
     let want_left = matches!(join.kind, JoinKind::Left | JoinKind::Full);
     let want_right = matches!(join.kind, JoinKind::Right | JoinKind::Full);
 
+    let keys = equi_keys(&join.on, left_width, &combined_schema);
+
     let mut out = Vec::new();
-    // Track which right rows matched at least once (for RIGHT/FULL padding).
     let mut right_matched = vec![false; right_rows.len()];
 
-    for left in rows.iter() {
-        let mut left_matched = false;
-        for (ri, right) in right_rows.iter().enumerate() {
-            let mut combined = left.clone();
-            combined.extend(right.clone());
-            if truthy(&eval_scalar(&join.on, &combined_schema, &combined, params)?) {
-                left_matched = true;
-                right_matched[ri] = true;
-                out.push(combined);
+    if keys.is_empty() {
+        // ── Nested-loop join ──
+        for left in rows.iter() {
+            let mut left_matched = false;
+            for (ri, right) in right_rows.iter().enumerate() {
+                let cand = combine(left, right);
+                if truthy(&eval_scalar(&join.on, &combined_schema, &cand, params)?) {
+                    left_matched = true;
+                    right_matched[ri] = true;
+                    out.push(cand);
+                }
+            }
+            if want_left && !left_matched {
+                out.push(combine(left, &vec![Value::Null; right_width]));
             }
         }
-        // LEFT/FULL: emit an unmatched left row padded with NULLs on the right.
-        if want_left && !left_matched {
-            let mut combined = left.clone();
-            combined.extend(std::iter::repeat_n(Value::Null, right_width));
-            out.push(combined);
+    } else {
+        // ── Hash join ──
+        // Build a hash table on the right rows keyed by the right-side keys.
+        // Rows with a NULL in any key component can never equi-match.
+        let left_key_exprs: Vec<&Expr> = keys.iter().map(|(l, _)| l).collect();
+        let right_key_exprs: Vec<&Expr> = keys.iter().map(|(_, r)| r).collect();
+
+        let mut table: std::collections::HashMap<Vec<HashKey>, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (ri, right) in right_rows.iter().enumerate() {
+            if let Some(key) = hash_key(&right_key_exprs, &right_schema, right, params)? {
+                table.entry(key).or_default().push(ri);
+            }
+        }
+
+        for left in rows.iter() {
+            let mut left_matched = false;
+            if let Some(key) = hash_key(&left_key_exprs, schema, left, params)?
+                && let Some(cands) = table.get(&key)
+            {
+                for &ri in cands {
+                    let cand = combine(left, &right_rows[ri]);
+                    // Re-check the full ON: guards against hash collisions and
+                    // applies any residual (non-equi) conjuncts.
+                    if truthy(&eval_scalar(&join.on, &combined_schema, &cand, params)?) {
+                        left_matched = true;
+                        right_matched[ri] = true;
+                        out.push(cand);
+                    }
+                }
+            }
+            if want_left && !left_matched {
+                out.push(combine(left, &vec![Value::Null; right_width]));
+            }
         }
     }
+
     // RIGHT/FULL: emit unmatched right rows padded with NULLs on the left.
     if want_right {
         for (ri, right) in right_rows.iter().enumerate() {
             if !right_matched[ri] {
-                let mut combined = vec![Value::Null; left_width];
-                combined.extend(right.clone());
-                out.push(combined);
+                out.push(combine(&vec![Value::Null; left_width], right));
             }
         }
     }
@@ -375,6 +424,132 @@ fn join_into<S: Store>(
     *schema = combined_schema;
     *rows = out;
     Ok(())
+}
+
+/// A hashable, equality-consistent projection of a join-key [`Value`].
+/// Numeric kinds collapse to one space (so `Int(5)` and `Double(5.0)` hash
+/// equal, matching the value comparison); NULL keys are handled by the caller.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum HashKey {
+    Num(u64),
+    Bool(bool),
+    Text(String),
+}
+
+fn hash_key_component(v: &Value) -> Option<HashKey> {
+    let norm = |f: f64| (if f == 0.0 { 0.0 } else { f }).to_bits();
+    match v {
+        Value::Null => None,
+        Value::Int(n) => Some(HashKey::Num(norm(*n as f64))),
+        Value::Double(f) => Some(HashKey::Num(norm(*f))),
+        Value::Timestamp(t) => Some(HashKey::Num(norm(*t as f64))),
+        Value::Bool(b) => Some(HashKey::Bool(*b)),
+        Value::Text(s) => Some(HashKey::Text(s.clone())),
+    }
+}
+
+/// Evaluate the key expressions over `row`; returns `None` if any component is
+/// NULL (a NULL key never equi-matches).
+fn hash_key(
+    exprs: &[&Expr],
+    schema: &[ColRef],
+    row: &[Value],
+    params: &[Value],
+) -> Result<Option<Vec<HashKey>>> {
+    let mut key = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        let v = eval_scalar(e, schema, row, params)?;
+        match hash_key_component(&v) {
+            Some(k) => key.push(k),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(key))
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    Left,
+    Right,
+}
+
+/// Extract equi-join key pairs `(left_expr, right_expr)` from an `ON` predicate:
+/// top-level `AND` conjuncts of the form `E1 = E2` where one side references
+/// only left-schema columns and the other only right-schema columns.
+fn equi_keys(on: &Expr, left_len: usize, combined: &[ColRef]) -> Vec<(Expr, Expr)> {
+    let mut out = Vec::new();
+    collect_equi(on, left_len, combined, &mut out);
+    out
+}
+
+fn collect_equi(e: &Expr, left_len: usize, combined: &[ColRef], out: &mut Vec<(Expr, Expr)>) {
+    match e {
+        Expr::Binary {
+            op: BinOp::And,
+            left,
+            right,
+        } => {
+            collect_equi(left, left_len, combined, out);
+            collect_equi(right, left_len, combined, out);
+        }
+        Expr::Binary {
+            op: BinOp::Eq,
+            left,
+            right,
+        } => match (
+            expr_side(left, left_len, combined),
+            expr_side(right, left_len, combined),
+        ) {
+            (Some(Side::Left), Some(Side::Right)) => {
+                out.push(((**left).clone(), (**right).clone()))
+            }
+            (Some(Side::Right), Some(Side::Left)) => {
+                out.push(((**right).clone(), (**left).clone()))
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Which side of the join an expression's columns belong to: `Some(Left)` /
+/// `Some(Right)` if all its columns are on one side, `None` if it references
+/// both sides, no columns, or a column that doesn't resolve.
+fn expr_side(e: &Expr, left_len: usize, combined: &[ColRef]) -> Option<Side> {
+    let mut cols = Vec::new();
+    collect_col_refs(e, &mut cols);
+    let mut side: Option<Side> = None;
+    for (table, name) in cols {
+        let idx = resolve_col(combined, table, name).ok()?;
+        let s = if idx < left_len {
+            Side::Left
+        } else {
+            Side::Right
+        };
+        match side {
+            None => side = Some(s),
+            Some(prev) if prev != s => return None,
+            _ => {}
+        }
+    }
+    side
+}
+
+fn collect_col_refs<'a>(e: &'a Expr, out: &mut Vec<(&'a Option<String>, &'a str)>) {
+    match e {
+        Expr::Column { table, name } => out.push((table, name)),
+        Expr::Binary { left, right, .. } => {
+            collect_col_refs(left, out);
+            collect_col_refs(right, out);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => collect_col_refs(expr, out),
+        Expr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                collect_col_refs(a, out);
+            }
+        }
+        Expr::Literal(_) | Expr::Param(_) => {}
+    }
 }
 
 /// Fetch base rows for a single (join-free) table, using an index when possible.
