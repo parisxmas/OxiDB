@@ -96,6 +96,17 @@ fn where_true_and_false_constant_ish() {
 }
 
 #[test]
+fn order_by_projection_alias() {
+    let (_d, db) = open();
+    seed(&db);
+    // `id2` is an output alias, not an input column.
+    assert_eq!(
+        rows(&db, "SELECT id AS id2 FROM t ORDER BY id2 DESC"),
+        vec![vec![i(3)], vec![i(2)], vec![i(1)]]
+    );
+}
+
+#[test]
 fn table_alias_qualified_columns() {
     let (_d, db) = open();
     seed(&db);

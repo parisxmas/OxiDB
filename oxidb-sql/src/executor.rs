@@ -211,6 +211,7 @@ fn exec_delete<S: Store>(
 // ── SELECT ────────────────────────────────────────────────────────────────
 
 fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Result<QueryResult> {
+    let mut select = select;
     // 1. Build the source: base table, then nested-loop inner joins.
     let (schema, mut rows) = build_source(store, &select, params)?;
 
@@ -227,6 +228,19 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
 
     // 3. Expand the projection into (output name, expr) pairs.
     let proj = expand_projection(&select.projection, &schema)?;
+
+    // Resolve ORDER BY references to projection aliases: a bare column that is
+    // not an input column but matches an output name (`... AS spend ... ORDER BY
+    // spend`) is rewritten to that projection's expression. Real input columns
+    // keep their meaning, so this is backward compatible.
+    for (expr, _) in select.order_by.iter_mut() {
+        if let Expr::Column { table: None, name } = expr
+            && resolve_col(&schema, &None, name).is_err()
+            && let Some((_, pe)) = proj.iter().find(|(n, _)| n == name)
+        {
+            *expr = pe.clone();
+        }
+    }
 
     // Bind all column references up front, so unknown/ambiguous columns are
     // caught even when the (post-filter) row set is empty.
