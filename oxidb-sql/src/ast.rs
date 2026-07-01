@@ -116,6 +116,10 @@ pub enum Expr {
         table: Option<String>,
         name: String,
     },
+    /// A column reference resolved to a positional index into the current row.
+    /// Produced by the executor's bind pass; evaluating it is O(1) (no name
+    /// lookup). Not produced by the parser.
+    Col(usize),
     Literal(Value),
     /// A bind parameter: `?` (assigned left-to-right) or `$N` (`index = N-1`).
     Param(usize),

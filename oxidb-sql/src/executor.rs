@@ -212,22 +212,11 @@ fn exec_delete<S: Store>(
 
 fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Result<QueryResult> {
     let mut select = select;
-    // 1. Build the source: base table, then nested-loop inner joins.
+    // 1. Build the source: base table, then joins (the join ON is bound inside).
     let (schema, mut rows) = build_source(store, &select, params)?;
 
-    // 2. WHERE.
-    if let Some(pred) = &select.filter {
-        let mut kept = Vec::with_capacity(rows.len());
-        for row in rows {
-            if truthy(&eval_scalar(pred, &schema, &row, params)?) {
-                kept.push(row);
-            }
-        }
-        rows = kept;
-    }
-
-    // 3. Expand the projection into (output name, expr) pairs.
-    let proj = expand_projection(&select.projection, &schema)?;
+    // 2. Expand the projection into (output name, expr) pairs (still unbound).
+    let proj_unbound = expand_projection(&select.projection, &schema)?;
 
     // Resolve ORDER BY references to projection aliases: a bare column that is
     // not an input column but matches an output name (`... AS spend ... ORDER BY
@@ -236,35 +225,55 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
     for (expr, _) in select.order_by.iter_mut() {
         if let Expr::Column { table: None, name } = expr
             && resolve_col(&schema, &None, name).is_err()
-            && let Some((_, pe)) = proj.iter().find(|(n, _)| n == name)
+            && let Some((_, pe)) = proj_unbound.iter().find(|(n, _)| n == name)
         {
             *expr = pe.clone();
         }
     }
 
-    // Bind all column references up front, so unknown/ambiguous columns are
-    // caught even when the (post-filter) row set is empty.
-    if let Some(f) = &select.filter {
-        check_columns(f, &schema)?;
-    }
-    for (_, e) in &proj {
-        check_columns(e, &schema)?;
-    }
-    for e in &select.group_by {
-        check_columns(e, &schema)?;
-    }
-    if let Some(h) = &select.having {
-        check_columns(h, &schema)?;
-    }
-    for (e, _) in &select.order_by {
-        check_columns(e, &schema)?;
-    }
-
     let aggregating = !select.group_by.is_empty()
-        || proj.iter().any(|(_, e)| has_aggregate(e))
+        || proj_unbound.iter().any(|(_, e)| has_aggregate(e))
         || select.having.as_ref().is_some_and(has_aggregate);
+    let columns: Vec<String> = proj_unbound.iter().map(|(n, _)| n.clone()).collect();
 
-    let columns: Vec<String> = proj.iter().map(|(n, _)| n.clone()).collect();
+    // 3. Bind every expression's columns to positional indices. This both
+    //    validates columns (unknown/ambiguous -> error, even over empty rows)
+    //    and makes per-row evaluation O(1).
+    let bound_filter = select
+        .filter
+        .as_ref()
+        .map(|f| bind_expr(f, &schema))
+        .transpose()?;
+    let proj: Vec<(String, Expr)> = proj_unbound
+        .into_iter()
+        .map(|(n, e)| Ok::<_, SqlError>((n, bind_expr(&e, &schema)?)))
+        .collect::<Result<_>>()?;
+    select.group_by = select
+        .group_by
+        .iter()
+        .map(|e| bind_expr(e, &schema))
+        .collect::<Result<_>>()?;
+    select.having = select
+        .having
+        .as_ref()
+        .map(|h| bind_expr(h, &schema))
+        .transpose()?;
+    select.order_by = select
+        .order_by
+        .iter()
+        .map(|(e, a)| Ok::<_, SqlError>((bind_expr(e, &schema)?, *a)))
+        .collect::<Result<_>>()?;
+
+    // 4. WHERE.
+    if let Some(pred) = &bound_filter {
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            if truthy(&eval_scalar(pred, &schema, &row, params)?) {
+                kept.push(row);
+            }
+        }
+        rows = kept;
+    }
 
     let out_rows = if aggregating {
         select_aggregated(&schema, rows, &select, &proj, params)?
@@ -354,7 +363,9 @@ fn join_into<S: Store>(
     let want_left = matches!(join.kind, JoinKind::Left | JoinKind::Full);
     let want_right = matches!(join.kind, JoinKind::Right | JoinKind::Full);
 
+    // Detect equi-keys on the raw (named) ON, then bind everything to indices.
     let keys = equi_keys(&join.on, left_width, &combined_schema);
+    let on = bind_expr(&join.on, &combined_schema)?;
 
     let mut out = Vec::new();
     let mut right_matched = vec![false; right_rows.len()];
@@ -365,7 +376,7 @@ fn join_into<S: Store>(
             let mut left_matched = false;
             for (ri, right) in right_rows.iter().enumerate() {
                 let cand = combine(left, right);
-                if truthy(&eval_scalar(&join.on, &combined_schema, &cand, params)?) {
+                if truthy(&eval_scalar(&on, &combined_schema, &cand, params)?) {
                     left_matched = true;
                     right_matched[ri] = true;
                     out.push(cand);
@@ -379,27 +390,33 @@ fn join_into<S: Store>(
         // ── Hash join ──
         // Build a hash table on the right rows keyed by the right-side keys.
         // Rows with a NULL in any key component can never equi-match.
-        let left_key_exprs: Vec<&Expr> = keys.iter().map(|(l, _)| l).collect();
-        let right_key_exprs: Vec<&Expr> = keys.iter().map(|(_, r)| r).collect();
+        let left_keys: Vec<Expr> = keys
+            .iter()
+            .map(|(l, _)| bind_expr(l, schema))
+            .collect::<Result<_>>()?;
+        let right_keys: Vec<Expr> = keys
+            .iter()
+            .map(|(_, r)| bind_expr(r, &right_schema))
+            .collect::<Result<_>>()?;
 
         let mut table: std::collections::HashMap<Vec<HashKey>, Vec<usize>> =
             std::collections::HashMap::new();
         for (ri, right) in right_rows.iter().enumerate() {
-            if let Some(key) = hash_key(&right_key_exprs, &right_schema, right, params)? {
+            if let Some(key) = hash_key(&right_keys, &right_schema, right, params)? {
                 table.entry(key).or_default().push(ri);
             }
         }
 
         for left in rows.iter() {
             let mut left_matched = false;
-            if let Some(key) = hash_key(&left_key_exprs, schema, left, params)?
+            if let Some(key) = hash_key(&left_keys, schema, left, params)?
                 && let Some(cands) = table.get(&key)
             {
                 for &ri in cands {
                     let cand = combine(left, &right_rows[ri]);
                     // Re-check the full ON: guards against hash collisions and
                     // applies any residual (non-equi) conjuncts.
-                    if truthy(&eval_scalar(&join.on, &combined_schema, &cand, params)?) {
+                    if truthy(&eval_scalar(&on, &combined_schema, &cand, params)?) {
                         left_matched = true;
                         right_matched[ri] = true;
                         out.push(cand);
@@ -451,7 +468,7 @@ fn hash_key_component(v: &Value) -> Option<HashKey> {
 /// Evaluate the key expressions over `row`; returns `None` if any component is
 /// NULL (a NULL key never equi-matches).
 fn hash_key(
-    exprs: &[&Expr],
+    exprs: &[Expr],
     schema: &[ColRef],
     row: &[Value],
     params: &[Value],
@@ -548,7 +565,8 @@ fn collect_col_refs<'a>(e: &'a Expr, out: &mut Vec<(&'a Option<String>, &'a str)
                 collect_col_refs(a, out);
             }
         }
-        Expr::Literal(_) | Expr::Param(_) => {}
+        // `Col` only appears after binding; equi-key detection runs before that.
+        Expr::Col(_) | Expr::Literal(_) | Expr::Param(_) => {}
     }
 }
 
@@ -662,7 +680,7 @@ fn select_aggregated(
     params: &[Value],
 ) -> Result<Vec<Vec<Value>>> {
     // Group by the group-by key (empty group-by => single group over all rows).
-    let groups = group_rows(schema, &rows, &select.group_by, params)?;
+    let groups = group_rows(schema, rows, &select.group_by, params)?;
 
     let mut prepared: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
     for (_key, group) in groups {
@@ -694,26 +712,27 @@ fn select_aggregated(
 #[allow(clippy::type_complexity)]
 fn group_rows(
     schema: &[ColRef],
-    rows: &[Vec<Value>],
+    rows: Vec<Vec<Value>>,
     group_by: &[Expr],
     params: &[Value],
 ) -> Result<Vec<(Vec<Value>, Vec<Vec<Value>>)>> {
     if group_by.is_empty() {
         // One group over everything (present even when there are no rows).
-        return Ok(vec![(Vec::new(), rows.to_vec())]);
+        return Ok(vec![(Vec::new(), rows)]);
     }
-    // Preserve first-seen group order via an index map.
+    // Preserve first-seen group order via an index map. Rows are *moved* into
+    // their group bucket (each row belongs to exactly one group) — no clone.
     let mut order: Vec<Vec<IndexKey>> = Vec::new();
     let mut map: BTreeMap<Vec<IndexKey>, Vec<Vec<Value>>> = BTreeMap::new();
     for row in rows {
         let key: Vec<IndexKey> = group_by
             .iter()
-            .map(|e| Ok(IndexKey(eval_scalar(e, schema, row, params)?)))
+            .map(|e| Ok(IndexKey(eval_scalar(e, schema, &row, params)?)))
             .collect::<Result<_>>()?;
         if !map.contains_key(&key) {
             order.push(key.clone());
         }
-        map.entry(key).or_default().push(row.clone());
+        map.entry(key).or_default().push(row);
     }
     Ok(order
         .into_iter()
@@ -856,28 +875,6 @@ fn qualified_schema(table_key: &str, def: &crate::catalog::Table) -> Vec<ColRef>
         .collect()
 }
 
-/// Verify that every column reference in `expr` resolves against `schema`.
-fn check_columns(expr: &Expr, schema: &[ColRef]) -> Result<()> {
-    match expr {
-        Expr::Column { table, name } => {
-            resolve_col(schema, table, name)?;
-            Ok(())
-        }
-        Expr::Binary { left, right, .. } => {
-            check_columns(left, schema)?;
-            check_columns(right, schema)
-        }
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => check_columns(expr, schema),
-        Expr::Aggregate { arg, .. } => {
-            if let Some(a) = arg {
-                check_columns(a, schema)?;
-            }
-            Ok(())
-        }
-        Expr::Literal(_) | Expr::Param(_) => Ok(()),
-    }
-}
-
 fn resolve_col(schema: &[ColRef], table: &Option<String>, name: &str) -> Result<usize> {
     let mut found = None;
     for (i, c) in schema.iter().enumerate() {
@@ -901,6 +898,10 @@ fn truthy(v: &Value) -> bool {
 /// Evaluate a scalar (non-aggregate) expression over a single row.
 fn eval_scalar(expr: &Expr, schema: &[ColRef], row: &[Value], params: &[Value]) -> Result<Value> {
     match expr {
+        Expr::Col(i) => row
+            .get(*i)
+            .cloned()
+            .ok_or_else(|| SqlError::Eval(format!("bound column {i} out of range"))),
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Param(i) => params
             .get(*i)
@@ -931,6 +932,38 @@ fn eval_scalar(expr: &Expr, schema: &[ColRef], row: &[Value], params: &[Value]) 
     }
 }
 
+/// Resolve every `Column` reference in `expr` to a positional [`Expr::Col`]
+/// against `schema`, so later per-row evaluation is O(1). Also validates that
+/// all columns exist / are unambiguous (replacing the old check_columns pass).
+fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
+    Ok(match expr {
+        Expr::Column { table, name } => Expr::Col(resolve_col(schema, table, name)?),
+        Expr::Col(i) => Expr::Col(*i),
+        Expr::Literal(v) => Expr::Literal(v.clone()),
+        Expr::Param(i) => Expr::Param(*i),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(bind_expr(left, schema)?),
+            right: Box::new(bind_expr(right, schema)?),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(bind_expr(expr, schema)?),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(bind_expr(expr, schema)?),
+            negated: *negated,
+        },
+        Expr::Aggregate { func, arg } => Expr::Aggregate {
+            func: *func,
+            arg: match arg {
+                Some(a) => Some(Box::new(bind_expr(a, schema)?)),
+                None => None,
+            },
+        },
+    })
+}
+
 /// Evaluate an expression that may contain aggregates, over a group of rows.
 /// Non-aggregate leaves are evaluated on the group's first row (as SQL requires
 /// them to be group keys).
@@ -949,6 +982,16 @@ fn eval_agg(
             .get(*i)
             .cloned()
             .ok_or_else(|| SqlError::Eval(format!("missing bind parameter ${}", i + 1))),
+        Expr::Col(i) => {
+            // A grouped column: same across the group; read from the first row.
+            match group.first() {
+                Some(row) => row
+                    .get(*i)
+                    .cloned()
+                    .ok_or_else(|| SqlError::Eval(format!("bound column {i} out of range"))),
+                None => Ok(Value::Null),
+            }
+        }
         Expr::Column { table, name } => {
             // A grouped column: same across the group; read from the first row.
             let idx = resolve_col(schema, table, name)?;
