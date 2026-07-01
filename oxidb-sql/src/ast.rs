@@ -18,6 +18,16 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    CreateIndex {
+        name: String,
+        table: String,
+        column: String,
+        if_not_exists: bool,
+    },
+    DropIndex {
+        name: String,
+        if_exists: bool,
+    },
     Insert {
         table: String,
         /// Column names if an explicit list was given; else insert positionally.
@@ -35,31 +45,69 @@ pub enum Statement {
         table: String,
         filter: Option<Expr>,
     },
+    /// Transaction control (scoped to a single `execute()` call in Phase 2).
+    Begin,
+    Commit,
+    Rollback,
 }
 
-/// A single-table SELECT (the Phase 1 subset).
+/// A SELECT, possibly with inner joins and aggregation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
-    pub table: String,
-    pub projection: Projection,
+    pub from: TableRef,
+    pub joins: Vec<Join>,
+    pub projection: Vec<SelectItem>,
     pub filter: Option<Expr>,
-    /// `(column, ascending)` sort keys, in priority order.
-    pub order_by: Vec<(String, bool)>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
+    /// `(expr, ascending)` sort keys, in priority order.
+    pub order_by: Vec<(Expr, bool)>,
     pub limit: Option<usize>,
 }
 
-/// SELECT projection: either all columns or an explicit list.
+/// A table reference in FROM/JOIN, with optional alias.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Projection {
-    All,
-    Columns(Vec<String>),
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
 }
 
-/// A scalar expression appearing in WHERE / VALUES / SET / ORDER BY.
+impl TableRef {
+    /// The name columns are qualified by: the alias if present, else the table.
+    pub fn key(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// An INNER JOIN clause (the only join kind supported in Phase 2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub table: TableRef,
+    pub on: Expr,
+}
+
+/// One item in a SELECT projection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectItem {
+    /// `*`
+    Wildcard,
+    /// `t.*`
+    QualifiedWildcard(String),
+    /// An expression with an optional output alias.
+    Expr { expr: Expr, alias: Option<String> },
+}
+
+/// A scalar (or aggregate) expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
-    Column(String),
+    /// A column reference, optionally table-qualified (`t.col`).
+    Column {
+        table: Option<String>,
+        name: String,
+    },
     Literal(Value),
+    /// A bind parameter: `?` (assigned left-to-right) or `$N` (`index = N-1`).
+    Param(usize),
     Binary {
         op: BinOp,
         left: Box<Expr>,
@@ -74,6 +122,20 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    /// An aggregate function call. `arg` is `None` for `COUNT(*)`.
+    Aggregate {
+        func: AggFunc,
+        arg: Option<Box<Expr>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +170,8 @@ pub enum QueryResult {
     },
     /// An INSERT/UPDATE/DELETE, with the number of rows affected.
     Mutation { affected: usize },
-    /// A DDL statement (CREATE/DROP) executed.
+    /// A DDL statement (CREATE/DROP table or index) executed.
     Ddl,
+    /// A transaction control statement (`BEGIN`/`COMMIT`/`ROLLBACK`).
+    Transaction,
 }

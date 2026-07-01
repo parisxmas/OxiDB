@@ -4,12 +4,11 @@
 //! (see ADR-0010). It owns its own files, catalog, storage format, WAL, and
 //! recovery, and shares no state with the document engine.
 //!
-//! **Phase 0 scope (this crate revision):** the durable foundation only —
-//! catalog, typed rows, row-oriented `.rdat` snapshots, an independent WAL, and
-//! crash recovery. The SQL parser, planner, and executor arrive in later phases;
-//! for now the engine exposes a small programmatic API (`create_table`,
-//! `insert`, `delete`, `scan`, `checkpoint`) sufficient to prove durability and
-//! independent crash-replay.
+//! The engine exposes both a programmatic row API (`create_table`, `insert`,
+//! `scan`, …) and a SQL surface via [`SqlEngine::execute`] /
+//! [`SqlEngine::execute_params`]: DDL, DML, single-table and inner-join SELECT
+//! with aggregation, secondary indexes, parameterized queries, and per-engine
+//! transactions (`BEGIN`/`COMMIT`/`ROLLBACK`).
 
 mod ast;
 mod catalog;
@@ -17,10 +16,12 @@ mod error;
 mod executor;
 mod parser;
 mod storage;
+mod store;
+mod transaction;
 mod types;
 mod wal;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -29,15 +30,26 @@ pub use catalog::{Column, Table};
 pub use error::{Result, SqlError};
 pub use types::{SqlType, Value};
 
-use catalog::Catalog;
+use catalog::{Catalog, IndexDef};
+use store::Store;
+use transaction::Transaction;
+use types::IndexKey;
 use wal::{Wal, WalRecord};
 
-/// Runtime state for one table: its definition plus its live rows keyed by a
-/// dense, engine-assigned `row_id`.
+/// An in-memory single-column secondary index: value -> set of row ids.
+struct SecondaryIndex {
+    col_pos: usize,
+    map: BTreeMap<IndexKey, BTreeSet<u64>>,
+}
+
+/// Runtime state for one table: its definition, its live rows keyed by a dense
+/// engine-assigned `row_id`, and any secondary indexes.
 struct TableState {
     def: Table,
     rows: BTreeMap<u64, Vec<Value>>,
     next_row_id: u64,
+    /// Secondary indexes keyed by index name.
+    indexes: BTreeMap<String, SecondaryIndex>,
 }
 
 impl TableState {
@@ -46,12 +58,53 @@ impl TableState {
             def,
             rows: BTreeMap::new(),
             next_row_id: 1,
+            indexes: BTreeMap::new(),
         }
     }
 
     fn observe_row_id(&mut self, row_id: u64) {
         if row_id >= self.next_row_id {
             self.next_row_id = row_id + 1;
+        }
+    }
+
+    /// (Re)build a secondary index over `column` from the current rows.
+    fn build_index(&mut self, index_name: &str, column: &str) -> Result<()> {
+        let col_pos = self
+            .def
+            .columns
+            .iter()
+            .position(|c| c.name == column)
+            .ok_or_else(|| SqlError::NoSuchColumn(column.to_string()))?;
+        let mut map: BTreeMap<IndexKey, BTreeSet<u64>> = BTreeMap::new();
+        for (rid, cells) in &self.rows {
+            map.entry(IndexKey(cells[col_pos].clone()))
+                .or_default()
+                .insert(*rid);
+        }
+        self.indexes
+            .insert(index_name.to_string(), SecondaryIndex { col_pos, map });
+        Ok(())
+    }
+
+    fn index_insert(&mut self, row_id: u64, cells: &[Value]) {
+        for idx in self.indexes.values_mut() {
+            idx.map
+                .entry(IndexKey(cells[idx.col_pos].clone()))
+                .or_default()
+                .insert(row_id);
+        }
+    }
+
+    fn index_remove(&mut self, row_id: u64, cells: &[Value]) {
+        for idx in self.indexes.values_mut() {
+            let key = IndexKey(cells[idx.col_pos].clone());
+            if let Some(set) = idx.map.get_mut(&key) {
+                set.remove(&row_id);
+                if set.is_empty() {
+                    idx.map.remove(&key);
+                }
+            }
         }
     }
 }
@@ -70,8 +123,8 @@ pub struct SqlEngine {
 
 impl SqlEngine {
     /// Open (creating if needed) a SQL engine rooted at `dir` (e.g.
-    /// `oxidb_data/sql`). Loads the catalog and `.rdat` snapshots, then replays
-    /// the WAL tail to recover any mutations made since the last checkpoint.
+    /// `oxidb_data/sql`). Loads the catalog and `.rdat` snapshots, replays the
+    /// WAL tail, then (re)builds secondary indexes.
     pub fn open(dir: impl AsRef<Path>) -> Result<SqlEngine> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -92,8 +145,20 @@ impl SqlEngine {
 
         // 3. Replay the WAL tail over the snapshots (idempotent).
         let (wal, records) = Wal::open(&dir)?;
-        for rec in records {
-            Self::apply(&mut catalog, &mut tables, rec);
+        for rec in &records {
+            Self::apply_live(&mut catalog, &mut tables, rec);
+        }
+
+        // 4. Build any indexes that existed before the last checkpoint (they are
+        //    in the loaded catalog but not in the truncated WAL, so replay didn't
+        //    reconstruct them).
+        let defs: Vec<IndexDef> = catalog.indexes.values().cloned().collect();
+        for def in defs {
+            if let Some(state) = tables.get_mut(&def.table)
+                && !state.indexes.contains_key(&def.name)
+            {
+                let _ = state.build_index(&def.name, &def.column);
+            }
         }
 
         Ok(SqlEngine {
@@ -106,33 +171,64 @@ impl SqlEngine {
         })
     }
 
-    /// Apply a WAL record to the in-memory catalog + tables. Idempotent by
-    /// (table, row_id) so replay over a snapshot always converges.
-    fn apply(catalog: &mut Catalog, tables: &mut BTreeMap<String, TableState>, rec: WalRecord) {
+    /// Apply a WAL record to the in-memory catalog + tables, maintaining
+    /// secondary indexes and `next_row_id`. Idempotent by (table, row_id) so
+    /// replay over a snapshot always converges. `Batch` is applied whole.
+    fn apply_live(
+        catalog: &mut Catalog,
+        tables: &mut BTreeMap<String, TableState>,
+        rec: &WalRecord,
+    ) {
         match rec {
             WalRecord::CreateTable(def) => {
                 catalog.tables.insert(def.name.clone(), def.clone());
                 tables
                     .entry(def.name.clone())
-                    .or_insert_with(|| TableState::empty(def));
+                    .or_insert_with(|| TableState::empty(def.clone()));
             }
             WalRecord::DropTable(name) => {
-                catalog.tables.remove(&name);
-                tables.remove(&name);
+                catalog.tables.remove(name);
+                tables.remove(name);
+                // Drop any indexes that belonged to the table.
+                catalog.indexes.retain(|_, d| &d.table != name);
+            }
+            WalRecord::CreateIndex(def) => {
+                catalog.indexes.insert(def.name.clone(), def.clone());
+                if let Some(state) = tables.get_mut(&def.table) {
+                    let _ = state.build_index(&def.name, &def.column);
+                }
+            }
+            WalRecord::DropIndex(name) => {
+                if let Some(def) = catalog.indexes.remove(name)
+                    && let Some(state) = tables.get_mut(&def.table)
+                {
+                    state.indexes.remove(name);
+                }
             }
             WalRecord::Insert {
                 table,
                 row_id,
                 cells,
             } => {
-                if let Some(state) = tables.get_mut(&table) {
-                    state.observe_row_id(row_id);
-                    state.rows.insert(row_id, cells);
+                if let Some(state) = tables.get_mut(table) {
+                    if let Some(old) = state.rows.get(row_id).cloned() {
+                        state.index_remove(*row_id, &old);
+                    }
+                    state.observe_row_id(*row_id);
+                    state.rows.insert(*row_id, cells.clone());
+                    state.index_insert(*row_id, cells);
                 }
             }
             WalRecord::Delete { table, row_id } => {
-                if let Some(state) = tables.get_mut(&table) {
-                    state.rows.remove(&row_id);
+                if let Some(state) = tables.get_mut(table)
+                    && let Some(old) = state.rows.remove(row_id)
+                {
+                    state.index_remove(*row_id, &old);
+                }
+            }
+            WalRecord::Batch(ops) => {
+                for op in ops {
+                    Self::apply_live(catalog, tables, op);
                 }
             }
         }
@@ -144,11 +240,10 @@ impl SqlEngine {
         if inner.catalog.contains(&def.name) {
             return Err(SqlError::TableExists(def.name));
         }
-        inner.wal.append(&WalRecord::CreateTable(def.clone()))?;
-        inner.catalog.tables.insert(def.name.clone(), def.clone());
-        inner
-            .tables
-            .insert(def.name.clone(), TableState::empty(def));
+        let rec = WalRecord::CreateTable(def);
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
         Ok(())
     }
 
@@ -158,14 +253,55 @@ impl SqlEngine {
         if !inner.catalog.contains(name) {
             return Err(SqlError::NoSuchTable(name.to_string()));
         }
-        inner.wal.append(&WalRecord::DropTable(name.to_string()))?;
-        inner.catalog.tables.remove(name);
-        inner.tables.remove(name);
+        let rec = WalRecord::DropTable(name.to_string());
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
         Ok(())
     }
 
-    /// Insert a row, returning its assigned `row_id`. The row is validated
-    /// against the table schema (arity, types, nullability) before it is logged.
+    /// Create a single-column secondary index. Errors if the index name is
+    /// taken or the table/column does not exist.
+    pub fn create_index(&self, name: &str, table: &str, column: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.catalog.indexes.contains_key(name) {
+            return Err(SqlError::IndexExists(name.to_string()));
+        }
+        let def = inner
+            .tables
+            .get(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?
+            .def
+            .clone();
+        if !def.columns.iter().any(|c| c.name == column) {
+            return Err(SqlError::NoSuchColumn(column.to_string()));
+        }
+        let rec = WalRecord::CreateIndex(IndexDef {
+            name: name.to_string(),
+            table: table.to_string(),
+            column: column.to_string(),
+        });
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Ok(())
+    }
+
+    /// Drop a secondary index by name. Errors if it does not exist.
+    pub fn drop_index(&self, name: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.catalog.indexes.contains_key(name) {
+            return Err(SqlError::NoSuchIndex(name.to_string()));
+        }
+        let rec = WalRecord::DropIndex(name.to_string());
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Ok(())
+    }
+
+    /// Insert a row, returning its assigned `row_id`. Validated against the
+    /// schema (arity, types, nullability) before it is logged.
     pub fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
         let mut inner = self.inner.lock().unwrap();
         let def = inner
@@ -176,34 +312,20 @@ impl SqlEngine {
             .clone();
         def.validate_row(&cells)?;
 
-        let row_id = {
-            let state = inner.tables.get_mut(table).expect("table state present");
-            let id = state.next_row_id;
-            state.next_row_id += 1;
-            id
-        };
-
-        inner.wal.append(&WalRecord::Insert {
+        let row_id = inner.tables.get(table).expect("present").next_row_id;
+        let rec = WalRecord::Insert {
             table: table.to_string(),
             row_id,
-            cells: cells.clone(),
-        })?;
-        inner
-            .tables
-            .get_mut(table)
-            .expect("table state present")
-            .rows
-            .insert(row_id, cells);
+            cells,
+        };
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
         Ok(row_id)
     }
 
-    /// Overwrite the cells of an existing row, keeping its `row_id`. The new
-    /// cells are validated against the schema before being logged. Errors if the
-    /// table or the row does not exist.
-    ///
-    /// This is logged as an idempotent `Insert` record for `row_id` — replaying
-    /// it re-establishes exactly this row image, which is why an update never
-    /// needs a distinct WAL op.
+    /// Overwrite the cells of an existing row, keeping its `row_id`. Logged as
+    /// an idempotent `Insert` record for `row_id`.
     pub fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let def = inner
@@ -216,7 +338,7 @@ impl SqlEngine {
         if !inner
             .tables
             .get(table)
-            .expect("table state present")
+            .expect("present")
             .rows
             .contains_key(&row_id)
         {
@@ -224,17 +346,14 @@ impl SqlEngine {
                 "row {row_id} does not exist in {table:?}"
             )));
         }
-        inner.wal.append(&WalRecord::Insert {
+        let rec = WalRecord::Insert {
             table: table.to_string(),
             row_id,
-            cells: cells.clone(),
-        })?;
-        inner
-            .tables
-            .get_mut(table)
-            .expect("table state present")
-            .rows
-            .insert(row_id, cells);
+            cells,
+        };
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
         Ok(())
     }
 
@@ -252,16 +371,13 @@ impl SqlEngine {
         if !present {
             return Ok(false);
         }
-        inner.wal.append(&WalRecord::Delete {
+        let rec = WalRecord::Delete {
             table: table.to_string(),
             row_id,
-        })?;
-        inner
-            .tables
-            .get_mut(table)
-            .expect("table state present")
-            .rows
-            .remove(&row_id);
+        };
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
         Ok(true)
     }
 
@@ -273,6 +389,41 @@ impl SqlEngine {
             .get(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
         Ok(state.rows.iter().map(|(id, c)| (*id, c.clone())).collect())
+    }
+
+    /// Look up rows where an indexed `column` equals `value`. `Ok(None)` when no
+    /// index covers `(table, column)`.
+    fn index_lookup_eq(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+    ) -> Result<Option<store::Rows>> {
+        let inner = self.inner.lock().unwrap();
+        let Some(state) = inner.tables.get(table) else {
+            return Err(SqlError::NoSuchTable(table.to_string()));
+        };
+        // Find an index whose column matches.
+        let Some((_name, def)) = inner
+            .catalog
+            .indexes
+            .iter()
+            .find(|(_, d)| d.table == table && d.column == column)
+        else {
+            return Ok(None);
+        };
+        let Some(idx) = state.indexes.get(&def.name) else {
+            return Ok(None);
+        };
+        let key = IndexKey(value.clone());
+        let rows = match idx.map.get(&key) {
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| state.rows.get(id).map(|c| (*id, c.clone())))
+                .collect(),
+            None => Vec::new(),
+        };
+        Ok(Some(rows))
     }
 
     /// Number of live rows in a table.
@@ -297,12 +448,28 @@ impl SqlEngine {
         inner.catalog.tables.keys().cloned().collect()
     }
 
+    /// The next `row_id` a table would assign (for transaction id seeding).
+    pub(crate) fn peek_next_row_id(&self, table: &str) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        inner.tables.get(table).map(|s| s.next_row_id)
+    }
+
+    /// Atomically apply a group of records produced by a committing transaction:
+    /// one `Batch` WAL record (a single fsync), then applied to live state.
+    pub(crate) fn commit_batch(&self, ops: Vec<WalRecord>) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let rec = WalRecord::Batch(ops);
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Ok(())
+    }
+
     /// Durably capture current state into `.rdat` snapshots + `catalog.json`,
     /// then truncate the WAL.
-    ///
-    /// Ordering is crash-safe: snapshots and catalog are fsynced *before* the
-    /// WAL is truncated, so a crash mid-checkpoint recovers to the same state by
-    /// loading the snapshots and replaying the (not-yet-truncated) WAL.
     pub fn checkpoint(&self) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         let Inner {
@@ -312,13 +479,10 @@ impl SqlEngine {
             wal,
         } = &mut *inner;
 
-        // 1. Write every live table's snapshot.
         for (name, state) in tables.iter() {
             let rows = state.rows.iter().map(|(id, c)| (*id, c.as_slice()));
             storage::write_snapshot(dir, name, rows)?;
         }
-        // 2. Remove snapshots for tables that no longer exist.
-        //    (Any `.rdat` whose table is absent from the catalog is stale.)
         for entry in std::fs::read_dir(&*dir)? {
             let entry = entry?;
             let file_name = entry.file_name();
@@ -329,26 +493,106 @@ impl SqlEngine {
                 storage::remove_snapshot(dir, table)?;
             }
         }
-        // 3. Persist the schema, then truncate the WAL.
         catalog.save(dir)?;
         wal.truncate()?;
         Ok(())
     }
 
     /// Parse and execute a SQL string, returning one [`QueryResult`] per
-    /// statement (a single string may contain several `;`-separated statements).
+    /// statement.
     pub fn execute(&self, sql: &str) -> Result<Vec<QueryResult>> {
+        self.execute_params(sql, &[])
+    }
+
+    /// Like [`execute`](Self::execute) but binds `?`/`$N` placeholders to
+    /// `params` (left-to-right for `?`, `N-1` for `$N`).
+    ///
+    /// `BEGIN`/`COMMIT`/`ROLLBACK` within the string open and close a
+    /// transaction whose writes are buffered and, on `COMMIT`, flushed
+    /// atomically as one WAL batch. An unmatched `BEGIN` at end of string is
+    /// rolled back (its buffered writes are discarded).
+    pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<Vec<QueryResult>> {
+        use ast::Statement;
         let statements = parser::parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
+        let mut txn: Option<Transaction<'_>> = None;
+
         for stmt in statements {
-            results.push(executor::execute(self, stmt)?);
+            match stmt {
+                Statement::Begin => {
+                    if txn.is_some() {
+                        return Err(SqlError::Unsupported("nested transaction".into()));
+                    }
+                    txn = Some(Transaction::new(self));
+                    results.push(QueryResult::Transaction);
+                }
+                Statement::Commit => {
+                    let t = txn
+                        .take()
+                        .ok_or_else(|| SqlError::Unsupported("COMMIT without BEGIN".into()))?;
+                    t.commit()?;
+                    results.push(QueryResult::Transaction);
+                }
+                Statement::Rollback => {
+                    txn.take()
+                        .ok_or_else(|| SqlError::Unsupported("ROLLBACK without BEGIN".into()))?;
+                    results.push(QueryResult::Transaction);
+                }
+                other => {
+                    let r = match &txn {
+                        Some(t) => executor::execute(t, other, params)?,
+                        None => executor::execute(self, other, params)?,
+                    };
+                    results.push(r);
+                }
+            }
         }
+        // An open transaction at end of the batch is discarded (auto-rollback).
         Ok(results)
     }
 
     /// Path to the SQL root directory.
     pub fn dir(&self) -> PathBuf {
         self.inner.lock().unwrap().dir.clone()
+    }
+}
+
+/// Autocommit `Store`: every operation is applied and logged immediately.
+impl Store for SqlEngine {
+    fn table_def(&self, name: &str) -> Option<Table> {
+        SqlEngine::table_def(self, name)
+    }
+    fn scan(&self, table: &str) -> Result<Vec<(u64, Vec<Value>)>> {
+        SqlEngine::scan(self, table)
+    }
+    fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
+        SqlEngine::insert(self, table, cells)
+    }
+    fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()> {
+        SqlEngine::update_row(self, table, row_id, cells)
+    }
+    fn delete(&self, table: &str, row_id: u64) -> Result<bool> {
+        SqlEngine::delete(self, table, row_id)
+    }
+    fn create_table(&self, table: Table) -> Result<()> {
+        SqlEngine::create_table(self, table)
+    }
+    fn drop_table(&self, name: &str) -> Result<()> {
+        SqlEngine::drop_table(self, name)
+    }
+    fn create_index(&self, name: &str, table: &str, column: &str) -> Result<()> {
+        SqlEngine::create_index(self, name, table, column)
+    }
+    fn drop_index(&self, name: &str) -> Result<()> {
+        SqlEngine::drop_index(self, name)
+    }
+    fn index_lookup_eq(
+        &self,
+        table: &str,
+        column: &str,
+        value: &Value,
+    ) -> Result<Option<store::Rows>> {
+        SqlEngine::index_lookup_eq(self, table, column, value)
     }
 }
 
@@ -402,12 +646,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = SqlEngine::open(dir.path()).unwrap();
         db.create_table(users()).unwrap();
-        // NOT NULL name violated
         assert!(
             db.insert("users", vec![Value::Int(1), Value::Null])
                 .is_err()
         );
-        // wrong arity
         assert!(db.insert("users", vec![Value::Int(1)]).is_err());
     }
 }

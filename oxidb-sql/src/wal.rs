@@ -22,7 +22,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::Table;
+use crate::catalog::{IndexDef, Table};
 use crate::error::{Result, SqlError};
 use crate::types::Value;
 
@@ -39,6 +39,8 @@ const HEADER_LEN: u64 = 8;
 pub enum WalRecord {
     CreateTable(Table),
     DropTable(String),
+    CreateIndex(IndexDef),
+    DropIndex(String),
     Insert {
         table: String,
         row_id: u64,
@@ -48,6 +50,10 @@ pub enum WalRecord {
         table: String,
         row_id: u64,
     },
+    /// An atomic group of records committed together by a transaction. On
+    /// replay it is applied whole; a torn/corrupt batch is discarded whole
+    /// (the CRC covers the entire batch), giving all-or-nothing durability.
+    Batch(Vec<WalRecord>),
 }
 
 /// Append-only WAL writer bound to `sql/wal/live.wal`.

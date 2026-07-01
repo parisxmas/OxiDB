@@ -50,6 +50,62 @@ impl Value {
                 | (Value::Timestamp(_), SqlType::Timestamp)
         )
     }
+
+    /// Numeric view of Int/Double/Timestamp, for cross-numeric comparison.
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Int(n) => Some(*n as f64),
+            Value::Double(f) => Some(*f),
+            Value::Timestamp(t) => Some(*t as f64),
+            _ => None,
+        }
+    }
+
+    /// A **total** order over values, used by ORDER BY and by index keys.
+    ///
+    /// Establishes a cross-type ranking (Null < Bool < numeric < Text), orders
+    /// within a kind, and treats the numeric kinds (Int/Double/Timestamp) as one
+    /// comparable class. NaN doubles are treated as equal to avoid a partial
+    /// order (they should not occur in stored data).
+    pub fn total_order(a: &Value, b: &Value) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        fn rank(v: &Value) -> u8 {
+            match v {
+                Value::Null => 0,
+                Value::Bool(_) => 1,
+                Value::Int(_) | Value::Double(_) | Value::Timestamp(_) => 2,
+                Value::Text(_) => 3,
+            }
+        }
+        match (a, b) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+            (Value::Text(x), Value::Text(y)) => x.cmp(y),
+            _ if rank(a) == 2 && rank(b) == 2 => a
+                .as_f64()
+                .unwrap()
+                .partial_cmp(&b.as_f64().unwrap())
+                .unwrap_or(Ordering::Equal),
+            _ => rank(a).cmp(&rank(b)),
+        }
+    }
+}
+
+/// A wrapper giving [`Value`] a total `Ord`, so values can be used as keys in a
+/// `BTreeMap` (secondary indexes). Ordering is [`Value::total_order`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexKey(pub Value);
+
+impl Eq for IndexKey {}
+impl PartialOrd for IndexKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for IndexKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        Value::total_order(&self.0, &other.0)
+    }
 }
 
 // Cell tags. NULL has its own tag so a nullable column round-trips exactly.

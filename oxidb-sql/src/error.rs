@@ -23,6 +23,14 @@ pub enum SqlError {
     #[error("table already exists: {0}")]
     TableExists(String),
 
+    /// An index with this name already exists.
+    #[error("index already exists: {0}")]
+    IndexExists(String),
+
+    /// A referenced index does not exist.
+    #[error("no such index: {0}")]
+    NoSuchIndex(String),
+
     /// A row's cell count or a cell's type does not match the table schema.
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),

@@ -99,10 +99,21 @@ impl Table {
     }
 }
 
+/// A single-column secondary index definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDef {
+    pub name: String,
+    pub table: String,
+    pub column: String,
+}
+
 /// The in-memory catalog plus where it persists.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Catalog {
     pub tables: BTreeMap<String, Table>,
+    /// Secondary indexes, keyed by index name.
+    #[serde(default)]
+    pub indexes: BTreeMap<String, IndexDef>,
 }
 
 impl Catalog {
