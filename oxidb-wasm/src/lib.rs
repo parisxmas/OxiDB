@@ -116,3 +116,64 @@ pub fn aggregate(collection: &str, pipeline: &str) -> Result<String, JsValue> {
     let results = with_db(|db| db.aggregate(collection, &stages))?;
     serde_json::to_string(&results).map_err(|e| JsValue::from_str(&e.to_string()))
 }
+
+/// Serialize the entire database to a portable JSON image:
+/// `{ "version": 1, "collections": { name: [docs...] } }`.
+///
+/// Intended for durable persistence in environments without a filesystem
+/// (e.g. the browser): dump the image, store it (OPFS, etc.), and reload it
+/// with [`restore`] on the next start.
+#[wasm_bindgen]
+pub fn dump() -> Result<String, JsValue> {
+    let guard = DB.read();
+    let db = guard
+        .as_ref()
+        .ok_or_else(|| JsValue::from_str("database not initialized — call init() first"))?;
+    let mut collections = serde_json::Map::new();
+    for name in db.list_collections() {
+        let docs = db
+            .find(&name, &json!({}))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        collections.insert(name, Value::Array(docs));
+    }
+    let image = json!({ "version": 1, "collections": Value::Object(collections) });
+    serde_json::to_string(&image).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Load a database image produced by [`dump`] into the current (freshly
+/// initialized) database. The engine-managed `_id` / `_version` fields are
+/// stripped so documents are re-inserted with fresh identifiers.
+#[wasm_bindgen]
+pub fn restore(image: &str) -> Result<(), JsValue> {
+    let parsed: Value =
+        serde_json::from_str(image).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let collections = parsed
+        .get("collections")
+        .and_then(Value::as_object)
+        .ok_or_else(|| JsValue::from_str("invalid image: missing 'collections' object"))?;
+
+    let guard = DB.read();
+    let db = guard
+        .as_ref()
+        .ok_or_else(|| JsValue::from_str("database not initialized — call init() first"))?;
+
+    for (name, docs_val) in collections {
+        let Some(arr) = docs_val.as_array() else { continue };
+        let docs: Vec<Value> = arr
+            .iter()
+            .map(|doc| {
+                let mut doc = doc.clone();
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.remove("_id");
+                    obj.remove("_version");
+                }
+                doc
+            })
+            .collect();
+        if !docs.is_empty() {
+            db.insert_many(name, docs)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        }
+    }
+    Ok(())
+}
