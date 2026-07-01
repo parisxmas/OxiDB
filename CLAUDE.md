@@ -97,3 +97,10 @@ Length-prefixed JSON over TCP (max 16 MiB). Auth via SCRAM-SHA-256. RBAC roles: 
 - `OXIDB_AUDIT_MAX_AGE_SECS` (optional; rotates after this many elapsed seconds since file became active)
 - `OXIDB_AUDIT_CALENDAR` (optional; `hourly` / `daily` / `none` — UTC calendar boundary)
 - `OXIDB_AUDIT_COMPRESS` (optional; `true`/`1`/`yes`/`on` to gzip rotated audit files; default off)
+
+### Second engine — SQL (`oxidb-sql/`, ADR-0010)
+A standalone relational SQL engine (its own crate) can be mounted alongside the document engine in the same server. It owns **entirely separate files** and shares no state — a collection name and a SQL table name never collide. Off by default.
+- `OXIDB_SQL` (set to `1`/`true`/`yes`/`on` to enable; default off — zero cost when unused)
+- `OXIDB_SQL_DATA` (SQL engine data dir; default `${OXIDB_DATA}/sql`)
+
+Wire routing (`handler.rs`): a request with `engine: "sql"` — or the reserved `sql` command — is served by the SQL engine; a missing/`"doc"` engine keeps the document path byte-for-byte (full backward compatibility). Request shape: `{ "engine": "sql", "cmd": "sql", "sql": "SELECT ...", "params": [ ... ] }` (`params` binds `?`/`$N`). RBAC gates `sql` at the `ReadWrite` role. SQL supports DDL, DML, single-table + INNER/LEFT/RIGHT/FULL-join SELECT with GROUP BY/HAVING aggregates, secondary indexes, parameterized queries, and per-engine transactions (`BEGIN`/`COMMIT`/`ROLLBACK`). Node-local in v1 (not Raft-replicated).

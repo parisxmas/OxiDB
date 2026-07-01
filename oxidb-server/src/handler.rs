@@ -101,6 +101,22 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
     // Take ownership of mutable request for extracting fields without cloning
     let mut request = request;
 
+    // ── Second-engine routing (ADR-0010) ──
+    // Requests carrying `engine: "sql"` — or the reserved `sql` command — are
+    // served by the standalone SQL engine, which owns entirely separate files
+    // and shares no state with the document engine. A missing/`"doc"` engine
+    // keeps the document path below byte-for-byte, so existing clients are
+    // unaffected. In cluster mode `sql` is not a write command, so it runs
+    // node-locally (SQL is not Raft-replicated in v1).
+    match request.get("engine").and_then(|v| v.as_str()) {
+        Some("sql") => return crate::sql_bridge::handle_sql(&cmd, &request),
+        Some("doc") | None => {}
+        Some(other) => return err_bytes(&format!("unknown engine: {other:?}")),
+    }
+    if cmd == "sql" {
+        return crate::sql_bridge::handle_sql(&cmd, &request);
+    }
+
     // FDW v1: if the targeted collection is registered as a linked
     // collection (see oxidb::links), route to the remote OxiDB
     // instead of the local engine. Read commands are proxied; write
