@@ -324,6 +324,42 @@ impl SqlEngine {
         Ok(row_id)
     }
 
+    /// Insert many rows in one durable step: all rows are validated, logged as
+    /// a single WAL `Batch` record (one fsync), then applied. Returns the
+    /// number of rows inserted.
+    pub fn insert_many(&self, table: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        let def = inner
+            .tables
+            .get(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?
+            .def
+            .clone();
+        for cells in &rows {
+            def.validate_row(cells)?;
+        }
+
+        let first_id = inner.tables.get(table).expect("present").next_row_id;
+        let n = rows.len() as u64;
+        let ops: Vec<WalRecord> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, cells)| WalRecord::Insert {
+                table: table.to_string(),
+                row_id: first_id + i as u64,
+                cells,
+            })
+            .collect();
+        let rec = WalRecord::Batch(ops);
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Ok(n)
+    }
+
     /// Overwrite the cells of an existing row, keeping its `row_id`. Logged as
     /// an idempotent `Insert` record for `row_id`.
     pub fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()> {
@@ -565,8 +601,30 @@ impl Store for SqlEngine {
     fn scan(&self, table: &str) -> Result<Vec<(u64, Vec<Value>)>> {
         SqlEngine::scan(self, table)
     }
+    fn scan_pruned(&self, table: &str, keep: &[usize]) -> Result<store::Chunk> {
+        let inner = self.inner.lock().unwrap();
+        let state = inner
+            .tables
+            .get(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        let n = state.rows.len();
+        let mut cells = Vec::with_capacity(n * keep.len());
+        for row in state.rows.values() {
+            for &k in keep {
+                cells.push(row[k].clone());
+            }
+        }
+        Ok(store::Chunk {
+            width: keep.len(),
+            n,
+            cells,
+        })
+    }
     fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
         SqlEngine::insert(self, table, cells)
+    }
+    fn insert_many(&self, table: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
+        SqlEngine::insert_many(self, table, rows)
     }
     fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()> {
         SqlEngine::update_row(self, table, row_id, cells)

@@ -4,10 +4,16 @@
 --
 -- Repro:
 --   createdb oxidb_sql_bench
---   psql -d oxidb_sql_bench -f join_bench_postgres.sql
+--   psql -d oxidb_sql_bench -f join_bench_postgres.sql            # scale 1
+--   psql -d oxidb_sql_bench -v k=20 -f join_bench_postgres.sql    # scale 20
 --
--- Sizes: R=10 regions, S=10 suppliers, C=1000 customers, P=300 products,
---        O=5000 orders, I=15000 items. i is 0-based, id = i+1.
+-- Sizes (scale k): R=10 regions, S=10 suppliers, C=1000k customers,
+--        P=300k products, O=5000k orders, I=15000k items. i is 0-based, id = i+1.
+
+\if :{?k}
+\else
+\set k 1
+\endif
 
 DROP TABLE IF EXISTS items, orders, products, customers, suppliers, regions;
 
@@ -22,16 +28,16 @@ INSERT INTO regions   SELECT i+1, 'R'||(i+1) FROM generate_series(0, 9) i;
 INSERT INTO suppliers SELECT i+1, 'S'||(i+1) FROM generate_series(0, 9) i;
 INSERT INTO customers
   SELECT i+1, 'c'||(i+1), CASE WHEN i%7=0 THEN NULL ELSE (i%10)+1 END
-  FROM generate_series(0, 999) i;
+  FROM generate_series(0, 1000*:k - 1) i;
 INSERT INTO products
   SELECT i+1, 'p'||(i+1), (i%9)+1, CASE WHEN i%5=0 THEN NULL ELSE (i%10)+1 END
-  FROM generate_series(0, 299) i;
+  FROM generate_series(0, 300*:k - 1) i;
 INSERT INTO orders
-  SELECT i+1, CASE WHEN i%11=0 THEN 1000000+i ELSE (i%1000)+1 END, i%100
-  FROM generate_series(0, 4999) i;
+  SELECT i+1, CASE WHEN i%11=0 THEN 1000000+i ELSE (i%(1000*:k))+1 END, i%100
+  FROM generate_series(0, 5000*:k - 1) i;
 INSERT INTO items
-  SELECT i+1, (i%5000)+1, (i%300)+1, (i%5)+1
-  FROM generate_series(0, 14999) i;
+  SELECT i+1, (i%(5000*:k))+1, (i%(300*:k))+1, (i%5)+1
+  FROM generate_series(0, 15000*:k - 1) i;
 ANALYZE;
 
 \timing on

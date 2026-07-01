@@ -6,6 +6,7 @@
 //! wall-clock time over several runs.
 //!
 //! Run: `cargo run --release --example join_bench -p oxidb-sql`
+//! Scale the dataset with `SCALE=20` (multiplies customers/products/orders/items).
 
 use std::time::Instant;
 
@@ -13,16 +14,21 @@ use oxidb_sql::{QueryResult, SqlEngine, Value};
 
 const R: usize = 10; // regions
 const S: usize = 10; // suppliers
-const C: usize = 1000; // customers
-const P: usize = 300; // products
-const O: usize = 5000; // orders
-const I: usize = 15000; // items
 const RUNS: usize = 5;
 
+fn scale() -> usize {
+    std::env::var("SCALE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+}
+
 fn main() {
+    let k = scale();
+    let (c, p, o, i) = (1000 * k, 300 * k, 5000 * k, 15000 * k);
     let dir = tempfile::tempdir().unwrap();
     let db = SqlEngine::open(dir.path()).unwrap();
-    seed(&db);
+    seed(&db, c, p, o, i);
 
     let queries: &[(&str, &str)] = &[
         (
@@ -60,7 +66,9 @@ fn main() {
         ),
     ];
 
-    println!("oxidb-sql join benchmark — R={R} S={S} C={C} P={P} O={O} I={I}, best of {RUNS}\n");
+    println!(
+        "oxidb-sql join benchmark — R={R} S={S} C={c} P={p} O={o} I={i}, best of {RUNS}\n"
+    );
     for (label, sql) in queries {
         // Warm up + correctness capture.
         let first = db.execute(sql).unwrap().pop().unwrap();
@@ -97,7 +105,7 @@ fn fmt_value(v: &Value) -> String {
     }
 }
 
-fn seed(db: &SqlEngine) {
+fn seed(db: &SqlEngine, c: usize, p: usize, o: usize, n_items: usize) {
     db.execute("CREATE TABLE regions   (id INT PRIMARY KEY, name TEXT NOT NULL)")
         .unwrap();
     db.execute("CREATE TABLE suppliers (id INT PRIMARY KEY, name TEXT NOT NULL)")
@@ -126,7 +134,7 @@ fn seed(db: &SqlEngine) {
     exec_insert(db, "suppliers", &vals);
 
     vals.clear();
-    for i in 0..C {
+    for i in 0..c {
         let region = if i % 7 == 0 {
             "NULL".to_string()
         } else {
@@ -141,7 +149,7 @@ fn seed(db: &SqlEngine) {
     exec_insert(db, "customers", &vals);
 
     vals.clear();
-    for i in 0..P {
+    for i in 0..p {
         let supplier = if i % 5 == 0 {
             "NULL".to_string()
         } else {
@@ -156,11 +164,11 @@ fn seed(db: &SqlEngine) {
     exec_insert(db, "products", &vals);
 
     vals.clear();
-    for i in 0..O {
+    for i in 0..o {
         let cust = if i % 11 == 0 {
             1_000_000 + i
         } else {
-            (i % C) + 1
+            (i % c) + 1
         };
         push_tuple(
             &mut vals,
@@ -171,15 +179,15 @@ fn seed(db: &SqlEngine) {
     exec_insert(db, "orders", &vals);
 
     vals.clear();
-    for i in 0..I {
+    for i in 0..n_items {
         push_tuple(
             &mut vals,
             i,
             format_args!(
                 "({}, {}, {}, {})",
                 i + 1,
-                (i % O) + 1,
-                (i % P) + 1,
+                (i % o) + 1,
+                (i % p) + 1,
                 (i % 5) + 1
             ),
         );

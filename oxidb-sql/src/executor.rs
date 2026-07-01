@@ -1,21 +1,26 @@
 //! Execute logical [`Statement`]s against a [`Store`].
 //!
-//! A tree-walking interpreter over typed rows. SELECT builds a combined row set
-//! (base table + nested-loop inner joins), filters it, optionally groups and
-//! aggregates, then projects / orders / limits. It is generic over [`Store`], so
-//! the identical code runs in autocommit mode (against the engine) and inside a
-//! transaction (against the buffered overlay).
+//! A tree-walking interpreter over typed rows. SELECT uses **late
+//! materialization**: each scanned table becomes a flat, column-pruned
+//! [`Chunk`], and joins combine *row indices* (u32 tuples) instead of copying
+//! cell values. Expressions read cells through a [`View`] that maps a bound
+//! column position to (table, column) — values are only touched at final
+//! projection/aggregation. It is generic over [`Store`], so the identical code
+//! runs in autocommit mode (against the engine) and inside a transaction
+//! (against the buffered overlay).
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
     AggFunc, BinOp, Expr, Join, JoinKind, QueryResult, SelectItem, SelectStmt, Statement, TableRef,
     UnOp,
 };
 use crate::error::{Result, SqlError};
-use crate::store::Store;
-use crate::types::{IndexKey, Value};
+use crate::store::{Chunk, Store};
+use crate::types::Value;
 
 /// A column in a working row set, qualified by its (aliased) table name.
 #[derive(Debug, Clone)]
@@ -90,6 +95,62 @@ pub(crate) fn execute<S: Store>(
     }
 }
 
+/// The empty input row VALUES expressions are evaluated against.
+const NO_ROW: &[Value] = &[];
+
+/// A fast, non-cryptographic hasher (fxhash-style multiply-rotate) for the
+/// executor's internal hash maps. Join/group hashing is on the per-row hot
+/// path, where SipHash's per-write cost dominates; DoS-resistance is not
+/// needed for these transient, query-local tables.
+#[derive(Default)]
+struct FxHasher(u64);
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, n: u64) {
+        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        // xor-shift-multiply finalizer: the accumulator's entropy sits in the
+        // high bits, but the hash table picks buckets from the low bits (and
+        // f64-bit keys of small integers have dozens of trailing zeros) — mix
+        // high bits down before handing the hash out.
+        let mut x = self.0;
+        x ^= x >> 32;
+        x = x.wrapping_mul(0xd6e8_feb8_6659_fd93);
+        x ^= x >> 32;
+        x
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.add(b as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, n: u8) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, n: u32) {
+        self.add(n as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+}
+
+type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
 fn exec_insert<S: Store>(
     store: &S,
     table: &str,
@@ -101,40 +162,51 @@ fn exec_insert<S: Store>(
         .table_def(table)
         .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
 
-    let mut affected = 0;
+    // Resolve the (optional) column list to cell positions once.
+    let col_indexes: Option<Vec<usize>> = match &columns {
+        Some(cols) => Some(
+            cols.iter()
+                .map(|name| {
+                    def.columns
+                        .iter()
+                        .position(|c| &c.name == name)
+                        .ok_or_else(|| SqlError::NoSuchColumn(name.clone()))
+                })
+                .collect::<Result<_>>()?,
+        ),
+        None => None,
+    };
+
+    let mut all_cells = Vec::with_capacity(rows.len());
     for row_exprs in rows {
         // VALUES cannot reference columns; evaluate against an empty row.
         let values: Vec<Value> = row_exprs
             .iter()
-            .map(|e| eval_scalar(e, &[], &[], params))
+            .map(|e| eval_scalar(e, &[], NO_ROW, params))
             .collect::<Result<_>>()?;
 
-        let cells = match &columns {
-            Some(cols) => {
-                if cols.len() != values.len() {
+        let cells = match &col_indexes {
+            Some(idxs) => {
+                if idxs.len() != values.len() {
                     return Err(SqlError::SchemaMismatch(format!(
                         "INSERT has {} columns but {} values",
-                        cols.len(),
+                        idxs.len(),
                         values.len()
                     )));
                 }
                 let mut cells = vec![Value::Null; def.arity()];
-                for (name, val) in cols.iter().zip(values) {
-                    let idx = def
-                        .columns
-                        .iter()
-                        .position(|c| &c.name == name)
-                        .ok_or_else(|| SqlError::NoSuchColumn(name.clone()))?;
-                    cells[idx] = val;
+                for (idx, val) in idxs.iter().zip(values) {
+                    cells[*idx] = val;
                 }
                 cells
             }
             None => values,
         };
-
-        store.insert(table, cells)?;
-        affected += 1;
+        all_cells.push(cells);
     }
+
+    // One durable batch: all rows of a multi-row INSERT share a single fsync.
+    let affected = store.insert_many(table, all_cells)? as usize;
     Ok(QueryResult::Mutation { affected })
 }
 
@@ -164,13 +236,13 @@ fn exec_update<S: Store>(
     let mut affected = 0;
     for (row_id, cells) in store.scan(table)? {
         if let Some(pred) = &filter
-            && !truthy(&eval_scalar(pred, &schema, &cells, params)?)
+            && !truthy(&eval_scalar(pred, &schema, cells.as_slice(), params)?)
         {
             continue;
         }
         let mut new_cells = cells.clone();
         for (idx, expr) in &targets {
-            new_cells[*idx] = eval_scalar(expr, &schema, &cells, params)?;
+            new_cells[*idx] = eval_scalar(expr, &schema, cells.as_slice(), params)?;
         }
         store.update_row(table, row_id, new_cells)?;
         affected += 1;
@@ -192,7 +264,7 @@ fn exec_delete<S: Store>(
     let mut to_delete = Vec::new();
     for (row_id, cells) in store.scan(table)? {
         let matches = match &filter {
-            Some(pred) => truthy(&eval_scalar(pred, &schema, &cells, params)?),
+            Some(pred) => truthy(&eval_scalar(pred, &schema, cells.as_slice(), params)?),
             None => true,
         };
         if matches {
@@ -210,10 +282,98 @@ fn exec_delete<S: Store>(
 
 // ── SELECT ────────────────────────────────────────────────────────────────
 
+/// Per-table pruned scan chunks plus the layout mapping a combined-schema
+/// position to its (table, column) location.
+#[derive(Default)]
+struct Sources {
+    chunks: Vec<Chunk>,
+    /// For each combined-schema position: which chunk it lives in.
+    table_of: Vec<usize>,
+    /// For each combined-schema position: the column inside that chunk.
+    col_of: Vec<usize>,
+}
+
+impl Sources {
+    fn push_table(&mut self, chunk: Chunk) {
+        let t = self.chunks.len();
+        for c in 0..chunk.width {
+            self.table_of.push(t);
+            self.col_of.push(c);
+        }
+        self.chunks.push(chunk);
+    }
+}
+
+/// The working set of a SELECT: each logical row is a tuple of `stride` row
+/// indices (one per joined table), stored flat. `u32::MAX` marks an outer
+/// join's NULL side.
+struct Tuples {
+    stride: usize,
+    data: Vec<u32>,
+}
+
+impl Tuples {
+    #[inline]
+    fn n(&self) -> usize {
+        self.data.len() / self.stride
+    }
+    #[inline]
+    fn row(&self, i: usize) -> &[u32] {
+        &self.data[i * self.stride..(i + 1) * self.stride]
+    }
+}
+
+/// NULL-row sentinel in a tuple (the padded side of an outer join).
+const NULL_ROW: u32 = u32::MAX;
+
+static NULL_VALUE: Value = Value::Null;
+
+/// A logical row: a tuple of per-table row indices viewed through [`Sources`].
+#[derive(Clone, Copy)]
+struct View<'a> {
+    src: &'a Sources,
+    tuple: &'a [u32],
+}
+
+impl<'a> View<'a> {
+    /// Cell at combined-schema position `p`, with the underlying data's
+    /// lifetime (outlives this `View` value).
+    #[inline]
+    fn val_ref(&self, p: usize) -> Option<&'a Value> {
+        let t = *self.src.table_of.get(p)?;
+        let r = self.tuple[t];
+        if r == NULL_ROW {
+            return Some(&NULL_VALUE);
+        }
+        let ch = &self.src.chunks[t];
+        Some(&ch.cells[r as usize * ch.width + self.src.col_of[p]])
+    }
+}
+
+/// Anything an expression can be evaluated over: a plain cell slice or a
+/// join-tuple [`View`].
+trait RowLike {
+    fn val(&self, i: usize) -> Option<&Value>;
+}
+
+impl RowLike for [Value] {
+    #[inline]
+    fn val(&self, i: usize) -> Option<&Value> {
+        self.get(i)
+    }
+}
+
+impl RowLike for View<'_> {
+    #[inline]
+    fn val(&self, i: usize) -> Option<&Value> {
+        self.val_ref(i)
+    }
+}
+
 fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Result<QueryResult> {
     let mut select = select;
     // 1. Build the source: base table, then joins (the join ON is bound inside).
-    let (schema, mut rows) = build_source(store, &select, params)?;
+    let (schema, src, mut tuples) = build_source(store, &select, params)?;
 
     // 2. Expand the projection into (output name, expr) pairs (still unbound).
     let proj_unbound = expand_projection(&select.projection, &schema)?;
@@ -264,21 +424,23 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
         .map(|(e, a)| Ok::<_, SqlError>((bind_expr(e, &schema)?, *a)))
         .collect::<Result<_>>()?;
 
-    // 4. WHERE.
+    // 4. WHERE: keep only matching tuples.
     if let Some(pred) = &bound_filter {
-        let mut kept = Vec::with_capacity(rows.len());
-        for row in rows {
-            if truthy(&eval_scalar(pred, &schema, &row, params)?) {
-                kept.push(row);
+        let mut kept = Vec::with_capacity(tuples.data.len());
+        for i in 0..tuples.n() {
+            let tuple = tuples.row(i);
+            let view = View { src: &src, tuple };
+            if truthy(&eval_scalar(pred, &schema, &view, params)?) {
+                kept.extend_from_slice(tuple);
             }
         }
-        rows = kept;
+        tuples.data = kept;
     }
 
     let out_rows = if aggregating {
-        select_aggregated(&schema, rows, &select, &proj, params)?
+        select_aggregated(&schema, &src, &tuples, &select, &proj, params)?
     } else {
-        select_simple(&schema, rows, &select, &proj, params)?
+        select_simple(&schema, &src, &tuples, &select, &proj, params)?
     };
 
     // LIMIT.
@@ -293,103 +455,182 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
     })
 }
 
-/// Build the combined (schema, rows) for FROM + inner joins.
+/// The set of columns a query actually references, used to prune scanned
+/// tables before joining (projection push-down). Wide intermediate rows are
+/// the dominant cost of multi-way joins, so carrying only referenced columns
+/// is a large win.
+struct Needed {
+    /// `SELECT *` — keep everything.
+    all: bool,
+    /// `SELECT t.*` — keep all columns of these table keys.
+    tables_all: std::collections::HashSet<String>,
+    /// Individual references. `None` table = unqualified: keep the name in
+    /// every table (binding resolves/ambiguity-checks exactly as before).
+    cols: std::collections::HashSet<(Option<String>, String)>,
+}
+
+impl Needed {
+    fn keep(&self, table_key: &str, col: &str) -> bool {
+        self.all
+            || self.tables_all.contains(table_key)
+            || self
+                .cols
+                .contains(&(Some(table_key.to_string()), col.to_string()))
+            || self.cols.contains(&(None, col.to_string()))
+    }
+}
+
+fn collect_needed(select: &SelectStmt) -> Needed {
+    let mut needed = Needed {
+        all: false,
+        tables_all: std::collections::HashSet::new(),
+        cols: std::collections::HashSet::new(),
+    };
+    let mut refs: Vec<(&Option<String>, &str)> = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard => needed.all = true,
+            SelectItem::QualifiedWildcard(t) => {
+                needed.tables_all.insert(t.clone());
+            }
+            SelectItem::Expr { expr, .. } => collect_col_refs(expr, &mut refs),
+        }
+    }
+    if let Some(f) = &select.filter {
+        collect_col_refs(f, &mut refs);
+    }
+    for j in &select.joins {
+        collect_col_refs(&j.on, &mut refs);
+    }
+    for e in &select.group_by {
+        collect_col_refs(e, &mut refs);
+    }
+    if let Some(h) = &select.having {
+        collect_col_refs(h, &mut refs);
+    }
+    for (e, _) in &select.order_by {
+        collect_col_refs(e, &mut refs);
+    }
+    for (t, n) in refs {
+        needed.cols.insert((t.clone(), n.to_string()));
+    }
+    needed
+}
+
+/// Column indices of `full` kept by `needed` for table `key`.
+fn keep_indices(full: &[ColRef], key: &str, needed: &Needed) -> Vec<usize> {
+    (0..full.len())
+        .filter(|&i| needed.keep(key, &full[i].name))
+        .collect()
+}
+
+/// Build the combined (schema, sources, tuples) for FROM + joins.
 fn build_source<S: Store>(
     store: &S,
     select: &SelectStmt,
     params: &[Value],
-) -> Result<(Vec<ColRef>, Vec<Vec<Value>>)> {
+) -> Result<(Vec<ColRef>, Sources, Tuples)> {
     let base_def = store
         .table_def(&select.from.name)
         .ok_or_else(|| SqlError::NoSuchTable(select.from.name.clone()))?;
-    let mut schema = qualified_schema(select.from.key(), &base_def);
+    let needed = collect_needed(select);
+    let full = qualified_schema(select.from.key(), &base_def);
+    let keep = keep_indices(&full, select.from.key(), &needed);
+    let mut schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
 
     // Base rows: use an index when there are no joins and WHERE has a usable
     // equality on an indexed column; otherwise full scan.
-    let mut rows: Vec<Vec<Value>> = if select.joins.is_empty() {
-        base_rows(store, &select.from, &select.filter, params)?
+    let chunk = if select.joins.is_empty() {
+        base_chunk(store, &select.from, &select.filter, params, &keep)?
     } else {
-        store
-            .scan(&select.from.name)?
-            .into_iter()
-            .map(|(_, c)| c)
-            .collect()
+        store.scan_pruned(&select.from.name, &keep)?
+    };
+
+    let mut src = Sources::default();
+    let n = chunk.n;
+    src.push_table(chunk);
+    let mut tuples = Tuples {
+        stride: 1,
+        data: (0..n as u32).collect(),
     };
 
     for join in &select.joins {
-        let (schema, rows_ref) = (&mut schema, &mut rows);
-        join_into(store, join, schema, rows_ref, params)?;
+        join_into(store, join, &mut schema, &mut src, &mut tuples, params, &needed)?;
     }
-    Ok((schema, rows))
+    Ok((schema, src, tuples))
 }
 
-/// Combine a left and right row into one.
-fn combine(left: &[Value], right: &[Value]) -> Vec<Value> {
-    let mut c = Vec::with_capacity(left.len() + right.len());
-    c.extend_from_slice(left);
-    c.extend_from_slice(right);
-    c
-}
-
-/// Join the next table into the accumulated (schema, rows).
+/// Join the next table into the accumulated working set.
 ///
 /// Simple planner: if the `ON` predicate contains at least one equi-join key
 /// (`left_col = right_col`), use a **hash join** (O(N+M)); otherwise fall back
-/// to a nested-loop join (O(N·M)). Both re-evaluate the full `ON` on candidate
-/// pairs, so results are identical either way — the hash table only avoids the
-/// full cross product.
+/// to a nested-loop join (O(N·M)). A hash-bucket hit already proves the
+/// equi-key conjuncts (HashMap key equality), so only the residual (non-equi)
+/// part of the ON — if any — is re-evaluated on candidate pairs.
 fn join_into<S: Store>(
     store: &S,
     join: &Join,
     schema: &mut Vec<ColRef>,
-    rows: &mut Vec<Vec<Value>>,
+    src: &mut Sources,
+    tuples: &mut Tuples,
     params: &[Value],
+    needed: &Needed,
 ) -> Result<()> {
     let def = store
         .table_def(&join.table.name)
         .ok_or_else(|| SqlError::NoSuchTable(join.table.name.clone()))?;
-    let right_schema = qualified_schema(join.table.key(), &def);
-    let right_rows: Vec<Vec<Value>> = store
-        .scan(&join.table.name)?
-        .into_iter()
-        .map(|(_, c)| c)
-        .collect();
+    let full = qualified_schema(join.table.key(), &def);
+    let keep = keep_indices(&full, join.table.key(), needed);
+    let right_schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
+    let chunk = store.scan_pruned(&join.table.name, &keep)?;
+    let nright = chunk.n;
 
-    let left_width = schema.len();
-    let right_width = right_schema.len();
-    let mut combined_schema = schema.clone();
-    combined_schema.extend(right_schema.clone());
+    let left_len = schema.len();
+    let mut combined = schema.clone();
+    combined.extend(right_schema.iter().cloned());
+
+    // Split the raw (named) ON into equi-key pairs and a residual predicate.
+    let (keys, residual) = split_on(&join.on, left_len, &combined);
+    let residual = residual
+        .as_ref()
+        .map(|r| bind_expr(r, &combined))
+        .transpose()?;
 
     let want_left = matches!(join.kind, JoinKind::Left | JoinKind::Full);
     let want_right = matches!(join.kind, JoinKind::Right | JoinKind::Full);
 
-    // Detect equi-keys on the raw (named) ON, then bind everything to indices.
-    let keys = equi_keys(&join.on, left_width, &combined_schema);
-    let on = bind_expr(&join.on, &combined_schema)?;
+    let stride = tuples.stride;
+    src.push_table(chunk);
+    let right = src.chunks.last().expect("just pushed");
 
-    let mut out = Vec::new();
-    let mut right_matched = vec![false; right_rows.len()];
+    let mut right_matched = vec![false; nright];
+    let mut out: Vec<u32> = Vec::new();
+    let mut cand: Vec<u32> = vec![0; stride + 1];
 
     if keys.is_empty() {
         // ── Nested-loop join ──
-        for left in rows.iter() {
+        let on = bind_expr(&join.on, &combined)?;
+        for lt in tuples.data.chunks_exact(stride) {
+            cand[..stride].copy_from_slice(lt);
             let mut left_matched = false;
-            for (ri, right) in right_rows.iter().enumerate() {
-                let cand = combine(left, right);
-                if truthy(&eval_scalar(&on, &combined_schema, &cand, params)?) {
+            for (ri, matched) in right_matched.iter_mut().enumerate() {
+                cand[stride] = ri as u32;
+                let view = View { src, tuple: &cand };
+                if truthy(&eval_scalar(&on, &combined, &view, params)?) {
                     left_matched = true;
-                    right_matched[ri] = true;
-                    out.push(cand);
+                    *matched = true;
+                    out.extend_from_slice(&cand);
                 }
             }
             if want_left && !left_matched {
-                out.push(combine(left, &vec![Value::Null; right_width]));
+                cand[stride] = NULL_ROW;
+                out.extend_from_slice(&cand);
             }
         }
     } else {
         // ── Hash join ──
-        // Build a hash table on the right rows keyed by the right-side keys.
-        // Rows with a NULL in any key component can never equi-match.
+        // Build an index over the right rows keyed by the right-side keys.
+        // Rows with a NULL (or NaN) in any key component never equi-match.
         let left_keys: Vec<Expr> = keys
             .iter()
             .map(|(l, _)| bind_expr(l, schema))
@@ -399,47 +640,53 @@ fn join_into<S: Store>(
             .map(|(_, r)| bind_expr(r, &right_schema))
             .collect::<Result<_>>()?;
 
-        let mut table: std::collections::HashMap<Vec<HashKey>, Vec<usize>> =
-            std::collections::HashMap::new();
-        for (ri, right) in right_rows.iter().enumerate() {
-            if let Some(key) = hash_key(&right_keys, &right_schema, right, params)? {
-                table.entry(key).or_default().push(ri);
-            }
-        }
+        let index = RightIndex::build(&right_keys, &right_schema, right, params)?;
 
-        for left in rows.iter() {
+        for lt in tuples.data.chunks_exact(stride) {
+            cand[..stride].copy_from_slice(lt);
             let mut left_matched = false;
-            if let Some(key) = hash_key(&left_keys, schema, left, params)?
-                && let Some(cands) = table.get(&key)
-            {
-                for &ri in cands {
-                    let cand = combine(left, &right_rows[ri]);
-                    // Re-check the full ON: guards against hash collisions and
-                    // applies any residual (non-equi) conjuncts.
-                    if truthy(&eval_scalar(&on, &combined_schema, &cand, params)?) {
-                        left_matched = true;
-                        right_matched[ri] = true;
-                        out.push(cand);
+            let lview = View {
+                src,
+                tuple: &cand[..stride],
+            };
+            let mut chain = index.probe(&left_keys, schema, &lview, params)?;
+            while chain != CHAIN_END {
+                let ri = chain;
+                chain = index.next(ri);
+                cand[stride] = ri;
+                let keep = match &residual {
+                    None => true,
+                    Some(res) => {
+                        let view = View { src, tuple: &cand };
+                        truthy(&eval_scalar(res, &combined, &view, params)?)
                     }
+                };
+                if keep {
+                    left_matched = true;
+                    right_matched[ri as usize] = true;
+                    out.extend_from_slice(&cand);
                 }
             }
             if want_left && !left_matched {
-                out.push(combine(left, &vec![Value::Null; right_width]));
+                cand[stride] = NULL_ROW;
+                out.extend_from_slice(&cand);
             }
         }
     }
 
     // RIGHT/FULL: emit unmatched right rows padded with NULLs on the left.
     if want_right {
-        for (ri, right) in right_rows.iter().enumerate() {
-            if !right_matched[ri] {
-                out.push(combine(&vec![Value::Null; left_width], right));
+        for (ri, matched) in right_matched.iter().enumerate() {
+            if !matched {
+                out.extend(std::iter::repeat_n(NULL_ROW, stride));
+                out.push(ri as u32);
             }
         }
     }
 
-    *schema = combined_schema;
-    *rows = out;
+    *schema = combined;
+    tuples.stride = stride + 1;
+    tuples.data = out;
     Ok(())
 }
 
@@ -453,11 +700,23 @@ enum HashKey {
     Text(String),
 }
 
+/// A join key of one or more components. The common 1–2 component cases avoid
+/// a per-row `Vec` allocation.
+#[derive(PartialEq, Eq, Hash)]
+enum JoinKey {
+    One(HashKey),
+    Two(HashKey, HashKey),
+    Many(Vec<HashKey>),
+}
+
 fn hash_key_component(v: &Value) -> Option<HashKey> {
     let norm = |f: f64| (if f == 0.0 { 0.0 } else { f }).to_bits();
     match v {
         Value::Null => None,
         Value::Int(n) => Some(HashKey::Num(norm(*n as f64))),
+        // NaN = NaN is not true in SQL, so a NaN key can never equi-match —
+        // exclude it (like NULL) rather than let bit-equality pair two NaNs.
+        Value::Double(f) if f.is_nan() => None,
         Value::Double(f) => Some(HashKey::Num(norm(*f))),
         Value::Timestamp(t) => Some(HashKey::Num(norm(*t as f64))),
         Value::Bool(b) => Some(HashKey::Bool(*b)),
@@ -467,21 +726,192 @@ fn hash_key_component(v: &Value) -> Option<HashKey> {
 
 /// Evaluate the key expressions over `row`; returns `None` if any component is
 /// NULL (a NULL key never equi-matches).
-fn hash_key(
+fn join_key<R: RowLike + ?Sized>(
     exprs: &[Expr],
     schema: &[ColRef],
-    row: &[Value],
+    row: &R,
     params: &[Value],
-) -> Result<Option<Vec<HashKey>>> {
-    let mut key = Vec::with_capacity(exprs.len());
-    for e in exprs {
-        let v = eval_scalar(e, schema, row, params)?;
-        match hash_key_component(&v) {
-            Some(k) => key.push(k),
-            None => return Ok(None),
+) -> Result<Option<JoinKey>> {
+    match exprs {
+        [a] => Ok(hash_key_component(&eval_scalar(a, schema, row, params)?).map(JoinKey::One)),
+        [a, b] => {
+            let ka = hash_key_component(&eval_scalar(a, schema, row, params)?);
+            let kb = hash_key_component(&eval_scalar(b, schema, row, params)?);
+            Ok(match (ka, kb) {
+                (Some(x), Some(y)) => Some(JoinKey::Two(x, y)),
+                _ => None,
+            })
+        }
+        _ => {
+            let mut key = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                match hash_key_component(&eval_scalar(e, schema, row, params)?) {
+                    Some(k) => key.push(k),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(JoinKey::Many(key)))
         }
     }
-    Ok(Some(key))
+}
+
+/// End-of-chain sentinel in a [`RightIndex`] bucket chain.
+const CHAIN_END: u32 = u32::MAX;
+
+/// The numeric key of a value if it is exactly an integer (`Int`, `Timestamp`,
+/// or an integral `Double` — the numeric kinds compare equal across types).
+#[inline]
+fn int_key(v: &Value) -> Option<i64> {
+    const I64_MAX_F: f64 = 9_223_372_036_854_775_807.0;
+    match v {
+        Value::Int(i) => Some(*i),
+        Value::Timestamp(t) => Some(*t),
+        Value::Double(f) if f.fract() == 0.0 && *f >= -I64_MAX_F && *f <= I64_MAX_F => {
+            Some(*f as i64)
+        }
+        _ => None,
+    }
+}
+
+/// The build side of a hash join. Bucket chains live in a flat `next` array
+/// (no per-key `Vec`), preserving right-row order within a key. When the key
+/// is a single, densely-packed integer column (the typical `fk = pk` case),
+/// the buckets are a direct-address array — no hashing at all.
+enum RightIndex {
+    Dense {
+        min: i64,
+        heads: Vec<u32>,
+        next: Vec<u32>,
+    },
+    Map {
+        map: FxMap<JoinKey, (u32, u32)>, // key -> (chain head, chain tail)
+        next: Vec<u32>,
+    },
+}
+
+impl RightIndex {
+    fn build(
+        right_keys: &[Expr],
+        right_schema: &[ColRef],
+        right: &Chunk,
+        params: &[Value],
+    ) -> Result<RightIndex> {
+        let nright = right.n;
+
+        // Single-component key: check for the dense-int case first.
+        if let [key_expr] = right_keys {
+            let mut vals: Vec<Option<i64>> = Vec::with_capacity(nright);
+            let mut all_int = true;
+            let (mut min, mut max) = (i64::MAX, i64::MIN);
+            for ri in 0..nright {
+                let v = eval_scalar(key_expr, right_schema, right.row(ri), params)?;
+                if matches!(v, Value::Null) {
+                    vals.push(None);
+                    continue;
+                }
+                match int_key(&v) {
+                    Some(k) => {
+                        min = min.min(k);
+                        max = max.max(k);
+                        vals.push(Some(k));
+                    }
+                    None => {
+                        all_int = false;
+                        break;
+                    }
+                }
+            }
+            if all_int {
+                let range = if min > max {
+                    0 // no non-null keys
+                } else {
+                    (max as i128 - min as i128) + 1
+                };
+                // Only direct-address when the key space is comparably sized
+                // to the row count (the two build arrays cost 8 bytes/slot,
+                // so this caps the memory overhead at ~128 bytes/row).
+                if range <= (nright as i128) * 16 + 65_536 {
+                    let mut heads = vec![CHAIN_END; range as usize];
+                    let mut tails = vec![CHAIN_END; range as usize];
+                    let mut next = vec![CHAIN_END; nright];
+                    for (ri, k) in vals.iter().enumerate() {
+                        let Some(k) = k else { continue };
+                        let slot = (k - min) as usize;
+                        if heads[slot] == CHAIN_END {
+                            heads[slot] = ri as u32;
+                        } else {
+                            next[tails[slot] as usize] = ri as u32;
+                        }
+                        tails[slot] = ri as u32;
+                    }
+                    return Ok(RightIndex::Dense { min, heads, next });
+                }
+            }
+        }
+
+        // General case: hash map from key to chain head/tail.
+        let mut map: FxMap<JoinKey, (u32, u32)> =
+            FxMap::with_capacity_and_hasher(nright, Default::default());
+        let mut next = vec![CHAIN_END; nright];
+        for ri in 0..nright {
+            if let Some(key) = join_key(right_keys, right_schema, right.row(ri), params)? {
+                match map.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert((ri as u32, ri as u32));
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        let (_, tail) = *e.get();
+                        next[tail as usize] = ri as u32;
+                        e.get_mut().1 = ri as u32;
+                    }
+                }
+            }
+        }
+        Ok(RightIndex::Map { map, next })
+    }
+
+    /// Head of the bucket chain matching the left row's key ([`CHAIN_END`] if
+    /// none).
+    fn probe<R: RowLike + ?Sized>(
+        &self,
+        left_keys: &[Expr],
+        schema: &[ColRef],
+        row: &R,
+        params: &[Value],
+    ) -> Result<u32> {
+        match self {
+            RightIndex::Dense { min, heads, .. } => {
+                let v = eval_scalar(&left_keys[0], schema, row, params)?;
+                // Non-integer keys (Text/Bool/fractional/NULL/NaN) can never
+                // equal an integer right key — no match, as in the hash path.
+                Ok(match int_key(&v) {
+                    Some(k) => {
+                        let off = k as i128 - *min as i128;
+                        if off >= 0 && off < heads.len() as i128 {
+                            heads[off as usize]
+                        } else {
+                            CHAIN_END
+                        }
+                    }
+                    _ => CHAIN_END,
+                })
+            }
+            RightIndex::Map { map, .. } => {
+                Ok(match join_key(left_keys, schema, row, params)? {
+                    Some(key) => map.get(&key).map(|(head, _)| *head).unwrap_or(CHAIN_END),
+                    None => CHAIN_END,
+                })
+            }
+        }
+    }
+
+    /// Next right row in the same bucket chain.
+    #[inline]
+    fn next(&self, ri: u32) -> u32 {
+        match self {
+            RightIndex::Dense { next, .. } | RightIndex::Map { next, .. } => next[ri as usize],
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -490,24 +920,36 @@ enum Side {
     Right,
 }
 
-/// Extract equi-join key pairs `(left_expr, right_expr)` from an `ON` predicate:
-/// top-level `AND` conjuncts of the form `E1 = E2` where one side references
-/// only left-schema columns and the other only right-schema columns.
-fn equi_keys(on: &Expr, left_len: usize, combined: &[ColRef]) -> Vec<(Expr, Expr)> {
-    let mut out = Vec::new();
-    collect_equi(on, left_len, combined, &mut out);
-    out
+/// Split an `ON` predicate into equi-join key pairs `(left_expr, right_expr)`
+/// — top-level `AND` conjuncts of the form `E1 = E2` where one side references
+/// only left-schema columns and the other only right-schema columns — plus the
+/// residual predicate (the AND of every conjunct that is *not* an equi-key).
+/// `residual == None` means the ON is exactly the equi-keys, so a hash-table
+/// bucket match alone proves the ON holds.
+#[allow(clippy::type_complexity)]
+fn split_on(on: &Expr, left_len: usize, combined: &[ColRef]) -> (Vec<(Expr, Expr)>, Option<Expr>) {
+    let mut keys = Vec::new();
+    let mut residual: Option<Expr> = None;
+    collect_equi(on, left_len, combined, &mut keys, &mut residual);
+    (keys, residual)
 }
 
-fn collect_equi(e: &Expr, left_len: usize, combined: &[ColRef], out: &mut Vec<(Expr, Expr)>) {
-    match e {
+fn collect_equi(
+    e: &Expr,
+    left_len: usize,
+    combined: &[ColRef],
+    keys: &mut Vec<(Expr, Expr)>,
+    residual: &mut Option<Expr>,
+) {
+    let leftover = match e {
         Expr::Binary {
             op: BinOp::And,
             left,
             right,
         } => {
-            collect_equi(left, left_len, combined, out);
-            collect_equi(right, left_len, combined, out);
+            collect_equi(left, left_len, combined, keys, residual);
+            collect_equi(right, left_len, combined, keys, residual);
+            return;
         }
         Expr::Binary {
             op: BinOp::Eq,
@@ -518,15 +960,25 @@ fn collect_equi(e: &Expr, left_len: usize, combined: &[ColRef], out: &mut Vec<(E
             expr_side(right, left_len, combined),
         ) {
             (Some(Side::Left), Some(Side::Right)) => {
-                out.push(((**left).clone(), (**right).clone()))
+                keys.push(((**left).clone(), (**right).clone()));
+                return;
             }
             (Some(Side::Right), Some(Side::Left)) => {
-                out.push(((**right).clone(), (**left).clone()))
+                keys.push(((**right).clone(), (**left).clone()));
+                return;
             }
-            _ => {}
+            _ => e.clone(),
         },
-        _ => {}
-    }
+        _ => e.clone(),
+    };
+    *residual = Some(match residual.take() {
+        None => leftover,
+        Some(prev) => Expr::Binary {
+            op: BinOp::And,
+            left: Box::new(prev),
+            right: Box::new(leftover),
+        },
+    });
 }
 
 /// Which side of the join an expression's columns belong to: `Some(Left)` /
@@ -570,25 +1022,23 @@ fn collect_col_refs<'a>(e: &'a Expr, out: &mut Vec<(&'a Option<String>, &'a str)
     }
 }
 
-/// Fetch base rows for a single (join-free) table, using an index when possible.
-fn base_rows<S: Store>(
+/// Fetch base rows for a single (join-free) table as a pruned chunk, using an
+/// index when possible.
+fn base_chunk<S: Store>(
     store: &S,
     from: &TableRef,
     filter: &Option<Expr>,
     params: &[Value],
-) -> Result<Vec<Vec<Value>>> {
+    keep: &[usize],
+) -> Result<Chunk> {
     if let Some(expr) = filter {
         for (col, val) in eq_conjuncts(expr, from.key(), params) {
             if let Some(rows) = store.index_lookup_eq(&from.name, &col, &val)? {
-                return Ok(rows.into_iter().map(|(_, c)| c).collect());
+                return Ok(Chunk::from_rows(rows.into_iter().map(|(_, c)| c), keep));
             }
         }
     }
-    Ok(store
-        .scan(&from.name)?
-        .into_iter()
-        .map(|(_, c)| c)
-        .collect())
+    store.scan_pruned(&from.name, keep)
 }
 
 /// Collect `column = constant` conjuncts (split on AND) usable for an index seek.
@@ -641,107 +1091,185 @@ fn const_value(e: &Expr, params: &[Value]) -> Option<Value> {
     }
 }
 
-/// Non-aggregated projection: one output row per input row.
+/// Non-aggregated projection: one output row per input tuple.
 fn select_simple(
     schema: &[ColRef],
-    rows: Vec<Vec<Value>>,
+    src: &Sources,
+    tuples: &Tuples,
     select: &SelectStmt,
     proj: &[(String, Expr)],
     params: &[Value],
 ) -> Result<Vec<Vec<Value>>> {
-    // Keep each input row alongside its output for ORDER BY.
-    let mut prepared: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(rows.len());
-    for row in rows {
-        let out: Vec<Value> = proj
-            .iter()
-            .map(|(_, e)| eval_scalar(e, schema, &row, params))
-            .collect::<Result<_>>()?;
-        prepared.push((out, row));
-    }
-
-    if !select.order_by.is_empty() {
-        let keys = &select.order_by;
-        let mut err = None;
-        prepared.sort_by(|a, b| cmp_by_order(keys, schema, &a.1, &b.1, params, &mut err));
-        if let Some(e) = err {
-            return Err(e);
+    let n = tuples.n();
+    if select.order_by.is_empty() {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let view = View {
+                src,
+                tuple: tuples.row(i),
+            };
+            let row: Vec<Value> = proj
+                .iter()
+                .map(|(_, e)| eval_scalar(e, schema, &view, params))
+                .collect::<Result<_>>()?;
+            out.push(row);
         }
+        return Ok(out);
     }
 
-    Ok(prepared.into_iter().map(|(out, _)| out).collect())
+    // Evaluate the sort keys once per row (not per comparison), then sort.
+    let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let view = View {
+            src,
+            tuple: tuples.row(i),
+        };
+        let keys: Vec<Value> = select
+            .order_by
+            .iter()
+            .map(|(e, _)| eval_scalar(e, schema, &view, params))
+            .collect::<Result<_>>()?;
+        let row: Vec<Value> = proj
+            .iter()
+            .map(|(_, e)| eval_scalar(e, schema, &view, params))
+            .collect::<Result<_>>()?;
+        keyed.push((keys, row));
+    }
+    keyed.sort_by(|a, b| cmp_keys(&select.order_by, &a.0, &b.0));
+    Ok(keyed.into_iter().map(|(_, row)| row).collect())
 }
 
-/// Aggregated projection: group rows, compute aggregates per group.
+/// Aggregated projection: group tuples, compute aggregates per group.
 fn select_aggregated(
     schema: &[ColRef],
-    rows: Vec<Vec<Value>>,
+    src: &Sources,
+    tuples: &Tuples,
     select: &SelectStmt,
     proj: &[(String, Expr)],
     params: &[Value],
 ) -> Result<Vec<Vec<Value>>> {
     // Group by the group-by key (empty group-by => single group over all rows).
-    let groups = group_rows(schema, rows, &select.group_by, params)?;
+    let groups = group_tuples(schema, src, tuples, &select.group_by, params)?;
 
-    let mut prepared: Vec<(Vec<Value>, Vec<Vec<Value>>)> = Vec::new();
-    for (_key, group) in groups {
+    let mut prepared: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(groups.len());
+    for group in &groups {
         if let Some(having) = &select.having
-            && !truthy(&eval_agg(having, schema, &group, params)?)
+            && !truthy(&eval_agg(having, schema, src, tuples, group, params)?)
         {
             continue;
         }
         let out: Vec<Value> = proj
             .iter()
-            .map(|(_, e)| eval_agg(e, schema, &group, params))
+            .map(|(_, e)| eval_agg(e, schema, src, tuples, group, params))
             .collect::<Result<_>>()?;
-        prepared.push((out, group));
+        // Evaluate the sort keys once per group (not per comparison).
+        let keys: Vec<Value> = select
+            .order_by
+            .iter()
+            .map(|(e, _)| eval_agg(e, schema, src, tuples, group, params))
+            .collect::<Result<_>>()?;
+        prepared.push((keys, out));
     }
 
     if !select.order_by.is_empty() {
-        let keys = &select.order_by;
-        let mut err = None;
-        prepared.sort_by(|a, b| cmp_by_order_agg(keys, schema, &a.1, &b.1, params, &mut err));
-        if let Some(e) = err {
-            return Err(e);
-        }
+        prepared.sort_by(|a, b| cmp_keys(&select.order_by, &a.0, &b.0));
     }
-
-    Ok(prepared.into_iter().map(|(out, _)| out).collect())
+    Ok(prepared.into_iter().map(|(_, out)| out).collect())
 }
 
-/// Group input rows by the evaluated group-by key.
-#[allow(clippy::type_complexity)]
-fn group_rows(
+/// Group tuple indices by the evaluated group-by key, preserving first-seen
+/// group order. Streams over the tuples once; group keys are only cloned when
+/// a new group is created.
+fn group_tuples(
     schema: &[ColRef],
-    rows: Vec<Vec<Value>>,
+    src: &Sources,
+    tuples: &Tuples,
     group_by: &[Expr],
     params: &[Value],
-) -> Result<Vec<(Vec<Value>, Vec<Vec<Value>>)>> {
+) -> Result<Vec<Vec<u32>>> {
+    let n = tuples.n();
     if group_by.is_empty() {
         // One group over everything (present even when there are no rows).
-        return Ok(vec![(Vec::new(), rows)]);
+        return Ok(vec![(0..n as u32).collect()]);
     }
-    // Preserve first-seen group order via an index map. Rows are *moved* into
-    // their group bucket (each row belongs to exactly one group) — no clone.
-    let mut order: Vec<Vec<IndexKey>> = Vec::new();
-    let mut map: BTreeMap<Vec<IndexKey>, Vec<Vec<Value>>> = BTreeMap::new();
-    for row in rows {
-        let key: Vec<IndexKey> = group_by
-            .iter()
-            .map(|e| Ok(IndexKey(eval_scalar(e, schema, &row, params)?)))
-            .collect::<Result<_>>()?;
-        if !map.contains_key(&key) {
-            order.push(key.clone());
+
+    // hash(key) -> group ids with that hash; collisions resolved by comparing
+    // the evaluated key against the group's stored key values.
+    let mut by_hash: FxMap<u64, Vec<usize>> = FxMap::default();
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    let mut group_keys: Vec<Vec<Value>> = Vec::new();
+    let mut scratch: Vec<Cow<'_, Value>> = Vec::with_capacity(group_by.len());
+
+    for i in 0..n {
+        let view = View {
+            src,
+            tuple: tuples.row(i),
+        };
+        scratch.clear();
+        for e in group_by {
+            // Bare-column keys (the common case) borrow the cell; anything
+            // else evaluates to an owned value.
+            match e {
+                Expr::Col(p) => scratch.push(Cow::Borrowed(view.val_ref(*p).ok_or_else(
+                    || SqlError::Eval(format!("bound column {p} out of range")),
+                )?)),
+                _ => scratch.push(Cow::Owned(eval_scalar(e, schema, &view, params)?)),
+            }
         }
-        map.entry(key).or_default().push(row);
+
+        let mut hasher = FxHasher::default();
+        for c in scratch.iter() {
+            hash_value_norm(c, &mut hasher);
+        }
+        let h = hasher.finish();
+
+        let ids = by_hash.entry(h).or_default();
+        let found = ids.iter().copied().find(|&g| {
+            group_keys[g]
+                .iter()
+                .zip(scratch.iter())
+                .all(|(a, b)| Value::total_order(a, b) == Ordering::Equal)
+        });
+        match found {
+            Some(g) => groups[g].push(i as u32),
+            None => {
+                let g = groups.len();
+                ids.push(g);
+                groups.push(vec![i as u32]);
+                group_keys.push(scratch.iter().map(|c| c.as_ref().clone()).collect());
+            }
+        }
     }
-    Ok(order
-        .into_iter()
-        .map(|k| {
-            let rows = map.remove(&k).unwrap();
-            let key = k.into_iter().map(|ik| ik.0).collect();
-            (key, rows)
-        })
-        .collect())
+    Ok(groups)
+}
+
+/// Hash a value consistently with [`Value::total_order`] equality: the numeric
+/// kinds share one space, `0.0`/`-0.0` collapse, and NaNs collapse (NaN is
+/// *equal* under the total order used for grouping).
+fn hash_value_norm(v: &Value, h: &mut impl Hasher) {
+    match v {
+        Value::Null => h.write_u8(0),
+        Value::Bool(b) => {
+            h.write_u8(1);
+            h.write_u8(*b as u8);
+        }
+        Value::Int(_) | Value::Double(_) | Value::Timestamp(_) => {
+            let f = as_f64(v).expect("numeric");
+            let bits = if f.is_nan() {
+                f64::NAN.to_bits()
+            } else if f == 0.0 {
+                0f64.to_bits()
+            } else {
+                f.to_bits()
+            };
+            h.write_u8(2);
+            h.write_u64(bits);
+        }
+        Value::Text(s) => {
+            h.write_u8(3);
+            h.write(s.as_bytes());
+        }
+    }
 }
 
 // ── projection helpers ──────────────────────────────────────────────────────
@@ -803,54 +1331,10 @@ fn default_name(expr: &Expr) -> String {
 
 // ── ORDER BY helpers ────────────────────────────────────────────────────────
 
-fn cmp_by_order(
-    keys: &[(Expr, bool)],
-    schema: &[ColRef],
-    a: &[Value],
-    b: &[Value],
-    params: &[Value],
-    err: &mut Option<SqlError>,
-) -> Ordering {
-    for (expr, asc) in keys {
-        let (va, vb) = match (
-            eval_scalar(expr, schema, a, params),
-            eval_scalar(expr, schema, b, params),
-        ) {
-            (Ok(va), Ok(vb)) => (va, vb),
-            (Err(e), _) | (_, Err(e)) => {
-                *err = Some(e);
-                return Ordering::Equal;
-            }
-        };
-        let ord = Value::total_order(&va, &vb);
-        let ord = if *asc { ord } else { ord.reverse() };
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
-}
-
-fn cmp_by_order_agg(
-    keys: &[(Expr, bool)],
-    schema: &[ColRef],
-    a: &[Vec<Value>],
-    b: &[Vec<Value>],
-    params: &[Value],
-    err: &mut Option<SqlError>,
-) -> Ordering {
-    for (expr, asc) in keys {
-        let (va, vb) = match (
-            eval_agg(expr, schema, a, params),
-            eval_agg(expr, schema, b, params),
-        ) {
-            (Ok(va), Ok(vb)) => (va, vb),
-            (Err(e), _) | (_, Err(e)) => {
-                *err = Some(e);
-                return Ordering::Equal;
-            }
-        };
-        let ord = Value::total_order(&va, &vb);
+/// Compare two precomputed sort-key rows under the ORDER BY directions.
+fn cmp_keys(order: &[(Expr, bool)], a: &[Value], b: &[Value]) -> Ordering {
+    for (i, (_, asc)) in order.iter().enumerate() {
+        let ord = Value::total_order(&a[i], &b[i]);
         let ord = if *asc { ord } else { ord.reverse() };
         if ord != Ordering::Equal {
             return ord;
@@ -895,11 +1379,17 @@ fn truthy(v: &Value) -> bool {
     matches!(v, Value::Bool(true))
 }
 
-/// Evaluate a scalar (non-aggregate) expression over a single row.
-fn eval_scalar(expr: &Expr, schema: &[ColRef], row: &[Value], params: &[Value]) -> Result<Value> {
+/// Evaluate a scalar (non-aggregate) expression over a single row (a cell
+/// slice or a join-tuple view).
+fn eval_scalar<R: RowLike + ?Sized>(
+    expr: &Expr,
+    schema: &[ColRef],
+    row: &R,
+    params: &[Value],
+) -> Result<Value> {
     match expr {
         Expr::Col(i) => row
-            .get(*i)
+            .val(*i)
             .cloned()
             .ok_or_else(|| SqlError::Eval(format!("bound column {i} out of range"))),
         Expr::Literal(v) => Ok(v.clone()),
@@ -909,7 +1399,7 @@ fn eval_scalar(expr: &Expr, schema: &[ColRef], row: &[Value], params: &[Value]) 
             .ok_or_else(|| SqlError::Eval(format!("missing bind parameter ${}", i + 1))),
         Expr::Column { table, name } => {
             let idx = resolve_col(schema, table, name)?;
-            row.get(idx)
+            row.val(idx)
                 .cloned()
                 .ok_or_else(|| SqlError::Eval(format!("column {name:?} out of range")))
         }
@@ -964,56 +1454,50 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
     })
 }
 
-/// Evaluate an expression that may contain aggregates, over a group of rows.
-/// Non-aggregate leaves are evaluated on the group's first row (as SQL requires
-/// them to be group keys).
+/// Evaluate an expression that may contain aggregates, over a group of tuple
+/// indices. Non-aggregate leaves are evaluated on the group's first row (as
+/// SQL requires them to be group keys).
 fn eval_agg(
     expr: &Expr,
     schema: &[ColRef],
-    group: &[Vec<Value>],
+    src: &Sources,
+    tuples: &Tuples,
+    group: &[u32],
     params: &[Value],
 ) -> Result<Value> {
     match expr {
         Expr::Aggregate { func, arg } => {
-            eval_aggregate(*func, arg.as_deref(), schema, group, params)
+            eval_aggregate(*func, arg.as_deref(), schema, src, tuples, group, params)
         }
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Param(i) => params
             .get(*i)
             .cloned()
             .ok_or_else(|| SqlError::Eval(format!("missing bind parameter ${}", i + 1))),
-        Expr::Col(i) => {
+        Expr::Col(_) | Expr::Column { .. } => {
             // A grouped column: same across the group; read from the first row.
             match group.first() {
-                Some(row) => row
-                    .get(*i)
-                    .cloned()
-                    .ok_or_else(|| SqlError::Eval(format!("bound column {i} out of range"))),
-                None => Ok(Value::Null),
-            }
-        }
-        Expr::Column { table, name } => {
-            // A grouped column: same across the group; read from the first row.
-            let idx = resolve_col(schema, table, name)?;
-            match group.first() {
-                Some(row) => row
-                    .get(idx)
-                    .cloned()
-                    .ok_or_else(|| SqlError::Eval(format!("column {name:?} out of range"))),
+                Some(&i) => {
+                    let view = View {
+                        src,
+                        tuple: tuples.row(i as usize),
+                    };
+                    eval_scalar(expr, schema, &view, params)
+                }
                 None => Ok(Value::Null),
             }
         }
         Expr::IsNull { expr, negated } => {
-            let v = eval_agg(expr, schema, group, params)?;
+            let v = eval_agg(expr, schema, src, tuples, group, params)?;
             Ok(Value::Bool(matches!(v, Value::Null) != *negated))
         }
         Expr::Unary { op, expr } => {
-            let v = eval_agg(expr, schema, group, params)?;
+            let v = eval_agg(expr, schema, src, tuples, group, params)?;
             apply_unary(*op, v)
         }
         Expr::Binary { op, left, right } => {
-            let l = eval_agg(left, schema, group, params)?;
-            let r = eval_agg(right, schema, group, params)?;
+            let l = eval_agg(left, schema, src, tuples, group, params)?;
+            let r = eval_agg(right, schema, src, tuples, group, params)?;
             eval_binary(*op, l, r)
         }
     }
@@ -1023,83 +1507,124 @@ fn eval_aggregate(
     func: AggFunc,
     arg: Option<&Expr>,
     schema: &[ColRef],
-    group: &[Vec<Value>],
+    src: &Sources,
+    tuples: &Tuples,
+    group: &[u32],
     params: &[Value],
 ) -> Result<Value> {
-    // COUNT(*) counts all rows; COUNT(expr) counts non-null; others fold values.
+    // COUNT(*) counts all rows; COUNT(expr) counts non-null; others fold
+    // values. All folds stream — no per-group buffering of evaluated values.
     if func == AggFunc::Count && arg.is_none() {
         return Ok(Value::Int(group.len() as i64));
     }
     let arg = arg.ok_or_else(|| SqlError::Eval("aggregate requires an argument".into()))?;
-    let mut values = Vec::new();
-    for row in group {
-        let v = eval_scalar(arg, schema, row, params)?;
-        if !matches!(v, Value::Null) {
-            values.push(v);
-        }
-    }
+    let view_of = |i: &u32| View {
+        src,
+        tuple: tuples.row(*i as usize),
+    };
     match func {
-        AggFunc::Count => Ok(Value::Int(values.len() as i64)),
-        AggFunc::Min => Ok(fold_extreme(&values, Ordering::Less)),
-        AggFunc::Max => Ok(fold_extreme(&values, Ordering::Greater)),
-        AggFunc::Sum => Ok(fold_sum(&values)?),
-        AggFunc::Avg => {
-            if values.is_empty() {
-                return Ok(Value::Null);
+        AggFunc::Count => {
+            let mut n: i64 = 0;
+            for i in group {
+                if !matches!(eval_scalar(arg, schema, &view_of(i), params)?, Value::Null) {
+                    n += 1;
+                }
             }
-            let sum = fold_sum(&values)?;
-            let n = values.len() as f64;
+            Ok(Value::Int(n))
+        }
+        AggFunc::Min | AggFunc::Max => {
+            let want = if func == AggFunc::Min {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+            let mut best: Option<Value> = None;
+            for i in group {
+                let v = eval_scalar(arg, schema, &view_of(i), params)?;
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                match &best {
+                    None => best = Some(v),
+                    Some(cur) => {
+                        if Value::total_order(&v, cur) == want {
+                            best = Some(v);
+                        }
+                    }
+                }
+            }
+            Ok(best.unwrap_or(Value::Null))
+        }
+        AggFunc::Sum | AggFunc::Avg => {
+            let mut sum = SumAcc::Empty;
+            let mut n: i64 = 0;
+            for i in group {
+                let v = eval_scalar(arg, schema, &view_of(i), params)?;
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                sum.add(&v)?;
+                n += 1;
+            }
+            let sum = match sum {
+                SumAcc::Empty => return Ok(Value::Null),
+                SumAcc::Int(i) => Value::Int(i),
+                SumAcc::Float(f) => Value::Double(f),
+            };
+            if func == AggFunc::Sum {
+                return Ok(sum);
+            }
             let s = match sum {
                 Value::Int(i) => i as f64,
                 Value::Double(d) => d,
-                _ => return Err(SqlError::Eval("AVG over non-numeric values".into())),
+                _ => unreachable!(),
             };
-            Ok(Value::Double(s / n))
+            Ok(Value::Double(s / n as f64))
         }
     }
 }
 
-fn fold_extreme(values: &[Value], want: Ordering) -> Value {
-    let mut best: Option<&Value> = None;
-    for v in values {
-        match best {
-            None => best = Some(v),
-            Some(cur) => {
-                if Value::total_order(v, cur) == want {
-                    best = Some(v);
+/// Streaming SUM accumulator: integer until the first Double, then float
+/// (matching SQL's numeric widening; Int sums use wrapping arithmetic as
+/// before).
+enum SumAcc {
+    Empty,
+    Int(i64),
+    Float(f64),
+}
+
+impl SumAcc {
+    fn add(&mut self, v: &Value) -> Result<()> {
+        let vf = match v {
+            Value::Int(i) => {
+                match self {
+                    SumAcc::Empty => *self = SumAcc::Int(*i),
+                    SumAcc::Int(acc) => *acc = acc.wrapping_add(*i),
+                    SumAcc::Float(acc) => *acc += *i as f64,
                 }
+                return Ok(());
             }
+            Value::Timestamp(t) => {
+                match self {
+                    SumAcc::Empty => *self = SumAcc::Int(*t),
+                    SumAcc::Int(acc) => *acc = acc.wrapping_add(*t),
+                    SumAcc::Float(acc) => *acc += *t as f64,
+                }
+                return Ok(());
+            }
+            Value::Double(d) => *d,
+            other => {
+                return Err(SqlError::Eval(format!(
+                    "SUM over non-numeric value {other:?}"
+                )));
+            }
+        };
+        match self {
+            SumAcc::Empty => *self = SumAcc::Float(vf),
+            SumAcc::Int(acc) => *self = SumAcc::Float(*acc as f64 + vf),
+            SumAcc::Float(acc) => *acc += vf,
         }
-    }
-    best.cloned().unwrap_or(Value::Null)
-}
-
-fn fold_sum(values: &[Value]) -> Result<Value> {
-    if values.is_empty() {
-        return Ok(Value::Null);
-    }
-    let any_float = values.iter().any(|v| matches!(v, Value::Double(_)));
-    if any_float {
-        let mut acc = 0.0;
-        for v in values {
-            acc += match v {
-                Value::Int(i) => *i as f64,
-                Value::Double(d) => *d,
-                Value::Timestamp(t) => *t as f64,
-                _ => return Err(SqlError::Eval("SUM over non-numeric values".into())),
-            };
-        }
-        Ok(Value::Double(acc))
-    } else {
-        let mut acc: i64 = 0;
-        for v in values {
-            acc = acc.wrapping_add(match v {
-                Value::Int(i) => *i,
-                Value::Timestamp(t) => *t,
-                _ => return Err(SqlError::Eval("SUM over non-numeric values".into())),
-            });
-        }
-        Ok(Value::Int(acc))
+        Ok(())
     }
 }
 
