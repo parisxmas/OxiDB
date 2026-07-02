@@ -598,3 +598,54 @@ fn window_rejected_outside_projection() {
         vec![vec![i(1)]]
     );
 }
+
+// ── join reordering ─────────────────────────────────────────────────────────
+
+#[test]
+fn join_reordering_preserves_results() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE big (id INT, small_id INT, v INT)")
+        .unwrap();
+    db.execute("CREATE TABLE small (id INT, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE mid (id INT, big_id INT)").unwrap();
+    let mut vals = String::new();
+    for i in 0..500 {
+        if i > 0 {
+            vals.push(',');
+        }
+        vals.push_str(&format!("({}, {}, {})", i, i % 5, i * 2));
+    }
+    db.execute(&format!("INSERT INTO big VALUES {vals}"))
+        .unwrap();
+    db.execute("INSERT INTO small VALUES (0,'a'),(1,'b'),(2,'c'),(3,'d'),(4,'e')")
+        .unwrap();
+    db.execute("INSERT INTO mid VALUES (1, 10), (2, 20), (3, 499)")
+        .unwrap();
+    // Written big-first: the planner may reorder (small, mid first) but the
+    // result set must be identical.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT s.name, m.id, b.v FROM big b \
+             JOIN small s ON s.id = b.small_id \
+             JOIN mid m ON m.big_id = b.id \
+             ORDER BY m.id"
+        ),
+        vec![
+            vec![t("a"), i(1), i(20)],
+            vec![t("a"), i(2), i(40)],
+            vec![t("e"), i(3), i(998)],
+        ]
+    );
+    // Outer joins keep written order (and stay correct).
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT COUNT(*) AS n FROM big b \
+             LEFT JOIN small s ON s.id = b.small_id \
+             JOIN mid m ON m.big_id = b.id"
+        ),
+        vec![vec![i(3)]]
+    );
+}

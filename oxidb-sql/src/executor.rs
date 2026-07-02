@@ -1551,6 +1551,126 @@ fn view_source<S: Store>(
     Ok(Some((schema, chunk)))
 }
 
+/// Which side of an equi conjunct a (fully qualified) expression belongs to.
+enum ConnSide {
+    Avail,
+    Right,
+}
+
+/// Classify an expression for join connectivity: `Some(Avail)` if every
+/// column is table-qualified and every qualifier is an already-available
+/// table, `Some(Right)` if every qualifier is the joining table. `None` for
+/// anything else (unqualified columns, mixed sides, no columns).
+fn conn_side(
+    e: &Expr,
+    avail: &std::collections::HashSet<String>,
+    right_key: &str,
+) -> Option<ConnSide> {
+    let mut refs = Vec::new();
+    collect_col_refs(e, &mut refs);
+    if refs.is_empty() {
+        return None;
+    }
+    let mut side: Option<ConnSide> = None;
+    for (table, _) in refs {
+        let t = table.as_deref()?; // unqualified -> unknown
+        let s = if t == right_key {
+            ConnSide::Right
+        } else if avail.contains(t) {
+            ConnSide::Avail
+        } else {
+            return None;
+        };
+        match (&side, &s) {
+            (None, _) => side = Some(s),
+            (Some(ConnSide::Avail), ConnSide::Avail) => {}
+            (Some(ConnSide::Right), ConnSide::Right) => {}
+            _ => return None,
+        }
+    }
+    side
+}
+
+/// Whether every column reference in `on` is table-qualified and resolves to
+/// an available table or the joining table itself (so executing the join now
+/// cannot break binding), and at least one `a = b` conjunct connects the two
+/// (so it stays a hash join).
+fn join_placeable(on: &Expr, avail: &std::collections::HashSet<String>, right_key: &str) -> bool {
+    let mut refs = Vec::new();
+    collect_col_refs(on, &mut refs);
+    for (table, _) in &refs {
+        match table.as_deref() {
+            Some(t) if t == right_key || avail.contains(t) => {}
+            _ => return false,
+        }
+    }
+    fn connects(e: &Expr, avail: &std::collections::HashSet<String>, right_key: &str) -> bool {
+        match e {
+            Expr::Binary {
+                op: BinOp::And,
+                left,
+                right,
+            } => connects(left, avail, right_key) || connects(right, avail, right_key),
+            Expr::Binary {
+                op: BinOp::Eq,
+                left,
+                right,
+            } => matches!(
+                (
+                    conn_side(left, avail, right_key),
+                    conn_side(right, avail, right_key)
+                ),
+                (Some(ConnSide::Avail), Some(ConnSide::Right))
+                    | (Some(ConnSide::Right), Some(ConnSide::Avail))
+            ),
+            _ => false,
+        }
+    }
+    connects(on, avail, right_key)
+}
+
+/// Greedily reorder an all-INNER join chain: at each step, among the pending
+/// joins that are placeable against the tables joined so far, pick the one
+/// with the smallest right-table cardinality (build the smallest hash/index
+/// inputs first, shrinking intermediate results early). Written order is kept
+/// whenever anything makes reordering unsafe or unknowable: an outer join, a
+/// view (no cardinality hint), or an ON with unqualified columns. When no
+/// pending join is placeable, the earliest remaining one is taken — its
+/// written-order predecessors have all been placed, so it is always valid.
+fn reorder_joins<'a, S: Store>(store: &S, from: &TableRef, joins: &'a [Join]) -> Vec<&'a Join> {
+    let original: Vec<&Join> = joins.iter().collect();
+    if joins.len() < 2 || joins.iter().any(|j| j.kind != JoinKind::Inner) {
+        return original;
+    }
+    let mut sizes = Vec::with_capacity(joins.len());
+    for j in joins {
+        match store.row_count_hint(&j.table.name) {
+            Some(n) => sizes.push(n),
+            None => return original,
+        }
+    }
+
+    let mut avail: std::collections::HashSet<String> =
+        std::iter::once(from.key().to_string()).collect();
+    let mut pending: Vec<usize> = (0..joins.len()).collect();
+    let mut order: Vec<&Join> = Vec::with_capacity(joins.len());
+    while !pending.is_empty() {
+        let mut best: Option<(usize, usize)> = None; // (position in pending, size)
+        for (pi, &ji) in pending.iter().enumerate() {
+            if join_placeable(&joins[ji].on, &avail, joins[ji].table.key())
+                && best.is_none_or(|(_, bs)| sizes[ji] < bs)
+            {
+                best = Some((pi, sizes[ji]));
+            }
+        }
+        let pi = best.map(|(pi, _)| pi).unwrap_or(0);
+        let ji = pending.remove(pi);
+        avail.insert(joins[ji].table.key().to_string());
+        order.push(&joins[ji]);
+    }
+    order
+}
+
 /// Build the combined (schema, sources, tuples) for FROM + joins.
 fn build_source<S: Store>(
     store: &S,
@@ -1584,7 +1704,7 @@ fn build_source<S: Store>(
         data: (0..n as u32).collect(),
     };
 
-    for join in &select.joins {
+    for join in reorder_joins(store, &select.from, &select.joins) {
         join_into(
             store,
             join,
@@ -1683,35 +1803,43 @@ fn join_into<S: Store>(
 
         let index = RightIndex::build(&right_keys, &right_schema, right, params)?;
 
-        for lt in tuples.data.chunks_exact(stride) {
-            cand[..stride].copy_from_slice(lt);
-            let mut left_matched = false;
-            let lview = View {
-                src,
-                tuple: &cand[..stride],
-            };
-            let mut chain = index.probe(&left_keys, schema, &lview, params)?;
-            while chain != CHAIN_END {
-                let ri = chain;
-                chain = index.next(ri);
-                cand[stride] = ri;
-                let keep = match &residual {
-                    None => true,
-                    Some(res) => {
-                        let view = View { src, tuple: &cand };
-                        truthy(&eval_scalar(res, &combined, &view, params)?)
+        let probe = ProbeCtx {
+            stride,
+            src,
+            index: &index,
+            left_keys: &left_keys,
+            left_schema: schema,
+            combined: &combined,
+            residual: &residual,
+            params,
+            want_left,
+            track_right: want_right,
+            nright,
+        };
+        let n_left = tuples.data.len() / stride;
+        if n_left >= PAR_THRESHOLD {
+            // Chunked parallel probe. Chunk outputs concatenate in chunk
+            // order, so the emitted rows are identical to the sequential
+            // loop; per-chunk right-matched bitmaps are OR-merged.
+            use rayon::prelude::*;
+            const TUPLES_PER_CHUNK: usize = 8_192;
+            let parts: Vec<(Vec<u32>, Vec<bool>)> = tuples
+                .data
+                .par_chunks(TUPLES_PER_CHUNK * stride)
+                .map(|lchunk| probe.run(lchunk))
+                .collect::<Result<_>>()?;
+            for (part_out, part_matched) in parts {
+                out.extend_from_slice(&part_out);
+                for (ri, m) in part_matched.into_iter().enumerate() {
+                    if m {
+                        right_matched[ri] = true;
                     }
-                };
-                if keep {
-                    left_matched = true;
-                    right_matched[ri as usize] = true;
-                    out.extend_from_slice(&cand);
                 }
             }
-            if want_left && !left_matched {
-                cand[stride] = NULL_ROW;
-                out.extend_from_slice(&cand);
-            }
+        } else {
+            let (seq_out, seq_matched) = probe.run(&tuples.data)?;
+            out = seq_out;
+            right_matched = seq_matched;
         }
     }
 
@@ -1799,6 +1927,10 @@ fn join_key<R: RowLike + ?Sized>(
 /// End-of-chain sentinel in a [`RightIndex`] bucket chain.
 const CHAIN_END: u32 = u32::MAX;
 
+/// Row-count threshold above which join build/probe loops run on the rayon
+/// pool (below it, thread fan-out costs more than it saves).
+const PAR_THRESHOLD: usize = 32_768;
+
 /// The numeric key of a value if it is exactly an integer (`Int`, `Timestamp`,
 /// or an integral `Double` — the numeric kinds compare equal across types).
 #[inline]
@@ -1830,6 +1962,75 @@ enum RightIndex {
     },
 }
 
+/// Everything one hash-join probe pass needs, bundled so the sequential and
+/// parallel paths share the exact same body.
+struct ProbeCtx<'a> {
+    stride: usize,
+    src: &'a Sources,
+    index: &'a RightIndex,
+    left_keys: &'a [Expr],
+    left_schema: &'a [ColRef],
+    combined: &'a [ColRef],
+    residual: &'a Option<Expr>,
+    params: &'a [Value],
+    want_left: bool,
+    track_right: bool,
+    nright: usize,
+}
+
+impl ProbeCtx<'_> {
+    /// Probe a slice of left tuples, returning the emitted output tuples and
+    /// (when tracking) which right rows matched.
+    fn run(&self, lchunk: &[u32]) -> Result<(Vec<u32>, Vec<bool>)> {
+        let stride = self.stride;
+        let mut out: Vec<u32> = Vec::new();
+        let mut matched: Vec<bool> = if self.track_right {
+            vec![false; self.nright]
+        } else {
+            Vec::new()
+        };
+        let mut cand: Vec<u32> = vec![0; stride + 1];
+        for lt in lchunk.chunks_exact(stride) {
+            cand[..stride].copy_from_slice(lt);
+            let mut left_matched = false;
+            let lview = View {
+                src: self.src,
+                tuple: &cand[..stride],
+            };
+            let mut chain =
+                self.index
+                    .probe(self.left_keys, self.left_schema, &lview, self.params)?;
+            while chain != CHAIN_END {
+                let ri = chain;
+                chain = self.index.next(ri);
+                cand[stride] = ri;
+                let keep = match self.residual {
+                    None => true,
+                    Some(res) => {
+                        let view = View {
+                            src: self.src,
+                            tuple: &cand,
+                        };
+                        truthy(&eval_scalar(res, self.combined, &view, self.params)?)
+                    }
+                };
+                if keep {
+                    left_matched = true;
+                    if self.track_right {
+                        matched[ri as usize] = true;
+                    }
+                    out.extend_from_slice(&cand);
+                }
+            }
+            if self.want_left && !left_matched {
+                cand[stride] = NULL_ROW;
+                out.extend_from_slice(&cand);
+            }
+        }
+        Ok((out, matched))
+    }
+}
+
 impl RightIndex {
     fn build(
         right_keys: &[Expr],
@@ -1839,18 +2040,29 @@ impl RightIndex {
     ) -> Result<RightIndex> {
         let nright = right.n;
 
-        // Single-component key: check for the dense-int case first.
+        // Single-component key: check for the dense-int case first. The key
+        // evaluation is embarrassingly parallel; the fold stays sequential.
         if let [key_expr] = right_keys {
+            let keyvals: Vec<Value> = if nright >= PAR_THRESHOLD {
+                use rayon::prelude::*;
+                (0..nright)
+                    .into_par_iter()
+                    .map(|ri| eval_scalar(key_expr, right_schema, right.row(ri), params))
+                    .collect::<Result<_>>()?
+            } else {
+                (0..nright)
+                    .map(|ri| eval_scalar(key_expr, right_schema, right.row(ri), params))
+                    .collect::<Result<_>>()?
+            };
             let mut vals: Vec<Option<i64>> = Vec::with_capacity(nright);
             let mut all_int = true;
             let (mut min, mut max) = (i64::MAX, i64::MIN);
-            for ri in 0..nright {
-                let v = eval_scalar(key_expr, right_schema, right.row(ri), params)?;
+            for v in &keyvals {
                 if matches!(v, Value::Null) {
                     vals.push(None);
                     continue;
                 }
-                match int_key(&v) {
+                match int_key(v) {
                     Some(k) => {
                         min = min.min(k);
                         max = max.max(k);

@@ -800,6 +800,9 @@ impl Store for SqlEngine {
     fn view_sql(&self, name: &str) -> Option<String> {
         SqlEngine::view_sql(self, name)
     }
+    fn row_count_hint(&self, table: &str) -> Option<usize> {
+        SqlEngine::row_count(self, table).ok()
+    }
     fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<store::Rows>> {
         SqlEngine::index_lookup_eq(self, table, eqs)
     }

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### SQL engine: join reordering + parallel hash joins
+
+- **Greedy join reordering** — all-INNER join chains execute
+  smallest-table-first among the joins whose `ON` is already fully
+  resolvable (and still equi-joins) against the tables placed so far;
+  written order is kept for outer joins, view sources, or `ON` clauses
+  with unqualified columns.
+- **Parallel probe/build (rayon)** — above 32k rows the hash-join probe
+  runs over left-tuple chunks in parallel (chunk-ordered concat keeps the
+  emitted rows identical to the sequential loop; right-matched bitmaps
+  OR-merge for outer joins), and build-side key evaluation parallelizes
+  the same way. Small queries stay sequential and unaffected.
+- Hard-join benchmark at 20× scale: Q1 21.2 ms / Q2 20.7 ms vs
+  PostgreSQL 15's 45.1 / 47.9 — the lead grows to 2.1–4.8× across all
+  four queries (`oxidb-sql/BENCHMARKS.md`).
+
 ### SQL engine: cluster replication, embedded surface, correlated subqueries, views, window functions
 
 - **Raft replication (server 0.31.5)** — in cluster mode, SQL writes (any

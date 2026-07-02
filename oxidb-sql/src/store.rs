@@ -81,6 +81,12 @@ pub(crate) trait Store {
     /// The stored SQL text of a view, if one with this name exists.
     fn view_sql(&self, name: &str) -> Option<String>;
 
+    /// A cheap cardinality estimate for join planning. `None` when unknown
+    /// (views, buffered transactions) — the planner then keeps written order.
+    fn row_count_hint(&self, _table: &str) -> Option<usize> {
+        None
+    }
+
     /// Look up rows using a secondary index, given the available
     /// `column = value` equality pairs from the WHERE clause.
     ///

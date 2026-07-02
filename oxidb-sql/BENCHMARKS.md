@@ -21,12 +21,16 @@ suppliers S1/S6 which the data formula never assigns; Q4 = 100000). ✅
 
 ## Speed — scale 20 (100k orders, 300k items), best of 5
 
-| Query | Shape | v2 (row-materializing) | v3 (late materialization) | PostgreSQL | Speedup |
-|-------|-------|-----------------------:|--------------------------:|-----------:|--------:|
-| Q1 | 5-way INNER, revenue/region   | 163.3 ms | **26.8 ms** | 45.1 ms | 1.7× |
-| Q2 | 6-way INNER, revenue/supplier | 180.0 ms | **28.3 ms** | 47.9 ms | 1.7× |
-| Q3 | LEFT chain, orders/region     |  27.5 ms |  **2.8 ms** | 14.8 ms | 5.3× |
-| Q4 | FULL join, row count          |  15.5 ms |  **1.3 ms** |  7.3 ms | 5.7× |
+| Query | Shape | v2 (row-materializing) | v3 (late materialization) | v4 (+parallel join) | PostgreSQL | Speedup |
+|-------|-------|-----------------------:|--------------------------:|--------------------:|-----------:|--------:|
+| Q1 | 5-way INNER, revenue/region   | 163.3 ms | 26.8 ms | **21.2 ms** | 45.1 ms | 2.1× |
+| Q2 | 6-way INNER, revenue/supplier | 180.0 ms | 28.3 ms | **20.7 ms** | 47.9 ms | 2.3× |
+| Q3 | LEFT chain, orders/region     |  27.5 ms |  2.8 ms |  **3.4 ms** | 14.8 ms | 4.4× |
+| Q4 | FULL join, row count          |  15.5 ms |  1.3 ms |  **1.5 ms** |  7.3 ms | 4.8× |
+
+(v3→v4 also absorbed the correlated-subquery / view / window-function
+evaluation plumbing added between the two measurements — Q3/Q4's small deltas
+are that, not the parallelism, which only engages above 32k rows.)
 
 ## Speed — scale 1 (5k orders, 15k items), best of 5
 
@@ -94,8 +98,25 @@ differential check against PostgreSQL produce identical results.
 | v2 | 7.0 ms | expression binding (positional `Col`), move-not-clone grouping |
 | v3 | 1.04 ms | late materialization: pruned flat chunks, u32 index-tuple joins, dense-int direct-address index, streaming group/agg, residual-only ON recheck |
 
+## v4: join reordering + parallel probe/build
+
+**Greedy join reordering.** An all-INNER join chain is reordered before
+execution: at each step, among the joins whose `ON` is fully resolvable
+against the tables placed so far (and still equi-connects — stays a hash
+join), the one with the smallest right-table row count goes first, shrinking
+intermediate results early. Written order is kept whenever reordering is
+unsafe or unknowable: any outer join, a view source (no cardinality hint), or
+an `ON` with unqualified column references.
+
+**Parallel probe/build (rayon).** Above 32k rows, the hash-join probe runs on
+chunks of left tuples in parallel — chunk outputs concatenate in chunk order,
+so emitted rows are byte-identical to the sequential loop; per-chunk
+right-matched bitmaps are OR-merged for outer joins. The build side's key
+evaluation parallelizes the same way. Below the threshold everything stays
+sequential, so small queries (scale 1: Q1 ≈ 1.06 ms) are unaffected.
+
 ## Remaining headroom
 
-Not yet done (would widen the lead further): join reordering / cost-based
-planning, building the index on the smaller join side, parallel probe/build,
-and SIMD-friendly column-major chunks.
+Not yet done (would widen the lead further): cost-based planning beyond the
+greedy reorder, building the index on the smaller join side, parallel
+grouping, and SIMD-friendly column-major chunks.
