@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### SQL engine: catalog introspection
+
+- New statements `SHOW TABLES` (with row counts), `SHOW VIEWS`,
+  `SHOW INDEXES [FROM table]`, and `DESCRIBE table` /
+  `SHOW COLUMNS FROM table` — answered from the catalog as ordinary result
+  sets. Read-only: allowed for the `read` role, never Raft-replicated, and
+  inside a transaction they see the transaction's own uncommitted DDL.
+
+### VS Code extension 0.2.0: SQL engine support
+
+- New **SQL** explorer view: tables (with row counts), columns, indexes, and
+  views, introspected live from the server; refresh, drop-table/view and
+  "Select Top 100" context actions.
+- **New SQL Query** command opens a `.sql` editor; **Run SQL** (`Cmd/Ctrl+Enter`
+  or `F5`) executes the selection or whole file — with `?` / `$N` parameter
+  support — and renders result grids per statement.
+- Document-engine improvements: connection status-bar item, pipelined TCP
+  client (requests no longer race), collection view kept usable.
+
 ## v0.32.0
 
 ### SQL engine: insert benchmark + WAL sync mode

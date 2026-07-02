@@ -27,11 +27,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub use ast::QueryResult;
-pub use catalog::{Column, Table};
+pub use catalog::{Column, IndexDef, Table};
 pub use error::{Result, SqlError};
 pub use types::{SqlType, Value};
 
-use catalog::{Catalog, IndexDef};
+use catalog::Catalog;
 use store::Store;
 use transaction::Transaction;
 use types::IndexKey;
@@ -622,6 +622,29 @@ impl SqlEngine {
         inner.catalog.tables.keys().cloned().collect()
     }
 
+    /// All table definitions, sorted by name.
+    pub fn list_tables(&self) -> Vec<Table> {
+        let inner = self.inner.lock().unwrap();
+        inner.catalog.tables.values().cloned().collect()
+    }
+
+    /// All views as `(name, body SQL)` pairs, sorted by name.
+    pub fn list_views(&self) -> Vec<(String, String)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .catalog
+            .views
+            .iter()
+            .map(|(n, s)| (n.clone(), s.clone()))
+            .collect()
+    }
+
+    /// All secondary index definitions, sorted by index name.
+    pub fn list_indexes(&self) -> Vec<IndexDef> {
+        let inner = self.inner.lock().unwrap();
+        inner.catalog.indexes.values().cloned().collect()
+    }
+
     /// The next `row_id` a table would assign (for transaction id seeding).
     pub(crate) fn peek_next_row_id(&self, table: &str) -> Option<u64> {
         let inner = self.inner.lock().unwrap();
@@ -731,13 +754,14 @@ impl SqlEngine {
     }
 }
 
-/// Whether every statement in `sql` is a read (a SELECT, possibly with set
-/// operations). Callers that gate write access per statement (e.g. a
-/// read-only server role) check this before executing.
+/// Whether every statement in `sql` is a read (a SELECT — possibly with set
+/// operations — or a SHOW/DESCRIBE introspection statement). Callers that
+/// gate write access per statement (e.g. a read-only server role) check this
+/// before executing.
 pub fn is_read_only(sql: &str) -> Result<bool> {
     Ok(parser::parse(sql)?
         .iter()
-        .all(|s| matches!(s, ast::Statement::Select(_))))
+        .all(|s| matches!(s, ast::Statement::Select(_) | ast::Statement::Show(_))))
 }
 
 /// Autocommit `Store`: every operation is applied and logged immediately.
@@ -799,6 +823,15 @@ impl Store for SqlEngine {
     }
     fn view_sql(&self, name: &str) -> Option<String> {
         SqlEngine::view_sql(self, name)
+    }
+    fn list_tables(&self) -> Vec<Table> {
+        SqlEngine::list_tables(self)
+    }
+    fn list_views(&self) -> Vec<(String, String)> {
+        SqlEngine::list_views(self)
+    }
+    fn list_indexes(&self) -> Vec<IndexDef> {
+        SqlEngine::list_indexes(self)
     }
     fn row_count_hint(&self, table: &str) -> Option<usize> {
         SqlEngine::row_count(self, table).ok()

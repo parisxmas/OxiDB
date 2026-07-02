@@ -60,6 +60,21 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    /// Catalog introspection: `SHOW TABLES` / `SHOW VIEWS` /
+    /// `SHOW INDEXES [FROM table]` / `DESCRIBE table`. Read-only; answered
+    /// from the catalog as an ordinary result set.
+    Show(ShowKind),
+}
+
+/// What a [`Statement::Show`] statement enumerates.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShowKind {
+    Tables,
+    Views,
+    /// All secondary indexes, or only those of one table.
+    Indexes(Option<String>),
+    /// The columns of one table (`DESCRIBE t` / `SHOW COLUMNS FROM t`).
+    Columns(String),
 }
 
 /// A full query: a plain SELECT or a set operation (UNION [ALL]) tree, plus

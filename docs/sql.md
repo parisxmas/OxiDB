@@ -154,6 +154,21 @@ Secondary indexes serve equality seeks on single-table SELECTs (a
 multi-column index applies when the WHERE clause has `col = value` conjuncts
 for **all** of its columns) and are maintained automatically on writes.
 
+### Introspection
+
+```sql
+SHOW TABLES;                -- columns: table, rows
+SHOW VIEWS;                 -- columns: view, definition
+SHOW INDEXES;               -- columns: index, table, columns
+SHOW INDEXES FROM users;    -- only that table's indexes
+DESCRIBE users;             -- columns: column, type, nullable, primary_key
+SHOW COLUMNS FROM users;    -- same as DESCRIBE
+```
+
+Introspection statements are read-only: the `read` role may run them, and in
+cluster mode they are served node-locally (not Raft-replicated). Inside a
+transaction they see the transaction's own uncommitted DDL.
+
 ## DML
 
 ```sql

@@ -9,7 +9,7 @@ use sqlparser::parser::Parser;
 
 use crate::ast::{
     AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, SelectItem, SelectQuery, SelectStmt,
-    Statement, TableRef, UnOp, WindowFunc,
+    ShowKind, Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::catalog::{Column, Table};
 use crate::error::{Result, SqlError};
@@ -21,6 +21,11 @@ use crate::types::{SqlType, Value};
 /// placeholders use `N-1` directly. Both resolve against the params slice at
 /// execution time.
 pub fn parse(sql: &str) -> Result<Vec<Statement>> {
+    // `SHOW INDEXES [FROM t]` has no sqlparser variant; recognize it directly
+    // when it is the whole input (the only shape clients send it in).
+    if let Some(stmt) = parse_show_indexes(sql) {
+        return Ok(vec![stmt]);
+    }
     let dialect = GenericDialect {};
     let statements =
         Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
@@ -29,6 +34,31 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         .into_iter()
         .map(|s| translate(s, &mut next_param))
         .collect()
+}
+
+/// Recognize `SHOW INDEXES` / `SHOW INDEX [FROM table]` (optionally
+/// `;`-terminated) as the whole input. Returns `None` when the input is
+/// anything else, letting `sqlparser` handle it.
+fn parse_show_indexes(sql: &str) -> Option<Statement> {
+    let mut words = sql.trim().trim_end_matches(';').split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("show") {
+        return None;
+    }
+    let kw = words.next()?;
+    if !kw.eq_ignore_ascii_case("indexes") && !kw.eq_ignore_ascii_case("index") {
+        return None;
+    }
+    match (words.next(), words.next(), words.next()) {
+        (None, ..) => Some(Statement::Show(ShowKind::Indexes(None))),
+        (Some(from), Some(table), None) if from.eq_ignore_ascii_case("from") => {
+            let table = table.trim_matches('"').trim_matches('`');
+            if table.is_empty() {
+                return None;
+            }
+            Some(Statement::Show(ShowKind::Indexes(Some(table.to_string()))))
+        }
+        _ => None,
+    }
 }
 
 fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
@@ -106,6 +136,20 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
         sp::Statement::StartTransaction { .. } => Ok(Statement::Begin),
         sp::Statement::Commit { .. } => Ok(Statement::Commit),
         sp::Statement::Rollback { .. } => Ok(Statement::Rollback),
+        sp::Statement::ShowTables { .. } => Ok(Statement::Show(ShowKind::Tables)),
+        sp::Statement::ShowViews { .. } => Ok(Statement::Show(ShowKind::Views)),
+        sp::Statement::ShowColumns { show_options, .. } => {
+            let table = show_options
+                .show_in
+                .and_then(|i| i.parent_name)
+                .ok_or_else(|| SqlError::Unsupported("SHOW COLUMNS without FROM <table>".into()))?;
+            Ok(Statement::Show(ShowKind::Columns(object_name_to_string(
+                &table,
+            )?)))
+        }
+        sp::Statement::ExplainTable { table_name, .. } => Ok(Statement::Show(ShowKind::Columns(
+            object_name_to_string(&table_name)?,
+        ))),
         other => Err(SqlError::Unsupported(format!("statement: {other}"))),
     }
 }

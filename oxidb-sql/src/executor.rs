@@ -16,7 +16,7 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
     AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, QueryResult, SelectItem, SelectQuery,
-    SelectStmt, Statement, TableRef, UnOp, WindowFunc,
+    SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::error::{Result, SqlError};
 use crate::store::{Chunk, Store};
@@ -112,6 +112,77 @@ pub(crate) fn execute<S: Store>(
         Statement::Begin | Statement::Commit | Statement::Rollback => Err(SqlError::Unsupported(
             "transaction control must be a top-level statement".into(),
         )),
+        Statement::Show(kind) => exec_show(store, kind),
+    }
+}
+
+/// Answer a `SHOW ...` / `DESCRIBE ...` introspection statement from the
+/// catalog as an ordinary result set.
+fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
+    let text = |s: &str| Value::Text(s.to_string());
+    match kind {
+        ShowKind::Tables => Ok(QueryResult::Select {
+            columns: vec!["table".into(), "rows".into()],
+            rows: store
+                .list_tables()
+                .into_iter()
+                .map(|t| {
+                    let rows = store
+                        .row_count_hint(&t.name)
+                        .map_or(Value::Null, |n| Value::Int(n as i64));
+                    vec![text(&t.name), rows]
+                })
+                .collect(),
+        }),
+        ShowKind::Views => Ok(QueryResult::Select {
+            columns: vec!["view".into(), "definition".into()],
+            rows: store
+                .list_views()
+                .into_iter()
+                .map(|(name, sql)| vec![Value::Text(name), Value::Text(sql)])
+                .collect(),
+        }),
+        ShowKind::Indexes(table) => {
+            if let Some(t) = &table
+                && store.table_def(t).is_none()
+            {
+                return Err(SqlError::NoSuchTable(t.clone()));
+            }
+            Ok(QueryResult::Select {
+                columns: vec!["index".into(), "table".into(), "columns".into()],
+                rows: store
+                    .list_indexes()
+                    .into_iter()
+                    .filter(|d| table.as_ref().is_none_or(|t| &d.table == t))
+                    .map(|d| vec![text(&d.name), text(&d.table), text(&d.columns.join(", "))])
+                    .collect(),
+            })
+        }
+        ShowKind::Columns(table) => {
+            let def = store
+                .table_def(&table)
+                .ok_or_else(|| SqlError::NoSuchTable(table.clone()))?;
+            Ok(QueryResult::Select {
+                columns: vec![
+                    "column".into(),
+                    "type".into(),
+                    "nullable".into(),
+                    "primary_key".into(),
+                ],
+                rows: def
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        vec![
+                            text(&c.name),
+                            text(&format!("{:?}", c.ty).to_uppercase()),
+                            Value::Bool(c.nullable),
+                            Value::Bool(c.primary_key),
+                        ]
+                    })
+                    .collect(),
+            })
+        }
     }
 }
 

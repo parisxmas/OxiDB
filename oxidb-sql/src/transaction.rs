@@ -317,6 +317,41 @@ impl Store for Transaction<'_> {
         self.engine.view_sql(name)
     }
 
+    fn list_tables(&self) -> Vec<Table> {
+        let st = self.state.borrow();
+        let mut tables: BTreeMap<String, Table> = self
+            .engine
+            .list_tables()
+            .into_iter()
+            .filter(|t| !st.dropped.contains(&t.name))
+            .map(|t| (t.name.clone(), t))
+            .collect();
+        for (name, def) in &st.created {
+            tables.insert(name.clone(), def.clone());
+        }
+        tables.into_values().collect()
+    }
+
+    fn list_views(&self) -> Vec<(String, String)> {
+        // Views can't be created or dropped inside a transaction.
+        self.engine.list_views()
+    }
+
+    fn list_indexes(&self) -> Vec<IndexDef> {
+        let st = self.state.borrow();
+        let mut indexes: BTreeMap<String, IndexDef> = self
+            .engine
+            .list_indexes()
+            .into_iter()
+            .filter(|d| !st.indexes_dropped.contains(&d.name) && !st.dropped.contains(&d.table))
+            .map(|d| (d.name.clone(), d))
+            .collect();
+        for (name, def) in &st.indexes_created {
+            indexes.insert(name.clone(), def.clone());
+        }
+        indexes.into_values().collect()
+    }
+
     fn index_lookup_eq(
         &self,
         _table: &str,

@@ -1,8 +1,8 @@
 {
   "name": "oxidb",
   "displayName": "OxiDB",
-  "description": "OxiDB document database client — browse collections, run queries, manage indexes",
-  "version": "0.1.0",
+  "description": "OxiDB client — browse collections, run document queries, and work with the SQL engine (tables, views, indexes, query editor)",
+  "version": "0.2.0",
   "publisher": "oxidb",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
@@ -17,35 +17,86 @@
       }]
     },
     "views": {
-      "oxidb-explorer": [{
-        "id": "oxidb.collections",
-        "name": "Collections"
-      }]
+      "oxidb-explorer": [
+        {
+          "id": "oxidb.collections",
+          "name": "Collections"
+        },
+        {
+          "id": "oxidb.sql",
+          "name": "SQL"
+        }
+      ]
     },
+    "viewsWelcome": [
+      {
+        "view": "oxidb.collections",
+        "contents": "Not connected to an OxiDB server.\n[Connect](command:oxidb.connect)"
+      },
+      {
+        "view": "oxidb.sql",
+        "contents": "Not connected to an OxiDB server.\n[Connect](command:oxidb.connect)\nThe SQL view requires OXIDB_SQL=1 on the server."
+      }
+    ],
     "commands": [
       { "command": "oxidb.connect", "title": "OxiDB: Connect", "icon": "$(plug)" },
-      { "command": "oxidb.disconnect", "title": "OxiDB: Disconnect" },
-      { "command": "oxidb.refreshCollections", "title": "OxiDB: Refresh", "icon": "$(refresh)" },
+      { "command": "oxidb.disconnect", "title": "OxiDB: Disconnect", "icon": "$(debug-disconnect)" },
+      { "command": "oxidb.refreshCollections", "title": "OxiDB: Refresh Collections", "icon": "$(refresh)" },
       { "command": "oxidb.newQuery", "title": "OxiDB: New Query", "icon": "$(new-file)" },
       { "command": "oxidb.runQuery", "title": "OxiDB: Run Query", "icon": "$(play)" },
       { "command": "oxidb.viewCollection", "title": "View Documents" },
       { "command": "oxidb.dropCollection", "title": "Drop Collection" },
       { "command": "oxidb.createIndex", "title": "Create Index" },
-      { "command": "oxidb.insertDocument", "title": "Insert Document" }
+      { "command": "oxidb.insertDocument", "title": "Insert Document" },
+      { "command": "oxidb.refreshSql", "title": "OxiDB: Refresh SQL", "icon": "$(refresh)" },
+      { "command": "oxidb.newSqlQuery", "title": "OxiDB: New SQL Query", "icon": "$(new-file)" },
+      { "command": "oxidb.runSql", "title": "OxiDB: Run SQL", "icon": "$(play)" },
+      { "command": "oxidb.sqlSelectTop", "title": "Select Top 100" },
+      { "command": "oxidb.sqlDescribe", "title": "Describe" },
+      { "command": "oxidb.sqlDropTable", "title": "Drop" }
     ],
     "menus": {
       "view/title": [
-        { "command": "oxidb.connect", "when": "view == oxidb.collections", "group": "navigation" },
-        { "command": "oxidb.refreshCollections", "when": "view == oxidb.collections", "group": "navigation" },
-        { "command": "oxidb.newQuery", "when": "view == oxidb.collections", "group": "navigation" }
+        { "command": "oxidb.connect", "when": "view == oxidb.collections", "group": "navigation@1" },
+        { "command": "oxidb.refreshCollections", "when": "view == oxidb.collections", "group": "navigation@2" },
+        { "command": "oxidb.newQuery", "when": "view == oxidb.collections", "group": "navigation@3" },
+        { "command": "oxidb.newSqlQuery", "when": "view == oxidb.sql", "group": "navigation@1" },
+        { "command": "oxidb.refreshSql", "when": "view == oxidb.sql", "group": "navigation@2" }
       ],
       "view/item/context": [
-        { "command": "oxidb.viewCollection", "when": "viewItem == collection" },
-        { "command": "oxidb.insertDocument", "when": "viewItem == collection" },
-        { "command": "oxidb.createIndex", "when": "viewItem == collection" },
-        { "command": "oxidb.dropCollection", "when": "viewItem == collection" }
+        { "command": "oxidb.viewCollection", "when": "view == oxidb.collections && viewItem == collection" },
+        { "command": "oxidb.insertDocument", "when": "view == oxidb.collections && viewItem == collection" },
+        { "command": "oxidb.createIndex", "when": "view == oxidb.collections && viewItem == collection" },
+        { "command": "oxidb.dropCollection", "when": "view == oxidb.collections && viewItem == collection" },
+        { "command": "oxidb.sqlSelectTop", "when": "view == oxidb.sql && viewItem == sql-table", "group": "1@1" },
+        { "command": "oxidb.sqlDescribe", "when": "view == oxidb.sql && viewItem == sql-table", "group": "1@2" },
+        { "command": "oxidb.sqlDropTable", "when": "view == oxidb.sql && viewItem == sql-table", "group": "2@1" },
+        { "command": "oxidb.sqlSelectTop", "when": "view == oxidb.sql && viewItem == sql-view", "group": "1@1" },
+        { "command": "oxidb.sqlDropTable", "when": "view == oxidb.sql && viewItem == sql-view", "group": "2@1" }
+      ],
+      "commandPalette": [
+        { "command": "oxidb.viewCollection", "when": "false" },
+        { "command": "oxidb.dropCollection", "when": "false" },
+        { "command": "oxidb.createIndex", "when": "false" },
+        { "command": "oxidb.insertDocument", "when": "false" },
+        { "command": "oxidb.sqlSelectTop", "when": "false" },
+        { "command": "oxidb.sqlDescribe", "when": "false" },
+        { "command": "oxidb.sqlDropTable", "when": "false" }
       ]
     },
+    "keybindings": [
+      {
+        "command": "oxidb.runSql",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorTextFocus && editorLangId == sql && oxidb.connected"
+      },
+      {
+        "command": "oxidb.runSql",
+        "key": "f5",
+        "when": "editorTextFocus && editorLangId == sql && oxidb.connected"
+      }
+    ],
     "languages": [{
       "id": "oxiscript",
       "aliases": ["OxiScript"],

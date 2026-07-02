@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { OxiDBClient } from './client';
 
+// ─── Document engine: collections ──────────────────────────────────────────
+
 export class CollectionItem extends vscode.TreeItem {
   constructor(
     public readonly name: string,
@@ -84,7 +86,6 @@ export class CollectionTreeProvider implements vscode.TreeDataProvider<Collectio
     }
 
     if (!element) {
-      // Root level: show collections
       const items: CollectionItem[] = [];
       for (const [name, count] of this.collections) {
         items.push(new CollectionItem(name, count, 'collection'));
@@ -92,7 +93,7 @@ export class CollectionTreeProvider implements vscode.TreeDataProvider<Collectio
       return items.sort((a, b) => a.name.localeCompare(b.name));
     }
 
-    // Children of a collection: show indexes
+    // Children of a collection: its indexes.
     const indexes = this.indexes.get(element.name) || [];
     return indexes.map(
       (idx: any) =>
@@ -102,5 +103,126 @@ export class CollectionTreeProvider implements vscode.TreeDataProvider<Collectio
           'index'
         )
     );
+  }
+}
+
+// ─── SQL engine: tables / views / columns / indexes ─────────────────────────
+
+type SqlNodeKind = 'table' | 'view' | 'column' | 'index' | 'message';
+
+export class SqlItem extends vscode.TreeItem {
+  constructor(
+    public readonly name: string,
+    public readonly kind: SqlNodeKind,
+    label: string,
+    description?: string,
+    tooltip?: string
+  ) {
+    super(
+      label,
+      kind === 'table' || kind === 'view'
+        ? vscode.TreeItemCollapsibleState.Collapsed
+        : vscode.TreeItemCollapsibleState.None
+    );
+    this.description = description;
+    if (tooltip) { this.tooltip = tooltip; }
+    this.contextValue = `sql-${kind}`;
+    switch (kind) {
+      case 'table':
+        this.iconPath = new vscode.ThemeIcon('table');
+        this.command = {
+          command: 'oxidb.sqlSelectTop',
+          title: 'Select Top 100',
+          arguments: [this],
+        };
+        break;
+      case 'view':
+        this.iconPath = new vscode.ThemeIcon('eye');
+        this.command = {
+          command: 'oxidb.sqlSelectTop',
+          title: 'Select Top 100',
+          arguments: [this],
+        };
+        break;
+      case 'column':
+        this.iconPath = new vscode.ThemeIcon('symbol-field');
+        break;
+      case 'index':
+        this.iconPath = new vscode.ThemeIcon('key');
+        break;
+      case 'message':
+        this.iconPath = new vscode.ThemeIcon('info');
+        break;
+    }
+  }
+}
+
+export class SqlTreeProvider implements vscode.TreeDataProvider<SqlItem> {
+  private _onDidChangeTreeData = new vscode.EventEmitter<SqlItem | undefined>();
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+  private client: OxiDBClient | null = null;
+
+  setClient(client: OxiDBClient | null): void {
+    this.client = client;
+    this.refresh();
+  }
+
+  refresh(): void {
+    this._onDidChangeTreeData.fire(undefined);
+  }
+
+  getTreeItem(element: SqlItem): vscode.TreeItem {
+    return element;
+  }
+
+  async getChildren(element?: SqlItem): Promise<SqlItem[]> {
+    if (!this.client || !this.client.isConnected()) {
+      return [];
+    }
+
+    try {
+      if (!element) {
+        const enabled = await this.client.sqlEnabled();
+        if (!enabled) {
+          return [new SqlItem('', 'message', 'SQL engine disabled', 'set OXIDB_SQL=1 on the server')];
+        }
+        const [tables, views] = await Promise.all([
+          this.client.sqlTables(),
+          this.client.sqlViews(),
+        ]);
+        return [
+          ...tables.map(
+            (t) => new SqlItem(t.name, 'table', t.name, t.rows === null ? undefined : `${t.rows} rows`)
+          ),
+          ...views.map((v) => new SqlItem(v.name, 'view', v.name, 'view', v.definition)),
+        ];
+      }
+
+      if (element.kind === 'table') {
+        const [columns, indexes] = await Promise.all([
+          this.client.sqlColumns(element.name),
+          this.client.sqlIndexes(element.name),
+        ]);
+        return [
+          ...columns.map((c) => {
+            const badges = [c.primaryKey ? 'PK' : '', c.nullable ? '' : 'NOT NULL']
+              .filter(Boolean)
+              .join(' ');
+            return new SqlItem(c.name, 'column', c.name, `${c.type}${badges ? ' · ' + badges : ''}`);
+          }),
+          ...indexes.map((i) => new SqlItem(i.name, 'index', i.name, `(${i.columns})`)),
+        ];
+      }
+
+      if (element.kind === 'view') {
+        const columns = await this.client.sqlColumns(element.name).catch(() => []);
+        return columns.map((c) => new SqlItem(c.name, 'column', c.name, c.type));
+      }
+    } catch (e: any) {
+      return [new SqlItem('', 'message', 'Error', String(e.message))];
+    }
+
+    return [];
   }
 }

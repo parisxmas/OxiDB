@@ -1,7 +1,99 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.DocumentViewProvider = void 0;
+exports.DocumentViewProvider = exports.SqlResultsView = void 0;
 const vscode = require("vscode");
+const BASE_STYLE = `
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 16px; }
+  h2 { margin: 0 0 8px; }
+  h3 { margin: 16px 0 8px; }
+  .stats { color: var(--vscode-descriptionForeground); margin-bottom: 16px; }
+  .toolbar { display: flex; gap: 8px; margin-bottom: 16px; }
+  input, textarea { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 6px 10px; border-radius: 4px; font-family: var(--vscode-editor-font-family); }
+  textarea { width: 100%; min-height: 60px; resize: vertical; }
+  button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; }
+  button:hover { background: var(--vscode-button-hoverBackground); }
+  .grid { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { background: var(--vscode-editor-selectionBackground); text-align: left; padding: 6px 10px; position: sticky; top: 0; }
+  td { padding: 4px 10px; border-bottom: 1px solid var(--vscode-widget-border); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.null { color: var(--vscode-descriptionForeground); font-style: italic; }
+  tr:hover td { background: var(--vscode-list-hoverBackground); }
+  .tabs { display: flex; gap: 0; margin-bottom: 16px; }
+  .tab { padding: 8px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
+  .tab.active { border-bottom-color: var(--vscode-focusBorder); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  pre { background: var(--vscode-textBlockQuote-background); padding: 12px; border-radius: 4px; overflow-x: auto; }
+  .idx { margin: 4px 0; padding: 4px 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); border-radius: 4px; display: inline-block; font-size: 12px; }
+  .ok { color: var(--vscode-testing-iconPassed, #73c991); }
+  .meta { color: var(--vscode-descriptionForeground); font-size: 12px; margin-bottom: 8px; }
+`;
+function esc(s) {
+    return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+function fmt(v) {
+    if (v === null || v === undefined) {
+        return '';
+    }
+    if (typeof v === 'object') {
+        return JSON.stringify(v);
+    }
+    return String(v);
+}
+/** Render one SQL statement result as an HTML fragment. */
+function sqlResultHtml(r, i, total) {
+    const heading = total > 1 ? `<h3>Statement ${i + 1}</h3>` : '';
+    if ('columns' in r) {
+        const head = r.columns.map((c) => `<th>${esc(c)}</th>`).join('');
+        const body = r.rows
+            .map((row) => '<tr>' +
+            row
+                .map((v) => {
+                if (v === null || v === undefined) {
+                    return '<td class="null">NULL</td>';
+                }
+                const cls = typeof v === 'number' ? ' class="num"' : '';
+                return `<td${cls} title="${esc(fmt(v))}">${esc(fmt(v))}</td>`;
+            })
+                .join('') +
+            '</tr>')
+            .join('');
+        return `${heading}<div class="meta">${r.rows.length} row${r.rows.length === 1 ? '' : 's'}</div>
+<div class="grid"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+    }
+    if ('affected' in r) {
+        return `${heading}<p class="ok">✓ ${r.affected} row${r.affected === 1 ? '' : 's'} affected</p>`;
+    }
+    if ('ddl' in r) {
+        return `${heading}<p class="ok">✓ OK</p>`;
+    }
+    return `${heading}<p class="ok">✓ transaction</p>`;
+}
+/** A single reused panel showing the results of Run SQL. */
+class SqlResultsView {
+    constructor() {
+        this.panel = null;
+    }
+    show(sql, results, elapsedMs) {
+        if (!this.panel) {
+            this.panel = vscode.window.createWebviewPanel('oxidb.sqlResults', 'OxiDB SQL Results', { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, { enableScripts: false });
+            this.panel.onDidDispose(() => { this.panel = null; });
+        }
+        const fragments = results.map((r, i) => sqlResultHtml(r, i, results.length)).join('\n');
+        this.panel.webview.html = `<!DOCTYPE html>
+<html><head><style>${BASE_STYLE}</style></head><body>
+<div class="meta">${esc(sql.length > 200 ? sql.slice(0, 200) + '…' : sql)} — ${elapsedMs}ms</div>
+${fragments}
+</body></html>`;
+        this.panel.reveal(vscode.ViewColumn.Beside, true);
+    }
+}
+exports.SqlResultsView = SqlResultsView;
 class DocumentViewProvider {
     constructor(client) {
         this.client = client;
@@ -58,30 +150,10 @@ class DocumentViewProvider {
         const cols = Array.from(fields);
         return `<!DOCTYPE html>
 <html><head>
-<style>
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 16px; }
-  h2 { margin: 0 0 8px; }
-  .stats { color: var(--vscode-descriptionForeground); margin-bottom: 16px; }
-  .toolbar { display: flex; gap: 8px; margin-bottom: 16px; }
-  input, textarea { background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border); padding: 6px 10px; border-radius: 4px; font-family: var(--vscode-editor-font-family); }
-  textarea { width: 100%; min-height: 60px; resize: vertical; }
-  button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; }
-  button:hover { background: var(--vscode-button-hoverBackground); }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { background: var(--vscode-editor-selectionBackground); text-align: left; padding: 6px 10px; position: sticky; top: 0; }
-  td { padding: 4px 10px; border-bottom: 1px solid var(--vscode-widget-border); max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  tr:hover td { background: var(--vscode-list-hoverBackground); }
-  .tabs { display: flex; gap: 0; margin-bottom: 16px; }
-  .tab { padding: 8px 16px; cursor: pointer; border-bottom: 2px solid transparent; }
-  .tab.active { border-bottom-color: var(--vscode-focusBorder); }
-  .panel { display: none; }
-  .panel.active { display: block; }
-  pre { background: var(--vscode-textBlockQuote-background); padding: 12px; border-radius: 4px; overflow-x: auto; }
-  .idx { margin: 4px 0; padding: 4px 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); border-radius: 4px; display: inline-block; font-size: 12px; }
-</style>
+<style>${BASE_STYLE}</style>
 </head><body>
-<h2>${collection}</h2>
-<div class="stats">${count} documents | ${indexes.length} indexes: ${indexes.map((i) => `<span class="idx">${i.name || i.field}</span>`).join(' ')}</div>
+<h2>${esc(collection)}</h2>
+<div class="stats">${count} documents | ${indexes.length} indexes: ${indexes.map((i) => `<span class="idx">${esc(i.name || i.field)}</span>`).join(' ')}</div>
 
 <div class="tabs">
   <div class="tab active" onclick="showTab('query')">Query</div>
@@ -107,9 +179,9 @@ class DocumentViewProvider {
   <button onclick="runAggregate()">Run Pipeline</button>
 </div>
 
-<div id="results">
-<table><thead><tr>${cols.map((c) => `<th>${c}</th>`).join('')}</tr></thead>
-<tbody>${docs.map((d) => `<tr>${cols.map((c) => `<td title="${this.esc(JSON.stringify(d[c]))}">${this.esc(this.fmt(d[c]))}</td>`).join('')}</tr>`).join('')}</tbody></table>
+<div id="results" class="grid">
+<table><thead><tr>${cols.map((c) => `<th>${esc(c)}</th>`).join('')}</tr></thead>
+<tbody>${docs.map((d) => `<tr>${cols.map((c) => `<td title="${esc(JSON.stringify(d[c]))}">${esc(fmt(d[c]))}</td>`).join('')}</tr>`).join('')}</tbody></table>
 </div>
 
 <script>
@@ -146,28 +218,13 @@ window.addEventListener('message', e => {
 </script>
 </body></html>`;
     }
-    esc(s) {
-        return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    }
-    fmt(v) {
-        if (v === null || v === undefined) {
-            return '';
-        }
-        if (typeof v === 'object') {
-            return JSON.stringify(v);
-        }
-        return String(v);
-    }
     getResultsHtml(title, docs) {
         return `<!DOCTYPE html>
 <html><head>
-<style>
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 16px; }
-  pre { background: var(--vscode-textBlockQuote-background); padding: 12px; border-radius: 4px; overflow-x: auto; white-space: pre-wrap; }
-</style>
+<style>${BASE_STYLE}</style>
 </head><body>
-<h3>${title}</h3>
-<pre>${JSON.stringify(docs, null, 2)}</pre>
+<h3>${esc(title)}</h3>
+<pre>${esc(JSON.stringify(docs, null, 2))}</pre>
 </body></html>`;
     }
 }

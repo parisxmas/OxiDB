@@ -1,0 +1,8 @@
+src/**
+tsconfig.json
+package-lock.json
+*.vsix
+media/**
+.vscodeignore
+out/queryParser.js.map
+node_modules/**

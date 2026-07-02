@@ -6,7 +6,7 @@
 //! in an overlay and are flushed atomically on commit). Making the executor
 //! generic over `Store` means the exact same query/DML code runs in both modes.
 
-use crate::catalog::Table;
+use crate::catalog::{IndexDef, Table};
 use crate::error::Result;
 use crate::types::Value;
 
@@ -80,6 +80,16 @@ pub(crate) trait Store {
     fn drop_view(&self, name: &str) -> Result<()>;
     /// The stored SQL text of a view, if one with this name exists.
     fn view_sql(&self, name: &str) -> Option<String>;
+
+    /// Introspection (`SHOW TABLES` / `DESCRIBE`): all table definitions,
+    /// sorted by name.
+    fn list_tables(&self) -> Vec<Table>;
+    /// Introspection (`SHOW VIEWS`): all `(name, body SQL)` pairs, sorted by
+    /// name.
+    fn list_views(&self) -> Vec<(String, String)>;
+    /// Introspection (`SHOW INDEXES`): all secondary index definitions,
+    /// sorted by index name.
+    fn list_indexes(&self) -> Vec<IndexDef>;
 
     /// A cheap cardinality estimate for join planning. `None` when unknown
     /// (views, buffered transactions) — the planner then keeps written order.

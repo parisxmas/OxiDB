@@ -26,7 +26,8 @@ pub fn execute_json(
             Ok(true) => {}
             Ok(false) => {
                 return Err(
-                    "permission denied: role 'read' may only execute SELECT statements".to_string(),
+                    "permission denied: role 'read' may only execute SELECT/SHOW statements"
+                        .to_string(),
                 );
             }
             Err(e) => return Err(format!("sql error: {e}")),
