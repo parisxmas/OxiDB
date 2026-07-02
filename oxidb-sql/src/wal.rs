@@ -61,10 +61,57 @@ pub enum WalRecord {
     Batch(Vec<WalRecord>),
 }
 
+/// How WAL appends are made durable.
+///
+/// `Full` (default) is a true storage flush (`File::sync_all` — on macOS an
+/// `F_FULLFSYNC`, surviving power loss). `Data` uses `File::sync_data`
+/// (`fdatasync` on Linux, a barrier fsync on macOS) — the same durability
+/// class as PostgreSQL's default `wal_sync_method`, several times faster per
+/// commit but not power-loss-proof on hardware with volatile write caches.
+/// Selected via `OXIDB_SQL_SYNC` = `full` (default) | `data`.
+#[derive(Clone, Copy, PartialEq)]
+enum SyncMode {
+    Full,
+    Data,
+}
+
+fn sync_mode_from_env() -> SyncMode {
+    match std::env::var("OXIDB_SQL_SYNC")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "data" | "datasync" | "barrier" => SyncMode::Data,
+        _ => SyncMode::Full,
+    }
+}
+
+/// The `Data` sync: `File::sync_data` everywhere except macOS, where Rust's
+/// `sync_data` still issues `F_FULLFSYNC` (Apple's `fdatasync` does not flush
+/// the drive cache, so std plays safe). Here `Data` explicitly means the
+/// PostgreSQL-default durability class — an OS-cache-level `fsync(2)` — so on
+/// macOS we call it directly.
+fn sync_data_fast(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_data()
+    }
+}
+
 /// Append-only WAL writer bound to `sql/wal/live.wal`.
 pub struct Wal {
     file: File,
     next_seq: u64,
+    sync: SyncMode,
 }
 
 impl Wal {
@@ -96,6 +143,7 @@ impl Wal {
         let wal = Wal {
             file,
             next_seq: max_seq + 1,
+            sync: sync_mode_from_env(),
         };
         Ok((wal, records))
     }
@@ -193,7 +241,10 @@ impl Wal {
         frame.extend_from_slice(&payload);
 
         self.file.write_all(&frame)?;
-        self.file.sync_all()?;
+        match self.sync {
+            SyncMode::Full => self.file.sync_all()?,
+            SyncMode::Data => sync_data_fast(&self.file)?,
+        }
         Ok(seq)
     }
 

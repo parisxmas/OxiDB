@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### SQL engine: insert benchmark + WAL sync mode
+
+- New differential write benchmark (`oxidb-sql/examples/insert_bench.rs` +
+  `insert_bench_postgres.sh`): identical INSERTs into a table with a PK and
+  four secondary indexes (one composite), measured at both durability
+  levels on both engines. At full durability OxiDB bulk-loads 2.1× faster
+  than PostgreSQL 15 and ties on single-row inserts (fsync-bound); at
+  PostgreSQL's own default (cache-level) durability OxiDB is 16× faster in
+  bulk and 5.5× faster per single insert. Parity checks byte-identical.
+- New `OXIDB_SQL_SYNC` = `full` (default) | `data`: WAL sync mode for the
+  SQL engine, the same trade PostgreSQL exposes as `wal_sync_method`
+  (`data` = OS-cache-level sync; on macOS an explicit `fsync(2)`, since
+  Rust's `sync_data` still issues `F_FULLFSYNC` there).
+
 ### SQL engine: join reordering + parallel hash joins
 
 - **Greedy join reordering** — all-INNER join chains execute

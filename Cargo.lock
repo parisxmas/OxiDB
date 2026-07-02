@@ -2307,6 +2307,7 @@ name = "oxidb-sql"
 version = "0.31.1"
 dependencies = [
  "crc32fast",
+ "libc",
  "rayon",
  "serde",
  "serde_json",

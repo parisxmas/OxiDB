@@ -115,6 +115,38 @@ right-matched bitmaps are OR-merged for outer joins. The build side's key
 evaluation parallelizes the same way. Below the threshold everything stays
 sequential, so small queries (scale 1: Q1 ≈ 1.06 ms) are unaffected.
 
+## Insert benchmark — PK + 4 secondary indexes
+
+`examples/insert_bench.rs` vs `examples/insert_bench_postgres.sh`: identical
+statements (100 batches x 1,000 rows, then 2,000 autocommit single-row
+INSERTs) into `events (id BIGINT PRIMARY KEY, user_id, kind, ts, amount)`
+with indexes on `user_id`, `kind`, `amount`, and `(user_id, kind)`, plus a
+bare (no PK, no index) table as contrast. Parity checks (COUNT, SUM, indexed
+lookups) are byte-identical on both engines.
+
+Durability matters more than anything else here, so both engines were
+measured at **both** durability levels (macOS, Apple SSD; a raw
+`F_FULLFSYNC` costs ~3.6 ms on this drive):
+
+| Workload | OxiDB `full`¹ | OxiDB `data`² | PG `fsync_writethrough`¹ | PG `open_datasync`² (default) |
+|----------|--------------:|--------------:|-------------------------:|------------------------------:|
+| bulk indexed (rows/s)  | **131,660** | **316,948** | 62,483 | 19,241 |
+| bulk bare (rows/s)     | **110,232** | **451,835** | 87,266 | 45,491 |
+| single insert (ms/ins) | 4.07 | **0.030** | **3.74** | 0.165 |
+
+¹ true storage flush (`F_FULLFSYNC`) — survives power loss.
+² OS-cache-level sync — PostgreSQL's macOS default; not power-loss-proof.
+
+Like-for-like: at full durability OxiDB loads **2.1× faster** in bulk and
+ties on single inserts (both are fsync-bound: 4.07 vs 3.74 ms against a
+3.6 ms physical flush). At PostgreSQL's own default durability class
+(`OXIDB_SQL_SYNC=data`), OxiDB is **16× faster** in bulk and **5.5× faster**
+per single insert. The bare-table delta shows index maintenance costs OxiDB
+~30% and PostgreSQL ~2-3× in bulk.
+
+`OXIDB_SQL_SYNC` = `full` (default) | `data` selects the WAL sync mode —
+the same trade PostgreSQL exposes as `wal_sync_method`.
+
 ## Remaining headroom
 
 Not yet done (would widen the lead further): cost-based planning beyond the

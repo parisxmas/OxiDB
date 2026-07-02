@@ -44,6 +44,7 @@ All configuration is done through environment variables.
 |----------|---------|-------------|
 | `OXIDB_SQL` | off | Enable the standalone SQL engine (`1`/`true`/`yes`/`on`) — see [SQL Engine](sql.md) |
 | `OXIDB_SQL_DATA` | `${OXIDB_DATA}/sql` | SQL engine data directory (entirely separate from document data) |
+| `OXIDB_SQL_SYNC` | `full` | SQL WAL durability: `full` = storage flush per commit, `data` = OS-cache sync (faster, PostgreSQL-default class) |
 
 ### Logging Settings
 

@@ -14,5 +14,8 @@ crc32fast = "1"
 thiserror = "2"
 sqlparser = "0.59"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

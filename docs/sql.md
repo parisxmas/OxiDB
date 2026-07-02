@@ -23,6 +23,7 @@ OXIDB_SQL=1 oxidb-server
 |----------|---------|-------------|
 | `OXIDB_SQL` | off | Set to `1`/`true`/`yes`/`on` to enable the SQL engine |
 | `OXIDB_SQL_DATA` | `${OXIDB_DATA}/sql` | SQL engine data directory |
+| `OXIDB_SQL_SYNC` | `full` | WAL durability: `full` = true storage flush per commit (survives power loss); `data` = OS-cache-level sync (PostgreSQL's default class, several times faster) |
 
 ## Wire Protocol
 
