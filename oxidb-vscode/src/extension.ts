@@ -89,6 +89,14 @@ export function activate(context: vscode.ExtensionContext) {
         await client.connect();
         const pong = await client.ping();
         vscode.window.showInformationMessage(`Connected to OxiDB (${pong})`);
+        client.onClose = () => {
+          client = null;
+          treeProvider.setClient(null);
+          sqlTreeProvider.setClient(null);
+          docView = null;
+          setConnected(false);
+          vscode.window.showWarningMessage('OxiDB connection lost');
+        };
         treeProvider.setClient(client);
         sqlTreeProvider.setClient(client);
         docView = new DocumentViewProvider(client);

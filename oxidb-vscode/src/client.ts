@@ -21,6 +21,9 @@ export class OxiDBClient {
   // pending promises pipelines safely.
   private pending: Pending[] = [];
   private recvBuf = Buffer.alloc(0);
+  private keepAlive: ReturnType<typeof setInterval> | null = null;
+  /** Invoked once when an established connection drops (not on disconnect()). */
+  onClose: (() => void) | null = null;
 
   constructor(host: string, port: number) {
     this.host = host;
@@ -36,6 +39,11 @@ export class OxiDBClient {
       this.socket = new net.Socket();
       this.socket.connect(this.port, this.host, () => {
         this.connected = true;
+        // The server closes idle connections (OXIDB_IDLE_TIMEOUT, default
+        // 30s); a periodic ping keeps this one alive.
+        this.keepAlive = setInterval(() => {
+          this.ping().catch(() => {});
+        }, 15000);
         resolve();
       });
       this.socket.on('data', (data) => this.onData(data));
@@ -45,19 +53,34 @@ export class OxiDBClient {
         reject(err);
       });
       this.socket.on('close', () => {
-        this.connected = false;
+        const wasConnected = this.connected;
+        this.stop();
         this.failAll(new Error('Connection closed'));
+        if (wasConnected && this.onClose) {
+          const cb = this.onClose;
+          this.onClose = null;
+          cb();
+        }
       });
     });
   }
 
   disconnect(): void {
+    this.onClose = null; // deliberate: don't report it as a drop
+    this.stop();
     if (this.socket) {
       this.socket.destroy();
       this.socket = null;
-      this.connected = false;
     }
     this.failAll(new Error('Disconnected'));
+  }
+
+  private stop(): void {
+    this.connected = false;
+    if (this.keepAlive) {
+      clearInterval(this.keepAlive);
+      this.keepAlive = null;
+    }
   }
 
   isConnected(): boolean {

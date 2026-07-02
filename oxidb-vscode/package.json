@@ -2,7 +2,7 @@
   "name": "oxidb",
   "displayName": "OxiDB",
   "description": "OxiDB client — browse collections, run document queries, and work with the SQL engine (tables, views, indexes, query editor)",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "oxidb",
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Other"],
@@ -31,10 +31,12 @@
     "viewsWelcome": [
       {
         "view": "oxidb.collections",
+        "when": "!oxidb.connected",
         "contents": "Not connected to an OxiDB server.\n[Connect](command:oxidb.connect)"
       },
       {
         "view": "oxidb.sql",
+        "when": "!oxidb.connected",
         "contents": "Not connected to an OxiDB server.\n[Connect](command:oxidb.connect)\nThe SQL view requires OXIDB_SQL=1 on the server."
       }
     ],

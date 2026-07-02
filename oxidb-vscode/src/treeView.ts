@@ -7,7 +7,7 @@ export class CollectionItem extends vscode.TreeItem {
   constructor(
     public readonly name: string,
     public readonly docCount: number,
-    public readonly itemType: 'collection' | 'index'
+    public readonly itemType: 'collection' | 'index' | 'message'
   ) {
     super(
       name,
@@ -16,7 +16,10 @@ export class CollectionItem extends vscode.TreeItem {
         : vscode.TreeItemCollapsibleState.None
     );
 
-    if (itemType === 'collection') {
+    if (itemType === 'message') {
+      this.iconPath = new vscode.ThemeIcon('info');
+      this.contextValue = 'message';
+    } else if (itemType === 'collection') {
       this.description = `${docCount} docs`;
       this.iconPath = new vscode.ThemeIcon('symbol-namespace');
       this.contextValue = 'collection';
@@ -89,6 +92,11 @@ export class CollectionTreeProvider implements vscode.TreeDataProvider<Collectio
       const items: CollectionItem[] = [];
       for (const [name, count] of this.collections) {
         items.push(new CollectionItem(name, count, 'collection'));
+      }
+      if (!items.length) {
+        // Never return an empty root while connected — that would show the
+        // view's "Not connected" welcome content.
+        return [new CollectionItem('No collections yet', 0, 'message')];
       }
       return items.sort((a, b) => a.name.localeCompare(b.name));
     }
@@ -191,6 +199,11 @@ export class SqlTreeProvider implements vscode.TreeDataProvider<SqlItem> {
           this.client.sqlTables(),
           this.client.sqlViews(),
         ]);
+        if (!tables.length && !views.length) {
+          // Never return an empty root while connected — that would show the
+          // view's "Not connected" welcome content.
+          return [new SqlItem('', 'message', 'No tables yet', 'create one with OxiDB: New SQL Query')];
+        }
         return [
           ...tables.map(
             (t) => new SqlItem(t.name, 'table', t.name, t.rows === null ? undefined : `${t.rows} rows`)
