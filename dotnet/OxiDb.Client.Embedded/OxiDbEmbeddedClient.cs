@@ -273,15 +273,24 @@ public sealed class OxiDbEmbeddedClient : IOxiDbClient
     // ── SQL engine (second engine, ADR-0010) ────────────────────────────
 
     /// <summary>
-    /// Not supported in embedded mode: the standalone SQL engine is a server
-    /// feature (ADR-0010); the embedded FFI has no SQL surface. Use
-    /// <see cref="OxiDbTcpClient"/> against a server started with
-    /// <c>OXIDB_SQL=1</c>.
+    /// Executes SQL against the embedded standalone SQL engine. Its data
+    /// lives under <c>&lt;data dir&gt;/sql</c>, entirely separate from
+    /// document collections; the engine opens lazily on the first call.
+    /// Same result shapes as the TCP client.
     /// </summary>
     public Task<JsonElement> SqlAsync(string sql, object?[]? @params = null, CancellationToken ct = default)
     {
-        throw new NotSupportedException(
-            "SQL is a server-side engine (OXIDB_SQL=1); the embedded client has no SQL surface.");
+        var payload = new Dictionary<string, object?>
+        {
+            ["engine"] = "sql",
+            ["cmd"] = "sql",
+            ["sql"] = sql
+        };
+        if (@params is not null)
+        {
+            payload["params"] = @params;
+        }
+        return Task.FromResult(Execute(payload));
     }
 
     // ── Transactions ────────────────────────────────────────────────────

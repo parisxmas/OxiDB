@@ -15,6 +15,7 @@ android = ["jni"]
 
 [dependencies]
 oxidb = { path = ".." }
+oxidb-sql = { path = "../oxidb-sql" }
 serde_json = "1"
 base64 = "0.22"
 jni = { version = "0.21", optional = true }

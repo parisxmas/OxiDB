@@ -28,6 +28,17 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    /// `CREATE [OR REPLACE] VIEW name AS SELECT ...` — the view is stored as
+    /// SQL text and re-executed when referenced.
+    CreateView {
+        name: String,
+        query_sql: String,
+        or_replace: bool,
+    },
+    DropView {
+        name: String,
+        if_exists: bool,
+    },
     Insert {
         table: String,
         /// Column names if an explicit list was given; else insert positionally.
@@ -188,6 +199,43 @@ pub enum Expr {
         query: Box<SelectQuery>,
         negated: bool,
     },
+    /// A **correlated** scalar subquery: `outer[k]` evaluates against the
+    /// outer row and binds to `Param(base + k)` inside `query`, which is
+    /// re-executed per outer row. Produced by the executor's resolution pass;
+    /// never by the parser.
+    CorrScalar {
+        query: Box<SelectQuery>,
+        outer: Vec<Expr>,
+        base: usize,
+    },
+    /// A **correlated** `expr [NOT] IN (SELECT ...)`, same mechanism as
+    /// [`Expr::CorrScalar`].
+    CorrIn {
+        expr: Box<Expr>,
+        query: Box<SelectQuery>,
+        outer: Vec<Expr>,
+        base: usize,
+        negated: bool,
+    },
+    /// A window function call: `func() OVER (PARTITION BY ... ORDER BY ...)`.
+    /// Whole-partition (or, with ORDER BY, running) evaluation; explicit
+    /// frames are not supported.
+    Window {
+        func: WindowFunc,
+        partition_by: Vec<Expr>,
+        order_by: Vec<(Expr, bool)>,
+    },
+}
+
+/// The function of a window expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    /// An aggregate over the window: whole partition without ORDER BY, a
+    /// running (peers-inclusive) aggregate with it.
+    Agg(AggFunc, Option<Box<Expr>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

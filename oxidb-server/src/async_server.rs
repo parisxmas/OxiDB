@@ -332,7 +332,7 @@ async fn dispatch_request(
     // Write routing through Raft (cluster mode)
     // ---------------------------------------------------------------
     if let Some(raft) = &state.raft {
-        if is_write_command(&cmd) && active_tx.is_none() {
+        if (is_write_command(&cmd) || sql_is_write(&cmd, &request)) && active_tx.is_none() {
             let raft_req = match build_raft_request(&cmd, &request) {
                 Some(req) => req,
                 None => {
@@ -415,6 +415,18 @@ async fn dispatch_local(
 
     log_audit(state, session, cmd, collection, "ok", "");
     bytes
+}
+
+/// A `sql` request is a write (Raft-replicated in cluster mode) iff it parses
+/// and contains any non-SELECT statement. SELECT-only SQL — and SQL that fails
+/// to parse, so the local handler produces the real error message — runs
+/// node-locally.
+fn sql_is_write(cmd: &str, request: &Value) -> bool {
+    cmd == "sql"
+        && request
+            .get("sql")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !oxidb_sql::is_read_only(s).unwrap_or(true))
 }
 
 /// Returns true if the command is a write operation that should go through Raft.
@@ -553,6 +565,12 @@ fn build_raft_request(cmd: &str, request: &Value) -> Option<OxiDbRequest> {
             bucket: request.get("bucket")?.as_str()?.to_string(),
             key: request.get("key")?.as_str()?.to_string(),
         }),
+        // SQL engine writes (ADR-0010): the SQL string + params replicate
+        // verbatim and re-execute on every node.
+        "sql" => Some(OxiDbRequest::Sql {
+            sql: request.get("sql")?.as_str()?.to_string(),
+            params: request.get("params").cloned().unwrap_or(Value::Null),
+        }),
         _ => None,
     }
 }
@@ -659,6 +677,58 @@ fn log_audit(
 mod create_with_options_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sql_write_classification() {
+        // SELECT-only SQL runs locally; any write statement replicates.
+        let read = json!({"cmd": "sql", "sql": "SELECT a FROM t UNION SELECT b FROM u"});
+        assert!(!sql_is_write("sql", &read));
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "CREATE TABLE t (a INT)",
+            "DROP TABLE t",
+            "CREATE INDEX i ON t (a)",
+            "SELECT a FROM t; INSERT INTO t VALUES (1)",
+            "BEGIN; UPDATE t SET a = 1; COMMIT;",
+        ] {
+            assert!(
+                sql_is_write("sql", &json!({"cmd": "sql", "sql": sql})),
+                "should classify as write: {sql}"
+            );
+        }
+        // Unparseable SQL runs locally so the error message reaches the client.
+        assert!(!sql_is_write(
+            "sql",
+            &json!({"cmd": "sql", "sql": "SELEKT"})
+        ));
+        // Only the sql command is affected.
+        assert!(!sql_is_write("insert", &json!({"cmd": "insert"})));
+    }
+
+    #[test]
+    fn build_raft_request_sql_carries_text_and_params() {
+        let req = build_raft_request(
+            "sql",
+            &json!({"cmd": "sql", "sql": "INSERT INTO t VALUES (?)", "params": [7]}),
+        )
+        .expect("should build a raft request");
+        match req {
+            OxiDbRequest::Sql { sql, params } => {
+                assert_eq!(sql, "INSERT INTO t VALUES (?)");
+                assert_eq!(params, json!([7]));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // No params -> Null marker.
+        match build_raft_request("sql", &json!({"cmd": "sql", "sql": "DROP TABLE t"})).unwrap() {
+            OxiDbRequest::Sql { params, .. } => assert_eq!(params, Value::Null),
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // Missing sql field -> falls through to local execution.
+        assert!(build_raft_request("sql", &json!({"cmd": "sql"})).is_none());
+    }
 
     #[test]
     fn build_raft_request_parses_options() {

@@ -2262,12 +2262,13 @@ dependencies = [
  "base64",
  "jni",
  "oxidb",
+ "oxidb-sql",
  "serde_json",
 ]
 
 [[package]]
 name = "oxidb-server"
-version = "0.31.4"
+version = "0.31.5"
 dependencies = [
  "aes-gcm",
  "argon2",

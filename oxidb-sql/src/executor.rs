@@ -16,7 +16,7 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
     AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, QueryResult, SelectItem, SelectQuery,
-    SelectStmt, Statement, TableRef, UnOp,
+    SelectStmt, Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::error::{Result, SqlError};
 use crate::store::{Chunk, Store};
@@ -77,6 +77,22 @@ pub(crate) fn execute<S: Store>(
             match store.drop_index(&name) {
                 Ok(()) => {}
                 Err(SqlError::NoSuchIndex(_)) if if_exists => {}
+                Err(e) => return Err(e),
+            }
+            Ok(QueryResult::Ddl)
+        }
+        Statement::CreateView {
+            name,
+            query_sql,
+            or_replace,
+        } => {
+            store.create_view(&name, &query_sql, or_replace)?;
+            Ok(QueryResult::Ddl)
+        }
+        Statement::DropView { name, if_exists } => {
+            match store.drop_view(&name) {
+                Ok(()) => {}
+                Err(SqlError::NoSuchView(_)) if if_exists => {}
                 Err(e) => return Err(e),
             }
             Ok(QueryResult::Ddl)
@@ -237,16 +253,26 @@ fn exec_update<S: Store>(
         })
         .collect::<Result<_>>()?;
 
+    let filter_corr = filter.as_ref().is_some_and(has_corr);
+    let targets_corr = targets.iter().any(|(_, e)| has_corr(e));
     let mut affected = 0;
     for (row_id, cells) in store.scan(table)? {
         if let Some(pred) = &filter
-            && !truthy(&eval_scalar(pred, &schema, cells.as_slice(), params)?)
+            && !truthy(&eval_scalar_corr(
+                store,
+                filter_corr,
+                pred,
+                &schema,
+                cells.as_slice(),
+                params,
+            )?)
         {
             continue;
         }
         let mut new_cells = cells.clone();
         for (idx, expr) in &targets {
-            new_cells[*idx] = eval_scalar(expr, &schema, cells.as_slice(), params)?;
+            new_cells[*idx] =
+                eval_scalar_corr(store, targets_corr, expr, &schema, cells.as_slice(), params)?;
         }
         store.update_row(table, row_id, new_cells)?;
         affected += 1;
@@ -265,10 +291,18 @@ fn exec_delete<S: Store>(
         .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
     let schema = table_schema(table, &def);
 
+    let filter_corr = filter.as_ref().is_some_and(has_corr);
     let mut to_delete = Vec::new();
     for (row_id, cells) in store.scan(table)? {
         let matches = match &filter {
-            Some(pred) => truthy(&eval_scalar(pred, &schema, cells.as_slice(), params)?),
+            Some(pred) => truthy(&eval_scalar_corr(
+                store,
+                filter_corr,
+                pred,
+                &schema,
+                cells.as_slice(),
+                params,
+            )?),
             None => true,
         };
         if matches {
@@ -467,43 +501,96 @@ fn exec_body<S: Store>(
 
 // ── subquery resolution ─────────────────────────────────────────────────────
 //
-// Uncorrelated subqueries are executed once, before row evaluation, and
-// replaced with literals: a scalar subquery becomes `Literal` (NULL when it
-// returns no row), `IN (SELECT ...)` becomes a literal `In` list. Column
-// references inside a subquery resolve only against the subquery's own tables
-// (correlated subqueries are not supported and fail binding there).
+// Subqueries are handled before row evaluation. An **uncorrelated** subquery
+// is executed once and replaced with literals: a scalar subquery becomes
+// `Literal` (NULL when it returns no row), `IN (SELECT ...)` becomes a
+// literal `In` list. A **correlated** subquery — one whose columns resolve
+// against the *enclosing* select's tables rather than its own — has those
+// outer references rewritten to synthetic `Param` slots and becomes a
+// `CorrScalar` / `CorrIn` node, re-executed per outer row at evaluation time.
+// Correlation reaches one level up (a subquery may reference its immediate
+// enclosing query only).
+
+/// The tables (key + definition) a column reference can resolve against in
+/// one query scope.
+struct Scope {
+    tables: Vec<(String, crate::catalog::Table)>,
+}
+
+impl Scope {
+    fn resolves(&self, table: &Option<String>, name: &str) -> bool {
+        match table {
+            Some(t) => self
+                .tables
+                .iter()
+                .any(|(k, def)| k == t && def.columns.iter().any(|c| c.name == name)),
+            None => self
+                .tables
+                .iter()
+                .any(|(_, def)| def.columns.iter().any(|c| c.name == name)),
+        }
+    }
+}
+
+fn scope_of<S: Store>(store: &S, s: &SelectStmt) -> Scope {
+    let mut tables = Vec::new();
+    let mut add = |r: &TableRef| {
+        if let Some(def) = store.table_def(&r.name) {
+            tables.push((r.key().to_string(), def));
+        }
+    };
+    add(&s.from);
+    for j in &s.joins {
+        add(&j.table);
+    }
+    Scope { tables }
+}
+
+fn scope_of_table<S: Store>(store: &S, table: &str) -> Scope {
+    let mut tables = Vec::new();
+    if let Some(def) = store.table_def(table) {
+        tables.push((table.to_string(), def));
+    }
+    Scope { tables }
+}
 
 fn resolve_subqueries_stmt<S: Store>(
     store: &S,
     stmt: &mut Statement,
     params: &[Value],
 ) -> Result<()> {
+    // Synthetic params for correlated outer values are allocated after the
+    // user's bind parameters.
+    let floor = params.len();
     match stmt {
         Statement::Insert { rows, .. } => {
+            // VALUES has no row scope — subqueries here must be uncorrelated.
             for row in rows {
                 for e in row {
-                    resolve_expr(store, e, params)?;
+                    resolve_expr(store, e, params, None, floor)?;
                 }
             }
             Ok(())
         }
-        Statement::Select(q) => resolve_query(store, q, params),
+        Statement::Select(q) => resolve_query(store, q, params, floor),
         Statement::Update {
+            table,
             assignments,
             filter,
-            ..
         } => {
+            let scope = scope_of_table(store, table);
             for (_, e) in assignments {
-                resolve_expr(store, e, params)?;
+                resolve_expr(store, e, params, Some(&scope), floor)?;
             }
             if let Some(f) = filter {
-                resolve_expr(store, f, params)?;
+                resolve_expr(store, f, params, Some(&scope), floor)?;
             }
             Ok(())
         }
-        Statement::Delete { filter, .. } => {
+        Statement::Delete { table, filter } => {
+            let scope = scope_of_table(store, table);
             if let Some(f) = filter {
-                resolve_expr(store, f, params)?;
+                resolve_expr(store, f, params, Some(&scope), floor)?;
             }
             Ok(())
         }
@@ -511,48 +598,358 @@ fn resolve_subqueries_stmt<S: Store>(
     }
 }
 
-fn resolve_query<S: Store>(store: &S, q: &mut SelectQuery, params: &[Value]) -> Result<()> {
-    resolve_body(store, &mut q.body, params)
+fn resolve_query<S: Store>(
+    store: &S,
+    q: &mut SelectQuery,
+    params: &[Value],
+    floor: usize,
+) -> Result<()> {
+    resolve_body(store, &mut q.body, params, floor)
 }
 
-fn resolve_body<S: Store>(store: &S, body: &mut QueryBody, params: &[Value]) -> Result<()> {
+fn resolve_body<S: Store>(
+    store: &S,
+    body: &mut QueryBody,
+    params: &[Value],
+    floor: usize,
+) -> Result<()> {
     match body {
-        QueryBody::Select(s) => resolve_select(store, s, params),
+        QueryBody::Select(s) => resolve_select(store, s, params, floor),
         QueryBody::SetOp { left, right, .. } => {
-            resolve_body(store, left, params)?;
-            resolve_body(store, right, params)
+            resolve_body(store, left, params, floor)?;
+            resolve_body(store, right, params, floor)
         }
     }
 }
 
-fn resolve_select<S: Store>(store: &S, s: &mut SelectStmt, params: &[Value]) -> Result<()> {
+fn resolve_select<S: Store>(
+    store: &S,
+    s: &mut SelectStmt,
+    params: &[Value],
+    floor: usize,
+) -> Result<()> {
+    // This select's own tables are the outer scope for subqueries in its
+    // expressions.
+    let scope = scope_of(store, s);
     for item in &mut s.projection {
         if let SelectItem::Expr { expr, .. } = item {
-            resolve_expr(store, expr, params)?;
+            resolve_expr(store, expr, params, Some(&scope), floor)?;
         }
     }
     if let Some(f) = &mut s.filter {
-        resolve_expr(store, f, params)?;
+        resolve_expr(store, f, params, Some(&scope), floor)?;
     }
     for j in &mut s.joins {
-        resolve_expr(store, &mut j.on, params)?;
+        resolve_expr(store, &mut j.on, params, Some(&scope), floor)?;
     }
     for e in &mut s.group_by {
-        resolve_expr(store, e, params)?;
+        resolve_expr(store, e, params, Some(&scope), floor)?;
     }
     if let Some(h) = &mut s.having {
-        resolve_expr(store, h, params)?;
+        resolve_expr(store, h, params, Some(&scope), floor)?;
     }
     for (e, _) in &mut s.order_by {
-        resolve_expr(store, e, params)?;
+        resolve_expr(store, e, params, Some(&scope), floor)?;
     }
     Ok(())
 }
 
-fn resolve_expr<S: Store>(store: &S, e: &mut Expr, params: &[Value]) -> Result<()> {
+fn resolve_expr<S: Store>(
+    store: &S,
+    e: &mut Expr,
+    params: &[Value],
+    scope: Option<&Scope>,
+    floor: usize,
+) -> Result<()> {
     match e {
         Expr::Subquery(q) => {
-            let (columns, mut rows) = exec_subquery(store, q, params)?;
+            let outer = match scope {
+                Some(sc) => extract_outer(store, q, sc, floor),
+                None => Vec::new(),
+            };
+            // Nested subqueries inside `q` resolve with q's own selects as
+            // their outer scope; their synthetic params start above ours.
+            resolve_query(store, q, params, floor + outer.len())?;
+            if outer.is_empty() {
+                let (columns, mut rows) = run_query_rows(store, (**q).clone(), params)?;
+                if columns.len() != 1 {
+                    return Err(SqlError::Unsupported(
+                        "scalar subquery must return exactly one column".into(),
+                    ));
+                }
+                if rows.len() > 1 {
+                    return Err(SqlError::Eval(
+                        "scalar subquery returned more than one row".into(),
+                    ));
+                }
+                let v = rows.pop().map(|mut r| r.remove(0)).unwrap_or(Value::Null);
+                *e = Expr::Literal(v);
+            } else {
+                *e = Expr::CorrScalar {
+                    query: q.clone(),
+                    outer,
+                    base: floor,
+                };
+            }
+            Ok(())
+        }
+        Expr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => {
+            resolve_expr(store, expr, params, scope, floor)?;
+            let outer = match scope {
+                Some(sc) => extract_outer(store, query, sc, floor),
+                None => Vec::new(),
+            };
+            resolve_query(store, query, params, floor + outer.len())?;
+            if outer.is_empty() {
+                let (columns, rows) = run_query_rows(store, (**query).clone(), params)?;
+                if columns.len() != 1 {
+                    return Err(SqlError::Unsupported(
+                        "IN subquery must return exactly one column".into(),
+                    ));
+                }
+                let list = rows
+                    .into_iter()
+                    .map(|mut r| Expr::Literal(r.remove(0)))
+                    .collect();
+                *e = Expr::In {
+                    expr: expr.clone(),
+                    list,
+                    negated: *negated,
+                };
+            } else {
+                *e = Expr::CorrIn {
+                    expr: expr.clone(),
+                    query: query.clone(),
+                    outer,
+                    base: floor,
+                    negated: *negated,
+                };
+            }
+            Ok(())
+        }
+        Expr::In { expr, list, .. } => {
+            resolve_expr(store, expr, params, scope, floor)?;
+            for item in list {
+                resolve_expr(store, item, params, scope, floor)?;
+            }
+            Ok(())
+        }
+        Expr::Binary { left, right, .. } => {
+            resolve_expr(store, left, params, scope, floor)?;
+            resolve_expr(store, right, params, scope, floor)
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            resolve_expr(store, expr, params, scope, floor)
+        }
+        Expr::Aggregate { arg, .. } => match arg {
+            Some(a) => resolve_expr(store, a, params, scope, floor),
+            None => Ok(()),
+        },
+        Expr::Window {
+            func,
+            partition_by,
+            order_by,
+        } => {
+            for e in partition_by {
+                resolve_expr(store, e, params, scope, floor)?;
+            }
+            for (e, _) in order_by {
+                resolve_expr(store, e, params, scope, floor)?;
+            }
+            if let WindowFunc::Agg(_, Some(a)) = func {
+                resolve_expr(store, a, params, scope, floor)?;
+            }
+            Ok(())
+        }
+        Expr::Column { .. }
+        | Expr::Col(_)
+        | Expr::Literal(_)
+        | Expr::Param(_)
+        | Expr::CorrScalar { .. }
+        | Expr::CorrIn { .. } => Ok(()),
+    }
+}
+
+/// Find column references inside `q` that do not resolve against the
+/// subquery's own tables but do resolve against the enclosing `outer` scope,
+/// and rewrite them to `Param(base + k)`. Returns the outer column
+/// expressions in slot order (deduplicated).
+fn extract_outer<S: Store>(
+    store: &S,
+    q: &mut SelectQuery,
+    outer: &Scope,
+    base: usize,
+) -> Vec<Expr> {
+    let mut out: Vec<Expr> = Vec::new();
+    extract_outer_body(store, &mut q.body, outer, base, &mut out);
+    out
+}
+
+fn extract_outer_body<S: Store>(
+    store: &S,
+    body: &mut QueryBody,
+    outer: &Scope,
+    base: usize,
+    out: &mut Vec<Expr>,
+) {
+    match body {
+        QueryBody::Select(s) => {
+            let inner = scope_of(store, s);
+            let mut rewrite = |e: &mut Expr| rewrite_outer_refs(e, &inner, outer, base, out);
+            for item in &mut s.projection {
+                if let SelectItem::Expr { expr, .. } = item {
+                    rewrite(expr);
+                }
+            }
+            if let Some(f) = &mut s.filter {
+                rewrite(f);
+            }
+            for j in &mut s.joins {
+                rewrite(&mut j.on);
+            }
+            for e in &mut s.group_by {
+                rewrite(e);
+            }
+            if let Some(h) = &mut s.having {
+                rewrite(h);
+            }
+            for (e, _) in &mut s.order_by {
+                rewrite(e);
+            }
+        }
+        QueryBody::SetOp { left, right, .. } => {
+            extract_outer_body(store, left, outer, base, out);
+            extract_outer_body(store, right, outer, base, out);
+        }
+    }
+}
+
+fn rewrite_outer_refs(
+    e: &mut Expr,
+    inner: &Scope,
+    outer: &Scope,
+    base: usize,
+    out: &mut Vec<Expr>,
+) {
+    match e {
+        Expr::Column { table, name } => {
+            // Inner scope wins (SQL name shadowing); only a reference that
+            // cannot resolve inside but can outside is correlated.
+            if inner.resolves(table, name) || !outer.resolves(table, name) {
+                return;
+            }
+            let k = out
+                .iter()
+                .position(|o| {
+                    matches!(o, Expr::Column { table: t2, name: n2 } if t2 == table && n2 == name)
+                })
+                .unwrap_or_else(|| {
+                    out.push(e.clone());
+                    out.len() - 1
+                });
+            *e = Expr::Param(base + k);
+        }
+        Expr::Binary { left, right, .. } => {
+            rewrite_outer_refs(left, inner, outer, base, out);
+            rewrite_outer_refs(right, inner, outer, base, out);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            rewrite_outer_refs(expr, inner, outer, base, out);
+        }
+        Expr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                rewrite_outer_refs(a, inner, outer, base, out);
+            }
+        }
+        Expr::In { expr, list, .. } => {
+            rewrite_outer_refs(expr, inner, outer, base, out);
+            for item in list {
+                rewrite_outer_refs(item, inner, outer, base, out);
+            }
+        }
+        // The probe of a nested IN-subquery belongs to *this* scope; the
+        // nested query body's references are handled when it is itself
+        // resolved (with this subquery as its outer scope).
+        Expr::InSubquery { expr, .. } => {
+            rewrite_outer_refs(expr, inner, outer, base, out);
+        }
+        Expr::Window {
+            func,
+            partition_by,
+            order_by,
+        } => {
+            for e in partition_by {
+                rewrite_outer_refs(e, inner, outer, base, out);
+            }
+            for (e, _) in order_by {
+                rewrite_outer_refs(e, inner, outer, base, out);
+            }
+            if let WindowFunc::Agg(_, Some(a)) = func {
+                rewrite_outer_refs(a, inner, outer, base, out);
+            }
+        }
+        Expr::Subquery(_)
+        | Expr::CorrScalar { .. }
+        | Expr::CorrIn { .. }
+        | Expr::Col(_)
+        | Expr::Literal(_)
+        | Expr::Param(_) => {}
+    }
+}
+
+/// Execute a fully-resolved query and return its columns + rows.
+fn run_query_rows<S: Store>(
+    store: &S,
+    q: SelectQuery,
+    params: &[Value],
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    match exec_query(store, q, params)? {
+        QueryResult::Select { columns, rows } => Ok((columns, rows)),
+        _ => unreachable!("subquery produced a non-select result"),
+    }
+}
+
+// ── correlated evaluation ───────────────────────────────────────────────────
+
+/// Whether an expression contains a correlated subquery node.
+fn has_corr(e: &Expr) -> bool {
+    match e {
+        Expr::CorrScalar { .. } | Expr::CorrIn { .. } => true,
+        Expr::Binary { left, right, .. } => has_corr(left) || has_corr(right),
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_corr(expr),
+        Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(has_corr),
+        Expr::In { expr, list, .. } => has_corr(expr) || list.iter().any(has_corr),
+        Expr::Window {
+            func,
+            partition_by,
+            order_by,
+        } => {
+            partition_by.iter().any(has_corr)
+                || order_by.iter().any(|(e, _)| has_corr(e))
+                || matches!(func, WindowFunc::Agg(_, Some(a)) if has_corr(a))
+        }
+        _ => false,
+    }
+}
+
+/// Replace every correlated subquery node in `e` with its result for this
+/// row: outer column values are evaluated against the row, appended to the
+/// params after slot `base`, and the subquery re-executed.
+fn resolve_corr_row<S: Store, R: RowLike + ?Sized>(
+    store: &S,
+    e: &Expr,
+    schema: &[ColRef],
+    row: &R,
+    params: &[Value],
+) -> Result<Expr> {
+    Ok(match e {
+        Expr::CorrScalar { query, outer, base } => {
+            let aug = corr_params(schema, row, params, outer, *base)?;
+            let (columns, mut rows) = run_query_rows(store, (**query).clone(), &aug)?;
             if columns.len() != 1 {
                 return Err(SqlError::Unsupported(
                     "scalar subquery must return exactly one column".into(),
@@ -563,65 +960,353 @@ fn resolve_expr<S: Store>(store: &S, e: &mut Expr, params: &[Value]) -> Result<(
                     "scalar subquery returned more than one row".into(),
                 ));
             }
-            let v = rows.pop().map(|mut r| r.remove(0)).unwrap_or(Value::Null);
-            *e = Expr::Literal(v);
-            Ok(())
+            Expr::Literal(rows.pop().map(|mut r| r.remove(0)).unwrap_or(Value::Null))
         }
-        Expr::InSubquery {
+        Expr::CorrIn {
             expr,
             query,
+            outer,
+            base,
             negated,
         } => {
-            resolve_expr(store, expr, params)?;
-            let (columns, rows) = exec_subquery(store, query, params)?;
+            let probe = resolve_corr_row(store, expr, schema, row, params)?;
+            let aug = corr_params(schema, row, params, outer, *base)?;
+            let (columns, rows) = run_query_rows(store, (**query).clone(), &aug)?;
             if columns.len() != 1 {
                 return Err(SqlError::Unsupported(
                     "IN subquery must return exactly one column".into(),
                 ));
             }
-            let list = rows
-                .into_iter()
-                .map(|mut r| Expr::Literal(r.remove(0)))
-                .collect();
-            *e = Expr::In {
-                expr: expr.clone(),
-                list,
+            Expr::In {
+                expr: Box::new(probe),
+                list: rows
+                    .into_iter()
+                    .map(|mut r| Expr::Literal(r.remove(0)))
+                    .collect(),
                 negated: *negated,
-            };
-            Ok(())
-        }
-        Expr::In { expr, list, .. } => {
-            resolve_expr(store, expr, params)?;
-            for item in list {
-                resolve_expr(store, item, params)?;
             }
-            Ok(())
         }
-        Expr::Binary { left, right, .. } => {
-            resolve_expr(store, left, params)?;
-            resolve_expr(store, right, params)
-        }
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => resolve_expr(store, expr, params),
-        Expr::Aggregate { arg, .. } => match arg {
-            Some(a) => resolve_expr(store, a, params),
-            None => Ok(()),
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(resolve_corr_row(store, left, schema, row, params)?),
+            right: Box::new(resolve_corr_row(store, right, schema, row, params)?),
         },
-        Expr::Column { .. } | Expr::Col(_) | Expr::Literal(_) | Expr::Param(_) => Ok(()),
+        Expr::Unary { op, expr } => Expr::Unary {
+            op: *op,
+            expr: Box::new(resolve_corr_row(store, expr, schema, row, params)?),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(resolve_corr_row(store, expr, schema, row, params)?),
+            negated: *negated,
+        },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: Box::new(resolve_corr_row(store, expr, schema, row, params)?),
+            list: list
+                .iter()
+                .map(|i| resolve_corr_row(store, i, schema, row, params))
+                .collect::<Result<_>>()?,
+            negated: *negated,
+        },
+        Expr::Aggregate { func, arg } => Expr::Aggregate {
+            func: *func,
+            arg: match arg {
+                Some(a) => Some(Box::new(resolve_corr_row(store, a, schema, row, params)?)),
+                None => None,
+            },
+        },
+        other => other.clone(),
+    })
+}
+
+/// Build the augmented parameter list for one correlated execution: the
+/// user's params (padded to `base`), then the outer values for this row.
+fn corr_params<R: RowLike + ?Sized>(
+    schema: &[ColRef],
+    row: &R,
+    params: &[Value],
+    outer: &[Expr],
+    base: usize,
+) -> Result<Vec<Value>> {
+    // The subquery sees the user params (padded) and its outer values at
+    // exactly `base..` — never any *later* synthetic slots (e.g. window
+    // values) the enclosing evaluation may have appended.
+    let mut aug: Vec<Value> = params.iter().take(base).cloned().collect();
+    if aug.len() < base {
+        aug.resize(base, Value::Null);
+    }
+    for oe in outer {
+        aug.push(eval_scalar(oe, schema, row, params)?);
+    }
+    Ok(aug)
+}
+
+/// Evaluate an expression that may contain correlated subqueries over one row.
+fn eval_scalar_corr<S: Store, R: RowLike + ?Sized>(
+    store: &S,
+    corr: bool,
+    e: &Expr,
+    schema: &[ColRef],
+    row: &R,
+    params: &[Value],
+) -> Result<Value> {
+    if corr {
+        let resolved = resolve_corr_row(store, e, schema, row, params)?;
+        eval_scalar(&resolved, schema, row, params)
+    } else {
+        eval_scalar(e, schema, row, params)
     }
 }
 
-/// Execute a subquery (resolving its own nested subqueries first) and return
-/// its columns + rows.
-fn exec_subquery<S: Store>(
-    store: &S,
-    q: &mut SelectQuery,
-    params: &[Value],
-) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
-    resolve_query(store, q, params)?;
-    match exec_query(store, q.clone(), params)? {
-        QueryResult::Select { columns, rows } => Ok((columns, rows)),
-        _ => unreachable!("subquery produced a non-select result"),
+// ── window functions ────────────────────────────────────────────────────────
+//
+// Window expressions in the SELECT list are computed per input row *before*
+// projection: each distinct `Window` node is replaced by a synthetic
+// `Param(win_base + k)` and its per-row values are appended to the params for
+// that row's evaluation. Partitioning reuses the streaming grouper; with
+// ORDER BY, aggregates run cumulatively and peer rows (equal sort keys) share
+// the value (the standard RANGE UNBOUNDED PRECEDING .. CURRENT ROW frame).
+
+/// Whether an expression contains a window function node.
+fn has_window(e: &Expr) -> bool {
+    match e {
+        Expr::Window { .. } => true,
+        Expr::Binary { left, right, .. } => has_window(left) || has_window(right),
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_window(expr),
+        Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(has_window),
+        Expr::In { expr, list, .. } => has_window(expr) || list.iter().any(has_window),
+        _ => false,
     }
+}
+
+/// The lowest params index safely usable for extra synthetic slots: one past
+/// every `Param` slot (user or correlated) the expression can touch.
+fn max_param_slot(e: &Expr) -> usize {
+    match e {
+        Expr::Param(i) => i + 1,
+        Expr::Binary { left, right, .. } => max_param_slot(left).max(max_param_slot(right)),
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => max_param_slot(expr),
+        Expr::Aggregate { arg, .. } => arg.as_deref().map(max_param_slot).unwrap_or(0),
+        Expr::In { expr, list, .. } => list
+            .iter()
+            .map(max_param_slot)
+            .fold(max_param_slot(expr), usize::max),
+        Expr::CorrScalar { outer, base, .. } => base + outer.len(),
+        Expr::CorrIn {
+            expr, outer, base, ..
+        } => (base + outer.len()).max(max_param_slot(expr)),
+        Expr::Window {
+            func,
+            partition_by,
+            order_by,
+        } => {
+            let mut m = partition_by.iter().map(max_param_slot).max().unwrap_or(0);
+            m = order_by
+                .iter()
+                .map(|(e, _)| max_param_slot(e))
+                .fold(m, usize::max);
+            if let WindowFunc::Agg(_, Some(a)) = func {
+                m = m.max(max_param_slot(a));
+            }
+            m
+        }
+        _ => 0,
+    }
+}
+
+/// Replace every `Window` node in `e` with `Param(win_base + k)`, collecting
+/// the distinct window nodes into `windows`.
+fn replace_windows(e: &mut Expr, windows: &mut Vec<Expr>, win_base: usize) {
+    match e {
+        Expr::Window { .. } => {
+            let k = windows.iter().position(|w| w == e).unwrap_or_else(|| {
+                windows.push(e.clone());
+                windows.len() - 1
+            });
+            *e = Expr::Param(win_base + k);
+        }
+        Expr::Binary { left, right, .. } => {
+            replace_windows(left, windows, win_base);
+            replace_windows(right, windows, win_base);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            replace_windows(expr, windows, win_base);
+        }
+        Expr::Aggregate { arg: Some(a), .. } => {
+            replace_windows(a, windows, win_base);
+        }
+        Expr::In { expr, list, .. } => {
+            replace_windows(expr, windows, win_base);
+            for item in list {
+                replace_windows(item, windows, win_base);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compute one window expression's value for every tuple (aligned with tuple
+/// order).
+fn compute_window(
+    schema: &[ColRef],
+    src: &Sources,
+    tuples: &Tuples,
+    window: &Expr,
+    params: &[Value],
+) -> Result<Vec<Value>> {
+    let Expr::Window {
+        func,
+        partition_by,
+        order_by,
+    } = window
+    else {
+        unreachable!("compute_window on a non-window expression");
+    };
+    let n = tuples.n();
+    let mut out = vec![Value::Null; n];
+
+    let partitions = group_tuples(schema, src, tuples, partition_by, params)?;
+    for mut part in partitions {
+        // Sort the partition by the window ORDER BY (stable).
+        let mut keys: Vec<Vec<Value>> = Vec::new();
+        if !order_by.is_empty() {
+            keys = part
+                .iter()
+                .map(|&i| {
+                    let view = View {
+                        src,
+                        tuple: tuples.row(i as usize),
+                    };
+                    order_by
+                        .iter()
+                        .map(|(e, _)| eval_scalar(e, schema, &view, params))
+                        .collect::<Result<Vec<Value>>>()
+                })
+                .collect::<Result<_>>()?;
+            let mut order: Vec<usize> = (0..part.len()).collect();
+            order.sort_by(|&a, &b| cmp_keys(order_by, &keys[a], &keys[b]));
+            part = order.iter().map(|&j| part[j]).collect();
+            keys = order
+                .into_iter()
+                .map(|j| std::mem::take(&mut keys[j]))
+                .collect();
+        }
+
+        // Peer groups: runs of rows whose sort keys all compare Equal (with
+        // no ORDER BY the whole partition is one peer group).
+        let peer_end = |start: usize| -> usize {
+            if order_by.is_empty() {
+                return part.len();
+            }
+            let mut end = start + 1;
+            while end < part.len()
+                && keys[start]
+                    .iter()
+                    .zip(keys[end].iter())
+                    .all(|(a, b)| Value::total_order(a, b) == Ordering::Equal)
+            {
+                end += 1;
+            }
+            end
+        };
+
+        match func {
+            WindowFunc::RowNumber => {
+                for (j, &i) in part.iter().enumerate() {
+                    out[i as usize] = Value::Int(j as i64 + 1);
+                }
+            }
+            WindowFunc::Rank | WindowFunc::DenseRank => {
+                let dense = matches!(func, WindowFunc::DenseRank);
+                let mut start = 0;
+                let mut dense_rank = 0i64;
+                while start < part.len() {
+                    let end = peer_end(start);
+                    dense_rank += 1;
+                    let rank = if dense { dense_rank } else { start as i64 + 1 };
+                    for &i in &part[start..end] {
+                        out[i as usize] = Value::Int(rank);
+                    }
+                    start = end;
+                }
+            }
+            WindowFunc::Agg(agg, arg) => {
+                if order_by.is_empty() {
+                    let v =
+                        eval_aggregate(*agg, arg.as_deref(), schema, src, tuples, &part, params)?;
+                    for &i in &part {
+                        out[i as usize] = v.clone();
+                    }
+                } else {
+                    // Running aggregate; peers share the value at the end of
+                    // their peer group.
+                    let mut count: i64 = 0;
+                    let mut sum = SumAcc::Empty;
+                    let mut best: Option<Value> = None;
+                    let mut start = 0;
+                    while start < part.len() {
+                        let end = peer_end(start);
+                        for &i in &part[start..end] {
+                            let view = View {
+                                src,
+                                tuple: tuples.row(i as usize),
+                            };
+                            let v = match arg {
+                                Some(a) => eval_scalar(a, schema, &view, params)?,
+                                // COUNT(*): every row counts.
+                                None => Value::Int(1),
+                            };
+                            if matches!(v, Value::Null) {
+                                continue;
+                            }
+                            count += 1;
+                            match agg {
+                                AggFunc::Sum | AggFunc::Avg => sum.add(&v)?,
+                                AggFunc::Min => {
+                                    if best
+                                        .as_ref()
+                                        .is_none_or(|b| Value::total_order(&v, b) == Ordering::Less)
+                                    {
+                                        best = Some(v);
+                                    }
+                                }
+                                AggFunc::Max => {
+                                    if best.as_ref().is_none_or(|b| {
+                                        Value::total_order(&v, b) == Ordering::Greater
+                                    }) {
+                                        best = Some(v);
+                                    }
+                                }
+                                AggFunc::Count => {}
+                            }
+                        }
+                        let v = match agg {
+                            AggFunc::Count => Value::Int(count),
+                            AggFunc::Sum => match &sum {
+                                SumAcc::Empty => Value::Null,
+                                SumAcc::Int(i) => Value::Int(*i),
+                                SumAcc::Float(f) => Value::Double(*f),
+                            },
+                            AggFunc::Avg => match &sum {
+                                SumAcc::Empty => Value::Null,
+                                SumAcc::Int(i) => Value::Double(*i as f64 / count as f64),
+                                SumAcc::Float(f) => Value::Double(*f / count as f64),
+                            },
+                            AggFunc::Min | AggFunc::Max => best.clone().unwrap_or(Value::Null),
+                        };
+                        for &i in &part[start..end] {
+                            out[i as usize] = v.clone();
+                        }
+                        start = end;
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Result<QueryResult> {
@@ -680,11 +1365,19 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
 
     // 4. WHERE: keep only matching tuples.
     if let Some(pred) = &bound_filter {
+        if has_window(pred) {
+            return Err(SqlError::Unsupported(
+                "window function in WHERE (use a view or an outer query)".into(),
+            ));
+        }
+        let corr = has_corr(pred);
         let mut kept = Vec::with_capacity(tuples.data.len());
         for i in 0..tuples.n() {
             let tuple = tuples.row(i);
             let view = View { src: &src, tuple };
-            if truthy(&eval_scalar(pred, &schema, &view, params)?) {
+            if truthy(&eval_scalar_corr(
+                store, corr, pred, &schema, &view, params,
+            )?) {
                 kept.extend_from_slice(tuple);
             }
         }
@@ -692,9 +1385,29 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
     }
 
     let out_rows = if aggregating {
+        // Correlated subqueries are per-row constructs; grouped evaluation
+        // has no single row to correlate against.
+        if proj.iter().any(|(_, e)| has_corr(e))
+            || select.group_by.iter().any(has_corr)
+            || select.having.as_ref().is_some_and(has_corr)
+            || select.order_by.iter().any(|(e, _)| has_corr(e))
+        {
+            return Err(SqlError::Unsupported(
+                "correlated subquery in an aggregated query".into(),
+            ));
+        }
+        if proj.iter().any(|(_, e)| has_window(e))
+            || select.group_by.iter().any(has_window)
+            || select.having.as_ref().is_some_and(has_window)
+            || select.order_by.iter().any(|(e, _)| has_window(e))
+        {
+            return Err(SqlError::Unsupported(
+                "window function in an aggregated query (use a view or an outer query)".into(),
+            ));
+        }
         select_aggregated(&schema, &src, &tuples, &select, &proj, params)?
     } else {
-        select_simple(&schema, &src, &tuples, &select, &proj, params)?
+        select_simple(store, &schema, &src, &tuples, &select, &proj, params)?
     };
 
     // OFFSET / LIMIT.
@@ -779,26 +1492,88 @@ fn keep_indices(full: &[ColRef], key: &str, needed: &Needed) -> Vec<usize> {
         .collect()
 }
 
+/// Execute a view's stored SELECT and materialize it as a pruned source.
+/// `Ok(None)` when no view with this name exists.
+fn view_source<S: Store>(
+    store: &S,
+    r: &TableRef,
+    needed: &Needed,
+) -> Result<Option<(Vec<ColRef>, Chunk)>> {
+    let Some(sql) = store.view_sql(&r.name) else {
+        return Ok(None);
+    };
+    // Guard against reference cycles formed via CREATE OR REPLACE.
+    thread_local! {
+        static VIEW_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            VIEW_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+    let depth = VIEW_DEPTH.with(|d| {
+        d.set(d.get() + 1);
+        d.get()
+    });
+    let _guard = DepthGuard;
+    if depth > 32 {
+        return Err(SqlError::Eval(format!(
+            "view {:?}: reference chain too deep (cycle?)",
+            r.name
+        )));
+    }
+
+    let stmts = crate::parser::parse(&sql)?;
+    let stmt = match (stmts.len(), stmts.into_iter().next()) {
+        (1, Some(s @ Statement::Select(_))) => s,
+        _ => {
+            return Err(SqlError::Corrupt(format!(
+                "view {:?} body is not a single SELECT",
+                r.name
+            )));
+        }
+    };
+    let (columns, rows) = match execute(store, stmt, &[])? {
+        QueryResult::Select { columns, rows } => (columns, rows),
+        _ => unreachable!("view body produced a non-select result"),
+    };
+    let full: Vec<ColRef> = columns
+        .iter()
+        .map(|c| ColRef {
+            table: r.key().to_string(),
+            name: c.clone(),
+        })
+        .collect();
+    let keep = keep_indices(&full, r.key(), needed);
+    let schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
+    let chunk = Chunk::from_rows(rows, &keep);
+    Ok(Some((schema, chunk)))
+}
+
 /// Build the combined (schema, sources, tuples) for FROM + joins.
 fn build_source<S: Store>(
     store: &S,
     select: &SelectStmt,
     params: &[Value],
 ) -> Result<(Vec<ColRef>, Sources, Tuples)> {
-    let base_def = store
-        .table_def(&select.from.name)
-        .ok_or_else(|| SqlError::NoSuchTable(select.from.name.clone()))?;
     let needed = collect_needed(select);
-    let full = qualified_schema(select.from.key(), &base_def);
-    let keep = keep_indices(&full, select.from.key(), &needed);
-    let mut schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
-
-    // Base rows: use an index when there are no joins and WHERE has a usable
-    // equality on an indexed column; otherwise full scan.
-    let chunk = if select.joins.is_empty() {
-        base_chunk(store, &select.from, &select.filter, params, &keep)?
-    } else {
-        store.scan_pruned(&select.from.name, &keep)?
+    let (mut schema, chunk) = match store.table_def(&select.from.name) {
+        Some(base_def) => {
+            let full = qualified_schema(select.from.key(), &base_def);
+            let keep = keep_indices(&full, select.from.key(), &needed);
+            let schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
+            // Base rows: use an index when there are no joins and WHERE has a
+            // usable equality on an indexed column; otherwise full scan.
+            let chunk = if select.joins.is_empty() {
+                base_chunk(store, &select.from, &select.filter, params, &keep)?
+            } else {
+                store.scan_pruned(&select.from.name, &keep)?
+            };
+            (schema, chunk)
+        }
+        None => view_source(store, &select.from, &needed)?
+            .ok_or_else(|| SqlError::NoSuchTable(select.from.name.clone()))?,
     };
 
     let mut src = Sources::default();
@@ -839,13 +1614,16 @@ fn join_into<S: Store>(
     params: &[Value],
     needed: &Needed,
 ) -> Result<()> {
-    let def = store
-        .table_def(&join.table.name)
-        .ok_or_else(|| SqlError::NoSuchTable(join.table.name.clone()))?;
-    let full = qualified_schema(join.table.key(), &def);
-    let keep = keep_indices(&full, join.table.key(), needed);
-    let right_schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
-    let chunk = store.scan_pruned(&join.table.name, &keep)?;
+    let (right_schema, chunk) = match store.table_def(&join.table.name) {
+        Some(def) => {
+            let full = qualified_schema(join.table.key(), &def);
+            let keep = keep_indices(&full, join.table.key(), needed);
+            let right_schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
+            (right_schema, store.scan_pruned(&join.table.name, &keep)?)
+        }
+        None => view_source(store, &join.table, needed)?
+            .ok_or_else(|| SqlError::NoSuchTable(join.table.name.clone()))?,
+    };
     let nright = chunk.n;
 
     let left_len = schema.len();
@@ -1285,8 +2063,35 @@ fn collect_col_refs<'a>(e: &'a Expr, out: &mut Vec<(&'a Option<String>, &'a str)
             }
         }
         // Subqueries resolve to literals before any column analysis; their
-        // inner column references belong to the subquery's own scope.
+        // inner column references belong to the subquery's own scope. A
+        // correlated node's outer refs and probe DO belong to this scope.
+        Expr::CorrScalar { outer, .. } => {
+            for o in outer {
+                collect_col_refs(o, out);
+            }
+        }
+        Expr::CorrIn { expr, outer, .. } => {
+            collect_col_refs(expr, out);
+            for o in outer {
+                collect_col_refs(o, out);
+            }
+        }
         Expr::Subquery(_) | Expr::InSubquery { .. } => {}
+        Expr::Window {
+            func,
+            partition_by,
+            order_by,
+        } => {
+            for e in partition_by {
+                collect_col_refs(e, out);
+            }
+            for (e, _) in order_by {
+                collect_col_refs(e, out);
+            }
+            if let WindowFunc::Agg(_, Some(a)) = func {
+                collect_col_refs(a, out);
+            }
+        }
         // `Col` only appears after binding; equi-key detection runs before that.
         Expr::Col(_) | Expr::Literal(_) | Expr::Param(_) => {}
     }
@@ -1363,7 +2168,8 @@ fn const_value(e: &Expr, params: &[Value]) -> Option<Value> {
 }
 
 /// Non-aggregated projection: one output row per input tuple.
-fn select_simple(
+fn select_simple<S: Store>(
+    store: &S,
     schema: &[ColRef],
     src: &Sources,
     tuples: &Tuples,
@@ -1372,16 +2178,62 @@ fn select_simple(
     params: &[Value],
 ) -> Result<Vec<Vec<Value>>> {
     let n = tuples.n();
-    if select.order_by.is_empty() {
+
+    // Extract window functions: each distinct Window node becomes a synthetic
+    // Param slot whose per-row values are computed up front.
+    let mut proj: Vec<(String, Expr)> = proj.to_vec();
+    let mut order_by: Vec<(Expr, bool)> = select.order_by.clone();
+    let win_base = proj
+        .iter()
+        .map(|(_, e)| max_param_slot(e))
+        .chain(order_by.iter().map(|(e, _)| max_param_slot(e)))
+        .fold(params.len(), usize::max);
+    let mut windows: Vec<Expr> = Vec::new();
+    for (_, e) in proj.iter_mut() {
+        replace_windows(e, &mut windows, win_base);
+    }
+    for (e, _) in order_by.iter_mut() {
+        replace_windows(e, &mut windows, win_base);
+    }
+    let win_vals: Vec<Vec<Value>> = windows
+        .iter()
+        .map(|w| {
+            if has_corr(w) {
+                return Err(SqlError::Unsupported(
+                    "correlated subquery inside a window function".into(),
+                ));
+            }
+            compute_window(schema, src, tuples, w, params)
+        })
+        .collect::<Result<_>>()?;
+
+    // Per-row parameter list: the user params (padded), then window values.
+    let mut pbuf: Vec<Value> = Vec::new();
+    let row_params = |i: usize, pbuf: &mut Vec<Value>| {
+        if win_vals.is_empty() {
+            return;
+        }
+        pbuf.clear();
+        pbuf.extend_from_slice(params);
+        pbuf.resize(win_base, Value::Null);
+        for vals in &win_vals {
+            pbuf.push(vals[i].clone());
+        }
+    };
+
+    let proj_corr = proj.iter().any(|(_, e)| has_corr(e));
+    if order_by.is_empty() {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let view = View {
                 src,
                 tuple: tuples.row(i),
             };
+            row_params(i, &mut pbuf);
+            let p: &[Value] = if win_vals.is_empty() { params } else { &pbuf };
             let row: Vec<Value> = proj
                 .iter()
-                .map(|(_, e)| eval_scalar(e, schema, &view, params))
+                .map(|(_, e)| eval_scalar_corr(store, proj_corr, e, schema, &view, p))
                 .collect::<Result<_>>()?;
             out.push(row);
         }
@@ -1389,24 +2241,26 @@ fn select_simple(
     }
 
     // Evaluate the sort keys once per row (not per comparison), then sort.
+    let keys_corr = order_by.iter().any(|(e, _)| has_corr(e));
     let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(n);
     for i in 0..n {
         let view = View {
             src,
             tuple: tuples.row(i),
         };
-        let keys: Vec<Value> = select
-            .order_by
+        row_params(i, &mut pbuf);
+        let p: &[Value] = if win_vals.is_empty() { params } else { &pbuf };
+        let keys: Vec<Value> = order_by
             .iter()
-            .map(|(e, _)| eval_scalar(e, schema, &view, params))
+            .map(|(e, _)| eval_scalar_corr(store, keys_corr, e, schema, &view, p))
             .collect::<Result<_>>()?;
         let row: Vec<Value> = proj
             .iter()
-            .map(|(_, e)| eval_scalar(e, schema, &view, params))
+            .map(|(_, e)| eval_scalar_corr(store, proj_corr, e, schema, &view, p))
             .collect::<Result<_>>()?;
         keyed.push((keys, row));
     }
-    keyed.sort_by(|a, b| cmp_keys(&select.order_by, &a.0, &b.0));
+    keyed.sort_by(|a, b| cmp_keys(&order_by, &a.0, &b.0));
     Ok(keyed.into_iter().map(|(_, row)| row).collect())
 }
 
@@ -1587,16 +2441,24 @@ fn expand_projection(items: &[SelectItem], schema: &[ColRef]) -> Result<Vec<(Str
 }
 
 fn default_name(expr: &Expr) -> String {
-    match expr {
-        Expr::Column { name, .. } => name.clone(),
-        Expr::Aggregate { func, .. } => match func {
+    fn agg_name(func: &AggFunc) -> &'static str {
+        match func {
             AggFunc::Count => "count",
             AggFunc::Sum => "sum",
             AggFunc::Avg => "avg",
             AggFunc::Min => "min",
             AggFunc::Max => "max",
         }
-        .to_string(),
+    }
+    match expr {
+        Expr::Column { name, .. } => name.clone(),
+        Expr::Aggregate { func, .. } => agg_name(func).to_string(),
+        Expr::Window { func, .. } => match func {
+            WindowFunc::RowNumber => "row_number".to_string(),
+            WindowFunc::Rank => "rank".to_string(),
+            WindowFunc::DenseRank => "dense_rank".to_string(),
+            WindowFunc::Agg(f, _) => agg_name(f).to_string(),
+        },
         _ => "expr".to_string(),
     }
 }
@@ -1704,6 +2566,12 @@ fn eval_scalar<R: RowLike + ?Sized>(
         Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::Eval(
             "internal: unresolved subquery reached evaluation".into(),
         )),
+        Expr::CorrScalar { .. } | Expr::CorrIn { .. } => Err(SqlError::Eval(
+            "internal: correlated subquery reached direct evaluation".into(),
+        )),
+        Expr::Window { .. } => Err(SqlError::Unsupported(
+            "window function only allowed in the SELECT list".into(),
+        )),
     }
 }
 
@@ -1779,6 +2647,53 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
                 .collect::<Result<_>>()?,
             negated: *negated,
         },
+        // A correlated node's outer refs and probe belong to the outer schema
+        // and bind here; the inner query binds against its own tables when it
+        // executes per row.
+        Expr::CorrScalar { query, outer, base } => Expr::CorrScalar {
+            query: query.clone(),
+            outer: outer
+                .iter()
+                .map(|o| bind_expr(o, schema))
+                .collect::<Result<_>>()?,
+            base: *base,
+        },
+        Expr::CorrIn {
+            expr,
+            query,
+            outer,
+            base,
+            negated,
+        } => Expr::CorrIn {
+            expr: Box::new(bind_expr(expr, schema)?),
+            query: query.clone(),
+            outer: outer
+                .iter()
+                .map(|o| bind_expr(o, schema))
+                .collect::<Result<_>>()?,
+            base: *base,
+            negated: *negated,
+        },
+        Expr::Window {
+            func,
+            partition_by,
+            order_by,
+        } => Expr::Window {
+            func: match func {
+                WindowFunc::Agg(f, Some(a)) => {
+                    WindowFunc::Agg(*f, Some(Box::new(bind_expr(a, schema)?)))
+                }
+                other => other.clone(),
+            },
+            partition_by: partition_by
+                .iter()
+                .map(|e| bind_expr(e, schema))
+                .collect::<Result<_>>()?,
+            order_by: order_by
+                .iter()
+                .map(|(e, a)| Ok::<_, SqlError>((bind_expr(e, schema)?, *a)))
+                .collect::<Result<_>>()?,
+        },
         Expr::Subquery(_) | Expr::InSubquery { .. } => {
             return Err(SqlError::Eval(
                 "internal: unresolved subquery reached binding".into(),
@@ -1845,6 +2760,12 @@ fn eval_agg(
         }
         Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::Eval(
             "internal: unresolved subquery reached evaluation".into(),
+        )),
+        Expr::CorrScalar { .. } | Expr::CorrIn { .. } => Err(SqlError::Unsupported(
+            "correlated subquery in an aggregated query".into(),
+        )),
+        Expr::Window { .. } => Err(SqlError::Unsupported(
+            "window function in an aggregated query (use a view or an outer query)".into(),
         )),
     }
 }
@@ -1980,6 +2901,7 @@ fn has_aggregate(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } => has_aggregate(left) || has_aggregate(right),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_aggregate(expr),
         Expr::In { expr, list, .. } => has_aggregate(expr) || list.iter().any(has_aggregate),
+        Expr::CorrIn { expr, .. } => has_aggregate(expr),
         _ => false,
     }
 }

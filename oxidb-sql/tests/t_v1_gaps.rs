@@ -310,3 +310,291 @@ fn subquery_works_inside_update_delete_and_transactions() {
         .unwrap();
     assert!(rows(&db, "SELECT id FROM t").is_empty());
 }
+
+// ── correlated subqueries ───────────────────────────────────────────────────
+
+#[test]
+fn correlated_scalar_in_where_and_projection() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE emp (id INT, dept INT, salary INT)")
+        .unwrap();
+    db.execute("INSERT INTO emp VALUES (1, 10, 100), (2, 10, 200), (3, 20, 50), (4, 20, 80)")
+        .unwrap();
+    // Employees earning the max of their own department.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT id FROM emp e WHERE salary = \
+             (SELECT MAX(salary) FROM emp x WHERE x.dept = e.dept) ORDER BY id"
+        ),
+        vec![vec![i(2)], vec![i(4)]]
+    );
+    // Correlated scalar in the projection.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT id, (SELECT COUNT(*) FROM emp x WHERE x.dept = e.dept) AS peers \
+             FROM emp e ORDER BY id"
+        ),
+        vec![
+            vec![i(1), i(2)],
+            vec![i(2), i(2)],
+            vec![i(3), i(2)],
+            vec![i(4), i(2)],
+        ]
+    );
+}
+
+#[test]
+fn correlated_in_subquery_and_update_delete() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE orders (id INT, cust INT, total INT)")
+        .unwrap();
+    db.execute("CREATE TABLE refunds (order_id INT, cust INT)")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (1, 7, 50), (2, 7, 60), (3, 8, 70)")
+        .unwrap();
+    db.execute("INSERT INTO refunds VALUES (1, 7)").unwrap();
+    // Orders that have a refund by the same customer.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT id FROM orders o WHERE id IN \
+             (SELECT order_id FROM refunds r WHERE r.cust = o.cust)"
+        ),
+        vec![vec![i(1)]]
+    );
+    // Correlated in UPDATE and DELETE (outer scope = the target table).
+    db.execute(
+        "UPDATE orders SET total = (SELECT COUNT(*) FROM refunds r WHERE r.cust = orders.cust)",
+    )
+    .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT total FROM orders ORDER BY id"),
+        vec![vec![i(1)], vec![i(1)], vec![i(0)]]
+    );
+    db.execute(
+        "DELETE FROM orders WHERE id IN (SELECT order_id FROM refunds r WHERE r.cust = orders.cust)",
+    )
+    .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id FROM orders ORDER BY id"),
+        vec![vec![i(2)], vec![i(3)]]
+    );
+}
+
+#[test]
+fn correlated_inner_scope_shadows_outer() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (v INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+    // `v` inside the subquery resolves to the subquery's own table, not the
+    // outer one — so the subquery is uncorrelated and errors on >1 row.
+    assert!(
+        db.execute("SELECT v FROM t o WHERE v = (SELECT v FROM t)")
+            .is_err()
+    );
+}
+
+#[test]
+fn correlated_in_aggregated_query_is_rejected() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (g INT, v INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    let err = db
+        .execute(
+            "SELECT g, SUM(v) FROM t o GROUP BY g \
+             HAVING SUM(v) > (SELECT v FROM t x WHERE x.g = o.g)",
+        )
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("correlated"),
+        "unexpected error: {err}"
+    );
+}
+
+// ── views ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn views_select_join_and_persistence() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_at(dir.path());
+        db.execute("CREATE TABLE sales (region TEXT, amount INT)")
+            .unwrap();
+        db.execute("INSERT INTO sales VALUES ('n', 10), ('n', 20), ('s', 5)")
+            .unwrap();
+        db.execute(
+            "CREATE VIEW region_totals AS \
+             SELECT region, SUM(amount) AS total FROM sales GROUP BY region",
+        )
+        .unwrap();
+        // Plain select through the view (with WHERE + ORDER BY on top).
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT region, total FROM region_totals WHERE total > 6 ORDER BY region"
+            ),
+            vec![vec![t("n"), i(30)]]
+        );
+        // A view is joinable like a table (with an alias).
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT s.amount FROM sales s \
+                 JOIN region_totals rt ON rt.region = s.region \
+                 WHERE rt.total > 6 ORDER BY s.amount"
+            ),
+            vec![vec![i(10)], vec![i(20)]]
+        );
+        // Views see fresh data on every use.
+        db.execute("INSERT INTO sales VALUES ('s', 100)").unwrap();
+        assert_eq!(
+            rows(&db, "SELECT total FROM region_totals WHERE region = 's'"),
+            vec![vec![i(105)]]
+        );
+    }
+    // Views persist across reopen.
+    let db = open_at(dir.path());
+    assert_eq!(
+        rows(&db, "SELECT total FROM region_totals WHERE region = 'n'"),
+        vec![vec![i(30)]]
+    );
+}
+
+#[test]
+fn view_ddl_rules() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (a INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    db.execute("CREATE VIEW v AS SELECT a FROM t").unwrap();
+
+    // Name collisions in both directions.
+    assert!(db.execute("CREATE VIEW t AS SELECT a FROM t").is_err());
+    assert!(db.execute("CREATE TABLE v (x INT)").is_err());
+    assert!(db.execute("CREATE VIEW v AS SELECT a FROM t").is_err());
+    // OR REPLACE swaps the body.
+    db.execute("CREATE OR REPLACE VIEW v AS SELECT a + 1 AS a FROM t")
+        .unwrap();
+    assert_eq!(rows(&db, "SELECT a FROM v"), vec![vec![i(2)]]);
+
+    // A view body referencing a missing table fails at creation.
+    assert!(
+        db.execute("CREATE VIEW bad AS SELECT x FROM ghost")
+            .is_err()
+    );
+    // A view body must be a single SELECT.
+    assert!(
+        db.execute("CREATE VIEW bad AS SELECT a FROM t; SELECT 1")
+            .is_err()
+    );
+
+    // Writes against a view fail.
+    assert!(db.execute("INSERT INTO v VALUES (9)").is_err());
+    // Views are per-statement read objects; a view over a view works.
+    db.execute("CREATE VIEW vv AS SELECT a FROM v").unwrap();
+    assert_eq!(rows(&db, "SELECT a FROM vv"), vec![vec![i(2)]]);
+
+    db.execute("DROP VIEW vv").unwrap();
+    db.execute("DROP VIEW IF EXISTS vv").unwrap();
+    assert!(db.execute("DROP VIEW vv").is_err());
+    // DROP VIEW does not touch same-named tables and vice versa.
+    assert!(db.execute("DROP VIEW t").is_err());
+}
+
+// ── window functions ────────────────────────────────────────────────────────
+
+#[test]
+fn window_ranking_functions() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE s (dept TEXT, score INT)").unwrap();
+    db.execute("INSERT INTO s VALUES ('a', 10), ('a', 30), ('a', 30), ('a', 40), ('b', 5)")
+        .unwrap();
+    // ROW_NUMBER / RANK / DENSE_RANK per partition (peers tie on 30).
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT dept, score, \
+             ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score) AS rn, \
+             RANK() OVER (PARTITION BY dept ORDER BY score) AS rk, \
+             DENSE_RANK() OVER (PARTITION BY dept ORDER BY score) AS dr \
+             FROM s ORDER BY dept, score, rn"
+        ),
+        vec![
+            vec![t("a"), i(10), i(1), i(1), i(1)],
+            vec![t("a"), i(30), i(2), i(2), i(2)],
+            vec![t("a"), i(30), i(3), i(2), i(2)],
+            vec![t("a"), i(40), i(4), i(4), i(3)],
+            vec![t("b"), i(5), i(1), i(1), i(1)],
+        ]
+    );
+}
+
+#[test]
+fn window_aggregates_whole_partition_and_running() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE s (g TEXT, v INT)").unwrap();
+    db.execute("INSERT INTO s VALUES ('a', 1), ('a', 2), ('a', 2), ('b', 10)")
+        .unwrap();
+    // Whole-partition aggregate (no ORDER BY in the window).
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT g, v, SUM(v) OVER (PARTITION BY g) AS total FROM s ORDER BY g, v"
+        ),
+        vec![
+            vec![t("a"), i(1), i(5)],
+            vec![t("a"), i(2), i(5)],
+            vec![t("a"), i(2), i(5)],
+            vec![t("b"), i(10), i(10)],
+        ]
+    );
+    // Running aggregate: peers (the two v=2 rows) share the cumulative value.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT v, SUM(v) OVER (PARTITION BY g ORDER BY v) AS run \
+             FROM s WHERE g = 'a' ORDER BY v"
+        ),
+        vec![vec![i(1), i(1)], vec![i(2), i(5)], vec![i(2), i(5)]]
+    );
+    // Running COUNT(*) and AVG.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT v, COUNT(*) OVER (ORDER BY v) AS c, AVG(v) OVER (ORDER BY v) AS a \
+             FROM s WHERE g = 'a' ORDER BY v, c"
+        ),
+        vec![
+            vec![i(1), i(1), d(1.0)],
+            vec![i(2), i(3), d(5.0 / 3.0)],
+            vec![i(2), i(3), d(5.0 / 3.0)],
+        ]
+    );
+}
+
+#[test]
+fn window_rejected_outside_projection() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE s (v INT)").unwrap();
+    db.execute("INSERT INTO s VALUES (1)").unwrap();
+    assert!(
+        db.execute("SELECT v FROM s WHERE ROW_NUMBER() OVER (ORDER BY v) = 1")
+            .is_err()
+    );
+    assert!(
+        db.execute("SELECT SUM(v), ROW_NUMBER() OVER (ORDER BY v) FROM s")
+            .is_err()
+    );
+    assert!(
+        db.execute("SELECT SUM(v) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM s")
+            .is_err()
+    );
+    // A view makes window results filterable.
+    db.execute("CREATE VIEW ranked AS SELECT v, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM s")
+        .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM ranked WHERE rn = 1"),
+        vec![vec![i(1)]]
+    );
+}

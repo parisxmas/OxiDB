@@ -14,6 +14,7 @@ mod ast;
 mod catalog;
 mod error;
 mod executor;
+pub mod json;
 mod parser;
 mod storage;
 mod store;
@@ -257,6 +258,12 @@ impl SqlEngine {
                     state.indexes.remove(name);
                 }
             }
+            WalRecord::CreateView { name, sql } => {
+                catalog.views.insert(name.clone(), sql.clone());
+            }
+            WalRecord::DropView(name) => {
+                catalog.views.remove(name);
+            }
             WalRecord::Insert {
                 table,
                 row_id,
@@ -286,10 +293,10 @@ impl SqlEngine {
         }
     }
 
-    /// Create a new table. Errors if a table of the same name already exists.
+    /// Create a new table. Errors if a table or view of the same name exists.
     pub fn create_table(&self, def: Table) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        if inner.catalog.contains(&def.name) {
+        if inner.catalog.contains(&def.name) || inner.catalog.views.contains_key(&def.name) {
             return Err(SqlError::TableExists(def.name));
         }
         let rec = WalRecord::CreateTable(def);
@@ -342,6 +349,56 @@ impl SqlEngine {
         inner.wal.append(&rec)?;
         Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
         Ok(())
+    }
+
+    /// Create (or with `or_replace`, overwrite) a view. The body must be a
+    /// single SELECT; it is trial-executed so errors surface at creation.
+    pub fn create_view(&self, name: &str, query_sql: &str, or_replace: bool) -> Result<()> {
+        // Validate before taking the engine lock: must parse to exactly one
+        // SELECT, and a trial run proves the referenced tables/columns exist.
+        let stmts = parser::parse(query_sql)?;
+        let is_single_select =
+            stmts.len() == 1 && matches!(stmts.first(), Some(ast::Statement::Select(_)));
+        if !is_single_select {
+            return Err(SqlError::Unsupported(
+                "a view body must be a single SELECT".into(),
+            ));
+        }
+        executor::execute(self, stmts.into_iter().next().expect("checked"), &[])?;
+
+        let mut inner = self.inner.lock().unwrap();
+        if inner.catalog.contains(name) {
+            return Err(SqlError::TableExists(name.to_string()));
+        }
+        if inner.catalog.views.contains_key(name) && !or_replace {
+            return Err(SqlError::TableExists(format!("{name} (view)")));
+        }
+        let rec = WalRecord::CreateView {
+            name: name.to_string(),
+            sql: query_sql.to_string(),
+        };
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Ok(())
+    }
+
+    /// Drop a view by name. Errors if it does not exist.
+    pub fn drop_view(&self, name: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.catalog.views.contains_key(name) {
+            return Err(SqlError::NoSuchView(name.to_string()));
+        }
+        let rec = WalRecord::DropView(name.to_string());
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Ok(())
+    }
+
+    /// The stored SQL text of a view, if it exists.
+    pub fn view_sql(&self, name: &str) -> Option<String> {
+        self.inner.lock().unwrap().catalog.views.get(name).cloned()
     }
 
     /// Drop a secondary index by name. Errors if it does not exist.
@@ -733,6 +790,15 @@ impl Store for SqlEngine {
     }
     fn drop_index(&self, name: &str) -> Result<()> {
         SqlEngine::drop_index(self, name)
+    }
+    fn create_view(&self, name: &str, query_sql: &str, or_replace: bool) -> Result<()> {
+        SqlEngine::create_view(self, name, query_sql, or_replace)
+    }
+    fn drop_view(&self, name: &str) -> Result<()> {
+        SqlEngine::drop_view(self, name)
+    }
+    fn view_sql(&self, name: &str) -> Option<String> {
+        SqlEngine::view_sql(self, name)
     }
     fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<store::Rows>> {
         SqlEngine::index_lookup_eq(self, table, eqs)

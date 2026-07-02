@@ -405,6 +405,21 @@ fn apply_request(db: &OxiDb, req: OxiDbRequest) -> OxiDbResponse {
                 },
             }
         }
+        OxiDbRequest::Sql { sql, params } => {
+            // Re-execute the replicated SQL on this node's SQL engine. The
+            // engine must be enabled (`OXIDB_SQL=1`) on every cluster node —
+            // a node with it disabled reports an error here but the log entry
+            // is already committed (operational requirement, documented).
+            let params = if params.is_null() {
+                None
+            } else {
+                Some(&params)
+            };
+            match crate::sql_bridge::execute_json(&sql, params, false) {
+                Ok(results) => OxiDbResponse::Ok { data: results },
+                Err(message) => OxiDbResponse::Error { message },
+            }
+        }
         OxiDbRequest::DropCollection { name } => match db.drop_collection(&name) {
             Ok(()) => OxiDbResponse::Ok {
                 data: json!("collection dropped"),

@@ -118,8 +118,9 @@ pub fn handle_request_opts(
     // served by the standalone SQL engine, which owns entirely separate files
     // and shares no state with the document engine. A missing/`"doc"` engine
     // keeps the document path below byte-for-byte, so existing clients are
-    // unaffected. In cluster mode `sql` is not a write command, so it runs
-    // node-locally (SQL is not Raft-replicated in v1).
+    // unaffected. In cluster mode, SQL *writes* are replicated through Raft
+    // by the session layer before this point; what reaches here runs locally
+    // (SELECTs, or standalone mode).
     match request.get("engine").and_then(|v| v.as_str()) {
         Some("sql") => return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly),
         Some("doc") | None => {}

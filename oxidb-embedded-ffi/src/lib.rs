@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use base64::Engine;
 use oxidb::OxiDb;
 use oxidb::query::parse_find_options;
+use oxidb_sql::SqlEngine;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
@@ -16,6 +17,25 @@ use serde_json::{Value, json};
 struct OxiDbHandle {
     db: Arc<OxiDb>,
     active_tx: Mutex<Option<u64>>,
+    /// Root data directory (the SQL engine lives under `<dir>/sql`).
+    dir: PathBuf,
+    /// The standalone SQL engine (ADR-0010), opened lazily on the first `sql`
+    /// command. `None` after a failed open (the error is reported per call).
+    sql: OnceLock<Option<Arc<SqlEngine>>>,
+}
+
+impl OxiDbHandle {
+    /// The SQL engine for this handle, opened at `<dir>/sql` on first use.
+    /// Unlike the server there is no env-var gate: calling `sql` *is* the
+    /// opt-in, and the engine costs nothing until then.
+    fn sql_engine(&self) -> Option<Arc<SqlEngine>> {
+        self.sql
+            .get_or_init(|| match SqlEngine::open(self.dir.join("sql")) {
+                Ok(e) => Some(Arc::new(e)),
+                Err(_) => None,
+            })
+            .clone()
+    }
 }
 
 type Handle = c_void;
@@ -634,6 +654,8 @@ pub unsafe extern "C" fn oxidb_open(path: *const c_char) -> *mut Handle {
             let handle = Box::new(OxiDbHandle {
                 db: Arc::new(db),
                 active_tx: Mutex::new(None),
+                dir: PathBuf::from(path_str),
+                sql: OnceLock::new(),
             });
             Box::into_raw(handle) as *mut Handle
         }
@@ -668,6 +690,8 @@ pub unsafe extern "C" fn oxidb_open_encrypted(
             let handle = Box::new(OxiDbHandle {
                 db: Arc::new(db),
                 active_tx: Mutex::new(None),
+                dir: PathBuf::from(path_str),
+                sql: OnceLock::new(),
             });
             Box::into_raw(handle) as *mut Handle
         }
@@ -714,9 +738,44 @@ pub unsafe extern "C" fn oxidb_execute(
         Err(e) => return result_to_cstring(err_bytes(&format!("invalid JSON: {e}"))),
     };
 
+    // ── Second-engine routing (ADR-0010) ── requests carrying
+    // `engine: "sql"` or the reserved `sql` command go to the standalone SQL
+    // engine (own files under `<dir>/sql`, opened lazily on first use).
+    let engine_field = request.get("engine").and_then(|v| v.as_str());
+    let cmd_field = request.get("cmd").and_then(|v| v.as_str());
+    match engine_field {
+        Some("sql") => return result_to_cstring(handle_sql(h, &request)),
+        Some("doc") | None => {}
+        Some(other) => {
+            return result_to_cstring(err_bytes(&format!("unknown engine: {other:?}")));
+        }
+    }
+    if cmd_field == Some("sql") {
+        return result_to_cstring(handle_sql(h, &request));
+    }
+
     let mut active_tx = h.active_tx.lock().unwrap();
     let response = handle_request(&h.db, request, &mut active_tx);
     result_to_cstring(response)
+}
+
+/// Serve a SQL-engine request. Same request/response shapes as the server:
+/// `{"engine":"sql","cmd":"sql","sql":"...","params":[...]}` →
+/// `{ok:true, data:[...one result per statement...]}`.
+fn handle_sql(h: &OxiDbHandle, request: &Value) -> Vec<u8> {
+    if request.get("cmd").and_then(|v| v.as_str()) != Some("sql") {
+        return err_bytes("SQL engine requests must use cmd \"sql\"");
+    }
+    let Some(engine) = h.sql_engine() else {
+        return err_bytes("failed to open the SQL engine data directory");
+    };
+    let Some(sql) = request.get("sql").and_then(|v| v.as_str()) else {
+        return err_bytes("missing 'sql' field");
+    };
+    match oxidb_sql::json::execute_json(&engine, sql, request.get("params"), false) {
+        Ok(results) => ok_bytes(results),
+        Err(msg) => err_bytes(&msg),
+    }
 }
 
 /// Free a string returned by `oxidb_execute`. Safe to call with NULL.

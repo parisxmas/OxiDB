@@ -93,7 +93,16 @@ await db.sql("INSERT INTO users VALUES (?, ?)", [1, "ada"]);
 const [res] = await db.sql("SELECT name FROM users WHERE id = $1", [1]);
 ```
 
-The embedded clients have no SQL surface — the engine is server-side.
+The **embedded** clients (Python `oxidb-embedded`, .NET `OxiDb.Client.Embedded`)
+have the same `sql()` surface: the engine opens lazily under
+`<data dir>/sql` on the first call — no env var needed in embedded mode.
+
+### Cluster mode
+
+SQL **writes** (any statement that isn't a SELECT) are replicated through
+Raft: the SQL string and params are appended to the Raft log and re-executed
+on every node. SELECT-only requests run node-locally. All cluster nodes must
+run with `OXIDB_SQL=1`.
 
 ## Data Types
 
@@ -182,17 +191,58 @@ ORDER BY 1 LIMIT 10 OFFSET 5;   -- outer clauses apply to the combined result
 column names. The outer `ORDER BY` uses output column names or 1-based
 positions. (`EXCEPT` / `INTERSECT` are not supported.)
 
-### Subqueries (uncorrelated)
+### Subqueries
 
 ```sql
+-- Uncorrelated: evaluated once per statement.
 SELECT id FROM orders WHERE total > (SELECT AVG(total) FROM orders);
 SELECT id FROM orders WHERE customer_id IN (SELECT id FROM vip);
+
+-- Correlated: references to the enclosing query's tables re-execute the
+-- subquery per outer row (inner names shadow outer ones, per SQL scoping).
+SELECT id FROM emp e
+WHERE salary = (SELECT MAX(salary) FROM emp x WHERE x.dept = e.dept);
 ```
 
-Subqueries are evaluated once per statement, before row evaluation: a scalar
-subquery must return one column and at most one row (zero rows = `NULL`);
-`IN (SELECT ...)` takes a one-column result. Correlated subqueries (references
-to the outer query's tables) are not supported.
+A scalar subquery must return one column and at most one row (zero rows =
+`NULL`); `IN (SELECT ...)` takes a one-column result. Correlation reaches one
+level up and also works in UPDATE/DELETE (the target table is the outer
+scope); correlated subqueries are not allowed inside aggregated queries or
+window functions.
+
+### Views
+
+```sql
+CREATE VIEW region_totals AS
+  SELECT region, SUM(amount) AS total FROM sales GROUP BY region;
+CREATE OR REPLACE VIEW region_totals AS SELECT ...;
+SELECT * FROM region_totals WHERE total > 100;   -- filter/join like a table
+DROP VIEW region_totals;
+```
+
+A view stores its SELECT and re-executes it whenever referenced (always-fresh
+results). The body is validated by a trial run at creation. Views are
+read-only and share the table namespace (no collisions).
+
+### Window functions
+
+```sql
+SELECT dept, salary,
+       ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn,
+       RANK()       OVER (PARTITION BY dept ORDER BY salary DESC) AS rk,
+       SUM(salary)  OVER (PARTITION BY dept)                      AS dept_total,
+       SUM(salary)  OVER (PARTITION BY dept ORDER BY salary)      AS running
+FROM emp;
+```
+
+`ROW_NUMBER`, `RANK`, `DENSE_RANK`, and the aggregates
+(`COUNT/SUM/AVG/MIN/MAX`) over a window. Without `ORDER BY` in the window an
+aggregate covers the whole partition; with it, the aggregate is cumulative
+and peer rows (equal sort keys) share the value — the standard default frame.
+Window functions are allowed in the SELECT list (and its ORDER BY aliases)
+of non-aggregated queries; to filter on a window result, wrap it in a view or
+subselect-free outer pattern. Explicit frames (`ROWS BETWEEN ...`) are not
+supported.
 
 ### Joins
 
@@ -247,12 +297,16 @@ request is rolled back.
 
 ## Limitations
 
-- Correlated subqueries, derived tables (`FROM (SELECT ...)`), `EXCEPT`,
-  `INTERSECT`, `DISTINCT`, views, and window functions are not supported
+- Derived tables (`FROM (SELECT ...)`), `EXCEPT`, `INTERSECT`, `DISTINCT`,
+  and explicit window frames are not supported
+- Correlated subqueries reach one level up and are not allowed inside
+  aggregated queries or window functions
 - Plain `UNIQUE` column constraints are accepted but not enforced
   (`PRIMARY KEY` **is** enforced)
-- Transactions are single-writer and their reads are not index-accelerated
-- Node-local: SQL statements are **not** Raft-replicated in cluster mode
+- Transactions are single-writer and their reads are not index-accelerated;
+  `CREATE/DROP VIEW` are not allowed inside a transaction
+- No cross-engine transactions (document + SQL) — see ADR-0011 for the
+  proposed design
 
 ## See Also
 

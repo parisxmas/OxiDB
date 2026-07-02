@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### SQL engine: cluster replication, embedded surface, correlated subqueries, views, window functions
+
+- **Raft replication (server 0.31.5)** — in cluster mode, SQL writes (any
+  non-SELECT statement) replicate through Raft and re-execute on every node;
+  SELECTs run node-locally. All nodes must set `OXIDB_SQL=1`.
+- **Embedded FFI SQL** — `oxidb-embedded-ffi` routes `engine:"sql"` requests
+  to a per-handle SQL engine at `<data dir>/sql`, opened lazily on first use
+  (no env var in embedded mode). Python `oxidb-embedded` and .NET
+  `OxiDb.Client.Embedded` gain the same `sql()` surface as the TCP clients.
+  The JSON bridging moved into `oxidb_sql::json`, shared by server and FFI.
+- **Correlated subqueries** — subqueries may reference the enclosing query's
+  tables (one level up; inner names shadow outer, per SQL scoping) and
+  re-execute per outer row; works in SELECT/UPDATE/DELETE. Rejected inside
+  aggregated queries and window functions.
+- **Views** — `CREATE [OR REPLACE] VIEW` / `DROP VIEW [IF EXISTS]`; the body
+  (a single SELECT) is trial-run at creation, stored in the catalog, and
+  re-executed fresh whenever the view is selected from or joined.
+- **Window functions** — `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()` and
+  `COUNT/SUM/AVG/MIN/MAX(...) OVER (PARTITION BY ... ORDER BY ...)`;
+  whole-partition without ORDER BY, standard running-with-peers frame with
+  it. SELECT-list only; explicit frames unsupported.
+- **ADR-0011** — proposed design for cross-engine (document + SQL)
+  transactions via a shared GSN commit clock and a two-log 2PC; not
+  implemented.
+
 ### SQL engine: v1 gap closure
 
 The standalone SQL engine (below) gained the features its v1 said were

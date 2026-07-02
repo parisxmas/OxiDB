@@ -53,6 +53,15 @@ pub enum OxiDbRequest {
         name: String,
         options: oxidb::StorageOptions,
     },
+    /// A write statement (or batch) for the standalone SQL engine (ADR-0010).
+    /// Applied by re-executing the SQL string with its params on every node —
+    /// deterministic because the engine has no non-deterministic functions and
+    /// row ids are assigned sequentially. Requires `OXIDB_SQL=1` on all nodes.
+    Sql {
+        sql: String,
+        /// JSON array of bind parameters, or `Null` when none were given.
+        params: Value,
+    },
     DropCollection {
         name: String,
     },

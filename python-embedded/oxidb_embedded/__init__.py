@@ -270,6 +270,28 @@ class OxiDbEmbedded:
         return self._execute({"cmd": "aggregate", "collection": collection, "pipeline": pipeline})
 
     # ------------------------------------------------------------------
+    # SQL engine (second engine, ADR-0010)
+    # ------------------------------------------------------------------
+
+    def sql(self, sql: str, params: list = None) -> list:
+        """Execute SQL against the embedded standalone SQL engine.
+
+        The engine's data lives under <data dir>/sql, entirely separate from
+        document collections, and opens lazily on the first call. `params`
+        optionally binds `?` / `$N` placeholders left-to-right.
+
+        Returns a list with one result per statement:
+        - SELECT: {"columns": [...], "rows": [[...], ...]}
+        - INSERT/UPDATE/DELETE: {"affected": N}
+        - DDL: {"ddl": True}
+        - BEGIN/COMMIT/ROLLBACK: {"transaction": True}
+        """
+        payload = {"engine": "sql", "cmd": "sql", "sql": sql}
+        if params is not None:
+            payload["params"] = params
+        return self._execute(payload)
+
+    # ------------------------------------------------------------------
     # Compaction
     # ------------------------------------------------------------------
 

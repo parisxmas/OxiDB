@@ -54,6 +54,10 @@ pub enum SqlError {
     /// A write would violate PRIMARY KEY uniqueness.
     #[error("duplicate key: {0}")]
     DuplicateKey(String),
+
+    /// A referenced view does not exist.
+    #[error("no such view: {0}")]
+    NoSuchView(String),
 }
 
 /// Convenience result alias for the SQL engine.

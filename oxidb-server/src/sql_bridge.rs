@@ -17,8 +17,8 @@
 
 use std::sync::{Arc, OnceLock};
 
-use oxidb_sql::{QueryResult, SqlEngine, Value as SqlValue};
-use serde_json::{Value, json};
+use oxidb_sql::SqlEngine;
+use serde_json::Value;
 
 use crate::handler::{err_bytes, ok_bytes};
 
@@ -86,132 +86,11 @@ pub fn handle_sql(cmd: &str, request: &Value, readonly: bool) -> Vec<u8> {
 /// Execute a SQL string with optional JSON `params` and return the results as
 /// JSON (one entry per statement). Shared by the TCP wire handler and the
 /// REST `POST /api/sql` endpoint. With `readonly`, only SELECT statements are
-/// permitted.
+/// permitted. (JSON bridging lives in `oxidb_sql::json`, shared with the
+/// embedded FFI.)
 pub fn execute_json(sql: &str, params: Option<&Value>, readonly: bool) -> Result<Value, String> {
     let Some(engine) = engine() else {
         return Err("SQL engine is not enabled (set OXIDB_SQL=1)".to_string());
     };
-    if readonly {
-        match oxidb_sql::is_read_only(sql) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(
-                    "permission denied: role 'read' may only execute SELECT statements".to_string(),
-                );
-            }
-            Err(e) => return Err(format!("sql error: {e}")),
-        }
-    }
-    let params = parse_params(params)?;
-    engine
-        .execute_params(sql, &params)
-        .map(results_to_json)
-        .map_err(|e| format!("sql error: {e}"))
-}
-
-/// Convert the optional `params` JSON array into typed SQL values.
-fn parse_params(params: Option<&Value>) -> Result<Vec<SqlValue>, String> {
-    let Some(params) = params else {
-        return Ok(Vec::new());
-    };
-    let arr = params
-        .as_array()
-        .ok_or_else(|| "'params' must be an array".to_string())?;
-    arr.iter().map(json_to_value).collect()
-}
-
-fn json_to_value(v: &Value) -> Result<SqlValue, String> {
-    match v {
-        Value::Null => Ok(SqlValue::Null),
-        Value::Bool(b) => Ok(SqlValue::Bool(*b)),
-        Value::String(s) => Ok(SqlValue::Text(s.clone())),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(SqlValue::Int(i))
-            } else if let Some(f) = n.as_f64() {
-                Ok(SqlValue::Double(f))
-            } else {
-                Err(format!("unsupported numeric parameter: {n}"))
-            }
-        }
-        other => Err(format!("unsupported parameter type: {other}")),
-    }
-}
-
-/// Convert one statement's result to JSON.
-fn result_to_json(r: QueryResult) -> Value {
-    match r {
-        QueryResult::Select { columns, rows } => {
-            let rows: Vec<Value> = rows
-                .into_iter()
-                .map(|row| Value::Array(row.iter().map(value_to_json).collect()))
-                .collect();
-            json!({ "columns": columns, "rows": rows })
-        }
-        QueryResult::Mutation { affected } => json!({ "affected": affected }),
-        QueryResult::Ddl => json!({ "ddl": true }),
-        QueryResult::Transaction => json!({ "transaction": true }),
-    }
-}
-
-/// Convert all statement results into a JSON array (one entry per statement).
-fn results_to_json(results: Vec<QueryResult>) -> Value {
-    Value::Array(results.into_iter().map(result_to_json).collect())
-}
-
-fn value_to_json(v: &SqlValue) -> Value {
-    match v {
-        SqlValue::Null => Value::Null,
-        SqlValue::Int(n) => json!(n),
-        SqlValue::Double(f) => json!(f),
-        SqlValue::Text(s) => json!(s),
-        SqlValue::Bool(b) => json!(b),
-        // Timestamps are epoch milliseconds on the wire.
-        SqlValue::Timestamp(t) => json!(t),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn params_parse_all_json_scalars() {
-        let p = json!([1, 2.5, "x", true, null]);
-        let vals = parse_params(Some(&p)).unwrap();
-        assert_eq!(
-            vals,
-            vec![
-                SqlValue::Int(1),
-                SqlValue::Double(2.5),
-                SqlValue::Text("x".into()),
-                SqlValue::Bool(true),
-                SqlValue::Null,
-            ]
-        );
-        assert!(parse_params(None).unwrap().is_empty());
-        assert!(parse_params(Some(&json!({"a": 1}))).is_err());
-        assert!(parse_params(Some(&json!([[1]]))).is_err());
-    }
-
-    #[test]
-    fn result_json_shapes() {
-        assert_eq!(
-            result_to_json(QueryResult::Mutation { affected: 3 }),
-            json!({ "affected": 3 })
-        );
-        assert_eq!(result_to_json(QueryResult::Ddl), json!({ "ddl": true }));
-        assert_eq!(
-            result_to_json(QueryResult::Transaction),
-            json!({ "transaction": true })
-        );
-        let sel = QueryResult::Select {
-            columns: vec!["id".into(), "name".into()],
-            rows: vec![vec![SqlValue::Int(1), SqlValue::Text("ada".into())]],
-        };
-        assert_eq!(
-            result_to_json(sel),
-            json!({ "columns": ["id", "name"], "rows": [[1, "ada"]] })
-        );
-    }
+    oxidb_sql::json::execute_json(&engine, sql, params, readonly)
 }

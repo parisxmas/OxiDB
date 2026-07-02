@@ -76,6 +76,10 @@ pub(crate) trait Store {
     fn drop_table(&self, name: &str) -> Result<()>;
     fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()>;
     fn drop_index(&self, name: &str) -> Result<()>;
+    fn create_view(&self, name: &str, query_sql: &str, or_replace: bool) -> Result<()>;
+    fn drop_view(&self, name: &str) -> Result<()>;
+    /// The stored SQL text of a view, if one with this name exists.
+    fn view_sql(&self, name: &str) -> Option<String>;
 
     /// Look up rows using a secondary index, given the available
     /// `column = value` equality pairs from the WHERE clause.

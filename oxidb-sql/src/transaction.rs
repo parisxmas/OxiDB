@@ -301,6 +301,22 @@ impl Store for Transaction<'_> {
         Ok(())
     }
 
+    fn create_view(&self, _name: &str, _query_sql: &str, _or_replace: bool) -> Result<()> {
+        Err(SqlError::Unsupported(
+            "CREATE VIEW inside a transaction".into(),
+        ))
+    }
+
+    fn drop_view(&self, _name: &str) -> Result<()> {
+        Err(SqlError::Unsupported(
+            "DROP VIEW inside a transaction".into(),
+        ))
+    }
+
+    fn view_sql(&self, name: &str) -> Option<String> {
+        self.engine.view_sql(name)
+    }
+
     fn index_lookup_eq(
         &self,
         _table: &str,

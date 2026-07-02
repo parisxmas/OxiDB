@@ -167,6 +167,9 @@ pub struct Catalog {
     /// Secondary indexes, keyed by index name.
     #[serde(default)]
     pub indexes: BTreeMap<String, IndexDef>,
+    /// Views: name -> the view body as SQL text (re-parsed on use).
+    #[serde(default)]
+    pub views: BTreeMap<String, String>,
 }
 
 impl Catalog {

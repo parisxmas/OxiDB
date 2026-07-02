@@ -9,7 +9,7 @@ use sqlparser::parser::Parser;
 
 use crate::ast::{
     AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, SelectItem, SelectQuery, SelectStmt,
-    Statement, TableRef, UnOp,
+    Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::catalog::{Column, Table};
 use crate::error::{Result, SqlError};
@@ -35,6 +35,29 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
     match stmt {
         sp::Statement::CreateTable(ct) => translate_create_table(ct),
         sp::Statement::CreateIndex(ci) => translate_create_index(ci),
+        sp::Statement::CreateView {
+            name,
+            query,
+            or_replace,
+            columns,
+            materialized,
+            ..
+        } => {
+            if materialized {
+                return Err(SqlError::Unsupported("MATERIALIZED VIEW".into()));
+            }
+            if !columns.is_empty() {
+                return Err(SqlError::Unsupported(
+                    "CREATE VIEW with a column list (alias in the SELECT instead)".into(),
+                ));
+            }
+            Ok(Statement::CreateView {
+                name: object_name_to_string(&name)?,
+                // Store the view body as SQL text (re-parsed on use).
+                query_sql: query.to_string(),
+                or_replace,
+            })
+        }
         sp::Statement::Drop {
             object_type,
             if_exists,
@@ -46,6 +69,10 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
                 if_exists,
             }),
             sp::ObjectType::Index => Ok(Statement::DropIndex {
+                name: single_object_name(&names)?,
+                if_exists,
+            }),
+            sp::ObjectType::View => Ok(Statement::DropView {
                 name: single_object_name(&names)?,
                 if_exists,
             }),
@@ -613,14 +640,6 @@ pub(crate) fn parse_timestamp(s: &str) -> Result<i64> {
 
 fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
     let fname = object_name_to_string(&f.name)?.to_ascii_lowercase();
-    let func = match fname.as_str() {
-        "count" => AggFunc::Count,
-        "sum" => AggFunc::Sum,
-        "avg" => AggFunc::Avg,
-        "min" => AggFunc::Min,
-        "max" => AggFunc::Max,
-        other => return Err(SqlError::Unsupported(format!("function {other}()"))),
-    };
     let args = match f.args {
         sp::FunctionArguments::List(list) => {
             if list.duplicate_treatment == Some(sp::DuplicateTreatment::Distinct) {
@@ -649,6 +668,58 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
                 "aggregate argument {other:?}"
             )));
         }
+    };
+
+    // Window function? (`... OVER (...)`)
+    if let Some(over) = f.over {
+        let spec = match over {
+            sp::WindowType::WindowSpec(spec) => spec,
+            sp::WindowType::NamedWindow(_) => {
+                return Err(SqlError::Unsupported("named WINDOW clause".into()));
+            }
+        };
+        if spec.window_frame.is_some() {
+            return Err(SqlError::Unsupported(
+                "explicit window frames (ROWS/RANGE BETWEEN ...)".into(),
+            ));
+        }
+        let func = match fname.as_str() {
+            "row_number" => WindowFunc::RowNumber,
+            "rank" => WindowFunc::Rank,
+            "dense_rank" => WindowFunc::DenseRank,
+            "count" => WindowFunc::Agg(AggFunc::Count, arg),
+            "sum" => WindowFunc::Agg(AggFunc::Sum, arg),
+            "avg" => WindowFunc::Agg(AggFunc::Avg, arg),
+            "min" => WindowFunc::Agg(AggFunc::Min, arg),
+            "max" => WindowFunc::Agg(AggFunc::Max, arg),
+            other => {
+                return Err(SqlError::Unsupported(format!("window function {other}()")));
+            }
+        };
+        let partition_by = spec
+            .partition_by
+            .into_iter()
+            .map(|e| translate_expr(e, p))
+            .collect::<Result<_>>()?;
+        let mut order_by = Vec::with_capacity(spec.order_by.len());
+        for ob in spec.order_by {
+            let asc = ob.options.asc.unwrap_or(true);
+            order_by.push((translate_expr(ob.expr, p)?, asc));
+        }
+        return Ok(Expr::Window {
+            func,
+            partition_by,
+            order_by,
+        });
+    }
+
+    let func = match fname.as_str() {
+        "count" => AggFunc::Count,
+        "sum" => AggFunc::Sum,
+        "avg" => AggFunc::Avg,
+        "min" => AggFunc::Min,
+        "max" => AggFunc::Max,
+        other => return Err(SqlError::Unsupported(format!("function {other}()"))),
     };
     Ok(Expr::Aggregate { func, arg })
 }

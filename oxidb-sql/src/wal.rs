@@ -41,6 +41,11 @@ pub enum WalRecord {
     DropTable(String),
     CreateIndex(IndexDef),
     DropIndex(String),
+    CreateView {
+        name: String,
+        sql: String,
+    },
+    DropView(String),
     Insert {
         table: String,
         row_id: u64,
