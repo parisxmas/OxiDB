@@ -1,6 +1,6 @@
 [package]
 name = "oxidb-sql"
-version = "0.31.1"
+version = "0.32.0"
 edition = "2024"
 description = "Standalone SQL engine for OxiDB — separate storage, WAL, and recovery from the document engine (ADR-0010)"
 license = "AGPL-3.0-only"

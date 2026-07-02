@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.32.0
+
 ### SQL engine: insert benchmark + WAL sync mode
 
 - New differential write benchmark (`oxidb-sql/examples/insert_bench.rs` +
