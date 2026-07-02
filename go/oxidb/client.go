@@ -700,6 +700,85 @@ func (c *Client) Aggregate(collection string, pipeline []map[string]any) ([]map[
 }
 
 // ------------------------------------------------------------------
+// SQL engine (second engine, ADR-0010)
+// ------------------------------------------------------------------
+
+// SqlResult is the outcome of one SQL statement.
+//
+// Exactly one shape is populated, mirroring the wire response:
+//   - SELECT:               Columns + Rows
+//   - INSERT/UPDATE/DELETE: Affected
+//   - CREATE/DROP:          Ddl = true
+//   - BEGIN/COMMIT/ROLLBACK: Transaction = true
+type SqlResult struct {
+	Columns     []string `json:"columns,omitempty"`
+	Rows        [][]any  `json:"rows,omitempty"`
+	Affected    int64    `json:"affected,omitempty"`
+	Ddl         bool     `json:"ddl,omitempty"`
+	Transaction bool     `json:"transaction,omitempty"`
+}
+
+// Sql executes SQL against the server's standalone SQL engine and returns one
+// result per statement.
+//
+// The SQL engine is separate from document collections (own tables, own
+// files) and must be enabled on the server with OXIDB_SQL=1. `params`
+// optionally binds `?` / `$N` placeholders left-to-right.
+//
+//	_, err := c.Sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+//	_, err = c.Sql("INSERT INTO users VALUES (?, ?)", 1, "ada")
+//	res, err := c.Sql("SELECT name FROM users WHERE id = $1", 1)
+//	// res[0].Columns == ["name"]; res[0].Rows == [["ada"]]
+func (c *Client) Sql(query string, params ...any) ([]SqlResult, error) {
+	payload := map[string]any{"engine": "sql", "cmd": "sql", "sql": query}
+	if len(params) > 0 {
+		payload["params"] = params
+	}
+	data, err := c.checked(payload)
+	if err != nil {
+		return nil, err
+	}
+	items, ok := data.([]any)
+	if !ok {
+		return nil, &Error{Msg: "unexpected sql response shape"}
+	}
+	results := make([]SqlResult, 0, len(items))
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			return nil, &Error{Msg: "unexpected sql result shape"}
+		}
+		var r SqlResult
+		if cols, ok := m["columns"].([]any); ok {
+			for _, col := range cols {
+				if s, ok := col.(string); ok {
+					r.Columns = append(r.Columns, s)
+				}
+			}
+			if rows, ok := m["rows"].([]any); ok {
+				r.Rows = make([][]any, 0, len(rows))
+				for _, row := range rows {
+					if cells, ok := row.([]any); ok {
+						r.Rows = append(r.Rows, cells)
+					}
+				}
+			}
+		}
+		if n, ok := m["affected"].(float64); ok {
+			r.Affected = int64(n)
+		}
+		if b, ok := m["ddl"].(bool); ok {
+			r.Ddl = b
+		}
+		if b, ok := m["transaction"].(bool); ok {
+			r.Transaction = b
+		}
+		results = append(results, r)
+	}
+	return results, nil
+}
+
+// ------------------------------------------------------------------
 // Compaction
 // ------------------------------------------------------------------
 

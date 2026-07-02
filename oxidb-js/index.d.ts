@@ -18,6 +18,22 @@ export interface StorageOptions {
   compact_dead_ratio?: number;
 }
 
+export type SqlParam = string | number | boolean | null;
+
+/** One SQL statement's result — exactly one shape is present. */
+export interface SqlResult {
+  /** SELECT: output column names. */
+  columns?: string[];
+  /** SELECT: result rows (cells are JSON scalars; timestamps are epoch ms). */
+  rows?: SqlParam[][];
+  /** INSERT/UPDATE/DELETE: number of rows affected. */
+  affected?: number;
+  /** CREATE/DROP TABLE|INDEX. */
+  ddl?: boolean;
+  /** BEGIN/COMMIT/ROLLBACK. */
+  transaction?: boolean;
+}
+
 export interface FindOptions {
   sort?: Record<string, 1 | -1>;
   skip?: number;
@@ -106,7 +122,7 @@ export class OxiDB {
   listCollections(): Promise<string[]>;
   createCollection(name: string, options?: StorageOptions): Promise<any>;
   dropCollection(name: string): Promise<any>;
-  sql(query: string): Promise<any>;
+  sql(sql: string, params?: SqlParam[]): Promise<SqlResult[]>;
 
   createProcedure(scriptOrDef: string | Record<string, any>): Promise<any>;
   callProcedure(name: string, params?: Record<string, any>): Promise<any>;

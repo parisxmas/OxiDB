@@ -139,24 +139,25 @@ Supported `metric` values: `"cosine"`, `"euclidean"`, `"dot_product"`. See [Vect
 
 The `pipeline` field is an array of stage objects. See [Aggregation](aggregation.md) for the full stage reference.
 
-### SQL
+### SQL Engine
+
+The standalone SQL engine (ADR-0010) is served by the reserved `sql` command.
+It must be enabled on the server with `OXIDB_SQL=1` and owns entirely separate
+data from document collections. Requests may also carry `engine: "sql"`; a
+missing `engine` field (or `"doc"`) routes to the document engine unchanged.
 
 | Command | Required Fields | Optional Fields | Return | Min Role |
 |---------|----------------|-----------------|--------|----------|
-| `sql` | `query` | - | Varies by statement type | ReadWrite |
+| `sql` | `sql` | `params` (array, binds `?`/`$N`) | Array, one result per statement | ReadWrite |
 
-Return values by statement type:
+Result shape per statement:
 
-- **SELECT**: `[{doc}, ...]`
-- **INSERT**: `{"id": N}` or `{"ids": [N, ...]}`
-- **UPDATE**: `{"modified": N}`
-- **DELETE**: `{"deleted": N}`
-- **CREATE TABLE**: `{"ok": true}`
-- **DROP TABLE**: `{"ok": true}`
-- **CREATE INDEX**: `{"ok": true}`
-- **SHOW TABLES**: `["col1", "col2", ...]`
+- **SELECT**: `{"columns": [...], "rows": [[cell, ...], ...]}`
+- **INSERT / UPDATE / DELETE**: `{"affected": N}`
+- **CREATE / DROP (table or index)**: `{"ddl": true}`
+- **BEGIN / COMMIT / ROLLBACK**: `{"transaction": true}`
 
-See [SQL](sql.md) for the full SQL syntax reference.
+See [SQL Engine](sql.md) for the full syntax reference and result details.
 
 ### Transactions
 

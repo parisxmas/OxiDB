@@ -272,6 +272,34 @@ class OxiDbClient:
         return self._checked({"cmd": "aggregate", "collection": collection, "pipeline": pipeline})
 
     # ------------------------------------------------------------------
+    # SQL engine (second engine, ADR-0010)
+    # ------------------------------------------------------------------
+
+    def sql(self, sql: str, params: list = None) -> list:
+        """Execute SQL against the server's standalone SQL engine.
+
+        The SQL engine is separate from document collections (own tables, own
+        files) and must be enabled on the server with OXIDB_SQL=1. `params`
+        optionally binds `?` / `$N` placeholders left-to-right.
+
+        Returns a list with one result per statement:
+        - SELECT: {"columns": [...], "rows": [[...], ...]}
+        - INSERT/UPDATE/DELETE: {"affected": N}
+        - DDL (CREATE/DROP TABLE|INDEX): {"ddl": True}
+        - BEGIN/COMMIT/ROLLBACK: {"transaction": True}
+
+        Example:
+            db.sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+            db.sql("INSERT INTO users VALUES (?, ?)", [1, "ada"])
+            [result] = db.sql("SELECT name FROM users WHERE id = $1", [1])
+            # result["columns"] == ["name"]; result["rows"] == [["ada"]]
+        """
+        payload = {"engine": "sql", "cmd": "sql", "sql": sql}
+        if params is not None:
+            payload["params"] = params
+        return self._checked(payload)
+
+    # ------------------------------------------------------------------
     # Compaction
     # ------------------------------------------------------------------
 
@@ -424,17 +452,6 @@ class OxiDbClient:
     def list_databases(self) -> list:
         """List all database names."""
         return self._checked({"cmd": "list_databases"})
-
-    # ------------------------------------------------------------------
-    # SQL
-    # ------------------------------------------------------------------
-
-    def sql(self, query: str, db: str = None):
-        """Execute a SQL query. Supports SELECT, INSERT, UPDATE, DELETE, CREATE/DROP TABLE, CREATE INDEX, SHOW TABLES, CREATE/DROP DATABASE, SHOW DATABASES, USE."""
-        payload = {"cmd": "sql", "query": query}
-        if db is not None:
-            payload["db"] = db
-        return self._checked(payload)
 
     # ------------------------------------------------------------------
     # Vector search

@@ -38,6 +38,13 @@ All configuration is done through environment variables.
 | `OXIDB_TLS_KEY` | - | Path to TLS private key PEM file |
 | `OXIDB_AUDIT` | `false` | Enable audit logging |
 
+### SQL Engine Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OXIDB_SQL` | off | Enable the standalone SQL engine (`1`/`true`/`yes`/`on`) — see [SQL Engine](sql.md) |
+| `OXIDB_SQL_DATA` | `${OXIDB_DATA}/sql` | SQL engine data directory (entirely separate from document data) |
+
 ### Logging Settings
 
 | Variable | Default | Description |

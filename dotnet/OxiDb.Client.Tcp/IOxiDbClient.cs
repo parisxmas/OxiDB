@@ -40,6 +40,18 @@ public interface IOxiDbClient : IAsyncDisposable, IDisposable
     // Aggregation
     Task<JsonElement> AggregateAsync(string collection, object[] pipeline, CancellationToken ct = default);
 
+    /// <summary>
+    /// Executes SQL against the server's standalone SQL engine (requires
+    /// <c>OXIDB_SQL=1</c> on the server; TCP only — the embedded engine has no
+    /// SQL surface). The SQL engine's tables are entirely separate from
+    /// document collections. <paramref name="params"/> optionally binds
+    /// <c>?</c>/<c>$N</c> placeholders left-to-right. Returns a JSON array
+    /// with one result per statement: <c>{"columns":[...],"rows":[[...]]}</c>
+    /// for SELECT, <c>{"affected":N}</c> for DML, <c>{"ddl":true}</c> for DDL,
+    /// <c>{"transaction":true}</c> for BEGIN/COMMIT/ROLLBACK.
+    /// </summary>
+    Task<JsonElement> SqlAsync(string sql, object?[]? @params = null, CancellationToken ct = default);
+
     // Transactions
     Task<JsonElement> BeginTransactionAsync(CancellationToken ct = default);
     Task CommitTransactionAsync(CancellationToken ct = default);

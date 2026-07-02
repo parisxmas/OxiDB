@@ -411,6 +411,23 @@ public sealed class OxiDbTcpClient : IOxiDbClient
         }, ct);
     }
 
+    // ── SQL engine (second engine, ADR-0010) ────────────────────────────
+
+    public async Task<JsonElement> SqlAsync(string sql, object?[]? @params = null, CancellationToken ct = default)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["engine"] = "sql",
+            ["cmd"] = "sql",
+            ["sql"] = sql
+        };
+        if (@params is not null)
+        {
+            payload["params"] = @params;
+        }
+        return await RequestAsync(payload, ct);
+    }
+
     // ── Transactions ────────────────────────────────────────────────────
 
     public async Task<JsonElement> BeginTransactionAsync(CancellationToken ct = default)

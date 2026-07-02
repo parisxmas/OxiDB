@@ -72,21 +72,27 @@ pub fn handle_sql(cmd: &str, request: &Value) -> Vec<u8> {
     if cmd != "sql" {
         return err_bytes("SQL engine requests must use cmd \"sql\"");
     }
-    let Some(engine) = engine() else {
-        return err_bytes("SQL engine is not enabled (set OXIDB_SQL=1)");
-    };
     let Some(sql) = request.get("sql").and_then(|v| v.as_str()) else {
         return err_bytes("missing 'sql' field");
     };
-    let params = match parse_params(request.get("params")) {
-        Ok(p) => p,
-        Err(msg) => return err_bytes(&msg),
-    };
-
-    match engine.execute_params(sql, &params) {
-        Ok(results) => ok_bytes(results_to_json(results)),
-        Err(e) => err_bytes(&format!("sql error: {e}")),
+    match execute_json(sql, request.get("params")) {
+        Ok(results) => ok_bytes(results),
+        Err(msg) => err_bytes(&msg),
     }
+}
+
+/// Execute a SQL string with optional JSON `params` and return the results as
+/// JSON (one entry per statement). Shared by the TCP wire handler and the
+/// REST `POST /api/sql` endpoint.
+pub fn execute_json(sql: &str, params: Option<&Value>) -> Result<Value, String> {
+    let Some(engine) = engine() else {
+        return Err("SQL engine is not enabled (set OXIDB_SQL=1)".to_string());
+    };
+    let params = parse_params(params)?;
+    engine
+        .execute_params(sql, &params)
+        .map(results_to_json)
+        .map_err(|e| format!("sql error: {e}"))
 }
 
 /// Convert the optional `params` JSON array into typed SQL values.

@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+### Second engine: standalone SQL (ADR-0010)
+
+OxiDB can now mount a real relational SQL engine alongside the document engine
+in the same server. It is a separate crate (`oxidb-sql`) with its own typed
+tables, catalog, row storage, WAL + crash recovery, secondary indexes, and
+transactions — it shares **no state or files** with document collections and
+is **off by default** (zero cost when unused).
+
+- **Enable** with `OXIDB_SQL=1`; data lives under `${OXIDB_DATA}/sql`
+  (override: `OXIDB_SQL_DATA`).
+- **Wire**: `{ "engine": "sql", "cmd": "sql", "sql": "SELECT ...", "params": [...] }`
+  → one result per statement (`{columns,rows}` / `{affected}` / `{ddl}` /
+  `{transaction}`). Requests without `engine` keep the document path
+  byte-for-byte. RBAC: `sql` requires ReadWrite. Node-local in v1 (not
+  Raft-replicated).
+- **REST**: `POST /api/sql` with `{"sql": "...", "params": [...]}` (the old
+  410 stub from the removed doc-engine SQL translator is gone).
+- **SQL surface**: CREATE/DROP TABLE + single-column indexes (IF [NOT]
+  EXISTS), INSERT (multi-row = one fsync, statement-atomic), UPDATE, DELETE,
+  SELECT with WHERE / INNER-LEFT-RIGHT-FULL joins / GROUP BY / HAVING /
+  aggregates / ORDER BY (incl. projection aliases) / LIMIT, `?`/`$N`
+  parameters, and BEGIN/COMMIT/ROLLBACK transactions.
+- **Performance**: late-materialization executor (column-pruned flat scans,
+  u32 index-tuple joins, direct-address dense-int join index, streaming
+  group/aggregate). On the hard multi-join differential benchmark
+  (`oxidb-sql/BENCHMARKS.md`) it beats PostgreSQL 15 on all four queries at
+  20× scale (e.g. 5-way join + GROUP BY over 300k items: 26.8 ms vs 45.1 ms)
+  with byte-identical results.
+- **Clients**: Python `db.sql(sql, params)` (0.27.0), Go
+  `client.Sql(sql, params...)` → `[]SqlResult`, .NET
+  `IOxiDbClient.SqlAsync(sql, params)` (TCP; embedded throws
+  `NotSupportedException`), JS `db.sql(sql, params)` via REST (0.25.0).
+- **Docs**: `docs/sql.md` rewritten for the new engine;
+  `docs/protocol-reference.md` and `docs/server.md` updated.
+
 ## v0.31.1
 
 ### `$ne` / `$nin` now match documents that lack the field (server 0.31.1)

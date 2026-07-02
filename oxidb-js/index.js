@@ -398,8 +398,30 @@ class OxiDB {
     return this._deleteNoBody(`/api/collections/${name}`);
   }
 
-  async sql(query) {
-    return this._post("/api/sql", { query });
+  /**
+   * Execute SQL against the server's standalone SQL engine.
+   *
+   * The SQL engine is separate from document collections (own tables, own
+   * files) and must be enabled on the server with OXIDB_SQL=1. `params`
+   * optionally binds `?` / `$N` placeholders left-to-right.
+   *
+   * Resolves to an array with one result per statement:
+   * - SELECT: {columns: [...], rows: [[...], ...]}
+   * - INSERT/UPDATE/DELETE: {affected: N}
+   * - CREATE/DROP: {ddl: true}
+   * - BEGIN/COMMIT/ROLLBACK: {transaction: true}
+   *
+   * @example
+   * await db.sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)");
+   * await db.sql("INSERT INTO users VALUES (?, ?)", [1, "ada"]);
+   * const [res] = await db.sql("SELECT name FROM users WHERE id = $1", [1]);
+   * // res.columns == ["name"]; res.rows == [["ada"]]
+   */
+  async sql(sql, params) {
+    const body = { sql };
+    if (params != null) body.params = params;
+    const res = await this._post("/api/sql", body);
+    return res.results;
   }
 
   // -- Procedures -----------------------------------------------

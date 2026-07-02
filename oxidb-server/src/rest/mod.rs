@@ -20,7 +20,7 @@
 //! | GET    | /api/{collection}/indexes | List indexes |
 //! | POST   | /api/{collection}/indexes | Create index |
 //! | DELETE | /api/{collection}/indexes/{name} | Drop index |
-//! | POST   | /api/sql | SQL query |
+//! | POST   | /api/sql | SQL engine query (requires `OXIDB_SQL=1`) |
 //! | POST   | /api/procedures | Create procedure |
 //! | GET    | /api/procedures | List procedures |
 //! | POST   | /api/procedures/{name}/call | Call procedure |
@@ -266,6 +266,14 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         }
     }
 
+    // ── SQL engine (ADR-0010) ─────────────────────────────────────────
+    // Handled outside the generic match so the dynamic error message from
+    // the SQL engine (syntax errors, etc.) reaches the client. Write-gated
+    // by `rest_permitted` above (POST, not admin-only => ReadWrite+).
+    if let ("POST", ["api", "sql"]) = (req.method.as_str(), segments.as_slice()) {
+        return with_rest_cors(handle_sql_endpoint(req));
+    }
+
     // ── Protected endpoints ──────────────────────────────────────────
     let result = match (req.method.as_str(), segments.as_slice()) {
         // Health (also available above without auth, but keep for pattern match)
@@ -296,10 +304,6 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         ("GET", ["api", col, "indexes"]) => handle_list_indexes(col, state),
         ("POST", ["api", col, "indexes"]) => handle_create_index(col, req, state),
         ("DELETE", ["api", col, "indexes", name]) => handle_drop_index(col, name, state),
-
-        // SQL
-        // SQL endpoint removed alongside the engine SQL surface.
-        ("POST", ["api", "sql"]) => Err((410, "SQL removed — use document CRUD")),
 
         // Procedures
         ("GET", ["api", "procedures"]) => handle_list_procedures(state),
@@ -559,12 +563,25 @@ fn handle_drop_index(
     Ok(json!({"dropped": name}))
 }
 
-// (`handle_sql` removed alongside the SQL surface. The REST /v1/sql
-//  route used to live here; clients should use the document-CRUD
-//  routes instead.)
-#[allow(dead_code)]
-fn handle_sql(_req: &HttpRequest, _state: &RestState) -> Result<Value, (u16, &'static str)> {
-    Err((410, "SQL endpoint removed — OxiDB is a document database"))
+/// `POST /api/sql` — the standalone SQL engine (ADR-0010). Body:
+/// `{"sql": "...", "params": [...]}`; `params` optionally binds `?`/`$N`
+/// placeholders. Responds `{"results": [...]}` (one entry per statement) or
+/// 400 `{"error": "..."}` with the engine's message. Requires `OXIDB_SQL=1`
+/// on the server; the engine's data is entirely separate from collections.
+fn handle_sql_endpoint(req: &HttpRequest) -> HttpResponse {
+    let body = match parse_json_body(req) {
+        Ok(b) => b,
+        Err((status, msg)) => {
+            return json_response(status, "Bad Request", json!({"error": msg}));
+        }
+    };
+    let Some(sql) = body.get("sql").and_then(|v| v.as_str()) else {
+        return json_response(400, "Bad Request", json!({"error": "missing 'sql'"}));
+    };
+    match crate::sql_bridge::execute_json(sql, body.get("params")) {
+        Ok(results) => json_response(200, "OK", json!({"results": results})),
+        Err(msg) => json_response(400, "Bad Request", json!({"error": msg})),
+    }
 }
 
 fn handle_list_procedures(state: &RestState) -> Result<Value, (u16, &'static str)> {
