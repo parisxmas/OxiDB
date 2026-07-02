@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### SQL engine: v1 gap closure
+
+The standalone SQL engine (below) gained the features its v1 said were
+missing:
+
+- **PRIMARY KEY uniqueness is enforced** — duplicate key values are rejected
+  on INSERT (multi-row batches are checked whole, all-or-nothing), UPDATE,
+  and inside transactions; enforcement survives restart/recovery. A table
+  can declare at most one PK column.
+- **Implicit numeric coercion** — integer values widen into `DOUBLE` columns
+  and into `TIMESTAMP` columns (epoch ms), for literals and parameters.
+- **Timestamp literals** — `TIMESTAMP '2026-01-02 03:04:05'`
+  (also `YYYY-MM-DD`, `T` separator, fractional seconds, `Z`/`±HH:MM`).
+- **OFFSET** — `LIMIT n OFFSET m` and bare `OFFSET`.
+- **UNION / UNION ALL** — with outer ORDER BY (output names or 1-based
+  positions), LIMIT and OFFSET applying to the combined result.
+- **`[NOT] IN` lists** with SQL three-valued NULL semantics.
+- **Uncorrelated subqueries** — scalar `(SELECT ...)` in any expression
+  (0 rows = NULL, >1 row errors) and `[NOT] IN (SELECT ...)`, usable in
+  SELECT/UPDATE/DELETE/INSERT and inside transactions.
+- **Multi-column secondary indexes** — `CREATE INDEX i ON t (a, b)`; used
+  when the WHERE clause has equality conjuncts for all index columns
+  (widest qualifying index wins). Old single-column catalogs/WALs load
+  unchanged.
+- **Read-role SQL (server 0.31.4)** — the `sql` command is now allowed for
+  the `read` role, restricted to SELECT statements; the flag is decided at
+  the session layer (TCP RBAC and REST JWT paths) and enforced per
+  statement by the SQL bridge.
+
 ### Second engine: standalone SQL (ADR-0010)
 
 OxiDB can now mount a real relational SQL engine alongside the document engine

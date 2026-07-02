@@ -74,13 +74,14 @@ pub(crate) trait Store {
     fn delete(&self, table: &str, row_id: u64) -> Result<bool>;
     fn create_table(&self, table: Table) -> Result<()>;
     fn drop_table(&self, name: &str) -> Result<()>;
-    fn create_index(&self, name: &str, table: &str, column: &str) -> Result<()>;
+    fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()>;
     fn drop_index(&self, name: &str) -> Result<()>;
 
-    /// Look up rows where an indexed `column` equals `value`.
+    /// Look up rows using a secondary index, given the available
+    /// `column = value` equality pairs from the WHERE clause.
     ///
-    /// Returns `Ok(None)` when no index covers `(table, column)` (the caller
-    /// should fall back to a full scan); `Ok(Some(rows))` — possibly empty —
-    /// when an index served the lookup.
-    fn index_lookup_eq(&self, table: &str, column: &str, value: &Value) -> Result<Option<Rows>>;
+    /// Returns `Ok(None)` when no index has *all* of its columns among `eqs`
+    /// (the caller should fall back to a full scan); `Ok(Some(rows))` —
+    /// possibly empty — when an index served the lookup.
+    fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<Rows>>;
 }

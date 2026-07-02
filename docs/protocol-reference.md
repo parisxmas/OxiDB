@@ -148,7 +148,7 @@ missing `engine` field (or `"doc"`) routes to the document engine unchanged.
 
 | Command | Required Fields | Optional Fields | Return | Min Role |
 |---------|----------------|-----------------|--------|----------|
-| `sql` | `sql` | `params` (array, binds `?`/`$N`) | Array, one result per statement | ReadWrite |
+| `sql` | `sql` | `params` (array, binds `?`/`$N`) | Array, one result per statement | Read (SELECT-only) / ReadWrite (all statements) |
 
 Result shape per statement:
 

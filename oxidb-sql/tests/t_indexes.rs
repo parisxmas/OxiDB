@@ -135,10 +135,26 @@ fn create_index_on_unknown_column_or_table_errors() {
 }
 
 #[test]
-fn multi_column_index_is_unsupported() {
+fn multi_column_index_serves_composite_equality() {
     let (_d, db) = open();
-    db.execute("CREATE TABLE t (a INT, b INT)").unwrap();
-    assert!(db.execute("CREATE INDEX i ON t(a, b)").is_err());
+    db.execute("CREATE TABLE t (a INT, b INT, v TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 'x'), (1, 2, 'y'), (2, 1, 'z')")
+        .unwrap();
+    db.execute("CREATE INDEX i ON t(a, b)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE a = 1 AND b = 2"),
+        vec![vec![t("y")]]
+    );
+    // Only part of the composite key -> falls back to a scan, same answer.
+    assert_eq!(rows(&db, "SELECT v FROM t WHERE a = 2"), vec![vec![t("z")]]);
+    // No match through the index.
+    assert!(rows(&db, "SELECT v FROM t WHERE a = 9 AND b = 9").is_empty());
+    // Writes maintain the composite index.
+    db.execute("INSERT INTO t VALUES (1, 2, 'w')").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM t WHERE a = 1 AND b = 2"),
+        vec![vec![t("y")], vec![t("w")]]
+    );
 }
 
 #[test]
@@ -171,10 +187,10 @@ fn programmatic_index_api() {
         .unwrap();
     db.insert("t", vec![Value::Int(2), Value::Text("a".into())])
         .unwrap();
-    db.create_index("t_tag", "t", "tag").unwrap();
+    db.create_index("t_tag", "t", &["tag".to_string()]).unwrap();
     // Duplicate index name errors; unknown column errors.
-    assert!(db.create_index("t_tag", "t", "tag").is_err());
-    assert!(db.create_index("t_x", "t", "nope").is_err());
+    assert!(db.create_index("t_tag", "t", &["tag".to_string()]).is_err());
+    assert!(db.create_index("t_x", "t", &["nope".to_string()]).is_err());
     db.drop_index("t_tag").unwrap();
     assert!(db.drop_index("t_tag").is_err());
 }

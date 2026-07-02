@@ -21,7 +21,7 @@ pub enum Statement {
     CreateIndex {
         name: String,
         table: String,
-        column: String,
+        columns: Vec<String>,
         if_not_exists: bool,
     },
     DropIndex {
@@ -35,7 +35,7 @@ pub enum Statement {
         /// One expression tuple per row.
         rows: Vec<Vec<Expr>>,
     },
-    Select(SelectStmt),
+    Select(SelectQuery),
     Update {
         table: String,
         assignments: Vec<(String, Expr)>,
@@ -51,6 +51,34 @@ pub enum Statement {
     Rollback,
 }
 
+/// A full query: a plain SELECT or a set operation (UNION [ALL]) tree, plus
+/// the outer ORDER BY / LIMIT / OFFSET that apply to the combined result.
+///
+/// For a plain SELECT the parser pushes ORDER BY / LIMIT / OFFSET *into* the
+/// [`SelectStmt`] and leaves the outer clauses empty, so the single-select
+/// fast path is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectQuery {
+    pub body: QueryBody,
+    /// Outer sort keys (set-operation results only): bare output-column names
+    /// or 1-based positions.
+    pub order_by: Vec<(Expr, bool)>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// The body of a query: one SELECT, or a UNION [ALL] of two bodies.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryBody {
+    Select(Box<SelectStmt>),
+    SetOp {
+        /// `true` = UNION ALL (keep duplicates); `false` = UNION (distinct).
+        all: bool,
+        left: Box<QueryBody>,
+        right: Box<QueryBody>,
+    },
+}
+
 /// A SELECT, possibly with inner joins and aggregation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
@@ -63,6 +91,7 @@ pub struct SelectStmt {
     /// `(expr, ascending)` sort keys, in priority order.
     pub order_by: Vec<(Expr, bool)>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 /// A table reference in FROM/JOIN, with optional alias.
@@ -141,6 +170,23 @@ pub enum Expr {
     Aggregate {
         func: AggFunc,
         arg: Option<Box<Expr>>,
+    },
+    /// `expr [NOT] IN (e1, e2, ...)` with SQL three-valued NULL semantics.
+    In {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
+    /// An uncorrelated scalar subquery (`(SELECT ...)`): one column, at most
+    /// one row (zero rows evaluate to NULL). Resolved to a `Literal` before
+    /// row evaluation.
+    Subquery(Box<SelectQuery>),
+    /// `expr [NOT] IN (SELECT ...)`: one output column. Resolved to `In`
+    /// before row evaluation.
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<SelectQuery>,
+        negated: bool,
     },
 }
 

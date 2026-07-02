@@ -18,7 +18,7 @@ use crate::SqlEngine;
 use crate::catalog::{IndexDef, Table};
 use crate::error::{Result, SqlError};
 use crate::store::Store;
-use crate::types::Value;
+use crate::types::{IndexKey, Value};
 use crate::wal::WalRecord;
 
 /// A row-level change in the overlay: `Some(cells)` upserts, `None` deletes.
@@ -37,6 +37,10 @@ struct TxnState {
     /// Indexes created / dropped within the transaction.
     indexes_created: BTreeMap<String, IndexDef>,
     indexes_dropped: BTreeSet<String>,
+    /// PRIMARY KEY value -> row_id per table, seeded lazily from the visible
+    /// rows on first write, then maintained by the overlay — enforces PK
+    /// uniqueness inside the transaction.
+    pk_seen: BTreeMap<String, BTreeMap<IndexKey, u64>>,
     /// The ordered operations to flush on commit.
     ops: Vec<WalRecord>,
 }
@@ -92,6 +96,59 @@ impl<'a> Transaction<'a> {
         st.next_row_id.insert(table.to_string(), next + 1);
         next
     }
+
+    /// Enforce PRIMARY KEY uniqueness for a candidate row against the rows
+    /// visible to this transaction. `exclude` is the row being replaced (for
+    /// updates). The per-table key map is seeded from a scan on first use.
+    fn check_pk(
+        &self,
+        table: &str,
+        def: &Table,
+        cells: &[Value],
+        exclude: Option<u64>,
+    ) -> Result<()> {
+        let Some(p) = def.pk_pos() else {
+            return Ok(());
+        };
+        if !self.state.borrow().pk_seen.contains_key(table) {
+            let rows = self.scan(table)?;
+            let mut map = BTreeMap::new();
+            for (rid, row) in rows {
+                map.insert(IndexKey(row[p].clone()), rid);
+            }
+            self.state
+                .borrow_mut()
+                .pk_seen
+                .insert(table.to_string(), map);
+        }
+        let st = self.state.borrow();
+        let map = st.pk_seen.get(table).expect("seeded");
+        if let Some(&rid) = map.get(&IndexKey(cells[p].clone()))
+            && Some(rid) != exclude
+        {
+            return Err(SqlError::DuplicateKey(format!(
+                "PRIMARY KEY value {:?} already exists in {table:?}",
+                cells[p]
+            )));
+        }
+        Ok(())
+    }
+
+    /// Record a write's effect on the seeded PK map (no-op when the table has
+    /// no PK or the map was never seeded).
+    fn pk_apply(&self, table: &str, def: &Table, row_id: u64, cells: Option<&[Value]>) {
+        let Some(p) = def.pk_pos() else { return };
+        let mut st = self.state.borrow_mut();
+        let Some(map) = st.pk_seen.get_mut(table) else {
+            return;
+        };
+        // Any prior key owned by this row is gone (update changes the key,
+        // delete removes the row).
+        map.retain(|_, rid| *rid != row_id);
+        if let Some(cells) = cells {
+            map.insert(IndexKey(cells[p].clone()), row_id);
+        }
+    }
 }
 
 impl Store for Transaction<'_> {
@@ -127,11 +184,15 @@ impl Store for Transaction<'_> {
     }
 
     fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
+        let mut cells = cells;
         let def = self
             .visible_def(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        def.coerce_row(&mut cells);
         def.validate_row(&cells)?;
+        self.check_pk(table, &def, &cells, None)?;
         let row_id = self.alloc_row_id(table);
+        self.pk_apply(table, &def, row_id, Some(&cells));
         let mut st = self.state.borrow_mut();
         st.rows
             .entry(table.to_string())
@@ -146,10 +207,14 @@ impl Store for Transaction<'_> {
     }
 
     fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()> {
+        let mut cells = cells;
         let def = self
             .visible_def(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        def.coerce_row(&mut cells);
         def.validate_row(&cells)?;
+        self.check_pk(table, &def, &cells, Some(row_id))?;
+        self.pk_apply(table, &def, row_id, Some(&cells));
         let mut st = self.state.borrow_mut();
         st.rows
             .entry(table.to_string())
@@ -164,9 +229,10 @@ impl Store for Transaction<'_> {
     }
 
     fn delete(&self, table: &str, row_id: u64) -> Result<bool> {
-        if self.visible_def(table).is_none() {
+        let Some(def) = self.visible_def(table) else {
             return Err(SqlError::NoSuchTable(table.to_string()));
-        }
+        };
+        self.pk_apply(table, &def, row_id, None);
         let mut st = self.state.borrow_mut();
         let overlay = st.rows.entry(table.to_string()).or_default();
         let existed = !matches!(overlay.get(&row_id), Some(None));
@@ -203,12 +269,14 @@ impl Store for Transaction<'_> {
         Ok(())
     }
 
-    fn create_index(&self, name: &str, table: &str, column: &str) -> Result<()> {
+    fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()> {
         let def = self
             .visible_def(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
-        if !def.columns.iter().any(|c| c.name == column) {
-            return Err(SqlError::NoSuchColumn(column.to_string()));
+        for column in columns {
+            if !def.columns.iter().any(|c| &c.name == column) {
+                return Err(SqlError::NoSuchColumn(column.to_string()));
+            }
         }
         let mut st = self.state.borrow_mut();
         if st.indexes_created.contains_key(name) {
@@ -217,7 +285,7 @@ impl Store for Transaction<'_> {
         let idx = IndexDef {
             name: name.to_string(),
             table: table.to_string(),
-            column: column.to_string(),
+            columns: columns.to_vec(),
         };
         st.indexes_dropped.remove(name);
         st.indexes_created.insert(name.to_string(), idx.clone());
@@ -236,8 +304,7 @@ impl Store for Transaction<'_> {
     fn index_lookup_eq(
         &self,
         _table: &str,
-        _column: &str,
-        _value: &Value,
+        _eqs: &[(String, Value)],
     ) -> Result<Option<crate::store::Rows>> {
         // Transactions always full-scan (correct, just not index-accelerated);
         // the overlay makes index reuse across engine+overlay not worth it here.

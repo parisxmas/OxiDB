@@ -50,8 +50,9 @@ fn unknown_engine_is_rejected() {
 fn sql_engine_roundtrip_when_enabled() {
     let sql_dir = tempfile::tempdir().unwrap();
     // Enable the SQL engine and point it at an isolated dir BEFORE the first
-    // SQL request triggers lazy init. This is the only test that touches the
-    // SQL engine in this binary.
+    // SQL request triggers lazy init. The engine is process-global (OnceLock),
+    // so every SQL-touching test in this binary shares one instance — tests
+    // use distinct table names.
     unsafe {
         std::env::set_var("OXIDB_SQL", "1");
         std::env::set_var("OXIDB_SQL_DATA", sql_dir.path());
@@ -124,4 +125,57 @@ fn sql_engine_roundtrip_when_enabled() {
         found["data"].as_array().unwrap().is_empty(),
         "doc engine must not see SQL rows: {found}"
     );
+}
+
+/// A Read-role session (flagged by the session layer) may SELECT but not
+/// write through the SQL engine.
+#[test]
+fn readonly_flag_restricts_sql_to_selects() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(OxiDb::open(dir.path()).unwrap());
+    unsafe { std::env::set_var("OXIDB_SQL", "1") };
+    unsafe { std::env::set_var("OXIDB_SQL_DATA", dir.path().join("sql").to_str().unwrap()) };
+
+    let run = |req: Value, readonly: bool| -> Value {
+        let mut tx = None;
+        let bytes = oxidb_server::handler::handle_request_opts(&db, req, &mut tx, readonly);
+        serde_json::from_slice(&bytes).unwrap()
+    };
+
+    // Seed as a writer.
+    let r = run(
+        json!({"cmd": "sql", "sql": "CREATE TABLE r (id INT); INSERT INTO r VALUES (1)"}),
+        false,
+    );
+    assert_eq!(r["ok"], json!(true), "seed failed: {r}");
+
+    // Read-only: SELECT ok (including UNION), writes and DDL denied.
+    let r = run(json!({"cmd": "sql", "sql": "SELECT id FROM r"}), true);
+    assert_eq!(r["ok"], json!(true), "readonly select failed: {r}");
+    let r = run(
+        json!({"cmd": "sql", "sql": "SELECT id FROM r UNION SELECT id FROM r"}),
+        true,
+    );
+    assert_eq!(r["ok"], json!(true));
+    for sql in [
+        "INSERT INTO r VALUES (2)",
+        "UPDATE r SET id = 3",
+        "DELETE FROM r",
+        "DROP TABLE r",
+        "SELECT id FROM r; INSERT INTO r VALUES (9)",
+        "BEGIN; INSERT INTO r VALUES (9); COMMIT;",
+    ] {
+        let r = run(json!({"cmd": "sql", "sql": sql}), true);
+        assert_eq!(r["ok"], json!(false), "should be denied: {sql}");
+        assert!(
+            r["error"].as_str().unwrap().contains("permission denied"),
+            "unexpected error for {sql}: {r}"
+        );
+    }
+    // Nothing leaked through.
+    let r = run(
+        json!({"cmd": "sql", "sql": "SELECT COUNT(*) AS n FROM r"}),
+        false,
+    );
+    assert_eq!(r["data"], json!([{ "columns": ["n"], "rows": [[1]] }]));
 }

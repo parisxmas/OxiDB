@@ -15,12 +15,12 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
-    AggFunc, BinOp, Expr, Join, JoinKind, QueryResult, SelectItem, SelectStmt, Statement, TableRef,
-    UnOp,
+    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, QueryResult, SelectItem, SelectQuery,
+    SelectStmt, Statement, TableRef, UnOp,
 };
 use crate::error::{Result, SqlError};
 use crate::store::{Chunk, Store};
-use crate::types::Value;
+use crate::types::{IndexKey, Value};
 
 /// A column in a working row set, qualified by its (aliased) table name.
 #[derive(Debug, Clone)]
@@ -36,6 +36,10 @@ pub(crate) fn execute<S: Store>(
     stmt: Statement,
     params: &[Value],
 ) -> Result<QueryResult> {
+    // Resolve uncorrelated subqueries to literal values up front, so the rest
+    // of the executor only ever sees plain expressions.
+    let mut stmt = stmt;
+    resolve_subqueries_stmt(store, &mut stmt, params)?;
     match stmt {
         Statement::CreateTable {
             table,
@@ -59,10 +63,10 @@ pub(crate) fn execute<S: Store>(
         Statement::CreateIndex {
             name,
             table,
-            column,
+            columns,
             if_not_exists,
         } => {
-            match store.create_index(&name, &table, &column) {
+            match store.create_index(&name, &table, &columns) {
                 Ok(()) => {}
                 Err(SqlError::IndexExists(_)) if if_not_exists => {}
                 Err(e) => return Err(e),
@@ -82,7 +86,7 @@ pub(crate) fn execute<S: Store>(
             columns,
             rows,
         } => exec_insert(store, &table, columns, rows, params),
-        Statement::Select(select) => exec_select(store, select, params),
+        Statement::Select(query) => exec_query(store, query, params),
         Statement::Update {
             table,
             assignments,
@@ -370,6 +374,256 @@ impl RowLike for View<'_> {
     }
 }
 
+/// Execute a full query: the single-select fast path, or a set-operation tree
+/// with outer ORDER BY / LIMIT / OFFSET applied to the combined result.
+fn exec_query<S: Store>(store: &S, query: SelectQuery, params: &[Value]) -> Result<QueryResult> {
+    match query.body {
+        QueryBody::Select(s)
+            if query.order_by.is_empty() && query.limit.is_none() && query.offset.is_none() =>
+        {
+            exec_select(store, *s, params)
+        }
+        body => {
+            let (columns, mut rows) = exec_body(store, body, params)?;
+            if !query.order_by.is_empty() {
+                let keys: Vec<(usize, bool)> = query
+                    .order_by
+                    .iter()
+                    .map(|(e, asc)| Ok::<_, SqlError>((outer_sort_pos(e, &columns)?, *asc)))
+                    .collect::<Result<_>>()?;
+                rows.sort_by(|a, b| {
+                    for &(i, asc) in &keys {
+                        let ord = Value::total_order(&a[i], &b[i]);
+                        let ord = if asc { ord } else { ord.reverse() };
+                        if ord != Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    Ordering::Equal
+                });
+            }
+            let rows: Vec<Vec<Value>> = rows
+                .into_iter()
+                .skip(query.offset.unwrap_or(0))
+                .take(query.limit.unwrap_or(usize::MAX))
+                .collect();
+            Ok(QueryResult::Select { columns, rows })
+        }
+    }
+}
+
+/// An outer (set-operation) ORDER BY key: a bare output-column name or a
+/// 1-based output position.
+fn outer_sort_pos(e: &Expr, columns: &[String]) -> Result<usize> {
+    match e {
+        Expr::Column { table: None, name } => columns
+            .iter()
+            .position(|c| c == name)
+            .ok_or_else(|| SqlError::NoSuchColumn(name.clone())),
+        Expr::Literal(Value::Int(n)) if *n >= 1 && (*n as usize) <= columns.len() => {
+            Ok(*n as usize - 1)
+        }
+        _ => Err(SqlError::Unsupported(
+            "UNION ORDER BY must be an output column name or 1-based position".into(),
+        )),
+    }
+}
+
+/// Execute a query body, returning `(columns, rows)`. Set operations take the
+/// column names from the left arm; arms must agree on column count.
+fn exec_body<S: Store>(
+    store: &S,
+    body: QueryBody,
+    params: &[Value],
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    match body {
+        QueryBody::Select(s) => match exec_select(store, *s, params)? {
+            QueryResult::Select { columns, rows } => Ok((columns, rows)),
+            _ => unreachable!("SELECT produced a non-select result"),
+        },
+        QueryBody::SetOp { all, left, right } => {
+            let (columns, mut rows) = exec_body(store, *left, params)?;
+            let (rcols, rrows) = exec_body(store, *right, params)?;
+            if columns.len() != rcols.len() {
+                return Err(SqlError::SchemaMismatch(format!(
+                    "UNION arms have {} and {} columns",
+                    columns.len(),
+                    rcols.len()
+                )));
+            }
+            rows.extend(rrows);
+            if !all {
+                // UNION (distinct): keep the first occurrence of each row.
+                let mut seen: std::collections::BTreeSet<Vec<IndexKey>> =
+                    std::collections::BTreeSet::new();
+                rows.retain(|row| {
+                    seen.insert(row.iter().cloned().map(IndexKey).collect::<Vec<_>>())
+                });
+            }
+            Ok((columns, rows))
+        }
+    }
+}
+
+// ── subquery resolution ─────────────────────────────────────────────────────
+//
+// Uncorrelated subqueries are executed once, before row evaluation, and
+// replaced with literals: a scalar subquery becomes `Literal` (NULL when it
+// returns no row), `IN (SELECT ...)` becomes a literal `In` list. Column
+// references inside a subquery resolve only against the subquery's own tables
+// (correlated subqueries are not supported and fail binding there).
+
+fn resolve_subqueries_stmt<S: Store>(
+    store: &S,
+    stmt: &mut Statement,
+    params: &[Value],
+) -> Result<()> {
+    match stmt {
+        Statement::Insert { rows, .. } => {
+            for row in rows {
+                for e in row {
+                    resolve_expr(store, e, params)?;
+                }
+            }
+            Ok(())
+        }
+        Statement::Select(q) => resolve_query(store, q, params),
+        Statement::Update {
+            assignments,
+            filter,
+            ..
+        } => {
+            for (_, e) in assignments {
+                resolve_expr(store, e, params)?;
+            }
+            if let Some(f) = filter {
+                resolve_expr(store, f, params)?;
+            }
+            Ok(())
+        }
+        Statement::Delete { filter, .. } => {
+            if let Some(f) = filter {
+                resolve_expr(store, f, params)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn resolve_query<S: Store>(store: &S, q: &mut SelectQuery, params: &[Value]) -> Result<()> {
+    resolve_body(store, &mut q.body, params)
+}
+
+fn resolve_body<S: Store>(store: &S, body: &mut QueryBody, params: &[Value]) -> Result<()> {
+    match body {
+        QueryBody::Select(s) => resolve_select(store, s, params),
+        QueryBody::SetOp { left, right, .. } => {
+            resolve_body(store, left, params)?;
+            resolve_body(store, right, params)
+        }
+    }
+}
+
+fn resolve_select<S: Store>(store: &S, s: &mut SelectStmt, params: &[Value]) -> Result<()> {
+    for item in &mut s.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            resolve_expr(store, expr, params)?;
+        }
+    }
+    if let Some(f) = &mut s.filter {
+        resolve_expr(store, f, params)?;
+    }
+    for j in &mut s.joins {
+        resolve_expr(store, &mut j.on, params)?;
+    }
+    for e in &mut s.group_by {
+        resolve_expr(store, e, params)?;
+    }
+    if let Some(h) = &mut s.having {
+        resolve_expr(store, h, params)?;
+    }
+    for (e, _) in &mut s.order_by {
+        resolve_expr(store, e, params)?;
+    }
+    Ok(())
+}
+
+fn resolve_expr<S: Store>(store: &S, e: &mut Expr, params: &[Value]) -> Result<()> {
+    match e {
+        Expr::Subquery(q) => {
+            let (columns, mut rows) = exec_subquery(store, q, params)?;
+            if columns.len() != 1 {
+                return Err(SqlError::Unsupported(
+                    "scalar subquery must return exactly one column".into(),
+                ));
+            }
+            if rows.len() > 1 {
+                return Err(SqlError::Eval(
+                    "scalar subquery returned more than one row".into(),
+                ));
+            }
+            let v = rows.pop().map(|mut r| r.remove(0)).unwrap_or(Value::Null);
+            *e = Expr::Literal(v);
+            Ok(())
+        }
+        Expr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => {
+            resolve_expr(store, expr, params)?;
+            let (columns, rows) = exec_subquery(store, query, params)?;
+            if columns.len() != 1 {
+                return Err(SqlError::Unsupported(
+                    "IN subquery must return exactly one column".into(),
+                ));
+            }
+            let list = rows
+                .into_iter()
+                .map(|mut r| Expr::Literal(r.remove(0)))
+                .collect();
+            *e = Expr::In {
+                expr: expr.clone(),
+                list,
+                negated: *negated,
+            };
+            Ok(())
+        }
+        Expr::In { expr, list, .. } => {
+            resolve_expr(store, expr, params)?;
+            for item in list {
+                resolve_expr(store, item, params)?;
+            }
+            Ok(())
+        }
+        Expr::Binary { left, right, .. } => {
+            resolve_expr(store, left, params)?;
+            resolve_expr(store, right, params)
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => resolve_expr(store, expr, params),
+        Expr::Aggregate { arg, .. } => match arg {
+            Some(a) => resolve_expr(store, a, params),
+            None => Ok(()),
+        },
+        Expr::Column { .. } | Expr::Col(_) | Expr::Literal(_) | Expr::Param(_) => Ok(()),
+    }
+}
+
+/// Execute a subquery (resolving its own nested subqueries first) and return
+/// its columns + rows.
+fn exec_subquery<S: Store>(
+    store: &S,
+    q: &mut SelectQuery,
+    params: &[Value],
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    resolve_query(store, q, params)?;
+    match exec_query(store, q.clone(), params)? {
+        QueryResult::Select { columns, rows } => Ok((columns, rows)),
+        _ => unreachable!("subquery produced a non-select result"),
+    }
+}
+
 fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Result<QueryResult> {
     let mut select = select;
     // 1. Build the source: base table, then joins (the join ON is bound inside).
@@ -443,11 +697,12 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
         select_simple(&schema, &src, &tuples, &select, &proj, params)?
     };
 
-    // LIMIT.
-    let out_rows = match select.limit {
-        Some(n) => out_rows.into_iter().take(n).collect(),
-        None => out_rows,
-    };
+    // OFFSET / LIMIT.
+    let out_rows: Vec<Vec<Value>> = out_rows
+        .into_iter()
+        .skip(select.offset.unwrap_or(0))
+        .take(select.limit.unwrap_or(usize::MAX))
+        .collect();
 
     Ok(QueryResult::Select {
         columns,
@@ -555,7 +810,15 @@ fn build_source<S: Store>(
     };
 
     for join in &select.joins {
-        join_into(store, join, &mut schema, &mut src, &mut tuples, params, &needed)?;
+        join_into(
+            store,
+            join,
+            &mut schema,
+            &mut src,
+            &mut tuples,
+            params,
+            &needed,
+        )?;
     }
     Ok((schema, src, tuples))
 }
@@ -896,12 +1159,10 @@ impl RightIndex {
                     _ => CHAIN_END,
                 })
             }
-            RightIndex::Map { map, .. } => {
-                Ok(match join_key(left_keys, schema, row, params)? {
-                    Some(key) => map.get(&key).map(|(head, _)| *head).unwrap_or(CHAIN_END),
-                    None => CHAIN_END,
-                })
-            }
+            RightIndex::Map { map, .. } => Ok(match join_key(left_keys, schema, row, params)? {
+                Some(key) => map.get(&key).map(|(head, _)| *head).unwrap_or(CHAIN_END),
+                None => CHAIN_END,
+            }),
         }
     }
 
@@ -1017,6 +1278,15 @@ fn collect_col_refs<'a>(e: &'a Expr, out: &mut Vec<(&'a Option<String>, &'a str)
                 collect_col_refs(a, out);
             }
         }
+        Expr::In { expr, list, .. } => {
+            collect_col_refs(expr, out);
+            for item in list {
+                collect_col_refs(item, out);
+            }
+        }
+        // Subqueries resolve to literals before any column analysis; their
+        // inner column references belong to the subquery's own scope.
+        Expr::Subquery(_) | Expr::InSubquery { .. } => {}
         // `Col` only appears after binding; equi-key detection runs before that.
         Expr::Col(_) | Expr::Literal(_) | Expr::Param(_) => {}
     }
@@ -1032,10 +1302,11 @@ fn base_chunk<S: Store>(
     keep: &[usize],
 ) -> Result<Chunk> {
     if let Some(expr) = filter {
-        for (col, val) in eq_conjuncts(expr, from.key(), params) {
-            if let Some(rows) = store.index_lookup_eq(&from.name, &col, &val)? {
-                return Ok(Chunk::from_rows(rows.into_iter().map(|(_, c)| c), keep));
-            }
+        let eqs = eq_conjuncts(expr, from.key(), params);
+        if !eqs.is_empty()
+            && let Some(rows) = store.index_lookup_eq(&from.name, &eqs)?
+        {
+            return Ok(Chunk::from_rows(rows.into_iter().map(|(_, c)| c), keep));
         }
     }
     store.scan_pruned(&from.name, keep)
@@ -1210,9 +1481,10 @@ fn group_tuples(
             // Bare-column keys (the common case) borrow the cell; anything
             // else evaluates to an owned value.
             match e {
-                Expr::Col(p) => scratch.push(Cow::Borrowed(view.val_ref(*p).ok_or_else(
-                    || SqlError::Eval(format!("bound column {p} out of range")),
-                )?)),
+                Expr::Col(p) => scratch
+                    .push(Cow::Borrowed(view.val_ref(*p).ok_or_else(|| {
+                        SqlError::Eval(format!("bound column {p} out of range"))
+                    })?)),
                 _ => scratch.push(Cow::Owned(eval_scalar(e, schema, &view, params)?)),
             }
         }
@@ -1416,10 +1688,54 @@ fn eval_scalar<R: RowLike + ?Sized>(
             let r = eval_scalar(right, schema, row, params)?;
             eval_binary(*op, l, r)
         }
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => {
+            let v = eval_scalar(expr, schema, row, params)?;
+            eval_in(&v, list, *negated, |item| {
+                eval_scalar(item, schema, row, params)
+            })
+        }
         Expr::Aggregate { .. } => Err(SqlError::Eval(
             "aggregate function used outside an aggregated query".into(),
         )),
+        Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::Eval(
+            "internal: unresolved subquery reached evaluation".into(),
+        )),
     }
+}
+
+/// SQL `IN` with three-valued logic: true if any element equals `v`; NULL if
+/// nothing matched but `v` or an element is NULL; false otherwise. Values of
+/// incomparable types simply don't match.
+fn eval_in<F>(v: &Value, list: &[Expr], negated: bool, mut eval_item: F) -> Result<Value>
+where
+    F: FnMut(&Expr) -> Result<Value>,
+{
+    let mut saw_null = matches!(v, Value::Null);
+    let mut found = false;
+    if !saw_null {
+        for item in list {
+            let iv = eval_item(item)?;
+            if matches!(iv, Value::Null) {
+                saw_null = true;
+                continue;
+            }
+            if cmp_values(v, &iv) == Some(Ordering::Equal) {
+                found = true;
+                break;
+            }
+        }
+    }
+    Ok(if found {
+        Value::Bool(!negated)
+    } else if saw_null {
+        Value::Null
+    } else {
+        Value::Bool(negated)
+    })
 }
 
 /// Resolve every `Column` reference in `expr` to a positional [`Expr::Col`]
@@ -1451,6 +1767,23 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
                 None => None,
             },
         },
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => Expr::In {
+            expr: Box::new(bind_expr(expr, schema)?),
+            list: list
+                .iter()
+                .map(|e| bind_expr(e, schema))
+                .collect::<Result<_>>()?,
+            negated: *negated,
+        },
+        Expr::Subquery(_) | Expr::InSubquery { .. } => {
+            return Err(SqlError::Eval(
+                "internal: unresolved subquery reached binding".into(),
+            ));
+        }
     })
 }
 
@@ -1500,6 +1833,19 @@ fn eval_agg(
             let r = eval_agg(right, schema, src, tuples, group, params)?;
             eval_binary(*op, l, r)
         }
+        Expr::In {
+            expr,
+            list,
+            negated,
+        } => {
+            let v = eval_agg(expr, schema, src, tuples, group, params)?;
+            eval_in(&v, list, *negated, |item| {
+                eval_agg(item, schema, src, tuples, group, params)
+            })
+        }
+        Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::Eval(
+            "internal: unresolved subquery reached evaluation".into(),
+        )),
     }
 }
 
@@ -1633,6 +1979,7 @@ fn has_aggregate(expr: &Expr) -> bool {
         Expr::Aggregate { .. } => true,
         Expr::Binary { left, right, .. } => has_aggregate(left) || has_aggregate(right),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_aggregate(expr),
+        Expr::In { expr, list, .. } => has_aggregate(expr) || list.iter().any(has_aggregate),
         _ => false,
     }
 }

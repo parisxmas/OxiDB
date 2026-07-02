@@ -65,14 +65,18 @@ fn drop_missing_table() {
 fn unsupported_select_features() {
     let (_d, db) = open();
     t1(&db);
+    // UNION and OFFSET are supported now; EXCEPT/INTERSECT are not.
     assert!(
-        db.execute("SELECT id FROM t UNION SELECT id FROM t")
+        db.execute("SELECT id FROM t EXCEPT SELECT id FROM t")
+            .is_err()
+    );
+    assert!(
+        db.execute("SELECT id FROM t INTERSECT SELECT id FROM t")
             .is_err()
     );
     assert!(db.execute("SELECT DISTINCT id FROM t").is_err());
-    assert!(db.execute("SELECT id FROM t LIMIT 1 OFFSET 1").is_err());
     assert!(db.execute("SELECT COUNT(DISTINCT id) FROM t").is_err());
-    assert!(db.execute("SELECT * FROM (SELECT id FROM t) x").is_err());
+    assert!(db.execute("SELECT * FROM (SELECT id FROM t) x").is_err()); // derived table
     assert!(db.execute("SELECT * FROM t, t t2").is_err()); // comma join
 }
 

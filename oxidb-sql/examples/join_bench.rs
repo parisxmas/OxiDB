@@ -66,9 +66,7 @@ fn main() {
         ),
     ];
 
-    println!(
-        "oxidb-sql join benchmark — R={R} S={S} C={c} P={p} O={o} I={i}, best of {RUNS}\n"
-    );
+    println!("oxidb-sql join benchmark — R={R} S={S} C={c} P={p} O={o} I={i}, best of {RUNS}\n");
     for (label, sql) in queries {
         // Warm up + correctness capture.
         let first = db.execute(sql).unwrap().pop().unwrap();

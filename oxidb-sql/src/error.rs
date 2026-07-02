@@ -50,6 +50,10 @@ pub enum SqlError {
     /// An expression could not be evaluated (type error, etc.).
     #[error("evaluation error: {0}")]
     Eval(String),
+
+    /// A write would violate PRIMARY KEY uniqueness.
+    #[error("duplicate key: {0}")]
+    DuplicateKey(String),
 }
 
 /// Convenience result alias for the SQL engine.

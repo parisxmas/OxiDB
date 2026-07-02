@@ -73,10 +73,15 @@ fn wrong_type_insert_errors() {
     db.execute("CREATE TABLE t (n INT, s TEXT)").unwrap();
     // text into int column
     assert!(db.execute("INSERT INTO t VALUES ('x', 'y')").is_err());
-    // int into double is also a mismatch (no implicit coercion)
+    // int into double implicitly widens; text into double still errors
     db.execute("CREATE TABLE f (d DOUBLE)").unwrap();
-    assert!(db.execute("INSERT INTO f VALUES (5)").is_err());
+    assert!(db.execute("INSERT INTO f VALUES (5)").is_ok());
+    assert!(db.execute("INSERT INTO f VALUES ('x')").is_err());
     assert!(db.execute("INSERT INTO f VALUES (5.0)").is_ok());
+    assert_eq!(
+        rows(&db, "SELECT d FROM f"),
+        vec![vec![d(5.0)], vec![d(5.0)]]
+    );
 }
 
 #[test]

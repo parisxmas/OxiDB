@@ -36,10 +36,20 @@ use transaction::Transaction;
 use types::IndexKey;
 use wal::{Wal, WalRecord};
 
-/// An in-memory single-column secondary index: value -> set of row ids.
+/// An in-memory secondary index over one or more columns:
+/// key tuple -> set of row ids.
 struct SecondaryIndex {
-    col_pos: usize,
-    map: BTreeMap<IndexKey, BTreeSet<u64>>,
+    col_pos: Vec<usize>,
+    map: BTreeMap<Vec<IndexKey>, BTreeSet<u64>>,
+}
+
+impl SecondaryIndex {
+    fn key_of(&self, cells: &[Value]) -> Vec<IndexKey> {
+        self.col_pos
+            .iter()
+            .map(|&p| IndexKey(cells[p].clone()))
+            .collect()
+    }
 }
 
 /// Runtime state for one table: its definition, its live rows keyed by a dense
@@ -50,15 +60,22 @@ struct TableState {
     next_row_id: u64,
     /// Secondary indexes keyed by index name.
     indexes: BTreeMap<String, SecondaryIndex>,
+    /// PRIMARY KEY column position (if any) and its value -> row_id map,
+    /// used to enforce uniqueness on writes.
+    pk_pos: Option<usize>,
+    pk_map: BTreeMap<IndexKey, u64>,
 }
 
 impl TableState {
     fn empty(def: Table) -> Self {
+        let pk_pos = def.pk_pos();
         TableState {
             def,
             rows: BTreeMap::new(),
             next_row_id: 1,
             indexes: BTreeMap::new(),
+            pk_pos,
+            pk_map: BTreeMap::new(),
         }
     }
 
@@ -68,37 +85,43 @@ impl TableState {
         }
     }
 
-    /// (Re)build a secondary index over `column` from the current rows.
-    fn build_index(&mut self, index_name: &str, column: &str) -> Result<()> {
-        let col_pos = self
-            .def
-            .columns
+    /// (Re)build a secondary index over `columns` from the current rows.
+    fn build_index(&mut self, index_name: &str, columns: &[String]) -> Result<()> {
+        let col_pos: Vec<usize> = columns
             .iter()
-            .position(|c| c.name == column)
-            .ok_or_else(|| SqlError::NoSuchColumn(column.to_string()))?;
-        let mut map: BTreeMap<IndexKey, BTreeSet<u64>> = BTreeMap::new();
+            .map(|column| {
+                self.def
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == column)
+                    .ok_or_else(|| SqlError::NoSuchColumn(column.to_string()))
+            })
+            .collect::<Result<_>>()?;
+        let mut idx = SecondaryIndex {
+            col_pos,
+            map: BTreeMap::new(),
+        };
         for (rid, cells) in &self.rows {
-            map.entry(IndexKey(cells[col_pos].clone()))
-                .or_default()
-                .insert(*rid);
+            let key = idx.key_of(cells);
+            idx.map.entry(key).or_default().insert(*rid);
         }
-        self.indexes
-            .insert(index_name.to_string(), SecondaryIndex { col_pos, map });
+        self.indexes.insert(index_name.to_string(), idx);
         Ok(())
     }
 
     fn index_insert(&mut self, row_id: u64, cells: &[Value]) {
         for idx in self.indexes.values_mut() {
-            idx.map
-                .entry(IndexKey(cells[idx.col_pos].clone()))
-                .or_default()
-                .insert(row_id);
+            let key = idx.key_of(cells);
+            idx.map.entry(key).or_default().insert(row_id);
+        }
+        if let Some(p) = self.pk_pos {
+            self.pk_map.insert(IndexKey(cells[p].clone()), row_id);
         }
     }
 
     fn index_remove(&mut self, row_id: u64, cells: &[Value]) {
         for idx in self.indexes.values_mut() {
-            let key = IndexKey(cells[idx.col_pos].clone());
+            let key = idx.key_of(cells);
             if let Some(set) = idx.map.get_mut(&key) {
                 set.remove(&row_id);
                 if set.is_empty() {
@@ -106,6 +129,32 @@ impl TableState {
                 }
             }
         }
+        if let Some(p) = self.pk_pos {
+            let key = IndexKey(cells[p].clone());
+            // Only remove the mapping if it still points at this row (an
+            // idempotent WAL replay can re-insert before the old delete).
+            if self.pk_map.get(&key) == Some(&row_id) {
+                self.pk_map.remove(&key);
+            }
+        }
+    }
+
+    /// Error if `cells`' PRIMARY KEY value already belongs to a row other
+    /// than `exclude_row`.
+    fn check_pk(&self, cells: &[Value], exclude_row: Option<u64>) -> Result<()> {
+        let Some(p) = self.pk_pos else {
+            return Ok(());
+        };
+        let key = IndexKey(cells[p].clone());
+        if let Some(&existing) = self.pk_map.get(&key)
+            && Some(existing) != exclude_row
+        {
+            return Err(SqlError::DuplicateKey(format!(
+                "PRIMARY KEY value {:?} already exists in {:?}",
+                cells[p], self.def.name
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -138,6 +187,9 @@ impl SqlEngine {
             let mut state = TableState::empty(def.clone());
             for (row_id, cells) in storage::read_snapshot(&dir, name, def.arity())? {
                 state.observe_row_id(row_id);
+                if let Some(p) = state.pk_pos {
+                    state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
+                }
                 state.rows.insert(row_id, cells);
             }
             tables.insert(name.clone(), state);
@@ -157,7 +209,7 @@ impl SqlEngine {
             if let Some(state) = tables.get_mut(&def.table)
                 && !state.indexes.contains_key(&def.name)
             {
-                let _ = state.build_index(&def.name, &def.column);
+                let _ = state.build_index(&def.name, &def.columns);
             }
         }
 
@@ -195,7 +247,7 @@ impl SqlEngine {
             WalRecord::CreateIndex(def) => {
                 catalog.indexes.insert(def.name.clone(), def.clone());
                 if let Some(state) = tables.get_mut(&def.table) {
-                    let _ = state.build_index(&def.name, &def.column);
+                    let _ = state.build_index(&def.name, &def.columns);
                 }
             }
             WalRecord::DropIndex(name) => {
@@ -260,12 +312,15 @@ impl SqlEngine {
         Ok(())
     }
 
-    /// Create a single-column secondary index. Errors if the index name is
-    /// taken or the table/column does not exist.
-    pub fn create_index(&self, name: &str, table: &str, column: &str) -> Result<()> {
+    /// Create a secondary index over one or more columns. Errors if the index
+    /// name is taken or the table / any column does not exist.
+    pub fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if inner.catalog.indexes.contains_key(name) {
             return Err(SqlError::IndexExists(name.to_string()));
+        }
+        if columns.is_empty() {
+            return Err(SqlError::Unsupported("index without columns".into()));
         }
         let def = inner
             .tables
@@ -273,13 +328,15 @@ impl SqlEngine {
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?
             .def
             .clone();
-        if !def.columns.iter().any(|c| c.name == column) {
-            return Err(SqlError::NoSuchColumn(column.to_string()));
+        for column in columns {
+            if !def.columns.iter().any(|c| &c.name == column) {
+                return Err(SqlError::NoSuchColumn(column.to_string()));
+            }
         }
         let rec = WalRecord::CreateIndex(IndexDef {
             name: name.to_string(),
             table: table.to_string(),
-            column: column.to_string(),
+            columns: columns.to_vec(),
         });
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
@@ -301,16 +358,18 @@ impl SqlEngine {
     }
 
     /// Insert a row, returning its assigned `row_id`. Validated against the
-    /// schema (arity, types, nullability) before it is logged.
+    /// schema (arity, types, nullability, PRIMARY KEY uniqueness) before it
+    /// is logged; integer values widen into DOUBLE/TIMESTAMP columns.
     pub fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
+        let mut cells = cells;
         let mut inner = self.inner.lock().unwrap();
-        let def = inner
+        let state = inner
             .tables
             .get(table)
-            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?
-            .def
-            .clone();
-        def.validate_row(&cells)?;
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        state.def.coerce_row(&mut cells);
+        state.def.validate_row(&cells)?;
+        state.check_pk(&cells, None)?;
 
         let row_id = inner.tables.get(table).expect("present").next_row_id;
         let rec = WalRecord::Insert {
@@ -324,22 +383,33 @@ impl SqlEngine {
         Ok(row_id)
     }
 
-    /// Insert many rows in one durable step: all rows are validated, logged as
-    /// a single WAL `Batch` record (one fsync), then applied. Returns the
-    /// number of rows inserted.
+    /// Insert many rows in one durable step: all rows are validated (schema +
+    /// PRIMARY KEY uniqueness, including duplicates *within* the batch),
+    /// logged as a single WAL `Batch` record (one fsync), then applied.
+    /// Returns the number of rows inserted.
     pub fn insert_many(&self, table: &str, rows: Vec<Vec<Value>>) -> Result<u64> {
         if rows.is_empty() {
             return Ok(0);
         }
+        let mut rows = rows;
         let mut inner = self.inner.lock().unwrap();
-        let def = inner
+        let state = inner
             .tables
             .get(table)
-            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?
-            .def
-            .clone();
-        for cells in &rows {
-            def.validate_row(cells)?;
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        let mut batch_keys: BTreeSet<IndexKey> = BTreeSet::new();
+        for cells in &mut rows {
+            state.def.coerce_row(cells);
+            state.def.validate_row(cells)?;
+            state.check_pk(cells, None)?;
+            if let Some(p) = state.pk_pos
+                && !batch_keys.insert(IndexKey(cells[p].clone()))
+            {
+                return Err(SqlError::DuplicateKey(format!(
+                    "PRIMARY KEY value {:?} appears twice in the same INSERT",
+                    cells[p]
+                )));
+            }
         }
 
         let first_id = inner.tables.get(table).expect("present").next_row_id;
@@ -363,14 +433,15 @@ impl SqlEngine {
     /// Overwrite the cells of an existing row, keeping its `row_id`. Logged as
     /// an idempotent `Insert` record for `row_id`.
     pub fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()> {
+        let mut cells = cells;
         let mut inner = self.inner.lock().unwrap();
-        let def = inner
+        let state = inner
             .tables
             .get(table)
-            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?
-            .def
-            .clone();
-        def.validate_row(&cells)?;
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        state.def.coerce_row(&mut cells);
+        state.def.validate_row(&cells)?;
+        state.check_pk(&cells, Some(row_id))?;
         if !inner
             .tables
             .get(table)
@@ -427,31 +498,41 @@ impl SqlEngine {
         Ok(state.rows.iter().map(|(id, c)| (*id, c.clone())).collect())
     }
 
-    /// Look up rows where an indexed `column` equals `value`. `Ok(None)` when no
-    /// index covers `(table, column)`.
-    fn index_lookup_eq(
-        &self,
-        table: &str,
-        column: &str,
-        value: &Value,
-    ) -> Result<Option<store::Rows>> {
+    /// Look up rows using a secondary index whose columns are all present in
+    /// the `column = value` pairs `eqs`. `Ok(None)` when no index qualifies.
+    fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<store::Rows>> {
         let inner = self.inner.lock().unwrap();
         let Some(state) = inner.tables.get(table) else {
             return Err(SqlError::NoSuchTable(table.to_string()));
         };
-        // Find an index whose column matches.
-        let Some((_name, def)) = inner
-            .catalog
-            .indexes
-            .iter()
-            .find(|(_, d)| d.table == table && d.column == column)
-        else {
+        // Find an index all of whose columns have an equality pair. Prefer
+        // wider indexes (more matched columns = more selective).
+        let mut best: Option<&IndexDef> = None;
+        for def in inner.catalog.indexes.values() {
+            if def.table == table
+                && def
+                    .columns
+                    .iter()
+                    .all(|c| eqs.iter().any(|(col, _)| col == c))
+                && best.is_none_or(|b| def.columns.len() > b.columns.len())
+            {
+                best = Some(def);
+            }
+        }
+        let Some(def) = best else {
             return Ok(None);
         };
         let Some(idx) = state.indexes.get(&def.name) else {
             return Ok(None);
         };
-        let key = IndexKey(value.clone());
+        let key: Vec<IndexKey> = def
+            .columns
+            .iter()
+            .map(|c| {
+                let (_, v) = eqs.iter().find(|(col, _)| col == c).expect("checked");
+                IndexKey(v.clone())
+            })
+            .collect();
         let rows = match idx.map.get(&key) {
             Some(ids) => ids
                 .iter()
@@ -593,6 +674,15 @@ impl SqlEngine {
     }
 }
 
+/// Whether every statement in `sql` is a read (a SELECT, possibly with set
+/// operations). Callers that gate write access per statement (e.g. a
+/// read-only server role) check this before executing.
+pub fn is_read_only(sql: &str) -> Result<bool> {
+    Ok(parser::parse(sql)?
+        .iter()
+        .all(|s| matches!(s, ast::Statement::Select(_))))
+}
+
 /// Autocommit `Store`: every operation is applied and logged immediately.
 impl Store for SqlEngine {
     fn table_def(&self, name: &str) -> Option<Table> {
@@ -638,19 +728,14 @@ impl Store for SqlEngine {
     fn drop_table(&self, name: &str) -> Result<()> {
         SqlEngine::drop_table(self, name)
     }
-    fn create_index(&self, name: &str, table: &str, column: &str) -> Result<()> {
-        SqlEngine::create_index(self, name, table, column)
+    fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()> {
+        SqlEngine::create_index(self, name, table, columns)
     }
     fn drop_index(&self, name: &str) -> Result<()> {
         SqlEngine::drop_index(self, name)
     }
-    fn index_lookup_eq(
-        &self,
-        table: &str,
-        column: &str,
-        value: &Value,
-    ) -> Result<Option<store::Rows>> {
-        SqlEngine::index_lookup_eq(self, table, column, value)
+    fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<store::Rows>> {
+        SqlEngine::index_lookup_eq(self, table, eqs)
     }
 }
 

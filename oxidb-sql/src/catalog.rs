@@ -68,6 +68,24 @@ impl Table {
         self.columns.len()
     }
 
+    /// Position of the PRIMARY KEY column, if the table has one.
+    pub fn pk_pos(&self) -> Option<usize> {
+        self.columns.iter().position(|c| c.primary_key)
+    }
+
+    /// Apply implicit numeric coercions a SQL user expects: an integer value
+    /// destined for a `DOUBLE` column widens to a float, and an integer
+    /// destined for a `TIMESTAMP` column is taken as epoch milliseconds.
+    pub fn coerce_row(&self, cells: &mut [Value]) {
+        for (col, cell) in self.columns.iter().zip(cells.iter_mut()) {
+            match (col.ty, &*cell) {
+                (SqlType::Double, Value::Int(i)) => *cell = Value::Double(*i as f64),
+                (SqlType::Timestamp, Value::Int(i)) => *cell = Value::Timestamp(*i),
+                _ => {}
+            }
+        }
+    }
+
     /// Validate a candidate row against this schema (arity, per-column type,
     /// and nullability). Returns `Err(SchemaMismatch)` describing the first
     /// problem found.
@@ -99,12 +117,47 @@ impl Table {
     }
 }
 
-/// A single-column secondary index definition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A secondary index definition over one or more columns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IndexDef {
     pub name: String,
     pub table: String,
-    pub column: String,
+    pub columns: Vec<String>,
+}
+
+// Older catalogs / WAL records store a single `"column": "x"` field; accept
+// both shapes on read (new writes always use `columns`).
+impl<'de> Deserialize<'de> for IndexDef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            name: String,
+            table: String,
+            #[serde(default)]
+            column: Option<String>,
+            #[serde(default)]
+            columns: Vec<String>,
+        }
+        let w = Wire::deserialize(deserializer)?;
+        let columns = if w.columns.is_empty() {
+            match w.column {
+                Some(c) => vec![c],
+                None => {
+                    return Err(serde::de::Error::custom("index definition has no columns"));
+                }
+            }
+        } else {
+            w.columns
+        };
+        Ok(IndexDef {
+            name: w.name,
+            table: w.table,
+            columns,
+        })
+    }
 }
 
 /// The in-memory catalog plus where it persists.

@@ -86,6 +86,18 @@ fn ok_docs_bytes(docs: &[Arc<Value>]) -> Vec<u8> {
 
 /// Handle a single JSON request and return pre-serialized JSON response bytes.
 pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u64>) -> Vec<u8> {
+    handle_request_opts(db, request, active_tx, false)
+}
+
+/// Like [`handle_request`], with per-request options decided by the session
+/// layer: `sql_readonly` restricts the SQL engine to SELECT statements (set
+/// for Read-role sessions; never derived from the request itself).
+pub fn handle_request_opts(
+    db: &Arc<OxiDb>,
+    request: Value,
+    active_tx: &mut Option<u64>,
+    sql_readonly: bool,
+) -> Vec<u8> {
     let cmd = match request
         .get("cmd")
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -109,12 +121,12 @@ pub fn handle_request(db: &Arc<OxiDb>, request: Value, active_tx: &mut Option<u6
     // unaffected. In cluster mode `sql` is not a write command, so it runs
     // node-locally (SQL is not Raft-replicated in v1).
     match request.get("engine").and_then(|v| v.as_str()) {
-        Some("sql") => return crate::sql_bridge::handle_sql(&cmd, &request),
+        Some("sql") => return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly),
         Some("doc") | None => {}
         Some(other) => return err_bytes(&format!("unknown engine: {other:?}")),
     }
     if cmd == "sql" {
-        return crate::sql_bridge::handle_sql(&cmd, &request);
+        return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly);
     }
 
     // FDW v1: if the targeted collection is registered as a linked

@@ -59,6 +59,9 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "count"
                 | "aggregate"
                 | "aggregate_docs"
+                // SELECT-only: the session layer flags Read-role sql requests
+                // and the SQL bridge rejects any non-SELECT statement.
+                | "sql"
                 | "list_collections"
                 | "list_buckets"
                 | "list_objects"

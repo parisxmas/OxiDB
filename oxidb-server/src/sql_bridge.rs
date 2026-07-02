@@ -68,14 +68,16 @@ fn engine() -> Option<Arc<SqlEngine>> {
 /// { "engine": "sql", "cmd": "sql", "sql": "SELECT ...", "params": [ ... ] }
 /// ```
 /// `params` is optional and binds `?` / `$N` placeholders left-to-right.
-pub fn handle_sql(cmd: &str, request: &Value) -> Vec<u8> {
+/// `readonly` is decided server-side from the session's effective role
+/// (Read = SELECT-only); it never comes from the request.
+pub fn handle_sql(cmd: &str, request: &Value, readonly: bool) -> Vec<u8> {
     if cmd != "sql" {
         return err_bytes("SQL engine requests must use cmd \"sql\"");
     }
     let Some(sql) = request.get("sql").and_then(|v| v.as_str()) else {
         return err_bytes("missing 'sql' field");
     };
-    match execute_json(sql, request.get("params")) {
+    match execute_json(sql, request.get("params"), readonly) {
         Ok(results) => ok_bytes(results),
         Err(msg) => err_bytes(&msg),
     }
@@ -83,11 +85,23 @@ pub fn handle_sql(cmd: &str, request: &Value) -> Vec<u8> {
 
 /// Execute a SQL string with optional JSON `params` and return the results as
 /// JSON (one entry per statement). Shared by the TCP wire handler and the
-/// REST `POST /api/sql` endpoint.
-pub fn execute_json(sql: &str, params: Option<&Value>) -> Result<Value, String> {
+/// REST `POST /api/sql` endpoint. With `readonly`, only SELECT statements are
+/// permitted.
+pub fn execute_json(sql: &str, params: Option<&Value>, readonly: bool) -> Result<Value, String> {
     let Some(engine) = engine() else {
         return Err("SQL engine is not enabled (set OXIDB_SQL=1)".to_string());
     };
+    if readonly {
+        match oxidb_sql::is_read_only(sql) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(
+                    "permission denied: role 'read' may only execute SELECT statements".to_string(),
+                );
+            }
+            Err(e) => return Err(format!("sql error: {e}")),
+        }
+    }
     let params = parse_params(params)?;
     engine
         .execute_params(sql, &params)

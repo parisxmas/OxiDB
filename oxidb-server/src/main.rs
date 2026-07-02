@@ -191,6 +191,9 @@ fn dispatch_request(
     // ---------------------------------------------------------------
     // RBAC check
     // ---------------------------------------------------------------
+    // Read-role sessions may use the SQL engine but only for SELECTs; the
+    // flag is decided here (session layer) and enforced by the SQL bridge.
+    let mut sql_readonly = false;
     if state.auth_enabled {
         if let Some(role) = session.role() {
             let is_user_cmd = matches!(
@@ -239,6 +242,7 @@ fn dispatch_request(
                     cmd
                 ));
             }
+            sql_readonly = cmd == "sql" && effective_role == oxidb_server::auth::Role::Read;
         }
     }
 
@@ -322,9 +326,8 @@ fn dispatch_request(
     // ---------------------------------------------------------------
     // Standard command dispatch
     // ---------------------------------------------------------------
-    // (The `sql` cmd dispatch was removed alongside the SQL surface;
-    // every request now flows through the document-API handler.)
-    let resp_bytes = handler::handle_request(&target_db, request.clone(), active_tx);
+    let resp_bytes =
+        handler::handle_request_opts(&target_db, request.clone(), active_tx, sql_readonly);
 
     log_audit(state, session, &cmd, collection.as_deref(), "ok", "");
 

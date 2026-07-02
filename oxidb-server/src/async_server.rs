@@ -174,6 +174,9 @@ async fn dispatch_request(
     // ---------------------------------------------------------------
     // RBAC check
     // ---------------------------------------------------------------
+    // Read-role sessions may use the SQL engine but only for SELECTs; the
+    // flag is decided here (session layer) and enforced by the SQL bridge.
+    let mut sql_readonly = false;
     if state.auth_enabled {
         if let Some(role) = session.role() {
             let is_user_cmd = matches!(
@@ -224,6 +227,7 @@ async fn dispatch_request(
                     cmd
                 ));
             }
+            sql_readonly = cmd == "sql" && effective_role == Role::Read;
         }
     }
 
@@ -340,6 +344,7 @@ async fn dispatch_request(
                         session,
                         &cmd,
                         collection.as_deref(),
+                        sql_readonly,
                     )
                     .await;
                 }
@@ -369,11 +374,13 @@ async fn dispatch_request(
         session,
         &cmd,
         collection.as_deref(),
+        sql_readonly,
     )
     .await
 }
 
 /// Execute a request locally via spawn_blocking.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_local(
     state: &ServerState,
     request: Value,
@@ -381,6 +388,7 @@ async fn dispatch_local(
     session: &Session,
     cmd: &str,
     collection: Option<&str>,
+    sql_readonly: bool,
 ) -> Vec<u8> {
     let db = Arc::clone(&state.db);
 
@@ -397,7 +405,7 @@ async fn dispatch_local(
     // All other commands: run handler in a blocking thread.
     let mut tx = active_tx.take();
     let resp_bytes = tokio::task::spawn_blocking(move || {
-        let resp = handler::handle_request(&db, request, &mut tx);
+        let resp = handler::handle_request_opts(&db, request, &mut tx, sql_readonly);
         (resp, tx)
     })
     .await

@@ -8,7 +8,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    AggFunc, BinOp, Expr, Join, JoinKind, SelectItem, SelectStmt, Statement, TableRef, UnOp,
+    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, SelectItem, SelectQuery, SelectStmt,
+    Statement, TableRef, UnOp,
 };
 use crate::catalog::{Column, Table};
 use crate::error::{Result, SqlError};
@@ -51,7 +52,7 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
             other => Err(SqlError::Unsupported(format!("DROP {other:?}"))),
         },
         sp::Statement::Insert(insert) => translate_insert(insert, p),
-        sp::Statement::Query(query) => translate_select(*query, p),
+        sp::Statement::Query(query) => Ok(Statement::Select(translate_query(*query, p)?)),
         sp::Statement::Update {
             table,
             assignments,
@@ -91,6 +92,11 @@ fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
     for col in &ct.columns {
         columns.push(translate_column(col)?);
     }
+    if columns.iter().filter(|c| c.primary_key).count() > 1 {
+        return Err(SqlError::Unsupported(
+            "multiple PRIMARY KEY columns (a table has at most one primary key)".into(),
+        ));
+    }
     Ok(Statement::CreateTable {
         table: Table::new(name, columns),
         if_not_exists: ct.if_not_exists,
@@ -103,23 +109,23 @@ fn translate_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         Some(n) => object_name_to_string(n)?,
         None => return Err(SqlError::Unsupported("CREATE INDEX without a name".into())),
     };
-    if ci.columns.len() != 1 {
-        return Err(SqlError::Unsupported(
-            "multi-column index (Phase 2 supports single-column)".into(),
-        ));
+    if ci.columns.is_empty() {
+        return Err(SqlError::Unsupported("CREATE INDEX without columns".into()));
     }
-    let column = match &ci.columns[0].column.expr {
-        sp::Expr::Identifier(id) => id.value.clone(),
-        other => {
-            return Err(SqlError::Unsupported(format!(
+    let columns = ci
+        .columns
+        .iter()
+        .map(|c| match &c.column.expr {
+            sp::Expr::Identifier(id) => Ok(id.value.clone()),
+            other => Err(SqlError::Unsupported(format!(
                 "index on expression {other:?} (columns only)"
-            )));
-        }
-    };
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(Statement::CreateIndex {
         name,
         table,
-        column,
+        columns,
         if_not_exists: ci.if_not_exists,
     })
 }
@@ -211,11 +217,76 @@ fn translate_delete(del: sp::Delete, p: &mut usize) -> Result<Statement> {
     Ok(Statement::Delete { table, filter })
 }
 
-fn translate_select(query: sp::Query, p: &mut usize) -> Result<Statement> {
-    let select = match *query.body {
-        sp::SetExpr::Select(s) => s,
-        _ => return Err(SqlError::Unsupported("compound / set query".into())),
-    };
+/// Translate a full query: a plain SELECT, or a UNION [ALL] tree with outer
+/// ORDER BY / LIMIT / OFFSET. For a plain SELECT the outer clauses are pushed
+/// into the [`SelectStmt`] itself (single-select fast path).
+fn translate_query(query: sp::Query, p: &mut usize) -> Result<SelectQuery> {
+    let order_by = translate_order_by(query.order_by, p)?;
+    let (limit, offset) = translate_limit(&query.limit_clause)?;
+    match *query.body {
+        sp::SetExpr::Select(s) => {
+            let mut stmt = translate_select_core(*s, p)?;
+            stmt.order_by = order_by;
+            stmt.limit = limit;
+            stmt.offset = offset;
+            Ok(SelectQuery {
+                body: QueryBody::Select(Box::new(stmt)),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            })
+        }
+        body @ sp::SetExpr::SetOperation { .. } => Ok(SelectQuery {
+            body: translate_set_expr(body, p)?,
+            order_by,
+            limit,
+            offset,
+        }),
+        other => Err(SqlError::Unsupported(format!("query body {other}"))),
+    }
+}
+
+/// Translate one side of a set operation (or the whole tree).
+fn translate_set_expr(e: sp::SetExpr, p: &mut usize) -> Result<QueryBody> {
+    match e {
+        sp::SetExpr::Select(s) => Ok(QueryBody::Select(Box::new(translate_select_core(*s, p)?))),
+        sp::SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            if op != sp::SetOperator::Union {
+                return Err(SqlError::Unsupported(format!("set operation {op}")));
+            }
+            let all = match set_quantifier {
+                sp::SetQuantifier::All => true,
+                sp::SetQuantifier::None | sp::SetQuantifier::Distinct => false,
+                other => {
+                    return Err(SqlError::Unsupported(format!("UNION quantifier {other}")));
+                }
+            };
+            Ok(QueryBody::SetOp {
+                all,
+                left: Box::new(translate_set_expr(*left, p)?),
+                right: Box::new(translate_set_expr(*right, p)?),
+            })
+        }
+        // A parenthesized branch: allowed as long as it has no ORDER BY/LIMIT
+        // of its own (per-branch ordering is meaningless under UNION).
+        sp::SetExpr::Query(inner) => {
+            if inner.order_by.is_some() || inner.limit_clause.is_some() {
+                return Err(SqlError::Unsupported(
+                    "ORDER BY / LIMIT inside a UNION branch".into(),
+                ));
+            }
+            translate_set_expr(*inner.body, p)
+        }
+        other => Err(SqlError::Unsupported(format!("query body {other}"))),
+    }
+}
+
+fn translate_select_core(select: sp::Select, p: &mut usize) -> Result<SelectStmt> {
     if select.from.len() != 1 {
         return Err(SqlError::Unsupported(
             "SELECT must reference exactly one table in FROM (use JOIN)".into(),
@@ -270,19 +341,18 @@ fn translate_select(query: sp::Query, p: &mut usize) -> Result<Statement> {
     };
 
     let having = select.having.map(|e| translate_expr(e, p)).transpose()?;
-    let order_by = translate_order_by(query.order_by, p)?;
-    let limit = translate_limit(&query.limit_clause, p)?;
 
-    Ok(Statement::Select(SelectStmt {
+    Ok(SelectStmt {
         from,
         joins,
         projection,
         filter,
         group_by,
         having,
-        order_by,
-        limit,
-    }))
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    })
 }
 
 fn translate_select_item(item: &sp::SelectItem, p: &mut usize) -> Result<SelectItem> {
@@ -323,25 +393,30 @@ fn translate_order_by(order_by: Option<sp::OrderBy>, p: &mut usize) -> Result<Ve
     Ok(keys)
 }
 
-fn translate_limit(limit: &Option<sp::LimitClause>, _p: &mut usize) -> Result<Option<usize>> {
+/// Translate LIMIT / OFFSET into `(limit, offset)`.
+fn translate_limit(limit: &Option<sp::LimitClause>) -> Result<(Option<usize>, Option<usize>)> {
     let Some(clause) = limit else {
-        return Ok(None);
+        return Ok((None, None));
     };
     match clause {
         sp::LimitClause::LimitOffset {
-            limit: Some(expr),
+            limit,
             offset,
             limit_by,
         } => {
-            if offset.is_some() {
-                return Err(SqlError::Unsupported("OFFSET (later phase)".into()));
-            }
             if !limit_by.is_empty() {
                 return Err(SqlError::Unsupported("LIMIT BY".into()));
             }
-            Ok(Some(expr_to_u64(expr)? as usize))
+            let limit = limit
+                .as_ref()
+                .map(|e| Ok::<_, SqlError>(expr_to_u64(e)? as usize))
+                .transpose()?;
+            let offset = offset
+                .as_ref()
+                .map(|o| Ok::<_, SqlError>(expr_to_u64(&o.value)? as usize))
+                .transpose()?;
+            Ok((limit, offset))
         }
-        sp::LimitClause::LimitOffset { limit: None, .. } => Ok(None),
         sp::LimitClause::OffsetCommaLimit { .. } => {
             Err(SqlError::Unsupported("MySQL LIMIT offset,count".into()))
         }
@@ -410,8 +485,130 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
             right: Box::new(translate_expr(*right, p)?),
         }),
         sp::Expr::Function(f) => translate_function(f, p),
+        sp::Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(Expr::In {
+            expr: Box::new(translate_expr(*expr, p)?),
+            list: list
+                .into_iter()
+                .map(|e| translate_expr(e, p))
+                .collect::<Result<_>>()?,
+            negated,
+        }),
+        sp::Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(Expr::InSubquery {
+            expr: Box::new(translate_expr(*expr, p)?),
+            query: Box::new(translate_subquery(*subquery, p)?),
+            negated,
+        }),
+        sp::Expr::Subquery(q) => Ok(Expr::Subquery(Box::new(translate_subquery(*q, p)?))),
+        // `TIMESTAMP '2026-01-02 03:04:05'` and friends.
+        sp::Expr::TypedString(ts) => {
+            let ty = map_data_type(&ts.data_type)?;
+            let s = match &ts.value.value {
+                sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s.clone(),
+                other => {
+                    return Err(SqlError::Unsupported(format!("typed literal {other:?}")));
+                }
+            };
+            match ty {
+                SqlType::Timestamp => Ok(Expr::Literal(Value::Timestamp(parse_timestamp(&s)?))),
+                other => Err(SqlError::Unsupported(format!(
+                    "typed string literal for {other:?}"
+                ))),
+            }
+        }
         other => Err(SqlError::Unsupported(format!("expression {other:?}"))),
     }
+}
+
+/// Translate a subquery, which may carry its own ORDER BY / LIMIT / OFFSET.
+fn translate_subquery(q: sp::Query, p: &mut usize) -> Result<SelectQuery> {
+    translate_query(q, p)
+}
+
+/// Parse a SQL timestamp string to epoch **milliseconds** (UTC).
+///
+/// Accepted: `YYYY-MM-DD`, `YYYY-MM-DD[ T]HH:MM:SS[.fff]`, optionally with a
+/// trailing `Z` or `±HH[:MM]` offset (applied to convert to UTC).
+pub(crate) fn parse_timestamp(s: &str) -> Result<i64> {
+    let bad = || SqlError::Parse(format!("bad timestamp literal {s:?}"));
+    let s = s.trim();
+
+    // Split off a trailing zone: 'Z' or ±HH[:MM] (only after a time part).
+    let (body, offset_min) = if let Some(b) = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')) {
+        (b, 0i64)
+    } else if s.len() > 10
+        && let Some(pos) = s.rfind(['+', '-']).filter(|&p| p >= 10)
+    {
+        let (b, z) = s.split_at(pos);
+        let sign = if z.starts_with('-') { -1i64 } else { 1 };
+        let z = &z[1..];
+        let (zh, zm) = match z.split_once(':') {
+            Some((h, m)) => (h, m),
+            None if z.len() == 4 => z.split_at(2),
+            None => (z, "0"),
+        };
+        let zh: i64 = zh.parse().map_err(|_| bad())?;
+        let zm: i64 = zm.parse().map_err(|_| bad())?;
+        (b, sign * (zh * 60 + zm))
+    } else {
+        (s, 0)
+    };
+
+    let (date, time) = match body.split_once([' ', 'T']) {
+        Some((d, t)) => (d, Some(t)),
+        None => (body, None),
+    };
+
+    let mut dp = date.split('-');
+    let year: i64 = dp.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let month: i64 = dp.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let day: i64 = dp.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    if dp.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(bad());
+    }
+
+    let (mut hour, mut min, mut sec, mut millis) = (0i64, 0i64, 0i64, 0i64);
+    if let Some(t) = time {
+        let (hms, frac) = match t.split_once('.') {
+            Some((a, f)) => (a, Some(f)),
+            None => (t, None),
+        };
+        let mut tp = hms.split(':');
+        hour = tp.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+        min = tp.next().unwrap_or("0").parse().map_err(|_| bad())?;
+        sec = tp.next().unwrap_or("0").parse().map_err(|_| bad())?;
+        if tp.next().is_some()
+            || !(0..=23).contains(&hour)
+            || !(0..=59).contains(&min)
+            || !(0..=59).contains(&sec)
+        {
+            return Err(bad());
+        }
+        if let Some(f) = frac {
+            let f: String = f.chars().take(3).collect();
+            let scale = 10i64.pow(3 - f.len() as u32);
+            millis = f.parse::<i64>().map_err(|_| bad())? * scale;
+        }
+    }
+
+    // Days since epoch (Howard Hinnant's days-from-civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    let secs = days * 86_400 + hour * 3_600 + min * 60 + sec - offset_min * 60;
+    Ok(secs * 1_000 + millis)
 }
 
 fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {

@@ -26,8 +26,9 @@ OXIDB_SQL=1 oxidb-server
 
 ## Wire Protocol
 
-Send a request with `engine: "sql"` and the reserved `sql` command
-(requires the **ReadWrite** role when auth is enabled):
+Send a request with `engine: "sql"` and the reserved `sql` command. With auth
+enabled, the **ReadWrite** role has full access; the **Read** role may execute
+SELECT statements only (any write or DDL is denied per statement):
 
 ```json
 { "engine": "sql", "cmd": "sql", "sql": "SELECT * FROM users WHERE id = $1", "params": [1] }
@@ -104,6 +105,15 @@ The embedded clients have no SQL surface — the engine is server-side.
 | `BOOL` (`BOOLEAN`) | boolean |
 | `TIMESTAMP` (`DATETIME`) | epoch milliseconds (64-bit integer) |
 
+Integer values implicitly widen into `DOUBLE` columns (`INSERT ... VALUES (5)`
+stores `5.0`) and into `TIMESTAMP` columns (taken as epoch milliseconds).
+Timestamp literals are also supported:
+
+```sql
+INSERT INTO events VALUES (TIMESTAMP '2026-01-02 03:04:05');
+SELECT * FROM events WHERE ts >= TIMESTAMP '2026-01-01';   -- also 'YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]'
+```
+
 Comparisons use SQL three-valued logic; `NULL` never equals anything
 (`IS NULL` / `IS NOT NULL` test for it).
 
@@ -111,7 +121,7 @@ Comparisons use SQL three-valued logic; `NULL` never equals anything
 
 ```sql
 CREATE TABLE users (
-  id    INT PRIMARY KEY,      -- PRIMARY KEY implies NOT NULL (no uniqueness check in v1)
+  id    INT PRIMARY KEY,      -- NOT NULL + uniqueness enforced on every write
   name  TEXT NOT NULL,
   age   INT
 );
@@ -119,14 +129,20 @@ CREATE TABLE IF NOT EXISTS users (...);
 DROP TABLE users;
 DROP TABLE IF EXISTS users;
 
-CREATE INDEX idx_users_age ON users (age);   -- single-column secondary index
+CREATE INDEX idx_users_age ON users (age);           -- single-column index
+CREATE INDEX idx_users_geo ON users (country, city); -- multi-column index
 CREATE INDEX IF NOT EXISTS idx_users_age ON users (age);
 DROP INDEX idx_users_age;
 DROP INDEX IF EXISTS idx_users_age;
 ```
 
-Secondary indexes serve `WHERE column = value` equality seeks on single-table
-SELECTs and are maintained automatically on writes.
+A duplicate `PRIMARY KEY` value is rejected with a `duplicate key` error —
+on plain INSERTs, multi-row INSERTs (checked across the whole batch before
+anything is applied), UPDATEs, and inside transactions.
+
+Secondary indexes serve equality seeks on single-table SELECTs (a
+multi-column index applies when the WHERE clause has `col = value` conjuncts
+for **all** of its columns) and are maintained automatically on writes.
 
 ## DML
 
@@ -145,12 +161,38 @@ the whole statement, and all rows are validated before any is applied.
 ```sql
 SELECT * FROM users;
 SELECT name AS n, age FROM users WHERE age >= 18 AND name <> 'root'
-ORDER BY age DESC, n ASC LIMIT 10;
+ORDER BY age DESC, n ASC LIMIT 10 OFFSET 20;
 ```
 
-- `WHERE` with `AND`/`OR`/`NOT`, comparisons, arithmetic, `IS [NOT] NULL`
+- `WHERE` with `AND`/`OR`/`NOT`, comparisons, arithmetic, `IS [NOT] NULL`,
+  `[NOT] IN (v1, v2, ...)`
 - `ORDER BY` on columns, expressions, or projection aliases; `ASC`/`DESC`
-- `LIMIT n`
+- `LIMIT n` / `OFFSET n`
+
+### UNION
+
+```sql
+SELECT name FROM customers
+UNION            -- distinct; UNION ALL keeps duplicates
+SELECT name FROM suppliers
+ORDER BY 1 LIMIT 10 OFFSET 5;   -- outer clauses apply to the combined result
+```
+
+`UNION` arms must have the same column count; the output takes the left arm's
+column names. The outer `ORDER BY` uses output column names or 1-based
+positions. (`EXCEPT` / `INTERSECT` are not supported.)
+
+### Subqueries (uncorrelated)
+
+```sql
+SELECT id FROM orders WHERE total > (SELECT AVG(total) FROM orders);
+SELECT id FROM orders WHERE customer_id IN (SELECT id FROM vip);
+```
+
+Subqueries are evaluated once per statement, before row evaluation: a scalar
+subquery must return one column and at most one row (zero rows = `NULL`);
+`IN (SELECT ...)` takes a one-column result. Correlated subqueries (references
+to the outer query's tables) are not supported.
 
 ### Joins
 
@@ -203,17 +245,14 @@ atomically as one WAL batch on `COMMIT`. Transaction control statements must
 appear in the same request string in v1. An unmatched `BEGIN` at the end of a
 request is rolled back.
 
-## v1 Limitations
+## Limitations
 
-- No implicit `INT` → `DOUBLE` coercion — write `5.0` for a `DOUBLE` column
-- No SQL timestamp literal — `TIMESTAMP` columns are populated via parameters
-  (epoch ms) or the programmatic API
-- `PRIMARY KEY` implies `NOT NULL` only; uniqueness is not enforced
-- Single-column secondary indexes
-- No `OFFSET`, subqueries, `UNION`, views, or window functions
+- Correlated subqueries, derived tables (`FROM (SELECT ...)`), `EXCEPT`,
+  `INTERSECT`, `DISTINCT`, views, and window functions are not supported
+- Plain `UNIQUE` column constraints are accepted but not enforced
+  (`PRIMARY KEY` **is** enforced)
 - Transactions are single-writer and their reads are not index-accelerated
 - Node-local: SQL statements are **not** Raft-replicated in cluster mode
-- No read-only SQL role: the `sql` command requires **ReadWrite**
 
 ## See Also
 

@@ -12,6 +12,12 @@ pub fn open() -> (TempDir, SqlEngine) {
     (dir, db)
 }
 
+/// Open (or reopen) an engine at an existing directory.
+#[allow(dead_code)]
+pub fn open_at(path: &std::path::Path) -> SqlEngine {
+    SqlEngine::open(path).unwrap()
+}
+
 /// Run SQL and return the last statement's SELECT rows.
 pub fn rows(db: &SqlEngine, sql: &str) -> Vec<Vec<Value>> {
     unwrap_select(db.execute(sql).unwrap()).1

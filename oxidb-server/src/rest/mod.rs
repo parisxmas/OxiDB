@@ -268,10 +268,11 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
 
     // ── SQL engine (ADR-0010) ─────────────────────────────────────────
     // Handled outside the generic match so the dynamic error message from
-    // the SQL engine (syntax errors, etc.) reaches the client. Write-gated
-    // by `rest_permitted` above (POST, not admin-only => ReadWrite+).
+    // the SQL engine (syntax errors, etc.) reaches the client. Read-role
+    // callers are restricted to SELECT statements by the SQL bridge.
     if let ("POST", ["api", "sql"]) = (req.method.as_str(), segments.as_slice()) {
-        return with_rest_cors(handle_sql_endpoint(req));
+        let readonly = enforced_role == Some(auth::Role::Read);
+        return with_rest_cors(handle_sql_endpoint(req, readonly));
     }
 
     // ── Protected endpoints ──────────────────────────────────────────
@@ -568,7 +569,7 @@ fn handle_drop_index(
 /// placeholders. Responds `{"results": [...]}` (one entry per statement) or
 /// 400 `{"error": "..."}` with the engine's message. Requires `OXIDB_SQL=1`
 /// on the server; the engine's data is entirely separate from collections.
-fn handle_sql_endpoint(req: &HttpRequest) -> HttpResponse {
+fn handle_sql_endpoint(req: &HttpRequest, readonly: bool) -> HttpResponse {
     let body = match parse_json_body(req) {
         Ok(b) => b,
         Err((status, msg)) => {
@@ -578,7 +579,7 @@ fn handle_sql_endpoint(req: &HttpRequest) -> HttpResponse {
     let Some(sql) = body.get("sql").and_then(|v| v.as_str()) else {
         return json_response(400, "Bad Request", json!({"error": "missing 'sql'"}));
     };
-    match crate::sql_bridge::execute_json(sql, body.get("params")) {
+    match crate::sql_bridge::execute_json(sql, body.get("params"), readonly) {
         Ok(results) => json_response(200, "OK", json!({"results": results})),
         Err(msg) => json_response(400, "Bad Request", json!({"error": msg})),
     }
@@ -897,11 +898,11 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str]) -> bool {
         Admin => true,
         // ReadWrite gets everything that is not admin-only.
         ReadWrite => true,
-        // Read is restricted to read-only operations: any GET, plus the
-        // read-only aggregation POST.
+        // Read is restricted to read-only operations: any GET, the read-only
+        // aggregation POST, and SQL (SELECT-only, enforced by the SQL bridge).
         Read => matches!(
             (method, segments),
-            ("GET", _) | ("POST", ["api", _, "aggregate"])
+            ("GET", _) | ("POST", ["api", _, "aggregate"]) | ("POST", ["api", "sql"])
         ),
     }
 }

@@ -163,9 +163,9 @@ fn errors_surface_cleanly() {
     assert!(db.execute("SELECT * FROM nope").is_err());
     // unknown column
     assert!(db.execute("SELECT missing FROM t").is_err());
-    // unsupported feature (compound/set query) should error, not panic
+    // unsupported set operation should error, not panic (UNION is supported)
     assert!(
-        db.execute("SELECT id FROM t UNION SELECT id FROM t")
+        db.execute("SELECT id FROM t EXCEPT SELECT id FROM t")
             .is_err()
     );
     // parse error
