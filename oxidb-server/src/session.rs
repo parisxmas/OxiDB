@@ -12,6 +12,9 @@ pub struct Session {
     /// transaction's buffered writes belong to one engine; requests that
     /// target a different database while it is open are rejected.
     pub tx_db: Option<String>,
+    /// Open interactive SQL transaction (ADR-0013 Phase B), parked in the
+    /// SQL engine between requests.
+    pub sql_tx: Option<u64>,
     /// Wire-protocol version negotiated via HELLO. Defaults to v1 for clients
     /// that never call `hello` (backward-compat with pre-1.0 clients).
     pub wire_version: u32,
@@ -26,6 +29,7 @@ impl Session {
             scram_state: None,
             current_database: "oxidb".to_string(),
             tx_db: None,
+            sql_tx: None,
             wire_version: 1,
         }
     }

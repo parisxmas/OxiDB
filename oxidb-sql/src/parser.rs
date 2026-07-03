@@ -405,7 +405,13 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
         sp::Statement::Delete(del) => translate_delete(del, p),
         sp::Statement::StartTransaction { .. } => Ok(Statement::Begin),
         sp::Statement::Commit { .. } => Ok(Statement::Commit),
+        sp::Statement::Rollback {
+            savepoint: Some(name),
+            ..
+        } => Ok(Statement::RollbackToSavepoint(name.value)),
         sp::Statement::Rollback { .. } => Ok(Statement::Rollback),
+        sp::Statement::Savepoint { name } => Ok(Statement::Savepoint(name.value)),
+        sp::Statement::ReleaseSavepoint { name } => Ok(Statement::ReleaseSavepoint(name.value)),
         sp::Statement::ShowTables { .. } => Ok(Statement::Show(ShowKind::Tables)),
         sp::Statement::ShowViews { .. } => Ok(Statement::Show(ShowKind::Views)),
         sp::Statement::ShowColumns { show_options, .. } => {

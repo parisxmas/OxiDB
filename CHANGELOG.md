@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### SQL engine: interactive transactions + savepoints (ADR-0013 Phase B)
+
+- `BEGIN` now opens a transaction that spans requests on the same
+  connection: statements across round-trips share it (read-your-writes,
+  invisible to other sessions), `COMMIT` flushes one atomic WAL batch.
+  `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT` give partial
+  rollback. A statement error aborts the transaction; disconnect rolls it
+  back; it stays bound to the database it began on. Engine API:
+  `execute_params_in_session` (the old `execute*` entry points keep their
+  batch-scoped auto-rollback contract).
+- Cluster mode rejects cross-request SQL transactions with a clear error
+  (self-contained `BEGIN..COMMIT` batches still replicate whole); lifting
+  this is the remaining Phase B item.
+
 ### SQL engine: EF-oriented expression surface (ADR-0013 Phase A)
 
 - `CASE WHEN` (searched + simple form, short-circuiting), `[NOT] LIKE`

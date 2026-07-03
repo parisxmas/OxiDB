@@ -101,7 +101,10 @@ fn sql_engine_roundtrip_when_enabled() {
         &db,
         json!({"engine": "sql", "cmd": "sql", "sql": "SELECT id FROM t"}),
     );
-    assert_eq!(r["data"], json!([{ "columns": ["id"], "types": ["INT"], "rows": [[2]] }]));
+    assert_eq!(
+        r["data"],
+        json!([{ "columns": ["id"], "types": ["INT"], "rows": [[2]] }])
+    );
 
     // The `cmd == "sql"` shortcut works without an explicit engine field.
     let r = resp(&db, json!({"cmd": "sql", "sql": "SELECT id FROM t"}));

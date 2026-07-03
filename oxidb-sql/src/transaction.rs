@@ -24,8 +24,8 @@ use crate::wal::WalRecord;
 /// A row-level change in the overlay: `Some(cells)` upserts, `None` deletes.
 type RowChange = Option<Vec<Value>>;
 
-#[derive(Default)]
-struct TxnState {
+#[derive(Default, Clone)]
+pub(crate) struct TxnState {
     /// Tables created within the transaction (name -> definition).
     created: BTreeMap<String, Table>,
     /// Tables dropped within the transaction.
@@ -46,6 +46,25 @@ struct TxnState {
     pk_seen: BTreeMap<String, BTreeMap<IndexKey, u64>>,
     /// The ordered operations to flush on commit.
     ops: Vec<WalRecord>,
+    /// Savepoint stack: `(name, data snapshot)`. Snapshots exclude the stack
+    /// itself, so rolling back to a savepoint keeps earlier savepoints.
+    savepoints: Vec<(String, Box<TxnState>)>,
+}
+
+impl TxnState {
+    /// The transaction's data without its savepoint stack.
+    fn data_snapshot(&self) -> TxnState {
+        let mut c = self.clone();
+        c.savepoints = Vec::new();
+        c
+    }
+
+    /// Replace the data (not the stack) with a snapshot's.
+    fn restore_data(&mut self, snap: &TxnState) {
+        let stack = std::mem::take(&mut self.savepoints);
+        *self = snap.clone();
+        self.savepoints = stack;
+    }
 }
 
 /// A buffered transaction over a [`SqlEngine`].
@@ -60,6 +79,51 @@ impl<'a> Transaction<'a> {
             engine,
             state: RefCell::new(TxnState::default()),
         }
+    }
+
+    /// Wrap a previously-suspended session transaction's state.
+    pub(crate) fn from_state(engine: &'a SqlEngine, state: TxnState) -> Self {
+        Transaction {
+            engine,
+            state: RefCell::new(state),
+        }
+    }
+
+    /// Suspend: hand the buffered state back (to be parked in the engine's
+    /// session-transaction map between requests).
+    pub(crate) fn into_state(self) -> TxnState {
+        self.state.into_inner()
+    }
+
+    /// `SAVEPOINT name` — snapshot the current buffered data.
+    pub(crate) fn savepoint(&self, name: &str) {
+        let mut st = self.state.borrow_mut();
+        let snap = Box::new(st.data_snapshot());
+        st.savepoints.push((name.to_string(), snap));
+    }
+
+    /// `ROLLBACK TO SAVEPOINT name` — restore that snapshot's data; the
+    /// savepoint itself (and earlier ones) survive, later ones are dropped.
+    pub(crate) fn rollback_to_savepoint(&self, name: &str) -> Result<()> {
+        let mut st = self.state.borrow_mut();
+        let Some(pos) = st.savepoints.iter().rposition(|(n, _)| n == name) else {
+            return Err(SqlError::Unsupported(format!("no such savepoint: {name}")));
+        };
+        let snap = st.savepoints[pos].1.clone();
+        st.restore_data(&snap);
+        st.savepoints.truncate(pos + 1);
+        Ok(())
+    }
+
+    /// `RELEASE SAVEPOINT name` — forget the savepoint (and any later ones);
+    /// buffered data is untouched.
+    pub(crate) fn release_savepoint(&self, name: &str) -> Result<()> {
+        let mut st = self.state.borrow_mut();
+        let Some(pos) = st.savepoints.iter().rposition(|(n, _)| n == name) else {
+            return Err(SqlError::Unsupported(format!("no such savepoint: {name}")));
+        };
+        st.savepoints.truncate(pos);
+        Ok(())
     }
 
     /// Flush all buffered operations to the engine as one atomic batch.

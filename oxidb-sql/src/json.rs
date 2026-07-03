@@ -40,6 +40,35 @@ pub fn execute_json(
         .map_err(|e| format!("sql error: {e}"))
 }
 
+/// [`execute_json`] with an interactive session transaction: `BEGIN` /
+/// `COMMIT` may span calls, `*session_tx` carrying the parked transaction's
+/// id between them (ADR-0013 Phase B).
+pub fn execute_json_in_session(
+    engine: &SqlEngine,
+    sql: &str,
+    params: Option<&Json>,
+    readonly: bool,
+    session_tx: &mut Option<u64>,
+) -> Result<Json, String> {
+    if readonly {
+        match is_read_only(sql) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(
+                    "permission denied: role 'read' may only execute SELECT/SHOW statements"
+                        .to_string(),
+                );
+            }
+            Err(e) => return Err(format!("sql error: {e}")),
+        }
+    }
+    let params = parse_params(params)?;
+    engine
+        .execute_params_in_session(sql, &params, session_tx)
+        .map(results_to_json)
+        .map_err(|e| format!("sql error: {e}"))
+}
+
 /// Convert the optional `params` JSON array into typed SQL values.
 pub fn parse_params(params: Option<&Json>) -> Result<Vec<Value>, String> {
     let Some(params) = params else {

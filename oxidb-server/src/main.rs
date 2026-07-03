@@ -300,7 +300,7 @@ fn dispatch_request(
     };
     // An open transaction's buffered writes belong to the database it began
     // on; reject requests that target a different one while it is open.
-    if active_tx.is_some()
+    if (active_tx.is_some() || session.sql_tx.is_some())
         && let Some(tx_db) = &session.tx_db
         && tx_db != &target_db_name
     {
@@ -312,18 +312,22 @@ fn dispatch_request(
     // ---------------------------------------------------------------
     // Standard command dispatch
     // ---------------------------------------------------------------
-    let resp_bytes = handler::handle_request_in_db(
+    let mut sql_tx = session.sql_tx;
+    let resp_bytes = handler::handle_request_session(
         &target_db,
         &target_db_name,
         request.clone(),
         active_tx,
+        &mut sql_tx,
         sql_readonly,
     );
+    session.sql_tx = sql_tx;
 
     // Keep the transaction's database binding in step with its lifecycle.
-    match (&active_tx, &session.tx_db) {
-        (Some(_), None) => session.tx_db = Some(target_db_name),
-        (None, Some(_)) => session.tx_db = None,
+    let any_tx = active_tx.is_some() || session.sql_tx.is_some();
+    match (any_tx, &session.tx_db) {
+        (true, None) => session.tx_db = Some(target_db_name),
+        (false, Some(_)) => session.tx_db = None,
         _ => {}
     }
 
@@ -568,6 +572,13 @@ fn handle_connection(stream: &TcpStream, state: &ServerState, peer: &str) {
     if let Some(tx_id) = active_tx {
         let _ = state.db.rollback_transaction(tx_id);
     }
+    if let Some(sql_tx) = session.sql_tx {
+        let db_name = session
+            .tx_db
+            .as_deref()
+            .unwrap_or(&session.current_database);
+        oxidb_server::sql_bridge::rollback_session_tx(db_name, sql_tx);
+    }
 }
 
 /// Process a pipeline command: execute multiple commands in one roundtrip.
@@ -696,6 +707,13 @@ fn handle_connection_single<S: Read + Write>(stream: &mut S, state: &ServerState
 
     if let Some(tx_id) = active_tx {
         let _ = state.db.rollback_transaction(tx_id);
+    }
+    if let Some(sql_tx) = session.sql_tx {
+        let db_name = session
+            .tx_db
+            .as_deref()
+            .unwrap_or(&session.current_database);
+        oxidb_server::sql_bridge::rollback_session_tx(db_name, sql_tx);
     }
 }
 

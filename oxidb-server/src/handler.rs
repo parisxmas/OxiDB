@@ -108,13 +108,35 @@ pub fn handle_request_opts(
 }
 
 /// Like [`handle_request_opts`], for a request the session layer has resolved
-/// to a specific database: `db` is that database's document engine and
-/// `db_name` its name (routes the SQL engine to the same database).
+/// to a specific database. Interactive SQL transactions are not reachable
+/// through this entry point: one left open by the batch is rolled back
+/// (callers that carry per-connection SQL transaction state use
+/// [`handle_request_session`]).
 pub fn handle_request_in_db(
     db: &Arc<OxiDb>,
     db_name: &str,
     request: Value,
     active_tx: &mut Option<u64>,
+    sql_readonly: bool,
+) -> Vec<u8> {
+    let mut sql_tx = None;
+    let resp = handle_request_session(db, db_name, request, active_tx, &mut sql_tx, sql_readonly);
+    if let Some(id) = sql_tx {
+        crate::sql_bridge::rollback_session_tx(db_name, id);
+    }
+    resp
+}
+
+/// The full session-aware entry point: `db`/`db_name` as in
+/// [`handle_request_in_db`], `active_tx` the document engine's open
+/// transaction, `sql_tx` the SQL engine's parked interactive transaction
+/// (ADR-0013 Phase B) — both owned by the connection's session.
+pub fn handle_request_session(
+    db: &Arc<OxiDb>,
+    db_name: &str,
+    request: Value,
+    active_tx: &mut Option<u64>,
+    sql_tx: &mut Option<u64>,
     sql_readonly: bool,
 ) -> Vec<u8> {
     let cmd = match request
@@ -141,12 +163,14 @@ pub fn handle_request_in_db(
     // by the session layer before this point; what reaches here runs locally
     // (SELECTs, or standalone mode).
     match request.get("engine").and_then(|v| v.as_str()) {
-        Some("sql") => return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly, db_name),
+        Some("sql") => {
+            return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly, db_name, sql_tx);
+        }
         Some("doc") | None => {}
         Some(other) => return err_bytes(&format!("unknown engine: {other:?}")),
     }
     if cmd == "sql" {
-        return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly, db_name);
+        return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly, db_name, sql_tx);
     }
 
     // FDW v1: if the targeted collection is registered as a linked

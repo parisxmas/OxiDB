@@ -148,16 +148,40 @@ pub fn forget_database(db_name: &str) {
 /// (Read = SELECT-only); it never comes from the request. `db_name` was
 /// resolved by the session layer (request `db` field, else the session's
 /// current database).
-pub fn handle_sql(cmd: &str, request: &Value, readonly: bool, db_name: &str) -> Vec<u8> {
+pub fn handle_sql(
+    cmd: &str,
+    request: &Value,
+    readonly: bool,
+    db_name: &str,
+    session_tx: &mut Option<u64>,
+) -> Vec<u8> {
     if cmd != "sql" {
         return err_bytes("SQL engine requests must use cmd \"sql\"");
     }
     let Some(sql) = request.get("sql").and_then(|v| v.as_str()) else {
         return err_bytes("missing 'sql' field");
     };
-    match execute_json_in(db_name, sql, request.get("params"), readonly) {
+    let engine = match engine_for(db_name) {
+        Ok(e) => e,
+        Err(msg) => return err_bytes(&msg),
+    };
+    match oxidb_sql::json::execute_json_in_session(
+        &engine,
+        sql,
+        request.get("params"),
+        readonly,
+        session_tx,
+    ) {
         Ok(results) => ok_bytes(results),
         Err(msg) => err_bytes(&msg),
+    }
+}
+
+/// Roll back a parked interactive SQL transaction (disconnect cleanup, or
+/// entry points that don't carry session state). Safe on stale ids.
+pub fn rollback_session_tx(db_name: &str, txn_id: u64) {
+    if let Ok(engine) = engine_for(db_name) {
+        engine.rollback_session_txn(txn_id);
     }
 }
 

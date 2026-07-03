@@ -1,6 +1,6 @@
 # ADR-0013: Full .NET EF Core support for the SQL engine
 
-**Status:** Accepted — 2026-07-03 (Phase A in progress)
+**Status:** Accepted — 2026-07-03 (Phases A + B shipped; B's cluster support pending)
 **Related:** [ADR-0010](0010-sql-engine-crate.md) (SQL engine),
 [ADR-0012](0012-multi-database.md) (multi-database),
 `dotnet/` (.NET packages; the pre-ADR-0010 EF Core provider was removed in
@@ -39,12 +39,15 @@ Close the gap in five phases, each independently shippable:
   `||` operator, and per-column **type metadata** on SELECT results (wire:
   `"types"` array) so a future `DbDataReader.GetFieldType` doesn't have to
   guess from values.
-- **Phase B — interactive transactions** (largest architectural item):
+- **Phase B — interactive transactions** *(shipped, standalone mode)*:
   connection-scoped SQL transactions (`BEGIN` → many requests with reads →
-  `COMMIT`), savepoints, and the cluster story (buffered ops commit as one
-  Raft batch). Requires re-shaping `Transaction<'a>` (engine borrow) into an
-  id-keyed owned transaction like the document engine's `active_tx`.
-  Design first (own ADR section or ADR-0014).
+  `COMMIT`) and savepoints. `TxnState` became owned/id-keyed: it parks in
+  the engine's session map between requests and is resumed per batch; the
+  session layer carries the id (`Session::sql_tx`), disconnect rolls back,
+  errors abort the transaction. Old `execute*` entry points keep the
+  batch-scoped auto-rollback contract. **Cluster**: cross-request
+  transactions are rejected (self-contained batches replicate whole);
+  replicating buffered commits as one Raft entry is the remaining item.
 - **Phase C — ADO.NET provider** (`OxiDb.Data`): `DbConnection`,
   `DbCommand` (named `@p` → positional rewrite), `DbDataReader` over the
   wire result + type metadata, `DbTransaction` over Phase B. Milestone:

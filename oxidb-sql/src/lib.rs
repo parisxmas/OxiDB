@@ -237,6 +237,11 @@ struct Inner {
 /// The public SQL engine handle. Cheap to share behind an `Arc`.
 pub struct SqlEngine {
     inner: Mutex<Inner>,
+    /// Interactive (session) transactions parked between calls, keyed by id
+    /// (ADR-0013 Phase B). A transaction lives here while its connection is
+    /// between requests; execution takes it out and puts it back.
+    session_txns: Mutex<std::collections::HashMap<u64, transaction::TxnState>>,
+    next_session_txn: std::sync::atomic::AtomicU64,
 }
 
 impl SqlEngine {
@@ -305,6 +310,8 @@ impl SqlEngine {
         }
 
         Ok(SqlEngine {
+            session_txns: Mutex::new(std::collections::HashMap::new()),
+            next_session_txn: std::sync::atomic::AtomicU64::new(1),
             inner: Mutex::new(Inner {
                 dir,
                 catalog,
@@ -912,10 +919,87 @@ impl SqlEngine {
     /// atomically as one WAL batch. An unmatched `BEGIN` at end of string is
     /// rolled back (its buffered writes are discarded).
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<Vec<QueryResult>> {
+        // Batch-scoped semantics: a transaction left open at the end of the
+        // batch is discarded (auto-rollback), exactly as before interactive
+        // transactions existed.
+        let mut session_tx = None;
+        let result = self.execute_params_in_session(sql, params, &mut session_tx);
+        if let Some(id) = session_tx {
+            self.rollback_session_txn(id);
+        }
+        result
+    }
+
+    /// Like [`execute_params`](Self::execute_params), but `BEGIN`/`COMMIT`
+    /// may span calls: a transaction left open at the end of the batch is
+    /// parked in the engine and `*session_tx` carries its id for the next
+    /// call (ADR-0013 Phase B — interactive transactions). `SAVEPOINT name`,
+    /// `ROLLBACK TO SAVEPOINT name`, and `RELEASE SAVEPOINT name` operate on
+    /// the open transaction. A statement error rolls the open transaction
+    /// back and clears `*session_tx`.
+    pub fn execute_params_in_session(
+        &self,
+        sql: &str,
+        params: &[Value],
+        session_tx: &mut Option<u64>,
+    ) -> Result<Vec<QueryResult>> {
+        // Resume a parked transaction, if the session has one.
+        let mut txn: Option<Transaction<'_>> = match *session_tx {
+            Some(id) => {
+                let state = self
+                    .session_txns
+                    .lock()
+                    .unwrap()
+                    .remove(&id)
+                    .ok_or_else(|| {
+                        SqlError::Unsupported(format!(
+                            "no such transaction: {id} (rolled back, committed, or busy)"
+                        ))
+                    })?;
+                Some(Transaction::from_state(self, state))
+            }
+            None => None,
+        };
+
+        let result = self.run_session_batch(sql, params, &mut txn);
+
+        match result {
+            Ok(results) => {
+                // Park a still-open transaction for the next call.
+                match txn {
+                    Some(t) => {
+                        let id = session_tx.unwrap_or_else(|| {
+                            self.next_session_txn
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        });
+                        self.session_txns.lock().unwrap().insert(id, t.into_state());
+                        *session_tx = Some(id);
+                    }
+                    None => *session_tx = None,
+                }
+                self.maybe_checkpoint();
+                Ok(results)
+            }
+            Err(e) => {
+                // A failed statement aborts the transaction (dropped = rolled
+                // back); the session starts clean.
+                drop(txn);
+                *session_tx = None;
+                Err(e)
+            }
+        }
+    }
+
+    /// Execute one statement batch against an optional open transaction.
+    fn run_session_batch<'a>(
+        &'a self,
+        sql: &str,
+        params: &[Value],
+        txn: &mut Option<Transaction<'a>>,
+    ) -> Result<Vec<QueryResult>> {
         use ast::Statement;
         let statements = parser::parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
-        let mut txn: Option<Transaction<'_>> = None;
 
         for stmt in statements {
             match stmt {
@@ -923,7 +1007,7 @@ impl SqlEngine {
                     if txn.is_some() {
                         return Err(SqlError::Unsupported("nested transaction".into()));
                     }
-                    txn = Some(Transaction::new(self));
+                    *txn = Some(Transaction::new(self));
                     results.push(QueryResult::Transaction);
                 }
                 Statement::Commit => {
@@ -938,6 +1022,32 @@ impl SqlEngine {
                         .ok_or_else(|| SqlError::Unsupported("ROLLBACK without BEGIN".into()))?;
                     results.push(QueryResult::Transaction);
                 }
+                Statement::Savepoint(name) => {
+                    txn.as_ref()
+                        .ok_or_else(|| {
+                            SqlError::Unsupported("SAVEPOINT outside a transaction".into())
+                        })?
+                        .savepoint(&name);
+                    results.push(QueryResult::Transaction);
+                }
+                Statement::RollbackToSavepoint(name) => {
+                    txn.as_ref()
+                        .ok_or_else(|| {
+                            SqlError::Unsupported(
+                                "ROLLBACK TO SAVEPOINT outside a transaction".into(),
+                            )
+                        })?
+                        .rollback_to_savepoint(&name)?;
+                    results.push(QueryResult::Transaction);
+                }
+                Statement::ReleaseSavepoint(name) => {
+                    txn.as_ref()
+                        .ok_or_else(|| {
+                            SqlError::Unsupported("RELEASE SAVEPOINT outside a transaction".into())
+                        })?
+                        .release_savepoint(&name)?;
+                    results.push(QueryResult::Transaction);
+                }
                 other => {
                     let r = match &txn {
                         Some(t) => executor::execute(t, other, params)?,
@@ -947,13 +1057,13 @@ impl SqlEngine {
                 }
             }
         }
-        // An open transaction at end of the batch is discarded (auto-rollback).
-
-        // Fold the WAL into snapshots once it outgrows the threshold. Runs
-        // between statement batches, so it never observes a mid-transaction
-        // engine state.
-        self.maybe_checkpoint();
         Ok(results)
+    }
+
+    /// Roll back (discard) a parked session transaction. Safe to call for
+    /// ids that no longer exist.
+    pub fn rollback_session_txn(&self, id: u64) {
+        self.session_txns.lock().unwrap().remove(&id);
     }
 
     /// Path to the SQL root directory.
@@ -966,6 +1076,21 @@ impl SqlEngine {
 /// operations — or a SHOW/DESCRIBE introspection statement). Callers that
 /// gate write access per statement (e.g. a read-only server role) check this
 /// before executing.
+/// Whether executing `sql` would leave a transaction open at the end of the
+/// batch (a `BEGIN` without a matching `COMMIT`/`ROLLBACK`). Used by the
+/// cluster session layer, which cannot replicate open-ended transactions.
+pub fn leaves_transaction_open(sql: &str) -> Result<bool> {
+    let mut open = false;
+    for stmt in parser::parse(sql)? {
+        match stmt {
+            ast::Statement::Begin => open = true,
+            ast::Statement::Commit | ast::Statement::Rollback => open = false,
+            _ => {}
+        }
+    }
+    Ok(open)
+}
+
 pub fn is_read_only(sql: &str) -> Result<bool> {
     Ok(parser::parse(sql)?
         .iter()

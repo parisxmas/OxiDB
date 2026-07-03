@@ -56,10 +56,15 @@ pub enum Statement {
         table: String,
         filter: Option<Expr>,
     },
-    /// Transaction control (scoped to a single `execute()` call in Phase 2).
+    /// Transaction control. Within one `execute()` call these are
+    /// batch-scoped; through `execute_params_in_session` they span calls
+    /// (interactive transactions, ADR-0013 Phase B).
     Begin,
     Commit,
     Rollback,
+    Savepoint(String),
+    RollbackToSavepoint(String),
+    ReleaseSavepoint(String),
     /// Catalog introspection: `SHOW TABLES` / `SHOW VIEWS` /
     /// `SHOW INDEXES [FROM table]` / `DESCRIBE table`. Read-only; answered
     /// from the catalog as an ordinary result set.

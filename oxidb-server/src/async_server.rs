@@ -137,9 +137,16 @@ async fn handle_stream<R, W>(
         }
     }
 
-    // Auto-rollback active transaction on disconnect.
+    // Auto-rollback active transactions on disconnect.
     if let Some(tx_id) = active_tx {
         let _ = state.db.rollback_transaction(tx_id);
+    }
+    if let Some(sql_tx) = session.sql_tx {
+        let db_name = session
+            .tx_db
+            .as_deref()
+            .unwrap_or(&session.current_database);
+        crate::sql_bridge::rollback_session_tx(db_name, sql_tx);
     }
 }
 
@@ -337,13 +344,30 @@ async fn dispatch_request(
         .and_then(|v| v.as_str())
         .unwrap_or(&session.current_database)
         .to_string();
-    if active_tx.is_some()
+    if (active_tx.is_some() || session.sql_tx.is_some())
         && let Some(tx_db) = &session.tx_db
         && tx_db != &target_db_name
     {
         return handler::err_bytes(&format!(
             "active transaction is bound to database '{tx_db}'; commit or roll it back before using '{target_db_name}'"
         ));
+    }
+
+    // Interactive (cross-request) SQL transactions are node-local state; a
+    // cluster cannot replicate them per statement. Reject them cleanly —
+    // self-contained BEGIN..COMMIT batches keep working (replicated whole).
+    if state.raft.is_some() {
+        let sql_text = request.get("sql").and_then(|v| v.as_str());
+        let is_sql = cmd == "sql" || request.get("engine").and_then(|v| v.as_str()) == Some("sql");
+        if is_sql
+            && (session.sql_tx.is_some()
+                || sql_text.is_some_and(|q| oxidb_sql::leaves_transaction_open(q).unwrap_or(false)))
+        {
+            return handler::err_bytes(
+                "interactive SQL transactions are not supported in cluster mode yet; \
+                 send a self-contained BEGIN..COMMIT batch",
+            );
+        }
     }
 
     // ---------------------------------------------------------------
@@ -483,10 +507,11 @@ async fn dispatch_request(
     .await;
 
     // Keep the transaction's database binding in step with its lifecycle:
-    // set when a transaction appears, cleared when it ends.
-    match (&active_tx, &session.tx_db) {
-        (Some(_), None) => session.tx_db = Some(target_db_name),
-        (None, Some(_)) => session.tx_db = None,
+    // set when a transaction appears, cleared when both kinds end.
+    let any_tx = active_tx.is_some() || session.sql_tx.is_some();
+    match (any_tx, &session.tx_db) {
+        (true, None) => session.tx_db = Some(target_db_name),
+        (false, Some(_)) => session.tx_db = None,
         _ => {}
     }
     resp
@@ -512,7 +537,7 @@ async fn dispatch_local(
     state: &ServerState,
     request: Value,
     active_tx: &mut Option<u64>,
-    session: &Session,
+    session: &mut Session,
     cmd: &str,
     collection: Option<&str>,
     sql_readonly: bool,
@@ -535,8 +560,16 @@ async fn dispatch_local(
     // Transaction commands must be handled in the current task (they modify active_tx).
     match cmd {
         "begin_tx" | "commit_tx" | "rollback_tx" => {
-            let resp_bytes =
-                handler::handle_request_in_db(&db, &db_name, request, active_tx, sql_readonly);
+            let mut sql_tx = session.sql_tx;
+            let resp_bytes = handler::handle_request_session(
+                &db,
+                &db_name,
+                request,
+                active_tx,
+                &mut sql_tx,
+                sql_readonly,
+            );
+            session.sql_tx = sql_tx;
             log_audit(state, session, cmd, collection, "ok", "");
             return resp_bytes;
         }
@@ -545,13 +578,28 @@ async fn dispatch_local(
 
     // All other commands: run handler in a blocking thread.
     let mut tx = active_tx.take();
+    let mut sql_tx = session.sql_tx.take();
     let resp_bytes = tokio::task::spawn_blocking(move || {
-        let resp = handler::handle_request_in_db(&db, &db_name, request, &mut tx, sql_readonly);
-        (resp, tx)
+        let resp = handler::handle_request_session(
+            &db,
+            &db_name,
+            request,
+            &mut tx,
+            &mut sql_tx,
+            sql_readonly,
+        );
+        (resp, tx, sql_tx)
     })
     .await
-    .unwrap_or_else(|e| (handler::err_bytes(&format!("internal error: {e}")), None));
+    .unwrap_or_else(|e| {
+        (
+            handler::err_bytes(&format!("internal error: {e}")),
+            None,
+            None,
+        )
+    });
     *active_tx = resp_bytes.1;
+    session.sql_tx = resp_bytes.2;
     let bytes = resp_bytes.0;
 
     log_audit(state, session, cmd, collection, "ok", "");

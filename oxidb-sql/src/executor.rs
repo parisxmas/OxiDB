@@ -112,7 +112,12 @@ pub(crate) fn execute<S: Store>(
             filter,
         } => exec_update(store, &table, assignments, filter, params),
         Statement::Delete { table, filter } => exec_delete(store, &table, filter, params),
-        Statement::Begin | Statement::Commit | Statement::Rollback => Err(SqlError::Unsupported(
+        Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::Savepoint(_)
+        | Statement::RollbackToSavepoint(_)
+        | Statement::ReleaseSavepoint(_) => Err(SqlError::Unsupported(
             "transaction control must be a top-level statement".into(),
         )),
         Statement::Show(kind) => exec_show(store, kind),

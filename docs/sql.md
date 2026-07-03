@@ -381,22 +381,36 @@ against PostgreSQL 15.
 
 ## Transactions
 
+Transactions are **interactive** (ADR-0013 Phase B): `BEGIN` opens a
+transaction that spans requests on the same connection — run any number of
+statements across round-trips (reads see your own buffered writes; other
+connections see nothing until commit), then `COMMIT` or `ROLLBACK`.
+Savepoints give partial rollback:
+
 ```sql
 BEGIN;
 INSERT INTO accounts VALUES (1, 100);
+SAVEPOINT a;
 UPDATE accounts SET balance = balance - 10 WHERE id = 1;
-COMMIT;   -- or ROLLBACK;
+ROLLBACK TO SAVEPOINT a;   -- the update is undone; savepoint a survives
+RELEASE SAVEPOINT a;       -- forget the savepoint, keep the data
+COMMIT;                    -- one atomic WAL batch, single fsync
 ```
 
-Writes inside a transaction are buffered (with read-your-writes) and flushed
-atomically as one WAL batch on `COMMIT`. Transaction control statements must
-appear in the same request string in v1. An unmatched `BEGIN` at the end of a
-request is rolled back.
+A statement error aborts the transaction (auto-rollback, PostgreSQL-style
+strictness without the "must ROLLBACK first" limbo); disconnecting rolls an
+open transaction back; a transaction is bound to the database it began on.
+Embedded/one-shot callers using `execute()` keep the old batch-scoped
+contract: an unmatched `BEGIN` at the end of the request is rolled back.
+
+**Cluster mode**: interactive (cross-request) transactions are rejected
+with a clear error — send a self-contained `BEGIN..COMMIT` batch, which is
+replicated whole through Raft.
 
 ## Limitations
 
-- Derived tables (`FROM (SELECT ...)`), `EXCEPT`, `INTERSECT`, `DISTINCT`,
-  and explicit window frames are not supported
+- Derived tables (`FROM (SELECT ...)`), `EXCEPT`, `INTERSECT`, `DISTINCT ON`,
+  aggregate `DISTINCT`, and explicit window frames are not supported
 - Correlated subqueries reach one level up and are not allowed inside
   aggregated queries or window functions
 - Plain `UNIQUE` column constraints are accepted but not enforced
