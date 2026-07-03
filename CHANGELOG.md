@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### .NET: OxiDb.Data ADO.NET provider — Dapper works (ADR-0013 Phase C)
+
+- New `OxiDb.Data` package: `OxiDbConnection` / `OxiDbCommand` /
+  `OxiDbDataReader` / `OxiDbParameter` / `OxiDbTransaction` /
+  `OxiDbFactory` over the TCP wire client. Named `@parameters` are
+  rewritten to positional placeholders; column CLR types come from the
+  wire's `types` metadata (INT→long, TIMESTAMP→DateTime, ...);
+  `DbTransaction` rides the interactive session transactions from Phase B,
+  including `Save`/`Rollback(name)`/`Release` savepoints. Connection
+  string: `Host=...;Port=...;Database=...` (database via session
+  `use_db`). **Dapper runs end-to-end** — typed queries, named params,
+  multi-command transactions (`tests/adonet-dapper-test/`).
+
 ### SQL engine: interactive transactions + savepoints (ADR-0013 Phase B)
 
 - `BEGIN` now opens a transaction that spans requests on the same

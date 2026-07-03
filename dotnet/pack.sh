@@ -125,6 +125,9 @@ dotnet_pack() {
     dotnet pack "$SCRIPT_DIR/OxiDb.Linq/OxiDb.Linq.csproj" \
         -c "$CONFIGURATION" -o "$ARTIFACTS_DIR" --no-restore
 
+    dotnet pack "$SCRIPT_DIR/OxiDb.Data/OxiDb.Data.csproj" \
+        -c "$CONFIGURATION" -o "$ARTIFACTS_DIR" --no-restore
+
     info "Packages:"
     ls -lh "$ARTIFACTS_DIR"/*.nupkg 2>/dev/null || echo "  (none found)"
     ls -lh "$ARTIFACTS_DIR"/*.snupkg 2>/dev/null || true

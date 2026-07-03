@@ -1,6 +1,6 @@
 # ADR-0013: Full .NET EF Core support for the SQL engine
 
-**Status:** Accepted — 2026-07-03 (Phases A + B shipped; B's cluster support pending)
+**Status:** Accepted — 2026-07-03 (Phases A + B + C shipped; B's cluster support pending)
 **Related:** [ADR-0010](0010-sql-engine-crate.md) (SQL engine),
 [ADR-0012](0012-multi-database.md) (multi-database),
 `dotnet/` (.NET packages; the pre-ADR-0010 EF Core provider was removed in
@@ -48,10 +48,14 @@ Close the gap in five phases, each independently shippable:
   batch-scoped auto-rollback contract. **Cluster**: cross-request
   transactions are rejected (self-contained batches replicate whole);
   replicating buffered commits as one Raft entry is the remaining item.
-- **Phase C — ADO.NET provider** (`OxiDb.Data`): `DbConnection`,
-  `DbCommand` (named `@p` → positional rewrite), `DbDataReader` over the
-  wire result + type metadata, `DbTransaction` over Phase B. Milestone:
-  **Dapper works** — a meaningful ecosystem unlock before EF.
+- **Phase C — ADO.NET provider** (`OxiDb.Data`) *(shipped)*:
+  `DbConnection` (connection string `Host/Port/Database`, database via
+  session `use_db`), `DbCommand` with named-`@p`-to-positional rewrite,
+  `DbDataReader` over the wire result + `types` metadata,
+  `DbTransaction`/savepoints over Phase B, `DbProviderFactory`.
+  Milestone hit: **Dapper runs end-to-end** (typed mapping incl.
+  TIMESTAMP→DateTime, named params, multi-command transactions) —
+  `tests/adonet-dapper-test/`.
 - **Phase D — DDL & types for Migrations**: `ALTER TABLE`
   ADD/DROP/RENAME COLUMN, column `DEFAULT`s, `DECIMAL`, `BLOB`/binary,
   UNIQUE **enforcement** (today parsed and silently ignored — an integrity
