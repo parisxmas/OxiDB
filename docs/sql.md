@@ -54,7 +54,7 @@ The response contains **one result per statement**:
 
 | Statement | Result shape |
 |-----------|--------------|
-| `SELECT` | `{"columns": [...], "rows": [[cell, ...], ...]}` |
+| `SELECT` | `{"columns": [...], "types": [...], "rows": [[cell, ...], ...]}` — `types` holds statically-known column types (`"INT"`/`"DOUBLE"`/`"TEXT"`/`"BOOL"`/`"TIMESTAMP"`, `null` = unknown) |
 | `INSERT` / `UPDATE` / `DELETE` | `{"affected": N}` — INSERTs that assigned AUTO_INCREMENT values add `"last_insert_id"` |
 | `CREATE` / `DROP` (table or index) | `{"ddl": true}` |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | `{"transaction": true}` |
@@ -132,14 +132,27 @@ SELECT * FROM events WHERE ts >= TIMESTAMP '2026-01-01';   -- also 'YYYY-MM-DDTH
 ```
 
 Comparisons use SQL three-valued logic; `NULL` never equals anything
-(`IS NULL` / `IS NOT NULL` test for it). NULL-handling scalar functions:
+(`IS NULL` / `IS NOT NULL` test for it). Scalar functions and operators:
 
 ```sql
 SELECT COALESCE(nickname, name, 'anon') FROM users;   -- first non-NULL (short-circuits)
 SELECT IFNULL(nickname, name) FROM users;             -- two-argument spelling
 SELECT total / NULLIF(count, 0) FROM stats;           -- NULL when equal (÷0 guard)
 SELECT grp, COALESCE(SUM(amt), 0) FROM k LEFT JOIN v ... GROUP BY grp;
+
+SELECT CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END FROM exams;
+SELECT CASE status WHEN 1 THEN 'open' WHEN 2 THEN 'closed' END FROM tickets;  -- simple form
+SELECT * FROM users WHERE name LIKE 'a%';             -- %, _, [NOT] LIKE, ESCAPE 'c'
+SELECT CAST(id AS TEXT), CAST('42' AS INT) FROM t;    -- NULL passes; bad parses error
+SELECT UPPER(s), LOWER(s), LENGTH(s), SUBSTRING(s, 1, 3), TRIM(s), LTRIM(s), RTRIM(s),
+       REPLACE(s, 'a', 'o'), CONCAT(a, '-', b), a || b, ABS(n) FROM t;
+SELECT DISTINCT city FROM users;                      -- dedup after ORDER BY, before LIMIT
+SELECT name FROM p WHERE EXISTS (SELECT 1 FROM orders o WHERE o.p_id = p.id);
 ```
+
+String functions are character-based and NULL-propagating (`CONCAT`/`||`
+return NULL if any input is NULL); `LIKE` is case-sensitive. `EXISTS`
+supports correlation; aggregated EXISTS bodies are rejected.
 
 ## DDL
 

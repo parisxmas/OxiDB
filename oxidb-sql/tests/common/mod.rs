@@ -62,7 +62,7 @@ pub fn first_select(results: Vec<QueryResult>) -> Vec<Vec<Value>> {
 
 fn unwrap_select(mut results: Vec<QueryResult>) -> (Vec<String>, Vec<Vec<Value>>) {
     match results.pop().unwrap() {
-        QueryResult::Select { columns, rows } => (columns, rows),
+        QueryResult::Select { columns, rows, .. } => (columns, rows),
         other => panic!("expected Select, got {other:?}"),
     }
 }

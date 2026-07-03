@@ -5,7 +5,7 @@
 //! executor-friendly types so the executor never depends on `sqlparser` shapes.
 
 use crate::catalog::Table;
-use crate::types::Value;
+use crate::types::{SqlType, Value};
 
 /// A single executable statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +108,9 @@ pub enum QueryBody {
 /// A SELECT, possibly with inner joins and aggregation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStmt {
+    /// `SELECT DISTINCT`: deduplicate output rows (after projection and
+    /// ordering, before LIMIT/OFFSET).
+    pub distinct: bool,
     pub from: TableRef,
     pub joins: Vec<Join>,
     pub projection: Vec<SelectItem>,
@@ -247,13 +250,41 @@ pub enum Expr {
     },
 }
 
-/// A row-scalar function.
+/// A row-scalar function. All of these ride the single [`Expr::Func`] node,
+/// so adding one changes no expression traversals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunc {
     /// First non-NULL argument (also spelled `IFNULL` with two arguments).
     Coalesce,
     /// NULL when the two arguments are equal, else the first.
     NullIf,
+    Upper,
+    Lower,
+    /// Character length of a string.
+    Length,
+    /// `SUBSTRING(s, start [, len])` — 1-based, character-based.
+    Substring,
+    /// Variadic string concatenation (NULL-propagating, like `||`).
+    Concat,
+    Trim,
+    Ltrim,
+    Rtrim,
+    /// `REPLACE(s, from, to)`.
+    Replace,
+    Abs,
+    /// `CAST(expr AS type)`.
+    Cast(SqlType),
+    /// `expr [NOT] LIKE pattern [ESCAPE c]` — args: `[expr, pattern]`.
+    Like {
+        negated: bool,
+        escape: Option<char>,
+    },
+    /// `CASE WHEN c THEN v ... [ELSE e] END` — args: `[c1, v1, c2, v2, ...]`
+    /// with the ELSE expression last when `has_else`. Lazily evaluated, so
+    /// branches short-circuit.
+    Case {
+        has_else: bool,
+    },
 }
 
 /// The function of a window expression.
@@ -290,6 +321,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// `||` — string concatenation (NULL-propagating).
+    Concat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,9 +334,11 @@ pub enum UnOp {
 /// The result of executing one statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
-    /// A SELECT result set.
+    /// A SELECT result set. `types` carries the statically-known column
+    /// types (`None` = unknown), aligned with `columns`.
     Select {
         columns: Vec<String>,
+        types: Vec<Option<SqlType>>,
         rows: Vec<Vec<Value>>,
     },
     /// An INSERT/UPDATE/DELETE, with the number of rows affected. For an

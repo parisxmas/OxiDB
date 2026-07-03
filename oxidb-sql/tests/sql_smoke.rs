@@ -15,7 +15,7 @@ fn select(db: &SqlEngine, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
     let mut results = db.execute(sql).unwrap();
     assert_eq!(results.len(), 1, "expected exactly one statement");
     match results.pop().unwrap() {
-        QueryResult::Select { columns, rows } => (columns, rows),
+        QueryResult::Select { columns, rows, .. } => (columns, rows),
         other => panic!("expected Select, got {other:?}"),
     }
 }

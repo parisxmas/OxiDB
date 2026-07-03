@@ -20,13 +20,16 @@ use crate::ast::{
 };
 use crate::error::{Result, SqlError};
 use crate::store::{Chunk, Store};
-use crate::types::{IndexKey, Value};
+use crate::types::{IndexKey, SqlType, Value};
 
 /// A column in a working row set, qualified by its (aliased) table name.
 #[derive(Debug, Clone)]
 struct ColRef {
     table: String,
     name: String,
+    /// The column's declared type when known (table columns); `None` for
+    /// view outputs and other untyped sources.
+    ty: Option<SqlType>,
 }
 
 /// Execute one data/DDL statement. (Transaction control is handled by the
@@ -123,6 +126,7 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
     match kind {
         ShowKind::Tables => Ok(QueryResult::Select {
             columns: vec!["table".into(), "rows".into()],
+            types: vec![Some(SqlType::Text), Some(SqlType::Int)],
             rows: store
                 .list_tables()
                 .into_iter()
@@ -136,6 +140,7 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
         }),
         ShowKind::Views => Ok(QueryResult::Select {
             columns: vec!["view".into(), "definition".into()],
+            types: vec![Some(SqlType::Text), Some(SqlType::Text)],
             rows: store
                 .list_views()
                 .into_iter()
@@ -150,6 +155,7 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
             }
             Ok(QueryResult::Select {
                 columns: vec!["index".into(), "table".into(), "columns".into()],
+                types: vec![Some(SqlType::Text); 3],
                 rows: store
                     .list_indexes()
                     .into_iter()
@@ -169,6 +175,13 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
                     "nullable".into(),
                     "primary_key".into(),
                     "auto_increment".into(),
+                ],
+                types: vec![
+                    Some(SqlType::Text),
+                    Some(SqlType::Text),
+                    Some(SqlType::Bool),
+                    Some(SqlType::Bool),
+                    Some(SqlType::Bool),
                 ],
                 rows: def
                     .columns
@@ -540,7 +553,12 @@ fn exec_query<S: Store>(store: &S, query: SelectQuery, params: &[Value]) -> Resu
                 .skip(query.offset.unwrap_or(0))
                 .take(query.limit.unwrap_or(usize::MAX))
                 .collect();
-            Ok(QueryResult::Select { columns, rows })
+            let types = vec![None; columns.len()];
+            Ok(QueryResult::Select {
+                columns,
+                types,
+                rows,
+            })
         }
     }
 }
@@ -571,7 +589,7 @@ fn exec_body<S: Store>(
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
     match body {
         QueryBody::Select(s) => match exec_select(store, *s, params)? {
-            QueryResult::Select { columns, rows } => Ok((columns, rows)),
+            QueryResult::Select { columns, rows, .. } => Ok((columns, rows)),
             _ => unreachable!("SELECT produced a non-select result"),
         },
         QueryBody::SetOp { all, left, right } => {
@@ -1018,7 +1036,7 @@ fn run_query_rows<S: Store>(
     params: &[Value],
 ) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
     match exec_query(store, q, params)? {
-        QueryResult::Select { columns, rows } => Ok((columns, rows)),
+        QueryResult::Select { columns, rows, .. } => Ok((columns, rows)),
         _ => unreachable!("subquery produced a non-select result"),
     }
 }
@@ -1459,6 +1477,10 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
         || proj_unbound.iter().any(|(_, e)| has_aggregate(e))
         || select.having.as_ref().is_some_and(has_aggregate);
     let columns: Vec<String> = proj_unbound.iter().map(|(n, _)| n.clone()).collect();
+    let types: Vec<Option<SqlType>> = proj_unbound
+        .iter()
+        .map(|(_, e)| expr_type(e, &schema))
+        .collect();
 
     // 3. Bind every expression's columns to positional indices. This both
     //    validates columns (unknown/ambiguous -> error, even over empty rows)
@@ -1535,6 +1557,17 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
         select_simple(store, &schema, &src, &tuples, &select, &proj, params)?
     };
 
+    // DISTINCT: dedup after projection + ordering, before OFFSET/LIMIT.
+    let out_rows = if select.distinct {
+        let mut seen: std::collections::BTreeSet<Vec<IndexKey>> = std::collections::BTreeSet::new();
+        out_rows
+            .into_iter()
+            .filter(|row| seen.insert(row.iter().cloned().map(IndexKey).collect()))
+            .collect()
+    } else {
+        out_rows
+    };
+
     // OFFSET / LIMIT.
     let out_rows: Vec<Vec<Value>> = out_rows
         .into_iter()
@@ -1544,6 +1577,7 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
 
     Ok(QueryResult::Select {
         columns,
+        types,
         rows: out_rows,
     })
 }
@@ -1659,15 +1693,21 @@ fn view_source<S: Store>(
             )));
         }
     };
-    let (columns, rows) = match execute(store, stmt, &[])? {
-        QueryResult::Select { columns, rows } => (columns, rows),
+    let (columns, types, rows) = match execute(store, stmt, &[])? {
+        QueryResult::Select {
+            columns,
+            types,
+            rows,
+        } => (columns, types, rows),
         _ => unreachable!("view body produced a non-select result"),
     };
     let full: Vec<ColRef> = columns
         .iter()
-        .map(|c| ColRef {
+        .zip(&types)
+        .map(|(c, ty)| ColRef {
             table: r.key().to_string(),
             name: c.clone(),
+            ty: *ty,
         })
         .collect();
     let keep = keep_indices(&full, r.key(), needed);
@@ -2782,6 +2822,90 @@ fn expand_projection(items: &[SelectItem], schema: &[ColRef]) -> Result<Vec<(Str
     Ok(out)
 }
 
+/// Best-effort static type of a projection expression (`None` = unknown).
+/// Used only for result metadata — never for evaluation.
+fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
+    match e {
+        Expr::Column { table, name } => {
+            let i = resolve_col(schema, table, name).ok()?;
+            schema.get(i)?.ty
+        }
+        Expr::Col(i) => schema.get(*i)?.ty,
+        Expr::Literal(v) => match v {
+            Value::Int(_) => Some(SqlType::Int),
+            Value::Double(_) => Some(SqlType::Double),
+            Value::Text(_) => Some(SqlType::Text),
+            Value::Bool(_) => Some(SqlType::Bool),
+            Value::Timestamp(_) => Some(SqlType::Timestamp),
+            Value::Null => None,
+        },
+        Expr::Binary { op, left, right } => match op {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or => Some(SqlType::Bool),
+            BinOp::Concat => Some(SqlType::Text),
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                match (expr_type(left, schema), expr_type(right, schema)) {
+                    (Some(SqlType::Double), _) | (_, Some(SqlType::Double)) => {
+                        Some(SqlType::Double)
+                    }
+                    (Some(SqlType::Int), Some(SqlType::Int)) => Some(SqlType::Int),
+                    _ => None,
+                }
+            }
+        },
+        Expr::Unary { op, expr } => match op {
+            UnOp::Not => Some(SqlType::Bool),
+            UnOp::Neg => expr_type(expr, schema),
+        },
+        Expr::IsNull { .. } | Expr::In { .. } | Expr::InSubquery { .. } | Expr::CorrIn { .. } => {
+            Some(SqlType::Bool)
+        }
+        Expr::Aggregate { func, arg } => match func {
+            AggFunc::Count => Some(SqlType::Int),
+            AggFunc::Avg => Some(SqlType::Double),
+            AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+                arg.as_deref().and_then(|a| expr_type(a, schema))
+            }
+        },
+        Expr::Window { func, .. } => match func {
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => Some(SqlType::Int),
+            WindowFunc::Agg(AggFunc::Count, _) => Some(SqlType::Int),
+            WindowFunc::Agg(AggFunc::Avg, _) => Some(SqlType::Double),
+            WindowFunc::Agg(_, arg) => arg.as_deref().and_then(|a| expr_type(a, schema)),
+        },
+        Expr::Func { func, args } => match func {
+            ScalarFunc::Upper
+            | ScalarFunc::Lower
+            | ScalarFunc::Substring
+            | ScalarFunc::Concat
+            | ScalarFunc::Trim
+            | ScalarFunc::Ltrim
+            | ScalarFunc::Rtrim
+            | ScalarFunc::Replace => Some(SqlType::Text),
+            ScalarFunc::Length => Some(SqlType::Int),
+            ScalarFunc::Like { .. } => Some(SqlType::Bool),
+            ScalarFunc::Cast(t) => Some(*t),
+            ScalarFunc::Abs | ScalarFunc::NullIf => args.first().and_then(|a| expr_type(a, schema)),
+            ScalarFunc::Coalesce => args.iter().find_map(|a| expr_type(a, schema)),
+            ScalarFunc::Case { has_else } => {
+                // Value slots are the odd positions (+ trailing ELSE).
+                let mut it: Vec<&Expr> = args.iter().skip(1).step_by(2).collect();
+                if *has_else {
+                    it.push(args.last().unwrap());
+                }
+                it.into_iter().find_map(|a| expr_type(a, schema))
+            }
+        },
+        Expr::Param(_) | Expr::Subquery(_) | Expr::CorrScalar { .. } => None,
+    }
+}
+
 fn default_name(expr: &Expr) -> String {
     fn agg_name(func: &AggFunc) -> &'static str {
         match func {
@@ -2798,6 +2922,19 @@ fn default_name(expr: &Expr) -> String {
         Expr::Func { func, .. } => match func {
             ScalarFunc::Coalesce => "coalesce".to_string(),
             ScalarFunc::NullIf => "nullif".to_string(),
+            ScalarFunc::Upper => "upper".to_string(),
+            ScalarFunc::Lower => "lower".to_string(),
+            ScalarFunc::Length => "length".to_string(),
+            ScalarFunc::Substring => "substring".to_string(),
+            ScalarFunc::Concat => "concat".to_string(),
+            ScalarFunc::Trim => "trim".to_string(),
+            ScalarFunc::Ltrim => "ltrim".to_string(),
+            ScalarFunc::Rtrim => "rtrim".to_string(),
+            ScalarFunc::Replace => "replace".to_string(),
+            ScalarFunc::Abs => "abs".to_string(),
+            ScalarFunc::Cast(_) => "cast".to_string(),
+            ScalarFunc::Like { .. } => "like".to_string(),
+            ScalarFunc::Case { .. } => "case".to_string(),
         },
         Expr::Window { func, .. } => match func {
             WindowFunc::RowNumber => "row_number".to_string(),
@@ -2835,6 +2972,7 @@ fn qualified_schema(table_key: &str, def: &crate::catalog::Table) -> Vec<ColRef>
         .map(|c| ColRef {
             table: table_key.to_string(),
             name: c.name.clone(),
+            ty: Some(c.ty),
         })
         .collect()
 }
@@ -2925,11 +3063,23 @@ fn eval_scalar<R: RowLike + ?Sized>(
 }
 
 /// Evaluate a row-scalar function over lazily-evaluated arguments.
-/// COALESCE short-circuits at the first non-NULL argument.
+/// COALESCE and CASE short-circuit.
 fn eval_scalar_func<F>(func: ScalarFunc, args: &[Expr], mut eval: F) -> Result<Value>
 where
     F: FnMut(&Expr) -> Result<Value>,
 {
+    // NULL-propagating string extraction.
+    fn as_text(v: Value, what: &str) -> Result<Option<String>> {
+        match v {
+            Value::Null => Ok(None),
+            Value::Text(s) => Ok(Some(s)),
+            Value::Int(n) => Ok(Some(n.to_string())),
+            Value::Double(f) => Ok(Some(f.to_string())),
+            Value::Bool(b) => Ok(Some(b.to_string())),
+            other => Err(SqlError::Eval(format!("{what} of {other:?}"))),
+        }
+    }
+
     match func {
         ScalarFunc::Coalesce => {
             for a in args {
@@ -2949,7 +3099,181 @@ where
                 Ok(a)
             }
         }
+        ScalarFunc::Case { has_else } => {
+            let pairs = if has_else { args.len() - 1 } else { args.len() } / 2;
+            for k in 0..pairs {
+                if truthy(&eval(&args[k * 2])?) {
+                    return eval(&args[k * 2 + 1]);
+                }
+            }
+            if has_else {
+                eval(&args[args.len() - 1])
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        ScalarFunc::Upper => Ok(match as_text(eval(&args[0])?, "UPPER")? {
+            Some(s) => Value::Text(s.to_uppercase()),
+            None => Value::Null,
+        }),
+        ScalarFunc::Lower => Ok(match as_text(eval(&args[0])?, "LOWER")? {
+            Some(s) => Value::Text(s.to_lowercase()),
+            None => Value::Null,
+        }),
+        ScalarFunc::Length => Ok(match as_text(eval(&args[0])?, "LENGTH")? {
+            Some(s) => Value::Int(s.chars().count() as i64),
+            None => Value::Null,
+        }),
+        ScalarFunc::Trim | ScalarFunc::Ltrim | ScalarFunc::Rtrim => {
+            Ok(match as_text(eval(&args[0])?, "TRIM")? {
+                Some(s) => Value::Text(match func {
+                    ScalarFunc::Ltrim => s.trim_start().to_string(),
+                    ScalarFunc::Rtrim => s.trim_end().to_string(),
+                    _ => s.trim().to_string(),
+                }),
+                None => Value::Null,
+            })
+        }
+        ScalarFunc::Concat => {
+            let mut out = String::new();
+            for a in args {
+                match as_text(eval(a)?, "CONCAT")? {
+                    Some(s) => out.push_str(&s),
+                    None => return Ok(Value::Null),
+                }
+            }
+            Ok(Value::Text(out))
+        }
+        ScalarFunc::Replace => {
+            let (s, from, to) = (
+                as_text(eval(&args[0])?, "REPLACE")?,
+                as_text(eval(&args[1])?, "REPLACE")?,
+                as_text(eval(&args[2])?, "REPLACE")?,
+            );
+            Ok(match (s, from, to) {
+                (Some(s), Some(f), Some(t)) if !f.is_empty() => Value::Text(s.replace(&f, &t)),
+                (Some(s), Some(_), Some(_)) => Value::Text(s),
+                _ => Value::Null,
+            })
+        }
+        ScalarFunc::Substring => {
+            let Some(s) = as_text(eval(&args[0])?, "SUBSTRING")? else {
+                return Ok(Value::Null);
+            };
+            let start = match eval(&args[1])? {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => n,
+                other => return Err(SqlError::Eval(format!("SUBSTRING start {other:?}"))),
+            };
+            let len = match args.get(2) {
+                None => None,
+                Some(e) => match eval(e)? {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Int(n) if n >= 0 => Some(n as usize),
+                    Value::Int(_) => {
+                        return Err(SqlError::Eval("SUBSTRING with negative length".into()));
+                    }
+                    other => return Err(SqlError::Eval(format!("SUBSTRING length {other:?}"))),
+                },
+            };
+            // 1-based, character-based; out-of-range clamps to empty.
+            let skip = (start.max(1) - 1) as usize;
+            let it = s.chars().skip(skip);
+            let out: String = match len {
+                // A start below 1 consumes length before the string begins.
+                Some(l) => {
+                    let consumed = (1 - start.min(1)) as usize;
+                    it.take(l.saturating_sub(consumed)).collect()
+                }
+                None => it.collect(),
+            };
+            Ok(Value::Text(out))
+        }
+        ScalarFunc::Abs => Ok(match eval(&args[0])? {
+            Value::Null => Value::Null,
+            Value::Int(n) => Value::Int(n.abs()),
+            Value::Double(f) => Value::Double(f.abs()),
+            other => return Err(SqlError::Eval(format!("ABS of {other:?}"))),
+        }),
+        ScalarFunc::Cast(ty) => cast_value(eval(&args[0])?, ty),
+        ScalarFunc::Like { negated, escape } => {
+            let s = eval(&args[0])?;
+            let pat = eval(&args[1])?;
+            match (s, pat) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(s), Value::Text(p)) => {
+                    Ok(Value::Bool(like_match(&s, &p, escape) != negated))
+                }
+                (a, b) => Err(SqlError::Eval(format!("LIKE on {a:?} / {b:?}"))),
+            }
+        }
     }
+}
+
+/// `CAST(v AS ty)` — NULL passes through; failed text parses are errors.
+fn cast_value(v: Value, ty: SqlType) -> Result<Value> {
+    use SqlType as T;
+    let fail = |v: &Value| SqlError::Eval(format!("cannot cast {v:?} to {ty:?}"));
+    Ok(match (v, ty) {
+        (Value::Null, _) => Value::Null,
+        (v @ Value::Int(_), T::Int)
+        | (v @ Value::Double(_), T::Double)
+        | (v @ Value::Text(_), T::Text)
+        | (v @ Value::Bool(_), T::Bool)
+        | (v @ Value::Timestamp(_), T::Timestamp) => v,
+        (Value::Int(n), T::Double) => Value::Double(n as f64),
+        (Value::Int(n), T::Bool) => Value::Bool(n != 0),
+        (Value::Int(n), T::Timestamp) => Value::Timestamp(n),
+        (Value::Double(f), T::Int) => Value::Int(f.trunc() as i64),
+        (Value::Bool(b), T::Int) => Value::Int(b as i64),
+        (Value::Timestamp(t), T::Int) => Value::Int(t),
+        (Value::Int(n), T::Text) => Value::Text(n.to_string()),
+        (Value::Double(f), T::Text) => Value::Text(f.to_string()),
+        (Value::Bool(b), T::Text) => Value::Text(b.to_string()),
+        (Value::Timestamp(t), T::Text) => Value::Text(t.to_string()),
+        (Value::Text(s), T::Int) => Value::Int(
+            s.trim()
+                .parse()
+                .map_err(|_| fail(&Value::Text(s.clone())))?,
+        ),
+        (Value::Text(s), T::Double) => Value::Double(
+            s.trim()
+                .parse()
+                .map_err(|_| fail(&Value::Text(s.clone())))?,
+        ),
+        (Value::Text(s), T::Bool) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "t" | "1" => Value::Bool(true),
+            "false" | "f" | "0" => Value::Bool(false),
+            _ => return Err(fail(&Value::Text(s))),
+        },
+        (v, _) => return Err(fail(&v)),
+    })
+}
+
+/// SQL LIKE: `%` matches any sequence, `_` any single character; `escape`
+/// makes the following character literal. Case-sensitive, character-based.
+fn like_match(s: &str, pattern: &str, escape: Option<char>) -> bool {
+    fn rec(s: &[char], p: &[char], escape: Option<char>) -> bool {
+        match p.split_first() {
+            None => s.is_empty(),
+            Some((&c, rest)) if Some(c) == escape => match rest.split_first() {
+                Some((&lit, rest2)) => s
+                    .split_first()
+                    .is_some_and(|(&sc, srest)| sc == lit && rec(srest, rest2, escape)),
+                None => s.len() == 1 && s[0] == c, // trailing escape = literal
+            },
+            Some(('%', rest)) => (0..=s.len()).any(|k| rec(&s[k..], rest, escape)),
+            Some(('_', rest)) => s
+                .split_first()
+                .is_some_and(|(_, srest)| rec(srest, rest, escape)),
+            Some((&c, rest)) => s
+                .split_first()
+                .is_some_and(|(&sc, srest)| sc == c && rec(srest, rest, escape)),
+        }
+    }
+    let sc: Vec<char> = s.chars().collect();
+    let pc: Vec<char> = pattern.chars().collect();
+    rec(&sc, &pc, escape)
 }
 
 /// SQL `IN` with three-valued logic: true if any element equals `v`; NULL if
@@ -3312,6 +3636,21 @@ fn apply_unary(op: UnOp, v: Value) -> Result<Value> {
 
 fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
     match op {
+        BinOp::Concat => Ok(match (l, r) {
+            (Value::Null, _) | (_, Value::Null) => Value::Null,
+            (l, r) => {
+                let to_s = |v: Value| -> Result<String> {
+                    Ok(match v {
+                        Value::Text(s) => s,
+                        Value::Int(n) => n.to_string(),
+                        Value::Double(f) => f.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        other => return Err(SqlError::Eval(format!("|| of {other:?}"))),
+                    })
+                };
+                Value::Text(format!("{}{}", to_s(l)?, to_s(r)?))
+            }
+        }),
         BinOp::And => Ok(three_valued(l, r, false)),
         BinOp::Or => Ok(three_valued(l, r, true)),
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {

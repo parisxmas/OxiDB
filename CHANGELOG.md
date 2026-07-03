@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### SQL engine: EF-oriented expression surface (ADR-0013 Phase A)
+
+- `CASE WHEN` (searched + simple form, short-circuiting), `[NOT] LIKE`
+  (`%`/`_`, `ESCAPE`), `CAST`, `SELECT DISTINCT`, `EXISTS`/`NOT EXISTS`
+  (correlated included — rewrites onto the correlated-IN machinery), string
+  scalars `UPPER`/`LOWER`/`LENGTH`/`SUBSTRING`/`CONCAT`/`TRIM`/`LTRIM`/
+  `RTRIM`/`REPLACE`/`ABS` and the `||` operator.
+- SELECT results now carry per-column type metadata: wire shape gains a
+  `"types"` array (`"INT"`... or `null` when unknown) — groundwork for an
+  ADO.NET `DbDataReader`. ADR-0013 documents the full EF Core roadmap
+  (interactive transactions, ADO.NET provider, Migrations DDL, EF provider).
+
 ### SQL engine: COALESCE / IFNULL / NULLIF
 
 - `COALESCE(a, b, ...)` (first non-NULL, short-circuiting), `IFNULL(a, b)`,

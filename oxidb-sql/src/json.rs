@@ -72,12 +72,23 @@ pub fn json_to_value(v: &Json) -> Result<Value, String> {
 /// Convert one statement's result to JSON.
 pub fn result_to_json(r: QueryResult) -> Json {
     match r {
-        QueryResult::Select { columns, rows } => {
+        QueryResult::Select {
+            columns,
+            types,
+            rows,
+        } => {
             let rows: Vec<Json> = rows
                 .into_iter()
                 .map(|row| Json::Array(row.iter().map(value_to_json).collect()))
                 .collect();
-            json!({ "columns": columns, "rows": rows })
+            let types: Vec<Json> = types
+                .iter()
+                .map(|t| match t {
+                    Some(t) => json!(format!("{t:?}").to_uppercase()),
+                    None => Json::Null,
+                })
+                .collect();
+            json!({ "columns": columns, "types": types, "rows": rows })
         }
         QueryResult::Mutation {
             affected,
@@ -147,11 +158,12 @@ mod tests {
         );
         let sel = QueryResult::Select {
             columns: vec!["id".into(), "name".into()],
+            types: vec![Some(crate::SqlType::Int), None],
             rows: vec![vec![Value::Int(1), Value::Text("ada".into())]],
         };
         assert_eq!(
             result_to_json(sel),
-            json!({ "columns": ["id", "name"], "rows": [[1, "ada"]] })
+            json!({ "columns": ["id", "name"], "types": ["INT", null], "rows": [[1, "ada"]] })
         );
     }
 

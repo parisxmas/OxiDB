@@ -658,9 +658,13 @@ fn translate_select_core(select: sp::Select, p: &mut usize) -> Result<SelectStmt
             "SELECT must reference exactly one table in FROM (use JOIN)".into(),
         ));
     }
-    if select.distinct.is_some() {
-        return Err(SqlError::Unsupported("SELECT DISTINCT".into()));
-    }
+    let distinct = match &select.distinct {
+        None => false,
+        Some(sp::Distinct::Distinct) => true,
+        Some(sp::Distinct::On(_)) => {
+            return Err(SqlError::Unsupported("SELECT DISTINCT ON (...)".into()));
+        }
+    };
 
     let from = table_ref_from_factor(&select.from[0].relation)?;
 
@@ -709,6 +713,7 @@ fn translate_select_core(select: sp::Select, p: &mut usize) -> Result<SelectStmt
     let having = select.having.map(|e| translate_expr(e, p)).transpose()?;
 
     Ok(SelectStmt {
+        distinct,
         from,
         joins,
         projection,
@@ -889,6 +894,118 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
                 ))),
             }
         }
+        sp::Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            // Simple form (`CASE x WHEN v ...`) desugars to the searched form
+            // (`CASE WHEN x = v ...`).
+            let operand = operand.map(|o| translate_expr(*o, p)).transpose()?;
+            let mut args = Vec::with_capacity(conditions.len() * 2 + 1);
+            for cw in conditions {
+                let cond = translate_expr(cw.condition, p)?;
+                let cond = match &operand {
+                    Some(op) => Expr::Binary {
+                        op: BinOp::Eq,
+                        left: Box::new(op.clone()),
+                        right: Box::new(cond),
+                    },
+                    None => cond,
+                };
+                args.push(cond);
+                args.push(translate_expr(cw.result, p)?);
+            }
+            let has_else = else_result.is_some();
+            if let Some(e) = else_result {
+                args.push(translate_expr(*e, p)?);
+            }
+            if args.is_empty() {
+                return Err(SqlError::Unsupported("CASE with no WHEN branches".into()));
+            }
+            Ok(Expr::Func {
+                func: ScalarFunc::Case { has_else },
+                args,
+            })
+        }
+        sp::Expr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            any,
+        } => {
+            if any {
+                return Err(SqlError::Unsupported("LIKE ANY".into()));
+            }
+            let escape = match escape_char {
+                None => None,
+                Some(sp::Value::SingleQuotedString(s)) if s.chars().count() == 1 => {
+                    s.chars().next()
+                }
+                Some(other) => {
+                    return Err(SqlError::Unsupported(format!(
+                        "LIKE ESCAPE {other:?} (single character only)"
+                    )));
+                }
+            };
+            Ok(Expr::Func {
+                func: ScalarFunc::Like { negated, escape },
+                args: vec![translate_expr(*expr, p)?, translate_expr(*pattern, p)?],
+            })
+        }
+        sp::Expr::Cast {
+            expr, data_type, ..
+        } => Ok(Expr::Func {
+            func: ScalarFunc::Cast(map_data_type(&data_type)?),
+            args: vec![translate_expr(*expr, p)?],
+        }),
+        sp::Expr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            let mut args = vec![translate_expr(*expr, p)?];
+            let from = substring_from
+                .ok_or_else(|| SqlError::Unsupported("SUBSTRING without a start".into()))?;
+            args.push(translate_expr(*from, p)?);
+            if let Some(f) = substring_for {
+                args.push(translate_expr(*f, p)?);
+            }
+            Ok(Expr::Func {
+                func: ScalarFunc::Substring,
+                args,
+            })
+        }
+        sp::Expr::Trim {
+            expr,
+            trim_where,
+            trim_what,
+            trim_characters,
+        } => {
+            if trim_where.is_some() || trim_what.is_some() || trim_characters.is_some() {
+                return Err(SqlError::Unsupported(
+                    "TRIM with LEADING/TRAILING/characters".into(),
+                ));
+            }
+            Ok(Expr::Func {
+                func: ScalarFunc::Trim,
+                args: vec![translate_expr(*expr, p)?],
+            })
+        }
+        sp::Expr::Exists { subquery, negated } => {
+            // `EXISTS (SELECT ...)` == `1 IN (SELECT 1 ...)` — reuses the
+            // (correlated) IN-subquery machinery wholesale.
+            let mut query = translate_subquery(*subquery, p)?;
+            exists_projection(&mut query.body)?;
+            Ok(Expr::InSubquery {
+                expr: Box::new(Expr::Literal(Value::Int(1))),
+                query: Box::new(query),
+                negated,
+            })
+        }
         other => Err(SqlError::Unsupported(format!("expression {other:?}"))),
     }
 }
@@ -977,6 +1094,30 @@ pub(crate) fn parse_timestamp(s: &str) -> Result<i64> {
     Ok(secs * 1_000 + millis)
 }
 
+/// Rewrite an EXISTS subquery body's projection to the literal `1` (its
+/// output values are irrelevant; only row existence matters). Aggregated
+/// bodies keep their aggregate-driven row count semantics and are rejected.
+fn exists_projection(body: &mut QueryBody) -> Result<()> {
+    match body {
+        QueryBody::Select(sel) => {
+            if !sel.group_by.is_empty() || sel.having.is_some() {
+                return Err(SqlError::Unsupported(
+                    "EXISTS over an aggregated subquery".into(),
+                ));
+            }
+            sel.projection = vec![SelectItem::Expr {
+                expr: Expr::Literal(Value::Int(1)),
+                alias: None,
+            }];
+            Ok(())
+        }
+        QueryBody::SetOp { left, right, .. } => {
+            exists_projection(left)?;
+            exists_projection(right)
+        }
+    }
+}
+
 fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
     let fname = object_name_to_string(&f.name)?.to_ascii_lowercase();
     let args = match f.args {
@@ -995,6 +1136,16 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
     if let Some(func) = match fname.as_str() {
         "coalesce" | "ifnull" => Some(ScalarFunc::Coalesce),
         "nullif" => Some(ScalarFunc::NullIf),
+        "upper" | "ucase" => Some(ScalarFunc::Upper),
+        "lower" | "lcase" => Some(ScalarFunc::Lower),
+        "length" | "char_length" | "character_length" | "len" => Some(ScalarFunc::Length),
+        "substring" | "substr" => Some(ScalarFunc::Substring),
+        "concat" => Some(ScalarFunc::Concat),
+        "trim" => Some(ScalarFunc::Trim),
+        "ltrim" => Some(ScalarFunc::Ltrim),
+        "rtrim" => Some(ScalarFunc::Rtrim),
+        "replace" => Some(ScalarFunc::Replace),
+        "abs" => Some(ScalarFunc::Abs),
         _ => None,
     } {
         if f.over.is_some() {
@@ -1011,8 +1162,20 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             .collect::<Result<_>>()?;
         let ok_arity = match func {
             ScalarFunc::Coalesce if fname == "ifnull" => exprs.len() == 2,
-            ScalarFunc::Coalesce => !exprs.is_empty(),
-            ScalarFunc::NullIf => exprs.len() == 2,
+            ScalarFunc::Coalesce | ScalarFunc::Concat => !exprs.is_empty(),
+            ScalarFunc::NullIf | ScalarFunc::Replace => {
+                exprs.len() == if func == ScalarFunc::Replace { 3 } else { 2 }
+            }
+            ScalarFunc::Upper
+            | ScalarFunc::Lower
+            | ScalarFunc::Length
+            | ScalarFunc::Trim
+            | ScalarFunc::Ltrim
+            | ScalarFunc::Rtrim
+            | ScalarFunc::Abs => exprs.len() == 1,
+            ScalarFunc::Substring => exprs.len() == 2 || exprs.len() == 3,
+            // Cast/Like/Case never arrive through the function-name path.
+            ScalarFunc::Cast(_) | ScalarFunc::Like { .. } | ScalarFunc::Case { .. } => false,
         };
         if !ok_arity {
             return Err(SqlError::Unsupported(format!(
@@ -1110,6 +1273,7 @@ fn map_binary_op(op: &sp::BinaryOperator) -> Result<BinOp> {
         B::Minus => BinOp::Sub,
         B::Multiply => BinOp::Mul,
         B::Divide => BinOp::Div,
+        B::StringConcat => BinOp::Concat,
         other => return Err(SqlError::Unsupported(format!("binary operator {other:?}"))),
     };
     Ok(mapped)

@@ -87,7 +87,7 @@ fn sql_engine_roundtrip_when_enabled() {
     assert_eq!(r["ok"], json!(true), "select failed: {r}");
     assert_eq!(
         r["data"],
-        json!([{ "columns": ["id", "name"], "rows": [[2, "bob"]] }])
+        json!([{ "columns": ["id", "name"], "types": ["INT", "TEXT"], "rows": [[2, "bob"]] }])
     );
 
     // Transaction (multi-statement, atomic)
@@ -101,7 +101,7 @@ fn sql_engine_roundtrip_when_enabled() {
         &db,
         json!({"engine": "sql", "cmd": "sql", "sql": "SELECT id FROM t"}),
     );
-    assert_eq!(r["data"], json!([{ "columns": ["id"], "rows": [[2]] }]));
+    assert_eq!(r["data"], json!([{ "columns": ["id"], "types": ["INT"], "rows": [[2]] }]));
 
     // The `cmd == "sql"` shortcut works without an explicit engine field.
     let r = resp(&db, json!({"cmd": "sql", "sql": "SELECT id FROM t"}));
@@ -177,5 +177,8 @@ fn readonly_flag_restricts_sql_to_selects() {
         json!({"cmd": "sql", "sql": "SELECT COUNT(*) AS n FROM r"}),
         false,
     );
-    assert_eq!(r["data"], json!([{ "columns": ["n"], "rows": [[1]] }]));
+    assert_eq!(
+        r["data"],
+        json!([{ "columns": ["n"], "types": ["INT"], "rows": [[1]] }])
+    );
 }
