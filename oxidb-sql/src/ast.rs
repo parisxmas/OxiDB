@@ -59,10 +59,15 @@ pub enum Statement {
         table: String,
         assignments: Vec<(String, Expr)>,
         filter: Option<Expr>,
+        /// `RETURNING <items>`: project the updated rows back as a result
+        /// set (EF Core emits `RETURNING 1` to count affected rows).
+        returning: Option<Vec<SelectItem>>,
     },
     Delete {
         table: String,
         filter: Option<Expr>,
+        /// `RETURNING <items>`: project the deleted rows back as a result set.
+        returning: Option<Vec<SelectItem>>,
     },
     /// Transaction control. Within one `execute()` call these are
     /// batch-scoped; through `execute_params_in_session` they span calls
@@ -111,8 +116,17 @@ pub struct SelectQuery {
     /// Outer sort keys (set-operation results only): bare output-column names
     /// or 1-based positions.
     pub order_by: Vec<(Expr, bool)>,
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
+    pub limit: Option<LimitExpr>,
+    pub offset: Option<LimitExpr>,
+}
+
+/// A LIMIT/OFFSET operand: a literal count, or a bind parameter (EF Core
+/// parameterizes Skip/Take). Resolved against `params` at execution time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitExpr {
+    Count(usize),
+    /// 0-based parameter slot (`$N` - 1).
+    Param(usize),
 }
 
 /// The body of a query: one SELECT, or a UNION [ALL] of two bodies.
@@ -141,15 +155,18 @@ pub struct SelectStmt {
     pub having: Option<Expr>,
     /// `(expr, ascending)` sort keys, in priority order.
     pub order_by: Vec<(Expr, bool)>,
-    pub limit: Option<usize>,
-    pub offset: Option<usize>,
+    pub limit: Option<LimitExpr>,
+    pub offset: Option<LimitExpr>,
 }
 
-/// A table reference in FROM/JOIN, with optional alias.
+/// A table reference in FROM/JOIN, with optional alias. A derived table
+/// (`FROM (SELECT ...) AS alias`) carries its subquery here; `name` is then
+/// the alias (for error messages) and the catalog is never consulted.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+    pub subquery: Option<Box<SelectQuery>>,
 }
 
 impl TableRef {

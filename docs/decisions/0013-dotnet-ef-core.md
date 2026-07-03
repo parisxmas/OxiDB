@@ -66,11 +66,25 @@ Close the gap in five phases, each independently shippable:
   `UNIQUE` **enforced** (engine + transactions; NULLs exempt), FK syntax
   parsed and ignored (documented), and `INSERT ... RETURNING` (how
   ADO.NET/EF read generated keys).
-- **Phase E — EF Core provider** (`OxiDb.EntityFrameworkCore`):
-  QuerySqlGenerator (LINQ → OxiDB dialect), TypeMappingSource,
-  Migrations/Update SQL generators (keys via `last_insert_id`; batched
-  inserts derive per-row ids from the contiguous block), scaffolding over
-  SHOW/DESCRIBE; validated against EF's relational specification tests.
+- **Phase E — EF Core provider** *(shipped, minimal)*
+  (`OxiDb.EntityFrameworkCore`, EF Core 9 / net10.0): relational service
+  registrations (convention set, type mappings, SQL generation helper),
+  QuerySqlGenerator (engine-form LIMIT/OFFSET), UpdateSqlGenerator (keys
+  read back via `RETURNING`), MigrationsSqlGenerator (`AUTO_INCREMENT` on
+  store-generated integer keys), string method/member translators
+  (Contains/StartsWith/EndsWith → LIKE, Upper/Lower/Trim/Replace/
+  Substring/Length), `EnsureCreated`-based schema creation, and a history
+  repository stub for `Database.Migrate()`. Engine gaps closed for EF's
+  query shapes: derived tables (`FROM (SELECT ...) AS x`), parameterized
+  `LIMIT $1 OFFSET $2`, `UPDATE`/`DELETE ... RETURNING`, table-level
+  `CONSTRAINT ... PRIMARY KEY/UNIQUE`. Verified by a live end-to-end
+  suite (`tests/efcore-oxidb-test/`): EnsureCreated, generated keys,
+  Where/OrderBy/join/GroupBy-Sum/Contains/Skip+Take LINQ, change-tracked
+  UPDATE/DELETE with concurrency checks, explicit transactions +
+  rollback. **Not** validated against EF's relational specification test
+  suites; no design-time scaffolding (`dotnet ef dbcontext scaffold`),
+  no migration-operation coverage beyond CreateTable, no value
+  converters beyond the built-in mappings.
 
 ## Notes / constraints
 

@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### .NET: OxiDb.EntityFrameworkCore — EF Core provider (ADR-0013 Phase E)
+
+- New `OxiDb.EntityFrameworkCore` package (EF Core 9 / net10.0):
+  `UseOxiDb("Host=...;Port=...;Database=...")`. Covers the relational
+  basics end-to-end against a live server: `EnsureCreated` (migrations
+  SQL with table-level `CONSTRAINT ... PRIMARY KEY` and `AUTO_INCREMENT`
+  on store-generated integer keys), LINQ queries (Where/OrderBy/joins/
+  GroupBy aggregates/`Contains`→`LIKE`/Skip/Take), `SaveChanges` with
+  generated keys via `RETURNING`, optimistic-concurrency affected-row
+  checks, and explicit transactions with rollback
+  (`tests/efcore-oxidb-test/`). Minimal provider: no migrations
+  scaffolding, no value converters beyond the built-in type mappings; not
+  validated against the EF Core specification test suites.
+- String translators: `Contains`/`StartsWith`/`EndsWith` (LIKE over
+  CONCAT), `ToUpper`/`ToLower`/`Trim`/`Replace`/`Substring`, and
+  `string.Length` → `LENGTH()`.
+
+### SQL engine: derived tables, parameterized LIMIT/OFFSET, UPDATE/DELETE RETURNING
+
+Engine gaps EF Core's query pipeline hits, useful to every client:
+
+- **Derived tables**: `SELECT ... FROM (SELECT ...) AS x`, in FROM and in
+  JOINs, with bind parameters inside the subquery (inline-view execution,
+  same machinery as views).
+- **Parameterized LIMIT/OFFSET**: `LIMIT $1 OFFSET $2` (EF parameterizes
+  Skip/Take); literal counts unchanged.
+- **`UPDATE ... RETURNING` / `DELETE ... RETURNING`**: project the
+  updated (post-assignment) or deleted rows back as a result set — how EF
+  counts affected rows (`RETURNING 1`); works inside transactions.
+- **Table-level constraints**: `CONSTRAINT name PRIMARY KEY (col)` /
+  `UNIQUE (col)` in `CREATE TABLE` (the shape EF migrations and pg_dump
+  emit); single-column for now.
+
 ### SQL engine: Phase D DDL/types + cluster interactive commits (ADR-0013)
 
 - `ALTER TABLE ADD/DROP/RENAME COLUMN`, column `DEFAULT`s, `DECIMAL`
@@ -35,9 +68,9 @@
   back; it stays bound to the database it began on. Engine API:
   `execute_params_in_session` (the old `execute*` entry points keep their
   batch-scoped auto-rollback contract).
-- Cluster mode rejects cross-request SQL transactions with a clear error
-  (self-contained `BEGIN..COMMIT` batches still replicate whole); lifting
-  this is the remaining Phase B item.
+- Cluster mode initially rejected cross-request SQL transactions
+  (self-contained `BEGIN..COMMIT` batches still replicated whole); the
+  Phase D entry above lifted this via `SqlTxnCommit`.
 
 ### SQL engine: EF-oriented expression surface (ADR-0013 Phase A)
 

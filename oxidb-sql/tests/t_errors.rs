@@ -78,7 +78,9 @@ fn unsupported_select_features() {
     // aggregate DISTINCT still are not.
     assert!(db.execute("SELECT DISTINCT ON (id) id FROM t").is_err());
     assert!(db.execute("SELECT COUNT(DISTINCT id) FROM t").is_err());
-    assert!(db.execute("SELECT * FROM (SELECT id FROM t) x").is_err()); // derived table
+    // Derived tables are supported since ADR-0013 Phase E; an alias is required.
+    assert!(db.execute("SELECT * FROM (SELECT id FROM t) x").is_ok());
+    assert!(db.execute("SELECT * FROM (SELECT id FROM t)").is_err());
     assert!(db.execute("SELECT * FROM t, t t2").is_err()); // comma join
 }
 

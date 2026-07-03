@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>OxiDb.EntityFrameworkCore</RootNamespace>
+
+    <PackageId>OxiDb.EntityFrameworkCore</PackageId>
+    <Description>Entity Framework Core provider for the OxiDB SQL engine.</Description>
+    <IsPackable>true</IsPackable>
+    <NoWarn>$(NoWarn);EF1001</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../OxiDb.Data/OxiDb.Data.csproj" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.8" />
+  </ItemGroup>
+
+</Project>

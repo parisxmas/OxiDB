@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
-    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, QueryResult, ScalarFunc, SelectItem,
-    SelectQuery, SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
+    AggFunc, BinOp, Expr, Join, JoinKind, LimitExpr, QueryBody, QueryResult, ScalarFunc,
+    SelectItem, SelectQuery, SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::error::{Result, SqlError};
 use crate::store::{Chunk, Store};
@@ -115,8 +115,13 @@ pub(crate) fn execute<S: Store>(
             table,
             assignments,
             filter,
-        } => exec_update(store, &table, assignments, filter, params),
-        Statement::Delete { table, filter } => exec_delete(store, &table, filter, params),
+            returning,
+        } => exec_update(store, &table, assignments, filter, returning, params),
+        Statement::Delete {
+            table,
+            filter,
+            returning,
+        } => exec_delete(store, &table, filter, returning, params),
         Statement::Begin
         | Statement::Commit
         | Statement::Rollback
@@ -351,28 +356,7 @@ fn exec_insert<S: Store>(
     // how ADO.NET/EF read generated keys.
     if let Some(items) = returning {
         let schema = table_schema(table, &def);
-        let proj = expand_projection(&items, &schema)?;
-        let columns: Vec<String> = proj.iter().map(|(n, _)| n.clone()).collect();
-        let types: Vec<Option<SqlType>> = proj.iter().map(|(_, e)| expr_type(e, &schema)).collect();
-        let bound: Vec<(String, Expr)> = proj
-            .into_iter()
-            .map(|(n, e)| Ok::<_, SqlError>((n, bind_expr(&e, &schema)?)))
-            .collect::<Result<_>>()?;
-        let mut out = Vec::with_capacity(all_cells.len());
-        for mut cells in all_cells {
-            // Re-apply coercions the store performed (INT->DOUBLE etc.).
-            def.coerce_row(&mut cells);
-            let row: Vec<Value> = bound
-                .iter()
-                .map(|(_, e)| eval_scalar(e, &schema, cells.as_slice(), params))
-                .collect::<Result<_>>()?;
-            out.push(row);
-        }
-        return Ok(QueryResult::Select {
-            columns,
-            types,
-            rows: out,
-        });
+        return returning_result(&items, &def, &schema, all_cells, params);
     }
 
     Ok(QueryResult::Mutation {
@@ -381,11 +365,44 @@ fn exec_insert<S: Store>(
     })
 }
 
+/// Project `RETURNING <items>` over the rows an INSERT/UPDATE/DELETE touched.
+fn returning_result(
+    items: &[SelectItem],
+    def: &crate::catalog::Table,
+    schema: &[ColRef],
+    touched: Vec<Vec<Value>>,
+    params: &[Value],
+) -> Result<QueryResult> {
+    let proj = expand_projection(items, schema)?;
+    let columns: Vec<String> = proj.iter().map(|(n, _)| n.clone()).collect();
+    let types: Vec<Option<SqlType>> = proj.iter().map(|(_, e)| expr_type(e, schema)).collect();
+    let bound: Vec<(String, Expr)> = proj
+        .into_iter()
+        .map(|(n, e)| Ok::<_, SqlError>((n, bind_expr(&e, schema)?)))
+        .collect::<Result<_>>()?;
+    let mut out = Vec::with_capacity(touched.len());
+    for mut cells in touched {
+        // Re-apply coercions the store performed (INT->DOUBLE etc.).
+        def.coerce_row(&mut cells);
+        let row: Vec<Value> = bound
+            .iter()
+            .map(|(_, e)| eval_scalar(e, schema, cells.as_slice(), params))
+            .collect::<Result<_>>()?;
+        out.push(row);
+    }
+    Ok(QueryResult::Select {
+        columns,
+        types,
+        rows: out,
+    })
+}
+
 fn exec_update<S: Store>(
     store: &S,
     table: &str,
     assignments: Vec<(String, Expr)>,
     filter: Option<Expr>,
+    returning: Option<Vec<SelectItem>>,
     params: &[Value],
 ) -> Result<QueryResult> {
     let def = store
@@ -407,6 +424,7 @@ fn exec_update<S: Store>(
     let filter_corr = filter.as_ref().is_some_and(has_corr);
     let targets_corr = targets.iter().any(|(_, e)| has_corr(e));
     let mut affected = 0;
+    let mut touched: Vec<Vec<Value>> = Vec::new();
     for (row_id, cells) in store.scan(table)? {
         if let Some(pred) = &filter
             && !truthy(&eval_scalar_corr(
@@ -425,8 +443,14 @@ fn exec_update<S: Store>(
             new_cells[*idx] =
                 eval_scalar_corr(store, targets_corr, expr, &schema, cells.as_slice(), params)?;
         }
+        if returning.is_some() {
+            touched.push(new_cells.clone());
+        }
         store.update_row(table, row_id, new_cells)?;
         affected += 1;
+    }
+    if let Some(items) = returning {
+        return returning_result(&items, &def, &schema, touched, params);
     }
     Ok(QueryResult::Mutation {
         affected,
@@ -438,6 +462,7 @@ fn exec_delete<S: Store>(
     store: &S,
     table: &str,
     filter: Option<Expr>,
+    returning: Option<Vec<SelectItem>>,
     params: &[Value],
 ) -> Result<QueryResult> {
     let def = store
@@ -460,14 +485,21 @@ fn exec_delete<S: Store>(
             None => true,
         };
         if matches {
-            to_delete.push(row_id);
+            to_delete.push((row_id, cells));
         }
     }
     let mut affected = 0;
-    for row_id in to_delete {
+    let mut touched: Vec<Vec<Value>> = Vec::new();
+    for (row_id, cells) in to_delete {
         if store.delete(table, row_id)? {
             affected += 1;
+            if returning.is_some() {
+                touched.push(cells);
+            }
         }
+    }
+    if let Some(items) = returning {
+        return returning_result(&items, &def, &schema, touched, params);
     }
     Ok(QueryResult::Mutation {
         affected,
@@ -565,6 +597,25 @@ impl RowLike for View<'_> {
     }
 }
 
+/// Resolve a LIMIT/OFFSET operand to a count: literal, or a bound parameter
+/// that must be a non-negative integer.
+fn resolve_limit(l: Option<LimitExpr>, params: &[Value], what: &str) -> Result<Option<usize>> {
+    match l {
+        None => Ok(None),
+        Some(LimitExpr::Count(n)) => Ok(Some(n)),
+        Some(LimitExpr::Param(i)) => match params.get(i) {
+            Some(Value::Int(n)) if *n >= 0 => Ok(Some(*n as usize)),
+            Some(other) => Err(SqlError::Eval(format!(
+                "{what} parameter must be a non-negative integer, got {other:?}"
+            ))),
+            None => Err(SqlError::Eval(format!(
+                "{what} parameter ${} not bound",
+                i + 1
+            ))),
+        },
+    }
+}
+
 /// Execute a full query: the single-select fast path, or a set-operation tree
 /// with outer ORDER BY / LIMIT / OFFSET applied to the combined result.
 fn exec_query<S: Store>(store: &S, query: SelectQuery, params: &[Value]) -> Result<QueryResult> {
@@ -595,8 +646,8 @@ fn exec_query<S: Store>(store: &S, query: SelectQuery, params: &[Value]) -> Resu
             }
             let rows: Vec<Vec<Value>> = rows
                 .into_iter()
-                .skip(query.offset.unwrap_or(0))
-                .take(query.limit.unwrap_or(usize::MAX))
+                .skip(resolve_limit(query.offset, params, "OFFSET")?.unwrap_or(0))
+                .take(resolve_limit(query.limit, params, "LIMIT")?.unwrap_or(usize::MAX))
                 .collect();
             let types = vec![None; columns.len()];
             Ok(QueryResult::Select {
@@ -739,6 +790,7 @@ fn resolve_subqueries_stmt<S: Store>(
             table,
             assignments,
             filter,
+            ..
         } => {
             let scope = scope_of_table(store, table);
             for (_, e) in assignments {
@@ -749,7 +801,7 @@ fn resolve_subqueries_stmt<S: Store>(
             }
             Ok(())
         }
-        Statement::Delete { table, filter } => {
+        Statement::Delete { table, filter, .. } => {
             let scope = scope_of_table(store, table);
             if let Some(f) = filter {
                 resolve_expr(store, f, params, Some(&scope), floor)?;
@@ -1616,8 +1668,8 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
     // OFFSET / LIMIT.
     let out_rows: Vec<Vec<Value>> = out_rows
         .into_iter()
-        .skip(select.offset.unwrap_or(0))
-        .take(select.limit.unwrap_or(usize::MAX))
+        .skip(resolve_limit(select.offset, params, "OFFSET")?.unwrap_or(0))
+        .take(resolve_limit(select.limit, params, "LIMIT")?.unwrap_or(usize::MAX))
         .collect();
 
     Ok(QueryResult::Select {
@@ -1697,6 +1749,39 @@ fn keep_indices(full: &[ColRef], key: &str, needed: &Needed) -> Vec<usize> {
 }
 
 /// Execute a view's stored SELECT and materialize it as a pruned source.
+/// Materialize a derived table (`FROM (SELECT ...) AS alias`): run the
+/// subquery with the outer statement's params and package the result like a
+/// base-table chunk, columns qualified by the alias.
+fn derived_source<S: Store>(
+    store: &S,
+    r: &TableRef,
+    sub: &SelectQuery,
+    needed: &Needed,
+    params: &[Value],
+) -> Result<(Vec<ColRef>, Chunk)> {
+    let (columns, types, rows) = match execute(store, Statement::Select(sub.clone()), params)? {
+        QueryResult::Select {
+            columns,
+            types,
+            rows,
+        } => (columns, types, rows),
+        _ => unreachable!("subquery produced a non-select result"),
+    };
+    let full: Vec<ColRef> = columns
+        .iter()
+        .zip(&types)
+        .map(|(c, ty)| ColRef {
+            table: r.key().to_string(),
+            name: c.clone(),
+            ty: *ty,
+        })
+        .collect();
+    let keep = keep_indices(&full, r.key(), needed);
+    let schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
+    let chunk = Chunk::from_rows(rows, &keep);
+    Ok((schema, chunk))
+}
+
 /// `Ok(None)` when no view with this name exists.
 fn view_source<S: Store>(
     store: &S,
@@ -1888,22 +1973,26 @@ fn build_source<S: Store>(
     params: &[Value],
 ) -> Result<(Vec<ColRef>, Sources, Tuples)> {
     let needed = collect_needed(select);
-    let (mut schema, chunk) = match store.table_def(&select.from.name) {
-        Some(base_def) => {
-            let full = qualified_schema(select.from.key(), &base_def);
-            let keep = keep_indices(&full, select.from.key(), &needed);
-            let schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
-            // Base rows: use an index when there are no joins and WHERE has a
-            // usable equality on an indexed column; otherwise full scan.
-            let chunk = if select.joins.is_empty() {
-                base_chunk(store, &select.from, &select.filter, params, &keep)?
-            } else {
-                store.scan_pruned(&select.from.name, &keep)?
-            };
-            (schema, chunk)
+    let (mut schema, chunk) = if let Some(sub) = &select.from.subquery {
+        derived_source(store, &select.from, sub, &needed, params)?
+    } else {
+        match store.table_def(&select.from.name) {
+            Some(base_def) => {
+                let full = qualified_schema(select.from.key(), &base_def);
+                let keep = keep_indices(&full, select.from.key(), &needed);
+                let schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
+                // Base rows: use an index when there are no joins and WHERE has a
+                // usable equality on an indexed column; otherwise full scan.
+                let chunk = if select.joins.is_empty() {
+                    base_chunk(store, &select.from, &select.filter, params, &keep)?
+                } else {
+                    store.scan_pruned(&select.from.name, &keep)?
+                };
+                (schema, chunk)
+            }
+            None => view_source(store, &select.from, &needed)?
+                .ok_or_else(|| SqlError::NoSuchTable(select.from.name.clone()))?,
         }
-        None => view_source(store, &select.from, &needed)?
-            .ok_or_else(|| SqlError::NoSuchTable(select.from.name.clone()))?,
     };
 
     let mut src = Sources::default();
@@ -1944,15 +2033,19 @@ fn join_into<S: Store>(
     params: &[Value],
     needed: &Needed,
 ) -> Result<()> {
-    let (right_schema, chunk) = match store.table_def(&join.table.name) {
-        Some(def) => {
-            let full = qualified_schema(join.table.key(), &def);
-            let keep = keep_indices(&full, join.table.key(), needed);
-            let right_schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
-            (right_schema, store.scan_pruned(&join.table.name, &keep)?)
+    let (right_schema, chunk) = if let Some(sub) = &join.table.subquery {
+        derived_source(store, &join.table, sub, needed, params)?
+    } else {
+        match store.table_def(&join.table.name) {
+            Some(def) => {
+                let full = qualified_schema(join.table.key(), &def);
+                let keep = keep_indices(&full, join.table.key(), needed);
+                let right_schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
+                (right_schema, store.scan_pruned(&join.table.name, &keep)?)
+            }
+            None => view_source(store, &join.table, needed)?
+                .ok_or_else(|| SqlError::NoSuchTable(join.table.name.clone()))?,
         }
-        None => view_source(store, &join.table, needed)?
-            .ok_or_else(|| SqlError::NoSuchTable(join.table.name.clone()))?,
     };
     let nright = chunk.n;
 

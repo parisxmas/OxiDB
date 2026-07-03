@@ -8,8 +8,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    AggFunc, AlterOp, BinOp, Expr, Join, JoinKind, QueryBody, ScalarFunc, SelectItem, SelectQuery,
-    SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
+    AggFunc, AlterOp, BinOp, Expr, Join, JoinKind, LimitExpr, QueryBody, ScalarFunc, SelectItem,
+    SelectQuery, SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::catalog::{Column, Table};
 use crate::error::{Result, SqlError};
@@ -385,6 +385,7 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
             assignments,
             from,
             selection,
+            returning,
             ..
         } => {
             if from.is_some() {
@@ -396,10 +397,12 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
                 .map(|a| translate_assignment(a, p))
                 .collect::<Result<Vec<_>>>()?;
             let filter = selection.map(|e| translate_expr(e, p)).transpose()?;
+            let returning = translate_returning(returning.as_ref(), p)?;
             Ok(Statement::Update {
                 table,
                 assignments,
                 filter,
+                returning,
             })
         }
         sp::Statement::Delete(del) => translate_delete(del, p),
@@ -467,11 +470,21 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
 }
 
 fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
+    let mut pk_col: Option<String> = None;
+    let mut unique_cols: Vec<String> = Vec::new();
     for c in &ct.constraints {
         match c {
             // Accepted and ignored (documented): referential integrity is
             // not enforced in v1, but EF/PG-style DDL must parse.
             sp::TableConstraint::ForeignKey { .. } => {}
+            // Table-level `[CONSTRAINT name] PRIMARY KEY (col)` — the form
+            // EF Core migrations and pg_dump emit. Single column only.
+            sp::TableConstraint::PrimaryKey { columns, .. } => {
+                pk_col = Some(single_index_column(columns, "PRIMARY KEY")?);
+            }
+            sp::TableConstraint::Unique { columns, .. } => {
+                unique_cols.push(single_index_column(columns, "UNIQUE")?);
+            }
             other => {
                 return Err(SqlError::Unsupported(format!("table constraint {other:?}")));
             }
@@ -481,6 +494,23 @@ fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
     let mut columns = Vec::with_capacity(ct.columns.len());
     for col in &ct.columns {
         columns.push(translate_column(col)?);
+    }
+    for (target, is_pk) in pk_col
+        .iter()
+        .map(|c| (c, true))
+        .chain(unique_cols.iter().map(|c| (c, false)))
+    {
+        let col = columns
+            .iter_mut()
+            .find(|c| &c.name == target)
+            .ok_or_else(|| {
+                SqlError::Unsupported(format!("table constraint on unknown column {target}"))
+            })?;
+        if is_pk {
+            col.primary_key = true;
+        } else {
+            col.unique = true;
+        }
     }
     if columns.iter().filter(|c| c.primary_key).count() > 1 {
         return Err(SqlError::Unsupported(
@@ -526,6 +556,21 @@ fn translate_create_index(ci: sp::CreateIndex) -> Result<Statement> {
         columns,
         if_not_exists: ci.if_not_exists,
     })
+}
+
+/// A table-level constraint's single column name (multi-column is v2).
+fn single_index_column(cols: &[sp::IndexColumn], what: &str) -> Result<String> {
+    let [ic] = cols else {
+        return Err(SqlError::Unsupported(format!(
+            "multi-column table-level {what} constraint"
+        )));
+    };
+    match &ic.column.expr {
+        sp::Expr::Identifier(id) => Ok(id.value.clone()),
+        other => Err(SqlError::Unsupported(format!(
+            "table-level {what} constraint on expression {other:?}"
+        ))),
+    }
 }
 
 fn translate_column(col: &sp::ColumnDef) -> Result<Column> {
@@ -619,6 +664,21 @@ fn map_data_type(dt: &sp::DataType) -> Result<SqlType> {
     Ok(ty)
 }
 
+/// Translate a `RETURNING <items>` clause.
+fn translate_returning(
+    items: Option<&Vec<sp::SelectItem>>,
+    p: &mut usize,
+) -> Result<Option<Vec<SelectItem>>> {
+    items
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| translate_select_item(item, p))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()
+}
+
 fn translate_insert(insert: sp::Insert, p: &mut usize) -> Result<Statement> {
     let table = match &insert.table {
         sp::TableObject::TableName(name) => object_name_to_string(name)?,
@@ -629,16 +689,7 @@ fn translate_insert(insert: sp::Insert, p: &mut usize) -> Result<Statement> {
     } else {
         Some(insert.columns.iter().map(|i| i.value.clone()).collect())
     };
-    let returning = insert
-        .returning
-        .as_ref()
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| translate_select_item(item, p))
-                .collect::<Result<Vec<_>>>()
-        })
-        .transpose()?;
+    let returning = translate_returning(insert.returning.as_ref(), p)?;
     let source = insert
         .source
         .ok_or_else(|| SqlError::Unsupported("INSERT without VALUES".into()))?;
@@ -671,7 +722,12 @@ fn translate_delete(del: sp::Delete, p: &mut usize) -> Result<Statement> {
     }
     let table = table_name_from_twj(&twjs[0])?;
     let filter = del.selection.map(|e| translate_expr(e, p)).transpose()?;
-    Ok(Statement::Delete { table, filter })
+    let returning = translate_returning(del.returning.as_ref(), p)?;
+    Ok(Statement::Delete {
+        table,
+        filter,
+        returning,
+    })
 }
 
 /// Translate a full query: a plain SELECT, or a UNION [ALL] tree with outer
@@ -679,7 +735,7 @@ fn translate_delete(del: sp::Delete, p: &mut usize) -> Result<Statement> {
 /// into the [`SelectStmt`] itself (single-select fast path).
 fn translate_query(query: sp::Query, p: &mut usize) -> Result<SelectQuery> {
     let order_by = translate_order_by(query.order_by, p)?;
-    let (limit, offset) = translate_limit(&query.limit_clause)?;
+    let (limit, offset) = translate_limit(&query.limit_clause, p)?;
     match *query.body {
         sp::SetExpr::Select(s) => {
             let mut stmt = translate_select_core(*s, p)?;
@@ -757,12 +813,12 @@ fn translate_select_core(select: sp::Select, p: &mut usize) -> Result<SelectStmt
         }
     };
 
-    let from = table_ref_from_factor(&select.from[0].relation)?;
+    let from = table_ref_from_factor(&select.from[0].relation, p)?;
 
     // JOINs: INNER / LEFT / RIGHT / FULL, all with an ON predicate.
     let mut joins = Vec::new();
     for j in &select.from[0].joins {
-        let table = table_ref_from_factor(&j.relation)?;
+        let table = table_ref_from_factor(&j.relation, p)?;
         let (kind, constraint) = match &j.join_operator {
             sp::JoinOperator::Inner(c) | sp::JoinOperator::Join(c) => (JoinKind::Inner, c),
             sp::JoinOperator::Left(c) | sp::JoinOperator::LeftOuter(c) => (JoinKind::Left, c),
@@ -856,7 +912,10 @@ fn translate_order_by(order_by: Option<sp::OrderBy>, p: &mut usize) -> Result<Ve
 }
 
 /// Translate LIMIT / OFFSET into `(limit, offset)`.
-fn translate_limit(limit: &Option<sp::LimitClause>) -> Result<(Option<usize>, Option<usize>)> {
+fn translate_limit(
+    limit: &Option<sp::LimitClause>,
+    p: &mut usize,
+) -> Result<(Option<LimitExpr>, Option<LimitExpr>)> {
     let Some(clause) = limit else {
         return Ok((None, None));
     };
@@ -869,13 +928,10 @@ fn translate_limit(limit: &Option<sp::LimitClause>) -> Result<(Option<usize>, Op
             if !limit_by.is_empty() {
                 return Err(SqlError::Unsupported("LIMIT BY".into()));
             }
-            let limit = limit
-                .as_ref()
-                .map(|e| Ok::<_, SqlError>(expr_to_u64(e)? as usize))
-                .transpose()?;
+            let limit = limit.as_ref().map(|e| limit_operand(e, p)).transpose()?;
             let offset = offset
                 .as_ref()
-                .map(|o| Ok::<_, SqlError>(expr_to_u64(&o.value)? as usize))
+                .map(|o| limit_operand(&o.value, p))
                 .transpose()?;
             Ok((limit, offset))
         }
@@ -883,6 +939,19 @@ fn translate_limit(limit: &Option<sp::LimitClause>) -> Result<(Option<usize>, Op
             Err(SqlError::Unsupported("MySQL LIMIT offset,count".into()))
         }
     }
+}
+
+/// A LIMIT/OFFSET operand: a literal count or a bind placeholder.
+fn limit_operand(e: &sp::Expr, p: &mut usize) -> Result<LimitExpr> {
+    if let sp::Expr::Value(v) = e
+        && matches!(&v.value, sp::Value::Placeholder(_))
+    {
+        return match translate_value(&v.value, p)? {
+            Expr::Param(i) => Ok(LimitExpr::Param(i)),
+            _ => unreachable!("placeholder translated to a non-param"),
+        };
+    }
+    Ok(LimitExpr::Count(expr_to_u64(e)? as usize))
 }
 
 fn translate_assignment(a: sp::Assignment, p: &mut usize) -> Result<(String, Expr)> {
@@ -1445,12 +1514,33 @@ fn single_object_name(names: &[sp::ObjectName]) -> Result<String> {
     object_name_to_string(&names[0])
 }
 
-fn table_ref_from_factor(factor: &sp::TableFactor) -> Result<TableRef> {
+fn table_ref_from_factor(factor: &sp::TableFactor, p: &mut usize) -> Result<TableRef> {
     match factor {
         sp::TableFactor::Table { name, alias, .. } => Ok(TableRef {
             name: object_name_to_string(name)?,
             alias: alias.as_ref().map(|a| a.name.value.clone()),
+            subquery: None,
         }),
+        sp::TableFactor::Derived {
+            lateral,
+            subquery,
+            alias,
+        } => {
+            if *lateral {
+                return Err(SqlError::Unsupported("LATERAL subquery in FROM".into()));
+            }
+            let Some(alias) = alias else {
+                return Err(SqlError::Unsupported(
+                    "derived table without an alias (add `AS name`)".into(),
+                ));
+            };
+            let q = translate_query((**subquery).clone(), p)?;
+            Ok(TableRef {
+                name: alias.name.value.clone(),
+                alias: Some(alias.name.value.clone()),
+                subquery: Some(Box::new(q)),
+            })
+        }
         other => Err(SqlError::Unsupported(format!("table factor {other:?}"))),
     }
 }
@@ -1459,5 +1549,9 @@ fn table_name_from_twj(twj: &sp::TableWithJoins) -> Result<String> {
     if !twj.joins.is_empty() {
         return Err(SqlError::Unsupported("JOIN not allowed here".into()));
     }
-    Ok(table_ref_from_factor(&twj.relation)?.name)
+    let r = table_ref_from_factor(&twj.relation, &mut 0)?;
+    if r.subquery.is_some() {
+        return Err(SqlError::Unsupported("subquery not allowed here".into()));
+    }
+    Ok(r.name)
 }

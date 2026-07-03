@@ -121,6 +121,8 @@ run with `OXIDB_SQL=1`.
 | `TEXT` (`VARCHAR`, `CHAR`, `STRING`, `NVARCHAR`) | UTF-8 string |
 | `BOOL` (`BOOLEAN`) | boolean |
 | `TIMESTAMP` (`DATETIME`) | epoch milliseconds (64-bit integer) |
+| `DECIMAL` (`NUMERIC`) | 64-bit float (precision/scale accepted, ignored) |
+| `BLOB` (`BYTEA`, `BINARY`, `VARBINARY`) | raw bytes (base64 on the JSON wire) |
 
 Integer values implicitly widen into `DOUBLE` columns (`INSERT ... VALUES (5)`
 stores `5.0`) and into `TIMESTAMP` columns (taken as epoch milliseconds).
@@ -160,11 +162,25 @@ supports correlation; aggregated EXISTS bodies are rejected.
 CREATE TABLE users (
   id    INT PRIMARY KEY,      -- NOT NULL + uniqueness enforced on every write
   name  TEXT NOT NULL,
-  age   INT
+  email TEXT UNIQUE,          -- enforced (NULLs exempt, SQL-standard)
+  age   INT DEFAULT 0         -- literal defaults fill omitted INSERT columns
 );
 CREATE TABLE IF NOT EXISTS users (...);
 DROP TABLE users;
 DROP TABLE IF EXISTS users;
+
+-- Table-level single-column constraints (the shape EF Core migrations and
+-- pg_dump emit); FOREIGN KEY clauses parse but are not enforced (documented).
+CREATE TABLE orders (
+  id      INT NOT NULL AUTO_INCREMENT,
+  email   TEXT,
+  CONSTRAINT pk_orders PRIMARY KEY (id),
+  CONSTRAINT uq_email  UNIQUE (email)
+);
+
+ALTER TABLE users ADD COLUMN city TEXT DEFAULT 'n/a';  -- one operation per statement
+ALTER TABLE users DROP COLUMN city;                    -- blocked while an index needs it
+ALTER TABLE users RENAME COLUMN name TO full_name;
 
 CREATE INDEX idx_users_age ON users (age);           -- single-column index
 CREATE INDEX idx_users_geo ON users (country, city); -- multi-column index
@@ -258,10 +274,17 @@ INSERT INTO users VALUES (1, 'ada', 36);
 INSERT INTO users (id, name) VALUES (2, 'bob'), (3, 'eve');  -- multi-row = one fsync, atomic
 UPDATE users SET age = age + 1 WHERE id = 1;
 DELETE FROM users WHERE age IS NULL;
+
+-- RETURNING projects the touched rows back as a result set (PostgreSQL-style):
+INSERT INTO users (name) VALUES ('ada') RETURNING id;   -- read generated keys
+UPDATE users SET age = age + 1 WHERE id = 1 RETURNING age;  -- post-update values
+DELETE FROM users WHERE age IS NULL RETURNING *;            -- the deleted rows
 ```
 
 A multi-row `INSERT` is durably applied as a single WAL batch: one fsync for
 the whole statement, and all rows are validated before any is applied.
+`RETURNING` works inside transactions and is how ADO.NET/EF Core read
+generated keys and count affected rows.
 
 ## SELECT
 
@@ -274,7 +297,9 @@ ORDER BY age DESC, n ASC LIMIT 10 OFFSET 20;
 - `WHERE` with `AND`/`OR`/`NOT`, comparisons, arithmetic, `IS [NOT] NULL`,
   `[NOT] IN (v1, v2, ...)`
 - `ORDER BY` on columns, expressions, or projection aliases; `ASC`/`DESC`
-- `LIMIT n` / `OFFSET n`
+- `LIMIT n` / `OFFSET n` — literals or bind parameters (`LIMIT $1 OFFSET $2`)
+- Derived tables: `FROM (SELECT ...) AS x`, also as a JOIN side; the alias
+  is required, and the subquery may use bind parameters
 
 ### UNION
 
@@ -403,18 +428,21 @@ open transaction back; a transaction is bound to the database it began on.
 Embedded/one-shot callers using `execute()` keep the old batch-scoped
 contract: an unmatched `BEGIN` at the end of the request is rolled back.
 
-**Cluster mode**: interactive (cross-request) transactions are rejected
-with a clear error — send a self-contained `BEGIN..COMMIT` batch, which is
-replicated whole through Raft.
+**Cluster mode**: interactive transactions work — statements run on the
+leader and a lone `COMMIT` replicates the buffered writes through Raft as
+one atomic entry applied on every node. Self-contained `BEGIN..COMMIT`
+batches also replicate whole. `BEGIN`/`COMMIT` must each be the only
+statement in their request in cluster mode.
 
 ## Limitations
 
-- Derived tables (`FROM (SELECT ...)`), `EXCEPT`, `INTERSECT`, `DISTINCT ON`,
-  aggregate `DISTINCT`, and explicit window frames are not supported
+- `EXCEPT`, `INTERSECT`, `DISTINCT ON`, aggregate `DISTINCT`, and explicit
+  window frames are not supported; `LATERAL` derived tables are not either
+- Table-level `PRIMARY KEY`/`UNIQUE` constraints take a single column
+  (multi-column PKs are not supported)
 - Correlated subqueries reach one level up and are not allowed inside
   aggregated queries or window functions
-- Plain `UNIQUE` column constraints are accepted but not enforced
-  (`PRIMARY KEY` **is** enforced)
+- `FOREIGN KEY` clauses parse but referential integrity is not enforced
 - Transactions are single-writer and their reads are not index-accelerated;
   `CREATE/DROP VIEW` are not allowed inside a transaction
 - No cross-engine transactions (document + SQL) — see ADR-0011 for the
