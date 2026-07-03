@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### SQL engine: Phase D DDL/types + cluster interactive commits (ADR-0013)
+
+- `ALTER TABLE ADD/DROP/RENAME COLUMN`, column `DEFAULT`s, `DECIMAL`
+  (stored as DOUBLE), a real `BLOB` type (base64 on the JSON wire),
+  column-level `UNIQUE` now **enforced** (was silently ignored), FK syntax
+  tolerated, and `INSERT ... RETURNING`.
+- Cluster mode now supports interactive SQL transactions: statements run
+  on the leader, a lone `COMMIT` replicates the buffered ops through Raft
+  as one atomic `SqlTxnCommit` entry applied on every node.
+
 ### .NET: OxiDb.Data ADO.NET provider — Dapper works (ADR-0013 Phase C)
 
 - New `OxiDb.Data` package: `OxiDbConnection` / `OxiDbCommand` /

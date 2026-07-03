@@ -1283,6 +1283,33 @@ impl SqlEngine {
         Self::checkpoint_locked(inner)
     }
 
+    /// Take a parked session transaction's buffered operations as JSON,
+    /// removing the transaction — for a host that replicates the commit
+    /// (cluster mode) instead of applying it locally. Applying the returned
+    /// ops via [`apply_replicated_txn_ops`](Self::apply_replicated_txn_ops)
+    /// on every node (including this one) completes the commit.
+    pub fn take_session_txn_ops(&self, id: u64) -> Result<serde_json::Value> {
+        let state = self
+            .session_txns
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .ok_or_else(|| {
+                SqlError::Unsupported(format!(
+                    "no such transaction: {id} (rolled back, committed, or busy)"
+                ))
+            })?;
+        Ok(serde_json::to_value(state.take_ops())?)
+    }
+
+    /// Apply a replicated buffered commit (the ops from
+    /// [`take_session_txn_ops`](Self::take_session_txn_ops)) as one atomic
+    /// WAL batch. Deterministic: the ops carry final row ids and cells.
+    pub fn apply_replicated_txn_ops(&self, ops: &serde_json::Value) -> Result<()> {
+        let ops: Vec<WalRecord> = serde_json::from_value(ops.clone())?;
+        self.commit_batch(ops)
+    }
+
     /// Roll back (discard) a parked session transaction. Safe to call for
     /// ids that no longer exist.
     pub fn rollback_session_txn(&self, id: u64) {
@@ -1302,6 +1329,18 @@ impl SqlEngine {
 /// Whether executing `sql` would leave a transaction open at the end of the
 /// batch (a `BEGIN` without a matching `COMMIT`/`ROLLBACK`). Used by the
 /// cluster session layer, which cannot replicate open-ended transactions.
+/// Whether `sql` is exactly one `BEGIN` statement (how a cluster session
+/// starts an interactive transaction).
+pub fn is_lone_begin(sql: &str) -> bool {
+    matches!(parser::parse(sql).as_deref(), Ok([ast::Statement::Begin]))
+}
+
+/// Whether `sql` is exactly one `COMMIT` statement (a cluster session's
+/// buffered commit is intercepted and replicated).
+pub fn is_lone_commit(sql: &str) -> bool {
+    matches!(parser::parse(sql).as_deref(), Ok([ast::Statement::Commit]))
+}
+
 pub fn leaves_transaction_open(sql: &str) -> Result<bool> {
     let mut open = false;
     for stmt in parser::parse(sql)? {

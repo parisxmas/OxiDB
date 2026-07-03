@@ -177,6 +177,23 @@ pub fn handle_sql(
     }
 }
 
+/// Take a parked interactive transaction's buffered ops (cluster commit
+/// path — the ops replicate through Raft and apply on every node).
+pub fn take_session_ops(db_name: &str, txn_id: u64) -> Result<serde_json::Value, String> {
+    let engine = engine_for(db_name)?;
+    engine
+        .take_session_txn_ops(txn_id)
+        .map_err(|e| format!("sql error: {e}"))
+}
+
+/// Apply a replicated buffered commit on this node.
+pub fn apply_replicated_sql_ops(db_name: &str, ops: &serde_json::Value) -> Result<(), String> {
+    let engine = engine_for(db_name)?;
+    engine
+        .apply_replicated_txn_ops(ops)
+        .map_err(|e| format!("sql error: {e}"))
+}
+
 /// Roll back a parked interactive SQL transaction (disconnect cleanup, or
 /// entry points that don't carry session state). Safe on stale ids.
 pub fn rollback_session_tx(db_name: &str, txn_id: u64) {

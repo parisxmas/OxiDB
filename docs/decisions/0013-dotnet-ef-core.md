@@ -1,6 +1,6 @@
 # ADR-0013: Full .NET EF Core support for the SQL engine
 
-**Status:** Accepted — 2026-07-03 (Phases A + B + C shipped; B's cluster support pending)
+**Status:** Accepted — 2026-07-03 (Phases A–D shipped incl. B's cluster support; Phase E minimal provider shipped)
 **Related:** [ADR-0010](0010-sql-engine-crate.md) (SQL engine),
 [ADR-0012](0012-multi-database.md) (multi-database),
 `dotnet/` (.NET packages; the pre-ADR-0010 EF Core provider was removed in
@@ -45,9 +45,12 @@ Close the gap in five phases, each independently shippable:
   the engine's session map between requests and is resumed per batch; the
   session layer carries the id (`Session::sql_tx`), disconnect rolls back,
   errors abort the transaction. Old `execute*` entry points keep the
-  batch-scoped auto-rollback contract. **Cluster**: cross-request
-  transactions are rejected (self-contained batches replicate whole);
-  replicating buffered commits as one Raft entry is the remaining item.
+  batch-scoped auto-rollback contract. **Cluster**: statements execute
+  locally on the leader (writes buffer in the parked transaction); a lone
+  `COMMIT` is intercepted by the dispatcher, the buffered ops replicate
+  through Raft as one `SqlTxnCommit` entry (deterministic — ops carry final
+  row ids/cells), and every node applies them as one atomic WAL batch.
+  `BEGIN` must be its own request in cluster mode.
 - **Phase C — ADO.NET provider** (`OxiDb.Data`) *(shipped)*:
   `DbConnection` (connection string `Host/Port/Database`, database via
   session `use_db`), `DbCommand` with named-`@p`-to-positional rewrite,
@@ -56,10 +59,13 @@ Close the gap in five phases, each independently shippable:
   Milestone hit: **Dapper runs end-to-end** (typed mapping incl.
   TIMESTAMP→DateTime, named params, multi-command transactions) —
   `tests/adonet-dapper-test/`.
-- **Phase D — DDL & types for Migrations**: `ALTER TABLE`
-  ADD/DROP/RENAME COLUMN, column `DEFAULT`s, `DECIMAL`, `BLOB`/binary,
-  UNIQUE **enforcement** (today parsed and silently ignored — an integrity
-  trap), FK syntax tolerance (parse + document non-enforcement, or enforce).
+- **Phase D — DDL & types for Migrations** *(shipped)*: `ALTER TABLE`
+  ADD/DROP/RENAME COLUMN (WAL-logged, rows rewritten, disk-first folds into
+  a fresh snapshot), column `DEFAULT` literals, `DECIMAL`→DOUBLE storage
+  (documented), a real `BLOB` type (base64 on the JSON wire), column
+  `UNIQUE` **enforced** (engine + transactions; NULLs exempt), FK syntax
+  parsed and ignored (documented), and `INSERT ... RETURNING` (how
+  ADO.NET/EF read generated keys).
 - **Phase E — EF Core provider** (`OxiDb.EntityFrameworkCore`):
   QuerySqlGenerator (LINQ → OxiDB dialect), TypeMappingSource,
   Migrations/Update SQL generators (keys via `last_insert_id`; batched

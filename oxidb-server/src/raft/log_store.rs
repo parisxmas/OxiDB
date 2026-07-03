@@ -369,6 +369,14 @@ fn apply_request_in(
                 },
             }
         }
+        OxiDbRequest::SqlTxnCommit { ops } => {
+            match crate::sql_bridge::apply_replicated_sql_ops(db_name, &ops) {
+                Ok(()) => OxiDbResponse::Ok {
+                    data: json!({ "transaction": true }),
+                },
+                Err(message) => OxiDbResponse::Error { message },
+            }
+        }
         OxiDbRequest::CreateDatabase {
             name,
             if_not_exists,

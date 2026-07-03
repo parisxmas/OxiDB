@@ -123,6 +123,13 @@ pub enum OxiDbRequest {
         #[serde(default)]
         if_exists: bool,
     },
+    /// A buffered interactive SQL transaction's commit (ADR-0013 Phase B,
+    /// cluster mode): the ordered ops captured on the leader, applied as one
+    /// atomic WAL batch on every node. Deterministic — ops carry final row
+    /// ids and cells.
+    SqlTxnCommit {
+        ops: Value,
+    },
     /// A write scoped to a named database (ADR-0012). Requests without this
     /// wrapper — including every pre-0.32.2 log entry — apply to the default
     /// database, so old logs replay unchanged.

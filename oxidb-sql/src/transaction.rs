@@ -56,6 +56,12 @@ pub(crate) struct TxnState {
 }
 
 impl TxnState {
+    /// Consume the state, yielding the ordered operations a commit would
+    /// flush (for replicating a buffered commit as one unit).
+    pub(crate) fn take_ops(self) -> Vec<WalRecord> {
+        self.ops
+    }
+
     /// The transaction's data without its savepoint stack.
     fn data_snapshot(&self) -> TxnState {
         let mut c = self.clone();

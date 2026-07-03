@@ -353,20 +353,47 @@ async fn dispatch_request(
         ));
     }
 
-    // Interactive (cross-request) SQL transactions are node-local state; a
-    // cluster cannot replicate them per statement. Reject them cleanly —
-    // self-contained BEGIN..COMMIT batches keep working (replicated whole).
-    if state.raft.is_some() {
+    // Interactive SQL transactions in cluster mode (ADR-0013 Phase B):
+    // statements execute locally on this node (writes buffer in the parked
+    // session transaction); the COMMIT is intercepted here and the buffered
+    // ops replicate through Raft as one atomic batch. To keep the protocol
+    // unambiguous, BEGIN and COMMIT must each be their own request.
+    if let Some(raft) = &state.raft {
         let sql_text = request.get("sql").and_then(|v| v.as_str());
         let is_sql = cmd == "sql" || request.get("engine").and_then(|v| v.as_str()) == Some("sql");
-        if is_sql
-            && (session.sql_tx.is_some()
-                || sql_text.is_some_and(|q| oxidb_sql::leaves_transaction_open(q).unwrap_or(false)))
-        {
-            return handler::err_bytes(
-                "interactive SQL transactions are not supported in cluster mode yet; \
-                 send a self-contained BEGIN..COMMIT batch",
-            );
+        if is_sql && let Some(sql) = sql_text {
+            if session.sql_tx.is_none()
+                && oxidb_sql::leaves_transaction_open(sql).unwrap_or(false)
+                && !oxidb_sql::is_lone_begin(sql)
+            {
+                return handler::err_bytes(
+                    "in cluster mode, start an interactive transaction with a lone BEGIN \
+                     (or send a self-contained BEGIN..COMMIT batch)",
+                );
+            }
+            if let Some(txn_id) = session.sql_tx
+                && oxidb_sql::is_lone_commit(sql)
+            {
+                let ops = match crate::sql_bridge::take_session_ops(&target_db_name, txn_id) {
+                    Ok(ops) => ops,
+                    Err(e) => {
+                        session.sql_tx = None;
+                        return handler::err_bytes(&e);
+                    }
+                };
+                session.sql_tx = None;
+                let raft_req = scope_to_db(OxiDbRequest::SqlTxnCommit { ops }, &target_db_name);
+                log_audit(state, session, &cmd, None, "ok", "");
+                return match raft.client_write(raft_req).await {
+                    Ok(resp) => match resp.data {
+                        OxiDbResponse::Ok { .. } => {
+                            handler::ok_bytes(serde_json::json!([{ "transaction": true }]))
+                        }
+                        OxiDbResponse::Error { message } => handler::err_bytes(&message),
+                    },
+                    Err(e) => handler::err_bytes(&format!("raft error: {e}")),
+                };
+            }
         }
     }
 
@@ -460,7 +487,10 @@ async fn dispatch_request(
     // Write routing through Raft (cluster mode)
     // ---------------------------------------------------------------
     if let Some(raft) = &state.raft {
-        if (is_write_command(&cmd) || sql_is_write(&cmd, &request)) && active_tx.is_none() {
+        if (is_write_command(&cmd) || sql_is_write(&cmd, &request))
+            && active_tx.is_none()
+            && session.sql_tx.is_none()
+        {
             let raft_req = match build_raft_request(&cmd, &request) {
                 Some(req) => scope_to_db(req, &target_db_name),
                 None => {
