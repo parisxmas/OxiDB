@@ -41,4 +41,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0009](0009-disk-first-storage.md) | Disk-first storage mode (opt-in) | Accepted |
 | [0010](0010-sql-engine-crate.md) | Standalone SQL engine crate mounted as a second engine | Accepted |
 | [0011](0011-cross-engine-transactions.md) | Cross-engine transactions (document + SQL) | Proposed |
-| [0012](0012-multi-database.md) | Multiple databases, shared by both engines | Proposed |
+| [0012](0012-multi-database.md) | Multiple databases, shared by both engines | Accepted |

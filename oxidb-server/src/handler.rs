@@ -98,6 +98,25 @@ pub fn handle_request_opts(
     active_tx: &mut Option<u64>,
     sql_readonly: bool,
 ) -> Vec<u8> {
+    handle_request_in_db(
+        db,
+        oxidb::database_manager::DEFAULT_DATABASE,
+        request,
+        active_tx,
+        sql_readonly,
+    )
+}
+
+/// Like [`handle_request_opts`], for a request the session layer has resolved
+/// to a specific database: `db` is that database's document engine and
+/// `db_name` its name (routes the SQL engine to the same database).
+pub fn handle_request_in_db(
+    db: &Arc<OxiDb>,
+    db_name: &str,
+    request: Value,
+    active_tx: &mut Option<u64>,
+    sql_readonly: bool,
+) -> Vec<u8> {
     let cmd = match request
         .get("cmd")
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -122,12 +141,12 @@ pub fn handle_request_opts(
     // by the session layer before this point; what reaches here runs locally
     // (SELECTs, or standalone mode).
     match request.get("engine").and_then(|v| v.as_str()) {
-        Some("sql") => return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly),
+        Some("sql") => return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly, db_name),
         Some("doc") | None => {}
         Some(other) => return err_bytes(&format!("unknown engine: {other:?}")),
     }
     if cmd == "sql" {
-        return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly);
+        return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly, db_name);
     }
 
     // FDW v1: if the targeted collection is registered as a linked

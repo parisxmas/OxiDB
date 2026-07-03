@@ -2268,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.32.0"
+version = "0.32.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2308,6 +2308,7 @@ version = "0.32.0"
 dependencies = [
  "crc32fast",
  "libc",
+ "memmap2",
  "rayon",
  "serde",
  "serde_json",

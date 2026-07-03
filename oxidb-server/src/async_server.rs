@@ -19,7 +19,12 @@ use crate::session::Session;
 
 /// Shared server state passed to each async connection handler.
 pub struct ServerState {
+    /// The default database — Raft applies and disconnect rollback target it
+    /// directly; per-request routing goes through `db_manager`.
     pub db: Arc<OxiDb>,
+    /// Multi-database registry (ADR-0012). `None` keeps every request on the
+    /// default database (e.g. minimal test setups).
+    pub db_manager: Option<Arc<oxidb::DatabaseManager>>,
     pub user_store: Option<Arc<Mutex<UserStore>>>,
     pub audit_log: Option<Arc<AuditLog>>,
     pub auth_enabled: bool,
@@ -256,6 +261,58 @@ async fn dispatch_request(
     }
 
     // ---------------------------------------------------------------
+    // Database management commands (ADR-0012). Node-local: database DDL is
+    // not Raft-replicated yet — in cluster mode issue it on every node.
+    // ---------------------------------------------------------------
+    if let Some(db_manager) = &state.db_manager {
+        match cmd.as_str() {
+            "create_database" => {
+                let Some(name) = request.get("name").and_then(|v| v.as_str()) else {
+                    return handler::err_bytes("missing 'name'");
+                };
+                return match db_manager.create_database(name) {
+                    Ok(()) => {
+                        log_audit(state, session, &cmd, None, "ok", "");
+                        handler::ok_bytes(serde_json::json!(format!("database '{name}' created")))
+                    }
+                    Err(e) => handler::err_bytes(&e.to_string()),
+                };
+            }
+            "drop_database" => {
+                let Some(name) = request.get("name").and_then(|v| v.as_str()) else {
+                    return handler::err_bytes("missing 'name'");
+                };
+                return match db_manager.drop_database(name) {
+                    Ok(()) => {
+                        crate::sql_bridge::forget_database(name);
+                        log_audit(state, session, &cmd, None, "ok", "");
+                        handler::ok_bytes(serde_json::json!(format!("database '{name}' dropped")))
+                    }
+                    Err(e) => handler::err_bytes(&e.to_string()),
+                };
+            }
+            "list_databases" => {
+                log_audit(state, session, &cmd, None, "ok", "");
+                return handler::ok_bytes(serde_json::json!(db_manager.list_databases()));
+            }
+            "use_db" => {
+                let Some(name) = request.get("name").and_then(|v| v.as_str()) else {
+                    return handler::err_bytes("missing 'name'");
+                };
+                if !db_manager.database_exists(name) {
+                    return handler::err_bytes(&format!("database not found: {name}"));
+                }
+                session.set_database(name.to_string());
+                log_audit(state, session, &cmd, None, "ok", "");
+                return handler::ok_bytes(serde_json::json!(format!(
+                    "switched to database '{name}'"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Transaction commit through Raft (cluster mode)
     // ---------------------------------------------------------------
     if let Some(raft) = &state.raft {
@@ -390,12 +447,26 @@ async fn dispatch_local(
     collection: Option<&str>,
     sql_readonly: bool,
 ) -> Vec<u8> {
-    let db = Arc::clone(&state.db);
+    // Resolve the target database: explicit `db` field, else the session's
+    // current database (set by `use_db`, default `oxidb`).
+    let db_name = request
+        .get("db")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&session.current_database)
+        .to_string();
+    let db = match &state.db_manager {
+        Some(mgr) => match mgr.get_database(&db_name) {
+            Ok(db) => db,
+            Err(e) => return handler::err_bytes(&e.to_string()),
+        },
+        None => Arc::clone(&state.db),
+    };
 
     // Transaction commands must be handled in the current task (they modify active_tx).
     match cmd {
         "begin_tx" | "commit_tx" | "rollback_tx" => {
-            let resp_bytes = handler::handle_request(&db, request, active_tx);
+            let resp_bytes =
+                handler::handle_request_in_db(&db, &db_name, request, active_tx, sql_readonly);
             log_audit(state, session, cmd, collection, "ok", "");
             return resp_bytes;
         }
@@ -405,7 +476,7 @@ async fn dispatch_local(
     // All other commands: run handler in a blocking thread.
     let mut tx = active_tx.take();
     let resp_bytes = tokio::task::spawn_blocking(move || {
-        let resp = handler::handle_request_opts(&db, request, &mut tx, sql_readonly);
+        let resp = handler::handle_request_in_db(&db, &db_name, request, &mut tx, sql_readonly);
         (resp, tx)
     })
     .await

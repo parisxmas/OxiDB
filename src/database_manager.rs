@@ -12,8 +12,12 @@ pub const DEFAULT_DATABASE: &str = "oxidb";
 /// Directories at the top level that are global (not per-database).
 const GLOBAL_DIRS: &[&str] = &["_auth", "_audit"];
 
-/// File extensions that belong to OxiDb collections.
-const COLLECTION_EXTENSIONS: &[&str] = &["dat", "wal", "idx", "fidx", "cidx", "vidx"];
+/// File extensions that belong to OxiDb collections — both the original
+/// append-only engine (`.dat` era) and the current B-tree engine
+/// (`.btree`/`.worm`/`.bopts`/`.bdat`).
+const COLLECTION_EXTENSIONS: &[&str] = &[
+    "dat", "wal", "idx", "fidx", "cidx", "vidx", "btree", "worm", "bopts", "bdat",
+];
 
 /// Manages multiple isolated OxiDb databases, each in its own subdirectory.
 ///
@@ -207,12 +211,15 @@ impl DatabaseManager {
                     Some(n) => n.to_string(),
                     None => continue,
                 };
-                // Skip global directories.
-                if GLOBAL_DIRS.contains(&dir_name.as_str()) {
-                    continue;
-                }
-                // Skip hidden directories.
-                if dir_name.starts_with('.') {
+                // Skip global directories, engine-owned directories left at
+                // the root by pre-manager layouts (`_`-prefixed can never be
+                // a database: names may not start with an underscore), hidden
+                // directories, and the default database's SQL directory.
+                if GLOBAL_DIRS.contains(&dir_name.as_str())
+                    || dir_name.starts_with('_')
+                    || dir_name.starts_with('.')
+                    || dir_name == "sql"
+                {
                     continue;
                 }
                 names.push(dir_name);
@@ -263,14 +270,19 @@ impl DatabaseManager {
         }
     }
 
-    /// Auto-migration: if the data_dir has `.dat` files at the top level
+    /// Auto-migration: if the data_dir has collection files at the top level
     /// (old flat layout), move them into the default database subdirectory.
     fn maybe_migrate(&self) -> Result<()> {
-        let has_dat_files = std::fs::read_dir(&self.data_dir)?
+        let has_collection_files = std::fs::read_dir(&self.data_dir)?
             .filter_map(|e| e.ok())
-            .any(|e| e.path().extension().and_then(|ext| ext.to_str()) == Some("dat"));
+            .any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| COLLECTION_EXTENSIONS.contains(&ext))
+            });
 
-        if !has_dat_files {
+        if !has_collection_files {
             return Ok(());
         }
 
@@ -281,7 +293,9 @@ impl DatabaseManager {
         let target = self.data_dir.join(DEFAULT_DATABASE);
         std::fs::create_dir_all(&target)?;
 
-        // Move collection files (.dat, .wal, .idx, .fidx, .cidx, .vidx)
+        // Move collection files. Never overwrite: if the default database
+        // already has a file of the same name, leave the flat one in place
+        // and warn — losing either copy silently is worse than a stray file.
         for entry in std::fs::read_dir(&self.data_dir)?.filter_map(|e| e.ok()) {
             let path = entry.path();
 
@@ -290,16 +304,32 @@ impl DatabaseManager {
                 if COLLECTION_EXTENSIONS.contains(&ext) {
                     let file_name = path.file_name().unwrap();
                     let dest = target.join(file_name);
+                    if dest.exists() {
+                        eprintln!(
+                            "[database_manager] migration skipped {} — {} already exists",
+                            path.display(),
+                            dest.display()
+                        );
+                        continue;
+                    }
                     std::fs::rename(&path, &dest)?;
                 }
             }
         }
 
-        // Move _blobs, _fts, _tx_commit_log into the default db directory
-        for name in &["_blobs", "_fts", "_tx_commit_log"] {
+        // Move engine-owned directories/files into the default db directory.
+        for name in &["_blobs", "_fts", "_tx_commit_log", "_archive", "_gsn"] {
             let src = self.data_dir.join(name);
+            let dest = target.join(name);
             if src.exists() {
-                let dest = target.join(name);
+                if dest.exists() {
+                    eprintln!(
+                        "[database_manager] migration skipped {} — {} already exists",
+                        src.display(),
+                        dest.display()
+                    );
+                    continue;
+                }
                 std::fs::rename(&src, &dest)?;
             }
         }
@@ -332,6 +362,11 @@ fn validate_database_name(name: &str) -> Result<()> {
     if name.starts_with('.') {
         return Err(Error::InvalidDatabaseName(
             "database name cannot start with dot".into(),
+        ));
+    }
+    if name == "sql" {
+        return Err(Error::InvalidDatabaseName(
+            "'sql' is reserved (the default database's SQL engine directory)".into(),
         ));
     }
     if !name
@@ -459,9 +494,22 @@ mod tests {
         assert!(validate_database_name("has/slash").is_err());
         assert!(validate_database_name(&"a".repeat(65)).is_err());
 
+        assert!(validate_database_name("sql").is_err()); // reserved
         assert!(validate_database_name("myapp").is_ok());
         assert!(validate_database_name("my-app").is_ok());
         assert!(validate_database_name("my_app_2").is_ok());
+    }
+
+    #[test]
+    fn list_databases_skips_engine_dirs() {
+        let (dir, mgr) = temp_mgr();
+        // Engine/system dirs a pre-manager layout leaves at the root.
+        for d in ["_blobs", "_fts", "_archive", "sql"] {
+            std::fs::create_dir_all(dir.path().join(d)).unwrap();
+        }
+        mgr.create_database("myapp").unwrap();
+        let names = mgr.list_databases();
+        assert_eq!(names, vec!["myapp", "oxidb", "postgres"]);
     }
 
     #[test]
@@ -499,6 +547,54 @@ mod tests {
         // _blobs should be moved
         assert!(!data_dir.join("_blobs").exists());
         assert!(data_dir.join("oxidb/_blobs/test.data").exists());
+    }
+
+    #[test]
+    fn auto_migration_covers_btree_engine_files() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+
+        // Modern flat layout: B-tree engine files at top level.
+        std::fs::write(data_dir.join("users.btree"), b"fake").unwrap();
+        std::fs::write(data_dir.join("users.wal"), b"fake").unwrap();
+        std::fs::write(data_dir.join("users.worm"), b"fake").unwrap();
+        std::fs::write(data_dir.join("big.bdat"), b"fake").unwrap();
+        std::fs::create_dir_all(data_dir.join("_archive")).unwrap();
+        std::fs::write(data_dir.join("_archive/manifest.json"), b"{}").unwrap();
+
+        let _mgr = DatabaseManager::open(data_dir, None, false, None).unwrap();
+
+        for f in ["users.btree", "users.wal", "users.worm", "big.bdat"] {
+            assert!(!data_dir.join(f).exists(), "{f} not migrated");
+            assert!(
+                data_dir.join("oxidb").join(f).exists(),
+                "{f} missing in default db"
+            );
+        }
+        assert!(data_dir.join("oxidb/_archive/manifest.json").exists());
+    }
+
+    #[test]
+    fn migration_never_overwrites_existing_files() {
+        let dir = tempdir().unwrap();
+        let data_dir = dir.path();
+
+        // A flat-layout file AND a same-named file already inside the default
+        // db: the flat one must be left in place, the nested one untouched.
+        std::fs::write(data_dir.join("users.btree"), b"flat").unwrap();
+        std::fs::create_dir_all(data_dir.join("oxidb")).unwrap();
+        std::fs::write(data_dir.join("oxidb/users.btree"), b"nested").unwrap();
+
+        let _mgr = DatabaseManager::open(data_dir, None, false, None).unwrap();
+
+        assert_eq!(
+            std::fs::read(data_dir.join("users.btree")).unwrap(),
+            b"flat"
+        );
+        assert_eq!(
+            std::fs::read(data_dir.join("oxidb/users.btree")).unwrap(),
+            b"nested"
+        );
     }
 
     #[test]

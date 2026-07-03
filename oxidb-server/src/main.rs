@@ -272,6 +272,7 @@ fn dispatch_request(
             };
             match state.db_manager.drop_database(name) {
                 Ok(()) => {
+                    oxidb_server::sql_bridge::forget_database(name);
                     log_audit(state, session, &cmd, None, "ok", name);
                     return handler::ok_bytes(serde_json::json!(format!(
                         "database '{name}' dropped"
@@ -326,8 +327,13 @@ fn dispatch_request(
     // ---------------------------------------------------------------
     // Standard command dispatch
     // ---------------------------------------------------------------
-    let resp_bytes =
-        handler::handle_request_opts(&target_db, request.clone(), active_tx, sql_readonly);
+    let resp_bytes = handler::handle_request_in_db(
+        &target_db,
+        target_db_name,
+        request.clone(),
+        active_tx,
+        sql_readonly,
+    );
 
     log_audit(state, session, &cmd, collection.as_deref(), "ok", "");
 
@@ -1636,29 +1642,29 @@ fn run_cluster_mode() {
     let raft_config =
         RaftConfig::from_env().expect("OXIDB_NODE_ID is set but Raft config is invalid");
 
-    // Open database
+    // Open the database manager (same managed layout as standalone mode:
+    // `data_dir/<name>/` per database, default `oxidb`, flat layouts
+    // auto-migrated). Raft applies writes to the default database.
     let open_start = std::time::Instant::now();
-    let db = if let Some(ref g) = gelf {
+    let log_callback: Option<oxidb::engine::LogCallback> = gelf.as_ref().map(|g| {
         let gelf_cb = Arc::clone(g);
-        OxiDb::open_with_log(
-            Path::new(&data_dir),
-            encryption_key,
-            verbose,
-            Arc::new(move |msg: &str| {
-                gelf_cb.send(GelfLevel::Informational, msg, &[]);
-            }),
-        )
-    } else {
-        OxiDb::open_verbose(Path::new(&data_dir), encryption_key, verbose)
-    }
-    .expect("failed to open database");
+        Arc::new(move |msg: &str| {
+            gelf_cb.send(GelfLevel::Informational, msg, &[]);
+        }) as oxidb::engine::LogCallback
+    });
+    let db_manager = Arc::new(
+        DatabaseManager::open(Path::new(&data_dir), encryption_key, verbose, log_callback)
+            .expect("failed to open database manager"),
+    );
+    let db = db_manager
+        .get_default_database()
+        .expect("failed to open default database");
     if verbose {
         eprintln!(
             "[verbose] database opened in {:.2}s",
             open_start.elapsed().as_secs_f64()
         );
     }
-    let db = Arc::new(db);
 
     // Authentication
     let auth_enabled = env::var("OXIDB_AUTH")
@@ -1741,6 +1747,7 @@ fn run_cluster_mode() {
         // Build async server state
         let state = Arc::new(AsyncServerState {
             db,
+            db_manager: Some(Arc::clone(&db_manager)),
             user_store,
             audit_log,
             auth_enabled,

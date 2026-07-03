@@ -128,6 +128,7 @@ async fn start_node(
 
     let state = Arc::new(ServerState {
         db,
+        db_manager: None,
         user_store: None,
         audit_log: None,
         auth_enabled: false,

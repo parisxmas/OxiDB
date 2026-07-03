@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Multi-database SQL + database-aware cluster path (ADR-0012, server 0.32.1)
+
+The document engine has had first-class databases since v0.19
+(`create_database`/`drop_database`/`list_databases`/`use_db`, per-request
+`db` field, per-database RBAC). This release closes the gaps around it:
+
+- **Per-database SQL engines** — SQL requests now land in the database the
+  session resolved, not one global catalog. Default database keeps its
+  historical `OXIDB_SQL_DATA` directory (existing data untouched); every
+  other database gets `${OXIDB_DATA}/<name>/sql`, dropped together with the
+  database. Same tables in different databases are fully isolated.
+- **Async/cluster server is database-aware** — it now routes by
+  `db`/session database, implements the four database commands, and opens
+  the same managed data layout as standalone mode (previously it served
+  only the default database and used an incompatible flat layout).
+- **Flat-layout auto-migration fixed** — it now recognizes the B-tree
+  engine's files (`.btree`/`.worm`/`.bopts`/`.bdat`; previously only the
+  original `.dat`-era extensions, leaving modern flat layouts orphaned),
+  moves `_archive`/`_gsn` along, and never overwrites an existing file
+  (collides → warn and leave the flat file in place).
+
+Known limitations (documented in ADR-0012): database DDL is node-local in
+cluster mode (not Raft-replicated); SQL-text `CREATE DATABASE`/`USE` are not
+parsed (wire commands cover it); TTL/alert threads run on the default
+database only; REST/WS/OxiMem/S3 address the default database.
+
 ### SQL engine: auto-checkpoint + disk-first row storage
 
 - **Auto-checkpoint** — the engine now folds the WAL into per-table `.rdat`

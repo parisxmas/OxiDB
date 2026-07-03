@@ -48,6 +48,9 @@ Client libraries: `python/`, `go/`, `julia/`, `dotnet/`, `swift/`
 ### Core Engine (`src/engine.rs`)
 `OxiDb` owns a `RwLock<HashMap<name, Arc<RwLock<Collection>>>>`. Per-collection locking enables concurrent reads. Collections are auto-created on first insert.
 
+### Multiple Databases (`src/database_manager.rs`, ADR-0012)
+`DatabaseManager` hosts many isolated `OxiDb` instances, one per subdirectory of `OXIDB_DATA`: default database `oxidb` (alias `postgres`), server-global `_auth`/`_audit` at the top level, flat legacy layouts auto-migrated into `oxidb/` on open (never overwriting). Wire: optional `db` field per request, `use_db` sets the session default, plus `create_database`/`drop_database`/`list_databases`. RBAC supports per-database roles (`db_roles`, `grant_db_role`/`revoke_db_role`). The SQL engine is per-database too: default db at `OXIDB_SQL_DATA` (`${OXIDB_DATA}/sql`), others at `${OXIDB_DATA}/<name>/sql` (`sql_bridge` registry). Database DDL is node-local (not Raft-replicated); TTL/alert threads and REST/WS/OxiMem/S3 currently serve the default database only.
+
 ### Collection (`src/collection.rs`)
 Each collection owns:
 - **Storage** (`storage.rs`) — append-only file with `[status:u8][length:u32 LE][payload]` records; soft-delete flips status byte in-place

@@ -1,208 +1,86 @@
 # ADR-0012: Multiple databases, shared by both engines
 
-**Status:** Proposed — 2026-07-03 (design only; no implementation)
+**Status:** Accepted — 2026-07-03 (revised; first draft 2026-07-03 was written
+against a wrong premise, see "Correction" below)
 **Related:** [ADR-0010](0010-sql-engine-crate.md) (SQL engine crate),
 [ADR-0011](0011-cross-engine-transactions.md) (cross-engine transactions),
-[`src/engine.rs`](../../src/engine.rs),
-[`oxidb-server/src/handler.rs`](../../oxidb-server/src/handler.rs),
+[`src/database_manager.rs`](../../src/database_manager.rs),
 [`oxidb-server/src/sql_bridge.rs`](../../oxidb-server/src/sql_bridge.rs)
 
-## Context
+## Correction
 
-Neither engine has a database concept today:
+The first draft of this ADR claimed "neither engine has a database concept
+today" and proposed a new registry with a `_dbs/<name>/` layout. That premise
+was wrong: the **document engine has had first-class databases since v0.19**
+— `DatabaseManager` (`src/database_manager.rs`) with this layout:
 
-- The **document engine** is one `OxiDb` over one data directory — a flat
-  collection namespace. Collections live as files directly in `OXIDB_DATA`
-  (`<name>.btree` / `.wal` / `.worm`), beside system directories (`_blobs/`,
-  `_fts/`, `_archive/`).
-- The **SQL engine** is one `SqlEngine` over one directory
-  (`OXIDB_SQL_DATA`, default `${OXIDB_DATA}/sql`) — a flat table/view/index
-  namespace in a single `catalog.json`.
-
-The only isolation available is name-prefixing (`crm.users`) or running a
-second server instance. Users coming from MongoDB (`use crm`) or PostgreSQL
-(`CREATE DATABASE`) expect first-class databases: independent namespaces,
-per-database access control, and cheap create/drop.
-
-A key design question is whether "database" is a per-engine concept (a SQL
-database and an unrelated document database that happen to share a name) or a
-**server-level concept spanning both engines**. Per-engine would be simpler
-to bolt on, but it duplicates DDL, duplicates RBAC scoping, and makes the
-eventual ADR-0011 cross-engine transaction story incoherent (a transaction
-would span "two databases"). This ADR proposes the shared model.
-
-## Decision (proposed design)
-
-One **server-level database registry**. A database is a named unit that
-contains *both* a document namespace and a SQL namespace. Creating database
-`crm` makes `crm` addressable from document commands and from SQL; dropping
-it removes both.
-
-```
-              ┌────────────── database "default" ──────────────┐
-OXIDB_DATA/   │ *.btree/*.wal/*.worm   _blobs/ _fts/   sql/    │   ← today's layout, untouched
-              └────────────────────────────────────────────────┘
-OXIDB_DATA/_dbs/crm/      ← database "crm"
-              ├── *.btree/*.wal/*.worm  _blobs/ _fts/          (document engine)
-              └── sql/                                         (SQL engine)
-OXIDB_DATA/_dbs/analytics/ ...
+```text
+OXIDB_DATA/
+├── _auth/  _audit/       # server-global
+├── oxidb/                # default database (postgres = alias)
+│   ├── *.btree/.wal/...  _blobs/ _fts/ _archive/
+├── myapp/                # user database
+└── sql/                  # default database's SQL engine (OXIDB_SQL_DATA)
 ```
 
-### 1. Directory layout & backward compatibility
+with wire commands `create_database` / `drop_database` / `list_databases` /
+`use_db`, a per-request `db` field, session-scoped current database, name
+validation, flat-layout auto-migration, and per-database RBAC
+(`db_roles` on users, `grant_db_role`/`revoke_db_role`, effective-role
+resolution). This revision documents what was actually missing and what was
+done about it.
 
-- The **existing data-dir root *is* database `default`**. Upgrading moves no
-  files; a server that never issues a database command behaves byte-for-byte
-  as today.
-- New databases live under `OXIDB_DATA/_dbs/<name>/`, each an ordinary
-  engine root (collections + `_blobs` + `_fts` + `sql/`). The `_dbs/` prefix
-  cannot collide with collection files or system dirs at the root.
-- Database names: `[A-Za-z0-9_-]{1,64}`, must not start with `_`;
-  `default` is reserved (always exists, cannot be dropped).
+## Context — the real gaps (as of v0.32.0)
 
-### 2. Registry
+1. **The SQL engine ignored databases entirely.** `sql_bridge` held one
+   process-global `SqlEngine` at `OXIDB_SQL_DATA`; a request's `db` field or
+   session database changed which *document* namespace it hit, but SQL always
+   landed in the same single catalog.
+2. **The async/cluster server ignored databases.** `async_server::dispatch`
+   routed every request to `state.db` (the default database) and had no
+   `create/drop/list/use_db` command handling — only the standalone
+   dispatcher was database-aware. Cluster mode didn't even construct a
+   `DatabaseManager`; it opened the data root as one flat database, an
+   incompatible layout.
+3. **Flat-layout auto-migration was stale.** `COLLECTION_EXTENSIONS` listed
+   only the original engine's extensions (`.dat` era), so modern
+   `.btree`/`.worm`/`.bopts`/`.bdat` files at the data root were never
+   migrated (left orphaned/invisible), `_archive`/`_gsn` were not moved, and
+   a name collision would silently overwrite the destination.
 
-A `Databases` struct owned by the server (and by the embedded FFI handle):
+## Decision (implemented, server 0.32.1)
 
-```rust
-struct Databases {
-    root: PathBuf,
-    doc:  RwLock<HashMap<String, Arc<OxiDb>>>,      // lazily opened
-    sql:  RwLock<HashMap<String, Arc<SqlEngine>>>,  // lazily opened, gated on OXIDB_SQL
-}
-```
+**One database = one document namespace + one SQL namespace**, addressed by
+the same name everywhere.
 
-- Engines open **lazily on first use** (like the SQL engine today) and stay
-  open; v1 does not evict idle databases. Cost of an open-but-idle document
-  engine is its caches — acceptable for the expected tens of databases, and
-  an LRU close policy can come later without wire changes.
-- `create_database` = validate name + `mkdir` + registry entry (cheap).
-  `drop_database` = close engines, delete the directory. Admin-only,
-  audited, and refused for `default` and for databases with an active
-  transaction.
-- `list_databases` = registry ∪ `_dbs/*` directory scan (so databases
-  created before a restart are found without a manifest file).
+1. **Per-database SQL engines** — `sql_bridge` keeps a registry
+   `name → Arc<SqlEngine>`, lazily opened:
+   - default database (`oxidb`, alias `postgres`): `OXIDB_SQL_DATA`
+     (historically `${OXIDB_DATA}/sql`) — existing SQL data untouched;
+   - every other database: `${OXIDB_DATA}/<name>/sql` — inside the
+     database's own directory, so `drop_database` removes it with the rest.
+   The handler routes SQL by the database the session layer already resolved
+   (`handle_request_in_db`); `drop_database` also evicts the registry entry
+   so a recreated database starts with a fresh catalog.
+2. **Async/cluster server is database-aware** — `ServerState` carries the
+   `DatabaseManager`; dispatch resolves `request.db` / session current
+   database for every command and implements the four database commands
+   (node-local; see limitations). Cluster mode now opens the same managed
+   layout as standalone.
+3. **Migration fixed** — extension list covers the B-tree engine files,
+   `_archive`/`_gsn` move with the database, and migration never overwrites:
+   on a name collision the flat file stays put with a warning.
 
-### 3. Wire protocol
+## Limitations / future work
 
-- Every request gains an **optional `"db"` field**; absent means
-  `"default"`. This keeps requests stateless — connection pools, OxiPool
-  fan-out, and retries need no session affinity. Existing clients are
-  untouched (full backward compatibility, same rule as the `engine` field).
-
-  ```json
-  { "db": "crm", "cmd": "find", "collection": "users", "query": {} }
-  { "db": "crm", "engine": "sql", "cmd": "sql", "sql": "SELECT ..." }
-  ```
-
-- New commands, document-engine style: `create_database`, `drop_database`,
-  `list_databases`.
-- **Convenience `use`** (optional, phase 2+): a session may set a default
-  db (`{"cmd": "use", "db": "crm"}`) applied when a request has no `db`
-  field. Pure session state in the connection handler; the wire stays
-  stateless underneath. Clients that pool connections should keep sending
-  explicit `db` instead.
-
-### 4. SQL surface
-
-The same registry, reachable from SQL — routed by the server's SQL bridge,
-not by `oxidb-sql` itself (the crate keeps owning exactly one directory;
-multiplexing is the host's job, mirroring how the embedded FFI already opens
-per-handle engines):
-
-```sql
-CREATE DATABASE crm;          -- registry create (both engines)
-DROP DATABASE crm;            -- registry drop (both engines)
-SHOW DATABASES;               -- introspection, read-only (like ADR SHOW TABLES)
-USE crm;                      -- session default, server-side state
-```
-
-`sqlparser` 0.59 already parses all four (`Statement::CreateDatabase`,
-`Statement::Drop` with `ObjectType::Database`, `Statement::ShowDatabases`,
-`Statement::Use`); the bridge intercepts them before `oxidb_sql::execute`
-and serves them from the registry.
-Qualified names (`crm.users`) stay unsupported inside SQL text in v1 — the
-`db` field / `USE` selects the database for the whole statement batch.
-
-### 5. RBAC
-
-Users gain an optional per-database role map on top of the global role:
-
-```json
-{ "user": "reporting", "role": "read",
-  "db_roles": { "crm": "readwrite", "analytics": "read" } }
-```
-
-- Effective role for a request = `db_roles[db]` if present, else the global
-  role. Empty `db_roles` ⇒ exactly today's semantics.
-- `create_database` / `drop_database` / `list_databases` (full list) require
-  Admin; non-admins see only databases they have a role for.
-
-### 6. Cluster (Raft)
-
-Database DDL is a replicated write: `OxiDbRequest` gains
-`CreateDatabase { name }` / `DropDatabase { name }`, and every existing
-write variant gains an optional `db` field (defaulting to `default`, so old
-log entries replay unchanged). SQL writes already replicate as SQL text;
-they additionally carry the resolved `db`. Snapshot/restore transfers the
-whole `OXIDB_DATA` tree, so `_dbs/` rides along for free.
-
-### 7. Embedded FFI & clients
-
-- Embedded: the handle's directory is the registry root; the FFI request
-  JSON accepts the same `db` field. Python/.NET embedded wrappers expose
-  `db=` / `Database=` options.
-- TCP clients (Python, Go, .NET, JS, Julia, PHP): constructor gains an
-  optional `db` (default `"default"`), stamped on every request. One client
-  object per database — mirrors MongoDB driver ergonomics.
-- REST: `POST /api/db/{db}/...` alongside the existing routes (which serve
-  `default`); WebSocket subscriptions gain a `db` field.
-- VS Code extension: a database picker above the trees; `USE` in the SQL
-  editor works via the session default.
-
-### 8. Interaction with other subsystems
-
-- **Blobs, FTS, TTL, alerts, schedules, security rules**: all are owned by
-  the per-database `OxiDb` instance and scope naturally. System collections
-  (`_auth_users` etc.) that are *server-global* stay in `default` — auth is
-  server-level, not per-database.
-- **PITR / backup**: v1 scopes `backup()` / `restore_to_point` to one
-  database (each `OxiDb` already owns its own GSN sequencer + archive).
-  A server-wide consistent multi-db snapshot needs the ADR-0011 shared GSN
-  clock — explicitly deferred to that work.
-- **ADR-0011**: cross-engine transactions coordinate the two engines *of one
-  database*. Cross-database transactions are a non-goal.
-- **OxiMem / MQTT**: keyspace stays global in v1 (`SELECT <n>`-style RESP
-  databases are an independent, orthogonal feature).
-
-## Non-goals (v1)
-
-- Cross-database queries, joins, `$lookup`, or transactions.
-- Qualified `db.table` names inside SQL text.
-- Per-database encryption keys, quotas, or resource limits.
-- Idle-database eviction (lazy open only).
-- Renaming databases.
-
-## Phasing
-
-1. **Registry + document engine** — `Databases`, lazy open, `db` field in
-   the handler, `create/drop/list_databases` commands, tests. No SQL, no
-   RBAC changes. Ships usable multi-db.
-2. **SQL surface** — `db` routing in the SQL bridge; `CREATE/DROP DATABASE`,
-   `SHOW DATABASES`, `USE` intercepted in the bridge; session default.
-3. **RBAC** — `db_roles`, effective-role resolution, admin gating, audit
-   fields.
-4. **Cluster** — Raft request variants + `db` on write variants, replay
-   compatibility tests.
-5. **Clients & tooling** — 6 client libraries, REST routes, embedded FFI,
-   VS Code extension picker, docs.
-
-## Consequences
-
-- One database concept for the whole product: one DDL surface, one RBAC
-  scope, one directory convention — and ADR-0011 composes with it cleanly.
-- Existing deployments upgrade with zero migration and zero behavior change
-  until the first database command arrives.
-- The per-database engine instances multiply memory for caches and WAL
-  handles; acceptable at tens of databases, revisit (eviction) beyond that.
-- `oxidb-sql` stays single-directory and host-multiplexed, so the crate's
-  complexity does not grow with this feature.
+- **Database DDL is not Raft-replicated**: in cluster mode,
+  `create/drop_database` apply to the node that received them; replicated
+  writes target the default database. Raft variants carrying a `db` field
+  are the natural next step.
+- SQL-text `CREATE DATABASE` / `USE` / `SHOW DATABASES` are not parsed; the
+  wire commands cover the functionality (`use_db` for sessions).
+- TTL eviction and alert-evaluator threads are started only for the default
+  database; lazily-opened databases don't run them yet.
+- REST/WebSocket/OxiMem/S3 surfaces still address the default database.
+- Cross-database queries/transactions remain non-goals (ADR-0011 scopes
+  cross-*engine* transactions to a single database).
