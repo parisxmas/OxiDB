@@ -109,6 +109,27 @@ pub enum OxiDbRequest {
     CommitTransaction {
         write_ops: Vec<TransactionWriteOp>,
     },
+    /// Create a database on every node (ADR-0012).
+    CreateDatabase {
+        name: String,
+        /// `IF NOT EXISTS`: an already-existing database is success.
+        #[serde(default)]
+        if_not_exists: bool,
+    },
+    /// Drop a database on every node (ADR-0012).
+    DropDatabase {
+        name: String,
+        /// `IF EXISTS`: a missing database is success.
+        #[serde(default)]
+        if_exists: bool,
+    },
+    /// A write scoped to a named database (ADR-0012). Requests without this
+    /// wrapper — including every pre-0.32.2 log entry — apply to the default
+    /// database, so old logs replay unchanged.
+    Scoped {
+        db: String,
+        inner: Box<OxiDbRequest>,
+    },
 }
 
 /// A single write operation from a committed transaction.

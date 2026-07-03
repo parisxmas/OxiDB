@@ -261,55 +261,75 @@ async fn dispatch_request(
     }
 
     // ---------------------------------------------------------------
-    // Database management commands (ADR-0012). Node-local: database DDL is
-    // not Raft-replicated yet — in cluster mode issue it on every node.
+    // Database management (ADR-0012) — wire commands and SQL text parse
+    // into one intent, share the permission gate, and (in cluster mode)
+    // replicate create/drop through Raft so every node converges.
     // ---------------------------------------------------------------
     if let Some(db_manager) = &state.db_manager {
-        match cmd.as_str() {
-            "create_database" => {
-                let Some(name) = request.get("name").and_then(|v| v.as_str()) else {
-                    return handler::err_bytes("missing 'name'");
-                };
-                return match db_manager.create_database(name) {
-                    Ok(()) => {
-                        log_audit(state, session, &cmd, None, "ok", "");
-                        handler::ok_bytes(serde_json::json!(format!("database '{name}' created")))
-                    }
-                    Err(e) => handler::err_bytes(&e.to_string()),
-                };
+        if let Some(intent) = crate::db_admin::parse_intent(&cmd, &request) {
+            if let Some(denied) =
+                crate::db_admin::permission_error(&intent, session, state.auth_enabled)
+            {
+                log_audit(state, session, intent.audit_cmd(), None, "denied", "");
+                return denied;
             }
-            "drop_database" => {
-                let Some(name) = request.get("name").and_then(|v| v.as_str()) else {
-                    return handler::err_bytes("missing 'name'");
-                };
-                return match db_manager.drop_database(name) {
-                    Ok(()) => {
-                        crate::sql_bridge::forget_database(name);
-                        log_audit(state, session, &cmd, None, "ok", "");
-                        handler::ok_bytes(serde_json::json!(format!("database '{name}' dropped")))
-                    }
-                    Err(e) => handler::err_bytes(&e.to_string()),
-                };
-            }
-            "list_databases" => {
-                log_audit(state, session, &cmd, None, "ok", "");
-                return handler::ok_bytes(serde_json::json!(db_manager.list_databases()));
-            }
-            "use_db" => {
-                let Some(name) = request.get("name").and_then(|v| v.as_str()) else {
-                    return handler::err_bytes("missing 'name'");
-                };
-                if !db_manager.database_exists(name) {
-                    return handler::err_bytes(&format!("database not found: {name}"));
+            let raft_req = match (&state.raft, &intent) {
+                (
+                    Some(_),
+                    crate::db_admin::DbIntent::Create {
+                        name,
+                        tolerate_exists,
+                        ..
+                    },
+                ) => Some(OxiDbRequest::CreateDatabase {
+                    name: name.clone(),
+                    if_not_exists: *tolerate_exists,
+                }),
+                (
+                    Some(_),
+                    crate::db_admin::DbIntent::Drop {
+                        name,
+                        tolerate_missing,
+                        ..
+                    },
+                ) => Some(OxiDbRequest::DropDatabase {
+                    name: name.clone(),
+                    if_exists: *tolerate_missing,
+                }),
+                _ => None,
+            };
+            let resp = if let (Some(raft), Some(raft_req)) = (&state.raft, raft_req) {
+                match raft.client_write(raft_req).await {
+                    Ok(resp) => match resp.data {
+                        OxiDbResponse::Ok { .. } => crate::db_admin::replicated_response(&intent),
+                        OxiDbResponse::Error { message } => handler::err_bytes(&message),
+                    },
+                    Err(e) => handler::err_bytes(&format!("raft error: {e}")),
                 }
-                session.set_database(name.to_string());
-                log_audit(state, session, &cmd, None, "ok", "");
-                return handler::ok_bytes(serde_json::json!(format!(
-                    "switched to database '{name}'"
-                )));
-            }
-            _ => {}
+            } else {
+                crate::db_admin::execute_local(&intent, db_manager, session)
+            };
+            log_audit(state, session, intent.audit_cmd(), None, "ok", "");
+            return resp;
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Target database for this request + transaction binding: an open
+    // transaction's buffered writes belong to the database it began on.
+    // ---------------------------------------------------------------
+    let target_db_name = request
+        .get("db")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&session.current_database)
+        .to_string();
+    if active_tx.is_some()
+        && let Some(tx_db) = &session.tx_db
+        && tx_db != &target_db_name
+    {
+        return handler::err_bytes(&format!(
+            "active transaction is bound to database '{tx_db}'; commit or roll it back before using '{target_db_name}'"
+        ));
     }
 
     // ---------------------------------------------------------------
@@ -318,8 +338,17 @@ async fn dispatch_request(
     if let Some(raft) = &state.raft {
         if cmd == "commit_tx" {
             if let Some(tx_id) = active_tx.take() {
+                // The transaction was begun on its bound database's engine;
+                // extract the buffered writes from that same engine.
+                let tx_engine = match (&state.db_manager, &session.tx_db) {
+                    (Some(mgr), Some(tx_db)) => match mgr.get_database(tx_db) {
+                        Ok(db) => db,
+                        Err(e) => return handler::err_bytes(&e.to_string()),
+                    },
+                    _ => Arc::clone(&state.db),
+                };
                 // Extract buffered writes from the transaction and send as one Raft entry
-                match state.db.extract_transaction_writes(tx_id) {
+                match tx_engine.extract_transaction_writes(tx_id) {
                     Ok(write_ops) => {
                         // Convert core WriteOp to Raft TransactionWriteOp
                         let raft_ops: Vec<crate::raft::types::TransactionWriteOp> = write_ops
@@ -355,9 +384,13 @@ async fn dispatch_request(
                                 }
                             })
                             .collect();
-                        let raft_req = crate::raft::types::OxiDbRequest::CommitTransaction {
-                            write_ops: raft_ops,
-                        };
+                        let raft_req = scope_to_db(
+                            crate::raft::types::OxiDbRequest::CommitTransaction {
+                                write_ops: raft_ops,
+                            },
+                            session.tx_db.as_deref().unwrap_or(&target_db_name),
+                        );
+                        session.tx_db = None;
                         let result = raft.client_write(raft_req).await;
                         log_audit(state, session, &cmd, None, "ok", "");
                         return match result {
@@ -391,7 +424,7 @@ async fn dispatch_request(
     if let Some(raft) = &state.raft {
         if (is_write_command(&cmd) || sql_is_write(&cmd, &request)) && active_tx.is_none() {
             let raft_req = match build_raft_request(&cmd, &request) {
-                Some(req) => req,
+                Some(req) => scope_to_db(req, &target_db_name),
                 None => {
                     // Fall through to local handler if we can't build a raft request
                     return dispatch_local(
@@ -424,7 +457,7 @@ async fn dispatch_request(
     // ---------------------------------------------------------------
     // Local execution (standalone mode, reads, or transactions)
     // ---------------------------------------------------------------
-    dispatch_local(
+    let resp = dispatch_local(
         state,
         request,
         active_tx,
@@ -433,7 +466,30 @@ async fn dispatch_request(
         collection.as_deref(),
         sql_readonly,
     )
-    .await
+    .await;
+
+    // Keep the transaction's database binding in step with its lifecycle:
+    // set when a transaction appears, cleared when it ends.
+    match (&active_tx, &session.tx_db) {
+        (Some(_), None) => session.tx_db = Some(target_db_name),
+        (None, Some(_)) => session.tx_db = None,
+        _ => {}
+    }
+    resp
+}
+
+/// Wrap a replicated write so it applies to `db_name` on every node. The
+/// default database stays unwrapped — byte-identical to pre-multi-database
+/// log entries.
+fn scope_to_db(req: OxiDbRequest, db_name: &str) -> OxiDbRequest {
+    if db_name == oxidb::database_manager::DEFAULT_DATABASE || db_name == "postgres" {
+        req
+    } else {
+        OxiDbRequest::Scoped {
+            db: db_name.to_string(),
+            inner: Box::new(req),
+        }
+    }
 }
 
 /// Execute a request locally via spawn_blocking.

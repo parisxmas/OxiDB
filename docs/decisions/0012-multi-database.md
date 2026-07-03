@@ -71,16 +71,36 @@ the same name everywhere.
    `_archive`/`_gsn` move with the database, and migration never overwrites:
    on a name collision the flat file stays put with a warning.
 
-## Limitations / future work
+## Completion (server 0.32.2)
 
-- **Database DDL is not Raft-replicated**: in cluster mode,
-  `create/drop_database` apply to the node that received them; replicated
-  writes target the default database. Raft variants carrying a `db` field
-  are the natural next step.
-- SQL-text `CREATE DATABASE` / `USE` / `SHOW DATABASES` are not parsed; the
-  wire commands cover the functionality (`use_db` for sessions).
-- TTL eviction and alert-evaluator threads are started only for the default
-  database; lazily-opened databases don't run them yet.
-- REST/WebSocket/OxiMem/S3 surfaces still address the default database.
+The v1 limitations were closed in a follow-up round:
+
+- **Raft**: `CreateDatabase`/`DropDatabase` request variants replicate
+  database DDL; a `Scoped { db, inner }` envelope replicates writes, SQL,
+  and transaction commits against named databases (unwrapped requests —
+  including every pre-0.32.2 log entry — apply to the default database, so
+  old logs replay unchanged).
+- **SQL text**: `CREATE DATABASE [IF NOT EXISTS]` / `DROP DATABASE
+  [IF EXISTS]` / `SHOW DATABASES` / `USE <db>` parse via
+  `oxidb_sql::parse_database_statement` (single-statement only). Both
+  surfaces funnel through one `DbIntent` (`oxidb-server/src/db_admin.rs`)
+  with one permission gate: create/drop are Admin-only on either surface.
+- **Background threads**: `DatabaseManager::enable_background_threads`
+  starts TTL eviction + alert evaluation on every opened/created database;
+  `drop_database` shuts the engine down (the TTL thread holds a strong Arc —
+  without the shutdown signal the dropped engine leaked forever).
+- **REST**: `?db=<name>` on every route, including `POST /api/sql`.
+  **WebSocket**: per-message `"db"` field; subscriptions remember the
+  engine they watch and unwatch it on cleanup.
+- **Transactions**: a session's open transaction is bound to the database
+  it began on (`Session::tx_db`); requests targeting another database are
+  rejected until commit/rollback, and replicated commits extract buffered
+  writes from — and apply to — the bound database.
+
+## Intentionally out of scope
+
+- **OxiMem/RESP keyspace stays global** — Redis-style `SELECT <n>` numbered
+  databases are an orthogonal protocol concept.
+- **S3 buckets stay global** — one bucket namespace, matching S3 semantics.
 - Cross-database queries/transactions remain non-goals (ADR-0011 scopes
   cross-*engine* transactions to a single database).

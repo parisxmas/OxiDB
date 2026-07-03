@@ -114,7 +114,10 @@ fn rss_mb() -> u64 {
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
         .expect("ps");
-    let kb: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+    let kb: u64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0);
     kb / 1024
 }
 

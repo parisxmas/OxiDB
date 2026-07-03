@@ -3341,7 +3341,11 @@ mod tests {
             // $ne: null EXCLUDES missing-field docs (absent ≡ null) — only the
             // two docs that explicitly carry a non-null value match.
             let ne_null = col.find(&json!({"owner_banned": {"$ne": null}})).unwrap();
-            assert_eq!(ne_null.len(), 2, "indexed={indexed}: $ne null excludes absent");
+            assert_eq!(
+                ne_null.len(),
+                2,
+                "indexed={indexed}: $ne null excludes absent"
+            );
         }
     }
 

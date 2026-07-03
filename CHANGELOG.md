@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Multi-database: remaining limitations closed (ADR-0012, server 0.32.2)
+
+- **Raft-replicated database DDL** — in cluster mode `create_database` /
+  `drop_database` (either surface) go through Raft and apply on every node;
+  writes and SQL targeting a named database replicate wrapped in a `Scoped`
+  envelope (old log entries replay unchanged against the default database).
+  Transaction commits replicate against the database the transaction began
+  on.
+- **SQL-text database DDL** — `CREATE DATABASE [IF NOT EXISTS]`,
+  `DROP DATABASE [IF EXISTS]`, `SHOW DATABASES`, `USE <db>` now work as SQL
+  statements (single-statement only). Wire commands and SQL text parse into
+  one shared intent with one permission gate: create/drop require the admin
+  role — the SQL form cannot slip through the `sql` command's ReadWrite
+  gate.
+- **Background threads on every database** — TTL eviction and alert
+  evaluation now run per database (previously default-only; cluster nodes
+  ran *no* TTL eviction at all). `drop_database` shuts the engine down
+  explicitly — previously its TTL thread held the engine alive forever
+  (leak), and `OxiDb::shutdown` never signalled the TTL thread.
+- **REST/WS database targeting** — REST accepts `?db=<name>` on every
+  route (including `POST /api/sql`); WebSocket messages accept a `"db"`
+  field, and subscriptions watch (and clean up on) the database they were
+  opened against.
+- **Transactions bound to their database** — a session's open transaction
+  now rejects requests targeting a different database (previously they'd
+  silently hit the wrong engine).
+
+Still intentionally global: OxiMem/RESP keyspace (Redis-style numbered
+databases are an orthogonal protocol concept) and S3 buckets (one global
+bucket namespace, matching S3 semantics).
+
 ### Multi-database SQL + database-aware cluster path (ADR-0012, server 0.32.1)
 
 The document engine has had first-class databases since v0.19

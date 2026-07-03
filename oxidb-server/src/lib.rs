@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod auth;
+pub mod db_admin;
 pub mod fdw;
 pub mod gelf;
 pub mod gelf_ingest;

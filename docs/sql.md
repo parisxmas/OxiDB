@@ -161,6 +161,24 @@ Secondary indexes serve equality seeks on single-table SELECTs (a
 multi-column index applies when the WHERE clause has `col = value` conjuncts
 for **all** of its columns) and are maintained automatically on writes.
 
+### Databases (ADR-0012)
+
+```sql
+CREATE DATABASE crm;             -- admin-only; replicated in cluster mode
+CREATE DATABASE IF NOT EXISTS crm;
+DROP DATABASE crm;               -- admin-only; drops document + SQL data
+DROP DATABASE IF EXISTS crm;
+SHOW DATABASES;                  -- columns: database
+USE crm;                         -- session default for subsequent requests
+```
+
+Each database has its own SQL engine (default at `OXIDB_SQL_DATA`, others
+at `${OXIDB_DATA}/<name>/sql`). Database statements must be sent alone —
+they cannot be mixed with other statements in one batch. The equivalent
+wire commands are `create_database` / `drop_database` / `list_databases` /
+`use_db`, and any request can target a database explicitly with a `db`
+field (REST: `?db=<name>`).
+
 ### Introspection
 
 ```sql

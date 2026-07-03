@@ -140,3 +140,44 @@ fn show_inside_transaction_sees_buffered_ddl() {
         .collect();
     assert_eq!(names, vec![t("orders"), t("users")]);
 }
+
+#[test]
+fn database_statements_parse() {
+    use oxidb_sql::{DatabaseStatement, parse_database_statement as p};
+    assert_eq!(
+        p("CREATE DATABASE crm"),
+        Some(DatabaseStatement::Create {
+            name: "crm".into(),
+            if_not_exists: false
+        })
+    );
+    assert_eq!(
+        p("create database if not exists crm;"),
+        Some(DatabaseStatement::Create {
+            name: "crm".into(),
+            if_not_exists: true
+        })
+    );
+    assert_eq!(
+        p("DROP DATABASE IF EXISTS crm"),
+        Some(DatabaseStatement::Drop {
+            name: "crm".into(),
+            if_exists: true
+        })
+    );
+    assert_eq!(p("SHOW DATABASES"), Some(DatabaseStatement::Show));
+    assert_eq!(
+        p("USE crm"),
+        Some(DatabaseStatement::Use { name: "crm".into() })
+    );
+    assert_eq!(
+        p("use crm;"),
+        Some(DatabaseStatement::Use { name: "crm".into() })
+    );
+
+    // Anything else — including mixing with other statements — is not one.
+    assert_eq!(p("SELECT 1 FROM t"), None);
+    assert_eq!(p("CREATE TABLE crm (id INT)"), None);
+    assert_eq!(p("CREATE DATABASE crm; SELECT 1 FROM t"), None);
+    assert_eq!(p("SHOW TABLES"), None);
+}

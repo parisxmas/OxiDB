@@ -39,6 +39,15 @@ pub struct DatabaseManager {
     verbose: bool,
     log_callback: Option<LogCallback>,
     in_memory: bool,
+    /// Background-thread intervals applied to every opened database
+    /// (TTL eviction, alert evaluator). `None` = thread not started.
+    background: RwLock<BackgroundConfig>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct BackgroundConfig {
+    ttl: Option<std::time::Duration>,
+    alerts: Option<std::time::Duration>,
 }
 
 impl DatabaseManager {
@@ -59,6 +68,7 @@ impl DatabaseManager {
             verbose,
             log_callback,
             in_memory: false,
+            background: RwLock::new(BackgroundConfig::default()),
         };
 
         // Auto-migrate old flat layout if needed.
@@ -90,6 +100,7 @@ impl DatabaseManager {
             verbose: false,
             log_callback: None,
             in_memory: true,
+            background: RwLock::new(BackgroundConfig::default()),
         })
     }
 
@@ -127,11 +138,14 @@ impl DatabaseManager {
             let arc = Arc::new(db);
 
             // Insert with write lock (double-check)
-            let mut dbs = self.databases.write().unwrap();
-            if let Some(existing) = dbs.get(name) {
-                return Ok(Arc::clone(existing));
+            {
+                let mut dbs = self.databases.write().unwrap();
+                if let Some(existing) = dbs.get(name) {
+                    return Ok(Arc::clone(existing));
+                }
+                dbs.insert(name.to_string(), Arc::clone(&arc));
             }
-            dbs.insert(name.to_string(), Arc::clone(&arc));
+            self.start_background(&arc);
             Ok(arc)
         }
 
@@ -142,6 +156,36 @@ impl DatabaseManager {
     /// Get the default database.
     pub fn get_default_database(&self) -> Result<Arc<OxiDb>> {
         self.get_database(DEFAULT_DATABASE)
+    }
+
+    /// Enable per-database background threads (TTL eviction, alert
+    /// evaluation). Applies immediately to every already-open database and
+    /// to every database opened or created afterwards.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_background_threads(
+        &self,
+        ttl: Option<std::time::Duration>,
+        alerts: Option<std::time::Duration>,
+    ) {
+        *self.background.write().unwrap() = BackgroundConfig { ttl, alerts };
+        let dbs = self.databases.read().unwrap();
+        for db in dbs.values() {
+            self.start_background(db);
+        }
+    }
+
+    /// Start the configured background threads on one engine instance.
+    /// (`start_ttl_thread`/`start_alert_evaluator` replace any prior thread's
+    /// shutdown channel, so re-invocation is restart, not duplication.)
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_background(&self, db: &Arc<OxiDb>) {
+        let cfg = *self.background.read().unwrap();
+        if let Some(i) = cfg.ttl {
+            db.start_ttl_thread(i);
+        }
+        if let Some(i) = cfg.alerts {
+            db.start_alert_evaluator(i);
+        }
     }
 
     /// Create a new database. Returns error if it already exists.
@@ -169,8 +213,13 @@ impl DatabaseManager {
         #[cfg(target_arch = "wasm32")]
         let db = OxiDb::open_in_memory()?;
 
-        let mut dbs = self.databases.write().unwrap();
-        dbs.insert(name.to_string(), Arc::new(db));
+        let arc = Arc::new(db);
+        {
+            let mut dbs = self.databases.write().unwrap();
+            dbs.insert(name.to_string(), Arc::clone(&arc));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.start_background(&arc);
 
         Ok(())
     }
@@ -186,10 +235,15 @@ impl DatabaseManager {
             return Err(Error::DatabaseNotFound(name.to_string()));
         }
 
-        // Remove from in-memory map first.
-        {
+        // Remove from the map and shut the engine down. The TTL thread holds
+        // a strong Arc to the engine; without the explicit shutdown signal
+        // the dropped database's engine (and its thread) would leak.
+        let removed = {
             let mut dbs = self.databases.write().unwrap();
-            dbs.remove(name);
+            dbs.remove(name)
+        };
+        if let Some(db) = removed {
+            db.shutdown();
         }
 
         // Remove the directory.

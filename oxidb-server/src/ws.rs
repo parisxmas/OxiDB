@@ -46,6 +46,9 @@ struct WsState {
     db: Arc<OxiDb>,
     active: AtomicUsize,
     jwt_secret: Option<String>,
+    /// Database registry (ADR-0012). A message's `"db"` field targets a
+    /// named database; absent (or `None` here) = the default database.
+    db_manager: Option<Arc<oxidb::DatabaseManager>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -56,6 +59,17 @@ pub fn start_ws_listener(
     addr: &str,
     db: Arc<OxiDb>,
     jwt_secret: Option<String>,
+) -> std::thread::JoinHandle<()> {
+    start_ws_listener_with_manager(addr, db, jwt_secret, None)
+}
+
+/// [`start_ws_listener`] with a database registry, enabling per-message
+/// `"db"` targeting (ADR-0012).
+pub fn start_ws_listener_with_manager(
+    addr: &str,
+    db: Arc<OxiDb>,
+    jwt_secret: Option<String>,
+    db_manager: Option<Arc<oxidb::DatabaseManager>>,
 ) -> std::thread::JoinHandle<()> {
     let listener = TcpListener::bind(addr).expect("failed to bind WebSocket listener");
 
@@ -69,6 +83,7 @@ pub fn start_ws_listener(
         db,
         active: AtomicUsize::new(0),
         jwt_secret,
+        db_manager,
     });
 
     let (conn_tx, conn_rx) = std::sync::mpsc::sync_channel::<TcpStream>(MAX_QUEUED);
@@ -294,6 +309,8 @@ struct Subscription {
     handle: WatchHandle,
     collection: Option<String>,
     query: Option<Value>,
+    /// The engine this watch was registered on (its database).
+    db: Arc<OxiDb>,
 }
 
 fn handle_connection(mut stream: TcpStream, state: &WsState) {
@@ -431,14 +448,14 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
         }
         for id in dead_subs {
             if let Some(sub) = subscriptions.remove(&id) {
-                state.db.unwatch(sub.handle.id);
+                sub.db.unwatch(sub.handle.id);
             }
         }
     }
 
     // Clean up all subscriptions
     for (_, sub) in subscriptions {
-        state.db.unwatch(sub.handle.id);
+        sub.db.unwatch(sub.handle.id);
     }
 }
 
@@ -482,6 +499,21 @@ fn handle_command(
         }
     }
 
+    // ── Database targeting (ADR-0012): a message's `"db"` field selects
+    // the database; absent = the default database (backward compatible).
+    let db: Arc<OxiDb> = match cmd.get("db").and_then(|v| v.as_str()) {
+        None => Arc::clone(&state.db),
+        Some(name) => match &state.db_manager {
+            None => {
+                return json!({"ok": false, "error": "database targeting is not available"});
+            }
+            Some(mgr) => match mgr.get_database(name) {
+                Ok(db) => db,
+                Err(e) => return json!({"ok": false, "error": e.to_string()}),
+            },
+        },
+    };
+
     match cmd_name {
         "ping" => json!({"ok": true, "data": "pong"}),
 
@@ -498,7 +530,7 @@ fn handle_command(
                 None => WatchFilter::All,
             };
 
-            match state.db.watch(filter, None) {
+            match db.watch(filter, None) {
                 Ok(handle) => {
                     let wh_id = handle.id;
                     subs.insert(
@@ -507,6 +539,7 @@ fn handle_command(
                             handle,
                             collection,
                             query,
+                            db: Arc::clone(&db),
                         },
                     );
                     json!({"ok": true, "data": {"subscribed": sub_id, "watch_id": wh_id}})
@@ -518,7 +551,7 @@ fn handle_command(
         "unsubscribe" => {
             let sub_id = cmd["id"].as_str().unwrap_or("default");
             if let Some(sub) = subs.remove(sub_id) {
-                state.db.unwatch(sub.handle.id);
+                sub.db.unwatch(sub.handle.id);
                 json!({"ok": true, "data": "unsubscribed"})
             } else {
                 json!({"ok": false, "error": "subscription not found"})
@@ -531,12 +564,12 @@ fn handle_command(
                 None => return json!({"ok": false, "error": "missing 'collection'"}),
             };
             if let Some(doc) = cmd.get("doc") {
-                match state.db.insert(col, doc.clone()) {
+                match db.insert(col, doc.clone()) {
                     Ok(id) => json!({"ok": true, "data": {"id": id}}),
                     Err(e) => json!({"ok": false, "error": e.to_string()}),
                 }
             } else if let Some(docs) = cmd.get("docs").and_then(|v| v.as_array()) {
-                match state.db.insert_many(col, docs.clone()) {
+                match db.insert_many(col, docs.clone()) {
                     Ok(ids) => json!({"ok": true, "data": {"ids": ids}}),
                     Err(e) => json!({"ok": false, "error": e.to_string()}),
                 }
@@ -552,7 +585,7 @@ fn handle_command(
             };
             let empty = json!({});
             let query = cmd.get("query").unwrap_or(&empty);
-            match state.db.find(col, query) {
+            match db.find(col, query) {
                 Ok(docs) => json!({"ok": true, "data": docs}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
@@ -565,7 +598,7 @@ fn handle_command(
             };
             let empty = json!({});
             let query = cmd.get("query").unwrap_or(&empty);
-            match state.db.find_one(col, query) {
+            match db.find_one(col, query) {
                 Ok(doc) => json!({"ok": true, "data": doc}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
@@ -584,7 +617,7 @@ fn handle_command(
                 Some(u) => u,
                 None => return json!({"ok": false, "error": "missing 'update'"}),
             };
-            match state.db.update(col, query, update) {
+            match db.update(col, query, update) {
                 Ok(n) => json!({"ok": true, "data": {"modified": n}}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
@@ -599,7 +632,7 @@ fn handle_command(
                 Some(q) => q,
                 None => return json!({"ok": false, "error": "missing 'query'"}),
             };
-            match state.db.delete(col, query) {
+            match db.delete(col, query) {
                 Ok(n) => json!({"ok": true, "data": {"deleted": n}}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
@@ -612,7 +645,7 @@ fn handle_command(
             };
             let empty = json!({});
             let query = cmd.get("query").unwrap_or(&empty);
-            match state.db.count(col, query) {
+            match db.count(col, query) {
                 Ok(n) => json!({"ok": true, "data": {"count": n}}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }

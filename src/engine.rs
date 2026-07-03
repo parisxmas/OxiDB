@@ -1040,11 +1040,14 @@ impl OxiDb {
     /// call, and the per-collection flushes are safe to repeat.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn shutdown(&self) {
-        // Drop the senders → background sync/scheduler/alert threads
-        // see RecvError, run their own final-flush blocks, exit.
+        // Drop the senders → background sync/scheduler/alert/TTL threads
+        // see RecvError, run their own final-flush blocks, exit. The TTL
+        // thread holds a strong Arc to the engine, so without this signal a
+        // dropped database's engine would never be released.
         let _ = self.scheduler_shutdown.lock().take();
         let _ = self.sync_shutdown.lock().take();
         let _ = self.alert_shutdown.lock().take();
+        let _ = self.ttl_shutdown.lock().take();
         #[cfg(not(target_arch = "wasm32"))]
         let _ = self.archiver_shutdown.lock().take();
         // Final checkpoint: persist + truncate WAL. Safe at shutdown

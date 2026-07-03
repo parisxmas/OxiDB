@@ -36,6 +36,67 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
         .collect()
 }
 
+/// A database-level statement recognized in SQL text. The engine itself is
+/// single-database; these are served by the host (the server's session
+/// layer), which owns the database registry and session state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatabaseStatement {
+    Create { name: String, if_not_exists: bool },
+    Drop { name: String, if_exists: bool },
+    Show,
+    Use { name: String },
+}
+
+/// Recognize a **single** `CREATE DATABASE` / `DROP DATABASE` /
+/// `SHOW DATABASES` / `USE <db>` statement as the whole input. Returns
+/// `None` for any other SQL (including multi-statement batches — database
+/// DDL cannot be mixed with ordinary statements).
+pub fn parse_database_statement(sql: &str) -> Option<DatabaseStatement> {
+    // Cheap prefix gate so ordinary queries never pay a second parse.
+    let head = sql.trim_start().get(..16).unwrap_or(sql.trim_start());
+    let head = head.to_ascii_lowercase();
+    if !(head.starts_with("create database")
+        || head.starts_with("drop database")
+        || head.starts_with("show databases")
+        || head.starts_with("use ")
+        || head == "use")
+    {
+        return None;
+    }
+
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql).ok()?;
+    let [stmt] = statements.as_slice() else {
+        return None;
+    };
+    match stmt {
+        sp::Statement::CreateDatabase {
+            db_name,
+            if_not_exists,
+            ..
+        } => Some(DatabaseStatement::Create {
+            name: object_name_to_string(db_name).ok()?,
+            if_not_exists: *if_not_exists,
+        }),
+        sp::Statement::Drop {
+            object_type: sp::ObjectType::Database,
+            names,
+            if_exists,
+            ..
+        } => Some(DatabaseStatement::Drop {
+            name: single_object_name(names).ok()?,
+            if_exists: *if_exists,
+        }),
+        sp::Statement::ShowDatabases { .. } => Some(DatabaseStatement::Show),
+        sp::Statement::Use(sp::Use::Object(name) | sp::Use::Database(name)) => {
+            Some(DatabaseStatement::Use {
+                name: object_name_to_string(name).ok()?,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Recognize `SHOW INDEXES` / `SHOW INDEX [FROM table]` (optionally
 /// `;`-terminated) as the whole input. Returns `None` when the input is
 /// anything else, letting `sqlparser` handle it.

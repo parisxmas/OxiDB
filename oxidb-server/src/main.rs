@@ -247,59 +247,20 @@ fn dispatch_request(
     }
 
     // ---------------------------------------------------------------
-    // Database management commands
+    // Database management (ADR-0012) — wire commands and SQL text
+    // (`CREATE DATABASE` / `DROP DATABASE` / `SHOW DATABASES` / `USE`)
+    // parse into one intent and share the permission gate.
     // ---------------------------------------------------------------
-    match cmd.as_str() {
-        "create_database" => {
-            let name = match request.get("name").and_then(|v| v.as_str()) {
-                Some(n) => n,
-                None => return handler::err_bytes("missing 'name'"),
-            };
-            match state.db_manager.create_database(name) {
-                Ok(()) => {
-                    log_audit(state, session, &cmd, None, "ok", name);
-                    return handler::ok_bytes(serde_json::json!(format!(
-                        "database '{name}' created"
-                    )));
-                }
-                Err(e) => return handler::err_bytes(&e.to_string()),
-            }
+    if let Some(intent) = oxidb_server::db_admin::parse_intent(&cmd, request) {
+        if let Some(denied) =
+            oxidb_server::db_admin::permission_error(&intent, session, state.auth_enabled)
+        {
+            log_audit(state, session, intent.audit_cmd(), None, "denied", "");
+            return denied;
         }
-        "drop_database" => {
-            let name = match request.get("name").and_then(|v| v.as_str()) {
-                Some(n) => n,
-                None => return handler::err_bytes("missing 'name'"),
-            };
-            match state.db_manager.drop_database(name) {
-                Ok(()) => {
-                    oxidb_server::sql_bridge::forget_database(name);
-                    log_audit(state, session, &cmd, None, "ok", name);
-                    return handler::ok_bytes(serde_json::json!(format!(
-                        "database '{name}' dropped"
-                    )));
-                }
-                Err(e) => return handler::err_bytes(&e.to_string()),
-            }
-        }
-        "list_databases" => {
-            let names = state.db_manager.list_databases();
-            log_audit(state, session, &cmd, None, "ok", "");
-            return handler::ok_bytes(serde_json::json!(names));
-        }
-        "use_db" => {
-            let name = match request.get("name").and_then(|v| v.as_str()) {
-                Some(n) => n,
-                None => return handler::err_bytes("missing 'name'"),
-            };
-            if !state.db_manager.database_exists(name) {
-                return handler::err_bytes(&format!("database not found: {name}"));
-            }
-            session.set_database(name.to_string());
-            log_audit(state, session, &cmd, None, "ok", name);
-            return handler::ok_bytes(serde_json::json!(format!("switched to database '{name}'")));
-        }
-        // (`set_dialect` removed alongside the SQL surface.)
-        _ => {}
+        let resp = oxidb_server::db_admin::execute_local(&intent, &state.db_manager, session);
+        log_audit(state, session, intent.audit_cmd(), None, "ok", "");
+        return resp;
     }
 
     // ---------------------------------------------------------------
@@ -318,22 +279,40 @@ fn dispatch_request(
     let target_db_name = request
         .get("db")
         .and_then(|v| v.as_str())
-        .unwrap_or(&session.current_database);
-    let target_db = match state.db_manager.get_database(target_db_name) {
+        .unwrap_or(&session.current_database)
+        .to_string();
+    let target_db = match state.db_manager.get_database(&target_db_name) {
         Ok(db) => db,
         Err(e) => return handler::err_bytes(&e.to_string()),
     };
+    // An open transaction's buffered writes belong to the database it began
+    // on; reject requests that target a different one while it is open.
+    if active_tx.is_some()
+        && let Some(tx_db) = &session.tx_db
+        && tx_db != &target_db_name
+    {
+        return handler::err_bytes(&format!(
+            "active transaction is bound to database '{tx_db}'; commit or roll it back before using '{target_db_name}'"
+        ));
+    }
 
     // ---------------------------------------------------------------
     // Standard command dispatch
     // ---------------------------------------------------------------
     let resp_bytes = handler::handle_request_in_db(
         &target_db,
-        target_db_name,
+        &target_db_name,
         request.clone(),
         active_tx,
         sql_readonly,
     );
+
+    // Keep the transaction's database binding in step with its lifecycle.
+    match (&active_tx, &session.tx_db) {
+        (Some(_), None) => session.tx_db = Some(target_db_name),
+        (None, Some(_)) => session.tx_db = None,
+        _ => {}
+    }
 
     log_audit(state, session, &cmd, collection.as_deref(), "ok", "");
 
@@ -1163,7 +1142,6 @@ fn main() {
     } else {
         Duration::from_secs(1)
     };
-    db.start_ttl_thread(ttl_interval);
     eprintln!(
         "TTL eviction: enabled (interval={}ms)",
         ttl_interval.as_millis()
@@ -1174,8 +1152,13 @@ fn main() {
         .unwrap_or_else(|_| "15".to_string())
         .parse()
         .expect("OXIDB_ALERT_INTERVAL must be a valid u64 (seconds)");
-    db.start_alert_evaluator(Duration::from_secs(alert_interval_secs));
     eprintln!("alert evaluator: enabled (interval={alert_interval_secs}s)");
+    // Via the manager, so every database — the default, lazily-opened, and
+    // future ones — runs its own TTL eviction + alert evaluation.
+    db_manager.enable_background_threads(
+        Some(ttl_interval),
+        Some(Duration::from_secs(alert_interval_secs)),
+    );
     eprintln!("{}", oxidb::fts::fts_config_summary());
 
     // GPU compute for vector search (optional, enabled with --features gpu)
@@ -1479,7 +1462,12 @@ fn main() {
     if http_port > 0 {
         let http_addr = format!("0.0.0.0:{http_port}");
         let http_db = Arc::clone(&state.db);
-        oxidb_server::rest::start_rest_listener(&http_addr, http_db, jwt_secret.clone());
+        oxidb_server::rest::start_rest_listener_with_manager(
+            &http_addr,
+            http_db,
+            jwt_secret.clone(),
+            Some(Arc::clone(&state.db_manager)),
+        );
         server_log!(
             state,
             GelfLevel::Notice,
@@ -1496,7 +1484,12 @@ fn main() {
     if ws_port > 0 {
         let ws_addr = format!("0.0.0.0:{ws_port}");
         let ws_db = Arc::clone(&state.db);
-        oxidb_server::ws::start_ws_listener(&ws_addr, ws_db, jwt_secret.clone());
+        oxidb_server::ws::start_ws_listener_with_manager(
+            &ws_addr,
+            ws_db,
+            jwt_secret.clone(),
+            Some(Arc::clone(&state.db_manager)),
+        );
         server_log!(
             state,
             GelfLevel::Notice,
@@ -1659,6 +1652,16 @@ fn run_cluster_mode() {
     let db = db_manager
         .get_default_database()
         .expect("failed to open default database");
+    // Background threads for every database (cluster nodes previously ran
+    // without TTL eviction or alert evaluation entirely).
+    let alert_interval_secs: u64 = env::var("OXIDB_ALERT_INTERVAL")
+        .unwrap_or_else(|_| "15".to_string())
+        .parse()
+        .expect("OXIDB_ALERT_INTERVAL must be a valid u64 (seconds)");
+    db_manager.enable_background_threads(
+        Some(Duration::from_secs(1)),
+        Some(Duration::from_secs(alert_interval_secs)),
+    );
     if verbose {
         eprintln!(
             "[verbose] database opened in {:.2}s",
@@ -1730,7 +1733,8 @@ fn run_cluster_mode() {
         let raft_addr = raft_config.raft_addr.clone();
         let openraft_config = RaftConfig::openraft_config();
 
-        let store = OxiDbStore::open(Arc::clone(&db), Path::new(&data_dir));
+        let store = OxiDbStore::open(Arc::clone(&db), Path::new(&data_dir))
+            .with_manager(Arc::clone(&db_manager));
         let (log_store, sm) = Adaptor::new(store);
 
         let raft = openraft::Raft::new(

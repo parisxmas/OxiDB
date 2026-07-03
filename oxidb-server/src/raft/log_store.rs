@@ -81,6 +81,9 @@ impl Inner {
 pub struct OxiDbStore {
     inner: Arc<RwLock<Inner>>,
     db: Arc<OxiDb>,
+    /// Database registry for multi-database requests (`Scoped`,
+    /// `CreateDatabase`, `DropDatabase`). `None` = default database only.
+    db_manager: Option<Arc<oxidb::DatabaseManager>>,
     paths: Option<RaftPaths>,
     /// Lock that serializes mutations to the on-disk log file.
     /// (in-memory operations are already serialized by the RwLock on `inner`.)
@@ -100,6 +103,7 @@ impl Clone for OxiDbStore {
         Self {
             inner: Arc::clone(&self.inner),
             db: Arc::clone(&self.db),
+            db_manager: self.db_manager.clone(),
             paths: self.paths.clone(),
             log_writer: Arc::clone(&self.log_writer),
         }
@@ -119,9 +123,17 @@ impl OxiDbStore {
                 current_snapshot: None,
             })),
             db,
+            db_manager: None,
             paths: None,
             log_writer: Arc::new(std::sync::Mutex::new(())),
         }
+    }
+
+    /// Attach the database registry so multi-database requests (`Scoped`,
+    /// `CreateDatabase`, `DropDatabase`) can be applied on this node.
+    pub fn with_manager(mut self, mgr: Arc<oxidb::DatabaseManager>) -> Self {
+        self.db_manager = Some(mgr);
+        self
     }
 
     /// Persistent variant: loads existing Raft state from `<data_dir>/raft_meta.json`
@@ -236,6 +248,7 @@ impl OxiDbStore {
                 current_snapshot: None,
             })),
             db,
+            db_manager: None,
             paths: Some(paths),
             log_writer: Arc::new(std::sync::Mutex::new(())),
         }
@@ -323,10 +336,83 @@ impl OxiDbStore {
 }
 
 /// Apply a single `OxiDbRequest` against the database engine.
-fn apply_request(db: &OxiDb, req: OxiDbRequest) -> OxiDbResponse {
+fn apply_request(
+    db: &OxiDb,
+    mgr: Option<&oxidb::DatabaseManager>,
+    req: OxiDbRequest,
+) -> OxiDbResponse {
+    apply_request_in(db, mgr, oxidb::database_manager::DEFAULT_DATABASE, req)
+}
+
+/// Apply one replicated request against `db` (the engine of database
+/// `db_name`). `Scoped` re-targets both before recursing.
+fn apply_request_in(
+    db: &OxiDb,
+    mgr: Option<&oxidb::DatabaseManager>,
+    db_name: &str,
+    req: OxiDbRequest,
+) -> OxiDbResponse {
     use std::collections::HashMap;
 
     match req {
+        OxiDbRequest::Scoped { db: name, inner } => {
+            let Some(mgr) = mgr else {
+                return OxiDbResponse::Error {
+                    message: "multi-database requests need a database registry on this node"
+                        .to_string(),
+                };
+            };
+            match mgr.get_database(&name) {
+                Ok(target) => apply_request_in(&target, Some(mgr), &name, *inner),
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        OxiDbRequest::CreateDatabase {
+            name,
+            if_not_exists,
+        } => {
+            let Some(mgr) = mgr else {
+                return OxiDbResponse::Error {
+                    message: "multi-database requests need a database registry on this node"
+                        .to_string(),
+                };
+            };
+            match mgr.create_database(&name) {
+                Ok(()) => OxiDbResponse::Ok {
+                    data: json!(format!("database '{name}' created")),
+                },
+                Err(oxidb::Error::DatabaseAlreadyExists(_)) if if_not_exists => OxiDbResponse::Ok {
+                    data: json!(format!("database '{name}' created")),
+                },
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+        OxiDbRequest::DropDatabase { name, if_exists } => {
+            let Some(mgr) = mgr else {
+                return OxiDbResponse::Error {
+                    message: "multi-database requests need a database registry on this node"
+                        .to_string(),
+                };
+            };
+            match mgr.drop_database(&name) {
+                Ok(()) => {
+                    crate::sql_bridge::forget_database(&name);
+                    OxiDbResponse::Ok {
+                        data: json!(format!("database '{name}' dropped")),
+                    }
+                }
+                Err(oxidb::Error::DatabaseNotFound(_)) if if_exists => OxiDbResponse::Ok {
+                    data: json!(format!("database '{name}' dropped")),
+                },
+                Err(e) => OxiDbResponse::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
         OxiDbRequest::Insert {
             collection,
             document,
@@ -415,7 +501,7 @@ fn apply_request(db: &OxiDb, req: OxiDbRequest) -> OxiDbResponse {
             } else {
                 Some(&params)
             };
-            match crate::sql_bridge::execute_json(&sql, params, false) {
+            match crate::sql_bridge::execute_json_in(db_name, &sql, params, false) {
                 Ok(results) => OxiDbResponse::Ok { data: results },
                 Err(message) => OxiDbResponse::Error { message },
             }
@@ -741,7 +827,7 @@ impl RaftStorage<TypeConfig> for OxiDbStore {
                         out.push(OxiDbResponse::Ok { data: json!(null) });
                     }
                     openraft::EntryPayload::Normal(req) => {
-                        let resp = apply_request(&self.db, req.clone());
+                        let resp = apply_request(&self.db, self.db_manager.as_deref(), req.clone());
                         out.push(resp);
                     }
                     openraft::EntryPayload::Membership(mem) => {

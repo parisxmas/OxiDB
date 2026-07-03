@@ -50,6 +50,9 @@ struct RestState {
     active: AtomicUsize,
     /// JWT secret. When `Some`, auth is enforced on all non-public endpoints.
     jwt_secret: Option<String>,
+    /// Database registry (ADR-0012). `?db=<name>` targets a named database;
+    /// `None` (or no param) serves the default database as before.
+    db_manager: Option<Arc<oxidb::DatabaseManager>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -60,6 +63,17 @@ pub fn start_rest_listener(
     addr: &str,
     db: Arc<OxiDb>,
     jwt_secret: Option<String>,
+) -> std::thread::JoinHandle<()> {
+    start_rest_listener_with_manager(addr, db, jwt_secret, None)
+}
+
+/// [`start_rest_listener`] with a database registry, enabling `?db=<name>`
+/// targeting (ADR-0012).
+pub fn start_rest_listener_with_manager(
+    addr: &str,
+    db: Arc<OxiDb>,
+    jwt_secret: Option<String>,
+    db_manager: Option<Arc<oxidb::DatabaseManager>>,
 ) -> std::thread::JoinHandle<()> {
     let listener = TcpListener::bind(addr).expect("failed to bind REST HTTP listener");
 
@@ -73,6 +87,7 @@ pub fn start_rest_listener(
         db,
         active: AtomicUsize::new(0),
         jwt_secret,
+        db_manager,
     });
 
     let (conn_tx, conn_rx) = std::sync::mpsc::sync_channel::<TcpStream>(MAX_QUEUED);
@@ -166,6 +181,45 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     if req.method == "OPTIONS" {
         return with_rest_cors(json_response(204, "No Content", json!(null)));
     }
+
+    // ── Database targeting (ADR-0012): `?db=<name>` selects the database;
+    // no parameter keeps the default database exactly as before.
+    let db_name = parse_query_string(&req.query)
+        .get("db")
+        .map(|v| url_decode(v));
+    let scoped_state: RestState;
+    let state = match &db_name {
+        None => state,
+        Some(name) => match &state.db_manager {
+            None => {
+                return with_rest_cors(json_response(
+                    400,
+                    "Bad Request",
+                    json!({"error": "database targeting is not available"}),
+                ));
+            }
+            Some(mgr) => match mgr.get_database(name) {
+                Ok(db) => {
+                    // `active` belongs to the listener's shared state; this
+                    // per-request scope only redirects `db`.
+                    scoped_state = RestState {
+                        db,
+                        active: AtomicUsize::new(0),
+                        jwt_secret: state.jwt_secret.clone(),
+                        db_manager: state.db_manager.clone(),
+                    };
+                    &scoped_state
+                }
+                Err(e) => {
+                    return with_rest_cors(json_response(
+                        404,
+                        "Not Found",
+                        json!({"error": e.to_string()}),
+                    ));
+                }
+            },
+        },
+    };
 
     // ── Phase 2 (ADR-0003): /v1/ is the 1.0 stable URL prefix. ──────────
     // Both `/v1/api/...` and the legacy bare `/api/...` resolve to the
@@ -272,7 +326,13 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // callers are restricted to SELECT statements by the SQL bridge.
     if let ("POST", ["api", "sql"]) = (req.method.as_str(), segments.as_slice()) {
         let readonly = enforced_role == Some(auth::Role::Read);
-        return with_rest_cors(handle_sql_endpoint(req, readonly));
+        return with_rest_cors(handle_sql_endpoint(
+            req,
+            readonly,
+            db_name.as_deref(),
+            state,
+            enforced_role,
+        ));
     }
 
     // ── Protected endpoints ──────────────────────────────────────────
@@ -569,7 +629,13 @@ fn handle_drop_index(
 /// placeholders. Responds `{"results": [...]}` (one entry per statement) or
 /// 400 `{"error": "..."}` with the engine's message. Requires `OXIDB_SQL=1`
 /// on the server; the engine's data is entirely separate from collections.
-fn handle_sql_endpoint(req: &HttpRequest, readonly: bool) -> HttpResponse {
+fn handle_sql_endpoint(
+    req: &HttpRequest,
+    readonly: bool,
+    db_name: Option<&str>,
+    state: &RestState,
+    enforced_role: Option<auth::Role>,
+) -> HttpResponse {
     let body = match parse_json_body(req) {
         Ok(b) => b,
         Err((status, msg)) => {
@@ -579,7 +645,71 @@ fn handle_sql_endpoint(req: &HttpRequest, readonly: bool) -> HttpResponse {
     let Some(sql) = body.get("sql").and_then(|v| v.as_str()) else {
         return json_response(400, "Bad Request", json!({"error": "missing 'sql'"}));
     };
-    match crate::sql_bridge::execute_json(sql, body.get("params"), readonly) {
+
+    // ── SQL-text database DDL (ADR-0012). REST is stateless, so `USE` has
+    // no session to act on — `?db=<name>` is the REST equivalent.
+    if let Some(stmt) = oxidb_sql::parse_database_statement(sql) {
+        use oxidb_sql::DatabaseStatement as Ds;
+        let Some(mgr) = &state.db_manager else {
+            return json_response(
+                400,
+                "Bad Request",
+                json!({"error": "database management is not available"}),
+            );
+        };
+        if matches!(stmt, Ds::Create { .. } | Ds::Drop { .. })
+            && enforced_role.is_some()
+            && enforced_role != Some(auth::Role::Admin)
+        {
+            return json_response(
+                403,
+                "Forbidden",
+                json!({"error": "creating or dropping databases requires the admin role"}),
+            );
+        }
+        return match stmt {
+            Ds::Create {
+                name,
+                if_not_exists,
+            } => match mgr.create_database(&name) {
+                Ok(()) => json_response(200, "OK", json!({"results": [{ "ddl": true }]})),
+                Err(oxidb::Error::DatabaseAlreadyExists(_)) if if_not_exists => {
+                    json_response(200, "OK", json!({"results": [{ "ddl": true }]}))
+                }
+                Err(e) => json_response(400, "Bad Request", json!({"error": e.to_string()})),
+            },
+            Ds::Drop { name, if_exists } => match mgr.drop_database(&name) {
+                Ok(()) => {
+                    crate::sql_bridge::forget_database(&name);
+                    json_response(200, "OK", json!({"results": [{ "ddl": true }]}))
+                }
+                Err(oxidb::Error::DatabaseNotFound(_)) if if_exists => {
+                    json_response(200, "OK", json!({"results": [{ "ddl": true }]}))
+                }
+                Err(e) => json_response(400, "Bad Request", json!({"error": e.to_string()})),
+            },
+            Ds::Show => {
+                let rows: Vec<Value> = mgr
+                    .list_databases()
+                    .into_iter()
+                    .map(|n| json!([n]))
+                    .collect();
+                json_response(
+                    200,
+                    "OK",
+                    json!({"results": [{ "columns": ["database"], "rows": rows }]}),
+                )
+            }
+            Ds::Use { .. } => json_response(
+                400,
+                "Bad Request",
+                json!({"error": "USE has no session over REST; target a database with ?db=<name>"}),
+            ),
+        };
+    }
+
+    let db = db_name.unwrap_or(oxidb::database_manager::DEFAULT_DATABASE);
+    match crate::sql_bridge::execute_json_in(db, sql, body.get("params"), readonly) {
         Ok(results) => json_response(200, "OK", json!({"results": results})),
         Err(msg) => json_response(400, "Bad Request", json!({"error": msg})),
     }

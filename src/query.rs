@@ -1263,9 +1263,7 @@ fn matches_raw_inner(query: &Query, raw: &jsonb::RawJsonb) -> Option<bool> {
                         // unless the operand is null (absent ≡ null here).
                         return Some(match op {
                             QueryOp::Ne(v) => *v != IndexValue::Null,
-                            QueryOp::Nin(vals) => {
-                                vals.binary_search(&IndexValue::Null).is_err()
-                            }
+                            QueryOp::Nin(vals) => vals.binary_search(&IndexValue::Null).is_err(),
                             _ => false,
                         });
                     };
