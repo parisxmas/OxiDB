@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.33.1
+
 ### SQL engine: AUTO_INCREMENT primary keys
 
 - `INT PRIMARY KEY AUTO_INCREMENT` (also `AUTOINCREMENT` and
