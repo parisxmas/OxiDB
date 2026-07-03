@@ -168,6 +168,7 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
                     "type".into(),
                     "nullable".into(),
                     "primary_key".into(),
+                    "auto_increment".into(),
                 ],
                 rows: def
                     .columns
@@ -178,6 +179,7 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
                             text(&format!("{:?}", c.ty).to_uppercase()),
                             Value::Bool(c.nullable),
                             Value::Bool(c.primary_key),
+                            Value::Bool(c.auto_increment),
                         ]
                     })
                     .collect(),
@@ -296,9 +298,29 @@ fn exec_insert<S: Store>(
         all_cells.push(cells);
     }
 
+    // AUTO_INCREMENT: rows that omit the column (or pass NULL) get values
+    // from the table's counter, reserved as one atomic block.
+    let mut last_insert_id = None;
+    if let Some(p) = def.columns.iter().position(|c| c.auto_increment) {
+        let missing = all_cells.iter().filter(|c| c[p] == Value::Null).count();
+        if missing > 0 {
+            let mut next = store.next_auto_block(table, missing as i64)?;
+            for cells in &mut all_cells {
+                if cells[p] == Value::Null {
+                    cells[p] = Value::Int(next);
+                    next += 1;
+                }
+            }
+            last_insert_id = Some(next - 1);
+        }
+    }
+
     // One durable batch: all rows of a multi-row INSERT share a single fsync.
     let affected = store.insert_many(table, all_cells)? as usize;
-    Ok(QueryResult::Mutation { affected })
+    Ok(QueryResult::Mutation {
+        affected,
+        last_insert_id,
+    })
 }
 
 fn exec_update<S: Store>(
@@ -348,7 +370,10 @@ fn exec_update<S: Store>(
         store.update_row(table, row_id, new_cells)?;
         affected += 1;
     }
-    Ok(QueryResult::Mutation { affected })
+    Ok(QueryResult::Mutation {
+        affected,
+        last_insert_id: None,
+    })
 }
 
 fn exec_delete<S: Store>(
@@ -386,7 +411,10 @@ fn exec_delete<S: Store>(
             affected += 1;
         }
     }
-    Ok(QueryResult::Mutation { affected })
+    Ok(QueryResult::Mutation {
+        affected,
+        last_insert_id: None,
+    })
 }
 
 // ── SELECT ────────────────────────────────────────────────────────────────

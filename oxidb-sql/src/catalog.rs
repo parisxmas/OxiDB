@@ -24,6 +24,11 @@ pub struct Column {
     pub nullable: bool,
     #[serde(default)]
     pub primary_key: bool,
+    /// `AUTO_INCREMENT` / `AUTOINCREMENT` / `GENERATED ... AS IDENTITY`:
+    /// an INT PRIMARY KEY whose omitted (or NULL) insert values are assigned
+    /// from a per-table counter. Old catalogs deserialize as `false`.
+    #[serde(default)]
+    pub auto_increment: bool,
 }
 
 impl Column {
@@ -33,11 +38,17 @@ impl Column {
             ty,
             nullable: true,
             primary_key: false,
+            auto_increment: false,
         }
     }
 
     pub fn not_null(mut self) -> Self {
         self.nullable = false;
+        self
+    }
+
+    pub fn auto_increment(mut self) -> Self {
+        self.auto_increment = true;
         self
     }
 

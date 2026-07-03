@@ -105,6 +105,11 @@ struct TableState {
     def: Table,
     rows: RowStore,
     next_row_id: u64,
+    /// Position of the AUTO_INCREMENT column (if any) and the next value its
+    /// counter would assign. Seeded from existing data at open (max + 1), so
+    /// restart semantics match SQLite's default rowid behavior.
+    auto_pos: Option<usize>,
+    next_auto: i64,
     /// Secondary indexes keyed by index name.
     indexes: BTreeMap<String, SecondaryIndex>,
     /// PRIMARY KEY column position (if any) and its value -> row_id map,
@@ -116,10 +121,13 @@ struct TableState {
 impl TableState {
     fn empty(def: Table, disk_first: bool) -> Self {
         let pk_pos = def.pk_pos();
+        let auto_pos = def.columns.iter().position(|c| c.auto_increment);
         TableState {
             def,
             rows: RowStore::new(disk_first),
             next_row_id: 1,
+            auto_pos,
+            next_auto: 1,
             indexes: BTreeMap::new(),
             pk_pos,
             pk_map: BTreeMap::new(),
@@ -129,6 +137,17 @@ impl TableState {
     fn observe_row_id(&mut self, row_id: u64) {
         if row_id >= self.next_row_id {
             self.next_row_id = row_id + 1;
+        }
+    }
+
+    /// Keep the auto-increment counter ahead of every value that reaches the
+    /// table — explicit inserts, WAL replay, snapshot load.
+    fn observe_auto(&mut self, cells: &[Value]) {
+        if let Some(p) = self.auto_pos
+            && let Some(Value::Int(v)) = cells.get(p)
+            && *v >= self.next_auto
+        {
+            self.next_auto = v + 1;
         }
     }
 
@@ -247,6 +266,7 @@ impl SqlEngine {
                 if let Some(snap) = storage::MappedSnapshot::open(&dir, name, def.arity())? {
                     for (row_id, cells) in snap.entries() {
                         state.observe_row_id(row_id);
+                        state.observe_auto(&cells);
                         if let Some(p) = state.pk_pos {
                             state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
                         }
@@ -256,6 +276,7 @@ impl SqlEngine {
             } else {
                 for (row_id, cells) in storage::read_snapshot(&dir, name, def.arity())? {
                     state.observe_row_id(row_id);
+                    state.observe_auto(&cells);
                     if let Some(p) = state.pk_pos {
                         state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
                     }
@@ -346,6 +367,7 @@ impl SqlEngine {
                         state.index_remove(*row_id, &old);
                     }
                     state.observe_row_id(*row_id);
+                    state.observe_auto(cells);
                     state.rows.insert(*row_id, cells.clone());
                     state.index_insert(*row_id, cells);
                 }
@@ -771,6 +793,27 @@ impl SqlEngine {
         inner.catalog.indexes.values().cloned().collect()
     }
 
+    /// Atomically reserve `n` auto-increment values for `table`, returning
+    /// the first. Values are handed out even if the insert later fails —
+    /// gaps are normal auto-increment behavior.
+    pub(crate) fn next_auto_block(&self, table: &str, n: i64) -> Result<i64> {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        let start = state.next_auto;
+        state.next_auto += n;
+        Ok(start)
+    }
+
+    /// The next auto-increment value a table would assign (for transaction
+    /// counter seeding).
+    pub(crate) fn peek_next_auto(&self, table: &str) -> Option<i64> {
+        let inner = self.inner.lock().unwrap();
+        inner.tables.get(table).map(|s| s.next_auto)
+    }
+
     /// The next `row_id` a table would assign (for transaction id seeding).
     pub(crate) fn peek_next_row_id(&self, table: &str) -> Option<u64> {
         let inner = self.inner.lock().unwrap();
@@ -988,6 +1031,9 @@ impl Store for SqlEngine {
     }
     fn view_sql(&self, name: &str) -> Option<String> {
         SqlEngine::view_sql(self, name)
+    }
+    fn next_auto_block(&self, table: &str, n: i64) -> Result<i64> {
+        SqlEngine::next_auto_block(self, table, n)
     }
     fn list_tables(&self) -> Vec<Table> {
         SqlEngine::list_tables(self)

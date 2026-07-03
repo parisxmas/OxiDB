@@ -36,7 +36,7 @@ pub fn rows_p(db: &SqlEngine, sql: &str, params: &[Value]) -> Vec<Vec<Value>> {
 /// Run SQL expected to be a single mutation; return the affected count.
 pub fn affected(db: &SqlEngine, sql: &str) -> usize {
     match db.execute(sql).unwrap().pop().unwrap() {
-        QueryResult::Mutation { affected } => affected,
+        QueryResult::Mutation { affected, .. } => affected,
         other => panic!("expected Mutation, got {other:?}"),
     }
 }
@@ -44,7 +44,7 @@ pub fn affected(db: &SqlEngine, sql: &str) -> usize {
 /// Run parameterized SQL expected to be a single mutation.
 pub fn affected_p(db: &SqlEngine, sql: &str, params: &[Value]) -> usize {
     match db.execute_params(sql, params).unwrap().pop().unwrap() {
-        QueryResult::Mutation { affected } => affected,
+        QueryResult::Mutation { affected, .. } => affected,
         other => panic!("expected Mutation, got {other:?}"),
     }
 }

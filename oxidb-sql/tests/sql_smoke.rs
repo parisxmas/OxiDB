@@ -22,7 +22,7 @@ fn select(db: &SqlEngine, sql: &str) -> (Vec<String>, Vec<Vec<Value>>) {
 
 fn affected(db: &SqlEngine, sql: &str) -> usize {
     match db.execute(sql).unwrap().pop().unwrap() {
-        QueryResult::Mutation { affected } => affected,
+        QueryResult::Mutation { affected, .. } => affected,
         other => panic!("expected Mutation, got {other:?}"),
     }
 }

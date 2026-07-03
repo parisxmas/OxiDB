@@ -55,7 +55,7 @@ The response contains **one result per statement**:
 | Statement | Result shape |
 |-----------|--------------|
 | `SELECT` | `{"columns": [...], "rows": [[cell, ...], ...]}` |
-| `INSERT` / `UPDATE` / `DELETE` | `{"affected": N}` |
+| `INSERT` / `UPDATE` / `DELETE` | `{"affected": N}` — INSERTs that assigned AUTO_INCREMENT values add `"last_insert_id"` |
 | `CREATE` / `DROP` (table or index) | `{"ddl": true}` |
 | `BEGIN` / `COMMIT` / `ROLLBACK` | `{"transaction": true}` |
 
@@ -152,6 +152,25 @@ CREATE INDEX IF NOT EXISTS idx_users_age ON users (age);
 DROP INDEX idx_users_age;
 DROP INDEX IF EXISTS idx_users_age;
 ```
+
+`AUTO_INCREMENT` (also `AUTOINCREMENT` and PostgreSQL's
+`GENERATED ... AS IDENTITY`) is supported on an `INT PRIMARY KEY` column:
+
+```sql
+CREATE TABLE users (
+  id   INT PRIMARY KEY AUTO_INCREMENT,
+  name TEXT NOT NULL
+);
+INSERT INTO users (name) VALUES ('ada'), ('bob');  -- ids 1, 2 assigned
+INSERT INTO users VALUES (NULL, 'eve');            -- NULL also draws from the counter
+```
+
+Omitted (or `NULL`) values draw sequential values from a per-table counter;
+the INSERT's result carries the last one as `last_insert_id`. Explicit
+values are allowed and push the counter past themselves. The counter is
+seeded from `max(id) + 1` at startup (SQLite-default semantics: ids of
+rows deleted from the top can be reused after a restart); rolled-back
+transactions leave gaps, as in every SQL engine.
 
 A duplicate `PRIMARY KEY` value is rejected with a `duplicate key` error —
 on plain INSERTs, multi-row INSERTs (checked across the whole batch before

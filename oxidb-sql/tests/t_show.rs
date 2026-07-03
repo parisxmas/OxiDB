@@ -80,18 +80,24 @@ fn describe_reports_columns() {
     let (_d, db) = setup();
     for sql in ["DESCRIBE users", "SHOW COLUMNS FROM users"] {
         let (cols, r) = cols_rows(&db, sql);
-        assert_eq!(cols, vec!["column", "type", "nullable", "primary_key"]);
+        assert_eq!(
+            cols,
+            vec![
+                "column",
+                "type",
+                "nullable",
+                "primary_key",
+                "auto_increment"
+            ]
+        );
+        let f = Value::Bool(false);
+        let tr = Value::Bool(true);
         assert_eq!(
             r,
             vec![
-                vec![t("id"), t("INT"), Value::Bool(false), Value::Bool(true)],
-                vec![
-                    t("email"),
-                    t("TEXT"),
-                    Value::Bool(false),
-                    Value::Bool(false)
-                ],
-                vec![t("age"), t("INT"), Value::Bool(true), Value::Bool(false)],
+                vec![t("id"), t("INT"), f.clone(), tr.clone(), f.clone()],
+                vec![t("email"), t("TEXT"), f.clone(), f.clone(), f.clone()],
+                vec![t("age"), t("INT"), tr.clone(), f.clone(), f.clone()],
             ],
             "for {sql}"
         );

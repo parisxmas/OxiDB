@@ -79,7 +79,13 @@ pub fn result_to_json(r: QueryResult) -> Json {
                 .collect();
             json!({ "columns": columns, "rows": rows })
         }
-        QueryResult::Mutation { affected } => json!({ "affected": affected }),
+        QueryResult::Mutation {
+            affected,
+            last_insert_id,
+        } => match last_insert_id {
+            Some(id) => json!({ "affected": affected, "last_insert_id": id }),
+            None => json!({ "affected": affected }),
+        },
         QueryResult::Ddl => json!({ "ddl": true }),
         QueryResult::Transaction => json!({ "transaction": true }),
     }
@@ -128,7 +134,10 @@ mod tests {
     #[test]
     fn result_json_shapes() {
         assert_eq!(
-            result_to_json(QueryResult::Mutation { affected: 3 }),
+            result_to_json(QueryResult::Mutation {
+                affected: 3,
+                last_insert_id: None
+            }),
             json!({ "affected": 3 })
         );
         assert_eq!(result_to_json(QueryResult::Ddl), json!({ "ddl": true }));

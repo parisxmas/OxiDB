@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### SQL engine: AUTO_INCREMENT primary keys
+
+- `INT PRIMARY KEY AUTO_INCREMENT` (also `AUTOINCREMENT` and
+  `GENERATED ... AS IDENTITY`): omitted or `NULL` insert values draw
+  sequential ids from a per-table counter; the INSERT result reports the
+  last assigned value as `last_insert_id`. Explicit values push the counter
+  past themselves; the counter survives restarts (seeded `max+1`), works
+  inside transactions, and `DESCRIBE` gains an `auto_increment` column.
+
 ## v0.33.0
 
 ### SQL-text user management (server 0.32.3)

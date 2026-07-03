@@ -292,8 +292,13 @@ pub enum QueryResult {
         columns: Vec<String>,
         rows: Vec<Vec<Value>>,
     },
-    /// An INSERT/UPDATE/DELETE, with the number of rows affected.
-    Mutation { affected: usize },
+    /// An INSERT/UPDATE/DELETE, with the number of rows affected. For an
+    /// INSERT that assigned AUTO_INCREMENT values, `last_insert_id` is the
+    /// last one assigned.
+    Mutation {
+        affected: usize,
+        last_insert_id: Option<i64>,
+    },
     /// A DDL statement (CREATE/DROP table or index) executed.
     Ddl,
     /// A transaction control statement (`BEGIN`/`COMMIT`/`ROLLBACK`).

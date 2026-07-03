@@ -168,7 +168,7 @@ pub fn parse_user_statement(sql: &str) -> Option<UserStatement> {
     }
 
     let mut i = 0usize;
-    let mut kw = |k: &str, i: &mut usize| -> bool {
+    let kw = |k: &str, i: &mut usize| -> bool {
         match toks.get(*i) {
             Some(Tok::Word(w)) if w.eq_ignore_ascii_case(k) => {
                 *i += 1;
@@ -438,6 +438,14 @@ fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
             "multiple PRIMARY KEY columns (a table has at most one primary key)".into(),
         ));
     }
+    for c in &columns {
+        if c.auto_increment && !(c.primary_key && c.ty == SqlType::Int) {
+            return Err(SqlError::Unsupported(format!(
+                "AUTO_INCREMENT on {:?} — only an INT PRIMARY KEY column can auto-increment",
+                c.name
+            )));
+        }
+    }
     Ok(Statement::CreateTable {
         table: Table::new(name, columns),
         if_not_exists: ct.if_not_exists,
@@ -484,6 +492,23 @@ fn translate_column(col: &sp::ColumnDef) -> Result<Column> {
             sp::ColumnOption::Unique { .. } => {
                 // Plain UNIQUE has no enforcement yet; accept the type, ignore
                 // the constraint (documented limitation).
+            }
+            // MySQL `AUTO_INCREMENT` / SQLite `AUTOINCREMENT`.
+            sp::ColumnOption::DialectSpecific(tokens)
+                if tokens.iter().any(|t| {
+                    matches!(t, sqlparser::tokenizer::Token::Word(w)
+                        if w.value.eq_ignore_ascii_case("AUTO_INCREMENT")
+                            || w.value.eq_ignore_ascii_case("AUTOINCREMENT"))
+                }) =>
+            {
+                column = column.auto_increment();
+            }
+            // PostgreSQL `GENERATED [ALWAYS | BY DEFAULT] AS IDENTITY`.
+            sp::ColumnOption::Generated {
+                generation_expr: None,
+                ..
+            } => {
+                column = column.auto_increment();
             }
             other => {
                 return Err(SqlError::Unsupported(format!(

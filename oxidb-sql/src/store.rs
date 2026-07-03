@@ -81,6 +81,10 @@ pub(crate) trait Store {
     /// The stored SQL text of a view, if one with this name exists.
     fn view_sql(&self, name: &str) -> Option<String>;
 
+    /// Atomically reserve `n` auto-increment values for `table`, returning
+    /// the first. Only called for tables with an AUTO_INCREMENT column.
+    fn next_auto_block(&self, table: &str, n: i64) -> Result<i64>;
+
     /// Introspection (`SHOW TABLES` / `DESCRIBE`): all table definitions,
     /// sorted by name.
     fn list_tables(&self) -> Vec<Table>;

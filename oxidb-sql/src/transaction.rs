@@ -34,6 +34,9 @@ struct TxnState {
     rows: BTreeMap<String, BTreeMap<u64, RowChange>>,
     /// Per-table row-id allocator, seeded lazily from the engine.
     next_row_id: BTreeMap<String, u64>,
+    /// Per-table auto-increment allocator, seeded lazily from the engine.
+    /// (Single-writer transactions, like row ids.)
+    next_auto: BTreeMap<String, i64>,
     /// Indexes created / dropped within the transaction.
     indexes_created: BTreeMap<String, IndexDef>,
     indexes_dropped: BTreeSet<String>,
@@ -330,6 +333,21 @@ impl Store for Transaction<'_> {
             tables.insert(name.clone(), def.clone());
         }
         tables.into_values().collect()
+    }
+
+    fn next_auto_block(&self, table: &str, n: i64) -> Result<i64> {
+        let mut st = self.state.borrow_mut();
+        let created = st.created.contains_key(table);
+        let next = st.next_auto.entry(table.to_string()).or_insert_with(|| {
+            if created {
+                1
+            } else {
+                self.engine.peek_next_auto(table).unwrap_or(1)
+            }
+        });
+        let start = *next;
+        *next += n;
+        Ok(start)
     }
 
     fn list_views(&self) -> Vec<(String, String)> {
