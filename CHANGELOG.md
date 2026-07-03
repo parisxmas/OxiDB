@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### SQL engine: auto-checkpoint + disk-first row storage
+
+- **Auto-checkpoint** — the engine now folds the WAL into per-table `.rdat`
+  snapshots automatically once the live WAL exceeds
+  `OXIDB_SQL_CHECKPOINT_BYTES` (default 64 MiB; `0` = manual only).
+  Previously checkpoints never ran in production: the WAL grew without bound
+  and every restart replayed all of it.
+- **Disk-first mode** (`OXIDB_SQL_DISK_FIRST`) — rows are served from the
+  mmap'd last-checkpoint snapshot; RAM holds only the changes made since
+  that checkpoint (auto-checkpointing bounds that overlay). At 1M rows this
+  roughly halves resident memory (272 → 143 MB) and speeds up open, at a
+  decode cost on full scans (11 → 43 ms). Indexes and the PRIMARY KEY map
+  stay in RAM. Both modes share the same on-disk format, so a database can
+  be reopened in either mode. New `SqlOptions` /
+  `SqlEngine::open_with_options` on the crate API; snapshot CRCs are
+  verified once at map time.
+
 ### SQL engine: catalog introspection
 
 - New statements `SHOW TABLES` (with row counts), `SHOW VIEWS`,

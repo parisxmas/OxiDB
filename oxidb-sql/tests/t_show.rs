@@ -66,7 +66,10 @@ fn show_indexes_all_and_per_table() {
         ]
     );
     let r = rows(&db, "SHOW INDEXES FROM orders");
-    assert_eq!(r, vec![vec![t("idx_orders_user"), t("orders"), t("user_id")]]);
+    assert_eq!(
+        r,
+        vec![vec![t("idx_orders_user"), t("orders"), t("user_id")]]
+    );
     // The singular form parses too.
     assert_eq!(rows(&db, "SHOW INDEX FROM orders"), r);
     assert!(db.execute("SHOW INDEXES FROM nope").is_err());
@@ -82,7 +85,12 @@ fn describe_reports_columns() {
             r,
             vec![
                 vec![t("id"), t("INT"), Value::Bool(false), Value::Bool(true)],
-                vec![t("email"), t("TEXT"), Value::Bool(false), Value::Bool(false)],
+                vec![
+                    t("email"),
+                    t("TEXT"),
+                    Value::Bool(false),
+                    Value::Bool(false)
+                ],
                 vec![t("age"), t("INT"), Value::Bool(true), Value::Bool(false)],
             ],
             "for {sql}"

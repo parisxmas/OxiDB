@@ -112,6 +112,8 @@ pub struct Wal {
     file: File,
     next_seq: u64,
     sync: SyncMode,
+    /// Current on-disk size (header + valid records) — drives auto-checkpoint.
+    bytes: u64,
 }
 
 impl Wal {
@@ -132,20 +134,28 @@ impl Wal {
             .truncate(false)
             .open(&path)?;
 
-        if file.metadata()?.len() == 0 {
+        let bytes = if file.metadata()?.len() == 0 {
             Self::write_header(&mut file)?;
+            HEADER_LEN
         } else {
             // Discard any torn tail so the next append starts from clean data.
             file.set_len(valid_end)?;
-        }
+            valid_end
+        };
         file.seek(SeekFrom::End(0))?;
 
         let wal = Wal {
             file,
             next_seq: max_seq + 1,
             sync: sync_mode_from_env(),
+            bytes,
         };
         Ok((wal, records))
+    }
+
+    /// Current on-disk size of the live WAL in bytes.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
     }
 
     fn write_header(file: &mut File) -> Result<()> {
@@ -245,6 +255,7 @@ impl Wal {
             SyncMode::Full => self.file.sync_all()?,
             SyncMode::Data => sync_data_fast(&self.file)?,
         }
+        self.bytes += frame.len() as u64;
         Ok(seq)
     }
 
@@ -255,6 +266,7 @@ impl Wal {
         self.file.seek(SeekFrom::Start(0))?;
         Self::write_header(&mut self.file)?;
         self.file.seek(SeekFrom::End(0))?;
+        self.bytes = HEADER_LEN;
         Ok(())
     }
 }

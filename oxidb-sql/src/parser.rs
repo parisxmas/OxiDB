@@ -8,8 +8,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, SelectItem, SelectQuery, SelectStmt,
-    ShowKind, Statement, TableRef, UnOp, WindowFunc,
+    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, SelectItem, SelectQuery, SelectStmt, ShowKind,
+    Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::catalog::{Column, Table};
 use crate::error::{Result, SqlError};

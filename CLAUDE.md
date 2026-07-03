@@ -102,5 +102,7 @@ Length-prefixed JSON over TCP (max 16 MiB). Auth via SCRAM-SHA-256. RBAC roles: 
 A standalone relational SQL engine (its own crate) can be mounted alongside the document engine in the same server. It owns **entirely separate files** and shares no state — a collection name and a SQL table name never collide. Off by default.
 - `OXIDB_SQL` (set to `1`/`true`/`yes`/`on` to enable; default off — zero cost when unused)
 - `OXIDB_SQL_DATA` (SQL engine data dir; default `${OXIDB_DATA}/sql`)
+- `OXIDB_SQL_DISK_FIRST` (rows served from the mmap'd last-checkpoint `.rdat` snapshot, only post-checkpoint changes in RAM; default off = all rows resident)
+- `OXIDB_SQL_CHECKPOINT_BYTES` (auto-checkpoint the SQL WAL past this size; default 64 MiB, `0` = manual only)
 
 Wire routing (`handler.rs`): a request with `engine: "sql"` — or the reserved `sql` command — is served by the SQL engine; a missing/`"doc"` engine keeps the document path byte-for-byte (full backward compatibility). Request shape: `{ "engine": "sql", "cmd": "sql", "sql": "SELECT ...", "params": [ ... ] }` (`params` binds `?`/`$N`). RBAC gates `sql` at the `ReadWrite` role. SQL supports DDL, DML, single-table + INNER/LEFT/RIGHT/FULL-join SELECT with GROUP BY/HAVING aggregates, secondary indexes, parameterized queries, and per-engine transactions (`BEGIN`/`COMMIT`/`ROLLBACK`). Node-local in v1 (not Raft-replicated).

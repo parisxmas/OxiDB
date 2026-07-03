@@ -16,6 +16,7 @@ mod error;
 mod executor;
 pub mod json;
 mod parser;
+mod rows;
 mod storage;
 mod store;
 mod transaction;
@@ -32,10 +33,52 @@ pub use error::{Result, SqlError};
 pub use types::{SqlType, Value};
 
 use catalog::Catalog;
+use rows::RowStore;
 use store::Store;
 use transaction::Transaction;
 use types::IndexKey;
 use wal::{Wal, WalRecord};
+
+/// Engine-level options, normally read from the environment by
+/// [`SqlEngine::open`]. Both row-store modes share the same on-disk format,
+/// so a database can be reopened in either mode.
+#[derive(Debug, Clone)]
+pub struct SqlOptions {
+    /// Keep the bulk of each table on disk (mmap'd last-checkpoint snapshot)
+    /// with only post-checkpoint changes in RAM, instead of holding every row
+    /// resident. Env: `OXIDB_SQL_DISK_FIRST`.
+    pub disk_first: bool,
+    /// Auto-checkpoint when the live WAL exceeds this many bytes (folds the
+    /// WAL into `.rdat` snapshots and truncates it; also bounds the RAM
+    /// overlay in disk-first mode). `0` disables auto-checkpointing.
+    /// Env: `OXIDB_SQL_CHECKPOINT_BYTES`.
+    pub checkpoint_bytes: u64,
+}
+
+impl Default for SqlOptions {
+    fn default() -> Self {
+        SqlOptions {
+            disk_first: false,
+            checkpoint_bytes: 64 << 20, // 64 MiB
+        }
+    }
+}
+
+impl SqlOptions {
+    pub fn from_env() -> Self {
+        let mut opts = SqlOptions::default();
+        if let Ok(v) = std::env::var("OXIDB_SQL_DISK_FIRST") {
+            opts.disk_first =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("OXIDB_SQL_CHECKPOINT_BYTES")
+            && let Ok(n) = v.trim().parse::<u64>()
+        {
+            opts.checkpoint_bytes = n;
+        }
+        opts
+    }
+}
 
 /// An in-memory secondary index over one or more columns:
 /// key tuple -> set of row ids.
@@ -57,7 +100,7 @@ impl SecondaryIndex {
 /// engine-assigned `row_id`, and any secondary indexes.
 struct TableState {
     def: Table,
-    rows: BTreeMap<u64, Vec<Value>>,
+    rows: RowStore,
     next_row_id: u64,
     /// Secondary indexes keyed by index name.
     indexes: BTreeMap<String, SecondaryIndex>,
@@ -68,11 +111,11 @@ struct TableState {
 }
 
 impl TableState {
-    fn empty(def: Table) -> Self {
+    fn empty(def: Table, disk_first: bool) -> Self {
         let pk_pos = def.pk_pos();
         TableState {
             def,
-            rows: BTreeMap::new(),
+            rows: RowStore::new(disk_first),
             next_row_id: 1,
             indexes: BTreeMap::new(),
             pk_pos,
@@ -102,9 +145,9 @@ impl TableState {
             col_pos,
             map: BTreeMap::new(),
         };
-        for (rid, cells) in &self.rows {
-            let key = idx.key_of(cells);
-            idx.map.entry(key).or_default().insert(*rid);
+        for (rid, cells) in self.rows.iter() {
+            let key = idx.key_of(&cells);
+            idx.map.entry(key).or_default().insert(rid);
         }
         self.indexes.insert(index_name.to_string(), idx);
         Ok(())
@@ -164,6 +207,9 @@ struct Inner {
     catalog: Catalog,
     tables: BTreeMap<String, TableState>,
     wal: Wal,
+    disk_first: bool,
+    /// Auto-checkpoint threshold in WAL bytes (0 = manual only).
+    checkpoint_bytes: u64,
 }
 
 /// The public SQL engine handle. Cheap to share behind an `Arc`.
@@ -173,25 +219,45 @@ pub struct SqlEngine {
 
 impl SqlEngine {
     /// Open (creating if needed) a SQL engine rooted at `dir` (e.g.
-    /// `oxidb_data/sql`). Loads the catalog and `.rdat` snapshots, replays the
-    /// WAL tail, then (re)builds secondary indexes.
+    /// `oxidb_data/sql`), with options from the environment. Loads the catalog
+    /// and `.rdat` snapshots, replays the WAL tail, then (re)builds secondary
+    /// indexes.
     pub fn open(dir: impl AsRef<Path>) -> Result<SqlEngine> {
+        Self::open_with_options(dir, SqlOptions::from_env())
+    }
+
+    /// [`open`](SqlEngine::open) with explicit options.
+    pub fn open_with_options(dir: impl AsRef<Path>, opts: SqlOptions) -> Result<SqlEngine> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
         // 1. Durable schema snapshot.
         let mut catalog = Catalog::load(&dir)?;
 
-        // 2. Load each table's row snapshot.
+        // 2. Load each table's row snapshot. Resident mode materializes every
+        //    row; disk-first maps the snapshot and makes one decoding pass to
+        //    seed `next_row_id` and the PK map without retaining the rows.
         let mut tables: BTreeMap<String, TableState> = BTreeMap::new();
         for (name, def) in &catalog.tables {
-            let mut state = TableState::empty(def.clone());
-            for (row_id, cells) in storage::read_snapshot(&dir, name, def.arity())? {
-                state.observe_row_id(row_id);
-                if let Some(p) = state.pk_pos {
-                    state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
+            let mut state = TableState::empty(def.clone(), opts.disk_first);
+            if opts.disk_first {
+                if let Some(snap) = storage::MappedSnapshot::open(&dir, name, def.arity())? {
+                    for (row_id, cells) in snap.entries() {
+                        state.observe_row_id(row_id);
+                        if let Some(p) = state.pk_pos {
+                            state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
+                        }
+                    }
+                    state.rows.attach_base(snap);
                 }
-                state.rows.insert(row_id, cells);
+            } else {
+                for (row_id, cells) in storage::read_snapshot(&dir, name, def.arity())? {
+                    state.observe_row_id(row_id);
+                    if let Some(p) = state.pk_pos {
+                        state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
+                    }
+                    state.rows.insert(row_id, cells);
+                }
             }
             tables.insert(name.clone(), state);
         }
@@ -199,7 +265,7 @@ impl SqlEngine {
         // 3. Replay the WAL tail over the snapshots (idempotent).
         let (wal, records) = Wal::open(&dir)?;
         for rec in &records {
-            Self::apply_live(&mut catalog, &mut tables, rec);
+            Self::apply_live(&mut catalog, &mut tables, rec, opts.disk_first);
         }
 
         // 4. Build any indexes that existed before the last checkpoint (they are
@@ -220,6 +286,8 @@ impl SqlEngine {
                 catalog,
                 tables,
                 wal,
+                disk_first: opts.disk_first,
+                checkpoint_bytes: opts.checkpoint_bytes,
             }),
         })
     }
@@ -231,13 +299,14 @@ impl SqlEngine {
         catalog: &mut Catalog,
         tables: &mut BTreeMap<String, TableState>,
         rec: &WalRecord,
+        disk_first: bool,
     ) {
         match rec {
             WalRecord::CreateTable(def) => {
                 catalog.tables.insert(def.name.clone(), def.clone());
                 tables
                     .entry(def.name.clone())
-                    .or_insert_with(|| TableState::empty(def.clone()));
+                    .or_insert_with(|| TableState::empty(def.clone(), disk_first));
             }
             WalRecord::DropTable(name) => {
                 catalog.tables.remove(name);
@@ -270,7 +339,7 @@ impl SqlEngine {
                 cells,
             } => {
                 if let Some(state) = tables.get_mut(table) {
-                    if let Some(old) = state.rows.get(row_id).cloned() {
+                    if let Some(old) = state.rows.get(*row_id) {
                         state.index_remove(*row_id, &old);
                     }
                     state.observe_row_id(*row_id);
@@ -280,14 +349,14 @@ impl SqlEngine {
             }
             WalRecord::Delete { table, row_id } => {
                 if let Some(state) = tables.get_mut(table)
-                    && let Some(old) = state.rows.remove(row_id)
+                    && let Some(old) = state.rows.remove(*row_id)
                 {
                     state.index_remove(*row_id, &old);
                 }
             }
             WalRecord::Batch(ops) => {
                 for op in ops {
-                    Self::apply_live(catalog, tables, op);
+                    Self::apply_live(catalog, tables, op, disk_first);
                 }
             }
         }
@@ -302,7 +371,12 @@ impl SqlEngine {
         let rec = WalRecord::CreateTable(def);
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(())
     }
 
@@ -315,7 +389,12 @@ impl SqlEngine {
         let rec = WalRecord::DropTable(name.to_string());
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(())
     }
 
@@ -347,7 +426,12 @@ impl SqlEngine {
         });
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(())
     }
 
@@ -379,7 +463,12 @@ impl SqlEngine {
         };
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(())
     }
 
@@ -392,7 +481,12 @@ impl SqlEngine {
         let rec = WalRecord::DropView(name.to_string());
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(())
     }
 
@@ -410,7 +504,12 @@ impl SqlEngine {
         let rec = WalRecord::DropIndex(name.to_string());
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(())
     }
 
@@ -436,7 +535,12 @@ impl SqlEngine {
         };
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(row_id)
     }
 
@@ -483,7 +587,12 @@ impl SqlEngine {
         let rec = WalRecord::Batch(ops);
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(n)
     }
 
@@ -504,7 +613,7 @@ impl SqlEngine {
             .get(table)
             .expect("present")
             .rows
-            .contains_key(&row_id)
+            .contains(row_id)
         {
             return Err(SqlError::SchemaMismatch(format!(
                 "row {row_id} does not exist in {table:?}"
@@ -517,7 +626,12 @@ impl SqlEngine {
         };
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(())
     }
 
@@ -530,7 +644,7 @@ impl SqlEngine {
         let present = inner
             .tables
             .get(table)
-            .map(|s| s.rows.contains_key(&row_id))
+            .map(|s| s.rows.contains(row_id))
             .unwrap_or(false);
         if !present {
             return Ok(false);
@@ -541,7 +655,12 @@ impl SqlEngine {
         };
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(true)
     }
 
@@ -552,7 +671,11 @@ impl SqlEngine {
             .tables
             .get(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
-        Ok(state.rows.iter().map(|(id, c)| (*id, c.clone())).collect())
+        Ok(state
+            .rows
+            .iter()
+            .map(|(id, c)| (id, c.into_owned()))
+            .collect())
     }
 
     /// Look up rows using a secondary index whose columns are all present in
@@ -593,7 +716,7 @@ impl SqlEngine {
         let rows = match idx.map.get(&key) {
             Some(ids) => ids
                 .iter()
-                .filter_map(|id| state.rows.get(id).map(|c| (*id, c.clone())))
+                .filter_map(|id| state.rows.get(*id).map(|c| (*id, c)))
                 .collect(),
             None => Vec::new(),
         };
@@ -661,7 +784,12 @@ impl SqlEngine {
         let rec = WalRecord::Batch(ops);
         let inner = &mut *inner;
         inner.wal.append(&rec)?;
-        Self::apply_live(&mut inner.catalog, &mut inner.tables, &rec);
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
         Ok(())
     }
 
@@ -669,16 +797,21 @@ impl SqlEngine {
     /// then truncate the WAL.
     pub fn checkpoint(&self) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        Self::checkpoint_locked(&mut inner)
+    }
+
+    fn checkpoint_locked(inner: &mut Inner) -> Result<()> {
         let Inner {
             dir,
             catalog,
             tables,
             wal,
-        } = &mut *inner;
+            disk_first,
+            ..
+        } = inner;
 
         for (name, state) in tables.iter() {
-            let rows = state.rows.iter().map(|(id, c)| (*id, c.as_slice()));
-            storage::write_snapshot(dir, name, rows)?;
+            storage::write_snapshot(dir, name, state.rows.iter())?;
         }
         for entry in std::fs::read_dir(&*dir)? {
             let entry = entry?;
@@ -692,7 +825,31 @@ impl SqlEngine {
         }
         catalog.save(dir)?;
         wal.truncate()?;
+
+        // Disk-first: adopt the freshly written snapshots as the new bases and
+        // drop the RAM overlays they absorbed. On failure the old base +
+        // overlay stay live — still correct, just not yet compacted.
+        if *disk_first {
+            for (name, state) in tables.iter_mut() {
+                if let Some(snap) = storage::MappedSnapshot::open(dir, name, state.def.arity())? {
+                    state.rows.attach_base(snap);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Checkpoint if the live WAL has grown past the configured threshold.
+    /// Best-effort: the data an auto-checkpoint would compact is already
+    /// durable in the WAL, so a failure here only defers compaction.
+    fn maybe_checkpoint(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.checkpoint_bytes > 0
+            && inner.wal.bytes() >= inner.checkpoint_bytes
+            && let Err(e) = Self::checkpoint_locked(&mut inner)
+        {
+            eprintln!("[oxidb-sql] auto-checkpoint failed (will retry): {e}");
+        }
     }
 
     /// Parse and execute a SQL string, returning one [`QueryResult`] per
@@ -745,6 +902,11 @@ impl SqlEngine {
             }
         }
         // An open transaction at end of the batch is discarded (auto-rollback).
+
+        // Fold the WAL into snapshots once it outgrows the threshold. Runs
+        // between statement batches, so it never observes a mid-transaction
+        // engine state.
+        self.maybe_checkpoint();
         Ok(results)
     }
 
@@ -780,7 +942,7 @@ impl Store for SqlEngine {
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
         let n = state.rows.len();
         let mut cells = Vec::with_capacity(n * keep.len());
-        for row in state.rows.values() {
+        for (_, row) in state.rows.iter() {
             for &k in keep {
                 cells.push(row[k].clone());
             }

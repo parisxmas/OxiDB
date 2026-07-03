@@ -30,9 +30,10 @@ pub fn rdat_path(dir: &Path, table: &str) -> PathBuf {
 }
 
 /// Atomically write a table snapshot containing `rows` (each `(row_id, cells)`).
-pub fn write_snapshot<'a, I>(dir: &Path, table: &str, rows: I) -> Result<()>
+pub fn write_snapshot<I, C>(dir: &Path, table: &str, rows: I) -> Result<()>
 where
-    I: IntoIterator<Item = (u64, &'a [Value])>,
+    I: IntoIterator<Item = (u64, C)>,
+    C: std::borrow::Borrow<[Value]>,
 {
     let path = rdat_path(dir, table);
     let tmp = path.with_extension("rdat.tmp");
@@ -43,7 +44,7 @@ where
     buf.extend_from_slice(&0u16.to_le_bytes()); // flags
 
     for (row_id, cells) in rows {
-        let payload = encode_row(cells);
+        let payload = encode_row(cells.borrow());
         let crc = crc32fast::hash(&payload);
         buf.extend_from_slice(&row_id.to_le_bytes());
         buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -108,6 +109,112 @@ pub fn read_snapshot(dir: &Path, table: &str, ncols: usize) -> Result<Vec<(u64, 
         rows.push((row_id, cells));
     }
     Ok(rows)
+}
+
+/// A table snapshot mapped read-only into memory (disk-first mode).
+///
+/// Record CRCs are verified once at open; reads afterwards decode straight
+/// from the mapping without re-hashing. The mapping pins the file's *inode*,
+/// so a later checkpoint atomically renaming a new snapshot over the path
+/// does not invalidate an existing `MappedSnapshot`.
+pub struct MappedSnapshot {
+    mmap: memmap2::Mmap,
+    /// `(row_id, payload offset, payload len)`, ascending by `row_id`.
+    index: Vec<(u64, u64, u32)>,
+    arity: usize,
+}
+
+impl MappedSnapshot {
+    /// Map a table's snapshot. `Ok(None)` when the table has never been
+    /// checkpointed (no file).
+    pub fn open(dir: &Path, table: &str, arity: usize) -> Result<Option<MappedSnapshot>> {
+        let path = rdat_path(dir, table);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // Safety: the file is only ever replaced via rename (never written in
+        // place), so the mapped inode's contents are immutable.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+        let bytes: &[u8] = &mmap;
+        if bytes.len() < HEADER_LEN || &bytes[0..4] != RDAT_MAGIC {
+            return Err(SqlError::Corrupt(format!("bad .rdat magic for {table:?}")));
+        }
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        if version != RDAT_VERSION {
+            return Err(SqlError::Corrupt(format!(
+                "unknown .rdat version {version} for {table:?}"
+            )));
+        }
+
+        let mut index = Vec::new();
+        let mut pos = HEADER_LEN;
+        while pos < bytes.len() {
+            let prefix = bytes.get(pos..pos + 16).ok_or_else(|| {
+                SqlError::Corrupt(format!("truncated record header in {table:?} snapshot"))
+            })?;
+            let row_id = u64::from_le_bytes(prefix[0..8].try_into().unwrap());
+            let len = u32::from_le_bytes(prefix[8..12].try_into().unwrap());
+            let crc = u32::from_le_bytes(prefix[12..16].try_into().unwrap());
+            let start = pos + 16;
+            let end = start + len as usize;
+            let payload = bytes.get(start..end).ok_or_else(|| {
+                SqlError::Corrupt(format!("truncated payload in {table:?} snapshot"))
+            })?;
+            if crc32fast::hash(payload) != crc {
+                return Err(SqlError::Corrupt(format!(
+                    "crc mismatch in {table:?} snapshot (row {row_id})"
+                )));
+            }
+            index.push((row_id, start as u64, len));
+            pos = end;
+        }
+        // `write_snapshot` emits rows in ascending row_id order, but sort
+        // defensively — the binary searches below depend on it.
+        index.sort_unstable_by_key(|&(id, _, _)| id);
+
+        Ok(Some(MappedSnapshot { mmap, index, arity }))
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn contains(&self, row_id: u64) -> bool {
+        self.index
+            .binary_search_by_key(&row_id, |&(id, _, _)| id)
+            .is_ok()
+    }
+
+    /// Decode one row by id.
+    pub fn get(&self, row_id: u64) -> Option<Vec<Value>> {
+        let i = self
+            .index
+            .binary_search_by_key(&row_id, |&(id, _, _)| id)
+            .ok()?;
+        Some(self.decode_at(i))
+    }
+
+    /// All rows in ascending `row_id` order, decoded on the fly.
+    pub fn entries(&self) -> impl Iterator<Item = (u64, Vec<Value>)> + '_ {
+        (0..self.index.len()).map(|i| (self.index[i].0, self.decode_at(i)))
+    }
+
+    /// The `row_id` at position `i` of the (sorted) index.
+    pub fn row_id_at(&self, i: usize) -> u64 {
+        self.index[i].0
+    }
+
+    /// Decode the row at position `i` of the index. CRC was verified at open,
+    /// so a decode failure here is snapshot corruption after the fact.
+    pub fn decode_at(&self, i: usize) -> Vec<Value> {
+        let (row_id, off, len) = self.index[i];
+        let payload = &self.mmap[off as usize..off as usize + len as usize];
+        decode_row(payload, self.arity)
+            .unwrap_or_else(|e| panic!("snapshot row {row_id} failed to decode: {e}"))
+    }
 }
 
 /// Delete a table's snapshot file if present (used when a table is dropped).
