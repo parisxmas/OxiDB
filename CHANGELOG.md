@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### SQL-text user management (server 0.32.3)
+
+- `CREATE USER name WITH PASSWORD '...' [ROLE r]`, `ALTER USER` (password
+  and/or role), `DROP USER [IF EXISTS]`, `SHOW USERS`, and per-database
+  grants — `GRANT role ON DATABASE db TO user` / `REVOKE [ALL] ON DATABASE
+  db FROM user` — now work as SQL statements, mirroring the wire commands
+  (`create_user` etc.) against the same SCRAM user store with the same
+  Admin-only gate. Single-statement only; wire-protocol only (REST rejects
+  them clearly — its JWT auth manages a different user system).
+
 ### Multi-database: remaining limitations closed (ADR-0012, server 0.32.2)
 
 - **Raft-replicated database DDL** — in cluster mode `create_database` /

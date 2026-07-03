@@ -181,3 +181,86 @@ fn database_statements_parse() {
     assert_eq!(p("CREATE DATABASE crm; SELECT 1 FROM t"), None);
     assert_eq!(p("SHOW TABLES"), None);
 }
+
+#[test]
+fn user_statements_parse() {
+    use oxidb_sql::{UserStatement as U, parse_user_statement as p};
+    assert_eq!(
+        p("CREATE USER ali WITH PASSWORD 'gizli; %42'"),
+        Some(U::Create {
+            name: "ali".into(),
+            password: "gizli; %42".into(),
+            role: None
+        })
+    );
+    assert_eq!(
+        p("create user ali with password 'x' role readwrite;"),
+        Some(U::Create {
+            name: "ali".into(),
+            password: "x".into(),
+            role: Some("readwrite".into())
+        })
+    );
+    assert_eq!(
+        p("ALTER USER ali WITH PASSWORD 'yeni'"),
+        Some(U::Alter {
+            name: "ali".into(),
+            password: Some("yeni".into()),
+            role: None
+        })
+    );
+    assert_eq!(
+        p("ALTER USER ali ROLE admin"),
+        Some(U::Alter {
+            name: "ali".into(),
+            password: None,
+            role: Some("admin".into())
+        })
+    );
+    assert_eq!(
+        p("ALTER USER ali PASSWORD 'y' ROLE read"),
+        Some(U::Alter {
+            name: "ali".into(),
+            password: Some("y".into()),
+            role: Some("read".into())
+        })
+    );
+    assert_eq!(
+        p("DROP USER IF EXISTS ali"),
+        Some(U::Drop {
+            name: "ali".into(),
+            if_exists: true
+        })
+    );
+    assert_eq!(p("SHOW USERS"), Some(U::Show));
+    assert_eq!(
+        p("GRANT readwrite ON DATABASE crm TO ali"),
+        Some(U::Grant {
+            role: "readwrite".into(),
+            database: "crm".into(),
+            user: "ali".into()
+        })
+    );
+    assert_eq!(
+        p("REVOKE ALL ON DATABASE crm FROM ali"),
+        Some(U::Revoke {
+            database: "crm".into(),
+            user: "ali".into()
+        })
+    );
+    assert_eq!(
+        p("REVOKE ON DATABASE crm FROM ali"),
+        Some(U::Revoke {
+            database: "crm".into(),
+            user: "ali".into()
+        })
+    );
+
+    // Not user statements: plain SQL, general GRANT, trailing junk, ALTER
+    // with no clause.
+    assert_eq!(p("SELECT 1 FROM users"), None);
+    assert_eq!(p("GRANT SELECT ON t TO ali"), None);
+    assert_eq!(p("CREATE USER ali WITH PASSWORD 'x' EXTRA"), None);
+    assert_eq!(p("ALTER USER ali"), None);
+    assert_eq!(p("CREATE USER ali"), None);
+}

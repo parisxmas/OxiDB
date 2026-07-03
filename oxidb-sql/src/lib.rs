@@ -30,7 +30,9 @@ use std::sync::Mutex;
 pub use ast::QueryResult;
 pub use catalog::{Column, IndexDef, Table};
 pub use error::{Result, SqlError};
-pub use parser::{DatabaseStatement, parse_database_statement};
+pub use parser::{
+    DatabaseStatement, UserStatement, parse_database_statement, parse_user_statement,
+};
 pub use types::{SqlType, Value};
 
 use catalog::Catalog;

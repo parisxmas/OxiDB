@@ -204,6 +204,128 @@ pub fn replicated_response(intent: &DbIntent) -> Vec<u8> {
     }
 }
 
+/// Handle a user-management statement arriving as SQL text (`CREATE USER` /
+/// `ALTER USER` / `DROP USER` / `SHOW USERS` / `GRANT role ON DATABASE` /
+/// `REVOKE ... ON DATABASE`). Returns `None` when the request is not one.
+/// All user statements are Admin-only, matching the wire commands' gate; the
+/// user store itself is node-local (like the wire commands — not
+/// Raft-replicated). On success, mutations answer `[{"ddl": true}]` and
+/// `SHOW USERS` answers a SELECT-shaped result.
+///
+/// The returned tuple carries the equivalent wire-command name for audit
+/// logging.
+pub fn handle_sql_user_statement(
+    cmd: &str,
+    request: &Value,
+    user_store: Option<&std::sync::Arc<std::sync::Mutex<crate::auth::UserStore>>>,
+    session: &Session,
+    auth_enabled: bool,
+) -> Option<(&'static str, Vec<u8>)> {
+    let is_sql = cmd == "sql" || request.get("engine").and_then(|v| v.as_str()) == Some("sql");
+    if !is_sql {
+        return None;
+    }
+    let sql = request.get("sql").and_then(|v| v.as_str())?;
+    let stmt = oxidb_sql::parse_user_statement(sql)?;
+
+    use oxidb_sql::UserStatement as Us;
+    let audit = match &stmt {
+        Us::Create { .. } => "create_user",
+        Us::Alter { .. } => "update_user",
+        Us::Drop { .. } => "drop_user",
+        Us::Show => "list_users",
+        Us::Grant { .. } => "grant_db_role",
+        Us::Revoke { .. } => "revoke_db_role",
+    };
+
+    if auth_enabled && session.role() != Some(Role::Admin) {
+        return Some((
+            audit,
+            err_bytes(&format!(
+                "permission denied: '{audit}' requires the admin role"
+            )),
+        ));
+    }
+    let Some(store) = user_store else {
+        return Some((
+            audit,
+            err_bytes("user management requires authentication (set OXIDB_AUTH=1)"),
+        ));
+    };
+
+    let parse_role = |r: &str| {
+        Role::from_str(r).ok_or_else(|| format!("invalid role: {r} (admin/readwrite/read)"))
+    };
+    let ddl_ok = || ok_bytes(json!([{ "ddl": true }]));
+
+    let mut store = store.lock().unwrap();
+    let resp = match stmt {
+        Us::Create {
+            name,
+            password,
+            role,
+        } => {
+            let role = match role.as_deref().map(parse_role).transpose() {
+                Ok(r) => r.unwrap_or(Role::Read),
+                Err(e) => return Some((audit, err_bytes(&e))),
+            };
+            match store.create_user(&name, &password, role) {
+                Ok(()) => ddl_ok(),
+                Err(e) => err_bytes(&e),
+            }
+        }
+        Us::Alter {
+            name,
+            password,
+            role,
+        } => {
+            let role = match role.as_deref().map(parse_role).transpose() {
+                Ok(r) => r,
+                Err(e) => return Some((audit, err_bytes(&e))),
+            };
+            match store.update_user(&name, password.as_deref(), role) {
+                Ok(()) => ddl_ok(),
+                Err(e) => err_bytes(&e),
+            }
+        }
+        Us::Drop { name, if_exists } => match store.drop_user(&name) {
+            Ok(()) => ddl_ok(),
+            Err(_) if if_exists => ddl_ok(),
+            Err(e) => err_bytes(&e),
+        },
+        Us::Show => {
+            let rows: Vec<Value> = store
+                .list_users()
+                .into_iter()
+                .map(|u| {
+                    let db_roles = u.get("db_roles").map(|d| d.to_string()).unwrap_or_default();
+                    json!([u["username"], u["role"], db_roles])
+                })
+                .collect();
+            ok_bytes(json!([{ "columns": ["user", "role", "db_roles"], "rows": rows }]))
+        }
+        Us::Grant {
+            role,
+            database,
+            user,
+        } => {
+            let role = match parse_role(&role) {
+                Ok(r) => r,
+                Err(e) => return Some((audit, err_bytes(&e))),
+            };
+            match store.grant_db_role(&user, &database, role) {
+                Ok(()) => ddl_ok(),
+                Err(e) => err_bytes(&e),
+            }
+        }
+        Us::Revoke { database, user } => match store.revoke_db_role(&user, &database) {
+            Ok(()) => ddl_ok(),
+            Err(e) => err_bytes(&e),
+        },
+    };
+    Some((audit, resp))
+}
+
 fn created_ok(name: &str, via_sql: bool) -> Vec<u8> {
     if via_sql {
         ok_bytes(json!([{ "ddl": true }]))
@@ -303,5 +425,70 @@ mod tests {
             serde_json::from_slice(&execute_local(&drop, &mgr, &mut session)).unwrap();
         assert_eq!(resp["ok"], json!(true));
         assert_eq!(resp["data"], json!("database 'crm' dropped"));
+    }
+}
+
+#[cfg(test)]
+mod sql_user_tests {
+    use super::*;
+    use crate::auth::{Role, UserStore};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    fn run(
+        sql: &str,
+        store: &Arc<Mutex<UserStore>>,
+        session: &Session,
+        auth: bool,
+    ) -> Option<(&'static str, serde_json::Value)> {
+        handle_sql_user_statement("sql", &json!({ "sql": sql }), Some(store), session, auth)
+            .map(|(a, b)| (a, serde_json::from_slice(&b).unwrap()))
+    }
+
+    #[test]
+    fn sql_user_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(UserStore::open(dir.path()).unwrap()));
+        let mut admin = Session::new();
+        admin.set_authenticated("root".into(), Role::Admin);
+
+        let (audit, r) = run(
+            "CREATE USER ali WITH PASSWORD 'gizli' ROLE readwrite",
+            &store,
+            &admin,
+            true,
+        )
+        .unwrap();
+        assert_eq!((audit, r["ok"].clone()), ("create_user", json!(true)));
+
+        let (_, r) = run("GRANT read ON DATABASE crm TO ali", &store, &admin, true).unwrap();
+        assert_eq!(r["ok"], json!(true));
+
+        let (_, r) = run("SHOW USERS", &store, &admin, true).unwrap();
+        assert_eq!(r["data"][0]["columns"], json!(["user", "role", "db_roles"]));
+        let rows = r["data"][0]["rows"].as_array().unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row[0] == "ali" && row[1] == "readWrite")
+        );
+
+        let (_, r) = run("ALTER USER ali ROLE read", &store, &admin, true).unwrap();
+        assert_eq!(r["ok"], json!(true));
+        let (_, r) = run("REVOKE ALL ON DATABASE crm FROM ali", &store, &admin, true).unwrap();
+        assert_eq!(r["ok"], json!(true));
+        let (_, r) = run("DROP USER ali", &store, &admin, true).unwrap();
+        assert_eq!(r["ok"], json!(true));
+        // IF EXISTS tolerates the missing user; plain DROP errors.
+        let (_, r) = run("DROP USER IF EXISTS ali", &store, &admin, true).unwrap();
+        assert_eq!(r["ok"], json!(true));
+        let (_, r) = run("DROP USER ali", &store, &admin, true).unwrap();
+        assert_eq!(r["ok"], json!(false));
+
+        // Non-admin is refused; ordinary SQL is not intercepted.
+        let mut rw = Session::new();
+        rw.set_authenticated("bob".into(), Role::ReadWrite);
+        let (_, r) = run("CREATE USER eve WITH PASSWORD 'x'", &store, &rw, true).unwrap();
+        assert_eq!(r["ok"], json!(false));
+        assert!(run("SELECT 1 FROM t", &store, &admin, true).is_none());
     }
 }

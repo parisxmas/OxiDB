@@ -263,6 +263,19 @@ fn dispatch_request(
         return resp;
     }
 
+    // User management as SQL text (CREATE/ALTER/DROP USER, SHOW USERS,
+    // GRANT/REVOKE ... ON DATABASE) — same Admin gate as the wire commands.
+    if let Some((audit_cmd, resp)) = oxidb_server::db_admin::handle_sql_user_statement(
+        &cmd,
+        request,
+        state.user_store.as_ref(),
+        session,
+        state.auth_enabled,
+    ) {
+        log_audit(state, session, audit_cmd, None, "ok", "");
+        return resp;
+    }
+
     // ---------------------------------------------------------------
     // Handle user management commands
     // ---------------------------------------------------------------

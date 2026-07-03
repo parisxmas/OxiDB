@@ -179,6 +179,24 @@ wire commands are `create_database` / `drop_database` / `list_databases` /
 `use_db`, and any request can target a database explicitly with a `db`
 field (REST: `?db=<name>`).
 
+### Users (wire-protocol user store)
+
+```sql
+CREATE USER ali WITH PASSWORD 'gizli' ROLE readwrite;  -- role: admin|readwrite|read (default read)
+ALTER USER ali WITH PASSWORD 'yeni';                   -- and/or: ALTER USER ali ROLE admin
+DROP USER [IF EXISTS] ali;
+SHOW USERS;                                            -- columns: user, role, db_roles
+GRANT readwrite ON DATABASE crm TO ali;                -- per-database role override
+REVOKE ALL ON DATABASE crm FROM ali;
+```
+
+These manage the SCRAM user store (`_auth/users.json`) and are Admin-only,
+exactly like the wire commands (`create_user` / `update_user` / `drop_user` /
+`list_users` / `grant_db_role` / `revoke_db_role`) they mirror. They require
+authentication to be enabled (`OXIDB_AUTH=1`) and must be sent alone (not
+mixed with other statements). Not available over REST — REST authenticates
+with JWT against a different user system.
+
 ### Introspection
 
 ```sql

@@ -314,6 +314,20 @@ async fn dispatch_request(
         }
     }
 
+    // User management as SQL text (CREATE/ALTER/DROP USER, SHOW USERS,
+    // GRANT/REVOKE ... ON DATABASE) — same Admin gate as the wire commands;
+    // node-local, like the wire user commands.
+    if let Some((audit_cmd, resp)) = crate::db_admin::handle_sql_user_statement(
+        &cmd,
+        &request,
+        state.user_store.as_ref(),
+        session,
+        state.auth_enabled,
+    ) {
+        log_audit(state, session, audit_cmd, None, "ok", "");
+        return resp;
+    }
+
     // ---------------------------------------------------------------
     // Target database for this request + transaction binding: an open
     // transaction's buffered writes belong to the database it began on.

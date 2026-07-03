@@ -646,6 +646,17 @@ fn handle_sql_endpoint(
         return json_response(400, "Bad Request", json!({"error": "missing 'sql'"}));
     };
 
+    // ── SQL-text user management is wire-protocol-only: REST authenticates
+    // with JWT against `_auth_users`, not the SCRAM user store these
+    // statements manage. Reject clearly instead of confusing engine errors.
+    if oxidb_sql::parse_user_statement(sql).is_some() {
+        return json_response(
+            400,
+            "Bad Request",
+            json!({"error": "user management statements are not available over REST; use the wire protocol"}),
+        );
+    }
+
     // ── SQL-text database DDL (ADR-0012). REST is stateless, so `USE` has
     // no session to act on — `?db=<name>` is the REST equivalent.
     if let Some(stmt) = oxidb_sql::parse_database_statement(sql) {

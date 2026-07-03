@@ -97,6 +97,215 @@ pub fn parse_database_statement(sql: &str) -> Option<DatabaseStatement> {
     }
 }
 
+/// A user-management statement recognized in SQL text. Like
+/// [`DatabaseStatement`], these are served by the host (which owns the user
+/// store), not by the engine. Role strings are validated by the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserStatement {
+    /// `CREATE USER name WITH PASSWORD 'pw' [ROLE role]`
+    Create {
+        name: String,
+        password: String,
+        role: Option<String>,
+    },
+    /// `ALTER USER name [WITH PASSWORD 'pw'] [ROLE role]` (at least one clause)
+    Alter {
+        name: String,
+        password: Option<String>,
+        role: Option<String>,
+    },
+    /// `DROP USER [IF EXISTS] name`
+    Drop { name: String, if_exists: bool },
+    /// `SHOW USERS`
+    Show,
+    /// `GRANT role ON DATABASE db TO user`
+    Grant {
+        role: String,
+        database: String,
+        user: String,
+    },
+    /// `REVOKE [role | ALL] ON DATABASE db FROM user`
+    Revoke { database: String, user: String },
+}
+
+/// Recognize a **single** user-management statement as the whole input.
+/// `None` for any other SQL. Tokenized with sqlparser's tokenizer (so quoted
+/// passwords behave), matched against the exact grammar above.
+pub fn parse_user_statement(sql: &str) -> Option<UserStatement> {
+    // Cheap prefix gate so ordinary queries never pay tokenization.
+    let head = sql.trim_start().get(..12).unwrap_or(sql.trim_start());
+    let head = head.to_ascii_lowercase();
+    if !(head.starts_with("create user")
+        || head.starts_with("alter user")
+        || head.starts_with("drop user")
+        || head.starts_with("show users")
+        || head.starts_with("grant ")
+        || head.starts_with("revoke "))
+    {
+        return None;
+    }
+
+    // Tokenize into just the shapes our grammar uses; anything else bails.
+    #[derive(PartialEq)]
+    enum Tok {
+        Word(String),
+        Str(String),
+    }
+    let dialect = GenericDialect {};
+    let raw = sqlparser::tokenizer::Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .ok()?;
+    let mut toks: Vec<Tok> = Vec::new();
+    for t in raw {
+        use sqlparser::tokenizer::Token;
+        match t {
+            Token::Whitespace(_) | Token::EOF => {}
+            Token::Word(w) => toks.push(Tok::Word(w.value)),
+            Token::SingleQuotedString(s) => toks.push(Tok::Str(s)),
+            Token::SemiColon => break, // statement end; nothing may follow
+            _ => return None,
+        }
+    }
+
+    let mut i = 0usize;
+    let mut kw = |k: &str, i: &mut usize| -> bool {
+        match toks.get(*i) {
+            Some(Tok::Word(w)) if w.eq_ignore_ascii_case(k) => {
+                *i += 1;
+                true
+            }
+            _ => false,
+        }
+    };
+    fn ident(toks: &[Tok], i: &mut usize) -> Option<String> {
+        match toks.get(*i) {
+            Some(Tok::Word(w)) => {
+                *i += 1;
+                Some(w.clone())
+            }
+            _ => None,
+        }
+    }
+    fn string(toks: &[Tok], i: &mut usize) -> Option<String> {
+        match toks.get(*i) {
+            Some(Tok::Str(s)) => {
+                *i += 1;
+                Some(s.clone())
+            }
+            _ => None,
+        }
+    }
+    let done = |i: usize| i == toks.len();
+
+    if kw("create", &mut i) {
+        if !kw("user", &mut i) {
+            return None;
+        }
+        let name = ident(&toks, &mut i)?;
+        if !kw("with", &mut i) || !kw("password", &mut i) {
+            return None;
+        }
+        let password = string(&toks, &mut i)?;
+        let role = if kw("role", &mut i) {
+            Some(ident(&toks, &mut i)?)
+        } else {
+            None
+        };
+        return done(i).then_some(UserStatement::Create {
+            name,
+            password,
+            role,
+        });
+    }
+    if kw("alter", &mut i) {
+        if !kw("user", &mut i) {
+            return None;
+        }
+        let name = ident(&toks, &mut i)?;
+        let mut password = None;
+        let mut role = None;
+        loop {
+            if kw("with", &mut i) {
+                if !kw("password", &mut i) {
+                    return None;
+                }
+                password = Some(string(&toks, &mut i)?);
+            } else if kw("password", &mut i) {
+                password = Some(string(&toks, &mut i)?);
+            } else if kw("role", &mut i) {
+                role = Some(ident(&toks, &mut i)?);
+            } else {
+                break;
+            }
+        }
+        if password.is_none() && role.is_none() {
+            return None;
+        }
+        return done(i).then_some(UserStatement::Alter {
+            name,
+            password,
+            role,
+        });
+    }
+    if kw("drop", &mut i) {
+        if !kw("user", &mut i) {
+            return None;
+        }
+        let if_exists = if kw("if", &mut i) {
+            if !kw("exists", &mut i) {
+                return None;
+            }
+            true
+        } else {
+            false
+        };
+        let name = ident(&toks, &mut i)?;
+        return done(i).then_some(UserStatement::Drop { name, if_exists });
+    }
+    if kw("show", &mut i) {
+        if !kw("users", &mut i) {
+            return None;
+        }
+        return done(i).then_some(UserStatement::Show);
+    }
+    if kw("grant", &mut i) {
+        let role = ident(&toks, &mut i)?;
+        if !kw("on", &mut i) || !kw("database", &mut i) {
+            return None;
+        }
+        let database = ident(&toks, &mut i)?;
+        if !kw("to", &mut i) {
+            return None;
+        }
+        let user = ident(&toks, &mut i)?;
+        return done(i).then_some(UserStatement::Grant {
+            role,
+            database,
+            user,
+        });
+    }
+    if kw("revoke", &mut i) {
+        // Optional role name (or ALL) before ON — the revoke drops the whole
+        // per-database override either way.
+        if !kw("on", &mut i) {
+            let _role = ident(&toks, &mut i)?;
+            if !kw("on", &mut i) {
+                return None;
+            }
+        }
+        if !kw("database", &mut i) {
+            return None;
+        }
+        let database = ident(&toks, &mut i)?;
+        if !kw("from", &mut i) {
+            return None;
+        }
+        let user = ident(&toks, &mut i)?;
+        return done(i).then_some(UserStatement::Revoke { database, user });
+    }
+    None
+}
+
 /// Recognize `SHOW INDEXES` / `SHOW INDEX [FROM table]` (optionally
 /// `;`-terminated) as the whole input. Returns `None` when the input is
 /// anything else, letting `sqlparser` handle it.
