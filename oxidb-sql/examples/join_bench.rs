@@ -26,9 +26,33 @@ fn scale() -> usize {
 fn main() {
     let k = scale();
     let (c, p, o, i) = (1000 * k, 300 * k, 5000 * k, 15000 * k);
-    let dir = tempfile::tempdir().unwrap();
-    let db = SqlEngine::open(dir.path()).unwrap();
-    seed(&db, c, p, o, i);
+    // JOIN_BENCH_DIR reuses a seeded directory across runs, so open + query
+    // can be measured in a fresh process (clean RSS, no seed-phase noise).
+    let (_tmp, dir) = match std::env::var("JOIN_BENCH_DIR") {
+        Ok(d) => (None, std::path::PathBuf::from(d)),
+        Err(_) => {
+            let t = tempfile::tempdir().unwrap();
+            let p = t.path().to_path_buf();
+            (Some(t), p)
+        }
+    };
+    let db = SqlEngine::open(&dir).unwrap();
+    if db.table_names().is_empty() {
+        seed(&db, c, p, o, i);
+        // Settle the seed into `.rdat` snapshots so a disk-first run reads its
+        // base data from the mmap, matching a server that has checkpointed.
+        db.checkpoint().unwrap();
+    } else {
+        println!("(reusing seeded data in {})", dir.display());
+    }
+    let disk_first = std::env::var("OXIDB_SQL_DISK_FIRST")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    println!(
+        "mode={}  rss_after_seed={} MB\n",
+        if disk_first { "disk-first" } else { "resident" },
+        rss_mb()
+    );
 
     let queries: &[(&str, &str)] = &[
         (
@@ -81,6 +105,17 @@ fn main() {
         print_result(&first);
         println!();
     }
+    println!("rss_after_queries={} MB", rss_mb());
+}
+
+/// Current (not peak) resident set size, via `ps`.
+fn rss_mb() -> u64 {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .expect("ps");
+    let kb: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+    kb / 1024
 }
 
 fn print_result(r: &QueryResult) {

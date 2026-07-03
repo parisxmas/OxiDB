@@ -147,6 +147,39 @@ per single insert. The bare-table delta shows index maintenance costs OxiDB
 `OXIDB_SQL_SYNC` = `full` (default) | `data` selects the WAL sync mode —
 the same trade PostgreSQL exposes as `wal_sync_method`.
 
+## v5 — disk-first row storage (2026-07-03)
+
+Same hard-join benchmark at scale 20, with `OXIDB_SQL_DISK_FIRST=1`: rows
+served from the mmap'd last-checkpoint `.rdat` snapshot, only
+post-checkpoint changes resident. Fresh process per run (seeded directory
+reused via `JOIN_BENCH_DIR`), current RSS via `ps`, PG 15 best-of-5 client
+`\timing` on the same machine:
+
+| Query | resident | disk-first | PostgreSQL 15 |
+|-------|---------:|-----------:|--------------:|
+| Q1 5-way INNER  | **23.0 ms** | 27.2 ms | 45.5 ms |
+| Q2 6-way INNER  | **23.4 ms** | 26.4 ms | 47.1 ms |
+| Q3 LEFT chain   | **3.2 ms**  | 5.3 ms  | 14.0 ms |
+| Q4 FULL join    | **1.7 ms**  | 3.8 ms  | 6.9 ms |
+
+Disk-first stays **1.7–2.6× ahead of PostgreSQL on every query** while
+giving up 15–120% to resident mode (mmap decode on base rows).
+
+Memory (same runs): RSS after open **109 MB resident vs 61 MB disk-first**;
+after the query workload 191 vs 187 MB (join intermediates dominate; the
+touched mmap pages are clean file pages the OS can evict under pressure).
+On a plainer 1M-row/4-col table (`examples/disk_first_rss.rs`, seed and
+measure in separate processes): **272 → 143 MB** RSS, open 226 → 170 ms,
+full scan 11 → 43 ms. The PG backend peaked at 47 MB RSS during the join
+queries (128 MB `shared_buffers` configured; PG additionally leans on the
+kernel page cache, which never shows up in its RSS — mmap'd disk-first is
+OxiDB's equivalent of that architecture).
+
+Write path is unaffected: the insert benchmark measures 127k vs 122k rows/s
+bulk (noise) and identical 3.92 ms single inserts (fsync-bound) across the
+two modes. Auto-checkpointing (`OXIDB_SQL_CHECKPOINT_BYTES`, default
+64 MiB) bounds both the WAL replay time and the disk-first RAM overlay.
+
 ## Remaining headroom
 
 Not yet done (would widen the lead further): cost-based planning beyond the
