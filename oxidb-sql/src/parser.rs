@@ -8,8 +8,8 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, SelectItem, SelectQuery, SelectStmt, ShowKind,
-    Statement, TableRef, UnOp, WindowFunc,
+    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, ScalarFunc, SelectItem, SelectQuery,
+    SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::catalog::{Column, Table};
 use crate::error::{Result, SqlError};
@@ -991,6 +991,38 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             return Err(SqlError::Unsupported("aggregate over subquery".into()));
         }
     };
+    // Row-scalar functions (before the single-argument aggregate path).
+    if let Some(func) = match fname.as_str() {
+        "coalesce" | "ifnull" => Some(ScalarFunc::Coalesce),
+        "nullif" => Some(ScalarFunc::NullIf),
+        _ => None,
+    } {
+        if f.over.is_some() {
+            return Err(SqlError::Unsupported(format!("{fname}() OVER (...)")));
+        }
+        let exprs: Vec<Expr> = args
+            .into_iter()
+            .map(|a| match a {
+                sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => translate_expr(e, p),
+                other => Err(SqlError::Unsupported(format!(
+                    "{fname}() argument {other:?}"
+                ))),
+            })
+            .collect::<Result<_>>()?;
+        let ok_arity = match func {
+            ScalarFunc::Coalesce if fname == "ifnull" => exprs.len() == 2,
+            ScalarFunc::Coalesce => !exprs.is_empty(),
+            ScalarFunc::NullIf => exprs.len() == 2,
+        };
+        if !ok_arity {
+            return Err(SqlError::Unsupported(format!(
+                "{fname}() with {} arguments",
+                exprs.len()
+            )));
+        }
+        return Ok(Expr::Func { func, args: exprs });
+    }
+
     if args.len() > 1 {
         return Err(SqlError::Unsupported(
             "aggregate with multiple arguments".into(),

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
-    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, QueryResult, SelectItem, SelectQuery,
-    SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
+    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, QueryResult, ScalarFunc, SelectItem,
+    SelectQuery, SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::error::{Result, SqlError};
 use crate::store::{Chunk, Store};
@@ -848,6 +848,12 @@ fn resolve_expr<S: Store>(
             Some(a) => resolve_expr(store, a, params, scope, floor),
             None => Ok(()),
         },
+        Expr::Func { args, .. } => {
+            for a in args {
+                resolve_expr(store, a, params, scope, floor)?;
+            }
+            Ok(())
+        }
         Expr::Window {
             func,
             partition_by,
@@ -964,6 +970,11 @@ fn rewrite_outer_refs(
                 rewrite_outer_refs(a, inner, outer, base, out);
             }
         }
+        Expr::Func { args, .. } => {
+            for a in args {
+                rewrite_outer_refs(a, inner, outer, base, out);
+            }
+        }
         Expr::In { expr, list, .. } => {
             rewrite_outer_refs(expr, inner, outer, base, out);
             for item in list {
@@ -1021,6 +1032,7 @@ fn has_corr(e: &Expr) -> bool {
         Expr::Binary { left, right, .. } => has_corr(left) || has_corr(right),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_corr(expr),
         Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(has_corr),
+        Expr::Func { args, .. } => args.iter().any(has_corr),
         Expr::In { expr, list, .. } => has_corr(expr) || list.iter().any(has_corr),
         Expr::Window {
             func,
@@ -1117,6 +1129,13 @@ fn resolve_corr_row<S: Store, R: RowLike + ?Sized>(
                 None => None,
             },
         },
+        Expr::Func { func, args } => Expr::Func {
+            func: *func,
+            args: args
+                .iter()
+                .map(|a| resolve_corr_row(store, a, schema, row, params))
+                .collect::<Result<_>>()?,
+        },
         other => other.clone(),
     })
 }
@@ -1176,6 +1195,7 @@ fn has_window(e: &Expr) -> bool {
         Expr::Binary { left, right, .. } => has_window(left) || has_window(right),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_window(expr),
         Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(has_window),
+        Expr::Func { args, .. } => args.iter().any(has_window),
         Expr::In { expr, list, .. } => has_window(expr) || list.iter().any(has_window),
         _ => false,
     }
@@ -1189,6 +1209,7 @@ fn max_param_slot(e: &Expr) -> usize {
         Expr::Binary { left, right, .. } => max_param_slot(left).max(max_param_slot(right)),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => max_param_slot(expr),
         Expr::Aggregate { arg, .. } => arg.as_deref().map(max_param_slot).unwrap_or(0),
+        Expr::Func { args, .. } => args.iter().map(max_param_slot).max().unwrap_or(0),
         Expr::In { expr, list, .. } => list
             .iter()
             .map(max_param_slot)
@@ -1236,6 +1257,11 @@ fn replace_windows(e: &mut Expr, windows: &mut Vec<Expr>, win_base: usize) {
         }
         Expr::Aggregate { arg: Some(a), .. } => {
             replace_windows(a, windows, win_base);
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                replace_windows(a, windows, win_base);
+            }
         }
         Expr::In { expr, list, .. } => {
             replace_windows(expr, windows, win_base);
@@ -2367,6 +2393,11 @@ fn collect_col_refs<'a>(e: &'a Expr, out: &mut Vec<(&'a Option<String>, &'a str)
                 collect_col_refs(a, out);
             }
         }
+        Expr::Func { args, .. } => {
+            for a in args {
+                collect_col_refs(a, out);
+            }
+        }
         Expr::In { expr, list, .. } => {
             collect_col_refs(expr, out);
             for item in list {
@@ -2764,6 +2795,10 @@ fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Column { name, .. } => name.clone(),
         Expr::Aggregate { func, .. } => agg_name(func).to_string(),
+        Expr::Func { func, .. } => match func {
+            ScalarFunc::Coalesce => "coalesce".to_string(),
+            ScalarFunc::NullIf => "nullif".to_string(),
+        },
         Expr::Window { func, .. } => match func {
             WindowFunc::RowNumber => "row_number".to_string(),
             WindowFunc::Rank => "rank".to_string(),
@@ -2871,6 +2906,9 @@ fn eval_scalar<R: RowLike + ?Sized>(
                 eval_scalar(item, schema, row, params)
             })
         }
+        Expr::Func { func, args } => {
+            eval_scalar_func(*func, args, |e| eval_scalar(e, schema, row, params))
+        }
         Expr::Aggregate { .. } => Err(SqlError::Eval(
             "aggregate function used outside an aggregated query".into(),
         )),
@@ -2883,6 +2921,34 @@ fn eval_scalar<R: RowLike + ?Sized>(
         Expr::Window { .. } => Err(SqlError::Unsupported(
             "window function only allowed in the SELECT list".into(),
         )),
+    }
+}
+
+/// Evaluate a row-scalar function over lazily-evaluated arguments.
+/// COALESCE short-circuits at the first non-NULL argument.
+fn eval_scalar_func<F>(func: ScalarFunc, args: &[Expr], mut eval: F) -> Result<Value>
+where
+    F: FnMut(&Expr) -> Result<Value>,
+{
+    match func {
+        ScalarFunc::Coalesce => {
+            for a in args {
+                let v = eval(a)?;
+                if !matches!(v, Value::Null) {
+                    return Ok(v);
+                }
+            }
+            Ok(Value::Null)
+        }
+        ScalarFunc::NullIf => {
+            let a = eval(&args[0])?;
+            let b = eval(&args[1])?;
+            if cmp_values(&a, &b) == Some(Ordering::Equal) {
+                Ok(Value::Null)
+            } else {
+                Ok(a)
+            }
+        }
     }
 }
 
@@ -2957,6 +3023,13 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
                 .map(|e| bind_expr(e, schema))
                 .collect::<Result<_>>()?,
             negated: *negated,
+        },
+        Expr::Func { func, args } => Expr::Func {
+            func: *func,
+            args: args
+                .iter()
+                .map(|e| bind_expr(e, schema))
+                .collect::<Result<_>>()?,
         },
         // A correlated node's outer refs and probe belong to the outer schema
         // and bind here; the inner query binds against its own tables when it
@@ -3069,6 +3142,9 @@ fn eval_agg(
                 eval_agg(item, schema, src, tuples, group, params)
             })
         }
+        Expr::Func { func, args } => eval_scalar_func(*func, args, |e| {
+            eval_agg(e, schema, src, tuples, group, params)
+        }),
         Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::Eval(
             "internal: unresolved subquery reached evaluation".into(),
         )),
@@ -3212,6 +3288,7 @@ fn has_aggregate(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } => has_aggregate(left) || has_aggregate(right),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_aggregate(expr),
         Expr::In { expr, list, .. } => has_aggregate(expr) || list.iter().any(has_aggregate),
+        Expr::Func { args, .. } => args.iter().any(has_aggregate),
         Expr::CorrIn { expr, .. } => has_aggregate(expr),
         _ => false,
     }

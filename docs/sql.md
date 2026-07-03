@@ -132,7 +132,14 @@ SELECT * FROM events WHERE ts >= TIMESTAMP '2026-01-01';   -- also 'YYYY-MM-DDTH
 ```
 
 Comparisons use SQL three-valued logic; `NULL` never equals anything
-(`IS NULL` / `IS NOT NULL` test for it).
+(`IS NULL` / `IS NOT NULL` test for it). NULL-handling scalar functions:
+
+```sql
+SELECT COALESCE(nickname, name, 'anon') FROM users;   -- first non-NULL (short-circuits)
+SELECT IFNULL(nickname, name) FROM users;             -- two-argument spelling
+SELECT total / NULLIF(count, 0) FROM stats;           -- NULL when equal (÷0 guard)
+SELECT grp, COALESCE(SUM(amt), 0) FROM k LEFT JOIN v ... GROUP BY grp;
+```
 
 ## DDL
 

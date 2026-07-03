@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### SQL engine: COALESCE / IFNULL / NULLIF
+
+- `COALESCE(a, b, ...)` (first non-NULL, short-circuiting), `IFNULL(a, b)`,
+  and `NULLIF(a, b)` work everywhere expressions do — SELECT lists, WHERE,
+  JOIN conditions, GROUP BY/HAVING, and over aggregates
+  (`COALESCE(SUM(x), 0)` with LEFT-JOIN NULL padding).
+
 ## v0.33.1
 
 ### SQL engine: AUTO_INCREMENT primary keys

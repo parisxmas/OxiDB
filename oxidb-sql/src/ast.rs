@@ -197,6 +197,11 @@ pub enum Expr {
         func: AggFunc,
         arg: Option<Box<Expr>>,
     },
+    /// A scalar function evaluated per row (`COALESCE`, `NULLIF`, ...).
+    Func {
+        func: ScalarFunc,
+        args: Vec<Expr>,
+    },
     /// `expr [NOT] IN (e1, e2, ...)` with SQL three-valued NULL semantics.
     In {
         expr: Box<Expr>,
@@ -240,6 +245,15 @@ pub enum Expr {
         partition_by: Vec<Expr>,
         order_by: Vec<(Expr, bool)>,
     },
+}
+
+/// A row-scalar function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunc {
+    /// First non-NULL argument (also spelled `IFNULL` with two arguments).
+    Coalesce,
+    /// NULL when the two arguments are equal, else the first.
+    NullIf,
 }
 
 /// The function of a window expression.

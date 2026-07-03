@@ -249,3 +249,97 @@ fn comparing_incompatible_types_is_error() {
     // text > int has no ordering -> evaluation error (rows present).
     assert!(db.execute("SELECT id FROM n WHERE s > 5").is_err());
 }
+
+// ── COALESCE / IFNULL / NULLIF ──────────────────────────────────────────────
+
+use oxidb_sql::Value;
+
+#[test]
+fn coalesce_basics() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, s TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, NULL, 7, NULL), (2, 5, NULL, 'x'), (3, NULL, NULL, NULL)")
+        .unwrap();
+
+    assert_eq!(
+        rows(&db, "SELECT COALESCE(a, b, 0) FROM t ORDER BY id"),
+        vec![
+            vec![Value::Int(7)],
+            vec![Value::Int(5)],
+            vec![Value::Int(0)]
+        ]
+    );
+    // IFNULL is the two-argument spelling; text works too.
+    assert_eq!(
+        rows(&db, "SELECT IFNULL(s, 'yok') FROM t ORDER BY id"),
+        vec![
+            vec![Value::Text("yok".into())],
+            vec![Value::Text("x".into())],
+            vec![Value::Text("yok".into())],
+        ]
+    );
+    // In WHERE, with a bind parameter as the fallback.
+    assert_eq!(
+        rows_p(
+            &db,
+            "SELECT id FROM t WHERE COALESCE(a, ?) > 4 ORDER BY id",
+            &[Value::Int(99)]
+        ),
+        vec![
+            vec![Value::Int(1)],
+            vec![Value::Int(2)],
+            vec![Value::Int(3)]
+        ]
+    );
+}
+
+#[test]
+fn coalesce_with_aggregates_and_joins() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE k (id INT PRIMARY KEY, grp TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE v (id INT PRIMARY KEY, k_id INT, amt INT)")
+        .unwrap();
+    db.execute("INSERT INTO k VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    db.execute("INSERT INTO v VALUES (1, 1, 10), (2, 1, 5)")
+        .unwrap();
+
+    // LEFT JOIN NULL padding is the classic COALESCE use.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT k.grp, COALESCE(SUM(v.amt), 0) AS toplam \
+             FROM k LEFT JOIN v ON v.k_id = k.id \
+             GROUP BY k.grp ORDER BY k.grp"
+        ),
+        vec![
+            vec![Value::Text("a".into()), Value::Int(15)],
+            vec![Value::Text("b".into()), Value::Int(0)],
+        ]
+    );
+}
+
+#[test]
+fn nullif_basics_and_arity_errors() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 3, 3), (2, 3, 4)")
+        .unwrap();
+
+    assert_eq!(
+        rows(&db, "SELECT NULLIF(a, b) FROM t ORDER BY id"),
+        vec![vec![Value::Null], vec![Value::Int(3)]]
+    );
+    // Division-by-zero guard, the classic NULLIF use.
+    assert_eq!(
+        rows(&db, "SELECT a / NULLIF(a - b, 0) FROM t ORDER BY id"),
+        vec![vec![Value::Null], vec![Value::Int(-3)]]
+    );
+
+    assert!(db.execute("SELECT NULLIF(a) FROM t").is_err());
+    assert!(db.execute("SELECT IFNULL(a, b, 0) FROM t").is_err());
+    assert!(db.execute("SELECT COALESCE() FROM t").is_err());
+}
