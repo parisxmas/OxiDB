@@ -37,6 +37,12 @@ const HEADER_LEN: u64 = 8;
 /// if some records were already materialized before a crash.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WalRecord {
+    /// `ALTER TABLE` (ADR-0013 Phase D). Replayed in log order, so records
+    /// before it carry the old shape and records after it the new one.
+    AlterTable {
+        table: String,
+        op: crate::ast::AlterOp,
+    },
     CreateTable(Table),
     DropTable(String),
     CreateIndex(IndexDef),

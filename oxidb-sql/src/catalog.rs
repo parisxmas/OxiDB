@@ -15,7 +15,7 @@ use crate::error::{Result, SqlError};
 use crate::types::{SqlType, Value};
 
 /// One column of a table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
     #[serde(rename = "type")]
@@ -29,6 +29,13 @@ pub struct Column {
     /// from a per-table counter. Old catalogs deserialize as `false`.
     #[serde(default)]
     pub auto_increment: bool,
+    /// `DEFAULT <literal>`: the value an INSERT that omits this column gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<Value>,
+    /// Column-level `UNIQUE` — enforced on writes (NULLs are exempt,
+    /// per SQL).
+    #[serde(default)]
+    pub unique: bool,
 }
 
 impl Column {
@@ -39,6 +46,8 @@ impl Column {
             nullable: true,
             primary_key: false,
             auto_increment: false,
+            default_value: None,
+            unique: false,
         }
     }
 
@@ -60,7 +69,7 @@ impl Column {
 }
 
 /// A table definition: an ordered list of typed columns.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
@@ -92,6 +101,13 @@ impl Table {
             match (col.ty, &*cell) {
                 (SqlType::Double, Value::Int(i)) => *cell = Value::Double(*i as f64),
                 (SqlType::Timestamp, Value::Int(i)) => *cell = Value::Timestamp(*i),
+                // Binary columns accept base64 text (the JSON wire has no
+                // byte type); invalid base64 fails type validation below.
+                (SqlType::Blob, Value::Text(s)) => {
+                    if let Ok(b) = base64_decode(s) {
+                        *cell = Value::Bytes(b);
+                    }
+                }
                 _ => {}
             }
         }
@@ -283,4 +299,51 @@ mod tests {
             .is_err()
         );
     }
+}
+
+/// Minimal RFC 4648 base64 (standard alphabet, `=` padding) — kept local so
+/// the engine gains no dependency for one wire shim.
+pub(crate) fn base64_decode(s: &str) -> std::result::Result<Vec<u8>, ()> {
+    fn val(c: u8) -> std::result::Result<u32, ()> {
+        match c {
+            b'A'..=b'Z' => Ok((c - b'A') as u32),
+            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            _ => Err(()),
+        }
+    }
+    let s = s.trim_end_matches('=').as_bytes();
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    for chunk in s.chunks(4) {
+        let mut acc = 0u32;
+        for &c in chunk {
+            acc = (acc << 6) | val(c)?;
+        }
+        let bits = chunk.len() * 6;
+        acc <<= 24 - bits;
+        let bytes = [(acc >> 16) as u8, (acc >> 8) as u8, acc as u8];
+        out.extend_from_slice(&bytes[..bits / 8]);
+    }
+    Ok(out)
+}
+
+pub(crate) fn base64_encode(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
+    for chunk in b.chunks(3) {
+        let mut acc = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            acc |= (c as u32) << (16 - i * 8);
+        }
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[((acc >> (18 - i * 6)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }

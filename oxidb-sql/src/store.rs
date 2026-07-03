@@ -74,6 +74,8 @@ pub(crate) trait Store {
     fn delete(&self, table: &str, row_id: u64) -> Result<bool>;
     fn create_table(&self, table: Table) -> Result<()>;
     fn drop_table(&self, name: &str) -> Result<()>;
+    /// `ALTER TABLE` — one operation (autocommit only in v1).
+    fn alter_table(&self, table: &str, op: &crate::ast::AlterOp) -> Result<()>;
     fn create_index(&self, name: &str, table: &str, columns: &[String]) -> Result<()>;
     fn drop_index(&self, name: &str) -> Result<()>;
     fn create_view(&self, name: &str, query_sql: &str, or_replace: bool) -> Result<()>;

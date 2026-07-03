@@ -135,6 +135,32 @@ impl RowStore {
         }
     }
 
+    /// Rewrite every live row in place (`ALTER TABLE` shape changes). In
+    /// disk-first mode the mmap'd base is immutable, so its rows materialize
+    /// into the overlay with the new shape (the caller checkpoints right
+    /// after, folding everything into a fresh snapshot).
+    pub fn rewrite_all(&mut self, f: impl Fn(&mut Vec<Value>)) {
+        match self {
+            RowStore::Resident(m) => {
+                for cells in m.values_mut() {
+                    f(cells);
+                }
+            }
+            RowStore::DiskFirst(d) => {
+                if let Some(base) = d.base.take() {
+                    for (id, cells) in base.entries() {
+                        d.overlay.entry(id).or_insert(Some(cells));
+                    }
+                }
+                d.overlay.retain(|_, change| change.is_some());
+                for cells in d.overlay.values_mut().flatten() {
+                    f(cells);
+                }
+                d.live = d.overlay.len();
+            }
+        }
+    }
+
     /// All live rows in ascending `row_id` order. Resident rows are borrowed;
     /// disk-first base rows are decoded on the fly.
     pub fn iter(&self) -> Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> {

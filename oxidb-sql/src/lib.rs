@@ -116,12 +116,22 @@ struct TableState {
     /// used to enforce uniqueness on writes.
     pk_pos: Option<usize>,
     pk_map: BTreeMap<IndexKey, u64>,
+    /// Column-level `UNIQUE` constraints: `(column position, value -> row_id)`.
+    /// NULLs are exempt (per SQL).
+    uniques: Vec<(usize, BTreeMap<IndexKey, u64>)>,
 }
 
 impl TableState {
     fn empty(def: Table, disk_first: bool) -> Self {
         let pk_pos = def.pk_pos();
         let auto_pos = def.columns.iter().position(|c| c.auto_increment);
+        let uniques = def
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.unique && !c.primary_key)
+            .map(|(i, _)| (i, BTreeMap::new()))
+            .collect();
         TableState {
             def,
             rows: RowStore::new(disk_first),
@@ -131,6 +141,39 @@ impl TableState {
             indexes: BTreeMap::new(),
             pk_pos,
             pk_map: BTreeMap::new(),
+            uniques,
+        }
+    }
+
+    /// Recompute the schema-derived positions and reseed every constraint
+    /// map from the current rows (used after `ALTER TABLE`).
+    fn rebuild_meta(&mut self) {
+        self.pk_pos = self.def.pk_pos();
+        self.auto_pos = self.def.columns.iter().position(|c| c.auto_increment);
+        self.uniques = self
+            .def
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.unique && !c.primary_key)
+            .map(|(i, _)| (i, BTreeMap::new()))
+            .collect();
+        self.pk_map.clear();
+        self.next_auto = 1;
+        let mut seeds: Vec<(u64, Vec<Value>)> = Vec::new();
+        for (rid, cells) in self.rows.iter() {
+            seeds.push((rid, cells.into_owned()));
+        }
+        for (rid, cells) in seeds {
+            if let Some(p) = self.pk_pos {
+                self.pk_map.insert(IndexKey(cells[p].clone()), rid);
+            }
+            for (pos, map) in self.uniques.iter_mut() {
+                if !matches!(cells[*pos], Value::Null) {
+                    map.insert(IndexKey(cells[*pos].clone()), rid);
+                }
+            }
+            self.observe_auto(&cells);
         }
     }
 
@@ -183,6 +226,11 @@ impl TableState {
         if let Some(p) = self.pk_pos {
             self.pk_map.insert(IndexKey(cells[p].clone()), row_id);
         }
+        for (pos, map) in self.uniques.iter_mut() {
+            if !matches!(cells[*pos], Value::Null) {
+                map.insert(IndexKey(cells[*pos].clone()), row_id);
+            }
+        }
     }
 
     fn index_remove(&mut self, row_id: u64, cells: &[Value]) {
@@ -203,22 +251,41 @@ impl TableState {
                 self.pk_map.remove(&key);
             }
         }
+        for (pos, map) in self.uniques.iter_mut() {
+            let key = IndexKey(cells[*pos].clone());
+            if map.get(&key) == Some(&row_id) {
+                map.remove(&key);
+            }
+        }
     }
 
     /// Error if `cells`' PRIMARY KEY value already belongs to a row other
     /// than `exclude_row`.
     fn check_pk(&self, cells: &[Value], exclude_row: Option<u64>) -> Result<()> {
-        let Some(p) = self.pk_pos else {
-            return Ok(());
-        };
-        let key = IndexKey(cells[p].clone());
-        if let Some(&existing) = self.pk_map.get(&key)
-            && Some(existing) != exclude_row
-        {
-            return Err(SqlError::DuplicateKey(format!(
-                "PRIMARY KEY value {:?} already exists in {:?}",
-                cells[p], self.def.name
-            )));
+        if let Some(p) = self.pk_pos {
+            let key = IndexKey(cells[p].clone());
+            if let Some(&existing) = self.pk_map.get(&key)
+                && Some(existing) != exclude_row
+            {
+                return Err(SqlError::DuplicateKey(format!(
+                    "PRIMARY KEY value {:?} already exists in {:?}",
+                    cells[p], self.def.name
+                )));
+            }
+        }
+        for (pos, map) in &self.uniques {
+            if matches!(cells[*pos], Value::Null) {
+                continue; // SQL: NULLs never collide under UNIQUE
+            }
+            let key = IndexKey(cells[*pos].clone());
+            if let Some(&existing) = map.get(&key)
+                && Some(existing) != exclude_row
+            {
+                return Err(SqlError::DuplicateKey(format!(
+                    "UNIQUE value {:?} already exists in {:?}.{:?}",
+                    cells[*pos], self.def.name, self.def.columns[*pos].name
+                )));
+            }
         }
         Ok(())
     }
@@ -275,6 +342,11 @@ impl SqlEngine {
                         if let Some(p) = state.pk_pos {
                             state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
                         }
+                        for (pos, map) in state.uniques.iter_mut() {
+                            if !matches!(cells[*pos], Value::Null) {
+                                map.insert(IndexKey(cells[*pos].clone()), row_id);
+                            }
+                        }
                     }
                     state.rows.attach_base(snap);
                 }
@@ -284,6 +356,11 @@ impl SqlEngine {
                     state.observe_auto(&cells);
                     if let Some(p) = state.pk_pos {
                         state.pk_map.insert(IndexKey(cells[p].clone()), row_id);
+                    }
+                    for (pos, map) in state.uniques.iter_mut() {
+                        if !matches!(cells[*pos], Value::Null) {
+                            map.insert(IndexKey(cells[*pos].clone()), row_id);
+                        }
                     }
                     state.rows.insert(row_id, cells);
                 }
@@ -333,6 +410,71 @@ impl SqlEngine {
         disk_first: bool,
     ) {
         match rec {
+            WalRecord::AlterTable { table, op } => {
+                let Some(def) = catalog.tables.get_mut(table) else {
+                    return;
+                };
+                use ast::AlterOp;
+                match op {
+                    AlterOp::AddColumn(col) => {
+                        def.columns.push(col.clone());
+                        if let Some(state) = tables.get_mut(table) {
+                            state.def = def.clone();
+                            let fill = col.default_value.clone().unwrap_or(Value::Null);
+                            state.rows.rewrite_all(|cells| cells.push(fill.clone()));
+                        }
+                    }
+                    AlterOp::DropColumn(name) => {
+                        let Some(pos) = def.columns.iter().position(|c| &c.name == name) else {
+                            return;
+                        };
+                        def.columns.remove(pos);
+                        // Indexes over the column go with it (replay-lenient;
+                        // the engine-level command validates first).
+                        catalog
+                            .indexes
+                            .retain(|_, d| !(&d.table == table && d.columns.contains(name)));
+                        if let Some(state) = tables.get_mut(table) {
+                            state.def = def.clone();
+                            state.rows.rewrite_all(|cells| {
+                                cells.remove(pos);
+                            });
+                        }
+                    }
+                    AlterOp::RenameColumn { old, new } => {
+                        if let Some(c) = def.columns.iter_mut().find(|c| &c.name == old) {
+                            c.name = new.clone();
+                        }
+                        for d in catalog.indexes.values_mut() {
+                            if &d.table == table {
+                                for c in d.columns.iter_mut() {
+                                    if c == old {
+                                        *c = new.clone();
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(state) = tables.get_mut(table) {
+                            state.def = def.clone();
+                        }
+                    }
+                }
+                // Positions may have shifted: rebuild constraint maps and the
+                // table's secondary indexes from the (possibly rewritten) rows.
+                let defs: Vec<IndexDef> = catalog
+                    .indexes
+                    .values()
+                    .filter(|d| &d.table == table)
+                    .cloned()
+                    .collect();
+                if let Some(state) = tables.get_mut(table) {
+                    state.rebuild_meta();
+                    state.indexes.clear();
+                    for d in defs {
+                        let _ = state.build_index(&d.name, &d.columns);
+                    }
+                }
+            }
             WalRecord::CreateTable(def) => {
                 catalog.tables.insert(def.name.clone(), def.clone());
                 tables
@@ -1060,6 +1202,87 @@ impl SqlEngine {
         Ok(results)
     }
 
+    /// `ALTER TABLE` — validate, log, apply, and checkpoint (the checkpoint
+    /// rewrites `.rdat` snapshots at the new arity, which disk-first mode's
+    /// mmap'd bases depend on).
+    pub fn alter_table(&self, table: &str, op: &ast::AlterOp) -> Result<()> {
+        use ast::AlterOp;
+        let mut inner = self.inner.lock().unwrap();
+        let Some(def) = inner.catalog.tables.get(table) else {
+            return Err(SqlError::NoSuchTable(table.to_string()));
+        };
+        match op {
+            AlterOp::AddColumn(col) => {
+                if def.columns.iter().any(|c| c.name == col.name) {
+                    return Err(SqlError::SchemaMismatch(format!(
+                        "column {:?} already exists in {table:?}",
+                        col.name
+                    )));
+                }
+                if col.primary_key || col.auto_increment {
+                    return Err(SqlError::Unsupported(
+                        "adding a PRIMARY KEY / AUTO_INCREMENT column".into(),
+                    ));
+                }
+                let has_rows = inner
+                    .tables
+                    .get(table)
+                    .map(|s| s.rows.len() > 0)
+                    .unwrap_or(false);
+                if !col.nullable && col.default_value.is_none() && has_rows {
+                    return Err(SqlError::SchemaMismatch(format!(
+                        "cannot add NOT NULL column {:?} without a DEFAULT to a non-empty table",
+                        col.name
+                    )));
+                }
+            }
+            AlterOp::DropColumn(name) => {
+                let Some(pos) = def.columns.iter().position(|c| &c.name == name) else {
+                    return Err(SqlError::NoSuchColumn(name.clone()));
+                };
+                if def.columns[pos].primary_key {
+                    return Err(SqlError::Unsupported(
+                        "dropping the PRIMARY KEY column".into(),
+                    ));
+                }
+                if let Some(d) = inner
+                    .catalog
+                    .indexes
+                    .values()
+                    .find(|d| d.table == table && d.columns.contains(name))
+                {
+                    return Err(SqlError::SchemaMismatch(format!(
+                        "index {:?} depends on column {:?} (drop the index first)",
+                        d.name, name
+                    )));
+                }
+            }
+            AlterOp::RenameColumn { old, new } => {
+                if !def.columns.iter().any(|c| &c.name == old) {
+                    return Err(SqlError::NoSuchColumn(old.clone()));
+                }
+                if def.columns.iter().any(|c| &c.name == new) {
+                    return Err(SqlError::SchemaMismatch(format!(
+                        "column {new:?} already exists in {table:?}"
+                    )));
+                }
+            }
+        }
+        let rec = WalRecord::AlterTable {
+            table: table.to_string(),
+            op: op.clone(),
+        };
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
+        Self::checkpoint_locked(inner)
+    }
+
     /// Roll back (discard) a parked session transaction. Safe to call for
     /// ids that no longer exist.
     pub fn rollback_session_txn(&self, id: u64) {
@@ -1159,6 +1382,9 @@ impl Store for SqlEngine {
     }
     fn next_auto_block(&self, table: &str, n: i64) -> Result<i64> {
         SqlEngine::next_auto_block(self, table, n)
+    }
+    fn alter_table(&self, table: &str, op: &ast::AlterOp) -> Result<()> {
+        SqlEngine::alter_table(self, table, op)
     }
     fn list_tables(&self) -> Vec<Table> {
         SqlEngine::list_tables(self)

@@ -21,6 +21,8 @@ pub enum SqlType {
     Text,
     Bool,
     Timestamp,
+    /// Binary data (`BLOB`/`BYTEA`/`BINARY`). JSON wire form is base64.
+    Blob,
 }
 
 /// A single typed cell value.
@@ -28,6 +30,7 @@ pub enum SqlType {
 #[serde(tag = "t", content = "v", rename_all = "lowercase")]
 pub enum Value {
     Null,
+    Bytes(Vec<u8>),
     Int(i64),
     Double(f64),
     Text(String),
@@ -48,6 +51,7 @@ impl Value {
                 | (Value::Text(_), SqlType::Text)
                 | (Value::Bool(_), SqlType::Bool)
                 | (Value::Timestamp(_), SqlType::Timestamp)
+                | (Value::Bytes(_), SqlType::Blob)
         )
     }
 
@@ -75,12 +79,14 @@ impl Value {
                 Value::Bool(_) => 1,
                 Value::Int(_) | Value::Double(_) | Value::Timestamp(_) => 2,
                 Value::Text(_) => 3,
+                Value::Bytes(_) => 4,
             }
         }
         match (a, b) {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Text(x), Value::Text(y)) => x.cmp(y),
+            (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
             _ if rank(a) == 2 && rank(b) == 2 => a
                 .as_f64()
                 .unwrap()
@@ -115,6 +121,7 @@ const TAG_DOUBLE: u8 = 2;
 const TAG_TEXT: u8 = 3;
 const TAG_BOOL: u8 = 4;
 const TAG_TIMESTAMP: u8 = 5;
+const TAG_BYTES: u8 = 6;
 
 /// Append the binary encoding of a single cell to `buf`.
 ///
@@ -148,6 +155,11 @@ pub fn encode_cell(v: &Value, buf: &mut Vec<u8>) {
             buf.push(TAG_TIMESTAMP);
             buf.extend_from_slice(&n.to_le_bytes());
         }
+        Value::Bytes(b) => {
+            buf.push(TAG_BYTES);
+            buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(b);
+        }
     }
 }
 
@@ -168,6 +180,16 @@ fn decode_cell(bytes: &[u8], pos: &mut usize) -> Result<Value> {
                 .ok_or_else(|| SqlError::Corrupt("truncated bool".into()))?;
             *pos += 1;
             Ok(Value::Bool(b != 0))
+        }
+        TAG_BYTES => {
+            let len = u32::from_le_bytes(read_4(bytes, pos)?) as usize;
+            let end = *pos + len;
+            let raw = bytes
+                .get(*pos..end)
+                .ok_or_else(|| SqlError::Corrupt("truncated bytes".into()))?
+                .to_vec();
+            *pos = end;
+            Ok(Value::Bytes(raw))
         }
         TAG_TEXT => {
             let len = u32::from_le_bytes(read_4(bytes, pos)?) as usize;

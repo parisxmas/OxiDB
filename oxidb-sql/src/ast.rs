@@ -45,6 +45,14 @@ pub enum Statement {
         columns: Option<Vec<String>>,
         /// One expression tuple per row.
         rows: Vec<Vec<Expr>>,
+        /// `RETURNING <items>`: project the inserted rows back as a result
+        /// set (PostgreSQL-style; how generated keys are read back).
+        returning: Option<Vec<SelectItem>>,
+    },
+    /// `ALTER TABLE <table> <op>` — one operation per statement.
+    AlterTable {
+        table: String,
+        op: AlterOp,
     },
     Select(SelectQuery),
     Update {
@@ -69,6 +77,15 @@ pub enum Statement {
     /// `SHOW INDEXES [FROM table]` / `DESCRIBE table`. Read-only; answered
     /// from the catalog as an ordinary result set.
     Show(ShowKind),
+}
+
+/// One `ALTER TABLE` operation. Serialized into the WAL.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[allow(clippy::enum_variant_names)] // the shared "Column" postfix is the point
+pub enum AlterOp {
+    AddColumn(crate::catalog::Column),
+    DropColumn(String),
+    RenameColumn { old: String, new: String },
 }
 
 /// What a [`Statement::Show`] statement enumerates.

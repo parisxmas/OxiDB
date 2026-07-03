@@ -24,6 +24,10 @@ use crate::wal::WalRecord;
 /// A row-level change in the overlay: `Some(cells)` upserts, `None` deletes.
 type RowChange = Option<Vec<Value>>;
 
+/// Per-table uniqueness maps: `(column position, value -> row_id)` for the
+/// PRIMARY KEY and each UNIQUE column.
+type UniqueMaps = Vec<(usize, BTreeMap<IndexKey, u64>)>;
+
 #[derive(Default, Clone)]
 pub(crate) struct TxnState {
     /// Tables created within the transaction (name -> definition).
@@ -40,10 +44,10 @@ pub(crate) struct TxnState {
     /// Indexes created / dropped within the transaction.
     indexes_created: BTreeMap<String, IndexDef>,
     indexes_dropped: BTreeSet<String>,
-    /// PRIMARY KEY value -> row_id per table, seeded lazily from the visible
-    /// rows on first write, then maintained by the overlay — enforces PK
-    /// uniqueness inside the transaction.
-    pk_seen: BTreeMap<String, BTreeMap<IndexKey, u64>>,
+    /// Uniqueness state per table, seeded lazily from the visible rows on
+    /// first write, then maintained by the overlay: one `(column position,
+    /// value -> row_id)` map for the PRIMARY KEY and each UNIQUE column.
+    pk_seen: BTreeMap<String, UniqueMaps>,
     /// The ordered operations to flush on commit.
     ops: Vec<WalRecord>,
     /// Savepoint stack: `(name, data snapshot)`. Snapshots exclude the stack
@@ -174,46 +178,68 @@ impl<'a> Transaction<'a> {
         cells: &[Value],
         exclude: Option<u64>,
     ) -> Result<()> {
-        let Some(p) = def.pk_pos() else {
+        // Constrained positions: the PRIMARY KEY plus every UNIQUE column.
+        let positions: Vec<usize> = def
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| c.primary_key || (c.unique && def.pk_pos() != Some(*i)))
+            .map(|(i, _)| i)
+            .collect();
+        if positions.is_empty() {
             return Ok(());
-        };
+        }
         if !self.state.borrow().pk_seen.contains_key(table) {
             let rows = self.scan(table)?;
-            let mut map = BTreeMap::new();
+            let mut maps: UniqueMaps = positions.iter().map(|&p| (p, BTreeMap::new())).collect();
             for (rid, row) in rows {
-                map.insert(IndexKey(row[p].clone()), rid);
+                for (p, map) in maps.iter_mut() {
+                    if !matches!(row[*p], Value::Null) {
+                        map.insert(IndexKey(row[*p].clone()), rid);
+                    }
+                }
             }
             self.state
                 .borrow_mut()
                 .pk_seen
-                .insert(table.to_string(), map);
+                .insert(table.to_string(), maps);
         }
         let st = self.state.borrow();
-        let map = st.pk_seen.get(table).expect("seeded");
-        if let Some(&rid) = map.get(&IndexKey(cells[p].clone()))
-            && Some(rid) != exclude
-        {
-            return Err(SqlError::DuplicateKey(format!(
-                "PRIMARY KEY value {:?} already exists in {table:?}",
-                cells[p]
-            )));
+        let maps = st.pk_seen.get(table).expect("seeded");
+        for (p, map) in maps {
+            if matches!(cells[*p], Value::Null) {
+                continue; // NULLs never collide (and the PK is NOT NULL anyway)
+            }
+            if let Some(&rid) = map.get(&IndexKey(cells[*p].clone()))
+                && Some(rid) != exclude
+            {
+                let is_pk = def.pk_pos() == Some(*p);
+                return Err(SqlError::DuplicateKey(format!(
+                    "{} value {:?} already exists in {table:?}",
+                    if is_pk { "PRIMARY KEY" } else { "UNIQUE" },
+                    cells[*p]
+                )));
+            }
         }
         Ok(())
     }
 
     /// Record a write's effect on the seeded PK map (no-op when the table has
     /// no PK or the map was never seeded).
-    fn pk_apply(&self, table: &str, def: &Table, row_id: u64, cells: Option<&[Value]>) {
-        let Some(p) = def.pk_pos() else { return };
+    fn pk_apply(&self, table: &str, _def: &Table, row_id: u64, cells: Option<&[Value]>) {
         let mut st = self.state.borrow_mut();
-        let Some(map) = st.pk_seen.get_mut(table) else {
+        let Some(maps) = st.pk_seen.get_mut(table) else {
             return;
         };
-        // Any prior key owned by this row is gone (update changes the key,
-        // delete removes the row).
-        map.retain(|_, rid| *rid != row_id);
-        if let Some(cells) = cells {
-            map.insert(IndexKey(cells[p].clone()), row_id);
+        for (p, map) in maps.iter_mut() {
+            // Any prior key owned by this row is gone (update changes the
+            // key, delete removes the row).
+            map.retain(|_, rid| *rid != row_id);
+            if let Some(cells) = cells
+                && !matches!(cells[*p], Value::Null)
+            {
+                map.insert(IndexKey(cells[*p].clone()), row_id);
+            }
         }
     }
 }
@@ -366,6 +392,12 @@ impl Store for Transaction<'_> {
         st.indexes_dropped.insert(name.to_string());
         st.ops.push(WalRecord::DropIndex(name.to_string()));
         Ok(())
+    }
+
+    fn alter_table(&self, _table: &str, _op: &crate::ast::AlterOp) -> Result<()> {
+        Err(SqlError::Unsupported(
+            "ALTER TABLE inside a transaction".into(),
+        ))
     }
 
     fn create_view(&self, _name: &str, _query_sql: &str, _or_replace: bool) -> Result<()> {

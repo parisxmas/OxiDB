@@ -104,7 +104,12 @@ pub(crate) fn execute<S: Store>(
             table,
             columns,
             rows,
-        } => exec_insert(store, &table, columns, rows, params),
+            returning,
+        } => exec_insert(store, &table, columns, rows, returning, params),
+        Statement::AlterTable { table, op } => {
+            store.alter_table(&table, &op)?;
+            Ok(QueryResult::Ddl)
+        }
         Statement::Select(query) => exec_query(store, query, params),
         Statement::Update {
             table,
@@ -267,6 +272,7 @@ fn exec_insert<S: Store>(
     table: &str,
     columns: Option<Vec<String>>,
     rows: Vec<Vec<Expr>>,
+    returning: Option<Vec<SelectItem>>,
     params: &[Value],
 ) -> Result<QueryResult> {
     let def = store
@@ -305,7 +311,12 @@ fn exec_insert<S: Store>(
                         values.len()
                     )));
                 }
-                let mut cells = vec![Value::Null; def.arity()];
+                // Omitted columns get their DEFAULT (NULL when none).
+                let mut cells: Vec<Value> = def
+                    .columns
+                    .iter()
+                    .map(|c| c.default_value.clone().unwrap_or(Value::Null))
+                    .collect();
                 for (idx, val) in idxs.iter().zip(values) {
                     cells[*idx] = val;
                 }
@@ -334,7 +345,36 @@ fn exec_insert<S: Store>(
     }
 
     // One durable batch: all rows of a multi-row INSERT share a single fsync.
-    let affected = store.insert_many(table, all_cells)? as usize;
+    let affected = store.insert_many(table, all_cells.clone())? as usize;
+
+    // `RETURNING`: project the inserted rows back as a result set. This is
+    // how ADO.NET/EF read generated keys.
+    if let Some(items) = returning {
+        let schema = table_schema(table, &def);
+        let proj = expand_projection(&items, &schema)?;
+        let columns: Vec<String> = proj.iter().map(|(n, _)| n.clone()).collect();
+        let types: Vec<Option<SqlType>> = proj.iter().map(|(_, e)| expr_type(e, &schema)).collect();
+        let bound: Vec<(String, Expr)> = proj
+            .into_iter()
+            .map(|(n, e)| Ok::<_, SqlError>((n, bind_expr(&e, &schema)?)))
+            .collect::<Result<_>>()?;
+        let mut out = Vec::with_capacity(all_cells.len());
+        for mut cells in all_cells {
+            // Re-apply coercions the store performed (INT->DOUBLE etc.).
+            def.coerce_row(&mut cells);
+            let row: Vec<Value> = bound
+                .iter()
+                .map(|(_, e)| eval_scalar(e, &schema, cells.as_slice(), params))
+                .collect::<Result<_>>()?;
+            out.push(row);
+        }
+        return Ok(QueryResult::Select {
+            columns,
+            types,
+            rows: out,
+        });
+    }
+
     Ok(QueryResult::Mutation {
         affected,
         last_insert_id,
@@ -2037,6 +2077,7 @@ enum HashKey {
     Num(u64),
     Bool(bool),
     Text(String),
+    Bytes(Vec<u8>),
 }
 
 /// A join key of one or more components. The common 1–2 component cases avoid
@@ -2052,6 +2093,7 @@ fn hash_key_component(v: &Value) -> Option<HashKey> {
     let norm = |f: f64| (if f == 0.0 { 0.0 } else { f }).to_bits();
     match v {
         Value::Null => None,
+        Value::Bytes(b) => Some(HashKey::Bytes(b.clone())),
         Value::Int(n) => Some(HashKey::Num(norm(*n as f64))),
         // NaN = NaN is not true in SQL, so a NaN key can never equi-match —
         // exclude it (like NULL) rather than let bit-equality pair two NaNs.
@@ -2782,6 +2824,10 @@ fn hash_value_norm(v: &Value, h: &mut impl Hasher) {
             h.write_u8(3);
             h.write(s.as_bytes());
         }
+        Value::Bytes(b) => {
+            h.write_u8(4);
+            h.write(b);
+        }
     }
 }
 
@@ -2842,6 +2888,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             Value::Text(_) => Some(SqlType::Text),
             Value::Bool(_) => Some(SqlType::Bool),
             Value::Timestamp(_) => Some(SqlType::Timestamp),
+            Value::Bytes(_) => Some(SqlType::Blob),
             Value::Null => None,
         },
         Expr::Binary { op, left, right } => match op {
@@ -3752,6 +3799,7 @@ fn cmp_values(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)),
         _ => {
             let (x, y) = (as_f64(a)?, as_f64(b)?);
             x.partial_cmp(&y)

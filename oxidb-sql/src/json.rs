@@ -143,6 +143,8 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::Double(f) => json!(f),
         Value::Text(s) => json!(s),
         Value::Bool(b) => json!(b),
+        // Binary is base64 on the JSON wire (paired with type "BLOB").
+        Value::Bytes(b) => json!(crate::catalog::base64_encode(b)),
         // Timestamps are epoch milliseconds on the wire.
         Value::Timestamp(t) => json!(t),
     }

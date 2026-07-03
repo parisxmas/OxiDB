@@ -96,7 +96,9 @@ fn unsupported_join_forms() {
 fn unsupported_data_type() {
     let (_d, db) = open();
     // A type we don't map should be rejected at parse/translate.
-    assert!(db.execute("CREATE TABLE t (x BLOB)").is_err());
+    // BLOB and DECIMAL are supported since ADR-0013 Phase D; something
+    // genuinely exotic still errors.
+    assert!(db.execute("CREATE TABLE t (x JSONB)").is_err());
 }
 
 #[test]

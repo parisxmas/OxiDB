@@ -8,7 +8,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    AggFunc, BinOp, Expr, Join, JoinKind, QueryBody, ScalarFunc, SelectItem, SelectQuery,
+    AggFunc, AlterOp, BinOp, Expr, Join, JoinKind, QueryBody, ScalarFunc, SelectItem, SelectQuery,
     SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
 };
 use crate::catalog::{Column, Table};
@@ -412,6 +412,42 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
         sp::Statement::Rollback { .. } => Ok(Statement::Rollback),
         sp::Statement::Savepoint { name } => Ok(Statement::Savepoint(name.value)),
         sp::Statement::ReleaseSavepoint { name } => Ok(Statement::ReleaseSavepoint(name.value)),
+        sp::Statement::AlterTable {
+            name, operations, ..
+        } => {
+            let table = object_name_to_string(&name)?;
+            let [op] = operations.as_slice() else {
+                return Err(SqlError::Unsupported(
+                    "ALTER TABLE with multiple operations (send one per statement)".into(),
+                ));
+            };
+            let op = match op {
+                sp::AlterTableOperation::AddColumn { column_def, .. } => {
+                    AlterOp::AddColumn(translate_column(&column_def.clone())?)
+                }
+                sp::AlterTableOperation::DropColumn { column_names, .. } => {
+                    let [name] = column_names.as_slice() else {
+                        return Err(SqlError::Unsupported(
+                            "DROP COLUMN with multiple columns".into(),
+                        ));
+                    };
+                    AlterOp::DropColumn(name.value.clone())
+                }
+                sp::AlterTableOperation::RenameColumn {
+                    old_column_name,
+                    new_column_name,
+                } => AlterOp::RenameColumn {
+                    old: old_column_name.value.clone(),
+                    new: new_column_name.value.clone(),
+                },
+                other => {
+                    return Err(SqlError::Unsupported(format!(
+                        "ALTER TABLE operation {other:?}"
+                    )));
+                }
+            };
+            Ok(Statement::AlterTable { table, op })
+        }
         sp::Statement::ShowTables { .. } => Ok(Statement::Show(ShowKind::Tables)),
         sp::Statement::ShowViews { .. } => Ok(Statement::Show(ShowKind::Views)),
         sp::Statement::ShowColumns { show_options, .. } => {
@@ -431,8 +467,15 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
 }
 
 fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
-    if !ct.constraints.is_empty() {
-        return Err(SqlError::Unsupported("table-level constraints".into()));
+    for c in &ct.constraints {
+        match c {
+            // Accepted and ignored (documented): referential integrity is
+            // not enforced in v1, but EF/PG-style DDL must parse.
+            sp::TableConstraint::ForeignKey { .. } => {}
+            other => {
+                return Err(SqlError::Unsupported(format!("table constraint {other:?}")));
+            }
+        }
     }
     let name = object_name_to_string(&ct.name)?;
     let mut columns = Vec::with_capacity(ct.columns.len());
@@ -496,9 +539,36 @@ fn translate_column(col: &sp::ColumnDef) -> Result<Column> {
                 column = column.primary_key();
             }
             sp::ColumnOption::Unique { .. } => {
-                // Plain UNIQUE has no enforcement yet; accept the type, ignore
-                // the constraint (documented limitation).
+                column.unique = true;
             }
+            sp::ColumnOption::Default(expr) => {
+                // Literal defaults only (constants a migration would emit).
+                let mut p0 = 0usize;
+                match translate_expr(expr.clone(), &mut p0)? {
+                    Expr::Literal(v) => column.default_value = Some(v),
+                    Expr::Unary {
+                        op: UnOp::Neg,
+                        expr,
+                    } if matches!(*expr, Expr::Literal(_)) => {
+                        if let Expr::Literal(v) = *expr {
+                            column.default_value = Some(match v {
+                                Value::Int(n) => Value::Int(-n),
+                                Value::Double(f) => Value::Double(-f),
+                                other => other,
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(SqlError::Unsupported(format!(
+                            "non-literal DEFAULT on {:?}",
+                            col.name.value
+                        )));
+                    }
+                }
+            }
+            // Referential integrity is not enforced in v1; accept the syntax
+            // so EF/PG-style DDL round-trips (documented limitation).
+            sp::ColumnOption::ForeignKey { .. } => {}
             // MySQL `AUTO_INCREMENT` / SQLite `AUTOINCREMENT`.
             sp::ColumnOption::DialectSpecific(tokens)
                 if tokens.iter().any(|t| {
@@ -540,6 +610,10 @@ fn map_data_type(dt: &sp::DataType) -> Result<SqlType> {
         | D::Nvarchar(_) => SqlType::Text,
         D::Bool | D::Boolean => SqlType::Bool,
         D::Timestamp(_, _) | D::Datetime(_) => SqlType::Timestamp,
+        // DECIMAL/NUMERIC store as DOUBLE (documented: no fixed-point
+        // arithmetic; precision/scale are accepted and ignored).
+        D::Decimal(_) | D::Numeric(_) | D::Dec(_) => SqlType::Double,
+        D::Blob(_) | D::Bytea | D::Binary(_) | D::Varbinary(_) => SqlType::Blob,
         other => return Err(SqlError::Unsupported(format!("data type {other:?}"))),
     };
     Ok(ty)
@@ -555,6 +629,16 @@ fn translate_insert(insert: sp::Insert, p: &mut usize) -> Result<Statement> {
     } else {
         Some(insert.columns.iter().map(|i| i.value.clone()).collect())
     };
+    let returning = insert
+        .returning
+        .as_ref()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| translate_select_item(item, p))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?;
     let source = insert
         .source
         .ok_or_else(|| SqlError::Unsupported("INSERT without VALUES".into()))?;
@@ -574,6 +658,7 @@ fn translate_insert(insert: sp::Insert, p: &mut usize) -> Result<Statement> {
         table,
         columns,
         rows,
+        returning,
     })
 }
 

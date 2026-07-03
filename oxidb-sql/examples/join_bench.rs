@@ -138,6 +138,7 @@ fn fmt_value(v: &Value) -> String {
         Value::Text(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
         Value::Timestamp(t) => t.to_string(),
+        Value::Bytes(b) => format!("<{} bytes>", b.len()),
     }
 }
 
