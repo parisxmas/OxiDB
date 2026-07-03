@@ -158,7 +158,9 @@ pub fn restore(image: &str) -> Result<(), JsValue> {
         .ok_or_else(|| JsValue::from_str("database not initialized — call init() first"))?;
 
     for (name, docs_val) in collections {
-        let Some(arr) = docs_val.as_array() else { continue };
+        let Some(arr) = docs_val.as_array() else {
+            continue;
+        };
         let docs: Vec<Value> = arr
             .iter()
             .map(|doc| {
