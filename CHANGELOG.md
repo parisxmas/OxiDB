@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.33.0
+
 ### SQL-text user management (server 0.32.3)
 
 - `CREATE USER name WITH PASSWORD '...' [ROLE r]`, `ALTER USER` (password
