@@ -43,3 +43,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0011](0011-cross-engine-transactions.md) | Cross-engine transactions (document + SQL) | Proposed |
 | [0012](0012-multi-database.md) | Multiple databases, shared by both engines | Accepted |
 | [0013](0013-dotnet-ef-core.md) | Full .NET EF Core support for the SQL engine | Accepted |
+| [0014](0014-cobra-stored-procedures.md) | Cobra as the compiled stored-procedure language | Accepted |
