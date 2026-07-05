@@ -358,6 +358,34 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
                 or_replace,
             })
         }
+        sp::Statement::CreateProcedure {
+            or_alter,
+            name,
+            params,
+            language,
+            body,
+        } => translate_create_procedure(or_alter, name, params, language, body),
+        sp::Statement::DropProcedure {
+            if_exists,
+            proc_desc,
+            ..
+        } => {
+            let [desc] = proc_desc.as_slice() else {
+                return Err(SqlError::Unsupported(
+                    "DROP PROCEDURE of multiple procedures".into(),
+                ));
+            };
+            if desc.args.is_some() {
+                return Err(SqlError::Unsupported(
+                    "DROP PROCEDURE with an argument list".into(),
+                ));
+            }
+            Ok(Statement::DropProcedure {
+                name: object_name_to_string(&desc.name)?,
+                if_exists,
+            })
+        }
+        sp::Statement::Call(func) => translate_call(func, p),
         sp::Statement::Drop {
             object_type,
             if_exists,
@@ -452,6 +480,13 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
             Ok(Statement::AlterTable { table, op })
         }
         sp::Statement::ShowTables { .. } => Ok(Statement::Show(ShowKind::Tables)),
+        // `SHOW PROCEDURES` parses as a generic SHOW <variable>.
+        sp::Statement::ShowVariable { variable }
+            if matches!(variable.as_slice(),
+                [v] if v.value.eq_ignore_ascii_case("procedures")) =>
+        {
+            Ok(Statement::Show(ShowKind::Procedures))
+        }
         sp::Statement::ShowViews { .. } => Ok(Statement::Show(ShowKind::Views)),
         sp::Statement::ShowColumns { show_options, .. } => {
             let table = show_options
@@ -467,6 +502,143 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
         ))),
         other => Err(SqlError::Unsupported(format!("statement: {other}"))),
     }
+}
+
+/// Translate `CREATE [OR ALTER] PROCEDURE`. The body's parameter references
+/// (unqualified identifiers matching a declared parameter, in expression
+/// position only) are rewritten to `$1..$N`, so a CALL is exactly a
+/// parameterized batch execution of the stored text.
+fn translate_create_procedure(
+    or_alter: bool,
+    name: sp::ObjectName,
+    params: Option<Vec<sp::ProcedureParam>>,
+    language: Option<sp::Ident>,
+    body: sp::ConditionalStatements,
+) -> Result<Statement> {
+    if let Some(lang) = language {
+        return Err(SqlError::Unsupported(format!(
+            "procedure LANGUAGE {lang} (only SQL bodies are supported)"
+        )));
+    }
+    let name = object_name_to_string(&name)?;
+    let mut declared: Vec<(String, SqlType)> = Vec::new();
+    for prm in params.unwrap_or_default() {
+        if prm.mode.is_some() {
+            return Err(SqlError::Unsupported("IN/OUT/INOUT parameter modes".into()));
+        }
+        if declared
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(&prm.name.value))
+        {
+            return Err(SqlError::Parse(format!(
+                "duplicate procedure parameter {:?}",
+                prm.name.value
+            )));
+        }
+        declared.push((prm.name.value.clone(), map_data_type(&prm.data_type)?));
+    }
+
+    let mut statements = body.statements().clone();
+    if statements.is_empty() {
+        return Err(SqlError::Unsupported(
+            "procedure body has no statements".into(),
+        ));
+    }
+    // v1 body surface: DML + SELECT. The body runs inside a transaction (a
+    // CALL is atomic), which rules out DDL; transaction control would break
+    // the wrapping; nested CALL is rejected to keep recursion out of v1.
+    for stmt in &statements {
+        match stmt {
+            sp::Statement::Insert(_)
+            | sp::Statement::Update { .. }
+            | sp::Statement::Delete(_)
+            | sp::Statement::Query(_) => {}
+            other => {
+                return Err(SqlError::Unsupported(format!(
+                    "statement in procedure body: {other} (bodies are DML/SELECT only)"
+                )));
+            }
+        }
+    }
+    rewrite_procedure_params(&mut statements, &declared)?;
+    let body: String = statements
+        .iter()
+        .map(|st| st.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    Ok(Statement::CreateProcedure {
+        name,
+        def: crate::catalog::ProcedureDef {
+            params: declared,
+            body,
+        },
+        or_alter,
+    })
+}
+
+/// Rewrite unqualified identifiers that name a declared parameter into
+/// `$N` placeholders — expression positions only, so INSERT column lists,
+/// table names, and qualified `t.col` references are untouched. Pre-existing
+/// placeholders in the body are rejected (they would collide with the
+/// parameter slots).
+fn rewrite_procedure_params(
+    statements: &mut [sp::Statement],
+    declared: &[(String, SqlType)],
+) -> Result<()> {
+    use core::ops::ControlFlow;
+    let mut err: Option<SqlError> = None;
+    for stmt in statements.iter_mut() {
+        let _ = sp::visit_expressions_mut(stmt, |e: &mut sp::Expr| {
+            match e {
+                sp::Expr::Value(v) => {
+                    if matches!(v.value, sp::Value::Placeholder(_)) {
+                        err.get_or_insert_with(|| {
+                            SqlError::Unsupported(
+                                "placeholders in a procedure body (reference parameters by name)"
+                                    .into(),
+                            )
+                        });
+                    }
+                }
+                sp::Expr::Identifier(id) if id.quote_style.is_none() => {
+                    if let Some(slot) = declared
+                        .iter()
+                        .position(|(n, _)| n.eq_ignore_ascii_case(&id.value))
+                    {
+                        *e = sp::Expr::Value(
+                            sp::Value::Placeholder(format!("${}", slot + 1)).with_empty_span(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            ControlFlow::<()>::Continue(())
+        });
+    }
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Translate `CALL name(args...)`.
+fn translate_call(func: sp::Function, p: &mut usize) -> Result<Statement> {
+    let name = object_name_to_string(&func.name)?;
+    let args = match func.args {
+        sp::FunctionArguments::List(list) => list
+            .args
+            .into_iter()
+            .map(|a| match a {
+                sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => translate_expr(e, p),
+                other => Err(SqlError::Unsupported(format!("CALL argument {other}"))),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        sp::FunctionArguments::None => Vec::new(),
+        other => {
+            return Err(SqlError::Unsupported(format!("CALL arguments {other}")));
+        }
+    };
+    Ok(Statement::Call { name, args })
 }
 
 fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {

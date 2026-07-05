@@ -506,6 +506,12 @@ impl SqlEngine {
             WalRecord::DropView(name) => {
                 catalog.views.remove(name);
             }
+            WalRecord::CreateProcedure { name, def } => {
+                catalog.procedures.insert(name.clone(), def.clone());
+            }
+            WalRecord::DropProcedure(name) => {
+                catalog.procedures.remove(name);
+            }
             WalRecord::Insert {
                 table,
                 row_id,
@@ -667,6 +673,76 @@ impl SqlEngine {
     /// The stored SQL text of a view, if it exists.
     pub fn view_sql(&self, name: &str) -> Option<String> {
         self.inner.lock().unwrap().catalog.views.get(name).cloned()
+    }
+
+    /// Create (or with `or_alter`, overwrite) a stored procedure. The body
+    /// was validated to shape (DML/SELECT only, params rewritten to `$N`) at
+    /// parse; here it is trial-parsed so unsupported constructs surface at
+    /// creation, not first call.
+    pub fn create_procedure(
+        &self,
+        name: &str,
+        def: catalog::ProcedureDef,
+        or_alter: bool,
+    ) -> Result<()> {
+        parser::parse(&def.body)?;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.catalog.procedures.contains_key(name) && !or_alter {
+            return Err(SqlError::TableExists(format!("{name} (procedure)")));
+        }
+        let rec = WalRecord::CreateProcedure {
+            name: name.to_string(),
+            def,
+        };
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
+        Ok(())
+    }
+
+    /// Drop a stored procedure by name. Errors if it does not exist.
+    pub fn drop_procedure(&self, name: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.catalog.procedures.contains_key(name) {
+            return Err(SqlError::NoSuchProcedure(name.to_string()));
+        }
+        let rec = WalRecord::DropProcedure(name.to_string());
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
+        Ok(())
+    }
+
+    /// A stored procedure's definition, if it exists.
+    pub fn procedure_def(&self, name: &str) -> Option<catalog::ProcedureDef> {
+        self.inner
+            .lock()
+            .unwrap()
+            .catalog
+            .procedures
+            .get(name)
+            .cloned()
+    }
+
+    /// All stored procedures as `(name, def)` pairs, sorted by name.
+    pub fn list_procedures(&self) -> Vec<(String, catalog::ProcedureDef)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .catalog
+            .procedures
+            .iter()
+            .map(|(n, d)| (n.clone(), d.clone()))
+            .collect()
     }
 
     /// Drop a secondary index by name. Errors if it does not exist.
@@ -1190,6 +1266,20 @@ impl SqlEngine {
                         .release_savepoint(&name)?;
                     results.push(QueryResult::Transaction);
                 }
+                Statement::Call { name, args } => {
+                    // A CALL is atomic: inside an open transaction it simply
+                    // joins it; at top level it runs in an implicit one.
+                    let r = match &txn {
+                        Some(t) => executor::exec_call(t, &name, &args, params)?,
+                        None => {
+                            let t = Transaction::new(self);
+                            let r = executor::exec_call(&t, &name, &args, params)?;
+                            t.commit()?;
+                            r
+                        }
+                    };
+                    results.push(r);
+                }
                 other => {
                     let r = match &txn {
                         Some(t) => executor::execute(t, other, params)?,
@@ -1418,6 +1508,23 @@ impl Store for SqlEngine {
     }
     fn view_sql(&self, name: &str) -> Option<String> {
         SqlEngine::view_sql(self, name)
+    }
+    fn create_procedure(
+        &self,
+        name: &str,
+        def: catalog::ProcedureDef,
+        or_alter: bool,
+    ) -> Result<()> {
+        SqlEngine::create_procedure(self, name, def, or_alter)
+    }
+    fn drop_procedure(&self, name: &str) -> Result<()> {
+        SqlEngine::drop_procedure(self, name)
+    }
+    fn procedure_def(&self, name: &str) -> Option<catalog::ProcedureDef> {
+        SqlEngine::procedure_def(self, name)
+    }
+    fn list_procedures(&self) -> Vec<(String, catalog::ProcedureDef)> {
+        SqlEngine::list_procedures(self)
     }
     fn next_auto_block(&self, table: &str, n: i64) -> Result<i64> {
         SqlEngine::next_auto_block(self, table, n)

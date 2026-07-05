@@ -187,6 +187,17 @@ impl<'de> Deserialize<'de> for IndexDef {
     }
 }
 
+/// A stored procedure: declared parameters and a body of SQL statements.
+/// Parameter references in the body were rewritten to `$1..$N` at creation,
+/// so calling is exactly a parameterized batch execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcedureDef {
+    /// `(name, type)` per declared parameter, in call order.
+    pub params: Vec<(String, SqlType)>,
+    /// The body as SQL text (`stmt; stmt; ...`), params rewritten to `$N`.
+    pub body: String,
+}
+
 /// The in-memory catalog plus where it persists.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Catalog {
@@ -197,6 +208,9 @@ pub struct Catalog {
     /// Views: name -> the view body as SQL text (re-parsed on use).
     #[serde(default)]
     pub views: BTreeMap<String, String>,
+    /// Stored procedures, keyed by name (their own namespace).
+    #[serde(default)]
+    pub procedures: BTreeMap<String, ProcedureDef>,
 }
 
 impl Catalog {

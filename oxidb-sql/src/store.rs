@@ -82,6 +82,15 @@ pub(crate) trait Store {
     fn drop_view(&self, name: &str) -> Result<()>;
     /// The stored SQL text of a view, if one with this name exists.
     fn view_sql(&self, name: &str) -> Option<String>;
+    fn create_procedure(
+        &self,
+        name: &str,
+        def: crate::catalog::ProcedureDef,
+        or_alter: bool,
+    ) -> Result<()>;
+    fn drop_procedure(&self, name: &str) -> Result<()>;
+    /// A stored procedure's definition, if one with this name exists.
+    fn procedure_def(&self, name: &str) -> Option<crate::catalog::ProcedureDef>;
 
     /// Atomically reserve `n` auto-increment values for `table`, returning
     /// the first. Only called for tables with an AUTO_INCREMENT column.
@@ -93,6 +102,9 @@ pub(crate) trait Store {
     /// Introspection (`SHOW VIEWS`): all `(name, body SQL)` pairs, sorted by
     /// name.
     fn list_views(&self) -> Vec<(String, String)>;
+    /// Introspection (`SHOW PROCEDURES`): all `(name, def)` pairs, sorted by
+    /// name.
+    fn list_procedures(&self) -> Vec<(String, crate::catalog::ProcedureDef)>;
     /// Introspection (`SHOW INDEXES`): all secondary index definitions,
     /// sorted by index name.
     fn list_indexes(&self) -> Vec<IndexDef>;

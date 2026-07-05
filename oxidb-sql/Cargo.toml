@@ -13,7 +13,7 @@ serde_json = "1"
 crc32fast = "1"
 memmap2 = "0.9"
 thiserror = "2"
-sqlparser = "0.59"
+sqlparser = { version = "0.59", features = ["visitor"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

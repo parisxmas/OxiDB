@@ -122,6 +122,23 @@ pub(crate) fn execute<S: Store>(
             filter,
             returning,
         } => exec_delete(store, &table, filter, returning, params),
+        Statement::CreateProcedure {
+            name,
+            def,
+            or_alter,
+        } => {
+            store.create_procedure(&name, def, or_alter)?;
+            Ok(QueryResult::Ddl)
+        }
+        Statement::DropProcedure { name, if_exists } => {
+            match store.drop_procedure(&name) {
+                Ok(()) => {}
+                Err(SqlError::NoSuchProcedure(_)) if if_exists => {}
+                Err(e) => return Err(e),
+            }
+            Ok(QueryResult::Ddl)
+        }
+        Statement::Call { name, args } => exec_call(store, &name, &args, params),
         Statement::Begin
         | Statement::Commit
         | Statement::Rollback
@@ -160,6 +177,27 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
                 .list_views()
                 .into_iter()
                 .map(|(name, sql)| vec![Value::Text(name), Value::Text(sql)])
+                .collect(),
+        }),
+        ShowKind::Procedures => Ok(QueryResult::Select {
+            columns: vec!["procedure".into(), "params".into(), "definition".into()],
+            types: vec![Some(SqlType::Text); 3],
+            rows: store
+                .list_procedures()
+                .into_iter()
+                .map(|(name, def)| {
+                    let params = def
+                        .params
+                        .iter()
+                        .map(|(n, t)| format!("{n} {}", format!("{t:?}").to_uppercase()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    vec![
+                        Value::Text(name),
+                        Value::Text(params),
+                        Value::Text(def.body),
+                    ]
+                })
                 .collect(),
         }),
         ShowKind::Indexes(table) => {
@@ -271,6 +309,89 @@ impl Hasher for FxHasher {
 }
 
 type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+/// Run a stored procedure: evaluate the arguments (literals or the caller's
+/// bind parameters — column references are rejected by binding against an
+/// empty schema), coerce them to the declared parameter types, and execute
+/// the stored body with the arguments as its `$N` parameters. The result is
+/// the last statement's result. Atomicity is the caller's job: `lib.rs`
+/// wraps a top-level CALL in an implicit transaction.
+pub(crate) fn exec_call<S: Store>(
+    store: &S,
+    name: &str,
+    args: &[Expr],
+    params: &[Value],
+) -> Result<QueryResult> {
+    let def = store
+        .procedure_def(name)
+        .ok_or_else(|| SqlError::NoSuchProcedure(name.to_string()))?;
+    if args.len() != def.params.len() {
+        return Err(SqlError::Eval(format!(
+            "procedure {name:?} takes {} argument(s), got {}",
+            def.params.len(),
+            args.len()
+        )));
+    }
+    let empty: &[ColRef] = &[];
+    let no_row: &[Value] = &[];
+    let mut values = Vec::with_capacity(args.len());
+    for (arg, (pname, ty)) in args.iter().zip(&def.params) {
+        let bound = bind_expr(arg, empty)?;
+        let v = eval_scalar(&bound, empty, no_row, params)?;
+        values.push(coerce_call_arg(v, *ty, pname)?);
+    }
+
+    let statements = crate::parser::parse(&def.body)?;
+    let mut last = QueryResult::Ddl;
+    for stmt in statements {
+        // The body was restricted to DML/SELECT at creation; keep the check
+        // as a defensive backstop for definitions from older catalogs.
+        match &stmt {
+            Statement::Insert { .. }
+            | Statement::Update { .. }
+            | Statement::Delete { .. }
+            | Statement::Select(_) => {}
+            _ => {
+                return Err(SqlError::Corrupt(format!(
+                    "procedure {name:?} body contains a non-DML statement"
+                )));
+            }
+        }
+        last = execute(store, stmt, &values)?;
+    }
+    Ok(last)
+}
+
+/// Coerce a CALL argument to the declared parameter type (the same implicit
+/// widenings column writes get); reject clear mismatches early so the error
+/// names the parameter instead of failing mid-body.
+fn coerce_call_arg(v: Value, ty: SqlType, pname: &str) -> Result<Value> {
+    let coerced = match (ty, v) {
+        (_, Value::Null) => Value::Null,
+        (SqlType::Double, Value::Int(i)) => Value::Double(i as f64),
+        (SqlType::Timestamp, Value::Int(i)) => Value::Timestamp(i),
+        (SqlType::Int, v @ Value::Int(_))
+        | (SqlType::Double, v @ Value::Double(_))
+        | (SqlType::Text, v @ Value::Text(_))
+        | (SqlType::Bool, v @ Value::Bool(_))
+        | (SqlType::Timestamp, v @ Value::Timestamp(_))
+        | (SqlType::Blob, v @ Value::Bytes(_)) => v,
+        (SqlType::Blob, Value::Text(t)) => match crate::catalog::base64_decode(&t) {
+            Ok(b) => Value::Bytes(b),
+            Err(()) => {
+                return Err(SqlError::Eval(format!(
+                    "parameter {pname:?}: invalid base64 for BLOB"
+                )));
+            }
+        },
+        (ty, v) => {
+            return Err(SqlError::Eval(format!(
+                "parameter {pname:?} expects {ty:?}, got {v:?}"
+            )));
+        }
+    };
+    Ok(coerced)
+}
 
 fn exec_insert<S: Store>(
     store: &S,

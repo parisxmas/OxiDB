@@ -58,6 +58,10 @@ pub enum SqlError {
     /// A referenced view does not exist.
     #[error("no such view: {0}")]
     NoSuchView(String),
+
+    /// A called (or dropped) stored procedure does not exist.
+    #[error("no such procedure: {0}")]
+    NoSuchProcedure(String),
 }
 
 /// Convenience result alias for the SQL engine.

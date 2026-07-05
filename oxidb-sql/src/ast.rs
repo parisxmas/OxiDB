@@ -39,6 +39,24 @@ pub enum Statement {
         name: String,
         if_exists: bool,
     },
+    /// `CREATE [OR ALTER] PROCEDURE name(p TYPE, ...) AS BEGIN ...; END` —
+    /// the body is stored as SQL text with parameter references already
+    /// rewritten to `$1..$N` (see `parser::translate_create_procedure`).
+    CreateProcedure {
+        name: String,
+        def: crate::catalog::ProcedureDef,
+        or_alter: bool,
+    },
+    DropProcedure {
+        name: String,
+        if_exists: bool,
+    },
+    /// `CALL name(arg, ...)` — run a stored procedure. Atomic: wrapped in an
+    /// implicit transaction unless one is already open.
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
     Insert {
         table: String,
         /// Column names if an explicit list was given; else insert positionally.
@@ -98,6 +116,8 @@ pub enum AlterOp {
 pub enum ShowKind {
     Tables,
     Views,
+    /// All stored procedures.
+    Procedures,
     /// All secondary indexes, or only those of one table.
     Indexes(Option<String>),
     /// The columns of one table (`DESCRIBE t` / `SHOW COLUMNS FROM t`).

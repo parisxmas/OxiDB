@@ -422,6 +422,31 @@ impl Store for Transaction<'_> {
         self.engine.view_sql(name)
     }
 
+    fn create_procedure(
+        &self,
+        _name: &str,
+        _def: crate::catalog::ProcedureDef,
+        _or_alter: bool,
+    ) -> Result<()> {
+        Err(SqlError::Unsupported(
+            "CREATE PROCEDURE inside a transaction".into(),
+        ))
+    }
+
+    fn drop_procedure(&self, _name: &str) -> Result<()> {
+        Err(SqlError::Unsupported(
+            "DROP PROCEDURE inside a transaction".into(),
+        ))
+    }
+
+    fn procedure_def(&self, name: &str) -> Option<crate::catalog::ProcedureDef> {
+        self.engine.procedure_def(name)
+    }
+
+    fn list_procedures(&self) -> Vec<(String, crate::catalog::ProcedureDef)> {
+        self.engine.list_procedures()
+    }
+
     fn list_tables(&self) -> Vec<Table> {
         let st = self.state.borrow();
         let mut tables: BTreeMap<String, Table> = self

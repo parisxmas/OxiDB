@@ -52,6 +52,11 @@ pub enum WalRecord {
         sql: String,
     },
     DropView(String),
+    CreateProcedure {
+        name: String,
+        def: crate::catalog::ProcedureDef,
+    },
+    DropProcedure(String),
     Insert {
         table: String,
         row_id: u64,

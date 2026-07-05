@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### SQL engine: stored procedures
+
+- `CREATE [OR ALTER] PROCEDURE name(p TYPE, ...) AS BEGIN ...; END`,
+  `CALL name(args...)`, `DROP PROCEDURE [IF EXISTS]`, `SHOW PROCEDURES`.
+  Bodies are DML/SELECT batches with **named parameters** (rewritten to
+  `$N` at creation — expression positions only, so INSERT column lists are
+  safe; parameters shadow same-named columns). A top-level `CALL` is
+  atomic via an implicit transaction; inside an open transaction it joins
+  it. The CALL's result is the last statement's result set. Procedures are
+  WAL-logged, checkpointed with the catalog, and replicate in cluster mode
+  like other writes. v1 body restrictions: no DDL / transaction control /
+  nested CALL. Stress-verified with a 1000+ line join- and math-heavy
+  procedure (`oxidb-sql/tests/data/complex_procedure.sql`).
+
 ### .NET: OxiDb.EntityFrameworkCore — EF Core provider (ADR-0013 Phase E)
 
 - New `OxiDb.EntityFrameworkCore` package (EF Core 9 / net10.0):

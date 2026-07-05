@@ -394,6 +394,47 @@ against PostgreSQL 15.
 `COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `MIN`, `MAX`, with `GROUP BY`
 (expressions allowed) and `HAVING`.
 
+## Stored Procedures
+
+SQL-native stored procedures (distinct from the document engine's
+[JSON/OxiScript procedures](stored-procedures.md)): a named, parameterized
+batch of DML/SELECT statements, stored in the catalog and executed
+atomically.
+
+```sql
+CREATE PROCEDURE yatir(kime TEXT, tutar DOUBLE) AS BEGIN
+  UPDATE hesap SET bakiye = bakiye + tutar WHERE ad = kime;
+  SELECT bakiye FROM hesap WHERE ad = kime;
+END;
+
+CALL yatir('ali', 25);        -- result = the LAST statement's result set
+CALL yatir($1, $2);           -- arguments can be bind parameters
+
+CREATE OR ALTER PROCEDURE yatir(...) AS BEGIN ... END;  -- replace
+DROP PROCEDURE [IF EXISTS] yatir;
+SHOW PROCEDURES;              -- name, params, stored definition
+```
+
+- **Parameters by name**: the body references parameters as plain
+  identifiers. At creation they are rewritten to `$N` placeholders —
+  expression positions only, so INSERT column lists and qualified
+  `table.col` references are untouched. In expression position a parameter
+  **shadows** a column of the same name (qualify the column to reach it).
+- **Atomic**: a top-level `CALL` runs in an implicit transaction (any
+  statement failing rolls the whole call back); inside an open transaction
+  it joins it.
+- **Body surface (v1)**: DML + SELECT only — no DDL, no transaction
+  control, no nested `CALL`, no `$N` placeholders of the body's own.
+  Arguments are coerced to the declared types (INT widens to
+  DOUBLE/TIMESTAMP; type mismatches name the offending parameter).
+- Procedures live in the catalog (their own namespace), are WAL-logged,
+  and survive restarts. In cluster mode `CREATE/DROP PROCEDURE` and `CALL`
+  replicate like any other write statement.
+
+A 1000+ line join/math-heavy example lives at
+`oxidb-sql/tests/data/complex_procedure.sql` (exercised by
+`t_procedures_stress.rs`).
+
 ## Parameters
 
 `?` placeholders bind left-to-right; `$1`, `$2`, … bind by position:
