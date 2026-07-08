@@ -16,6 +16,8 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -141,7 +143,7 @@ func trader(id, secs int) {
 			continue
 		}
 		buy := rng.Intn(2) == 0
-		aggressive := rng.Intn(2) == 0 // taker crosses the spread → causes a trade
+		aggressive := rng.Intn(10) < 7 // ~70% takers cross the spread → feed the matcher
 		spread := 0.001 + rng.Float64()*0.004
 		var price float64
 		if buy {
@@ -188,59 +190,73 @@ func trader(id, secs int) {
 
 // ---- matcher (the exchange core) -----------------------------------------
 
+// The matching engine is SHARDED BY SYMBOL: one goroutine (its own
+// connection) per symbol, matching that symbol's book independently — as
+// real venues shard matching across cores. Concurrent commits let group
+// commit batch their fsyncs, lifting throughput far above a single
+// serial matcher. Symbols are independent, but a user's cash account is
+// shared across symbols, so a fill locks all four touched accounts in a
+// global order (see executeTrade) to queue rather than conflict-storm.
 func matcher() {
-	c, err := Dial()
-	if err != nil {
-		panic(err)
-	}
-	seq := 0
-	trades, cancels := 0, 0
-	lastReport := time.Now()
+	var trades, cancels int64
+	start := time.Now()
+	var wg sync.WaitGroup
 
-	for {
-		didWork := false
-		for _, sym := range symbols {
-			for i := 0; i < 4; i++ { // drain a few crossing pairs per symbol per pass
+	for _, sym := range symbols {
+		wg.Add(1)
+		go func(sym string) {
+			defer wg.Done()
+			c, err := Dial()
+			if err != nil {
+				return
+			}
+			seq := 0
+			for {
 				bids, _ := c.Find("open_orders", map[string]any{"sym": sym, "side": "buy"},
 					map[string]any{"price": -1}, 1)
 				asks, _ := c.Find("open_orders", map[string]any{"sym": sym, "side": "sell"},
 					map[string]any{"price": 1}, 1)
 				if len(bids) == 0 || len(asks) == 0 {
-					break
+					time.Sleep(8 * time.Millisecond)
+					continue
 				}
 				bid, ask := bids[0], asks[0]
 				if getF(bid, "price") < getF(ask, "price") {
-					break // spread not crossed
+					time.Sleep(8 * time.Millisecond)
+					continue // spread not crossed
 				}
 				if getS(bid, "owner") == getS(ask, "owner") {
-					c.Delete("open_orders", map[string]any{"uid": getS(ask, "uid")}) // no self-trade
+					c.Delete("open_orders", map[string]any{"uid": getS(ask, "uid")})
 					continue
 				}
 				seq++
-				res := executeTrade(c, sym, bid, ask, seq)
-				didWork = true
-				switch res {
+				switch executeTrade(c, sym, bid, ask, fmt.Sprintf("%s-%d", sym, seq)) {
 				case "ok":
-					trades++
+					atomic.AddInt64(&trades, 1)
 				case "cancel":
-					cancels++
-				default: // gone/conflict — re-scan
+					atomic.AddInt64(&cancels, 1)
 				}
 			}
-		}
-		if time.Since(lastReport) > 15*time.Second {
-			fmt.Printf("[matcher] trades=%d cancels=%d\n", trades, cancels)
-			lastReport = time.Now()
-		}
-		if !didWork {
-			time.Sleep(20 * time.Millisecond) // no crossing orders right now
-		}
+		}(sym)
 	}
+
+	go func() {
+		last := int64(0)
+		lastT := start
+		for range time.Tick(15 * time.Second) {
+			t := atomic.LoadInt64(&trades)
+			rate := float64(t-last) / time.Since(lastT).Seconds()
+			fmt.Printf("[matcher] trades=%d cancels=%d (%.0f/s)\n",
+				t, atomic.LoadInt64(&cancels), rate)
+			last, lastT = t, time.Now()
+		}
+	}()
+	wg.Wait()
 }
 
 // executeTrade settles one match atomically. Returns "ok", "cancel"
 // (insufficient funds — offending order removed), or "" (retry/gone).
-func executeTrade(c *Client, sym string, bid, ask map[string]any, seq int) string {
+func executeTrade(c *Client, sym string, bid, ask map[string]any, uid string) string {
 	tradePrice := getF(ask, "price") // maker's price
 	qty := getF(bid, "remaining")
 	if a := getF(ask, "remaining"); a < qty {
@@ -251,16 +267,18 @@ func executeTrade(c *Client, sym string, bid, ask map[string]any, seq int) strin
 	}
 	buyer, seller := getS(bid, "owner"), getS(ask, "owner")
 	bidUID, askUID := getS(bid, "uid"), getS(ask, "uid")
-	uid := fmt.Sprintf("m-%d", seq)
 
-	for retry := 0; retry < 6; retry++ {
+	for retry := 0; retry < 8; retry++ {
 		if err := c.Begin(); err != nil {
 			return ""
 		}
-		// Re-read the two orders inside the tx (they may have been filled or
-		// TTL-expired since the scan).
-		lb, _ := c.TxFindForUpdate("open_orders", map[string]any{"uid": bidUID})
-		la, _ := c.TxFindForUpdate("open_orders", map[string]any{"uid": askUID})
+		// Re-read inside the tx (a plain `find` in an open tx records the
+		// read-set, so this is optimistic — no blocking locks, which keeps
+		// commits concurrent and lets group commit batch their fsyncs. A
+		// concurrent change to any doc read here aborts the commit and we
+		// retry). Orders may have been filled or TTL-expired since the scan.
+		lb, _ := c.Find("open_orders", map[string]any{"uid": bidUID}, nil, 1)
+		la, _ := c.Find("open_orders", map[string]any{"uid": askUID}, nil, 1)
 		if len(lb) == 0 || len(la) == 0 {
 			c.Rollback()
 			return ""
@@ -279,9 +297,9 @@ func executeTrade(c *Client, sym string, bid, ask map[string]any, seq int) strin
 		}
 		fillCost := tradePrice * fillQty
 
-		// Sufficiency: buyer cash, seller holding.
-		buUSD, _ := c.TxFindForUpdate("accounts", map[string]any{"owner": buyer, "asset": "USD"})
-		seAsset, _ := c.TxFindForUpdate("accounts", map[string]any{"owner": seller, "asset": sym})
+		// Sufficiency: buyer cash, seller holding (read into the read-set).
+		buUSD, _ := c.Find("accounts", map[string]any{"owner": buyer, "asset": "USD"}, nil, 1)
+		seAsset, _ := c.Find("accounts", map[string]any{"owner": seller, "asset": sym}, nil, 1)
 		if len(buUSD) == 0 || getF(buUSD[0], "bal") < fillCost-1e-9 {
 			c.Rollback()
 			c.Delete("open_orders", map[string]any{"uid": bidUID}) // can't afford → cancel

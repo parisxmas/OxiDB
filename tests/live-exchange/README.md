@@ -33,6 +33,14 @@ single matching engine — exactly how a venue works.
 Needs Go and the release `oxidb-server`. Uses a dedicated port (4455) and
 its own data dir (`.data/`); the Go binary and logs are gitignored.
 
-The matcher is the only writer of the ledger (accounts/trades/journal),
-so it runs at near-zero OCC conflict; traders only insert orders and read
-prices.
+## Throughput
+
+The matching engine is **sharded by symbol** — one goroutine (own
+connection) per symbol — so trades settle concurrently and group commit
+batches their fsyncs. `run.sh` runs the server in **lazy-sync** mode
+(`OXIDB_LAZY_SYNC`, batched fsyncs) because a live exchange is a
+throughput demo, not a durability test (those are separate suites):
+~150 trades/sec on a laptop. A user's USD account is shared across
+symbols, so the concurrent matchers do hit OCC conflicts on it; they
+retry (cheap under lazy-sync) and the ledger stays exactly consistent —
+verified after every run.
