@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Cluster: Jepsen-style network-partition test (+ documented liveness gap)
+
+- **`oxidb-server/tests/raft_partition_test.rs`** — deterministic
+  network-partition testing for the Raft cluster, in-process (no docker
+  / iptables). Partitions are injected at the transport by a
+  `PartitionedFactory` that wraps the real `OxiDbNetworkFactory` and
+  returns `Unreachable` for cut directed edges from a shared matrix —
+  openraft sees exactly what a dropped-packet partition looks like.
+  Two tests, both `--features cluster`:
+  - `raft_survives_follower_partition` — strands two followers (leader
+    stays in the majority). All four invariants hold across 3 rounds:
+    no lost acked writes, no split-brain, majority stays available,
+    full 5-node convergence on heal.
+  - `raft_leader_partition_safety` — the hard case: the current leader
+    is isolated into the minority. **Safety holds** — minority cannot
+    commit, majority re-elects and stays available, the whole majority
+    quorum converges and holds every acked write, and the stranded
+    ex-leader never surfaces uncommitted/phantom data.
+- **Documented liveness gap (openraft 0.9 has no PreVote):** an
+  isolated leader inflates its term while partitioned and, on heal,
+  returns as a disruptive stale-log candidate the quorum correctly
+  ignores — so it does **not** rejoin/catch up without a restart. Data
+  safety is unaffected (this is why the leader-partition test asserts
+  majority-quorum convergence, not full-cluster). Fix path: upgrade
+  openraft to a PreVote-capable release, or force an isolated leader to
+  step down to follower. Tracked for the cluster hardening pass.
 ### Durability fix: commit log survives crash-during-persist (found by new Jepsen-style test)
 
 - **`tests/jepsen_bank_crash.rs`** — Jepsen-style bank workload with
