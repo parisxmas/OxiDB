@@ -306,6 +306,26 @@ enum Stage {
         count_field: String,
         id_field: String,
     },
+    /// `$ohlcv`: collapse tick/trade documents into time-bucketed OHLCV
+    /// candles — open (first price in bucket), high, low, close (last
+    /// price), volume (summed), count. Optionally partitioned by a
+    /// symbol field, and optionally gap-filled: empty buckets between
+    /// the first and last observed candle of a partition carry the
+    /// previous close (o=h=l=c=prev_close, volume=0) — the standard
+    /// charting convention. Input docs are sorted by the time field
+    /// internally, so callers don't need a preceding `$sort`.
+    Ohlcv {
+        time_field: String,
+        interval: DateInterval,
+        price_field: String,
+        /// Volume source field; when `None`, volume is omitted from output.
+        volume_field: Option<String>,
+        /// Partition field (e.g. trading symbol); when `None`, one
+        /// partition spans all input docs.
+        symbol_field: Option<String>,
+        /// Fill empty buckets with the previous close (LOCF).
+        fill_previous: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -987,6 +1007,200 @@ fn exec_date_bucket_fill(
     out
 }
 
+/// Floor an epoch_ms value to the numeric start of its bucket. The
+/// numeric twin of `bucket_date_label` — used where the bucket must be
+/// walked arithmetically (gap filling) rather than rendered.
+fn floor_bucket_ms(epoch_ms: i64, interval: DateInterval) -> Option<i64> {
+    match interval {
+        DateInterval::Seconds(n) => {
+            let n_ms = (n as i64).checked_mul(1000)?;
+            Some(epoch_ms.div_euclid(n_ms) * n_ms)
+        }
+        DateInterval::Month => {
+            use chrono::{Datelike, NaiveDate};
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(epoch_ms)?;
+            let nd = NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)?;
+            Some(nd.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis())
+        }
+        DateInterval::Year => {
+            use chrono::{Datelike, NaiveDate};
+            let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(epoch_ms)?;
+            let nd = NaiveDate::from_ymd_opt(dt.year(), 1, 1)?;
+            Some(nd.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis())
+        }
+    }
+}
+
+/// One in-progress OHLCV candle. Folded in time order, so `open` is the
+/// first observed price and `close` the last.
+struct Candle {
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    count: u64,
+}
+
+impl Candle {
+    fn new(price: f64, volume: f64) -> Self {
+        Candle {
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume,
+            count: 1,
+        }
+    }
+    fn fold(&mut self, price: f64, volume: f64) {
+        self.high = self.high.max(price);
+        self.low = self.low.min(price);
+        self.close = price;
+        self.volume += volume;
+        self.count += 1;
+    }
+}
+
+/// Execute `$ohlcv`: collapse tick documents into per-interval candles,
+/// partitioned by symbol, optionally LOCF gap-filled. Docs missing a
+/// parseable time or numeric price are skipped.
+#[allow(clippy::too_many_arguments)]
+fn exec_ohlcv(
+    docs: Vec<Value>,
+    time_field: &str,
+    interval: DateInterval,
+    price_field: &str,
+    volume_field: Option<&str>,
+    symbol_field: Option<&str>,
+    fill_previous: bool,
+) -> Vec<Value> {
+    use std::collections::BTreeMap;
+
+    // Extract (symbol_key, ts, price, volume) rows, keeping the original
+    // symbol Value for output.
+    let mut rows: Vec<(String, i64, f64, f64)> = Vec::with_capacity(docs.len());
+    let mut symbol_values: std::collections::HashMap<String, Value> =
+        std::collections::HashMap::new();
+    for doc in &docs {
+        let Some(ts) = resolve_field_ref(doc, time_field).and_then(value_to_epoch_millis) else {
+            continue;
+        };
+        let Some(price) = resolve_field_ref(doc, price_field).and_then(|v| v.as_f64()) else {
+            continue;
+        };
+        let volume = volume_field
+            .and_then(|f| resolve_field_ref(doc, f))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let sym_key = match symbol_field {
+            Some(f) => {
+                let v = resolve_field_ref(doc, f).cloned().unwrap_or(Value::Null);
+                let key = match &v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                symbol_values.entry(key.clone()).or_insert(v);
+                key
+            }
+            None => String::new(),
+        };
+        rows.push((sym_key, ts, price, volume));
+    }
+
+    // Time order is what makes open/close correct; stable sort keeps
+    // same-timestamp ticks in input order.
+    rows.sort_by_key(|r| r.1);
+
+    // partition -> bucket_start_ms -> candle (BTreeMaps: deterministic,
+    // time-ordered output).
+    let mut parts: BTreeMap<String, BTreeMap<i64, Candle>> = BTreeMap::new();
+    for (sym, ts, price, volume) in rows {
+        let Some(bucket) = floor_bucket_ms(ts, interval) else {
+            continue;
+        };
+        parts
+            .entry(sym)
+            .or_default()
+            .entry(bucket)
+            .and_modify(|c| c.fold(price, volume))
+            .or_insert_with(|| Candle::new(price, volume));
+    }
+
+    let emit = |sym_key: &str,
+                bucket_ms: i64,
+                c: &Candle,
+                symbol_values: &std::collections::HashMap<String, Value>|
+     -> Option<Value> {
+        let label = bucket_date_label(bucket_ms, interval)?;
+        let mut obj = serde_json::Map::new();
+        if symbol_field.is_some() {
+            obj.insert(
+                "symbol".to_string(),
+                symbol_values.get(sym_key).cloned().unwrap_or(Value::Null),
+            );
+        }
+        obj.insert("time".to_string(), Value::String(label));
+        obj.insert("open".to_string(), json!(c.open));
+        obj.insert("high".to_string(), json!(c.high));
+        obj.insert("low".to_string(), json!(c.low));
+        obj.insert("close".to_string(), json!(c.close));
+        if volume_field.is_some() {
+            obj.insert("volume".to_string(), json!(c.volume));
+        }
+        obj.insert("count".to_string(), json!(c.count));
+        Some(Value::Object(obj))
+    };
+
+    let mut out: Vec<Value> = Vec::new();
+    for (sym_key, buckets) in &parts {
+        if !fill_previous || buckets.len() < 2 {
+            for (bucket_ms, candle) in buckets {
+                if let Some(v) = emit(sym_key, *bucket_ms, candle, &symbol_values) {
+                    out.push(v);
+                }
+            }
+            continue;
+        }
+
+        // LOCF gap fill: walk from the partition's first to last bucket;
+        // a missing bucket carries the previous close (flat candle,
+        // volume 0, count 0 — the standard charting convention).
+        let first = *buckets.keys().next().unwrap();
+        let last = *buckets.keys().next_back().unwrap();
+        let mut cur = first;
+        let mut prev_close: Option<f64> = None;
+        let mut iters = 0u32;
+        const MAX_ITERS: u32 = 1_000_000;
+        while cur <= last && iters < MAX_ITERS {
+            if let Some(candle) = buckets.get(&cur) {
+                if let Some(v) = emit(sym_key, cur, candle, &symbol_values) {
+                    out.push(v);
+                }
+                prev_close = Some(candle.close);
+            } else if let Some(pc) = prev_close {
+                let flat = Candle {
+                    open: pc,
+                    high: pc,
+                    low: pc,
+                    close: pc,
+                    volume: 0.0,
+                    count: 0,
+                };
+                if let Some(v) = emit(sym_key, cur, &flat, &symbol_values) {
+                    out.push(v);
+                }
+            }
+            match next_bucket_ms(cur, interval) {
+                Some(n) if n > cur => cur = n,
+                _ => break,
+            }
+            iters += 1;
+        }
+    }
+    out
+}
+
 /// Floor an epoch_ms value to the start of its bucket and render the
 /// bucket as an ISO 8601 / RFC 3339 string in UTC.
 fn bucket_date_label(epoch_ms: i64, interval: DateInterval) -> Option<String> {
@@ -1102,6 +1316,68 @@ fn parse_date_histogram_stage(val: &Value) -> Result<(Stage, Option<Stage>)> {
         None
     };
     Ok((group, fill))
+}
+
+/// Parse the `$ohlcv` stage body.
+///
+/// Body shape:
+///   { "$ohlcv": {
+///       "time": "ts",              // required: time field (ISO string or epoch ms)
+///       "interval": "1m",          // required: same grammar as $dateHistogram
+///       "price": "price",          // required: numeric price field
+///       "volume": "qty",           // optional: numeric volume field to sum
+///       "symbol": "sym",           // optional: partition field
+///       "fill": "previous"         // optional: "previous" = LOCF gap fill, "none" (default)
+///   }}
+fn parse_ohlcv_stage(val: &Value) -> Result<Stage> {
+    let obj = val
+        .as_object()
+        .ok_or_else(|| Error::InvalidPipeline("$ohlcv must be an object".into()))?;
+
+    let req_str = |key: &str| -> Result<String> {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::InvalidPipeline(format!("$ohlcv requires '{key}' string")))
+    };
+
+    let time_field = req_str("time")?;
+    let price_field = req_str("price")?;
+    let interval_raw = req_str("interval")?;
+    let interval = DateInterval::parse(&interval_raw).ok_or_else(|| {
+        Error::InvalidPipeline(format!(
+            "$ohlcv: unsupported interval '{interval_raw}' \
+             (try '1s', '1m', '5m', '1h', '1d', '1w', '1M', '1y')"
+        ))
+    })?;
+
+    let volume_field = obj
+        .get("volume")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let symbol_field = obj
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let fill_previous = match obj.get("fill").and_then(|v| v.as_str()) {
+        None | Some("none") => false,
+        Some("previous") => true,
+        Some(other) => {
+            return Err(Error::InvalidPipeline(format!(
+                "$ohlcv: unknown fill mode '{other}' (expected 'previous' or 'none')"
+            )));
+        }
+    };
+
+    Ok(Stage::Ohlcv {
+        time_field,
+        interval,
+        price_field,
+        volume_field,
+        symbol_field,
+        fill_previous,
+    })
 }
 
 fn parse_accumulator(val: &Value) -> Result<Accumulator> {
@@ -3238,6 +3514,7 @@ impl Pipeline {
             let stage = match stage_name.as_str() {
                 "$match" => Stage::Match(stage_body.clone()),
                 "$group" => parse_group_stage(stage_body)?,
+                "$ohlcv" => parse_ohlcv_stage(stage_body)?,
                 "$dateHistogram" => {
                     let (group_stage, maybe_fill) = parse_date_histogram_stage(stage_body)?;
                     stages.push(group_stage);
@@ -3569,6 +3846,22 @@ impl Pipeline {
                     count_field,
                     id_field,
                 } => exec_date_bucket_fill(current, *interval, count_field, id_field),
+                Stage::Ohlcv {
+                    time_field,
+                    interval,
+                    price_field,
+                    volume_field,
+                    symbol_field,
+                    fill_previous,
+                } => exec_ohlcv(
+                    current,
+                    time_field,
+                    *interval,
+                    price_field,
+                    volume_field.as_deref(),
+                    symbol_field.as_deref(),
+                    *fill_previous,
+                ),
             };
         }
         Ok(current)
@@ -3603,6 +3896,150 @@ mod tests {
     /// Helper: no-op lookup function for tests that don't use $lookup
     fn no_lookup(_col: &str, _q: &Value) -> Result<Vec<Value>> {
         Ok(vec![])
+    }
+
+    #[test]
+    fn ohlcv_basic_candles() {
+        // Two 1-minute buckets, deliberately out of time order to prove
+        // the stage sorts internally.
+        let docs = vec![
+            json!({"ts": "2026-01-01T00:00:30Z", "price": 105.0, "qty": 2.0}),
+            json!({"ts": "2026-01-01T00:00:10Z", "price": 100.0, "qty": 1.0}),
+            json!({"ts": "2026-01-01T00:00:50Z", "price": 95.0,  "qty": 1.0}),
+            json!({"ts": "2026-01-01T00:01:20Z", "price": 96.0,  "qty": 3.0}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$ohlcv": {"time": "ts", "interval": "1m", "price": "price", "volume": "qty"}}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out.len(), 2);
+
+        let c0 = &out[0];
+        assert_eq!(c0["time"], "2026-01-01T00:00:00Z");
+        assert_eq!(c0["open"], 100.0); // earliest tick, not first in input
+        assert_eq!(c0["high"], 105.0);
+        assert_eq!(c0["low"], 95.0);
+        assert_eq!(c0["close"], 95.0); // latest tick in bucket
+        assert_eq!(c0["volume"], 4.0);
+        assert_eq!(c0["count"], 3);
+
+        let c1 = &out[1];
+        assert_eq!(c1["time"], "2026-01-01T00:01:00Z");
+        assert_eq!(c1["open"], 96.0);
+        assert_eq!(c1["close"], 96.0);
+        assert_eq!(c1["count"], 1);
+    }
+
+    #[test]
+    fn ohlcv_partitions_by_symbol() {
+        let docs = vec![
+            json!({"ts": "2026-01-01T00:00:00Z", "price": 1.0, "sym": "BTC"}),
+            json!({"ts": "2026-01-01T00:00:30Z", "price": 2.0, "sym": "ETH"}),
+            json!({"ts": "2026-01-01T00:00:45Z", "price": 3.0, "sym": "BTC"}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$ohlcv": {"time": "ts", "interval": "1m", "price": "price", "symbol": "sym"}}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out.len(), 2);
+        // BTreeMap ordering: BTC before ETH.
+        assert_eq!(out[0]["symbol"], "BTC");
+        assert_eq!(out[0]["open"], 1.0);
+        assert_eq!(out[0]["close"], 3.0);
+        assert_eq!(out[0]["count"], 2);
+        assert_eq!(out[1]["symbol"], "ETH");
+        assert_eq!(out[1]["count"], 1);
+        // No volume field requested -> no volume key.
+        assert!(out[0].get("volume").is_none());
+    }
+
+    #[test]
+    fn ohlcv_gap_fill_carries_previous_close() {
+        // Ticks in minute 0 and minute 3; minutes 1-2 are empty.
+        let docs = vec![
+            json!({"ts": "2026-01-01T00:00:00Z", "price": 50.0, "qty": 1.0}),
+            json!({"ts": "2026-01-01T00:00:30Z", "price": 55.0, "qty": 1.0}),
+            json!({"ts": "2026-01-01T00:03:10Z", "price": 60.0, "qty": 2.0}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$ohlcv": {"time": "ts", "interval": "1m", "price": "price",
+                        "volume": "qty", "fill": "previous"}}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out.len(), 4, "minutes 0..=3 inclusive");
+
+        // Gap candles carry the previous close, flat, zero volume/count.
+        for gap in &out[1..3] {
+            assert_eq!(gap["open"], 55.0);
+            assert_eq!(gap["high"], 55.0);
+            assert_eq!(gap["low"], 55.0);
+            assert_eq!(gap["close"], 55.0);
+            assert_eq!(gap["volume"], 0.0);
+            assert_eq!(gap["count"], 0);
+        }
+        assert_eq!(out[1]["time"], "2026-01-01T00:01:00Z");
+        assert_eq!(out[2]["time"], "2026-01-01T00:02:00Z");
+        assert_eq!(out[3]["open"], 60.0);
+    }
+
+    #[test]
+    fn ohlcv_skips_unparseable_docs_and_accepts_epoch_ms() {
+        let docs = vec![
+            json!({"ts": 1767225600000i64, "price": 10}),  // epoch ms + int price
+            json!({"ts": "not a date", "price": 11.0}),     // skipped
+            json!({"price": 12.0}),                          // no ts: skipped
+            json!({"ts": "2026-01-01T00:00:20Z"}),          // no price: skipped
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$ohlcv": {"time": "ts", "interval": "1m", "price": "price"}}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["count"], 1);
+        assert_eq!(out[0]["open"], 10.0);
+        assert_eq!(out[0]["time"], "2026-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn ohlcv_composes_with_match_and_limit() {
+        let docs = vec![
+            json!({"ts": "2026-01-01T00:00:00Z", "price": 1.0, "sym": "BTC"}),
+            json!({"ts": "2026-01-01T00:01:00Z", "price": 2.0, "sym": "BTC"}),
+            json!({"ts": "2026-01-01T00:02:00Z", "price": 3.0, "sym": "BTC"}),
+            json!({"ts": "2026-01-01T00:00:00Z", "price": 9.0, "sym": "DOGE"}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$match": {"sym": "BTC"}},
+            {"$ohlcv": {"time": "ts", "interval": "1m", "price": "price"}},
+            {"$limit": 2}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["open"], 1.0);
+        assert_eq!(out[1]["open"], 2.0);
+    }
+
+    #[test]
+    fn ohlcv_rejects_bad_args() {
+        assert!(Pipeline::parse(&json!([{"$ohlcv": {"interval": "1m", "price": "p"}}])).is_err());
+        assert!(Pipeline::parse(&json!([{"$ohlcv": {"time": "t", "price": "p"}}])).is_err());
+        assert!(
+            Pipeline::parse(&json!([
+                {"$ohlcv": {"time": "t", "interval": "1zz", "price": "p"}}
+            ]))
+            .is_err()
+        );
+        assert!(
+            Pipeline::parse(&json!([
+                {"$ohlcv": {"time": "t", "interval": "1m", "price": "p", "fill": "zeroes"}}
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

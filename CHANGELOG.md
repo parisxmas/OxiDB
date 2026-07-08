@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Time-series: `$ohlcv` aggregation stage (tick → candle)
+
+- New pipeline stage collapsing tick/trade documents into time-bucketed
+  OHLCV candles:
+  `{"$ohlcv": {"time": "ts", "interval": "1m", "price": "price",
+  "volume": "qty", "symbol": "sym", "fill": "previous"}}` →
+  `{symbol, time, open, high, low, close, volume, count}` per bucket.
+  - Intervals share the `$dateHistogram` grammar (`1s`…`1y`, month/year
+    calendar-aware); time field accepts ISO 8601 strings or epoch ms.
+  - Input is time-sorted internally — open/close are correct without a
+    preceding `$sort`; same-timestamp ticks keep input order.
+  - `symbol` partitions candles per instrument in one pass.
+  - `fill: "previous"` synthesizes flat candles for empty buckets
+    carrying the previous close (o=h=l=c, volume 0, count 0) — the
+    standard charting convention (LOCF).
+  - Docs with unparseable time or non-numeric price are skipped.
+  - Composes with the rest of the pipeline (`$match` before,
+    `$sort`/`$limit`/`$project` after) and works through every surface
+    that runs aggregation (doc engine, REST, WS, all clients).
 ### Cluster: Jepsen-style network-partition test (+ documented liveness gap)
 
 - **`oxidb-server/tests/raft_partition_test.rs`** — deterministic

@@ -66,7 +66,7 @@ Query AST with field conditions and logical operators ($and, $or, $nor). Operato
 - Index-only count: returns set size without touching documents
 - Early termination: `update_one`/`delete_one` stop after first match
 
-Aggregation pipeline: $match, $group, $sort, $skip, $limit, $project, $count, $unwind, $addFields, $lookup, $facet, $setWindowFields (window functions).
+Aggregation pipeline: $match, $group, $sort, $skip, $limit, $project, $count, $unwind, $addFields, $lookup, $facet, $setWindowFields (window functions), $dateHistogram (time-bucketed group + empty-bucket fill), $ohlcv (tick→candle OHLCV with symbol partitioning and LOCF gap fill).
 
 ### Updates (`src/update.rs`)
 Field operators ($set, $unset, $inc, $mul, $min, $max, $rename, $currentDate) and array operators ($push, $pull, $addToSet, $pop). Supports dot-notation for nested fields.
