@@ -3,7 +3,7 @@ name = "oxidb-tail"
 version = "0.28.0"
 edition = "2024"
 description = "Real-time colored log viewer for OxiDB GELF logs"
-license = "AGPL-3.0-only"
+license-file = "../LICENSE"
 repository = "https://github.com/parisxmas/OxiDB"
 
 [[bin]]

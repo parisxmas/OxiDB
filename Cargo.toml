@@ -7,7 +7,7 @@ name = "oxidb"
 version = "0.33.1"
 edition = "2024"
 description = "A fast document database engine with optimized date indexing"
-license = "AGPL-3.0-only"
+license-file = "LICENSE"
 repository = "https://github.com/parisxmas/OxiDB"
 readme = "README.md"
 

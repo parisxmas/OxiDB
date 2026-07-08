@@ -3,7 +3,7 @@ name = "oxidb-agg-merge"
 version = "0.1.0"
 edition = "2024"
 description = "Splits an OxiDB aggregation pipeline into shard-local and merge halves for correct cross-shard scatter-gather"
-license = "AGPL-3.0-only"
+license-file = "../LICENSE"
 repository = "https://github.com/parisxmas/OxiDB"
 
 [dependencies]

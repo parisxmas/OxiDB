@@ -771,23 +771,20 @@ and click **Download**.)
 
 ## License
 
-OxiDB is **dual-licensed**:
+As of **v0.33.0**, OxiDB is **proprietary software** — see
+[LICENSE](LICENSE). Use, embedding, redistribution, and hosting require
+a commercial license; see
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) for terms and contact.
 
-- **Open source** — [GNU AGPL-3.0](LICENSE) (`AGPL-3.0-only`). Free to
-  use, modify, and redistribute, provided you release the complete
-  corresponding source of your work under the AGPL — and note that,
-  under the AGPL, offering OxiDB (or a product built on it) over a
-  network counts as distribution.
-- **Commercial** — for embedding OxiDB in a closed-source product, or
-  otherwise using it on terms the AGPL does not permit, a commercial
-  license is available. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+The thin TCP client libraries remain MIT-licensed — talking to a
+licensed OxiDB server from your own application needs no separate
+license.
 
-Prior releases were published under `MIT OR Apache-2.0`; that grant on
-those specific versions cannot be revoked. This and all future versions
-are AGPL-3.0 / commercial.
+Prior releases keep their original licenses irrevocably: early releases
+`MIT OR Apache-2.0`, later releases through v0.32.x `AGPL-3.0-only`.
 
 ### Contribution
 
-By submitting a contribution you agree it may be distributed under
-**both** licenses above — see
+By submitting a contribution you agree it may be distributed under the
+proprietary and commercial licenses above — see
 [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md#4-contributions).

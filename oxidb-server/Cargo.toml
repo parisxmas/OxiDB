@@ -1,9 +1,9 @@
 [package]
 name = "oxidb-server"
-version = "0.33.3"
+version = "0.33.4"
 edition = "2024"
 description = "TCP server for OxiDB document database"
-license = "AGPL-3.0-only"
+license-file = "../LICENSE"
 repository = "https://github.com/parisxmas/OxiDB"
 
 [features]

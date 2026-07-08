@@ -10,7 +10,18 @@
     <PackageId>OxiDb.Client.Embedded</PackageId>
     <Description>Embedded (in-process) OxiDB client via native FFI. No server required — runs the database engine directly in your process.</Description>
     <IsPackable>true</IsPackable>
+
+    <!-- This package bundles the OxiDB engine binaries (proprietary as of
+         v0.33.0) — override the MIT expression inherited from
+         Directory.Build.props with the proprietary license file. -->
+    <PackageLicenseExpression></PackageLicenseExpression>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\LICENSE" Pack="true" PackagePath="" Visible="false" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\OxiDb.Client.Tcp\OxiDb.Client.Tcp.csproj" />

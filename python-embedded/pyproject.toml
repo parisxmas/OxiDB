@@ -7,7 +7,8 @@ name = "oxidb-embedded"
 version = "0.25.21"
 description = "Embedded OxiDB for Python — run the database in-process via FFI (no server required)"
 readme = "README.md"
-license = "MIT OR Apache-2.0"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
 requires-python = ">=3.8"
 authors = [{name = "OxiDB"}]
 keywords = ["database", "document", "nosql", "oxidb", "embedded", "ffi"]

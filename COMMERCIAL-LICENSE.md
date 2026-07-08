@@ -1,74 +1,58 @@
 # OxiDB Licensing
 
-OxiDB is **dual-licensed**.
+As of **v0.33.0**, OxiDB is **proprietary, commercially licensed
+software**. There is no longer an open-source license option for new
+versions — see [`LICENSE`](LICENSE).
 
-## 1. Open-source license — AGPL-3.0
+## 1. What this means
 
-OxiDB is released to the public under the **GNU Affero General Public
-License, version 3** (`AGPL-3.0-only`) — see [`LICENSE`](LICENSE).
+All use of OxiDB v0.33.0 or later — running the server, embedding the
+engine (the `oxidb` crate, the FFI libraries, the WASM build, or the
+embedded client packages), redistributing it, or offering it as a
+service — requires a **commercial license** from the copyright holder.
 
-The AGPL is a strong copyleft license. In short, you may use, study,
-modify, and redistribute OxiDB **for free**, but if you do, you must:
+A commercial license is negotiated directly and can cover:
 
-- release the **complete corresponding source code** of your work under
-  the AGPL-3.0, and
-- do so **even if you only offer it over a network** — under the AGPL,
-  letting users interact with OxiDB (or a product built on it) over a
-  network counts as distribution, so your users are entitled to that
-  source.
-
-If your use of OxiDB fits within those terms, you owe nothing and need
-nothing further — the AGPL is your license.
-
-## 2. Commercial license
-
-The AGPL does **not** work for everyone. You need a **commercial
-license** if you want to do any of the following without releasing your
-own source code under the AGPL:
-
-- **embed** OxiDB (the `oxidb` crate, the FFI libraries, or any client
-  library in this repository) inside a **proprietary / closed-source**
-  application or product;
-- **distribute** OxiDB, or a product containing it, under terms other
-  than the AGPL;
-- run a **modified** OxiDB — including as a hosted/SaaS service — without
-  publishing your modifications.
-
-A commercial license removes the AGPL's copyleft obligations and lets
-you use OxiDB in a closed-source product on terms negotiated directly
-with the copyright holder.
+- **Embedding** — shipping OxiDB inside your (closed- or open-source)
+  application or device;
+- **Redistribution** — bundling OxiDB binaries with your product;
+- **Hosting** — offering OxiDB, or a service built on it, to third
+  parties over a network;
+- **Source access and modification rights**, support, and update terms
+  as agreed.
 
 **To obtain a commercial license, contact:**
 
 > **[ FILL IN: your commercial-licensing email or contact ]**
 
-(Until this is filled in, the only license on offer is the AGPL-3.0.)
+## 2. Client libraries
 
-## 3. Which one applies to me?
+The thin **TCP client libraries** (Python `oxidb`, npm `oxidb`,
+`OxiDb.Client.Tcp` / `OxiDb.Linq` / `OxiDb.Data` on NuGet, Go, Julia,
+PHP) remain **MIT-licensed**. Talking to a licensed OxiDB server from
+your own application does not require a commercial license of its own.
 
-| Your situation | License |
+Packages that **bundle the engine itself** — `oxidb-embedded` on PyPI,
+`OxiDb.Client.Embedded` on NuGet, and the FFI/WASM artifacts — contain
+the proprietary engine and are covered by [`LICENSE`](LICENSE).
+
+## 3. Prior versions
+
+Earlier versions of OxiDB were published under open-source licenses and
+those grants are irrevocable **for those specific versions**:
+
+| Versions | License |
 |---|---|
-| Personal, research, or hobby use | AGPL-3.0 — free |
-| An open-source project that is itself AGPL-compatible | AGPL-3.0 — free |
-| Talking to a stock, unmodified `oxidb-server` over the network from your own app | AGPL-3.0 — free (your app is not a derivative work) |
-| Embedding OxiDB *into* a closed-source product | **Commercial license required** |
-| Shipping a modified OxiDB, or running one as a service, without sharing your changes | **Commercial license required** |
+| Early releases (MIT era) | `MIT OR Apache-2.0` |
+| Later releases up to and including **v0.32.x** | `AGPL-3.0-only` (dual: AGPL / commercial) |
+| **v0.33.0 and later** | **Proprietary — commercial license required** |
 
-If you are unsure, assume you need a commercial license and reach out.
+You may continue to use those past versions under their original terms.
+No new versions will be published under an open-source license.
 
 ## 4. Contributions
 
 By submitting a contribution (pull request, patch, etc.) to OxiDB, you
-agree that your contribution may be distributed by the project under
-**both** licenses above — the AGPL-3.0 and the commercial license. This
-is what makes the dual-license model possible: the copyright holder must
-be able to offer the *whole* of OxiDB, including your contribution,
-under a commercial license. If you cannot agree to this, please do not
-submit contributions.
-
----
-
-*Note: prior releases of OxiDB were published under `MIT OR Apache-2.0`.
-That grant cannot be revoked — those specific past versions remain
-available under those terms. The dual AGPL-3.0 / commercial licensing
-described here applies to this and all future versions.*
+assign to the copyright holder the right to distribute your contribution
+under the proprietary license and any commercial license terms. If you
+cannot agree to this, please do not submit contributions.

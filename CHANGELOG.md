@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### License change — proprietary as of v0.33.0
+
+- OxiDB v0.33.0 and later is **proprietary, commercially licensed**
+  software (`LICENSE` replaced; see `COMMERCIAL-LICENSE.md`). Engine
+  crates now declare `license-file` instead of `AGPL-3.0-only`; the
+  engine-bundling packages (`oxidb-embedded` on PyPI,
+  `OxiDb.Client.Embedded` on NuGet) now ship the proprietary license
+  instead of MIT. Thin TCP client libraries remain MIT. Versions up to
+  and including v0.32.x stay available under their original licenses
+  (early releases `MIT OR Apache-2.0`, later `AGPL-3.0-only`).
+
 ### SQL engine: stored procedures
 
 - `CREATE [OR ALTER] PROCEDURE name(p TYPE, ...) AS BEGIN ...; END`,

@@ -3,7 +3,7 @@ name = "oxidb-embedded-ffi"
 version = "0.33.1"
 edition = "2024"
 description = "C-compatible FFI for embedded (in-process) OxiDB — no server required"
-license = "AGPL-3.0-only"
+license-file = "../LICENSE"
 repository = "https://github.com/parisxmas/OxiDB"
 
 [lib]
