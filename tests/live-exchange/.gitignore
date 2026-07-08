@@ -1,0 +1,6 @@
+.venv/
+.data/
+.server.log
+.feeder.log
+.trader-*.log
+.t*.log
