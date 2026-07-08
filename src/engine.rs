@@ -1632,6 +1632,73 @@ impl OxiDb {
         col.find_with_options_arcs(query, opts)
     }
 
+    /// Explain-and-run a find: query plan (strategy, index, post-filter
+    /// operators, sort mode) plus actual examined/returned/duration.
+    pub fn explain_find(
+        &self,
+        collection: &str,
+        query: &Value,
+        opts: &FindOptions,
+    ) -> Result<Value> {
+        let col = self.get_or_create_collection(collection)?;
+        col.explain_find(query, opts)
+    }
+
+    /// Explain-and-run a count: whether it was served index-only, plus
+    /// the count and duration.
+    pub fn explain_count(&self, collection: &str, query: &Value) -> Result<Value> {
+        let col = self.get_or_create_collection(collection)?;
+        col.explain_count(query)
+    }
+
+    /// Explain-and-run an aggregation: the stage list, the plan of the
+    /// leading `$match` (the stage that decides whether the pipeline
+    /// starts from an index or a full scan), and the run's
+    /// returned-count/duration.
+    pub fn explain_aggregate(&self, collection: &str, pipeline_json: &Value) -> Result<Value> {
+        let stages: Vec<String> = pipeline_json
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_object())
+                    .filter_map(|o| o.keys().next().cloned())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Plan of the leading $match — everything downstream operates on
+        // its output, so it decides index usage for the whole pipeline.
+        let first_match: Value = match pipeline_json
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|s| s.get("$match"))
+        {
+            Some(match_body) => {
+                let col = self.get_or_create_collection(collection)?;
+                let mut plan = col.explain_find(match_body, &FindOptions::default())?;
+                // The inner run's numbers describe only the $match probe;
+                // drop them to avoid confusion with the pipeline's run.
+                if let Some(obj) = plan.as_object_mut() {
+                    obj.remove("returned");
+                    obj.remove("duration_ms");
+                }
+                plan
+            }
+            None => Value::Null,
+        };
+
+        let start = Instant::now();
+        let results = self.aggregate(collection, pipeline_json)?;
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        Ok(json!({
+            "stages": stages,
+            "first_match": first_match,
+            "returned": results.len(),
+            "duration_ms": duration_us as f64 / 1000.0,
+        }))
+    }
+
     /// Look up a single doc's pre-encoded OxiWire bytes. Used by the
     /// server's find→wire path to skip per-doc encoding when the bytes
     /// cache (populated at insert time) is warm. Returns `None` if the
@@ -3421,6 +3488,84 @@ mod tests {
     fn temp_db() -> OxiDb {
         let dir = tempdir().unwrap();
         OxiDb::open(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn explain_reports_collscan_vs_index() {
+        let dir = tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        for i in 0..50 {
+            db.insert("orders", json!({"status": if i % 2 == 0 { "open" } else { "done" }, "n": i}))
+                .unwrap();
+        }
+
+        // No index: full scan, post-filter.
+        let plan = db
+            .explain_find("orders", &json!({"status": "open"}), &FindOptions::default())
+            .unwrap();
+        assert_eq!(plan["strategy"], "COLLSCAN");
+        assert_eq!(plan["examined"], 50);
+        assert_eq!(plan["returned"], 25);
+        assert_eq!(plan["index_used"], Value::Null);
+
+        // With an index: index scan, candidates narrowed to the match.
+        db.create_index("orders", "status").unwrap();
+        let plan = db
+            .explain_find("orders", &json!({"status": "open"}), &FindOptions::default())
+            .unwrap();
+        assert_eq!(plan["strategy"], "INDEX_SCAN");
+        assert_eq!(plan["candidates"], 25);
+        assert_eq!(plan["examined"], 25);
+        assert_eq!(plan["returned"], 25);
+        assert_eq!(plan["post_filter"], false);
+
+        // Post-filter-only operator: index can't serve $mod, and the
+        // plan says so.
+        let plan = db
+            .explain_find("orders", &json!({"n": {"$mod": [7, 0]}}), &FindOptions::default())
+            .unwrap();
+        assert_eq!(plan["strategy"], "COLLSCAN");
+        assert_eq!(plan["post_filter"], true);
+        assert_eq!(plan["post_filter_ops"], json!(["$mod"]));
+
+        // Index-only count.
+        let plan = db.explain_count("orders", &json!({"status": "open"})).unwrap();
+        assert_eq!(plan["strategy"], "INDEX_ONLY_COUNT");
+        assert_eq!(plan["count"], 25);
+
+        // Aggregate: stage list + leading-$match plan.
+        let plan = db
+            .explain_aggregate(
+                "orders",
+                &json!([
+                    {"$match": {"status": "open"}},
+                    {"$group": {"_id": null, "total": {"$sum": "$n"}}}
+                ]),
+            )
+            .unwrap();
+        assert_eq!(plan["stages"], json!(["$match", "$group"]));
+        assert_eq!(plan["first_match"]["strategy"], "INDEX_SCAN");
+        assert_eq!(plan["returned"], 1);
+    }
+
+    #[test]
+    fn explain_reports_index_backed_sort() {
+        let dir = tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        for i in 0..10 {
+            db.insert("t", json!({"ts": i})).unwrap();
+        }
+        db.create_index("t", "ts").unwrap();
+        let opts = FindOptions {
+            sort: Some(vec![("ts".to_string(), crate::query::SortOrder::Asc)]),
+            limit: Some(3),
+            ..Default::default()
+        };
+        let plan = db.explain_find("t", &json!({}), &opts).unwrap();
+        assert_eq!(plan["strategy"], "INDEX_SORT");
+        assert_eq!(plan["sort"], "index-backed");
+        assert_eq!(plan["index_used"], "ts");
+        assert_eq!(plan["returned"], 3);
     }
 
     #[test]

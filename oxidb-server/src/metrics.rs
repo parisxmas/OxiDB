@@ -49,6 +49,9 @@ pub struct Metrics {
     /// Successful / conflict-aborted document-engine transaction commits.
     pub tx_commits: AtomicU64,
     pub tx_conflicts: AtomicU64,
+
+    /// Wire operations that exceeded OXIDB_SLOW_QUERY_MS (see profiler.rs).
+    pub slow_queries: AtomicU64,
 }
 
 impl Metrics {
@@ -174,6 +177,12 @@ pub fn render_prometheus(db: &Arc<OxiDb>) -> String {
         "oxidb_tx_conflicts_total",
         "Document-engine transaction commits aborted by OCC conflict.",
         m.tx_conflicts.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "oxidb_slow_queries_total",
+        "Wire operations slower than OXIDB_SLOW_QUERY_MS (0 when profiler off).",
+        m.slow_queries.load(Ordering::Relaxed),
     );
 
     // ── Engine gauges (scrape-time) ──

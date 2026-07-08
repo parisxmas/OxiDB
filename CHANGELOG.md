@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Diagnostics: `explain` command + slow-query profiler
+
+- **`explain`** — query-plan introspection for the document engine:
+  `{"cmd": "explain", "inner": {"cmd": "find" | "count" | "aggregate",
+  ...}}` reports the plan and runs the operation for real numbers:
+  - find: `strategy` (`COLLSCAN` / `INDEX_SCAN` / `INDEX_SORT` /
+    `FULL_SCAN_ALL`), `index_used`, `candidates`, `examined` vs
+    `returned`, `post_filter` + `post_filter_ops` (the operators an
+    index cannot serve — `$ne $nin $exists $regex $elemMatch $not $all
+    $size $type $mod $nor $expr`), `sort` mode, `duration_ms`.
+  - count: `INDEX_ONLY_COUNT` vs `FILTERED_COUNT`.
+  - aggregate: stage list + the leading `$match`'s plan (it decides
+    whether the whole pipeline starts from an index).
+  The plan is computed by the SAME planner functions the real find path
+  calls (`execute_indexed`, `is_fully_indexed`), so it cannot drift.
+- **Slow-query profiler** — opt-in via `OXIDB_SLOW_QUERY_MS=<n>`
+  (default off, zero cost): every wire command slower than `n` ms is
+  recorded into the `_profile` collection with timestamp, db, cmd,
+  collection, request shape (query/pipeline/sql — not document
+  payloads), duration, and threshold. `_profile` gets a TTL index
+  (24 h default, `OXIDB_PROFILE_TTL_SECS` overrides). New Prometheus
+  counter `oxidb_slow_queries_total`. Covers the session-handler
+  surface (sync + cluster TCP, incl. SQL); REST is not profiled.
 ### Observability: Prometheus `/metrics` endpoint
 
 - `GET /metrics` on the REST listener (`OXIDB_HTTP_PORT`) serves the

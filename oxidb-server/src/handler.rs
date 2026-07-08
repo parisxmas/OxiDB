@@ -140,6 +140,48 @@ pub fn handle_request_session(
     sql_tx: &mut Option<u64>,
     sql_readonly: bool,
 ) -> Vec<u8> {
+    // Slow-query profiler (opt-in via OXIDB_SLOW_QUERY_MS): time the
+    // whole dispatch; record shape + duration when over threshold. The
+    // shape is captured up front because the request moves into the
+    // inner handler.
+    let Some(threshold) = *crate::profiler::SLOW_MS else {
+        return handle_request_session_inner(db, db_name, request, active_tx, sql_tx, sql_readonly);
+    };
+    let cmd_owned = request
+        .get("cmd")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let col_owned = request
+        .get("collection")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let shape = crate::profiler::request_shape(&request);
+    let start = std::time::Instant::now();
+    let resp = handle_request_session_inner(db, db_name, request, active_tx, sql_tx, sql_readonly);
+    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    if duration_ms >= threshold as f64 {
+        crate::profiler::record_slow(
+            db,
+            db_name,
+            &cmd_owned,
+            col_owned.as_deref(),
+            shape,
+            duration_ms,
+            threshold,
+        );
+    }
+    resp
+}
+
+fn handle_request_session_inner(
+    db: &Arc<OxiDb>,
+    db_name: &str,
+    request: Value,
+    active_tx: &mut Option<u64>,
+    sql_tx: &mut Option<u64>,
+    sql_readonly: bool,
+) -> Vec<u8> {
     let cmd = match request
         .get("cmd")
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -830,6 +872,59 @@ pub fn handle_request_session(
             match db.aggregate(col, pipeline) {
                 Ok(docs) => ok_bytes(json!(docs)),
                 Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
+        // Query-plan introspection: {"cmd": "explain", "inner": {"cmd":
+        // "find" | "count" | "aggregate", ...}} — reports the plan the
+        // engine would choose (strategy, index, post-filter operators)
+        // plus the real run's numbers.
+        "explain" => {
+            let inner = match request.get("inner") {
+                Some(i) => i,
+                None => return err_bytes("explain requires an 'inner' request object"),
+            };
+            let inner_cmd = match inner.get("cmd").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return err_bytes("explain 'inner' requires a 'cmd'"),
+            };
+            let col = match inner.get("collection").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return err_bytes("explain 'inner' requires a 'collection'"),
+            };
+            let empty_query = json!({});
+            match inner_cmd {
+                "find" | "find_one" => {
+                    let query = inner.get("query").unwrap_or(&empty_query);
+                    let opts = match parse_find_options(inner) {
+                        Ok(o) => o,
+                        Err(e) => return err_bytes(&e.to_string()),
+                    };
+                    match db.explain_find(col, query, &opts) {
+                        Ok(plan) => ok_bytes(plan),
+                        Err(e) => err_bytes(&e.to_string()),
+                    }
+                }
+                "count" => {
+                    let query = inner.get("query").unwrap_or(&empty_query);
+                    match db.explain_count(col, query) {
+                        Ok(plan) => ok_bytes(plan),
+                        Err(e) => err_bytes(&e.to_string()),
+                    }
+                }
+                "aggregate" => {
+                    let pipeline = match inner.get("pipeline") {
+                        Some(p) => p,
+                        None => return err_bytes("explain aggregate requires 'pipeline'"),
+                    };
+                    match db.explain_aggregate(col, pipeline) {
+                        Ok(plan) => ok_bytes(plan),
+                        Err(e) => err_bytes(&e.to_string()),
+                    }
+                }
+                other => err_bytes(&format!(
+                    "explain supports find/count/aggregate, got: {other}"
+                )),
             }
         }
 

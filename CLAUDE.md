@@ -100,6 +100,10 @@ Length-prefixed JSON over TCP (max 16 MiB). Auth via SCRAM-SHA-256. RBAC roles: 
 - `OXIDB_AUDIT_MAX_AGE_SECS` (optional; rotates after this many elapsed seconds since file became active)
 - `OXIDB_AUDIT_CALENDAR` (optional; `hourly` / `daily` / `none` — UTC calendar boundary)
 - `OXIDB_AUDIT_COMPRESS` (optional; `true`/`1`/`yes`/`on` to gzip rotated audit files; default off)
+- `OXIDB_SLOW_QUERY_MS` (optional; record wire commands slower than this many ms into `_profile` with a TTL index; default off)
+- `OXIDB_PROFILE_TTL_SECS` (optional; retention of `_profile` records, default 86400)
+
+Diagnostics: `{"cmd": "explain", "inner": {...find/count/aggregate...}}` returns the query plan (strategy, index used, examined/returned, post-filter operators) plus real run timing. Prometheus exposition at `GET /metrics` on the REST listener.
 
 ### Second engine — SQL (`oxidb-sql/`, ADR-0010)
 A standalone relational SQL engine (its own crate) can be mounted alongside the document engine in the same server. It owns **entirely separate files** and shares no state — a collection name and a SQL table name never collide. Off by default.

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::locks::{Mutex, RwLock};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::btree_storage::BTreeStorage;
 use crate::codec;
@@ -2463,6 +2463,118 @@ impl BTreeCollection {
         self.storage.count()
     }
 
+    /// Explain how a find would execute, then execute it and report
+    /// actual numbers. Reuses the SAME planner functions the real find
+    /// path calls (`execute_indexed`, `is_fully_indexed`, the
+    /// index-backed-sort check), so the reported plan can't drift from
+    /// reality. Plan fields:
+    ///
+    /// - `strategy`: `COLLSCAN` | `INDEX_SCAN` | `INDEX_SORT` |
+    ///   `FULL_SCAN_ALL` (match-all cursor walk)
+    /// - `index_used`, `candidates` (docs the index narrowed to),
+    /// - `post_filter` + `post_filter_ops` (operators an index can't
+    ///   serve — these force per-document predicate evaluation),
+    /// - `sort`: `none` | `index-backed` | `in-memory`,
+    /// - `examined` / `returned` / `duration_ms` from the real run.
+    pub fn explain_find(&self, query_json: &Value, opts: &FindOptions) -> Result<Value> {
+        let query = query::parse_query(query_json)?;
+        let total_docs = self.count();
+
+        // ── Plan (mirrors find_with_options_arcs decision order) ──
+        let fi = self.field_indexes.read();
+        let ci = self.composite_indexes.read();
+
+        let match_all = matches!(query, query::Query::All);
+        let fully_indexed = query::is_fully_indexed(&query, &fi);
+        let candidate_ids = query::execute_indexed(&query, &fi, &ci);
+
+        let sort_desc = match &opts.sort {
+            None => "none",
+            Some(fields) if fields.len() == 1 && fi.contains_key(&fields[0].0) => "index-backed",
+            Some(_) => "in-memory",
+        };
+
+        let (strategy, examined) = if match_all && opts.sort.is_none() {
+            ("FULL_SCAN_ALL", total_docs)
+        } else if sort_desc == "index-backed" {
+            // The index-sort path walks the sort index (early-terminating
+            // on limit) and post-filters; worst case examines everything.
+            ("INDEX_SORT", total_docs)
+        } else {
+            match &candidate_ids {
+                Some(ids) => ("INDEX_SCAN", ids.len()),
+                None => ("COLLSCAN", total_docs),
+            }
+        };
+
+        let index_used: Value = if sort_desc == "index-backed" {
+            json!(opts.sort.as_ref().unwrap()[0].0.clone())
+        } else if candidate_ids.is_some() {
+            // The fields whose index conditions narrowed the candidates.
+            let indexed_fields: Vec<String> = query::extract_eq_conditions(&query)
+                .map(|m| {
+                    m.into_iter()
+                        .map(|(f, _)| f)
+                        .filter(|f| fi.contains_key(f))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if indexed_fields.is_empty() {
+                json!("(range/in conditions)")
+            } else {
+                json!(indexed_fields)
+            }
+        } else {
+            Value::Null
+        };
+        drop(ci);
+        drop(fi);
+
+        let post_filter_ops = collect_post_filter_ops(query_json);
+        let candidates = candidate_ids.as_ref().map(|ids| ids.len());
+
+        // ── Analyze: run it for real ──
+        let start = std::time::Instant::now();
+        let results = self.find_with_options(query_json, opts)?;
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        Ok(json!({
+            "strategy": strategy,
+            "index_used": index_used,
+            "collection_docs": total_docs,
+            "candidates": candidates,
+            "examined": examined,
+            "returned": results.len(),
+            "post_filter": !fully_indexed && !match_all,
+            "post_filter_ops": post_filter_ops,
+            "sort": sort_desc,
+            "duration_ms": duration_us as f64 / 1000.0,
+        }))
+    }
+
+    /// Count documents matching a query, with plan + timing (see
+    /// [`BTreeCollection::explain_find`]). Reports whether the count was
+    /// served index-only (never touching documents).
+    pub fn explain_count(&self, query_json: &Value) -> Result<Value> {
+        let query = query::parse_query(query_json)?;
+        let fi = self.field_indexes.read();
+        let index_only =
+            matches!(query, query::Query::All) || query::count_indexed(&query, &fi).is_some();
+        drop(fi);
+
+        let start = std::time::Instant::now();
+        let count = self.count_matching(query_json)?;
+        let duration_us = start.elapsed().as_micros() as u64;
+
+        Ok(json!({
+            "strategy": if index_only { "INDEX_ONLY_COUNT" } else { "FILTERED_COUNT" },
+            "index_only": index_only,
+            "post_filter_ops": collect_post_filter_ops(query_json),
+            "count": count,
+            "duration_ms": duration_us as f64 / 1000.0,
+        }))
+    }
+
     /// Count documents matching a query.
     pub fn count_matching(&self, query_json: &Value) -> Result<usize> {
         let query = query::parse_query(query_json)?;
@@ -3760,6 +3872,51 @@ fn extract_field_path(bytes: &[u8], path: &str) -> Option<Value> {
         }
     }
     Some(current)
+}
+
+/// Walk a raw query and list the operators the index planner cannot
+/// serve (they force per-document post-filtering). The set mirrors
+/// `query::execute_field_op`'s `=> return None` arms plus the tree-level
+/// `$nor`/`$expr` — if the planner learns a new trick, update both.
+fn collect_post_filter_ops(query_json: &Value) -> Vec<String> {
+    const POST_FILTER: &[&str] = &[
+        "$ne",
+        "$nin",
+        "$exists",
+        "$regex",
+        "$elemMatch",
+        "$not",
+        "$all",
+        "$size",
+        "$type",
+        "$mod",
+        "$nor",
+        "$expr",
+    ];
+    let mut found: Vec<String> = Vec::new();
+    fn walk(v: &Value, found: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for (k, val) in map {
+                    if k.starts_with('$') && POST_FILTER.contains(&k.as_str()) {
+                        if !found.iter().any(|f| f == k) {
+                            found.push(k.clone());
+                        }
+                    }
+                    walk(val, found);
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    walk(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(query_json, &mut found);
+    found.sort();
+    found
 }
 
 fn eval_field_op_partial(op: &crate::query::QueryOp, field_val: Option<&Value>) -> Option<bool> {
