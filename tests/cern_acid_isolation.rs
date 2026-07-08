@@ -239,21 +239,29 @@ fn write_skew_pinned_behaviour() {
          (started at {initial}, each withdrew 60)"
     );
 
-    // PINNED: OxiDB's OCC validates write-set conflicts. The two txs
-    // touched DIFFERENT documents (x and y), so OCC sees no conflict
-    // and lets both commit. Result: final_total = 100 - 120 = -20,
-    // write skew occurred. If/when SSI lands and final_total stays
-    // ≥ 40 (one tx aborted, one committed), this assertion flips and
-    // the flip is the intentional promotion of the isolation level.
+    // PINNED (updated): OxiDB's OCC validates the full item READ-SET at
+    // commit, not just write-write conflicts. Both txs read x AND y for
+    // the constraint check, so the second committer's read-set contains
+    // a document the first one changed — validation aborts it. Item-read
+    // write skew is PREVENTED; exactly one withdrawal commits and the
+    // total ≥ 0 constraint survives.
+    //
+    // (This assertion originally pinned the opposite — both commit,
+    // total -20 — from an era when validation only covered write-sets.
+    // The promotion is deliberate. The remaining gap is PHANTOM write
+    // skew: predicate reads only record returned docs, so inserts evade
+    // validation — pinned in tests/isolation_characterization.rs, with
+    // the counter-doc mitigation. See docs/isolation.md.)
     assert_eq!(
-        committed, 2,
-        "PINNED: OCC alone admits write skew — both txs commit. \
-         If this fails, isolation has been promoted; update test + docs."
+        committed, 1,
+        "PINNED: read-set validation prevents item-read write skew — \
+         exactly one tx commits. If BOTH commit, isolation has REGRESSED \
+         to write-set-only validation; if NEITHER, liveness broke."
     );
     assert_eq!(
-        final_total, -20,
-        "PINNED: write skew → total goes negative. \
-         If this fails, isolation has been promoted."
+        final_total, 40,
+        "PINNED: constraint survives (100 - 60). A total of -20 means \
+         write skew returned — isolation regression."
     );
 }
 

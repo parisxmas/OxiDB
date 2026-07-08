@@ -77,6 +77,8 @@ Field operators ($set, $unset, $inc, $mul, $min, $max, $rename, $currentDate) an
 ### Transactions (`src/transaction.rs`, `src/tx_log.rs`)
 OCC with 3-phase commit: prepare → validate versions → commit. Writes are buffered until commit. Deadlock-free via sorted collection locking (BTreeSet). Recovery uses transaction log + WAL replay on startup.
 
+Isolation: backward-validating OCC over item read-sets — committed transactions are serializable w.r.t. the items they read/wrote; phantoms and torn reads for non-tx observers are admitted. The exact guarantee, anomaly scorecard, and application rules live in `docs/isolation.md`, pinned by `tests/isolation_characterization.rs`.
+
 ### Full-Text Search (`src/fts.rs`)
 Background worker thread receives indexing jobs via `sync_channel(256)`. Supports HTML, XML, JSON, PDF, DOCX, XLSX, images (OCR with `ocr` feature). TF-IDF ranking. Persisted as `_fts/index.json`.
 
