@@ -1,41 +1,38 @@
-# Live exchange integration test
+# Self-contained exchange over OxiDB (Go)
 
-An end-to-end test that runs OxiDB as a real exchange data layer under
-**live market data**:
+A real exchange, **not** a market-data replay: there is no external feed.
+Prices are formed entirely by the traders' own order flow, matched by a
+single matching engine — exactly how a venue works.
 
-- **1 feeder process** connects to three real crypto exchanges over
-  WebSocket — Binance, Coinbase, Kraken — and streams trade ticks for
-  **20 distinct symbols** into OxiDB (updates a `prices` row per symbol,
-  appends to `ticks`).
-- **10 trader processes** (one per user) read the live prices and place
-  atomic buy/sell fills. Each fill is ONE transaction touching five
-  collections — `receipts` (idempotency), `accounts` (USD cash + asset
-  position), `trades`, `orders`, `journal` (double-entry) — with retry
-  on OCC conflict and idempotent replay, the ledger pattern from the
-  exchange-readiness suite, now driven by real markets.
-- **`verify.py`** then checks the ledger is consistent: trade uids
-  unique, every trade has exactly one receipt and two journal legs, each
-  balance is reproducible from the journal, no overdraft, portfolio
-  value conserved.
+- **matcher** — the exchange core. One process, single-threaded per-symbol
+  matching (as real matching engines are). It reads the resting order
+  book, matches the best crossing bid/ask, and settles each fill in ONE
+  atomic transaction: move USD + asset between the two users, insert the
+  trade, write the double-entry journal, and **set the symbol's price to
+  the last trade** — so the market price emerges from trading.
+- **trader** (10 processes) — each a user. Reads the current price, places
+  limit buy/sell orders around it (some cross the spread and cause
+  trades), backed by its cash / holdings. Users start with USD **and** an
+  opening position in every symbol, so it's a closed system: every buy is
+  someone's sell.
+- **TTL** — resting orders expire (`open_orders.created_at`, default 20s),
+  so the order book can't grow without bound. The ledger
+  (trades/journal/receipts) is permanent and is not expired.
+- **verify** — after trading: trades == receipts (idempotent settlement),
+  journal balances, total USD conserved (no money created), each symbol's
+  holdings conserved, no overdraft, no naked shorts, every balance
+  reproducible from the journal, and prices moved from seed (the market
+  was formed by traders).
 
 ## Run
 
 ```bash
-# one-time: create the venv (needs internet for the websockets pkg)
-python3 -m venv .venv && .venv/bin/pip install websockets
-
-./run.sh 40      # 40 seconds of live trading, then verify
+./run.sh 45        # 45s of trading, then verify
 ```
 
-Requires internet (public exchange WebSocket feeds; no API keys). Uses a
-dedicated port (4455) and its own data dir (`.data/`), both isolated
-from any other running OxiDB. All artifacts (`.venv`, `.data`, logs) are
-gitignored.
+Needs Go and the release `oxidb-server`. Uses a dedicated port (4455) and
+its own data dir (`.data/`); the Go binary and logs are gitignored.
 
-## What it demonstrates
-
-Real-world load — bursty, unpredictable market data writes concurrent
-with multi-user transactional trading — over the exact
-durability/idempotency/atomicity machinery the unit and fault-injection
-suites verify. A green `verify.py` is the ledger staying provably
-consistent while live money moves against live prices.
+The matcher is the only writer of the ledger (accounts/trades/journal),
+so it runs at near-zero OCC conflict; traders only insert orders and read
+prices.

@@ -1,7 +1,5 @@
-.venv/
 .data/
+.exchange
 .server.log
-.feeder.log
+.matcher.log
 .trader-*.log
-.t*.log
-.data-ttl
