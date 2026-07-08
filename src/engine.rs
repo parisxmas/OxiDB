@@ -2135,11 +2135,13 @@ impl OxiDb {
 
         // Re-read AFTER acquiring the locks: the matched docs may have
         // changed while we waited, and the version recorded in the read
-        // set must be the locked one for OCC validation to pass.
+        // set must be the locked one for OCC validation to pass. Direct
+        // by-id lookup (cache-backed) — a `find` on `_id` would be a
+        // full collection scan per document.
         let mut results = Vec::with_capacity(ids.len());
         for id in &ids {
-            if let Some(doc) = col.find(&json!({ "_id": id }))?.into_iter().next() {
-                results.push(doc);
+            if let Some(doc) = col.load_doc_arc(*id) {
+                results.push((*doc).clone());
             }
         }
 

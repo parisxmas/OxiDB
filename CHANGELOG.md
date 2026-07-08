@@ -24,6 +24,12 @@
   tx/s (2.3×), p99 at full contention 502ms → 48ms (10×), max 1.5s →
   58ms; for-update mode eliminates conflicts entirely (0.00/commit at
   every hot ratio). Money-conservation invariant holds in all modes.
+  On Linux (4-core VPS, virtio): occ 1.5–2.2k tx/s with p99 ≤ 8.3ms,
+  for-update 1.1–1.3k tx/s with p99 ≈ 10ms — both at full durability,
+  every hot ratio. `tx_find_for_update`'s post-lock re-read uses the
+  direct by-id cache lookup (`load_doc_arc`); the initial `find`-based
+  re-read was a full scan per doc and cost for-update ~5–10× on fast
+  disks.
 
 ### License change — proprietary as of v0.33.0
 
