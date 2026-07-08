@@ -22,11 +22,15 @@ export default function Footer() {
               <Link href="/queries">Query API</Link>
               <Link href="/server">Server</Link>
               <Link href="/clients">Client Libraries</Link>
+              <Link href="/license">License</Link>
             </div>
           </div>
         </div>
         <div className="footer-bottom">
-          <p>OxiDB v0.18.0 -- Built with Rust</p>
+          <p>
+            © 2026 Barış AKIN — OxiDB is proprietary software (
+            <Link href="/license">licensing</Link>) — Built with Rust
+          </p>
         </div>
       </div>
     </footer>

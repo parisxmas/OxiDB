@@ -26,6 +26,7 @@ const navItems = [
   { href: '/storage', label: 'Storage' },
   { href: '/benchmarks', label: 'Benchmarks' },
   { href: '/changelog', label: 'Changelog' },
+  { href: '/license', label: 'License' },
 ]
 
 export default function Nav() {
