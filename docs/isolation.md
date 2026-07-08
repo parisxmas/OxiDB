@@ -68,7 +68,27 @@ see mid-commit.
 
 ## Exactly-once / idempotency (retries, timeouts, crashes)
 
-The client-visible failure mode isolation can't solve alone: a request
+The client-visible failure mode isolation can't solve alone: a client
+submits a withdrawal, times out, and retries — did the first attempt
+commit? The pattern, pinned by `tests/exactly_once.rs`:
+
+- Give every state-changing request a **`request_id`**.
+- Put a **unique index** on it
+  (`create_unique_index("receipts", "request_id")`).
+- In the **same transaction** as the money moves, insert a receipt
+  `{request_id}`. A retry re-runs the whole transaction:
+  - original committed → the receipt insert hits `UniqueViolation` →
+    the retry aborts and is reported as "already applied";
+  - original never committed → the retry applies cleanly (receipt +
+    moves, atomically).
+
+Effect is **exactly once** with no client-side check-then-apply race.
+Pinned under sequential retries, an 8-way concurrent retry storm on one
+id (exactly one applies), and SIGKILL-at-any-point crash+retry (50-round
+soak). Negative control: drop the receipt insert and the sequential
+test fails on the double application.
+
+## Known engine-level gaps (candidates, not bugs)
 
 - **Snapshot reads / MVCC** would close A5A-observation, P3-for-readers
   and G1b-for-observers in one move.
