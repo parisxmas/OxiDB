@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## v0.34.0
+
+Transaction correctness fix (same-document write composition), group
+commit + pessimistic document locks, a Jepsen-style crash + Raft
+network-partition test suite, a full time-series stage set, and
+first-class observability (Prometheus + `explain` + slow-query
+profiler). First release under the proprietary license.
+
+### Transaction correctness: same-doc write composition
+
+- Two writes to the same document in one transaction now compose
+  (read-your-own-writes). Previously each re-read the committed value
+  and the last write clobbered the others — `$inc -2` then `$inc +1`
+  yielded +1, not -1, creating money in a ledger. The commit prepare
+  phase threads a per-collection staged doc-state map; inserts feed it,
+  deletes remove from it. New `find_for_update` wire command
+  (`SELECT ... FOR UPDATE`). Benches now include self-transfers so the
+  case stays covered.
+
 ### Diagnostics: `explain` command + slow-query profiler
 
 - **`explain`** — query-plan introspection for the document engine:
