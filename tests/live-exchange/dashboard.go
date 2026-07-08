@@ -20,8 +20,8 @@ const dashboardHTML = `<!doctype html>
   .dot.on{background:var(--up);box-shadow:0 0 8px var(--up)}
   .stat{margin-left:auto;color:var(--dim)}
   .stat b{color:var(--tx)}
-  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
-        gap:12px;padding:16px;max-width:1280px;margin:0 auto}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+        gap:12px;padding:16px;max-width:1320px;margin:0 auto}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden}
   .head{display:flex;align-items:baseline;gap:8px;padding:11px 14px;
         border-bottom:1px solid var(--line);transition:background .35s}
@@ -31,17 +31,21 @@ const dashboardHTML = `<!doctype html>
   .head.up{background:#12241a}.head.down{background:#241416}
   .up .arrow,.up .px{color:var(--up)}.down .arrow,.down .px{color:var(--down)}
   .tlist{min-height:34px}
-  .trade{display:flex;gap:8px;padding:5px 14px;border-bottom:1px solid #171b24;
-         font-variant-numeric:tabular-nums;font-size:12.5px}
+  .trade{display:flex;gap:6px;padding:5px 12px;border-bottom:1px solid #171b24;
+         font-variant-numeric:tabular-nums;font-size:12.5px;align-items:baseline}
   .trade:last-child{border-bottom:none}
   .trade.new{animation:flash .6s}
-  .trade .side{width:34px;font-weight:600}
+  .trade .side{width:12px;font-weight:600}
   .trade.buy .side{color:var(--up)}.trade.sell .side{color:var(--down)}
-  .trade .p{width:82px;text-align:right;color:var(--accent)}
-  .trade .q{width:56px;text-align:right;color:var(--dim)}
-  .trade .u{flex:1;text-align:right;color:var(--dim);font-size:11px;
-            overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .empty{color:var(--dim);font-size:12px;padding:8px 14px}
+  .trade .p{width:84px;text-align:right;color:var(--accent)}
+  .trade .q{width:48px;text-align:right;color:var(--dim)}
+  .trade .u{flex:1;text-align:right;color:var(--dim);font-size:11px;white-space:nowrap}
+  .trade .u b{color:#aab2c5;font-weight:600}
+  .colhdr{display:flex;gap:6px;padding:4px 12px;font-size:10px;color:var(--dim);
+          text-transform:uppercase;letter-spacing:.4px;border-bottom:1px solid var(--line)}
+  .colhdr .side{width:12px}.colhdr .p{width:84px;text-align:right}
+  .colhdr .q{width:48px;text-align:right}.colhdr .u{flex:1;text-align:right}
+  .empty{color:var(--dim);font-size:12px;padding:8px 12px}
   @keyframes flash{from{background:#1a2030}to{background:transparent}}
 </style>
 </head>
@@ -66,6 +70,8 @@ const dashboardHTML = `<!doctype html>
     var el=document.createElement("div"); el.className="card";
     el.innerHTML='<div class="head"><span class="sym">'+sym+'</span>'+
       '<span class="px">–</span><span class="arrow"></span></div>'+
+      '<div class="colhdr"><span class="side"></span><span class="p">price</span>'+
+      '<span class="q">qty</span><span class="u">buyer ← seller</span></div>'+
       '<div class="tlist"></div>';
     grid.appendChild(el);
     return {head:el.querySelector(".head"), px:el.querySelector(".px"),
@@ -107,7 +113,7 @@ const dashboardHTML = `<!doctype html>
               '<span class="side">▲</span>'+
               '<span class="p">'+fmt(t.price)+'</span>'+
               '<span class="q">'+t.qty.toFixed(2)+'</span>'+
-              '<span class="u">'+shortUser(buy)+' ← '+shortUser(sell)+'</span></div>';
+              '<span class="u"><b>'+shortUser(buy)+'</b> ← <b>'+shortUser(sell)+'</b></span></div>';
           }).join("");
         }
       });

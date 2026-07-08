@@ -107,8 +107,23 @@ func setup() {
 	c.CreateIndex("trades", "sym") // per-symbol recent-trade lookups for the dashboard
 	c.CreateIndex("journal", "uid")
 
-	fmt.Printf("seeded %d symbols, %d users (cash %.0f + %.0f/symbol), order TTL=%ds\n",
-		len(symbols), nUsers, startCash, initHolding, ttl)
+	// Bound the ledger for a long-running demo. In a real venue the trade
+	// journal is permanent (archived, not deleted); here we expire it so
+	// RSS stays flat while you watch. Accounts (the source of truth for
+	// conservation) are never expired. Set LEDGER_TTL_SECS=0 to keep the
+	// full permanent ledger (RSS then grows by design).
+	lttl := 120
+	if v := os.Getenv("LEDGER_TTL_SECS"); v != "" {
+		lttl, _ = strconv.Atoi(v)
+	}
+	if lttl > 0 {
+		c.CreateTTL("trades", "created_at", lttl)
+		c.CreateTTL("receipts", "created_at", lttl)
+		c.CreateTTL("journal", "created_at", lttl)
+	}
+
+	fmt.Printf("seeded %d symbols, %d users (cash %.0f + %.0f/symbol), order TTL=%ds, ledger TTL=%ds\n",
+		len(symbols), nUsers, startCash, initHolding, ttl, lttl)
 }
 
 // ---- trader ---------------------------------------------------------------
@@ -311,8 +326,9 @@ func executeTrade(c *Client, sym string, bid, ask map[string]any, uid string) st
 			return "cancel"
 		}
 
+		ca := nowISO() // TTL stamp — bounds the ledger for a long demo
 		err := func() error {
-			if e := c.TxInsert("receipts", map[string]any{"uid": uid}); e != nil {
+			if e := c.TxInsert("receipts", map[string]any{"uid": uid, "created_at": ca}); e != nil {
 				return e
 			}
 			// Cash + asset moves (matcher is the sole writer of accounts).
@@ -334,14 +350,15 @@ func executeTrade(c *Client, sym string, bid, ask map[string]any, uid string) st
 			}
 			// Trade + double-entry journal.
 			if e := c.TxInsert("trades", map[string]any{"uid": uid, "sym": sym,
-				"price": tradePrice, "qty": fillQty, "buyer": buyer, "seller": seller}); e != nil {
+				"price": tradePrice, "qty": fillQty, "buyer": buyer, "seller": seller,
+				"created_at": ca}); e != nil {
 				return e
 			}
 			for _, leg := range []map[string]any{
-				{"uid": uid, "owner": buyer, "acct": "USD", "delta": -fillCost},
-				{"uid": uid, "owner": seller, "acct": "USD", "delta": fillCost},
-				{"uid": uid, "owner": buyer, "acct": sym, "delta_asset": fillQty},
-				{"uid": uid, "owner": seller, "acct": sym, "delta_asset": -fillQty},
+				{"uid": uid, "owner": buyer, "acct": "USD", "delta": -fillCost, "created_at": ca},
+				{"uid": uid, "owner": seller, "acct": "USD", "delta": fillCost, "created_at": ca},
+				{"uid": uid, "owner": buyer, "acct": sym, "delta_asset": fillQty, "created_at": ca},
+				{"uid": uid, "owner": seller, "acct": sym, "delta_asset": -fillQty, "created_at": ca},
 			} {
 				if e := c.TxInsert("journal", leg); e != nil {
 					return e
