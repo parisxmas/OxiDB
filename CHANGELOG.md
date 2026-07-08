@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Time-series: range/time windows, `$densify`, `$fill`
+
+- **`$setWindowFields` range windows** — in addition to document frames,
+  `window: {range: [lo, hi], unit: "minute"}` frames by the value of the
+  (single, ascending) `sortBy` field: with `unit` the field is a date and
+  bounds are `value × unit`; without it the field is numeric. Enables
+  true time-based moving averages ("last 5 minutes", not "last 5 docs").
+  Bounds accept numbers / `"current"` / `"unbounded"`. Fixed units only
+  (millisecond…week). Docs with an unparseable sort value get `null`.
+- **`$densify`** — generate documents at stepped values of a numeric or
+  date field where none exist: `{field, partitionByFields?, range:
+  {step, unit?, bounds: "full" | "partition" | [lo, hi)}}`. Synthetic
+  docs carry only the field + partition fields; explicit bounds are
+  hi-exclusive (MongoDB semantics); docs with missing field pass
+  through.
+- **`$fill`** — fill null/missing fields per partition in sort order:
+  `output: {f: {method: "locf"}}` (carry last value forward),
+  `{method: "linear"}` (interpolate over the single sortBy axis — numeric
+  or date), or `{value: const}`. Linear leaves leading/trailing nulls
+  (MongoDB semantics); LOCF does not leak across partitions.
+- The canonical gapless-series recipe now composes end-to-end:
+  `$ohlcv` / `$dateHistogram` → `$densify` → `$fill`.
 ### Time-series: `$ohlcv` aggregation stage (tick → candle)
 
 - New pipeline stage collapsing tick/trade documents into time-bucketed

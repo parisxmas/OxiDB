@@ -216,10 +216,52 @@ enum WindowBound {
     Offset(i64),
 }
 
+/// One endpoint of a range-based window (`window: { range: [lo, hi], unit? }`).
 #[derive(Debug, Clone)]
-struct WindowFrame {
-    lo: WindowBound,
-    hi: WindowBound,
+enum RangeBound {
+    Unbounded,
+    Current,
+    /// Offset in sort-value units (multiplied by `unit_ms` for time windows).
+    Delta(f64),
+}
+
+#[derive(Debug, Clone)]
+enum WindowFrame {
+    /// `window: { documents: [lo, hi] }` — frame by document position.
+    Docs { lo: WindowBound, hi: WindowBound },
+    /// `window: { range: [lo, hi], unit: "minute" }` — frame by the value
+    /// of the (single, ascending) `sortBy` field. With `unit_ms` set the
+    /// sort field is a date and deltas are `value × unit_ms`; without it
+    /// the sort field is numeric and deltas are raw.
+    Range {
+        lo: RangeBound,
+        hi: RangeBound,
+        unit_ms: Option<f64>,
+    },
+}
+
+impl WindowFrame {
+    fn whole_partition() -> Self {
+        WindowFrame::Docs {
+            lo: WindowBound::Unbounded,
+            hi: WindowBound::Unbounded,
+        }
+    }
+}
+
+/// Fixed-length time units accepted by range windows and `$densify`.
+/// Calendar units (month/quarter/year) are variable-length and not
+/// supported here.
+fn fixed_unit_ms(unit: &str) -> Option<f64> {
+    match unit {
+        "millisecond" => Some(1.0),
+        "second" => Some(1_000.0),
+        "minute" => Some(60_000.0),
+        "hour" => Some(3_600_000.0),
+        "day" => Some(86_400_000.0),
+        "week" => Some(604_800_000.0),
+        _ => None,
+    }
 }
 
 /// A single `output` operator in `$setWindowFields`.
@@ -249,6 +291,29 @@ enum WindowOp {
 struct WindowOutput {
     field: String,
     op: WindowOp,
+}
+
+/// Where `$densify` generates points.
+#[derive(Debug, Clone)]
+enum DensifyBounds {
+    /// Span the global min..max of `field` across all partitions.
+    Full,
+    /// Span each partition's own min..max.
+    Partition,
+    /// Explicit `[lo, hi)` — numeric, or epoch ms when a unit is set.
+    Explicit(f64, f64),
+}
+
+/// How `$fill` fills a null/missing output field.
+#[derive(Debug, Clone)]
+enum FillMethod {
+    /// Constant value.
+    Const(Value),
+    /// Last observation carried forward (in sort order).
+    Locf,
+    /// Linear interpolation between surrounding known points, on the
+    /// single numeric/date sortBy axis.
+    Linear,
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +370,25 @@ enum Stage {
         interval: DateInterval,
         count_field: String,
         id_field: String,
+    },
+    /// `$densify`: fill gaps on a numeric or date axis by generating
+    /// documents at stepped values of `field` where none exist.
+    /// Synthetic docs carry only `field` (+ the partition fields).
+    Densify {
+        field: String,
+        partition_fields: Vec<String>,
+        step: f64,
+        /// Fixed time unit in ms when `field` is a date; `None` = numeric.
+        unit_ms: Option<f64>,
+        bounds: DensifyBounds,
+    },
+    /// `$fill`: fill null/missing output fields per partition, in sort
+    /// order — constant value, last-observation-carried-forward, or
+    /// linear interpolation over the sort field.
+    Fill {
+        partition_by: Option<Expression>,
+        sort_by: Vec<(String, SortOrder)>,
+        outputs: Vec<(String, FillMethod)>,
     },
     /// `$ohlcv`: collapse tick/trade documents into time-bucketed OHLCV
     /// candles — open (first price in bucket), high, low, close (last
@@ -1201,6 +1285,261 @@ fn exec_ohlcv(
     out
 }
 
+/// Axis value for `$densify`/`$fill` linear: epoch ms for dates when a
+/// time unit is in play, plain numeric otherwise.
+fn densify_axis_value(v: &Value, time_axis: bool) -> Option<f64> {
+    if time_axis {
+        value_to_epoch_millis(v).map(|ms| ms as f64)
+    } else {
+        v.as_f64()
+    }
+}
+
+/// Render a densify axis value back into a document value: RFC 3339 UTC
+/// string on the time axis, a JSON number otherwise.
+fn densify_render_value(v: f64, time_axis: bool) -> Value {
+    if time_axis {
+        let ms = v.round() as i64;
+        match chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms) {
+            Some(dt) if ms % 1000 == 0 => {
+                Value::String(dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+            }
+            Some(dt) => Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
+            None => json!(v),
+        }
+    } else if v.fract() == 0.0 && v.abs() < 9e15 {
+        json!(v as i64)
+    } else {
+        json!(v)
+    }
+}
+
+/// Execute `$densify`: generate documents at stepped values of `field`
+/// where no document exists. Docs whose `field` is missing/unparseable
+/// pass through untouched. Output is ordered per partition by the axis
+/// value, existing docs before synthetic ones at equal values.
+fn exec_densify(
+    docs: Vec<Value>,
+    field: &str,
+    partition_fields: &[String],
+    step: f64,
+    unit_ms: Option<f64>,
+    bounds: &DensifyBounds,
+) -> Vec<Value> {
+    let time_axis = unit_ms.is_some();
+    let step_scaled = step * unit_ms.unwrap_or(1.0);
+
+    struct Part {
+        key_vals: Vec<(String, Value)>,
+        rows: Vec<(f64, Value)>,
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut parts: HashMap<String, Part> = HashMap::new();
+    let mut passthrough: Vec<Value> = Vec::new();
+
+    for doc in docs {
+        let axis = resolve_field_ref(&doc, field).and_then(|v| densify_axis_value(v, time_axis));
+        let Some(axis) = axis else {
+            passthrough.push(doc);
+            continue;
+        };
+        let mut key = String::new();
+        let mut key_vals = Vec::with_capacity(partition_fields.len());
+        for pf in partition_fields {
+            let v = resolve_field_ref(&doc, pf).cloned().unwrap_or(Value::Null);
+            key.push_str(&v.to_string());
+            key.push('\u{1f}');
+            key_vals.push((pf.clone(), v));
+        }
+        if !parts.contains_key(&key) {
+            order.push(key.clone());
+        }
+        parts
+            .entry(key)
+            .or_insert_with(|| Part {
+                key_vals,
+                rows: Vec::new(),
+            })
+            .rows
+            .push((axis, doc));
+    }
+
+    // Global span for bounds: "full".
+    let global: Option<(f64, f64)> = {
+        let mut mm: Option<(f64, f64)> = None;
+        for p in parts.values() {
+            for (v, _) in &p.rows {
+                mm = Some(match mm {
+                    None => (*v, *v),
+                    Some((lo, hi)) => (lo.min(*v), hi.max(*v)),
+                });
+            }
+        }
+        mm
+    };
+
+    let mut out: Vec<Value> = Vec::new();
+    for key in order {
+        let mut part = parts.remove(&key).unwrap();
+        part.rows
+            .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let local = (
+            part.rows.first().map(|r| r.0).unwrap_or(0.0),
+            part.rows.last().map(|r| r.0).unwrap_or(0.0),
+        );
+        // (start, end, end_exclusive)
+        let (lo, hi, exclusive) = match bounds {
+            DensifyBounds::Partition => (local.0, local.1, false),
+            DensifyBounds::Full => match global {
+                Some((g_lo, g_hi)) => (g_lo, g_hi, false),
+                None => (local.0, local.1, false),
+            },
+            DensifyBounds::Explicit(lo, hi) => (*lo, *hi, true),
+        };
+
+        // Generate synthetic rows at lo, lo+step, ... skipping values an
+        // existing doc already occupies (exact axis match).
+        let existing: Vec<f64> = part.rows.iter().map(|r| r.0).collect();
+        let mut synth: Vec<(f64, Value)> = Vec::new();
+        let mut v = lo;
+        let mut iters = 0u32;
+        const MAX_ITERS: u32 = 1_000_000;
+        while (if exclusive { v < hi } else { v <= hi }) && iters < MAX_ITERS {
+            let occupied = existing
+                .binary_search_by(|x| x.partial_cmp(&v).unwrap_or(std::cmp::Ordering::Equal))
+                .is_ok();
+            if !occupied {
+                let mut doc = json!({});
+                set_field(&mut doc, field, densify_render_value(v, time_axis));
+                for (pf, pv) in &part.key_vals {
+                    set_field(&mut doc, pf, pv.clone());
+                }
+                synth.push((v, doc));
+            }
+            v += step_scaled;
+            iters += 1;
+        }
+
+        // Merge, existing docs first at equal axis values.
+        let mut merged: Vec<(f64, u8, Value)> = Vec::with_capacity(part.rows.len() + synth.len());
+        merged.extend(part.rows.into_iter().map(|(v, d)| (v, 0u8, d)));
+        merged.extend(synth.into_iter().map(|(v, d)| (v, 1u8, d)));
+        merged.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        out.extend(merged.into_iter().map(|(_, _, d)| d));
+    }
+    out.extend(passthrough);
+    out
+}
+
+/// Execute `$fill`: per partition, in sort order, fill null/missing
+/// output fields by constant, LOCF, or linear interpolation over the
+/// sortBy axis.
+fn exec_fill(
+    docs: Vec<Value>,
+    partition_by: Option<&Expression>,
+    sort_by: &[(String, SortOrder)],
+    outputs: &[(String, FillMethod)],
+) -> Vec<Value> {
+    // Partition, preserving first-seen order (same scheme as
+    // exec_set_window_fields).
+    let mut order: Vec<IndexValue> = Vec::new();
+    let mut parts: HashMap<IndexValue, Vec<Value>> = HashMap::new();
+    for doc in docs {
+        let key = match partition_by {
+            Some(e) => IndexValue::from_json(&e.eval(&doc)),
+            None => IndexValue::Null,
+        };
+        if !parts.contains_key(&key) {
+            order.push(key.clone());
+        }
+        parts.entry(key).or_default().push(doc);
+    }
+
+    let is_missing = |doc: &Value, field: &str| -> bool {
+        matches!(resolve_field_ref(doc, field), None | Some(Value::Null))
+    };
+
+    let mut result = Vec::new();
+    for key in order {
+        let mut part = parts.remove(&key).unwrap();
+        if !sort_by.is_empty() {
+            part = exec_sort(part, sort_by);
+        }
+        let n = part.len();
+
+        for (field, method) in outputs {
+            match method {
+                FillMethod::Const(v) => {
+                    for doc in part.iter_mut() {
+                        if is_missing(doc, field) {
+                            set_field(doc, field, v.clone());
+                        }
+                    }
+                }
+                FillMethod::Locf => {
+                    let mut last: Option<Value> = None;
+                    for doc in part.iter_mut() {
+                        if is_missing(doc, field) {
+                            if let Some(l) = &last {
+                                set_field(doc, field, l.clone());
+                            }
+                        } else {
+                            last = resolve_field_ref(doc, field).cloned();
+                        }
+                    }
+                }
+                FillMethod::Linear => {
+                    // x: sortBy axis (numeric or date); y: the field.
+                    let sf = &sort_by[0].0;
+                    let xs: Vec<Option<f64>> = part
+                        .iter()
+                        .map(|d| {
+                            resolve_field_ref(d, sf)
+                                .and_then(|v| v.as_f64().or_else(|| densify_axis_value(v, true)))
+                        })
+                        .collect();
+                    let ys: Vec<Option<f64>> = part
+                        .iter()
+                        .map(|d| match resolve_field_ref(d, field) {
+                            None | Some(Value::Null) => None,
+                            Some(v) => v.as_f64(),
+                        })
+                        .collect();
+                    let known: Vec<usize> = (0..n)
+                        .filter(|&i| ys[i].is_some() && xs[i].is_some())
+                        .collect();
+                    // Interpolate strictly between consecutive known points;
+                    // values before the first / after the last stay null
+                    // (MongoDB semantics).
+                    for w in known.windows(2) {
+                        let (a, b) = (w[0], w[1]);
+                        let (xa, ya) = (xs[a].unwrap(), ys[a].unwrap());
+                        let (xb, yb) = (xs[b].unwrap(), ys[b].unwrap());
+                        if xb == xa {
+                            continue;
+                        }
+                        for i in (a + 1)..b {
+                            if ys[i].is_none() && is_missing(&part[i], field) {
+                                if let Some(x) = xs[i] {
+                                    let y = ya + (yb - ya) * (x - xa) / (xb - xa);
+                                    set_field(&mut part[i], field, json!(y));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result.extend(part);
+    }
+    result
+}
+
 /// Floor an epoch_ms value to the start of its bucket and render the
 /// bucket as an ISO 8601 / RFC 3339 string in UTC.
 fn bucket_date_label(epoch_ms: i64, interval: DateInterval) -> Option<String> {
@@ -1380,6 +1719,191 @@ fn parse_ohlcv_stage(val: &Value) -> Result<Stage> {
     })
 }
 
+/// Parse the `$densify` stage body.
+///
+/// Body shape (MongoDB-compatible subset):
+///   { "$densify": {
+///       "field": "ts",
+///       "partitionByFields": ["sym"],          // optional
+///       "range": {
+///           "step": 1,
+///           "unit": "minute",                   // optional: date axis (fixed units)
+///           "bounds": "full" | "partition" | [lo, hi]
+///       }
+///   }}
+fn parse_densify_stage(val: &Value) -> Result<Stage> {
+    let obj = val
+        .as_object()
+        .ok_or_else(|| Error::InvalidPipeline("$densify must be an object".into()))?;
+
+    let field = obj
+        .get("field")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::InvalidPipeline("$densify requires 'field' string".into()))?
+        .to_string();
+
+    let partition_fields: Vec<String> = match obj.get("partitionByFields") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .map(|v| {
+                v.as_str().map(|s| s.to_string()).ok_or_else(|| {
+                    Error::InvalidPipeline("$densify partitionByFields must be strings".into())
+                })
+            })
+            .collect::<Result<_>>()?,
+        None => Vec::new(),
+        _ => {
+            return Err(Error::InvalidPipeline(
+                "$densify 'partitionByFields' must be an array of strings".into(),
+            ));
+        }
+    };
+
+    let range = obj
+        .get("range")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| Error::InvalidPipeline("$densify requires a 'range' object".into()))?;
+
+    let step = range
+        .get("step")
+        .and_then(|v| v.as_f64())
+        .filter(|s| *s > 0.0)
+        .ok_or_else(|| Error::InvalidPipeline("$densify range 'step' must be > 0".into()))?;
+
+    let unit_ms = match range.get("unit").and_then(|v| v.as_str()) {
+        Some(u) => Some(fixed_unit_ms(u).ok_or_else(|| {
+            Error::InvalidPipeline(format!(
+                "$densify unit '{u}' not supported (fixed units only: \
+                 millisecond/second/minute/hour/day/week)"
+            ))
+        })?),
+        None => None,
+    };
+
+    let bounds = match range.get("bounds") {
+        Some(Value::String(s)) if s == "full" => DensifyBounds::Full,
+        Some(Value::String(s)) if s == "partition" => DensifyBounds::Partition,
+        Some(Value::Array(pair)) if pair.len() == 2 => {
+            let parse_bound = |v: &Value| -> Result<f64> {
+                if unit_ms.is_some() {
+                    value_to_epoch_millis(v).map(|ms| ms as f64).ok_or_else(|| {
+                        Error::InvalidPipeline(
+                            "$densify bounds must be dates when 'unit' is set".into(),
+                        )
+                    })
+                } else {
+                    v.as_f64().ok_or_else(|| {
+                        Error::InvalidPipeline("$densify bounds must be numbers".into())
+                    })
+                }
+            };
+            let lo = parse_bound(&pair[0])?;
+            let hi = parse_bound(&pair[1])?;
+            if lo > hi {
+                return Err(Error::InvalidPipeline(
+                    "$densify bounds must be [lo, hi] with lo <= hi".into(),
+                ));
+            }
+            DensifyBounds::Explicit(lo, hi)
+        }
+        _ => {
+            return Err(Error::InvalidPipeline(
+                "$densify range 'bounds' must be \"full\", \"partition\" or [lo, hi]".into(),
+            ));
+        }
+    };
+
+    Ok(Stage::Densify {
+        field,
+        partition_fields,
+        step,
+        unit_ms,
+        bounds,
+    })
+}
+
+/// Parse the `$fill` stage body.
+///
+/// Body shape (MongoDB-compatible subset):
+///   { "$fill": {
+///       "partitionBy": "$sym",                 // optional expression
+///       "sortBy": {"ts": 1},                   // required for locf/linear
+///       "output": {
+///           "price":  {"method": "locf"},
+///           "score":  {"method": "linear"},
+///           "status": {"value": "unknown"}
+///       }
+///   }}
+fn parse_fill_stage(val: &Value) -> Result<Stage> {
+    let obj = val
+        .as_object()
+        .ok_or_else(|| Error::InvalidPipeline("$fill must be an object".into()))?;
+
+    let partition_by = match obj.get("partitionBy") {
+        Some(v) if !v.is_null() => Some(parse_expression(v)?),
+        _ => None,
+    };
+    let sort_by = match obj.get("sortBy") {
+        Some(v) => parse_sort(v)?,
+        None => Vec::new(),
+    };
+
+    let out_obj = obj
+        .get("output")
+        .and_then(|v| v.as_object())
+        .filter(|o| !o.is_empty())
+        .ok_or_else(|| {
+            Error::InvalidPipeline("$fill requires a non-empty 'output' object".into())
+        })?;
+
+    let mut outputs = Vec::with_capacity(out_obj.len());
+    for (field, spec) in out_obj {
+        let spec_obj = spec.as_object().ok_or_else(|| {
+            Error::InvalidPipeline(format!("$fill output '{field}' must be an object"))
+        })?;
+        let method = match (spec_obj.get("method"), spec_obj.get("value")) {
+            (Some(m), None) => match m.as_str() {
+                Some("locf") => FillMethod::Locf,
+                Some("linear") => FillMethod::Linear,
+                other => {
+                    return Err(Error::InvalidPipeline(format!(
+                        "$fill output '{field}': unknown method {other:?} \
+                         (expected \"locf\" or \"linear\")"
+                    )));
+                }
+            },
+            (None, Some(v)) => FillMethod::Const(v.clone()),
+            _ => {
+                return Err(Error::InvalidPipeline(format!(
+                    "$fill output '{field}' must have exactly one of 'method' or 'value'"
+                )));
+            }
+        };
+        outputs.push((field.clone(), method));
+    }
+
+    let needs_sort = outputs
+        .iter()
+        .any(|(_, m)| matches!(m, FillMethod::Locf | FillMethod::Linear));
+    if needs_sort && sort_by.is_empty() {
+        return Err(Error::InvalidPipeline(
+            "$fill with method locf/linear requires 'sortBy'".into(),
+        ));
+    }
+    let has_linear = outputs.iter().any(|(_, m)| matches!(m, FillMethod::Linear));
+    if has_linear && sort_by.len() != 1 {
+        return Err(Error::InvalidPipeline(
+            "$fill method 'linear' requires exactly one sortBy field".into(),
+        ));
+    }
+
+    Ok(Stage::Fill {
+        partition_by,
+        sort_by,
+        outputs,
+    })
+}
+
 fn parse_accumulator(val: &Value) -> Result<Accumulator> {
     let obj = val
         .as_object()
@@ -1459,23 +1983,63 @@ fn parse_window_bound(v: &Value) -> Result<WindowBound> {
     }
 }
 
+fn parse_range_bound(v: &Value) -> Result<RangeBound> {
+    if let Some(s) = v.as_str() {
+        match s {
+            "unbounded" => Ok(RangeBound::Unbounded),
+            "current" => Ok(RangeBound::Current),
+            other => Err(Error::InvalidPipeline(format!(
+                "range bound must be a number, \"unbounded\" or \"current\", got \"{other}\""
+            ))),
+        }
+    } else if let Some(n) = v.as_f64() {
+        Ok(RangeBound::Delta(n))
+    } else {
+        Err(Error::InvalidPipeline(
+            "range bound must be a number or \"unbounded\"/\"current\"".into(),
+        ))
+    }
+}
+
 fn parse_window_frame(w: &Value) -> Result<WindowFrame> {
     let obj = w
         .as_object()
         .ok_or_else(|| Error::InvalidPipeline("window must be an object".into()))?;
-    // Only document-based windows are supported (not range/time windows).
+
+    if let Some(range) = obj.get("range") {
+        let pair = range.as_array().filter(|a| a.len() == 2).ok_or_else(|| {
+            Error::InvalidPipeline("window 'range' must be a [lo, hi] pair".into())
+        })?;
+        let unit_ms = match obj.get("unit").and_then(|v| v.as_str()) {
+            Some(u) => Some(fixed_unit_ms(u).ok_or_else(|| {
+                Error::InvalidPipeline(format!(
+                    "window unit '{u}' not supported (fixed units only: \
+                     millisecond/second/minute/hour/day/week)"
+                ))
+            })?),
+            None => None,
+        };
+        return Ok(WindowFrame::Range {
+            lo: parse_range_bound(&pair[0])?,
+            hi: parse_range_bound(&pair[1])?,
+            unit_ms,
+        });
+    }
+
     let docs = obj
         .get("documents")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            Error::InvalidPipeline("window currently supports only { documents: [lo, hi] }".into())
+            Error::InvalidPipeline(
+                "window must be { documents: [lo, hi] } or { range: [lo, hi], unit? }".into(),
+            )
         })?;
     if docs.len() != 2 {
         return Err(Error::InvalidPipeline(
             "window 'documents' must be a [lo, hi] pair".into(),
         ));
     }
-    Ok(WindowFrame {
+    Ok(WindowFrame::Docs {
         lo: parse_window_bound(&docs[0])?,
         hi: parse_window_bound(&docs[1])?,
     })
@@ -1490,10 +2054,7 @@ fn parse_window_op(field: &str, spec: &Value, has_sort: bool) -> Result<WindowOp
     let frame = match obj.get("window") {
         Some(w) => parse_window_frame(w)?,
         // Default frame: the entire partition.
-        None => WindowFrame {
-            lo: WindowBound::Unbounded,
-            hi: WindowBound::Unbounded,
-        },
+        None => WindowFrame::whole_partition(),
     };
     // The single operator key (everything except the optional "window").
     let mut op_key: Option<(&str, &Value)> = None;
@@ -1584,6 +2145,18 @@ fn parse_set_window_fields(body: &Value) -> Result<Stage> {
             op: parse_window_op(field, spec, has_sort)?,
         });
     }
+
+    // Range windows frame by the sortBy VALUE, so they require exactly
+    // one ascending sort field (MongoDB imposes the same restriction).
+    let has_range = output
+        .iter()
+        .any(|o| matches!(&o.op, WindowOp::Accum(_, WindowFrame::Range { .. })));
+    if has_range && (sort_by.len() != 1 || sort_by[0].1 != SortOrder::Asc) {
+        return Err(Error::InvalidPipeline(
+            "a range window requires exactly one ascending sortBy field".into(),
+        ));
+    }
+
     Ok(Stage::SetWindowFields {
         partition_by,
         sort_by,
@@ -2315,7 +2888,13 @@ fn window_sort_key(doc: &Value, sort_by: &[(String, SortOrder)]) -> Vec<IndexVal
 
 /// Resolve a window frame to absolute `[lo, hi]` document indices within a
 /// partition of length `n`, or `None` if the frame covers no documents.
-fn resolve_window_frame(frame: &WindowFrame, i: usize, n: usize) -> Option<(usize, usize)> {
+/// Resolve a document-based frame to inclusive part indices.
+fn resolve_docs_frame(
+    lo: &WindowBound,
+    hi: &WindowBound,
+    i: usize,
+    n: usize,
+) -> Option<(usize, usize)> {
     let bound = |b: &WindowBound, default_hi: bool| -> i64 {
         match b {
             WindowBound::Unbounded => {
@@ -2331,14 +2910,25 @@ fn resolve_window_frame(frame: &WindowFrame, i: usize, n: usize) -> Option<(usiz
             WindowBound::Offset(o) => (i as i64).saturating_add(*o),
         }
     };
-    let lo_raw = bound(&frame.lo, false);
-    let hi_raw = bound(&frame.hi, true);
+    let lo_raw = bound(lo, false);
+    let hi_raw = bound(hi, true);
     let lo = lo_raw.max(0);
     let hi = hi_raw.min(n as i64 - 1);
     if lo > hi || hi < 0 {
         None
     } else {
         Some((lo as usize, hi as usize))
+    }
+}
+
+/// Sort-field value of one document for a range window: epoch ms when
+/// the window has a time `unit`, plain numeric otherwise.
+fn range_sort_value(doc: &Value, sort_field: &str, unit_ms: Option<f64>) -> Option<f64> {
+    let v = resolve_field_ref(doc, sort_field)?;
+    if unit_ms.is_some() {
+        value_to_epoch_millis(v).map(|ms| ms as f64)
+    } else {
+        v.as_f64()
     }
 }
 
@@ -2413,8 +3003,11 @@ fn exec_set_window_fields(
                 if n == 0 {
                     continue;
                 }
-                match (&frame.lo, &frame.hi) {
-                    (WindowBound::Unbounded, WindowBound::Unbounded) => {
+                match frame {
+                    WindowFrame::Docs {
+                        lo: WindowBound::Unbounded,
+                        hi: WindowBound::Unbounded,
+                    } => {
                         let mut state = init_accumulator_state(acc);
                         for d in &part {
                             update_accumulator_state(&mut state, acc, d);
@@ -2422,7 +3015,10 @@ fn exec_set_window_fields(
                         let v = finalize_accumulator(state);
                         precomputed.insert(oi, vec![v; n]);
                     }
-                    (WindowBound::Unbounded, WindowBound::Current) => {
+                    WindowFrame::Docs {
+                        lo: WindowBound::Unbounded,
+                        hi: WindowBound::Current,
+                    } => {
                         let mut state = init_accumulator_state(acc);
                         let mut vals = Vec::with_capacity(n);
                         for d in &part {
@@ -2435,6 +3031,12 @@ fn exec_set_window_fields(
                 }
             }
         }
+
+        // Lazily-built ascending (sort_value, part_index) lists for range
+        // windows — index 0: numeric sort values, index 1: time (epoch ms).
+        // Built at most once per partition, shared by every range output
+        // and every row.
+        let mut range_cache: [Option<Vec<(f64, usize)>>; 2] = [None, None];
 
         // Compute all additions from the immutable partition first, then apply,
         // so output fields never feed into each other within this stage.
@@ -2463,16 +3065,61 @@ fn exec_set_window_fields(
                             _ => default.clone(),
                         }
                     }
-                    WindowOp::Accum(acc, frame) => match resolve_window_frame(frame, i, n) {
-                        Some((lo, hi)) => {
-                            let mut state = init_accumulator_state(acc);
-                            for d in &part[lo..=hi] {
-                                update_accumulator_state(&mut state, acc, d);
+                    WindowOp::Accum(acc, WindowFrame::Docs { lo, hi }) => {
+                        match resolve_docs_frame(lo, hi, i, n) {
+                            Some((lo, hi)) => {
+                                let mut state = init_accumulator_state(acc);
+                                for d in &part[lo..=hi] {
+                                    update_accumulator_state(&mut state, acc, d);
+                                }
+                                finalize_accumulator(state)
                             }
-                            finalize_accumulator(state)
+                            None => finalize_accumulator(init_accumulator_state(acc)),
                         }
-                        None => finalize_accumulator(init_accumulator_state(acc)),
-                    },
+                    }
+                    WindowOp::Accum(acc, WindowFrame::Range { lo, hi, unit_ms }) => {
+                        let cache_key = usize::from(unit_ms.is_some());
+                        if range_cache[cache_key].is_none() {
+                            let sf = &sort_by[0].0;
+                            let mut vals: Vec<(f64, usize)> = part
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(j, d)| {
+                                    range_sort_value(d, sf, *unit_ms).map(|v| (v, j))
+                                })
+                                .collect();
+                            vals.sort_by(|a, b| {
+                                a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            range_cache[cache_key] = Some(vals);
+                        }
+                        let svals = range_cache[cache_key].as_ref().unwrap();
+                        match range_sort_value(&part[i], &sort_by[0].0, *unit_ms) {
+                            // Docs whose sort field is missing / unparseable
+                            // have no place on the value axis: null output.
+                            None => Value::Null,
+                            Some(cur) => {
+                                let scale = unit_ms.unwrap_or(1.0);
+                                let lo_t = match lo {
+                                    RangeBound::Unbounded => f64::NEG_INFINITY,
+                                    RangeBound::Current => cur,
+                                    RangeBound::Delta(d) => cur + d * scale,
+                                };
+                                let hi_t = match hi {
+                                    RangeBound::Unbounded => f64::INFINITY,
+                                    RangeBound::Current => cur,
+                                    RangeBound::Delta(d) => cur + d * scale,
+                                };
+                                let start = svals.partition_point(|(x, _)| *x < lo_t);
+                                let end = svals.partition_point(|(x, _)| *x <= hi_t);
+                                let mut state = init_accumulator_state(acc);
+                                for &(_, j) in &svals[start..end] {
+                                    update_accumulator_state(&mut state, acc, &part[j]);
+                                }
+                                finalize_accumulator(state)
+                            }
+                        }
+                    }
                 };
                 row.push((out.field.clone(), val));
             }
@@ -3515,6 +4162,8 @@ impl Pipeline {
                 "$match" => Stage::Match(stage_body.clone()),
                 "$group" => parse_group_stage(stage_body)?,
                 "$ohlcv" => parse_ohlcv_stage(stage_body)?,
+                "$densify" => parse_densify_stage(stage_body)?,
+                "$fill" => parse_fill_stage(stage_body)?,
                 "$dateHistogram" => {
                     let (group_stage, maybe_fill) = parse_date_histogram_stage(stage_body)?;
                     stages.push(group_stage);
@@ -3862,6 +4511,18 @@ impl Pipeline {
                     symbol_field.as_deref(),
                     *fill_previous,
                 ),
+                Stage::Densify {
+                    field,
+                    partition_fields,
+                    step,
+                    unit_ms,
+                    bounds,
+                } => exec_densify(current, field, partition_fields, *step, *unit_ms, bounds),
+                Stage::Fill {
+                    partition_by,
+                    sort_by,
+                    outputs,
+                } => exec_fill(current, partition_by.as_ref(), sort_by, outputs),
             };
         }
         Ok(current)
@@ -3896,6 +4557,245 @@ mod tests {
     /// Helper: no-op lookup function for tests that don't use $lookup
     fn no_lookup(_col: &str, _q: &Value) -> Result<Vec<Value>> {
         Ok(vec![])
+    }
+
+    #[test]
+    fn range_window_time_moving_average() {
+        // 5-minute moving average over a time axis: window = [-4, 0] minutes
+        // relative to each doc. Docs at minutes 0, 1, 2, 10.
+        let docs = vec![
+            json!({"ts": "2026-01-01T00:00:00Z", "v": 10.0}),
+            json!({"ts": "2026-01-01T00:01:00Z", "v": 20.0}),
+            json!({"ts": "2026-01-01T00:02:00Z", "v": 30.0}),
+            json!({"ts": "2026-01-01T00:10:00Z", "v": 100.0}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$setWindowFields": {
+                "sortBy": {"ts": 1},
+                "output": {
+                    "ma5": {"$avg": "$v", "window": {"range": [-4, 0], "unit": "minute"}}
+                }
+            }}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out[0]["ma5"], 10.0);
+        assert_eq!(out[1]["ma5"], 15.0); // (10+20)/2
+        assert_eq!(out[2]["ma5"], 20.0); // (10+20+30)/3
+        assert_eq!(out[3]["ma5"], 100.0); // minute 10: nothing within 4 min back
+    }
+
+    #[test]
+    fn range_window_numeric_and_unbounded() {
+        let docs = vec![
+            json!({"x": 1, "v": 1.0}),
+            json!({"x": 2, "v": 2.0}),
+            json!({"x": 5, "v": 4.0}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$setWindowFields": {
+                "sortBy": {"x": 1},
+                "output": {
+                    "near": {"$sum": "$v", "window": {"range": [-1, 1]}},
+                    "run":  {"$sum": "$v", "window": {"range": ["unbounded", "current"]}}
+                }
+            }}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out[0]["near"], 3.0); // x∈[0,2] -> 1+2
+        assert_eq!(out[1]["near"], 3.0); // x∈[1,3] -> 1+2
+        assert_eq!(out[2]["near"], 4.0); // x∈[4,6] -> 4
+        assert_eq!(out[2]["run"], 7.0);
+    }
+
+    #[test]
+    fn range_window_requires_single_asc_sort() {
+        let mk = |sort: Value| {
+            Pipeline::parse(&json!([
+                {"$setWindowFields": {"sortBy": sort,
+                    "output": {"s": {"$sum": "$v", "window": {"range": [-1, 1]}}}}}
+            ]))
+        };
+        assert!(mk(json!({"x": -1})).is_err());
+        assert!(mk(json!({"x": 1, "y": 1})).is_err());
+        assert!(mk(json!({"x": 1})).is_ok());
+    }
+
+    #[test]
+    fn densify_numeric_partition_bounds() {
+        let docs = vec![json!({"x": 1, "keep": true}), json!({"x": 4, "keep": true})];
+        let p = Pipeline::parse(&json!([
+            {"$densify": {"field": "x", "range": {"step": 1, "bounds": "partition"}}}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        let xs: Vec<i64> = out.iter().map(|d| d["x"].as_i64().unwrap()).collect();
+        assert_eq!(xs, vec![1, 2, 3, 4]);
+        // Synthetic docs carry only the densify field.
+        assert!(out[1].get("keep").is_none());
+        assert!(out[0].get("keep").is_some());
+    }
+
+    #[test]
+    fn densify_dates_with_partitions_full_bounds() {
+        // BTC has minutes 0 and 2; ETH only minute 1. bounds: "full" spans
+        // 0..=2 for BOTH partitions.
+        let docs = vec![
+            json!({"ts": "2026-01-01T00:00:00Z", "sym": "BTC"}),
+            json!({"ts": "2026-01-01T00:02:00Z", "sym": "BTC"}),
+            json!({"ts": "2026-01-01T00:01:00Z", "sym": "ETH"}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$densify": {"field": "ts", "partitionByFields": ["sym"],
+                "range": {"step": 1, "unit": "minute", "bounds": "full"}}}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out.len(), 6, "3 buckets x 2 partitions");
+        let btc: Vec<&str> = out
+            .iter()
+            .filter(|d| d["sym"] == "BTC")
+            .map(|d| d["ts"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            btc,
+            vec![
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:01:00Z",
+                "2026-01-01T00:02:00Z"
+            ]
+        );
+        // Synthetic ETH docs carry the partition field.
+        let eth_synth = out
+            .iter()
+            .find(|d| d["sym"] == "ETH" && d["ts"] == "2026-01-01T00:00:00Z")
+            .unwrap();
+        assert_eq!(eth_synth["sym"], "ETH");
+    }
+
+    #[test]
+    fn densify_explicit_bounds_exclusive_hi() {
+        let docs = vec![json!({"x": 10})];
+        let p = Pipeline::parse(&json!([
+            {"$densify": {"field": "x", "range": {"step": 2, "bounds": [0, 6]}}}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        let xs: Vec<i64> = out.iter().map(|d| d["x"].as_i64().unwrap()).collect();
+        // Generated 0,2,4 (hi exclusive); existing 10 appended in axis order.
+        assert_eq!(xs, vec![0, 2, 4, 10]);
+    }
+
+    #[test]
+    fn fill_locf_linear_and_value() {
+        let docs = vec![
+            json!({"t": 1, "a": 10.0, "b": 0.0,          "c": "x"}),
+            json!({"t": 2,            "b": Value::Null}),
+            json!({"t": 3,            "b": Value::Null}),
+            json!({"t": 4, "a": 40.0, "b": 30.0,         "c": "y"}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$fill": {
+                "sortBy": {"t": 1},
+                "output": {
+                    "a": {"method": "locf"},
+                    "b": {"method": "linear"},
+                    "c": {"value": "?"}
+                }
+            }}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        // locf: 10 carried through t=2,3
+        assert_eq!(out[1]["a"], 10.0);
+        assert_eq!(out[2]["a"], 10.0);
+        assert_eq!(out[3]["a"], 40.0);
+        // linear between (t=1,b=0) and (t=4,b=30): t=2 -> 10, t=3 -> 20
+        assert_eq!(out[1]["b"], 10.0);
+        assert_eq!(out[2]["b"], 20.0);
+        // constant
+        assert_eq!(out[1]["c"], "?");
+        assert_eq!(out[0]["c"], "x");
+    }
+
+    #[test]
+    fn fill_partitioned_locf_does_not_leak_across_partitions() {
+        let docs = vec![
+            json!({"t": 1, "sym": "BTC", "p": 100.0}),
+            json!({"t": 2, "sym": "ETH"}),
+            json!({"t": 3, "sym": "BTC"}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$fill": {"partitionBy": "$sym", "sortBy": {"t": 1},
+                       "output": {"p": {"method": "locf"}}}}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        let btc_t3 = out
+            .iter()
+            .find(|d| d["sym"] == "BTC" && d["t"] == 3)
+            .unwrap();
+        assert_eq!(btc_t3["p"], 100.0);
+        let eth = out.iter().find(|d| d["sym"] == "ETH").unwrap();
+        assert!(eth.get("p").is_none(), "ETH must not inherit BTC's price");
+    }
+
+    #[test]
+    fn densify_then_fill_composes_for_gapless_series() {
+        // The canonical time-series recipe: bucket -> densify -> locf.
+        let docs = vec![
+            json!({"ts": "2026-01-01T00:00:00Z", "price": 5.0}),
+            json!({"ts": "2026-01-01T00:03:00Z", "price": 8.0}),
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$densify": {"field": "ts", "range": {"step": 1, "unit": "minute", "bounds": "partition"}}},
+            {"$fill": {"sortBy": {"ts": 1}, "output": {"price": {"method": "locf"}}}}
+        ]))
+        .unwrap();
+        let out = p.execute_from(0, docs, &no_lookup).unwrap();
+        assert_eq!(out.len(), 4);
+        let prices: Vec<f64> = out.iter().map(|d| d["price"].as_f64().unwrap()).collect();
+        assert_eq!(prices, vec![5.0, 5.0, 5.0, 8.0]);
+    }
+
+    #[test]
+    fn fill_rejects_bad_args() {
+        // locf without sortBy
+        assert!(
+            Pipeline::parse(&json!([
+                {"$fill": {"output": {"a": {"method": "locf"}}}}
+            ]))
+            .is_err()
+        );
+        // linear with compound sortBy
+        assert!(
+            Pipeline::parse(&json!([
+                {"$fill": {"sortBy": {"x": 1, "y": 1}, "output": {"a": {"method": "linear"}}}}
+            ]))
+            .is_err()
+        );
+        // both method and value
+        assert!(
+            Pipeline::parse(&json!([
+                {"$fill": {"sortBy": {"x": 1}, "output": {"a": {"method": "locf", "value": 1}}}}
+            ]))
+            .is_err()
+        );
+        // densify: zero step
+        assert!(
+            Pipeline::parse(&json!([
+                {"$densify": {"field": "x", "range": {"step": 0, "bounds": "partition"}}}
+            ]))
+            .is_err()
+        );
+        // densify: calendar unit rejected
+        assert!(
+            Pipeline::parse(&json!([
+                {"$densify": {"field": "x", "range": {"step": 1, "unit": "month", "bounds": "partition"}}}
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
