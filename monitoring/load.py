@@ -9,6 +9,7 @@ Usage:  python3 load.py [host] [port]   (default 127.0.0.1 4444)
 Stop with Ctrl-C.
 """
 import json
+import os
 import random
 import socket
 import struct
@@ -41,7 +42,14 @@ def rpc(sock, obj):
 
 def seed():
     s = connect()
-    # A pool of accounts + one hot "fee" account for contention.
+    # Idempotent: skip if the account pool already exists (the data dir
+    # persists across restarts). Otherwise re-seeding would double the
+    # accounts and skew the money-conservation baseline.
+    existing = rpc(s, {"cmd": "count", "collection": "accounts", "query": {}})["data"]["count"]
+    if existing >= 201:
+        print(f"accounts already seeded ({existing}) — skipping")
+        s.close()
+        return
     for i in range(200):
         rpc(s, {"cmd": "insert", "collection": "accounts",
                 "doc": {"id": f"acct-{i}", "balance": 1_000_000}})
@@ -85,21 +93,42 @@ def crud_worker(wid):
         time.sleep(random.uniform(0.01, 0.05))
 
 
+# Concurrency strategy for tx workers: "occ" (optimistic — conflicts on
+# the hot account) or "for_update" (pessimistic locks — no conflicts,
+# transactions queue on the hot account). Set via env MODE.
+TX_MODE = os.environ.get("MODE", "occ")
+
+
 def tx_worker(wid):
-    """Transfers that all touch the hot 'fee' account -> OCC conflicts."""
+    """Transfers that all touch the hot 'fee' account.
+
+    occ:        blind $inc updates + commit -> commit conflicts under
+                contention (the retry-storm signal).
+    for_update: lock all touched accounts (sorted, 'fee' last) with
+                find_for_update before writing -> contenders queue on the
+                lock, zero commit conflicts.
+    """
     s = connect()
     while True:
         try:
             frm = f"acct-{random.randrange(200)}"
             to = f"acct-{random.randrange(200)}"
-            tx = rpc(s, {"cmd": "begin_tx"})["data"]["tx_id"]
+            rpc(s, {"cmd": "begin_tx"})
+            if TX_MODE == "for_update":
+                # Lock in a global order to avoid deadlock: sorted account
+                # ids, then "fee" (sorts after every "acct-*").
+                for acct in sorted({frm, to}) + ["fee"]:
+                    rpc(s, {"cmd": "find_for_update", "collection": "accounts",
+                            "query": {"id": acct}, "lock_timeout_ms": 5000})
+            # Proper double-entry: the fee is DEBITED from the sender, so
+            # every transfer nets zero and total balance is conserved.
             rpc(s, {"cmd": "update", "collection": "accounts",
-                    "query": {"id": frm}, "update": {"$inc": {"balance": -1}}})
+                    "query": {"id": frm}, "update": {"$inc": {"balance": -2}}})
             rpc(s, {"cmd": "update", "collection": "accounts",
                     "query": {"id": to}, "update": {"$inc": {"balance": 1}}})
             rpc(s, {"cmd": "update", "collection": "accounts",
                     "query": {"id": "fee"}, "update": {"$inc": {"balance": 1}}})
-            rpc(s, {"cmd": "commit_tx"})  # may return conflict — that's the point
+            rpc(s, {"cmd": "commit_tx"})  # occ: may conflict; for_update: won't
         except Exception as e:
             print(f"tx[{wid}] reconnect: {e}")
             time.sleep(0.5)
@@ -127,7 +156,7 @@ if __name__ == "__main__":
     threads.append(threading.Thread(target=slow_worker, daemon=True))
     for t in threads:
         t.start()
-    print(f"load running: 6 CRUD + 4 tx (hot-account) + 1 slow worker -> {HOST}:{PORT}")
+    print(f"load running: 6 CRUD + 4 tx (hot-account, MODE={TX_MODE}) + 1 slow worker -> {HOST}:{PORT}")
     print("Ctrl-C to stop.")
     try:
         while True:

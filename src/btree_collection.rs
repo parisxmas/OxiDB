@@ -3340,6 +3340,7 @@ impl BTreeCollection {
         query_json: &Value,
         update_json: &Value,
         tx_id: u64,
+        staged: &mut std::collections::HashMap<DocumentId, Value>,
     ) -> Result<Vec<crate::collection::PreparedMutation>> {
         let update_obj = update_json
             .as_object()
@@ -3357,47 +3358,66 @@ impl BTreeCollection {
 
         let mut mutations = Vec::new();
 
-        let process_candidate = |id: DocumentId,
-                                 cached: &Value,
-                                 mutations: &mut Vec<crate::collection::PreparedMutation>|
-         -> Result<()> {
-            if !query::matches_value(&query, cached) {
-                return Ok(());
-            }
-            let old_data = cached.clone();
-            let mut data = cached.clone();
+        // `staged` holds documents already mutated earlier in THIS
+        // transaction. A doc's effective value is its staged version if
+        // present, else the committed value — so successive updates to the
+        // same doc compose (read-your-own-writes within the tx) instead of
+        // each recomputing from the committed base and the last one
+        // winning. `old_data` is the effective (staged) value too, so
+        // apply_prepared's index maintenance chains correctly across the
+        // per-doc mutation sequence.
+        let mut process_candidate =
+            |id: DocumentId,
+             committed: &Value,
+             mutations: &mut Vec<crate::collection::PreparedMutation>,
+             staged: &mut std::collections::HashMap<DocumentId, Value>|
+             -> Result<()> {
+                let effective = staged.get(&id).unwrap_or(committed);
+                if !query::matches_value(&query, effective) {
+                    return Ok(());
+                }
+                let old_data = effective.clone();
+                let mut data = effective.clone();
 
-            crate::update::apply_update(&mut data, update_json)?;
+                crate::update::apply_update(&mut data, update_json)?;
 
-            let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-            let new_version = old_version + 1;
-            data.as_object_mut()
-                .unwrap()
-                .insert("_version".to_string(), Value::Number(new_version.into()));
+                let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                let new_version = old_version + 1;
+                data.as_object_mut()
+                    .unwrap()
+                    .insert("_version".to_string(), Value::Number(new_version.into()));
 
-            Self::check_unique_constraints_with(&fi, &data, Some(id))?;
+                Self::check_unique_constraints_with(&fi, &data, Some(id))?;
 
-            let new_bytes = codec::encode_doc(&data)?;
-            mutations.push(crate::collection::PreparedMutation {
-                wal_entry: crate::wal::WalEntry::Update {
+                staged.insert(id, data.clone());
+                let new_bytes = codec::encode_doc(&data)?;
+                mutations.push(crate::collection::PreparedMutation {
+                    wal_entry: crate::wal::WalEntry::Update {
+                        doc_id: id,
+                        doc_bytes: new_bytes.clone(),
+                        tx_id,
+                    },
                     doc_id: id,
-                    doc_bytes: new_bytes.clone(),
-                    tx_id,
-                },
-                doc_id: id,
-                new_bytes,
-                old_loc: None, // No DocLocation in B-tree mode
-                old_data: Some(old_data),
-                new_data: data,
-                is_delete: false,
-            });
-            Ok(())
-        };
+                    new_bytes,
+                    old_loc: None, // No DocLocation in B-tree mode
+                    old_data: Some(old_data),
+                    new_data: data,
+                    is_delete: false,
+                });
+                Ok(())
+            };
+
+        // Committed-candidate ids we examined, so the staged-only pass
+        // below (for docs inserted earlier in THIS tx, absent from the
+        // committed index) doesn't double-process them.
+        let mut processed: std::collections::HashSet<DocumentId> =
+            std::collections::HashSet::new();
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
+                processed.insert(id);
                 if let Some(data) = self.read_doc(id)? {
-                    process_candidate(id, &data, &mut mutations)?;
+                    process_candidate(id, &data, &mut mutations, staged)?;
                 }
             }
         } else {
@@ -3411,16 +3431,18 @@ impl BTreeCollection {
             // Re-acquire for unique checks in process_candidate
             let fi = self.field_indexes.read();
             let _ci = self.composite_indexes.read();
-            let process_candidate_reborrowed =
+            let mut process_candidate_reborrowed =
                 |id: DocumentId,
-                 cached: &Value,
-                 mutations: &mut Vec<crate::collection::PreparedMutation>|
+                 committed: &Value,
+                 mutations: &mut Vec<crate::collection::PreparedMutation>,
+                 staged: &mut std::collections::HashMap<DocumentId, Value>|
                  -> Result<()> {
-                    if !query::matches_value(&query, cached) {
+                    let effective = staged.get(&id).unwrap_or(committed);
+                    if !query::matches_value(&query, effective) {
                         return Ok(());
                     }
-                    let old_data = cached.clone();
-                    let mut data = cached.clone();
+                    let old_data = effective.clone();
+                    let mut data = effective.clone();
 
                     crate::update::apply_update(&mut data, update_json)?;
 
@@ -3432,6 +3454,7 @@ impl BTreeCollection {
 
                     Self::check_unique_constraints_with(&fi, &data, Some(id))?;
 
+                    staged.insert(id, data.clone());
                     let new_bytes = codec::encode_doc(&data)?;
                     mutations.push(crate::collection::PreparedMutation {
                         wal_entry: crate::wal::WalEntry::Update {
@@ -3449,7 +3472,48 @@ impl BTreeCollection {
                     Ok(())
                 };
             for (id, data) in &snapshot {
-                process_candidate_reborrowed(*id, data, &mut mutations)?;
+                processed.insert(*id);
+                process_candidate_reborrowed(*id, data, &mut mutations, staged)?;
+            }
+        }
+
+        // Staged-only pass: documents inserted earlier in this same
+        // transaction are not in the committed index/snapshot, so the
+        // loops above miss them. Apply the update to any that match.
+        let staged_only: Vec<(DocumentId, Value)> = staged
+            .iter()
+            .filter(|(id, _)| !processed.contains(id))
+            .map(|(id, v)| (*id, v.clone()))
+            .collect();
+        if !staged_only.is_empty() {
+            let fi = self.field_indexes.read();
+            for (id, effective) in staged_only {
+                if !query::matches_value(&query, &effective) {
+                    continue;
+                }
+                let old_data = effective.clone();
+                let mut data = effective.clone();
+                crate::update::apply_update(&mut data, update_json)?;
+                let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                data.as_object_mut()
+                    .unwrap()
+                    .insert("_version".to_string(), Value::Number((old_version + 1).into()));
+                Self::check_unique_constraints_with(&fi, &data, Some(id))?;
+                staged.insert(id, data.clone());
+                let new_bytes = codec::encode_doc(&data)?;
+                mutations.push(crate::collection::PreparedMutation {
+                    wal_entry: crate::wal::WalEntry::Update {
+                        doc_id: id,
+                        doc_bytes: new_bytes.clone(),
+                        tx_id,
+                    },
+                    doc_id: id,
+                    new_bytes,
+                    old_loc: None,
+                    old_data: Some(old_data),
+                    new_data: data,
+                    is_delete: false,
+                });
             }
         }
 

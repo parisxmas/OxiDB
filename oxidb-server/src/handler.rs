@@ -309,6 +309,35 @@ fn handle_request_session_inner(
             None => err_bytes("no active transaction"),
         },
 
+        // Pessimistic read within a transaction: SELECT ... FOR UPDATE.
+        // Locks every matched document until commit/rollback so
+        // contending transactions queue instead of racing to a commit
+        // conflict — the hot-account escape hatch from OCC retries.
+        // Requires an active transaction; `lock_timeout_ms` optional
+        // (default 5000).
+        "find_for_update" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let tx_id = match *active_tx {
+                Some(id) => id,
+                None => return err_bytes("find_for_update requires an active transaction"),
+            };
+            let empty = json!({});
+            let query = request.get("query").unwrap_or(&empty);
+            let timeout = std::time::Duration::from_millis(
+                request
+                    .get("lock_timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5000),
+            );
+            match db.tx_find_for_update(tx_id, col, query, timeout) {
+                Ok(docs) => ok_bytes(json!(docs)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         // -------------------------------------------------------------------
         // CRUD commands (tx-aware)
         // -------------------------------------------------------------------

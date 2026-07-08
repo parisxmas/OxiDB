@@ -2377,9 +2377,19 @@ impl OxiDb {
                 .collect();
 
             // 4. Prepare: execute each WriteOp against the collection
-            //    Collect WAL entries and mutations per collection
+            //    Collect WAL entries and mutations per collection.
+            //
+            //    `staged` carries each collection's in-transaction doc
+            //    state so successive ops on the same document compose
+            //    (read-your-own-writes). Without it, two updates to one
+            //    doc in a transaction each recomputed from the committed
+            //    base and the last write silently clobbered the first —
+            //    e.g. `$inc -2` then `$inc +1` yielded +1, not -1,
+            //    creating money in a ledger. (The benches never hit this
+            //    because they force distinct from/to accounts.)
             let mut all_mutations: HashMap<String, Vec<crate::collection::PreparedMutation>> =
                 HashMap::new();
+            let mut staged: HashMap<String, HashMap<DocumentId, Value>> = HashMap::new();
 
             for op in tx.write_ops {
                 match op {
@@ -2390,6 +2400,10 @@ impl OxiDb {
                     } => {
                         let col = col_map.get(&collection).unwrap();
                         let mutation = col.prepare_tx_insert(data, tx_id, id)?;
+                        staged
+                            .entry(collection.clone())
+                            .or_default()
+                            .insert(mutation.doc_id, mutation.new_data.clone());
                         all_mutations.entry(collection).or_default().push(mutation);
                     }
                     WriteOp::Update {
@@ -2398,7 +2412,8 @@ impl OxiDb {
                         update,
                     } => {
                         let col = col_map.get(&collection).unwrap();
-                        let mutations = col.prepare_tx_update(&query, &update, tx_id)?;
+                        let stage = staged.entry(collection.clone()).or_default();
+                        let mutations = col.prepare_tx_update(&query, &update, tx_id, stage)?;
                         all_mutations
                             .entry(collection)
                             .or_default()
@@ -2407,6 +2422,13 @@ impl OxiDb {
                     WriteOp::Delete { collection, query } => {
                         let col = col_map.get(&collection).unwrap();
                         let mutations = col.prepare_tx_delete(&query, tx_id)?;
+                        // Deleted docs leave the staged view so a later
+                        // update in the same tx can't resurrect them.
+                        if let Some(stage) = staged.get_mut(&collection) {
+                            for m in &mutations {
+                                stage.remove(&m.doc_id);
+                            }
+                        }
                         all_mutations
                             .entry(collection)
                             .or_default()
@@ -3488,6 +3510,69 @@ mod tests {
     fn temp_db() -> OxiDb {
         let dir = tempdir().unwrap();
         OxiDb::open(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn tx_multiple_updates_same_doc_compose() {
+        // Regression: two $inc updates to the SAME doc in one transaction
+        // must compose (read-your-own-writes), not clobber. 100 -2 +1 = 99.
+        let db = temp_db();
+        db.insert("acc", json!({"id": "x", "bal": 100})).unwrap();
+
+        let tx = db.begin_transaction();
+        db.tx_update(tx, "acc", &json!({"id": "x"}), &json!({"$inc": {"bal": -2}}))
+            .unwrap();
+        db.tx_update(tx, "acc", &json!({"id": "x"}), &json!({"$inc": {"bal": 1}}))
+            .unwrap();
+        db.commit_transaction(tx).unwrap();
+
+        let doc = db.find_one("acc", &json!({"id": "x"})).unwrap().unwrap();
+        assert_eq!(doc["bal"], 99, "deltas must compose, not last-write-wins");
+    }
+
+    #[test]
+    fn tx_insert_then_update_same_doc() {
+        // Insert then update the inserted doc in the same tx: the update
+        // must see the inserted value.
+        let db = temp_db();
+        let tx = db.begin_transaction();
+        db.tx_insert(tx, "acc", json!({"id": "y", "bal": 10})).unwrap();
+        db.tx_update(tx, "acc", &json!({"id": "y"}), &json!({"$inc": {"bal": 5}}))
+            .unwrap();
+        db.commit_transaction(tx).unwrap();
+        let doc = db.find_one("acc", &json!({"id": "y"})).unwrap().unwrap();
+        assert_eq!(doc["bal"], 15);
+    }
+
+    #[test]
+    fn tx_money_conserved_with_self_transfer() {
+        // A transfer where from == to (two updates hit the same doc) plus
+        // a fee leg must conserve total balance. This is the exact shape
+        // that created money before the staging fix.
+        let db = temp_db();
+        db.insert("acc", json!({"id": "a", "bal": 1000})).unwrap();
+        db.insert("acc", json!({"id": "fee", "bal": 0})).unwrap();
+        let total_before = 1000;
+
+        // from==to==a: debit amount+fee (2), credit amount (1), fee +1.
+        let tx = db.begin_transaction();
+        db.tx_update(tx, "acc", &json!({"id": "a"}), &json!({"$inc": {"bal": -2}}))
+            .unwrap();
+        db.tx_update(tx, "acc", &json!({"id": "a"}), &json!({"$inc": {"bal": 1}}))
+            .unwrap();
+        db.tx_update(tx, "acc", &json!({"id": "fee"}), &json!({"$inc": {"bal": 1}}))
+            .unwrap();
+        db.commit_transaction(tx).unwrap();
+
+        let total: i64 = db
+            .find("acc", &json!({}))
+            .unwrap()
+            .iter()
+            .map(|d| d["bal"].as_i64().unwrap())
+            .sum();
+        assert_eq!(total, total_before, "money must be conserved");
+        let a = db.find_one("acc", &json!({"id": "a"})).unwrap().unwrap();
+        assert_eq!(a["bal"], 999); // 1000 - 2 + 1
     }
 
     #[test]

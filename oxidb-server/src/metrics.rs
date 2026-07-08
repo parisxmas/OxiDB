@@ -62,6 +62,7 @@ impl Metrics {
         let counter = match cmd {
             "insert" | "insert_many" => &self.cmd_insert,
             "find" | "find_one" | "get" => &self.cmd_find,
+            "find_for_update" => &self.cmd_find,
             "update" | "update_one" | "find_and_modify" => &self.cmd_update,
             "delete" | "delete_one" => &self.cmd_delete,
             "count" => &self.cmd_count,
