@@ -1,0 +1,158 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "5s",
+  "title": "OxiDB — Live",
+  "uid": "oxidb-live",
+  "schemaVersion": 39,
+  "tags": ["oxidb"],
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(oxidb_up, instance)",
+        "refresh": 2,
+        "includeAll": false,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Up",
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "oxidb_up{instance=\"$instance\"}", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "1": { "text": "UP", "color": "green" }, "0": { "text": "DOWN", "color": "red" } } }], "thresholds": { "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } }
+    },
+    {
+      "type": "stat",
+      "title": "Uptime",
+      "gridPos": { "h": 4, "w": 3, "x": 3, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "oxidb_uptime_seconds{instance=\"$instance\"}", "refId": "A" }],
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "type": "stat",
+      "title": "Documents",
+      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "oxidb_documents_total{instance=\"$instance\"}", "refId": "A" }],
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } }
+    },
+    {
+      "type": "stat",
+      "title": "Collections",
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "oxidb_collections{instance=\"$instance\"}", "refId": "A" }],
+      "options": { "colorMode": "value", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "type": "stat",
+      "title": "Command rate",
+      "gridPos": { "h": 4, "w": 3, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "sum(rate(oxidb_commands_total{instance=\"$instance\"}[1m]))", "refId": "A" }],
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "fixed", "fixedColor": "green" } } }
+    },
+    {
+      "type": "stat",
+      "title": "Error rate",
+      "gridPos": { "h": 4, "w": 3, "x": 15, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "rate(oxidb_errors_total{instance=\"$instance\"}[1m])", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "reqps", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.1 }, { "color": "red", "value": 1 }] } } }
+    },
+    {
+      "type": "stat",
+      "title": "Slow queries",
+      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "oxidb_slow_queries_total{instance=\"$instance\"}", "refId": "A" }],
+      "options": { "colorMode": "background", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short", "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }] } } }
+    },
+    {
+      "type": "stat",
+      "title": "RSS",
+      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "oxidb_process_resident_memory_bytes{instance=\"$instance\"}", "refId": "A" }],
+      "options": { "colorMode": "value", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "fixed", "fixedColor": "purple" } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Commands / sec by class",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "rate(oxidb_commands_total{instance=\"$instance\"}[1m])", "legendFormat": "{{class}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 15, "showPoints": "never", "stacking": { "mode": "normal" } } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Transactions: commits vs conflicts /sec",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(oxidb_tx_commits_total{instance=\"$instance\"}[1m])", "legendFormat": "commits", "refId": "A" },
+        { "expr": "rate(oxidb_tx_conflicts_total{instance=\"$instance\"}[1m])", "legendFormat": "conflicts", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "fillOpacity": 15, "showPoints": "never" } }, "overrides": [{ "matcher": { "id": "byName", "options": "conflicts" }, "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }] }] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "OCC conflict ratio (conflicts / commits)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "rate(oxidb_tx_conflicts_total{instance=\"$instance\"}[1m]) / clamp_min(rate(oxidb_tx_commits_total{instance=\"$instance\"}[1m]), 0.001)", "legendFormat": "conflict ratio", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "custom": { "fillOpacity": 20, "showPoints": "never", "thresholdsStyle": { "mode": "line" } }, "thresholds": { "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 0.5 }, { "color": "red", "value": 1 }] } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "CPU % and threads",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "oxidb_process_cpu_percent{instance=\"$instance\"}", "legendFormat": "cpu %", "refId": "A" },
+        { "expr": "oxidb_process_threads{instance=\"$instance\"}", "legendFormat": "threads", "refId": "B" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10, "showPoints": "never" } }, "overrides": [{ "matcher": { "id": "byName", "options": "threads" }, "properties": [{ "id": "custom.axisPlacement", "value": "right" }, { "id": "unit", "value": "short" }] }, { "matcher": { "id": "byName", "options": "cpu %" }, "properties": [{ "id": "unit", "value": "percent" }] }] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Documents per collection",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "oxidb_documents{instance=\"$instance\"}", "legendFormat": "{{collection}}", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "fillOpacity": 10, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Resident memory",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "expr": "oxidb_process_resident_memory_bytes{instance=\"$instance\"}", "legendFormat": "rss", "refId": "A" }],
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "fillOpacity": 20, "showPoints": "never" }, "color": { "mode": "fixed", "fixedColor": "purple" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } }
+    }
+  ]
+}

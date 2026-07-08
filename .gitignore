@@ -86,3 +86,6 @@ repl-test
 udp-bench
 scale-test
 telco-test
+monitoring/.oxidb-data/
+monitoring/.oxidb-server.log
+monitoring/.load.log
