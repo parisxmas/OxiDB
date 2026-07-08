@@ -66,7 +66,9 @@ see mid-commit.
    commit), or tolerate torn views — plain reads can observe a commit's
    partial apply window.
 
-## Known engine-level gaps (candidates, not bugs)
+## Exactly-once / idempotency (retries, timeouts, crashes)
+
+The client-visible failure mode isolation can't solve alone: a request
 
 - **Snapshot reads / MVCC** would close A5A-observation, P3-for-readers
   and G1b-for-observers in one move.
