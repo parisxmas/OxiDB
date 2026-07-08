@@ -3,3 +3,4 @@
 .server.log
 .matcher.log
 .trader-*.log
+.web.log

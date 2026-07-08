@@ -45,7 +45,7 @@ func nowISO() string { return time.Now().UTC().Format("2006-01-02T15:04:05Z") }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: exchange setup|matcher|trader <id> <secs>|verify")
+		fmt.Println("usage: exchange setup|matcher|trader <id> <secs>|web|verify")
 		os.Exit(2)
 	}
 	switch os.Args[1] {
@@ -57,6 +57,8 @@ func main() {
 		id, _ := strconv.Atoi(os.Args[2])
 		secs, _ := strconv.Atoi(os.Args[3])
 		trader(id, secs)
+	case "web":
+		web()
 	case "verify":
 		os.Exit(verify())
 	default:

@@ -34,6 +34,14 @@ echo "[run] starting matching engine…"
 "$HERE/.exchange" matcher > "$HERE/.matcher.log" 2>&1 &
 PIDS+=($!)
 
+WEB_PORT="${WEB_PORT:-8090}"
+echo "[run] starting web dashboard…"
+WEB_PORT="$WEB_PORT" "$HERE/.exchange" web > "$HERE/.web.log" 2>&1 &
+PIDS+=($!)
+echo "[run]   ┌───────────────────────────────────────────────┐"
+echo "[run]   │  OPEN THE DASHBOARD:  http://localhost:$WEB_PORT      │"
+echo "[run]   └───────────────────────────────────────────────┘"
+
 echo "[run] launching 10 traders for ${SECS}s…"
 TRADER_PIDS=()
 for u in $(seq 0 9); do
