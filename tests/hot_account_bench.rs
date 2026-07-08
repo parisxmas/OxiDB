@@ -266,10 +266,18 @@ fn run_mode(
                 let mut stats = WorkerStats::default();
                 while !stop.load(Ordering::Relaxed) {
                     let from_i = rng.below(n_accounts as u64);
-                    let mut to_i = rng.below(n_accounts as u64);
-                    if to_i == from_i {
-                        to_i = (to_i + 1) % n_accounts as u64;
-                    }
+                    // 1-in-8 transfers are self-transfers (from == to),
+                    // deliberately exercising two updates to the SAME
+                    // document in one transaction — the composition path a
+                    // prior bug clobbered (engine.rs staged-writes fix).
+                    // Self-transfers still net zero, so the money-
+                    // conservation invariant below must keep holding.
+                    let to_i = if rng.below(8) == 0 {
+                        from_i
+                    } else {
+                        let t = rng.below(n_accounts as u64);
+                        if t == from_i { (t + 1) % n_accounts as u64 } else { t }
+                    };
                     let from = format!("acct-{from_i}");
                     let to = format!("acct-{to_i}");
                     let amount = 1 + rng.below(MAX_AMOUNT as u64) as i64;

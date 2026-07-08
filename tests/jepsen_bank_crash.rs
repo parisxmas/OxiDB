@@ -201,10 +201,16 @@ fn run_victim() -> ! {
             let for_update = w % 2 == 0;
             loop {
                 let from_i = rng.below(n_accounts as u64);
-                let mut to_i = rng.below(n_accounts as u64);
-                if to_i == from_i {
-                    to_i = (to_i + 1) % n_accounts as u64;
-                }
+                // 1-in-8 are self-transfers (from == to) — two updates to
+                // the same doc in one tx, plus a fee leg. Nets zero, so
+                // atomicity + conservation must still hold on recovery;
+                // this is the shape the same-doc composition bug broke.
+                let to_i = if rng.below(8) == 0 {
+                    from_i
+                } else {
+                    let t = rng.below(n_accounts as u64);
+                    if t == from_i { (t + 1) % n_accounts as u64 } else { t }
+                };
                 let from = format!("acct-{from_i}");
                 let to = format!("acct-{to_i}");
                 let amount = 1 + rng.below(MAX_AMOUNT as u64) as i64;

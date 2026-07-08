@@ -113,7 +113,17 @@ fn no_money_lost_under_concurrent_transfers() {
                     state ^= state >> 7;
                     state ^= state << 17;
                     let amount = 1 + (state % 1_000) as i64;
-                    let (from, to) = if state & 1 == 0 { ("a", "b") } else { ("b", "a") };
+                    // Include self-transfers (a->a, b->b): two updates to
+                    // the same document in one transaction. They net zero,
+                    // so the money-conservation invariant must still hold —
+                    // this exercises the same-doc write composition that a
+                    // prior commit-prepare bug clobbered.
+                    let (from, to) = match state % 4 {
+                        0 => ("a", "b"),
+                        1 => ("b", "a"),
+                        2 => ("a", "a"),
+                        _ => ("b", "b"),
+                    };
 
                     let mut retry = 0;
                     loop {
