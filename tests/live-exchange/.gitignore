@@ -4,3 +4,4 @@
 .matcher.log
 .trader-*.log
 .web.log
+.run.log

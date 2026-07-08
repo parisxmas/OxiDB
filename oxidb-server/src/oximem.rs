@@ -8,6 +8,7 @@
 //! via SQL: `SELECT * FROM _kv WHERE _key LIKE 'session:%'`
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -164,6 +165,16 @@ pub struct OxiMemStore {
     sets: RwLock<HashMap<String, HashSet<String>>>,
     sorted_sets: RwLock<HashMap<String, SortedSet>>,
     pubsub: Mutex<HashMap<String, Vec<PubSubSender>>>,
+    /// Serializes MULTI/EXEC transaction blocks so two EXECs never interleave
+    /// their queued commands — the isolation Redis gets for free from being
+    /// single-threaded. Held only for the duration of an EXEC.
+    tx_lock: Mutex<()>,
+    /// Per-key mutation counters for WATCH: every write command bumps its
+    /// key's counter, so a WATCH snapshot is an O(1) integer instead of a
+    /// serialized copy of the value (which would be O(n) for a large book).
+    versions: RwLock<HashMap<String, u64>>,
+    /// Bumped by FLUSHALL/FLUSHDB — invalidates every outstanding WATCH.
+    epoch: AtomicU64,
     /// Optional OxiDB reference for SQL-queryable mirroring.
     db: Option<Arc<OxiDb>>,
 }
@@ -178,6 +189,9 @@ impl OxiMemStore {
             sets: RwLock::new(HashMap::new()),
             sorted_sets: RwLock::new(HashMap::new()),
             pubsub: Mutex::new(HashMap::new()),
+            tx_lock: Mutex::new(()),
+            versions: RwLock::new(HashMap::new()),
+            epoch: AtomicU64::new(0),
             db: None,
         }
     }
@@ -191,6 +205,9 @@ impl OxiMemStore {
             sets: RwLock::new(HashMap::new()),
             sorted_sets: RwLock::new(HashMap::new()),
             pubsub: Mutex::new(HashMap::new()),
+            tx_lock: Mutex::new(()),
+            versions: RwLock::new(HashMap::new()),
+            epoch: AtomicU64::new(0),
             db: Some(db),
         }
     }
@@ -233,6 +250,37 @@ impl OxiMemStore {
 
     pub fn sql_enabled(&self) -> bool {
         self.db.is_some()
+    }
+
+    /// Record a mutation on `key` (for WATCH change detection).
+    fn bump_version(&self, key: &str) {
+        let mut v = self.versions.write().unwrap();
+        *v.entry(key.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record a whole-store mutation (FLUSHALL/FLUSHDB).
+    fn bump_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn key_version(&self, key: &str) -> u64 {
+        self.versions.read().unwrap().get(key).copied().unwrap_or(0)
+    }
+
+    /// Whether the key currently holds a live value of any type.
+    fn key_exists(&self, key: &str) -> bool {
+        {
+            let s = self.strings.read().unwrap();
+            if let Some(e) = s.get(key) {
+                if !e.is_expired() {
+                    return true;
+                }
+            }
+        }
+        self.hashes.read().unwrap().contains_key(key)
+            || self.lists.read().unwrap().contains_key(key)
+            || self.sets.read().unwrap().contains_key(key)
+            || self.sorted_sets.read().unwrap().contains_key(key)
     }
 }
 
@@ -285,13 +333,36 @@ pub fn execute_pipeline(store: &OxiMemStore, commands: &[RespValue]) -> Vec<Resp
             .filter_map(|p| p.map(|items| &items[1..]))
             .collect();
 
+        // Coalesced write paths bypass execute(), so bump WATCH versions here.
+        let bump_all_keys = |store: &OxiMemStore| {
+            for args in &args_list {
+                if let Some(k) = args.first().and_then(|a| a.as_str()) {
+                    store.bump_version(k);
+                }
+            }
+        };
         match first_cmd.as_str() {
             "GET" => return pipeline_get(store, &args_list),
-            "SET" => return pipeline_set(store, &args_list),
-            "INCR" => return pipeline_incr(store, &args_list),
-            "LPUSH" => return pipeline_lpush(store, &args_list),
-            "RPUSH" => return pipeline_rpush(store, &args_list),
-            "HSET" => return pipeline_hset(store, &args_list),
+            "SET" => {
+                bump_all_keys(store);
+                return pipeline_set(store, &args_list);
+            }
+            "INCR" => {
+                bump_all_keys(store);
+                return pipeline_incr(store, &args_list);
+            }
+            "LPUSH" => {
+                bump_all_keys(store);
+                return pipeline_lpush(store, &args_list);
+            }
+            "RPUSH" => {
+                bump_all_keys(store);
+                return pipeline_rpush(store, &args_list);
+            }
+            "HSET" => {
+                bump_all_keys(store);
+                return pipeline_hset(store, &args_list);
+            }
             "PING" => {
                 return args_list
                     .iter()
@@ -442,7 +513,217 @@ fn pipeline_hset(store: &OxiMemStore, args_list: &[&[RespValue]]) -> Vec<RespVal
 }
 
 /// Execute a Redis command against the native store.
+/// Per-connection transaction state for MULTI / EXEC / WATCH.
+#[derive(Default)]
+pub struct Session {
+    in_multi: bool,
+    aborted: bool,
+    queued: Vec<Vec<RespValue>>,
+    watched: Vec<(String, KeySnap)>,
+}
+
+impl Session {
+    /// True while mid-MULTI or holding WATCHes — the caller must then route
+    /// every command through `execute_session` (not the batched fast path).
+    pub fn is_active(&self) -> bool {
+        self.in_multi || !self.watched.is_empty()
+    }
+    fn reset(&mut self) {
+        self.in_multi = false;
+        self.aborted = false;
+        self.queued.clear();
+        self.watched.clear();
+    }
+}
+
+/// Whether a command participates in transaction control (so a pipeline
+/// containing one must be run statefully rather than lock-coalesced).
+pub fn is_tx_command(name: &str) -> bool {
+    matches!(
+        name.to_uppercase().as_str(),
+        "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH"
+    )
+}
+
+/// Every command the dispatcher understands — used to validate commands at
+/// MULTI queue time, so a typo aborts the transaction (Redis EXECABORT
+/// semantics) instead of failing half-way through EXEC.
+fn is_known_command(name: &str) -> bool {
+    matches!(
+        name,
+        "PING" | "ECHO" | "QUIT" | "SELECT" | "COMMAND" | "CLIENT" | "AUTH" | "CONFIG"
+            | "INFO" | "DBSIZE" | "FLUSHALL" | "FLUSHDB" | "KEYS" | "SCAN" | "RANDOMKEY"
+            | "RENAME" | "TYPE" | "EXISTS" | "DEL" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
+            | "PERSIST" | "TTL" | "PTTL" | "SET" | "GET" | "GETSET" | "SETNX" | "SETEX"
+            | "PSETEX" | "MSET" | "MGET" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
+            | "INCRBYFLOAT" | "APPEND" | "STRLEN" | "GETRANGE" | "HSET" | "HMSET"
+            | "HSETNX" | "HGET" | "HMGET" | "HGETALL" | "HDEL" | "HEXISTS" | "HKEYS"
+            | "HVALS" | "HLEN" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP" | "RPOP"
+            | "LLEN" | "LRANGE" | "LINDEX" | "SADD" | "SREM" | "SMEMBERS" | "SISMEMBER"
+            | "SCARD" | "ZADD" | "ZREM" | "ZSCORE" | "ZCARD" | "ZCOUNT" | "ZINCRBY"
+            | "ZRANK" | "ZREVRANK" | "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE"
+            | "ZREVRANGEBYSCORE" | "ZPOPMIN" | "ZPOPMAX" | "PUBLISH"
+    )
+}
+
+/// O(1) fingerprint of a key for WATCH change detection: the store epoch
+/// (bumped by FLUSHALL), the key's mutation counter (bumped by every write
+/// command touching it), and whether the key currently exists (so a lazy
+/// TTL expiry between WATCH and EXEC still registers as a change).
+type KeySnap = (u64, u64, bool);
+
+fn snapshot_key(store: &OxiMemStore, key: &str) -> KeySnap {
+    (
+        store.epoch.load(Ordering::SeqCst),
+        store.key_version(key),
+        store.key_exists(key),
+    )
+}
+
+/// Session-aware entry point: handles MULTI/EXEC/DISCARD/WATCH/UNWATCH, queues
+/// commands while in MULTI, and delegates everything else to `execute`.
+///
+/// Isolation model: EXEC takes `store.tx_lock`, so two EXEC blocks never
+/// interleave their queued commands, and re-checks WATCHed keys under that lock
+/// — if any changed since WATCH, EXEC aborts (returns nil) and the client
+/// retries. This is the standard Redis optimistic-transaction primitive, and is
+/// exactly what a multi-account settlement needs: WATCH the two cash accounts,
+/// verify sufficiency, then move funds atomically or retry.
+pub fn execute_session(store: &OxiMemStore, sess: &mut Session, args: &[RespValue]) -> RespValue {
+    if args.is_empty() {
+        return resp::err("empty command");
+    }
+    let cmd = match args[0].as_str() {
+        Some(s) => s.to_uppercase(),
+        None => return resp::err("invalid command"),
+    };
+    match cmd.as_str() {
+        "MULTI" => {
+            if sess.in_multi {
+                return resp::err("MULTI calls can not be nested");
+            }
+            sess.in_multi = true;
+            sess.aborted = false;
+            sess.queued.clear();
+            resp::ok()
+        }
+        "DISCARD" => {
+            if !sess.in_multi {
+                return resp::err("DISCARD without MULTI");
+            }
+            sess.reset();
+            resp::ok()
+        }
+        "UNWATCH" => {
+            sess.watched.clear();
+            resp::ok()
+        }
+        "WATCH" => {
+            if sess.in_multi {
+                return resp::err("WATCH inside MULTI is not allowed");
+            }
+            if args.len() < 2 {
+                return resp::err("wrong number of arguments for 'watch' command");
+            }
+            for a in &args[1..] {
+                if let Some(k) = a.as_str() {
+                    let snap = snapshot_key(store, k);
+                    sess.watched.push((k.to_string(), snap));
+                }
+            }
+            resp::ok()
+        }
+        "EXEC" => {
+            if !sess.in_multi {
+                return resp::err("EXEC without MULTI");
+            }
+            if sess.aborted {
+                sess.reset();
+                return resp::err(
+                    "EXECABORT Transaction discarded because of previous errors.",
+                );
+            }
+            let _guard = store.tx_lock.lock().unwrap();
+            for (key, snap) in &sess.watched {
+                if &snapshot_key(store, key) != snap {
+                    sess.reset();
+                    return RespValue::NullArray; // a WATCHed key changed — abort
+                }
+            }
+            let queued = std::mem::take(&mut sess.queued);
+            let mut out = Vec::with_capacity(queued.len());
+            for qcmd in &queued {
+                out.push(execute(store, qcmd));
+            }
+            sess.reset();
+            RespValue::Array(out)
+        }
+        _ => {
+            if sess.in_multi {
+                // Queue-time validation: an unknown command poisons the whole
+                // transaction (Redis EXECABORT semantics) rather than failing
+                // part-way through EXEC.
+                if !is_known_command(&cmd) {
+                    sess.aborted = true;
+                    return resp::err(&format!("unknown command '{cmd}'"));
+                }
+                sess.queued.push(args.to_vec());
+                RespValue::SimpleString("QUEUED".to_string())
+            } else {
+                execute(store, args)
+            }
+        }
+    }
+}
+
+/// Which argument positions hold keys a command mutates (for WATCH version
+/// bumps). Empty for read-only / unknown commands; `None` marks FLUSH-class
+/// commands that invalidate everything.
+fn write_key_indices(cmd: &str, argc: usize) -> Option<Vec<usize>> {
+    match cmd {
+        "SET" | "SETNX" | "SETEX" | "PSETEX" | "GETSET" | "APPEND" | "INCR" | "DECR"
+        | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
+        | "PERSIST" | "HSET" | "HMSET" | "HSETNX" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH"
+        | "LPOP" | "RPOP" | "SADD" | "SREM" | "ZADD" | "ZINCRBY" | "ZREM" | "ZPOPMIN"
+        | "ZPOPMAX" => Some(vec![1]),
+        "DEL" => Some((1..argc).collect()),
+        "RENAME" => Some(vec![1, 2]),
+        "MSET" => Some((1..argc).step_by(2).collect()),
+        "FLUSHALL" | "FLUSHDB" => None, // whole-store: bump the epoch
+        _ => Some(vec![]),
+    }
+}
+
+/// Bump WATCH version counters for every key `args` mutates.
+fn bump_write_versions(store: &OxiMemStore, args: &[RespValue]) {
+    let cmd = match args.first().and_then(|a| a.as_str()) {
+        Some(s) => s.to_uppercase(),
+        None => return,
+    };
+    match write_key_indices(&cmd, args.len()) {
+        None => store.bump_epoch(),
+        Some(idxs) => {
+            for i in idxs {
+                if let Some(k) = args.get(i).and_then(|a| a.as_str()) {
+                    store.bump_version(k);
+                }
+            }
+        }
+    }
+}
+
 pub fn execute(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let result = execute_cmd(store, args);
+    // Errors don't modify state; anything else on a write command might have,
+    // so bump conservatively (a spurious WATCH abort just retries — a missed
+    // change would break the optimistic lock).
+    if !matches!(result, RespValue::Error(_)) {
+        bump_write_versions(store, args);
+    }
+    result
+}
+
+fn execute_cmd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     if args.is_empty() {
         return resp::err("empty command");
     }
@@ -2304,5 +2585,238 @@ mod tests {
         assert_eq!(glob_to_regex("user:*"), "^user:.*$");
         assert_eq!(glob_to_regex("h?llo"), "^h.llo$");
         assert_eq!(glob_to_regex("hello.world"), "^hello\\.world$");
+    }
+
+    // ---- MULTI / EXEC / WATCH transaction tests ----
+
+    fn c(parts: &[&str]) -> Vec<RespValue> {
+        parts
+            .iter()
+            .map(|p| RespValue::BulkString(p.as_bytes().to_vec()))
+            .collect()
+    }
+    fn is_ok(r: &RespValue) -> bool {
+        matches!(r, RespValue::SimpleString(s) if s == "OK")
+    }
+    fn getf(store: &OxiMemStore, key: &str) -> f64 {
+        execute(store, &c(&["GET", key]))
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn multi_exec_runs_queued_atomically() {
+        let store = OxiMemStore::new();
+        let mut s = Session::default();
+        assert!(is_ok(&execute_session(&store, &mut s, &c(&["MULTI"]))));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["SET", "a", "1"])),
+            RespValue::SimpleString(ref x) if x == "QUEUED"
+        ));
+        execute_session(&store, &mut s, &c(&["INCR", "a"]));
+        match execute_session(&store, &mut s, &c(&["EXEC"])) {
+            RespValue::Array(v) => assert_eq!(v.len(), 2),
+            other => panic!("expected array, got {other:?}"),
+        }
+        assert_eq!(execute(&store, &c(&["GET", "a"])).as_str(), Some("2"));
+    }
+
+    #[test]
+    fn discard_cancels_queue() {
+        let store = OxiMemStore::new();
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["SET", "x", "1"]));
+        assert!(is_ok(&execute_session(&store, &mut s, &c(&["DISCARD"]))));
+        assert!(matches!(execute(&store, &c(&["GET", "x"])), RespValue::Null));
+        // EXEC now has no transaction to run.
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::Error(_)
+        ));
+    }
+
+    #[test]
+    fn exec_and_multi_state_errors() {
+        let store = OxiMemStore::new();
+        let mut s = Session::default();
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::Error(_)
+        ));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["DISCARD"])),
+            RespValue::Error(_)
+        ));
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["MULTI"])),
+            RespValue::Error(_)
+        ));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["WATCH", "k"])),
+            RespValue::Error(_)
+        ));
+    }
+
+    #[test]
+    fn watch_allows_exec_when_unchanged() {
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SET", "k", "1"]));
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["WATCH", "k"]));
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["SET", "k", "2"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::Array(_)
+        ));
+        assert_eq!(execute(&store, &c(&["GET", "k"])).as_str(), Some("2"));
+    }
+
+    #[test]
+    fn watch_aborts_exec_on_change() {
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SET", "k", "1"]));
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["WATCH", "k"]));
+        // Another connection modifies the watched key.
+        execute(&store, &c(&["SET", "k", "999"]));
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["SET", "k", "2"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::NullArray // aborted
+        ));
+        // The transaction did not run.
+        assert_eq!(execute(&store, &c(&["GET", "k"])).as_str(), Some("999"));
+    }
+
+    #[test]
+    fn atomic_settlement_transfer() {
+        // The exchange pattern: move 100 cash from A to B atomically.
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SET", "usd:A", "1000"]));
+        execute(&store, &c(&["SET", "usd:B", "500"]));
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["WATCH", "usd:A", "usd:B"]));
+        // (client checks A has enough) then moves funds in one atomic block
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["INCRBYFLOAT", "usd:A", "-100"]));
+        execute_session(&store, &mut s, &c(&["INCRBYFLOAT", "usd:B", "100"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::Array(_)
+        ));
+        assert!((getf(&store, "usd:A") - 900.0).abs() < 1e-9);
+        assert!((getf(&store, "usd:B") - 600.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn settlement_aborts_on_concurrent_change_no_double_spend() {
+        // WATCH is what makes hot-account settlement safe: if the balance moved
+        // between the sufficiency check and EXEC, the transaction aborts instead
+        // of overdrawing.
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SET", "usd:A", "1000"]));
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["WATCH", "usd:A"]));
+        // A concurrent matcher drains the account after our WATCH.
+        execute(&store, &c(&["INCRBYFLOAT", "usd:A", "-1000"]));
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["INCRBYFLOAT", "usd:A", "-100"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::NullArray // aborted — no overdraft
+        ));
+        assert!((getf(&store, "usd:A") - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unknown_command_in_multi_aborts_exec() {
+        let store = OxiMemStore::new();
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["SET", "a", "1"]));
+        // Typo'd command poisons the transaction at queue time…
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["SETT", "b", "2"])),
+            RespValue::Error(_)
+        ));
+        // …so EXEC refuses to run anything (EXECABORT).
+        match execute_session(&store, &mut s, &c(&["EXEC"])) {
+            RespValue::Error(e) => assert!(e.contains("EXECABORT"), "got {e}"),
+            other => panic!("expected EXECABORT, got {other:?}"),
+        }
+        assert!(matches!(execute(&store, &c(&["GET", "a"])), RespValue::Null));
+    }
+
+    #[test]
+    fn watch_detects_expiry_and_flushall() {
+        let store = OxiMemStore::new();
+        // Lazy expiry between WATCH and EXEC counts as a change.
+        execute(&store, &c(&["SET", "e", "1"]));
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["WATCH", "e"]));
+        execute(&store, &c(&["DEL", "e"])); // stand-in for expiry: key vanishes
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["SET", "e", "2"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::NullArray
+        ));
+        // FLUSHALL bumps the epoch — aborts any WATCH, even on other keys.
+        execute(&store, &c(&["SET", "f", "1"]));
+        let mut s2 = Session::default();
+        execute_session(&store, &mut s2, &c(&["WATCH", "f"]));
+        execute(&store, &c(&["FLUSHALL"]));
+        execute_session(&store, &mut s2, &c(&["MULTI"]));
+        execute_session(&store, &mut s2, &c(&["SET", "f", "2"]));
+        assert!(matches!(
+            execute_session(&store, &mut s2, &c(&["EXEC"])),
+            RespValue::NullArray
+        ));
+    }
+
+    #[test]
+    fn watch_sees_coalesced_pipeline_writes() {
+        // The lock-coalesced pipeline path bypasses execute(); its writes must
+        // still bump WATCH versions.
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SET", "p", "1"]));
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["WATCH", "p"]));
+        let batch = vec![
+            RespValue::Array(c(&["SET", "p", "9"])),
+            RespValue::Array(c(&["SET", "p2", "9"])),
+        ];
+        execute_pipeline(&store, &batch);
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["SET", "p", "2"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::NullArray
+        ));
+        assert_eq!(execute(&store, &c(&["GET", "p"])).as_str(), Some("9"));
+    }
+
+    #[test]
+    fn watch_hash_and_zset_keys() {
+        // WATCH must detect changes on hash (balances) and sorted-set (book) keys.
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["HSET", "bal", "usd", "10"]));
+        execute(&store, &c(&["ZADD", "book", "1", "o1"]));
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["WATCH", "bal", "book"]));
+        execute(&store, &c(&["ZADD", "book", "2", "o2"])); // book changed
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["HINCRBY", "bal", "usd", "5"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::NullArray
+        ));
+        assert_eq!(execute(&store, &c(&["HGET", "bal", "usd"])).as_str(), Some("10"));
     }
 }

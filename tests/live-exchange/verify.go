@@ -31,13 +31,12 @@ func verify() int {
 	}
 
 	nTrades := c.Count("trades", map[string]any{})
-	nReceipts := c.Count("receipts", map[string]any{})
 	nJournal := c.Count("journal", map[string]any{})
 	nOpen := c.Count("open_orders", map[string]any{})
 
 	fmt.Printf("\n=== exchange verification ===\n")
-	fmt.Printf("trades=%d receipts=%d journal_legs=%d open_orders(resting)=%d\n",
-		nTrades, nReceipts, nJournal, nOpen)
+	fmt.Printf("trades=%d journal_docs=%d open_orders(resting)=%d\n",
+		nTrades, nJournal, nOpen)
 
 	// Under ledger TTL a sweep can fire between these counts, so allow a
 	// tiny boundary skew; with no TTL the relation is exact.
@@ -52,8 +51,9 @@ func verify() int {
 		return x
 	}
 	check(nTrades > 0, "trades were executed (traders formed a market)")
-	check(absi(nTrades-nReceipts) <= tol, fmt.Sprintf("trades == receipts (%d ~ %d) — idempotent settlement", nTrades, nReceipts))
-	check(absi(nJournal-4*nTrades) <= 4*tol, fmt.Sprintf("journal_legs == 4 x trades (%d ~ %d)", nJournal, 4*nTrades))
+	// One journal doc (4 legs) per trade — 1:1, since each is written in the
+	// same atomic settlement transaction.
+	check(absi(nJournal-nTrades) <= tol, fmt.Sprintf("journal doc per trade (%d ~ %d) — atomic double-entry", nJournal, nTrades))
 
 	// Distinct trade uids.
 	dcount := c.Aggregate("trades", []any{
@@ -66,11 +66,13 @@ func verify() int {
 	}
 	check(absi(nDistinct-nTrades) <= tol, fmt.Sprintf("trade uids all distinct (%d ~ %d) — no double-settlement", nDistinct, nTrades))
 
-	// USD net per owner from the journal.
+	// USD net per owner from the journal — legs live in an array per doc, so
+	// $unwind them first, then sum by owner.
 	usdNet := map[string]float64{}
 	for _, r := range c.Aggregate("journal", []any{
-		map[string]any{"$match": map[string]any{"acct": "USD"}},
-		map[string]any{"$group": map[string]any{"_id": "$owner", "s": map[string]any{"$sum": "$delta"}}},
+		map[string]any{"$unwind": "$legs"},
+		map[string]any{"$match": map[string]any{"legs.acct": "USD"}},
+		map[string]any{"$group": map[string]any{"_id": "$legs.owner", "s": map[string]any{"$sum": "$legs.delta"}}},
 	}) {
 		usdNet[getS(r, "_id")] = getF(r, "s")
 	}
@@ -78,10 +80,11 @@ func verify() int {
 	type key struct{ o, a string }
 	assetNet := map[key]float64{}
 	for _, r := range c.Aggregate("journal", []any{
-		map[string]any{"$match": map[string]any{"acct": map[string]any{"$ne": "USD"}}},
+		map[string]any{"$unwind": "$legs"},
+		map[string]any{"$match": map[string]any{"legs.acct": map[string]any{"$ne": "USD"}}},
 		map[string]any{"$group": map[string]any{
-			"_id": map[string]any{"o": "$owner", "a": "$acct"},
-			"s":   map[string]any{"$sum": "$delta_asset"}}},
+			"_id": map[string]any{"o": "$legs.owner", "a": "$legs.acct"},
+			"s":   map[string]any{"$sum": "$legs.delta_asset"}}},
 	}) {
 		id, _ := r["_id"].(map[string]any)
 		assetNet[key{getS(id, "o"), getS(id, "a")}] = getF(r, "s")
@@ -119,14 +122,16 @@ func verify() int {
 	_ = usdReproduce
 	_ = assetReproduce
 
-	check(math.Abs(totalUSD-nUsers*startCash) < 1e-2,
-		fmt.Sprintf("total USD conserved (%.2f == %.0f) — no money created/destroyed", totalUSD, nUsers*startCash))
+	wantUSD := float64(nUsers) * startCash
+	check(math.Abs(totalUSD-wantUSD) < 1e-2,
+		fmt.Sprintf("total USD conserved (%.2f == %.0f) — no money created/destroyed", totalUSD, wantUSD))
 
 	symOK := true
+	wantHold := float64(nUsers) * initHolding
 	for _, s := range symbols {
-		if math.Abs(holdingBySym[s]-nUsers*initHolding) > 1e-3 {
+		if math.Abs(holdingBySym[s]-wantHold) > 1e-3 {
 			symOK = false
-			fmt.Printf("      %s total holdings %.4f != %.0f\n", s, holdingBySym[s], nUsers*initHolding)
+			fmt.Printf("      %s total holdings %.4f != %.0f\n", s, holdingBySym[s], wantHold)
 		}
 	}
 	check(symOK, "each symbol's total holdings conserved (closed system: every buy has a sell)")

@@ -11,6 +11,13 @@ DATA="$HERE/.data"
 SECS="${1:-45}"
 PORT=4455
 export OXIDB_PORT="$PORT"
+NUSERS="${NUSERS:-10}"; export NUSERS
+# Throughput knobs. Every write shares one WAL, so an un-paced order flood
+# starves settlement; pacing the order rate and lifting the taker share hands
+# WAL bandwidth back to trades → ~200+ trades/s (vs ~130 un-paced).
+export ORDER_RATE_EACH="${ORDER_RATE_EACH:-70}"   # orders/s per trader (×NUSERS)
+export TAKER_PCT="${TAKER_PCT:-45}"               # % of orders that cross → trade
+: "${ORDER_TTL_SECS:=35}"; export ORDER_TTL_SECS  # resting-order lifetime
 PIDS=()
 
 cleanup() { echo; echo "[run] stopping…"; for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; }
@@ -27,10 +34,14 @@ rm -rf "$DATA"; mkdir -p "$DATA"
 # demo, not a durability test (those are separate). Trades commit far
 # faster; the trade-off is up to SYNC_INTERVAL_MS of loss on a hard crash.
 echo "[run] starting oxidb-server on :$PORT (metrics :14580, lazy-sync)…"
+# Pool size: 12 matcher goroutines + 10 traders + web all hit the server
+# concurrently. The default (4 worker threads) queues them; give it enough
+# threads to actually run the fan-out in parallel.
 OXIDB_DATA="$DATA" OXIDB_ADDR="127.0.0.1:$PORT" OXIDB_HTTP_PORT=14580 \
+  OXIDB_POOL_SIZE="${OXIDB_POOL_SIZE:-16}" \
   OXIDB_LAZY_SYNC=true OXIDB_SYNC_INTERVAL_MS="${SYNC_MS:-200}" \
   "$BIN" > "$HERE/.server.log" 2>&1 &
-PIDS+=($!); sleep 3
+SERVER_PID=$!; PIDS+=($SERVER_PID); sleep 3
 lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || { echo "server failed to bind"; cat "$HERE/.server.log"; exit 1; }
 
 echo "[run] seeding…"; "$HERE/.exchange" setup
@@ -41,15 +52,15 @@ MATCHER_PID=$!; PIDS+=($MATCHER_PID)
 
 WEB_PORT="${WEB_PORT:-8090}"
 echo "[run] starting web dashboard…"
-WEB_PORT="$WEB_PORT" "$HERE/.exchange" web > "$HERE/.web.log" 2>&1 &
+WEB_PORT="$WEB_PORT" SERVER_PID="$SERVER_PID" "$HERE/.exchange" web > "$HERE/.web.log" 2>&1 &
 WEB_PID=$!; PIDS+=($WEB_PID)
 echo "[run]   ┌───────────────────────────────────────────────┐"
 echo "[run]   │  OPEN THE DASHBOARD:  http://localhost:$WEB_PORT      │"
 echo "[run]   └───────────────────────────────────────────────┘"
 
-echo "[run] launching 10 traders for ${SECS}s…"
+echo "[run] launching $NUSERS traders for ${SECS}s…"
 TRADER_PIDS=()
-for u in $(seq 0 9); do
+for u in $(seq 0 $((NUSERS-1))); do
   "$HERE/.exchange" trader "$u" "$SECS" > "$HERE/.trader-$u.log" 2>&1 &
   TRADER_PIDS+=($!); PIDS+=($!)
 done

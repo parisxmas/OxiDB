@@ -25,6 +25,12 @@ func Dial() (*Client, error) {
 	return c, c.connect()
 }
 
+func (c *Client) Close() {
+	if c.conn != nil {
+		c.conn.Close()
+	}
+}
+
 func (c *Client) connect() error {
 	conn, err := net.Dial("tcp", c.addr)
 	if err != nil {

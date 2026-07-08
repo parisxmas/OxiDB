@@ -9,6 +9,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,10 +29,209 @@ func web() {
 		w.Write([]byte(dashboardHTML))
 	})
 	http.HandleFunc("/ws", serveWS)
+	http.HandleFunc("/candles", serveCandles)
+	http.HandleFunc("/allcandles", serveAllCandles)
+	http.HandleFunc("/candles24", serveCandles24)
+	http.HandleFunc("/metrics-json", serveMetricsJSON)
 	fmt.Printf("[web] dashboard on http://localhost:%s  (WS /ws)\n", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		fmt.Println("[web] error:", err)
 	}
+}
+
+// serveCandles returns a symbol's OHLCV history (oldest→newest) as JSON for
+// the candlestick chart. GET /candles?sym=BTC&n=120
+func serveCandles(w http.ResponseWriter, r *http.Request) {
+	sym := r.URL.Query().Get("sym")
+	n := 150
+	if v := r.URL.Query().Get("n"); v != "" {
+		if k, err := strconv.Atoi(v); err == nil && k > 0 {
+			n = k
+		}
+	}
+	db, err := Dial()
+	if err != nil {
+		http.Error(w, "db", 500)
+		return
+	}
+	// Newest n by ts, then reversed to chronological order for plotting.
+	rows, _ := db.Find("candles", map[string]any{"sym": sym}, map[string]any{"ts": -1}, n)
+	out := make([]map[string]any, 0, len(rows))
+	for i := len(rows) - 1; i >= 0; i-- {
+		r := rows[i]
+		out = append(out, map[string]any{
+			"ts": getF(r, "ts"), "o": getF(r, "o"), "h": getF(r, "h"),
+			"l": getF(r, "l"), "c": getF(r, "c"), "v": getF(r, "v"),
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	b, _ := json.Marshal(map[string]any{"sym": sym, "candles": out})
+	w.Write(b)
+}
+
+// serveMetricsJSON scrapes OxiDB's Prometheus endpoint server-side (no CORS
+// for the browser) and returns the counters the dashboard graphs. The client
+// turns the counter deltas into per-second rates. GET /metrics-json
+func serveMetricsJSON(w http.ResponseWriter, r *http.Request) {
+	url := os.Getenv("METRICS_URL")
+	if url == "" {
+		url = "http://127.0.0.1:14580/metrics"
+	}
+	out := map[string]float64{"at": float64(time.Now().UnixMilli())}
+	resp, err := http.Get(url)
+	if err == nil {
+		defer resp.Body.Close()
+		sc := bufio.NewScanner(resp.Body)
+		for sc.Scan() {
+			ln := sc.Text()
+			if strings.HasPrefix(ln, "#") {
+				continue
+			}
+			f := strings.Fields(ln)
+			if len(f) < 2 {
+				continue
+			}
+			v, e := strconv.ParseFloat(f[len(f)-1], 64)
+			if e != nil {
+				continue
+			}
+			name := f[0]
+			switch {
+			case name == "oxidb_tx_commits_total":
+				out["commits"] = v
+			case name == "oxidb_tx_conflicts_total":
+				out["conflicts"] = v
+			case strings.HasPrefix(name, "oxidb_commands_total{"):
+				for _, cls := range []string{"insert", "find", "update", "delete", "tx"} {
+					if strings.Contains(name, "class=\""+cls+"\"") {
+						out[cls] = v
+					}
+				}
+			}
+		}
+	}
+	// OxiDB's own process memory + CPU. Its Prometheus process gauges are
+	// Linux-only, so read them cross-platform via `ps` on the server PID
+	// (passed in by run.sh). RSS in MB, CPU as a percent of one core.
+	if rss, cpu, ok := procStats(); ok {
+		out["rss_mb"] = rss
+		out["cpu_pct"] = cpu
+	}
+	// Trader count = number of users (one USD account each).
+	if db, err := Dial(); err == nil {
+		out["traders"] = float64(db.Count("accounts", map[string]any{"asset": "USD"}))
+		db.Close()
+	}
+	w.Header().Set("Content-Type", "application/json")
+	b, _ := json.Marshal(out)
+	w.Write(b)
+}
+
+func procStats() (float64, float64, bool) {
+	pid := os.Getenv("SERVER_PID")
+	if pid == "" {
+		return 0, 0, false
+	}
+	out, err := exec.Command("ps", "-o", "rss=,%cpu=", "-p", pid).Output()
+	if err != nil {
+		return 0, 0, false
+	}
+	f := strings.Fields(string(out))
+	if len(f) < 2 {
+		return 0, 0, false
+	}
+	rssKB, _ := strconv.ParseFloat(f[0], 64)
+	cpu, _ := strconv.ParseFloat(f[1], 64)
+	return rssKB / 1024.0, cpu, true
+}
+
+// serveCandles24 returns a symbol's candles at a chosen timeframe for the big
+// chart. GET /candles24?sym=BTC&tf=15  (tf = minutes). Sub-5-minute frames are
+// rolled up from the fine 2s series; 5-minute-and-up from the 24h base series,
+// aggregated on the fly into tf-minute buckets. Newest window, chronological.
+func serveCandles24(w http.ResponseWriter, r *http.Request) {
+	sym := r.URL.Query().Get("sym")
+	tf := 15
+	if v := r.URL.Query().Get("tf"); v != "" {
+		if k, err := strconv.Atoi(v); err == nil && k > 0 {
+			tf = k
+		}
+	}
+	db, err := Dial()
+	if err != nil {
+		http.Error(w, "db", 500)
+		return
+	}
+	src := "hcandles" // 5-min base (24h)
+	if tf < 5 {
+		src = "candles" // 2s base (last ~15 min)
+	}
+	// Pull the whole base series (oldest→newest) and bucket by tf minutes.
+	rows, _ := db.Find(src, map[string]any{"sym": sym}, map[string]any{"ts": 1}, 0)
+	bucket := int64(tf) * 60
+	type cndl struct{ ts int64; o, h, l, c, v float64 }
+	var out []cndl
+	for _, r := range rows {
+		ts := int64(getF(r, "ts"))
+		bs := ts - ts%bucket
+		o, h, l, c, v := getF(r, "o"), getF(r, "h"), getF(r, "l"), getF(r, "c"), getF(r, "v")
+		if len(out) > 0 && out[len(out)-1].ts == bs {
+			k := &out[len(out)-1]
+			if h > k.h {
+				k.h = h
+			}
+			if l < k.l {
+				k.l = l
+			}
+			k.c = c
+			k.v += v
+		} else {
+			out = append(out, cndl{bs, o, h, l, c, v})
+		}
+	}
+	const max = 220
+	if len(out) > max {
+		out = out[len(out)-max:]
+	}
+	arr := make([]map[string]any, len(out))
+	for i, k := range out {
+		arr[i] = map[string]any{"ts": k.ts, "o": k.o, "h": k.h, "l": k.l, "c": k.c, "v": k.v}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	b, _ := json.Marshal(map[string]any{"sym": sym, "tf": tf, "candles": arr})
+	w.Write(b)
+}
+
+// serveAllCandles returns recent candles for EVERY symbol in one request,
+// feeding the per-card mini charts without a fetch storm. GET /allcandles?n=40
+func serveAllCandles(w http.ResponseWriter, r *http.Request) {
+	n := 40
+	if v := r.URL.Query().Get("n"); v != "" {
+		if k, err := strconv.Atoi(v); err == nil && k > 0 {
+			n = k
+		}
+	}
+	db, err := Dial()
+	if err != nil {
+		http.Error(w, "db", 500)
+		return
+	}
+	out := map[string][]map[string]any{}
+	for _, s := range symbols {
+		rows, _ := db.Find("candles", map[string]any{"sym": s}, map[string]any{"ts": -1}, n)
+		cs := make([]map[string]any, 0, len(rows))
+		for i := len(rows) - 1; i >= 0; i-- { // chronological
+			r := rows[i]
+			cs = append(cs, map[string]any{
+				"o": getF(r, "o"), "h": getF(r, "h"),
+				"l": getF(r, "l"), "c": getF(r, "c"),
+			})
+		}
+		out[s] = cs
+	}
+	w.Header().Set("Content-Type", "application/json")
+	b, _ := json.Marshal(out)
+	w.Write(b)
 }
 
 func serveWS(w http.ResponseWriter, r *http.Request) {
@@ -72,7 +274,7 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	tick := time.NewTicker(400 * time.Millisecond)
+	tick := time.NewTicker(1000 * time.Millisecond)
 	defer tick.Stop()
 	for {
 		select {
@@ -90,12 +292,38 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// level is one aggregated price level in the order book.
+type level struct {
+	P float64 `json:"p"`
+	Q float64 `json:"q"`
+}
+
+// levels collapses same-price orders (already price-sorted) into at most
+// n depth levels with summed quantity.
+func levels(orders []map[string]any, n int) []level {
+	var out []level
+	for _, o := range orders {
+		p, q := getF(o, "price"), getF(o, "remaining")
+		if len(out) > 0 && out[len(out)-1].P == p {
+			out[len(out)-1].Q += q
+			continue
+		}
+		if len(out) >= n {
+			break
+		}
+		out = append(out, level{p, q})
+	}
+	return out
+}
+
 // snapshot builds the JSON pushed to the browser: for each symbol its
-// current price AND its own most-recent trades, plus the total count.
+// last price, order-book depth (bids/asks), and recent trades.
 func snapshot(db *Client) []byte {
 	type symOut struct {
 		Sym    string           `json:"sym"`
 		Price  float64          `json:"price"`
+		Bids   []level          `json:"bids"` // best (highest) first
+		Asks   []level          `json:"asks"` // best (lowest) first
 		Trades []map[string]any `json:"trades"`
 	}
 	out := struct {
@@ -110,9 +338,26 @@ func snapshot(db *Client) []byte {
 		if row != nil {
 			price = getF(row, "price")
 		}
+		if row != nil {
+			out.Total += int(getF(row, "traded"))
+		}
 		so := symOut{Sym: s, Price: price}
-		// This symbol's last few trades (newest first).
-		recent, _ := db.Find("trades", map[string]any{"sym": s}, map[string]any{"_id": -1}, 6)
+		// The RESTING (maker) book a real venue shows: resting bids sit below
+		// the fair mid, resting asks above it. Fetch around the mid so we get
+		// the depth ladder near the spread — NOT the marketable orders in
+		// flight (taker buys above the mid / taker sells below it), which the
+		// matcher is about to consume. Guarantees best-bid < mid < best-ask.
+		mid := 0.7*price + 0.3*seedPrice[s]
+		bidRaw, _ := db.Find("open_orders",
+			map[string]any{"sym": s, "side": "buy", "price": map[string]any{"$lte": mid}},
+			map[string]any{"price": -1}, 40)
+		askRaw, _ := db.Find("open_orders",
+			map[string]any{"sym": s, "side": "sell", "price": map[string]any{"$gte": mid}},
+			map[string]any{"price": 1}, 40)
+		so.Bids = levels(bidRaw, 6) // best (highest) first
+		so.Asks = levels(askRaw, 6) // best (lowest) first
+		// A couple of most-recent prints.
+		recent, _ := db.Find("trades", map[string]any{"sym": s}, map[string]any{"_id": -1}, 4)
 		for _, t := range recent {
 			so.Trades = append(so.Trades, map[string]any{
 				"price": getF(t, "price"), "qty": getF(t, "qty"),
@@ -121,7 +366,6 @@ func snapshot(db *Client) []byte {
 		}
 		out.Symbols = append(out.Symbols, so)
 	}
-	out.Total = db.Count("trades", map[string]any{})
 	b, _ := json.Marshal(out)
 	return b
 }

@@ -789,6 +789,7 @@ fn log_resp_value(value: &oxidb_server::resp::RespValue) {
         }
         RespValue::Array(items) => eprintln!("[oximem] >> *{} items", items.len()),
         RespValue::Null => eprintln!("[oximem] >> (nil)"),
+        RespValue::NullArray => eprintln!("[oximem] >> (nil array)"),
     }
 }
 
@@ -806,6 +807,9 @@ fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: boo
     if log {
         eprintln!("[oximem] connected peer={peer}");
     }
+
+    // Per-connection MULTI/EXEC/WATCH transaction state.
+    let mut sess = oximem::Session::default();
 
     loop {
         // Read first command (blocking)
@@ -845,7 +849,7 @@ fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: boo
                 let cmd_str: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
                 eprintln!("[oximem] << {}", cmd_str.join(" "));
             }
-            let response = oximem::execute(store, args);
+            let response = oximem::execute_session(store, &mut sess, args);
             if log {
                 log_resp_value(&response);
             }
@@ -862,7 +866,17 @@ fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: boo
                 }
             }
 
-            if !store.sql_enabled() {
+            // A transaction in flight (or a MULTI/EXEC/WATCH in the batch) must
+            // run statefully, command by command; otherwise use the fast
+            // lock-coalesced path.
+            let has_tx = sess.is_active()
+                || batch.iter().any(|c| {
+                    matches!(c, resp::RespValue::Array(items)
+                        if items.first().and_then(|a| a.as_str())
+                            .map(oximem::is_tx_command).unwrap_or(false))
+                });
+
+            if !has_tx && !store.sql_enabled() {
                 // Lock-coalesced pipeline (fast in-memory mode)
                 let responses = oximem::execute_pipeline(store, &batch);
                 for response in &responses {
@@ -871,7 +885,7 @@ fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: boo
                     }
                 }
             } else {
-                // SQL mode — execute one by one
+                // Stateful path (transactions and/or SQL mode) — one by one.
                 for cmd in &batch {
                     let args = match cmd {
                         resp::RespValue::Array(items) => items.as_slice(),
@@ -880,7 +894,7 @@ fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: boo
                             continue;
                         }
                     };
-                    let response = oximem::execute(store, args);
+                    let response = oximem::execute_session(store, &mut sess, args);
                     if resp::write_value(&mut writer, &response).is_err() {
                         return;
                     }

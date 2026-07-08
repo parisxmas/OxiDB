@@ -24,6 +24,9 @@ pub enum RespValue {
     BulkString(Vec<u8>),
     Null,
     Array(Vec<RespValue>),
+    /// RESP2 null array (`*-1`) — what EXEC returns for an aborted
+    /// transaction, distinct from a null bulk string (`$-1`).
+    NullArray,
 }
 
 impl RespValue {
@@ -179,6 +182,9 @@ pub fn write_value<W: Write>(writer: &mut W, value: &RespValue) -> io::Result<()
         }
         RespValue::Null => {
             writer.write_all(b"$-1\r\n")?;
+        }
+        RespValue::NullArray => {
+            writer.write_all(b"*-1\r\n")?;
         }
         RespValue::Array(items) => {
             writer.write_all(b"*")?;

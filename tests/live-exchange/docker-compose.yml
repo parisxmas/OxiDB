@@ -1,0 +1,24 @@
+# Run from the repo root on the server:
+#   docker compose -f tests/live-exchange/docker-compose.yml up -d --build
+# Web is published only on loopback; nginx reverse-proxies the public domain.
+services:
+  oxidb-exchange:
+    build:
+      context: ../..
+      dockerfile: tests/live-exchange/Dockerfile
+    image: oxidb-exchange:latest
+    container_name: oxidb-exchange
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8095:8090"
+    # Ledger/orders/candles are TTL-bounded and ephemeral, so keep the WAL in
+    # RAM — removes disk (overlayfs) write latency, the throughput killer on a
+    # busy shared host.
+    tmpfs:
+      - /data
+    environment:
+      OXIDB_POOL_SIZE: "8"
+      NUSERS: "10"
+      ORDER_RATE_EACH: "55"
+      TAKER_PCT: "62"
+      LEDGER_TTL_SECS: "60"
