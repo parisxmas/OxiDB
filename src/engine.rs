@@ -479,6 +479,17 @@ pub struct OxiDb {
     /// `commit_lock` once a commit's in-memory apply has succeeded, so
     /// ticket order == the order in which writes became visible.
     commit_ticket: AtomicU64,
+    /// Durability poison. Group commit applies a transaction's writes to
+    /// memory in phase 1, before the phase-2 WAL fsync. If that fsync
+    /// FAILS (disk EIO — "fsyncgate"), the commit returns Err, but the
+    /// applied-in-memory state is now untrustworthy: it holds a rejected
+    /// transaction's effects. Persisting it would make a "failed" commit
+    /// durable. So a fsync failure poisons durability: snapshot persists
+    /// and the WAL-truncating final checkpoint are skipped, forcing
+    /// recovery to rebuild from the last durable snapshot + WAL replay of
+    /// only *marked* (acked) transactions — which excludes the rejected
+    /// one. Standard "fsync failure is fatal to in-memory trust" posture.
+    durability_poisoned: AtomicBool,
     /// Next ticket allowed to submit its tx_log commit mark (+condvar).
     /// Marks must reach the tx_log committer in ticket order: commit B
     /// may have read commit A's applied-but-not-yet-durable writes, and
@@ -589,6 +600,7 @@ impl OxiDb {
             commit_lock: RwLock::new(()),
             doc_locks: crate::doc_locks::DocLockManager::default(),
             commit_ticket: AtomicU64::new(0),
+            durability_poisoned: AtomicBool::new(false),
             mark_turn: std::sync::Mutex::new(0),
             mark_cv: std::sync::Condvar::new(),
             open_locks: Mutex::new(HashMap::new()),
@@ -619,6 +631,7 @@ impl OxiDb {
             commit_lock: RwLock::new(()),
             doc_locks: crate::doc_locks::DocLockManager::default(),
             commit_ticket: AtomicU64::new(0),
+            durability_poisoned: AtomicBool::new(false),
             mark_turn: std::sync::Mutex::new(0),
             mark_cv: std::sync::Condvar::new(),
             open_locks: Mutex::new(HashMap::new()),
@@ -767,6 +780,7 @@ impl OxiDb {
             commit_lock: RwLock::new(()),
             doc_locks: crate::doc_locks::DocLockManager::default(),
             commit_ticket: AtomicU64::new(0),
+            durability_poisoned: AtomicBool::new(false),
             mark_turn: std::sync::Mutex::new(0),
             mark_cv: std::sync::Condvar::new(),
             open_locks: Mutex::new(HashMap::new()),
@@ -1119,6 +1133,15 @@ impl OxiDb {
             // Let any straggler commit finish its durability phase before
             // the final persist (see wait_marks_settled).
             self.wait_marks_settled();
+            if self.durability_poisoned.load(Ordering::SeqCst) {
+                // A fsync failed earlier: the in-memory state holds a
+                // rejected transaction. Do NOT persist it and do NOT
+                // truncate any WAL — leave the last durable snapshot and
+                // the full WAL intact so recovery replays only marked
+                // (acked) transactions, dropping the rejected one.
+                self.flush_indexes();
+                return;
+            }
             let cols = self.collections.read();
             let mut all_checkpointed = true;
             for col_arc in cols.values() {
@@ -1188,6 +1211,14 @@ impl OxiDb {
                 loop {
                     match rx.recv_timeout(interval) {
                         Err(mpsc::RecvTimeoutError::Timeout) => {
+                            // A prior fsync failure poisoned durability:
+                            // never persist the untrusted in-memory state
+                            // (it holds a rejected transaction). Let
+                            // recovery rebuild from the durable snapshot +
+                            // marked-WAL replay instead.
+                            if db.durability_poisoned.load(Ordering::SeqCst) {
+                                continue;
+                            }
                             // Snapshot the commit log BEFORE persisting.
                             // Under the commit lock no transaction sits
                             // between its commit point and apply, so every
@@ -2594,7 +2625,15 @@ impl OxiDb {
         #[cfg(target_arch = "wasm32")]
         let _ = my_ticket;
 
-        wal_result?;
+        if let Err(e) = wal_result {
+            // The WAL fsync failed: this transaction's phase-1 in-memory
+            // apply is a rejected write that must never become durable.
+            // Poison durability so no checkpoint persists the untrusted
+            // state; recovery rebuilds from the last durable snapshot +
+            // marked-WAL replay (this tx was never marked). See the field.
+            self.durability_poisoned.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
 
         // c) COMMIT POINT: wait for the tx_log batch fsync that covers our
         // mark. Many commits wait here concurrently on the same batch.

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Durability fix: fsync failure poisons in-memory state (fsyncgate)
+
+- A new fsync-EIO test (`tests/fsync_fault.rs`, via a zero-cost WAL
+  fault seam `oxidb::wal::fault`) surfaced a durability hole in group
+  commit: a transaction applies its writes to memory in phase 1, before
+  the phase-2 WAL fsync. If that fsync failed, the commit correctly
+  returned `Err` — but the already-applied, now-rejected writes leaked
+  into the next checkpoint, so a "failed" transfer became durable after
+  a clean shutdown (money moved despite the API reporting failure).
+- Fix: a WAL fsync failure now **poisons durability** — snapshot
+  persists and the WAL-truncating final checkpoint are skipped, forcing
+  recovery to rebuild from the last durable snapshot + WAL replay of
+  only *marked* (acked) transactions, which excludes the rejected one.
+  Standard "fsync failure is fatal to in-memory trust" posture.
+- Tests pin: a fsync-failed insert/commit returns `Err` (never a false
+  Ok — the fsyncgate property), the rejected write is absent after
+  recovery, acked writes survive, and multi-op transactions are
+  all-or-nothing.
+
 ## v0.34.0
 
 Transaction correctness fix (same-document write composition), group

@@ -1,5 +1,58 @@
 use crate::document::DocumentId;
 
+/// Durability fault injection for tests (fsyncgate-class coverage).
+/// A single relaxed atomic load per fsync when disarmed — negligible,
+/// and OFF by default. Lets a test force the WAL's next fsync to return
+/// EIO so we can prove a commit whose fsync failed is NOT acknowledged.
+pub mod fault {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // 0 = disarmed. N>0 = fail the Nth fsync counted from arming, then
+    // auto-disarm.
+    static FAIL_AT: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Arm: the `n`-th fsync from now returns an injected error, then the
+    /// fault disarms itself. `n == 1` = the very next fsync.
+    pub fn fail_fsync_at(n: u64) {
+        COUNT.store(0, Ordering::SeqCst);
+        FAIL_AT.store(n, Ordering::SeqCst);
+    }
+
+    /// Disarm any pending fault.
+    pub fn disarm() {
+        FAIL_AT.store(0, Ordering::SeqCst);
+    }
+
+    /// Returns true if THIS fsync should fail (and disarms if so).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn should_fail() -> bool {
+        let target = FAIL_AT.load(Ordering::SeqCst);
+        if target == 0 {
+            return false;
+        }
+        let n = COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        if n >= target {
+            FAIL_AT.store(0, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// fsync a WAL file, honoring an armed durability fault (see `fault`).
+#[cfg(not(target_arch = "wasm32"))]
+fn fsync_file(file: &File) -> std::io::Result<()> {
+    if fault::should_fail() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "injected fsync failure (EIO)",
+        ));
+    }
+    file.sync_data()
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 use crate::locks::Mutex;
 #[cfg(not(target_arch = "wasm32"))]
@@ -328,7 +381,7 @@ impl Wal {
         self.ensure_header_locked(&mut file)?;
         file.seek(SeekFrom::End(0))?;
         file.write_all(&rec)?;
-        file.sync_data()?;
+        fsync_file(&file)?;
         self.maybe_seal_locked(&mut file)?;
         Ok(())
     }
@@ -387,7 +440,7 @@ impl Wal {
         file.write_all(&buf)?;
         let seq = self.append_seq.fetch_add(1, Ordering::SeqCst) + 1;
         if sync {
-            file.sync_data()?;
+            fsync_file(&file)?;
             self.synced_seq.fetch_max(seq, Ordering::SeqCst);
         }
         self.maybe_seal_locked(&mut file)?;
@@ -410,7 +463,7 @@ impl Wal {
         file.write_all(&buf)?;
         let seq = self.append_seq.fetch_add(1, Ordering::SeqCst) + 1;
         if sync {
-            file.sync_data()?;
+            fsync_file(&file)?;
             self.synced_seq.fetch_max(seq, Ordering::SeqCst);
         }
         self.maybe_seal_locked(&mut file)?;
@@ -449,7 +502,7 @@ impl Wal {
     pub fn sync(&self) -> Result<()> {
         let seq = self.append_seq.load(Ordering::SeqCst);
         let file = self.inner.lock();
-        file.sync_data()?;
+        fsync_file(&file)?;
         self.synced_seq.fetch_max(seq, Ordering::SeqCst);
         Ok(())
     }
@@ -478,7 +531,7 @@ impl Wal {
             let file = self.inner.lock();
             (file.try_clone()?, self.append_seq.load(Ordering::SeqCst))
         };
-        dup.sync_data()?;
+        fsync_file(&dup)?;
         self.synced_seq.fetch_max(covered, Ordering::SeqCst);
         Ok(())
     }
@@ -487,7 +540,7 @@ impl Wal {
     pub fn checkpoint(&self) -> Result<()> {
         let file = self.inner.lock();
         file.set_len(0)?;
-        file.sync_data()?;
+        fsync_file(&file)?;
         // Truncation discards every pending append — nothing left to sync.
         self.synced_seq
             .fetch_max(self.append_seq.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -724,7 +777,7 @@ impl Wal {
     /// are recoverable; no acknowledged write is lost.
     fn seal_locked(&self, file: &mut File) -> Result<()> {
         // Flush any not-yet-synced writes into the segment being sealed.
-        file.sync_data()?;
+        fsync_file(&file)?;
         let seq = self.next_seal_seq.fetch_add(1, Ordering::SeqCst);
         let sealed_path = Self::sealed_segment_path(&self.path, seq);
         fs::rename(&self.path, &sealed_path)?;
@@ -956,7 +1009,7 @@ impl Wal {
         }
         file.seek(SeekFrom::End(0))?;
         file.write_all(&buf)?;
-        file.sync_data()?;
+        fsync_file(&file)?;
         Ok(())
     }
 
