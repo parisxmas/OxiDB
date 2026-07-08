@@ -48,8 +48,13 @@ def on_trade(venue, raw_sym, price, qty):
         _db.call({"cmd": "update", "collection": "prices",
                   "query": {"sym": sym},
                   "update": {"$set": {"price": price, "venue": venue, "ts": time.time()}}})
-        _db.insert("ticks", {"sym": sym, "venue": venue, "price": price,
-                             "qty": qty, "ts": time.time()})
+        # `created_at` is an ISO 8601 string so OxiDB stores it as a
+        # DateTime — required for the TTL index on `ticks` to recognize
+        # and expire old market-data rows (a numeric epoch would be typed
+        # Num and the TTL sweep, which scans the DateTime range, skips it).
+        _db.insert("ticks", {"sym": sym, "venue": venue, "price": price, "qty": qty,
+                             "ts": time.time(),
+                             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
         _stats["ticks"] += 1
         if _stats["ticks"] % 200 == 0:
             print(f"[feeder] {_stats['ticks']} ticks written "

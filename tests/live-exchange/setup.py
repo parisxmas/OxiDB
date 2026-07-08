@@ -27,4 +27,13 @@ db.create_index("trades", "uid")
 db.create_index("orders", "owner")
 db.create_index("journal", "uid")
 
-print(f"seeded {len(SYMBOLS)} symbols, {N_USERS} users @ {START_CASH} USD, indexes ready")
+# Market data is pure noise once it's a few minutes old — expire ticks so
+# the collection (and its resident index/cache footprint) stays bounded.
+# The ledger (trades/journal/receipts) is the permanent record and is NOT
+# expired; it needs archival, not TTL.
+TICK_TTL_SECS = int(__import__("os").environ.get("TICK_TTL_SECS", "60"))
+db.call({"cmd": "create_ttl_index", "collection": "ticks",
+         "field": "created_at", "expireAfterSeconds": TICK_TTL_SECS})
+
+print(f"seeded {len(SYMBOLS)} symbols, {N_USERS} users @ {START_CASH} USD, "
+      f"indexes ready; ticks TTL = {TICK_TTL_SECS}s")
