@@ -90,18 +90,18 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// snapshot builds the JSON pushed to the browser: current prices + the
-// most recent trades + the total trade count.
+// snapshot builds the JSON pushed to the browser: for each symbol its
+// current price AND its own most-recent trades, plus the total count.
 func snapshot(db *Client) []byte {
 	type symOut struct {
-		Sym   string  `json:"sym"`
-		Price float64 `json:"price"`
+		Sym    string           `json:"sym"`
+		Price  float64          `json:"price"`
+		Trades []map[string]any `json:"trades"`
 	}
 	out := struct {
-		Symbols []symOut         `json:"symbols"`
-		Trades  []map[string]any `json:"trades"`
-		Total   int              `json:"total"`
-		At      int64            `json:"at"`
+		Symbols []symOut `json:"symbols"`
+		Total   int      `json:"total"`
+		At      int64    `json:"at"`
 	}{At: time.Now().UnixMilli()}
 
 	for _, s := range symbols {
@@ -110,14 +110,16 @@ func snapshot(db *Client) []byte {
 		if row != nil {
 			price = getF(row, "price")
 		}
-		out.Symbols = append(out.Symbols, symOut{s, price})
-	}
-	recent, _ := db.Find("trades", map[string]any{}, map[string]any{"_id": -1}, 12)
-	for _, t := range recent {
-		out.Trades = append(out.Trades, map[string]any{
-			"sym": getS(t, "sym"), "price": getF(t, "price"),
-			"qty": getF(t, "qty"), "buyer": getS(t, "buyer"), "seller": getS(t, "seller"),
-		})
+		so := symOut{Sym: s, Price: price}
+		// This symbol's last few trades (newest first).
+		recent, _ := db.Find("trades", map[string]any{"sym": s}, map[string]any{"_id": -1}, 6)
+		for _, t := range recent {
+			so.Trades = append(so.Trades, map[string]any{
+				"price": getF(t, "price"), "qty": getF(t, "qty"),
+				"buyer": getS(t, "buyer"), "seller": getS(t, "seller"),
+			})
+		}
+		out.Symbols = append(out.Symbols, so)
 	}
 	out.Total = db.Count("trades", map[string]any{})
 	b, _ := json.Marshal(out)

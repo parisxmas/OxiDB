@@ -102,6 +102,7 @@ func setup() {
 
 	c.CreateUniqueIndex("receipts", "uid")
 	c.CreateIndex("trades", "uid")
+	c.CreateIndex("trades", "sym") // per-symbol recent-trade lookups for the dashboard
 	c.CreateIndex("journal", "uid")
 
 	fmt.Printf("seeded %d symbols, %d users (cash %.0f + %.0f/symbol), order TTL=%ds\n",
