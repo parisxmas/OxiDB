@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Observability: Prometheus `/metrics` endpoint
+
+- `GET /metrics` on the REST listener (`OXIDB_HTTP_PORT`) serves the
+  Prometheus text exposition (format 0.0.4), zero new dependencies.
+  Deliberately unauthenticated (standard scraper practice) — bind the
+  HTTP port privately if the API is private.
+- **Counters** (lock-free atomics on the hot paths):
+  `oxidb_commands_total{class=insert|find|update|delete|count|aggregate|sql|tx|blob|other}`
+  (every wire command, counted at the session-handler chokepoint — both
+  sync and cluster TCP paths), `oxidb_errors_total` (every error
+  response built by the server), `oxidb_http_requests_total`,
+  `oxidb_tx_commits_total` / `oxidb_tx_conflicts_total` (OCC conflicts
+  distinguished — the hot-account saturation signal).
+- **Gauges** (computed per scrape): `oxidb_up`, `oxidb_uptime_seconds`,
+  `oxidb_process_resident_memory_bytes` / `_cpu_percent` / `_threads`
+  (via the existing `/proc/self` reader; zeros on non-Linux),
+  `oxidb_collections`, `oxidb_documents{collection}` (index-backed
+  count) and `oxidb_documents_total` — default database.
+- PROC_STATS is now anchored at process start, so uptime measures the
+  server, not "since first scrape".
 ### Time-series: range/time windows, `$densify`, `$fill`
 
 - **`$setWindowFields` range windows** — in addition to document frames,

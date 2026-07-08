@@ -8,6 +8,7 @@
 //! | Method | Path | Description |
 //! |--------|------|-------------|
 //! | GET    | /api/ping | Health check |
+//! | GET    | /metrics | Prometheus exposition (text format 0.0.4, public) |
 //! | GET    | /api/collections | List collections |
 //! | POST   | /api/collections | Create collection |
 //! | DELETE | /api/collections/{name} | Drop collection |
@@ -174,6 +175,9 @@ fn handle_connection(mut stream: TcpStream, state: &RestState) {
 // ---------------------------------------------------------------------------
 
 fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
+    crate::metrics::METRICS
+        .http_requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = req.path.trim_end_matches('/');
     let raw_segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -250,6 +254,21 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
                 }
             }),
         ));
+    }
+
+    // ── Prometheus exposition (always public — standard practice for
+    // scrapers; bind OXIDB_HTTP_PORT privately if the API is private).
+    // Serves the DEFAULT database's gauges regardless of `?db=`.
+    if (req.method.as_str(), segments.as_slice()) == ("GET", &["metrics"][..]) {
+        let body = crate::metrics::render_prometheus(&state.db);
+        return HttpResponse {
+            status: 200,
+            status_text: "OK",
+            content_type: "text/plain; version=0.0.4; charset=utf-8".to_string(),
+            headers: Vec::new(),
+            body: body.into_bytes(),
+            content_length_override: None,
+        };
     }
 
     // ── Auth endpoints (always public) ──────────────────────────────────

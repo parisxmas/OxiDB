@@ -21,6 +21,7 @@ pub mod tls;
 pub mod udp_ingest;
 
 pub mod jwt;
+pub mod metrics;
 pub mod proc_stats;
 pub mod rest;
 pub mod rules;

@@ -35,6 +35,7 @@ pub fn ok_bytes(data: Value) -> Vec<u8> {
 }
 
 pub fn err_bytes(msg: &str) -> Vec<u8> {
+    crate::metrics::METRICS.record_error();
     match protocol::wire_format() {
         WireFormat::Json => serde_json::to_vec(&json!({ "ok": false, "error": msg })).unwrap(),
         WireFormat::MsgPack => {
@@ -146,6 +147,7 @@ pub fn handle_request_session(
         Some(c) => c,
         None => return err_bytes("missing or invalid 'cmd' field"),
     };
+    crate::metrics::METRICS.record_command(&cmd);
 
     let collection: Option<String> = request
         .get("collection")
@@ -239,8 +241,20 @@ pub fn handle_request_session(
 
         "commit_tx" => match active_tx.take() {
             Some(tx_id) => match db.commit_transaction(tx_id) {
-                Ok(()) => ok_bytes(json!("committed")),
-                Err(e) => err_bytes(&e.to_string()),
+                Ok(()) => {
+                    crate::metrics::METRICS
+                        .tx_commits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ok_bytes(json!("committed"))
+                }
+                Err(e) => {
+                    if matches!(e, oxidb::Error::TransactionConflict { .. }) {
+                        crate::metrics::METRICS
+                            .tx_conflicts
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    err_bytes(&e.to_string())
+                }
             },
             None => err_bytes("no active transaction"),
         },

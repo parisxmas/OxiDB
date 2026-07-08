@@ -1020,6 +1020,10 @@ fn handle_oximem_subscribe(
 }
 
 fn main() {
+    // Anchor the process-stats clock at startup — PROC_STATS is lazy, and
+    // without this the /metrics uptime would measure "since first scrape".
+    std::sync::LazyLock::force(&oxidb_server::proc_stats::PROC_STATS);
+
     // If OXIDB_NODE_ID is set and cluster feature is enabled, run in cluster mode.
     #[cfg(feature = "cluster")]
     if env::var("OXIDB_NODE_ID").is_ok() {
