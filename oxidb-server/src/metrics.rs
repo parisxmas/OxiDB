@@ -52,6 +52,12 @@ pub struct Metrics {
 
     /// Wire operations that exceeded OXIDB_SLOW_QUERY_MS (see profiler.rs).
     pub slow_queries: AtomicU64,
+
+    // OxiMem (RESP) commands by class.
+    pub oximem_reads: AtomicU64,
+    pub oximem_writes: AtomicU64,
+    pub oximem_tx: AtomicU64,
+    pub oximem_other: AtomicU64,
 }
 
 impl Metrics {
@@ -77,6 +83,28 @@ impl Metrics {
 
     pub fn record_error(&self) {
         self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Classify and count one OxiMem RESP command.
+    pub fn record_oximem(&self, cmd: &str) {
+        let counter = match cmd {
+            "GET" | "MGET" | "GETRANGE" | "STRLEN" | "EXISTS" | "TTL" | "PTTL" | "TYPE"
+            | "KEYS" | "SCAN" | "HGET" | "HMGET" | "HGETALL" | "HKEYS" | "HVALS" | "HLEN"
+            | "HEXISTS" | "HRANDFIELD" | "LRANGE" | "LLEN" | "LINDEX" | "SMEMBERS"
+            | "SISMEMBER" | "SCARD" | "SINTER" | "SUNION" | "SDIFF" | "ZRANGE" | "ZREVRANGE"
+            | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "ZSCORE" | "ZCARD"
+            | "ZCOUNT" | "ZRANK" | "ZREVRANK" | "RANDOMKEY" | "DBSIZE" => &self.oximem_reads,
+            "MULTI" | "EXEC" | "DISCARD" | "WATCH" | "UNWATCH" => &self.oximem_tx,
+            "SET" | "SETNX" | "SETEX" | "PSETEX" | "MSET" | "GETSET" | "GETDEL" | "SETRANGE"
+            | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "DEL"
+            | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST" | "RENAME"
+            | "COPY" | "HSET" | "HMSET" | "HSETNX" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH"
+            | "LPOP" | "RPOP" | "BLPOP" | "BRPOP" | "SADD" | "SREM" | "SINTERSTORE"
+            | "SUNIONSTORE" | "SDIFFSTORE" | "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN"
+            | "ZPOPMAX" | "BZPOPMIN" | "FLUSHALL" | "FLUSHDB" => &self.oximem_writes,
+            _ => &self.oximem_other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -185,6 +213,20 @@ pub fn render_prometheus(db: &Arc<OxiDb>) -> String {
         "Wire operations slower than OXIDB_SLOW_QUERY_MS (0 when profiler off).",
         m.slow_queries.load(Ordering::Relaxed),
     );
+
+    // ── OxiMem (RESP) commands by class ──
+    out.push_str(
+        "# HELP oximem_commands_total OxiMem RESP commands processed, by class.\n\
+         # TYPE oximem_commands_total counter\n",
+    );
+    for (class, v) in [
+        ("read", m.oximem_reads.load(Ordering::Relaxed)),
+        ("write", m.oximem_writes.load(Ordering::Relaxed)),
+        ("tx", m.oximem_tx.load(Ordering::Relaxed)),
+        ("other", m.oximem_other.load(Ordering::Relaxed)),
+    ] {
+        out.push_str(&format!("oximem_commands_total{{class=\"{class}\"}} {v}\n"));
+    }
 
     // ── Engine gauges (scrape-time) ──
     let collections = db.list_collections();

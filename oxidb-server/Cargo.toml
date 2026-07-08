@@ -1,6 +1,6 @@
 [package]
 name = "oxidb-server"
-version = "0.34.2"
+version = "0.34.3"
 edition = "2024"
 description = "TCP server for OxiDB document database"
 license-file = "../LICENSE"
@@ -28,6 +28,7 @@ webpki-roots = "0.26"
 argon2 = "0.5"
 sha1 = "0.10"
 sha2 = "0.10"
+mlua = { version = "0.10", features = ["lua54", "vendored"] }  # OxiMem EVAL scripting
 md-5 = "0.10"
 hmac = "0.12"
 rand = "0.9"

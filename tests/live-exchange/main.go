@@ -81,6 +81,9 @@ func main() {
 		web()
 	case "verify":
 		os.Exit(verify())
+	case "hybrid":
+		secs, _ := strconv.Atoi(os.Args[2])
+		hybrid(secs)
 	default:
 		fmt.Println("unknown mode:", os.Args[1])
 		os.Exit(2)

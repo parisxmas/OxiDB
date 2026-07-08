@@ -8,7 +8,7 @@
 //! via SQL: `SELECT * FROM _kv WHERE _key LIKE 'session:%'`
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -175,6 +175,14 @@ pub struct OxiMemStore {
     versions: RwLock<HashMap<String, u64>>,
     /// Bumped by FLUSHALL/FLUSHDB — invalidates every outstanding WATCH.
     epoch: AtomicU64,
+    /// Sessions currently holding WATCHes — lets `bump_version` garbage-
+    /// collect the versions map when nobody is watching.
+    active_watches: AtomicUsize,
+    /// Keyspace notifications (`__keyspace@0__:<key>` / `__keyevent@0__:<cmd>`)
+    /// — off by default, toggled via `CONFIG SET notify-keyspace-events`.
+    notify: AtomicBool,
+    /// SCRIPT LOAD cache: sha1-hex → Lua source (for EVALSHA).
+    scripts: RwLock<HashMap<String, String>>,
     /// Optional OxiDB reference for SQL-queryable mirroring.
     db: Option<Arc<OxiDb>>,
 }
@@ -192,12 +200,23 @@ impl OxiMemStore {
             tx_lock: Mutex::new(()),
             versions: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(0),
+            active_watches: AtomicUsize::new(0),
+            notify: AtomicBool::new(false),
+            scripts: RwLock::new(HashMap::new()),
             db: None,
         }
     }
 
-    /// SQL mode — data mirrored to OxiDB collections for SQL queries.
+    /// SQL mode — data mirrored to OxiDB collections for SQL queries, and
+    /// loaded BACK from them on construction, so a restart repopulates the
+    /// in-memory state from the durable mirror (rebuild-on-boot).
     pub fn new_with_sql(db: Arc<OxiDb>) -> Self {
+        let store = Self::new_with_sql_inner(db);
+        store.load_from_mirror();
+        store
+    }
+
+    fn new_with_sql_inner(db: Arc<OxiDb>) -> Self {
         Self {
             strings: RwLock::new(HashMap::new()),
             hashes: RwLock::new(HashMap::new()),
@@ -208,6 +227,9 @@ impl OxiMemStore {
             tx_lock: Mutex::new(()),
             versions: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(0),
+            active_watches: AtomicUsize::new(0),
+            notify: AtomicBool::new(false),
+            scripts: RwLock::new(HashMap::new()),
             db: Some(db),
         }
     }
@@ -252,10 +274,105 @@ impl OxiMemStore {
         self.db.is_some()
     }
 
-    /// Record a mutation on `key` (for WATCH change detection).
+    /// Record a mutation on `key` (for WATCH change detection). When the map
+    /// grows large and NO session holds a WATCH, it is safe to clear it (a
+    /// future WATCH re-snapshots from scratch) — bounds memory on long runs.
     fn bump_version(&self, key: &str) {
         let mut v = self.versions.write().unwrap();
+        if v.len() > 100_000 && self.active_watches.load(Ordering::SeqCst) == 0 {
+            v.clear();
+            self.epoch.fetch_add(1, Ordering::SeqCst); // belt & suspenders
+        }
         *v.entry(key.to_string()).or_insert(0) += 1;
+    }
+
+    /// Repopulate in-memory state from the SQL-mirror collections.
+    fn load_from_mirror(&self) {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return,
+        };
+        let all = json!({});
+        if let Ok(rows) = db.find("_kv", &all) {
+            let mut s = self.strings.write().unwrap();
+            for r in rows {
+                if let (Some(k), Some(v)) = (r["_key"].as_str(), r["_value"].as_str()) {
+                    s.insert(k.to_string(), KvEntry::new(v.to_string()));
+                }
+            }
+        }
+        if let Ok(rows) = db.find("_hash", &all) {
+            let mut h = self.hashes.write().unwrap();
+            for r in rows {
+                if let (Some(k), Some(obj)) = (r["_key"].as_str(), r.as_object()) {
+                    // Fields are mirrored flat on the doc; skip internal keys.
+                    let m: HashMap<String, String> = obj
+                        .iter()
+                        .filter(|(f, _)| !f.starts_with('_'))
+                        .filter_map(|(f, v)| v.as_str().map(|s| (f.clone(), s.to_string())))
+                        .collect();
+                    h.insert(k.to_string(), m);
+                }
+            }
+        }
+        if let Ok(rows) = db.find("_list", &all) {
+            let mut l = self.lists.write().unwrap();
+            for r in rows {
+                if let (Some(k), Some(items)) = (r["_key"].as_str(), r["_items"].as_array()) {
+                    let v: VecDeque<String> = items
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect();
+                    l.insert(k.to_string(), v);
+                }
+            }
+        }
+        if let Ok(rows) = db.find("_set", &all) {
+            let mut st = self.sets.write().unwrap();
+            for r in rows {
+                if let (Some(k), Some(items)) = (r["_key"].as_str(), r["_members"].as_array()) {
+                    let m: HashSet<String> = items
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect();
+                    st.insert(k.to_string(), m);
+                }
+            }
+        }
+        if let Ok(rows) = db.find("_zset", &all) {
+            let mut z = self.sorted_sets.write().unwrap();
+            for r in rows {
+                if let (Some(k), Some(items)) = (r["_key"].as_str(), r["_members"].as_array()) {
+                    let ss = z.entry(k.to_string()).or_insert_with(SortedSet::new);
+                    for it in items {
+                        if let (Some(m), Some(sc)) = (it["member"].as_str(), it["score"].as_f64())
+                        {
+                            ss.insert(m.to_string(), sc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// All live keys across every type map (strings filtered by expiry).
+    fn all_live_keys(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        {
+            let s = self.strings.read().unwrap();
+            out.extend(
+                s.iter()
+                    .filter(|(_, e)| !e.is_expired())
+                    .map(|(k, _)| k.clone()),
+            );
+        }
+        out.extend(self.hashes.read().unwrap().keys().cloned());
+        out.extend(self.lists.read().unwrap().keys().cloned());
+        out.extend(self.sets.read().unwrap().keys().cloned());
+        out.extend(self.sorted_sets.read().unwrap().keys().cloned());
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Record a whole-store mutation (FLUSHALL/FLUSHDB).
@@ -310,6 +427,12 @@ pub fn execute_pipeline(store: &OxiMemStore, commands: &[RespValue]) -> Vec<Resp
             None
         })
         .collect();
+
+    for p in parsed.iter().flatten() {
+        if let Some(c) = p.first().and_then(|a| a.as_str()) {
+            crate::metrics::METRICS.record_oximem(&c.to_uppercase());
+        }
+    }
 
     // Check if all commands are the same type
     let first_cmd = parsed
@@ -528,11 +651,17 @@ impl Session {
     pub fn is_active(&self) -> bool {
         self.in_multi || !self.watched.is_empty()
     }
-    fn reset(&mut self) {
+    fn clear_watches(&mut self, store: &OxiMemStore) {
+        if !self.watched.is_empty() {
+            store.active_watches.fetch_sub(1, Ordering::SeqCst);
+            self.watched.clear();
+        }
+    }
+    fn reset(&mut self, store: &OxiMemStore) {
         self.in_multi = false;
         self.aborted = false;
         self.queued.clear();
-        self.watched.clear();
+        self.clear_watches(store);
     }
 }
 
@@ -562,7 +691,10 @@ fn is_known_command(name: &str) -> bool {
             | "LLEN" | "LRANGE" | "LINDEX" | "SADD" | "SREM" | "SMEMBERS" | "SISMEMBER"
             | "SCARD" | "ZADD" | "ZREM" | "ZSCORE" | "ZCARD" | "ZCOUNT" | "ZINCRBY"
             | "ZRANK" | "ZREVRANK" | "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE"
-            | "ZREVRANGEBYSCORE" | "ZPOPMIN" | "ZPOPMAX" | "PUBLISH"
+            | "ZREVRANGEBYSCORE" | "ZPOPMIN" | "ZPOPMAX" | "PUBLISH" | "HELLO"
+            | "GETDEL" | "SETRANGE" | "PEXPIREAT" | "COPY" | "SINTER" | "SUNION"
+            | "SDIFF" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "HRANDFIELD"
+            | "ZRANGEBYLEX" | "BLPOP" | "BRPOP" | "BZPOPMIN" | "EVAL" | "EVALSHA" | "SCRIPT"
     )
 }
 
@@ -597,6 +729,7 @@ pub fn execute_session(store: &OxiMemStore, sess: &mut Session, args: &[RespValu
         Some(s) => s.to_uppercase(),
         None => return resp::err("invalid command"),
     };
+    crate::metrics::METRICS.record_oximem(&cmd);
     match cmd.as_str() {
         "MULTI" => {
             if sess.in_multi {
@@ -611,11 +744,11 @@ pub fn execute_session(store: &OxiMemStore, sess: &mut Session, args: &[RespValu
             if !sess.in_multi {
                 return resp::err("DISCARD without MULTI");
             }
-            sess.reset();
+            sess.reset(store);
             resp::ok()
         }
         "UNWATCH" => {
-            sess.watched.clear();
+            sess.clear_watches(store);
             resp::ok()
         }
         "WATCH" => {
@@ -624,6 +757,9 @@ pub fn execute_session(store: &OxiMemStore, sess: &mut Session, args: &[RespValu
             }
             if args.len() < 2 {
                 return resp::err("wrong number of arguments for 'watch' command");
+            }
+            if sess.watched.is_empty() {
+                store.active_watches.fetch_add(1, Ordering::SeqCst);
             }
             for a in &args[1..] {
                 if let Some(k) = a.as_str() {
@@ -638,7 +774,7 @@ pub fn execute_session(store: &OxiMemStore, sess: &mut Session, args: &[RespValu
                 return resp::err("EXEC without MULTI");
             }
             if sess.aborted {
-                sess.reset();
+                sess.reset(store);
                 return resp::err(
                     "EXECABORT Transaction discarded because of previous errors.",
                 );
@@ -646,16 +782,28 @@ pub fn execute_session(store: &OxiMemStore, sess: &mut Session, args: &[RespValu
             let _guard = store.tx_lock.lock().unwrap();
             for (key, snap) in &sess.watched {
                 if &snapshot_key(store, key) != snap {
-                    sess.reset();
+                    sess.reset(store);
                     return RespValue::NullArray; // a WATCHed key changed — abort
                 }
             }
             let queued = std::mem::take(&mut sess.queued);
             let mut out = Vec::with_capacity(queued.len());
             for qcmd in &queued {
+                // Blocking commands never block inside a transaction (Redis
+                // semantics) — they'd stall every EXEC via tx_lock. Rewrite
+                // their timeout to "poll once".
+                if let Some(name) = qcmd.first().and_then(|a| a.as_str()) {
+                    if matches!(name.to_uppercase().as_str(), "BLPOP" | "BRPOP" | "BZPOPMIN") {
+                        let mut nb = qcmd.clone();
+                        let last = nb.len() - 1;
+                        nb[last] = resp::bulk_string("-1"); // sentinel: single poll
+                        out.push(execute(store, &nb));
+                        continue;
+                    }
+                }
                 out.push(execute(store, qcmd));
             }
-            sess.reset();
+            sess.reset(store);
             RespValue::Array(out)
         }
         _ => {
@@ -666,6 +814,13 @@ pub fn execute_session(store: &OxiMemStore, sess: &mut Session, args: &[RespValu
                 if !is_known_command(&cmd) {
                     sess.aborted = true;
                     return resp::err(&format!("unknown command '{cmd}'"));
+                }
+                if args.len() < min_args(&cmd) {
+                    sess.aborted = true;
+                    return resp::err(&format!(
+                        "wrong number of arguments for '{}' command",
+                        cmd.to_lowercase()
+                    ));
                 }
                 sess.queued.push(args.to_vec());
                 RespValue::SimpleString("QUEUED".to_string())
@@ -685,12 +840,36 @@ fn write_key_indices(cmd: &str, argc: usize) -> Option<Vec<usize>> {
         | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
         | "PERSIST" | "HSET" | "HMSET" | "HSETNX" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH"
         | "LPOP" | "RPOP" | "SADD" | "SREM" | "ZADD" | "ZINCRBY" | "ZREM" | "ZPOPMIN"
-        | "ZPOPMAX" => Some(vec![1]),
+        | "ZPOPMAX" | "GETDEL" | "SETRANGE" | "PEXPIREAT" | "SINTERSTORE" | "SUNIONSTORE"
+        | "SDIFFSTORE" => Some(vec![1]),
         "DEL" => Some((1..argc).collect()),
         "RENAME" => Some(vec![1, 2]),
+        "COPY" => Some(vec![2]),
         "MSET" => Some((1..argc).step_by(2).collect()),
+        // Blocking pops may consume from any of their keys (last arg = timeout).
+        "BLPOP" | "BRPOP" | "BZPOPMIN" => Some((1..argc.saturating_sub(1)).collect()),
         "FLUSHALL" | "FLUSHDB" => None, // whole-store: bump the epoch
         _ => Some(vec![]),
+    }
+}
+
+/// Minimum argc (command name included) for queue-time arity validation.
+fn min_args(cmd: &str) -> usize {
+    match cmd {
+        "GET" | "DEL" | "EXISTS" | "TTL" | "PTTL" | "TYPE" | "STRLEN" | "INCR" | "DECR"
+        | "PERSIST" | "GETDEL" | "HGETALL" | "HKEYS" | "HVALS" | "HLEN" | "LLEN" | "LPOP"
+        | "RPOP" | "SMEMBERS" | "SCARD" | "ZCARD" | "SINTER" | "SUNION" | "SDIFF"
+        | "HRANDFIELD" => 2,
+        "SET" | "GETSET" | "SETNX" | "APPEND" | "INCRBY" | "DECRBY" | "INCRBYFLOAT"
+        | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "RENAME" | "HGET" | "HDEL"
+        | "HEXISTS" | "LPUSH" | "RPUSH" | "LINDEX" | "SADD" | "SREM" | "SISMEMBER"
+        | "ZREM" | "ZSCORE" | "ZRANK" | "ZREVRANK" | "PUBLISH" | "MSET" | "MGET"
+        | "COPY" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "BLPOP" | "BRPOP"
+        | "BZPOPMIN" => 3,
+        "SETEX" | "PSETEX" | "SETRANGE" | "HSET" | "HMSET" | "HSETNX" | "HINCRBY"
+        | "LRANGE" | "ZADD" | "ZINCRBY" | "ZCOUNT" | "ZRANGE" | "ZREVRANGE"
+        | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "HMGET" => 4,
+        _ => 1,
     }
 }
 
@@ -719,8 +898,57 @@ pub fn execute(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     // change would break the optimistic lock).
     if !matches!(result, RespValue::Error(_)) {
         bump_write_versions(store, args);
+        if store.notify.load(Ordering::Relaxed) {
+            emit_keyspace_events(store, args);
+        }
+        // Sorted sets are mirrored centrally (their write commands predate the
+        // mirror layer): re-snapshot the touched zset after any zset write.
+        if store.sql_enabled() {
+            if let Some(cmd) = args.first().and_then(|a| a.as_str()) {
+                if matches!(
+                    cmd.to_uppercase().as_str(),
+                    "ZADD" | "ZREM" | "ZINCRBY" | "ZPOPMIN" | "ZPOPMAX" | "BZPOPMIN"
+                ) {
+                    if let Some(key) = args.get(1).and_then(|a| a.as_str()) {
+                        let pairs: Vec<(String, f64)> = store
+                            .sorted_sets
+                            .read()
+                            .unwrap()
+                            .get(key)
+                            .map(|ss| ss.scores.iter().map(|(m, &s)| (m.clone(), s)).collect())
+                            .unwrap_or_default();
+                        if pairs.is_empty() {
+                            mirror_zset_del(store, key);
+                        } else {
+                            mirror_zset_save(store, key, &pairs);
+                        }
+                    }
+                }
+            }
+        }
     }
     result
+}
+
+/// Keyspace notifications over the existing pub/sub: for every key a write
+/// command touched, publish `__keyspace@0__:<key>` (payload = event) and
+/// `__keyevent@0__:<event>` (payload = key). Event name = lowercased command.
+fn emit_keyspace_events(store: &OxiMemStore, args: &[RespValue]) {
+    let cmd = match args.first().and_then(|a| a.as_str()) {
+        Some(s) => s.to_uppercase(),
+        None => return,
+    };
+    let idxs = match write_key_indices(&cmd, args.len()) {
+        Some(v) if !v.is_empty() => v,
+        _ => return,
+    };
+    let event = cmd.to_lowercase();
+    for i in idxs {
+        if let Some(key) = args.get(i).and_then(|a| a.as_str()) {
+            store.publish(&format!("__keyspace@0__:{key}"), &event);
+            store.publish(&format!("__keyevent@0__:{event}"), key);
+        }
+    }
 }
 
 fn execute_cmd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
@@ -757,6 +985,25 @@ fn execute_cmd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         "COMMAND" => resp::ok(),
         "CLIENT" => resp::ok(),
         "AUTH" => resp::ok(),
+        "HELLO" => cmd_hello(&args[1..]),
+        "GETDEL" => cmd_getdel(store, &args[1..]),
+        "SETRANGE" => cmd_setrange(store, &args[1..]),
+        "PEXPIREAT" => cmd_pexpireat(store, &args[1..]),
+        "COPY" => cmd_copy(store, &args[1..]),
+        "SINTER" => cmd_setop(store, &args[1..], SetOp::Inter, false),
+        "SUNION" => cmd_setop(store, &args[1..], SetOp::Union, false),
+        "SDIFF" => cmd_setop(store, &args[1..], SetOp::Diff, false),
+        "SINTERSTORE" => cmd_setop(store, &args[1..], SetOp::Inter, true),
+        "SUNIONSTORE" => cmd_setop(store, &args[1..], SetOp::Union, true),
+        "SDIFFSTORE" => cmd_setop(store, &args[1..], SetOp::Diff, true),
+        "HRANDFIELD" => cmd_hrandfield(store, &args[1..]),
+        "ZRANGEBYLEX" => cmd_zrangebylex(store, &args[1..]),
+        "BLPOP" => cmd_bpop(store, &args[1..], PopSide::Left),
+        "BRPOP" => cmd_bpop(store, &args[1..], PopSide::Right),
+        "BZPOPMIN" => cmd_bpop(store, &args[1..], PopSide::ZMin),
+        "EVAL" => cmd_eval(store, &args[1..], false),
+        "EVALSHA" => cmd_eval(store, &args[1..], true),
+        "SCRIPT" => cmd_script(store, &args[1..]),
 
         // -- String commands --
         "SET" => cmd_set(store, &args[1..]),
@@ -844,7 +1091,7 @@ fn execute_cmd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
 
         // -- Server commands --
         "INFO" => cmd_info(store),
-        "CONFIG" => resp::ok(),
+        "CONFIG" => cmd_config(store, &args[1..]),
 
         _ => resp::err(&format!("unknown command '{cmd}'")),
     }
@@ -920,12 +1167,32 @@ fn mirror_set_del(store: &OxiMemStore, key: &str) {
     }
 }
 
+fn mirror_zset_save(store: &OxiMemStore, key: &str, pairs: &[(String, f64)]) {
+    if let Some(db) = &store.db {
+        let _ = db.delete("_zset", &json!({"_key": key}));
+        if !pairs.is_empty() {
+            let arr: Vec<serde_json::Value> = pairs
+                .iter()
+                .map(|(m, s)| json!({"member": m, "score": s}))
+                .collect();
+            let _ = db.insert("_zset", json!({"_key": key, "_members": arr}));
+        }
+    }
+}
+
+fn mirror_zset_del(store: &OxiMemStore, key: &str) {
+    if let Some(db) = &store.db {
+        let _ = db.delete("_zset", &json!({"_key": key}));
+    }
+}
+
 fn mirror_flush(store: &OxiMemStore) {
     if let Some(db) = &store.db {
         let _ = db.drop_collection("_kv");
         let _ = db.drop_collection("_hash");
         let _ = db.drop_collection("_list");
         let _ = db.drop_collection("_set");
+        let _ = db.drop_collection("_zset");
     }
 }
 
@@ -1629,8 +1896,17 @@ fn cmd_flushdb(store: &OxiMemStore) -> RespValue {
     resp::ok()
 }
 
+/// Real cursor-based SCAN over ALL key types: the cursor is an offset into
+/// the sorted live-key list, COUNT bounds the batch (default 10), MATCH is
+/// applied after the batch is taken (Redis semantics — a page may be empty).
 fn cmd_scan(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let cursor: usize = args
+        .first()
+        .and_then(|a| a.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let mut pattern = "*";
+    let mut count = 10usize;
     let mut i = 1;
     while i + 1 < args.len() {
         if let Some(flag) = args[i].as_str() {
@@ -1638,12 +1914,31 @@ fn cmd_scan(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
                 if let Some(p) = args.get(i + 1).and_then(|a| a.as_str()) {
                     pattern = p;
                 }
+            } else if flag.eq_ignore_ascii_case("COUNT") {
+                if let Some(c) = args.get(i + 1).and_then(|a| a.as_str()).and_then(|s| s.parse().ok())
+                {
+                    count = c;
+                }
             }
         }
         i += 2;
     }
-    let keys_resp = cmd_keys(store, &[resp::bulk_string(pattern)]);
-    resp::array(vec![resp::bulk_string("0"), keys_resp])
+    let re = match regex::Regex::new(&glob_to_regex(pattern)) {
+        Ok(r) => r,
+        Err(_) => return resp::array(vec![resp::bulk_string("0"), resp::array(vec![])]),
+    };
+    let all = store.all_live_keys();
+    let end = (cursor + count.max(1)).min(all.len());
+    let batch: Vec<RespValue> = all[cursor.min(all.len())..end]
+        .iter()
+        .filter(|k| re.is_match(k))
+        .map(|k| resp::bulk_string(k))
+        .collect();
+    let next = if end >= all.len() { 0 } else { end };
+    resp::array(vec![
+        resp::bulk_string(&next.to_string()),
+        resp::array(batch),
+    ])
 }
 
 // ===========================================================================
@@ -2342,10 +2637,31 @@ fn cmd_zrange(store: &OxiMemStore, args: &[RespValue], rev: bool) -> RespValue {
         None => return resp::array(vec![]),
     };
 
-    let mut items = zset.range_by_rank(start, stop);
-    if rev {
-        items.reverse();
-    }
+    // For ZREVRANGE the ranks are positions in the DESCENDING view, so map
+    // them onto ascending ranks BEFORE slicing, then reverse the slice.
+    // (The old code sliced ascending first and reversed after, which made
+    // `ZREVRANGE key 0 0` return the LOWEST member instead of the highest.)
+    let mut items = if rev {
+        let n = zset.len() as isize;
+        let norm = |i: isize| -> isize {
+            if i < 0 { (n + i).max(0) } else { i.min(n - 1) }
+        };
+        if n == 0 {
+            Vec::new()
+        } else {
+            let (s, e) = (norm(start), norm(stop));
+            if s > e {
+                Vec::new()
+            } else {
+                let mut v = zset.range_by_rank(n - 1 - e, n - 1 - s);
+                v.reverse();
+                v
+            }
+        }
+    } else {
+        zset.range_by_rank(start, stop)
+    };
+    let _ = &mut items;
 
     if withscores {
         let result: Vec<RespValue> = items
@@ -2533,6 +2849,668 @@ fn cmd_publish(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let message = args[1].as_str().unwrap_or("");
     let count = store.publish(channel, message);
     resp::integer(count)
+}
+
+// ===========================================================================
+// Extended commands: HELLO/CONFIG, GETDEL/SETRANGE/PEXPIREAT/COPY, set ops,
+// HRANDFIELD, ZRANGEBYLEX, real SCAN cursor, blocking pops
+// ===========================================================================
+
+fn cmd_hello(args: &[RespValue]) -> RespValue {
+    if let Some(ver) = args.first().and_then(|a| a.as_str()) {
+        if ver != "2" {
+            // We speak RESP2 only; clients asking for RESP3 fall back.
+            return resp::err("NOPROTO unsupported protocol version");
+        }
+    }
+    resp::array(vec![
+        resp::bulk_string("server"),
+        resp::bulk_string("oximem"),
+        resp::bulk_string("version"),
+        resp::bulk_string(env!("CARGO_PKG_VERSION")),
+        resp::bulk_string("proto"),
+        resp::integer(2),
+    ])
+}
+
+fn cmd_config(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let sub = args
+        .first()
+        .and_then(|a| a.as_str())
+        .unwrap_or("")
+        .to_uppercase();
+    let name = args.get(1).and_then(|a| a.as_str()).unwrap_or("");
+    match sub.as_str() {
+        "SET" if name.eq_ignore_ascii_case("notify-keyspace-events") => {
+            let val = args.get(2).and_then(|a| a.as_str()).unwrap_or("");
+            store.notify.store(!val.is_empty(), Ordering::Relaxed);
+            resp::ok()
+        }
+        "GET" if name.eq_ignore_ascii_case("notify-keyspace-events") => {
+            let v = if store.notify.load(Ordering::Relaxed) {
+                "KEA"
+            } else {
+                ""
+            };
+            resp::array(vec![resp::bulk_string(name), resp::bulk_string(v)])
+        }
+        "GET" => resp::array(vec![resp::bulk_string(name), resp::bulk_string("")]),
+        _ => resp::ok(),
+    }
+}
+
+fn cmd_getdel(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let key = match args.first().and_then(|a| a.as_str()) {
+        Some(k) => k,
+        None => return resp::err("wrong number of arguments for 'getdel' command"),
+    };
+    let mut map = store.strings.write().unwrap();
+    match map.remove(key) {
+        Some(e) if !e.is_expired() => {
+            drop(map);
+            mirror_kv_del(store, key);
+            resp::bulk_string(&e.value)
+        }
+        _ => resp::null(),
+    }
+}
+
+fn cmd_setrange(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments for 'setrange' command");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let offset: usize = match args[1].as_str().and_then(|s| s.parse().ok()) {
+        Some(o) => o,
+        None => return resp::err("value is not an integer or out of range"),
+    };
+    let patch = args[2].as_str().unwrap_or("");
+    let mut map = store.strings.write().unwrap();
+    let entry = map
+        .entry(key.to_string())
+        .or_insert_with(|| KvEntry::new(String::new()));
+    let mut bytes = entry.value.clone().into_bytes();
+    if bytes.len() < offset + patch.len() {
+        bytes.resize(offset + patch.len(), 0);
+    }
+    bytes[offset..offset + patch.len()].copy_from_slice(patch.as_bytes());
+    entry.value = String::from_utf8_lossy(&bytes).to_string();
+    let len = entry.value.len() as i64;
+    let val = entry.value.clone();
+    drop(map);
+    mirror_kv_set(store, key, &val, None);
+    resp::integer(len)
+}
+
+fn cmd_pexpireat(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments for 'pexpireat' command");
+    }
+    let key = match args[0].as_str() {
+        Some(k) => k,
+        None => return resp::integer(0),
+    };
+    let ts_ms: u64 = match args[1].as_str().and_then(|s| s.parse().ok()) {
+        Some(t) => t,
+        None => return resp::err("value is not an integer or out of range"),
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut map = store.strings.write().unwrap();
+    if ts_ms <= now_ms {
+        if map.remove(key).is_some() {
+            drop(map);
+            mirror_kv_del(store, key);
+            return resp::integer(1);
+        }
+        return resp::integer(0);
+    }
+    if let Some(entry) = map.get_mut(key) {
+        if !entry.is_expired() {
+            entry.expires_at =
+                Some(Instant::now() + std::time::Duration::from_millis(ts_ms - now_ms));
+            return resp::integer(1);
+        }
+    }
+    resp::integer(0)
+}
+
+/// COPY src dst [REPLACE] — copies a value of any type.
+fn cmd_copy(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments for 'copy' command");
+    }
+    let src = args[0].as_str().unwrap_or("");
+    let dst = args[1].as_str().unwrap_or("");
+    let replace = args
+        .get(2)
+        .and_then(|a| a.as_str())
+        .map(|s| s.eq_ignore_ascii_case("REPLACE"))
+        .unwrap_or(false);
+    if !replace && store.key_exists(dst) {
+        return resp::integer(0);
+    }
+    {
+        let s = store.strings.read().unwrap();
+        if let Some(e) = s.get(src) {
+            if !e.is_expired() {
+                let val = e.value.clone();
+                drop(s);
+                store
+                    .strings
+                    .write()
+                    .unwrap()
+                    .insert(dst.to_string(), KvEntry::new(val.clone()));
+                mirror_kv_set(store, dst, &val, None);
+                return resp::integer(1);
+            }
+        }
+    }
+    {
+        let h = store.hashes.read().unwrap();
+        if let Some(m) = h.get(src) {
+            let m = m.clone();
+            drop(h);
+            store
+                .hashes
+                .write()
+                .unwrap()
+                .insert(dst.to_string(), m.clone());
+            mirror_hash_save(store, dst, &m);
+            return resp::integer(1);
+        }
+    }
+    {
+        let l = store.lists.read().unwrap();
+        if let Some(v) = l.get(src) {
+            let v = v.clone();
+            drop(l);
+            store
+                .lists
+                .write()
+                .unwrap()
+                .insert(dst.to_string(), v.clone());
+            mirror_list_save(store, dst, &v);
+            return resp::integer(1);
+        }
+    }
+    {
+        let st = store.sets.read().unwrap();
+        if let Some(m) = st.get(src) {
+            let m = m.clone();
+            drop(st);
+            store
+                .sets
+                .write()
+                .unwrap()
+                .insert(dst.to_string(), m.clone());
+            mirror_set_save(store, dst, &m);
+            return resp::integer(1);
+        }
+    }
+    {
+        let z = store.sorted_sets.read().unwrap();
+        if let Some(ss) = z.get(src) {
+            let pairs: Vec<(String, f64)> =
+                ss.scores.iter().map(|(m, &sc)| (m.clone(), sc)).collect();
+            drop(z);
+            let mut zw = store.sorted_sets.write().unwrap();
+            let dst_set = zw.entry(dst.to_string()).or_insert_with(SortedSet::new);
+            dst_set.scores.clear();
+            dst_set.tree.clear();
+            for (m, sc) in &pairs {
+                dst_set.insert(m.clone(), *sc);
+            }
+            drop(zw);
+            mirror_zset_save(store, dst, &pairs);
+            return resp::integer(1);
+        }
+    }
+    resp::integer(0)
+}
+
+enum SetOp {
+    Inter,
+    Union,
+    Diff,
+}
+
+/// SINTER/SUNION/SDIFF (+STORE variants — dest is the first arg then).
+fn cmd_setop(store: &OxiMemStore, args: &[RespValue], op: SetOp, store_dest: bool) -> RespValue {
+    let min = if store_dest { 2 } else { 1 };
+    if args.len() < min {
+        return resp::err("wrong number of arguments");
+    }
+    let (dest, key_args) = if store_dest {
+        (Some(args[0].as_str().unwrap_or("")), &args[1..])
+    } else {
+        (None, args)
+    };
+    let map = store.sets.read().unwrap();
+    let empty = HashSet::new();
+    let mut iter = key_args
+        .iter()
+        .map(|a| map.get(a.as_str().unwrap_or("")).unwrap_or(&empty));
+    let first = match iter.next() {
+        Some(s) => s.clone(),
+        None => HashSet::new(),
+    };
+    let result: HashSet<String> = iter.fold(first, |acc, s| match op {
+        SetOp::Inter => acc.intersection(s).cloned().collect(),
+        SetOp::Union => acc.union(s).cloned().collect(),
+        SetOp::Diff => acc.difference(s).cloned().collect(),
+    });
+    drop(map);
+    match dest {
+        Some(d) => {
+            let n = result.len() as i64;
+            store
+                .sets
+                .write()
+                .unwrap()
+                .insert(d.to_string(), result.clone());
+            mirror_set_save(store, d, &result);
+            resp::integer(n)
+        }
+        None => {
+            let mut v: Vec<&String> = result.iter().collect();
+            v.sort(); // deterministic output
+            resp::array(v.into_iter().map(|s| resp::bulk_string(s)).collect())
+        }
+    }
+}
+
+fn cmd_hrandfield(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let key = match args.first().and_then(|a| a.as_str()) {
+        Some(k) => k,
+        None => return resp::err("wrong number of arguments for 'hrandfield' command"),
+    };
+    let count: Option<i64> = args.get(1).and_then(|a| a.as_str()).and_then(|s| s.parse().ok());
+    let map = store.hashes.read().unwrap();
+    let hash = match map.get(key) {
+        Some(h) if !h.is_empty() => h,
+        _ => {
+            return match count {
+                Some(_) => resp::array(vec![]),
+                None => resp::null(),
+            };
+        }
+    };
+    let mut fields: Vec<&String> = hash.keys().collect();
+    fields.sort();
+    // Pseudo-random pick from the clock — good enough without a rand dep.
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as usize;
+    match count {
+        None => resp::bulk_string(fields[seed % fields.len()]),
+        Some(n) => {
+            let n = n.unsigned_abs() as usize;
+            let out: Vec<RespValue> = (0..n.min(fields.len()))
+                .map(|i| resp::bulk_string(fields[(seed + i) % fields.len()]))
+                .collect();
+            resp::array(out)
+        }
+    }
+}
+
+/// ZRANGEBYLEX key min max — `[m` inclusive, `(m` exclusive, `-`/`+` open.
+fn cmd_zrangebylex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments for 'zrangebylex' command");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let parse = |s: &str| -> Option<(String, bool)> {
+        // (member, inclusive)
+        match s.chars().next()? {
+            '[' => Some((s[1..].to_string(), true)),
+            '(' => Some((s[1..].to_string(), false)),
+            '-' | '+' => Some((s.to_string(), true)),
+            _ => None,
+        }
+    };
+    let min = match args[1].as_str().and_then(parse) {
+        Some(m) => m,
+        None => return resp::err("min or max not valid string range item"),
+    };
+    let max = match args[2].as_str().and_then(parse) {
+        Some(m) => m,
+        None => return resp::err("min or max not valid string range item"),
+    };
+    let map = store.sorted_sets.read().unwrap();
+    let zset = match map.get(key) {
+        Some(z) => z,
+        None => return resp::array(vec![]),
+    };
+    let in_range = |m: &str| -> bool {
+        let lo_ok = match min.0.as_str() {
+            "-" => true,
+            "+" => false,
+            v => {
+                if min.1 {
+                    m >= v
+                } else {
+                    m > v
+                }
+            }
+        };
+        let hi_ok = match max.0.as_str() {
+            "+" => true,
+            "-" => false,
+            v => {
+                if max.1 {
+                    m <= v
+                } else {
+                    m < v
+                }
+            }
+        };
+        lo_ok && hi_ok
+    };
+    let out: Vec<RespValue> = zset
+        .tree
+        .iter()
+        .filter(|(_, m)| in_range(m))
+        .map(|(_, m)| resp::bulk_string(m))
+        .collect();
+    resp::array(out)
+}
+
+enum PopSide {
+    Left,
+    Right,
+    ZMin,
+}
+
+/// BLPOP/BRPOP/BZPOPMIN keys… timeout — poll-based blocking (20ms tick).
+/// A timeout of "-1" is the internal single-poll sentinel used inside EXEC.
+fn cmd_bpop(store: &OxiMemStore, args: &[RespValue], side: PopSide) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments");
+    }
+    let timeout: f64 = args[args.len() - 1]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let keys = &args[..args.len() - 1];
+    let deadline = if timeout > 0.0 {
+        Some(Instant::now() + std::time::Duration::from_secs_f64(timeout))
+    } else {
+        None
+    };
+    loop {
+        for karg in keys {
+            let key = karg.as_str().unwrap_or("");
+            match side {
+                PopSide::Left | PopSide::Right => {
+                    let mut map = store.lists.write().unwrap();
+                    if let Some(list) = map.get_mut(key) {
+                        let popped = match side {
+                            PopSide::Left => list.pop_front(),
+                            _ => list.pop_back(),
+                        };
+                        if let Some(v) = popped {
+                            if list.is_empty() {
+                                map.remove(key);
+                            }
+                            drop(map);
+                            store.bump_version(key);
+                            return resp::array(vec![
+                                resp::bulk_string(key),
+                                resp::bulk_string(&v),
+                            ]);
+                        }
+                    }
+                }
+                PopSide::ZMin => {
+                    let mut map = store.sorted_sets.write().unwrap();
+                    if let Some(zset) = map.get_mut(key) {
+                        if let Some(entry) = zset.tree.iter().next().cloned() {
+                            zset.tree.remove(&entry);
+                            zset.scores.remove(&entry.1);
+                            if zset.len() == 0 {
+                                map.remove(key);
+                            }
+                            drop(map);
+                            store.bump_version(key);
+                            return resp::array(vec![
+                                resp::bulk_string(key),
+                                resp::bulk_string(&entry.1),
+                                resp::bulk_string(&format_score(entry.0.0)),
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+        if timeout < 0.0 {
+            return RespValue::NullArray; // single-poll sentinel (inside EXEC)
+        }
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                return RespValue::NullArray;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+// ===========================================================================
+// EVAL — server-side Lua scripting (mlua, Lua 5.4 vendored)
+// ===========================================================================
+
+fn sha1_hex(src: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(src.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn cmd_script(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let sub = args
+        .first()
+        .and_then(|a| a.as_str())
+        .unwrap_or("")
+        .to_uppercase();
+    match sub.as_str() {
+        "LOAD" => {
+            let src = match args.get(1).and_then(|a| a.as_str()) {
+                Some(s) => s.to_string(),
+                None => return resp::err("wrong number of arguments for 'script load'"),
+            };
+            let sha = sha1_hex(&src);
+            store.scripts.write().unwrap().insert(sha.clone(), src);
+            resp::bulk_string(&sha)
+        }
+        "EXISTS" => {
+            let cache = store.scripts.read().unwrap();
+            let out: Vec<RespValue> = args[1..]
+                .iter()
+                .map(|a| {
+                    let sha = a.as_str().unwrap_or("").to_lowercase();
+                    resp::integer(if cache.contains_key(&sha) { 1 } else { 0 })
+                })
+                .collect();
+            resp::array(out)
+        }
+        "FLUSH" => {
+            store.scripts.write().unwrap().clear();
+            resp::ok()
+        }
+        _ => resp::err("unknown SCRIPT subcommand"),
+    }
+}
+
+fn lua_to_resp(v: mlua::Value) -> RespValue {
+    match v {
+        mlua::Value::Nil => resp::null(),
+        mlua::Value::Boolean(b) => {
+            if b {
+                resp::integer(1)
+            } else {
+                resp::null()
+            }
+        }
+        mlua::Value::Integer(n) => resp::integer(n),
+        mlua::Value::Number(n) => resp::integer(n as i64),
+        mlua::Value::String(s) => resp::bulk(&s.as_bytes()),
+        mlua::Value::Table(t) => {
+            // {err=...} / {ok=...} Redis conventions, else a sequential array.
+            if let Ok(e) = t.get::<String>("err") {
+                return resp::err(&e);
+            }
+            if let Ok(o) = t.get::<String>("ok") {
+                return RespValue::SimpleString(o);
+            }
+            let mut items = Vec::new();
+            for i in 1.. {
+                match t.get::<mlua::Value>(i) {
+                    Ok(mlua::Value::Nil) => break,
+                    Ok(x) => items.push(lua_to_resp(x)),
+                    Err(_) => break,
+                }
+            }
+            resp::array(items)
+        }
+        _ => resp::null(),
+    }
+}
+
+fn resp_to_lua(lua: &mlua::Lua, v: &RespValue) -> mlua::Result<mlua::Value> {
+    Ok(match v {
+        RespValue::Integer(n) => mlua::Value::Integer(*n),
+        RespValue::SimpleString(s) => {
+            // redis.call returns status replies as {ok=...}
+            let t = lua.create_table()?;
+            t.set("ok", s.as_str())?;
+            mlua::Value::Table(t)
+        }
+        RespValue::BulkString(b) => mlua::Value::String(lua.create_string(b)?),
+        RespValue::Null | RespValue::NullArray => mlua::Value::Boolean(false),
+        RespValue::Array(items) => {
+            let t = lua.create_table()?;
+            for (i, it) in items.iter().enumerate() {
+                t.set(i + 1, resp_to_lua(lua, it)?)?;
+            }
+            mlua::Value::Table(t)
+        }
+        RespValue::Error(e) => {
+            let t = lua.create_table()?;
+            t.set("err", e.as_str())?;
+            mlua::Value::Table(t)
+        }
+    })
+}
+
+/// EVAL script numkeys key… arg… / EVALSHA sha1 numkeys key… arg…
+/// The whole script runs under `tx_lock`, so it is atomic and isolated w.r.t.
+/// MULTI/EXEC blocks and other scripts — exactly Redis's guarantee.
+fn cmd_eval(store: &OxiMemStore, args: &[RespValue], by_sha: bool) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments for 'eval' command");
+    }
+    let src = if by_sha {
+        let sha = args[0].as_str().unwrap_or("").to_lowercase();
+        match store.scripts.read().unwrap().get(&sha) {
+            Some(s) => s.clone(),
+            None => return resp::err("NOSCRIPT No matching script."),
+        }
+    } else {
+        let s = args[0].as_str().unwrap_or("").to_string();
+        // EVAL also populates the cache (Redis behaviour).
+        store
+            .scripts
+            .write()
+            .unwrap()
+            .insert(sha1_hex(&s), s.clone());
+        s
+    };
+    let numkeys: usize = match args[1].as_str().and_then(|s| s.parse().ok()) {
+        Some(n) => n,
+        None => return resp::err("value is not an integer or out of range"),
+    };
+    if args.len() < 2 + numkeys {
+        return resp::err("Number of keys can't be greater than number of args");
+    }
+    let keys: Vec<String> = args[2..2 + numkeys]
+        .iter()
+        .map(|a| a.as_str().unwrap_or("").to_string())
+        .collect();
+    let argv: Vec<String> = args[2 + numkeys..]
+        .iter()
+        .map(|a| a.as_str().unwrap_or("").to_string())
+        .collect();
+
+    let _guard = store.tx_lock.lock().unwrap(); // whole script is atomic
+    let lua = mlua::Lua::new();
+    let out: mlua::Result<RespValue> = lua.scope(|scope| {
+        let globals = lua.globals();
+        let keys_t = lua.create_table()?;
+        for (i, k) in keys.iter().enumerate() {
+            keys_t.set(i + 1, k.as_str())?;
+        }
+        let argv_t = lua.create_table()?;
+        for (i, a) in argv.iter().enumerate() {
+            argv_t.set(i + 1, a.as_str())?;
+        }
+        globals.set("KEYS", keys_t)?;
+        globals.set("ARGV", argv_t)?;
+
+        let redis_t = lua.create_table()?;
+        let call = scope.create_function(|lua, cargs: mlua::MultiValue| {
+            let mut parts: Vec<RespValue> = Vec::with_capacity(cargs.len());
+            for v in cargs {
+                match v {
+                    mlua::Value::String(s) => parts.push(resp::bulk(&s.as_bytes())),
+                    mlua::Value::Integer(n) => parts.push(resp::bulk_string(&n.to_string())),
+                    mlua::Value::Number(n) => parts.push(resp::bulk_string(&format_score(n))),
+                    _ => return Err(mlua::Error::runtime("invalid redis.call argument")),
+                }
+            }
+            let r = execute(store, &parts);
+            if let RespValue::Error(e) = &r {
+                return Err(mlua::Error::runtime(e.clone()));
+            }
+            resp_to_lua(lua, &r)
+        })?;
+        let pcall = scope.create_function(|lua, cargs: mlua::MultiValue| {
+            let mut parts: Vec<RespValue> = Vec::with_capacity(cargs.len());
+            for v in cargs {
+                match v {
+                    mlua::Value::String(s) => parts.push(resp::bulk(&s.as_bytes())),
+                    mlua::Value::Integer(n) => parts.push(resp::bulk_string(&n.to_string())),
+                    mlua::Value::Number(n) => parts.push(resp::bulk_string(&format_score(n))),
+                    _ => return Err(mlua::Error::runtime("invalid redis.pcall argument")),
+                }
+            }
+            resp_to_lua(lua, &execute(store, &parts)) // errors become {err=...}
+        })?;
+        let error_reply = scope.create_function(|lua, msg: String| {
+            let t = lua.create_table()?;
+            t.set("err", msg)?;
+            Ok(t)
+        })?;
+        let status_reply = scope.create_function(|lua, msg: String| {
+            let t = lua.create_table()?;
+            t.set("ok", msg)?;
+            Ok(t)
+        })?;
+        redis_t.set("call", call)?;
+        redis_t.set("pcall", pcall)?;
+        redis_t.set("error_reply", error_reply)?;
+        redis_t.set("status_reply", status_reply)?;
+        globals.set("redis", redis_t)?;
+
+        let v: mlua::Value = lua.load(&src).eval()?;
+        Ok(lua_to_resp(v))
+    });
+    match out {
+        Ok(r) => r,
+        Err(e) => resp::err(&format!("ERR Error running script: {e}")),
+    }
 }
 
 fn format_score(s: f64) -> String {
@@ -2800,6 +3778,285 @@ mod tests {
             RespValue::NullArray
         ));
         assert_eq!(execute(&store, &c(&["GET", "p"])).as_str(), Some("9"));
+    }
+
+    // ---- extended-command tests ----
+
+    #[test]
+    fn getdel_setrange_copy_roundtrip() {
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SET", "g", "hello"]));
+        assert_eq!(execute(&store, &c(&["GETDEL", "g"])).as_str(), Some("hello"));
+        assert!(matches!(execute(&store, &c(&["GET", "g"])), RespValue::Null));
+        execute(&store, &c(&["SET", "r", "Hello World"]));
+        assert_eq!(
+            execute(&store, &c(&["SETRANGE", "r", "6", "Redis"])),
+            RespValue::Integer(11)
+        );
+        assert_eq!(execute(&store, &c(&["GET", "r"])).as_str(), Some("Hello Redis"));
+        // COPY without REPLACE fails onto an existing key.
+        execute(&store, &c(&["SET", "dst", "x"]));
+        assert_eq!(execute(&store, &c(&["COPY", "r", "dst"])), RespValue::Integer(0));
+        assert_eq!(
+            execute(&store, &c(&["COPY", "r", "dst", "REPLACE"])),
+            RespValue::Integer(1)
+        );
+        assert_eq!(execute(&store, &c(&["GET", "dst"])).as_str(), Some("Hello Redis"));
+    }
+
+    #[test]
+    fn set_operations_and_store_variants() {
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SADD", "a", "1", "2", "3"]));
+        execute(&store, &c(&["SADD", "b", "2", "3", "4"]));
+        match execute(&store, &c(&["SINTER", "a", "b"])) {
+            RespValue::Array(v) => assert_eq!(v.len(), 2), // 2,3
+            other => panic!("{other:?}"),
+        }
+        match execute(&store, &c(&["SUNION", "a", "b"])) {
+            RespValue::Array(v) => assert_eq!(v.len(), 4),
+            other => panic!("{other:?}"),
+        }
+        match execute(&store, &c(&["SDIFF", "a", "b"])) {
+            RespValue::Array(v) => assert_eq!(v.len(), 1), // 1
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            execute(&store, &c(&["SINTERSTORE", "dest", "a", "b"])),
+            RespValue::Integer(2)
+        );
+        assert_eq!(execute(&store, &c(&["SCARD", "dest"])), RespValue::Integer(2));
+    }
+
+    #[test]
+    fn scan_cursor_pages_through_all_types() {
+        let store = OxiMemStore::new();
+        for i in 0..25 {
+            execute(&store, &c(&["SET", &format!("k{i:02}"), "v"]));
+        }
+        execute(&store, &c(&["HSET", "h1", "f", "v"]));
+        execute(&store, &c(&["ZADD", "z1", "1", "m"]));
+        let mut cursor = "0".to_string();
+        let mut seen = 0;
+        loop {
+            let r = execute(&store, &c(&["SCAN", &cursor, "COUNT", "7"]));
+            let arr = match r {
+                RespValue::Array(v) => v,
+                other => panic!("{other:?}"),
+            };
+            cursor = arr[0].as_str().unwrap().to_string();
+            if let RespValue::Array(keys) = &arr[1] {
+                seen += keys.len();
+            }
+            if cursor == "0" {
+                break;
+            }
+        }
+        assert_eq!(seen, 27); // 25 strings + hash + zset
+    }
+
+    #[test]
+    fn zrevrange_ranks_are_relative_to_descending_view() {
+        // Found by the hybrid-exchange prototype: `ZREVRANGE book 0 0` (best
+        // bid) returned the LOWEST price. Ranks must index the DESC ordering.
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["ZADD", "z", "1", "low"]));
+        execute(&store, &c(&["ZADD", "z", "3", "high"]));
+        execute(&store, &c(&["ZADD", "z", "2", "mid"]));
+        match execute(&store, &c(&["ZREVRANGE", "z", "0", "0"])) {
+            RespValue::Array(v) => assert_eq!(v[0].as_str(), Some("high")),
+            other => panic!("{other:?}"),
+        }
+        match execute(&store, &c(&["ZREVRANGE", "z", "1", "2"])) {
+            RespValue::Array(v) => {
+                let names: Vec<_> = v.iter().filter_map(|x| x.as_str()).collect();
+                assert_eq!(names, ["mid", "low"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match execute(&store, &c(&["ZRANGE", "z", "0", "0"])) {
+            RespValue::Array(v) => assert_eq!(v[0].as_str(), Some("low")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn zrangebylex_bounds() {
+        let store = OxiMemStore::new();
+        for m in ["a", "b", "c", "d"] {
+            execute(&store, &c(&["ZADD", "z", "0", m]));
+        }
+        match execute(&store, &c(&["ZRANGEBYLEX", "z", "[b", "(d"])) {
+            RespValue::Array(v) => {
+                let names: Vec<_> = v.iter().filter_map(|x| x.as_str()).collect();
+                assert_eq!(names, ["b", "c"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match execute(&store, &c(&["ZRANGEBYLEX", "z", "-", "+"])) {
+            RespValue::Array(v) => assert_eq!(v.len(), 4),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocking_pop_returns_immediately_when_data_exists() {
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["RPUSH", "q", "job1"]));
+        match execute(&store, &c(&["BLPOP", "q", "5"])) {
+            RespValue::Array(v) => {
+                assert_eq!(v[0].as_str(), Some("q"));
+                assert_eq!(v[1].as_str(), Some("job1"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Empty + short timeout → NullArray after ~timeout.
+        let t0 = std::time::Instant::now();
+        assert!(matches!(
+            execute(&store, &c(&["BLPOP", "q", "0.1"])),
+            RespValue::NullArray
+        ));
+        assert!(t0.elapsed() >= std::time::Duration::from_millis(90));
+        // BZPOPMIN pops lowest score.
+        execute(&store, &c(&["ZADD", "zq", "2", "b"]));
+        execute(&store, &c(&["ZADD", "zq", "1", "a"]));
+        match execute(&store, &c(&["BZPOPMIN", "zq", "1"])) {
+            RespValue::Array(v) => assert_eq!(v[1].as_str(), Some("a")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyspace_notifications_publish_events() {
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["CONFIG", "SET", "notify-keyspace-events", "KEA"]));
+        let rx = store.subscribe("__keyspace@0__:nk");
+        execute(&store, &c(&["SET", "nk", "1"]));
+        let (chan, msg) = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(chan, "__keyspace@0__:nk");
+        assert_eq!(msg, "set");
+    }
+
+    #[test]
+    fn hello_negotiates_resp2_and_rejects_resp3() {
+        let store = OxiMemStore::new();
+        assert!(matches!(execute(&store, &c(&["HELLO"])), RespValue::Array(_)));
+        assert!(matches!(execute(&store, &c(&["HELLO", "2"])), RespValue::Array(_)));
+        match execute(&store, &c(&["HELLO", "3"])) {
+            RespValue::Error(e) => assert!(e.contains("NOPROTO")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn arity_error_in_multi_aborts() {
+        let store = OxiMemStore::new();
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["SET", "onlykey"])), // missing value
+            RespValue::Error(_)
+        ));
+        match execute_session(&store, &mut s, &c(&["EXEC"])) {
+            RespValue::Error(e) => assert!(e.contains("EXECABORT")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_runs_scripts_atomically() {
+        let store = OxiMemStore::new();
+        // Plain return value conversions.
+        assert_eq!(
+            execute(&store, &c(&["EVAL", "return 1 + 1", "0"])),
+            RespValue::Integer(2)
+        );
+        assert_eq!(
+            execute(&store, &c(&["EVAL", "return ARGV[1]", "0", "hi"])).as_str(),
+            Some("hi")
+        );
+        // redis.call bridge + KEYS.
+        execute(&store, &c(&["SET", "bal", "100"]));
+        let script = "local b = tonumber(redis.call('GET', KEYS[1])) \
+                      if b >= tonumber(ARGV[1]) then \
+                        redis.call('INCRBYFLOAT', KEYS[1], '-' .. ARGV[1]) \
+                        return 1 \
+                      end \
+                      return 0";
+        assert_eq!(
+            execute(&store, &c(&["EVAL", script, "1", "bal", "40"])),
+            RespValue::Integer(1)
+        );
+        assert_eq!(execute(&store, &c(&["GET", "bal"])).as_str(), Some("60"));
+        // Insufficient funds path.
+        assert_eq!(
+            execute(&store, &c(&["EVAL", script, "1", "bal", "999"])),
+            RespValue::Integer(0)
+        );
+        assert_eq!(execute(&store, &c(&["GET", "bal"])).as_str(), Some("60"));
+    }
+
+    #[test]
+    fn evalsha_and_script_cache() {
+        let store = OxiMemStore::new();
+        let sha = match execute(&store, &c(&["SCRIPT", "LOAD", "return 42"])) {
+            RespValue::BulkString(b) => String::from_utf8(b).unwrap(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            execute(&store, &c(&["EVALSHA", &sha, "0"])),
+            RespValue::Integer(42)
+        );
+        match execute(&store, &c(&["SCRIPT", "EXISTS", &sha, "deadbeef"])) {
+            RespValue::Array(v) => {
+                assert_eq!(v[0], RespValue::Integer(1));
+                assert_eq!(v[1], RespValue::Integer(0));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            execute(&store, &c(&["EVALSHA", "deadbeef", "0"])),
+            RespValue::Error(_)
+        ));
+    }
+
+    #[test]
+    fn eval_writes_are_visible_to_watch() {
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SET", "w", "1"]));
+        let mut s = Session::default();
+        execute_session(&store, &mut s, &c(&["WATCH", "w"]));
+        execute(&store, &c(&["EVAL", "redis.call('SET', KEYS[1], '2')", "1", "w"]));
+        execute_session(&store, &mut s, &c(&["MULTI"]));
+        execute_session(&store, &mut s, &c(&["SET", "w", "3"]));
+        assert!(matches!(
+            execute_session(&store, &mut s, &c(&["EXEC"])),
+            RespValue::NullArray
+        ));
+    }
+
+    #[test]
+    fn rebuild_on_boot_restores_all_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(OxiDb::open(dir.path()).unwrap());
+        {
+            let store = OxiMemStore::new_with_sql(Arc::clone(&db));
+            execute(&store, &c(&["SET", "k", "v"]));
+            execute(&store, &c(&["HSET", "h", "f1", "x", "f2", "y"]));
+            execute(&store, &c(&["RPUSH", "l", "a", "b"]));
+            execute(&store, &c(&["SADD", "s", "m1", "m2"]));
+            execute(&store, &c(&["ZADD", "z", "1.5", "mem"]));
+        }
+        // A fresh store over the same OxiDb must repopulate everything.
+        let store2 = OxiMemStore::new_with_sql(Arc::clone(&db));
+        assert_eq!(execute(&store2, &c(&["GET", "k"])).as_str(), Some("v"));
+        assert_eq!(execute(&store2, &c(&["HGET", "h", "f2"])).as_str(), Some("y"));
+        assert_eq!(execute(&store2, &c(&["LLEN", "l"])), RespValue::Integer(2));
+        assert_eq!(execute(&store2, &c(&["SCARD", "s"])), RespValue::Integer(2));
+        assert_eq!(
+            execute(&store2, &c(&["ZSCORE", "z", "mem"])).as_str(),
+            Some("1.5")
+        );
     }
 
     #[test]

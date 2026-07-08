@@ -16,7 +16,7 @@ const MAX_RESP_BULK_LEN: i64 = 16 * 1024 * 1024;
 const MAX_RESP_ARRAY_LEN: i64 = 16 * 1024 * 1024;
 
 /// A parsed RESP value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RespValue {
     SimpleString(String),
     Error(String),
