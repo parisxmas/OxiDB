@@ -67,4 +67,7 @@ echo "[run] trading finished — verifying ledger…"
 RESULT=$?
 
 echo "[run] feeder: $(grep -oE '[0-9]+ ticks written' "$HERE/.feeder.log" | tail -1)"
+commits=$(curl -s http://127.0.0.1:14580/metrics | grep '^oxidb_tx_commits_total' | awk '{print $2}')
+conflicts=$(curl -s http://127.0.0.1:14580/metrics | grep '^oxidb_tx_conflicts_total' | awk '{print $2}')
+echo "[run] engine tx: commits=${commits:-?} conflicts=${conflicts:-?} (real OCC conflict events, retries included)"
 exit $RESULT

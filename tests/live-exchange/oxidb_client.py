@@ -64,6 +64,12 @@ class OxiDB:
     def tx_update(self, coll, query, update):
         return self.call({"cmd": "update", "collection": coll, "query": query, "update": update})
 
+    def tx_find_for_update(self, coll, query, lock_ms=5000):
+        """SELECT ... FOR UPDATE — locks matched docs until commit/rollback.
+        Requires an active transaction."""
+        return self.call({"cmd": "find_for_update", "collection": coll,
+                          "query": query, "lock_timeout_ms": lock_ms}).get("data", [])
+
     def tx_insert(self, coll, doc):
         return self.call({"cmd": "insert", "collection": coll, "doc": doc})
 
