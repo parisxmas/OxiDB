@@ -88,6 +88,26 @@ id (exactly one applies), and SIGKILL-at-any-point crash+retry (50-round
 soak). Negative control: drop the receipt insert and the sequential
 test fails on the double application.
 
+## Serializability, checked directly (not just invariants)
+
+`tests/linearizability.rs` verifies the DEFINITION of serializability,
+not a domain invariant: it runs thousands of concurrent transactions
+that append globally-unique values to keys' lists and read those lists
+(Elle/Adya technique — append-only lists expose a per-key write order
+that reads reveal), reconstructs the ww / wr / rw dependency graph from
+the observed history, and asserts it is **acyclic** (a cycle is a proof
+of non-serializability: G0 = ww cycle, G1c = ww+wr, G2 = with an rw
+anti-dependency). It also pins that every acked append lands exactly
+once and every observed read is a prefix of its key's final list
+(append-only can't reorder or drop a value mid-history).
+
+Result: over 2000 committed transactions on 20 keys / 8 workers, ~5.4k
+dependency edges, the graph is acyclic — no G0/G1c/G2 anomaly. The
+cycle detector itself is unit-tested (`cycle_detector_is_correct`, in
+the normal suite) so a green run is meaningful. This is the empirical
+confirmation of the "serializable w.r.t. the items read/wrote" claim for
+key-addressed access.
+
 ## Known engine-level gaps (candidates, not bugs)
 
 - **Snapshot reads / MVCC** would close A5A-observation, P3-for-readers
