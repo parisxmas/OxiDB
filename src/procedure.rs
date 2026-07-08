@@ -611,9 +611,15 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    fn temp_db() -> OxiDb {
+    // Returns the TempDir alongside the engine: dropping it here would
+    // delete the data dir while the engine is live, and the commit log's
+    // atomic-replace persist (rename into the directory) then fails with
+    // NotFound. The old in-place rewrite only "worked" on the deleted
+    // directory through its open fd — nothing was actually durable.
+    fn temp_db() -> (tempfile::TempDir, OxiDb) {
         let dir = tempdir().unwrap();
-        OxiDb::open(dir.path()).unwrap()
+        let db = OxiDb::open(dir.path()).unwrap();
+        (dir, db)
     }
 
     #[test]
@@ -734,7 +740,7 @@ mod tests {
 
     #[test]
     fn test_execute_return_only() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let def = json!({
             "name": "greet",
             "params": ["who"],
@@ -748,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_execute_insert_and_verify_after_commit() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let def = json!({
             "name": "add_user",
             "params": ["name"],
@@ -767,7 +773,7 @@ mod tests {
 
     #[test]
     fn test_execute_abort() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let def = json!({
             "name": "fail",
             "params": [],
@@ -787,7 +793,7 @@ mod tests {
 
     #[test]
     fn test_execute_if_then() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let def = json!({
             "name": "conditional",
             "params": ["val"],
@@ -813,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_execute_set_variable() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let def = json!({
             "name": "set_test",
             "params": ["a", "b"],
@@ -828,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_execute_count() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("items", json!({"x": 1})).unwrap();
         db.insert("items", json!({"x": 2})).unwrap();
         db.insert("items", json!({"x": 3})).unwrap();
@@ -847,7 +853,7 @@ mod tests {
 
     #[test]
     fn test_execute_delete() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("items", json!({"x": 1})).unwrap();
         db.insert("items", json!({"x": 2})).unwrap();
 
@@ -868,7 +874,7 @@ mod tests {
 
     #[test]
     fn test_execute_update() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("items", json!({"name": "Alice", "score": 10}))
             .unwrap();
 
@@ -893,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_execute_no_explicit_return() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let def = json!({
             "name": "no_return",
             "params": [],
@@ -910,7 +916,7 @@ mod tests {
 
     #[test]
     fn test_execute_transfer_funds() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("accounts", json!({"account_id": "A", "balance": 100}))
             .unwrap();
         db.insert("accounts", json!({"account_id": "B", "balance": 50}))
@@ -954,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_execute_transfer_insufficient() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("accounts", json!({"account_id": "A", "balance": 10}))
             .unwrap();
         db.insert("accounts", json!({"account_id": "B", "balance": 50}))
@@ -986,7 +992,7 @@ mod tests {
 
     #[test]
     fn test_execute_params_as_array() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let def = json!({
             "name": "greet",
             "params": ["who"],
@@ -1023,7 +1029,7 @@ mod tests {
 
     #[test]
     fn e2e_arithmetic_in_return() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let src = r#"
             proc add(a, b) {
                 return {sum: a + b}
@@ -1042,7 +1048,7 @@ mod tests {
 
     #[test]
     fn e2e_nested_if_with_abort() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         let src = r#"
             proc validate(age, role) {
                 if age < 18 {
@@ -1072,7 +1078,7 @@ mod tests {
 
     #[test]
     fn e2e_aggregate_result_access() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("sales", json!({"product": "A", "amount": 100}))
             .unwrap();
         db.insert("sales", json!({"product": "A", "amount": 200}))
@@ -1098,7 +1104,7 @@ mod tests {
 
     #[test]
     fn e2e_count_and_branch() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("items", json!({"status": "active"})).unwrap();
         db.insert("items", json!({"status": "active"})).unwrap();
         db.insert("items", json!({"status": "archived"})).unwrap();
@@ -1119,7 +1125,7 @@ mod tests {
 
     #[test]
     fn e2e_multi_collection_abort_rollback() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("accounts", json!({"id": "A", "balance": 100}))
             .unwrap();
         db.insert("ledger", json!({"entries": 0})).unwrap();
@@ -1154,7 +1160,7 @@ mod tests {
 
     #[test]
     fn e2e_update_with_multiple_operators() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert(
             "users",
             json!({"name": "Alice", "score": 10, "active": false}),
@@ -1181,7 +1187,7 @@ mod tests {
 
     #[test]
     fn e2e_delete_and_verify() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("logs", json!({"level": "error", "msg": "fail"}))
             .unwrap();
         db.insert("logs", json!({"level": "info", "msg": "ok"}))
@@ -1206,7 +1212,7 @@ mod tests {
 
     #[test]
     fn e2e_call_chain_with_return_value() {
-        let db = temp_db();
+        let (_dir, db) = temp_db();
         db.insert("accounts", json!({"account_id": "X", "balance": 500}))
             .unwrap();
 

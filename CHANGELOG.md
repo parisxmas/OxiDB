@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Durability fix: commit log survives crash-during-persist (found by new Jepsen-style test)
+
+- **`tests/jepsen_bank_crash.rs`** — Jepsen-style bank workload with
+  crash faults: concurrent transfer transactions (journal doc + three
+  balance `$inc`s, atomic; mixed OCC / `tx_find_for_update` paths), a
+  parent process records ACKs, SIGKILLs the victim at a random moment,
+  reopens the data dir and checks the history: every ACKed transfer
+  present (durability), every account's balance derivable from the
+  journal (atomicity — no half-applied transactions), journal uids
+  unique (no double replay), global sum conserved. Rounds accumulate on
+  one dir, so recovery-after-recovery is exercised too.
+- **The test found a real pre-existing durability bug in 3 rounds:**
+  `_tx_commit_log` was persisted by truncate-and-rewrite in place; a
+  crash landing inside the persist left the file empty/torn, and
+  recovery then discarded EVERY transactional WAL entry not yet in a
+  snapshot — acked commits vanished wholesale. Fixed with atomic
+  replace (tmp + fsync + rename + dir fsync); stale tmp cleaned on
+  open. All transactional server versions carried this window.
+- In-memory engines now use a unique temp dir per instance (was
+  per-process): concurrent in-memory engines shared one commit log,
+  cross-contaminating committed sets.
+- Fixed `procedure.rs` test helper dropping its `TempDir` while the
+  engine was live — tests ran on a deleted directory (masked by the old
+  in-place persist writing to unlinked fds).
+- Verified: 15 SIGKILL rounds on macOS + 15 on Linux (13.7k transfers),
+  zero lost acks, zero partial applies; full lib/ACID/crash/sigkill
+  suites green.
+
 ### Engine: group commit + pessimistic document locks (hot-account contention)
 
 - **Group commit.** `commit_transaction` is now a two-phase pipeline:

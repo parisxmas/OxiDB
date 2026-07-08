@@ -545,7 +545,17 @@ impl OxiDb {
     /// Create a pure in-memory database (no disk I/O at all).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open_in_memory() -> Result<Self> {
-        let tmp = std::env::temp_dir().join(format!("oxidb_mem_{}", std::process::id()));
+        // Unique per engine instance, not just per process: concurrent
+        // in-memory engines (e.g. parallel tests) sharing one directory
+        // also shared one _tx_commit_log — their committer threads
+        // cross-contaminated each other's committed sets and, with the
+        // atomic-replace persist, raced on the same tmp file (ENOENT).
+        static MEM_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "oxidb_mem_{}_{}",
+            std::process::id(),
+            MEM_DIR_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
         std::fs::create_dir_all(&tmp)?;
 
         let blob_store = BlobStore::open_with_encryption(&tmp, None)?;

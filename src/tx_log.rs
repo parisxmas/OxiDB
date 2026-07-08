@@ -112,6 +112,11 @@ impl TxCommitLog {
             .truncate(false)
             .open(&path)?;
 
+        // A stale sibling tmp file means a crash landed inside a persist's
+        // write-to-tmp step (before the atomic rename). The live file is
+        // intact — the tmp is garbage; remove it so nothing ever reads it.
+        let _ = fs::remove_file(path.with_extension("tmp"));
+
         let committed = parse_log(&mut file)?;
 
         let (tx, rx) = mpsc::channel::<Cmd>();
@@ -303,10 +308,20 @@ fn parse_log(file: &mut File) -> std::io::Result<HashSet<TransactionId>> {
     Ok(set)
 }
 
-/// Rewrite the file with the current set + fsync. Sorted for
-/// reproducible on-disk content — keeps tests deterministic and makes
-/// hex-diffing post-recovery state across runs cheap.
-fn persist(file: &mut File, set: &HashSet<TransactionId>) -> std::io::Result<()> {
+/// Rewrite the log with the current set + fsync, via atomic replace.
+/// Sorted for reproducible on-disk content — keeps tests deterministic
+/// and makes hex-diffing post-recovery state across runs cheap.
+///
+/// Atomic replace (tmp + fsync + rename + dir fsync) is load-bearing:
+/// the previous implementation truncated and rewrote the live file in
+/// place, so a crash (SIGKILL, power loss) between the truncate and the
+/// completed write left the commit log empty or torn — and recovery
+/// then discarded EVERY transactional WAL entry not yet persisted to a
+/// snapshot: acked commits vanished wholesale. Found by
+/// `tests/jepsen_bank_crash.rs` (round 3). `rename(2)` is atomic on
+/// POSIX: a crash now leaves either the complete old set or the
+/// complete new set, never a torn file.
+fn persist(path: &Path, set: &HashSet<TransactionId>) -> std::io::Result<()> {
     let mut ids: Vec<TransactionId> = set.iter().copied().collect();
     ids.sort_unstable();
     let mut buf: Vec<u8> = Vec::with_capacity(TX_HEADER_SIZE + ids.len() * 8);
@@ -319,18 +334,30 @@ fn persist(file: &mut File, set: &HashSet<TransactionId>) -> std::io::Result<()>
     for id in &ids {
         buf.extend_from_slice(&id.to_le_bytes());
     }
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&buf)?;
-    file.sync_data()?;
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&buf)?;
+        f.sync_data()?;
+    }
+    fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
     Ok(())
 }
 
 fn committer_loop(
     rx: Receiver<Cmd>,
-    mut file: File,
+    _file: File,
     mut committed: HashSet<TransactionId>,
-    _path: PathBuf,
+    path: PathBuf,
 ) {
     loop {
         // Block waiting for the first command of a new batch. A short
@@ -399,7 +426,7 @@ fn committer_loop(
         }
 
         let flush_result: std::io::Result<()> = if mutated {
-            persist(&mut file, &committed)
+            persist(&path, &committed)
         } else {
             Ok(())
         };
