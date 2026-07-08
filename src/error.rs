@@ -48,6 +48,9 @@ pub enum Error {
         actual_version: u64,
     },
 
+    #[error("lock timeout on '{collection}' doc {doc_id}: held by another transaction")]
+    LockTimeout { collection: String, doc_id: u64 },
+
     #[error("transaction not found: {0}")]
     TransactionNotFound(u64),
 

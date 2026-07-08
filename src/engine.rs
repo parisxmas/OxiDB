@@ -471,6 +471,23 @@ pub struct OxiDb {
     /// other (shared lock; per-document atomicity is the collection's
     /// job), they only exclude in-flight commits.
     commit_lock: RwLock<()>,
+    /// Pessimistic per-document locks taken by `tx_find_for_update`.
+    /// See `doc_locks.rs` — the hot-document escape hatch from OCC
+    /// retry storms. Released on commit (post-apply) and rollback.
+    doc_locks: crate::doc_locks::DocLockManager,
+    /// Total order of transaction commits. A ticket is assigned under
+    /// `commit_lock` once a commit's in-memory apply has succeeded, so
+    /// ticket order == the order in which writes became visible.
+    commit_ticket: AtomicU64,
+    /// Next ticket allowed to submit its tx_log commit mark (+condvar).
+    /// Marks must reach the tx_log committer in ticket order: commit B
+    /// may have read commit A's applied-but-not-yet-durable writes, and
+    /// submitting marks in order puts A's mark in the same or an earlier
+    /// fsync batch — B can never be durable without A. std (not
+    /// parking_lot) because Condvar::wait_timeout isn't needed and the
+    /// guard must be waitable.
+    mark_turn: std::sync::Mutex<u64>,
+    mark_cv: std::sync::Condvar,
     /// Per-name serialization of collection opens. Opening a pre-existing
     /// collection replays its WAL, persists a snapshot, and truncates the
     /// WAL; two threads doing that concurrently for the SAME name could
@@ -560,6 +577,10 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
             commit_lock: RwLock::new(()),
+            doc_locks: crate::doc_locks::DocLockManager::default(),
+            commit_ticket: AtomicU64::new(0),
+            mark_turn: std::sync::Mutex::new(0),
+            mark_cv: std::sync::Condvar::new(),
             open_locks: Mutex::new(HashMap::new()),
             links: LinksTable::in_memory(),
             ttl_shutdown: Mutex::new(None),
@@ -586,6 +607,10 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
             commit_lock: RwLock::new(()),
+            doc_locks: crate::doc_locks::DocLockManager::default(),
+            commit_ticket: AtomicU64::new(0),
+            mark_turn: std::sync::Mutex::new(0),
+            mark_cv: std::sync::Condvar::new(),
             open_locks: Mutex::new(HashMap::new()),
             links: LinksTable::in_memory(),
         })
@@ -730,6 +755,10 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: false,
             commit_lock: RwLock::new(()),
+            doc_locks: crate::doc_locks::DocLockManager::default(),
+            commit_ticket: AtomicU64::new(0),
+            mark_turn: std::sync::Mutex::new(0),
+            mark_cv: std::sync::Condvar::new(),
             open_locks: Mutex::new(HashMap::new()),
             links: LinksTable::open(data_dir)?,
             ttl_shutdown: Mutex::new(None),
@@ -1077,6 +1106,9 @@ impl OxiDb {
                     eprintln!("[archiver] shutdown pass failed: {e}");
                 }
             }
+            // Let any straggler commit finish its durability phase before
+            // the final persist (see wait_marks_settled).
+            self.wait_marks_settled();
             let cols = self.collections.read();
             let mut all_checkpointed = true;
             for col_arc in cols.values() {
@@ -1157,6 +1189,12 @@ impl OxiDb {
                             // post-date this persist.
                             let prune: Vec<u64> = {
                                 let _commit_guard = db.commit_lock.write();
+                                // Group commit applies writes before their
+                                // marks are durable; wait for every applied
+                                // tx to clear the mark turnstile so the
+                                // persist below never snapshots data whose
+                                // commit record could still be lost.
+                                db.wait_marks_settled();
                                 db.tx_log
                                     .read_committed()
                                     .map(|s| s.into_iter().collect())
@@ -2062,6 +2100,68 @@ impl OxiDb {
         Ok(results)
     }
 
+    /// `tx_find` with pessimistic per-document write locks — the engine's
+    /// `SELECT ... FOR UPDATE`. Locks every matched document (in doc-id
+    /// order within this call) before reading it, so between this read
+    /// and the commit no other `for_update` transaction can slip a write
+    /// in — on hot documents this replaces the OCC retry storm with
+    /// orderly queueing. Locks are released at commit (as soon as the
+    /// writes are applied) or rollback; waiting for a busy document gives
+    /// up with [`Error::LockTimeout`] after `lock_timeout`.
+    ///
+    /// The locks only exclude other `for_update` callers; plain writers
+    /// bypass them, and OCC validation at commit remains the correctness
+    /// backstop. Callers locking documents across several calls should
+    /// order those calls consistently to avoid deadlock-by-timeout.
+    pub fn tx_find_for_update(
+        &self,
+        tx_id: TransactionId,
+        collection: &str,
+        query: &Value,
+        lock_timeout: std::time::Duration,
+    ) -> Result<Vec<Value>> {
+        let col = self.get_or_create_collection(collection)?;
+
+        // Match first (unlocked), then lock in sorted-id order.
+        let matching = col.find(query)?;
+        let mut ids: Vec<u64> = matching
+            .iter()
+            .filter_map(|d| d.get("_id").and_then(|v| v.as_u64()))
+            .collect();
+        ids.sort_unstable();
+        for id in &ids {
+            self.doc_locks.lock(collection, *id, tx_id, lock_timeout)?;
+        }
+
+        // Re-read AFTER acquiring the locks: the matched docs may have
+        // changed while we waited, and the version recorded in the read
+        // set must be the locked one for OCC validation to pass.
+        let mut results = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if let Some(doc) = col.find(&json!({ "_id": id }))?.into_iter().next() {
+                results.push(doc);
+            }
+        }
+
+        let txs = self.active_transactions.read();
+        let tx_mutex = txs.get(&tx_id).ok_or(Error::TransactionNotFound(tx_id))?;
+        let mut tx = tx_mutex.lock();
+        tx.collections_involved.insert(collection.to_string());
+
+        for doc in &results {
+            if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                let version = col.get_version(doc_id);
+                tx.read_set.push(ReadRecord {
+                    collection: collection.to_string(),
+                    doc_id,
+                    version,
+                });
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Buffer an update within a transaction, recording read versions.
     pub fn tx_update(
         &self,
@@ -2127,7 +2227,26 @@ impl OxiDb {
     }
 
     /// Commit a transaction using OCC validation.
+    ///
+    /// Two-phase group commit. Phase 1 (validate → WAL append → apply)
+    /// runs under `commit_lock`; phase 2 (WAL fsync + commit-log mark)
+    /// runs OUTSIDE it, so concurrent committers overlap their phase 1
+    /// with an in-flight fsync and share the next one — throughput is no
+    /// longer one-fsync-per-commit. The ack still comes only after both
+    /// fsyncs: durability semantics are unchanged. The one observable
+    /// trade: between apply and ack, other connections can already read
+    /// this transaction's writes; a crash inside that window rolls them
+    /// back on recovery (the tx was never acked).
     pub fn commit_transaction(&self, tx_id: TransactionId) -> Result<()> {
+        let res = self.commit_transaction_inner(tx_id);
+        // Every exit — success, conflict, IO error — must release the
+        // pessimistic doc locks. The happy path already released them
+        // right after apply; this is the backstop for error returns.
+        self.doc_locks.release_all(tx_id);
+        res
+    }
+
+    fn commit_transaction_inner(&self, tx_id: TransactionId) -> Result<()> {
         // 1. Remove transaction from active set
         let tx = {
             let mut txs = self.active_transactions.write();
@@ -2143,185 +2262,271 @@ impl OxiDb {
             locked_collections.push((col_name.clone(), col));
         }
 
-        // Serialize the validate→apply critical section across all committers
-        // AND against direct (non-transactional) writes, which hold the read
-        // side. Held until the end of the function so that version validation
-        // (step 3) and the corresponding apply (step 8) are atomic with
-        // respect to every other writer — preventing the lost-update race
-        // where a commit validates version N and a concurrent writer bumps
-        // the doc before the apply blindly overwrites it.
-        let _commit_guard = self.commit_lock.write();
+        // ---- PHASE 1: validate → WAL append (no fsync) → apply, under the
+        // commit lock. Serialized against every other committer AND against
+        // direct (non-transactional) writes, which hold the read side —
+        // version validation and the corresponding apply are atomic with
+        // respect to every other writer. Everything in here is memory plus
+        // buffered file appends; the fsyncs happen in phase 2 OUTSIDE the
+        // lock, so other commits run their phase 1 while we flush and the
+        // next flush covers them all (group commit).
+        let (my_ticket, wal_cols, pending_events, apply_result) = {
+            let _commit_guard = self.commit_lock.write();
 
-        // 3. OCC validation: verify all recorded versions match current versions
-        for record in &tx.read_set {
-            if let Some((_, col)) = locked_collections
-                .iter()
-                .find(|(n, _)| n == &record.collection)
-            {
-                let current_version = col.get_version(record.doc_id);
-                if current_version != record.version {
-                    return Err(Error::TransactionConflict {
-                        collection: record.collection.clone(),
-                        doc_id: record.doc_id,
-                        expected_version: record.version,
-                        actual_version: current_version,
-                    });
-                }
-            }
-        }
-
-        // Build a name→Arc map for quick lookup
-        let col_map: HashMap<String, Arc<BTreeCollection>> = locked_collections
-            .iter()
-            .map(|(n, c)| (n.clone(), Arc::clone(c)))
-            .collect();
-
-        // 4. Prepare: execute each WriteOp against the collection
-        //    Collect WAL entries and mutations per collection
-        let mut all_mutations: HashMap<String, Vec<crate::collection::PreparedMutation>> =
-            HashMap::new();
-
-        for op in tx.write_ops {
-            match op {
-                WriteOp::Insert {
-                    collection,
-                    data,
-                    id,
-                } => {
-                    let col = col_map.get(&collection).unwrap();
-                    let mutation = col.prepare_tx_insert(data, tx_id, id)?;
-                    all_mutations.entry(collection).or_default().push(mutation);
-                }
-                WriteOp::Update {
-                    collection,
-                    query,
-                    update,
-                } => {
-                    let col = col_map.get(&collection).unwrap();
-                    let mutations = col.prepare_tx_update(&query, &update, tx_id)?;
-                    all_mutations
-                        .entry(collection)
-                        .or_default()
-                        .extend(mutations);
-                }
-                WriteOp::Delete { collection, query } => {
-                    let col = col_map.get(&collection).unwrap();
-                    let mutations = col.prepare_tx_delete(&query, tx_id)?;
-                    all_mutations
-                        .entry(collection)
-                        .or_default()
-                        .extend(mutations);
-                }
-            }
-        }
-
-        // 5. WAL log: for each collection, log WAL entries with single fsync each
-        for (col_name, mutations) in &all_mutations {
-            let col = col_map.get(col_name).unwrap();
-            let entries: Vec<crate::wal::WalEntry> = mutations
-                .iter()
-                .map(|m| match &m.wal_entry {
-                    crate::wal::WalEntry::Insert {
-                        doc_id,
-                        doc_bytes,
-                        tx_id,
-                    } => crate::wal::WalEntry::Insert {
-                        doc_id: *doc_id,
-                        doc_bytes: doc_bytes.clone(),
-                        tx_id: *tx_id,
-                    },
-                    crate::wal::WalEntry::Update {
-                        doc_id,
-                        doc_bytes,
-                        tx_id,
-                    } => crate::wal::WalEntry::Update {
-                        doc_id: *doc_id,
-                        doc_bytes: doc_bytes.clone(),
-                        tx_id: *tx_id,
-                    },
-                    crate::wal::WalEntry::Delete { doc_id, tx_id } => {
-                        crate::wal::WalEntry::Delete {
-                            doc_id: *doc_id,
-                            tx_id: *tx_id,
-                        }
+            // 3. OCC validation: verify all recorded versions match current versions
+            for record in &tx.read_set {
+                if let Some((_, col)) = locked_collections
+                    .iter()
+                    .find(|(n, _)| n == &record.collection)
+                {
+                    let current_version = col.get_version(record.doc_id);
+                    if current_version != record.version {
+                        return Err(Error::TransactionConflict {
+                            collection: record.collection.clone(),
+                            doc_id: record.doc_id,
+                            expected_version: record.version,
+                            actual_version: current_version,
+                        });
                     }
-                })
-                .collect();
-            col.log_wal_batch(&entries)?;
-        }
+                }
+            }
 
-        // 6. COMMIT POINT: mark transaction as committed in the global log
-        #[cfg(not(target_arch = "wasm32"))]
-        self.tx_log.mark_committed(tx_id)?;
-
-        // 7. Collect event data before consuming mutations
-        let emit = self.change_broker.has_subscribers();
-        let pending_events: Vec<ChangeEvent> = if emit {
-            all_mutations
+            // Build a name→Arc map for quick lookup
+            let col_map: HashMap<String, Arc<BTreeCollection>> = locked_collections
                 .iter()
-                .flat_map(|(col_name, mutations)| {
-                    mutations.iter().map(move |m| {
-                        if m.is_delete {
-                            ChangeEvent {
-                                token: 0,
-                                operation: OperationType::Delete,
-                                collection: col_name.clone(),
-                                doc_id: m.doc_id,
-                                document: None,
-                                tx_id: Some(tx_id),
-                            }
-                        } else if m.old_loc.is_some() {
-                            ChangeEvent {
-                                token: 0,
-                                operation: OperationType::Update,
-                                collection: col_name.clone(),
-                                doc_id: m.doc_id,
-                                document: None,
-                                tx_id: Some(tx_id),
-                            }
-                        } else {
-                            ChangeEvent {
-                                token: 0,
-                                operation: OperationType::Insert,
-                                collection: col_name.clone(),
-                                doc_id: m.doc_id,
-                                document: Some(m.new_data.clone()),
-                                tx_id: Some(tx_id),
+                .map(|(n, c)| (n.clone(), Arc::clone(c)))
+                .collect();
+
+            // 4. Prepare: execute each WriteOp against the collection
+            //    Collect WAL entries and mutations per collection
+            let mut all_mutations: HashMap<String, Vec<crate::collection::PreparedMutation>> =
+                HashMap::new();
+
+            for op in tx.write_ops {
+                match op {
+                    WriteOp::Insert {
+                        collection,
+                        data,
+                        id,
+                    } => {
+                        let col = col_map.get(&collection).unwrap();
+                        let mutation = col.prepare_tx_insert(data, tx_id, id)?;
+                        all_mutations.entry(collection).or_default().push(mutation);
+                    }
+                    WriteOp::Update {
+                        collection,
+                        query,
+                        update,
+                    } => {
+                        let col = col_map.get(&collection).unwrap();
+                        let mutations = col.prepare_tx_update(&query, &update, tx_id)?;
+                        all_mutations
+                            .entry(collection)
+                            .or_default()
+                            .extend(mutations);
+                    }
+                    WriteOp::Delete { collection, query } => {
+                        let col = col_map.get(&collection).unwrap();
+                        let mutations = col.prepare_tx_delete(&query, tx_id)?;
+                        all_mutations
+                            .entry(collection)
+                            .or_default()
+                            .extend(mutations);
+                    }
+                }
+            }
+
+            // 5. WAL append — NO fsync here. Failing mid-way is safe: the
+            // appended entries belong to a tx that will never be marked
+            // committed, so replay discards them.
+            for (col_name, mutations) in &all_mutations {
+                let col = col_map.get(col_name).unwrap();
+                let entries: Vec<crate::wal::WalEntry> = mutations
+                    .iter()
+                    .map(|m| match &m.wal_entry {
+                        crate::wal::WalEntry::Insert {
+                            doc_id,
+                            doc_bytes,
+                            tx_id,
+                        } => crate::wal::WalEntry::Insert {
+                            doc_id: *doc_id,
+                            doc_bytes: doc_bytes.clone(),
+                            tx_id: *tx_id,
+                        },
+                        crate::wal::WalEntry::Update {
+                            doc_id,
+                            doc_bytes,
+                            tx_id,
+                        } => crate::wal::WalEntry::Update {
+                            doc_id: *doc_id,
+                            doc_bytes: doc_bytes.clone(),
+                            tx_id: *tx_id,
+                        },
+                        crate::wal::WalEntry::Delete { doc_id, tx_id } => {
+                            crate::wal::WalEntry::Delete {
+                                doc_id: *doc_id,
+                                tx_id: *tx_id,
                             }
                         }
                     })
-                })
-                .collect()
-        } else {
-            Vec::new()
+                    .collect();
+                col.log_wal_batch_no_sync(&entries)?;
+            }
+
+            // The collections whose WALs phase 2 must make durable.
+            let wal_cols: Vec<Arc<BTreeCollection>> = all_mutations
+                .keys()
+                .map(|n| Arc::clone(col_map.get(n).unwrap()))
+                .collect();
+
+            // 6. Collect event data before consuming mutations
+            let emit = self.change_broker.has_subscribers();
+            let pending_events: Vec<ChangeEvent> = if emit {
+                all_mutations
+                    .iter()
+                    .flat_map(|(col_name, mutations)| {
+                        mutations.iter().map(move |m| {
+                            if m.is_delete {
+                                ChangeEvent {
+                                    token: 0,
+                                    operation: OperationType::Delete,
+                                    collection: col_name.clone(),
+                                    doc_id: m.doc_id,
+                                    document: None,
+                                    tx_id: Some(tx_id),
+                                }
+                            } else if m.old_loc.is_some() {
+                                ChangeEvent {
+                                    token: 0,
+                                    operation: OperationType::Update,
+                                    collection: col_name.clone(),
+                                    doc_id: m.doc_id,
+                                    document: None,
+                                    tx_id: Some(tx_id),
+                                }
+                            } else {
+                                ChangeEvent {
+                                    token: 0,
+                                    operation: OperationType::Insert,
+                                    collection: col_name.clone(),
+                                    doc_id: m.doc_id,
+                                    document: Some(m.new_data.clone()),
+                                    tx_id: Some(tx_id),
+                                }
+                            }
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            // 7. Apply: for each collection, apply mutations to storage.
+            // On error we still run phase 2: the WAL entries are complete,
+            // so marking the tx committed lets replay-on-restart heal the
+            // in-memory state — the same semantics as the old ordering,
+            // where an apply error happened after the commit point.
+            let mut apply_result: Result<()> = Ok(());
+            'apply: for (col_name, mut mutations) in all_mutations {
+                let col = col_map.get(&col_name).unwrap();
+                if let Err(e) = col.apply_prepared(&mut mutations) {
+                    apply_result = Err(e);
+                    break 'apply;
+                }
+            }
+
+            // 8. Mark collections dirty for the background persister.
+            for (col_name, _) in &locked_collections {
+                let col = col_map.get(col_name).unwrap();
+                col.checkpoint_wal()?;
+            }
+
+            // 9. Ticket — our writes are now visible, so take our slot in
+            // the durability order. From this point the mark turnstile in
+            // phase 2 MUST be traversed on every path, or later commits
+            // wait on our turn forever.
+            let my_ticket = self.commit_ticket.fetch_add(1, Ordering::SeqCst);
+
+            (my_ticket, wal_cols, pending_events, apply_result)
         };
 
-        // 8. Apply: for each collection, apply mutations to storage
-        for (col_name, mut mutations) in all_mutations {
-            let col = col_map.get(&col_name).unwrap();
-            col.apply_prepared(&mut mutations)?;
+        // Writes are applied and versioned — the pessimistic doc locks have
+        // done their job. Release BEFORE the fsync wait so the next
+        // transaction on the same hot documents runs its phase 1 while we
+        // flush; that overlap is exactly what batches hot-doc commits.
+        self.doc_locks.release_all(tx_id);
+
+        // ---- PHASE 2: durability, outside the lock.
+
+        // a) Group-fsync each written collection's WAL. Concurrent
+        // committers share the physical fsync (Wal::sync_shared).
+        let mut wal_result: Result<()> = Ok(());
+        for col in &wal_cols {
+            if let Err(e) = col.sync_wal_shared() {
+                wal_result = Err(e);
+                break;
+            }
         }
 
-        // 9. Checkpoint: for each collection, checkpoint WAL
-        for (col_name, _) in &locked_collections {
-            let col = col_map.get(col_name).unwrap();
-            col.checkpoint_wal()?;
+        // b) Submit the commit mark in ticket order. Ordered submission
+        // guarantees a commit can only become durable together with (or
+        // after) every commit whose applied writes it may have read — the
+        // tx_log committer fsyncs batches in submission order. The
+        // turnstile must advance even when the WAL fsync failed (in which
+        // case we DON'T mark: an unmarked tx is discarded on replay).
+        #[cfg(not(target_arch = "wasm32"))]
+        let mark_rx = {
+            let mut turn = self.mark_turn.lock().unwrap_or_else(|e| e.into_inner());
+            while *turn != my_ticket {
+                turn = self.mark_cv.wait(turn).unwrap_or_else(|e| e.into_inner());
+            }
+            let rx = if wal_result.is_ok() {
+                Some(self.tx_log.mark_committed_async(tx_id))
+            } else {
+                None
+            };
+            *turn += 1;
+            drop(turn);
+            self.mark_cv.notify_all();
+            rx
+        };
+        #[cfg(target_arch = "wasm32")]
+        let _ = my_ticket;
+
+        wal_result?;
+
+        // c) COMMIT POINT: wait for the tx_log batch fsync that covers our
+        // mark. Many commits wait here concurrently on the same batch.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let rx = mark_rx.expect("mark submitted when WAL sync succeeded")?;
+            match rx.recv() {
+                Ok(r) => r?,
+                Err(_) => {
+                    return Err(Error::Io(std::io::Error::other(
+                        "tx commit-log writer thread is gone",
+                    )));
+                }
+            }
         }
 
-        // 10. The tx_id intentionally STAYS in the commit log here. WAL
-        //     replay skips transactional entries whose id is absent from the
-        //     log, and this transaction's WAL entries outlive this function
-        //     (the WAL is only truncated at checkpoint). Removing the id now
-        //     would make a crash-before-snapshot-persist silently drop the
-        //     committed writes on recovery. The background sync thread prunes
-        //     the log after each snapshot persist; shutdown clears it.
+        // The tx_id intentionally STAYS in the commit log here. WAL
+        // replay skips transactional entries whose id is absent from the
+        // log, and this transaction's WAL entries outlive this function
+        // (the WAL is only truncated at checkpoint). Removing the id now
+        // would make a crash-before-snapshot-persist silently drop the
+        // committed writes on recovery. The background sync thread prunes
+        // the log after each snapshot persist; shutdown clears it.
 
-        // 11. Emit change events after successful commit
+        // Surface a deferred apply error only after durability settled —
+        // the on-disk state is committed either way (see step 7).
+        apply_result?;
+
+        // Emit change events after the commit is durable.
         for event in pending_events {
             self.change_broker.emit(event);
         }
 
-        // 12. Collection Arcs drop automatically when scope ends
         Ok(())
     }
 
@@ -2329,7 +2534,28 @@ impl OxiDb {
     pub fn rollback_transaction(&self, tx_id: TransactionId) -> Result<()> {
         let mut txs = self.active_transactions.write();
         txs.remove(&tx_id);
+        drop(txs);
+        self.doc_locks.release_all(tx_id);
         Ok(())
+    }
+
+    /// Wait until every assigned commit ticket has passed the mark
+    /// turnstile in `commit_transaction` phase 2. Callers hold
+    /// `commit_lock` (or run at shutdown with writers quiesced), so no
+    /// new tickets appear while waiting. Afterwards `tx_log`'s committed
+    /// set — whose reads are answered post-fsync — reflects every
+    /// applied transaction. Required before persisting snapshots: a
+    /// snapshot may contain applied writes, and their commit marks must
+    /// be durable first, or a crash could leave a multi-collection
+    /// transaction half-persisted with no commit-log record to finish
+    /// or discard it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn wait_marks_settled(&self) {
+        let target = self.commit_ticket.load(Ordering::SeqCst);
+        let mut turn = self.mark_turn.lock().unwrap_or_else(|e| e.into_inner());
+        while *turn < target {
+            turn = self.mark_cv.wait(turn).unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     // -----------------------------------------------------------------------

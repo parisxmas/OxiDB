@@ -542,6 +542,15 @@ impl WalBackend {
         }
     }
 
+    /// Group-commit fsync — see [`Wal::sync_shared`].
+    pub fn sync_shared(&self) -> Result<()> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::File(w) => w.sync_shared(),
+            Self::Memory => Ok(()),
+        }
+    }
+
     pub fn checkpoint(&self) -> Result<()> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]

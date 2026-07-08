@@ -184,6 +184,18 @@ pub struct Wal {
     /// but exposed as an atomic so read-only paths (like `scan`) can
     /// observe it without taking the lock twice.
     header_state: std::sync::atomic::AtomicU8,
+    /// Monotonic count of completed append calls, bumped under the
+    /// `inner` lock. Together with `synced_seq` this powers
+    /// [`Wal::sync_shared`]: an append is durable iff its sequence is
+    /// ≤ `synced_seq`.
+    append_seq: AtomicU64,
+    /// Highest `append_seq` known to be covered by an fsync.
+    synced_seq: AtomicU64,
+    /// Leadership lock for [`Wal::sync_shared`] — the holder performs one
+    /// fsync on behalf of every waiter whose appends predate it (group
+    /// commit). Deliberately separate from `inner` so appends proceed
+    /// while an fsync is in flight.
+    sync_lock: Mutex<()>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -218,6 +230,9 @@ impl Wal {
             sequencer: None,
             next_seal_seq: AtomicU64::new(next_seal_seq),
             header_state: std::sync::atomic::AtomicU8::new(header_state),
+            append_seq: AtomicU64::new(0),
+            synced_seq: AtomicU64::new(0),
+            sync_lock: Mutex::new(()),
         })
     }
 
@@ -370,8 +385,10 @@ impl Wal {
         }
         file.seek(SeekFrom::End(0))?;
         file.write_all(&buf)?;
+        let seq = self.append_seq.fetch_add(1, Ordering::SeqCst) + 1;
         if sync {
             file.sync_data()?;
+            self.synced_seq.fetch_max(seq, Ordering::SeqCst);
         }
         self.maybe_seal_locked(&mut file)?;
         Ok(())
@@ -391,8 +408,10 @@ impl Wal {
         }
         file.seek(SeekFrom::End(0))?;
         file.write_all(&buf)?;
+        let seq = self.append_seq.fetch_add(1, Ordering::SeqCst) + 1;
         if sync {
             file.sync_data()?;
+            self.synced_seq.fetch_max(seq, Ordering::SeqCst);
         }
         self.maybe_seal_locked(&mut file)?;
         Ok(())
@@ -428,8 +447,39 @@ impl Wal {
     /// Used after the *_no_sync batch paths when the caller wants to
     /// finalize durability for a group of writes.
     pub fn sync(&self) -> Result<()> {
+        let seq = self.append_seq.load(Ordering::SeqCst);
         let file = self.inner.lock();
         file.sync_data()?;
+        self.synced_seq.fetch_max(seq, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Group-commit fsync: make every append that completed before this
+    /// call durable, sharing the physical fsync with every concurrent
+    /// caller. The fast path returns without any syscall when a
+    /// concurrent leader's fsync already covered this caller's appends.
+    ///
+    /// The leader clones the file handle under the `inner` lock (so the
+    /// covered-sequence snapshot is consistent and a concurrent `seal`
+    /// can't swap the file mid-snapshot) but performs the fsync *outside*
+    /// it — appends keep flowing while the disk flush is in flight, which
+    /// is what lets a batch build up for the next round.
+    pub fn sync_shared(&self) -> Result<()> {
+        let target = self.append_seq.load(Ordering::SeqCst);
+        if self.synced_seq.load(Ordering::SeqCst) >= target {
+            return Ok(());
+        }
+        let _lead = self.sync_lock.lock();
+        if self.synced_seq.load(Ordering::SeqCst) >= target {
+            // A previous leader's fsync covered us while we waited.
+            return Ok(());
+        }
+        let (dup, covered) = {
+            let file = self.inner.lock();
+            (file.try_clone()?, self.append_seq.load(Ordering::SeqCst))
+        };
+        dup.sync_data()?;
+        self.synced_seq.fetch_max(covered, Ordering::SeqCst);
         Ok(())
     }
 
@@ -438,6 +488,9 @@ impl Wal {
         let file = self.inner.lock();
         file.set_len(0)?;
         file.sync_data()?;
+        // Truncation discards every pending append — nothing left to sync.
+        self.synced_seq
+            .fetch_max(self.append_seq.load(Ordering::SeqCst), Ordering::SeqCst);
         // The truncate removed the OXWA header along with the records; the
         // next append must rewrite it. Leaving the state PRESENT made the
         // first post-checkpoint record land at offset 0 while in-process
@@ -454,6 +507,9 @@ impl Wal {
     pub fn checkpoint_no_sync(&self) -> Result<()> {
         let file = self.inner.lock();
         file.set_len(0)?;
+        // Truncation discards every pending append — nothing left to sync.
+        self.synced_seq
+            .fetch_max(self.append_seq.load(Ordering::SeqCst), Ordering::SeqCst);
         // See `checkpoint` — the header must be rewritten on next append.
         self.header_state
             .store(header_state::NEEDED, std::sync::atomic::Ordering::Release);

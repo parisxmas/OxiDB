@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod database_manager;
 pub mod doc_bytes_cache;
 pub mod doc_cache;
+pub(crate) mod doc_locks;
 pub mod jsonb_oxiwire;
 pub mod wire_oxiwire;
 

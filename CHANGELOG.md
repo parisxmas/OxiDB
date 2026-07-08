@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Engine: group commit + pessimistic document locks (hot-account contention)
+
+- **Group commit.** `commit_transaction` is now a two-phase pipeline:
+  validate → WAL append (no fsync) → apply runs under the commit lock;
+  the WAL fsync (`Wal::sync_shared`, leader-elected shared flush) and
+  the tx-commit-log mark (submitted async, in ticket order) run outside
+  it, so concurrent commits share physical fsyncs instead of paying one
+  each. Ack still comes only after both fsyncs — durability semantics
+  unchanged. Commit marks are submitted in apply order (turnstile), so
+  a commit can never become durable without the commits whose writes it
+  read; snapshot persistence waits for the turnstile to settle before
+  writing (`wait_marks_settled`).
+- **`tx_find_for_update`** — pessimistic per-document write locks
+  (`SELECT ... FOR UPDATE`): matched docs are locked (sorted, re-read
+  under the lock) until commit/rollback; waiting is bounded by a lock
+  timeout (`Error::LockTimeout`). Hot documents (the exchange
+  fee-account pattern) queue instead of burning OCC retries.
+- New bench `tests/hot_account_bench.rs` (hot-ratio sweep × occ /
+  for-update). On an M-series Mac, 8 workers: throughput 130 → ~300
+  tx/s (2.3×), p99 at full contention 502ms → 48ms (10×), max 1.5s →
+  58ms; for-update mode eliminates conflicts entirely (0.00/commit at
+  every hot ratio). Money-conservation invariant holds in all modes.
+
 ### License change — proprietary as of v0.33.0
 
 - OxiDB v0.33.0 and later is **proprietary, commercially licensed**

@@ -137,6 +137,19 @@ impl TxCommitLog {
     /// batch has been fsync'd — durability semantics identical to the
     /// pre-group-commit version; only the underlying fsync is shared.
     pub fn mark_committed(&self, tx_id: TransactionId) -> Result<()> {
+        let done_rx = self.mark_committed_async(tx_id)?;
+        match done_rx.recv() {
+            Ok(r) => r,
+            Err(_) => Err(committer_gone()),
+        }
+    }
+
+    /// Submit a commit mark WITHOUT waiting for the batch fsync; the
+    /// returned receiver fires once the enclosing batch is durable.
+    /// This is the group-commit split point: the engine submits marks in
+    /// commit order (cheap) and lets many commits wait on the same batch
+    /// fsync concurrently, instead of serializing one fsync per commit.
+    pub fn mark_committed_async(&self, tx_id: TransactionId) -> Result<mpsc::Receiver<Result<()>>> {
         let (done_tx, done_rx) = mpsc::sync_channel::<Result<()>>(1);
         self.submit
             .send(Cmd::Mark {
@@ -144,10 +157,7 @@ impl TxCommitLog {
                 done: done_tx,
             })
             .map_err(|_| committer_gone())?;
-        match done_rx.recv() {
-            Ok(r) => r,
-            Err(_) => Err(committer_gone()),
-        }
+        Ok(done_rx)
     }
 
     /// Remove a tx_id from the commit log. Same fsync-coupled semantics

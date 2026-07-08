@@ -3135,6 +3135,25 @@ impl BTreeCollection {
         }
     }
 
+    /// Append tx WAL entries WITHOUT fsync. The commit pipeline calls
+    /// this inside the commit critical section, then finalizes
+    /// durability outside it via [`BTreeCollection::sync_wal_shared`] so
+    /// concurrent commits share one fsync (group commit).
+    pub fn log_wal_batch_no_sync(&self, entries: &[crate::wal::WalEntry]) -> Result<()> {
+        self.wal.log_batch_no_sync(entries)
+    }
+
+    /// Group-commit durability point for entries appended via
+    /// [`BTreeCollection::log_wal_batch_no_sync`]. No-op under
+    /// `lazy_sync` — that mode already trades durability for speed.
+    pub fn sync_wal_shared(&self) -> Result<()> {
+        if self.lazy_sync.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            self.wal.sync_shared()
+        }
+    }
+
     pub fn checkpoint_wal(&self) -> Result<()> {
         // Mark the data as needing eventual persistence. The actual
         // btree-snapshot write is now handled by sync_writes (called

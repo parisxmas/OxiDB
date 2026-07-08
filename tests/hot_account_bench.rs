@@ -68,10 +68,103 @@ impl Rng {
 struct WorkerStats {
     commits: u64,
     conflicts: u64,
+    lock_timeouts: u64,
     insufficient: u64,
     give_ups: u64,
     /// Latency of each completed transfer in µs, retries included.
     latencies_us: Vec<u64>,
+}
+
+const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One transfer using pessimistic `tx_find_for_update` locks: documents
+/// are locked in a global order (sorted account ids, then "fee" — which
+/// sorts after every "acct-*"), so no deadlock. On a hot document this
+/// queues instead of burning OCC retries.
+fn transfer_for_update(
+    db: &OxiDb,
+    from: &str,
+    to: &str,
+    amount: i64,
+    with_fee: bool,
+    max_retries: usize,
+    stats: &mut WorkerStats,
+) -> bool {
+    for _ in 0..max_retries {
+        let tx = db.begin_transaction();
+
+        let (first, second) = if from < to { (from, to) } else { (to, from) };
+        let locked = (|| -> Result<Vec<serde_json::Value>, Error> {
+            let mut a = db.tx_find_for_update(tx, "accounts", &json!({"id": first}), LOCK_TIMEOUT)?;
+            let b = db.tx_find_for_update(tx, "accounts", &json!({"id": second}), LOCK_TIMEOUT)?;
+            a.extend(b);
+            if with_fee {
+                db.tx_find_for_update(tx, "accounts", &json!({"id": "fee"}), LOCK_TIMEOUT)?;
+            }
+            Ok(a)
+        })();
+        let docs = match locked {
+            Ok(d) => d,
+            Err(Error::LockTimeout { .. }) => {
+                db.rollback_transaction(tx).ok();
+                stats.lock_timeouts += 1;
+                continue;
+            }
+            Err(_) => {
+                db.rollback_transaction(tx).ok();
+                continue;
+            }
+        };
+
+        let from_balance = docs
+            .iter()
+            .find(|d| d["id"] == from)
+            .and_then(|d| d["balance"].as_i64())
+            .unwrap_or(0);
+        let total_debit = amount + if with_fee { FEE } else { 0 };
+        if from_balance < total_debit {
+            db.rollback_transaction(tx).ok();
+            stats.insufficient += 1;
+            return false;
+        }
+
+        let dec: Value = json!({ "$inc": { "balance": -total_debit } });
+        let inc: Value = json!({ "$inc": { "balance": amount } });
+        let ok = db
+            .tx_update(tx, "accounts", &json!({"id": from}), &dec)
+            .and_then(|_| db.tx_update(tx, "accounts", &json!({"id": to}), &inc))
+            .and_then(|_| {
+                if with_fee {
+                    db.tx_update(
+                        tx,
+                        "accounts",
+                        &json!({"id": "fee"}),
+                        &json!({ "$inc": { "balance": FEE } }),
+                    )
+                    .map(|_| ())
+                } else {
+                    Ok(())
+                }
+            });
+        if ok.is_err() {
+            db.rollback_transaction(tx).ok();
+            continue;
+        }
+
+        match db.commit_transaction(tx) {
+            Ok(()) => {
+                stats.commits += 1;
+                return true;
+            }
+            Err(Error::TransactionConflict { .. }) => {
+                stats.conflicts += 1;
+                continue;
+            }
+            Err(_) => return false,
+        }
+    }
+    stats.give_ups += 1;
+    false
 }
 
 /// One transfer with retry-on-conflict. Returns (committed, conflicts_seen).
@@ -156,6 +249,7 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 fn run_mode(
     db: &Arc<OxiDb>,
     hot_ratio: f64,
+    for_update: bool,
     workers: usize,
     duration: Duration,
     n_accounts: usize,
@@ -182,15 +276,11 @@ fn run_mode(
                     let with_fee = rng.unit() < hot_ratio;
 
                     let t0 = Instant::now();
-                    let committed = transfer_with_retries(
-                        &db,
-                        &from,
-                        &to,
-                        amount,
-                        with_fee,
-                        max_retries,
-                        &mut stats,
-                    );
+                    let committed = if for_update {
+                        transfer_for_update(&db, &from, &to, amount, with_fee, max_retries, &mut stats)
+                    } else {
+                        transfer_with_retries(&db, &from, &to, amount, with_fee, max_retries, &mut stats)
+                    };
                     if committed {
                         stats.latencies_us.push(t0.elapsed().as_micros() as u64);
                     }
@@ -208,6 +298,7 @@ fn run_mode(
         let s = h.join().unwrap();
         total.commits += s.commits;
         total.conflicts += s.conflicts;
+        total.lock_timeouts += s.lock_timeouts;
         total.insufficient += s.insufficient;
         total.give_ups += s.give_ups;
         total.latencies_us.extend(s.latencies_us);
@@ -245,46 +336,52 @@ fn hot_account_contention_sweep() {
          {n_accounts} accounts, 1 shared fee account"
     );
     println!(
-        "{:>9} | {:>9} | {:>9} | {:>13} | {:>9} | {:>9} | {:>9} | {:>8}",
-        "hot_ratio", "commits", "tx/s", "conflicts/tx", "p50 µs", "p99 µs", "max µs", "give-ups"
+        "{:>10} | {:>9} | {:>9} | {:>9} | {:>13} | {:>9} | {:>9} | {:>9} | {:>8}",
+        "mode", "hot_ratio", "commits", "tx/s", "conflicts/tx", "p50 µs", "p99 µs", "max µs",
+        "give-ups"
     );
-    println!("{}", "-".repeat(96));
+    println!("{}", "-".repeat(108));
 
-    for &hot_ratio in &[0.0, 0.1, 0.5, 1.0] {
-        let mut stats = run_mode(&db, hot_ratio, workers, duration, n_accounts, max_retries);
-        stats.latencies_us.sort_unstable();
+    for &for_update in &[false, true] {
+        for &hot_ratio in &[0.0, 0.1, 0.5, 1.0] {
+            let mut stats = run_mode(
+                &db, hot_ratio, for_update, workers, duration, n_accounts, max_retries,
+            );
+            stats.latencies_us.sort_unstable();
 
-        let tx_s = stats.commits as f64 / duration_secs as f64;
-        let conflicts_per_commit = if stats.commits > 0 {
-            stats.conflicts as f64 / stats.commits as f64
-        } else {
-            f64::NAN
-        };
-        println!(
-            "{:>9.2} | {:>9} | {:>9.0} | {:>13.2} | {:>9} | {:>9} | {:>9} | {:>8}",
-            hot_ratio,
-            stats.commits,
-            tx_s,
-            conflicts_per_commit,
-            percentile(&stats.latencies_us, 0.50),
-            percentile(&stats.latencies_us, 0.99),
-            stats.latencies_us.last().copied().unwrap_or(0),
-            stats.give_ups,
-        );
+            let tx_s = stats.commits as f64 / duration_secs as f64;
+            let conflicts_per_commit = if stats.commits > 0 {
+                (stats.conflicts + stats.lock_timeouts) as f64 / stats.commits as f64
+            } else {
+                f64::NAN
+            };
+            println!(
+                "{:>10} | {:>9.2} | {:>9} | {:>9.0} | {:>13.2} | {:>9} | {:>9} | {:>9} | {:>8}",
+                if for_update { "for-update" } else { "occ" },
+                hot_ratio,
+                stats.commits,
+                tx_s,
+                conflicts_per_commit,
+                percentile(&stats.latencies_us, 0.50),
+                percentile(&stats.latencies_us, 0.99),
+                stats.latencies_us.last().copied().unwrap_or(0),
+                stats.give_ups,
+            );
 
-        // Money-conservation invariant: transfers and fee legs only move
-        // balance between documents, so the sum must never drift. A lost
-        // update under contention shows up here.
-        let total: i64 = db
-            .find("accounts", &json!({}))
-            .unwrap()
-            .iter()
-            .map(|d| d["balance"].as_i64().unwrap())
-            .sum();
-        assert_eq!(
-            total, expected_total,
-            "money conservation violated after hot_ratio={hot_ratio}: \
-             total {total} != expected {expected_total}"
-        );
+            // Money-conservation invariant: transfers and fee legs only move
+            // balance between documents, so the sum must never drift. A lost
+            // update under contention shows up here.
+            let total: i64 = db
+                .find("accounts", &json!({}))
+                .unwrap()
+                .iter()
+                .map(|d| d["balance"].as_i64().unwrap())
+                .sum();
+            assert_eq!(
+                total, expected_total,
+                "money conservation violated after mode={for_update} hot_ratio={hot_ratio}: \
+                 total {total} != expected {expected_total}"
+            );
+        }
     }
 }
