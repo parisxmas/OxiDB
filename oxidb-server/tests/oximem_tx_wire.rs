@@ -257,3 +257,61 @@ fn wire_execabort_on_unknown_command() {
     }
     assert_eq!(cmd(&mut c, &["GET", "z"]), Reply::Null);
 }
+
+/// EVAL over the wire: KEYS/ARGV + redis.call, atomic result.
+#[test]
+fn wire_eval_roundtrip() {
+    let srv = spawn_server();
+    let mut c = connect(srv.oximem_port);
+    assert_eq!(cmd(&mut c, &["SET", "bal", "100"]), Reply::Simple("OK".into()));
+    let script = "local b = tonumber(redis.call('GET', KEYS[1])) \
+                  if b >= tonumber(ARGV[1]) then \
+                    redis.call('INCRBYFLOAT', KEYS[1], '-' .. ARGV[1]) return 1 \
+                  end return 0";
+    assert_eq!(cmd(&mut c, &["EVAL", script, "1", "bal", "30"]), Reply::Int(1));
+    assert_eq!(cmd(&mut c, &["GET", "bal"]), Reply::Bulk("70".into()));
+}
+
+/// PSUBSCRIBE over the wire: pattern match delivers a pmessage frame.
+#[test]
+fn wire_psubscribe_pmessage() {
+    let srv = spawn_server();
+    let mut sub = connect(srv.oximem_port);
+    send(&mut sub, &["PSUBSCRIBE", "news.*"]);
+    match read_reply(&mut sub) {
+        Reply::Array(v) => assert_eq!(v[0], Reply::Bulk("psubscribe".into())),
+        o => panic!("{o:?}"),
+    }
+    let mut publ = connect(srv.oximem_port);
+    assert_eq!(cmd(&mut publ, &["PUBLISH", "news.tech", "hi"]), Reply::Int(1));
+    match read_reply(&mut sub) {
+        Reply::Array(v) => {
+            assert_eq!(v[0], Reply::Bulk("pmessage".into()));
+            assert_eq!(v[1], Reply::Bulk("news.*".into()));
+            assert_eq!(v[2], Reply::Bulk("news.tech".into()));
+            assert_eq!(v[3], Reply::Bulk("hi".into()));
+        }
+        o => panic!("{o:?}"),
+    }
+}
+
+/// BLPOP blocks on one connection until another pushes.
+#[test]
+fn wire_blpop_cross_connection() {
+    let srv = spawn_server();
+    let port = srv.oximem_port;
+    let waiter = std::thread::spawn(move || {
+        let mut c = connect(port);
+        cmd(&mut c, &["BLPOP", "jobs", "5"])
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let mut p = connect(srv.oximem_port);
+    assert_eq!(cmd(&mut p, &["RPUSH", "jobs", "j1"]), Reply::Int(1));
+    match waiter.join().unwrap() {
+        Reply::Array(v) => {
+            assert_eq!(v[0], Reply::Bulk("jobs".into()));
+            assert_eq!(v[1], Reply::Bulk("j1".into()));
+        }
+        o => panic!("{o:?}"),
+    }
+}

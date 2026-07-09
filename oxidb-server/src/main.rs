@@ -1009,6 +1009,22 @@ fn handle_oximem_subscribe(
                                 }
                             }
                             let _ = writer.flush();
+                        } else if cmd.eq_ignore_ascii_case("PUNSUBSCRIBE") {
+                            for arg in &items[1..] {
+                                if let Some(pat) = arg.as_str() {
+                                    receivers.retain(|(name, is_pat, _)| {
+                                        !(*is_pat && name == pat)
+                                    });
+                                    store.punsubscribe(pat);
+                                    let msg = resp::array(vec![
+                                        resp::bulk_string("punsubscribe"),
+                                        resp::bulk_string(pat),
+                                        resp::integer(receivers.len() as i64),
+                                    ]);
+                                    let _ = resp::write_value(writer, &msg);
+                                }
+                            }
+                            let _ = writer.flush();
                         } else if cmd.eq_ignore_ascii_case("UNSUBSCRIBE") {
                             if items.len() > 1 {
                                 for arg in &items[1..] {
@@ -1449,8 +1465,15 @@ fn main() {
                 loop {
                     std::thread::sleep(Duration::from_secs(snap_secs));
                     let tmp = path.with_extension("snap.tmp");
-                    if std::fs::write(&tmp, store.snapshot_json()).is_ok() {
-                        let _ = std::fs::rename(&tmp, &path);
+                    // write + fsync + rename: a crash mid-save never corrupts
+                    // the previous snapshot.
+                    if let Ok(mut f) = std::fs::File::create(&tmp) {
+                        use std::io::Write as _;
+                        if f.write_all(store.snapshot_json().as_bytes()).is_ok()
+                            && f.sync_all().is_ok()
+                        {
+                            let _ = std::fs::rename(&tmp, &path);
+                        }
                     }
                 }
             });

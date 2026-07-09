@@ -185,6 +185,10 @@ pub struct OxiMemStore {
     notify: AtomicBool,
     /// SCRIPT LOAD cache: sha1-hex → Lua source (for EVALSHA).
     scripts: RwLock<HashMap<String, String>>,
+    /// SCRIPT KILL flag — the Lua hook aborts the running script when set.
+    script_kill: Arc<AtomicBool>,
+    /// Wakes blocked BLPOP/BRPOP/BZPOPMIN/BLMOVE waiters on list/zset writes.
+    write_cv: Arc<(Mutex<u64>, std::sync::Condvar)>,
     /// Optional OxiDB reference for SQL-queryable mirroring.
     db: Option<Arc<OxiDb>>,
 }
@@ -206,6 +210,8 @@ impl OxiMemStore {
             active_watches: AtomicUsize::new(0),
             notify: AtomicBool::new(false),
             scripts: RwLock::new(HashMap::new()),
+            script_kill: Arc::new(AtomicBool::new(false)),
+            write_cv: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
             db: None,
         }
     }
@@ -234,6 +240,8 @@ impl OxiMemStore {
             active_watches: AtomicUsize::new(0),
             notify: AtomicBool::new(false),
             scripts: RwLock::new(HashMap::new()),
+            script_kill: Arc::new(AtomicBool::new(false)),
+            write_cv: Arc::new((Mutex::new(0), std::sync::Condvar::new())),
             db: Some(db),
         }
     }
@@ -269,6 +277,11 @@ impl OxiMemStore {
             subs.push((pattern.to_string(), re, vec![tx]));
         }
         Some(rx)
+    }
+
+    /// Remove a pattern subscription entry entirely (PUNSUBSCRIBE).
+    pub fn punsubscribe(&self, pattern: &str) {
+        self.psubs.lock().unwrap().retain(|(p, _, _)| p != pattern);
     }
 
     /// Publish a message to a channel, returns number of receivers
@@ -872,6 +885,7 @@ fn is_known_command(name: &str) -> bool {
             | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZUNIONSTORE" | "ZINTERSTORE"
             | "LREM" | "LSET" | "LTRIM" | "RPOPLPUSH" | "LMOVE" | "SPOP" | "SRANDMEMBER"
             | "HSCAN" | "SSCAN" | "ZSCAN" | "GETEX" | "SETBIT" | "GETBIT" | "BITCOUNT"
+            | "SMISMEMBER" | "LMPOP" | "ZMPOP" | "BLMOVE" | "BRPOPLPUSH" | "PUNSUBSCRIBE"
     )
 }
 
@@ -899,6 +913,13 @@ fn snapshot_key(store: &OxiMemStore, key: &str) -> KeySnap {
 /// exactly what a multi-account settlement needs: WATCH the two cash accounts,
 /// verify sufficiency, then move funds atomically or retry.
 pub fn execute_session(store: &OxiMemStore, sess: &mut Session, args: &[RespValue]) -> RespValue {
+    let t0 = Instant::now();
+    let r = execute_session_inner(store, sess, args);
+    crate::metrics::METRICS.record_oximem_latency(t0.elapsed().as_micros() as u64);
+    r
+}
+
+fn execute_session_inner(store: &OxiMemStore, sess: &mut Session, args: &[RespValue]) -> RespValue {
     if args.is_empty() {
         return resp::err("empty command");
     }
@@ -970,7 +991,10 @@ pub fn execute_session(store: &OxiMemStore, sess: &mut Session, args: &[RespValu
                 // semantics) — they'd stall every EXEC via tx_lock. Rewrite
                 // their timeout to "poll once".
                 if let Some(name) = qcmd.first().and_then(|a| a.as_str()) {
-                    if matches!(name.to_uppercase().as_str(), "BLPOP" | "BRPOP" | "BZPOPMIN") {
+                    if matches!(
+                        name.to_uppercase().as_str(),
+                        "BLPOP" | "BRPOP" | "BZPOPMIN" | "BLMOVE" | "BRPOPLPUSH"
+                    ) {
                         let mut nb = qcmd.clone();
                         let last = nb.len() - 1;
                         nb[last] = resp::bulk_string("-1"); // sentinel: single poll
@@ -1022,7 +1046,8 @@ fn write_key_indices(cmd: &str, argc: usize) -> Option<Vec<usize>> {
         | "ZINTERSTORE" | "LREM" | "LSET" | "LTRIM" | "SPOP" | "GETEX" | "SETBIT" => {
             Some(vec![1])
         }
-        "RPOPLPUSH" | "LMOVE" => Some(vec![1, 2]),
+        "RPOPLPUSH" | "LMOVE" | "BLMOVE" | "BRPOPLPUSH" => Some(vec![1, 2]),
+        "LMPOP" | "ZMPOP" => Some((2..argc).collect()),
         "DEL" => Some((1..argc).collect()),
         "RENAME" => Some(vec![1, 2]),
         "COPY" => Some(vec![2]),
@@ -1084,6 +1109,17 @@ pub fn execute(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         bump_write_versions(store, args);
         if store.notify.load(Ordering::Relaxed) {
             emit_keyspace_events(store, args);
+        }
+        // Wake blocked pop waiters on any list/zset write.
+        if let Some(cmd) = args.first().and_then(|a| a.as_str()) {
+            if matches!(
+                cmd.to_uppercase().as_str(),
+                "LPUSH" | "RPUSH" | "ZADD" | "ZINCRBY" | "LMOVE" | "RPOPLPUSH" | "LSET"
+            ) {
+                let (lock, cv) = &*store.write_cv;
+                *lock.lock().unwrap() += 1;
+                cv.notify_all();
+            }
         }
         // Sorted sets are mirrored centrally (their write commands predate the
         // mirror layer): re-snapshot the touched zset after any zset write.
@@ -1203,6 +1239,12 @@ fn execute_cmd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         "SETBIT" => cmd_setbit(store, &args[1..]),
         "GETBIT" => cmd_getbit(store, &args[1..]),
         "BITCOUNT" => cmd_bitcount(store, &args[1..]),
+        "SMISMEMBER" => cmd_smismember(store, &args[1..]),
+        "LMPOP" => cmd_mpop(store, &args[1..], false),
+        "ZMPOP" => cmd_mpop(store, &args[1..], true),
+        "BLMOVE" => cmd_blmove(store, &args[1..], false),
+        "BRPOPLPUSH" => cmd_blmove(store, &args[1..], true),
+        "PUNSUBSCRIBE" => resp::ok(),
         "EVAL" => cmd_eval(store, &args[1..], false),
         "EVALSHA" => cmd_eval(store, &args[1..], true),
         "SCRIPT" => cmd_script(store, &args[1..]),
@@ -3498,7 +3540,13 @@ fn cmd_bpop(store: &OxiMemStore, args: &[RespValue], side: PopSide) -> RespValue
                 return RespValue::NullArray;
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Wait for a producer instead of spinning: any list/zset write
+        // notifies write_cv; cap the wait so timeouts stay accurate.
+        let (lock, cv) = &*store.write_cv;
+        let guard = lock.lock().unwrap();
+        let _ = cv
+            .wait_timeout(guard, std::time::Duration::from_millis(20))
+            .unwrap();
     }
 }
 
@@ -3778,12 +3826,27 @@ fn cmd_spop(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         Some(s) if !s.is_empty() => s,
         _ => return resp::null(),
     };
-    let victim = set.iter().next().cloned().unwrap();
-    set.remove(&victim);
-    if set.is_empty() {
-        map.remove(key);
+    let count: Option<usize> = args.get(1).and_then(|a| a.as_str()).and_then(|s| s.parse().ok());
+    match count {
+        None => {
+            let victim = set.iter().next().cloned().unwrap();
+            set.remove(&victim);
+            if set.is_empty() {
+                map.remove(key);
+            }
+            resp::bulk_string(&victim)
+        }
+        Some(n) => {
+            let victims: Vec<String> = set.iter().take(n).cloned().collect();
+            for v in &victims {
+                set.remove(v);
+            }
+            if set.is_empty() {
+                map.remove(key);
+            }
+            resp::array(victims.iter().map(|v| resp::bulk_string(v)).collect())
+        }
     }
-    resp::bulk_string(&victim)
 }
 
 fn cmd_srandmember(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
@@ -3801,61 +3864,82 @@ fn cmd_srandmember(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         .unwrap_or_default()
         .subsec_nanos() as usize;
     let v: Vec<&String> = set.iter().collect();
-    resp::bulk_string(v[seed % v.len()])
+    match args.get(1).and_then(|a| a.as_str()).and_then(|s| s.parse::<i64>().ok()) {
+        None => resp::bulk_string(v[seed % v.len()]),
+        Some(n) => {
+            let n = n.unsigned_abs() as usize;
+            resp::array(
+                (0..n.min(v.len()))
+                    .map(|i| resp::bulk_string(v[(seed + i) % v.len()]))
+                    .collect(),
+            )
+        }
+    }
 }
 
-/// HSCAN/SSCAN/ZSCAN key cursor [MATCH p] — single-page (cursor always "0").
+/// HSCAN/SSCAN/ZSCAN key cursor [MATCH p] [COUNT n] — real offset cursor
+/// over the sorted element list, MATCH applied after the page is taken.
 fn cmd_subscan(store: &OxiMemStore, args: &[RespValue], kind: u8) -> RespValue {
     let key = args.first().and_then(|a| a.as_str()).unwrap_or("");
+    let cursor: usize = args
+        .get(1)
+        .and_then(|a| a.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut count = 10usize;
     let mut pattern = "*".to_string();
-    let mut i = 1;
+    let mut i = 2;
     while i + 1 < args.len() {
         if let Some(f) = args[i].as_str() {
             if f.eq_ignore_ascii_case("MATCH") {
                 pattern = args[i + 1].as_str().unwrap_or("*").to_string();
+            } else if f.eq_ignore_ascii_case("COUNT") {
+                if let Some(c) = args[i + 1].as_str().and_then(|s| s.parse().ok()) {
+                    count = c;
+                }
             }
         }
         i += 2;
     }
     let re = regex::Regex::new(&glob_to_regex(&pattern)).ok();
     let ok = |s: &str| re.as_ref().map(|r| r.is_match(s)).unwrap_or(true);
-    let items: Vec<RespValue> = match kind {
+    // (element name, optional paired value) in a stable sorted order.
+    let mut all: Vec<(String, Option<String>)> = match kind {
         b'h' => store
-            .hashes
-            .read()
-            .unwrap()
-            .get(key)
-            .map(|h| {
-                h.iter()
-                    .filter(|(f, _)| ok(f))
-                    .flat_map(|(f, v)| vec![resp::bulk_string(f), resp::bulk_string(v)])
-                    .collect()
-            })
+            .hashes.read().unwrap().get(key)
+            .map(|h| h.iter().map(|(f, v)| (f.clone(), Some(v.clone()))).collect())
             .unwrap_or_default(),
         b's' => store
-            .sets
-            .read()
-            .unwrap()
-            .get(key)
-            .map(|s| s.iter().filter(|m| ok(m)).map(|m| resp::bulk_string(m)).collect())
+            .sets.read().unwrap().get(key)
+            .map(|s| s.iter().map(|m| (m.clone(), None)).collect())
             .unwrap_or_default(),
         _ => store
-            .sorted_sets
-            .read()
-            .unwrap()
-            .get(key)
+            .sorted_sets.read().unwrap().get(key)
             .map(|z| {
-                z.tree
-                    .iter()
-                    .filter(|(_, m)| ok(m))
-                    .flat_map(|(Score(s), m)| {
-                        vec![resp::bulk_string(m), resp::bulk_string(&format_score(*s))]
-                    })
+                z.tree.iter()
+                    .map(|(Score(s), m)| (m.clone(), Some(format_score(*s))))
                     .collect()
             })
             .unwrap_or_default(),
     };
-    resp::array(vec![resp::bulk_string("0"), resp::array(items)])
+    if kind != b'z' {
+        all.sort(); // zset already ordered by (score, member)
+    }
+    let end = (cursor + count.max(1)).min(all.len());
+    let mut items = Vec::new();
+    for (name, val) in &all[cursor.min(all.len())..end] {
+        if ok(name) {
+            items.push(resp::bulk_string(name));
+            if let Some(v) = val {
+                items.push(resp::bulk_string(v));
+            }
+        }
+    }
+    let next = if end >= all.len() { 0 } else { end };
+    resp::array(vec![
+        resp::bulk_string(&next.to_string()),
+        resp::array(items),
+    ])
 }
 
 /// GETEX key [EX seconds | PERSIST] — GET that can adjust the ttl.
@@ -3869,11 +3953,30 @@ fn cmd_getex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         Some(e) if !e.is_expired() => e,
         _ => return resp::null(),
     };
+    let num = |i: usize| -> Option<u64> {
+        args.get(i).and_then(|a| a.as_str()).and_then(|s| s.parse().ok())
+    };
     match args.get(1).and_then(|a| a.as_str()).map(|s| s.to_uppercase()) {
         Some(ref s) if s == "EX" => {
-            if let Some(secs) = args.get(2).and_then(|a| a.as_str()).and_then(|s| s.parse().ok())
-            {
+            if let Some(secs) = num(2) {
                 e.expires_at = Some(Instant::now() + std::time::Duration::from_secs(secs));
+            }
+        }
+        Some(ref s) if s == "PX" => {
+            if let Some(ms) = num(2) {
+                e.expires_at = Some(Instant::now() + std::time::Duration::from_millis(ms));
+            }
+        }
+        Some(ref s) if s == "EXAT" => {
+            if let Some(at) = num(2) {
+                let now = now_secs();
+                e.expires_at = Some(Instant::now() + std::time::Duration::from_secs(at.saturating_sub(now)));
+            }
+        }
+        Some(ref s) if s == "PXAT" => {
+            if let Some(at_ms) = num(2) {
+                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                e.expires_at = Some(Instant::now() + std::time::Duration::from_millis(at_ms.saturating_sub(now_ms)));
             }
         }
         Some(ref s) if s == "PERSIST" => e.expires_at = None,
@@ -3938,9 +4041,129 @@ fn cmd_bitcount(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let n = map
         .get(key)
         .filter(|e| !e.is_expired())
-        .map(|e| e.value.as_bytes().iter().map(|b| b.count_ones() as i64).sum())
+        .map(|e| {
+            let bytes = e.value.as_bytes();
+            let len = bytes.len() as isize;
+            let norm = |i: isize| if i < 0 { (len + i).max(0) } else { i.min(len - 1) };
+            let (s, e2) = match (
+                args.get(1).and_then(|a| a.as_str()).and_then(|s| s.parse().ok()),
+                args.get(2).and_then(|a| a.as_str()).and_then(|s| s.parse().ok()),
+            ) {
+                (Some(a), Some(b)) => (norm(a), norm(b)),
+                _ => (0, len - 1),
+            };
+            if len == 0 || s > e2 {
+                0
+            } else {
+                bytes[s as usize..=(e2 as usize)]
+                    .iter()
+                    .map(|b| b.count_ones() as i64)
+                    .sum()
+            }
+        })
         .unwrap_or(0);
     resp::integer(n)
+}
+
+fn cmd_smismember(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let map = store.sets.read().unwrap();
+    let empty = HashSet::new();
+    let set = map.get(key).unwrap_or(&empty);
+    resp::array(
+        args[1..]
+            .iter()
+            .map(|a| resp::integer(set.contains(a.as_str().unwrap_or("")) as i64))
+            .collect(),
+    )
+}
+
+/// LMPOP numkeys key… LEFT|RIGHT / ZMPOP numkeys key… MIN — first non-empty.
+fn cmd_mpop(store: &OxiMemStore, args: &[RespValue], zset: bool) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments");
+    }
+    let numkeys: usize = args[0].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if numkeys == 0 || args.len() < 1 + numkeys + 1 {
+        return resp::err("numkeys should be greater than 0");
+    }
+    let dir = args[1 + numkeys].as_str().unwrap_or("").to_uppercase();
+    for karg in &args[1..1 + numkeys] {
+        let key = karg.as_str().unwrap_or("");
+        if zset {
+            let r = cmd_zpopmin(store, &[resp::bulk_string(key)]);
+            if let RespValue::Array(v) = &r {
+                if !v.is_empty() {
+                    store.bump_version(key);
+                    return resp::array(vec![resp::bulk_string(key), r]);
+                }
+            }
+        } else {
+            let mut map = store.lists.write().unwrap();
+            if let Some(l) = map.get_mut(key) {
+                let popped = if dir == "LEFT" { l.pop_front() } else { l.pop_back() };
+                if let Some(v) = popped {
+                    if l.is_empty() {
+                        map.remove(key);
+                    }
+                    drop(map);
+                    store.bump_version(key);
+                    return resp::array(vec![
+                        resp::bulk_string(key),
+                        resp::array(vec![resp::bulk_string(&v)]),
+                    ]);
+                }
+            }
+        }
+    }
+    RespValue::NullArray
+}
+
+/// BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout / BRPOPLPUSH src dst timeout —
+/// blocking variants of LMOVE (condvar-woken, "-1" = single-poll in EXEC).
+fn cmd_blmove(store: &OxiMemStore, args: &[RespValue], legacy: bool) -> RespValue {
+    let need = if legacy { 3 } else { 5 };
+    if args.len() < need {
+        return resp::err("wrong number of arguments");
+    }
+    let timeout: f64 = args[args.len() - 1]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+    let inner = &args[..args.len() - 1];
+    let deadline = if timeout > 0.0 {
+        Some(Instant::now() + std::time::Duration::from_secs_f64(timeout))
+    } else {
+        None
+    };
+    loop {
+        let r = cmd_lmove(store, inner, legacy);
+        if !matches!(r, RespValue::Null) {
+            if let Some(k) = inner.first().and_then(|a| a.as_str()) {
+                store.bump_version(k);
+            }
+            if let Some(k) = inner.get(1).and_then(|a| a.as_str()) {
+                store.bump_version(k);
+            }
+            return r;
+        }
+        if timeout < 0.0 {
+            return resp::null();
+        }
+        if let Some(d) = deadline {
+            if Instant::now() >= d {
+                return resp::null();
+            }
+        }
+        let (lock, cv) = &*store.write_cv;
+        let guard = lock.lock().unwrap();
+        let _ = cv
+            .wait_timeout(guard, std::time::Duration::from_millis(20))
+            .unwrap();
+    }
 }
 
 // ===========================================================================
@@ -3983,6 +4206,10 @@ fn cmd_script(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         }
         "FLUSH" => {
             store.scripts.write().unwrap().clear();
+            resp::ok()
+        }
+        "KILL" => {
+            store.script_kill.store(true, Ordering::SeqCst);
             resp::ok()
         }
         _ => resp::err("unknown SCRIPT subcommand"),
@@ -4094,10 +4321,14 @@ fn cmd_eval(store: &OxiMemStore, args: &[RespValue], by_sha: bool) -> RespValue 
     // Busy-script guard: an infinite loop would hold tx_lock forever and
     // freeze every EXEC/EVAL on the server. Kill scripts after ~200ms.
     let started = Instant::now();
+    store.script_kill.store(false, Ordering::SeqCst);
+    let kill = Arc::clone(&store.script_kill);
     lua.set_hook(
         mlua::HookTriggers::new().every_nth_instruction(20_000),
         move |_lua, _dbg| {
-            if started.elapsed() > std::time::Duration::from_millis(200) {
+            if kill.load(Ordering::SeqCst) {
+                Err(mlua::Error::runtime("script killed by SCRIPT KILL"))
+            } else if started.elapsed() > std::time::Duration::from_millis(200) {
                 Err(mlua::Error::runtime("script exceeded time limit"))
             } else {
                 Ok(mlua::VmState::Continue)
@@ -4156,11 +4387,83 @@ fn cmd_eval(store: &OxiMemStore, args: &[RespValue], by_sha: bool) -> RespValue 
             t.set("ok", msg)?;
             Ok(t)
         })?;
+        let sha1hex_f = scope.create_function(|_, s: mlua::String| {
+            Ok(sha1_hex(&s.to_string_lossy()))
+        })?;
+        redis_t.set("sha1hex", sha1hex_f)?;
         redis_t.set("call", call)?;
         redis_t.set("pcall", pcall)?;
         redis_t.set("error_reply", error_reply)?;
         redis_t.set("status_reply", status_reply)?;
         globals.set("redis", redis_t)?;
+
+        // Minimal cjson: encode/decode bridged through serde_json.
+        let cjson_t = lua.create_table()?;
+        let enc = scope.create_function(|lua, v: mlua::Value| {
+            fn to_json(lua: &mlua::Lua, v: &mlua::Value) -> serde_json::Value {
+                match v {
+                    mlua::Value::Nil => serde_json::Value::Null,
+                    mlua::Value::Boolean(b) => json!(b),
+                    mlua::Value::Integer(n) => json!(n),
+                    mlua::Value::Number(n) => json!(n),
+                    mlua::Value::String(s) => json!(s.to_string_lossy()),
+                    mlua::Value::Table(t) => {
+                        let len = t.raw_len();
+                        if len > 0 {
+                            let arr: Vec<serde_json::Value> = (1..=len)
+                                .filter_map(|i| t.get::<mlua::Value>(i).ok())
+                                .map(|x| to_json(lua, &x))
+                                .collect();
+                            serde_json::Value::Array(arr)
+                        } else {
+                            let mut m = serde_json::Map::new();
+                            for pair in t.clone().pairs::<String, mlua::Value>().flatten() {
+                                m.insert(pair.0, to_json(lua, &pair.1));
+                            }
+                            serde_json::Value::Object(m)
+                        }
+                    }
+                    _ => serde_json::Value::Null,
+                }
+            }
+            Ok(to_json(lua, &v).to_string())
+        })?;
+        let dec = scope.create_function(|lua, s: mlua::String| {
+            fn to_lua(lua: &mlua::Lua, v: &serde_json::Value) -> mlua::Result<mlua::Value> {
+                Ok(match v {
+                    serde_json::Value::Null => mlua::Value::Nil,
+                    serde_json::Value::Bool(b) => mlua::Value::Boolean(*b),
+                    serde_json::Value::Number(n) => {
+                        if let Some(i) = n.as_i64() {
+                            mlua::Value::Integer(i)
+                        } else {
+                            mlua::Value::Number(n.as_f64().unwrap_or(0.0))
+                        }
+                    }
+                    serde_json::Value::String(s) => mlua::Value::String(lua.create_string(s)?),
+                    serde_json::Value::Array(a) => {
+                        let t = lua.create_table()?;
+                        for (i, x) in a.iter().enumerate() {
+                            t.set(i + 1, to_lua(lua, x)?)?;
+                        }
+                        mlua::Value::Table(t)
+                    }
+                    serde_json::Value::Object(o) => {
+                        let t = lua.create_table()?;
+                        for (k, x) in o {
+                            t.set(k.as_str(), to_lua(lua, x)?)?;
+                        }
+                        mlua::Value::Table(t)
+                    }
+                })
+            }
+            let parsed: serde_json::Value =
+                serde_json::from_str(&s.to_string_lossy()).map_err(mlua::Error::runtime)?;
+            to_lua(lua, &parsed)
+        })?;
+        cjson_t.set("encode", enc)?;
+        cjson_t.set("decode", dec)?;
+        globals.set("cjson", cjson_t)?;
 
         let v: mlua::Value = lua.load(&src).eval()?;
         Ok(lua_to_resp(v))
@@ -4715,6 +5018,108 @@ mod tests {
             execute(&store2, &c(&["ZSCORE", "z", "mem"])).as_str(),
             Some("1.5")
         );
+    }
+
+    #[test]
+    fn round3_command_variants() {
+        let store = OxiMemStore::new();
+        // SPOP/SRANDMEMBER count
+        execute(&store, &c(&["SADD", "s3", "a", "b", "c", "d"]));
+        match execute(&store, &c(&["SPOP", "s3", "2"])) {
+            RespValue::Array(v) => assert_eq!(v.len(), 2),
+            o => panic!("{o:?}"),
+        }
+        assert_eq!(execute(&store, &c(&["SCARD", "s3"])), RespValue::Integer(2));
+        match execute(&store, &c(&["SRANDMEMBER", "s3", "2"])) {
+            RespValue::Array(v) => assert_eq!(v.len(), 2),
+            o => panic!("{o:?}"),
+        }
+        // SMISMEMBER
+        match execute(&store, &c(&["SMISMEMBER", "s3", "zzz"])) {
+            RespValue::Array(v) => assert_eq!(v[0], RespValue::Integer(0)),
+            o => panic!("{o:?}"),
+        }
+        // BITCOUNT range
+        execute(&store, &c(&["SET", "bits", "foobar"]));
+        assert_eq!(execute(&store, &c(&["BITCOUNT", "bits"])), RespValue::Integer(26));
+        assert_eq!(
+            execute(&store, &c(&["BITCOUNT", "bits", "1", "1"])),
+            RespValue::Integer(6)
+        );
+        // GETEX PX then PERSIST
+        execute(&store, &c(&["SET", "gx", "v"]));
+        execute(&store, &c(&["GETEX", "gx", "PX", "60000"]));
+        assert!(matches!(execute(&store, &c(&["TTL", "gx"])), RespValue::Integer(n) if n > 0));
+        execute(&store, &c(&["GETEX", "gx", "PERSIST"]));
+        assert_eq!(execute(&store, &c(&["TTL", "gx"])), RespValue::Integer(-1));
+        // LMPOP / ZMPOP
+        execute(&store, &c(&["RPUSH", "l3", "x", "y"]));
+        match execute(&store, &c(&["LMPOP", "2", "nope", "l3", "LEFT"])) {
+            RespValue::Array(v) => assert_eq!(v[0].as_str(), Some("l3")),
+            o => panic!("{o:?}"),
+        }
+        execute(&store, &c(&["ZADD", "z3", "1", "m"]));
+        match execute(&store, &c(&["ZMPOP", "1", "z3", "MIN"])) {
+            RespValue::Array(v) => assert_eq!(v[0].as_str(), Some("z3")),
+            o => panic!("{o:?}"),
+        }
+        // BRPOPLPUSH immediate + BLMOVE
+        execute(&store, &c(&["RPUSH", "q1", "job"]));
+        assert_eq!(
+            execute(&store, &c(&["BRPOPLPUSH", "q1", "q2", "1"])).as_str(),
+            Some("job")
+        );
+        assert_eq!(execute(&store, &c(&["LLEN", "q2"])), RespValue::Integer(1));
+    }
+
+    #[test]
+    fn round3_subscan_cursors_and_punsubscribe() {
+        let store = OxiMemStore::new();
+        for i in 0..25 {
+            execute(&store, &c(&["HSET", "bigh", &format!("f{i:02}"), "v"]));
+        }
+        let mut cursor = "0".to_string();
+        let mut seen = 0;
+        loop {
+            let r = execute(&store, &c(&["HSCAN", "bigh", &cursor, "COUNT", "7"]));
+            let arr = match r {
+                RespValue::Array(v) => v,
+                o => panic!("{o:?}"),
+            };
+            cursor = arr[0].as_str().unwrap().to_string();
+            if let RespValue::Array(items) = &arr[1] {
+                seen += items.len() / 2;
+            }
+            if cursor == "0" {
+                break;
+            }
+        }
+        assert_eq!(seen, 25);
+        // PSUBSCRIBE receives, PUNSUBSCRIBE stops delivery.
+        let rx = store.psubscribe("ch.*").unwrap();
+        execute(&store, &c(&["PUBLISH", "ch.one", "hello"]));
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap().1, "hello");
+        store.punsubscribe("ch.*");
+        assert_eq!(execute(&store, &c(&["PUBLISH", "ch.one", "again"])), RespValue::Integer(0));
+    }
+
+    #[test]
+    fn round3_eval_helpers_and_script_kill_flag() {
+        let store = OxiMemStore::new();
+        // cjson round-trip inside Lua.
+        let r = execute(&store, &c(&[
+            "EVAL",
+            "local t = cjson.decode(ARGV[1]) return cjson.encode({t.a, t.b})",
+            "0",
+            "{\"a\":1,\"b\":\"x\"}",
+        ]));
+        assert_eq!(r.as_str(), Some("[1,\"x\"]"));
+        // sha1hex
+        let r = execute(&store, &c(&["EVAL", "return redis.sha1hex('')", "0"]));
+        assert_eq!(r.as_str(), Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"));
+        // Busy-script guard still kills infinite loops.
+        let r = execute(&store, &c(&["EVAL", "while true do end", "0"]));
+        assert!(matches!(r, RespValue::Error(e) if e.contains("time limit")));
     }
 
     #[test]

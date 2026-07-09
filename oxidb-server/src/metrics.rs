@@ -60,6 +60,15 @@ pub struct Metrics {
     pub oximem_keys_sets: AtomicU64,
     pub oximem_keys_zsets: AtomicU64,
 
+    // OxiMem command latency histogram (seconds; cumulative buckets).
+    pub oximem_lat_100us: AtomicU64,
+    pub oximem_lat_500us: AtomicU64,
+    pub oximem_lat_1ms: AtomicU64,
+    pub oximem_lat_5ms: AtomicU64,
+    pub oximem_lat_10ms: AtomicU64,
+    pub oximem_lat_inf: AtomicU64,
+    pub oximem_lat_sum_us: AtomicU64,
+
     // OxiMem (RESP) commands by class.
     pub oximem_reads: AtomicU64,
     pub oximem_writes: AtomicU64,
@@ -90,6 +99,24 @@ impl Metrics {
 
     pub fn record_error(&self) {
         self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one OxiMem command's latency into the histogram.
+    pub fn record_oximem_latency(&self, us: u64) {
+        if us <= 100 {
+            self.oximem_lat_100us.fetch_add(1, Ordering::Relaxed);
+        } else if us <= 500 {
+            self.oximem_lat_500us.fetch_add(1, Ordering::Relaxed);
+        } else if us <= 1_000 {
+            self.oximem_lat_1ms.fetch_add(1, Ordering::Relaxed);
+        } else if us <= 5_000 {
+            self.oximem_lat_5ms.fetch_add(1, Ordering::Relaxed);
+        } else if us <= 10_000 {
+            self.oximem_lat_10ms.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.oximem_lat_inf.fetch_add(1, Ordering::Relaxed);
+        }
+        self.oximem_lat_sum_us.fetch_add(us, Ordering::Relaxed);
     }
 
     /// Classify and count one OxiMem RESP command.
@@ -233,6 +260,27 @@ pub fn render_prometheus(db: &Arc<OxiDb>) -> String {
         ("other", m.oximem_other.load(Ordering::Relaxed)),
     ] {
         out.push_str(&format!("oximem_commands_total{{class=\"{class}\"}} {v}\n"));
+    }
+    // Histogram exposition (cumulative buckets, Prometheus convention).
+    {
+        let b = [
+            ("0.0001", m.oximem_lat_100us.load(Ordering::Relaxed)),
+            ("0.0005", m.oximem_lat_500us.load(Ordering::Relaxed)),
+            ("0.001", m.oximem_lat_1ms.load(Ordering::Relaxed)),
+            ("0.005", m.oximem_lat_5ms.load(Ordering::Relaxed)),
+            ("0.01", m.oximem_lat_10ms.load(Ordering::Relaxed)),
+        ];
+        let inf = m.oximem_lat_inf.load(Ordering::Relaxed);
+        out.push_str("# HELP oximem_command_duration_seconds OxiMem command latency.\n# TYPE oximem_command_duration_seconds histogram\n");
+        let mut cum = 0u64;
+        for (le, v) in b {
+            cum += v;
+            out.push_str(&format!("oximem_command_duration_seconds_bucket{{le=\"{le}\"}} {cum}\n"));
+        }
+        cum += inf;
+        out.push_str(&format!("oximem_command_duration_seconds_bucket{{le=\"+Inf\"}} {cum}\n"));
+        out.push_str(&format!("oximem_command_duration_seconds_sum {}\n", m.oximem_lat_sum_us.load(Ordering::Relaxed) as f64 / 1e6));
+        out.push_str(&format!("oximem_command_duration_seconds_count {cum}\n"));
     }
     out.push_str(
         "# HELP oximem_keys OxiMem live keys by type.\n# TYPE oximem_keys gauge\n",
