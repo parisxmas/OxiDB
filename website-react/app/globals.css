@@ -828,3 +828,14 @@ tbody td code {
 .toc a:hover { color: var(--accent); }
 .toc-group { break-inside: avoid; margin-bottom: 12px; }
 .toc-group h4 { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text); margin-bottom: 4px; }
+
+/* terminal-style feature block (home) */
+.termblock{background:#0a0f0a;border:1px solid #1d2b1d;border-radius:12px;overflow:hidden;
+  box-shadow:0 8px 30px rgba(0,0,0,.35);max-width:860px;margin:0 auto}
+.termbar{display:flex;gap:7px;padding:11px 14px;background:#101710;border-bottom:1px solid #1d2b1d}
+.termbar span{width:11px;height:11px;border-radius:50%;background:#2e3d2e}
+.termbar span:first-child{background:#e0483e}.termbar span:nth-child(2){background:#e5c07b}
+.termbar span:nth-child(3){background:#26a269}
+.termblock pre{margin:0;padding:22px 26px;color:#4ade80;background:transparent;border:0;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14.5px;line-height:1.75;
+  white-space:pre-wrap;overflow-x:auto}

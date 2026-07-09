@@ -22,7 +22,7 @@ dotnet add package OxiDb.Client.Embedded
 
 <span class="co"># Standalone LINQ provider (typed queries over either client)</span>
 dotnet add package OxiDb.Linq</code></pre>
-      <p>Available on nuget.org. Latest: <strong>v0.28.18</strong>. Source &amp; samples in <code>dotnet/</code>.</p>
+      <p>Available on nuget.org. Latest: <strong>v0.34.0</strong>. Source &amp; samples in <code>dotnet/</code>.</p>
     </div>
 
     <!-- OxiDb.Linq -->

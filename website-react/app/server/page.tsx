@@ -31,7 +31,7 @@ export default function Page() {
 
     <h3>Clustering (Raft)</h3>
     <p>Multi-node replication via Raft consensus (openraft). Each node runs its own state machine and persistent log; writes commit on quorum (2/3 for a 3-node group). Enable with the <code>cluster</code> feature flag in <code>oxidb-server</code>.</p>
-    <p><strong>Persistent state <span class="version-badge latest">v0.28.18</span></strong> — Raft state is written to <code>raft_meta.json</code> + <code>raft_log.jsonl</code> on every mutation. Nodes survive container restarts and rejoin their Raft group automatically (previously the node would come back as a fresh <code>Learner</code> and the cluster would diverge).</p>
+    <p><strong>Persistent state <span class="version-badge latest">v0.34.0</span></strong> — Raft state is written to <code>raft_meta.json</code> + <code>raft_log.jsonl</code> on every mutation. Nodes survive container restarts and rejoin their Raft group automatically (previously the node would come back as a fresh <code>Learner</code> and the cluster would diverge).</p>
     <p>To bootstrap a 3-node cluster, send <code>raft_init</code> on node 1, then <code>raft_add_learner</code> for nodes 2 and 3, then <code>raft_change_membership: [1, 2, 3]</code>. The full reference deployment lives at <a href="https://github.com/parisxmas/OxiDB/tree/master/ShardReplicaRealWorldTest"><code>ShardReplicaRealWorldTest/</code></a> — 3 shards × 3 Raft nodes, fronted by oxipool, validated under 1M-record load with mid-stream failover.</p>
 
     <h3>Configuration</h3>

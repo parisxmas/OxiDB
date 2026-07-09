@@ -6,7 +6,7 @@ export default function Page() {
 <p>From zero to a working S3 endpoint in three steps.</p>
 
 <h3>1. Build / get a server with S3 support</h3>
-<p>The S3 module is feature-gated. Pre-built v0.28.18 binaries already include it. If you build from source:</p>
+<p>The S3 module is feature-gated. Pre-built v0.34.0 binaries already include it. If you build from source:</p>
 <pre><code class="lang-bash">cargo build --release -p oxidb-server --features s3</code></pre>
 
 <h3>2. Start the server</h3>

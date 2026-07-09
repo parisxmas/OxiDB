@@ -11,12 +11,118 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.34.7 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.34.7</h3>
+        <span class="version-date">2026-07-09</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; full MQTT 3.1.1 broker</h4>
+        <ul>
+          <li><strong>Topic wildcards</strong> &mdash; <code>+</code> (one level) and <code>#</code> (subtree) filters, backed by the OxiMem pattern-subscriber layer.</li>
+          <li><strong>Retained messages</strong> &mdash; last-known-value delivery to new subscribers; empty retained payload clears.</li>
+          <li><strong>QoS</strong> &mdash; QoS&nbsp;1 delivery with packet ids; inbound QoS&nbsp;2 completes the PUBREC/PUBREL/PUBCOMP handshake.</li>
+          <li><strong>Last Will &amp; Testament</strong> &mdash; published on abnormal disconnect or keepalive expiry (1.5&times; enforced).</li>
+          <li><strong>Auth</strong> &mdash; <code>OXIDB_MQTT_USER</code>/<code>OXIDB_MQTT_PASSWORD</code> require matching CONNECT credentials.</li>
+          <li>Wire-test suite speaking raw MQTT bytes (6 tests).</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- v0.34.6 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.34.6</h3>
+        <span class="version-date">2026-07-09</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; S3 API</h4>
+        <ul>
+          <li><strong>ListObjectsV2 continuation tokens</strong> &mdash; <code>aws s3 ls</code> pages correctly over large buckets.</li>
+          <li><strong>Lifecycle expiration</strong> &mdash; <code>?lifecycle</code> Days rules per bucket with a background sweeper.</li>
+          <li>SigV4 wire-test suite under <code>cargo test</code>: signed roundtrip, corrupted-signature 403, multipart assembly, batch delete.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- v0.34.2-v0.34.5 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.34.2 &ndash; v0.34.5</h3>
+        <span class="version-date">2026-07-09</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; OxiMem becomes a full Redis-class store</h4>
+        <ul>
+          <li><strong>Transactions</strong> &mdash; MULTI/EXEC/DISCARD/WATCH/UNWATCH with O(1) version-counter WATCH and Redis EXECABORT semantics.</li>
+          <li><strong>Server-side scripting</strong> &mdash; EVAL/EVALSHA/SCRIPT (Lua 5.4) with KEYS/ARGV, <code>redis.call</code>, <code>cjson</code>, <code>redis.sha1hex</code>; atomic, busy-script time limit, SCRIPT KILL.</li>
+          <li><strong>Blocking ops</strong> &mdash; BLPOP/BRPOP/BZPOPMIN/BLMOVE/BRPOPLPUSH, condvar-woken.</li>
+          <li><strong>Persistence</strong> &mdash; rebuild-on-boot from the SQL mirror (all five types, TTL-correct) and fast-mode snapshots.</li>
+          <li><strong>Pub/sub</strong> &mdash; PSUBSCRIBE glob patterns, keyspace notifications, <code>expired</code> events.</li>
+          <li>30+ new commands (set ops, GETDEL/COPY/GETEX, ZREMRANGEBY*, ZUNION/ZINTERSTORE, LMPOP/ZMPOP, bit ops, sub-scans with real cursors), Prometheus command counters + latency histogram.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed</h4>
+        <ul>
+          <li><strong>ZREVRANGE rank order</strong> &mdash; <code>ZREVRANGE key 0 0</code> returned the lowest member; ranks now index the descending view.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- v0.34.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.34.0</h3>
+        <span class="version-date">2026-07-08</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li><strong>Group commit</strong> &mdash; concurrent transactions share fsyncs; hot-account workloads went from ~130 to 300+ tx/s on a laptop, 1.5&ndash;2.2k tx/s on a 4-core Linux VPS at full durability.</li>
+          <li><strong>SELECT FOR UPDATE</strong> &mdash; <code>find_for_update</code> pessimistic document locks: contenders queue instead of conflict-storming.</li>
+          <li><strong>Time-series aggregation</strong> &mdash; <code>$ohlcv</code> (tick&rarr;candle), range/time window frames, <code>$densify</code>, <code>$fill</code>.</li>
+          <li><strong>Prometheus</strong> &mdash; <code>GET /metrics</code> on the REST listener; zero dependencies.</li>
+          <li><strong>explain &amp; slow-query profiler</strong> &mdash; real planner output plus <code>OXIDB_SLOW_QUERY_MS</code> capture.</li>
+          <li><strong>Isolation characterization</strong> &mdash; the OCC model documented and pinned by tests; Jepsen-style crash suite, fsync-failure injection, Elle-style serializability checker, Raft partition tests.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed</h4>
+        <ul>
+          <li><strong>Torn transaction-log writes</strong> &mdash; commit log now replaced atomically (found by the Jepsen-style suite).</li>
+          <li><strong>Same-document write composition</strong> &mdash; two updates to one document in a transaction no longer clobber each other.</li>
+          <li><strong>fsync-failure durability hole</strong> &mdash; a rejected commit can no longer leak into a checkpoint.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- v0.29-v0.33 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.29 &ndash; v0.33</h3>
+        <span class="version-date">2026-06 &ndash; 2026-07</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Highlights</h4>
+        <ul>
+          <li><strong>SQL engine</strong> (ADR-0010) &mdash; standalone relational engine beside the document engine: DDL, DML, joins, GROUP BY/HAVING, secondary indexes, parameterized queries, per-engine transactions; beats PostgreSQL&nbsp;15 on the reference workload.</li>
+          <li><strong>Stored procedures</strong> &mdash; CREATE/DROP PROCEDURE, CALL, named params, atomic execution.</li>
+          <li><strong>EF Core &amp; ADO.NET</strong> (ADR-0013) &mdash; OxiDb.Data (Dapper-ready) and an EF&nbsp;Core&nbsp;9 provider; interactive transactions with savepoints.</li>
+          <li><strong>Multi-database</strong> (ADR-0012) &mdash; isolated databases with per-database SQL engines, RBAC, TTL/alert threads.</li>
+          <li><strong>Licensing</strong> &mdash; v0.33.0+ is proprietary (commercial licensing); TCP client libraries remain MIT.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.28.18 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.28.18</h3>
         <span class="version-date">2026-05-25</span>
-        <span class="version-badge latest">latest</span>
+        
       </div>
 
       <div class="change-group">

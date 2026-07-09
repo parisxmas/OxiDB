@@ -15,6 +15,36 @@ export default function Page() {
         <p>Use as a library in your Rust app with zero network overhead. No separate process needed.</p>
       </div>
       <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div>
+        <h3>SQL Engine</h3>
+        <p>A full relational engine beside the document engine: joins, DDL, GROUP BY/HAVING, secondary indexes, stored procedures, EF Core &amp; ADO.NET providers. Beats PostgreSQL 15 on the reference workload.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+        <h3>OxiMem &mdash; Redis-class KV</h3>
+        <p>RESP wire (works with redis-cli), sorted sets, pub/sub with patterns, MULTI/EXEC/WATCH transactions, Lua scripting (EVAL), blocking queues, keyspace notifications, snapshots. 93&ndash;101% of Redis single-command throughput.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0114.08 0"/><path d="M1.42 9a16 16 0 0121.16 0"/><path d="M8.53 16.11a6 6 0 016.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg></div>
+        <h3>MQTT Broker</h3>
+        <p>Built-in MQTT 3.1.1: wildcards (+/#), retained messages, QoS 1/2, Last Will, keepalive, auth &mdash; sharing pub/sub channels with the RESP side, so IoT devices and Redis clients see the same messages.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
+        <h3>Time-Series</h3>
+        <p>$ohlcv tick&rarr;candle aggregation, range/time window functions, $densify gap generation and $fill (locf/linear) &mdash; a gapless candlestick pipeline in one aggregation.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg></div>
+        <h3>Observability</h3>
+        <p>Prometheus /metrics out of the box, query explain from the real planner, slow-query profiler with TTL&rsquo;d capture, per-command latency histograms.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="4" cy="6" r="2"/><circle cx="20" cy="6" r="2"/><circle cx="4" cy="18" r="2"/><circle cx="20" cy="18" r="2"/><path d="M6 7l4 3M18 7l-4 3M6 17l4-3M18 17l-4-3"/></svg></div>
+        <h3>Raft Clustering</h3>
+        <p>Replication with persistent state, database-aware DDL replication, partition-tested (no split-brain, quorum-acked writes survive failover).</p>
+      </div>
+      <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 2v20"/><path d="M2 12h5"/><path d="M2 7h5"/><path d="M2 17h5"/></svg></div>
         <h3>Client/Server</h3>
         <p>Run as a TCP server with SCRAM-SHA-256 auth, TLS, RBAC, and audit logging. Connect from any language.</p>
@@ -96,7 +126,7 @@ export default function Page() {
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><line x1="7" y1="7" x2="10" y2="10"/><line x1="14" y1="10" x2="17" y2="7"/><line x1="7" y1="17" x2="10" y2="14"/><line x1="14" y1="14" x2="17" y2="17"/></svg></div>
-        <h3>Raft Replication <span class="version-badge latest">v0.28.18</span></h3>
+        <h3>Raft Replication <span class="version-badge latest">v0.34.0</span></h3>
         <p>Multi-node replication via openraft consensus. Persistent state (<code>raft_meta.json</code> + append-only <code>raft_log.jsonl</code>) survives container restarts. Quorum-based commits, automatic catch-up on rejoin, verified at 1M records under mid-stream failover.</p>
       </div>
       <div class="feature-card">

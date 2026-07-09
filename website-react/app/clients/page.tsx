@@ -51,21 +51,21 @@ client.Backup(path)</code></pre>
 
       <div class="client-card">
         <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></div>
-        <h3>.NET (TCP) <span class="version-badge latest">v0.28.18</span></h3>
+        <h3>.NET (TCP) <span class="version-badge latest">v0.34.0</span></h3>
         <p>Pure managed C# client. <code>HelloAsync</code> handshake, typed <code>FindAsync&lt;T&gt;</code> / <code>InsertReturningIdAsync</code>, <code>IAsyncEnumerable&lt;T&gt;</code> streaming, <code>services.AddOxiDbTcp(...)</code> DI extension, <code>Query.Eq/Gte/In/...</code> builder, domain exception hierarchy.</p>
         <pre><code>dotnet add package OxiDb.Client.Tcp</code></pre>
       </div>
 
       <div class="client-card">
         <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></div>
-        <h3>.NET (Embedded) <span class="version-badge latest">v0.28.18</span></h3>
+        <h3>.NET (Embedded) <span class="version-badge latest">v0.34.0</span></h3>
         <p>FFI bindings to the native Rust library. In-process, no server needed. Bundles native runtimes for darwin-arm64/amd64, linux-x64/arm64, windows-x64.</p>
         <pre><code>dotnet add package OxiDb.Client.Embedded</code></pre>
       </div>
 
       <div class="client-card">
         <div class="client-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
-        <h3>.NET (LINQ) <span class="version-badge latest">v0.28.18</span></h3>
+        <h3>.NET (LINQ) <span class="version-badge latest">v0.34.0</span></h3>
         <p>Standalone LINQ provider over <code>IOxiDbClient</code>. <code>client.GetCollection&lt;T&gt;("users").Where(u =&gt; u.Age &gt;= 18).ToListAsync()</code>. Translates expression trees to OxiWire document queries — no SQL, no EF Core.</p>
         <pre><code>dotnet add package OxiDb.Linq</code></pre>
       </div>

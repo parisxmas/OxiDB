@@ -225,7 +225,7 @@ drop(db);</code></pre></div>
   <span class="str">"ok"</span>: <span class="kw">true</span>,
   <span class="str">"server"</span>: {
     <span class="str">"name"</span>: <span class="str">"oxidb-server"</span>,
-    <span class="str">"version"</span>: <span class="str">"0.28.18"</span>,
+    <span class="str">"version"</span>: <span class="str">"0.34.0"</span>,
     <span class="str">"wire_version"</span>: <span class="num">1</span>,
     <span class="str">"supported_wire_versions"</span>: [<span class="num">1</span>],
     <span class="str">"stable_surface_version"</span>: <span class="str">"1.0"</span>,

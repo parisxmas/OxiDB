@@ -7,14 +7,14 @@ export default function Page() {
 
 <h3>1. Get a server running</h3>
 <pre><code class="lang-bash"><span class="co"># macOS (Apple Silicon)</span>
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.28.18/oxidb-server-v0.28.18-darwin-arm64.tar.gz
-tar xzf oxidb-server-v0.28.18-darwin-arm64.tar.gz
+curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-server-v0.34.0-darwin-arm64.tar.gz
+tar xzf oxidb-server-v0.34.0-darwin-arm64.tar.gz
 ./oxidb-server &amp;</code></pre>
 <p>For Linux, Windows, Docker, or building from source, see the <a href="/quickstart/">Quick Start</a>.</p>
 
 <h3>2. Get the CLI</h3>
-<pre><code class="lang-bash">curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.28.18/oxidb-cli-v0.28.18-darwin-arm64.tar.gz
-tar xzf oxidb-cli-v0.28.18-darwin-arm64.tar.gz
+<pre><code class="lang-bash">curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-cli-v0.34.0-darwin-arm64.tar.gz
+tar xzf oxidb-cli-v0.34.0-darwin-arm64.tar.gz
 ./oxidb --host 127.0.0.1 --port 4444</code></pre>
 
 <h3>3. Confirm OxiScript is on</h3>
