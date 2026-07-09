@@ -589,3 +589,11 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-secondary);
   white-space: pre;
 }
+
+.ct-section {
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}

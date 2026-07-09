@@ -5,6 +5,7 @@ import { ContextMenu } from "../common/ContextMenu";
 import type { MenuItem } from "../common/ContextMenu";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 import { CreateTableDialog } from "./CreateTableDialog";
+import { AlterTableDialog } from "./AlterTableDialog";
 import { useToast } from "../common/Toast";
 
 interface StmtResult {
@@ -52,6 +53,7 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; message: string; sql: string } | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [editTable, setEditTable] = useState<string | null>(null);
 
   const loadTables = useCallback(async () => {
     setLoading(true);
@@ -144,6 +146,7 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
         { label: "Describe columns", onClick: () => onQuery(`DESCRIBE ${table};`) },
         { label: "Show indexes", onClick: () => onQuery(`SHOW INDEXES FROM ${table};`) },
         { label: "", onClick: () => {}, separator: true },
+        { label: "Edit table…", onClick: () => setEditTable(table) },
         { label: "Insert name into editor", onClick: () => onInsert(table) },
         { label: "", onClick: () => {}, separator: true },
         {
@@ -305,6 +308,39 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
               toast(String(e), "error");
             }
             return ok;
+          }}
+        />
+      )}
+
+      {editTable && (
+        <AlterTableDialog
+          table={editTable}
+          onCancel={() => setEditTable(null)}
+          onApply={async (statements) => {
+            // Run each ALTER in order; stop at the first engine error so a
+            // partial rename/drop is visible rather than silently continued.
+            for (let i = 0; i < statements.length; i++) {
+              try {
+                const resp = (await runSql(statements[i])) as unknown as {
+                  ok?: boolean;
+                  error?: string;
+                };
+                if (resp && resp.ok === false) {
+                  toast(`Step ${i + 1}/${statements.length}: ${resp.error}`, "error");
+                  setCols({});
+                  loadTables();
+                  return false;
+                }
+              } catch (e) {
+                toast(String(e), "error");
+                return false;
+              }
+            }
+            toast(`Applied ${statements.length} change(s)`, "success");
+            setEditTable(null);
+            setCols({});
+            loadTables();
+            return true;
           }}
         />
       )}
