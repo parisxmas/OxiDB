@@ -12,6 +12,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(Mutex::new(DbBackend::Disconnected))
+        .manage(commands::oximem::OxiMemState::default())
         .invoke_handler(tauri::generate_handler![
             // Connection
             commands::connection::open_embedded,
@@ -42,6 +43,14 @@ pub fn run() {
             commands::query::execute_raw_command,
             // SQL engine (ADR-0010)
             commands::sql::run_sql,
+            // OxiMem (Redis-compatible KV)
+            commands::oximem::oximem_connect,
+            commands::oximem::oximem_disconnect,
+            commands::oximem::oximem_status,
+            commands::oximem::oximem_scan,
+            commands::oximem::oximem_get,
+            commands::oximem::oximem_set_string,
+            commands::oximem::oximem_del,
             // Aggregation
             commands::aggregation::run_aggregation,
             // Blobs

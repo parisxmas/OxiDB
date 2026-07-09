@@ -86,6 +86,19 @@ export const executeRawCommand = (command: JsonValue) =>
 export const runSql = (sql: string, params?: JsonValue[], db?: string) =>
   invoke<JsonValue>("run_sql", { sql, params, db });
 
+// OxiMem (Redis-compatible KV, separate port)
+export const oximemConnect = (host: string, port: number) =>
+  invoke<JsonValue>("oximem_connect", { host, port });
+export const oximemDisconnect = () => invoke<void>("oximem_disconnect");
+export const oximemStatus = () => invoke<JsonValue>("oximem_status");
+export const oximemScan = (cursor: string, pattern: string) =>
+  invoke<JsonValue>("oximem_scan", { cursor, pattern });
+export const oximemGet = (key: string) =>
+  invoke<JsonValue>("oximem_get", { key });
+export const oximemSetString = (key: string, value: string) =>
+  invoke<JsonValue>("oximem_set_string", { key, value });
+export const oximemDel = (key: string) => invoke<JsonValue>("oximem_del", { key });
+
 // Aggregation
 export const runAggregation = (collection: string, pipeline: JsonValue) =>
   invoke<JsonValue[]>("run_aggregation", { collection, pipeline });

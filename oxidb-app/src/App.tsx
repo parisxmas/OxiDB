@@ -9,6 +9,7 @@ import { DashboardPage } from "./components/dashboard/DashboardPage";
 import { CollectionBrowser } from "./components/collections/CollectionBrowser";
 import { QueryEditor } from "./components/query/QueryEditor";
 import { SqlPage } from "./components/sql/SqlPage";
+import { OxiMemPage } from "./components/oximem/OxiMemPage";
 import { IndexManager } from "./components/indexes/IndexManager";
 import { BlobManager } from "./components/blobs/BlobManager";
 import { AggregationBuilder } from "./components/aggregation/AggregationBuilder";
@@ -35,6 +36,7 @@ function AppRoutes() {
         <Route path="/collections" element={<CollectionBrowser />} />
         <Route path="/query" element={<QueryEditor />} />
         <Route path="/sql" element={<SqlPage />} />
+        <Route path="/oximem" element={<OxiMemPage />} />
         <Route path="/indexes" element={<IndexManager />} />
         <Route path="/blobs" element={<BlobManager />} />
         <Route path="/aggregation" element={<AggregationBuilder />} />
