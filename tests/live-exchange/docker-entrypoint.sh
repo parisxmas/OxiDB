@@ -15,6 +15,7 @@ export OXIDB_LAZY_SYNC=true
 export OXIDB_SYNC_INTERVAL_MS=200
 export OXIDB_IDLE_TIMEOUT=0   # never drop client connections (traders/matcher stay live)
 export WEB_PORT=8090
+export WS_TICK_MS="${WS_TICK_MS:-500}"   # shared 4-core host: calmer WS push
 export METRICS_URL=http://127.0.0.1:14580/metrics
 export LEDGER_TTL_SECS="${LEDGER_TTL_SECS:-60}"
 export ORDER_TTL_SECS="${ORDER_TTL_SECS:-35}"

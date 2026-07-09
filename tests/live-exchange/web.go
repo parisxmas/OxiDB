@@ -283,7 +283,16 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	tick := time.NewTicker(1000 * time.Millisecond)
+	// Snapshot push cadence. Books/prices come from OxiMem now (microsecond
+	// reads), so a fast tick is cheap — 250ms default; WS_TICK_MS overrides
+	// (the 4-core shared server deploy sets it higher).
+	tickMs := 250
+	if v := os.Getenv("WS_TICK_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 50 {
+			tickMs = n
+		}
+	}
+	tick := time.NewTicker(time.Duration(tickMs) * time.Millisecond)
 	defer tick.Stop()
 	for {
 		select {
