@@ -6,4 +6,5 @@ pub mod dashboard;
 pub mod documents;
 pub mod indexes;
 pub mod query;
+pub mod sql;
 pub mod transactions;

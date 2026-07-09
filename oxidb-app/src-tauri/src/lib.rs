@@ -39,6 +39,8 @@ pub fn run() {
             commands::indexes::drop_index,
             // Query
             commands::query::execute_raw_command,
+            // SQL engine (ADR-0010)
+            commands::sql::run_sql,
             // Aggregation
             commands::aggregation::run_aggregation,
             // Blobs

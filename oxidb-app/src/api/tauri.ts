@@ -77,6 +77,10 @@ export const dropIndex = (collection: string, index: string) =>
 export const executeRawCommand = (command: JsonValue) =>
   invoke<JsonValue>("execute_raw_command", { command });
 
+// SQL engine (ADR-0010) — { ok, data: [ per-statement result ] }
+export const runSql = (sql: string, params?: JsonValue[], db?: string) =>
+  invoke<JsonValue>("run_sql", { sql, params, db });
+
 // Aggregation
 export const runAggregation = (collection: string, pipeline: JsonValue) =>
   invoke<JsonValue[]>("run_aggregation", { collection, pipeline });

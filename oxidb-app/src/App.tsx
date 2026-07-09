@@ -7,6 +7,7 @@ import { ConnectionScreen } from "./components/connection/ConnectionScreen";
 import { DashboardPage } from "./components/dashboard/DashboardPage";
 import { CollectionBrowser } from "./components/collections/CollectionBrowser";
 import { QueryEditor } from "./components/query/QueryEditor";
+import { SqlPage } from "./components/sql/SqlPage";
 import { IndexManager } from "./components/indexes/IndexManager";
 import { BlobManager } from "./components/blobs/BlobManager";
 import { AggregationBuilder } from "./components/aggregation/AggregationBuilder";
@@ -32,6 +33,7 @@ function AppRoutes() {
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/collections" element={<CollectionBrowser />} />
         <Route path="/query" element={<QueryEditor />} />
+        <Route path="/sql" element={<SqlPage />} />
         <Route path="/indexes" element={<IndexManager />} />
         <Route path="/blobs" element={<BlobManager />} />
         <Route path="/aggregation" element={<AggregationBuilder />} />

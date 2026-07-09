@@ -4,6 +4,7 @@ const links = [
   { to: "/dashboard", label: "Dashboard" },
   { to: "/collections", label: "Collections" },
   { to: "/query", label: "Query" },
+  { to: "/sql", label: "SQL" },
   { to: "/indexes", label: "Indexes" },
   { to: "/blobs", label: "Blobs" },
   { to: "/aggregation", label: "Aggregation" },
