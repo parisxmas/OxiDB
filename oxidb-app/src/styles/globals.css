@@ -597,3 +597,33 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-secondary);
   margin-bottom: 4px;
 }
+
+/* ── Font-size (UI scale) control ───────────────────────────────────── */
+.font-scale {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: var(--bg-secondary);
+}
+.font-scale-btn,
+.font-scale-pct {
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 4px 8px;
+  line-height: 1;
+}
+.font-scale-btn:hover,
+.font-scale-pct:hover { background: var(--accent); color: #fff; }
+.font-scale-pct {
+  min-width: 42px;
+  text-align: center;
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  border-left: 1px solid var(--border-color);
+  border-right: 1px solid var(--border-color);
+}

@@ -1,11 +1,13 @@
 import { useConnection } from "../../context/ConnectionContext";
 import { useTheme } from "../../context/ThemeContext";
+import { useFontScale } from "../../context/FontScaleContext";
 import { disconnect as apiDisconnect } from "../../api/tauri";
 import { useNavigate } from "react-router-dom";
 
 export function Header() {
   const { status, setStatus } = useConnection();
   const { theme, toggle } = useTheme();
+  const { scale, inc, dec, reset } = useFontScale();
   const navigate = useNavigate();
 
   const handleDisconnect = async () => {
@@ -39,6 +41,21 @@ export function Header() {
         )}
       </div>
       <div className="header-right">
+        <div className="font-scale" title="Font size (⌘+ / ⌘- / ⌘0)">
+          <button className="font-scale-btn" onClick={dec} aria-label="Smaller">
+            A−
+          </button>
+          <button
+            className="font-scale-pct"
+            onClick={reset}
+            title="Reset to 100%"
+          >
+            {Math.round(scale * 100)}%
+          </button>
+          <button className="font-scale-btn" onClick={inc} aria-label="Larger">
+            A+
+          </button>
+        </div>
         <button className="btn btn-secondary btn-sm" onClick={toggle}>
           {theme === "dark" ? "Light" : "Dark"}
         </button>

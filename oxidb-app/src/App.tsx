@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ThemeProvider } from "./context/ThemeContext";
+import { FontScaleProvider } from "./context/FontScaleContext";
 import { ConnectionProvider, useConnection } from "./context/ConnectionContext";
 import { ToastProvider } from "./components/common/Toast";
 import { AppLayout } from "./components/layout/AppLayout";
@@ -46,13 +47,15 @@ function AppRoutes() {
 export default function App() {
   return (
     <ThemeProvider>
-      <ConnectionProvider>
-        <ToastProvider>
-          <BrowserRouter>
-            <AppRoutes />
-          </BrowserRouter>
-        </ToastProvider>
-      </ConnectionProvider>
+      <FontScaleProvider>
+        <ConnectionProvider>
+          <ToastProvider>
+            <BrowserRouter>
+              <AppRoutes />
+            </BrowserRouter>
+          </ToastProvider>
+        </ConnectionProvider>
+      </FontScaleProvider>
     </ThemeProvider>
   );
 }
