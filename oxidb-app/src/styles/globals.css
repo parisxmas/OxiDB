@@ -792,3 +792,18 @@ tr:hover .row-del { opacity: 1; }
   background: rgba(255, 255, 255, 0.25);
   font-size: 10px;
 }
+
+/* ── Schema tree: procedures section ────────────────────────────────── */
+.schema-procs { border-top: 1px solid var(--border-color); }
+.schema-section-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+.schema-section-head:hover { color: var(--text-primary); }

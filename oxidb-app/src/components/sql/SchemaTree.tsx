@@ -7,6 +7,7 @@ import { ConfirmDialog } from "../common/ConfirmDialog";
 import { CreateTableDialog } from "./CreateTableDialog";
 import { AlterTableDialog } from "./AlterTableDialog";
 import { IndexDialog } from "./IndexDialog";
+import { ProcedureDialog, type ProcInfo } from "./ProcedureDialog";
 import { useToast } from "../common/Toast";
 
 interface StmtResult {
@@ -58,6 +59,9 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [showCreate, setShowCreate] = useState(false);
   const [editTable, setEditTable] = useState<string | null>(null);
   const [indexTable, setIndexTable] = useState<string | null>(null);
+  const [procs, setProcs] = useState<ProcInfo[]>([]);
+  const [procsOpen, setProcsOpen] = useState(true);
+  const [viewProc, setViewProc] = useState<ProcInfo | null>(null);
 
   const loadTables = useCallback(async () => {
     setLoading(true);
@@ -76,6 +80,22 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
             rows: typeof r[1] === "number" ? r[1] : null,
           }))
         );
+      }
+      // Stored procedures (best-effort — empty when none / unsupported).
+      const ps = firstSelect(await runSql("SHOW PROCEDURES"));
+      if (ps && !ps.error) {
+        const pi = (ps.columns || []).indexOf("procedure");
+        const pp = (ps.columns || []).indexOf("params");
+        const pd = (ps.columns || []).indexOf("definition");
+        setProcs(
+          (ps.rows || []).map((r) => ({
+            name: String(r[pi]),
+            params: String(r[pp] ?? ""),
+            definition: String(r[pd] ?? ""),
+          }))
+        );
+      } else {
+        setProcs([]);
       }
     } catch (e) {
       setError(String(e));
@@ -265,6 +285,44 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
         </ul>
       )}
 
+      {procs.length > 0 && (
+        <div className="schema-procs">
+          <div className="schema-section-head" onClick={() => setProcsOpen((o) => !o)}>
+            <span className="schema-caret">{procsOpen ? "▾" : "▸"}</span>
+            PROCEDURES ({procs.length})
+          </div>
+          {procsOpen && (
+            <ul className="schema-list" style={{ flex: "none" }}>
+              {procs.map((p) => (
+                <li key={p.name}>
+                  <div className="schema-table-row">
+                    <span className="schema-caret" style={{ visibility: "hidden" }}>
+                      ▸
+                    </span>
+                    <span
+                      className="schema-table-name"
+                      title="Click to view · double-click to insert CALL"
+                      onClick={() => setViewProc(p)}
+                      onDoubleClick={() => {
+                        const args = p.params
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean)
+                          .map(() => "?")
+                          .join(", ");
+                        onQuery(`CALL ${p.name}(${args});`);
+                      }}
+                    >
+                      ⚙ {p.name}
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       {menu && (
         <ContextMenu
           x={menu.x}
@@ -354,6 +412,22 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
           table={indexTable}
           onClose={() => setIndexTable(null)}
           onChanged={loadTables}
+        />
+      )}
+
+      {viewProc && (
+        <ProcedureDialog
+          proc={viewProc}
+          onClose={() => setViewProc(null)}
+          onInsert={onInsert}
+          onDrop={(procName) => {
+            setViewProc(null);
+            setConfirm({
+              title: `Drop ${procName}?`,
+              message: `This permanently removes the stored procedure "${procName}".`,
+              sql: `DROP PROCEDURE ${procName};`,
+            });
+          }}
         />
       )}
     </div>
