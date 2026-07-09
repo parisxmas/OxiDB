@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { runSql } from "../../api/tauri";
 import type { JsonValue } from "../../api/types";
 import { useToast } from "../common/Toast";
+import { Pagination } from "../common/Pagination";
 
 interface Col {
   name: string;
@@ -73,10 +74,19 @@ export function TableDataView({ table }: Props) {
   const [editVal, setEditVal] = useState("");
   const [adding, setAdding] = useState<string[] | null>(null);
   const [busy, setBusy] = useState(false);
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(PAGE);
+  const [total, setTotal] = useState<number | null>(null);
   const editRef = useRef<HTMLInputElement>(null);
 
   const pkCols = cols.filter((c) => c.primaryKey);
   const editable = pkCols.length > 0;
+
+  // A new table resets to the first page.
+  useEffect(() => {
+    setPage(0);
+    setTotal(null);
+  }, [table]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -101,7 +111,14 @@ export function TableDataView({ table }: Props) {
       }));
       setCols(cs);
 
-      const s = unwrap(await runSql(`SELECT * FROM ${table} LIMIT ${PAGE}`));
+      // Total row count (once) so the pager can show "of N" and a last page.
+      const cnt = unwrap(await runSql(`SELECT COUNT(*) AS n FROM ${table}`));
+      const cntRow = (cnt.data?.[0] as { rows?: JsonValue[][] } | undefined)?.rows?.[0];
+      if (cnt.ok && cntRow) setTotal(Number(cntRow[0]) || 0);
+
+      const s = unwrap(
+        await runSql(`SELECT * FROM ${table} LIMIT ${pageSize} OFFSET ${page * pageSize}`)
+      );
       const sel = s.data?.[0] as { columns?: string[]; rows?: JsonValue[][] } | undefined;
       setColNames(sel?.columns || cs.map((c) => c.name));
       setRows(sel?.rows || []);
@@ -110,7 +127,7 @@ export function TableDataView({ table }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [table]);
+  }, [table, page, pageSize]);
 
   useEffect(() => {
     load();
@@ -182,7 +199,10 @@ export function TableDataView({ table }: Props) {
           await runSql(`DELETE FROM ${table} WHERE ${clause}`, params as JsonValue[])
         );
         if (!resp.ok) toast(resp.error || "delete failed", "error");
-        else setRows((rs) => rs.filter((_, i) => i !== r));
+        else {
+          setRows((rs) => rs.filter((_, i) => i !== r));
+          setTotal((t) => (t != null ? Math.max(0, t - 1) : t));
+        }
       } catch (e) {
         toast(String(e), "error");
       } finally {
@@ -237,8 +257,7 @@ export function TableDataView({ table }: Props) {
       <div className="toolbar">
         <strong style={{ fontFamily: "var(--font-mono)" }}>{table}</strong>
         <span style={{ marginLeft: 8, fontSize: 12, color: "var(--text-secondary)" }}>
-          {rows.length} row{rows.length === 1 ? "" : "s"}
-          {rows.length >= PAGE ? ` (first ${PAGE})` : ""}
+          {total != null ? `${total.toLocaleString()} row${total === 1 ? "" : "s"}` : `${rows.length} rows`}
         </span>
         {!editable && (
           <span style={{ marginLeft: 10, fontSize: 12, color: "var(--danger)" }}>
@@ -379,6 +398,21 @@ export function TableDataView({ table }: Props) {
           <div className="empty-state">No rows</div>
         )}
       </div>
+
+      {((total ?? 0) > pageSize || page > 0) && (
+        <Pagination
+          page={page}
+          pageSize={pageSize}
+          total={total ?? undefined}
+          currentCount={rows.length}
+          onPage={setPage}
+          onPageSize={(s) => {
+            setPageSize(s);
+            setPage(0);
+          }}
+          busy={loading}
+        />
+      )}
 
       {adding && (
         <div className="toolbar" style={{ justifyContent: "flex-end" }}>

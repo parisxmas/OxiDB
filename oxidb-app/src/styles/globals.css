@@ -807,3 +807,41 @@ tr:hover .row-del { opacity: 1; }
   user-select: none;
 }
 .schema-section-head:hover { color: var(--text-primary); }
+
+/* ── Pagination bar ─────────────────────────────────────────────────── */
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+}
+.pager-btn {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 13px;
+  min-width: 26px;
+  padding: 2px 6px;
+}
+.pager-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.pager-btn:disabled { opacity: 0.35; cursor: default; }
+.pager-info {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  padding: 0 8px;
+}
+.pager-size {
+  margin-left: auto;
+  font-size: 12px;
+  padding: 2px 6px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+}

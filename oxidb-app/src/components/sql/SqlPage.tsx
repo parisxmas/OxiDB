@@ -6,6 +6,7 @@ import { SqlEditor } from "../common/SqlEditor";
 import { SchemaTree } from "./SchemaTree";
 import { TableDataView } from "./TableDataView";
 import { DataTable } from "../common/DataTable";
+import { Pagination } from "../common/Pagination";
 import { useToast } from "../common/Toast";
 import { useConnection } from "../../context/ConnectionContext";
 
@@ -69,6 +70,8 @@ export function SqlPage() {
   const [schemaKey, setSchemaKey] = useState(0);
   const [browseTable, setBrowseTable] = useState<string | null>(null);
   const [resultTab, setResultTab] = useState<"query" | "data">("query");
+  const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(100);
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const [splitPct, setSplitPct] = useState(42);
@@ -110,6 +113,7 @@ export function SqlPage() {
     const text = sql.trim();
     if (!text) return;
     setResultTab("query");
+    setPage(0);
     setLoading(true);
     setError(null);
     const start = performance.now();
@@ -145,6 +149,8 @@ export function SqlPage() {
 
   const cur = results && results[active] ? results[active] : null;
   const isSelect = !!cur?.columns;
+  const allRows = isSelect ? (toRowObjects(cur) as JsonValue[]) : [];
+  const pagedRows = allRows.slice(page * pageSize, (page + 1) * pageSize);
 
   return (
     <div
@@ -324,7 +330,10 @@ export function SqlPage() {
                   className={`btn btn-sm ${
                     i === active ? "btn-primary" : "btn-secondary"
                   }`}
-                  onClick={() => setActive(i)}
+                  onClick={() => {
+                    setActive(i);
+                    setPage(0);
+                  }}
                 >
                   #{i + 1}
                 </button>
@@ -350,11 +359,24 @@ export function SqlPage() {
           ) : !cur ? (
             <div className="empty-state">Run a statement to see results</div>
           ) : isSelect ? (
-            <DataTable data={toRowObjects(cur) as JsonValue[]} />
+            <DataTable data={pagedRows} />
           ) : (
             <div className="empty-state">{summarize(cur)}</div>
           )}
         </div>
+        {resultTab === "query" && isSelect && allRows.length > pageSize && (
+          <Pagination
+            page={page}
+            pageSize={pageSize}
+            total={allRows.length}
+            currentCount={pagedRows.length}
+            onPage={setPage}
+            onPageSize={(s) => {
+              setPageSize(s);
+              setPage(0);
+            }}
+          />
+        )}
       </div>
       </div>
     </div>
