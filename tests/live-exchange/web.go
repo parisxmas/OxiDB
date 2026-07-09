@@ -117,10 +117,19 @@ func serveMetricsJSON(w http.ResponseWriter, r *http.Request) {
 		out["rss_mb"] = rss
 		out["cpu_pct"] = cpu
 	}
-	// Trader count = number of users (one USD account each).
-	if db, err := Dial(); err == nil {
-		out["traders"] = float64(db.Count("accounts", map[string]any{"asset": "USD"}))
-		db.Close()
+	// Trader count + cumulative trade counter from OxiMem.
+	if mem, err := DialResp(); err == nil {
+		if v, err := mem.Do("KEYS", "usd:*"); err == nil {
+			if arr, ok := v.([]any); ok {
+				out["traders"] = float64(len(arr))
+			}
+		}
+		if v, err := mem.Do("GET", "trades:count"); err == nil {
+			if n, err := strconv.ParseFloat(str(v), 64); err == nil {
+				out["trades_count"] = n
+			}
+		}
+		mem.Close()
 	}
 	w.Header().Set("Content-Type", "application/json")
 	b, _ := json.Marshal(out)
@@ -298,6 +307,51 @@ type level struct {
 	Q float64 `json:"q"`
 }
 
+// memLevels reads a book side from an OxiMem ZSET and aggregates it into at
+// most n price levels: bids ≤ mid (best/highest first), asks ≥ mid (best/
+// lowest first). Marketable orders beyond the mid are in flight for the
+// matcher and are hidden, keeping the displayed book uncrossed.
+func memLevels(mem *Resp, key string, bids bool, mid float64, n int) []level {
+	if mem == nil {
+		return nil
+	}
+	var raw any
+	var err error
+	if bids {
+		raw, err = mem.Do("ZREVRANGE", key, "0", "79", "WITHSCORES")
+	} else {
+		raw, err = mem.Do("ZRANGE", key, "0", "79", "WITHSCORES")
+	}
+	if err != nil {
+		return nil
+	}
+	arr, _ := raw.([]any)
+	var out []level
+	for i := 0; i+1 < len(arr); i += 2 {
+		member := str(arr[i])
+		price, _ := strconv.ParseFloat(str(arr[i+1]), 64)
+		if bids && price > mid {
+			continue // marketable bid in flight
+		}
+		if !bids && price < mid {
+			continue
+		}
+		qty := 0.0
+		if parts := strings.SplitN(member, "|", 3); len(parts) == 3 {
+			qty, _ = strconv.ParseFloat(parts[2], 64)
+		}
+		if len(out) > 0 && out[len(out)-1].P == price {
+			out[len(out)-1].Q += qty
+			continue
+		}
+		if len(out) >= n {
+			break
+		}
+		out = append(out, level{price, qty})
+	}
+	return out
+}
+
 // levels collapses same-price orders (already price-sorted) into at most
 // n depth levels with summed quantity.
 func levels(orders []map[string]any, n int) []level {
@@ -332,30 +386,33 @@ func snapshot(db *Client) []byte {
 		At      int64    `json:"at"`
 	}{At: time.Now().UnixMilli()}
 
-	for _, s := range symbols {
-		row, _ := db.FindOne("symbols", map[string]any{"sym": s})
-		price := seedPrice[s]
-		if row != nil {
-			price = getF(row, "price")
+	mem, _ := DialResp()
+	if mem != nil {
+		defer mem.Close()
+	}
+	if mem != nil {
+		if v, err := mem.Do("GET", "trades:count"); err == nil {
+			if n, err := strconv.Atoi(str(v)); err == nil {
+				out.Total = n
+			}
 		}
-		if row != nil {
-			out.Total += int(getF(row, "traded"))
+	}
+	for _, s := range symbols {
+		price := seedPrice[s]
+		if mem != nil {
+			if v, err := mem.Do("GET", "px:"+s); err == nil {
+				if f, err := strconv.ParseFloat(str(v), 64); err == nil && f > 0 {
+					price = f
+				}
+			}
 		}
 		so := symOut{Sym: s, Price: price}
 		// The RESTING (maker) book a real venue shows: resting bids sit below
-		// the fair mid, resting asks above it. Fetch around the mid so we get
-		// the depth ladder near the spread — NOT the marketable orders in
-		// flight (taker buys above the mid / taker sells below it), which the
-		// matcher is about to consume. Guarantees best-bid < mid < best-ask.
+		// the fair mid, resting asks above it (marketable orders in flight are
+		// filtered out client-side). Books live in OxiMem ZSETs now.
 		mid := 0.7*price + 0.3*seedPrice[s]
-		bidRaw, _ := db.Find("open_orders",
-			map[string]any{"sym": s, "side": "buy", "price": map[string]any{"$lte": mid}},
-			map[string]any{"price": -1}, 40)
-		askRaw, _ := db.Find("open_orders",
-			map[string]any{"sym": s, "side": "sell", "price": map[string]any{"$gte": mid}},
-			map[string]any{"price": 1}, 40)
-		so.Bids = levels(bidRaw, 6) // best (highest) first
-		so.Asks = levels(askRaw, 6) // best (lowest) first
+		so.Bids = memLevels(mem, "book:"+s+":b", true, mid, 6)
+		so.Asks = memLevels(mem, "book:"+s+":a", false, mid, 6)
 		// A couple of most-recent prints.
 		recent, _ := db.Find("trades", map[string]any{"sym": s}, map[string]any{"_id": -1}, 4)
 		for _, t := range recent {

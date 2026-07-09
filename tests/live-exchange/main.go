@@ -72,8 +72,14 @@ func main() {
 	case "setup":
 		setup()
 	case "matcher":
-		matcher()
+		hybridMatcher()
 	case "trader":
+		id, _ := strconv.Atoi(os.Args[2])
+		secs, _ := strconv.Atoi(os.Args[3])
+		hybridTrader(id, secs)
+	case "matcher-doc": // legacy doc-engine matcher (kept for comparison)
+		matcher()
+	case "trader-doc":
 		id, _ := strconv.Atoi(os.Args[2])
 		secs, _ := strconv.Atoi(os.Args[3])
 		trader(id, secs)
@@ -97,67 +103,31 @@ func setup() {
 	if err != nil {
 		panic(err)
 	}
-	for _, s := range symbols {
-		c.Insert("symbols", map[string]any{"sym": s, "price": seedPrice[s], "ts": 0})
-	}
-	c.CreateIndex("symbols", "sym")
+	// Durable ledger + chart collections live in the doc engine; the order
+	// books, balances and prices live in OxiMem (see hybrid.go).
+	c.CreateUniqueIndex("trades", "uid") // exactly-once ledger writes
+	c.CreateIndex("trades", "sym")
 
-	for u := 0; u < nUsers; u++ {
-		owner := fmt.Sprintf("user-%d", u)
-		c.Insert("accounts", map[string]any{"owner": owner, "asset": "USD", "bal": startCash})
-		for _, s := range symbols {
-			c.Insert("accounts", map[string]any{"owner": owner, "asset": s, "bal": initHolding})
-		}
-	}
-	c.CreateIndex("accounts", "owner")
-
-	// Resting order book: indexed for best-bid/best-ask scans, and TTL'd so
-	// unfilled orders expire and the book can't grow without bound.
-	c.CreateIndex("open_orders", "sym")
-	c.CreateIndex("open_orders", "uid")
-	c.CreateIndex("open_orders", "price") // best-bid/ask + depth sorts for the book
-	ttl := 20
-	if v := os.Getenv("ORDER_TTL_SECS"); v != "" {
-		ttl, _ = strconv.Atoi(v)
-	}
-	if err := c.CreateTTL("open_orders", "created_at", ttl); err != nil {
-		fmt.Println("WARN: ttl:", err)
-	}
-
-	c.CreateUniqueIndex("trades", "uid") // exactly-once settlement guard
-	c.CreateIndex("trades", "sym")       // per-symbol recent-trade lookups for the dashboard
-	c.CreateIndex("journal", "uid")
-
-	// OHLCV candles for the per-symbol chart. The candle builder rolls up
-	// recent trades into fixed buckets and appends here; kept longer than the
-	// trades window (which is a 60s rolling window) so the chart shows real
-	// history even after the underlying trades expire.
-	c.CreateIndex("candles", "sym")
-	c.CreateTTL("candles", "created_at", 900) // ~15 min of 2s candles (mini charts)
-
-	// 24h candle series (coarser buckets) for the big chart. Seeded with a
-	// full 24h of history at startup so the chart shows a real day from the
-	// first paint, then kept live by the builder.
-	c.CreateIndex("hcandles", "sym")
-	c.CreateTTL("hcandles", "created_at", 90000) // > 24h so the backfill persists
-	backfill24h(c)
-
-	// Bound the ledger for a long-running demo. In a real venue the trade
-	// journal is permanent (archived, not deleted); here we expire it so
-	// RSS stays flat while you watch. Accounts (the source of truth for
-	// conservation) are never expired. Set LEDGER_TTL_SECS=0 to keep the
-	// full permanent ledger (RSS then grows by design).
 	lttl := 120
 	if v := os.Getenv("LEDGER_TTL_SECS"); v != "" {
 		lttl, _ = strconv.Atoi(v)
 	}
 	if lttl > 0 {
 		c.CreateTTL("trades", "created_at", lttl)
-		c.CreateTTL("journal", "created_at", lttl)
 	}
 
-	fmt.Printf("seeded %d symbols, %d users (cash %.0f + %.0f/symbol), order TTL=%ds, ledger TTL=%ds\n",
-		len(symbols), nUsers, startCash, initHolding, ttl, lttl)
+	// OHLCV candles for the charts (built from the trades ledger).
+	c.CreateIndex("candles", "sym")
+	c.CreateTTL("candles", "created_at", 900)
+	c.CreateIndex("hcandles", "sym")
+	c.CreateTTL("hcandles", "created_at", 90000)
+	backfill24h(c)
+
+	// Market state (balances, prices, empty books) in OxiMem.
+	seedMem()
+
+	fmt.Printf("seeded %d symbols, %d users (cash %.0f + %.0f/symbol), ledger TTL=%ds\n",
+		len(symbols), nUsers, startCash, initHolding, lttl)
 }
 
 // ---- trader ---------------------------------------------------------------

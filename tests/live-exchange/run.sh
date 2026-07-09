@@ -11,6 +11,7 @@ DATA="$HERE/.data"
 SECS="${1:-45}"
 PORT=4455
 export OXIDB_PORT="$PORT"
+export OXIMEM_PORT="${OXIMEM_PORT:-6489}"
 NUSERS="${NUSERS:-10}"; export NUSERS
 # Throughput knobs. Every write shares one WAL, so an un-paced order flood
 # starves settlement; pacing the order rate and lifting the taker share hands
@@ -38,6 +39,7 @@ echo "[run] starting oxidb-server on :$PORT (metrics :14580, lazy-sync)…"
 # concurrently. The default (4 worker threads) queues them; give it enough
 # threads to actually run the fan-out in parallel.
 OXIDB_DATA="$DATA" OXIDB_ADDR="127.0.0.1:$PORT" OXIDB_HTTP_PORT=14580 \
+  OXIDB_OXIMEM_PORT="${OXIMEM_PORT:-6489}" \
   OXIDB_POOL_SIZE="${OXIDB_POOL_SIZE:-16}" \
   OXIDB_LAZY_SYNC=true OXIDB_SYNC_INTERVAL_MS="${SYNC_MS:-200}" \
   "$BIN" > "$HERE/.server.log" 2>&1 &

@@ -5,3 +5,7 @@
 .trader-*.log
 .web.log
 .run.log
+.hydata/
+.hy.log
+.hyserver.log
+.run.log

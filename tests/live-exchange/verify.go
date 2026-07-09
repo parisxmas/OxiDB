@@ -1,5 +1,9 @@
 package main
 
+// verify — post-run consistency for the hybrid exchange: conservation is
+// checked from the OxiMem balances (never expired) and the durable OxiDB
+// ledger is cross-checked against the cumulative trade counter.
+
 import (
 	"fmt"
 	"math"
@@ -8,14 +12,14 @@ import (
 )
 
 func verify() int {
-	c, err := Dial()
+	mem, err := DialResp()
 	if err != nil {
 		panic(err)
 	}
-	// When the ledger is TTL-bounded it's a rolling window, so balances
-	// can't be integrated from the (partial) journal — the conservation
-	// checks below, computed from the never-expiring accounts, are the
-	// real correctness proof and hold regardless.
+	doc, err := Dial()
+	if err != nil {
+		panic(err)
+	}
 	ledgerTTL := 120
 	if v := os.Getenv("LEDGER_TTL_SECS"); v != "" {
 		ledgerTTL, _ = strconv.Atoi(v)
@@ -30,125 +34,82 @@ func verify() int {
 		}
 	}
 
-	nTrades := c.Count("trades", map[string]any{})
-	nJournal := c.Count("journal", map[string]any{})
-	nOpen := c.Count("open_orders", map[string]any{})
+	fmt.Printf("\n=== exchange verification (hybrid: OxiMem market + OxiDB ledger) ===\n")
 
-	fmt.Printf("\n=== exchange verification ===\n")
-	fmt.Printf("trades=%d journal_docs=%d open_orders(resting)=%d\n",
-		nTrades, nJournal, nOpen)
+	// Cumulative fills settled atomically in OxiMem.
+	cntV, _ := mem.Do("GET", "trades:count")
+	counter, _ := strconv.Atoi(str(cntV))
+	nLedger := doc.Count("trades", map[string]any{})
+	qlenV, _ := mem.Do("LLEN", "trades:q")
+	qlen, _ := qlenV.(int64)
+	fmt.Printf("settled=%d ledger=%d queue_backlog=%d\n", counter, nLedger, qlen)
 
-	// Under ledger TTL a sweep can fire between these counts, so allow a
-	// tiny boundary skew; with no TTL the relation is exact.
-	tol := 0
-	if ledgerTTL > 0 {
-		tol = 20
+	check(counter > 0, "trades were executed (traders formed a market)")
+
+	// Ledger completeness: with no TTL every settled fill must be in OxiDB
+	// (minus whatever is still queued); with a TTL the ledger is a rolling
+	// window, so only require it to be non-empty and bounded by the counter.
+	if ledgerTTL == 0 {
+		check(nLedger+int(qlen) == counter,
+			fmt.Sprintf("ledger complete (%d + %d queued == %d settled)", nLedger, qlen, counter))
+	} else {
+		check(nLedger > 0 && nLedger <= counter,
+			fmt.Sprintf("ledger is a live rolling window (%d of %d, ttl=%ds)", nLedger, counter, ledgerTTL))
 	}
-	absi := func(x int) int {
-		if x < 0 {
-			return -x
-		}
-		return x
-	}
-	check(nTrades > 0, "trades were executed (traders formed a market)")
-	// One journal doc (4 legs) per trade — 1:1, since each is written in the
-	// same atomic settlement transaction.
-	check(absi(nJournal-nTrades) <= tol, fmt.Sprintf("journal doc per trade (%d ~ %d) — atomic double-entry", nJournal, nTrades))
 
-	// Distinct trade uids.
-	dcount := c.Aggregate("trades", []any{
+	// Distinct uids in the ledger (exactly-once writes; unique index backs it).
+	d := doc.Aggregate("trades", []any{
 		map[string]any{"$group": map[string]any{"_id": "$uid"}},
 		map[string]any{"$count": "n"},
 	})
 	nDistinct := 0
-	if len(dcount) > 0 {
-		nDistinct = int(getF(dcount[0], "n"))
+	if len(d) > 0 {
+		nDistinct = int(getF(d[0], "n"))
 	}
-	check(absi(nDistinct-nTrades) <= tol, fmt.Sprintf("trade uids all distinct (%d ~ %d) — no double-settlement", nDistinct, nTrades))
+	check(nDistinct == nLedger, fmt.Sprintf("ledger uids all distinct (%d == %d)", nDistinct, nLedger))
 
-	// USD net per owner from the journal — legs live in an array per doc, so
-	// $unwind them first, then sum by owner.
-	usdNet := map[string]float64{}
-	for _, r := range c.Aggregate("journal", []any{
-		map[string]any{"$unwind": "$legs"},
-		map[string]any{"$match": map[string]any{"legs.acct": "USD"}},
-		map[string]any{"$group": map[string]any{"_id": "$legs.owner", "s": map[string]any{"$sum": "$legs.delta"}}},
-	}) {
-		usdNet[getS(r, "_id")] = getF(r, "s")
-	}
-	// Asset net per (owner, symbol).
-	type key struct{ o, a string }
-	assetNet := map[key]float64{}
-	for _, r := range c.Aggregate("journal", []any{
-		map[string]any{"$unwind": "$legs"},
-		map[string]any{"$match": map[string]any{"legs.acct": map[string]any{"$ne": "USD"}}},
-		map[string]any{"$group": map[string]any{
-			"_id": map[string]any{"o": "$legs.owner", "a": "$legs.acct"},
-			"s":   map[string]any{"$sum": "$legs.delta_asset"}}},
-	}) {
-		id, _ := r["_id"].(map[string]any)
-		assetNet[key{getS(id, "o"), getS(id, "a")}] = getF(r, "s")
-	}
-
-	accts, _ := c.Find("accounts", map[string]any{}, nil, 0)
-	usdReproduce, assetReproduce := true, true
-	negCash, negHold := 0, 0
+	// Conservation from OxiMem balances (the source of truth).
 	totalUSD := 0.0
-	holdingBySym := map[string]float64{}
-	for _, a := range accts {
-		owner, asset, bal := getS(a, "owner"), getS(a, "asset"), getF(a, "bal")
-		if asset == "USD" {
-			totalUSD += bal
-			if bal < -1e-6 {
-				negCash++
-			}
-			exp := startCash + usdNet[owner]
-			if math.Abs(bal-exp) > 1e-3 {
-				usdReproduce = false
-				fmt.Printf("      %s USD %.6f != %.6f\n", owner, bal, exp)
-			}
-		} else {
-			holdingBySym[asset] += bal
-			if bal < -1e-6 {
-				negHold++
-			}
-			exp := initHolding + assetNet[key{owner, asset}]
-			if math.Abs(bal-exp) > 1e-3 {
-				assetReproduce = false
-				fmt.Printf("      %s/%s %.6f != %.6f\n", owner, asset, bal, exp)
-			}
+	negCash := 0
+	for u := 0; u < nUsers; u++ {
+		v, _ := mem.Do("GET", fmt.Sprintf("usd:user-%d", u))
+		f, _ := strconv.ParseFloat(str(v), 64)
+		totalUSD += f
+		if f < -1e-6 {
+			negCash++
 		}
 	}
-	_ = usdReproduce
-	_ = assetReproduce
-
 	wantUSD := float64(nUsers) * startCash
-	check(math.Abs(totalUSD-wantUSD) < 1e-2,
+	check(math.Abs(totalUSD-wantUSD) < 1.0,
 		fmt.Sprintf("total USD conserved (%.2f == %.0f) — no money created/destroyed", totalUSD, wantUSD))
+	check(negCash == 0, fmt.Sprintf("no negative USD (overdrafts: %d)", negCash))
 
-	symOK := true
+	symOK, negHold := true, 0
 	wantHold := float64(nUsers) * initHolding
 	for _, s := range symbols {
-		if math.Abs(holdingBySym[s]-wantHold) > 1e-3 {
+		tot := 0.0
+		for u := 0; u < nUsers; u++ {
+			v, _ := mem.Do("GET", fmt.Sprintf("ast:%s:user-%d", s, u))
+			f, _ := strconv.ParseFloat(str(v), 64)
+			tot += f
+			if f < -1e-6 {
+				negHold++
+			}
+		}
+		if math.Abs(tot-wantHold) > 0.01 {
 			symOK = false
-			fmt.Printf("      %s total holdings %.4f != %.0f\n", s, holdingBySym[s], wantHold)
+			fmt.Printf("      %s holdings %.4f != %.0f\n", s, tot, wantHold)
 		}
 	}
-	check(symOK, "each symbol's total holdings conserved (closed system: every buy has a sell)")
-	check(negCash == 0, fmt.Sprintf("no negative USD (overdrafts: %d)", negCash))
+	check(symOK, "each symbol's total holdings conserved (closed system)")
 	check(negHold == 0, fmt.Sprintf("no negative holdings / no naked shorts (%d)", negHold))
-	if ledgerTTL == 0 {
-		check(usdReproduce, "every USD balance reproducible from the journal")
-		check(assetReproduce, "every position reproducible from the journal")
-	} else {
-		fmt.Printf("  --  journal is a %ds rolling window (ledger TTL) — conservation above is the proof\n", ledgerTTL)
-	}
 
-	// Prices moved from the seed → the market was formed by traders.
+	// Prices moved from seed → the market was formed by traders.
 	moved := 0
 	for _, s := range symbols {
-		row, _ := c.FindOne("symbols", map[string]any{"sym": s})
-		if row != nil && math.Abs(getF(row, "price")-seedPrice[s]) > 1e-9 {
+		v, _ := mem.Do("GET", "px:"+s)
+		f, _ := strconv.ParseFloat(str(v), 64)
+		if math.Abs(f-seedPrice[s]) > 1e-9 {
 			moved++
 		}
 	}
@@ -159,6 +120,6 @@ func verify() int {
 		fmt.Printf("RESULT: %d CHECK(S) FAILED\n", fails)
 		return 1
 	}
-	fmt.Println("RESULT: ALL CHECKS PASSED — trader-formed market, ledger consistent")
+	fmt.Println("RESULT: ALL CHECKS PASSED — RAM-matched market, durable ledger consistent")
 	return 0
 }

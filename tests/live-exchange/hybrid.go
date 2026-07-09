@@ -1,17 +1,23 @@
 package main
 
-// hybrid — the real-exchange architecture on one process: the ORDER BOOK and
-// BALANCES live in OxiMem (ZSETs + strings, matched at memory speed with
-// WATCH/MULTI/EXEC atomic settlement), while every fill is appended to the
-// OxiDB document engine as the durable trade ledger. This is the pattern real
-// venues use: match in RAM, persist events.
+// The exchange core, v2 — built on the full OxiMem stack:
 //
-//	usd:{owner}        string balance (INCRBYFLOAT)
-//	ast:{sym}:{owner}  string position
-//	book:{sym}:b/a     ZSET score=price member="uid|owner|qty"
-//	px:{sym}           last trade price
+//   order books   ZSETs  book:{sym}:b / book:{sym}:a  (member "uid|owner|qty")
+//   balances      strings usd:{owner} / ast:{sym}:{owner}
+//   last price    string  px:{sym}
+//   settlement    ONE EVALSHA — a Lua script that checks funds, consumes the
+//                 orders (re-listing partial-fill remainders), moves cash and
+//                 assets, sets the price, bumps the cumulative counter and
+//                 queues the trade event — atomically, in a single round
+//                 trip. No WATCH, no aborts, no retries.
+//   durability    ledger writers BLPOP trades:q and insert each fill into
+//                 the OxiDB `trades` collection (uid unique) — the durable
+//                 event log that also feeds the candle builders.
+//
+// This is the "match in RAM, persist events" architecture real venues use.
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -20,69 +26,123 @@ import (
 	"time"
 )
 
-func hybrid(secs int) {
-	nUsersH := envInt("HY_USERS", 10)
-	rateEach := envInt("HY_RATE_EACH", 150) // orders/s per trader
-	takerPct := envInt("HY_TAKER_PCT", 50)
+// settleLua is the atomic settlement script.
+// KEYS: 1 bkey 2 akey 3 usd:buyer 4 usd:seller 5 ast:buyer 6 ast:seller 7 px 8 counter 9 queue
+// ARGV: 1 bidM 2 askM 3 qty 4 price 5 cost 6 bidRemMember 7 bidPrice 8 askRemMember 9 askPrice 10 tradeJson
+// Returns 1 = settled, 0 = buyer can't pay (bid cancelled), -1 = seller short (ask cancelled).
+const settleLua = `local ub = tonumber(redis.call('GET', KEYS[3]) or '0')
+if ub < tonumber(ARGV[5]) then redis.call('ZREM', KEYS[1], ARGV[1]) return 0 end
+local sa = tonumber(redis.call('GET', KEYS[6]) or '0')
+if sa < tonumber(ARGV[3]) then redis.call('ZREM', KEYS[2], ARGV[2]) return -1 end
+redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('ZREM', KEYS[2], ARGV[2])
+if ARGV[6] ~= '' then redis.call('ZADD', KEYS[1], ARGV[7], ARGV[6]) end
+if ARGV[8] ~= '' then redis.call('ZADD', KEYS[2], ARGV[9], ARGV[8]) end
+redis.call('INCRBYFLOAT', KEYS[3], '-' .. ARGV[5])
+redis.call('INCRBYFLOAT', KEYS[4], ARGV[5])
+redis.call('INCRBYFLOAT', KEYS[5], ARGV[3])
+redis.call('INCRBYFLOAT', KEYS[6], '-' .. ARGV[3])
+redis.call('SET', KEYS[7], ARGV[4])
+redis.call('INCR', KEYS[8])
+redis.call('RPUSH', KEYS[9], ARGV[10])
+return 1`
 
-	// Seed balances + prices in OxiMem.
-	seedC, err := DialResp()
+// seedMem seeds balances + prices in OxiMem (fresh market).
+func seedMem() {
+	c, err := DialResp()
 	if err != nil {
-		panic(fmt.Sprintf("OxiMem dial: %v (set OXIDB_OXIMEM_PORT on the server, OXIMEM_PORT here)", err))
+		panic(fmt.Sprintf("OxiMem dial: %v (is OXIDB_OXIMEM_PORT set on the server?)", err))
 	}
-	seedC.Do("FLUSHALL")
-	for u := 0; u < nUsersH; u++ {
+	defer c.Close()
+	c.Do("FLUSHALL")
+	for u := 0; u < nUsers; u++ {
 		owner := fmt.Sprintf("user-%d", u)
-		seedC.Do("SET", "usd:"+owner, fmt.Sprintf("%f", startCash))
+		c.Do("SET", "usd:"+owner, fmt.Sprintf("%f", startCash))
 		for _, s := range symbols {
-			seedC.Do("SET", "ast:"+s+":"+owner, fmt.Sprintf("%f", initHolding))
+			c.Do("SET", "ast:"+s+":"+owner, fmt.Sprintf("%f", initHolding))
 		}
 	}
 	for _, s := range symbols {
-		seedC.Do("SET", "px:"+s, fmt.Sprintf("%f", seedPrice[s]))
+		c.Do("SET", "px:"+s, fmt.Sprintf("%f", seedPrice[s]))
 	}
-	fmt.Printf("[hybrid] seeded %d users × %d symbols in OxiMem\n", nUsersH, len(symbols))
+	c.Do("SET", "trades:count", "0")
+	fmt.Printf("[mem] seeded %d users × %d symbols in OxiMem\n", nUsers, len(symbols))
+}
 
-	// Durable ledger writers: fills stream to OxiDB without stalling matchers.
-	ledger := make(chan map[string]any, 4096)
+// hybridMatcher runs the matching engine: one goroutine per symbol scanning
+// its book and settling crossings via EVALSHA, plus ledger writers draining
+// trades:q into OxiDB, plus a book pruner. Blocks forever.
+func hybridMatcher() {
+	var trades, cancels int64
+
+	// Durable ledger writers: BLPOP the fill queue into OxiDB.
 	for w := 0; w < 2; w++ {
 		go func() {
-			dc, err := Dial()
+			mem, err := DialResp()
 			if err != nil {
 				return
 			}
-			for doc := range ledger {
-				dc.Insert("trades", doc)
+			doc, err := Dial()
+			if err != nil {
+				return
+			}
+			for {
+				r, err := mem.Do("BLPOP", "trades:q", "1")
+				if err != nil {
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+				arr, ok := r.([]any)
+				if !ok || len(arr) < 2 {
+					continue
+				}
+				var t map[string]any
+				if json.Unmarshal([]byte(str(arr[1])), &t) == nil {
+					doc.Insert("trades", t)
+				}
 			}
 		}()
 	}
 
-	var trades, aborts, cancels, placed, skipped, scans int64
-	stop := make(chan struct{})
+	// Book pruner: cap resting depth per side (drops worst-priced tail).
+	go func() {
+		c, err := DialResp()
+		if err != nil {
+			return
+		}
+		for range time.Tick(5 * time.Second) {
+			for _, s := range symbols {
+				c.Do("ZREMRANGEBYRANK", "book:"+s+":b", "0", "-2001")
+				c.Do("ZREMRANGEBYRANK", "book:"+s+":a", "2000", "-1")
+			}
+		}
+	}()
 
-	// One matcher goroutine per symbol — single-threaded per book.
 	for _, sym := range symbols {
 		go func(sym string) {
 			c, err := DialResp()
 			if err != nil {
 				return
 			}
+			shaV, err := c.Do("SCRIPT", "LOAD", settleLua)
+			if err != nil {
+				fmt.Printf("[matcher] %s SCRIPT LOAD failed: %v\n", sym, err)
+				return
+			}
+			sha := str(shaV)
 			bkey, akey := "book:"+sym+":b", "book:"+sym+":a"
 			seq := 0
 			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				bb, err1 := c.Do("ZREVRANGE", bkey, "0", "0", "WITHSCORES")
-				ba, err2 := c.Do("ZRANGE", akey, "0", "0", "WITHSCORES")
-				if err1 != nil || err2 != nil {
-					fmt.Printf("[hybrid] %s matcher error: %v %v — reconnecting\n", sym, err1, err2)
+				bb, e1 := c.Do("ZREVRANGE", bkey, "0", "0", "WITHSCORES")
+				ba, e2 := c.Do("ZRANGE", akey, "0", "0", "WITHSCORES")
+				if e1 != nil || e2 != nil {
 					c.Close()
 					time.Sleep(100 * time.Millisecond)
 					if nc, e := DialResp(); e == nil {
 						c = nc
+						if sv, e := c.Do("SCRIPT", "LOAD", settleLua); e == nil {
+							sha = str(sv)
+						}
 					}
 					continue
 				}
@@ -92,11 +152,10 @@ func hybrid(secs int) {
 					time.Sleep(2 * time.Millisecond)
 					continue
 				}
-				bidM, _ := bidArr[0].(string)
-				bidP, _ := strconv.ParseFloat(bidArr[1].(string), 64)
-				askM, _ := askArr[0].(string)
-				askP, _ := strconv.ParseFloat(askArr[1].(string), 64)
-				atomic.AddInt64(&scans, 1)
+				bidM := str(bidArr[0])
+				bidP, _ := strconv.ParseFloat(str(bidArr[1]), 64)
+				askM := str(askArr[0])
+				askP, _ := strconv.ParseFloat(str(askArr[1]), 64)
 				if bidP < askP {
 					time.Sleep(2 * time.Millisecond)
 					continue
@@ -121,189 +180,123 @@ func hybrid(secs int) {
 				}
 				price := (bidP + askP) / 2 // midpoint — value-neutral fills
 				cost := price * qty
-
-				// Optimistic settlement: WATCH the two hot cash keys, verify
-				// sufficiency, then move everything in one atomic EXEC.
-				ok := false
-				for retry := 0; retry < 5; retry++ {
-					c.Do("WATCH", "usd:"+buyer, "usd:"+seller)
-					bv, _ := c.Do("GET", "usd:"+buyer)
-					sv, _ := c.Do("GET", "ast:"+sym+":"+seller)
-					bbal, _ := strconv.ParseFloat(str(bv), 64)
-					sbal, _ := strconv.ParseFloat(str(sv), 64)
-					if bbal < cost {
-						c.Do("UNWATCH")
-						c.Do("ZREM", bkey, bidM) // can't afford → cancel bid
-						atomic.AddInt64(&cancels, 1)
-						break
-					}
-					if sbal < qty {
-						c.Do("UNWATCH")
-						c.Do("ZREM", akey, askM)
-						atomic.AddInt64(&cancels, 1)
-						break
-					}
-					c.Do("MULTI")
-					c.Do("ZREM", bkey, bidM)
-					c.Do("ZREM", akey, askM)
-					// PARTIAL FILLS: the untraded remainder of the larger
-					// order goes straight back on the book, same price.
-					if bq > qty {
-						rem := fmt.Sprintf("%s|%s|%.4f", bf[0], buyer, bq-qty)
-						c.Do("ZADD", bkey, fmt.Sprintf("%f", bidP), rem)
-					}
-					if aq > qty {
-						rem := fmt.Sprintf("%s|%s|%.4f", af[0], seller, aq-qty)
-						c.Do("ZADD", akey, fmt.Sprintf("%f", askP), rem)
-					}
-					c.Do("INCRBYFLOAT", "usd:"+buyer, fmt.Sprintf("%f", -cost))
-					c.Do("INCRBYFLOAT", "usd:"+seller, fmt.Sprintf("%f", cost))
-					c.Do("INCRBYFLOAT", "ast:"+sym+":"+buyer, fmt.Sprintf("%f", qty))
-					c.Do("INCRBYFLOAT", "ast:"+sym+":"+seller, fmt.Sprintf("%f", -qty))
-					c.Do("SET", "px:"+sym, fmt.Sprintf("%f", price))
-					r, err := c.Do("EXEC")
-					if err == nil && r != nil { // nil = WATCH abort
-						ok = true
-						break
-					}
-					atomic.AddInt64(&aborts, 1)
+				bidRem, askRem := "", ""
+				if bq > qty {
+					bidRem = fmt.Sprintf("%s|%s|%.4f", bf[0], buyer, bq-qty)
 				}
-				if ok {
-					seq++
+				if aq > qty {
+					askRem = fmt.Sprintf("%s|%s|%.4f", af[0], seller, aq-qty)
+				}
+				seq++
+				ev, _ := json.Marshal(map[string]any{
+					"uid": fmt.Sprintf("%s-h%d", sym, seq), "sym": sym,
+					"price": price, "qty": qty, "buyer": buyer, "seller": seller,
+					"created_at": nowISO(),
+				})
+				r, err := c.Do("EVALSHA", sha, "9",
+					bkey, akey, "usd:"+buyer, "usd:"+seller,
+					"ast:"+sym+":"+buyer, "ast:"+sym+":"+seller,
+					"px:"+sym, "trades:count", "trades:q",
+					bidM, askM,
+					fmt.Sprintf("%f", qty), fmt.Sprintf("%f", price), fmt.Sprintf("%f", cost),
+					bidRem, fmt.Sprintf("%f", bidP), askRem, fmt.Sprintf("%f", askP),
+					string(ev))
+				if err != nil {
+					continue
+				}
+				switch v, _ := r.(int64); v {
+				case 1:
 					atomic.AddInt64(&trades, 1)
-					select { // never block the matcher on the ledger
-					case ledger <- map[string]any{
-						"uid": fmt.Sprintf("%s-h%d", sym, seq), "sym": sym,
-						"price": price, "qty": qty, "buyer": buyer, "seller": seller,
-						"created_at": nowISO(),
-					}:
-					default:
-					}
+				default:
+					atomic.AddInt64(&cancels, 1)
 				}
 			}
 		}(sym)
 	}
 
-	// Book pruner: cap each side at 2000 resting orders using the new
-	// ZREMRANGEBYRANK — drops the worst-priced tail (lowest bids / highest
-	// asks) so an unmatched backlog can't grow without bound.
-	go func() {
-		c, err := DialResp()
-		if err != nil {
-			return
-		}
-		for {
-			select {
-			case <-stop:
-				return
-			case <-time.After(5 * time.Second):
-			}
-			for _, s := range symbols {
-				c.Do("ZREMRANGEBYRANK", "book:"+s+":b", "0", "-2001") // keep top bids
-				c.Do("ZREMRANGEBYRANK", "book:"+s+":a", "2000", "-1") // keep low asks
-			}
-		}
-	}()
+	go candleBuilder()
+	go hcandleBuilder()
 
-	// Trader goroutines: place limit orders around px into the ZSET book.
-	for u := 0; u < nUsersH; u++ {
-		go func(u int) {
-			c, err := DialResp()
-			if err != nil {
-				return
-			}
-			owner := fmt.Sprintf("user-%d", u)
-			rng := rand.New(rand.NewSource(int64(u)*7919 + time.Now().UnixNano()))
-			gap := time.Second / time.Duration(rateEach)
-			seq := 0
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-				time.Sleep(gap)
-				sym := symbols[rng.Intn(len(symbols))]
-				pv, _ := c.Do("GET", "px:"+sym)
-				p, _ := strconv.ParseFloat(str(pv), 64)
-				if p <= 0 {
-					atomic.AddInt64(&skipped, 1)
-					continue
-				}
-				fair := 0.7*p + 0.3*seedPrice[sym]
-				buy := rng.Intn(2) == 0
-				aggressive := rng.Intn(100) < takerPct
-				var price float64
-				off := 0.0004 + rng.Float64()*0.004
-				cross := 0.0002 + rng.Float64()*0.001
-				side := "a"
-				if buy {
-					side = "b"
-					if aggressive {
-						price = fair * (1 + cross)
-					} else {
-						price = fair * (1 - off)
-					}
-				} else if aggressive {
-					price = fair * (1 - cross)
-				} else {
-					price = fair * (1 + off)
-				}
-				qty := 1 + rng.Float64()*9
-				seq++
-				member := fmt.Sprintf("%s-%d|%s|%.4f", owner, seq, owner, qty)
-				if _, err := c.Do("ZADD", "book:"+sym+":"+side, fmt.Sprintf("%f", price), member); err == nil {
-					atomic.AddInt64(&placed, 1)
-				} else {
-					atomic.AddInt64(&skipped, 1)
-				}
-			}
-		}(u)
-	}
-
-	// Report + conservation check.
-	start := time.Now()
 	last := int64(0)
-	for time.Since(start) < time.Duration(secs)*time.Second {
-		time.Sleep(5 * time.Second)
+	for range time.Tick(15 * time.Second) {
 		t := atomic.LoadInt64(&trades)
-		fmt.Printf("[hybrid] trades=%d (%.0f/s) aborts=%d cancels=%d placed=%d skipped=%d scans=%d\n",
-			t, float64(t-last)/5, atomic.LoadInt64(&aborts), atomic.LoadInt64(&cancels),
-			atomic.LoadInt64(&placed), atomic.LoadInt64(&skipped), atomic.LoadInt64(&scans))
+		fmt.Printf("[matcher] trades=%d cancels=%d (%.0f/s)\n",
+			t, atomic.LoadInt64(&cancels), float64(t-last)/15)
 		last = t
 	}
-	close(stop)
-	time.Sleep(300 * time.Millisecond)
+}
 
-	fmt.Println("[hybrid] verifying conservation from OxiMem…")
+// hybridTrader places limit orders into the OxiMem books around px.
+func hybridTrader(id, secs int) {
+	c, err := DialResp()
+	if err != nil {
+		panic(err)
+	}
+	owner := fmt.Sprintf("user-%d", id)
+	rng := rand.New(rand.NewSource(int64(id)*7919 + time.Now().UnixNano()))
+	deadline := time.Now().Add(time.Duration(secs) * time.Second)
+	rate := envInt("ORDER_RATE_EACH", 70)
+	takerPct := envInt("TAKER_PCT", 45)
+	gap := time.Second / time.Duration(rate)
+	placed, seq := 0, 0
+	for time.Now().Before(deadline) {
+		time.Sleep(gap)
+		sym := symbols[rng.Intn(len(symbols))]
+		pv, _ := c.Do("GET", "px:"+sym)
+		p, _ := strconv.ParseFloat(str(pv), 64)
+		if p <= 0 {
+			continue
+		}
+		fair := 0.7*p + 0.3*seedPrice[sym]
+		buy := rng.Intn(2) == 0
+		aggressive := rng.Intn(100) < takerPct
+		off := 0.0004 + rng.Float64()*0.004
+		cross := 0.0002 + rng.Float64()*0.001
+		side := "a"
+		var price float64
+		if buy {
+			side = "b"
+			if aggressive {
+				price = fair * (1 + cross)
+			} else {
+				price = fair * (1 - off)
+			}
+		} else if aggressive {
+			price = fair * (1 - cross)
+		} else {
+			price = fair * (1 + off)
+		}
+		qty := 1 + rng.Float64()*9
+		seq++
+		member := fmt.Sprintf("%s-%d|%s|%.4f", owner, seq, owner, qty)
+		if _, err := c.Do("ZADD", "book:"+sym+":"+side, fmt.Sprintf("%f", price), member); err == nil {
+			placed++
+		}
+	}
+	fmt.Printf("[%s] placed=%d\n", owner, placed)
+}
+
+// hybrid keeps the original all-in-one benchmark mode (seed + matcher +
+// traders in one process for N seconds, then a conservation check).
+func hybrid(secs int) {
+	seedMem()
+	go hybridMatcher()
+	for u := 0; u < nUsers; u++ {
+		go hybridTrader(u, secs)
+	}
+	time.Sleep(time.Duration(secs) * time.Second)
+	time.Sleep(500 * time.Millisecond)
 	vc, _ := DialResp()
-	totUSD := 0.0
-	for u := 0; u < nUsersH; u++ {
+	tot := 0.0
+	for u := 0; u < nUsers; u++ {
 		v, _ := vc.Do("GET", fmt.Sprintf("usd:user-%d", u))
 		f, _ := strconv.ParseFloat(str(v), 64)
-		totUSD += f
+		tot += f
 	}
-	wantUSD := float64(nUsersH) * startCash
-	fmt.Printf("  USD total: %.2f (want %.0f) %s\n", totUSD, wantUSD, okMark(abs(totUSD-wantUSD) < 1.0))
-	allOk := abs(totUSD-wantUSD) < 1.0
-	for _, s := range symbols {
-		tot := 0.0
-		for u := 0; u < nUsersH; u++ {
-			v, _ := vc.Do("GET", fmt.Sprintf("ast:%s:user-%d", s, u))
-			f, _ := strconv.ParseFloat(str(v), 64)
-			tot += f
-		}
-		if abs(tot-float64(nUsersH)*initHolding) > 0.01 {
-			fmt.Printf("  %s holdings %.4f != %.0f FAIL\n", s, tot, float64(nUsersH)*initHolding)
-			allOk = false
-		}
-	}
-	if allOk {
-		fmt.Printf("[hybrid] ALL CONSERVED — %d trades settled atomically in OxiMem\n",
-			atomic.LoadInt64(&trades))
-	} else {
-		fmt.Println("[hybrid] CONSERVATION FAILED")
-	}
+	cnt, _ := vc.Do("GET", "trades:count")
+	fmt.Printf("[hybrid] trades=%s USD total=%.2f (want %.0f) %s\n",
+		str(cnt), tot, float64(nUsers)*startCash,
+		okMark(abs(tot-float64(nUsers)*startCash) < 1.0))
 }
 
 func str(v any) string {

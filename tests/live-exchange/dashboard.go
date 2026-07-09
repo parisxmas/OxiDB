@@ -323,7 +323,7 @@ const dashboardHTML = `<!doctype html>
       if(mPrev){
         var dt=(m.at-mPrev.at)/1000; if(dt<=0) dt=1;
         function rate(k){ return Math.max(0,((m[k]||0)-(mPrev[k]||0))/dt); }
-        setN("s_trades", rate("commits").toFixed(0));
+        setN("s_trades", rate(m.trades_count!==undefined?"trades_count":"commits").toFixed(0));
         setN("s_conf",   rate("conflicts").toFixed(0));
         setN("s_ins",    rate("insert").toFixed(0));
         setN("s_find",   rate("find").toFixed(0));
