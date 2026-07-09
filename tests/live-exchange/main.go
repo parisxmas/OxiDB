@@ -77,6 +77,10 @@ func main() {
 		id, _ := strconv.Atoi(os.Args[2])
 		secs, _ := strconv.Atoi(os.Args[3])
 		hybridTrader(id, secs)
+	case "traders": // all N traders as goroutines in one process
+		n, _ := strconv.Atoi(os.Args[2])
+		secs, _ := strconv.Atoi(os.Args[3])
+		tradersMode(n, secs)
 	case "matcher-doc": // legacy doc-engine matcher (kept for comparison)
 		matcher()
 	case "trader-doc":

@@ -16,8 +16,9 @@ NUSERS="${NUSERS:-10}"; export NUSERS
 # Throughput knobs. Every write shares one WAL, so an un-paced order flood
 # starves settlement; pacing the order rate and lifting the taker share hands
 # WAL bandwidth back to trades → ~200+ trades/s (vs ~130 un-paced).
-export ORDER_RATE_EACH="${ORDER_RATE_EACH:-70}"   # orders/s per trader (×NUSERS)
-export TAKER_PCT="${TAKER_PCT:-45}"               # % of orders that cross → trade
+# 0 = each trader picks its own personality (rate 5-40/s, taker 20-70%).
+export ORDER_RATE_EACH="${ORDER_RATE_EACH:-0}"
+export TAKER_PCT="${TAKER_PCT:-0}"
 : "${ORDER_TTL_SECS:=35}"; export ORDER_TTL_SECS  # resting-order lifetime
 PIDS=()
 
@@ -60,13 +61,10 @@ echo "[run]   ┌─────────────────────
 echo "[run]   │  OPEN THE DASHBOARD:  http://localhost:$WEB_PORT      │"
 echo "[run]   └───────────────────────────────────────────────┘"
 
-echo "[run] launching $NUSERS traders for ${SECS}s…"
-TRADER_PIDS=()
-for u in $(seq 0 $((NUSERS-1))); do
-  "$HERE/.exchange" trader "$u" "$SECS" > "$HERE/.trader-$u.log" 2>&1 &
-  TRADER_PIDS+=($!); PIDS+=($!)
-done
-for p in "${TRADER_PIDS[@]}"; do wait "$p" 2>/dev/null || true; done
+echo "[run] launching $NUSERS traders (one process, staggered personalities) for ${SECS}s…"
+"$HERE/.exchange" traders "$NUSERS" "$SECS" > "$HERE/.traders.log" 2>&1 &
+TRADERS_PID=$!; PIDS+=($TRADERS_PID)
+wait "$TRADERS_PID" 2>/dev/null || true
 
 echo "[run] traders done — draining the book…"
 sleep 2                                  # let the matcher settle the last crossing orders

@@ -227,6 +227,11 @@ func hybridMatcher() {
 }
 
 // hybridTrader places limit orders into the OxiMem books around px.
+// Every trader gets a PERSONALITY derived from its id: a staggered start, an
+// on/off activity cycle (bursts of trading separated by idle spells), its own
+// order rate, aggressiveness, size preference and a favourite subset of
+// symbols — so 100 traders behave like 100 different market participants
+// acting at different times, not one clone army.
 func hybridTrader(id, secs int) {
 	c, err := DialResp()
 	if err != nil {
@@ -235,13 +240,53 @@ func hybridTrader(id, secs int) {
 	owner := fmt.Sprintf("user-%d", id)
 	rng := rand.New(rand.NewSource(int64(id)*7919 + time.Now().UnixNano()))
 	deadline := time.Now().Add(time.Duration(secs) * time.Second)
-	rate := envInt("ORDER_RATE_EACH", 70)
-	takerPct := envInt("TAKER_PCT", 45)
-	gap := time.Second / time.Duration(rate)
+
+	// --- personality ---
+	baseRate := envInt("ORDER_RATE_EACH", 0)
+	if baseRate == 0 {
+		baseRate = 5 + rng.Intn(36) // 5..40 orders/s while active
+	}
+	takerPct := envInt("TAKER_PCT", 0)
+	if takerPct == 0 {
+		takerPct = 20 + rng.Intn(51) // 20..70 %
+	}
+	sizeMax := 2.0 + rng.Float64()*13.0 // biggest order this trader places
+	// Favourite symbols: a random subset (4..all), traded most of the time.
+	favs := append([]string(nil), symbols...)
+	rng.Shuffle(len(favs), func(i, j int) { favs[i], favs[j] = favs[j], favs[i] })
+	favs = favs[:4+rng.Intn(len(favs)-3)]
+	// Duty cycle: active bursts and idle spells of personal length.
+	activeFor := time.Duration(10+rng.Intn(50)) * time.Second
+	idleFor := time.Duration(5+rng.Intn(35)) * time.Second
+	// Staggered start: traders wake up over the first ~20s.
+	time.Sleep(time.Duration(rng.Intn(20000)) * time.Millisecond)
+
+	gap := time.Second / time.Duration(baseRate)
 	placed, seq := 0, 0
+	phaseEnd := time.Now().Add(activeFor)
+	active := true
 	for time.Now().Before(deadline) {
+		// Flip between active bursts and idle spells.
+		if time.Now().After(phaseEnd) {
+			active = !active
+			if active {
+				phaseEnd = time.Now().Add(activeFor)
+			} else {
+				phaseEnd = time.Now().Add(idleFor)
+			}
+		}
+		if !active {
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
 		time.Sleep(gap)
-		sym := symbols[rng.Intn(len(symbols))]
+		// Mostly favourites, occasionally anything.
+		var sym string
+		if rng.Intn(100) < 80 {
+			sym = favs[rng.Intn(len(favs))]
+		} else {
+			sym = symbols[rng.Intn(len(symbols))]
+		}
 		pv, _ := c.Do("GET", "px:"+sym)
 		p, _ := strconv.ParseFloat(str(pv), 64)
 		if p <= 0 {
@@ -266,14 +311,29 @@ func hybridTrader(id, secs int) {
 		} else {
 			price = fair * (1 + off)
 		}
-		qty := 1 + rng.Float64()*9
+		qty := 1 + rng.Float64()*sizeMax
 		seq++
 		member := fmt.Sprintf("%s-%d|%s|%.4f", owner, seq, owner, qty)
 		if _, err := c.Do("ZADD", "book:"+sym+":"+side, fmt.Sprintf("%f", price), member); err == nil {
 			placed++
 		}
 	}
-	fmt.Printf("[%s] placed=%d\n", owner, placed)
+	fmt.Printf("[%s] placed=%d rate=%d taker=%d%% favs=%d\n", owner, placed, baseRate, takerPct, len(favs))
+}
+
+// traders runs N personality traders as goroutines in ONE process (spawning
+// 100 OS processes is pointless — each trader is just a connection + a loop).
+func tradersMode(n, secs int) {
+	done := make(chan int, n)
+	for u := 0; u < n; u++ {
+		go func(u int) {
+			hybridTrader(u, secs)
+			done <- u
+		}(u)
+	}
+	for range n {
+		<-done
+	}
 }
 
 // hybrid keeps the original all-in-one benchmark mode (seed + matcher +
