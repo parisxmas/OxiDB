@@ -674,3 +674,56 @@ input:focus, textarea:focus, select:focus {
 tr:hover .row-del { opacity: 1; }
 .row-del:hover:not(:disabled) { color: var(--danger); }
 .add-row td { background: var(--bg-secondary); }
+
+/* ── Saved connections ──────────────────────────────────────────────── */
+.saved-conns { margin-bottom: 16px; }
+.saved-conns-label {
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.saved-conn {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  margin-bottom: 4px;
+}
+.saved-conn-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  cursor: pointer;
+  text-align: left;
+}
+.saved-conn-main:hover { border-color: var(--accent); }
+.saved-conn-name { font-size: 13px; color: var(--text-primary); font-weight: 600; }
+.saved-conn-detail { font-size: 11px; color: var(--text-secondary); font-family: var(--font-mono); }
+.saved-conn-edit,
+.saved-conn-del {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+  width: 30px;
+  font-size: 12px;
+}
+.saved-conn-edit:hover { color: var(--accent); border-color: var(--accent); }
+.saved-conn-del:hover { color: var(--danger); border-color: var(--danger); }
+.remember-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 12px;
+  cursor: pointer;
+}

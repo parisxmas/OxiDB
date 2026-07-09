@@ -12,9 +12,9 @@ pub fn list_buckets(state: State<'_, Mutex<DbBackend>>) -> Result<Vec<String>, S
     let mut backend = state.lock().unwrap();
     match &mut *backend {
         DbBackend::Embedded { db, .. } => Ok(db.list_buckets()),
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let resp =
-                DbBackend::send_or_reconnect(stream, host, *port, &json!({"cmd": "list_buckets"}))?;
+                DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &json!({"cmd": "list_buckets"}))?;
             resp.get("data")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .ok_or_else(|| "invalid response".to_string())
@@ -34,11 +34,13 @@ pub fn create_bucket(
             db.create_bucket(&name).map_err(|e| e.to_string())?;
             Ok("bucket created".to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let resp = DbBackend::send_or_reconnect(
                 stream,
                 host,
                 *port,
+                user.as_deref(),
+                password.as_deref(),
                 &json!({"cmd": "create_bucket", "bucket": name}),
             )?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -66,11 +68,13 @@ pub fn delete_bucket(
             db.delete_bucket(&name).map_err(|e| e.to_string())?;
             Ok("bucket deleted".to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let resp = DbBackend::send_or_reconnect(
                 stream,
                 host,
                 *port,
+                user.as_deref(),
+                password.as_deref(),
                 &json!({"cmd": "delete_bucket", "bucket": name}),
             )?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -99,7 +103,7 @@ pub fn list_objects(
         DbBackend::Embedded { db, .. } => db
             .list_objects(&bucket, prefix.as_deref(), limit.map(|n| n as usize))
             .map_err(|e| e.to_string()),
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let mut req = json!({"cmd": "list_objects", "bucket": bucket});
             if let Some(p) = prefix {
                 req["prefix"] = json!(p);
@@ -107,7 +111,7 @@ pub fn list_objects(
             if let Some(l) = limit {
                 req["limit"] = json!(l);
             }
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp
                     .get("data")
@@ -147,7 +151,7 @@ pub fn put_object(
             db.put_object(&bucket, &key, &data, ct, meta)
                 .map_err(|e| e.to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({
                 "cmd": "put_object",
                 "bucket": bucket,
@@ -156,7 +160,7 @@ pub fn put_object(
                 "content_type": ct,
                 "metadata": meta,
             });
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!(null)))
             } else {
@@ -184,9 +188,9 @@ pub fn get_object(
             let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
             Ok(json!({"content": encoded, "metadata": meta}))
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "get_object", "bucket": bucket, "key": key});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!(null)))
             } else {
@@ -214,9 +218,9 @@ pub fn delete_object(
                 .map_err(|e| e.to_string())?;
             Ok("object deleted".to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "delete_object", "bucket": bucket, "key": key});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok("object deleted".to_string())
             } else {
@@ -244,12 +248,12 @@ pub fn search_objects(
         DbBackend::Embedded { db, .. } => db
             .search(bucket.as_deref(), &query, lim)
             .map_err(|e| e.to_string()),
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let mut req = json!({"cmd": "search", "query": query, "limit": lim});
             if let Some(b) = bucket {
                 req["bucket"] = json!(b);
             }
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp
                     .get("data")

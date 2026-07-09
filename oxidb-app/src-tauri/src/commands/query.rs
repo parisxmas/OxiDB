@@ -88,8 +88,8 @@ pub fn execute_raw_command(
                 _ => Err(format!("unknown command: {cmd}")),
             }
         }
-        DbBackend::Client { stream, host, port } => {
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &command)?;
+        DbBackend::Client { stream, host, port, user, password } => {
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &command)?;
             Ok(resp)
         }
         DbBackend::Disconnected => Err("not connected".to_string()),

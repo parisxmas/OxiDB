@@ -16,13 +16,13 @@ pub fn run_aggregation(
         DbBackend::Embedded { db, .. } => db
             .aggregate(&collection, &pipeline)
             .map_err(|e| e.to_string()),
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({
                 "cmd": "aggregate",
                 "collection": collection,
                 "pipeline": pipeline,
             });
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp
                     .get("data")

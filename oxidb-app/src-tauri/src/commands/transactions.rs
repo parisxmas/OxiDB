@@ -19,9 +19,9 @@ pub fn begin_transaction(
             *active_tx = Some(tx_id);
             Ok(json!({"tx_id": tx_id}))
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let resp =
-                DbBackend::send_or_reconnect(stream, host, *port, &json!({"cmd": "begin_tx"}))?;
+                DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &json!({"cmd": "begin_tx"}))?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!(null)))
             } else {
@@ -50,9 +50,9 @@ pub fn commit_transaction(
             }
             None => Err("no active transaction".to_string()),
         },
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let resp =
-                DbBackend::send_or_reconnect(stream, host, *port, &json!({"cmd": "commit_tx"}))?;
+                DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &json!({"cmd": "commit_tx"}))?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok("committed".to_string())
             } else {
@@ -80,9 +80,9 @@ pub fn rollback_transaction(
             }
             None => Err("no active transaction".to_string()),
         },
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let resp =
-                DbBackend::send_or_reconnect(stream, host, *port, &json!({"cmd": "rollback_tx"}))?;
+                DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &json!({"cmd": "rollback_tx"}))?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok("rolled back".to_string())
             } else {

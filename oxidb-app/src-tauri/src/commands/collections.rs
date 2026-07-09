@@ -10,8 +10,8 @@ pub fn list_collections(state: State<'_, Mutex<DbBackend>>) -> Result<Vec<String
     let mut backend = state.lock().unwrap();
     match &mut *backend {
         DbBackend::Embedded { db, .. } => Ok(db.list_collections()),
-        DbBackend::Client { stream, host, port } => {
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &json!({"cmd": "list_collections"}))?;
+        DbBackend::Client { stream, host, port, user, password } => {
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &json!({"cmd": "list_collections"}))?;
             resp.get("data")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .ok_or_else(|| "invalid response".to_string())
@@ -32,11 +32,13 @@ pub fn create_collection(
                 .map_err(|e| e.to_string())?;
             Ok("collection created".to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let resp = DbBackend::send_or_reconnect(
                 stream,
                 host,
                 *port,
+                user.as_deref(),
+                password.as_deref(),
                 &json!({"cmd": "create_collection", "collection": name}),
             )?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -64,11 +66,13 @@ pub fn drop_collection(
             db.drop_collection(&name).map_err(|e| e.to_string())?;
             Ok("collection dropped".to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let resp = DbBackend::send_or_reconnect(
                 stream,
                 host,
                 *port,
+                user.as_deref(),
+                password.as_deref(),
                 &json!({"cmd": "drop_collection", "collection": name}),
             )?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -100,11 +104,13 @@ pub fn compact_collection(
                 "docs_kept": stats.docs_kept
             }))
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let resp = DbBackend::send_or_reconnect(
                 stream,
                 host,
                 *port,
+                user.as_deref(),
+                password.as_deref(),
                 &json!({"cmd": "compact", "collection": name}),
             )?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {

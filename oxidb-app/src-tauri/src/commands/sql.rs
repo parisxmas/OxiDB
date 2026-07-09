@@ -24,7 +24,7 @@ pub fn run_sql(
 ) -> Result<Value, String> {
     let mut backend = state.lock().unwrap();
     match &mut *backend {
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let mut request = json!({
                 "engine": "sql",
                 "cmd": "sql",
@@ -38,7 +38,7 @@ pub fn run_sql(
                     request["db"] = json!(name);
                 }
             }
-            DbBackend::send_or_reconnect(stream, host, *port, &request)
+            DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &request)
         }
         DbBackend::Embedded { .. } => Err(
             "SQL runs on a server's SQL engine — connect to a Remote Server \

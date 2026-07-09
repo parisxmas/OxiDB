@@ -1,4 +1,5 @@
 mod commands;
+mod scram;
 mod state;
 
 use std::sync::Mutex;

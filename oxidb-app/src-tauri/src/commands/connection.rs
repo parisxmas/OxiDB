@@ -54,20 +54,37 @@ pub fn open_embedded(
 pub fn connect_remote(
     host: String,
     port: u16,
+    username: Option<String>,
+    password: Option<String>,
     state: State<'_, Mutex<DbBackend>>,
 ) -> Result<ConnectionStatus, String> {
-    let stream = TcpStream::connect((&host[..], port))
+    let mut stream = TcpStream::connect((&host[..], port))
         .map_err(|e| format!("connection failed: {e}"))?;
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .ok();
 
-    let detail = format!("{host}:{port}");
+    // Authenticate only when a username is supplied; an anonymous server
+    // (no OXIDB_AUTH) needs no handshake.
+    let user = username.filter(|u| !u.is_empty());
+    let pass = password.filter(|p| !p.is_empty());
+    if let Some(u) = &user {
+        let p = pass.as_deref().unwrap_or("");
+        DbBackend::authenticate(&mut stream, u, p)
+            .map_err(|e| format!("authentication failed: {e}"))?;
+    }
+
+    let detail = match &user {
+        Some(u) => format!("{u}@{host}:{port}"),
+        None => format!("{host}:{port}"),
+    };
     let mut backend = state.lock().unwrap();
     *backend = DbBackend::Client {
         stream,
         host: host.clone(),
         port,
+        user,
+        password: pass,
     };
     Ok(ConnectionStatus {
         connected: true,
@@ -92,10 +109,13 @@ pub fn get_connection_status(state: State<'_, Mutex<DbBackend>>) -> ConnectionSt
             mode: "embedded".to_string(),
             detail: data_path.clone(),
         },
-        DbBackend::Client { host, port, .. } => ConnectionStatus {
+        DbBackend::Client { host, port, user, .. } => ConnectionStatus {
             connected: true,
             mode: "client".to_string(),
-            detail: format!("{host}:{port}"),
+            detail: match user {
+                Some(u) => format!("{u}@{host}:{port}"),
+                None => format!("{host}:{port}"),
+            },
         },
         DbBackend::Disconnected => ConnectionStatus {
             connected: false,

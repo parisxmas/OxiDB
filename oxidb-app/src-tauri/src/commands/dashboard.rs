@@ -55,9 +55,9 @@ pub fn get_dashboard_stats(
                 total_storage_bytes: total_storage,
             })
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "list_collections"});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             let names: Vec<String> = resp
                 .get("data")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -68,7 +68,7 @@ pub fn get_dashboard_stats(
 
             for name in &names {
                 let count_req = json!({"cmd": "count", "collection": name, "query": {}});
-                let count_resp = DbBackend::send_or_reconnect(stream, host, *port, &count_req)?;
+                let count_resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &count_req)?;
                 let count = count_resp
                     .pointer("/data/count")
                     .and_then(|v| v.as_u64())

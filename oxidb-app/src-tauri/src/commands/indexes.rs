@@ -16,9 +16,9 @@ pub fn list_indexes(
             let indexes = db.list_indexes(&collection).map_err(|e| e.to_string())?;
             Ok(json!(indexes))
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "list_indexes", "collection": collection});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!([])))
             } else {
@@ -46,9 +46,9 @@ pub fn create_index(
                 .map_err(|e| e.to_string())?;
             Ok("index created".to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "create_index", "collection": collection, "field": field});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok("index created".to_string())
             } else {
@@ -76,9 +76,9 @@ pub fn create_unique_index(
                 .map_err(|e| e.to_string())?;
             Ok("unique index created".to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "create_unique_index", "collection": collection, "field": field});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok("unique index created".to_string())
             } else {
@@ -107,9 +107,9 @@ pub fn create_composite_index(
                 .map_err(|e| e.to_string())?;
             Ok(name)
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "create_composite_index", "collection": collection, "fields": fields});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp
                     .pointer("/data/index")
@@ -141,9 +141,9 @@ pub fn create_text_index(
                 .map_err(|e| e.to_string())?;
             Ok("text index created".to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "create_text_index", "collection": collection, "fields": fields});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok("text index created".to_string())
             } else {
@@ -171,9 +171,9 @@ pub fn drop_index(
                 .map_err(|e| e.to_string())?;
             Ok("index dropped".to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "drop_index", "collection": collection, "index": index});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok("index dropped".to_string())
             } else {

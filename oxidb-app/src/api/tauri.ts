@@ -10,8 +10,13 @@ import type {
 export const openEmbedded = (path: string) =>
   invoke<ConnectionStatus>("open_embedded", { path });
 
-export const connectRemote = (host: string, port: number) =>
-  invoke<ConnectionStatus>("connect_remote", { host, port });
+export const connectRemote = (
+  host: string,
+  port: number,
+  username?: string,
+  password?: string
+) =>
+  invoke<ConnectionStatus>("connect_remote", { host, port, username, password });
 
 export const disconnect = () => invoke<void>("disconnect");
 

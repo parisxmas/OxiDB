@@ -46,7 +46,7 @@ pub fn find_documents(
             db.find_with_options(&params.collection, &query, &opts)
                 .map_err(|e| e.to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let mut req = json!({
                 "cmd": "find",
                 "collection": params.collection,
@@ -61,7 +61,7 @@ pub fn find_documents(
             if let Some(limit) = params.limit {
                 req["limit"] = json!(limit);
             }
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp
                     .get("data")
@@ -92,9 +92,9 @@ pub fn insert_document(
             let id = db.insert(&collection, doc).map_err(|e| e.to_string())?;
             Ok(json!({"id": id}))
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "insert", "collection": collection, "doc": doc});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!(null)))
             } else {
@@ -124,14 +124,14 @@ pub fn update_documents(
                 .map_err(|e| e.to_string())?;
             Ok(json!({"modified": count}))
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({
                 "cmd": "update",
                 "collection": collection,
                 "query": query,
                 "update": update,
             });
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!(null)))
             } else {
@@ -160,13 +160,13 @@ pub fn delete_documents(
                 .map_err(|e| e.to_string())?;
             Ok(json!({"deleted": count}))
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({
                 "cmd": "delete",
                 "collection": collection,
                 "query": query,
             });
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!(null)))
             } else {
@@ -193,9 +193,9 @@ pub fn count_documents(
         DbBackend::Embedded { db, .. } => {
             db.count(&collection, &query).map_err(|e| e.to_string())
         }
-        DbBackend::Client { stream, host, port } => {
+        DbBackend::Client { stream, host, port, user, password } => {
             let req = json!({"cmd": "count", "collection": collection, "query": query});
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, &req)?;
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             resp.pointer("/data/count")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize)
