@@ -39,11 +39,13 @@ interface Props {
   onInsert: (text: string) => void;
   /** Replace the editor with a ready-made query. */
   onQuery: (sql: string) => void;
+  /** Open a table in the editable data grid. */
+  onBrowse: (table: string) => void;
   /** Bumped by the parent after a DDL run, to force a refresh. */
   refreshKey?: number;
 }
 
-export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
+export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const toast = useToast();
   const [tables, setTables] = useState<TableInfo[]>([]);
   const [cols, setCols] = useState<Record<string, ColumnInfo[]>>({});
@@ -141,6 +143,7 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
       e.preventDefault();
       e.stopPropagation();
       const items: MenuItem[] = [
+        { label: "Browse & edit data", onClick: () => onBrowse(table) },
         { label: "SELECT * (100 rows)", onClick: () => onQuery(`SELECT * FROM ${table} LIMIT 100;`) },
         { label: "SELECT COUNT(*)", onClick: () => onQuery(`SELECT COUNT(*) FROM ${table};`) },
         { label: "Describe columns", onClick: () => onQuery(`DESCRIBE ${table};`) },
@@ -172,7 +175,7 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
       ];
       setMenu({ x: e.clientX, y: e.clientY, items });
     },
-    [onQuery, onInsert]
+    [onQuery, onInsert, onBrowse]
   );
 
   return (
@@ -221,11 +224,9 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
                 </button>
                 <span
                   className="schema-table-name"
-                  title="Click to insert · double-click to SELECT * · right-click for menu"
+                  title="Click to insert · double-click to browse & edit · right-click for menu"
                   onClick={() => onInsert(t.name)}
-                  onDoubleClick={() =>
-                    onQuery(`SELECT * FROM ${t.name} LIMIT 100;`)
-                  }
+                  onDoubleClick={() => onBrowse(t.name)}
                 >
                   {t.name}
                 </span>

@@ -4,6 +4,7 @@ import { runSql } from "../../api/tauri";
 import type { JsonValue } from "../../api/types";
 import { SqlEditor } from "../common/SqlEditor";
 import { SchemaTree } from "./SchemaTree";
+import { TableDataView } from "./TableDataView";
 import { DataTable } from "../common/DataTable";
 import { useToast } from "../common/Toast";
 import { useConnection } from "../../context/ConnectionContext";
@@ -66,6 +67,8 @@ export function SqlPage() {
   const [active, setActive] = useState(0);
   const [history, setHistory] = useState<string[]>(loadHistory);
   const [schemaKey, setSchemaKey] = useState(0);
+  const [browseTable, setBrowseTable] = useState<string | null>(null);
+  const [resultTab, setResultTab] = useState<"query" | "data">("query");
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const [splitPct, setSplitPct] = useState(42);
@@ -106,6 +109,7 @@ export function SqlPage() {
   const run = useCallback(async () => {
     const text = sql.trim();
     if (!text) return;
+    setResultTab("query");
     setLoading(true);
     setError(null);
     const start = performance.now();
@@ -156,6 +160,10 @@ export function SqlPage() {
         refreshKey={schemaKey}
         onInsert={insertAtCursor}
         onQuery={(q) => setSql(q)}
+        onBrowse={(t) => {
+          setBrowseTable(t);
+          setResultTab("data");
+        }}
       />
 
       {/* Right: editor + results (the original vertical split) */}
@@ -259,8 +267,32 @@ export function SqlPage() {
         }}
       >
         <div className="toolbar">
-          <strong>Results</strong>
-          {elapsed !== null && (
+          <button
+            className={`result-tab${resultTab === "query" ? " active" : ""}`}
+            onClick={() => setResultTab("query")}
+          >
+            Query Result
+          </button>
+          {browseTable && (
+            <button
+              className={`result-tab${resultTab === "data" ? " active" : ""}`}
+              onClick={() => setResultTab("data")}
+            >
+              Data: <span style={{ fontFamily: "var(--font-mono)" }}>{browseTable}</span>
+              <span
+                className="result-tab-close"
+                title="Close"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setBrowseTable(null);
+                  setResultTab("query");
+                }}
+              >
+                ✕
+              </span>
+            </button>
+          )}
+          {resultTab === "query" && elapsed !== null && (
             <span
               style={{
                 marginLeft: 12,
@@ -272,7 +304,7 @@ export function SqlPage() {
               {elapsed.toFixed(1)} ms
             </span>
           )}
-          {cur && (
+          {resultTab === "query" && cur && (
             <span
               style={{
                 marginLeft: 8,
@@ -284,7 +316,7 @@ export function SqlPage() {
             </span>
           )}
           <div style={{ flex: 1 }} />
-          {results && results.length > 1 && (
+          {resultTab === "query" && results && results.length > 1 && (
             <div style={{ display: "flex", gap: 4 }}>
               {results.map((_, i) => (
                 <button
@@ -301,7 +333,9 @@ export function SqlPage() {
           )}
         </div>
         <div style={{ flex: 1, overflow: "auto" }}>
-          {error ? (
+          {resultTab === "data" && browseTable ? (
+            <TableDataView key={browseTable} table={browseTable} />
+          ) : error ? (
             <div
               style={{
                 padding: 16,
