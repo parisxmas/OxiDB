@@ -408,3 +408,102 @@ input:focus, textarea:focus, select:focus {
   color: var(--accent);
   border-bottom-color: var(--accent);
 }
+
+/* ── SQL schema tree (SqlPage left panel) ───────────────────────────── */
+.schema-tree {
+  width: 240px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  overflow: hidden;
+  user-select: none;
+}
+.schema-tree-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
+.schema-refresh {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.schema-refresh:hover { color: var(--accent); }
+.schema-empty {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+.schema-list, .schema-cols {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+}
+.schema-list { flex: 1; padding: 4px 0; }
+.schema-table-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 13px;
+}
+.schema-caret {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  width: 14px;
+  font-size: 10px;
+  padding: 0;
+}
+.schema-table-name {
+  flex: 1;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.schema-table-name:hover { color: var(--accent); }
+.schema-rowcount {
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  padding-left: 6px;
+}
+.schema-cols { padding: 0 0 4px 0; }
+.schema-col {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 2px 26px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+}
+.schema-col:hover { background: var(--bg-primary); }
+.schema-pk { font-size: 10px; }
+.schema-col-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.schema-col-type {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+}

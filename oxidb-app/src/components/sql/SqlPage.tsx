@@ -1,7 +1,9 @@
 import { useState, useCallback, useRef } from "react";
+import type { editor as MonacoEditor } from "monaco-editor";
 import { runSql } from "../../api/tauri";
 import type { JsonValue } from "../../api/types";
 import { SqlEditor } from "../common/SqlEditor";
+import { SchemaTree } from "./SchemaTree";
 import { DataTable } from "../common/DataTable";
 import { useToast } from "../common/Toast";
 import { useConnection } from "../../context/ConnectionContext";
@@ -63,9 +65,25 @@ export function SqlPage() {
   const [elapsed, setElapsed] = useState<number | null>(null);
   const [active, setActive] = useState(0);
   const [history, setHistory] = useState<string[]>(loadHistory);
+  const [schemaKey, setSchemaKey] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const [splitPct, setSplitPct] = useState(42);
   const draggingRef = useRef(false);
+
+  /** Insert an identifier at the cursor (schema-tree click). */
+  const insertAtCursor = useCallback((text: string) => {
+    const ed = editorRef.current;
+    if (!ed) {
+      setSql((s) => s + text);
+      return;
+    }
+    const sel = ed.getSelection();
+    if (sel) {
+      ed.executeEdits("schema-insert", [{ range: sel, text, forceMoveMarkers: true }]);
+    }
+    ed.focus();
+  }, []);
 
   const onSplitterMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -105,6 +123,8 @@ export function SqlPage() {
         const data = (resp?.data as StmtResult[]) || [];
         setResults(data);
         setActive(data.length - 1); // focus the last statement's result
+        // A DDL statement changed the catalog — refresh the schema tree.
+        if (data.some((d) => d.ddl)) setSchemaKey((k) => k + 1);
         const nh = [text, ...history.filter((h) => h !== text)].slice(0, 50);
         setHistory(nh);
         saveHistory(nh);
@@ -124,13 +144,30 @@ export function SqlPage() {
 
   return (
     <div
-      ref={containerRef}
       style={{
         display: "flex",
-        flexDirection: "column",
+        flexDirection: "row",
         height: "calc(100vh - var(--header-height) - 40px)",
+        gap: 0,
       }}
     >
+      {/* Left: schema tree */}
+      <SchemaTree
+        refreshKey={schemaKey}
+        onInsert={insertAtCursor}
+        onQuery={(q) => setSql(q)}
+      />
+
+      {/* Right: editor + results (the original vertical split) */}
+      <div
+        ref={containerRef}
+        style={{
+          flex: 1,
+          minWidth: 0,
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
       {/* Editor */}
       <div
         style={{
@@ -189,7 +226,13 @@ export function SqlPage() {
           </button>
         </div>
         <div style={{ flex: 1, minHeight: 0 }}>
-          <SqlEditor value={sql} onChange={setSql} onRun={run} height="100%" />
+          <SqlEditor
+            value={sql}
+            onChange={setSql}
+            onRun={run}
+            onReady={(ed) => (editorRef.current = ed)}
+            height="100%"
+          />
         </div>
       </div>
 
@@ -278,6 +321,7 @@ export function SqlPage() {
             <div className="empty-state">{summarize(cur)}</div>
           )}
         </div>
+      </div>
       </div>
     </div>
   );

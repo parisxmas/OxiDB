@@ -1,11 +1,14 @@
 import Editor from "@monaco-editor/react";
 import type { OnMount } from "@monaco-editor/react";
+import type { editor as MonacoEditor } from "monaco-editor";
 import { useTheme } from "../../context/ThemeContext";
 
 interface Props {
   value: string;
   onChange?: (value: string) => void;
   onRun?: () => void;
+  /** Receives the editor instance once mounted (for insert-at-cursor, etc.). */
+  onReady?: (editor: MonacoEditor.IStandaloneCodeEditor) => void;
   readOnly?: boolean;
   height?: string;
 }
@@ -15,6 +18,7 @@ export function SqlEditor({
   value,
   onChange,
   onRun,
+  onReady,
   readOnly = false,
   height = "100%",
 }: Props) {
@@ -25,6 +29,7 @@ export function SqlEditor({
       monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
       () => onRun?.()
     );
+    onReady?.(editor);
   };
 
   return (
