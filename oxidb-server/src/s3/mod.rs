@@ -20,6 +20,7 @@ mod bucket;
 mod encryption;
 mod helpers;
 pub mod http;
+mod lifecycle;
 mod multipart;
 mod object;
 mod tagging;
@@ -157,6 +158,20 @@ pub fn start_s3_listener(addr: &str, db: Arc<OxiDb>) -> std::thread::JoinHandle<
         uploads: Mutex::new(HashMap::new()),
         active_connections: AtomicUsize::new(0),
     });
+
+    // Lifecycle expiration sweeper (every 5 min; cheap when no rules).
+    let db_sweep = Arc::clone(&state.db);
+    {
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(300));
+                let n = lifecycle::sweep(&db_sweep);
+                if n > 0 {
+                    eprintln!("[s3] lifecycle expired {n} objects");
+                }
+            }
+        });
+    }
 
     // Background cleanup of abandoned multipart uploads
     {
@@ -303,6 +318,16 @@ fn route_request(
         ("GET", 0) => bucket::handle_list_buckets(db),
 
         // --- Bucket-level ---
+        // Lifecycle: PUT/GET/DELETE /bucket?lifecycle
+        ("PUT", 1) if params.contains_key("lifecycle") => {
+            lifecycle::handle_put_lifecycle(db, segments[0], &req.body)
+        }
+        ("GET", 1) if params.contains_key("lifecycle") => {
+            lifecycle::handle_get_lifecycle(db, segments[0])
+        }
+        ("DELETE", 1) if params.contains_key("lifecycle") => {
+            lifecycle::handle_delete_lifecycle(db, segments[0])
+        }
         ("PUT", 1) => bucket::handle_create_bucket(db, segments[0]),
         ("DELETE", 1) if !params.contains_key("delete") => {
             bucket::handle_delete_bucket(db, segments[0])

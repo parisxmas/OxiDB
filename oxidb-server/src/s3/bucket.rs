@@ -71,7 +71,12 @@ pub fn handle_list_objects(
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000);
     let delimiter = params.get("delimiter").map(|s| s.as_str());
-    let start_after = params.get("start-after").map(|s| s.as_str());
+    // V2 continuation: our NextContinuationToken is the last key returned,
+    // so continuation-token behaves exactly like start-after.
+    let start_after = params
+        .get("continuation-token")
+        .or_else(|| params.get("start-after"))
+        .map(|s| s.as_str());
 
     match db.list_objects(bucket, prefix, Some(max_keys + 1000)) {
         Ok(all_objects) => {
@@ -110,6 +115,15 @@ pub fn handle_list_objects(
             }
 
             let truncated = objects.len() >= max_keys;
+            let next_token = if truncated {
+                objects.last().and_then(|o| {
+                    serde_json::to_value(o)
+                        .ok()
+                        .and_then(|m| m["key"].as_str().map(String::from))
+                })
+            } else {
+                None
+            };
             let mut xml = format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Name>{}</Name>\n  <Prefix>{}</Prefix>\n  <MaxKeys>{}</MaxKeys>\n  <IsTruncated>{}</IsTruncated>\n  <KeyCount>{}</KeyCount>\n",
                 xml_escape(bucket),
@@ -120,6 +134,18 @@ pub fn handle_list_objects(
             );
             if let Some(d) = delimiter {
                 xml.push_str(&format!("  <Delimiter>{}</Delimiter>\n", xml_escape(d)));
+            }
+            if let Some(tok) = &next_token {
+                xml.push_str(&format!(
+                    "  <NextContinuationToken>{}</NextContinuationToken>\n",
+                    xml_escape(tok)
+                ));
+            }
+            if let Some(ct) = params.get("continuation-token") {
+                xml.push_str(&format!(
+                    "  <ContinuationToken>{}</ContinuationToken>\n",
+                    xml_escape(ct)
+                ));
             }
             for obj in &objects {
                 let meta = serde_json::to_value(obj).unwrap_or_default();

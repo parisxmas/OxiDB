@@ -1,6 +1,6 @@
 [package]
 name = "oxidb-server"
-version = "0.34.5"
+version = "0.34.6"
 edition = "2024"
 description = "TCP server for OxiDB document database"
 license-file = "../LICENSE"
@@ -50,6 +50,8 @@ tikv-jemallocator = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
+hmac = "0.12"
+sha2 = "0.10"
 openraft = { version = "0.9", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "io-util", "net", "time", "macros", "sync"] }
 # self-signed cert generation for the REST FDW HTTPS integration test
