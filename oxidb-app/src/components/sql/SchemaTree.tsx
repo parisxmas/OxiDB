@@ -1,6 +1,11 @@
 import { useState, useCallback, useEffect } from "react";
 import { runSql } from "../../api/tauri";
 import type { JsonValue } from "../../api/types";
+import { ContextMenu } from "../common/ContextMenu";
+import type { MenuItem } from "../common/ContextMenu";
+import { ConfirmDialog } from "../common/ConfirmDialog";
+import { CreateTableDialog } from "./CreateTableDialog";
+import { useToast } from "../common/Toast";
 
 interface StmtResult {
   columns?: string[];
@@ -38,11 +43,15 @@ interface Props {
 }
 
 export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
+  const toast = useToast();
   const [tables, setTables] = useState<TableInfo[]>([]);
   const [cols, setCols] = useState<Record<string, ColumnInfo[]>>({});
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  const [confirm, setConfirm] = useState<{ title: string; message: string; sql: string } | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
 
   const loadTables = useCallback(async () => {
     setLoading(true);
@@ -103,18 +112,87 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
     [open, cols, loadColumns]
   );
 
+  /** Run a DDL/DML statement from the menu, toast the outcome, refresh. */
+  const runDdl = useCallback(
+    async (sql: string, okMsg: string) => {
+      try {
+        const resp = (await runSql(sql)) as unknown as {
+          ok?: boolean;
+          error?: string;
+        };
+        if (resp && resp.ok === false) {
+          toast(resp.error || "statement failed", "error");
+          return;
+        }
+        toast(okMsg, "success");
+        setCols({}); // drop cached columns (a table may be gone/changed)
+        loadTables();
+      } catch (e) {
+        toast(String(e), "error");
+      }
+    },
+    [toast, loadTables]
+  );
+
+  const openTableMenu = useCallback(
+    (e: React.MouseEvent, table: string) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const items: MenuItem[] = [
+        { label: "SELECT * (100 rows)", onClick: () => onQuery(`SELECT * FROM ${table} LIMIT 100;`) },
+        { label: "SELECT COUNT(*)", onClick: () => onQuery(`SELECT COUNT(*) FROM ${table};`) },
+        { label: "Describe columns", onClick: () => onQuery(`DESCRIBE ${table};`) },
+        { label: "Show indexes", onClick: () => onQuery(`SHOW INDEXES FROM ${table};`) },
+        { label: "", onClick: () => {}, separator: true },
+        { label: "Insert name into editor", onClick: () => onInsert(table) },
+        { label: "", onClick: () => {}, separator: true },
+        {
+          label: "Truncate (delete all rows)",
+          danger: true,
+          onClick: () =>
+            setConfirm({
+              title: `Truncate ${table}?`,
+              message: `This deletes every row in "${table}". The table itself stays.`,
+              sql: `DELETE FROM ${table};`,
+            }),
+        },
+        {
+          label: "Drop table",
+          danger: true,
+          onClick: () =>
+            setConfirm({
+              title: `Drop ${table}?`,
+              message: `This permanently removes the table "${table}" and all its data.`,
+              sql: `DROP TABLE ${table};`,
+            }),
+        },
+      ];
+      setMenu({ x: e.clientX, y: e.clientY, items });
+    },
+    [onQuery, onInsert]
+  );
+
   return (
     <div className="schema-tree">
       <div className="schema-tree-head">
         <span>SCHEMA</span>
-        <button
-          className="schema-refresh"
-          title="Refresh"
-          onClick={loadTables}
-          disabled={loading}
-        >
-          {loading ? "…" : "⟳"}
-        </button>
+        <div style={{ display: "flex", gap: 2 }}>
+          <button
+            className="schema-refresh"
+            title="New table"
+            onClick={() => setShowCreate(true)}
+          >
+            +
+          </button>
+          <button
+            className="schema-refresh"
+            title="Refresh"
+            onClick={loadTables}
+            disabled={loading}
+          >
+            {loading ? "…" : "⟳"}
+          </button>
+        </div>
       </div>
 
       {error ? (
@@ -127,7 +205,10 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
         <ul className="schema-list">
           {tables.map((t) => (
             <li key={t.name}>
-              <div className="schema-table-row">
+              <div
+                className="schema-table-row"
+                onContextMenu={(e) => openTableMenu(e, t.name)}
+              >
                 <button
                   className="schema-caret"
                   onClick={() => toggle(t.name)}
@@ -137,7 +218,7 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
                 </button>
                 <span
                   className="schema-table-name"
-                  title="Click to insert · double-click to SELECT *"
+                  title="Click to insert · double-click to SELECT * · right-click for menu"
                   onClick={() => onInsert(t.name)}
                   onDoubleClick={() =>
                     onQuery(`SELECT * FROM ${t.name} LIMIT 100;`)
@@ -175,6 +256,57 @@ export function SchemaTree({ onInsert, onQuery, refreshKey }: Props) {
             </li>
           ))}
         </ul>
+      )}
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          items={menu.items}
+          onClose={() => setMenu(null)}
+        />
+      )}
+
+      {confirm && (
+        <ConfirmDialog
+          title={confirm.title}
+          message={confirm.message}
+          confirmLabel="Yes, do it"
+          danger
+          onCancel={() => setConfirm(null)}
+          onConfirm={() => {
+            const { sql } = confirm;
+            setConfirm(null);
+            runDdl(sql, "Done");
+          }}
+        />
+      )}
+
+      {showCreate && (
+        <CreateTableDialog
+          onCancel={() => setShowCreate(false)}
+          onCreate={async (sql) => {
+            let ok = false;
+            try {
+              const resp = (await runSql(sql)) as unknown as {
+                ok?: boolean;
+                error?: string;
+              };
+              if (resp && resp.ok === false) {
+                toast(resp.error || "create failed", "error");
+              } else {
+                ok = true;
+                toast("Table created", "success");
+                setShowCreate(false);
+                setCols({});
+                loadTables();
+              }
+            } catch (e) {
+              toast(String(e), "error");
+            }
+            return ok;
+          }}
+        />
       )}
     </div>
   );

@@ -507,3 +507,85 @@ input:focus, textarea:focus, select:focus {
   color: var(--text-secondary);
   text-transform: uppercase;
 }
+
+/* ── Context menu ───────────────────────────────────────────────────── */
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 190px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+}
+.context-menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 13px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.context-menu-item:hover { background: var(--accent); color: #fff; }
+.context-menu-item.danger { color: var(--danger); }
+.context-menu-item.danger:hover { background: var(--danger); color: #fff; }
+.context-menu-sep {
+  height: 1px;
+  background: var(--border-color);
+  margin: 4px 2px;
+}
+
+/* ── Create Table dialog ────────────────────────────────────────────── */
+.ct-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.ct-table th {
+  text-align: left;
+  padding: 4px 6px;
+  color: var(--text-secondary);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border-color);
+  white-space: nowrap;
+}
+.ct-table td { padding: 3px 6px; }
+.ct-table input[type="text"],
+.ct-table input:not([type]),
+.ct-table select {
+  padding: 3px 6px;
+  font-size: 12px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+}
+.ct-remove {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+.ct-remove:hover:not(:disabled) { color: var(--danger); }
+.ct-remove:disabled { opacity: 0.3; cursor: default; }
+.ct-preview {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  overflow: auto;
+  max-height: 140px;
+}
+.ct-preview pre {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: pre;
+}
