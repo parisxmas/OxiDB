@@ -21,31 +21,60 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 )
 
-// settleLua is the atomic settlement script.
-// KEYS: 1 bkey 2 akey 3 usd:buyer 4 usd:seller 5 ast:buyer 6 ast:seller 7 px 8 counter 9 queue
-// ARGV: 1 bidM 2 askM 3 qty 4 price 5 cost 6 bidRemMember 7 bidPrice 8 askRemMember 9 askPrice 10 tradeJson
-// Returns 1 = settled, 0 = buyer can't pay (bid cancelled), -1 = seller short (ask cancelled).
-const settleLua = `local ub = tonumber(redis.call('GET', KEYS[3]) or '0')
-if ub < tonumber(ARGV[5]) then redis.call('ZREM', KEYS[1], ARGV[1]) return 0 end
-local sa = tonumber(redis.call('GET', KEYS[6]) or '0')
-if sa < tonumber(ARGV[3]) then redis.call('ZREM', KEYS[2], ARGV[2]) return -1 end
-redis.call('ZREM', KEYS[1], ARGV[1])
-redis.call('ZREM', KEYS[2], ARGV[2])
-if ARGV[6] ~= '' then redis.call('ZADD', KEYS[1], ARGV[7], ARGV[6]) end
-if ARGV[8] ~= '' then redis.call('ZADD', KEYS[2], ARGV[9], ARGV[8]) end
-redis.call('INCRBYFLOAT', KEYS[3], '-' .. ARGV[5])
-redis.call('INCRBYFLOAT', KEYS[4], ARGV[5])
-redis.call('INCRBYFLOAT', KEYS[5], ARGV[3])
-redis.call('INCRBYFLOAT', KEYS[6], '-' .. ARGV[3])
-redis.call('SET', KEYS[7], ARGV[4])
-redis.call('PUBLISH', KEYS[7], ARGV[4])
-redis.call('INCR', KEYS[8])
-redis.call('RPUSH', KEYS[9], ARGV[10])
+// matchLua is the WHOLE matching step in one atomic script: scan the top of
+// both books, detect a cross, verify funds, consume the orders (re-listing
+// partial-fill remainders), move balances, set+publish the price, bump the
+// counter and queue the trade event. One EVALSHA per attempt — no separate
+// scans, no sleep-scan-settle round-trips.
+// KEYS: 1 bkey 2 akey 3 pxkey 4 counter 5 queue
+// ARGV: 1 sym 2 seq 3 nowISO
+// Returns 1=trade, 0=no cross, -2=self-cross pruned, -3/-4=cancelled order.
+const matchLua = `local bids = redis.call('ZREVRANGE', KEYS[1], '0', '0', 'WITHSCORES')
+if #bids < 2 then return 0 end
+local asks = redis.call('ZRANGE', KEYS[2], '0', '0', 'WITHSCORES')
+if #asks < 2 then return 0 end
+local bidM, bidP = bids[1], tonumber(bids[2])
+local askM, askP = asks[1], tonumber(asks[2])
+if bidP < askP then return 0 end
+local buid, buyer, bqs = string.match(bidM, '([^|]+)|([^|]+)|([^|]+)')
+local auid, seller, aqs = string.match(askM, '([^|]+)|([^|]+)|([^|]+)')
+if buid == nil or auid == nil then
+  redis.call('ZREM', KEYS[1], bidM)
+  redis.call('ZREM', KEYS[2], askM)
+  return -2
+end
+if buyer == seller then redis.call('ZREM', KEYS[2], askM) return -2 end
+local bq = tonumber(bqs)
+local aq = tonumber(aqs)
+local qty = math.min(bq, aq)
+local price = (bidP + askP) / 2
+local cost = price * qty
+local sym = ARGV[1]
+local ub = tonumber(redis.call('GET', 'usd:' .. buyer) or '0')
+if ub < cost then redis.call('ZREM', KEYS[1], bidM) return -3 end
+local sa = tonumber(redis.call('GET', 'ast:' .. sym .. ':' .. seller) or '0')
+if sa < qty then redis.call('ZREM', KEYS[2], askM) return -4 end
+redis.call('ZREM', KEYS[1], bidM)
+redis.call('ZREM', KEYS[2], askM)
+if bq > qty then
+  redis.call('ZADD', KEYS[1], string.format('%.6f', bidP), string.format('%s|%s|%.4f', buid, buyer, bq - qty))
+end
+if aq > qty then
+  redis.call('ZADD', KEYS[2], string.format('%.6f', askP), string.format('%s|%s|%.4f', auid, seller, aq - qty))
+end
+redis.call('INCRBYFLOAT', 'usd:' .. buyer, string.format('%.6f', -cost))
+redis.call('INCRBYFLOAT', 'usd:' .. seller, string.format('%.6f', cost))
+redis.call('INCRBYFLOAT', 'ast:' .. sym .. ':' .. buyer, string.format('%.6f', qty))
+redis.call('INCRBYFLOAT', 'ast:' .. sym .. ':' .. seller, string.format('%.6f', -qty))
+redis.call('SET', KEYS[3], string.format('%.6f', price))
+redis.call('PUBLISH', KEYS[3], string.format('%.6f', price))
+redis.call('INCR', KEYS[4])
+redis.call('RPUSH', KEYS[5], cjson.encode({uid = sym .. '-e' .. ARGV[2], sym = sym,
+  price = price, qty = qty, buyer = buyer, seller = seller, created_at = ARGV[3]}))
 return 1`
 
 // seedMem seeds balances + prices in OxiMem (fresh market).
@@ -125,7 +154,7 @@ func hybridMatcher() {
 			if err != nil {
 				return
 			}
-			shaV, err := c.Do("SCRIPT", "LOAD", settleLua)
+			shaV, err := c.Do("SCRIPT", "LOAD", matchLua)
 			if err != nil {
 				fmt.Printf("[matcher] %s SCRIPT LOAD failed: %v\n", sym, err)
 				return
@@ -134,80 +163,27 @@ func hybridMatcher() {
 			bkey, akey := "book:"+sym+":b", "book:"+sym+":a"
 			seq := 0
 			for {
-				bb, e1 := c.Do("ZREVRANGE", bkey, "0", "0", "WITHSCORES")
-				ba, e2 := c.Do("ZRANGE", akey, "0", "0", "WITHSCORES")
-				if e1 != nil || e2 != nil {
+				// ONE round-trip: scan + match + settle, atomically in Lua.
+				r, err := c.Do("EVALSHA", sha, "5",
+					bkey, akey, "px:"+sym, "trades:count", "trades:q",
+					sym, strconv.Itoa(seq+1), nowISO())
+				if err != nil {
 					c.Close()
 					time.Sleep(100 * time.Millisecond)
 					if nc, e := DialResp(); e == nil {
 						c = nc
-						if sv, e := c.Do("SCRIPT", "LOAD", settleLua); e == nil {
+						if sv, e := c.Do("SCRIPT", "LOAD", matchLua); e == nil {
 							sha = str(sv)
 						}
 					}
 					continue
 				}
-				bidArr, _ := bb.([]any)
-				askArr, _ := ba.([]any)
-				if len(bidArr) < 2 || len(askArr) < 2 {
-					time.Sleep(2 * time.Millisecond)
-					continue
-				}
-				bidM := str(bidArr[0])
-				bidP, _ := strconv.ParseFloat(str(bidArr[1]), 64)
-				askM := str(askArr[0])
-				askP, _ := strconv.ParseFloat(str(askArr[1]), 64)
-				if bidP < askP {
-					time.Sleep(2 * time.Millisecond)
-					continue
-				}
-				bf := strings.SplitN(bidM, "|", 3)
-				af := strings.SplitN(askM, "|", 3)
-				if len(bf) != 3 || len(af) != 3 {
-					c.Do("ZREM", bkey, bidM)
-					c.Do("ZREM", akey, askM)
-					continue
-				}
-				buyer, seller := bf[1], af[1]
-				if buyer == seller { // self-cross: drop the ask, rescan
-					c.Do("ZREM", akey, askM)
-					continue
-				}
-				bq, _ := strconv.ParseFloat(bf[2], 64)
-				aq, _ := strconv.ParseFloat(af[2], 64)
-				qty := bq
-				if aq < qty {
-					qty = aq
-				}
-				price := (bidP + askP) / 2 // midpoint — value-neutral fills
-				cost := price * qty
-				bidRem, askRem := "", ""
-				if bq > qty {
-					bidRem = fmt.Sprintf("%s|%s|%.4f", bf[0], buyer, bq-qty)
-				}
-				if aq > qty {
-					askRem = fmt.Sprintf("%s|%s|%.4f", af[0], seller, aq-qty)
-				}
-				seq++
-				ev, _ := json.Marshal(map[string]any{
-					"uid": fmt.Sprintf("%s-h%d", sym, seq), "sym": sym,
-					"price": price, "qty": qty, "buyer": buyer, "seller": seller,
-					"created_at": nowISO(),
-				})
-				r, err := c.Do("EVALSHA", sha, "9",
-					bkey, akey, "usd:"+buyer, "usd:"+seller,
-					"ast:"+sym+":"+buyer, "ast:"+sym+":"+seller,
-					"px:"+sym, "trades:count", "trades:q",
-					bidM, askM,
-					fmt.Sprintf("%f", qty), fmt.Sprintf("%f", price), fmt.Sprintf("%f", cost),
-					bidRem, fmt.Sprintf("%f", bidP), askRem, fmt.Sprintf("%f", askP),
-					string(ev))
-				if err != nil {
-					continue
-				}
 				switch v, _ := r.(int64); v {
 				case 1:
+					seq++
 					atomic.AddInt64(&trades, 1)
+				case 0:
+					time.Sleep(2 * time.Millisecond) // no cross — let the book breathe
 				default:
 					atomic.AddInt64(&cancels, 1)
 				}
