@@ -15,6 +15,9 @@ const CONNECT: u8 = 1;
 const CONNACK: u8 = 2;
 const PUBLISH: u8 = 3;
 const PUBACK: u8 = 4;
+const PUBREC: u8 = 5;
+const PUBREL: u8 = 6;
+const PUBCOMP: u8 = 7;
 const SUBSCRIBE: u8 = 8;
 const SUBACK: u8 = 9;
 const UNSUBSCRIBE: u8 = 10;
@@ -99,6 +102,42 @@ fn write_packet(
     Ok(())
 }
 
+/// MQTT topic filter → anchored regex: `+` matches one level, `#` (only as
+/// the final level) matches the rest of the topic.
+fn filter_to_regex(filter: &str) -> Option<regex::Regex> {
+    let mut out = String::from("^");
+    let levels: Vec<&str> = filter.split('/').collect();
+    for (i, lv) in levels.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        match *lv {
+            "+" => out.push_str("[^/]+"),
+            "#" => {
+                if i != levels.len() - 1 {
+                    return None; // '#' must be last
+                }
+                // '#' also matches the parent level itself.
+                if i > 0 {
+                    out.pop(); // drop the '/'
+                    out.push_str("(/.*)?");
+                } else {
+                    out.push_str(".*");
+                }
+                break;
+            }
+            plain => out.push_str(&regex::escape(plain)),
+        }
+    }
+    out.push('$');
+    regex::Regex::new(&out).ok()
+}
+
+/// True if the filter contains MQTT wildcards.
+fn has_wildcard(f: &str) -> bool {
+    f.split('/').any(|l| l == "+" || l == "#")
+}
+
 // ---------------------------------------------------------------------------
 // Connection handler
 // ---------------------------------------------------------------------------
@@ -140,20 +179,54 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
     if off >= payload.len() {
         return;
     }
-    let _conn_flags = payload[off];
+    let conn_flags = payload[off];
     off += 1;
     if off + 1 >= payload.len() {
         return;
     }
-    let _keepalive = u16::from_be_bytes([payload[off], payload[off + 1]]);
+    let keepalive = u16::from_be_bytes([payload[off], payload[off + 1]]);
     off += 2;
     let client_id = read_utf8(&payload, &mut off).unwrap_or_default();
+
+    // Last Will & Testament (flag bit 2; qos bits 3-4; retain bit 5).
+    let will_flag = conn_flags & 0x04 != 0;
+    let will_retain = conn_flags & 0x20 != 0;
+    let mut will: Option<(String, String)> = None;
+    if will_flag {
+        let t = read_utf8(&payload, &mut off).unwrap_or_default();
+        let m = read_utf8(&payload, &mut off).unwrap_or_default();
+        will = Some((t, m));
+    }
+    // Username (bit 7) / password (bit 6).
+    let username = if conn_flags & 0x80 != 0 {
+        read_utf8(&payload, &mut off).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let password = if conn_flags & 0x40 != 0 {
+        read_utf8(&payload, &mut off).unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     if log {
         eprintln!("[mqtt] CONNECT client_id=\"{client_id}\" peer={peer}");
     }
 
-    // CONNACK: session_present=0, return_code=0 (accepted)
+    // Auth: if OXIDB_MQTT_USER/OXIDB_MQTT_PASSWORD are set, require a match.
+    if let (Ok(want_u), Ok(want_p)) = (
+        std::env::var("OXIDB_MQTT_USER"),
+        std::env::var("OXIDB_MQTT_PASSWORD"),
+    ) {
+        if username != want_u || password != want_p {
+            // 0x04 = bad user name or password
+            let _ = write_packet(&mut writer, CONNACK, 0, &[0x00, 0x04]);
+            let _ = writer.flush();
+            return;
+        }
+    }
+
+    // CONNACK: session_present=0 (stateless broker by design), accepted.
     if write_packet(&mut writer, CONNACK, 0, &[0x00, 0x00]).is_err() {
         return;
     }
@@ -162,18 +235,35 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
     }
 
     // --- Main loop ---
-    let mut receivers: Vec<(String, std::sync::mpsc::Receiver<(String, String)>)> = Vec::new();
+    // (filter, granted_qos, receiver)
+    let mut receivers: Vec<(String, u8, std::sync::mpsc::Receiver<(String, String)>)> = Vec::new();
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut next_pkt_id: u16 = 1;
+    let mut last_activity = std::time::Instant::now();
+    let mut clean_close = false;
+    // MQTT-3.1.2-24: disconnect after 1.5 × keepalive of silence.
+    let ka_limit = if keepalive > 0 {
+        Some(Duration::from_millis(keepalive as u64 * 1500))
+    } else {
+        None
+    };
 
     loop {
         // Deliver queued messages to subscribed client
         let mut wrote = false;
-        for (_topic, rx) in &receivers {
+        for (_topic, granted_qos, rx) in &receivers {
             while let Ok((topic, message)) = rx.try_recv() {
                 let mut buf = Vec::new();
                 write_utf8(&mut buf, &topic);
+                let flags = if *granted_qos >= 1 {
+                    buf.extend_from_slice(&next_pkt_id.to_be_bytes());
+                    next_pkt_id = next_pkt_id.wrapping_add(1).max(1);
+                    0x02 // QoS 1
+                } else {
+                    0x00
+                };
                 buf.extend_from_slice(message.as_bytes());
-                if write_packet(&mut writer, PUBLISH, 0, &buf).is_err() {
+                if write_packet(&mut writer, PUBLISH, flags, &buf).is_err() {
                     return;
                 }
                 if log {
@@ -193,10 +283,16 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
             {
+                if let Some(limit) = ka_limit {
+                    if last_activity.elapsed() > limit {
+                        break; // keepalive expired → abnormal close (will fires)
+                    }
+                }
                 continue;
             }
             Err(_) => break,
         }
+        last_activity = std::time::Instant::now();
 
         let pkt_type = hdr[0] >> 4;
         let remaining = match read_remaining_length(&mut reader) {
@@ -216,17 +312,29 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     Err(_) => continue,
                 };
                 let qos = (hdr[0] >> 1) & 0x03;
+                let retain = hdr[0] & 0x01 != 0;
                 if qos > 0 && off + 2 <= payload.len() {
                     let pkt_id = u16::from_be_bytes([payload[off], payload[off + 1]]);
                     off += 2;
                     if qos == 1 {
                         let _ = write_packet(&mut writer, PUBACK, 0, &pkt_id.to_be_bytes());
                         let _ = writer.flush();
+                    } else if qos == 2 {
+                        // Method A: publish now, complete the 4-way handshake.
+                        let _ = write_packet(&mut writer, PUBREC, 0, &pkt_id.to_be_bytes());
+                        let _ = writer.flush();
                     }
                 }
                 let message = String::from_utf8_lossy(&payload[off..]).to_string();
                 if log {
                     eprintln!("[mqtt] << PUBLISH topic=\"{topic}\" msg=\"{message}\"");
+                }
+                if retain {
+                    if message.is_empty() {
+                        store.retain_clear(&topic); // empty retained = clear
+                    } else {
+                        store.retain_set(&topic, &message);
+                    }
                 }
                 store.publish(&topic, &message);
             }
@@ -243,7 +351,7 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                         Ok(t) => t,
                         Err(_) => break,
                     };
-                    let _qos = if off < payload.len() {
+                    let req_qos = if off < payload.len() {
                         let q = payload[off];
                         off += 1;
                         q
@@ -253,9 +361,37 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     if log {
                         eprintln!("[mqtt] << SUBSCRIBE topic=\"{topic}\"");
                     }
-                    let rx = store.subscribe(&topic);
-                    receivers.push((topic, rx));
-                    return_codes.push(0x00); // granted QoS 0
+                    let granted = req_qos.min(1); // QoS 2 subscriptions granted at 1
+                    // Wildcard filters go through the pattern layer; exact
+                    // topics use the fast exact-channel map.
+                    let (rx, re) = if has_wildcard(&topic) {
+                        match filter_to_regex(&topic) {
+                            Some(re) => (store.psubscribe_regex(&topic, re.clone()), Some(re)),
+                            None => {
+                                return_codes.push(0x80); // failure
+                                continue;
+                            }
+                        }
+                    } else {
+                        (store.subscribe(&topic), regex::Regex::new(&format!("^{}$", regex::escape(&topic))).ok())
+                    };
+                    // Deliver matching retained messages immediately (retain=1).
+                    if let Some(re) = &re {
+                        for (rt, rm) in store.retained_matching(re) {
+                            let mut buf = Vec::new();
+                            write_utf8(&mut buf, &rt);
+                            if granted >= 1 {
+                                buf.extend_from_slice(&next_pkt_id.to_be_bytes());
+                                next_pkt_id = next_pkt_id.wrapping_add(1).max(1);
+                            }
+                            buf.extend_from_slice(rm.as_bytes());
+                            let flags = 0x01 | if granted >= 1 { 0x02 } else { 0 };
+                            let _ = write_packet(&mut writer, PUBLISH, flags, &buf);
+                        }
+                        let _ = writer.flush();
+                    }
+                    receivers.push((topic, granted, rx));
+                    return_codes.push(granted);
                 }
                 let mut suback = Vec::new();
                 suback.extend_from_slice(&pkt_id.to_be_bytes());
@@ -278,11 +414,22 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     if log {
                         eprintln!("[mqtt] << UNSUBSCRIBE topic=\"{topic}\"");
                     }
-                    receivers.retain(|(name, _)| name != &topic);
-                    store.unsubscribe(&topic);
+                    receivers.retain(|(name, _, _)| name != &topic);
+                    if has_wildcard(&topic) {
+                        store.punsubscribe(&topic);
+                    } else {
+                        store.unsubscribe(&topic);
+                    }
                 }
                 let _ = write_packet(&mut writer, UNSUBACK, 0, &pkt_id.to_be_bytes());
                 let _ = writer.flush();
+            }
+
+            PUBREL => {
+                if payload.len() >= 2 {
+                    let _ = write_packet(&mut writer, PUBCOMP, 0, &payload[..2]);
+                    let _ = writer.flush();
+                }
             }
 
             PINGREQ => {
@@ -294,10 +441,25 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                 if log {
                     eprintln!("[mqtt] DISCONNECT client_id=\"{client_id}\"");
                 }
+                clean_close = true;
                 break;
             }
 
             _ => {} // ignore unknown packets
+        }
+    }
+
+    // Last Will: published on any abnormal termination (socket error or
+    // keepalive expiry) — a clean DISCONNECT discards it (MQTT-3.14.4-3).
+    if !clean_close {
+        if let Some((wt, wm)) = &will {
+            if will_retain {
+                store.retain_set(wt, wm);
+            }
+            store.publish(wt, wm);
+            if log {
+                eprintln!("[mqtt] will published topic=\"{wt}\"");
+            }
         }
     }
 

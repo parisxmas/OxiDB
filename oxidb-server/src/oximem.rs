@@ -167,6 +167,8 @@ pub struct OxiMemStore {
     pubsub: Mutex<HashMap<String, Vec<PubSubSender>>>,
     /// PSUBSCRIBE pattern subscribers: (glob pattern, compiled regex, senders).
     psubs: Mutex<Vec<(String, regex::Regex, Vec<PubSubSender>)>>,
+    /// MQTT retained messages: topic → last retained payload.
+    retained: RwLock<HashMap<String, String>>,
     /// Serializes MULTI/EXEC transaction blocks so two EXECs never interleave
     /// their queued commands — the isolation Redis gets for free from being
     /// single-threaded. Held only for the duration of an EXEC.
@@ -204,6 +206,7 @@ impl OxiMemStore {
             sorted_sets: RwLock::new(HashMap::new()),
             pubsub: Mutex::new(HashMap::new()),
             psubs: Mutex::new(Vec::new()),
+            retained: RwLock::new(HashMap::new()),
             tx_lock: Mutex::new(()),
             versions: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(0),
@@ -234,6 +237,7 @@ impl OxiMemStore {
             sorted_sets: RwLock::new(HashMap::new()),
             pubsub: Mutex::new(HashMap::new()),
             psubs: Mutex::new(Vec::new()),
+            retained: RwLock::new(HashMap::new()),
             tx_lock: Mutex::new(()),
             versions: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(0),
@@ -277,6 +281,42 @@ impl OxiMemStore {
             subs.push((pattern.to_string(), re, vec![tx]));
         }
         Some(rx)
+    }
+
+    /// Pattern-subscribe with a pre-compiled regex (MQTT wildcard filters).
+    pub fn psubscribe_regex(
+        &self,
+        display: &str,
+        re: regex::Regex,
+    ) -> mpsc::Receiver<(String, String)> {
+        let (tx, rx) = mpsc::channel();
+        let mut subs = self.psubs.lock().unwrap();
+        if let Some(e) = subs.iter_mut().find(|(p, _, _)| p == display) {
+            e.2.push(tx);
+        } else {
+            subs.push((display.to_string(), re, vec![tx]));
+        }
+        rx
+    }
+
+    /// Store / clear / query MQTT retained messages.
+    pub fn retain_set(&self, topic: &str, msg: &str) {
+        self.retained
+            .write()
+            .unwrap()
+            .insert(topic.to_string(), msg.to_string());
+    }
+    pub fn retain_clear(&self, topic: &str) {
+        self.retained.write().unwrap().remove(topic);
+    }
+    pub fn retained_matching(&self, re: &regex::Regex) -> Vec<(String, String)> {
+        self.retained
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| re.is_match(t))
+            .map(|(t, m)| (t.clone(), m.clone()))
+            .collect()
     }
 
     /// Remove a pattern subscription entry entirely (PUNSUBSCRIBE).
