@@ -4357,156 +4357,185 @@ fn cmd_eval(store: &OxiMemStore, args: &[RespValue], by_sha: bool) -> RespValue 
         .collect();
 
     let _guard = store.tx_lock.lock().unwrap(); // whole script is atomic
-    let lua = mlua::Lua::new();
-    // Busy-script guard: an infinite loop would hold tx_lock forever and
-    // freeze every EXEC/EVAL on the server. Kill scripts after ~200ms.
-    let started = Instant::now();
-    store.script_kill.store(false, Ordering::SeqCst);
-    let kill = Arc::clone(&store.script_kill);
-    lua.set_hook(
-        mlua::HookTriggers::new().every_nth_instruction(20_000),
-        move |_lua, _dbg| {
-            if kill.load(Ordering::SeqCst) {
-                Err(mlua::Error::runtime("script killed by SCRIPT KILL"))
-            } else if started.elapsed() > std::time::Duration::from_millis(200) {
-                Err(mlua::Error::runtime("script exceeded time limit"))
-            } else {
-                Ok(mlua::VmState::Continue)
-            }
-        },
-    );
-    let out: mlua::Result<RespValue> = lua.scope(|scope| {
-        let globals = lua.globals();
-        let keys_t = lua.create_table()?;
-        for (i, k) in keys.iter().enumerate() {
-            keys_t.set(i + 1, k.as_str())?;
-        }
-        let argv_t = lua.create_table()?;
-        for (i, a) in argv.iter().enumerate() {
-            argv_t.set(i + 1, a.as_str())?;
-        }
-        globals.set("KEYS", keys_t)?;
-        globals.set("ARGV", argv_t)?;
 
-        let redis_t = lua.create_table()?;
-        let call = scope.create_function(|lua, cargs: mlua::MultiValue| {
-            let mut parts: Vec<RespValue> = Vec::with_capacity(cargs.len());
-            for v in cargs {
-                match v {
-                    mlua::Value::String(s) => parts.push(resp::bulk(&s.as_bytes())),
-                    mlua::Value::Integer(n) => parts.push(resp::bulk_string(&n.to_string())),
-                    mlua::Value::Number(n) => parts.push(resp::bulk_string(&format_score(n))),
-                    _ => return Err(mlua::Error::runtime("invalid redis.call argument")),
-                }
-            }
-            let r = execute(store, &parts);
-            if let RespValue::Error(e) = &r {
-                return Err(mlua::Error::runtime(e.clone()));
-            }
-            resp_to_lua(lua, &r)
-        })?;
-        let pcall = scope.create_function(|lua, cargs: mlua::MultiValue| {
-            let mut parts: Vec<RespValue> = Vec::with_capacity(cargs.len());
-            for v in cargs {
-                match v {
-                    mlua::Value::String(s) => parts.push(resp::bulk(&s.as_bytes())),
-                    mlua::Value::Integer(n) => parts.push(resp::bulk_string(&n.to_string())),
-                    mlua::Value::Number(n) => parts.push(resp::bulk_string(&format_score(n))),
-                    _ => return Err(mlua::Error::runtime("invalid redis.pcall argument")),
-                }
-            }
-            resp_to_lua(lua, &execute(store, &parts)) // errors become {err=...}
-        })?;
-        let error_reply = scope.create_function(|lua, msg: String| {
-            let t = lua.create_table()?;
-            t.set("err", msg)?;
-            Ok(t)
-        })?;
-        let status_reply = scope.create_function(|lua, msg: String| {
-            let t = lua.create_table()?;
-            t.set("ok", msg)?;
-            Ok(t)
-        })?;
-        let sha1hex_f = scope.create_function(|_, s: mlua::String| {
-            Ok(sha1_hex(&s.to_string_lossy()))
-        })?;
-        redis_t.set("sha1hex", sha1hex_f)?;
-        redis_t.set("call", call)?;
-        redis_t.set("pcall", pcall)?;
-        redis_t.set("error_reply", error_reply)?;
-        redis_t.set("status_reply", status_reply)?;
-        globals.set("redis", redis_t)?;
+    // The Lua VM is REUSED per server thread (thread_local) and compiled
+    // scripts are cached in its registry by sha1 — creating a fresh VM and
+    // re-parsing the script on every EVAL dominated settlement latency
+    // inside tx_lock. Globals (KEYS/ARGV/redis/cjson) are re-bound per call
+    // through a scope, so `store` borrows stay sound.
+    thread_local! {
+        static LUA_VM: mlua::Lua = mlua::Lua::new();
+    }
 
-        // Minimal cjson: encode/decode bridged through serde_json.
-        let cjson_t = lua.create_table()?;
-        let enc = scope.create_function(|lua, v: mlua::Value| {
-            fn to_json(lua: &mlua::Lua, v: &mlua::Value) -> serde_json::Value {
-                match v {
-                    mlua::Value::Nil => serde_json::Value::Null,
-                    mlua::Value::Boolean(b) => json!(b),
-                    mlua::Value::Integer(n) => json!(n),
-                    mlua::Value::Number(n) => json!(n),
-                    mlua::Value::String(s) => json!(s.to_string_lossy()),
-                    mlua::Value::Table(t) => {
-                        let len = t.raw_len();
-                        if len > 0 {
-                            let arr: Vec<serde_json::Value> = (1..=len)
-                                .filter_map(|i| t.get::<mlua::Value>(i).ok())
-                                .map(|x| to_json(lua, &x))
-                                .collect();
-                            serde_json::Value::Array(arr)
-                        } else {
-                            let mut m = serde_json::Map::new();
-                            for pair in t.clone().pairs::<String, mlua::Value>().flatten() {
-                                m.insert(pair.0, to_json(lua, &pair.1));
+    let out: mlua::Result<RespValue> = LUA_VM.with(|lua| {
+        store.script_kill.store(false, Ordering::SeqCst);
+        let kill = Arc::clone(&store.script_kill);
+        let started = Instant::now();
+        lua.set_hook(
+            mlua::HookTriggers::new().every_nth_instruction(20_000),
+            move |_lua, _dbg| {
+                if kill.load(Ordering::SeqCst) {
+                    Err(mlua::Error::runtime("script killed by SCRIPT KILL"))
+                } else if started.elapsed() > std::time::Duration::from_millis(200) {
+                    Err(mlua::Error::runtime("script exceeded time limit"))
+                } else {
+                    Ok(mlua::VmState::Continue)
+                }
+            },
+        );
+        let sha_key = sha1_hex(&src);
+        let result = lua.scope(|scope| {
+            let globals = lua.globals();
+            let keys_t = lua.create_table()?;
+            for (i, k) in keys.iter().enumerate() {
+                keys_t.set(i + 1, k.as_str())?;
+            }
+            let argv_t = lua.create_table()?;
+            for (i, a) in argv.iter().enumerate() {
+                argv_t.set(i + 1, a.as_str())?;
+            }
+            globals.set("KEYS", keys_t)?;
+            globals.set("ARGV", argv_t)?;
+
+            let redis_t = lua.create_table()?;
+            let call = scope.create_function(|lua, cargs: mlua::MultiValue| {
+                let mut parts: Vec<RespValue> = Vec::with_capacity(cargs.len());
+                for v in cargs {
+                    match v {
+                        mlua::Value::String(s) => parts.push(resp::bulk(&s.as_bytes())),
+                        mlua::Value::Integer(n) => parts.push(resp::bulk_string(&n.to_string())),
+                        mlua::Value::Number(n) => parts.push(resp::bulk_string(&format_score(n))),
+                        _ => return Err(mlua::Error::runtime("invalid redis.call argument")),
+                    }
+                }
+                let r = execute(store, &parts);
+                if let RespValue::Error(e) = &r {
+                    return Err(mlua::Error::runtime(e.clone()));
+                }
+                resp_to_lua(lua, &r)
+            })?;
+            let pcall = scope.create_function(|lua, cargs: mlua::MultiValue| {
+                let mut parts: Vec<RespValue> = Vec::with_capacity(cargs.len());
+                for v in cargs {
+                    match v {
+                        mlua::Value::String(s) => parts.push(resp::bulk(&s.as_bytes())),
+                        mlua::Value::Integer(n) => parts.push(resp::bulk_string(&n.to_string())),
+                        mlua::Value::Number(n) => parts.push(resp::bulk_string(&format_score(n))),
+                        _ => return Err(mlua::Error::runtime("invalid redis.pcall argument")),
+                    }
+                }
+                resp_to_lua(lua, &execute(store, &parts))
+            })?;
+            let error_reply = scope.create_function(|lua, msg: String| {
+                let t = lua.create_table()?;
+                t.set("err", msg)?;
+                Ok(t)
+            })?;
+            let status_reply = scope.create_function(|lua, msg: String| {
+                let t = lua.create_table()?;
+                t.set("ok", msg)?;
+                Ok(t)
+            })?;
+            let sha1hex_f = scope.create_function(|_, s: mlua::String| {
+                Ok(sha1_hex(&s.to_string_lossy()))
+            })?;
+            redis_t.set("sha1hex", sha1hex_f)?;
+            redis_t.set("call", call)?;
+            redis_t.set("pcall", pcall)?;
+            redis_t.set("error_reply", error_reply)?;
+            redis_t.set("status_reply", status_reply)?;
+            globals.set("redis", redis_t)?;
+
+            // Minimal cjson: encode/decode bridged through serde_json.
+            let cjson_t = lua.create_table()?;
+            let enc = scope.create_function(|lua, v: mlua::Value| {
+                fn to_json(lua: &mlua::Lua, v: &mlua::Value) -> serde_json::Value {
+                    match v {
+                        mlua::Value::Nil => serde_json::Value::Null,
+                        mlua::Value::Boolean(b) => json!(b),
+                        mlua::Value::Integer(n) => json!(n),
+                        mlua::Value::Number(n) => json!(n),
+                        mlua::Value::String(s) => json!(s.to_string_lossy()),
+                        mlua::Value::Table(t) => {
+                            let len = t.raw_len();
+                            if len > 0 {
+                                let arr: Vec<serde_json::Value> = (1..=len)
+                                    .filter_map(|i| t.get::<mlua::Value>(i).ok())
+                                    .map(|x| to_json(lua, &x))
+                                    .collect();
+                                serde_json::Value::Array(arr)
+                            } else {
+                                let mut m = serde_json::Map::new();
+                                for pair in t.clone().pairs::<String, mlua::Value>().flatten() {
+                                    m.insert(pair.0, to_json(lua, &pair.1));
+                                }
+                                serde_json::Value::Object(m)
                             }
-                            serde_json::Value::Object(m)
                         }
+                        _ => serde_json::Value::Null,
                     }
-                    _ => serde_json::Value::Null,
                 }
-            }
-            Ok(to_json(lua, &v).to_string())
-        })?;
-        let dec = scope.create_function(|lua, s: mlua::String| {
-            fn to_lua(lua: &mlua::Lua, v: &serde_json::Value) -> mlua::Result<mlua::Value> {
-                Ok(match v {
-                    serde_json::Value::Null => mlua::Value::Nil,
-                    serde_json::Value::Bool(b) => mlua::Value::Boolean(*b),
-                    serde_json::Value::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            mlua::Value::Integer(i)
-                        } else {
-                            mlua::Value::Number(n.as_f64().unwrap_or(0.0))
+                Ok(to_json(lua, &v).to_string())
+            })?;
+            let dec = scope.create_function(|lua, s: mlua::String| {
+                fn to_lua(lua: &mlua::Lua, v: &serde_json::Value) -> mlua::Result<mlua::Value> {
+                    Ok(match v {
+                        serde_json::Value::Null => mlua::Value::Nil,
+                        serde_json::Value::Bool(b) => mlua::Value::Boolean(*b),
+                        serde_json::Value::Number(n) => {
+                            if let Some(i) = n.as_i64() {
+                                mlua::Value::Integer(i)
+                            } else {
+                                mlua::Value::Number(n.as_f64().unwrap_or(0.0))
+                            }
                         }
-                    }
-                    serde_json::Value::String(s) => mlua::Value::String(lua.create_string(s)?),
-                    serde_json::Value::Array(a) => {
-                        let t = lua.create_table()?;
-                        for (i, x) in a.iter().enumerate() {
-                            t.set(i + 1, to_lua(lua, x)?)?;
+                        serde_json::Value::String(s) => mlua::Value::String(lua.create_string(s)?),
+                        serde_json::Value::Array(a) => {
+                            let t = lua.create_table()?;
+                            for (i, x) in a.iter().enumerate() {
+                                t.set(i + 1, to_lua(lua, x)?)?;
+                            }
+                            mlua::Value::Table(t)
                         }
-                        mlua::Value::Table(t)
-                    }
-                    serde_json::Value::Object(o) => {
-                        let t = lua.create_table()?;
-                        for (k, x) in o {
-                            t.set(k.as_str(), to_lua(lua, x)?)?;
+                        serde_json::Value::Object(o) => {
+                            let t = lua.create_table()?;
+                            for (k, x) in o {
+                                t.set(k.as_str(), to_lua(lua, x)?)?;
+                            }
+                            mlua::Value::Table(t)
                         }
-                        mlua::Value::Table(t)
-                    }
-                })
-            }
-            let parsed: serde_json::Value =
-                serde_json::from_str(&s.to_string_lossy()).map_err(mlua::Error::runtime)?;
-            to_lua(lua, &parsed)
-        })?;
-        cjson_t.set("encode", enc)?;
-        cjson_t.set("decode", dec)?;
-        globals.set("cjson", cjson_t)?;
+                    })
+                }
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&s.to_string_lossy()).map_err(mlua::Error::runtime)?;
+                to_lua(lua, &parsed)
+            })?;
+            cjson_t.set("encode", enc)?;
+            cjson_t.set("decode", dec)?;
+            globals.set("cjson", cjson_t)?;
 
-        let v: mlua::Value = lua.load(&src).eval()?;
-        Ok(lua_to_resp(v))
+            // Compile-once: cached Function in the VM registry, keyed by sha1.
+            let cache: mlua::Table = match lua.named_registry_value("oxi_scripts") {
+                Ok(t) => t,
+                Err(_) => {
+                    let t = lua.create_table()?;
+                    lua.set_named_registry_value("oxi_scripts", t.clone())?;
+                    t
+                }
+            };
+            let func: mlua::Function = match cache.get::<mlua::Value>(sha_key.as_str())? {
+                mlua::Value::Function(f) => f,
+                _ => {
+                    let f = lua.load(&src).into_function()?;
+                    cache.set(sha_key.as_str(), f.clone())?;
+                    f
+                }
+            };
+            let v: mlua::Value = func.call(())?;
+            Ok(lua_to_resp(v))
+        });
+        lua.remove_hook();
+        result
     });
     match out {
         Ok(r) => r,
