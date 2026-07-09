@@ -6,6 +6,7 @@ import type { MenuItem } from "../common/ContextMenu";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 import { CreateTableDialog } from "./CreateTableDialog";
 import { AlterTableDialog } from "./AlterTableDialog";
+import { IndexDialog } from "./IndexDialog";
 import { useToast } from "../common/Toast";
 
 interface StmtResult {
@@ -56,6 +57,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [confirm, setConfirm] = useState<{ title: string; message: string; sql: string } | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [editTable, setEditTable] = useState<string | null>(null);
+  const [indexTable, setIndexTable] = useState<string | null>(null);
 
   const loadTables = useCallback(async () => {
     setLoading(true);
@@ -150,6 +152,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
         { label: "Show indexes", onClick: () => onQuery(`SHOW INDEXES FROM ${table};`) },
         { label: "", onClick: () => {}, separator: true },
         { label: "Edit table…", onClick: () => setEditTable(table) },
+        { label: "Manage indexes…", onClick: () => setIndexTable(table) },
         { label: "Insert name into editor", onClick: () => onInsert(table) },
         { label: "", onClick: () => {}, separator: true },
         {
@@ -343,6 +346,14 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
             loadTables();
             return true;
           }}
+        />
+      )}
+
+      {indexTable && (
+        <IndexDialog
+          table={indexTable}
+          onClose={() => setIndexTable(null)}
+          onChanged={loadTables}
         />
       )}
     </div>
