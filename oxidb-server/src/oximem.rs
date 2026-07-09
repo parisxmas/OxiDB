@@ -165,6 +165,8 @@ pub struct OxiMemStore {
     sets: RwLock<HashMap<String, HashSet<String>>>,
     sorted_sets: RwLock<HashMap<String, SortedSet>>,
     pubsub: Mutex<HashMap<String, Vec<PubSubSender>>>,
+    /// PSUBSCRIBE pattern subscribers: (glob pattern, compiled regex, senders).
+    psubs: Mutex<Vec<(String, regex::Regex, Vec<PubSubSender>)>>,
     /// Serializes MULTI/EXEC transaction blocks so two EXECs never interleave
     /// their queued commands — the isolation Redis gets for free from being
     /// single-threaded. Held only for the duration of an EXEC.
@@ -197,6 +199,7 @@ impl OxiMemStore {
             sets: RwLock::new(HashMap::new()),
             sorted_sets: RwLock::new(HashMap::new()),
             pubsub: Mutex::new(HashMap::new()),
+            psubs: Mutex::new(Vec::new()),
             tx_lock: Mutex::new(()),
             versions: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(0),
@@ -224,6 +227,7 @@ impl OxiMemStore {
             sets: RwLock::new(HashMap::new()),
             sorted_sets: RwLock::new(HashMap::new()),
             pubsub: Mutex::new(HashMap::new()),
+            psubs: Mutex::new(Vec::new()),
             tx_lock: Mutex::new(()),
             versions: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(0),
@@ -254,18 +258,43 @@ impl OxiMemStore {
         }
     }
 
-    /// Publish a message to a channel, returns number of receivers.
+    /// Subscribe to a glob pattern (PSUBSCRIBE), returns a receiver.
+    pub fn psubscribe(&self, pattern: &str) -> Option<mpsc::Receiver<(String, String)>> {
+        let re = regex::Regex::new(&glob_to_regex(pattern)).ok()?;
+        let (tx, rx) = mpsc::channel();
+        let mut subs = self.psubs.lock().unwrap();
+        if let Some(entry) = subs.iter_mut().find(|(p, _, _)| p == pattern) {
+            entry.2.push(tx);
+        } else {
+            subs.push((pattern.to_string(), re, vec![tx]));
+        }
+        Some(rx)
+    }
+
+    /// Publish a message to a channel, returns number of receivers
+    /// (exact-channel subscribers + matching pattern subscribers).
     pub fn publish(&self, channel: &str, message: &str) -> i64 {
-        let mut map = self.pubsub.lock().unwrap();
-        let senders = match map.get_mut(channel) {
-            Some(s) => s,
-            None => return 0,
-        };
-        // Send to all, remove dead senders
-        senders.retain(|tx| tx.send((channel.to_string(), message.to_string())).is_ok());
-        let count = senders.len() as i64;
-        if senders.is_empty() {
-            map.remove(channel);
+        let mut count = 0i64;
+        {
+            let mut map = self.pubsub.lock().unwrap();
+            if let Some(senders) = map.get_mut(channel) {
+                senders.retain(|tx| tx.send((channel.to_string(), message.to_string())).is_ok());
+                count += senders.len() as i64;
+                if senders.is_empty() {
+                    map.remove(channel);
+                }
+            }
+        }
+        {
+            let mut subs = self.psubs.lock().unwrap();
+            for (_, re, senders) in subs.iter_mut() {
+                if re.is_match(channel) {
+                    senders
+                        .retain(|tx| tx.send((channel.to_string(), message.to_string())).is_ok());
+                    count += senders.len() as i64;
+                }
+            }
+            subs.retain(|(_, _, s)| !s.is_empty());
         }
         count
     }
@@ -279,7 +308,13 @@ impl OxiMemStore {
     /// future WATCH re-snapshots from scratch) — bounds memory on long runs.
     fn bump_version(&self, key: &str) {
         let mut v = self.versions.write().unwrap();
-        if v.len() > 100_000 && self.active_watches.load(Ordering::SeqCst) == 0 {
+        static GC_AT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+            std::env::var("OXIMEM_VERSIONS_GC")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100_000)
+        });
+        if v.len() > *GC_AT && self.active_watches.load(Ordering::SeqCst) == 0 {
             v.clear();
             self.epoch.fetch_add(1, Ordering::SeqCst); // belt & suspenders
         }
@@ -295,9 +330,20 @@ impl OxiMemStore {
         let all = json!({});
         if let Ok(rows) = db.find("_kv", &all) {
             let mut s = self.strings.write().unwrap();
+            let now = now_secs();
             for r in rows {
                 if let (Some(k), Some(v)) = (r["_key"].as_str(), r["_value"].as_str()) {
-                    s.insert(k.to_string(), KvEntry::new(v.to_string()));
+                    // Restore the REMAINING ttl from the absolute deadline;
+                    // already-expired keys are simply not loaded.
+                    match r["_exp"].as_u64() {
+                        Some(exp) if exp <= now => continue,
+                        Some(exp) => {
+                            s.insert(k.to_string(), KvEntry::with_ttl(v.to_string(), exp - now));
+                        }
+                        None => {
+                            s.insert(k.to_string(), KvEntry::new(v.to_string()));
+                        }
+                    }
                 }
             }
         }
@@ -348,6 +394,134 @@ impl OxiMemStore {
                         if let (Some(m), Some(sc)) = (it["member"].as_str(), it["score"].as_f64())
                         {
                             ss.insert(m.to_string(), sc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove expired string keys eagerly, returning them so the caller can
+    /// emit `expired` keyspace events. Run from a periodic sweeper thread.
+    pub fn sweep_expired(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut s = self.strings.write().unwrap();
+        s.retain(|k, e| {
+            if e.is_expired() {
+                out.push(k.clone());
+                false
+            } else {
+                true
+            }
+        });
+        drop(s);
+        for k in &out {
+            self.bump_version(k);
+            if self.notify.load(Ordering::Relaxed) {
+                self.publish(&format!("__keyspace@0__:{k}"), "expired");
+                self.publish("__keyevent@0__:expired", k);
+            }
+        }
+        out
+    }
+
+    /// Key counts per type, for metrics gauges.
+    pub fn key_counts(&self) -> [u64; 5] {
+        [
+            self.strings.read().unwrap().len() as u64,
+            self.hashes.read().unwrap().len() as u64,
+            self.lists.read().unwrap().len() as u64,
+            self.sets.read().unwrap().len() as u64,
+            self.sorted_sets.read().unwrap().len() as u64,
+        ]
+    }
+
+    /// Serialize the whole store to JSON (fast-mode snapshot persistence).
+    pub fn snapshot_json(&self) -> String {
+        let now = now_secs();
+        let strings: Vec<serde_json::Value> = self
+            .strings.read().unwrap().iter()
+            .filter(|(_, e)| !e.is_expired())
+            .map(|(k, e)| {
+                let t = e.ttl_secs();
+                json!({"k": k, "v": e.value, "exp": if t >= 0 { Some(now + t as u64) } else { None }})
+            })
+            .collect();
+        let hashes: Vec<serde_json::Value> = self.hashes.read().unwrap().iter()
+            .map(|(k, m)| json!({"k": k, "m": m})).collect();
+        let lists: Vec<serde_json::Value> = self.lists.read().unwrap().iter()
+            .map(|(k, v)| json!({"k": k, "v": v.iter().collect::<Vec<_>>()})).collect();
+        let sets: Vec<serde_json::Value> = self.sets.read().unwrap().iter()
+            .map(|(k, m)| json!({"k": k, "m": m.iter().collect::<Vec<_>>()})).collect();
+        let zsets: Vec<serde_json::Value> = self.sorted_sets.read().unwrap().iter()
+            .map(|(k, z)| {
+                let pairs: Vec<serde_json::Value> =
+                    z.scores.iter().map(|(m, s)| json!([m, s])).collect();
+                json!({"k": k, "z": pairs})
+            })
+            .collect();
+        json!({"s": strings, "h": hashes, "l": lists, "t": sets, "z": zsets}).to_string()
+    }
+
+    /// Restore a snapshot produced by `snapshot_json` (expired keys skipped).
+    pub fn load_snapshot_json(&self, data: &str) {
+        let v: serde_json::Value = match serde_json::from_str(data) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let now = now_secs();
+        if let Some(arr) = v["s"].as_array() {
+            let mut s = self.strings.write().unwrap();
+            for it in arr {
+                if let (Some(k), Some(val)) = (it["k"].as_str(), it["v"].as_str()) {
+                    match it["exp"].as_u64() {
+                        Some(exp) if exp <= now => continue,
+                        Some(exp) => {
+                            s.insert(k.into(), KvEntry::with_ttl(val.into(), exp - now));
+                        }
+                        None => {
+                            s.insert(k.into(), KvEntry::new(val.into()));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(arr) = v["h"].as_array() {
+            let mut h = self.hashes.write().unwrap();
+            for it in arr {
+                if let (Some(k), Some(m)) = (it["k"].as_str(), it["m"].as_object()) {
+                    h.insert(k.into(), m.iter()
+                        .filter_map(|(f, x)| x.as_str().map(|s| (f.clone(), s.to_string())))
+                        .collect());
+                }
+            }
+        }
+        if let Some(arr) = v["l"].as_array() {
+            let mut l = self.lists.write().unwrap();
+            for it in arr {
+                if let (Some(k), Some(items)) = (it["k"].as_str(), it["v"].as_array()) {
+                    l.insert(k.into(), items.iter()
+                        .filter_map(|x| x.as_str().map(String::from)).collect());
+                }
+            }
+        }
+        if let Some(arr) = v["t"].as_array() {
+            let mut t = self.sets.write().unwrap();
+            for it in arr {
+                if let (Some(k), Some(items)) = (it["k"].as_str(), it["m"].as_array()) {
+                    t.insert(k.into(), items.iter()
+                        .filter_map(|x| x.as_str().map(String::from)).collect());
+                }
+            }
+        }
+        if let Some(arr) = v["z"].as_array() {
+            let mut zm = self.sorted_sets.write().unwrap();
+            for it in arr {
+                if let (Some(k), Some(pairs)) = (it["k"].as_str(), it["z"].as_array()) {
+                    let z = zm.entry(k.into()).or_insert_with(SortedSet::new);
+                    for p in pairs {
+                        if let (Some(m), Some(s)) = (p[0].as_str(), p[1].as_f64()) {
+                            z.insert(m.to_string(), s);
                         }
                     }
                 }
@@ -695,6 +869,9 @@ fn is_known_command(name: &str) -> bool {
             | "GETDEL" | "SETRANGE" | "PEXPIREAT" | "COPY" | "SINTER" | "SUNION"
             | "SDIFF" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "HRANDFIELD"
             | "ZRANGEBYLEX" | "BLPOP" | "BRPOP" | "BZPOPMIN" | "EVAL" | "EVALSHA" | "SCRIPT"
+            | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZUNIONSTORE" | "ZINTERSTORE"
+            | "LREM" | "LSET" | "LTRIM" | "RPOPLPUSH" | "LMOVE" | "SPOP" | "SRANDMEMBER"
+            | "HSCAN" | "SSCAN" | "ZSCAN" | "GETEX" | "SETBIT" | "GETBIT" | "BITCOUNT"
     )
 }
 
@@ -841,7 +1018,11 @@ fn write_key_indices(cmd: &str, argc: usize) -> Option<Vec<usize>> {
         | "PERSIST" | "HSET" | "HMSET" | "HSETNX" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH"
         | "LPOP" | "RPOP" | "SADD" | "SREM" | "ZADD" | "ZINCRBY" | "ZREM" | "ZPOPMIN"
         | "ZPOPMAX" | "GETDEL" | "SETRANGE" | "PEXPIREAT" | "SINTERSTORE" | "SUNIONSTORE"
-        | "SDIFFSTORE" => Some(vec![1]),
+        | "SDIFFSTORE" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZUNIONSTORE"
+        | "ZINTERSTORE" | "LREM" | "LSET" | "LTRIM" | "SPOP" | "GETEX" | "SETBIT" => {
+            Some(vec![1])
+        }
+        "RPOPLPUSH" | "LMOVE" => Some(vec![1, 2]),
         "DEL" => Some((1..argc).collect()),
         "RENAME" => Some(vec![1, 2]),
         "COPY" => Some(vec![2]),
@@ -859,16 +1040,19 @@ fn min_args(cmd: &str) -> usize {
         "GET" | "DEL" | "EXISTS" | "TTL" | "PTTL" | "TYPE" | "STRLEN" | "INCR" | "DECR"
         | "PERSIST" | "GETDEL" | "HGETALL" | "HKEYS" | "HVALS" | "HLEN" | "LLEN" | "LPOP"
         | "RPOP" | "SMEMBERS" | "SCARD" | "ZCARD" | "SINTER" | "SUNION" | "SDIFF"
-        | "HRANDFIELD" => 2,
+        | "HRANDFIELD" | "SPOP" | "SRANDMEMBER" | "BITCOUNT" | "GETEX" => 2,
         "SET" | "GETSET" | "SETNX" | "APPEND" | "INCRBY" | "DECRBY" | "INCRBYFLOAT"
         | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "RENAME" | "HGET" | "HDEL"
         | "HEXISTS" | "LPUSH" | "RPUSH" | "LINDEX" | "SADD" | "SREM" | "SISMEMBER"
         | "ZREM" | "ZSCORE" | "ZRANK" | "ZREVRANK" | "PUBLISH" | "MSET" | "MGET"
         | "COPY" | "SINTERSTORE" | "SUNIONSTORE" | "SDIFFSTORE" | "BLPOP" | "BRPOP"
-        | "BZPOPMIN" => 3,
+        | "BZPOPMIN" | "GETBIT" | "HSCAN" | "SSCAN" | "ZSCAN" | "RPOPLPUSH" => 3,
         "SETEX" | "PSETEX" | "SETRANGE" | "HSET" | "HMSET" | "HSETNX" | "HINCRBY"
         | "LRANGE" | "ZADD" | "ZINCRBY" | "ZCOUNT" | "ZRANGE" | "ZREVRANGE"
-        | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "HMGET" => 4,
+        | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" | "ZRANGEBYLEX" | "HMGET" | "LREM" | "LSET"
+        | "LTRIM" | "SETBIT" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZUNIONSTORE"
+        | "ZINTERSTORE" => 4,
+        "LMOVE" => 5,
         _ => 1,
     }
 }
@@ -1001,6 +1185,24 @@ fn execute_cmd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         "BLPOP" => cmd_bpop(store, &args[1..], PopSide::Left),
         "BRPOP" => cmd_bpop(store, &args[1..], PopSide::Right),
         "BZPOPMIN" => cmd_bpop(store, &args[1..], PopSide::ZMin),
+        "ZREMRANGEBYRANK" => cmd_zremrangebyrank(store, &args[1..]),
+        "ZREMRANGEBYSCORE" => cmd_zremrangebyscore(store, &args[1..]),
+        "ZUNIONSTORE" => cmd_zsetstore(store, &args[1..], false),
+        "ZINTERSTORE" => cmd_zsetstore(store, &args[1..], true),
+        "LREM" => cmd_lrem(store, &args[1..]),
+        "LSET" => cmd_lset(store, &args[1..]),
+        "LTRIM" => cmd_ltrim(store, &args[1..]),
+        "RPOPLPUSH" => cmd_lmove(store, &args[1..], true),
+        "LMOVE" => cmd_lmove(store, &args[1..], false),
+        "SPOP" => cmd_spop(store, &args[1..]),
+        "SRANDMEMBER" => cmd_srandmember(store, &args[1..]),
+        "HSCAN" => cmd_subscan(store, &args[1..], b'h'),
+        "SSCAN" => cmd_subscan(store, &args[1..], b's'),
+        "ZSCAN" => cmd_subscan(store, &args[1..], b'z'),
+        "GETEX" => cmd_getex(store, &args[1..]),
+        "SETBIT" => cmd_setbit(store, &args[1..]),
+        "GETBIT" => cmd_getbit(store, &args[1..]),
+        "BITCOUNT" => cmd_bitcount(store, &args[1..]),
         "EVAL" => cmd_eval(store, &args[1..], false),
         "EVALSHA" => cmd_eval(store, &args[1..], true),
         "SCRIPT" => cmd_script(store, &args[1..]),
@@ -1107,6 +1309,8 @@ fn mirror_kv_set(store: &OxiMemStore, key: &str, value: &str, ttl: Option<u64>) 
         let mut doc = json!({"_key": key, "_value": value});
         if let Some(t) = ttl {
             doc["_ttl"] = json!(t);
+            // Absolute deadline so a restart can restore the REMAINING ttl.
+            doc["_exp"] = json!(now_secs() + t);
         }
         let _ = db.insert("_kv", doc);
     }
@@ -3299,6 +3503,447 @@ fn cmd_bpop(store: &OxiMemStore, args: &[RespValue], side: PopSide) -> RespValue
 }
 
 // ===========================================================================
+// Round-2 commands: zset range-removal & store-combinators, list surgery,
+// set sampling, sub-scans, GETEX, bit operations
+// ===========================================================================
+
+fn zpairs(store: &OxiMemStore, key: &str) -> Vec<(String, f64)> {
+    store
+        .sorted_sets
+        .read()
+        .unwrap()
+        .get(key)
+        .map(|z| z.scores.iter().map(|(m, &s)| (m.clone(), s)).collect())
+        .unwrap_or_default()
+}
+
+fn cmd_zremrangebyrank(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let start: isize = args[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let stop: isize = args[2].as_str().and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let mut map = store.sorted_sets.write().unwrap();
+    let z = match map.get_mut(key) {
+        Some(z) => z,
+        None => return resp::integer(0),
+    };
+    let victims: Vec<String> = z
+        .range_by_rank(start, stop)
+        .into_iter()
+        .map(|(m, _)| m.to_string())
+        .collect();
+    for m in &victims {
+        z.remove(m);
+    }
+    if z.len() == 0 {
+        map.remove(key);
+    }
+    resp::integer(victims.len() as i64)
+}
+
+fn cmd_zremrangebyscore(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let parse = |s: &str| -> (f64, bool) {
+        // (bound, inclusive)
+        if let Some(rest) = s.strip_prefix('(') {
+            (rest.parse().unwrap_or(f64::NAN), false)
+        } else if s == "-inf" {
+            (f64::NEG_INFINITY, true)
+        } else if s == "+inf" {
+            (f64::INFINITY, true)
+        } else {
+            (s.parse().unwrap_or(f64::NAN), true)
+        }
+    };
+    let (lo, lo_inc) = parse(args[1].as_str().unwrap_or(""));
+    let (hi, hi_inc) = parse(args[2].as_str().unwrap_or(""));
+    let mut map = store.sorted_sets.write().unwrap();
+    let z = match map.get_mut(key) {
+        Some(z) => z,
+        None => return resp::integer(0),
+    };
+    let victims: Vec<String> = z
+        .scores
+        .iter()
+        .filter(|&(_, &s)| {
+            (if lo_inc { s >= lo } else { s > lo }) && (if hi_inc { s <= hi } else { s < hi })
+        })
+        .map(|(m, _)| m.clone())
+        .collect();
+    for m in &victims {
+        z.remove(m);
+    }
+    if z.len() == 0 {
+        map.remove(key);
+    }
+    resp::integer(victims.len() as i64)
+}
+
+/// ZUNIONSTORE/ZINTERSTORE dest numkeys key… (SUM aggregate).
+fn cmd_zsetstore(store: &OxiMemStore, args: &[RespValue], inter: bool) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments");
+    }
+    let dest = args[0].as_str().unwrap_or("");
+    let numkeys: usize = args[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if numkeys == 0 || args.len() < 2 + numkeys {
+        return resp::err("at least 1 input key is needed");
+    }
+    let mut acc: HashMap<String, (f64, usize)> = HashMap::new();
+    for a in &args[2..2 + numkeys] {
+        for (m, s) in zpairs(store, a.as_str().unwrap_or("")) {
+            let e = acc.entry(m).or_insert((0.0, 0));
+            e.0 += s;
+            e.1 += 1;
+        }
+    }
+    let mut map = store.sorted_sets.write().unwrap();
+    let z = map.entry(dest.to_string()).or_insert_with(SortedSet::new);
+    z.scores.clear();
+    z.tree.clear();
+    let mut n = 0i64;
+    for (m, (s, cnt)) in acc {
+        if !inter || cnt == numkeys {
+            z.insert(m, s);
+            n += 1;
+        }
+    }
+    if z.len() == 0 {
+        map.remove(dest);
+    }
+    resp::integer(n)
+}
+
+fn cmd_lrem(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let count: i64 = args[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let val = args[2].as_str().unwrap_or("");
+    let mut map = store.lists.write().unwrap();
+    let list = match map.get_mut(key) {
+        Some(l) => l,
+        None => return resp::integer(0),
+    };
+    let before = list.len();
+    if count == 0 {
+        list.retain(|x| x != val);
+    } else if count > 0 {
+        let mut left = count;
+        list.retain(|x| {
+            if left > 0 && x == val {
+                left -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    } else {
+        let mut left = -count;
+        let mut keep: VecDeque<String> = VecDeque::with_capacity(list.len());
+        while let Some(x) = list.pop_back() {
+            if left > 0 && x == val {
+                left -= 1;
+            } else {
+                keep.push_front(x);
+            }
+        }
+        *list = keep;
+    }
+    let removed = (before - list.len()) as i64;
+    if list.is_empty() {
+        map.remove(key);
+    }
+    resp::integer(removed)
+}
+
+fn cmd_lset(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let idx: isize = args[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let val = args[2].as_str().unwrap_or("").to_string();
+    let mut map = store.lists.write().unwrap();
+    let list = match map.get_mut(key) {
+        Some(l) => l,
+        None => return resp::err("no such key"),
+    };
+    let n = list.len() as isize;
+    let i = if idx < 0 { n + idx } else { idx };
+    if i < 0 || i >= n {
+        return resp::err("index out of range");
+    }
+    list[i as usize] = val;
+    resp::ok()
+}
+
+fn cmd_ltrim(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let start: isize = args[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let stop: isize = args[2].as_str().and_then(|s| s.parse().ok()).unwrap_or(-1);
+    let mut map = store.lists.write().unwrap();
+    if let Some(list) = map.get_mut(key) {
+        let n = list.len() as isize;
+        let norm = |i: isize| if i < 0 { (n + i).max(0) } else { i.min(n) };
+        let (s, e) = (norm(start), norm(stop));
+        let kept: VecDeque<String> = if s > e {
+            VecDeque::new()
+        } else {
+            list.iter()
+                .skip(s as usize)
+                .take((e - s + 1) as usize)
+                .cloned()
+                .collect()
+        };
+        if kept.is_empty() {
+            map.remove(key);
+        } else {
+            *list = kept;
+        }
+    }
+    resp::ok()
+}
+
+/// RPOPLPUSH src dst / LMOVE src dst LEFT|RIGHT LEFT|RIGHT.
+fn cmd_lmove(store: &OxiMemStore, args: &[RespValue], legacy: bool) -> RespValue {
+    let (src, dst, from_left, to_left) = if legacy {
+        if args.len() < 2 {
+            return resp::err("wrong number of arguments");
+        }
+        (
+            args[0].as_str().unwrap_or(""),
+            args[1].as_str().unwrap_or(""),
+            false,
+            true,
+        )
+    } else {
+        if args.len() < 4 {
+            return resp::err("wrong number of arguments");
+        }
+        (
+            args[0].as_str().unwrap_or(""),
+            args[1].as_str().unwrap_or(""),
+            args[2]
+                .as_str()
+                .map(|s| s.eq_ignore_ascii_case("LEFT"))
+                .unwrap_or(false),
+            args[3]
+                .as_str()
+                .map(|s| s.eq_ignore_ascii_case("LEFT"))
+                .unwrap_or(false),
+        )
+    };
+    let mut map = store.lists.write().unwrap();
+    let val = match map.get_mut(src) {
+        Some(l) => {
+            let v = if from_left { l.pop_front() } else { l.pop_back() };
+            if l.is_empty() {
+                map.remove(src);
+            }
+            v
+        }
+        None => None,
+    };
+    match val {
+        Some(v) => {
+            let dl = map.entry(dst.to_string()).or_default();
+            if to_left {
+                dl.push_front(v.clone());
+            } else {
+                dl.push_back(v.clone());
+            }
+            resp::bulk_string(&v)
+        }
+        None => resp::null(),
+    }
+}
+
+fn cmd_spop(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let key = match args.first().and_then(|a| a.as_str()) {
+        Some(k) => k,
+        None => return resp::err("wrong number of arguments"),
+    };
+    let mut map = store.sets.write().unwrap();
+    let set = match map.get_mut(key) {
+        Some(s) if !s.is_empty() => s,
+        _ => return resp::null(),
+    };
+    let victim = set.iter().next().cloned().unwrap();
+    set.remove(&victim);
+    if set.is_empty() {
+        map.remove(key);
+    }
+    resp::bulk_string(&victim)
+}
+
+fn cmd_srandmember(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let key = match args.first().and_then(|a| a.as_str()) {
+        Some(k) => k,
+        None => return resp::err("wrong number of arguments"),
+    };
+    let map = store.sets.read().unwrap();
+    let set = match map.get(key) {
+        Some(s) if !s.is_empty() => s,
+        _ => return resp::null(),
+    };
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as usize;
+    let v: Vec<&String> = set.iter().collect();
+    resp::bulk_string(v[seed % v.len()])
+}
+
+/// HSCAN/SSCAN/ZSCAN key cursor [MATCH p] — single-page (cursor always "0").
+fn cmd_subscan(store: &OxiMemStore, args: &[RespValue], kind: u8) -> RespValue {
+    let key = args.first().and_then(|a| a.as_str()).unwrap_or("");
+    let mut pattern = "*".to_string();
+    let mut i = 1;
+    while i + 1 < args.len() {
+        if let Some(f) = args[i].as_str() {
+            if f.eq_ignore_ascii_case("MATCH") {
+                pattern = args[i + 1].as_str().unwrap_or("*").to_string();
+            }
+        }
+        i += 2;
+    }
+    let re = regex::Regex::new(&glob_to_regex(&pattern)).ok();
+    let ok = |s: &str| re.as_ref().map(|r| r.is_match(s)).unwrap_or(true);
+    let items: Vec<RespValue> = match kind {
+        b'h' => store
+            .hashes
+            .read()
+            .unwrap()
+            .get(key)
+            .map(|h| {
+                h.iter()
+                    .filter(|(f, _)| ok(f))
+                    .flat_map(|(f, v)| vec![resp::bulk_string(f), resp::bulk_string(v)])
+                    .collect()
+            })
+            .unwrap_or_default(),
+        b's' => store
+            .sets
+            .read()
+            .unwrap()
+            .get(key)
+            .map(|s| s.iter().filter(|m| ok(m)).map(|m| resp::bulk_string(m)).collect())
+            .unwrap_or_default(),
+        _ => store
+            .sorted_sets
+            .read()
+            .unwrap()
+            .get(key)
+            .map(|z| {
+                z.tree
+                    .iter()
+                    .filter(|(_, m)| ok(m))
+                    .flat_map(|(Score(s), m)| {
+                        vec![resp::bulk_string(m), resp::bulk_string(&format_score(*s))]
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    resp::array(vec![resp::bulk_string("0"), resp::array(items)])
+}
+
+/// GETEX key [EX seconds | PERSIST] — GET that can adjust the ttl.
+fn cmd_getex(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let key = match args.first().and_then(|a| a.as_str()) {
+        Some(k) => k,
+        None => return resp::err("wrong number of arguments"),
+    };
+    let mut map = store.strings.write().unwrap();
+    let e = match map.get_mut(key) {
+        Some(e) if !e.is_expired() => e,
+        _ => return resp::null(),
+    };
+    match args.get(1).and_then(|a| a.as_str()).map(|s| s.to_uppercase()) {
+        Some(ref s) if s == "EX" => {
+            if let Some(secs) = args.get(2).and_then(|a| a.as_str()).and_then(|s| s.parse().ok())
+            {
+                e.expires_at = Some(Instant::now() + std::time::Duration::from_secs(secs));
+            }
+        }
+        Some(ref s) if s == "PERSIST" => e.expires_at = None,
+        _ => {}
+    }
+    resp::bulk_string(&e.value)
+}
+
+fn cmd_setbit(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 3 {
+        return resp::err("wrong number of arguments");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let off: usize = args[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let bit: u8 = args[2].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut map = store.strings.write().unwrap();
+    let e = map
+        .entry(key.to_string())
+        .or_insert_with(|| KvEntry::new(String::new()));
+    let mut bytes = e.value.clone().into_bytes();
+    let byte_i = off / 8;
+    if bytes.len() <= byte_i {
+        bytes.resize(byte_i + 1, 0);
+    }
+    let mask = 1u8 << (7 - (off % 8));
+    let old = (bytes[byte_i] & mask != 0) as i64;
+    if bit != 0 {
+        bytes[byte_i] |= mask;
+    } else {
+        bytes[byte_i] &= !mask;
+    }
+    e.value = unsafe { String::from_utf8_unchecked(bytes) };
+    resp::integer(old)
+}
+
+fn cmd_getbit(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let off: usize = args[1].as_str().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let map = store.strings.read().unwrap();
+    let bit = map
+        .get(key)
+        .filter(|e| !e.is_expired())
+        .map(|e| {
+            let bytes = e.value.as_bytes();
+            let bi = off / 8;
+            if bi < bytes.len() {
+                ((bytes[bi] >> (7 - (off % 8))) & 1) as i64
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
+    resp::integer(bit)
+}
+
+fn cmd_bitcount(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    let key = args.first().and_then(|a| a.as_str()).unwrap_or("");
+    let map = store.strings.read().unwrap();
+    let n = map
+        .get(key)
+        .filter(|e| !e.is_expired())
+        .map(|e| e.value.as_bytes().iter().map(|b| b.count_ones() as i64).sum())
+        .unwrap_or(0);
+    resp::integer(n)
+}
+
+// ===========================================================================
 // EVAL — server-side Lua scripting (mlua, Lua 5.4 vendored)
 // ===========================================================================
 
@@ -3446,6 +4091,19 @@ fn cmd_eval(store: &OxiMemStore, args: &[RespValue], by_sha: bool) -> RespValue 
 
     let _guard = store.tx_lock.lock().unwrap(); // whole script is atomic
     let lua = mlua::Lua::new();
+    // Busy-script guard: an infinite loop would hold tx_lock forever and
+    // freeze every EXEC/EVAL on the server. Kill scripts after ~200ms.
+    let started = Instant::now();
+    lua.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(20_000),
+        move |_lua, _dbg| {
+            if started.elapsed() > std::time::Duration::from_millis(200) {
+                Err(mlua::Error::runtime("script exceeded time limit"))
+            } else {
+                Ok(mlua::VmState::Continue)
+            }
+        },
+    );
     let out: mlua::Result<RespValue> = lua.scope(|scope| {
         let globals = lua.globals();
         let keys_t = lua.create_table()?;

@@ -823,13 +823,14 @@ fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: boo
         // Check for SUBSCRIBE before normal dispatch
         if let resp::RespValue::Array(ref items) = value {
             if let Some(cmd) = items.first().and_then(|a| a.as_str()) {
-                if cmd.eq_ignore_ascii_case("SUBSCRIBE") {
+                if cmd.eq_ignore_ascii_case("SUBSCRIBE") || cmd.eq_ignore_ascii_case("PSUBSCRIBE") {
+                    let is_pattern = cmd.eq_ignore_ascii_case("PSUBSCRIBE");
                     if log {
                         let channels: Vec<&str> =
                             items[1..].iter().filter_map(|a| a.as_str()).collect();
                         eprintln!("[oximem] << SUBSCRIBE {}", channels.join(" "));
                     }
-                    handle_oximem_subscribe(&stream, store, &mut reader, &mut writer, &items[1..]);
+                    handle_oximem_subscribe(&stream, store, &mut reader, &mut writer, &items[1..], is_pattern);
                     return;
                 }
             }
@@ -916,19 +917,28 @@ fn handle_oximem_subscribe(
     reader: &mut BufReader<&TcpStream>,
     writer: &mut BufWriter<&TcpStream>,
     initial_channels: &[oxidb_server::resp::RespValue],
+    is_pattern: bool,
 ) {
     use oxidb_server::resp;
 
-    let mut receivers: Vec<(String, std::sync::mpsc::Receiver<(String, String)>)> = Vec::new();
+    let mut receivers: Vec<(String, bool, std::sync::mpsc::Receiver<(String, String)>)> =
+        Vec::new();
 
-    // Subscribe to initial channels
+    // Subscribe to initial channels (or PSUBSCRIBE glob patterns)
     for arg in initial_channels {
         if let Some(ch) = arg.as_str() {
-            let rx = store.subscribe(ch);
-            receivers.push((ch.to_string(), rx));
-            // Send subscribe confirmation
+            let rx = if is_pattern {
+                match store.psubscribe(ch) {
+                    Some(rx) => rx,
+                    None => continue, // bad pattern
+                }
+            } else {
+                store.subscribe(ch)
+            };
+            receivers.push((ch.to_string(), is_pattern, rx));
+            let kind = if is_pattern { "psubscribe" } else { "subscribe" };
             let msg = resp::array(vec![
-                resp::bulk_string("subscribe"),
+                resp::bulk_string(kind),
                 resp::bulk_string(ch),
                 resp::integer(receivers.len() as i64),
             ]);
@@ -943,18 +953,26 @@ fn handle_oximem_subscribe(
     loop {
         // Deliver any pending messages
         let mut wrote = false;
-        for (ch_name, rx) in &receivers {
+        for (ch_name, pat, rx) in &receivers {
             while let Ok((channel, message)) = rx.try_recv() {
-                let msg = resp::array(vec![
-                    resp::bulk_string("message"),
-                    resp::bulk_string(&channel),
-                    resp::bulk_string(&message),
-                ]);
+                let msg = if *pat {
+                    resp::array(vec![
+                        resp::bulk_string("pmessage"),
+                        resp::bulk_string(ch_name),
+                        resp::bulk_string(&channel),
+                        resp::bulk_string(&message),
+                    ])
+                } else {
+                    resp::array(vec![
+                        resp::bulk_string("message"),
+                        resp::bulk_string(&channel),
+                        resp::bulk_string(&message),
+                    ])
+                };
                 if resp::write_value(writer, &msg).is_err() {
                     return;
                 }
                 wrote = true;
-                let _ = ch_name; // used for tracking
             }
         }
         if wrote {
@@ -968,13 +986,22 @@ fn handle_oximem_subscribe(
             Ok(value) => {
                 if let resp::RespValue::Array(ref items) = value {
                     if let Some(cmd) = items.first().and_then(|a| a.as_str()) {
-                        if cmd.eq_ignore_ascii_case("SUBSCRIBE") {
+                        if cmd.eq_ignore_ascii_case("SUBSCRIBE") || cmd.eq_ignore_ascii_case("PSUBSCRIBE") {
+                    let is_pattern = cmd.eq_ignore_ascii_case("PSUBSCRIBE");
                             for arg in &items[1..] {
                                 if let Some(ch) = arg.as_str() {
-                                    let rx = store.subscribe(ch);
-                                    receivers.push((ch.to_string(), rx));
+                                    let rx = if is_pattern {
+                                        match store.psubscribe(ch) {
+                                            Some(rx) => rx,
+                                            None => continue,
+                                        }
+                                    } else {
+                                        store.subscribe(ch)
+                                    };
+                                    receivers.push((ch.to_string(), is_pattern, rx));
+                                    let kind = if is_pattern { "psubscribe" } else { "subscribe" };
                                     let msg = resp::array(vec![
-                                        resp::bulk_string("subscribe"),
+                                        resp::bulk_string(kind),
                                         resp::bulk_string(ch),
                                         resp::integer(receivers.len() as i64),
                                     ]);
@@ -986,7 +1013,7 @@ fn handle_oximem_subscribe(
                             if items.len() > 1 {
                                 for arg in &items[1..] {
                                     if let Some(ch) = arg.as_str() {
-                                        receivers.retain(|(name, _)| name != ch);
+                                        receivers.retain(|(name, _, _)| name != ch);
                                         store.unsubscribe(ch);
                                         let msg = resp::array(vec![
                                             resp::bulk_string("unsubscribe"),
@@ -998,7 +1025,7 @@ fn handle_oximem_subscribe(
                                 }
                             } else {
                                 // Unsubscribe from all
-                                for (name, _) in &receivers {
+                                for (name, _, _) in &receivers {
                                     store.unsubscribe(name);
                                 }
                                 receivers.clear();
@@ -1387,6 +1414,47 @@ fn main() {
             GelfLevel::Notice,
             format!("OxiMem RESP listening on {oximem_addr} ({mode_label})")
         );
+
+        // Expiry sweeper: eager-expire string keys (emits `expired` keyspace
+        // events, bumps WATCH versions) + refresh key-count gauges.
+        {
+            let store = Arc::clone(&shared_store);
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let _ = store.sweep_expired();
+                    let counts = store.key_counts();
+                    let m = &oxidb_server::metrics::METRICS;
+                    m.oximem_keys_strings.store(counts[0], std::sync::atomic::Ordering::Relaxed);
+                    m.oximem_keys_hashes.store(counts[1], std::sync::atomic::Ordering::Relaxed);
+                    m.oximem_keys_lists.store(counts[2], std::sync::atomic::Ordering::Relaxed);
+                    m.oximem_keys_sets.store(counts[3], std::sync::atomic::Ordering::Relaxed);
+                    m.oximem_keys_zsets.store(counts[4], std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        // Fast-mode snapshot persistence: load at boot, save periodically.
+        let snap_secs: u64 = std::env::var("OXIDB_OXIMEM_SNAPSHOT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if snap_secs > 0 {
+            let path = std::path::Path::new(&data_dir).join("_oximem.snap");
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                shared_store.load_snapshot_json(&data);
+                server_log!(state, GelfLevel::Notice, "OxiMem snapshot loaded".to_string());
+            }
+            let store = Arc::clone(&shared_store);
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(snap_secs));
+                    let tmp = path.with_extension("snap.tmp");
+                    if std::fs::write(&tmp, store.snapshot_json()).is_ok() {
+                        let _ = std::fs::rename(&tmp, &path);
+                    }
+                }
+            });
+        }
 
         let state_oximem = Arc::clone(&state);
         let oximem_store = Arc::clone(&shared_store);

@@ -146,6 +146,16 @@ func hybrid(secs int) {
 					c.Do("MULTI")
 					c.Do("ZREM", bkey, bidM)
 					c.Do("ZREM", akey, askM)
+					// PARTIAL FILLS: the untraded remainder of the larger
+					// order goes straight back on the book, same price.
+					if bq > qty {
+						rem := fmt.Sprintf("%s|%s|%.4f", bf[0], buyer, bq-qty)
+						c.Do("ZADD", bkey, fmt.Sprintf("%f", bidP), rem)
+					}
+					if aq > qty {
+						rem := fmt.Sprintf("%s|%s|%.4f", af[0], seller, aq-qty)
+						c.Do("ZADD", akey, fmt.Sprintf("%f", askP), rem)
+					}
 					c.Do("INCRBYFLOAT", "usd:"+buyer, fmt.Sprintf("%f", -cost))
 					c.Do("INCRBYFLOAT", "usd:"+seller, fmt.Sprintf("%f", cost))
 					c.Do("INCRBYFLOAT", "ast:"+sym+":"+buyer, fmt.Sprintf("%f", qty))
@@ -173,6 +183,27 @@ func hybrid(secs int) {
 			}
 		}(sym)
 	}
+
+	// Book pruner: cap each side at 2000 resting orders using the new
+	// ZREMRANGEBYRANK — drops the worst-priced tail (lowest bids / highest
+	// asks) so an unmatched backlog can't grow without bound.
+	go func() {
+		c, err := DialResp()
+		if err != nil {
+			return
+		}
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Second):
+			}
+			for _, s := range symbols {
+				c.Do("ZREMRANGEBYRANK", "book:"+s+":b", "0", "-2001") // keep top bids
+				c.Do("ZREMRANGEBYRANK", "book:"+s+":a", "2000", "-1") // keep low asks
+			}
+		}
+	}()
 
 	// Trader goroutines: place limit orders around px into the ZSET book.
 	for u := 0; u < nUsersH; u++ {

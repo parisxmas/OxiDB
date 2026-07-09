@@ -53,6 +53,13 @@ pub struct Metrics {
     /// Wire operations that exceeded OXIDB_SLOW_QUERY_MS (see profiler.rs).
     pub slow_queries: AtomicU64,
 
+    // OxiMem key-count gauges (updated by the sweeper thread).
+    pub oximem_keys_strings: AtomicU64,
+    pub oximem_keys_hashes: AtomicU64,
+    pub oximem_keys_lists: AtomicU64,
+    pub oximem_keys_sets: AtomicU64,
+    pub oximem_keys_zsets: AtomicU64,
+
     // OxiMem (RESP) commands by class.
     pub oximem_reads: AtomicU64,
     pub oximem_writes: AtomicU64,
@@ -226,6 +233,18 @@ pub fn render_prometheus(db: &Arc<OxiDb>) -> String {
         ("other", m.oximem_other.load(Ordering::Relaxed)),
     ] {
         out.push_str(&format!("oximem_commands_total{{class=\"{class}\"}} {v}\n"));
+    }
+    out.push_str(
+        "# HELP oximem_keys OxiMem live keys by type.\n# TYPE oximem_keys gauge\n",
+    );
+    for (t, v) in [
+        ("string", m.oximem_keys_strings.load(Ordering::Relaxed)),
+        ("hash", m.oximem_keys_hashes.load(Ordering::Relaxed)),
+        ("list", m.oximem_keys_lists.load(Ordering::Relaxed)),
+        ("set", m.oximem_keys_sets.load(Ordering::Relaxed)),
+        ("zset", m.oximem_keys_zsets.load(Ordering::Relaxed)),
+    ] {
+        out.push_str(&format!("oximem_keys{{type=\"{t}\"}} {v}\n"));
     }
 
     // ── Engine gauges (scrape-time) ──
