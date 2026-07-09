@@ -30,8 +30,10 @@ import (
 // partial-fill remainders), move balances, set+publish the price, bump the
 // counter and queue the trade event. One EVALSHA per attempt — no separate
 // scans, no sleep-scan-settle round-trips.
-// KEYS: 1 bkey 2 akey 3 pxkey 4 counter 5 queue
-// ARGV: 1 sym 2 seq 3 nowISO
+// KEYS (declared → stripe-locked, all symbol-local): 1 bkey 2 akey 3 pxkey
+// ARGV: 1 sym 2 seq 3 nowISO. Balances/counter/queue are undeclared:
+// per-command atomicity + DECRBYFLOATGE conditional debits keep them safe,
+// and symbol-local stripes let ALL symbols settle in parallel.
 // Returns 1=trade, 0=no cross, -2=self-cross pruned, -3/-4=cancelled order.
 const matchLua = `local bids = redis.call('ZREVRANGE', KEYS[1], '0', '0', 'WITHSCORES')
 if #bids < 2 then return 0 end
@@ -54,10 +56,19 @@ local qty = math.min(bq, aq)
 local price = (bidP + askP) / 2
 local cost = price * qty
 local sym = ARGV[1]
-local ub = tonumber(redis.call('GET', 'usd:' .. buyer) or '0')
-if ub < cost then redis.call('ZREM', KEYS[1], bidM) return -3 end
-local sa = tonumber(redis.call('GET', 'ast:' .. sym .. ':' .. seller) or '0')
-if sa < qty then redis.call('ZREM', KEYS[2], askM) return -4 end
+-- Balances are UNDECLARED keys (they belong to no single symbol), so the
+-- debits use DECRBYFLOATGE: a single-command atomic check-and-debit. On the
+-- second debit failing, the first is compensated — no lock needed across
+-- symbols, no overdraft possible.
+if redis.call('DECRBYFLOATGE', 'usd:' .. buyer, string.format('%.6f', cost)) == false then
+  redis.call('ZREM', KEYS[1], bidM)
+  return -3
+end
+if redis.call('DECRBYFLOATGE', 'ast:' .. sym .. ':' .. seller, string.format('%.6f', qty)) == false then
+  redis.call('INCRBYFLOAT', 'usd:' .. buyer, string.format('%.6f', cost)) -- refund
+  redis.call('ZREM', KEYS[2], askM)
+  return -4
+end
 redis.call('ZREM', KEYS[1], bidM)
 redis.call('ZREM', KEYS[2], askM)
 if bq > qty then
@@ -66,14 +77,12 @@ end
 if aq > qty then
   redis.call('ZADD', KEYS[2], string.format('%.6f', askP), string.format('%s|%s|%.4f', auid, seller, aq - qty))
 end
-redis.call('INCRBYFLOAT', 'usd:' .. buyer, string.format('%.6f', -cost))
 redis.call('INCRBYFLOAT', 'usd:' .. seller, string.format('%.6f', cost))
 redis.call('INCRBYFLOAT', 'ast:' .. sym .. ':' .. buyer, string.format('%.6f', qty))
-redis.call('INCRBYFLOAT', 'ast:' .. sym .. ':' .. seller, string.format('%.6f', -qty))
 redis.call('SET', KEYS[3], string.format('%.6f', price))
 redis.call('PUBLISH', KEYS[3], string.format('%.6f', price))
-redis.call('INCR', KEYS[4])
-redis.call('RPUSH', KEYS[5], cjson.encode({uid = sym .. '-e' .. ARGV[2], sym = sym,
+redis.call('INCR', 'trades:count')
+redis.call('RPUSH', 'trades:q', cjson.encode({uid = sym .. '-e' .. ARGV[2], sym = sym,
   price = price, qty = qty, buyer = buyer, seller = seller, created_at = ARGV[3]}))
 return 1`
 
@@ -164,8 +173,8 @@ func hybridMatcher() {
 			seq := 0
 			for {
 				// ONE round-trip: scan + match + settle, atomically in Lua.
-				r, err := c.Do("EVALSHA", sha, "5",
-					bkey, akey, "px:"+sym, "trades:count", "trades:q",
+				r, err := c.Do("EVALSHA", sha, "3",
+					bkey, akey, "px:"+sym,
 					sym, strconv.Itoa(seq+1), nowISO())
 				if err != nil {
 					c.Close()

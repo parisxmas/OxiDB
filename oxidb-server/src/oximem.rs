@@ -173,6 +173,14 @@ pub struct OxiMemStore {
     /// their queued commands — the isolation Redis gets for free from being
     /// single-threaded. Held only for the duration of an EXEC.
     tx_lock: Mutex<()>,
+    /// EVAL concurrency gate: scripts take a READ lock (many can run at
+    /// once); EXEC takes the WRITE lock (excludes all scripts + other EXECs).
+    eval_gate: RwLock<()>,
+    /// Striped key locks for EVAL: a script locks the stripes of its
+    /// DECLARED KEYS (sorted — deadlock-free), so scripts touching disjoint
+    /// keys run in parallel. Undeclared-key access falls back to per-command
+    /// atomicity — the same contract Redis documents for scripts.
+    eval_stripes: Vec<Mutex<()>>,
     /// Per-key mutation counters for WATCH: every write command bumps its
     /// key's counter, so a WATCH snapshot is an O(1) integer instead of a
     /// serialized copy of the value (which would be O(n) for a large book).
@@ -208,6 +216,8 @@ impl OxiMemStore {
             psubs: Mutex::new(Vec::new()),
             retained: RwLock::new(HashMap::new()),
             tx_lock: Mutex::new(()),
+            eval_gate: RwLock::new(()),
+            eval_stripes: (0..128).map(|_| Mutex::new(())).collect(),
             versions: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(0),
             active_watches: AtomicUsize::new(0),
@@ -239,6 +249,8 @@ impl OxiMemStore {
             psubs: Mutex::new(Vec::new()),
             retained: RwLock::new(HashMap::new()),
             tx_lock: Mutex::new(()),
+            eval_gate: RwLock::new(()),
+            eval_stripes: (0..128).map(|_| Mutex::new(())).collect(),
             versions: RwLock::new(HashMap::new()),
             epoch: AtomicU64::new(0),
             active_watches: AtomicUsize::new(0),
@@ -912,11 +924,12 @@ fn is_known_command(name: &str) -> bool {
             | "RENAME" | "TYPE" | "EXISTS" | "DEL" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
             | "PERSIST" | "TTL" | "PTTL" | "SET" | "GET" | "GETSET" | "SETNX" | "SETEX"
             | "PSETEX" | "MSET" | "MGET" | "INCR" | "DECR" | "INCRBY" | "DECRBY"
-            | "INCRBYFLOAT" | "APPEND" | "STRLEN" | "GETRANGE" | "HSET" | "HMSET"
+            | "INCRBYFLOAT" | "DECRBYFLOATGE" | "APPEND" | "STRLEN" | "GETRANGE" | "HSET" | "HMSET"
             | "HSETNX" | "HGET" | "HMGET" | "HGETALL" | "HDEL" | "HEXISTS" | "HKEYS"
             | "HVALS" | "HLEN" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP" | "RPOP"
             | "LLEN" | "LRANGE" | "LINDEX" | "SADD" | "SREM" | "SMEMBERS" | "SISMEMBER"
             | "SCARD" | "ZADD" | "ZREM" | "ZSCORE" | "ZCARD" | "ZCOUNT" | "ZINCRBY"
+            | "DECRBYFLOATGE"
             | "ZRANK" | "ZREVRANK" | "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE"
             | "ZREVRANGEBYSCORE" | "ZPOPMIN" | "ZPOPMAX" | "PUBLISH" | "HELLO"
             | "GETDEL" | "SETRANGE" | "PEXPIREAT" | "COPY" | "SINTER" | "SUNION"
@@ -1017,6 +1030,7 @@ fn execute_session_inner(store: &OxiMemStore, sess: &mut Session, args: &[RespVa
                     "EXECABORT Transaction discarded because of previous errors.",
                 );
             }
+            let _gate = store.eval_gate.write().unwrap(); // exclude running scripts
             let _guard = store.tx_lock.lock().unwrap();
             for (key, snap) in &sess.watched {
                 if &snapshot_key(store, key) != snap {
@@ -1078,7 +1092,7 @@ fn execute_session_inner(store: &OxiMemStore, sess: &mut Session, args: &[RespVa
 fn write_key_indices(cmd: &str, argc: usize) -> Option<Vec<usize>> {
     match cmd {
         "SET" | "SETNX" | "SETEX" | "PSETEX" | "GETSET" | "APPEND" | "INCR" | "DECR"
-        | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
+        | "INCRBY" | "DECRBY" | "INCRBYFLOAT" | "DECRBYFLOATGE" | "EXPIRE" | "PEXPIRE" | "EXPIREAT"
         | "PERSIST" | "HSET" | "HMSET" | "HSETNX" | "HDEL" | "HINCRBY" | "LPUSH" | "RPUSH"
         | "LPOP" | "RPOP" | "SADD" | "SREM" | "ZADD" | "ZINCRBY" | "ZREM" | "ZPOPMIN"
         | "ZPOPMAX" | "GETDEL" | "SETRANGE" | "PEXPIREAT" | "SINTERSTORE" | "SUNIONSTORE"
@@ -1247,6 +1261,7 @@ fn execute_cmd(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
         "AUTH" => resp::ok(),
         "HELLO" => cmd_hello(&args[1..]),
         "GETDEL" => cmd_getdel(store, &args[1..]),
+        "DECRBYFLOATGE" => cmd_decrbyfloatge(store, &args[1..]),
         "SETRANGE" => cmd_setrange(store, &args[1..]),
         "PEXPIREAT" => cmd_pexpireat(store, &args[1..]),
         "COPY" => cmd_copy(store, &args[1..]),
@@ -3185,6 +3200,41 @@ fn cmd_config(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     }
 }
 
+/// DECRBYFLOATGE key amount — atomic check-and-debit: if the key's numeric
+/// value is >= amount, subtract and return the new value; otherwise return
+/// Null and change nothing. This is the single-command primitive that makes
+/// balance debits safe WITHOUT a surrounding transaction/script lock.
+fn cmd_decrbyfloatge(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
+    if args.len() < 2 {
+        return resp::err("wrong number of arguments for 'decrbyfloatge' command");
+    }
+    let key = args[0].as_str().unwrap_or("");
+    let amt: f64 = match args[1].as_str().and_then(|s| s.parse().ok()) {
+        Some(a) => a,
+        None => return resp::err("value is not a valid float"),
+    };
+    let mut map = store.strings.write().unwrap();
+    let e = match map.get_mut(key) {
+        Some(e) if !e.is_expired() => e,
+        _ => return resp::null(),
+    };
+    let cur: f64 = match e.value.parse() {
+        Ok(c) => c,
+        Err(_) => return resp::err("value is not a valid float"),
+    };
+    if cur < amt {
+        return resp::null();
+    }
+    let newv = cur - amt;
+    e.value = format_score(newv);
+    let out = e.value.clone();
+    drop(map);
+    if store.sql_enabled() {
+        mirror_kv_set(store, key, &out, None);
+    }
+    resp::bulk_string(&out)
+}
+
 fn cmd_getdel(store: &OxiMemStore, args: &[RespValue]) -> RespValue {
     let key = match args.first().and_then(|a| a.as_str()) {
         Some(k) => k,
@@ -4356,7 +4406,25 @@ fn cmd_eval(store: &OxiMemStore, args: &[RespValue], by_sha: bool) -> RespValue 
         .map(|a| a.as_str().unwrap_or("").to_string())
         .collect();
 
-    let _guard = store.tx_lock.lock().unwrap(); // whole script is atomic
+    // Sharded locking: gate read-lock (so EXEC can exclude us) + the sorted
+    // stripe locks of the DECLARED keys. Scripts with disjoint declared keys
+    // run fully in parallel.
+    let _gate = store.eval_gate.read().unwrap();
+    let mut stripe_ids: Vec<usize> = keys
+        .iter()
+        .map(|k| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            k.hash(&mut h);
+            (h.finish() as usize) % store.eval_stripes.len()
+        })
+        .collect();
+    stripe_ids.sort_unstable();
+    stripe_ids.dedup();
+    let _stripes: Vec<_> = stripe_ids
+        .iter()
+        .map(|&i| store.eval_stripes[i].lock().unwrap())
+        .collect();
 
     // The Lua VM is REUSED per server thread (thread_local) and compiled
     // scripts are cached in its registry by sha1 — creating a fresh VM and
@@ -5189,6 +5257,91 @@ mod tests {
         // Busy-script guard still kills infinite loops.
         let r = execute(&store, &c(&["EVAL", "while true do end", "0"]));
         assert!(matches!(r, RespValue::Error(e) if e.contains("time limit")));
+    }
+
+    #[test]
+    fn decrbyfloatge_conditional_debit() {
+        let store = OxiMemStore::new();
+        execute(&store, &c(&["SET", "bal", "100"]));
+        assert_eq!(
+            execute(&store, &c(&["DECRBYFLOATGE", "bal", "40"])).as_str(),
+            Some("60")
+        );
+        // Insufficient → Null, unchanged.
+        assert!(matches!(
+            execute(&store, &c(&["DECRBYFLOATGE", "bal", "100"])),
+            RespValue::Null
+        ));
+        assert_eq!(execute(&store, &c(&["GET", "bal"])).as_str(), Some("60"));
+        // Missing key → Null.
+        assert!(matches!(
+            execute(&store, &c(&["DECRBYFLOATGE", "nope", "1"])),
+            RespValue::Null
+        ));
+    }
+
+    #[test]
+    fn concurrent_disjoint_evals_are_correct() {
+        // 4 threads × disjoint counters via EVAL: sharded stripes must let
+        // them run concurrently AND keep every increment.
+        let store = std::sync::Arc::new(OxiMemStore::new());
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let st = std::sync::Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                let key = format!("cnt{t}");
+                for _ in 0..500 {
+                    execute(
+                        &st,
+                        &c(&["EVAL", "redis.call('INCR', KEYS[1]) return 1", "1", &key]),
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        for t in 0..4 {
+            assert_eq!(
+                execute(&store, &c(&["GET", &format!("cnt{t}")])).as_str(),
+                Some("500")
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_conditional_debits_never_overdraw() {
+        // 8 threads race DECRBYFLOATGE on ONE balance via EVAL (undeclared-
+        // key pattern): total debited must equal the starting balance, never
+        // more — the single-command atomicity contract.
+        let store = std::sync::Arc::new(OxiMemStore::new());
+        execute(&store, &c(&["SET", "hot", "1000"]));
+        let ok = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let st = std::sync::Arc::clone(&store);
+            let okc = std::sync::Arc::clone(&ok);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    let r = execute(
+                        &st,
+                        &c(&[
+                            "EVAL",
+                            "return redis.call('DECRBYFLOATGE', 'hot', '1') ~= false and 1 or 0",
+                            "0",
+                        ]),
+                    );
+                    if r == RespValue::Integer(1) {
+                        okc.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(ok.load(Ordering::SeqCst), 1000); // exactly the balance
+        assert_eq!(execute(&store, &c(&["GET", "hot"])).as_str(), Some("0"));
     }
 
     #[test]
