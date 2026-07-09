@@ -43,6 +43,7 @@ redis.call('INCRBYFLOAT', KEYS[4], ARGV[5])
 redis.call('INCRBYFLOAT', KEYS[5], ARGV[3])
 redis.call('INCRBYFLOAT', KEYS[6], '-' .. ARGV[3])
 redis.call('SET', KEYS[7], ARGV[4])
+redis.call('PUBLISH', KEYS[7], ARGV[4])
 redis.call('INCR', KEYS[8])
 redis.call('RPUSH', KEYS[9], ARGV[10])
 return 1`

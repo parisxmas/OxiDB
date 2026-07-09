@@ -271,6 +271,36 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	// EVENT-DRIVEN price pushes: a dedicated OxiMem connection PSUBSCRIBEs
+	// px:* — the settlement script PUBLISHes every last-trade price, so the
+	// browser sees a price the instant it changes, not at the next snapshot
+	// tick. (Books still go by snapshot: they mutate ~1000×/s.)
+	pxEvents := make(chan [2]string, 256)
+	go func() {
+		sub, err := DialResp()
+		if err != nil {
+			return
+		}
+		defer sub.Close()
+		if _, err := sub.Do("PSUBSCRIBE", "px:*"); err != nil {
+			return
+		}
+		for {
+			r, err := sub.read()
+			if err != nil {
+				return
+			}
+			arr, ok := r.([]any)
+			if !ok || len(arr) < 4 || str(arr[0]) != "pmessage" {
+				continue
+			}
+			sym := strings.TrimPrefix(str(arr[2]), "px:")
+			select {
+			case pxEvents <- [2]string{sym, str(arr[3])}:
+			default: // browser slower than the market — drop, snapshot catches up
+			}
+		}
+	}()
 	// Reader goroutine: drain client frames so a browser close is noticed.
 	closed := make(chan struct{})
 	go func() {
@@ -298,6 +328,15 @@ func serveWS(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-closed:
 			return
+		case ev := <-pxEvents:
+			// Tiny instant frame: {"px":{"sym":"BTC","price":…}}
+			price, _ := strconv.ParseFloat(ev[1], 64)
+			b, _ := json.Marshal(map[string]any{
+				"px": map[string]any{"sym": ev[0], "price": price},
+			})
+			if writeTextFrame(buf, b) != nil || buf.Flush() != nil {
+				return
+			}
 		case <-tick.C:
 			payload := snapshot(db)
 			if err := writeTextFrame(buf, payload); err != nil {

@@ -342,6 +342,22 @@ const dashboardHTML = `<!doctype html>
     ws.onclose=function(){ dot.classList.remove("on"); setTimeout(connect,1000); };
     ws.onmessage=function(ev){
       var d=JSON.parse(ev.data);
+      if(d.px){ // instant price event (published by the settlement script)
+        var c=cards[d.px.sym];
+        if(c){
+          var p=prev[d.px.sym];
+          c.px.textContent=fmt(d.px.price);
+          if(p!==undefined && d.px.price!==p){
+            var up=d.px.price>p;
+            c.head.classList.remove("up","down"); void c.head.offsetWidth;
+            c.head.classList.add(up?"up":"down");
+            c.arrow.textContent=up?"▲":"▼";
+          }
+          prev[d.px.sym]=d.px.price;
+          if(selSym===d.px.sym) document.getElementById("fPx").textContent=fmt(d.px.price);
+        }
+        return;
+      }
       d.symbols.forEach(function(s){
         var c=cards[s.sym]||(cards[s.sym]=makeCard(s.sym));
         var p=prev[s.sym];
