@@ -1,0 +1,11 @@
+[package]
+name = "oxidb-tsdb"
+version = "0.1.0"
+edition = "2024"
+description = "OxiDB time-series engine — compressed columnar storage for metrics/ticks (InfluxDB-style)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
