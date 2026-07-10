@@ -2,6 +2,7 @@ pub mod aggregation;
 pub mod blobs;
 pub mod collections;
 pub mod connection;
+pub mod database;
 pub mod dashboard;
 pub mod documents;
 pub mod fs;

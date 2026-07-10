@@ -82,9 +82,25 @@ export const dropIndex = (collection: string, index: string) =>
 export const executeRawCommand = (command: JsonValue) =>
   invoke<JsonValue>("execute_raw_command", { command });
 
+// Current database (ADR-0012). SQL commands default to it unless a `db`
+// is passed explicitly, so every SQL surface scopes to the selected database
+// without threading it through each call.
+let currentDb: string | undefined;
+export const setCurrentDb = (db: string | undefined) => {
+  currentDb = db;
+};
+export const getCurrentDb = () => currentDb;
+
 // SQL engine (ADR-0010) — { ok, data: [ per-statement result ] }
 export const runSql = (sql: string, params?: JsonValue[], db?: string) =>
-  invoke<JsonValue>("run_sql", { sql, params, db });
+  invoke<JsonValue>("run_sql", { sql, params, db: db ?? currentDb });
+
+// Databases (ADR-0012)
+export const listDatabases = () => invoke<string[]>("list_databases");
+export const createDatabase = (name: string) =>
+  invoke<string>("create_database", { name });
+export const dropDatabase = (name: string) =>
+  invoke<string>("drop_database", { name });
 
 // Filesystem — read a user-picked file's text (for import)
 export const readFileText = (path: string) =>

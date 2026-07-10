@@ -19,6 +19,10 @@ pub fn run() {
             commands::connection::connect_remote,
             commands::connection::disconnect,
             commands::connection::get_connection_status,
+            // Databases (ADR-0012)
+            commands::database::list_databases,
+            commands::database::create_database,
+            commands::database::drop_database,
             // Dashboard
             commands::dashboard::get_dashboard_stats,
             // Collections
