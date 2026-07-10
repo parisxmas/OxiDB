@@ -411,8 +411,7 @@ input:focus, textarea:focus, select:focus {
 
 /* ── SQL schema tree (SqlPage left panel) ───────────────────────────── */
 .schema-tree {
-  width: 240px;
-  flex-shrink: 0;
+  width: 100%;
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--border-color);
@@ -960,3 +959,13 @@ tr:hover .row-del { opacity: 1; }
   display: flex;
   flex-direction: column;
 }
+
+/* ── Vertical column resizer (schema tree ↔ editor) ─────────────────── */
+.col-resizer {
+  width: 5px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  background: var(--border-color);
+  transition: background 0.15s;
+}
+.col-resizer:hover { background: var(--accent); }

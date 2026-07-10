@@ -75,7 +75,34 @@ export function SqlPage() {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const [splitPct, setSplitPct] = useState(42);
+  const [treeWidth, setTreeWidth] = useState<number>(() => {
+    const v = parseInt(localStorage.getItem("oxidb-tree-width") || "260", 10);
+    return Number.isFinite(v) ? v : 260;
+  });
   const draggingRef = useRef(false);
+
+  /** Drag the vertical splitter between the schema tree and the editor. */
+  const onTreeResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      const startX = e.clientX;
+      const startW = treeWidth;
+      const onMove = (ev: MouseEvent) => {
+        const w = Math.max(160, Math.min(640, startW + ev.clientX - startX));
+        setTreeWidth(w);
+      };
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        localStorage.setItem("oxidb-tree-width", String(treeWidthRef.current));
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    },
+    [treeWidth]
+  );
+  const treeWidthRef = useRef(treeWidth);
+  treeWidthRef.current = treeWidth;
 
   /** Insert an identifier at the cursor (schema-tree click). */
   const insertAtCursor = useCallback((text: string) => {
@@ -161,16 +188,21 @@ export function SqlPage() {
         gap: 0,
       }}
     >
-      {/* Left: schema tree */}
-      <SchemaTree
-        refreshKey={schemaKey}
-        onInsert={insertAtCursor}
-        onQuery={(q) => setSql(q)}
-        onBrowse={(t) => {
-          setBrowseTable(t);
-          setResultTab("data");
-        }}
-      />
+      {/* Left: schema tree (resizable) */}
+      <div style={{ width: treeWidth, flexShrink: 0, minWidth: 0, display: "flex" }}>
+        <SchemaTree
+          refreshKey={schemaKey}
+          onInsert={insertAtCursor}
+          onQuery={(q) => setSql(q)}
+          onBrowse={(t) => {
+            setBrowseTable(t);
+            setResultTab("data");
+          }}
+        />
+      </div>
+
+      {/* Vertical splitter */}
+      <div className="col-resizer" onMouseDown={onTreeResize} title="Drag to resize" />
 
       {/* Right: editor + results (the original vertical split) */}
       <div
