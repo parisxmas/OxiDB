@@ -5,7 +5,7 @@ import type { JsonValue } from "../../api/types";
 import { SqlEditor } from "../common/SqlEditor";
 import { SchemaTree } from "./SchemaTree";
 import { TableDataView } from "./TableDataView";
-import { DataTable } from "../common/DataTable";
+import { EditableResultGrid } from "./EditableResultGrid";
 import { Pagination } from "../common/Pagination";
 import { useToast } from "../common/Toast";
 import { useConnection } from "../../context/ConnectionContext";
@@ -64,15 +64,6 @@ function newTab(id: number): QueryTab {
     page: 0,
     pageSize: 100,
   };
-}
-
-function toRowObjects(r: StmtResult): Record<string, JsonValue>[] {
-  const cols = r.columns || [];
-  return (r.rows || []).map((row) => {
-    const obj: Record<string, JsonValue> = {};
-    cols.forEach((c, i) => (obj[c] = row[i]));
-    return obj;
-  });
 }
 
 function summarize(r: StmtResult): string {
@@ -217,8 +208,12 @@ export function SqlPage() {
 
   const cur = t.results && t.results[t.active] ? t.results[t.active] : null;
   const isSelect = !!cur?.columns;
-  const allRows = isSelect ? (toRowObjects(cur) as JsonValue[]) : [];
-  const pagedRows = allRows.slice(t.page * t.pageSize, (t.page + 1) * t.pageSize);
+  const totalRows = isSelect ? cur!.rows?.length ?? 0 : 0;
+  const pagedResult: StmtResult | null =
+    cur && isSelect
+      ? { columns: cur.columns, types: cur.types, rows: (cur.rows || []).slice(t.page * t.pageSize, (t.page + 1) * t.pageSize) }
+      : null;
+  const pagedCount = pagedResult?.rows?.length ?? 0;
 
   return (
     <div style={{ display: "flex", flexDirection: "row", height: "calc(100vh - var(--header-height) - 40px)" }}>
@@ -354,18 +349,18 @@ export function SqlPage() {
               <div style={{ padding: 16, color: "var(--danger)", fontFamily: "var(--font-mono)", fontSize: 13, whiteSpace: "pre-wrap" }}>{t.error}</div>
             ) : !cur ? (
               <div className="empty-state">Run a statement to see results</div>
-            ) : isSelect ? (
-              <DataTable data={pagedRows} />
+            ) : isSelect && pagedResult ? (
+              <EditableResultGrid result={pagedResult} sql={t.sql} />
             ) : (
               <div className="empty-state">{summarize(cur)}</div>
             )}
           </div>
-          {t.resultTab === "query" && isSelect && allRows.length > t.pageSize && (
+          {t.resultTab === "query" && isSelect && totalRows > t.pageSize && (
             <Pagination
               page={t.page}
               pageSize={t.pageSize}
-              total={allRows.length}
-              currentCount={pagedRows.length}
+              total={totalRows}
+              currentCount={pagedCount}
               onPage={(p) => patchActive({ page: p })}
               onPageSize={(s) => patchActive({ pageSize: s, page: 0 })}
             />

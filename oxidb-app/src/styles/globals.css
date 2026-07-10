@@ -1030,3 +1030,11 @@ tr:hover .row-del { opacity: 1; }
   align-self: center;
 }
 .query-tab-new:hover { color: var(--accent); }
+
+.result-readonly-note {
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border-color);
+}
