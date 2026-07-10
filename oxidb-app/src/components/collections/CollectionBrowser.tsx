@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import {
   listCollections,
   findDocuments,
+  countDocuments,
   insertDocument,
   updateDocuments,
   deleteDocuments,
@@ -13,14 +14,30 @@ import { DataTable } from "../common/DataTable";
 import { JsonEditor } from "../common/JsonEditor";
 import { JsonViewer } from "../common/JsonViewer";
 import { ConfirmDialog } from "../common/ConfirmDialog";
+import { Pagination } from "../common/Pagination";
 import { useToast } from "../common/Toast";
+
+function downloadJson(name: string, data: unknown) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(url);
+}
 
 export function CollectionBrowser() {
   const toast = useToast();
   const [collections, setCollections] = useState<string[]>([]);
+  const [counts, setCounts] = useState<Record<string, number>>({});
   const [selected, setSelected] = useState<string | null>(null);
   const [docs, setDocs] = useState<JsonValue[]>([]);
+  const [total, setTotal] = useState<number | null>(null);
   const [page, setPage] = useState(0);
+  const [pageSize, setPageSize] = useState(50);
+  const [filter, setFilter] = useState("");
+  const [filterErr, setFilterErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [viewDoc, setViewDoc] = useState<JsonValue | null>(null);
   const [showInsert, setShowInsert] = useState(false);
@@ -32,12 +49,25 @@ export function CollectionBrowser() {
   const [newCollName, setNewCollName] = useState("");
   const [showNewColl, setShowNewColl] = useState(false);
 
-  const PAGE_SIZE = 50;
-
   const loadCollections = useCallback(async () => {
     try {
-      const names = await listCollections();
-      setCollections(names.sort());
+      // Hide internal collections (empty name, or "_"-prefixed system ones
+      // like _alerts / _schedules / _fts).
+      const names = (await listCollections())
+        .filter((n) => n && !n.startsWith("_"))
+        .sort();
+      setCollections(names);
+      // Per-collection document counts (best-effort, in parallel).
+      const entries = await Promise.all(
+        names.map(async (n) => {
+          try {
+            return [n, await countDocuments(n)] as const;
+          } catch {
+            return [n, -1] as const;
+          }
+        })
+      );
+      setCounts(Object.fromEntries(entries));
     } catch (e) {
       toast(String(e), "error");
     }
@@ -47,28 +77,69 @@ export function CollectionBrowser() {
     loadCollections();
   }, [loadCollections]);
 
-  const loadDocs = useCallback(async (col: string, pageNum: number) => {
-    setLoading(true);
+  const parseFilter = useCallback((): Record<string, JsonValue> | null => {
+    const t = filter.trim();
+    if (!t) return {};
     try {
-      const results = await findDocuments({
-        collection: col,
-        skip: pageNum * PAGE_SIZE,
-        limit: PAGE_SIZE,
-        sort: { _id: -1 },
-      });
-      setDocs(results);
+      const q = JSON.parse(t);
+      setFilterErr(null);
+      return q;
     } catch (e) {
-      toast(String(e), "error");
-    } finally {
-      setLoading(false);
+      setFilterErr(String(e));
+      return null;
     }
-  }, [toast]);
+  }, [filter]);
+
+  const loadDocs = useCallback(
+    async (col: string, pageNum: number, size: number) => {
+      const query = parseFilter();
+      if (query === null) return; // invalid filter JSON
+      setLoading(true);
+      try {
+        const [results, n] = await Promise.all([
+          findDocuments({
+            collection: col,
+            query,
+            skip: pageNum * size,
+            limit: size,
+            sort: { _id: -1 },
+          }),
+          countDocuments(col, query as JsonValue).catch(() => -1),
+        ]);
+        setDocs(results);
+        setTotal(n >= 0 ? n : null);
+      } catch (e) {
+        toast(String(e), "error");
+      } finally {
+        setLoading(false);
+      }
+    },
+    [toast, parseFilter]
+  );
 
   const handleSelect = (name: string) => {
     setSelected(name);
     setPage(0);
     setViewDoc(null);
-    loadDocs(name, 0);
+    loadDocs(name, 0, pageSize);
+  };
+
+  const applyFilter = () => {
+    if (!selected) return;
+    setPage(0);
+    loadDocs(selected, 0, pageSize);
+  };
+
+  const gotoPage = (p: number) => {
+    if (!selected) return;
+    setPage(p);
+    loadDocs(selected, p, pageSize);
+  };
+
+  const changePageSize = (s: number) => {
+    setPageSize(s);
+    setPage(0);
+    if (selected) loadDocs(selected, 0, s);
   };
 
   const handleInsert = async () => {
@@ -79,7 +150,7 @@ export function CollectionBrowser() {
       toast("Document inserted", "success");
       setShowInsert(false);
       setInsertJson("{}");
-      loadDocs(selected, page);
+      loadDocs(selected, page, pageSize);
     } catch (e) {
       toast(String(e), "error");
     }
@@ -102,7 +173,7 @@ export function CollectionBrowser() {
       await updateDocuments(selected, { _id: editDocId }, { $set: update });
       toast("Document updated", "success");
       setShowEdit(false);
-      loadDocs(selected, page);
+      loadDocs(selected, page, pageSize);
     } catch (e) {
       toast(String(e), "error");
     }
@@ -114,7 +185,7 @@ export function CollectionBrowser() {
     try {
       await deleteDocuments(selected, { _id: d._id } as Record<string, JsonValue>);
       toast("Document deleted", "success");
-      loadDocs(selected, page);
+      loadDocs(selected, page, pageSize);
       setViewDoc(null);
     } catch (e) {
       toast(String(e), "error");
@@ -172,9 +243,14 @@ export function CollectionBrowser() {
               marginBottom: 2,
             }}
           >
-            <span style={{ flex: 1 }} onClick={() => handleSelect(name)}>
+            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} onClick={() => handleSelect(name)}>
               {name}
             </span>
+            {counts[name] != null && counts[name] >= 0 && (
+              <span style={{ fontSize: 11, color: "var(--text-secondary)", fontFamily: "var(--font-mono)", marginRight: 4 }}>
+                {counts[name]}
+              </span>
+            )}
             <button
               className="btn btn-sm"
               style={{ padding: "2px 6px", color: "var(--danger)", background: "none" }}
@@ -186,8 +262,12 @@ export function CollectionBrowser() {
           </div>
         ))}
         {collections.length === 0 && (
-          <div style={{ color: "var(--text-muted)", padding: 8, fontSize: 13 }}>
-            No collections
+          <div style={{ padding: 12, fontSize: 13, color: "var(--text-secondary)", textAlign: "center" }}>
+            No collections yet.
+            <br />
+            <button className="btn btn-primary btn-sm" style={{ marginTop: 8 }} onClick={() => setShowNewColl(true)}>
+              + Create collection
+            </button>
           </div>
         )}
       </div>
@@ -197,32 +277,74 @@ export function CollectionBrowser() {
           <>
             <div className="toolbar">
               <strong>{selected}</strong>
+              {total != null && (
+                <span style={{ marginLeft: 8, fontSize: 12, color: "var(--text-secondary)" }}>
+                  {total.toLocaleString()} doc{total === 1 ? "" : "s"}
+                </span>
+              )}
               <div style={{ flex: 1 }} />
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => downloadJson(`${selected}.json`, docs)}
+                title="Export the loaded page as JSON"
+                disabled={docs.length === 0}
+              >
+                Export
+              </button>
               <button className="btn btn-primary btn-sm" onClick={() => { setInsertJson("{}"); setShowInsert(true); }}>
                 Insert
               </button>
-              <button className="btn btn-secondary btn-sm" onClick={() => loadDocs(selected, page)}>
+              <button className="btn btn-secondary btn-sm" onClick={() => loadDocs(selected, page, pageSize)}>
                 Refresh
               </button>
             </div>
+
+            {/* JSON query filter */}
+            <div className="toolbar" style={{ gap: 6 }}>
+              <input
+                style={{ flex: 1, fontFamily: "var(--font-mono)", fontSize: 12 }}
+                placeholder='filter, e.g. {"age": {"$gt": 30}}'
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && applyFilter()}
+              />
+              <button className="btn btn-primary btn-sm" onClick={applyFilter}>
+                Find
+              </button>
+              {filter && (
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => { setFilter(""); setFilterErr(null); setPage(0); if (selected) loadDocs(selected, 0, pageSize); }}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            {filterErr && (
+              <div style={{ padding: "4px 12px", fontSize: 12, color: "var(--danger)", fontFamily: "var(--font-mono)" }}>
+                {filterErr}
+              </div>
+            )}
+
             {loading ? (
               <div className="empty-state"><span className="spinner" /></div>
             ) : (
-              <>
-                <DataTable
-                  data={docs}
-                  onRowClick={(row) => setViewDoc(row)}
-                />
-                <div className="pagination">
-                  <button className="btn btn-secondary btn-sm" disabled={page === 0} onClick={() => { setPage(page - 1); loadDocs(selected, page - 1); }}>
-                    Prev
-                  </button>
-                  <span style={{ color: "var(--text-secondary)", fontSize: 13 }}>Page {page + 1}</span>
-                  <button className="btn btn-secondary btn-sm" disabled={docs.length < PAGE_SIZE} onClick={() => { setPage(page + 1); loadDocs(selected, page + 1); }}>
-                    Next
-                  </button>
+              <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+                <div style={{ flex: 1, overflow: "auto" }}>
+                  <DataTable data={docs} onRowClick={(row) => setViewDoc(row)} />
                 </div>
-              </>
+                {((total ?? 0) > pageSize || page > 0) && (
+                  <Pagination
+                    page={page}
+                    pageSize={pageSize}
+                    total={total ?? undefined}
+                    currentCount={docs.length}
+                    onPage={gotoPage}
+                    onPageSize={changePageSize}
+                    busy={loading}
+                  />
+                )}
+              </div>
             )}
           </>
         ) : (
