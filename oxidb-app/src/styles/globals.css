@@ -919,3 +919,14 @@ tr:hover .row-del { opacity: 1; }
 .stage-move:hover:not(:disabled) { color: var(--accent); }
 .stage-move:disabled { opacity: 0.3; cursor: default; }
 .stage-card-header { display: flex; align-items: center; }
+
+/* ── Sidebar nav icons ──────────────────────────────────────────────── */
+.sidebar-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+.sidebar-link.active .sidebar-icon { opacity: 1; }

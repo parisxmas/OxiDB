@@ -1,15 +1,27 @@
 import { NavLink } from "react-router-dom";
+import type { ReactNode } from "react";
+import {
+  IconDashboard,
+  IconCollections,
+  IconQuery,
+  IconSql,
+  IconOxiMem,
+  IconIndexes,
+  IconBlobs,
+  IconAggregation,
+  IconMonitor,
+} from "./NavIcons";
 
-const links = [
-  { to: "/dashboard", label: "Dashboard" },
-  { to: "/collections", label: "Collections" },
-  { to: "/query", label: "Query" },
-  { to: "/sql", label: "SQL" },
-  { to: "/oximem", label: "OxiMem" },
-  { to: "/indexes", label: "Indexes" },
-  { to: "/blobs", label: "Blobs" },
-  { to: "/aggregation", label: "Aggregation" },
-  { to: "/monitor", label: "Monitor" },
+const links: { to: string; label: string; icon: ReactNode }[] = [
+  { to: "/dashboard", label: "Dashboard", icon: <IconDashboard /> },
+  { to: "/collections", label: "Collections", icon: <IconCollections /> },
+  { to: "/query", label: "Query", icon: <IconQuery /> },
+  { to: "/sql", label: "SQL", icon: <IconSql /> },
+  { to: "/oximem", label: "OxiMem", icon: <IconOxiMem /> },
+  { to: "/indexes", label: "Indexes", icon: <IconIndexes /> },
+  { to: "/blobs", label: "Blobs", icon: <IconBlobs /> },
+  { to: "/aggregation", label: "Aggregation", icon: <IconAggregation /> },
+  { to: "/monitor", label: "Monitor", icon: <IconMonitor /> },
 ];
 
 export function Sidebar() {
@@ -25,6 +37,7 @@ export function Sidebar() {
               `sidebar-link${isActive ? " active" : ""}`
             }
           >
+            <span className="sidebar-icon">{link.icon}</span>
             {link.label}
           </NavLink>
         ))}
