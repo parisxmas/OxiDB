@@ -285,8 +285,8 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                                   </button>
                                   <span
                                     className="schema-table-name"
-                                    title="Click to insert · double-click to browse & edit · right-click for menu"
-                                    onClick={() => onInsert(t.name)}
+                                    title="Click to expand columns · double-click to browse & edit · right-click for menu"
+                                    onClick={() => toggleTable(dbName, t.name)}
                                     onDoubleClick={() => { setDb(dbName); onBrowse(t.name); }}
                                   >
                                     {t.name}
