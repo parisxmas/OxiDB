@@ -36,7 +36,7 @@ export function newTab(id: number): QueryTab {
   return {
     id,
     name: `Query ${id}`,
-    sql: "SELECT name FROM sqlite_schema;\n-- F5 or ⌘/Ctrl+Enter to run",
+    sql: "",
     results: null,
     error: null,
     elapsed: null,
