@@ -14,32 +14,62 @@
 mod bits;
 mod gorilla;
 mod model;
+mod persist;
 mod store;
 
 pub use model::{Point, SeriesKey};
 pub use store::{Agg, Block, GroupPoint, QuerySpec, ResultSeries, TagPredicate};
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
-/// The time-series database: a set of compressed series streams.
+/// Auto-checkpoint once the WAL passes this many bytes.
+const DEFAULT_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The time-series database: a set of compressed series streams, optionally
+/// persisted to disk.
 #[derive(Default)]
 pub struct Tsdb {
     series: BTreeMap<SeriesKey, store::Series>,
     /// Points per sealed block; smaller = finer retention/query granularity,
     /// larger = better compression. 1024 is a reasonable default.
     block_points: usize,
+    persist: Option<persist::Persist>,
+    checkpoint_bytes: u64,
 }
 
 impl Tsdb {
+    /// An in-memory database (no disk persistence).
     pub fn new() -> Self {
         Tsdb {
             series: BTreeMap::new(),
             block_points: 1024,
+            persist: None,
+            checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
         }
+    }
+
+    /// Open (or create) a database persisted under `dir`, loading its snapshot
+    /// + WAL.
+    pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
+        let mut series = BTreeMap::new();
+        let block_points = 1024;
+        let p = persist::Persist::open(dir.as_ref(), &mut series, block_points)?;
+        Ok(Tsdb {
+            series,
+            block_points,
+            persist: Some(p),
+            checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
+        })
     }
 
     pub fn with_block_points(mut self, n: usize) -> Self {
         self.block_points = n.max(1);
+        self
+    }
+
+    pub fn with_checkpoint_bytes(mut self, n: u64) -> Self {
+        self.checkpoint_bytes = n.max(1);
         self
     }
 
@@ -49,9 +79,31 @@ impl Tsdb {
     pub fn write(&mut self, p: &Point) {
         for (fname, fval) in &p.fields {
             let key = SeriesKey::new(&p.measurement, p.tags.clone(), fname);
+            if let Some(persist) = &mut self.persist {
+                let _ = persist.wal_append(&key, p.ts, *fval);
+            }
             let bp = self.block_points;
             self.series.entry(key).or_default().push(p.ts, *fval, bp);
         }
+        if let Some(persist) = &mut self.persist {
+            let _ = persist.flush();
+            if persist.wal_bytes >= self.checkpoint_bytes {
+                let _ = self.checkpoint();
+            }
+        }
+    }
+
+    /// Force-persist all data: seal active buffers, write a fresh snapshot, and
+    /// rotate the WAL. No-op for an in-memory database.
+    pub fn checkpoint(&mut self) -> std::io::Result<()> {
+        if self.persist.is_none() {
+            return Ok(());
+        }
+        for s in self.series.values_mut() {
+            s.seal_active();
+        }
+        let persist = self.persist.as_mut().unwrap();
+        persist.checkpoint(&self.series)
     }
 
     /// Number of distinct series (measurement × tag-set × field).

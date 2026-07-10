@@ -23,6 +23,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use oxidb::database_manager::DEFAULT_DATABASE;
@@ -31,8 +32,10 @@ use serde_json::{Value, json};
 
 use crate::handler::{err_bytes, ok_bytes};
 
-/// Per-database in-memory time-series engines.
+/// Per-database time-series engines, persisted on disk.
 struct Registry {
+    root: PathBuf,
+    default_dir: PathBuf,
     engines: RwLock<HashMap<String, Arc<RwLock<Tsdb>>>>,
 }
 
@@ -54,8 +57,18 @@ fn registry() -> Option<&'static Registry> {
             if !env_truthy("OXIDB_TSDB") {
                 return None;
             }
-            eprintln!("[oxidb] TSDB engine enabled (in-memory)");
+            let root =
+                PathBuf::from(std::env::var("OXIDB_DATA").unwrap_or_else(|_| "./oxidb_data".into()));
+            let default_dir = std::env::var("OXIDB_TSDB_DATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| root.join("tsdb"));
+            eprintln!(
+                "[oxidb] TSDB engine enabled (default db at {})",
+                default_dir.display()
+            );
             Some(Registry {
+                root,
+                default_dir,
                 engines: RwLock::new(HashMap::new()),
             })
         })
@@ -78,12 +91,24 @@ fn engine_for(db_name: &str) -> Result<Arc<RwLock<Tsdb>>, String> {
     if let Some(e) = reg.engines.read().unwrap().get(name) {
         return Ok(Arc::clone(e));
     }
+    let dir = if name == DEFAULT_DATABASE {
+        reg.default_dir.clone()
+    } else {
+        let db_dir = reg.root.join(name);
+        if !db_dir.is_dir() {
+            return Err(format!("database not found: {name}"));
+        }
+        db_dir.join("tsdb")
+    };
+    let engine =
+        Tsdb::open(&dir).map_err(|e| format!("failed to open TSDB for database {name:?}: {e}"))?;
     let mut engines = reg.engines.write().unwrap();
-    Ok(Arc::clone(
-        engines
-            .entry(name.to_string())
-            .or_insert_with(|| Arc::new(RwLock::new(Tsdb::new()))),
-    ))
+    if let Some(existing) = engines.get(name) {
+        return Ok(Arc::clone(existing));
+    }
+    let arc = Arc::new(RwLock::new(engine));
+    engines.insert(name.to_string(), Arc::clone(&arc));
+    Ok(arc)
 }
 
 /// Drop a database's TSDB engine (called by `drop_database`).
@@ -128,7 +153,16 @@ pub fn handle_tsdb(cmd: &str, request: &Value, readonly: bool, db_name: &str) ->
             let removed = engine.write().unwrap().enforce_retention(cutoff);
             ok_bytes(json!({ "removed": removed }))
         }
-        "" => err_bytes("missing 'op' (write | query | stats | retention)"),
+        "checkpoint" => {
+            if readonly {
+                return err_bytes("permission denied: read-only role cannot checkpoint");
+            }
+            match engine.write().unwrap().checkpoint() {
+                Ok(()) => ok_bytes(json!({ "ok": true })),
+                Err(e) => err_bytes(&format!("checkpoint failed: {e}")),
+            }
+        }
+        "" => err_bytes("missing 'op' (write | query | stats | retention | checkpoint)"),
         other => err_bytes(&format!("unknown tsdb op: {other:?}")),
     }
 }

@@ -29,6 +29,22 @@ impl Series {
         }
     }
 
+    /// Sealed blocks (for persistence snapshots).
+    pub fn sealed_blocks(&self) -> &[Block] {
+        &self.sealed
+    }
+
+    /// Adopt a block loaded from disk.
+    pub fn push_block(&mut self, block: Block) {
+        self.sealed.push(block);
+    }
+
+    /// Force the active buffer into a sealed block (used before a checkpoint
+    /// snapshot so all data is in blocks).
+    pub fn seal_active(&mut self) {
+        self.seal();
+    }
+
     fn seal(&mut self) {
         if self.active.is_empty() {
             return;
