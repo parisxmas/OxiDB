@@ -20,7 +20,10 @@ mod store;
 
 pub use line_protocol::parse as parse_line_protocol;
 pub use model::{FieldType, FieldValue, Point, SeriesKey};
-pub use store::{Agg, Block, GroupPoint, QuerySpec, ResultSeries, TagPredicate};
+pub use store::{
+    Agg, Block, GroupPoint, QuerySpec, ResultSeries, StrGroupPoint, StrResultSeries, StrValue,
+    TagPredicate,
+};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -33,6 +36,7 @@ const DEFAULT_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Default)]
 pub struct Tsdb {
     series: BTreeMap<SeriesKey, store::Series>,
+    str_series: BTreeMap<SeriesKey, store::StrSeries>,
     /// Points per sealed block; smaller = finer retention/query granularity,
     /// larger = better compression. 1024 is a reasonable default.
     block_points: usize,
@@ -45,6 +49,7 @@ impl Tsdb {
     pub fn new() -> Self {
         Tsdb {
             series: BTreeMap::new(),
+            str_series: BTreeMap::new(),
             block_points: 1024,
             persist: None,
             checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
@@ -55,10 +60,12 @@ impl Tsdb {
     /// + WAL.
     pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut series = BTreeMap::new();
+        let mut str_series = BTreeMap::new();
         let block_points = 1024;
-        let p = persist::Persist::open(dir.as_ref(), &mut series, block_points)?;
+        let p = persist::Persist::open(dir.as_ref(), &mut series, &mut str_series, block_points)?;
         Ok(Tsdb {
             series,
+            str_series,
             block_points,
             persist: Some(p),
             checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
@@ -81,6 +88,17 @@ impl Tsdb {
     pub fn write(&mut self, p: &Point) {
         for (fname, fval) in &p.fields {
             let key = SeriesKey::new(&p.measurement, p.tags.clone(), fname);
+            if let FieldValue::Str(s) = fval {
+                // Text field — separate storage path.
+                if let Some(persist) = &mut self.persist {
+                    let _ = persist.wal_append_str(&key, p.ts, s);
+                }
+                self.str_series
+                    .entry(key)
+                    .or_default()
+                    .push(p.ts, s.clone());
+                continue;
+            }
             let f = fval.as_f64();
             let ft = fval.ftype();
             if let Some(persist) = &mut self.persist {
@@ -109,7 +127,19 @@ impl Tsdb {
             s.seal_active();
         }
         let persist = self.persist.as_mut().unwrap();
-        persist.checkpoint(&self.series)
+        persist.checkpoint(&self.series, &self.str_series)
+    }
+
+    /// True when a text field with this measurement+field name exists.
+    pub fn is_string_field(&self, measurement: &str, field: &str) -> bool {
+        self.str_series
+            .keys()
+            .any(|k| k.measurement == measurement && k.field == field)
+    }
+
+    /// Query a text field. Returns one group per tag combination.
+    pub fn query_str(&self, spec: &QuerySpec) -> Vec<StrResultSeries> {
+        store::run_query_str(&self.str_series, spec)
     }
 
     /// Number of distinct series (measurement × tag-set × field).
@@ -119,7 +149,8 @@ impl Tsdb {
 
     /// Total stored points across all series.
     pub fn point_count(&self) -> usize {
-        self.series.values().map(|s| s.len()).sum()
+        self.series.values().map(|s| s.len()).sum::<usize>()
+            + self.str_series.values().map(|s| s.len()).sum::<usize>()
     }
 
     /// On-disk-equivalent compressed byte size across all sealed blocks (the
@@ -136,6 +167,10 @@ impl Tsdb {
             removed += s.drop_before(cutoff);
         }
         self.series.retain(|_, s| !s.is_empty());
+        for s in self.str_series.values_mut() {
+            removed += s.drop_before(cutoff);
+        }
+        self.str_series.retain(|_, s| !s.is_empty());
         removed
     }
 

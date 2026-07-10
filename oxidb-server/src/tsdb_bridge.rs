@@ -199,11 +199,13 @@ fn write_points(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
             return err_bytes("each point needs a 'fields' object");
         };
         for (k, v) in fields {
-            // JSON bool → boolean field, integer → integer field, else float.
+            // JSON bool → boolean, integer → integer, string → text, else float.
             if let Some(b) = v.as_bool() {
                 point = point.field_bool(k, b);
             } else if v.is_i64() {
                 point = point.field_int(k, v.as_i64().unwrap());
+            } else if let Some(s) = v.as_str() {
+                point = point.field_str(k, s);
             } else if let Some(f) = v.as_f64() {
                 point = point.field(k, f);
             }
@@ -268,6 +270,7 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
         "min" => Agg::Min,
         "max" => Agg::Max,
         "count" => Agg::Count,
+        "distinct" => Agg::Distinct,
         "first" => Agg::First,
         "last" => Agg::Last,
         "rate" => Agg::Rate,
@@ -293,8 +296,32 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
         interval: request.get("interval").and_then(|v| v.as_i64()).filter(|&i| i > 0),
         agg,
     };
-    let results = engine.read().unwrap().query(&spec);
-    let out: Vec<Value> = results
+    let db = engine.read().unwrap();
+    // A text field goes through the string query path (first/last/count/distinct).
+    if db.is_string_field(measurement, field) {
+        let out: Vec<Value> = db
+            .query_str(&spec)
+            .into_iter()
+            .map(|r| {
+                let tags: serde_json::Map<String, Value> =
+                    r.tags.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+                json!({
+                    "tags": tags,
+                    "type": "string",
+                    "points": r.points.into_iter().map(|p| {
+                        let value = match p.value {
+                            oxidb_tsdb::StrValue::Text(t) => Value::String(t),
+                            oxidb_tsdb::StrValue::Num(n) => json!(n),
+                        };
+                        json!({ "ts": p.ts, "value": value })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        return ok_bytes(json!(out));
+    }
+    let out: Vec<Value> = db
+        .query(&spec)
         .into_iter()
         .map(|r| {
             let tags: serde_json::Map<String, Value> = r

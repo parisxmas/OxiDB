@@ -41,6 +41,8 @@ pub enum FieldType {
     Float,
     Int,
     Bool,
+    /// A text field (stored separately from the numeric Gorilla path).
+    Str,
 }
 
 impl FieldType {
@@ -49,6 +51,7 @@ impl FieldType {
             FieldType::Float => "float",
             FieldType::Int => "integer",
             FieldType::Bool => "boolean",
+            FieldType::Str => "string",
         }
     }
     pub fn to_u8(self) -> u8 {
@@ -56,44 +59,50 @@ impl FieldType {
             FieldType::Float => 0,
             FieldType::Int => 1,
             FieldType::Bool => 2,
+            FieldType::Str => 3,
         }
     }
     pub fn from_u8(b: u8) -> FieldType {
         match b {
             1 => FieldType::Int,
             2 => FieldType::Bool,
+            3 => FieldType::Str,
             _ => FieldType::Float,
         }
     }
 }
 
 /// A typed field value.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FieldValue {
     Float(f64),
     Int(i64),
     Bool(bool),
+    Str(String),
 }
 
 impl FieldValue {
-    pub fn as_f64(self) -> f64 {
+    /// Numeric view (NaN for a string field).
+    pub fn as_f64(&self) -> f64 {
         match self {
-            FieldValue::Float(f) => f,
-            FieldValue::Int(i) => i as f64,
+            FieldValue::Float(f) => *f,
+            FieldValue::Int(i) => *i as f64,
             FieldValue::Bool(b) => {
-                if b {
+                if *b {
                     1.0
                 } else {
                     0.0
                 }
             }
+            FieldValue::Str(_) => f64::NAN,
         }
     }
-    pub fn ftype(self) -> FieldType {
+    pub fn ftype(&self) -> FieldType {
         match self {
             FieldValue::Float(_) => FieldType::Float,
             FieldValue::Int(_) => FieldType::Int,
             FieldValue::Bool(_) => FieldType::Bool,
+            FieldValue::Str(_) => FieldType::Str,
         }
     }
 }
@@ -127,6 +136,11 @@ impl Point {
     }
     pub fn field_int(mut self, k: &str, v: i64) -> Self {
         self.fields.push((k.to_string(), FieldValue::Int(v)));
+        self
+    }
+    pub fn field_str(mut self, k: &str, v: &str) -> Self {
+        self.fields
+            .push((k.to_string(), FieldValue::Str(v.to_string())));
         self
     }
     pub fn field_bool(mut self, k: &str, v: bool) -> Self {

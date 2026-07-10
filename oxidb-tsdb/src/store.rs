@@ -139,6 +139,8 @@ pub enum Agg {
     Count,
     First,
     Last,
+    /// Count of distinct values in the bucket.
+    Distinct,
     /// Per-second rate of change across the bucket: `(last - first) / span_s`.
     /// For counter-style series. 0 with fewer than two points.
     Rate,
@@ -149,7 +151,7 @@ pub enum Agg {
 
 impl Agg {
     fn needs_values(self) -> bool {
-        matches!(self, Agg::Percentile(_))
+        matches!(self, Agg::Percentile(_) | Agg::Distinct)
     }
 }
 
@@ -255,6 +257,13 @@ impl Acc {
                 }
             }
             Agg::Percentile(p) => percentile(self.vals.as_deref().unwrap_or(&[]), p),
+            Agg::Distinct => {
+                let vs = self.vals.as_deref().unwrap_or(&[]);
+                let mut keys: Vec<u64> = vs.iter().map(|v| v.to_bits()).collect();
+                keys.sort_unstable();
+                keys.dedup();
+                keys.len() as f64
+            }
         }
     }
 }
@@ -320,6 +329,144 @@ pub fn run_query(series: &BTreeMap<SeriesKey, Series>, spec: &QuerySpec) -> Vec<
             points: buckets
                 .into_iter()
                 .map(|(ts, acc)| GroupPoint {
+                    ts,
+                    value: acc.value(spec.agg),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+// ── String fields ─────────────────────────────────────────────────────────
+// Text fields live outside the numeric Gorilla path. MVP: an in-memory vector
+// of (ts, string) per series; persistence serializes them raw. Aggregations
+// are first / last / count / distinct.
+
+/// One text stream.
+#[derive(Default)]
+pub struct StrSeries {
+    points: Vec<(i64, String)>,
+}
+
+impl StrSeries {
+    pub fn push(&mut self, ts: i64, s: String) {
+        self.points.push((ts, s));
+    }
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+    /// All points (for persistence snapshots).
+    pub fn points(&self) -> &[(i64, String)] {
+        &self.points
+    }
+    pub fn drop_before(&mut self, cutoff: i64) -> usize {
+        let before = self.points.len();
+        self.points.retain(|(t, _)| *t >= cutoff);
+        before - self.points.len()
+    }
+    fn for_each_in<F: FnMut(i64, &str)>(&self, start: i64, end: i64, mut f: F) {
+        for (t, s) in &self.points {
+            if *t >= start && *t < end {
+                f(*t, s);
+            }
+        }
+    }
+}
+
+/// A string aggregate value: text (first/last) or a number (count/distinct).
+#[derive(Debug, Clone, PartialEq)]
+pub enum StrValue {
+    Text(String),
+    Num(f64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrGroupPoint {
+    pub ts: i64,
+    pub value: StrValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrResultSeries {
+    pub tags: Vec<(String, String)>,
+    pub points: Vec<StrGroupPoint>,
+}
+
+#[derive(Default)]
+struct StrAcc {
+    count: u64,
+    first_ts: i64,
+    first_val: String,
+    last_ts: i64,
+    last_val: String,
+    distinct: std::collections::BTreeSet<String>,
+}
+
+impl StrAcc {
+    fn add(&mut self, ts: i64, s: &str) {
+        if self.count == 0 || ts < self.first_ts {
+            self.first_ts = ts;
+            self.first_val = s.to_string();
+        }
+        if self.count == 0 || ts >= self.last_ts {
+            self.last_ts = ts;
+            self.last_val = s.to_string();
+        }
+        self.distinct.insert(s.to_string());
+        self.count += 1;
+    }
+    fn value(&self, agg: Agg) -> StrValue {
+        match agg {
+            Agg::First => StrValue::Text(self.first_val.clone()),
+            Agg::Last => StrValue::Text(self.last_val.clone()),
+            Agg::Count => StrValue::Num(self.count as f64),
+            Agg::Distinct => StrValue::Num(self.distinct.len() as f64),
+            // Numeric aggs are meaningless on text — report the last value.
+            _ => StrValue::Text(self.last_val.clone()),
+        }
+    }
+}
+
+pub fn run_query_str(
+    series: &BTreeMap<SeriesKey, StrSeries>,
+    spec: &QuerySpec,
+) -> Vec<StrResultSeries> {
+    let mut groups: BTreeMap<Vec<String>, BTreeMap<i64, StrAcc>> = BTreeMap::new();
+    for (key, s) in series {
+        if key.measurement != spec.measurement || key.field != spec.field {
+            continue;
+        }
+        if !spec
+            .tag_filters
+            .iter()
+            .all(|p| key.tag(&p.key) == Some(p.value.as_str()))
+        {
+            continue;
+        }
+        let gvals: Vec<String> = spec
+            .group_tags
+            .iter()
+            .map(|k| key.tag(k).unwrap_or("").to_string())
+            .collect();
+        let buckets = groups.entry(gvals).or_default();
+        s.for_each_in(spec.start, spec.end, |t, v| {
+            let bucket = match spec.interval {
+                Some(iv) if iv > 0 => t - t.rem_euclid(iv),
+                _ => spec.start,
+            };
+            buckets.entry(bucket).or_default().add(t, v);
+        });
+    }
+    groups
+        .into_iter()
+        .map(|(gvals, buckets)| StrResultSeries {
+            tags: spec.group_tags.iter().cloned().zip(gvals).collect(),
+            points: buckets
+                .into_iter()
+                .map(|(ts, acc)| StrGroupPoint {
                     ts,
                     value: acc.value(spec.agg),
                 })

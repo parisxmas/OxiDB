@@ -21,7 +21,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::model::{FieldType, SeriesKey};
-use crate::store::{Block, Series};
+use crate::store::{Block, Series, StrSeries};
 
 pub struct Persist {
     dir: PathBuf,
@@ -65,27 +65,45 @@ impl Persist {
     pub fn open(
         dir: &Path,
         series: &mut BTreeMap<SeriesKey, Series>,
+        str_series: &mut BTreeMap<SeriesKey, StrSeries>,
         block_points: usize,
     ) -> io::Result<Persist> {
         fs::create_dir_all(dir)?;
         let generation = read_gen(dir);
 
-        // Load the snapshot's sealed blocks.
+        // Load the snapshot: numeric block records + string-series records.
         if let Ok(f) = File::open(blocks_path(dir, generation)) {
             let mut r = BufReader::new(f);
-            while let Some((key, ftype, block)) = read_block(&mut r)? {
-                let s = series.entry(key).or_default();
-                s.set_ftype(ftype);
-                s.push_block(block);
+            while let Some(rec) = read_snapshot_record(&mut r)? {
+                match rec {
+                    SnapRec::Num(key, ftype, block) => {
+                        let s = series.entry(key).or_default();
+                        s.set_ftype(ftype);
+                        s.push_block(block);
+                    }
+                    SnapRec::Str(key, pts) => {
+                        let s = str_series.entry(key).or_default();
+                        for (ts, val) in pts {
+                            s.push(ts, val);
+                        }
+                    }
+                }
             }
         }
         // Replay the WAL (points written after the snapshot).
         if let Ok(f) = File::open(wal_path(dir, generation)) {
             let mut r = BufReader::new(f);
-            while let Some((key, ftype, ts, val)) = read_wal_rec(&mut r)? {
-                let s = series.entry(key).or_default();
-                s.set_ftype(ftype);
-                s.push(ts, val, block_points);
+            while let Some(rec) = read_wal_rec(&mut r)? {
+                match rec {
+                    WalRec::Num(key, ftype, ts, val) => {
+                        let s = series.entry(key).or_default();
+                        s.set_ftype(ftype);
+                        s.push(ts, val, block_points);
+                    }
+                    WalRec::Str(key, ts, val) => {
+                        str_series.entry(key).or_default().push(ts, val);
+                    }
+                }
             }
         }
 
@@ -120,13 +138,30 @@ impl Persist {
         Ok(())
     }
 
+    /// Append one text sample to the WAL.
+    pub fn wal_append_str(&mut self, key: &SeriesKey, ts: i64, val: &str) -> io::Result<()> {
+        let mut buf = Vec::with_capacity(64 + val.len());
+        write_key(&mut buf, key);
+        buf.push(FieldType::Str.to_u8());
+        buf.extend_from_slice(&ts.to_le_bytes());
+        buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        buf.extend_from_slice(val.as_bytes());
+        self.wal.write_all(&buf)?;
+        self.wal_bytes += buf.len() as u64;
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> io::Result<()> {
         self.wal.flush()
     }
 
     /// Write a full snapshot of `series` at generation+1, commit the MANIFEST, and
     /// rotate the WAL. Callers must seal active buffers first.
-    pub fn checkpoint(&mut self, series: &BTreeMap<SeriesKey, Series>) -> io::Result<()> {
+    pub fn checkpoint(
+        &mut self,
+        series: &BTreeMap<SeriesKey, Series>,
+        str_series: &BTreeMap<SeriesKey, StrSeries>,
+    ) -> io::Result<()> {
         let next = self.generation + 1;
         {
             let f = File::create(blocks_path(&self.dir, next))?;
@@ -135,6 +170,9 @@ impl Persist {
                 for b in s.sealed_blocks() {
                     write_block(&mut w, key, s.ftype(), b)?;
                 }
+            }
+            for (key, s) in str_series {
+                write_str_series(&mut w, key, s.points())?;
             }
             w.flush()?;
             w.get_ref().sync_all()?;
@@ -186,6 +224,25 @@ fn write_block<W: Write>(
     buf.extend_from_slice(&(b.count as u32).to_le_bytes());
     buf.extend_from_slice(&(b.bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(&b.bytes);
+    w.write_all(&buf)
+}
+
+/// One string-series snapshot record: `[key][ftype=Str][npoints u32][(ts, len,
+/// bytes)*]`.
+fn write_str_series<W: Write>(
+    w: &mut W,
+    key: &SeriesKey,
+    points: &[(i64, String)],
+) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(32);
+    write_key(&mut buf, key);
+    buf.push(FieldType::Str.to_u8());
+    buf.extend_from_slice(&(points.len() as u32).to_le_bytes());
+    for (ts, s) in points {
+        buf.extend_from_slice(&ts.to_le_bytes());
+        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
     w.write_all(&buf)
 }
 
@@ -254,13 +311,48 @@ fn read_u8<R: Read>(r: &mut R) -> io::Result<Option<u8>> {
     Ok(Some(b[0]))
 }
 
-fn read_block<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, FieldType, Block)>> {
+fn read_u32<R: Read>(r: &mut R) -> io::Result<Option<u32>> {
+    let mut b = [0u8; 4];
+    if !read_exact_opt(r, &mut b)? {
+        return Ok(None);
+    }
+    Ok(Some(u32::from_le_bytes(b)))
+}
+
+enum SnapRec {
+    Num(SeriesKey, FieldType, Block),
+    Str(SeriesKey, Vec<(i64, String)>),
+}
+
+fn read_snapshot_record<R: Read>(r: &mut R) -> io::Result<Option<SnapRec>> {
     let Some(key) = read_key(r)? else {
         return Ok(None);
     };
     let Some(ft) = read_u8(r)? else {
         return Ok(None);
     };
+    if FieldType::from_u8(ft) == FieldType::Str {
+        let Some(n) = read_u32(r)? else {
+            return Ok(None);
+        };
+        let mut pts = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let mut tsb = [0u8; 8];
+            if !read_exact_opt(r, &mut tsb)? {
+                return Ok(None);
+            }
+            let ts = i64::from_le_bytes(tsb);
+            let Some(len) = read_u32(r)? else {
+                return Ok(None);
+            };
+            let mut sb = vec![0u8; len as usize];
+            if !read_exact_opt(r, &mut sb)? {
+                return Ok(None);
+            }
+            pts.push((ts, String::from_utf8_lossy(&sb).into_owned()));
+        }
+        return Ok(Some(SnapRec::Str(key, pts)));
+    }
     let mut hdr = [0u8; 8 + 8 + 4 + 4];
     if !read_exact_opt(r, &mut hdr)? {
         return Ok(None);
@@ -273,7 +365,7 @@ fn read_block<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, FieldType, Bl
     if !read_exact_opt(r, &mut bytes)? {
         return Ok(None);
     }
-    Ok(Some((
+    Ok(Some(SnapRec::Num(
         key,
         FieldType::from_u8(ft),
         Block {
@@ -285,18 +377,41 @@ fn read_block<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, FieldType, Bl
     )))
 }
 
-fn read_wal_rec<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, FieldType, i64, f64)>> {
+enum WalRec {
+    Num(SeriesKey, FieldType, i64, f64),
+    Str(SeriesKey, i64, String),
+}
+
+fn read_wal_rec<R: Read>(r: &mut R) -> io::Result<Option<WalRec>> {
     let Some(key) = read_key(r)? else {
         return Ok(None);
     };
     let Some(ft) = read_u8(r)? else {
         return Ok(None);
     };
-    let mut b = [0u8; 16];
-    if !read_exact_opt(r, &mut b)? {
+    let mut tsb = [0u8; 8];
+    if !read_exact_opt(r, &mut tsb)? {
         return Ok(None);
     }
-    let ts = i64::from_le_bytes(b[0..8].try_into().unwrap());
-    let val = f64::from_bits(u64::from_le_bytes(b[8..16].try_into().unwrap()));
-    Ok(Some((key, FieldType::from_u8(ft), ts, val)))
+    let ts = i64::from_le_bytes(tsb);
+    if FieldType::from_u8(ft) == FieldType::Str {
+        let Some(len) = read_u32(r)? else {
+            return Ok(None);
+        };
+        let mut sb = vec![0u8; len as usize];
+        if !read_exact_opt(r, &mut sb)? {
+            return Ok(None);
+        }
+        return Ok(Some(WalRec::Str(
+            key,
+            ts,
+            String::from_utf8_lossy(&sb).into_owned(),
+        )));
+    }
+    let mut vb = [0u8; 8];
+    if !read_exact_opt(r, &mut vb)? {
+        return Ok(None);
+    }
+    let val = f64::from_bits(u64::from_le_bytes(vb));
+    Ok(Some(WalRec::Num(key, FieldType::from_u8(ft), ts, val)))
 }

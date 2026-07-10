@@ -3,8 +3,8 @@
 //! ```text
 //! measurement[,tag=val,...] field=val[,field=val,...] [timestamp]
 //! ```
-//! Field values: `1.5` float, `10i` integer, `t`/`true`/`f`/`false` boolean.
-//! (String field values `"..."` are skipped — this engine stores numerics.)
+//! Field values: `1.5` float, `10i` integer, `t`/`true`/`f`/`false` boolean,
+//! `"..."` string (internal spaces must be backslash-escaped in this MVP).
 //! The timestamp is epoch **milliseconds** here; when absent the caller supplies
 //! one. Backslash escapes for `,` ` ` `=` in identifiers are honored.
 
@@ -57,7 +57,8 @@ fn parse_line(line: &str, default_ts: i64) -> Result<Point, String> {
             Some(FieldValue::Float(x)) => point = point.field(&name, x),
             Some(FieldValue::Int(x)) => point = point.field_int(&name, x),
             Some(FieldValue::Bool(x)) => point = point.field_bool(&name, x),
-            None => continue, // string field — skip
+            Some(FieldValue::Str(x)) => point = point.field_str(&name, &x),
+            None => continue, // unparseable — skip
         }
         any = true;
     }
@@ -68,8 +69,9 @@ fn parse_line(line: &str, default_ts: i64) -> Result<Point, String> {
 }
 
 fn parse_field_value(v: &str) -> Option<FieldValue> {
-    if v.starts_with('"') {
-        return None; // string field, unsupported
+    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
+        // Quoted string field.
+        return Some(FieldValue::Str(v[1..v.len() - 1].to_string()));
     }
     match v {
         "t" | "T" | "true" | "True" | "TRUE" => return Some(FieldValue::Bool(true)),
