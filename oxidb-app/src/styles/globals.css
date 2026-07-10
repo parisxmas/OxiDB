@@ -930,3 +930,33 @@ tr:hover .row-del { opacity: 1; }
   opacity: 0.85;
 }
 .sidebar-link.active .sidebar-icon { opacity: 1; }
+
+/* ── Schema tree: database root node ────────────────────────────────── */
+.schema-db-node {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 8px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+  font-family: var(--font-mono);
+}
+.schema-db-node:hover { background: var(--bg-primary); }
+.schema-db-node.open { color: var(--accent); }
+.schema-db-node-icon { font-size: 12px; }
+.schema-db-node-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.schema-db-node-loading { color: var(--text-secondary); }
+.schema-db-children {
+  padding-left: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}

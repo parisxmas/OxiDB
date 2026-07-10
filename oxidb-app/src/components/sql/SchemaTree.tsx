@@ -65,15 +65,19 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [procsOpen, setProcsOpen] = useState(true);
   const [viewProc, setViewProc] = useState<ProcInfo | null>(null);
   const [showImport, setShowImport] = useState(false);
+  const [dbOpen, setDbOpen] = useState(false); // database root node — collapsed by default
+  const [loaded, setLoaded] = useState(false); // have we run SHOW TABLES for this db yet
   const { db } = useDatabase();
 
-  // The global database selector (header) drives `db`; reload the tree when
-  // it changes.
+  // Switching database collapses the root and forgets what was loaded, so the
+  // next expand re-runs SHOW TABLES against the newly selected database.
   useEffect(() => {
+    setDbOpen(false);
+    setLoaded(false);
+    setTables([]);
     setCols({});
     setProcs([]);
-    loadTables();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    setError(null);
   }, [db]);
 
   const loadTables = useCallback(async () => {
@@ -115,12 +119,26 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
       setTables([]);
     } finally {
       setLoading(false);
+      setLoaded(true);
+      setDbOpen(true); // a refresh/DDL reveals the tree
     }
   }, []);
 
+  // Toggle the database root node; load on first expand.
+  const toggleDb = useCallback(() => {
+    setDbOpen((o) => {
+      const next = !o;
+      if (next && !loaded) loadTables();
+      return next;
+    });
+  }, [loaded, loadTables]);
+
+  // A DDL run (create/alter/drop) bumps refreshKey — only reload if the tree
+  // has already been opened, so it stays collapsed until the user expands it.
   useEffect(() => {
-    loadTables();
-  }, [loadTables, refreshKey]);
+    if (refreshKey && loaded) loadTables();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
 
   const loadColumns = useCallback(async (table: string) => {
     const sel = firstSelect(await runSql(`DESCRIBE ${table}`));
@@ -244,12 +262,26 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
         </div>
       </div>
 
+      {/* Database root node — collapsed by default; expanding runs SHOW TABLES */}
+      <div
+        className={`schema-db-node${dbOpen ? " open" : ""}`}
+        onClick={toggleDb}
+        title="Click to expand — loads tables (SHOW TABLES)"
+      >
+        <span className="schema-caret">{dbOpen ? "▾" : "▸"}</span>
+        <span className="schema-db-node-icon">🗄</span>
+        <span className="schema-db-node-name">{db || "database"}</span>
+        {loading && <span className="schema-db-node-loading">…</span>}
+      </div>
+
+      {dbOpen && (
+      <div className="schema-db-children">
       {error ? (
         <div className="schema-empty">{error}</div>
+      ) : loading && !loaded ? (
+        <div className="schema-empty">Loading…</div>
       ) : tables.length === 0 ? (
-        <div className="schema-empty">
-          {loading ? "Loading…" : "No tables"}
-        </div>
+        <div className="schema-empty">No tables</div>
       ) : (
         <ul className="schema-list">
           {tables.map((t) => (
@@ -341,6 +373,8 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
             </ul>
           )}
         </div>
+      )}
+      </div>
       )}
 
       {menu && (
