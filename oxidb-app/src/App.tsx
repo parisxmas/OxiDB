@@ -3,6 +3,7 @@ import { ThemeProvider } from "./context/ThemeContext";
 import { FontScaleProvider } from "./context/FontScaleContext";
 import { ConnectionProvider, useConnection } from "./context/ConnectionContext";
 import { DatabaseProvider } from "./context/DatabaseContext";
+import { SqlSessionProvider } from "./context/SqlSessionContext";
 import { ToastProvider } from "./components/common/Toast";
 import { AppLayout } from "./components/layout/AppLayout";
 import { ConnectionScreen } from "./components/connection/ConnectionScreen";
@@ -54,9 +55,11 @@ export default function App() {
         <ConnectionProvider>
           <DatabaseProvider>
             <ToastProvider>
-              <BrowserRouter>
-                <AppRoutes />
-              </BrowserRouter>
+              <SqlSessionProvider>
+                <BrowserRouter>
+                  <AppRoutes />
+                </BrowserRouter>
+              </SqlSessionProvider>
             </ToastProvider>
           </DatabaseProvider>
         </ConnectionProvider>

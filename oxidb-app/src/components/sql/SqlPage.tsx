@@ -9,63 +9,17 @@ import { EditableResultGrid } from "./EditableResultGrid";
 import { Pagination } from "../common/Pagination";
 import { useToast } from "../common/Toast";
 import { useConnection } from "../../context/ConnectionContext";
+import {
+  useSqlSession,
+  newTab,
+  type StmtResult,
+  type QueryTab,
+} from "../../context/SqlSessionContext";
 
 const HISTORY_KEY = "oxidb-sql-history";
 
-function loadHistory(): string[] {
-  try {
-    return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
-  } catch {
-    return [];
-  }
-}
 function saveHistory(items: string[]) {
   localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, 50)));
-}
-
-interface StmtResult {
-  columns?: string[];
-  types?: (string | null)[];
-  rows?: JsonValue[][];
-  affected?: number;
-  last_insert_id?: number;
-  ddl?: boolean;
-  transaction?: boolean;
-  /** print() output from a stored procedure (like a psql NOTICE). */
-  notices?: string[];
-}
-
-/** One query tab — its own editor text, results and view state. */
-interface QueryTab {
-  id: number;
-  name: string;
-  sql: string;
-  results: StmtResult[] | null;
-  error: string | null;
-  elapsed: number | null;
-  loading: boolean;
-  active: number; // focused statement index
-  browseTable: string | null;
-  resultTab: "query" | "data";
-  page: number;
-  pageSize: number;
-}
-
-function newTab(id: number): QueryTab {
-  return {
-    id,
-    name: `Query ${id}`,
-    sql: "SELECT name FROM sqlite_schema;\n-- ⌘/Ctrl+Enter to run",
-    results: null,
-    error: null,
-    elapsed: null,
-    loading: false,
-    active: 0,
-    browseTable: null,
-    resultTab: "query",
-    page: 0,
-    pageSize: 100,
-  };
 }
 
 function summarize(r: StmtResult): string {
@@ -81,10 +35,10 @@ export function SqlPage() {
   const toast = useToast();
   const { status } = useConnection();
 
-  const [tabs, setTabs] = useState<QueryTab[]>([newTab(1)]);
-  const [activeIdx, setActiveIdx] = useState(0);
-  const nextId = useRef(2);
-  const [history, setHistory] = useState<string[]>(loadHistory);
+  // Session state (tabs, active tab, history) lives above the router so it
+  // survives navigating to another view and back.
+  const { tabs, setTabs, activeIdx, setActiveIdx, allocId, history, setHistory } =
+    useSqlSession();
   const [schemaKey, setSchemaKey] = useState(0);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -112,12 +66,25 @@ export function SqlPage() {
 
   // ── Tab management ────────────────────────────────────────────────
   const addTab = useCallback(() => {
-    const id = nextId.current++;
+    const id = allocId();
     setTabs((ts) => {
       setActiveIdx(ts.length); // focus the appended tab
       return [...ts, newTab(id)];
     });
-  }, []);
+  }, [allocId, setTabs, setActiveIdx]);
+
+  /** Open a table's data view in a NEW tab (double-clicking a table), instead
+   *  of replacing whatever the active tab is showing. */
+  const openBrowseTab = useCallback(
+    (tbl: string) => {
+      const id = allocId();
+      setTabs((ts) => {
+        setActiveIdx(ts.length);
+        return [...ts, { ...newTab(id), name: tbl, browseTable: tbl, resultTab: "data" as const }];
+      });
+    },
+    [allocId, setTabs, setActiveIdx]
+  );
 
   const closeTab = useCallback(
     (idx: number) => {
@@ -225,7 +192,7 @@ export function SqlPage() {
           refreshKey={schemaKey}
           onInsert={insertAtCursor}
           onQuery={(q) => patchActive({ sql: q })}
-          onBrowse={(tbl) => patchActive({ browseTable: tbl, resultTab: "data" })}
+          onBrowse={openBrowseTab}
         />
       </div>
 
