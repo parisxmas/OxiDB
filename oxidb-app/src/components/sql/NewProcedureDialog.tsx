@@ -221,6 +221,13 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
               scrollBeyondLastLine: false,
               automaticLayout: true,
               tabSize: 4,
+              // Don't box non-ASCII/"ambiguous" chars — Turkish letters (ı, ş…)
+              // in comments are legitimate, not homoglyph attacks.
+              unicodeHighlight: {
+                ambiguousCharacters: false,
+                invisibleCharacters: false,
+                nonBasicASCII: false,
+              },
             }}
           />
         </div>

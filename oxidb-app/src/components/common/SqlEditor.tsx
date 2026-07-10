@@ -53,6 +53,13 @@ export function SqlEditor({
         automaticLayout: true,
         wordWrap: "off",
         suggestOnTriggerCharacters: true,
+        // Don't box non-ASCII/"ambiguous" chars — Turkish letters (ı, ş…) in
+        // comments and string literals are legitimate, not homoglyph attacks.
+        unicodeHighlight: {
+          ambiguousCharacters: false,
+          invisibleCharacters: false,
+          nonBasicASCII: false,
+        },
       }}
     />
   );
