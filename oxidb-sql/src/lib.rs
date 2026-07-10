@@ -1590,6 +1590,105 @@ mod tests {
         assert_eq!(db.row_count("users").unwrap(), 1);
     }
 
+    fn select_rows(db: &SqlEngine, sql: &str) -> Vec<Vec<Value>> {
+        match db.execute(sql).unwrap().pop().unwrap() {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("expected Select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_on_keeps_first_per_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE sales (id INT PRIMARY KEY, cust INT, amount INT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO sales VALUES (1,10,5),(2,10,9),(3,10,3),(4,20,7),(5,20,7),(6,30,1)",
+        )
+        .unwrap();
+        // Highest-amount row per customer (argmax) — DISTINCT ON + ORDER BY.
+        let rows = select_rows(
+            &db,
+            "SELECT DISTINCT ON (cust) cust, amount FROM sales \
+             ORDER BY cust, amount DESC",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(10), Value::Int(9)],
+                vec![Value::Int(20), Value::Int(7)],
+                vec![Value::Int(30), Value::Int(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_on_over_group_by_is_argmax() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE s (id INT PRIMARY KEY, cust INT, cat TEXT, spend INT)")
+            .unwrap();
+        // cust 1: books=10, toys=25 → toys.  cust 2: books=8, toys=3 → books.
+        db.execute(
+            "INSERT INTO s VALUES \
+             (1,1,'books',6),(2,1,'books',4),(3,1,'toys',25),\
+             (4,2,'books',8),(5,2,'toys',3)",
+        )
+        .unwrap();
+        // Dominant category per customer: GROUP BY (cust,cat) sums, then
+        // DISTINCT ON (cust) picks the top by summed spend.
+        let rows = select_rows(
+            &db,
+            "SELECT DISTINCT ON (cust) cust, cat, SUM(spend) AS s \
+             FROM s GROUP BY cust, cat ORDER BY cust, SUM(spend) DESC",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("toys".into()), Value::Int(25)],
+                vec![Value::Int(2), Value::Text("books".into()), Value::Int(8)],
+            ]
+        );
+    }
+
+    #[test]
+    fn mode_within_group_returns_most_frequent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, g INT, c TEXT)")
+            .unwrap();
+        db.execute(
+            "INSERT INTO t VALUES \
+             (1,1,'a'),(2,1,'a'),(3,1,'b'),(4,2,'x'),(5,2,'y'),(6,2,'x')",
+        )
+        .unwrap();
+        let rows = select_rows(
+            &db,
+            "SELECT g, mode() WITHIN GROUP (ORDER BY c) FROM t GROUP BY g ORDER BY g",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Text("a".into())],
+                vec![Value::Int(2), Value::Text("x".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn mode_ties_break_to_smallest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        // 5 and 9 each appear twice; the tie breaks to the smaller value.
+        db.execute("INSERT INTO t VALUES (1,9),(2,5),(3,9),(4,5),(5,7)")
+            .unwrap();
+        let rows = select_rows(&db, "SELECT mode() WITHIN GROUP (ORDER BY v) FROM t");
+        assert_eq!(rows, vec![vec![Value::Int(5)]]);
+    }
+
     #[test]
     fn create_table_rejects_duplicate() {
         let dir = tempfile::tempdir().unwrap();

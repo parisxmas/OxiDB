@@ -74,9 +74,12 @@ fn unsupported_select_features() {
         db.execute("SELECT id FROM t INTERSECT SELECT id FROM t")
             .is_err()
     );
-    // SELECT DISTINCT is supported since ADR-0013 Phase A; DISTINCT ON and
-    // aggregate DISTINCT still are not.
-    assert!(db.execute("SELECT DISTINCT ON (id) id FROM t").is_err());
+    // SELECT DISTINCT (Phase A) and DISTINCT ON (argmax) are supported; aggregate
+    // DISTINCT still is not.
+    assert!(
+        db.execute("SELECT DISTINCT ON (id) id FROM t ORDER BY id")
+            .is_ok()
+    );
     assert!(db.execute("SELECT COUNT(DISTINCT id) FROM t").is_err());
     // Derived tables are supported since ADR-0013 Phase E; an alias is required.
     assert!(db.execute("SELECT * FROM (SELECT id FROM t) x").is_ok());

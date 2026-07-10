@@ -1206,11 +1206,20 @@ fn translate_select_core(select: sp::Select, p: &mut usize) -> Result<SelectStmt
             "SELECT must reference exactly one table in FROM (use JOIN)".into(),
         ));
     }
-    let distinct = match &select.distinct {
-        None => false,
-        Some(sp::Distinct::Distinct) => true,
-        Some(sp::Distinct::On(_)) => {
-            return Err(SqlError::Unsupported("SELECT DISTINCT ON (...)".into()));
+    let (distinct, distinct_on) = match select.distinct.clone() {
+        None => (false, Vec::new()),
+        Some(sp::Distinct::Distinct) => (true, Vec::new()),
+        Some(sp::Distinct::On(exprs)) => {
+            let on = exprs
+                .into_iter()
+                .map(|e| translate_expr(e, p))
+                .collect::<Result<Vec<_>>>()?;
+            if on.is_empty() {
+                return Err(SqlError::Unsupported(
+                    "DISTINCT ON () with no expressions".into(),
+                ));
+            }
+            (false, on)
         }
     };
 
@@ -1262,6 +1271,7 @@ fn translate_select_core(select: sp::Select, p: &mut usize) -> Result<SelectStmt
 
     Ok(SelectStmt {
         distinct,
+        distinct_on,
         from,
         joins,
         projection,
@@ -1747,6 +1757,34 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             )));
         }
         return Ok(Expr::Func { func, args: exprs });
+    }
+
+    // Ordered-set aggregate: `mode() WITHIN GROUP (ORDER BY expr)`. The value
+    // whose mode is taken comes from the WITHIN GROUP clause, not the arg list.
+    if fname == "mode" {
+        if !args.is_empty() {
+            return Err(SqlError::Unsupported(
+                "mode() takes no direct arguments".into(),
+            ));
+        }
+        if f.over.is_some() {
+            return Err(SqlError::Unsupported("mode() OVER (...)".into()));
+        }
+        if f.within_group.len() != 1 {
+            return Err(SqlError::Unsupported(
+                "mode() requires exactly one WITHIN GROUP (ORDER BY <expr>)".into(),
+            ));
+        }
+        let arg = translate_expr(f.within_group.into_iter().next().unwrap().expr, p)?;
+        return Ok(Expr::Aggregate {
+            func: AggFunc::Mode,
+            arg: Some(Box::new(arg)),
+        });
+    }
+    if !f.within_group.is_empty() {
+        return Err(SqlError::Unsupported(
+            "WITHIN GROUP is only supported for mode()".into(),
+        ));
     }
 
     if args.len() > 1 {

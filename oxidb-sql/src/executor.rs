@@ -1763,6 +1763,8 @@ fn compute_window(
                                     }
                                 }
                                 AggFunc::Count => {}
+                                // mode() OVER is rejected at parse; unreachable here.
+                                AggFunc::Mode => {}
                             }
                         }
                         let v = match agg {
@@ -1770,6 +1772,7 @@ fn compute_window(
                             AggFunc::Sum => sum.clone().into_sum(),
                             AggFunc::Avg => sum.clone().into_avg(count),
                             AggFunc::Min | AggFunc::Max => best.clone().unwrap_or(Value::Null),
+                            AggFunc::Mode => Value::Null,
                         };
                         for &i in &part[start..end] {
                             out[i as usize] = v.clone();
@@ -2981,15 +2984,32 @@ fn select_simple<S: Store>(
     };
 
     let proj_corr = proj.iter().any(|(_, e)| has_corr(e));
+    // DISTINCT ON (exprs): keep the first row per key group after ordering.
+    let don = &select.distinct_on;
+    let don_corr = don.iter().any(has_corr);
+    let dkey = |i: usize, p: &[Value]| -> Result<Vec<IndexKey>> {
+        let view = View {
+            src,
+            tuple: tuples.row(i),
+        };
+        don.iter()
+            .map(|e| eval_scalar_corr(store, don_corr, e, schema, &view, p).map(IndexKey))
+            .collect()
+    };
+
     if order_by.is_empty() {
         let mut out = Vec::with_capacity(n);
+        let mut seen: std::collections::BTreeSet<Vec<IndexKey>> = std::collections::BTreeSet::new();
         for i in 0..n {
+            row_params(i, &mut pbuf);
+            let p: &[Value] = if win_vals.is_empty() { params } else { &pbuf };
+            if !don.is_empty() && !seen.insert(dkey(i, p)?) {
+                continue;
+            }
             let view = View {
                 src,
                 tuple: tuples.row(i),
             };
-            row_params(i, &mut pbuf);
-            let p: &[Value] = if win_vals.is_empty() { params } else { &pbuf };
             let row: Vec<Value> = proj
                 .iter()
                 .map(|(_, e)| eval_scalar_corr(store, proj_corr, e, schema, &view, p))
@@ -3001,14 +3021,19 @@ fn select_simple<S: Store>(
 
     // Evaluate the sort keys once per row (not per comparison), then sort.
     let keys_corr = order_by.iter().any(|(e, _)| has_corr(e));
-    let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(n);
+    let mut keyed: Vec<(Vec<Value>, Vec<IndexKey>, Vec<Value>)> = Vec::with_capacity(n);
     for i in 0..n {
+        row_params(i, &mut pbuf);
+        let p: &[Value] = if win_vals.is_empty() { params } else { &pbuf };
+        let dk = if don.is_empty() {
+            Vec::new()
+        } else {
+            dkey(i, p)?
+        };
         let view = View {
             src,
             tuple: tuples.row(i),
         };
-        row_params(i, &mut pbuf);
-        let p: &[Value] = if win_vals.is_empty() { params } else { &pbuf };
         let keys: Vec<Value> = order_by
             .iter()
             .map(|(e, _)| eval_scalar_corr(store, keys_corr, e, schema, &view, p))
@@ -3017,10 +3042,19 @@ fn select_simple<S: Store>(
             .iter()
             .map(|(_, e)| eval_scalar_corr(store, proj_corr, e, schema, &view, p))
             .collect::<Result<_>>()?;
-        keyed.push((keys, row));
+        keyed.push((keys, dk, row));
     }
     keyed.sort_by(|a, b| cmp_keys(&order_by, &a.0, &b.0));
-    Ok(keyed.into_iter().map(|(_, row)| row).collect())
+    if don.is_empty() {
+        Ok(keyed.into_iter().map(|(_, _, row)| row).collect())
+    } else {
+        let mut seen: std::collections::BTreeSet<Vec<IndexKey>> = std::collections::BTreeSet::new();
+        Ok(keyed
+            .into_iter()
+            .filter(|(_, dk, _)| seen.insert(dk.clone()))
+            .map(|(_, _, row)| row)
+            .collect())
+    }
 }
 
 /// Aggregated projection: group tuples, compute aggregates per group.
@@ -3035,7 +3069,12 @@ fn select_aggregated(
     // Group by the group-by key (empty group-by => single group over all rows).
     let groups = group_tuples(schema, src, tuples, &select.group_by, params)?;
 
-    let mut prepared: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(groups.len());
+    // DISTINCT ON over aggregated output: the ON expressions are evaluated per
+    // group (like the projection). This is the argmax idiom — GROUP BY (a, b),
+    // ORDER BY a, agg DESC, DISTINCT ON (a) keeps the top b per a.
+    let don = &select.distinct_on;
+    let mut prepared: Vec<(Vec<Value>, Vec<IndexKey>, Vec<Value>)> =
+        Vec::with_capacity(groups.len());
     for group in &groups {
         if let Some(having) = &select.having
             && !truthy(&eval_agg(having, schema, src, tuples, group, params)?)
@@ -3052,13 +3091,26 @@ fn select_aggregated(
             .iter()
             .map(|(e, _)| eval_agg(e, schema, src, tuples, group, params))
             .collect::<Result<_>>()?;
-        prepared.push((keys, out));
+        let dk: Vec<IndexKey> = don
+            .iter()
+            .map(|e| eval_agg(e, schema, src, tuples, group, params).map(IndexKey))
+            .collect::<Result<_>>()?;
+        prepared.push((keys, dk, out));
     }
 
     if !select.order_by.is_empty() {
         prepared.sort_by(|a, b| cmp_keys(&select.order_by, &a.0, &b.0));
     }
-    Ok(prepared.into_iter().map(|(_, out)| out).collect())
+    if don.is_empty() {
+        Ok(prepared.into_iter().map(|(_, _, out)| out).collect())
+    } else {
+        let mut seen: std::collections::BTreeSet<Vec<IndexKey>> = std::collections::BTreeSet::new();
+        Ok(prepared
+            .into_iter()
+            .filter(|(_, dk, _)| seen.insert(dk.clone()))
+            .map(|(_, _, out)| out)
+            .collect())
+    }
 }
 
 /// Group tuple indices by the evaluated group-by key, preserving first-seen
@@ -3252,7 +3304,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
         Expr::Aggregate { func, arg } => match func {
             AggFunc::Count => Some(SqlType::Int),
             AggFunc::Avg => Some(SqlType::Double),
-            AggFunc::Sum | AggFunc::Min | AggFunc::Max => {
+            AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Mode => {
                 arg.as_deref().and_then(|a| expr_type(a, schema))
             }
         },
@@ -3299,6 +3351,7 @@ fn default_name(expr: &Expr) -> String {
             AggFunc::Avg => "avg",
             AggFunc::Min => "min",
             AggFunc::Max => "max",
+            AggFunc::Mode => "mode",
         }
     }
     match expr {
@@ -3980,6 +4033,39 @@ fn eval_aggregate(
             } else {
                 Ok(sum.into_avg(n))
             }
+        }
+        AggFunc::Mode => {
+            // Most frequent non-null value; ties broken by the smallest value
+            // (SQL-standard `mode() WITHIN GROUP`). Tally by total order.
+            let mut counts: Vec<(Value, i64)> = Vec::new();
+            for i in group {
+                let v = eval_scalar(arg, schema, &view_of(i), params)?;
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                match counts
+                    .iter_mut()
+                    .find(|(k, _)| Value::total_order(k, &v) == Ordering::Equal)
+                {
+                    Some((_, c)) => *c += 1,
+                    None => counts.push((v, 1)),
+                }
+            }
+            let best = counts.into_iter().reduce(|a, b| {
+                match a.1.cmp(&b.1) {
+                    Ordering::Greater => a,
+                    Ordering::Less => b,
+                    // tie → smaller value wins
+                    Ordering::Equal => {
+                        if Value::total_order(&a.0, &b.0) == Ordering::Greater {
+                            b
+                        } else {
+                            a
+                        }
+                    }
+                }
+            });
+            Ok(best.map(|(v, _)| v).unwrap_or(Value::Null))
         }
     }
 }

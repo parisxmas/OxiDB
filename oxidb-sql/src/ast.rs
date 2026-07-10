@@ -167,6 +167,9 @@ pub struct SelectStmt {
     /// `SELECT DISTINCT`: deduplicate output rows (after projection and
     /// ordering, before LIMIT/OFFSET).
     pub distinct: bool,
+    /// `SELECT DISTINCT ON (exprs)`: keep the first row of each group of these
+    /// expressions after ORDER BY (Postgres semantics). Empty = not used.
+    pub distinct_on: Vec<Expr>,
     pub from: TableRef,
     pub joins: Vec<Join>,
     pub projection: Vec<SelectItem>,
@@ -367,6 +370,10 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    /// `mode() WITHIN GROUP (ORDER BY expr)` — the most frequent value of the
+    /// within-group expression (ties broken by the smallest value). The arg
+    /// carries that within-group expression.
+    Mode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
