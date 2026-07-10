@@ -361,7 +361,7 @@ export function CollectionBrowser() {
 
       {/* View document */}
       {viewDoc && (
-        <div className="dialog-overlay" onClick={() => setViewDoc(null)}>
+        <div className="dialog-overlay">
           <div className="dialog" style={{ minWidth: 560 }} onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">Document</div>
             <JsonViewer data={viewDoc} />
@@ -382,7 +382,7 @@ export function CollectionBrowser() {
 
       {/* Insert dialog */}
       {showInsert && (
-        <div className="dialog-overlay" onClick={() => setShowInsert(false)}>
+        <div className="dialog-overlay">
           <div className="dialog" style={{ minWidth: 520 }} onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">Insert Document</div>
             <JsonEditor value={insertJson} onChange={setInsertJson} height="250px" />
@@ -396,7 +396,7 @@ export function CollectionBrowser() {
 
       {/* Edit dialog */}
       {showEdit && (
-        <div className="dialog-overlay" onClick={() => setShowEdit(false)}>
+        <div className="dialog-overlay">
           <div className="dialog" style={{ minWidth: 520 }} onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">Edit Document (ID: {editDocId})</div>
             <JsonEditor value={editJson} onChange={setEditJson} height="250px" />
@@ -410,7 +410,7 @@ export function CollectionBrowser() {
 
       {/* Create collection dialog */}
       {showNewColl && (
-        <div className="dialog-overlay" onClick={() => setShowNewColl(false)}>
+        <div className="dialog-overlay">
           <div className="dialog" onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">Create Collection</div>
             <div className="form-group">

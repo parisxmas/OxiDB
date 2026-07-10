@@ -29,7 +29,7 @@ export function PromptDialog({
     if (value.trim()) onConfirm(value.trim());
   };
   return (
-    <div className="dialog-overlay" onClick={onCancel}>
+    <div className="dialog-overlay">
       <div className="dialog" style={{ width: 380 }} onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">{title}</div>
         <div className="form-group">

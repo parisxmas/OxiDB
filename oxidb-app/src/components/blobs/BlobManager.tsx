@@ -302,7 +302,7 @@ export function BlobManager() {
       </div>
 
       {showNewBucket && (
-        <div className="dialog-overlay" onClick={() => setShowNewBucket(false)}>
+        <div className="dialog-overlay">
           <div className="dialog" onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">Create Bucket</div>
             <div className="form-group">
@@ -318,7 +318,7 @@ export function BlobManager() {
       )}
 
       {showUpload && (
-        <div className="dialog-overlay" onClick={() => setShowUpload(false)}>
+        <div className="dialog-overlay">
           <div className="dialog" style={{ minWidth: 480 }} onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">Upload Object to {selected}</div>
             <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
@@ -364,7 +364,7 @@ export function BlobManager() {
       )}
 
       {viewObject && (
-        <div className="dialog-overlay" onClick={() => setViewObject(null)}>
+        <div className="dialog-overlay">
           <div className="dialog" style={{ minWidth: 520 }} onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">Object</div>
             <JsonViewer data={viewObject} />

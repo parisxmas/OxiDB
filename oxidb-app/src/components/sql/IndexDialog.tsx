@@ -112,7 +112,7 @@ export function IndexDialog({ table, onClose, onChanged }: Props) {
   };
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
+    <div className="dialog-overlay">
       <div
         className="dialog"
         style={{ width: 640, maxHeight: "86vh", display: "flex", flexDirection: "column" }}

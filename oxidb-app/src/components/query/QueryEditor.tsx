@@ -258,7 +258,7 @@ export function QueryEditor() {
 
       {/* Edit Document Dialog */}
       {editDoc !== null && (
-        <div className="dialog-overlay" onClick={() => setEditDoc(null)}>
+        <div className="dialog-overlay">
           <div
             className="dialog"
             style={{ width: 700, maxHeight: "80vh", display: "flex", flexDirection: "column" }}

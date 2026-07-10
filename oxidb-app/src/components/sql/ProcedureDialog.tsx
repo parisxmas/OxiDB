@@ -1,4 +1,5 @@
 import { SqlEditor } from "../common/SqlEditor";
+import { useEscapeClose } from "../common/useEscapeClose";
 
 export interface ProcInfo {
   name: string;
@@ -28,6 +29,7 @@ interface Props {
 }
 
 export function ProcedureDialog({ proc, onClose, onInsert, onDrop, onEdit }: Props) {
+  useEscapeClose(onClose);
   const params = proc.params
     .split(",")
     .map((s) => s.trim())
@@ -37,10 +39,10 @@ export function ProcedureDialog({ proc, onClose, onInsert, onDrop, onEdit }: Pro
   const hasSource = proc.language === "cobra" && !proc.definition.startsWith("<cobra bytecode");
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
+    <div className="dialog-overlay">
       <div
         className="dialog"
-        style={{ width: 680, maxHeight: "86vh", display: "flex", flexDirection: "column" }}
+        style={{ width: "min(900px, 92vw)", height: "84vh", display: "flex", flexDirection: "column" }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="dialog-title">
@@ -84,7 +86,7 @@ export function ProcedureDialog({ proc, onClose, onInsert, onDrop, onEdit }: Pro
         <div className="ct-section" style={{ marginTop: 4 }}>
           {proc.language === "cobra" ? (hasSource ? "Source (.cobra)" : "Body") : "Body"}
         </div>
-        <div style={{ height: 240, border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", overflow: "hidden", marginBottom: 12 }}>
+        <div style={{ flex: 1, minHeight: 160, border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", overflow: "hidden", marginBottom: 12 }}>
           <SqlEditor value={proc.definition} readOnly height="100%" />
         </div>
 

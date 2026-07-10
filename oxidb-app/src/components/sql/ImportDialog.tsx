@@ -121,7 +121,7 @@ export function ImportDialog({ tables, onClose, onDone }: Props) {
   }, [data, mode, newName, existing, types, toast, onDone, onClose]);
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
+    <div className="dialog-overlay">
       <div
         className="dialog"
         style={{ width: 720, maxHeight: "88vh", display: "flex", flexDirection: "column" }}

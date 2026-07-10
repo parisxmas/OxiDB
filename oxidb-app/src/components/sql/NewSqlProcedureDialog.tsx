@@ -2,6 +2,7 @@ import { useState, useMemo, useCallback } from "react";
 import { runSql } from "../../api/tauri";
 import { SqlEditor } from "../common/SqlEditor";
 import { useToast } from "../common/Toast";
+import { useEscapeClose } from "../common/useEscapeClose";
 
 const TYPES = ["INT", "TEXT", "DOUBLE", "DECIMAL", "BOOL", "TIMESTAMP", "BLOB"];
 
@@ -25,6 +26,7 @@ interface Props {
 export function NewSqlProcedureDialog({ onClose, onCreated, initial }: Props) {
   const toast = useToast();
   const isEdit = !!initial;
+  useEscapeClose(onClose);
 
   const [name, setName] = useState(initial?.name ?? "");
   const [params, setParams] = useState<Param[]>(initial?.params ?? []);
@@ -73,10 +75,10 @@ export function NewSqlProcedureDialog({ onClose, onCreated, initial }: Props) {
   }, [name, createSql, isEdit, toast, onCreated, onClose]);
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
+    <div className="dialog-overlay">
       <div
         className="dialog"
-        style={{ width: 720, maxHeight: "88vh", display: "flex", flexDirection: "column" }}
+        style={{ width: "min(960px, 94vw)", height: "86vh", display: "flex", flexDirection: "column" }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="dialog-title">{isEdit ? "Edit SQL Procedure" : "New SQL Procedure"}</div>
@@ -131,7 +133,7 @@ export function NewSqlProcedureDialog({ onClose, onCreated, initial }: Props) {
         </button>
 
         <div className="ct-section">Body (DML / SELECT statements)</div>
-        <div style={{ height: 220, border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", overflow: "hidden", marginBottom: 10 }}>
+        <div style={{ flex: 1, minHeight: 160, border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", overflow: "hidden", marginBottom: 10 }}>
           <SqlEditor value={body} onChange={setBody} height="100%" />
         </div>
 

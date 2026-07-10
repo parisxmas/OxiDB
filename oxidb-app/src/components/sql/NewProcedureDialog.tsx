@@ -4,6 +4,7 @@ import { cobraDetect, cobraCompile, runSql } from "../../api/tauri";
 import { useToast } from "../common/Toast";
 import { useTheme } from "../../context/ThemeContext";
 import { useFontScale } from "../../context/FontScaleContext";
+import { useEscapeClose } from "../common/useEscapeClose";
 
 const TYPES = ["INT", "TEXT", "DOUBLE", "DECIMAL", "BOOL", "TIMESTAMP", "BLOB"];
 const PATH_KEY = "oxidb-cobra-path";
@@ -45,6 +46,7 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
   const { theme } = useTheme();
   const { scale } = useFontScale();
   const isEdit = !!initial;
+  useEscapeClose(onClose);
 
   const [name, setName] = useState(initial?.name ?? "");
   const [params, setParams] = useState<Param[]>(initial?.params ?? []);
@@ -133,10 +135,10 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
   }, [name, params, source, cobraPath, toast, onCreated, onClose, isEdit, fail]);
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
+    <div className="dialog-overlay">
       <div
         className="dialog"
-        style={{ width: 760, maxHeight: "90vh", display: "flex", flexDirection: "column" }}
+        style={{ width: "min(1000px, 94vw)", height: "88vh", display: "flex", flexDirection: "column" }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="dialog-title">{isEdit ? "Edit Cobra Procedure" : "New Cobra Procedure"}</div>
@@ -202,7 +204,7 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
             </span>
           )}
         </div>
-        <div style={{ height: 240, border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", overflow: "hidden", marginBottom: 10 }}>
+        <div style={{ flex: 1, minHeight: 160, border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", overflow: "hidden", marginBottom: 10 }}>
           <Editor
             height="100%"
             defaultLanguage="python"

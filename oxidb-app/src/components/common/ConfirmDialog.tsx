@@ -16,7 +16,7 @@ export function ConfirmDialog({
   onCancel,
 }: Props) {
   return (
-    <div className="dialog-overlay" onClick={onCancel}>
+    <div className="dialog-overlay">
       <div className="dialog" onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">{title}</div>
         <p style={{ color: "var(--text-secondary)" }}>{message}</p>

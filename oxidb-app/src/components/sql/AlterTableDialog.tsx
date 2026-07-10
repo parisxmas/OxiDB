@@ -108,7 +108,7 @@ export function AlterTableDialog({ table, onApply, onCancel }: Props) {
   }, [statements, onApply]);
 
   return (
-    <div className="dialog-overlay" onClick={onCancel}>
+    <div className="dialog-overlay">
       <div
         className="dialog"
         style={{ width: 720, maxHeight: "86vh", display: "flex", flexDirection: "column" }}

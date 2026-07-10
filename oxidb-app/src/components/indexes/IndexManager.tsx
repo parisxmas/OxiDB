@@ -146,7 +146,7 @@ export function IndexManager() {
       )}
 
       {showCreate && (
-        <div className="dialog-overlay" onClick={() => setShowCreate(false)}>
+        <div className="dialog-overlay">
           <div className="dialog" onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">Create Index on {selected}</div>
             <div className="form-group">

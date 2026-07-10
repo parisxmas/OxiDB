@@ -65,7 +65,7 @@ export function NewKeyDialog({ onClose, onCreated }: Props) {
   };
 
   return (
-    <div className="dialog-overlay" onClick={onClose}>
+    <div className="dialog-overlay">
       <div className="dialog" style={{ width: 440 }} onClick={(e) => e.stopPropagation()}>
         <div className="dialog-title">New key</div>
 

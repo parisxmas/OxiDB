@@ -86,7 +86,7 @@ export function CreateTableDialog({ onCreate, onCancel }: Props) {
   };
 
   return (
-    <div className="dialog-overlay" onClick={onCancel}>
+    <div className="dialog-overlay">
       <div
         className="dialog"
         style={{ width: 720, maxHeight: "86vh", display: "flex", flexDirection: "column" }}
