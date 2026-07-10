@@ -44,6 +44,16 @@ export function IconQuery({ size = 18 }: P) {
   );
 }
 
+export function IconDesigner({ size = 18 }: P) {
+  return (
+    <svg {...base(size)}>
+      <rect x="3" y="4" width="7" height="6" rx="1" />
+      <rect x="14" y="14" width="7" height="6" rx="1" />
+      <path d="M10 7h4a3 3 0 0 1 3 3v4" />
+    </svg>
+  );
+}
+
 export function IconSql({ size = 18 }: P) {
   return (
     <svg {...base(size)}>
