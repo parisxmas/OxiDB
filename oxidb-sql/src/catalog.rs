@@ -187,15 +187,65 @@ impl<'de> Deserialize<'de> for IndexDef {
     }
 }
 
+/// The language a stored procedure is written in (ADR-0014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProcLanguage {
+    /// A SQL-text body (`AS BEGIN dml; ... END`) — the default, and what
+    /// every catalog/WAL record written before ADR-0014 deserializes as.
+    #[default]
+    Sql,
+    /// Compiled Cobra bytecode (`LANGUAGE COBRA AS '<base64 .cobrac>'`).
+    Cobra,
+}
+
+impl ProcLanguage {
+    /// The lowercase name shown by `SHOW PROCEDURES`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProcLanguage::Sql => "sql",
+            ProcLanguage::Cobra => "cobra",
+        }
+    }
+}
+
 /// A stored procedure: declared parameters and a body of SQL statements.
 /// Parameter references in the body were rewritten to `$1..$N` at creation,
 /// so calling is exactly a parameterized batch execution.
+///
+/// A COBRA procedure (ADR-0014) instead stores validated `.cobrac` bytecode
+/// in `bytecode`; `body` then holds a display placeholder. Both new fields
+/// default, so catalogs and WAL records from older versions still load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcedureDef {
     /// `(name, type)` per declared parameter, in call order.
     pub params: Vec<(String, SqlType)>,
-    /// The body as SQL text (`stmt; stmt; ...`), params rewritten to `$N`.
+    /// SQL: the body text (`stmt; stmt; ...`), params rewritten to `$N`.
+    /// COBRA: `<cobra bytecode, N bytes>` (display only) — except between
+    /// parse and CREATE-time validation, where it carries the raw base64
+    /// payload the executor decodes.
     pub body: String,
+    #[serde(default)]
+    pub language: ProcLanguage,
+    /// COBRA only: the decoded `.cobrac` bytes (base64 in JSON).
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "b64_bytes")]
+    pub bytecode: Vec<u8>,
+}
+
+/// serde adapter: `Vec<u8>` as a base64 string (a JSON number array would
+/// quadruple the catalog/WAL footprint of stored bytecode).
+mod b64_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&super::base64_encode(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        super::base64_decode(&s)
+            .map_err(|()| serde::de::Error::custom("invalid base64 in stored bytecode"))
+    }
 }
 
 /// The in-memory catalog plus where it persists.
@@ -274,6 +324,41 @@ mod tests {
 
         let loaded = Catalog::load(dir.path()).unwrap();
         assert_eq!(loaded.get("users"), Some(&users_table()));
+    }
+
+    /// A ProcedureDef serialized before ADR-0014 (no `language`/`bytecode`
+    /// fields) must still deserialize — as a SQL procedure.
+    #[test]
+    fn legacy_procedure_def_deserializes() {
+        let legacy = r#"{
+            "params": [["kime", "text"], ["tutar", "double"]],
+            "body": "UPDATE hesap SET bakiye = bakiye + $2 WHERE ad = $1"
+        }"#;
+        let def: ProcedureDef = serde_json::from_str(legacy).unwrap();
+        assert_eq!(def.language, ProcLanguage::Sql);
+        assert!(def.bytecode.is_empty());
+        assert_eq!(def.params.len(), 2);
+
+        // And a cobra def round-trips (bytecode as base64 text in JSON).
+        let cobra = ProcedureDef {
+            params: vec![("a".into(), SqlType::Int)],
+            body: "<cobra bytecode, 3 bytes>".into(),
+            language: ProcLanguage::Cobra,
+            bytecode: vec![1, 2, 3],
+        };
+        let json = serde_json::to_string(&cobra).unwrap();
+        assert!(json.contains("\"AQID\""), "bytecode must be base64: {json}");
+        let back: ProcedureDef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cobra);
+
+        // A sql def serializes without the bytecode field at all.
+        let sql = ProcedureDef {
+            params: vec![],
+            body: "SELECT 1".into(),
+            language: ProcLanguage::Sql,
+            bytecode: vec![],
+        };
+        assert!(!serde_json::to_string(&sql).unwrap().contains("bytecode"));
     }
 
     #[test]

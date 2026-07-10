@@ -12,6 +12,7 @@
 
 mod ast;
 mod catalog;
+mod cobra;
 mod error;
 mod executor;
 pub mod json;
@@ -675,17 +676,21 @@ impl SqlEngine {
         self.inner.lock().unwrap().catalog.views.get(name).cloned()
     }
 
-    /// Create (or with `or_alter`, overwrite) a stored procedure. The body
+    /// Create (or with `or_alter`, overwrite) a stored procedure. A SQL body
     /// was validated to shape (DML/SELECT only, params rewritten to `$N`) at
     /// parse; here it is trial-parsed so unsupported constructs surface at
-    /// creation, not first call.
+    /// creation, not first call. A COBRA body was already decoded and
+    /// validated by the executor (its `body` is a display placeholder, not
+    /// SQL).
     pub fn create_procedure(
         &self,
         name: &str,
         def: catalog::ProcedureDef,
         or_alter: bool,
     ) -> Result<()> {
-        parser::parse(&def.body)?;
+        if def.language == catalog::ProcLanguage::Sql {
+            parser::parse(&def.body)?;
+        }
         let mut inner = self.inner.lock().unwrap();
         if inner.catalog.procedures.contains_key(name) && !or_alter {
             return Err(SqlError::TableExists(format!("{name} (procedure)")));

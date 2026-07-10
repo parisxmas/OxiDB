@@ -128,6 +128,17 @@ pub fn result_to_json(r: QueryResult) -> Json {
         },
         QueryResult::Ddl => json!({ "ddl": true }),
         QueryResult::Transaction => json!({ "transaction": true }),
+        // A COBRA CALL with print output: the inner result as usual, plus a
+        // "notices" key (one entry per printed line).
+        QueryResult::Called { inner, notices } => {
+            let mut j = result_to_json(*inner);
+            if !notices.is_empty()
+                && let Some(obj) = j.as_object_mut()
+            {
+                obj.insert("notices".into(), json!(notices));
+            }
+            j
+        }
     }
 }
 

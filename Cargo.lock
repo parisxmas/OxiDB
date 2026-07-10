@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.34.9"
+version = "0.34.10"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2374,9 +2374,11 @@ dependencies = [
 name = "oxidb-sql"
 version = "0.34.0"
 dependencies = [
+ "base64",
  "crc32fast",
  "libc",
  "memmap2",
+ "oxidb-cobra",
  "rayon",
  "serde",
  "serde_json",

@@ -20,4 +20,5 @@ pub mod vm;
 
 pub use bytecode::{Bytecode, decode};
 pub use validate::validate;
-pub use vm::{RuntimeError, Vm};
+pub use value::{NativeError, NativeObject, Value};
+pub use vm::{ProcOutcome, RuntimeError, Vm, run_procedure};

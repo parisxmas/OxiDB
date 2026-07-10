@@ -124,9 +124,14 @@ pub(crate) fn execute<S: Store>(
         } => exec_delete(store, &table, filter, returning, params),
         Statement::CreateProcedure {
             name,
-            def,
+            mut def,
             or_alter,
         } => {
+            // COBRA (ADR-0014): decode + validate the bytecode NOW, so a bad
+            // payload can never reach the catalog (or a mid-call failure).
+            if def.language == crate::catalog::ProcLanguage::Cobra {
+                crate::cobra::validate_cobra_def(&mut def)?;
+            }
             store.create_procedure(&name, def, or_alter)?;
             Ok(QueryResult::Ddl)
         }
@@ -180,8 +185,13 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
                 .collect(),
         }),
         ShowKind::Procedures => Ok(QueryResult::Select {
-            columns: vec!["procedure".into(), "params".into(), "definition".into()],
-            types: vec![Some(SqlType::Text); 3],
+            columns: vec![
+                "procedure".into(),
+                "params".into(),
+                "language".into(),
+                "definition".into(),
+            ],
+            types: vec![Some(SqlType::Text); 4],
             rows: store
                 .list_procedures()
                 .into_iter()
@@ -195,6 +205,9 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
                     vec![
                         Value::Text(name),
                         Value::Text(params),
+                        text(def.language.as_str()),
+                        // For cobra this is the stored `<cobra bytecode,
+                        // N bytes>` placeholder.
                         Value::Text(def.body),
                     ]
                 })
@@ -339,6 +352,12 @@ pub(crate) fn exec_call<S: Store>(
         let bound = bind_expr(arg, empty)?;
         let v = eval_scalar(&bound, empty, no_row, params)?;
         values.push(coerce_call_arg(v, *ty, pname)?);
+    }
+
+    // A COBRA procedure executes its stored bytecode (ADR-0014); the SQL
+    // path below re-parses the stored text as before.
+    if def.language == crate::catalog::ProcLanguage::Cobra {
+        return crate::cobra::exec_call_cobra(store, name, &def, values);
     }
 
     let statements = crate::parser::parse(&def.body)?;

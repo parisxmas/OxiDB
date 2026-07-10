@@ -1,0 +1,2 @@
+# run_procedure fixture: `run` exists but is not a function.
+let run = 42

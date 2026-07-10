@@ -1,0 +1,5 @@
+# run_procedure fixture: plain arithmetic + a notice.
+def run(db, a, b)
+    print("adding", a, b)
+    return a + b
+end

@@ -1,0 +1,8 @@
+# CREATE PROCEDURE atomic_fail() LANGUAGE COBRA
+# The second execute violates the PK and is NOT caught: the whole CALL must
+# roll back, including the first insert.
+def run(db)
+    db.execute("INSERT INTO people (name, age) VALUES ('ghost', 1)")
+    db.execute("INSERT INTO people (id, name, age) VALUES (1, 'dup', 0)")
+    return "unreachable"
+end

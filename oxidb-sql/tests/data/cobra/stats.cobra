@@ -1,0 +1,15 @@
+# CREATE PROCEDURE stats() LANGUAGE COBRA
+# Queries, aggregates with a Cobra loop, prints a notice, returns a dict.
+def run(db)
+    let rows = db.query("SELECT name, age FROM people ORDER BY age")
+    let total = 0
+    let n = 0
+    let oldest = ""
+    for r in rows
+        total = total + r["age"]
+        n = n + 1
+        oldest = r["name"]
+    end
+    print("stats over", n, "rows")
+    return {"count": n, "total": total, "oldest": oldest}
+end

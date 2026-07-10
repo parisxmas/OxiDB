@@ -411,4 +411,11 @@ pub enum QueryResult {
     Ddl,
     /// A transaction control statement (`BEGIN`/`COMMIT`/`ROLLBACK`).
     Transaction,
+    /// A `CALL` of a COBRA procedure that printed notices: the shaped result
+    /// plus everything `print` wrote (one entry per line). Only constructed
+    /// when `notices` is non-empty.
+    Called {
+        inner: Box<QueryResult>,
+        notices: Vec<String>,
+    },
 }

@@ -1,0 +1,16 @@
+# run_procedure fixture: drives a host NativeObject — method calls, a
+# caught unknown-method error, str()/type() of the handle.
+def run(db)
+    let rows = db.query("SELECT")
+    let n = 0
+    for r in rows
+        n = n + r
+    end
+    try
+        db.boom()
+    catch e
+        print("caught:", e)
+    end
+    print("db is", str(db), type(db))
+    return n
+end

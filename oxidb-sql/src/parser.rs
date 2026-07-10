@@ -26,6 +26,12 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     if let Some(stmt) = parse_show_indexes(sql) {
         return Ok(vec![stmt]);
     }
+    // `CREATE PROCEDURE ... LANGUAGE COBRA AS '<base64>'` — sqlparser cannot
+    // parse an `AS '<string>'` body ("Expected: an SQL statement"), so the
+    // COBRA form is recognized directly from the token stream (ADR-0014).
+    if let Some(result) = parse_cobra_procedure(sql) {
+        return result.map(|stmt| vec![stmt]);
+    }
     let dialect = GenericDialect {};
     let statements =
         Parser::parse_sql(&dialect, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
@@ -331,6 +337,185 @@ fn parse_show_indexes(sql: &str) -> Option<Statement> {
     }
 }
 
+/// Recognize a **single** COBRA stored-procedure definition as the whole
+/// input (ADR-0014):
+///
+/// ```sql
+/// CREATE [OR ALTER] PROCEDURE name(param TYPE, ...) LANGUAGE COBRA AS '<base64>';
+/// ```
+///
+/// Returns `None` when the input is anything else (including `CREATE
+/// PROCEDURE` with a SQL body or another LANGUAGE — sqlparser handles
+/// those), and `Some(Err(..))` when the statement *is* `LANGUAGE COBRA` but
+/// malformed. The base64 payload rides in `def.body`; the executor decodes
+/// and validates it at CREATE time.
+fn parse_cobra_procedure(sql: &str) -> Option<Result<Statement>> {
+    // Cheap gate so ordinary statements never pay tokenization.
+    let head = sql.trim_start().get(..6).unwrap_or(sql.trim_start());
+    if !head.eq_ignore_ascii_case("create") || !sql.to_ascii_lowercase().contains("language") {
+        return None;
+    }
+
+    // Tokenize into just the shapes the grammar uses; anything else bails to
+    // sqlparser (which owns the error message for non-COBRA input).
+    #[derive(PartialEq)]
+    enum Tok {
+        Word(String),
+        Str(String),
+        LParen,
+        RParen,
+        Comma,
+    }
+    let dialect = GenericDialect {};
+    let raw = sqlparser::tokenizer::Tokenizer::new(&dialect, sql)
+        .tokenize()
+        .ok()?;
+    let mut toks: Vec<Tok> = Vec::new();
+    for t in raw {
+        use sqlparser::tokenizer::Token;
+        match t {
+            Token::Whitespace(_) | Token::EOF => {}
+            Token::Word(w) => toks.push(Tok::Word(w.value)),
+            Token::SingleQuotedString(s) => toks.push(Tok::Str(s)),
+            Token::LParen => toks.push(Tok::LParen),
+            Token::RParen => toks.push(Tok::RParen),
+            Token::Comma => toks.push(Tok::Comma),
+            Token::SemiColon => break, // statement end; nothing may follow
+            _ => return None,
+        }
+    }
+
+    let mut i = 0usize;
+    let kw = |k: &str, i: &mut usize| -> bool {
+        match toks.get(*i) {
+            Some(Tok::Word(w)) if w.eq_ignore_ascii_case(k) => {
+                *i += 1;
+                true
+            }
+            _ => false,
+        }
+    };
+    fn ident(toks: &[Tok], i: &mut usize) -> Option<String> {
+        match toks.get(*i) {
+            Some(Tok::Word(w)) => {
+                *i += 1;
+                Some(w.clone())
+            }
+            _ => None,
+        }
+    }
+
+    if !kw("create", &mut i) {
+        return None;
+    }
+    let or_alter = kw("or", &mut i);
+    if or_alter && !kw("alter", &mut i) {
+        return None;
+    }
+    if !kw("procedure", &mut i) {
+        return None;
+    }
+    let name = ident(&toks, &mut i)?;
+
+    // Optional parameter list; the whole clause is committed to only once
+    // LANGUAGE COBRA is seen, so failures before that fall back to sqlparser.
+    let mut declared: Vec<(String, SqlType)> = Vec::new();
+    let mut malformed: Option<SqlError> = None;
+    if toks.get(i) == Some(&Tok::LParen) {
+        i += 1;
+        if toks.get(i) == Some(&Tok::RParen) {
+            i += 1;
+        } else {
+            loop {
+                let pname = ident(&toks, &mut i)?;
+                let tyword = ident(&toks, &mut i)?;
+                match param_type_from_word(&tyword) {
+                    Some(ty) => {
+                        if declared.iter().any(|(n, _)| n.eq_ignore_ascii_case(&pname)) {
+                            malformed.get_or_insert(SqlError::Parse(format!(
+                                "duplicate procedure parameter {pname:?}"
+                            )));
+                        }
+                        declared.push((pname, ty));
+                    }
+                    None => {
+                        malformed.get_or_insert(SqlError::Unsupported(format!(
+                            "data type {tyword} in a COBRA procedure parameter"
+                        )));
+                    }
+                }
+                match toks.get(i) {
+                    Some(Tok::Comma) => i += 1,
+                    Some(Tok::RParen) => {
+                        i += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+
+    if !kw("language", &mut i) {
+        return None;
+    }
+    let lang = ident(&toks, &mut i)?;
+    if !lang.eq_ignore_ascii_case("cobra") {
+        // Another LANGUAGE: let sqlparser parse it (a SQL-statement body
+        // works there) and `translate_create_procedure` reject it with the
+        // established message.
+        return None;
+    }
+
+    // From here on the statement is claimed: errors are COBRA-shaped.
+    if let Some(e) = malformed {
+        return Some(Err(e));
+    }
+    if !kw("as", &mut i) {
+        return Some(Err(SqlError::Parse(
+            "LANGUAGE COBRA procedure: expected AS '<base64 .cobrac>'".into(),
+        )));
+    }
+    let Some(Tok::Str(payload)) = toks.get(i) else {
+        return Some(Err(SqlError::Parse(
+            "LANGUAGE COBRA body must be a single-quoted base64 string".into(),
+        )));
+    };
+    i += 1;
+    if i != toks.len() {
+        return Some(Err(SqlError::Parse(
+            "unexpected tokens after the COBRA procedure body".into(),
+        )));
+    }
+
+    Some(Ok(Statement::CreateProcedure {
+        name,
+        def: crate::catalog::ProcedureDef {
+            params: declared,
+            body: payload.clone(),
+            language: crate::catalog::ProcLanguage::Cobra,
+            bytecode: Vec::new(),
+        },
+        or_alter,
+    }))
+}
+
+/// The single-word parameter types accepted in a COBRA procedure signature —
+/// the same names [`map_data_type`] accepts for SQL procedures, minus the
+/// parenthesized/multi-word spellings.
+fn param_type_from_word(w: &str) -> Option<SqlType> {
+    let ty = match w.to_ascii_uppercase().as_str() {
+        "INT" | "INTEGER" | "BIGINT" | "SMALLINT" | "TINYINT" => SqlType::Int,
+        "DOUBLE" | "FLOAT" | "REAL" | "DECIMAL" | "NUMERIC" | "DEC" => SqlType::Double,
+        "TEXT" | "VARCHAR" | "CHAR" | "STRING" | "NVARCHAR" => SqlType::Text,
+        "BOOL" | "BOOLEAN" => SqlType::Bool,
+        "TIMESTAMP" | "DATETIME" => SqlType::Timestamp,
+        "BLOB" | "BYTEA" | "BINARY" | "VARBINARY" => SqlType::Blob,
+        _ => return None,
+    };
+    Some(ty)
+}
+
 fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
     match stmt {
         sp::Statement::CreateTable(ct) => translate_create_table(ct),
@@ -571,6 +756,8 @@ fn translate_create_procedure(
         def: crate::catalog::ProcedureDef {
             params: declared,
             body,
+            language: crate::catalog::ProcLanguage::Sql,
+            bytecode: Vec::new(),
         },
         or_alter,
     })

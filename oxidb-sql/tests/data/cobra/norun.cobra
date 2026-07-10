@@ -1,0 +1,4 @@
+# Defines no function named `run` — CREATE must reject it.
+def helper()
+    return 1
+end

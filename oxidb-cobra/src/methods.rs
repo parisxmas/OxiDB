@@ -42,6 +42,9 @@ pub fn call_method(vm: &Vm, receiver: &Value, name: &str, args: &[Value]) -> OpR
         Value::List(_) => list_method(receiver, name, args),
         Value::Dict(_) => dict_method(receiver, name, args),
         Value::Decimal(d) => decimal_method(d, name, args),
+        // Host objects (the stored-procedure `db` handle) dispatch to their
+        // own implementation; it reports unknown methods itself.
+        Value::Native(obj) => Some(obj.call_method(name, args)),
         // StructName.method(args): a static, called with no self.
         Value::Struct(def) => match def.find_static(name) {
             Some(f) => Some(vm.call_callable(&f, args)),

@@ -1,0 +1,11 @@
+# CREATE PROCEDURE safe_insert(id INT) LANGUAGE COBRA
+# try/catch around a possibly-failing db.execute: a constraint violation is
+# catchable and the procedure returns a fallback value instead of failing.
+def run(db, id)
+    try
+        db.execute("INSERT INTO people (id, name, age) VALUES (?, 'dup', 0)", [id])
+        return "inserted"
+    catch e
+        return "fallback: " + e
+    end
+end

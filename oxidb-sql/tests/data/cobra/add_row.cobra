@@ -1,0 +1,5 @@
+# CREATE PROCEDURE add_row(name TEXT, age INT) LANGUAGE COBRA
+# Inserts via db.execute and returns the affected count.
+def run(db, name, age)
+    return db.execute("INSERT INTO people (name, age) VALUES (?, ?)", [name, age])
+end

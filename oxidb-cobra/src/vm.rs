@@ -10,7 +10,7 @@
 //! fresh micro-VM sharing this VM's constants/globals/output runs a
 //! two-instruction driver (`OpCall argc; OpHalt`).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::bytecode::CompiledFunction;
@@ -72,6 +72,10 @@ pub struct Vm {
     frames: Vec<Frame>,
     handlers: Vec<Handler>,
     out: Rc<RefCell<String>>,
+    /// Remaining instruction budget (`None` = unlimited). Shared with every
+    /// micro-VM spawned for native re-entry, so nested closure calls cannot
+    /// escape the limit.
+    fuel: Option<Rc<Cell<u64>>>,
 }
 
 impl Vm {
@@ -109,7 +113,18 @@ impl Vm {
             }],
             handlers: Vec::new(),
             out: Rc::new(RefCell::new(String::new())),
+            fuel: None,
         }
+    }
+
+    /// Cap execution at `limit` instructions (`None` = unlimited, the
+    /// default). Exceeding the budget raises the **non-catchable** runtime
+    /// error `instruction limit exceeded` — it bypasses try/catch handlers
+    /// so a runaway loop cannot swallow its own kill. The budget is shared
+    /// with nested native re-entry (functional builtins, `run_procedure`'s
+    /// closure call), and once exhausted it stays exhausted.
+    pub fn set_fuel(&mut self, limit: Option<u64>) {
+        self.fuel = limit.map(|n| Rc::new(Cell::new(n)));
     }
 
     /// Everything `print` wrote during the run.
@@ -290,6 +305,16 @@ impl Vm {
         }
 
         loop {
+            // Fuel: one unit per executed instruction. Exhaustion is Fatal
+            // (not Thrown), so no handler in this VM can catch it, and the
+            // shared zeroed counter re-kills any outer frame that tries.
+            if let Some(fuel) = &self.fuel {
+                let left = fuel.get();
+                if left == 0 {
+                    return Err(VmError::Fatal("instruction limit exceeded".into()));
+                }
+                fuel.set(left - 1);
+            }
             ip += 1;
             let op = Op::from_byte(func.instructions[ip as usize]).ok_or_else(|| {
                 VmError::Fatal(format!(
@@ -1164,6 +1189,7 @@ impl Vm {
             }],
             handlers: Vec::new(),
             out: Rc::clone(&self.out),
+            fuel: self.fuel.clone(),
         };
         micro.stack[0] = Value::Closure(Rc::clone(cl));
         micro.stack[1..1 + args.len()].clone_from_slice(args);
@@ -1217,6 +1243,52 @@ impl Vm {
             ))),
         }
     }
+}
+
+/// What [`run_procedure`] hands back: the called function's return value and
+/// everything `print` wrote (the host surfaces it as notices).
+#[derive(Debug)]
+pub struct ProcOutcome {
+    pub result: Value,
+    pub notices: String,
+}
+
+/// Execute a stored procedure (ADR-0014 Phase 2): run the main program
+/// (which defines globals, including the procedure's functions), then call
+/// the global function `fn_name` with `args` via the VM's native closure
+/// re-entry. `fuel` caps the *total* instruction count (main + the call);
+/// exceeding it is the non-catchable error `instruction limit exceeded`.
+///
+/// Errors (as plain strings, ready for the host's error type):
+/// - `procedure has no function '<fn_name>'` — no such global, or it never
+///   got a value;
+/// - `'<fn_name>' is not a function` — the global is not a closure;
+/// - the usual `wrong number of arguments to <fn_name>: want=N, got=K` on
+///   an arity mismatch;
+/// - any runtime error the program raised and did not catch.
+pub fn run_procedure(
+    bc: &Bytecode,
+    fn_name: &str,
+    args: Vec<Value>,
+    fuel: Option<u64>,
+) -> Result<ProcOutcome, String> {
+    let mut vm = Vm::new(bc);
+    vm.set_fuel(fuel);
+    vm.run().map_err(|e| e.message)?;
+
+    let slot = bc.global_names.iter().position(|n| n == fn_name);
+    let func = slot.and_then(|idx| vm.globals.borrow().get(idx).cloned().flatten());
+    let Some(func) = func else {
+        return Err(format!("procedure has no function '{fn_name}'"));
+    };
+    let Value::Closure(cl) = &func else {
+        return Err(format!("'{fn_name}' is not a function"));
+    };
+    let result = vm.call_closure_native(cl, &args).map_err(|e| e.msg)?;
+    Ok(ProcOutcome {
+        result,
+        notices: vm.output(),
+    })
 }
 
 /// A constructor frame returned: init defined every field, so the instance

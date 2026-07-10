@@ -1,0 +1,10 @@
+# CREATE PROCEDURE spin() LANGUAGE COBRA
+# An infinite loop inside try/catch: the fuel kill must not be catchable.
+def run(db)
+    try
+        while true
+        end
+    catch e
+        return "caught"
+    end
+end

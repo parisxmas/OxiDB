@@ -41,6 +41,30 @@ pub enum Value {
     Iterator(Rc<RefCell<Iter>>),
     /// VM-internal: rides the stack through a finally block on the error path.
     Rethrow(Rc<Thrown>),
+    /// A host-provided object (e.g. the SQL engine's `db` handle in a stored
+    /// procedure). Only its methods are callable; it has no properties, is
+    /// always truthy, compares by pointer identity, and is not hashable.
+    Native(Rc<dyn NativeObject>),
+}
+
+/// A host object exposed to Cobra code as an opaque value with methods.
+///
+/// The implementation lives outside this crate (e.g. oxidb-sql's `db`
+/// handle); the trait is deliberately minimal and object-safe. Errors
+/// returned from [`call_method`](NativeObject::call_method) surface as
+/// ordinary catchable runtime errors (the VM adds the `line N: ` prefix).
+pub trait NativeObject {
+    /// The type name used in error messages and `type()` (e.g. `"db"`).
+    fn type_name(&self) -> &str;
+
+    /// Invoke `receiver.name(args)`. Unknown methods should return the
+    /// conventional `"<type> has no method '<name>'"` error.
+    fn call_method(&self, name: &str, args: &[Value]) -> Result<Value, NativeError>;
+
+    /// What `print`/`str` show for this object. Default: `<type_name>`.
+    fn inspect(&self) -> String {
+        format!("<{}>", self.type_name())
+    }
 }
 
 /// A catchable runtime error: the message (for an uncaught crash) and the
@@ -406,6 +430,7 @@ impl Value {
             Value::Cell(_) => "CELL".into(),
             Value::Iterator(_) => "ITERATOR".into(),
             Value::Rethrow(_) => "RETHROW".into(),
+            Value::Native(n) => n.type_name().to_string(),
         }
     }
 }
@@ -528,6 +553,7 @@ pub fn objects_equal(left: &Value, right: &Value) -> bool {
         Value::Cell(l) => matches!(right, Value::Cell(r) if Rc::ptr_eq(l, r)),
         Value::Iterator(l) => matches!(right, Value::Iterator(r) if Rc::ptr_eq(l, r)),
         Value::Rethrow(l) => matches!(right, Value::Rethrow(r) if Rc::ptr_eq(l, r)),
+        Value::Native(l) => matches!(right, Value::Native(r) if Rc::ptr_eq(l, r)),
     }
 }
 
@@ -699,6 +725,7 @@ fn inspect_seen(v: &Value, seen: &mut Vec<usize>) -> String {
         Value::Cell(_) => "<cell>".into(),
         Value::Iterator(_) => "iterator".into(),
         Value::Rethrow(_) => "rethrow token".into(),
+        Value::Native(n) => n.inspect(),
     }
 }
 

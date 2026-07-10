@@ -1,0 +1,10 @@
+# run_procedure fixture: an infinite loop wrapped in try/catch — the fuel
+# kill must NOT be catchable.
+def run(db)
+    try
+        while true
+        end
+    catch e
+        return "caught: " + e
+    end
+end

@@ -1,0 +1,5 @@
+# CREATE PROCEDURE all_rows() LANGUAGE COBRA
+# Returns db.query's list of dicts directly (shaped as a result set).
+def run(db)
+    return db.query("SELECT id, name FROM people ORDER BY id")
+end
