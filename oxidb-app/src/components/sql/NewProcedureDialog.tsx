@@ -80,9 +80,18 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
     return `CREATE PROCEDURE ${t}(${decls}) LANGUAGE COBRA AS '…'`;
   }, [name, params]);
 
+  const fail = useCallback(
+    (where: string, msg: string) => {
+      setErr({ where, msg });
+      // Also toast — the in-dialog box can scroll below the fold.
+      toast(`${where === "compile" ? "Compile" : where === "deploy" ? "Deploy" : ""} ${msg}`.trim(), "error");
+    },
+    [toast]
+  );
+
   const compileAndDeploy = useCallback(async () => {
     if (!name.trim()) {
-      setErr({ where: "form", msg: "Enter a procedure name" });
+      fail("form", "Enter a procedure name");
       return;
     }
     setBusy(true);
@@ -94,7 +103,7 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
         b64 = await cobraCompile(source, cobraPath || undefined);
         localStorage.setItem(PATH_KEY, cobraPath);
       } catch (e) {
-        setErr({ where: "compile", msg: String(e) });
+        fail("compile", String(e));
         setBusy(false);
         return;
       }
@@ -109,7 +118,7 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
       const sql = `${verb} ${name.trim()}(${decls}) LANGUAGE COBRA AS '${b64}' SOURCE '${srcB64}'`;
       const resp = (await runSql(sql)) as unknown as { ok?: boolean; error?: string };
       if (resp && resp.ok === false) {
-        setErr({ where: "deploy", msg: resp.error || "create failed" });
+        fail("deploy", resp.error || "create failed");
         setBusy(false);
         return;
       }
@@ -117,11 +126,11 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
       onCreated();
       onClose();
     } catch (e) {
-      setErr({ where: "deploy", msg: String(e) });
+      fail("deploy", String(e));
     } finally {
       setBusy(false);
     }
-  }, [name, params, source, cobraPath, toast, onCreated, onClose, isEdit]);
+  }, [name, params, source, cobraPath, toast, onCreated, onClose, isEdit, fail]);
 
   return (
     <div className="dialog-overlay" onClick={onClose}>
@@ -249,7 +258,7 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
           <button className="btn btn-secondary" onClick={onClose}>
             Cancel
           </button>
-          <button className="btn btn-primary" onClick={compileAndDeploy} disabled={busy || !name.trim()}>
+          <button className="btn btn-primary" onClick={compileAndDeploy} disabled={busy}>
             {busy ? <span className="spinner" /> : null}
             {isEdit ? "Recompile & Update" : "Compile & Deploy"}
           </button>
