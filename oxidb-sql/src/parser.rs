@@ -1135,28 +1135,181 @@ fn translate_delete(del: sp::Delete, p: &mut usize) -> Result<Statement> {
 /// ORDER BY / LIMIT / OFFSET. For a plain SELECT the outer clauses are pushed
 /// into the [`SelectStmt`] itself (single-select fast path).
 fn translate_query(query: sp::Query, p: &mut usize) -> Result<SelectQuery> {
+    // WITH (CTE): non-recursive common table expressions are sugar for derived
+    // tables. Translate each CTE body first (so positional `?` params bind in
+    // textual order), inlining earlier CTEs into it, then inline the whole set
+    // into the main query. A CTE referenced N times is inlined N times.
+    let resolved: Vec<(String, SelectQuery)> = if let Some(with) = query.with {
+        if with.recursive {
+            return Err(SqlError::Unsupported("WITH RECURSIVE".into()));
+        }
+        let mut resolved: Vec<(String, SelectQuery)> = Vec::new();
+        for cte in with.cte_tables {
+            if !cte.alias.columns.is_empty() {
+                return Err(SqlError::Unsupported(
+                    "WITH column aliases (`WITH c(a, b) AS ...`)".into(),
+                ));
+            }
+            let name = cte.alias.name.value.clone();
+            let mut q = translate_query(*cte.query, p)?;
+            inline_ctes_query(&mut q, &resolved);
+            resolved.push((name, q));
+        }
+        resolved
+    } else {
+        Vec::new()
+    };
+
     let order_by = translate_order_by(query.order_by, p)?;
     let (limit, offset) = translate_limit(&query.limit_clause, p)?;
-    match *query.body {
+    let mut result = match *query.body {
         sp::SetExpr::Select(s) => {
             let mut stmt = translate_select_core(*s, p)?;
             stmt.order_by = order_by;
             stmt.limit = limit;
             stmt.offset = offset;
-            Ok(SelectQuery {
+            SelectQuery {
                 body: QueryBody::Select(Box::new(stmt)),
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
-            })
+            }
         }
-        body @ sp::SetExpr::SetOperation { .. } => Ok(SelectQuery {
+        body @ sp::SetExpr::SetOperation { .. } => SelectQuery {
             body: translate_set_expr(body, p)?,
             order_by,
             limit,
             offset,
-        }),
-        other => Err(SqlError::Unsupported(format!("query body {other}"))),
+        },
+        other => return Err(SqlError::Unsupported(format!("query body {other}"))),
+    };
+    if !resolved.is_empty() {
+        inline_ctes_query(&mut result, &resolved);
+    }
+    Ok(result)
+}
+
+/// Inline CTE definitions into a query: any bare table reference whose name
+/// matches a CTE becomes a derived table wrapping that CTE's (already fully
+/// resolved) query. Recurses through joins, derived tables, and subqueries so
+/// a CTE is visible everywhere in the query it scopes.
+fn inline_ctes_query(q: &mut SelectQuery, ctes: &[(String, SelectQuery)]) {
+    inline_ctes_body(&mut q.body, ctes);
+    for (e, _) in &mut q.order_by {
+        inline_ctes_expr(e, ctes);
+    }
+}
+
+fn inline_ctes_body(b: &mut QueryBody, ctes: &[(String, SelectQuery)]) {
+    match b {
+        QueryBody::Select(s) => inline_ctes_select(s, ctes),
+        QueryBody::SetOp { left, right, .. } => {
+            inline_ctes_body(left, ctes);
+            inline_ctes_body(right, ctes);
+        }
+    }
+}
+
+fn inline_ctes_select(s: &mut SelectStmt, ctes: &[(String, SelectQuery)]) {
+    inline_ctes_tableref(&mut s.from, ctes);
+    for j in &mut s.joins {
+        inline_ctes_tableref(&mut j.table, ctes);
+        inline_ctes_expr(&mut j.on, ctes);
+    }
+    for item in &mut s.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            inline_ctes_expr(expr, ctes);
+        }
+    }
+    if let Some(f) = &mut s.filter {
+        inline_ctes_expr(f, ctes);
+    }
+    for e in &mut s.group_by {
+        inline_ctes_expr(e, ctes);
+    }
+    if let Some(h) = &mut s.having {
+        inline_ctes_expr(h, ctes);
+    }
+    for (e, _) in &mut s.order_by {
+        inline_ctes_expr(e, ctes);
+    }
+    for e in &mut s.distinct_on {
+        inline_ctes_expr(e, ctes);
+    }
+}
+
+fn inline_ctes_tableref(t: &mut TableRef, ctes: &[(String, SelectQuery)]) {
+    // An existing derived table shadows any same-named CTE within it — recurse
+    // rather than replace.
+    if let Some(sub) = &mut t.subquery {
+        inline_ctes_query(sub, ctes);
+        return;
+    }
+    if let Some((_, q)) = ctes.iter().find(|(n, _)| n == &t.name) {
+        // The derived-table convention is name == alias == the visible key.
+        let key = t.alias.clone().unwrap_or_else(|| t.name.clone());
+        t.subquery = Some(Box::new(q.clone()));
+        t.name = key.clone();
+        t.alias = Some(key);
+    }
+}
+
+fn inline_ctes_expr(e: &mut Expr, ctes: &[(String, SelectQuery)]) {
+    match e {
+        Expr::Subquery(q) => inline_ctes_query(q, ctes),
+        Expr::InSubquery { expr, query, .. } => {
+            inline_ctes_expr(expr, ctes);
+            inline_ctes_query(query, ctes);
+        }
+        Expr::CorrScalar { query, outer, .. } => {
+            inline_ctes_query(query, ctes);
+            for o in outer {
+                inline_ctes_expr(o, ctes);
+            }
+        }
+        Expr::CorrIn {
+            expr, query, outer, ..
+        } => {
+            inline_ctes_expr(expr, ctes);
+            inline_ctes_query(query, ctes);
+            for o in outer {
+                inline_ctes_expr(o, ctes);
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            inline_ctes_expr(left, ctes);
+            inline_ctes_expr(right, ctes);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => inline_ctes_expr(expr, ctes),
+        Expr::In { expr, list, .. } => {
+            inline_ctes_expr(expr, ctes);
+            for x in list {
+                inline_ctes_expr(x, ctes);
+            }
+        }
+        Expr::Func { args, .. } => {
+            for a in args {
+                inline_ctes_expr(a, ctes);
+            }
+        }
+        Expr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                inline_ctes_expr(a, ctes);
+            }
+        }
+        Expr::Window {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for e in partition_by {
+                inline_ctes_expr(e, ctes);
+            }
+            for (e, _) in order_by {
+                inline_ctes_expr(e, ctes);
+            }
+        }
+        Expr::Column { .. } | Expr::Col(_) | Expr::Literal(_) | Expr::Param(_) => {}
     }
 }
 

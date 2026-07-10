@@ -1598,6 +1598,53 @@ mod tests {
     }
 
     #[test]
+    fn cte_basic_and_chained() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)")
+            .unwrap();
+
+        // Single CTE.
+        let r = select_rows(
+            &db,
+            "WITH big AS (SELECT id, v FROM t WHERE v >= 30) \
+                                  SELECT id FROM big ORDER BY id",
+        );
+        assert_eq!(r, vec![vec![Value::Int(3)], vec![Value::Int(4)]]);
+
+        // Chained CTE (b references a) + aggregate in the body.
+        let r = select_rows(
+            &db,
+            "WITH a AS (SELECT id, v FROM t WHERE v >= 20), \
+                  b AS (SELECT v FROM a WHERE v <= 30) \
+             SELECT SUM(v) AS s FROM b",
+        );
+        assert_eq!(r, vec![vec![Value::Int(50)]]); // 20 + 30
+    }
+
+    #[test]
+    fn cte_referenced_twice_and_joined() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+            .unwrap();
+        // `nums` used twice: once for the avg, once joined — the classic
+        // "compare each row to the group average" shape.
+        let r = select_rows(
+            &db,
+            "WITH nums AS (SELECT id, v FROM t) \
+             SELECT n.id, n.v FROM nums n \
+             JOIN (SELECT AVG(v) AS av FROM nums) g ON 1=1 \
+             WHERE n.v > g.av ORDER BY n.id",
+        );
+        assert_eq!(r, vec![vec![Value::Int(3), Value::Int(30)]]); // avg=20, only 30 > 20
+    }
+
+    #[test]
     fn distinct_on_keeps_first_per_group() {
         let dir = tempfile::tempdir().unwrap();
         let db = SqlEngine::open(dir.path()).unwrap();
