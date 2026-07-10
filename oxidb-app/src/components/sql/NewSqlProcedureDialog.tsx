@@ -78,7 +78,7 @@ export function NewSqlProcedureDialog({ onClose, onCreated, initial }: Props) {
     <div className="dialog-overlay">
       <div
         className="dialog"
-        style={{ width: "min(960px, 94vw)", height: "86vh", display: "flex", flexDirection: "column" }}
+        style={{ width: "min(1500px, 96vw)", height: "90vh", display: "flex", flexDirection: "column" }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="dialog-title">{isEdit ? "Edit SQL Procedure" : "New SQL Procedure"}</div>

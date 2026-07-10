@@ -138,7 +138,7 @@ export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
     <div className="dialog-overlay">
       <div
         className="dialog"
-        style={{ width: "min(1000px, 94vw)", height: "88vh", display: "flex", flexDirection: "column" }}
+        style={{ width: "min(1500px, 96vw)", height: "90vh", display: "flex", flexDirection: "column" }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="dialog-title">{isEdit ? "Edit Cobra Procedure" : "New Cobra Procedure"}</div>

@@ -43,7 +43,7 @@ export function ProcedureDialog({ proc, onClose, onInsert, onDrop, onEdit }: Pro
     <div className="dialog-overlay">
       <div
         className="dialog"
-        style={{ width: "min(900px, 92vw)", height: "84vh", display: "flex", flexDirection: "column" }}
+        style={{ width: "min(1500px, 96vw)", height: "90vh", display: "flex", flexDirection: "column" }}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="dialog-title">
