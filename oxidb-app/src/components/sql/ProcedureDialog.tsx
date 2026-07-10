@@ -23,13 +23,18 @@ interface Props {
   onClose: () => void;
   onInsert: (text: string) => void;
   onDrop: (name: string) => void;
+  /** Open the cobra editor prefilled with this procedure's source. */
+  onEdit?: (proc: ProcInfo) => void;
 }
 
-export function ProcedureDialog({ proc, onClose, onInsert, onDrop }: Props) {
+export function ProcedureDialog({ proc, onClose, onInsert, onDrop, onEdit }: Props) {
   const params = proc.params
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
+  // For cobra, `definition` is the .cobra source unless it was uploaded
+  // without one (then it's the "<cobra bytecode, N bytes>" placeholder).
+  const hasSource = proc.language === "cobra" && !proc.definition.startsWith("<cobra bytecode");
 
   return (
     <div className="dialog-overlay" onClick={onClose}>
@@ -76,7 +81,9 @@ export function ProcedureDialog({ proc, onClose, onInsert, onDrop }: Props) {
           </table>
         )}
 
-        <div className="ct-section" style={{ marginTop: 4 }}>Body</div>
+        <div className="ct-section" style={{ marginTop: 4 }}>
+          {proc.language === "cobra" ? (hasSource ? "Source (.cobra)" : "Body") : "Body"}
+        </div>
         <div style={{ height: 240, border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", overflow: "hidden", marginBottom: 12 }}>
           <SqlEditor value={proc.definition} readOnly height="100%" />
         </div>
@@ -89,6 +96,15 @@ export function ProcedureDialog({ proc, onClose, onInsert, onDrop }: Props) {
           >
             Drop procedure
           </button>
+          {proc.language === "cobra" && onEdit && (
+            <button
+              className="btn btn-secondary"
+              onClick={() => onEdit(proc)}
+              title={hasSource ? "Edit source and recompile" : "No source stored — paste new source to replace"}
+            >
+              Edit source…
+            </button>
+          )}
           <button className="btn btn-secondary" onClick={onClose}>
             Close
           </button>

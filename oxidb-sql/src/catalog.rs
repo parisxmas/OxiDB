@@ -230,6 +230,11 @@ pub struct ProcedureDef {
     /// COBRA only: the decoded `.cobrac` bytes (base64 in JSON).
     #[serde(default, skip_serializing_if = "Vec::is_empty", with = "b64_bytes")]
     pub bytecode: Vec<u8>,
+    /// COBRA only: the original `.cobra` source text, kept so tooling can show
+    /// and edit the procedure. Optional — empty when the source wasn't
+    /// supplied (a plain `AS '<bytecode>'` upload). Never executed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
 }
 
 /// serde adapter: `Vec<u8>` as a base64 string (a JSON number array would
@@ -345,6 +350,7 @@ mod tests {
             body: "<cobra bytecode, 3 bytes>".into(),
             language: ProcLanguage::Cobra,
             bytecode: vec![1, 2, 3],
+            source: "def run(db, a) return a end".into(),
         };
         let json = serde_json::to_string(&cobra).unwrap();
         assert!(json.contains("\"AQID\""), "bytecode must be base64: {json}");
@@ -357,8 +363,10 @@ mod tests {
             body: "SELECT 1".into(),
             language: ProcLanguage::Sql,
             bytecode: vec![],
+            source: String::new(),
         };
-        assert!(!serde_json::to_string(&sql).unwrap().contains("bytecode"));
+        let sj = serde_json::to_string(&sql).unwrap();
+        assert!(!sj.contains("bytecode") && !sj.contains("source"), "{sj}");
     }
 
     #[test]

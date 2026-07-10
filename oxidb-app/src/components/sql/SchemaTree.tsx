@@ -74,6 +74,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [showNewDb, setShowNewDb] = useState(false);
   const [dropDbName, setDropDbName] = useState<string | null>(null);
   const [showNewProc, setShowNewProc] = useState(false);
+  const [editProc, setEditProc] = useState<{ name: string; params: { name: string; type: string }[]; source: string } | null>(null);
 
   /** Load one database's tables + procedures (scoped explicitly to it). */
   const load = useCallback(async (dbName: string) => {
@@ -493,11 +494,33 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
         />
       )}
 
+      {editProc && (
+        <NewProcedureDialog
+          initial={editProc}
+          onClose={() => setEditProc(null)}
+          onCreated={reloadCurrent}
+        />
+      )}
+
       {viewProc && (
         <ProcedureDialog
           proc={viewProc}
           onClose={() => setViewProc(null)}
           onInsert={onInsert}
+          onEdit={(p) => {
+            // params string "a INT, b TEXT" → typed rows; definition = source
+            const params = p.params
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
+              .map((s) => {
+                const [n, ...ty] = s.split(/\s+/);
+                return { name: n, type: (ty.join(" ") || "INT").toUpperCase() };
+              });
+            const source = p.definition.startsWith("<cobra bytecode") ? "" : p.definition;
+            setViewProc(null);
+            setEditProc({ name: p.name, params, source });
+          }}
           onDrop={(procName) => {
             setViewProc(null);
             setConfirm({ title: `Drop ${procName}?`, message: `This permanently removes the stored procedure "${procName}".`, sql: `DROP PROCEDURE ${procName};`, db: currentDb });

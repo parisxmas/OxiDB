@@ -482,6 +482,34 @@ fn parse_cobra_procedure(sql: &str) -> Option<Result<Statement>> {
         )));
     };
     i += 1;
+
+    // Optional `SOURCE '<base64 of the .cobra text>'` — kept verbatim so
+    // tooling can show/edit the procedure; never executed.
+    let mut source = String::new();
+    if kw("source", &mut i) {
+        let Some(Tok::Str(src_b64)) = toks.get(i) else {
+            return Some(Err(SqlError::Parse(
+                "COBRA procedure SOURCE must be a single-quoted base64 string".into(),
+            )));
+        };
+        i += 1;
+        match crate::catalog::base64_decode(src_b64) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(s) => source = s,
+                Err(_) => {
+                    return Some(Err(SqlError::Parse(
+                        "COBRA procedure SOURCE is not valid UTF-8".into(),
+                    )));
+                }
+            },
+            Err(()) => {
+                return Some(Err(SqlError::Parse(
+                    "COBRA procedure SOURCE is not valid base64".into(),
+                )));
+            }
+        }
+    }
+
     if i != toks.len() {
         return Some(Err(SqlError::Parse(
             "unexpected tokens after the COBRA procedure body".into(),
@@ -495,6 +523,7 @@ fn parse_cobra_procedure(sql: &str) -> Option<Result<Statement>> {
             body: payload.clone(),
             language: crate::catalog::ProcLanguage::Cobra,
             bytecode: Vec::new(),
+            source,
         },
         or_alter,
     }))
@@ -758,6 +787,7 @@ fn translate_create_procedure(
             body,
             language: crate::catalog::ProcLanguage::Sql,
             bytecode: Vec::new(),
+            source: String::new(),
         },
         or_alter,
     })

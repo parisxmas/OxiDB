@@ -8,6 +8,14 @@ import { useFontScale } from "../../context/FontScaleContext";
 const TYPES = ["INT", "TEXT", "DOUBLE", "DECIMAL", "BOOL", "TIMESTAMP", "BLOB"];
 const PATH_KEY = "oxidb-cobra-path";
 
+/** UTF-8-safe base64 (btoa alone throws on non-Latin1). */
+function utf8ToBase64(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  bytes.forEach((b) => (bin += String.fromCharCode(b)));
+  return btoa(bin);
+}
+
 interface Param {
   name: string;
   type: string;
@@ -28,17 +36,20 @@ end
 interface Props {
   onClose: () => void;
   onCreated: () => void;
+  /** When editing an existing procedure — prefills and uses CREATE OR ALTER. */
+  initial?: { name: string; params: Param[]; source: string };
 }
 
-export function NewProcedureDialog({ onClose, onCreated }: Props) {
+export function NewProcedureDialog({ onClose, onCreated, initial }: Props) {
   const toast = useToast();
   const { theme } = useTheme();
   const { scale } = useFontScale();
+  const isEdit = !!initial;
 
-  const [name, setName] = useState("");
-  const [params, setParams] = useState<Param[]>([]);
-  const [source, setSource] = useState(template([]));
-  const [srcEdited, setSrcEdited] = useState(false);
+  const [name, setName] = useState(initial?.name ?? "");
+  const [params, setParams] = useState<Param[]>(initial?.params ?? []);
+  const [source, setSource] = useState(initial?.source ?? template([]));
+  const [srcEdited, setSrcEdited] = useState(isEdit); // don't overwrite a loaded source
   const [cobraPath, setCobraPath] = useState(() => localStorage.getItem(PATH_KEY) || "");
   const [detected, setDetected] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -87,19 +98,22 @@ export function NewProcedureDialog({ onClose, onCreated }: Props) {
         setBusy(false);
         return;
       }
-      // 2. Deploy — the server re-validates (determinism + run arity).
+      // 2. Deploy — server re-validates (determinism + run arity). The source
+      // rides along in a SOURCE clause so it can be shown/edited later.
       const decls = params
         .filter((p) => p.name.trim())
         .map((p) => `${p.name.trim()} ${p.type}`)
         .join(", ");
-      const sql = `CREATE PROCEDURE ${name.trim()}(${decls}) LANGUAGE COBRA AS '${b64}'`;
+      const srcB64 = utf8ToBase64(source);
+      const verb = isEdit ? "CREATE OR ALTER PROCEDURE" : "CREATE PROCEDURE";
+      const sql = `${verb} ${name.trim()}(${decls}) LANGUAGE COBRA AS '${b64}' SOURCE '${srcB64}'`;
       const resp = (await runSql(sql)) as unknown as { ok?: boolean; error?: string };
       if (resp && resp.ok === false) {
         setErr({ where: "deploy", msg: resp.error || "create failed" });
         setBusy(false);
         return;
       }
-      toast("Procedure created", "success");
+      toast(isEdit ? "Procedure updated" : "Procedure created", "success");
       onCreated();
       onClose();
     } catch (e) {
@@ -107,7 +121,7 @@ export function NewProcedureDialog({ onClose, onCreated }: Props) {
     } finally {
       setBusy(false);
     }
-  }, [name, params, source, cobraPath, toast, onCreated, onClose]);
+  }, [name, params, source, cobraPath, toast, onCreated, onClose, isEdit]);
 
   return (
     <div className="dialog-overlay" onClick={onClose}>
@@ -116,17 +130,18 @@ export function NewProcedureDialog({ onClose, onCreated }: Props) {
         style={{ width: 760, maxHeight: "90vh", display: "flex", flexDirection: "column" }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="dialog-title">New Cobra Procedure</div>
+        <div className="dialog-title">{isEdit ? "Edit Cobra Procedure" : "New Cobra Procedure"}</div>
 
         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
           <div className="form-group" style={{ flex: 1, marginBottom: 0 }}>
             <label>Name</label>
             <input
-              autoFocus
+              autoFocus={!isEdit}
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="transfer"
-              style={{ fontFamily: "var(--font-mono)" }}
+              readOnly={isEdit}
+              style={{ fontFamily: "var(--font-mono)", opacity: isEdit ? 0.7 : 1 }}
             />
           </div>
         </div>
@@ -236,7 +251,7 @@ export function NewProcedureDialog({ onClose, onCreated }: Props) {
           </button>
           <button className="btn btn-primary" onClick={compileAndDeploy} disabled={busy || !name.trim()}>
             {busy ? <span className="spinner" /> : null}
-            Compile & Deploy
+            {isEdit ? "Recompile & Update" : "Compile & Deploy"}
           </button>
         </div>
       </div>

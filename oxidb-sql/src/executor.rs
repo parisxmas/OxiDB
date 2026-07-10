@@ -202,13 +202,22 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
                         .map(|(n, t)| format!("{n} {}", format!("{t:?}").to_uppercase()))
                         .collect::<Vec<_>>()
                         .join(", ");
+                    // For cobra: the stored `.cobra` source if it was
+                    // supplied (so tooling can show/edit it), otherwise the
+                    // `<cobra bytecode, N bytes>` placeholder. SQL bodies use
+                    // their text as before.
+                    let definition = if def.language == crate::catalog::ProcLanguage::Cobra
+                        && !def.source.is_empty()
+                    {
+                        def.source
+                    } else {
+                        def.body
+                    };
                     vec![
                         Value::Text(name),
                         Value::Text(params),
                         text(def.language.as_str()),
-                        // For cobra this is the stored `<cobra bytecode,
-                        // N bytes>` placeholder.
-                        Value::Text(def.body),
+                        Value::Text(definition),
                     ]
                 })
                 .collect(),
