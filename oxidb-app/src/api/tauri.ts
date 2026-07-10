@@ -89,6 +89,10 @@ export const runSql = (sql: string, params?: JsonValue[], db?: string) =>
 // Filesystem — read a user-picked file's text (for import)
 export const readFileText = (path: string) =>
   invoke<string>("read_file_text", { path });
+export const readFileBase64 = (path: string) =>
+  invoke<string>("read_file_base64", { path });
+export const writeFileBase64 = (path: string, base64Data: string) =>
+  invoke<void>("write_file_base64", { path, base64Data });
 
 // OxiMem (Redis-compatible KV, separate port)
 export const oximemConnect = (host: string, port: number) =>

@@ -43,8 +43,10 @@ pub fn run() {
             commands::query::execute_raw_command,
             // SQL engine (ADR-0010)
             commands::sql::run_sql,
-            // Filesystem (import)
+            // Filesystem (import + blob upload/download)
             commands::fs::read_file_text,
+            commands::fs::read_file_base64,
+            commands::fs::write_file_base64,
             // OxiMem (Redis-compatible KV)
             commands::oximem::oximem_connect,
             commands::oximem::oximem_disconnect,

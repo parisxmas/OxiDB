@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   listBuckets,
   createBucket,
@@ -8,11 +9,35 @@ import {
   getObject,
   deleteObject,
   searchObjects,
+  readFileBase64,
+  writeFileBase64,
 } from "../../api/tauri";
 import type { JsonValue } from "../../api/types";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 import { JsonViewer } from "../common/JsonViewer";
 import { useToast } from "../common/Toast";
+
+/** UTF-8-safe base64 (btoa alone throws on non-Latin1 characters). */
+function utf8ToBase64(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  bytes.forEach((b) => (bin += String.fromCharCode(b)));
+  return btoa(bin);
+}
+
+function humanSize(n: unknown): string {
+  const b = typeof n === "number" ? n : parseInt(String(n), 10);
+  if (!Number.isFinite(b)) return "";
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const EXT_TYPES: Record<string, string> = {
+  txt: "text/plain", json: "application/json", csv: "text/csv",
+  html: "text/html", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  gif: "image/gif", pdf: "application/pdf", zip: "application/zip",
+};
 
 export function BlobManager() {
   const toast = useToast();
@@ -24,6 +49,8 @@ export function BlobManager() {
   const [uploadKey, setUploadKey] = useState("");
   const [uploadType, setUploadType] = useState("application/octet-stream");
   const [uploadData, setUploadData] = useState("");
+  const [uploadB64, setUploadB64] = useState<string | null>(null); // set when a file is chosen
+  const [uploadFileName, setUploadFileName] = useState("");
   const [newBucket, setNewBucket] = useState("");
   const [showNewBucket, setShowNewBucket] = useState(false);
   const [confirmDeleteBucket, setConfirmDeleteBucket] = useState<string | null>(null);
@@ -83,16 +110,39 @@ export function BlobManager() {
     }
   };
 
+  const openUpload = () => {
+    setUploadKey("");
+    setUploadType("application/octet-stream");
+    setUploadData("");
+    setUploadB64(null);
+    setUploadFileName("");
+    setShowUpload(true);
+  };
+
+  const chooseFile = async () => {
+    const sel = await open({ multiple: false });
+    if (!sel || typeof sel !== "string") return;
+    try {
+      const b64 = await readFileBase64(sel);
+      const name = sel.split(/[/\\]/).pop() || sel;
+      setUploadB64(b64);
+      setUploadFileName(name);
+      if (!uploadKey) setUploadKey(name);
+      const ext = name.split(".").pop()?.toLowerCase() || "";
+      if (EXT_TYPES[ext]) setUploadType(EXT_TYPES[ext]);
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  };
+
   const handleUpload = async () => {
     if (!selected || !uploadKey.trim()) return;
     try {
-      // Convert text to base64
-      const b64 = btoa(uploadData);
+      // A chosen file uploads its raw bytes; otherwise the typed text (UTF-8).
+      const b64 = uploadB64 ?? utf8ToBase64(uploadData);
       await putObject(selected, uploadKey.trim(), b64, uploadType || undefined);
       toast("Object uploaded", "success");
       setShowUpload(false);
-      setUploadKey("");
-      setUploadData("");
       loadObjects(selected);
     } catch (e) {
       toast(String(e), "error");
@@ -104,6 +154,23 @@ export function BlobManager() {
     try {
       const result = await getObject(selected, key);
       setViewObject(result);
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  };
+
+  const handleSaveToDisk = async (key: string) => {
+    if (!selected) return;
+    try {
+      const result = (await getObject(selected, key)) as { content?: string };
+      if (!result?.content) {
+        toast("nothing to save", "error");
+        return;
+      }
+      const path = await save({ defaultPath: key.split("/").pop() || key });
+      if (!path) return;
+      await writeFileBase64(path, result.content);
+      toast("Saved to disk", "success");
     } catch (e) {
       toast(String(e), "error");
     }
@@ -160,7 +227,13 @@ export function BlobManager() {
           </div>
         ))}
         {buckets.length === 0 && (
-          <div style={{ color: "var(--text-muted)", padding: 8, fontSize: 13 }}>No buckets</div>
+          <div style={{ padding: 12, fontSize: 13, color: "var(--text-secondary)", textAlign: "center" }}>
+            No buckets yet.
+            <br />
+            <button className="btn btn-primary btn-sm" style={{ marginTop: 8 }} onClick={() => setShowNewBucket(true)}>
+              + Create bucket
+            </button>
+          </div>
         )}
       </div>
 
@@ -178,7 +251,7 @@ export function BlobManager() {
                 onKeyDown={(e) => e.key === "Enter" && handleSearch()}
               />
               <button className="btn btn-secondary btn-sm" onClick={handleSearch}>Search</button>
-              <button className="btn btn-primary btn-sm" onClick={() => setShowUpload(true)}>Upload</button>
+              <button className="btn btn-primary btn-sm" onClick={openUpload}>Upload</button>
               <button className="btn btn-secondary btn-sm" onClick={() => loadObjects(selected)}>Refresh</button>
             </div>
             {loading ? (
@@ -192,6 +265,7 @@ export function BlobManager() {
                     <th>Key</th>
                     <th>Content Type</th>
                     <th>Size</th>
+                    <th>Modified</th>
                     <th></th>
                   </tr>
                 </thead>
@@ -199,14 +273,19 @@ export function BlobManager() {
                   {objects.map((obj, i) => {
                     const o = obj as Record<string, unknown>;
                     const key = (o.key || o.name || "") as string;
+                    const created = (o.created_at || "") as string;
                     return (
                       <tr key={i}>
                         <td style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}>{key}</td>
-                        <td>{(o.content_type || "") as string}</td>
-                        <td>{(o.size || "") as string}</td>
+                        <td style={{ color: "var(--text-secondary)" }}>{(o.content_type || "") as string}</td>
+                        <td style={{ fontFamily: "var(--font-mono)" }}>{humanSize(o.size)}</td>
+                        <td style={{ color: "var(--text-secondary)", fontSize: 12 }}>
+                          {created ? created.replace("T", " ").replace("Z", "") : ""}
+                        </td>
                         <td>
                           <div style={{ display: "flex", gap: 4 }}>
                             <button className="btn btn-secondary btn-sm" onClick={() => handleDownload(key)}>View</button>
+                            <button className="btn btn-secondary btn-sm" onClick={() => handleSaveToDisk(key)}>Save</button>
                             <button className="btn btn-danger btn-sm" onClick={() => handleDeleteObject(key)}>Delete</button>
                           </div>
                         </td>
@@ -242,6 +321,21 @@ export function BlobManager() {
         <div className="dialog-overlay" onClick={() => setShowUpload(false)}>
           <div className="dialog" style={{ minWidth: 480 }} onClick={(e) => e.stopPropagation()}>
             <div className="dialog-title">Upload Object to {selected}</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 12 }}>
+              <button className="btn btn-secondary btn-sm" onClick={chooseFile}>Choose file…</button>
+              <span style={{ fontSize: 12, color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
+                {uploadFileName || "or type text below"}
+              </span>
+              {uploadB64 && (
+                <button
+                  className="btn btn-sm"
+                  style={{ marginLeft: "auto", background: "none", color: "var(--text-secondary)" }}
+                  onClick={() => { setUploadB64(null); setUploadFileName(""); }}
+                >
+                  clear
+                </button>
+              )}
+            </div>
             <div className="form-group">
               <label>Key</label>
               <input value={uploadKey} onChange={(e) => setUploadKey(e.target.value)} placeholder="file.txt" autoFocus />
@@ -250,15 +344,17 @@ export function BlobManager() {
               <label>Content Type</label>
               <input value={uploadType} onChange={(e) => setUploadType(e.target.value)} placeholder="application/octet-stream" />
             </div>
-            <div className="form-group">
-              <label>Content (text)</label>
-              <textarea
-                value={uploadData}
-                onChange={(e) => setUploadData(e.target.value)}
-                rows={6}
-                style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}
-              />
-            </div>
+            {!uploadB64 && (
+              <div className="form-group">
+                <label>Content (text)</label>
+                <textarea
+                  value={uploadData}
+                  onChange={(e) => setUploadData(e.target.value)}
+                  rows={6}
+                  style={{ fontFamily: "var(--font-mono)", fontSize: 13 }}
+                />
+              </div>
+            )}
             <div className="dialog-actions">
               <button className="btn btn-secondary" onClick={() => setShowUpload(false)}>Cancel</button>
               <button className="btn btn-primary" onClick={handleUpload}>Upload</button>
