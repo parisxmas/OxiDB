@@ -59,6 +59,11 @@ export function QueryDesigner() {
   const [whereText, setWhereText] = useState("");
   const [distinct, setDistinct] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
+  // Live drag-to-connect state.
+  const [dragLine, setDragLine] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+  const [dropHint, setDropHint] = useState<string | null>(null); // `${uid}::${col}` under cursor
+  const dragRef = useRef<{ uid: string; col: string } | null>(null);
+  const hoverRef = useRef<{ uid: string; col: string } | null>(null);
 
   // Load the database's table list for the palette.
   useEffect(() => {
@@ -140,6 +145,68 @@ export function QueryDesigner() {
     },
     [pending]
   );
+
+  // Cursor position in canvas-content coordinates (matches table x/y).
+  const canvasPoint = useCallback((clientX: number, clientY: number) => {
+    const el = canvasRef.current;
+    if (!el) return { x: clientX, y: clientY };
+    const rect = el.getBoundingClientRect();
+    return { x: clientX - rect.left + el.scrollLeft, y: clientY - rect.top + el.scrollTop };
+  }, []);
+
+  // Drag from a column's port → draw a line to the cursor → drop on another
+  // table's column to create the join.
+  const startConn = useCallback(
+    (uid: string, col: string, e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      dragRef.current = { uid, col };
+      hoverRef.current = null;
+      const t = byUid.get(uid);
+      if (!t) return;
+      const a = anchor(t, col, "r");
+      const p = canvasPoint(e.clientX, e.clientY);
+      setDragLine({ x1: a.x, y1: a.y, x2: p.x, y2: p.y });
+      const onMove = (ev: MouseEvent) => {
+        const pt = canvasPoint(ev.clientX, ev.clientY);
+        setDragLine((dl) => (dl ? { ...dl, x2: pt.x, y2: pt.y } : null));
+      };
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        const from = dragRef.current;
+        const to = hoverRef.current;
+        if (from && to && from.uid !== to.uid) {
+          const id = `j${uidSeq++}`;
+          setJoins((js) => [
+            ...js,
+            { id, aUid: from.uid, aCol: from.col, bUid: to.uid, bCol: to.col, kind: "INNER" },
+          ]);
+        }
+        dragRef.current = null;
+        hoverRef.current = null;
+        setDragLine(null);
+        setDropHint(null);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    },
+    // anchor/byUid are stable enough per render; canvasPoint is memoized
+    [byUid, canvasPoint]
+  );
+
+  const onColEnter = useCallback((uid: string, col: string) => {
+    if (dragRef.current && dragRef.current.uid !== uid) {
+      hoverRef.current = { uid, col };
+      setDropHint(`${uid}::${col}`);
+    }
+  }, []);
+  const onColLeave = useCallback((uid: string, col: string) => {
+    if (hoverRef.current && hoverRef.current.uid === uid && hoverRef.current.col === col) {
+      hoverRef.current = null;
+      setDropHint(null);
+    }
+  }, []);
 
   const toggleOutput = useCallback((uid: string, col: string) => {
     const key = `${uid}::${col}`;
@@ -287,6 +354,21 @@ export function QueryDesigner() {
       <div className="qd-main">
         <div className="qd-canvas" ref={canvasRef}>
           <svg className="qd-svg">
+            <defs>
+              <marker id="qd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" className="qd-arrow-head" />
+              </marker>
+            </defs>
+            {dragLine && (
+              <line
+                x1={dragLine.x1}
+                y1={dragLine.y1}
+                x2={dragLine.x2}
+                y2={dragLine.y2}
+                className="qd-drag-line"
+                markerEnd="url(#qd-arrow)"
+              />
+            )}
             {joins.map((j) => {
               const at = byUid.get(j.aUid);
               const bt = byUid.get(j.bUid);
@@ -298,9 +380,8 @@ export function QueryDesigner() {
               const d = `M ${p1.x} ${p1.y} C ${p1.x + (aRight ? dx : -dx)} ${p1.y}, ${p2.x + (aRight ? -dx : dx)} ${p2.y}, ${p2.x} ${p2.y}`;
               return (
                 <g key={j.id}>
-                  <path d={d} className="qd-join-line" />
+                  <path d={d} className="qd-join-line" markerEnd="url(#qd-arrow)" />
                   <circle cx={p1.x} cy={p1.y} r={3} className="qd-join-dot" />
-                  <circle cx={p2.x} cy={p2.y} r={3} className="qd-join-dot" />
                 </g>
               );
             })}
@@ -317,15 +398,22 @@ export function QueryDesigner() {
               {t.cols.map((c) => {
                 const key = `${t.uid}::${c.name}`;
                 const armed = pending && pending.uid === t.uid && pending.col === c.name;
+                const isDrop = dropHint === key;
                 return (
-                  <div key={c.name} className={`qd-col${armed ? " armed" : ""}`} style={{ height: ROW_H }}>
+                  <div
+                    key={c.name}
+                    className={`qd-col${armed ? " armed" : ""}${isDrop ? " drop" : ""}`}
+                    style={{ height: ROW_H }}
+                    onMouseEnter={() => onColEnter(t.uid, c.name)}
+                    onMouseLeave={() => onColLeave(t.uid, c.name)}
+                  >
                     <input
                       type="checkbox"
                       checked={output.has(key)}
                       onChange={() => toggleOutput(t.uid, c.name)}
                       title="Output this column"
                     />
-                    <span className="qd-col-name" onClick={() => clickColumn(t.uid, c.name)} title="Click to start/finish a join">
+                    <span className="qd-col-name" onClick={() => clickColumn(t.uid, c.name)} title="Drag the ● to another column to join (or click two columns)">
                       {c.pk && <span className="schema-pk">🔑</span>}
                       {c.name}
                     </span>
@@ -336,6 +424,11 @@ export function QueryDesigner() {
                     >
                       {sorts[key] === "ASC" ? "↑" : sorts[key] === "DESC" ? "↓" : "⇅"}
                     </button>
+                    <span
+                      className="qd-port"
+                      title="Drag to another column to create a join"
+                      onMouseDown={(e) => startConn(t.uid, c.name, e)}
+                    />
                   </div>
                 );
               })}

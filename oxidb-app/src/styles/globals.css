@@ -1261,3 +1261,25 @@ tr:hover .row-del { opacity: 1; }
   font-family: var(--font-mono); font-size: 12.5px; line-height: 1.5;
   color: var(--text-primary); white-space: pre;
 }
+
+/* Query Designer — drag-to-connect ports, drag line, arrowheads */
+.qd-col { position: relative; }
+.qd-col.drop { background: color-mix(in srgb, var(--accent) 28%, transparent); }
+.qd-port {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  background: var(--bg-primary);
+  cursor: crosshair;
+  flex-shrink: 0;
+  margin-right: -3px;
+}
+.qd-port:hover { background: var(--accent); }
+.qd-drag-line {
+  stroke: var(--accent);
+  stroke-width: 1.8;
+  stroke-dasharray: 5 3;
+  fill: none;
+}
+.qd-arrow-head { fill: var(--accent); }
