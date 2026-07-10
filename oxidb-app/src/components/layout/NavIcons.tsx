@@ -97,3 +97,30 @@ export function IconMonitor({ size = 18 }: P) {
     </svg>
   );
 }
+
+export function IconTable({ size = 18 }: P) {
+  return (
+    <svg {...base(size)}>
+      <rect x="3" y="4" width="18" height="16" rx="1.5" />
+      <path d="M3 9h18M3 14.5h18M9 9v11" />
+    </svg>
+  );
+}
+
+export function IconKey({ size = 18 }: P) {
+  return (
+    <svg {...base(size)}>
+      <circle cx="7.5" cy="15.5" r="3.5" />
+      <path d="M10 13 20 3M17 6l2 2M14 9l2 2" />
+    </svg>
+  );
+}
+
+export function IconFunction({ size = 18 }: P) {
+  return (
+    <svg {...base(size)}>
+      <path d="M8 21c2 0 3-1 3.4-3.5L14 4c.4-2.5 1.4-3 3-3" />
+      <path d="M5 9h9" />
+    </svg>
+  );
+}

@@ -885,7 +885,7 @@ tr:hover .row-del { opacity: 1; }
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
 }
-.db-selector-icon { font-size: 12px; opacity: 0.7; }
+.db-selector-icon { display: inline-flex; align-items: center; opacity: 0.7; }
 .db-selector select {
   background: none;
   border: none;
@@ -943,7 +943,8 @@ tr:hover .row-del { opacity: 1; }
 }
 .schema-db-node:hover { background: var(--bg-primary); }
 .schema-db-node.open { color: var(--accent); }
-.schema-db-node-icon { font-size: 12px; }
+.schema-db-node-icon { display: inline-flex; align-items: center; opacity: 0.8; }
+.schema-db-node.open .schema-db-node-icon { opacity: 1; }
 .schema-db-node-name {
   flex: 1;
   overflow: hidden;
@@ -969,3 +970,17 @@ tr:hover .row-del { opacity: 1; }
   transition: background 0.15s;
 }
 .col-resizer:hover { background: var(--accent); }
+
+/* ── Schema tree row icons (table / procedure) ──────────────────────── */
+.schema-row-icon {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.schema-pk {
+  display: inline-flex;
+  align-items: center;
+  color: var(--accent);
+  margin-right: 2px;
+}

@@ -3,6 +3,7 @@ import { useDatabase } from "../../context/DatabaseContext";
 import { useToast } from "../common/Toast";
 import { PromptDialog } from "../common/PromptDialog";
 import { ConfirmDialog } from "../common/ConfirmDialog";
+import { IconSql } from "./NavIcons";
 
 const BUILTIN = ["oxidb", "postgres"];
 
@@ -37,7 +38,7 @@ export function DatabaseSelector() {
 
   return (
     <div className="db-selector" title="Current database">
-      <span className="db-selector-icon">🗄</span>
+      <span className="db-selector-icon"><IconSql size={13} /></span>
       <select value={db} onChange={(e) => setDb(e.target.value)}>
         {databases.map((d) => (
           <option key={d} value={d}>

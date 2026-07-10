@@ -11,6 +11,7 @@ import { AlterTableDialog } from "./AlterTableDialog";
 import { IndexDialog } from "./IndexDialog";
 import { ProcedureDialog, type ProcInfo } from "./ProcedureDialog";
 import { ImportDialog } from "./ImportDialog";
+import { IconSql, IconTable, IconKey, IconFunction } from "../layout/NavIcons";
 import { useToast } from "../common/Toast";
 
 interface StmtResult {
@@ -298,7 +299,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                     title="Click to expand · right-click for menu (new table, drop database…)"
                   >
                     <span className="schema-caret">{isOpen ? "▾" : "▸"}</span>
-                    <span className="schema-db-node-icon">🗄</span>
+                    <span className="schema-db-node-icon"><IconSql size={14} /></span>
                     <span className="schema-db-node-name">{dbName}</span>
                     {loadingThis && <span className="schema-db-node-loading">…</span>}
                   </div>
@@ -323,6 +324,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                                   <button className="schema-caret" onClick={() => toggleTable(dbName, t.name)} aria-label="expand">
                                     {tOpen ? "▾" : "▸"}
                                   </button>
+                                  <span className="schema-row-icon"><IconTable size={13} /></span>
                                   <span
                                     className="schema-table-name"
                                     title="Click to expand columns · double-click to browse & edit · right-click for menu"
@@ -337,7 +339,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                                   <ul className="schema-cols">
                                     {tcols.map((c) => (
                                       <li key={c.name} className="schema-col" title={`${c.type}${c.nullable ? " · nullable" : " · not null"}`} onClick={() => onInsert(c.name)}>
-                                        {c.primaryKey && <span className="schema-pk" title="primary key">🔑</span>}
+                                        {c.primaryKey && <span className="schema-pk" title="primary key"><IconKey size={12} /></span>}
                                         <span className="schema-col-name">{c.name}</span>
                                         <span className="schema-col-type">{c.type}</span>
                                       </li>
@@ -359,6 +361,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                               <li key={p.name}>
                                 <div className="schema-table-row">
                                   <span className="schema-caret" style={{ visibility: "hidden" }}>▸</span>
+                                  <span className="schema-row-icon"><IconFunction size={13} /></span>
                                   <span
                                     className="schema-table-name"
                                     title="Click to view · double-click to insert CALL"
@@ -369,7 +372,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                                       onQuery(`CALL ${p.name}(${args});`);
                                     }}
                                   >
-                                    ⚙ {p.name}
+                                    {p.name}
                                   </span>
                                 </div>
                               </li>
