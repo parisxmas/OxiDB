@@ -2,6 +2,7 @@ import Editor from "@monaco-editor/react";
 import type { OnMount } from "@monaco-editor/react";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { useTheme } from "../../context/ThemeContext";
+import { useFontScale } from "../../context/FontScaleContext";
 
 interface Props {
   value: string;
@@ -23,6 +24,7 @@ export function SqlEditor({
   height = "100%",
 }: Props) {
   const { theme } = useTheme();
+  const { scale } = useFontScale();
 
   const handleMount: OnMount = (editor, monaco) => {
     editor.addCommand(
@@ -43,7 +45,7 @@ export function SqlEditor({
       options={{
         readOnly,
         minimap: { enabled: false },
-        fontSize: 13,
+        fontSize: Math.round(13 * scale),
         fontFamily: "var(--font-mono)",
         lineNumbers: "on",
         scrollBeyondLastLine: false,

@@ -1,5 +1,6 @@
 import Editor from "@monaco-editor/react";
 import { useTheme } from "../../context/ThemeContext";
+import { useFontScale } from "../../context/FontScaleContext";
 
 interface Props {
   value: string;
@@ -15,6 +16,7 @@ export function JsonEditor({
   height = "300px",
 }: Props) {
   const { theme } = useTheme();
+  const { scale } = useFontScale();
   return (
     <Editor
       height={height}
@@ -25,7 +27,7 @@ export function JsonEditor({
       options={{
         readOnly,
         minimap: { enabled: false },
-        fontSize: 13,
+        fontSize: Math.round(13 * scale),
         fontFamily: "var(--font-mono)",
         lineNumbers: "on",
         scrollBeyondLastLine: false,

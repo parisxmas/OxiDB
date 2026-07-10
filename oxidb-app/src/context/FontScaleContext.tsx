@@ -38,10 +38,17 @@ export function FontScaleProvider({ children }: { children: ReactNode }) {
   });
 
   useEffect(() => {
-    // `zoom` is honored by the Tauri webview (Chromium/WebKit) and scales
-    // layout with the text, which is the intended "make everything bigger".
-    (document.documentElement.style as CSSStyleDeclaration & { zoom?: string }).zoom =
-      String(scale);
+    // Scale the root font-size (rem/em- and inherited-size text follow) and
+    // expose the factor as a CSS variable. We deliberately do NOT use CSS
+    // `zoom`/`transform` on the document: on the macOS WebKit webview those
+    // break Monaco's click→cursor position mapping (getBoundingClientRect
+    // returns zoomed coords Monaco doesn't compensate for). Monaco editors
+    // instead scale via their own fontSize option (see SqlEditor/JsonEditor),
+    // which keeps mouse targeting exact.
+    const root = document.documentElement;
+    root.style.removeProperty("zoom"); // clear any zoom from an earlier build
+    root.style.fontSize = `${16 * scale}px`;
+    root.style.setProperty("--font-scale", String(scale));
     localStorage.setItem("oxidb-font-scale", String(scale));
   }, [scale]);
 
