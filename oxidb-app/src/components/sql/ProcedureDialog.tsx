@@ -96,13 +96,19 @@ export function ProcedureDialog({ proc, onClose, onInsert, onDrop, onEdit }: Pro
           >
             Drop procedure
           </button>
-          {proc.language === "cobra" && onEdit && (
+          {onEdit && (
             <button
               className="btn btn-secondary"
               onClick={() => onEdit(proc)}
-              title={hasSource ? "Edit source and recompile" : "No source stored — paste new source to replace"}
+              title={
+                proc.language === "cobra"
+                  ? hasSource
+                    ? "Edit source and recompile"
+                    : "No source stored — paste new source to replace"
+                  : "Edit the procedure body"
+              }
             >
-              Edit source…
+              Edit…
             </button>
           )}
           <button className="btn btn-secondary" onClick={onClose}>

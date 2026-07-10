@@ -12,6 +12,7 @@ import { IndexDialog } from "./IndexDialog";
 import { ProcedureDialog, type ProcInfo } from "./ProcedureDialog";
 import { ImportDialog } from "./ImportDialog";
 import { NewProcedureDialog } from "./NewProcedureDialog";
+import { NewSqlProcedureDialog } from "./NewSqlProcedureDialog";
 import { IconSql, IconTable, IconKey, IconFunction } from "../layout/NavIcons";
 import { useToast } from "../common/Toast";
 
@@ -74,7 +75,9 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [showNewDb, setShowNewDb] = useState(false);
   const [dropDbName, setDropDbName] = useState<string | null>(null);
   const [showNewProc, setShowNewProc] = useState(false);
+  const [showNewSqlProc, setShowNewSqlProc] = useState(false);
   const [editProc, setEditProc] = useState<{ name: string; params: { name: string; type: string }[]; source: string } | null>(null);
+  const [editSqlProc, setEditSqlProc] = useState<{ name: string; params: { name: string; type: string }[]; body: string } | null>(null);
 
   /** Load one database's tables + procedures (scoped explicitly to it). */
   const load = useCallback(async (dbName: string) => {
@@ -248,6 +251,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
       const builtin = dbName === "oxidb" || dbName === "postgres";
       const items: MenuItem[] = [
         { label: "New table…", onClick: () => { setDb(dbName); setShowCreate(true); } },
+        { label: "New SQL procedure…", onClick: () => { setDb(dbName); setShowNewSqlProc(true); } },
         { label: "New Cobra procedure…", onClick: () => { setDb(dbName); setShowNewProc(true); } },
         { label: "Import CSV / JSON…", onClick: () => { setDb(dbName); setShowImport(true); } },
         { label: "Refresh", onClick: () => load(dbName) },
@@ -502,13 +506,28 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
         />
       )}
 
+      {showNewSqlProc && (
+        <NewSqlProcedureDialog
+          onClose={() => setShowNewSqlProc(false)}
+          onCreated={reloadCurrent}
+        />
+      )}
+
+      {editSqlProc && (
+        <NewSqlProcedureDialog
+          initial={editSqlProc}
+          onClose={() => setEditSqlProc(null)}
+          onCreated={reloadCurrent}
+        />
+      )}
+
       {viewProc && (
         <ProcedureDialog
           proc={viewProc}
           onClose={() => setViewProc(null)}
           onInsert={onInsert}
           onEdit={(p) => {
-            // params string "a INT, b TEXT" → typed rows; definition = source
+            // params string "a INT, b TEXT" → typed rows
             const params = p.params
               .split(",")
               .map((s) => s.trim())
@@ -517,9 +536,20 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                 const [n, ...ty] = s.split(/\s+/);
                 return { name: n, type: (ty.join(" ") || "INT").toUpperCase() };
               });
-            const source = p.definition.startsWith("<cobra bytecode") ? "" : p.definition;
             setViewProc(null);
-            setEditProc({ name: p.name, params, source });
+            if (p.language === "cobra") {
+              const source = p.definition.startsWith("<cobra bytecode") ? "" : p.definition;
+              setEditProc({ name: p.name, params, source });
+            } else {
+              // SHOW returns the body with parameters rewritten to $1..$N;
+              // turn them back into names so the edit form + re-CREATE parse
+              // (the engine re-rewrites names → $N on save).
+              const body = p.definition.replace(
+                /\$(\d+)/g,
+                (m, n) => params[Number(n) - 1]?.name ?? m
+              );
+              setEditSqlProc({ name: p.name, params, body });
+            }
           }}
           onDrop={(procName) => {
             setViewProc(null);
