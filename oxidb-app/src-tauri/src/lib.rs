@@ -5,12 +5,47 @@ mod state;
 use std::sync::Mutex;
 
 use state::DbBackend;
+use tauri::{Emitter, WindowEvent};
+use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
+
+/// F5 (no modifiers) — the "Run query" accelerator. Captured globally so it
+/// reaches the app even when macOS would otherwise route the function-key row
+/// to a system service (Dictation, etc.) without holding Fn. Registered only
+/// while the window is focused, so it doesn't swallow F5 in other apps.
+fn run_shortcut() -> Shortcut {
+    Shortcut::new(None, Code::F5)
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if *shortcut == run_shortcut() && event.state() == ShortcutState::Pressed {
+                        // Frontend runs it only when the SQL page is mounted.
+                        let _ = app.emit("run-sql-shortcut", ());
+                    }
+                })
+                .build(),
+        )
+        .setup(|app| {
+            // The window is focused at launch; register F5 now.
+            let _ = app.global_shortcut().register(run_shortcut());
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::Focused(focused) = event {
+                let gs = window.global_shortcut();
+                if *focused {
+                    let _ = gs.register(run_shortcut());
+                } else {
+                    let _ = gs.unregister(run_shortcut());
+                }
+            }
+        })
         .manage(Mutex::new(DbBackend::Disconnected))
         .manage(commands::oximem::OxiMemState::default())
         .invoke_handler(tauri::generate_handler![

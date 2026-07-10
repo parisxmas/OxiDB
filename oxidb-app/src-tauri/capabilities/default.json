@@ -7,6 +7,9 @@
     "core:default",
     "dialog:default",
     "dialog:allow-open",
-    "shell:default"
+    "shell:default",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister",
+    "global-shortcut:allow-is-registered"
   ]
 }

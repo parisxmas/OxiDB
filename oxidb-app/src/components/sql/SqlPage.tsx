@@ -1,4 +1,5 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { listen } from "@tauri-apps/api/event";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { runSql } from "../../api/tauri";
 import type { JsonValue } from "../../api/types";
@@ -185,6 +186,17 @@ export function SqlPage() {
       toast(String(e), "error");
     }
   }, [tabs, activeIdx, history, toast, patch]);
+
+  // F5 arrives as a backend event (a global shortcut, so it works on macOS
+  // without holding Fn). Only the SQL page listens, so F5 only runs here.
+  useEffect(() => {
+    const un = listen("run-sql-shortcut", () => {
+      void run();
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, [run]);
 
   const cur = t.results && t.results[t.active] ? t.results[t.active] : null;
   const isSelect = !!cur?.columns;

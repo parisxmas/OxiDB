@@ -16,6 +16,9 @@ oxidb = { path = "../.." }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
+# Capture F5 (Run) even when macOS routes the function-key row to system
+# services, so it reaches the app without holding Fn.
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
