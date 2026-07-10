@@ -3329,7 +3329,9 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             ScalarFunc::Abs | ScalarFunc::Round | ScalarFunc::NullIf => {
                 args.first().and_then(|a| expr_type(a, schema))
             }
-            ScalarFunc::Coalesce => args.iter().find_map(|a| expr_type(a, schema)),
+            ScalarFunc::Coalesce | ScalarFunc::Least | ScalarFunc::Greatest => {
+                args.iter().find_map(|a| expr_type(a, schema))
+            }
             ScalarFunc::Case { has_else } => {
                 // Value slots are the odd positions (+ trailing ELSE).
                 let mut it: Vec<&Expr> = args.iter().skip(1).step_by(2).collect();
@@ -3359,6 +3361,8 @@ fn default_name(expr: &Expr) -> String {
         Expr::Aggregate { func, .. } => agg_name(func).to_string(),
         Expr::Func { func, .. } => match func {
             ScalarFunc::Coalesce => "coalesce".to_string(),
+            ScalarFunc::Least => "least".to_string(),
+            ScalarFunc::Greatest => "greatest".to_string(),
             ScalarFunc::NullIf => "nullif".to_string(),
             ScalarFunc::Upper => "upper".to_string(),
             ScalarFunc::Lower => "lower".to_string(),
@@ -3529,6 +3533,31 @@ where
                 }
             }
             Ok(Value::Null)
+        }
+        ScalarFunc::Least | ScalarFunc::Greatest => {
+            // Smallest/largest non-NULL argument (NULLs ignored, like Postgres;
+            // all-NULL → NULL). Cross-type ordering matches MIN/MAX.
+            let want = if matches!(func, ScalarFunc::Least) {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+            let mut best: Option<Value> = None;
+            for a in args {
+                let v = eval(a)?;
+                if matches!(v, Value::Null) {
+                    continue;
+                }
+                match &best {
+                    None => best = Some(v),
+                    Some(cur) => {
+                        if Value::total_order(&v, cur) == want {
+                            best = Some(v);
+                        }
+                    }
+                }
+            }
+            Ok(best.unwrap_or(Value::Null))
         }
         ScalarFunc::NullIf => {
             let a = eval(&args[0])?;

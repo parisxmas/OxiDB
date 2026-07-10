@@ -318,6 +318,9 @@ pub enum Expr {
 pub enum ScalarFunc {
     /// First non-NULL argument (also spelled `IFNULL` with two arguments).
     Coalesce,
+    /// Smallest / largest non-NULL argument (variadic; NULLs ignored).
+    Least,
+    Greatest,
     /// NULL when the two arguments are equal, else the first.
     NullIf,
     Upper,

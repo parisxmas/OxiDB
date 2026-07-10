@@ -1859,6 +1859,8 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
     // Row-scalar functions (before the single-argument aggregate path).
     if let Some(func) = match fname.as_str() {
         "coalesce" | "ifnull" => Some(ScalarFunc::Coalesce),
+        "least" => Some(ScalarFunc::Least),
+        "greatest" => Some(ScalarFunc::Greatest),
         "nullif" => Some(ScalarFunc::NullIf),
         "upper" | "ucase" => Some(ScalarFunc::Upper),
         "lower" | "lcase" => Some(ScalarFunc::Lower),
@@ -1887,7 +1889,10 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             .collect::<Result<_>>()?;
         let ok_arity = match func {
             ScalarFunc::Coalesce if fname == "ifnull" => exprs.len() == 2,
-            ScalarFunc::Coalesce | ScalarFunc::Concat => !exprs.is_empty(),
+            ScalarFunc::Coalesce
+            | ScalarFunc::Concat
+            | ScalarFunc::Least
+            | ScalarFunc::Greatest => !exprs.is_empty(),
             ScalarFunc::NullIf | ScalarFunc::Replace => {
                 exprs.len() == if func == ScalarFunc::Replace { 3 } else { 2 }
             }

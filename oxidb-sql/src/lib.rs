@@ -1598,6 +1598,31 @@ mod tests {
     }
 
     #[test]
+    fn least_greatest_ignore_nulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a INT, b INT, c INT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,3,9,5),(2,7,NULL,2)")
+            .unwrap();
+        let rows = select_rows(
+            &db,
+            "SELECT LEAST(a,b,c) AS lo, GREATEST(a,b,c) AS hi FROM t ORDER BY id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(3), Value::Int(9)],
+                // row 2: b is NULL and is ignored (not treated as smallest).
+                vec![Value::Int(2), Value::Int(7)],
+            ]
+        );
+        // All-NULL → NULL.
+        let r = select_rows(&db, "SELECT LEAST(NULL, NULL) AS x FROM t WHERE id=1");
+        assert_eq!(r, vec![vec![Value::Null]]);
+    }
+
+    #[test]
     fn cte_basic_and_chained() {
         let dir = tempfile::tempdir().unwrap();
         let db = SqlEngine::open(dir.path()).unwrap();
