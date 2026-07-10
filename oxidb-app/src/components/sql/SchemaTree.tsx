@@ -122,6 +122,43 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
     }
   }, []);
 
+  /**
+   * Open a procedure in the viewer with source fetched FRESH from the server,
+   * not the (possibly stale) copy cached in the tree. Another client — or an
+   * earlier deploy — may have changed the body since the tree last loaded;
+   * editing a stale copy and saving would silently clobber the newer version.
+   * Falls back to the cached ProcInfo if the refetch fails.
+   */
+  const openProc = useCallback(async (dbName: string, cached: ProcInfo) => {
+    setDb(dbName);
+    setViewProc(cached); // show immediately; upgrade to fresh below
+    try {
+      const ps = firstSelect(await runSql("SHOW PROCEDURES", undefined, dbName));
+      if (!ps || ps.error) return;
+      const pi = (ps.columns || []).indexOf("procedure");
+      const pp = (ps.columns || []).indexOf("params");
+      const pd = (ps.columns || []).indexOf("definition");
+      const pl = (ps.columns || []).indexOf("language");
+      const fresh = (ps.rows || [])
+        .map((r) => ({
+          name: String(r[pi]),
+          params: String(r[pp] ?? ""),
+          definition: String(r[pd] ?? ""),
+          language: pl >= 0 ? String(r[pl] ?? "sql") : "sql",
+        }))
+        .find((p) => p.name === cached.name);
+      if (fresh) {
+        setViewProc(fresh);
+        setProcsByDb((prev) => ({
+          ...prev,
+          [dbName]: (prev[dbName] || []).map((p) => (p.name === fresh.name ? fresh : p)),
+        }));
+      }
+    } catch {
+      /* keep the cached copy already shown */
+    }
+  }, []);
+
   /** Reload whatever database the current operation targeted. */
   const reloadCurrent = useCallback(() => {
     const d = getCurrentDb() || db;
@@ -375,7 +412,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                                   <span
                                     className="schema-table-name"
                                     title="Click to view · double-click to insert CALL"
-                                    onClick={() => { setDb(dbName); setViewProc(p); }}
+                                    onClick={() => openProc(dbName, p)}
                                     onDoubleClick={() => {
                                       setDb(dbName);
                                       const args = p.params.split(",").map((s) => s.trim()).filter(Boolean).map(() => "?").join(", ");
