@@ -27,10 +27,74 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use oxidb::database_manager::DEFAULT_DATABASE;
-use oxidb_tsdb::{Agg, Point, QuerySpec, TagPredicate, Tsdb};
+use oxidb_tsdb::{Agg, Point, QuerySpec, RollupSpec, TagPredicate, Tsdb};
 use serde_json::{Value, json};
 
 use crate::handler::{err_bytes, ok_bytes};
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse an aggregation name (with `p95` / `percentile`+`p` shorthands).
+fn parse_agg(s: &str, p: Option<f64>) -> Result<Agg, String> {
+    Ok(match s {
+        "mean" | "avg" => Agg::Mean,
+        "sum" => Agg::Sum,
+        "min" => Agg::Min,
+        "max" => Agg::Max,
+        "count" => Agg::Count,
+        "distinct" => Agg::Distinct,
+        "first" => Agg::First,
+        "last" => Agg::Last,
+        "rate" => Agg::Rate,
+        "percentile" | "quantile" => Agg::Percentile(p.ok_or("percentile requires 'p'")?),
+        s if s.starts_with('p') && s[1..].parse::<f64>().is_ok() => {
+            Agg::Percentile(s[1..].parse().unwrap())
+        }
+        other => return Err(format!("unknown agg: {other:?}")),
+    })
+}
+
+/// Define a rollup rule: `{measurement, label, interval, aggs:[...]}`.
+fn rollup_add(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
+    let Some(measurement) = request.get("measurement").and_then(|v| v.as_str()) else {
+        return err_bytes("rollup_add requires a 'measurement'");
+    };
+    let Some(interval) = request.get("interval").and_then(|v| v.as_i64()) else {
+        return err_bytes("rollup_add requires an integer 'interval' (ms)");
+    };
+    if interval <= 0 {
+        return err_bytes("interval must be > 0");
+    }
+    let label = request
+        .get("label")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("{interval}ms"));
+    let agg_names: Vec<&str> = request
+        .get("aggs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_else(|| vec!["mean", "min", "max", "count"]);
+    let mut aggs = Vec::new();
+    for name in agg_names {
+        match parse_agg(name, None) {
+            Ok(a) => aggs.push(a),
+            Err(e) => return err_bytes(&e),
+        }
+    }
+    engine.write().unwrap().add_rollup(RollupSpec {
+        measurement: measurement.to_string(),
+        label,
+        interval,
+        aggs,
+    });
+    ok_bytes(json!({ "ok": true }))
+}
 
 /// Per-database time-series engines, persisted on disk.
 struct Registry {
@@ -168,7 +232,35 @@ pub fn handle_tsdb(cmd: &str, request: &Value, readonly: bool, db_name: &str) ->
                 Err(e) => err_bytes(&format!("checkpoint failed: {e}")),
             }
         }
-        "" => err_bytes("missing 'op' (write | query | stats | retention | checkpoint)"),
+        "rollup_add" => {
+            if readonly {
+                return err_bytes("permission denied: read-only role cannot define rollups");
+            }
+            rollup_add(&engine, request)
+        }
+        "rollup_refresh" => {
+            if readonly {
+                return err_bytes("permission denied: read-only role cannot refresh rollups");
+            }
+            let now = request
+                .get("now")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_else(now_ms);
+            let n = engine.write().unwrap().refresh_rollups(now);
+            ok_bytes(json!({ "written": n }))
+        }
+        "rollups" => {
+            let db = engine.read().unwrap();
+            let list: Vec<Value> = db
+                .rollups()
+                .iter()
+                .map(|r| json!({ "measurement": r.measurement, "label": r.label, "interval": r.interval }))
+                .collect();
+            ok_bytes(json!(list))
+        }
+        "" => err_bytes(
+            "missing 'op' (write | write_lp | query | stats | retention | checkpoint | rollup_add | rollup_refresh | rollups)",
+        ),
         other => err_bytes(&format!("unknown tsdb op: {other:?}")),
     }
 }

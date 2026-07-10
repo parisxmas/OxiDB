@@ -130,7 +130,7 @@ pub struct TagPredicate {
 }
 
 /// Aggregation applied per (tag-group, time-bucket).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Agg {
     Mean,
     Sum,
@@ -283,6 +283,46 @@ fn percentile(vals: &[f64], p: f64) -> f64 {
     let hi = rank.ceil() as usize;
     let frac = rank - lo as f64;
     v[lo] + (v[hi] - v[lo]) * frac
+}
+
+/// Short name for an aggregation, used to name rollup fields (`usage_mean`).
+pub fn agg_name(agg: Agg) -> String {
+    match agg {
+        Agg::Mean => "mean".into(),
+        Agg::Sum => "sum".into(),
+        Agg::Min => "min".into(),
+        Agg::Max => "max".into(),
+        Agg::Count => "count".into(),
+        Agg::First => "first".into(),
+        Agg::Last => "last".into(),
+        Agg::Distinct => "distinct".into(),
+        Agg::Rate => "rate".into(),
+        Agg::Percentile(p) => format!("p{p}"),
+    }
+}
+
+/// Bucket a single numeric series over `[start, end)` at `interval`, returning
+/// `(bucket_start, [agg-value per requested agg])`. Used to materialize rollups.
+pub fn rollup_series(
+    s: &Series,
+    start: i64,
+    end: i64,
+    interval: i64,
+    aggs: &[Agg],
+) -> Vec<(i64, Vec<f64>)> {
+    let collect = aggs.iter().any(|a| a.needs_values());
+    let mut buckets: BTreeMap<i64, Acc> = BTreeMap::new();
+    s.for_each_in(start, end, |t, v| {
+        let b = t - t.rem_euclid(interval);
+        buckets
+            .entry(b)
+            .or_insert_with(|| Acc::new(collect))
+            .add(t, v);
+    });
+    buckets
+        .into_iter()
+        .map(|(ts, acc)| (ts, aggs.iter().map(|a| acc.value(*a)).collect()))
+        .collect()
 }
 
 pub fn run_query(series: &BTreeMap<SeriesKey, Series>, spec: &QuerySpec) -> Vec<ResultSeries> {

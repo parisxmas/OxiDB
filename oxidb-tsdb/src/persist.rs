@@ -39,6 +39,26 @@ fn blocks_path(dir: &Path, generation: u64) -> PathBuf {
 fn wal_path(dir: &Path, generation: u64) -> PathBuf {
     dir.join(format!("wal.{generation}.log"))
 }
+fn wm_path(dir: &Path, generation: u64) -> PathBuf {
+    dir.join(format!("rollup_wm.{generation}.json"))
+}
+fn rollups_path(dir: &Path) -> PathBuf {
+    dir.join("rollups.json")
+}
+
+/// Persist the rollup rule set (survives restart; watermark is per-generation).
+pub fn save_rollups(dir: &Path, rules: &[crate::RollupSpec]) -> io::Result<()> {
+    let tmp = dir.join("rollups.tmp");
+    fs::write(&tmp, serde_json::to_vec(rules).unwrap_or_default())?;
+    fs::rename(&tmp, rollups_path(dir))
+}
+
+pub fn load_rollups(dir: &Path) -> Vec<crate::RollupSpec> {
+    fs::read(rollups_path(dir))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
 
 fn read_gen(dir: &Path) -> u64 {
     fs::read(manifest_path(dir))
@@ -66,10 +86,18 @@ impl Persist {
         dir: &Path,
         series: &mut BTreeMap<SeriesKey, Series>,
         str_series: &mut BTreeMap<SeriesKey, StrSeries>,
+        watermark: &mut BTreeMap<String, i64>,
         block_points: usize,
     ) -> io::Result<Persist> {
         fs::create_dir_all(dir)?;
         let generation = read_gen(dir);
+
+        // Rollup watermark sidecar for this generation.
+        if let Ok(bytes) = fs::read(wm_path(dir, generation))
+            && let Ok(map) = serde_json::from_slice::<BTreeMap<String, i64>>(&bytes)
+        {
+            *watermark = map;
+        }
 
         // Load the snapshot: numeric block records + string-series records.
         if let Ok(f) = File::open(blocks_path(dir, generation)) {
@@ -155,12 +183,17 @@ impl Persist {
         self.wal.flush()
     }
 
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// Write a full snapshot of `series` at generation+1, commit the MANIFEST, and
     /// rotate the WAL. Callers must seal active buffers first.
     pub fn checkpoint(
         &mut self,
         series: &BTreeMap<SeriesKey, Series>,
         str_series: &BTreeMap<SeriesKey, StrSeries>,
+        watermark: &BTreeMap<String, i64>,
     ) -> io::Result<()> {
         let next = self.generation + 1;
         {
@@ -177,6 +210,12 @@ impl Persist {
             w.flush()?;
             w.get_ref().sync_all()?;
         }
+        // Rollup watermark rides the same generation (written before the commit).
+        {
+            let mut f = File::create(wm_path(&self.dir, next))?;
+            f.write_all(&serde_json::to_vec(watermark).unwrap_or_default())?;
+            f.sync_all()?;
+        }
         write_manifest(&self.dir, next)?; // commit point
 
         // New empty WAL for the new generation, then drop the old files.
@@ -189,6 +228,7 @@ impl Persist {
         self.wal_bytes = 0;
         let _ = fs::remove_file(blocks_path(&self.dir, self.generation));
         let _ = fs::remove_file(wal_path(&self.dir, self.generation));
+        let _ = fs::remove_file(wm_path(&self.dir, self.generation));
         self.generation = next;
         Ok(())
     }

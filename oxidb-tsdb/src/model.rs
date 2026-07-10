@@ -30,6 +30,21 @@ impl SeriesKey {
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
+
+    /// A stable string identity (for watermark keys). Uses `\x1f` separators,
+    /// which never appear in normal identifiers.
+    pub fn canonical(&self) -> String {
+        let mut s = self.measurement.clone();
+        for (k, v) in &self.tags {
+            s.push('\u{1f}');
+            s.push_str(k);
+            s.push('=');
+            s.push_str(v);
+        }
+        s.push('\u{1f}');
+        s.push_str(&self.field);
+        s
+    }
 }
 
 /// The logical type of a field. Values are stored as `f64` internally (ints are

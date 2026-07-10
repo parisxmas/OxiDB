@@ -31,12 +31,26 @@ use std::path::Path;
 /// Auto-checkpoint once the WAL passes this many bytes.
 const DEFAULT_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 
+/// A continuous-aggregate rule: roll every numeric series of `measurement` up
+/// to `interval`-wide buckets, materializing `aggs` into a derived measurement
+/// `<measurement>@<label>` with fields `<field>_<agg>`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RollupSpec {
+    pub measurement: String,
+    pub label: String,
+    pub interval: i64,
+    pub aggs: Vec<Agg>,
+}
+
 /// The time-series database: a set of compressed series streams, optionally
 /// persisted to disk.
 #[derive(Default)]
 pub struct Tsdb {
     series: BTreeMap<SeriesKey, store::Series>,
     str_series: BTreeMap<SeriesKey, store::StrSeries>,
+    rollups: Vec<RollupSpec>,
+    /// Last materialized bucket start per `"<series canonical>\x1f<interval>"`.
+    watermark: BTreeMap<String, i64>,
     /// Points per sealed block; smaller = finer retention/query granularity,
     /// larger = better compression. 1024 is a reasonable default.
     block_points: usize,
@@ -50,6 +64,8 @@ impl Tsdb {
         Tsdb {
             series: BTreeMap::new(),
             str_series: BTreeMap::new(),
+            rollups: Vec::new(),
+            watermark: BTreeMap::new(),
             block_points: 1024,
             persist: None,
             checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
@@ -61,15 +77,97 @@ impl Tsdb {
     pub fn open(dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut series = BTreeMap::new();
         let mut str_series = BTreeMap::new();
+        let mut watermark = BTreeMap::new();
         let block_points = 1024;
-        let p = persist::Persist::open(dir.as_ref(), &mut series, &mut str_series, block_points)?;
+        let p = persist::Persist::open(
+            dir.as_ref(),
+            &mut series,
+            &mut str_series,
+            &mut watermark,
+            block_points,
+        )?;
+        let rollups = persist::load_rollups(dir.as_ref());
         Ok(Tsdb {
             series,
             str_series,
+            rollups,
+            watermark,
             block_points,
             persist: Some(p),
             checkpoint_bytes: DEFAULT_CHECKPOINT_BYTES,
         })
+    }
+
+    /// Registered rollup rules.
+    pub fn rollups(&self) -> &[RollupSpec] {
+        &self.rollups
+    }
+
+    /// Register a continuous-aggregate rule (replacing any with the same
+    /// measurement+label). Persisted so it survives restarts.
+    pub fn add_rollup(&mut self, spec: RollupSpec) {
+        self.rollups
+            .retain(|r| !(r.measurement == spec.measurement && r.label == spec.label));
+        self.rollups.push(spec);
+        if let Some(p) = &self.persist {
+            let _ = persist::save_rollups(p.dir(), &self.rollups);
+        }
+    }
+
+    /// Materialize completed rollup buckets for all registered rules up to
+    /// `now` (only buckets whose window has fully closed). Incremental via a
+    /// per-series watermark. Returns the number of rollup points written.
+    pub fn refresh_rollups(&mut self, now: i64) -> usize {
+        let specs = self.rollups.clone();
+        let mut to_write: Vec<Point> = Vec::new();
+        let mut wm_updates: Vec<(String, i64)> = Vec::new();
+        for spec in &specs {
+            if spec.interval <= 0 {
+                continue;
+            }
+            let last_complete = now - now.rem_euclid(spec.interval) - spec.interval;
+            for (key, s) in &self.series {
+                if key.measurement != spec.measurement {
+                    continue;
+                }
+                let wmk = format!("{}\u{1f}{}", key.canonical(), spec.interval);
+                let last_done = self.watermark.get(&wmk).copied();
+                let range_start = match last_done {
+                    Some(b) => b + spec.interval,
+                    None => i64::MIN / 2,
+                };
+                let range_end = last_complete + spec.interval; // exclusive
+                if range_end <= range_start {
+                    continue;
+                }
+                let rows =
+                    store::rollup_series(s, range_start, range_end, spec.interval, &spec.aggs);
+                let mut max_bucket = last_done.unwrap_or(i64::MIN / 2);
+                let roll_meas = format!("{}@{}", spec.measurement, spec.label);
+                for (bts, vals) in rows {
+                    let mut p = Point::new(&roll_meas, bts);
+                    for (tk, tv) in &key.tags {
+                        p = p.tag(tk, tv);
+                    }
+                    for (agg, v) in spec.aggs.iter().zip(vals) {
+                        p = p.field(&format!("{}_{}", key.field, store::agg_name(*agg)), v);
+                    }
+                    to_write.push(p);
+                    if bts > max_bucket {
+                        max_bucket = bts;
+                    }
+                }
+                wm_updates.push((wmk, max_bucket));
+            }
+        }
+        let n = to_write.len();
+        for p in &to_write {
+            self.write(p);
+        }
+        for (k, b) in wm_updates {
+            self.watermark.insert(k, b);
+        }
+        n
     }
 
     pub fn with_block_points(mut self, n: usize) -> Self {
@@ -127,7 +225,7 @@ impl Tsdb {
             s.seal_active();
         }
         let persist = self.persist.as_mut().unwrap();
-        persist.checkpoint(&self.series, &self.str_series)
+        persist.checkpoint(&self.series, &self.str_series, &self.watermark)
     }
 
     /// True when a text field with this measurement+field name exists.
