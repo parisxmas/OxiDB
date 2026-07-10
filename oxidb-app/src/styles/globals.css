@@ -1038,3 +1038,16 @@ tr:hover .row-del { opacity: 1; }
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
 }
+
+/* Cobra procedure badge in the schema tree */
+.schema-lang-badge {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-left: 6px;
+  flex-shrink: 0;
+}

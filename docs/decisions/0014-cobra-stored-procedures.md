@@ -1,6 +1,6 @@
 # ADR-0014: Cobra as the compiled stored-procedure language
 
-**Status:** Accepted — 2026-07-06 (Phase 0 shipped)
+**Status:** Accepted — 2026-07-06 (Phases 0–2 shipped 2026-07-10; Phase 3 cluster classification pinned)
 
 ## Context
 
@@ -69,22 +69,37 @@ Rejected alternatives:
   runtime auto-detects gob vs portable when loading, so `.cobrac` files
   in either encoding just run. Golden-bytes + round-trip + gob-equivalence
   tests pin the format.
-- **Phase 1 — Rust VM core** (`oxidb-cobra` crate): decoder for
-  `COBRAP\0` v1, value types mirroring Cobra semantics (int/float/string/
-  bool/null/list/dict), frames/closures, the 118-opcode dispatch loop, and
-  a curated builtin subset (pure functions only). Conformance: run Cobra's
-  own example programs on both VMs and diff the output.
-- **Phase 2 — server integration**: `CREATE PROCEDURE name(params)
-  LANGUAGE COBRA AS '<base64 .cobrac>'` (wire clients upload the compiled
-  payload; the CLI grows a helper), catalog + WAL storage next to SQL-text
-  procedures, `CALL` dispatches on the procedure's language, host
-  functions `sql(text, params...)` / `params[...]` bound to the calling
-  transaction, result = the procedure's return value shaped as a result
-  set.
-- **Phase 3 — cluster + polish**: determinism validation at CREATE,
-  Raft replication (rides the existing SQL-text write path), docs,
-  `SHOW PROCEDURES` language column, and the OxiScript-convergence
-  question for the document engine (separate ADR if pursued).
+- **Phase 1 — Rust VM core** *(shipped, `98dc4853`)*: `oxidb-cobra`
+  crate — COBRAP v1 decoder, full value model (incl. dicts with insertion
+  order, decimals, structs/records/contracts), the 51-opcode dispatch loop
+  (the VM slimmed from 118 since this ADR), all 35 builtins (parallel
+  p-variants run sequentially — order-preserving in Go, so observably
+  identical and deterministic), and the CREATE-time validation gate.
+  Conformance: 15 Cobra example programs byte-identical against the Go VM;
+  async/parallel rejected by validation as designed. `SEMANTICS.md` in the
+  crate is the extracted port contract. Known upstream gap: the Go portable
+  encoder cannot serialize Contract constants yet.
+- **Phase 2 — server integration** *(shipped, `d7ea59c0`)*: `CREATE
+  PROCEDURE name(params) LANGUAGE COBRA AS '<base64 .cobrac>'` via a
+  pre-parse intercept (sqlparser cannot parse `AS '<string>'`), catalog +
+  WAL storage beside SQL-text procedures (serde-default backward compat),
+  `CALL` dispatches on language. Host surface (refined from the sketch
+  above): the procedure defines `def run(db, ...params)`; `db` is a native
+  handle with `db.query(sql[,params])` → list of dicts and
+  `db.execute(sql[,params])` → affected count, single-statement,
+  SELECT/DML only, executed through the caller's store so the procedure
+  joins the CALL's transaction; db errors are catchable in Cobra. Return
+  value shapes to a result set (dict → row, list of dicts → table,
+  scalar → "value"); `print` output returns as `notices`. A 100M-
+  instruction fuel limit (non-catchable) bounds runaway loops.
+- **Phase 3 — cluster + polish** *(classification pinned)*: determinism
+  validation shipped with Phase 1; `CREATE ... LANGUAGE COBRA`, `CALL`
+  and `DROP PROCEDURE` are pinned as Raft write statements (the intercept
+  lives inside `parser::parse`, so `is_read_only` sees it — a parse-level
+  miss would have left them silently node-local). `SHOW PROCEDURES` grew
+  the language column in Phase 2. Remaining nice-to-haves: a CLI upload
+  helper (`cobra build` + wrap in CREATE) and notices surfacing in the
+  clients; OxiScript convergence stays a separate ADR.
 
 ## Consequences
 

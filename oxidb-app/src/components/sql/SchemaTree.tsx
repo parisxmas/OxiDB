@@ -95,6 +95,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
       const pi = (ps?.columns || []).indexOf("procedure");
       const pp = (ps?.columns || []).indexOf("params");
       const pd = (ps?.columns || []).indexOf("definition");
+      const pl = (ps?.columns || []).indexOf("language"); // older servers lack it
       setProcsByDb((p) => ({
         ...p,
         [dbName]: ps && !ps.error
@@ -102,6 +103,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
               name: String(r[pi]),
               params: String(r[pp] ?? ""),
               definition: String(r[pd] ?? ""),
+              language: pl >= 0 ? String(r[pl] ?? "sql") : "sql",
             }))
           : [],
       }));
@@ -374,6 +376,9 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                                   >
                                     {p.name}
                                   </span>
+                                  {p.language === "cobra" && (
+                                    <span className="schema-lang-badge">cobra</span>
+                                  )}
                                 </div>
                               </li>
                             ))}

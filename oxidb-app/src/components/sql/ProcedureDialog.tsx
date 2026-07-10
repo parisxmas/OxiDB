@@ -3,7 +3,8 @@ import { SqlEditor } from "../common/SqlEditor";
 export interface ProcInfo {
   name: string;
   params: string; // e.g. "delta INT, name TEXT"
-  definition: string; // body SQL, params shown as $1..$N
+  definition: string; // body SQL ($1..$N), or a bytecode placeholder for cobra
+  language: string; // "sql" | "cobra"
 }
 
 /** Build a `CALL name(?, ?)` template with a comment naming each parameter. */
@@ -39,6 +40,9 @@ export function ProcedureDialog({ proc, onClose, onInsert, onDrop }: Props) {
       >
         <div className="dialog-title">
           Procedure <span style={{ fontFamily: "var(--font-mono)" }}>{proc.name}</span>
+          {proc.language === "cobra" && (
+            <span className="badge badge-muted" style={{ marginLeft: 8 }}>COBRA (compiled)</span>
+          )}
         </div>
 
         <div className="ct-section">Parameters</div>
