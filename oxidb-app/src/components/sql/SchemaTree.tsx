@@ -35,6 +35,11 @@ interface ColumnInfo {
   nullable: boolean;
 }
 
+interface IndexInfo {
+  name: string;
+  columns: string; // e.g. "customer_id" or "a, b"
+}
+
 /** Pull the single SELECT result out of the {ok,data:[...]} envelope. */
 function firstSelect(resp: unknown): StmtResult | null {
   const r = resp as { ok?: boolean; error?: string; data?: StmtResult[] };
@@ -64,7 +69,11 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [tablesByDb, setTablesByDb] = useState<Record<string, TableInfo[]>>({});
   const [procsByDb, setProcsByDb] = useState<Record<string, ProcInfo[]>>({});
   const [colsByDb, setColsByDb] = useState<Record<string, Record<string, ColumnInfo[]>>>({});
+  const [idxByDb, setIdxByDb] = useState<Record<string, Record<string, IndexInfo[]>>>({});
   const [openTables, setOpenTables] = useState<Record<string, boolean>>({}); // `${db}::${table}`
+  // Tables / Stored Procedures group nodes, keyed `${db}::tables|procs`.
+  // Undefined = open (groups default to expanded).
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
 
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
   const [confirm, setConfirm] = useState<{ title: string; message: string; sql: string; db: string } | null>(null);
@@ -206,6 +215,22 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
         },
       }));
     }
+    // Secondary indexes on this table (SHOW INDEXES → index, table, columns).
+    const ix = firstSelect(await runSql(`SHOW INDEXES FROM ${table}`, undefined, dbName));
+    if (ix && !ix.error) {
+      const ni = (ix.columns || []).indexOf("index");
+      const ci = (ix.columns || []).indexOf("columns");
+      setIdxByDb((prev) => ({
+        ...prev,
+        [dbName]: {
+          ...(prev[dbName] || {}),
+          [table]: (ix.rows || []).map((r) => ({
+            name: String(r[ni]),
+            columns: String(r[ci]),
+          })),
+        },
+      }));
+    }
   }, []);
 
   const toggleTable = useCallback(
@@ -217,6 +242,11 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
     },
     [openTables, colsByDb, loadColumns]
   );
+
+  const toggleGroup = useCallback((dbName: string, kind: "tables" | "procs") => {
+    const key = `${dbName}::${kind}`;
+    setCollapsedGroups((p) => ({ ...p, [key]: !p[key] }));
+  }, []);
 
   /** Run a DDL/DML statement scoped to a db, toast, then reload that db. */
   const runDdl = useCallback(
@@ -358,78 +388,131 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                         <div className="schema-empty">{err}</div>
                       ) : loadingThis && !loadedDbs[dbName] ? (
                         <div className="schema-empty">Loading…</div>
-                      ) : tables.length === 0 ? (
-                        <div className="schema-empty">No tables</div>
                       ) : (
-                        <ul className="schema-list">
-                          {tables.map((t) => {
-                            const tkey = `${dbName}::${t.name}`;
-                            const tOpen = !!openTables[tkey];
-                            const tcols = colsByDb[dbName]?.[t.name] || [];
+                        <>
+                          {/* ── Tables group ── */}
+                          {(() => {
+                            const tablesOpen = !collapsedGroups[`${dbName}::tables`];
                             return (
-                              <li key={t.name}>
-                                <div className="schema-table-row" onContextMenu={(e) => openTableMenu(e, dbName, t.name)}>
-                                  <button className="schema-caret" onClick={() => toggleTable(dbName, t.name)} aria-label="expand">
-                                    {tOpen ? "▾" : "▸"}
-                                  </button>
-                                  <span className="schema-row-icon"><IconTable size={13} /></span>
-                                  <span
-                                    className="schema-table-name"
-                                    title="Click to expand columns · double-click to browse & edit · right-click for menu"
-                                    onClick={() => toggleTable(dbName, t.name)}
-                                    onDoubleClick={() => { setDb(dbName); onBrowse(t.name); }}
-                                  >
-                                    {t.name}
-                                  </span>
-                                  {t.rows !== null && <span className="schema-rowcount">{t.rows}</span>}
+                              <div>
+                                <div
+                                  className="schema-group-node"
+                                  onClick={() => toggleGroup(dbName, "tables")}
+                                  title="Tables"
+                                >
+                                  <span className="schema-caret">{tablesOpen ? "▾" : "▸"}</span>
+                                  <span className="schema-group-name">Tables ({tables.length})</span>
                                 </div>
-                                {tOpen && (
-                                  <ul className="schema-cols">
-                                    {tcols.map((c) => (
-                                      <li key={c.name} className="schema-col" title={`${c.type}${c.nullable ? " · nullable" : " · not null"}`} onClick={() => onInsert(c.name)}>
-                                        {c.primaryKey && <span className="schema-pk" title="primary key"><IconKey size={12} /></span>}
-                                        <span className="schema-col-name">{c.name}</span>
-                                        <span className="schema-col-type">{c.type}</span>
-                                      </li>
-                                    ))}
-                                    {tcols.length === 0 && <li className="schema-col schema-empty">…</li>}
-                                  </ul>
-                                )}
-                              </li>
+                                {tablesOpen &&
+                                  (tables.length === 0 ? (
+                                    <div className="schema-empty" style={{ paddingLeft: 18 }}>No tables</div>
+                                  ) : (
+                                    <ul className="schema-list" style={{ paddingLeft: 10 }}>
+                                      {tables.map((t) => {
+                                        const tkey = `${dbName}::${t.name}`;
+                                        const tOpen = !!openTables[tkey];
+                                        const tcols = colsByDb[dbName]?.[t.name] || [];
+                                        const tidx = idxByDb[dbName]?.[t.name] || [];
+                                        return (
+                                          <li key={t.name}>
+                                            <div className="schema-table-row" onContextMenu={(e) => openTableMenu(e, dbName, t.name)}>
+                                              <button className="schema-caret" onClick={() => toggleTable(dbName, t.name)} aria-label="expand">
+                                                {tOpen ? "▾" : "▸"}
+                                              </button>
+                                              <span className="schema-row-icon"><IconTable size={13} /></span>
+                                              <span
+                                                className="schema-table-name"
+                                                title="Click to expand columns · double-click to browse & edit · right-click for menu"
+                                                onClick={() => toggleTable(dbName, t.name)}
+                                                onDoubleClick={() => { setDb(dbName); onBrowse(t.name); }}
+                                              >
+                                                {t.name}
+                                              </span>
+                                              {t.rows !== null && <span className="schema-rowcount">{t.rows}</span>}
+                                            </div>
+                                            {tOpen && (
+                                              <ul className="schema-cols">
+                                                {tcols.map((c) => (
+                                                  <li key={c.name} className="schema-col" title={`${c.type}${c.nullable ? " · nullable" : " · not null"}`} onClick={() => onInsert(c.name)}>
+                                                    {c.primaryKey && <span className="schema-pk" title="primary key"><IconKey size={12} /></span>}
+                                                    <span className="schema-col-name">{c.name}</span>
+                                                    <span className="schema-col-type">{c.type}</span>
+                                                  </li>
+                                                ))}
+                                                {tcols.length === 0 && <li className="schema-col schema-empty">…</li>}
+                                                {tidx.length > 0 && (
+                                                  <li className="schema-col schema-idx-head">Indexes</li>
+                                                )}
+                                                {tidx.map((ix) => (
+                                                  <li
+                                                    key={ix.name}
+                                                    className="schema-col schema-idx"
+                                                    title={`index on (${ix.columns})`}
+                                                    onClick={() => onInsert(ix.columns)}
+                                                  >
+                                                    <span className="schema-idx-icon"><IconKey size={11} /></span>
+                                                    <span className="schema-col-name">{ix.name}</span>
+                                                    <span className="schema-col-type">{ix.columns}</span>
+                                                  </li>
+                                                ))}
+                                              </ul>
+                                            )}
+                                          </li>
+                                        );
+                                      })}
+                                    </ul>
+                                  ))}
+                              </div>
                             );
-                          })}
-                        </ul>
-                      )}
+                          })()}
 
-                      {procs.length > 0 && (
-                        <div className="schema-procs">
-                          <div className="schema-section-head">PROCEDURES ({procs.length})</div>
-                          <ul className="schema-list" style={{ flex: "none" }}>
-                            {procs.map((p) => (
-                              <li key={p.name}>
-                                <div className="schema-table-row">
-                                  <span className="schema-caret" style={{ visibility: "hidden" }}>▸</span>
-                                  <span className="schema-row-icon"><IconFunction size={13} /></span>
-                                  <span
-                                    className="schema-table-name"
-                                    title="Click to view · double-click to insert CALL"
-                                    onClick={() => openProc(dbName, p)}
-                                    onDoubleClick={() => {
-                                      setDb(dbName);
-                                      const args = p.params.split(",").map((s) => s.trim()).filter(Boolean).map(() => "?").join(", ");
-                                      onQuery(`CALL ${p.name}(${args});`);
-                                    }}
-                                  >
-                                    {p.name}
-                                  </span>
-                                  {p.language === "cobra" && (
-                                    <span className="schema-lang-badge">cobra</span>
-                                  )}
+                          {/* ── Stored Procedures group ── */}
+                          {(() => {
+                            const procsOpen = !collapsedGroups[`${dbName}::procs`];
+                            return (
+                              <div style={{ marginTop: 4 }}>
+                                <div
+                                  className="schema-group-node"
+                                  onClick={() => toggleGroup(dbName, "procs")}
+                                  title="Stored Procedures"
+                                >
+                                  <span className="schema-caret">{procsOpen ? "▾" : "▸"}</span>
+                                  <span className="schema-group-name">Stored Procedures ({procs.length})</span>
                                 </div>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
+                                {procsOpen &&
+                                  (procs.length === 0 ? (
+                                    <div className="schema-empty" style={{ paddingLeft: 18 }}>No procedures</div>
+                                  ) : (
+                                    <ul className="schema-list" style={{ paddingLeft: 10, flex: "none" }}>
+                                      {procs.map((p) => (
+                                        <li key={p.name}>
+                                          <div className="schema-table-row">
+                                            <span className="schema-caret" style={{ visibility: "hidden" }}>▸</span>
+                                            <span className="schema-row-icon"><IconFunction size={13} /></span>
+                                            <span
+                                              className="schema-table-name"
+                                              title="Click to view · double-click to insert CALL"
+                                              onClick={() => openProc(dbName, p)}
+                                              onDoubleClick={() => {
+                                                setDb(dbName);
+                                                const args = p.params.split(",").map((s) => s.trim()).filter(Boolean).map(() => "?").join(", ");
+                                                onQuery(`CALL ${p.name}(${args});`);
+                                              }}
+                                            >
+                                              {p.name}
+                                            </span>
+                                            {p.language === "cobra" && (
+                                              <span className="schema-lang-badge">cobra</span>
+                                            )}
+                                          </div>
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  ))}
+                              </div>
+                            );
+                          })()}
+                        </>
                       )}
                     </div>
                   )}

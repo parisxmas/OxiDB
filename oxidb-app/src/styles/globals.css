@@ -1078,3 +1078,38 @@ tr:hover .row-del { opacity: 1; }
   padding: 0 4px;
   flex-shrink: 0;
 }
+
+/* ── Schema tree: Tables / Stored Procedures group nodes ─────────────── */
+.schema-group-node {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+.schema-group-node:hover { color: var(--text-primary); }
+.schema-group-name { white-space: nowrap; }
+
+/* Index rows under a table's column list */
+.schema-idx-head {
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  opacity: 0.75;
+  cursor: default;
+  padding-top: 4px;
+}
+.schema-idx .schema-idx-icon {
+  display: inline-flex;
+  color: var(--accent);
+  opacity: 0.8;
+  margin-right: 2px;
+}
+.schema-idx .schema-col-type { color: var(--text-secondary); font-style: italic; }
