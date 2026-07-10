@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
-import { runSql } from "../../api/tauri";
+import { runSql, getCurrentDb } from "../../api/tauri";
 import { useDatabase } from "../../context/DatabaseContext";
 import type { JsonValue } from "../../api/types";
 import { ContextMenu } from "../common/ContextMenu";
@@ -39,11 +39,8 @@ function firstSelect(resp: unknown): StmtResult | null {
 }
 
 interface Props {
-  /** Insert a snippet (table or column name) into the editor at the cursor. */
   onInsert: (text: string) => void;
-  /** Replace the editor with a ready-made query. */
   onQuery: (sql: string) => void;
-  /** Open a table in the editable data grid. */
   onBrowse: (table: string) => void;
   /** Bumped by the parent after a DDL run, to force a refresh. */
   refreshKey?: number;
@@ -51,340 +48,305 @@ interface Props {
 
 export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const toast = useToast();
-  const [tables, setTables] = useState<TableInfo[]>([]);
-  const [cols, setCols] = useState<Record<string, ColumnInfo[]>>({});
-  const [open, setOpen] = useState<Record<string, boolean>>({});
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const { db, databases, setDb, reload: reloadDatabases } = useDatabase();
+
+  // Everything is keyed by database name so several databases can stay
+  // expanded at once, each with its own tables/procedures.
+  const [openDbs, setOpenDbs] = useState<Record<string, boolean>>({});
+  const [loadedDbs, setLoadedDbs] = useState<Record<string, boolean>>({});
+  const [loadingDb, setLoadingDb] = useState<string | null>(null);
+  const [errorByDb, setErrorByDb] = useState<Record<string, string | null>>({});
+  const [tablesByDb, setTablesByDb] = useState<Record<string, TableInfo[]>>({});
+  const [procsByDb, setProcsByDb] = useState<Record<string, ProcInfo[]>>({});
+  const [colsByDb, setColsByDb] = useState<Record<string, Record<string, ColumnInfo[]>>>({});
+  const [openTables, setOpenTables] = useState<Record<string, boolean>>({}); // `${db}::${table}`
+
   const [menu, setMenu] = useState<{ x: number; y: number; items: MenuItem[] } | null>(null);
-  const [confirm, setConfirm] = useState<{ title: string; message: string; sql: string } | null>(null);
+  const [confirm, setConfirm] = useState<{ title: string; message: string; sql: string; db: string } | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [editTable, setEditTable] = useState<string | null>(null);
   const [indexTable, setIndexTable] = useState<string | null>(null);
-  const [procs, setProcs] = useState<ProcInfo[]>([]);
-  const [procsOpen, setProcsOpen] = useState(true);
   const [viewProc, setViewProc] = useState<ProcInfo | null>(null);
   const [showImport, setShowImport] = useState(false);
-  const [dbOpen, setDbOpen] = useState(false); // database root node — collapsed by default
-  const [loaded, setLoaded] = useState(false); // have we run SHOW TABLES for this db yet
-  const { db } = useDatabase();
 
-  // Switching database collapses the root and forgets what was loaded, so the
-  // next expand re-runs SHOW TABLES against the newly selected database.
-  useEffect(() => {
-    setDbOpen(false);
-    setLoaded(false);
-    setTables([]);
-    setCols({});
-    setProcs([]);
-    setError(null);
-  }, [db]);
-
-  const loadTables = useCallback(async () => {
-    setLoading(true);
-    setError(null);
+  /** Load one database's tables + procedures (scoped explicitly to it). */
+  const load = useCallback(async (dbName: string) => {
+    setLoadingDb(dbName);
+    setErrorByDb((p) => ({ ...p, [dbName]: null }));
     try {
-      const sel = firstSelect(await runSql("SHOW TABLES"));
-      if (!sel) {
-        setTables([]);
-      } else if (sel.error) {
-        setError(sel.error);
-        setTables([]);
+      const sel = firstSelect(await runSql("SHOW TABLES", undefined, dbName));
+      if (sel?.error) {
+        setErrorByDb((p) => ({ ...p, [dbName]: sel.error || "error" }));
+        setTablesByDb((p) => ({ ...p, [dbName]: [] }));
       } else {
-        setTables(
-          (sel.rows || []).map((r) => ({
+        setTablesByDb((p) => ({
+          ...p,
+          [dbName]: (sel?.rows || []).map((r) => ({
             name: String(r[0]),
             rows: typeof r[1] === "number" ? r[1] : null,
-          }))
-        );
+          })),
+        }));
       }
-      // Stored procedures (best-effort — empty when none / unsupported).
-      const ps = firstSelect(await runSql("SHOW PROCEDURES"));
-      if (ps && !ps.error) {
-        const pi = (ps.columns || []).indexOf("procedure");
-        const pp = (ps.columns || []).indexOf("params");
-        const pd = (ps.columns || []).indexOf("definition");
-        setProcs(
-          (ps.rows || []).map((r) => ({
-            name: String(r[pi]),
-            params: String(r[pp] ?? ""),
-            definition: String(r[pd] ?? ""),
-          }))
-        );
-      } else {
-        setProcs([]);
-      }
+      const ps = firstSelect(await runSql("SHOW PROCEDURES", undefined, dbName));
+      const pi = (ps?.columns || []).indexOf("procedure");
+      const pp = (ps?.columns || []).indexOf("params");
+      const pd = (ps?.columns || []).indexOf("definition");
+      setProcsByDb((p) => ({
+        ...p,
+        [dbName]: ps && !ps.error
+          ? (ps.rows || []).map((r) => ({
+              name: String(r[pi]),
+              params: String(r[pp] ?? ""),
+              definition: String(r[pd] ?? ""),
+            }))
+          : [],
+      }));
     } catch (e) {
-      setError(String(e));
-      setTables([]);
+      setErrorByDb((p) => ({ ...p, [dbName]: String(e) }));
     } finally {
-      setLoading(false);
-      setLoaded(true);
-      setDbOpen(true); // a refresh/DDL reveals the tree
+      setLoadingDb(null);
+      setLoadedDbs((p) => ({ ...p, [dbName]: true }));
+      setOpenDbs((p) => ({ ...p, [dbName]: true }));
     }
   }, []);
 
-  // Toggle the database root node; load on first expand.
-  const toggleDb = useCallback(() => {
-    setDbOpen((o) => {
-      const next = !o;
-      if (next && !loaded) loadTables();
-      return next;
-    });
-  }, [loaded, loadTables]);
+  /** Reload whatever database the current operation targeted. */
+  const reloadCurrent = useCallback(() => {
+    const d = getCurrentDb() || db;
+    setColsByDb((p) => ({ ...p, [d]: {} }));
+    if (d) load(d);
+  }, [db, load]);
 
-  // A DDL run (create/alter/drop) bumps refreshKey — only reload if the tree
-  // has already been opened, so it stays collapsed until the user expands it.
+  // Expand/collapse a database root node; make it current; load on first open.
+  const toggleDb = useCallback(
+    (dbName: string) => {
+      setDb(dbName);
+      setOpenDbs((prev) => {
+        const next = !prev[dbName];
+        if (next && !loadedDbs[dbName]) load(dbName);
+        return { ...prev, [dbName]: next };
+      });
+    },
+    [setDb, loadedDbs, load]
+  );
+
+  // A DDL run from the SQL editor bumps refreshKey — reload the current db if
+  // it's already loaded (otherwise leave it collapsed).
   useEffect(() => {
-    if (refreshKey && loaded) loadTables();
+    const d = getCurrentDb() || db;
+    if (refreshKey && d && loadedDbs[d]) load(d);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshKey]);
 
-  const loadColumns = useCallback(async (table: string) => {
-    const sel = firstSelect(await runSql(`DESCRIBE ${table}`));
+  const loadColumns = useCallback(async (dbName: string, table: string) => {
+    const sel = firstSelect(await runSql(`DESCRIBE ${table}`, undefined, dbName));
     if (sel && !sel.error) {
       const idx = (name: string) => (sel.columns || []).indexOf(name);
-      const ci = idx("column"),
-        ti = idx("type"),
-        pki = idx("primary_key"),
-        ni = idx("nullable");
-      setCols((prev) => ({
+      const ci = idx("column"), ti = idx("type"), pki = idx("primary_key"), ni = idx("nullable");
+      setColsByDb((prev) => ({
         ...prev,
-        [table]: (sel.rows || []).map((r) => ({
-          name: String(r[ci]),
-          type: String(r[ti]),
-          primaryKey: r[pki] === true,
-          nullable: r[ni] === true,
-        })),
+        [dbName]: {
+          ...(prev[dbName] || {}),
+          [table]: (sel.rows || []).map((r) => ({
+            name: String(r[ci]),
+            type: String(r[ti]),
+            primaryKey: r[pki] === true,
+            nullable: r[ni] === true,
+          })),
+        },
       }));
     }
   }, []);
 
-  const toggle = useCallback(
-    (table: string) => {
-      const next = !open[table];
-      setOpen((p) => ({ ...p, [table]: next }));
-      if (next && !cols[table]) loadColumns(table);
+  const toggleTable = useCallback(
+    (dbName: string, table: string) => {
+      const key = `${dbName}::${table}`;
+      const next = !openTables[key];
+      setOpenTables((p) => ({ ...p, [key]: next }));
+      if (next && !colsByDb[dbName]?.[table]) loadColumns(dbName, table);
     },
-    [open, cols, loadColumns]
+    [openTables, colsByDb, loadColumns]
   );
 
-  /** Run a DDL/DML statement from the menu, toast the outcome, refresh. */
+  /** Run a DDL/DML statement scoped to a db, toast, then reload that db. */
   const runDdl = useCallback(
-    async (sql: string, okMsg: string) => {
+    async (sql: string, dbName: string, okMsg: string) => {
       try {
-        const resp = (await runSql(sql)) as unknown as {
-          ok?: boolean;
-          error?: string;
-        };
+        const resp = (await runSql(sql, undefined, dbName)) as unknown as { ok?: boolean; error?: string };
         if (resp && resp.ok === false) {
           toast(resp.error || "statement failed", "error");
           return;
         }
         toast(okMsg, "success");
-        setCols({}); // drop cached columns (a table may be gone/changed)
-        loadTables();
+        setColsByDb((p) => ({ ...p, [dbName]: {} }));
+        load(dbName);
       } catch (e) {
         toast(String(e), "error");
       }
     },
-    [toast, loadTables]
+    [toast, load]
   );
 
   const openTableMenu = useCallback(
-    (e: React.MouseEvent, table: string) => {
+    (e: React.MouseEvent, dbName: string, table: string) => {
       e.preventDefault();
       e.stopPropagation();
+      const scope = () => setDb(dbName); // point operations at this table's db
       const items: MenuItem[] = [
-        { label: "Browse & edit data", onClick: () => onBrowse(table) },
-        { label: "SELECT * (100 rows)", onClick: () => onQuery(`SELECT * FROM ${table} LIMIT 100;`) },
-        { label: "SELECT COUNT(*)", onClick: () => onQuery(`SELECT COUNT(*) FROM ${table};`) },
-        { label: "Describe columns", onClick: () => onQuery(`DESCRIBE ${table};`) },
-        { label: "Show indexes", onClick: () => onQuery(`SHOW INDEXES FROM ${table};`) },
+        { label: "Browse & edit data", onClick: () => { scope(); onBrowse(table); } },
+        { label: "SELECT * (100 rows)", onClick: () => { scope(); onQuery(`SELECT * FROM ${table} LIMIT 100;`); } },
+        { label: "SELECT COUNT(*)", onClick: () => { scope(); onQuery(`SELECT COUNT(*) FROM ${table};`); } },
+        { label: "Describe columns", onClick: () => { scope(); onQuery(`DESCRIBE ${table};`); } },
+        { label: "Show indexes", onClick: () => { scope(); onQuery(`SHOW INDEXES FROM ${table};`); } },
         { label: "", onClick: () => {}, separator: true },
-        { label: "Edit table…", onClick: () => setEditTable(table) },
-        { label: "Manage indexes…", onClick: () => setIndexTable(table) },
+        { label: "Edit table…", onClick: () => { scope(); setEditTable(table); } },
+        { label: "Manage indexes…", onClick: () => { scope(); setIndexTable(table); } },
         { label: "Insert name into editor", onClick: () => onInsert(table) },
         { label: "", onClick: () => {}, separator: true },
         {
           label: "Truncate (delete all rows)",
           danger: true,
-          onClick: () =>
-            setConfirm({
-              title: `Truncate ${table}?`,
-              message: `This deletes every row in "${table}". The table itself stays.`,
-              sql: `DELETE FROM ${table};`,
-            }),
+          onClick: () => setConfirm({ title: `Truncate ${table}?`, message: `This deletes every row in "${table}". The table itself stays.`, sql: `DELETE FROM ${table};`, db: dbName }),
         },
         {
           label: "Drop table",
           danger: true,
-          onClick: () =>
-            setConfirm({
-              title: `Drop ${table}?`,
-              message: `This permanently removes the table "${table}" and all its data.`,
-              sql: `DROP TABLE ${table};`,
-            }),
+          onClick: () => setConfirm({ title: `Drop ${table}?`, message: `This permanently removes the table "${table}" and all its data.`, sql: `DROP TABLE ${table};`, db: dbName }),
         },
       ];
       setMenu({ x: e.clientX, y: e.clientY, items });
     },
-    [onQuery, onInsert, onBrowse]
+    [onQuery, onInsert, onBrowse, setDb]
   );
+
+  const currentDb = getCurrentDb() || db;
 
   return (
     <div className="schema-tree">
       <div className="schema-tree-head">
-        <span>SCHEMA</span>
+        <span>DATABASES</span>
         <div style={{ display: "flex", gap: 2 }}>
-          <button
-            className="schema-refresh"
-            title="Import CSV / JSON"
-            onClick={() => setShowImport(true)}
-          >
-            ⇪
-          </button>
-          <button
-            className="schema-refresh"
-            title="New table"
-            onClick={() => setShowCreate(true)}
-          >
-            +
-          </button>
+          <button className="schema-refresh" title="Import CSV / JSON" onClick={() => setShowImport(true)}>⇪</button>
+          <button className="schema-refresh" title="New table (in current database)" onClick={() => setShowCreate(true)}>+</button>
           <button
             className="schema-refresh"
             title="Refresh"
-            onClick={loadTables}
-            disabled={loading}
+            onClick={() => { reloadDatabases(); Object.keys(loadedDbs).filter((d) => loadedDbs[d]).forEach(load); }}
+            disabled={!!loadingDb}
           >
-            {loading ? "…" : "⟳"}
+            {loadingDb ? "…" : "⟳"}
           </button>
         </div>
       </div>
 
-      {/* Database root node — collapsed by default; expanding runs SHOW TABLES */}
-      <div
-        className={`schema-db-node${dbOpen ? " open" : ""}`}
-        onClick={toggleDb}
-        title="Click to expand — loads tables (SHOW TABLES)"
-      >
-        <span className="schema-caret">{dbOpen ? "▾" : "▸"}</span>
-        <span className="schema-db-node-icon">🗄</span>
-        <span className="schema-db-node-name">{db || "database"}</span>
-        {loading && <span className="schema-db-node-loading">…</span>}
-      </div>
-
-      {dbOpen && (
-      <div className="schema-db-children">
-      {error ? (
-        <div className="schema-empty">{error}</div>
-      ) : loading && !loaded ? (
-        <div className="schema-empty">Loading…</div>
-      ) : tables.length === 0 ? (
-        <div className="schema-empty">No tables</div>
-      ) : (
-        <ul className="schema-list">
-          {tables.map((t) => (
-            <li key={t.name}>
-              <div
-                className="schema-table-row"
-                onContextMenu={(e) => openTableMenu(e, t.name)}
-              >
-                <button
-                  className="schema-caret"
-                  onClick={() => toggle(t.name)}
-                  aria-label="expand"
-                >
-                  {open[t.name] ? "▾" : "▸"}
-                </button>
-                <span
-                  className="schema-table-name"
-                  title="Click to insert · double-click to browse & edit · right-click for menu"
-                  onClick={() => onInsert(t.name)}
-                  onDoubleClick={() => onBrowse(t.name)}
-                >
-                  {t.name}
-                </span>
-                {t.rows !== null && (
-                  <span className="schema-rowcount">{t.rows}</span>
-                )}
-              </div>
-              {open[t.name] && (
-                <ul className="schema-cols">
-                  {(cols[t.name] || []).map((c) => (
-                    <li
-                      key={c.name}
-                      className="schema-col"
-                      title={`${c.type}${c.nullable ? " · nullable" : " · not null"}`}
-                      onClick={() => onInsert(c.name)}
-                    >
-                      {c.primaryKey && (
-                        <span className="schema-pk" title="primary key">
-                          🔑
-                        </span>
-                      )}
-                      <span className="schema-col-name">{c.name}</span>
-                      <span className="schema-col-type">{c.type}</span>
-                    </li>
-                  ))}
-                  {(cols[t.name]?.length ?? 0) === 0 && (
-                    <li className="schema-col schema-empty">…</li>
-                  )}
-                </ul>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {procs.length > 0 && (
-        <div className="schema-procs">
-          <div className="schema-section-head" onClick={() => setProcsOpen((o) => !o)}>
-            <span className="schema-caret">{procsOpen ? "▾" : "▸"}</span>
-            PROCEDURES ({procs.length})
-          </div>
-          {procsOpen && (
-            <ul className="schema-list" style={{ flex: "none" }}>
-              {procs.map((p) => (
-                <li key={p.name}>
-                  <div className="schema-table-row">
-                    <span className="schema-caret" style={{ visibility: "hidden" }}>
-                      ▸
-                    </span>
-                    <span
-                      className="schema-table-name"
-                      title="Click to view · double-click to insert CALL"
-                      onClick={() => setViewProc(p)}
-                      onDoubleClick={() => {
-                        const args = p.params
-                          .split(",")
-                          .map((s) => s.trim())
-                          .filter(Boolean)
-                          .map(() => "?")
-                          .join(", ");
-                        onQuery(`CALL ${p.name}(${args});`);
-                      }}
-                    >
-                      ⚙ {p.name}
-                    </span>
+      <div className="schema-db-children" style={{ paddingLeft: 0 }}>
+        {databases.length === 0 ? (
+          <div className="schema-empty">No databases</div>
+        ) : (
+          <ul className="schema-list">
+            {databases.map((dbName) => {
+              const isOpen = !!openDbs[dbName];
+              const tables = tablesByDb[dbName] || [];
+              const procs = procsByDb[dbName] || [];
+              const err = errorByDb[dbName];
+              const loadingThis = loadingDb === dbName;
+              return (
+                <li key={dbName}>
+                  <div
+                    className={`schema-db-node${dbName === currentDb ? " open" : ""}`}
+                    onClick={() => toggleDb(dbName)}
+                    title="Click to expand — loads tables (SHOW TABLES)"
+                  >
+                    <span className="schema-caret">{isOpen ? "▾" : "▸"}</span>
+                    <span className="schema-db-node-icon">🗄</span>
+                    <span className="schema-db-node-name">{dbName}</span>
+                    {loadingThis && <span className="schema-db-node-loading">…</span>}
                   </div>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
-      </div>
-      )}
 
-      {menu && (
-        <ContextMenu
-          x={menu.x}
-          y={menu.y}
-          items={menu.items}
-          onClose={() => setMenu(null)}
-        />
-      )}
+                  {isOpen && (
+                    <div style={{ paddingLeft: 10 }}>
+                      {err ? (
+                        <div className="schema-empty">{err}</div>
+                      ) : loadingThis && !loadedDbs[dbName] ? (
+                        <div className="schema-empty">Loading…</div>
+                      ) : tables.length === 0 ? (
+                        <div className="schema-empty">No tables</div>
+                      ) : (
+                        <ul className="schema-list">
+                          {tables.map((t) => {
+                            const tkey = `${dbName}::${t.name}`;
+                            const tOpen = !!openTables[tkey];
+                            const tcols = colsByDb[dbName]?.[t.name] || [];
+                            return (
+                              <li key={t.name}>
+                                <div className="schema-table-row" onContextMenu={(e) => openTableMenu(e, dbName, t.name)}>
+                                  <button className="schema-caret" onClick={() => toggleTable(dbName, t.name)} aria-label="expand">
+                                    {tOpen ? "▾" : "▸"}
+                                  </button>
+                                  <span
+                                    className="schema-table-name"
+                                    title="Click to insert · double-click to browse & edit · right-click for menu"
+                                    onClick={() => onInsert(t.name)}
+                                    onDoubleClick={() => { setDb(dbName); onBrowse(t.name); }}
+                                  >
+                                    {t.name}
+                                  </span>
+                                  {t.rows !== null && <span className="schema-rowcount">{t.rows}</span>}
+                                </div>
+                                {tOpen && (
+                                  <ul className="schema-cols">
+                                    {tcols.map((c) => (
+                                      <li key={c.name} className="schema-col" title={`${c.type}${c.nullable ? " · nullable" : " · not null"}`} onClick={() => onInsert(c.name)}>
+                                        {c.primaryKey && <span className="schema-pk" title="primary key">🔑</span>}
+                                        <span className="schema-col-name">{c.name}</span>
+                                        <span className="schema-col-type">{c.type}</span>
+                                      </li>
+                                    ))}
+                                    {tcols.length === 0 && <li className="schema-col schema-empty">…</li>}
+                                  </ul>
+                                )}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
+
+                      {procs.length > 0 && (
+                        <div className="schema-procs">
+                          <div className="schema-section-head">PROCEDURES ({procs.length})</div>
+                          <ul className="schema-list" style={{ flex: "none" }}>
+                            {procs.map((p) => (
+                              <li key={p.name}>
+                                <div className="schema-table-row">
+                                  <span className="schema-caret" style={{ visibility: "hidden" }}>▸</span>
+                                  <span
+                                    className="schema-table-name"
+                                    title="Click to view · double-click to insert CALL"
+                                    onClick={() => { setDb(dbName); setViewProc(p); }}
+                                    onDoubleClick={() => {
+                                      setDb(dbName);
+                                      const args = p.params.split(",").map((s) => s.trim()).filter(Boolean).map(() => "?").join(", ");
+                                      onQuery(`CALL ${p.name}(${args});`);
+                                    }}
+                                  >
+                                    ⚙ {p.name}
+                                  </span>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+
+      {menu && <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
 
       {confirm && (
         <ConfirmDialog
@@ -394,9 +356,9 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
           danger
           onCancel={() => setConfirm(null)}
           onConfirm={() => {
-            const { sql } = confirm;
+            const { sql, db: cdb } = confirm;
             setConfirm(null);
-            runDdl(sql, "Done");
+            runDdl(sql, cdb, "Done");
           }}
         />
       )}
@@ -407,22 +369,10 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
           onCreate={async (sql) => {
             let ok = false;
             try {
-              const resp = (await runSql(sql)) as unknown as {
-                ok?: boolean;
-                error?: string;
-              };
-              if (resp && resp.ok === false) {
-                toast(resp.error || "create failed", "error");
-              } else {
-                ok = true;
-                toast("Table created", "success");
-                setShowCreate(false);
-                setCols({});
-                loadTables();
-              }
-            } catch (e) {
-              toast(String(e), "error");
-            }
+              const resp = (await runSql(sql)) as unknown as { ok?: boolean; error?: string };
+              if (resp && resp.ok === false) toast(resp.error || "create failed", "error");
+              else { ok = true; toast("Table created", "success"); setShowCreate(false); reloadCurrent(); }
+            } catch (e) { toast(String(e), "error"); }
             return ok;
           }}
         />
@@ -433,50 +383,29 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
           table={editTable}
           onCancel={() => setEditTable(null)}
           onApply={async (statements) => {
-            // Run each ALTER in order; stop at the first engine error so a
-            // partial rename/drop is visible rather than silently continued.
             for (let i = 0; i < statements.length; i++) {
               try {
-                const resp = (await runSql(statements[i])) as unknown as {
-                  ok?: boolean;
-                  error?: string;
-                };
-                if (resp && resp.ok === false) {
-                  toast(`Step ${i + 1}/${statements.length}: ${resp.error}`, "error");
-                  setCols({});
-                  loadTables();
-                  return false;
-                }
-              } catch (e) {
-                toast(String(e), "error");
-                return false;
-              }
+                const resp = (await runSql(statements[i])) as unknown as { ok?: boolean; error?: string };
+                if (resp && resp.ok === false) { toast(`Step ${i + 1}/${statements.length}: ${resp.error}`, "error"); reloadCurrent(); return false; }
+              } catch (e) { toast(String(e), "error"); return false; }
             }
             toast(`Applied ${statements.length} change(s)`, "success");
             setEditTable(null);
-            setCols({});
-            loadTables();
+            reloadCurrent();
             return true;
           }}
         />
       )}
 
       {indexTable && (
-        <IndexDialog
-          table={indexTable}
-          onClose={() => setIndexTable(null)}
-          onChanged={loadTables}
-        />
+        <IndexDialog table={indexTable} onClose={() => setIndexTable(null)} onChanged={reloadCurrent} />
       )}
 
       {showImport && (
         <ImportDialog
-          tables={tables.map((t) => t.name)}
+          tables={(tablesByDb[currentDb] || []).map((t) => t.name)}
           onClose={() => setShowImport(false)}
-          onDone={() => {
-            setCols({});
-            loadTables();
-          }}
+          onDone={reloadCurrent}
         />
       )}
 
@@ -487,11 +416,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
           onInsert={onInsert}
           onDrop={(procName) => {
             setViewProc(null);
-            setConfirm({
-              title: `Drop ${procName}?`,
-              message: `This permanently removes the stored procedure "${procName}".`,
-              sql: `DROP PROCEDURE ${procName};`,
-            });
+            setConfirm({ title: `Drop ${procName}?`, message: `This permanently removes the stored procedure "${procName}".`, sql: `DROP PROCEDURE ${procName};`, db: currentDb });
           }}
         />
       )}
