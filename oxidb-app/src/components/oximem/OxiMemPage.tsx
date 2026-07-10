@@ -12,6 +12,7 @@ import { useToast } from "../common/Toast";
 import { useConnection } from "../../context/ConnectionContext";
 import { OxiMemValueEditor } from "./OxiMemValueEditor";
 import { NewKeyDialog } from "./NewKeyDialog";
+import { PromptDialog } from "../common/PromptDialog";
 
 interface KeyValue {
   type: string;
@@ -41,6 +42,7 @@ export function OxiMemPage() {
   const [busy, setBusy] = useState(false);
   const [ttlInput, setTtlInput] = useState("");
   const [showNew, setShowNew] = useState(false);
+  const [showRename, setShowRename] = useState(false);
 
   useEffect(() => {
     oximemStatus().then((s) => {
@@ -128,23 +130,25 @@ export function OxiMemPage() {
     }
   }, [selected, ttlInput, toast, openKey]);
 
-  const renameKey = useCallback(async () => {
-    if (selected === null) return;
-    const next = window.prompt("Rename key to:", selected);
-    if (!next || next === selected) return;
-    setBusy(true);
-    try {
-      await oximemExec(["RENAME", selected, next]);
-      toast("Renamed", "success");
-      setKeys((ks) => ks.map((k) => (k === selected ? next : k)));
-      setSelected(next);
-      openKey(next);
-    } catch (e) {
-      toast(String(e), "error");
-    } finally {
-      setBusy(false);
-    }
-  }, [selected, toast, openKey]);
+  const renameKey = useCallback(
+    async (next: string) => {
+      setShowRename(false);
+      if (selected === null || !next || next === selected) return;
+      setBusy(true);
+      try {
+        await oximemExec(["RENAME", selected, next]);
+        toast("Renamed", "success");
+        setKeys((ks) => ks.map((k) => (k === selected ? next : k)));
+        setSelected(next);
+        openKey(next);
+      } catch (e) {
+        toast(String(e), "error");
+      } finally {
+        setBusy(false);
+      }
+    },
+    [selected, toast, openKey]
+  );
 
   const delKey = useCallback(async () => {
     if (selected === null) return;
@@ -261,7 +265,7 @@ export function OxiMemPage() {
                   <span className="badge badge-muted">TTL {detailVal.ttl}s</span>
                 )}
                 <div style={{ flex: 1 }} />
-                <button className="btn btn-secondary btn-sm" onClick={renameKey} disabled={busy}>
+                <button className="btn btn-secondary btn-sm" onClick={() => setShowRename(true)} disabled={busy}>
                   Rename
                 </button>
                 <button className="btn btn-danger btn-sm" onClick={delKey} disabled={busy}>
@@ -307,6 +311,17 @@ export function OxiMemPage() {
           )}
         </div>
       </div>
+
+      {showRename && selected && (
+        <PromptDialog
+          title="Rename key"
+          label="New key name"
+          initial={selected}
+          confirmLabel="Rename"
+          onConfirm={renameKey}
+          onCancel={() => setShowRename(false)}
+        />
+      )}
 
       {showNew && (
         <NewKeyDialog

@@ -5,6 +5,7 @@ import type { JsonValue } from "../../api/types";
 import { ContextMenu } from "../common/ContextMenu";
 import type { MenuItem } from "../common/ContextMenu";
 import { ConfirmDialog } from "../common/ConfirmDialog";
+import { PromptDialog } from "../common/PromptDialog";
 import { CreateTableDialog } from "./CreateTableDialog";
 import { AlterTableDialog } from "./AlterTableDialog";
 import { IndexDialog } from "./IndexDialog";
@@ -68,6 +69,8 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [indexTable, setIndexTable] = useState<string | null>(null);
   const [viewProc, setViewProc] = useState<ProcInfo | null>(null);
   const [showImport, setShowImport] = useState(false);
+  const [showNewDb, setShowNewDb] = useState(false);
+  const [dropDbName, setDropDbName] = useState<string | null>(null);
 
   /** Load one database's tables + procedures (scoped explicitly to it). */
   const load = useCallback(async (dbName: string) => {
@@ -219,16 +222,18 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
     [onQuery, onInsert, onBrowse, setDb]
   );
 
-  const newDatabase = useCallback(async () => {
-    const name = window.prompt("New database name:");
-    if (!name?.trim()) return;
-    try {
-      await createDb(name.trim());
-      toast("Database created", "success");
-    } catch (e) {
-      toast(String(e), "error");
-    }
-  }, [createDb, toast]);
+  const createDatabaseNamed = useCallback(
+    async (name: string) => {
+      setShowNewDb(false);
+      try {
+        await createDb(name);
+        toast("Database created", "success");
+      } catch (e) {
+        toast(String(e), "error");
+      }
+    },
+    [createDb, toast]
+  );
 
   const openDbMenu = useCallback(
     (e: React.MouseEvent, dbName: string) => {
@@ -245,8 +250,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
           danger: true,
           onClick: () => {
             if (builtin) { toast("The built-in oxidb/postgres database can't be dropped", "error"); return; }
-            if (!window.confirm(`Drop database "${dbName}" and everything in it?`)) return;
-            dropDb(dbName).then(() => toast("Database dropped", "success")).catch((err) => toast(String(err), "error"));
+            setDropDbName(dbName);
           },
         },
       ];
@@ -262,7 +266,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
       <div className="schema-tree-head">
         <span>DATABASES</span>
         <div style={{ display: "flex", gap: 2 }}>
-          <button className="schema-refresh" title="New database" onClick={newDatabase}>+</button>
+          <button className="schema-refresh" title="New database" onClick={() => setShowNewDb(true)}>+</button>
           <button
             className="schema-refresh"
             title="Refresh"
@@ -383,6 +387,32 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
       </div>
 
       {menu && <ContextMenu x={menu.x} y={menu.y} items={menu.items} onClose={() => setMenu(null)} />}
+
+      {showNewDb && (
+        <PromptDialog
+          title="New database"
+          label="Database name"
+          placeholder="my_database"
+          confirmLabel="Create"
+          onConfirm={createDatabaseNamed}
+          onCancel={() => setShowNewDb(false)}
+        />
+      )}
+
+      {dropDbName && (
+        <ConfirmDialog
+          title={`Drop ${dropDbName}?`}
+          message={`This permanently removes the database "${dropDbName}" and everything in it.`}
+          confirmLabel="Drop database"
+          danger
+          onCancel={() => setDropDbName(null)}
+          onConfirm={() => {
+            const name = dropDbName;
+            setDropDbName(null);
+            dropDb(name).then(() => toast("Database dropped", "success")).catch((err) => toast(String(err), "error"));
+          }}
+        />
+      )}
 
       {confirm && (
         <ConfirmDialog

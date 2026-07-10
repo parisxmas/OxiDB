@@ -1,5 +1,8 @@
+import { useState } from "react";
 import { useDatabase } from "../../context/DatabaseContext";
 import { useToast } from "../common/Toast";
+import { PromptDialog } from "../common/PromptDialog";
+import { ConfirmDialog } from "../common/ConfirmDialog";
 
 const BUILTIN = ["oxidb", "postgres"];
 
@@ -7,23 +10,23 @@ const BUILTIN = ["oxidb", "postgres"];
 export function DatabaseSelector() {
   const { db, databases, setDb, createDb, dropDb } = useDatabase();
   const toast = useToast();
+  const [showNew, setShowNew] = useState(false);
+  const [showDrop, setShowDrop] = useState(false);
 
   if (databases.length === 0) return null;
 
-  const onNew = async () => {
-    const name = window.prompt("New database name:");
-    if (!name?.trim()) return;
+  const create = async (name: string) => {
+    setShowNew(false);
     try {
-      await createDb(name.trim());
+      await createDb(name);
       toast("Database created", "success");
     } catch (e) {
       toast(String(e), "error");
     }
   };
 
-  const onDrop = async () => {
-    if (!db || BUILTIN.includes(db)) return;
-    if (!window.confirm(`Drop database "${db}" and everything in it?`)) return;
+  const drop = async () => {
+    setShowDrop(false);
     try {
       await dropDb(db);
       toast("Database dropped", "success");
@@ -42,17 +45,38 @@ export function DatabaseSelector() {
           </option>
         ))}
       </select>
-      <button className="db-selector-btn" title="New database" onClick={onNew}>
+      <button className="db-selector-btn" title="New database" onClick={() => setShowNew(true)}>
         +
       </button>
       <button
         className="db-selector-btn"
         title="Drop current database"
-        onClick={onDrop}
+        onClick={() => setShowDrop(true)}
         disabled={BUILTIN.includes(db)}
       >
         🗑
       </button>
+
+      {showNew && (
+        <PromptDialog
+          title="New database"
+          label="Database name"
+          placeholder="my_database"
+          confirmLabel="Create"
+          onConfirm={create}
+          onCancel={() => setShowNew(false)}
+        />
+      )}
+      {showDrop && (
+        <ConfirmDialog
+          title={`Drop ${db}?`}
+          message={`This permanently removes the database "${db}" and everything in it.`}
+          confirmLabel="Drop database"
+          danger
+          onConfirm={drop}
+          onCancel={() => setShowDrop(false)}
+        />
+      )}
     </div>
   );
 }
