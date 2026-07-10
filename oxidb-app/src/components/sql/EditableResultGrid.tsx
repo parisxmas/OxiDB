@@ -83,6 +83,24 @@ export function EditableResultGrid({ result, sql }: Props) {
   const editRef = useRef<HTMLInputElement>(null);
   const table = detectTable(sql);
 
+  // A column reads as numeric if its SQL type is a number type, or — when the
+  // type is unknown (computed columns) — its first non-null value is a number.
+  // Numeric columns are right-aligned, the convention in SQL/spreadsheet tools.
+  const types = result.types || [];
+  const isNumericCol = useCallback(
+    (c: number): boolean => {
+      const t = (types[c] || "").toUpperCase();
+      if (t) return /^(INT|INTEGER|BIGINT|SMALLINT|TINYINT|DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL)/.test(t);
+      for (const row of rows) {
+        const v = row[c];
+        if (v === null || v === undefined) continue;
+        return typeof v === "number";
+      }
+      return false;
+    },
+    [types, rows]
+  );
+
   // Reset when a new result arrives.
   useEffect(() => {
     setRows(result.rows || []);
@@ -156,8 +174,8 @@ export function EditableResultGrid({ result, sql }: Props) {
         <table className="data-table">
           <thead>
             <tr>
-              {columns.map((c) => (
-                <th key={c}>
+              {columns.map((c, ci) => (
+                <th key={c} style={isNumericCol(ci) ? { textAlign: "right" } : undefined}>
                   {editable && isPk(c) && <span className="schema-pk" style={{ marginRight: 4 }} title="primary key">🔑</span>}
                   {c}
                 </th>
@@ -175,7 +193,11 @@ export function EditableResultGrid({ result, sql }: Props) {
                       key={c}
                       onDoubleClick={() => startEdit(r, c)}
                       title={canEdit ? "Double-click to edit" : undefined}
-                      style={{ cursor: canEdit ? "text" : "default" }}
+                      style={{
+                        cursor: canEdit ? "text" : "default",
+                        textAlign: isNumericCol(c) ? "right" : undefined,
+                        fontVariantNumeric: isNumericCol(c) ? "tabular-nums" : undefined,
+                      }}
                     >
                       {editing ? (
                         <input
