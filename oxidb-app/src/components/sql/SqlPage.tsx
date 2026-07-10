@@ -31,6 +31,8 @@ interface StmtResult {
   last_insert_id?: number;
   ddl?: boolean;
   transaction?: boolean;
+  /** print() output from a stored procedure (like a psql NOTICE). */
+  notices?: string[];
 }
 
 /** One query tab — its own editor text, results and view state. */
@@ -342,6 +344,17 @@ export function SqlPage() {
               </div>
             )}
           </div>
+          {/* Procedure print() output (notices) */}
+          {t.resultTab === "query" && cur?.notices && cur.notices.length > 0 && (
+            <div className="notices">
+              {cur.notices.map((n, i) => (
+                <div key={i} className="notice-line">
+                  <span className="notice-tag">NOTICE</span>
+                  {n}
+                </div>
+              ))}
+            </div>
+          )}
           <div style={{ flex: 1, overflow: "auto" }}>
             {t.resultTab === "data" && t.browseTable ? (
               <TableDataView key={t.browseTable} table={t.browseTable} />

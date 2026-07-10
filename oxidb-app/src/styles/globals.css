@@ -1051,3 +1051,30 @@ tr:hover .row-del { opacity: 1; }
   margin-left: 6px;
   flex-shrink: 0;
 }
+
+/* ── Stored-procedure notices (print output) ────────────────────────── */
+.notices {
+  flex-shrink: 0;
+  max-height: 120px;
+  overflow-y: auto;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+}
+.notice-line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.notice-tag {
+  font-size: 9px;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
