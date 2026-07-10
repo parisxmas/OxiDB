@@ -51,6 +51,7 @@ pub fn run() {
             commands::oximem::oximem_get,
             commands::oximem::oximem_set_string,
             commands::oximem::oximem_del,
+            commands::oximem::oximem_exec,
             // Aggregation
             commands::aggregation::run_aggregation,
             // Blobs

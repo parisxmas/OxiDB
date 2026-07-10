@@ -98,6 +98,8 @@ export const oximemGet = (key: string) =>
 export const oximemSetString = (key: string, value: string) =>
   invoke<JsonValue>("oximem_set_string", { key, value });
 export const oximemDel = (key: string) => invoke<JsonValue>("oximem_del", { key });
+export const oximemExec = (args: string[]) =>
+  invoke<JsonValue>("oximem_exec", { args });
 
 // Aggregation
 export const runAggregation = (collection: string, pipeline: JsonValue) =>

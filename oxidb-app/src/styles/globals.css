@@ -845,3 +845,12 @@ tr:hover .row-del { opacity: 1; }
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
 }
+
+/* ── OxiMem rich editing ────────────────────────────────────────────── */
+.oximem-add {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+.oximem-value .data-table { margin-bottom: 4px; }

@@ -5,11 +5,13 @@ import {
   oximemStatus,
   oximemScan,
   oximemGet,
-  oximemSetString,
   oximemDel,
+  oximemExec,
 } from "../../api/tauri";
 import { useToast } from "../common/Toast";
 import { useConnection } from "../../context/ConnectionContext";
+import { OxiMemValueEditor } from "./OxiMemValueEditor";
+import { NewKeyDialog } from "./NewKeyDialog";
 
 interface KeyValue {
   type: string;
@@ -37,6 +39,8 @@ export function OxiMemPage() {
   const [detailVal, setDetailVal] = useState<KeyValue | null>(null);
   const [editStr, setEditStr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [ttlInput, setTtlInput] = useState("");
+  const [showNew, setShowNew] = useState(false);
 
   useEffect(() => {
     oximemStatus().then((s) => {
@@ -103,19 +107,44 @@ export function OxiMemPage() {
     [toast]
   );
 
-  const saveString = useCallback(async () => {
-    if (selected === null || editStr === null) return;
+  const setTtl = useCallback(async () => {
+    if (selected === null) return;
+    const secs = parseInt(ttlInput, 10);
     setBusy(true);
     try {
-      await oximemSetString(selected, editStr);
-      toast("Saved", "success");
+      if (!ttlInput || isNaN(secs) || secs < 0) {
+        await oximemExec(["PERSIST", selected]);
+        toast("TTL removed", "success");
+      } else {
+        await oximemExec(["EXPIRE", selected, String(secs)]);
+        toast(`TTL set to ${secs}s`, "success");
+      }
+      setTtlInput("");
       openKey(selected);
     } catch (e) {
       toast(String(e), "error");
     } finally {
       setBusy(false);
     }
-  }, [selected, editStr, toast, openKey]);
+  }, [selected, ttlInput, toast, openKey]);
+
+  const renameKey = useCallback(async () => {
+    if (selected === null) return;
+    const next = window.prompt("Rename key to:", selected);
+    if (!next || next === selected) return;
+    setBusy(true);
+    try {
+      await oximemExec(["RENAME", selected, next]);
+      toast("Renamed", "success");
+      setKeys((ks) => ks.map((k) => (k === selected ? next : k)));
+      setSelected(next);
+      openKey(next);
+    } catch (e) {
+      toast(String(e), "error");
+    } finally {
+      setBusy(false);
+    }
+  }, [selected, toast, openKey]);
 
   const delKey = useCallback(async () => {
     if (selected === null) return;
@@ -175,6 +204,9 @@ export function OxiMemPage() {
           <button className="btn btn-primary btn-sm" onClick={() => scan(true)} disabled={scanning}>
             Scan
           </button>
+          <button className="btn btn-secondary btn-sm" title="New key" onClick={() => setShowNew(true)}>
+            +
+          </button>
         </div>
         <div style={{ flex: 1, overflow: "auto" }}>
           {keys.length === 0 ? (
@@ -222,103 +254,70 @@ export function OxiMemPage() {
             <div className="empty-state">Select a key</div>
           ) : (
             <>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
                 <strong style={{ fontFamily: "var(--font-mono)", fontSize: 15 }}>{selected}</strong>
                 <span className="badge badge-muted">{detailVal.type}</span>
                 {detailVal.ttl != null && detailVal.ttl >= 0 && (
                   <span className="badge badge-muted">TTL {detailVal.ttl}s</span>
                 )}
                 <div style={{ flex: 1 }} />
+                <button className="btn btn-secondary btn-sm" onClick={renameKey} disabled={busy}>
+                  Rename
+                </button>
                 <button className="btn btn-danger btn-sm" onClick={delKey} disabled={busy}>
                   Delete key
                 </button>
               </div>
-              <OxiMemValue
-                kind={detailVal.value.kind}
-                value={detailVal.value.value}
+
+              {/* TTL controls */}
+              <div className="oximem-add" style={{ marginBottom: 14 }}>
+                <span style={{ fontSize: 12, color: "var(--text-secondary)" }}>TTL</span>
+                <input
+                  className="cell-edit"
+                  style={{ width: 120 }}
+                  type="number"
+                  placeholder={detailVal.ttl != null && detailVal.ttl >= 0 ? `${detailVal.ttl}s` : "no expiry"}
+                  value={ttlInput}
+                  onChange={(e) => setTtlInput(e.target.value)}
+                />
+                <button className="btn btn-secondary btn-sm" onClick={setTtl} disabled={busy}>
+                  Set (s)
+                </button>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={() => {
+                    setTtlInput("");
+                    setTtl();
+                  }}
+                  disabled={busy}
+                >
+                  Persist
+                </button>
+              </div>
+
+              <OxiMemValueEditor
+                key={selected}
+                keyName={selected}
+                detail={detailVal}
                 editStr={editStr}
                 setEditStr={setEditStr}
-                onSave={saveString}
-                busy={busy}
+                onReload={() => openKey(selected)}
               />
             </>
           )}
         </div>
       </div>
-    </div>
-  );
-}
 
-function OxiMemValue({
-  kind,
-  value,
-  editStr,
-  setEditStr,
-  onSave,
-  busy,
-}: {
-  kind: string;
-  value: unknown;
-  editStr: string | null;
-  setEditStr: (s: string) => void;
-  onSave: () => void;
-  busy: boolean;
-}) {
-  if (kind === "string") {
-    return (
-      <div>
-        <textarea
-          className="oximem-string"
-          value={editStr ?? ""}
-          onChange={(e) => setEditStr(e.target.value)}
-          spellCheck={false}
+      {showNew && (
+        <NewKeyDialog
+          onClose={() => setShowNew(false)}
+          onCreated={(k) => {
+            setShowNew(false);
+            scan(true);
+            openKey(k);
+          }}
         />
-        <div style={{ marginTop: 8 }}>
-          <button className="btn btn-primary btn-sm" onClick={onSave} disabled={busy}>
-            Save
-          </button>
-        </div>
-      </div>
-    );
-  }
-  const rows = (value as unknown[]) || [];
-  if (kind === "hash" || kind === "zset") {
-    return (
-      <table className="data-table">
-        <thead>
-          <tr>
-            <th>{kind === "zset" ? "member" : "field"}</th>
-            <th>{kind === "zset" ? "score" : "value"}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {(rows as [string, string][]).map((p, i) => (
-            <tr key={i}>
-              <td style={{ fontFamily: "var(--font-mono)" }}>{p[0]}</td>
-              <td style={{ fontFamily: "var(--font-mono)" }}>{p[1]}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    );
-  }
-  // list / set
-  return (
-    <table className="data-table">
-      <thead>
-        <tr>
-          <th style={{ width: 60 }}>#</th>
-          <th>value</th>
-        </tr>
-      </thead>
-      <tbody>
-        {(rows as string[]).map((v, i) => (
-          <tr key={i}>
-            <td style={{ color: "var(--text-secondary)" }}>{i}</td>
-            <td style={{ fontFamily: "var(--font-mono)" }}>{v}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+      )}
+    </div>
   );
 }

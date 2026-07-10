@@ -2,7 +2,7 @@
 //! port (RESP protocol), separate from the document/SQL TCP port, so it gets
 //! its own managed connection here rather than reusing DbBackend.
 
-use std::io::{BufRead, BufReader, Read as _, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -175,6 +175,20 @@ pub fn oximem_del(key: String, state: State<'_, OxiMemState>) -> Result<Value, S
     let mut guard = state.0.lock().unwrap();
     let conn = guard.as_mut().ok_or("not connected")?;
     conn.command(&["DEL", &key])
+}
+
+/// Run one arbitrary RESP command (the rich editor drives hash/list/set/zset
+/// mutations, TTL, and rename through this). It is the user's own store, so
+/// no allowlist — same posture as any Redis GUI's console.
+#[tauri::command]
+pub fn oximem_exec(args: Vec<String>, state: State<'_, OxiMemState>) -> Result<Value, String> {
+    if args.is_empty() {
+        return Err("empty command".into());
+    }
+    let mut guard = state.0.lock().unwrap();
+    let conn = guard.as_mut().ok_or("not connected")?;
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    conn.command(&refs)
 }
 
 #[cfg(test)]
