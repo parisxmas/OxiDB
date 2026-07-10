@@ -984,3 +984,49 @@ tr:hover .row-del { opacity: 1; }
   color: var(--accent);
   margin-right: 2px;
 }
+
+/* ── SQL query tabs ─────────────────────────────────────────────────── */
+.query-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 4px 6px 0;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  overflow-x: auto;
+  flex-shrink: 0;
+}
+.query-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.query-tab:hover { color: var(--text-primary); }
+.query-tab.active {
+  background: var(--bg-primary);
+  border-color: var(--border-color);
+  color: var(--text-primary);
+}
+.query-tab-close {
+  font-size: 10px;
+  opacity: 0.5;
+}
+.query-tab-close:hover { opacity: 1; color: var(--danger); }
+.query-tab-new {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 8px;
+  align-self: center;
+}
+.query-tab-new:hover { color: var(--accent); }

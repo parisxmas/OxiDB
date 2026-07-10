@@ -19,7 +19,6 @@ function loadHistory(): string[] {
     return [];
   }
 }
-
 function saveHistory(items: string[]) {
   localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, 50)));
 }
@@ -34,7 +33,39 @@ interface StmtResult {
   transaction?: boolean;
 }
 
-/** Turn a {columns, rows} result into row objects the DataTable understands. */
+/** One query tab — its own editor text, results and view state. */
+interface QueryTab {
+  id: number;
+  name: string;
+  sql: string;
+  results: StmtResult[] | null;
+  error: string | null;
+  elapsed: number | null;
+  loading: boolean;
+  active: number; // focused statement index
+  browseTable: string | null;
+  resultTab: "query" | "data";
+  page: number;
+  pageSize: number;
+}
+
+function newTab(id: number): QueryTab {
+  return {
+    id,
+    name: `Query ${id}`,
+    sql: "SELECT name FROM sqlite_schema;\n-- ⌘/Ctrl+Enter to run",
+    results: null,
+    error: null,
+    elapsed: null,
+    loading: false,
+    active: 0,
+    browseTable: null,
+    resultTab: "query",
+    page: 0,
+    pageSize: 100,
+  };
+}
+
 function toRowObjects(r: StmtResult): Record<string, JsonValue>[] {
   const cols = r.columns || [];
   return (r.rows || []).map((row) => {
@@ -47,9 +78,7 @@ function toRowObjects(r: StmtResult): Record<string, JsonValue>[] {
 function summarize(r: StmtResult): string {
   if (r.columns) return `${r.rows?.length ?? 0} row(s)`;
   if (r.affected !== undefined)
-    return `${r.affected} row(s) affected${
-      r.last_insert_id !== undefined ? `, last id ${r.last_insert_id}` : ""
-    }`;
+    return `${r.affected} row(s) affected${r.last_insert_id !== undefined ? `, last id ${r.last_insert_id}` : ""}`;
   if (r.ddl) return "OK — schema changed";
   if (r.transaction) return "OK — transaction";
   return "OK";
@@ -58,20 +87,13 @@ function summarize(r: StmtResult): string {
 export function SqlPage() {
   const toast = useToast();
   const { status } = useConnection();
-  const [sql, setSql] = useState(
-    "SELECT name FROM sqlite_schema;\n-- ⌘/Ctrl+Enter to run"
-  );
-  const [results, setResults] = useState<StmtResult[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [elapsed, setElapsed] = useState<number | null>(null);
-  const [active, setActive] = useState(0);
+
+  const [tabs, setTabs] = useState<QueryTab[]>([newTab(1)]);
+  const [activeIdx, setActiveIdx] = useState(0);
+  const nextId = useRef(2);
   const [history, setHistory] = useState<string[]>(loadHistory);
   const [schemaKey, setSchemaKey] = useState(0);
-  const [browseTable, setBrowseTable] = useState<string | null>(null);
-  const [resultTab, setResultTab] = useState<"query" | "data">("query");
-  const [page, setPage] = useState(0);
-  const [pageSize, setPageSize] = useState(100);
+
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
   const [splitPct, setSplitPct] = useState(42);
@@ -80,17 +102,49 @@ export function SqlPage() {
     return Number.isFinite(v) ? v : 260;
   });
   const draggingRef = useRef(false);
+  const treeWidthRef = useRef(treeWidth);
+  treeWidthRef.current = treeWidth;
 
-  /** Drag the vertical splitter between the schema tree and the editor. */
+  const t = tabs[activeIdx] ?? tabs[0];
+
+  /** Patch a tab by id (safe across async + tab switches). */
+  const patch = useCallback((id: number, p: Partial<QueryTab>) => {
+    setTabs((ts) => ts.map((tab) => (tab.id === id ? { ...tab, ...p } : tab)));
+  }, []);
+  /** Patch the currently active tab. */
+  const patchActive = useCallback(
+    (p: Partial<QueryTab>) => patch(t.id, p),
+    [patch, t.id]
+  );
+
+  // ── Tab management ────────────────────────────────────────────────
+  const addTab = useCallback(() => {
+    const id = nextId.current++;
+    setTabs((ts) => {
+      setActiveIdx(ts.length); // focus the appended tab
+      return [...ts, newTab(id)];
+    });
+  }, []);
+
+  const closeTab = useCallback(
+    (idx: number) => {
+      setTabs((ts) => {
+        if (ts.length === 1) return ts; // keep at least one
+        const next = ts.filter((_, i) => i !== idx);
+        setActiveIdx((cur) => (cur >= next.length ? next.length - 1 : cur > idx ? cur - 1 : cur));
+        return next;
+      });
+    },
+    []
+  );
+
+  // ── Splitters ─────────────────────────────────────────────────────
   const onTreeResize = useCallback(
     (e: React.MouseEvent) => {
       e.preventDefault();
       const startX = e.clientX;
       const startW = treeWidth;
-      const onMove = (ev: MouseEvent) => {
-        const w = Math.max(160, Math.min(640, startW + ev.clientX - startX));
-        setTreeWidth(w);
-      };
+      const onMove = (ev: MouseEvent) => setTreeWidth(Math.max(160, Math.min(640, startW + ev.clientX - startX)));
       const onUp = () => {
         document.removeEventListener("mousemove", onMove);
         document.removeEventListener("mouseup", onUp);
@@ -101,22 +155,6 @@ export function SqlPage() {
     },
     [treeWidth]
   );
-  const treeWidthRef = useRef(treeWidth);
-  treeWidthRef.current = treeWidth;
-
-  /** Insert an identifier at the cursor (schema-tree click). */
-  const insertAtCursor = useCallback((text: string) => {
-    const ed = editorRef.current;
-    if (!ed) {
-      setSql((s) => s + text);
-      return;
-    }
-    const sel = ed.getSelection();
-    if (sel) {
-      ed.executeEdits("schema-insert", [{ range: sel, text, forceMoveMarkers: true }]);
-    }
-    ed.focus();
-  }, []);
 
   const onSplitterMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -124,8 +162,7 @@ export function SqlPage() {
     const onMove = (ev: MouseEvent) => {
       if (!draggingRef.current || !containerRef.current) return;
       const rect = containerRef.current.getBoundingClientRect();
-      const pct = ((ev.clientY - rect.top) / rect.height) * 100;
-      setSplitPct(Math.max(15, Math.min(85, pct)));
+      setSplitPct(Math.max(15, Math.min(85, ((ev.clientY - rect.top) / rect.height) * 100)));
     };
     const onUp = () => {
       draggingRef.current = false;
@@ -136,280 +173,204 @@ export function SqlPage() {
     document.addEventListener("mouseup", onUp);
   }, []);
 
+  const insertAtCursor = useCallback(
+    (text: string) => {
+      const ed = editorRef.current;
+      if (!ed) {
+        patchActive({ sql: t.sql + text });
+        return;
+      }
+      const sel = ed.getSelection();
+      if (sel) ed.executeEdits("schema-insert", [{ range: sel, text, forceMoveMarkers: true }]);
+      ed.focus();
+    },
+    [patchActive, t.sql]
+  );
+
+  // ── Run ───────────────────────────────────────────────────────────
   const run = useCallback(async () => {
-    const text = sql.trim();
+    const tab = tabs[activeIdx];
+    if (!tab) return;
+    const text = tab.sql.trim();
     if (!text) return;
-    setResultTab("query");
-    setPage(0);
-    setLoading(true);
-    setError(null);
+    const id = tab.id;
+    patch(id, { resultTab: "query", page: 0, loading: true, error: null });
     const start = performance.now();
     try {
-      const resp = (await runSql(text)) as unknown as {
-        ok?: boolean;
-        error?: string;
-        data?: StmtResult[];
-      };
-      setElapsed(performance.now() - start);
+      const resp = (await runSql(text)) as unknown as { ok?: boolean; error?: string; data?: StmtResult[] };
+      const elapsed = performance.now() - start;
       if (resp && resp.ok === false) {
-        setError(resp.error || "query failed");
-        setResults(null);
+        patch(id, { elapsed, error: resp.error || "query failed", results: null, loading: false });
       } else {
         const data = (resp?.data as StmtResult[]) || [];
-        setResults(data);
-        setActive(data.length - 1); // focus the last statement's result
-        // A DDL statement changed the catalog — refresh the schema tree.
+        patch(id, { elapsed, results: data, active: data.length - 1, loading: false });
         if (data.some((d) => d.ddl)) setSchemaKey((k) => k + 1);
         const nh = [text, ...history.filter((h) => h !== text)].slice(0, 50);
         setHistory(nh);
         saveHistory(nh);
       }
     } catch (e) {
-      setElapsed(performance.now() - start);
-      setError(String(e));
-      setResults(null);
+      patch(id, { elapsed: performance.now() - start, error: String(e), results: null, loading: false });
       toast(String(e), "error");
-    } finally {
-      setLoading(false);
     }
-  }, [sql, history, toast]);
+  }, [tabs, activeIdx, history, toast, patch]);
 
-  const cur = results && results[active] ? results[active] : null;
+  const cur = t.results && t.results[t.active] ? t.results[t.active] : null;
   const isSelect = !!cur?.columns;
   const allRows = isSelect ? (toRowObjects(cur) as JsonValue[]) : [];
-  const pagedRows = allRows.slice(page * pageSize, (page + 1) * pageSize);
+  const pagedRows = allRows.slice(t.page * t.pageSize, (t.page + 1) * t.pageSize);
 
   return (
-    <div
-      style={{
-        display: "flex",
-        flexDirection: "row",
-        height: "calc(100vh - var(--header-height) - 40px)",
-        gap: 0,
-      }}
-    >
+    <div style={{ display: "flex", flexDirection: "row", height: "calc(100vh - var(--header-height) - 40px)" }}>
       {/* Left: schema tree (resizable) */}
       <div style={{ width: treeWidth, flexShrink: 0, minWidth: 0, display: "flex" }}>
         <SchemaTree
           refreshKey={schemaKey}
           onInsert={insertAtCursor}
-          onQuery={(q) => setSql(q)}
-          onBrowse={(t) => {
-            setBrowseTable(t);
-            setResultTab("data");
-          }}
+          onQuery={(q) => patchActive({ sql: q })}
+          onBrowse={(tbl) => patchActive({ browseTable: tbl, resultTab: "data" })}
         />
       </div>
 
-      {/* Vertical splitter */}
       <div className="col-resizer" onMouseDown={onTreeResize} title="Drag to resize" />
 
-      {/* Right: editor + results (the original vertical split) */}
-      <div
-        ref={containerRef}
-        style={{
-          flex: 1,
-          minWidth: 0,
-          display: "flex",
-          flexDirection: "column",
-        }}
-      >
-      {/* Editor */}
-      <div
-        style={{
-          flex: `0 0 ${splitPct}%`,
-          display: "flex",
-          flexDirection: "column",
-          minHeight: 0,
-        }}
-      >
-        <div className="toolbar">
-          <strong>SQL</strong>
-          <span
-            style={{
-              marginLeft: 10,
-              fontSize: 11,
-              color: "var(--text-secondary)",
-              fontFamily: "var(--font-mono)",
-            }}
-          >
-            {status.mode === "client" ? status.detail : "not on a server"}
-          </span>
-          {history.length > 0 && (
-            <select
-              style={{
-                marginLeft: 12,
-                fontSize: 12,
-                padding: "2px 6px",
-                background: "var(--bg-secondary)",
-                color: "var(--text-secondary)",
-                border: "1px solid var(--border-color)",
-                borderRadius: "var(--radius-sm)",
-                fontFamily: "var(--font-mono)",
-                maxWidth: 320,
-              }}
-              value=""
-              onChange={(e) => {
-                if (e.target.value) setSql(e.target.value);
-              }}
+      {/* Right: query tabs + editor + results */}
+      <div ref={containerRef} style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column" }}>
+        {/* Query tab bar */}
+        <div className="query-tabs">
+          {tabs.map((tab, i) => (
+            <div
+              key={tab.id}
+              className={`query-tab${i === activeIdx ? " active" : ""}`}
+              onClick={() => setActiveIdx(i)}
+              title={tab.name}
             >
-              <option value="">History ({history.length})</option>
-              {history.map((h, i) => (
-                <option key={i} value={h}>
-                  {h.replace(/\n/g, " ").substring(0, 90)}
-                </option>
-              ))}
-            </select>
-          )}
-          <div style={{ flex: 1 }} />
-          <button
-            className="btn btn-primary btn-sm"
-            onClick={run}
-            disabled={loading}
-          >
-            {loading ? <span className="spinner" /> : null}
-            Run (⌘+Enter)
-          </button>
-        </div>
-        <div style={{ flex: 1, minHeight: 0 }}>
-          <SqlEditor
-            value={sql}
-            onChange={setSql}
-            onRun={run}
-            onReady={(ed) => (editorRef.current = ed)}
-            height="100%"
-          />
-        </div>
-      </div>
-
-      {/* Splitter */}
-      <div
-        onMouseDown={onSplitterMouseDown}
-        style={{
-          height: 6,
-          flexShrink: 0,
-          cursor: "row-resize",
-          background: "var(--border-color)",
-          borderRadius: 3,
-          margin: "2px 0",
-        }}
-      />
-
-      {/* Results */}
-      <div
-        style={{
-          flex: 1,
-          display: "flex",
-          flexDirection: "column",
-          minHeight: 0,
-        }}
-      >
-        <div className="toolbar">
-          <button
-            className={`result-tab${resultTab === "query" ? " active" : ""}`}
-            onClick={() => setResultTab("query")}
-          >
-            Query Result
-          </button>
-          {browseTable && (
-            <button
-              className={`result-tab${resultTab === "data" ? " active" : ""}`}
-              onClick={() => setResultTab("data")}
-            >
-              Data: <span style={{ fontFamily: "var(--font-mono)" }}>{browseTable}</span>
-              <span
-                className="result-tab-close"
-                title="Close"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setBrowseTable(null);
-                  setResultTab("query");
-                }}
-              >
-                ✕
-              </span>
-            </button>
-          )}
-          {resultTab === "query" && elapsed !== null && (
-            <span
-              style={{
-                marginLeft: 12,
-                fontSize: 12,
-                color: "var(--text-secondary)",
-                fontFamily: "var(--font-mono)",
-              }}
-            >
-              {elapsed.toFixed(1)} ms
-            </span>
-          )}
-          {resultTab === "query" && cur && (
-            <span
-              style={{
-                marginLeft: 8,
-                fontSize: 12,
-                color: "var(--text-secondary)",
-              }}
-            >
-              {summarize(cur)}
-            </span>
-          )}
-          <div style={{ flex: 1 }} />
-          {resultTab === "query" && results && results.length > 1 && (
-            <div style={{ display: "flex", gap: 4 }}>
-              {results.map((_, i) => (
-                <button
-                  key={i}
-                  className={`btn btn-sm ${
-                    i === active ? "btn-primary" : "btn-secondary"
-                  }`}
-                  onClick={() => {
-                    setActive(i);
-                    setPage(0);
+              <span className="query-tab-name">{tab.name}</span>
+              {tabs.length > 1 && (
+                <span
+                  className="query-tab-close"
+                  title="Close"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    closeTab(i);
                   }}
                 >
-                  #{i + 1}
-                </button>
-              ))}
+                  ✕
+                </span>
+              )}
             </div>
+          ))}
+          <button className="query-tab-new" title="New query" onClick={addTab}>
+            +
+          </button>
+        </div>
+
+        {/* Editor */}
+        <div style={{ flex: `0 0 ${splitPct}%`, display: "flex", flexDirection: "column", minHeight: 0 }}>
+          <div className="toolbar">
+            <strong>SQL</strong>
+            <span style={{ marginLeft: 10, fontSize: 11, color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>
+              {status.mode === "client" ? status.detail : "not on a server"}
+            </span>
+            {history.length > 0 && (
+              <select
+                style={{ marginLeft: 12, fontSize: 12, padding: "2px 6px", background: "var(--bg-secondary)", color: "var(--text-secondary)", border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", fontFamily: "var(--font-mono)", maxWidth: 320 }}
+                value=""
+                onChange={(e) => { if (e.target.value) patchActive({ sql: e.target.value }); }}
+              >
+                <option value="">History ({history.length})</option>
+                {history.map((h, i) => (
+                  <option key={i} value={h}>{h.replace(/\n/g, " ").substring(0, 90)}</option>
+                ))}
+              </select>
+            )}
+            <div style={{ flex: 1 }} />
+            <button className="btn btn-primary btn-sm" onClick={run} disabled={t.loading}>
+              {t.loading ? <span className="spinner" /> : null}
+              Run (⌘+Enter)
+            </button>
+          </div>
+          <div style={{ flex: 1, minHeight: 0 }}>
+            <SqlEditor
+              key={t.id}
+              value={t.sql}
+              onChange={(v) => patchActive({ sql: v })}
+              onRun={run}
+              onReady={(ed) => (editorRef.current = ed)}
+              height="100%"
+            />
+          </div>
+        </div>
+
+        {/* Splitter */}
+        <div
+          onMouseDown={onSplitterMouseDown}
+          style={{ height: 6, flexShrink: 0, cursor: "row-resize", background: "var(--border-color)", borderRadius: 3, margin: "2px 0" }}
+        />
+
+        {/* Results */}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+          <div className="toolbar">
+            <button className={`result-tab${t.resultTab === "query" ? " active" : ""}`} onClick={() => patchActive({ resultTab: "query" })}>
+              Query Result
+            </button>
+            {t.browseTable && (
+              <button className={`result-tab${t.resultTab === "data" ? " active" : ""}`} onClick={() => patchActive({ resultTab: "data" })}>
+                Data: <span style={{ fontFamily: "var(--font-mono)" }}>{t.browseTable}</span>
+                <span
+                  className="result-tab-close"
+                  title="Close"
+                  onClick={(e) => { e.stopPropagation(); patchActive({ browseTable: null, resultTab: "query" }); }}
+                >
+                  ✕
+                </span>
+              </button>
+            )}
+            {t.resultTab === "query" && t.elapsed !== null && (
+              <span style={{ marginLeft: 12, fontSize: 12, color: "var(--text-secondary)", fontFamily: "var(--font-mono)" }}>{t.elapsed.toFixed(1)} ms</span>
+            )}
+            {t.resultTab === "query" && cur && (
+              <span style={{ marginLeft: 8, fontSize: 12, color: "var(--text-secondary)" }}>{summarize(cur)}</span>
+            )}
+            <div style={{ flex: 1 }} />
+            {t.resultTab === "query" && t.results && t.results.length > 1 && (
+              <div style={{ display: "flex", gap: 4 }}>
+                {t.results.map((_, i) => (
+                  <button
+                    key={i}
+                    className={`btn btn-sm ${i === t.active ? "btn-primary" : "btn-secondary"}`}
+                    onClick={() => patchActive({ active: i, page: 0 })}
+                  >
+                    #{i + 1}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <div style={{ flex: 1, overflow: "auto" }}>
+            {t.resultTab === "data" && t.browseTable ? (
+              <TableDataView key={t.browseTable} table={t.browseTable} />
+            ) : t.error ? (
+              <div style={{ padding: 16, color: "var(--danger)", fontFamily: "var(--font-mono)", fontSize: 13, whiteSpace: "pre-wrap" }}>{t.error}</div>
+            ) : !cur ? (
+              <div className="empty-state">Run a statement to see results</div>
+            ) : isSelect ? (
+              <DataTable data={pagedRows} />
+            ) : (
+              <div className="empty-state">{summarize(cur)}</div>
+            )}
+          </div>
+          {t.resultTab === "query" && isSelect && allRows.length > t.pageSize && (
+            <Pagination
+              page={t.page}
+              pageSize={t.pageSize}
+              total={allRows.length}
+              currentCount={pagedRows.length}
+              onPage={(p) => patchActive({ page: p })}
+              onPageSize={(s) => patchActive({ pageSize: s, page: 0 })}
+            />
           )}
         </div>
-        <div style={{ flex: 1, overflow: "auto" }}>
-          {resultTab === "data" && browseTable ? (
-            <TableDataView key={browseTable} table={browseTable} />
-          ) : error ? (
-            <div
-              style={{
-                padding: 16,
-                color: "var(--danger)",
-                fontFamily: "var(--font-mono)",
-                fontSize: 13,
-                whiteSpace: "pre-wrap",
-              }}
-            >
-              {error}
-            </div>
-          ) : !cur ? (
-            <div className="empty-state">Run a statement to see results</div>
-          ) : isSelect ? (
-            <DataTable data={pagedRows} />
-          ) : (
-            <div className="empty-state">{summarize(cur)}</div>
-          )}
-        </div>
-        {resultTab === "query" && isSelect && allRows.length > pageSize && (
-          <Pagination
-            page={page}
-            pageSize={pageSize}
-            total={allRows.length}
-            currentCount={pagedRows.length}
-            onPage={setPage}
-            onPageSize={(s) => {
-              setPageSize(s);
-              setPage(0);
-            }}
-          />
-        )}
-      </div>
       </div>
     </div>
   );
