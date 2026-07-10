@@ -87,7 +87,12 @@ export function ProcedureDialog({ proc, onClose, onInsert, onDrop, onEdit }: Pro
           {proc.language === "cobra" ? (hasSource ? "Source (.cobra)" : "Body") : "Body"}
         </div>
         <div style={{ flex: 1, minHeight: 160, border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", overflow: "hidden", marginBottom: 12 }}>
-          <SqlEditor value={proc.definition} readOnly height="100%" />
+          <SqlEditor
+            value={proc.definition}
+            readOnly
+            height="100%"
+            language={proc.language === "cobra" && hasSource ? "python" : "sql"}
+          />
         </div>
 
         <div className="dialog-actions">

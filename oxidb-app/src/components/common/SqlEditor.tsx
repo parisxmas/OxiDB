@@ -12,6 +12,12 @@ interface Props {
   onReady?: (editor: MonacoEditor.IStandaloneCodeEditor) => void;
   readOnly?: boolean;
   height?: string;
+  /**
+   * Monaco language id. Defaults to "sql". Pass "python" for Cobra source so
+   * the SQL tokenizer doesn't mis-read an apostrophe (e.g. "CALL'da") as an
+   * unterminated string and turn the whole file red.
+   */
+  language?: string;
 }
 
 /** Monaco configured for SQL, with ⌘/Ctrl+Enter wired to `onRun`. */
@@ -22,6 +28,7 @@ export function SqlEditor({
   onReady,
   readOnly = false,
   height = "100%",
+  language = "sql",
 }: Props) {
   const { theme } = useTheme();
   const { scale } = useFontScale();
@@ -38,6 +45,7 @@ export function SqlEditor({
     <Editor
       height={height}
       defaultLanguage="sql"
+      language={language}
       value={value}
       onChange={(v) => onChange?.(v || "")}
       onMount={handleMount}
