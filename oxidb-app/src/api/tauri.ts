@@ -102,6 +102,12 @@ export const createDatabase = (name: string) =>
 export const dropDatabase = (name: string) =>
   invoke<string>("drop_database", { name });
 
+// Cobra stored procedure compilation (ADR-0014)
+export const cobraDetect = (cobraPath?: string) =>
+  invoke<string | null>("cobra_detect", { cobraPath });
+export const cobraCompile = (source: string, cobraPath?: string) =>
+  invoke<string>("cobra_compile", { source, cobraPath });
+
 // Filesystem — read a user-picked file's text (for import)
 export const readFileText = (path: string) =>
   invoke<string>("read_file_text", { path });

@@ -11,6 +11,7 @@ import { AlterTableDialog } from "./AlterTableDialog";
 import { IndexDialog } from "./IndexDialog";
 import { ProcedureDialog, type ProcInfo } from "./ProcedureDialog";
 import { ImportDialog } from "./ImportDialog";
+import { NewProcedureDialog } from "./NewProcedureDialog";
 import { IconSql, IconTable, IconKey, IconFunction } from "../layout/NavIcons";
 import { useToast } from "../common/Toast";
 
@@ -72,6 +73,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [showImport, setShowImport] = useState(false);
   const [showNewDb, setShowNewDb] = useState(false);
   const [dropDbName, setDropDbName] = useState<string | null>(null);
+  const [showNewProc, setShowNewProc] = useState(false);
 
   /** Load one database's tables + procedures (scoped explicitly to it). */
   const load = useCallback(async (dbName: string) => {
@@ -245,6 +247,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
       const builtin = dbName === "oxidb" || dbName === "postgres";
       const items: MenuItem[] = [
         { label: "New table…", onClick: () => { setDb(dbName); setShowCreate(true); } },
+        { label: "New Cobra procedure…", onClick: () => { setDb(dbName); setShowNewProc(true); } },
         { label: "Import CSV / JSON…", onClick: () => { setDb(dbName); setShowImport(true); } },
         { label: "Refresh", onClick: () => load(dbName) },
         { label: "", onClick: () => {}, separator: true },
@@ -480,6 +483,13 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
           tables={(tablesByDb[currentDb] || []).map((t) => t.name)}
           onClose={() => setShowImport(false)}
           onDone={reloadCurrent}
+        />
+      )}
+
+      {showNewProc && (
+        <NewProcedureDialog
+          onClose={() => setShowNewProc(false)}
+          onCreated={reloadCurrent}
         />
       )}
 

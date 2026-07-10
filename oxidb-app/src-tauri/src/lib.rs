@@ -47,6 +47,9 @@ pub fn run() {
             commands::query::execute_raw_command,
             // SQL engine (ADR-0010)
             commands::sql::run_sql,
+            // Cobra stored procedure compilation (ADR-0014)
+            commands::cobra::cobra_detect,
+            commands::cobra::cobra_compile,
             // Filesystem (import + blob upload/download)
             commands::fs::read_file_text,
             commands::fs::read_file_base64,

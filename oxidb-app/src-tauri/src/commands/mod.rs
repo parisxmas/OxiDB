@@ -1,5 +1,6 @@
 pub mod aggregation;
 pub mod blobs;
+pub mod cobra;
 pub mod collections;
 pub mod connection;
 pub mod database;
