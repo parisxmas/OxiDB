@@ -48,7 +48,7 @@ interface Props {
 
 export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const toast = useToast();
-  const { db, databases, setDb, reload: reloadDatabases } = useDatabase();
+  const { db, databases, setDb, reload: reloadDatabases, createDb, dropDb } = useDatabase();
 
   // Everything is keyed by database name so several databases can stay
   // expanded at once, each with its own tables/procedures.
@@ -219,6 +219,42 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
     [onQuery, onInsert, onBrowse, setDb]
   );
 
+  const newDatabase = useCallback(async () => {
+    const name = window.prompt("New database name:");
+    if (!name?.trim()) return;
+    try {
+      await createDb(name.trim());
+      toast("Database created", "success");
+    } catch (e) {
+      toast(String(e), "error");
+    }
+  }, [createDb, toast]);
+
+  const openDbMenu = useCallback(
+    (e: React.MouseEvent, dbName: string) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const builtin = dbName === "oxidb" || dbName === "postgres";
+      const items: MenuItem[] = [
+        { label: "New table…", onClick: () => { setDb(dbName); setShowCreate(true); } },
+        { label: "Import CSV / JSON…", onClick: () => { setDb(dbName); setShowImport(true); } },
+        { label: "Refresh", onClick: () => load(dbName) },
+        { label: "", onClick: () => {}, separator: true },
+        {
+          label: builtin ? "Drop database (built-in)" : "Drop database",
+          danger: true,
+          onClick: () => {
+            if (builtin) { toast("The built-in oxidb/postgres database can't be dropped", "error"); return; }
+            if (!window.confirm(`Drop database "${dbName}" and everything in it?`)) return;
+            dropDb(dbName).then(() => toast("Database dropped", "success")).catch((err) => toast(String(err), "error"));
+          },
+        },
+      ];
+      setMenu({ x: e.clientX, y: e.clientY, items });
+    },
+    [setDb, load, dropDb, toast]
+  );
+
   const currentDb = getCurrentDb() || db;
 
   return (
@@ -226,8 +262,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
       <div className="schema-tree-head">
         <span>DATABASES</span>
         <div style={{ display: "flex", gap: 2 }}>
-          <button className="schema-refresh" title="Import CSV / JSON" onClick={() => setShowImport(true)}>⇪</button>
-          <button className="schema-refresh" title="New table (in current database)" onClick={() => setShowCreate(true)}>+</button>
+          <button className="schema-refresh" title="New database" onClick={newDatabase}>+</button>
           <button
             className="schema-refresh"
             title="Refresh"
@@ -255,7 +290,8 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
                   <div
                     className={`schema-db-node${dbName === currentDb ? " open" : ""}`}
                     onClick={() => toggleDb(dbName)}
-                    title="Click to expand — loads tables (SHOW TABLES)"
+                    onContextMenu={(e) => openDbMenu(e, dbName)}
+                    title="Click to expand · right-click for menu (new table, drop database…)"
                   >
                     <span className="schema-caret">{isOpen ? "▾" : "▸"}</span>
                     <span className="schema-db-node-icon">🗄</span>
