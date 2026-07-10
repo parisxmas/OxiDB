@@ -80,7 +80,18 @@ export function SqlPage() {
       const id = allocId();
       setTabs((ts) => {
         setActiveIdx(ts.length);
-        return [...ts, { ...newTab(id), name: tbl, browseTable: tbl, resultTab: "data" as const }];
+        return [
+          ...ts,
+          {
+            ...newTab(id),
+            name: tbl,
+            // A useful starting query for the table (editable/runnable), while
+            // the data view shows its rows right away.
+            sql: `SELECT * FROM ${tbl} LIMIT 100;`,
+            browseTable: tbl,
+            resultTab: "data" as const,
+          },
+        ];
       });
     },
     [allocId, setTabs, setActiveIdx]
