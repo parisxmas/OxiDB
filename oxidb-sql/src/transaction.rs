@@ -513,11 +513,40 @@ impl Store for Transaction<'_> {
 
     fn index_lookup_eq(
         &self,
-        _table: &str,
-        _eqs: &[(String, Value)],
+        table: &str,
+        eqs: &[(String, Value)],
     ) -> Result<Option<crate::store::Rows>> {
-        // Transactions always full-scan (correct, just not index-accelerated);
-        // the overlay makes index reuse across engine+overlay not worth it here.
-        Ok(None)
+        let st = self.state.borrow();
+        // A table dropped or created in this transaction has no usable base
+        // index — fall back to a full (overlay-aware) scan.
+        if st.dropped.contains(table) || st.created.contains_key(table) {
+            return Ok(None);
+        }
+        // Candidate rows from the committed base index. `None` means no index
+        // covers `eqs`, so let the caller full-scan.
+        let Some(base) = self.engine.index_lookup_eq(table, eqs)? else {
+            return Ok(None);
+        };
+        // Merge the overlay. The executor re-applies the WHERE predicate to
+        // whatever we return, so a superset is safe: we must not MISS a match,
+        // but harmless extras are filtered out. Base candidates touched by the
+        // overlay are dropped here and re-added (fresh) from the overlay pass,
+        // which also covers inserts and rows an update moved *into* the result.
+        let overlay = st.rows.get(table);
+        let mut out: crate::store::Rows = Vec::with_capacity(base.len());
+        for (rid, cells) in base {
+            match overlay.and_then(|o| o.get(&rid)) {
+                Some(_) => {} // updated or deleted: handled by the overlay pass
+                None => out.push((rid, cells)),
+            }
+        }
+        if let Some(o) = overlay {
+            for (rid, change) in o {
+                if let Some(cells) = change {
+                    out.push((*rid, cells.clone()));
+                }
+            }
+        }
+        Ok(Some(out))
     }
 }

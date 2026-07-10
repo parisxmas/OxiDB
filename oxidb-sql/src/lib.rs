@@ -942,6 +942,22 @@ impl SqlEngine {
         let Some(state) = inner.tables.get(table) else {
             return Err(SqlError::NoSuchTable(table.to_string()));
         };
+        // PRIMARY KEY: a unique equality lookup is the most selective index
+        // there is, and the pk_map already maps value -> row_id. Use it before
+        // considering (redundant) secondary indexes.
+        if let Some(p) = state.pk_pos
+            && let Some((_, v)) = eqs
+                .iter()
+                .find(|(col, _)| *col == state.def.columns[p].name)
+        {
+            let rows: store::Rows = state
+                .pk_map
+                .get(&IndexKey(v.clone()))
+                .and_then(|id| state.rows.get(*id).map(|c| (*id, c)))
+                .into_iter()
+                .collect();
+            return Ok(Some(rows));
+        }
         // Find an index all of whose columns have an equality pair. Prefer
         // wider indexes (more matched columns = more selective).
         let mut best: Option<&IndexDef> = None;
@@ -1595,6 +1611,58 @@ mod tests {
             QueryResult::Select { rows, .. } => rows,
             other => panic!("expected Select, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn indexed_lookup_inside_transaction_sees_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT, v TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_t_k ON t(k)").unwrap();
+        db.execute("INSERT INTO t VALUES (1,10,'a'),(2,10,'b'),(3,20,'c'),(4,30,'d')")
+            .unwrap();
+
+        // Baseline (no transaction): index lookup returns the two k=10 rows.
+        let base = select_rows(&db, "SELECT id FROM t WHERE k = 10 ORDER BY id");
+        assert_eq!(base, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+        // Inside a transaction the same indexed lookup must reflect the overlay:
+        // an insert into the group, an update moving a row in, and a delete.
+        // A transaction spans calls, so drive it through the session API.
+        let mut sess: Option<u64> = None;
+        db.execute_params_in_session("BEGIN", &[], &mut sess)
+            .unwrap();
+        db.execute_params_in_session("INSERT INTO t VALUES (5,10,'e')", &[], &mut sess)
+            .unwrap();
+        db.execute_params_in_session("UPDATE t SET k = 10 WHERE id = 3", &[], &mut sess)
+            .unwrap();
+        db.execute_params_in_session("DELETE FROM t WHERE id = 1", &[], &mut sess)
+            .unwrap();
+        let inside = match db
+            .execute_params_in_session("SELECT id FROM t WHERE k = 10 ORDER BY id", &[], &mut sess)
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            QueryResult::Select { rows, .. } => rows,
+            other => panic!("expected Select, got {other:?}"),
+        };
+        db.execute_params_in_session("ROLLBACK", &[], &mut sess)
+            .unwrap();
+        // Expect {2, 3, 5}: original 2, updated-in 3, inserted 5; 1 deleted.
+        assert_eq!(
+            inside,
+            vec![
+                vec![Value::Int(2)],
+                vec![Value::Int(3)],
+                vec![Value::Int(5)]
+            ]
+        );
+
+        // After rollback the base is unchanged.
+        let after = select_rows(&db, "SELECT id FROM t WHERE k = 10 ORDER BY id");
+        assert_eq!(after, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
     }
 
     #[test]
