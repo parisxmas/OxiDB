@@ -1,0 +1,66 @@
+# builtins corners
+print(chr(65), ord("çok"), hash("abc"), int("  42 "), float("2.5"), int(true), int(3.99), int(-3.99))
+try
+    int("x1")
+catch e
+    print("int:", e)
+end
+print(zip([1,2,3], ["a","b"]), enumerate(["x","y"], 5))
+print(any([0, "", null]), all([]), any(range(0)), all(range(1, 3)))
+print(len(range(10)), range(10)[3], range(10)[-1])
+try
+    len(5)
+catch e
+    print("len:", e)
+end
+# string methods corners
+print("a,b,,c".split(","), "  x  ".lstrip().rstrip() + "|", "ab".count(""))
+print("hello".slice(1, 3), "hello".substr(1, 3), "hello".slice(-3))
+try
+    "x".join([1])
+catch e
+    print("join:", e)
+end
+# dict methods
+let d = {"k": 1}
+print(d.get("k"), d.get("m"), d.get("m", 99), d.items())
+try
+    d.del("zz")
+catch e
+    print("del:", e)
+end
+# nested data + equality
+print({"a": {"b": [1, {"c": true}]}} == {"a": {"b": [1, {"c": true}]}})
+# struct statics as value + consts on instance
+struct M
+    const K = 7
+    static def make()
+        return M()
+    end
+    def init()
+        self.v = M.K
+    end
+end
+print(M.K, M.make().v)
+let f = M.make
+print(type(f), f().v)
+# iteration over dict after delete keeps order
+let dd = {"a": 1, "b": 2, "c": 3}
+del(dd, "b")
+dd["b"] = 9
+for k in dd
+    print(k, dd[k])
+end
+# while + break/continue in try
+let i = 0
+while true
+    i = i + 1
+    if i == 3
+        break
+    end
+end
+print(i)
+# negative modulo float
+print(-7.5 % 2.0, 7.5 % -2.0)
+# comparison chains on strings
+print("abc" < "abd", "B" < "a", "" <= "")

@@ -1,0 +1,19 @@
+# assorted semantics pinned as unit tests
+let d = {"b": 1, 1: "int", 1.0: "float", true: "bool"}
+d["a"] = 2
+print(d)
+print(len(d), has(d, 1), has(d, 1.0))
+del(d, 1)
+print(keys(d))
+let dec = decimal("19.90")
+print(dec, dec + decimal("0.10"), dec.scale())
+print(decimal(1) / decimal(3))
+print(dec.round(1), dec.to_float())
+print("çilek"[1], len("çilek"), "çilek"[1:3])
+let l = [5, 1, 4]
+print(l[::-1], l[0:2])
+let s = "hello world"
+print(s.find("world"), s.split(" "), s.count("l"))
+print(1 == 1.0, [1, 2] == [1, 2.0], "a" != "b")
+print(-(-5), !0, !"x")
+print(str(3.0), str(10000000000000000.0), str(0.00001))

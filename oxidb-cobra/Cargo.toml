@@ -1,0 +1,9 @@
+[package]
+name = "oxidb-cobra"
+version = "0.1.0"
+edition = "2024"
+description = "Rust VM for Cobra portable bytecode (COBRAP v1) — executes compiled stored procedures (ADR-0014)"
+license-file = "../LICENSE"
+publish = false
+
+[dependencies]

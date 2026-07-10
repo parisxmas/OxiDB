@@ -1,0 +1,145 @@
+# inheritance + super
+struct Animal
+    def init(name)
+        self.name = name
+    end
+    def speak()
+        return self.name + " makes a sound"
+    end
+    def describe()
+        return "I am " + self.name
+    end
+end
+
+struct Dog < Animal
+    def init(name, breed)
+        super.init(name)
+        self.breed = breed
+    end
+    def speak()
+        return super.speak() + " (woof, " + self.breed + ")"
+    end
+end
+
+let d = Dog("Rex", "lab")
+print(d.speak())
+print(d.describe())
+print(d)
+print(type(d))
+
+# records + with + value equality
+record Point
+    def init(x, y)
+        self.x = x
+        self.y = y
+    end
+end
+let p1 = Point(1, 2)
+let p2 = p1.with({"y": 9})
+print(p1, p2, p1 == Point(1, 2), p1 == p2)
+try
+    p1.x = 5
+catch e
+    print("frozen:", e)
+end
+try
+    p1.with({"z": 1})
+catch e
+    print("with:", e)
+end
+
+# setters + getters
+struct Temp
+    def init()
+        self.c = 0
+    end
+    get f()
+        return self.c * 9 / 5 + 32
+    end
+    set f(v)
+        self.c = (v - 32) * 5 / 9
+    end
+end
+let t = Temp()
+t.f = 212
+print(t.c, t.f)
+
+# sealed typo error with suggestion
+try
+    t.cc = 1
+catch e
+    print("sealed:", e)
+end
+try
+    print(t.speed)
+catch e
+    print("nofield:", e)
+end
+
+# method-hint error
+try
+    print(d.speak)
+catch e
+    print("hint:", e)
+end
+
+# closures over loop vars, boxed locals
+let fns = []
+for i in range(3)
+    let j = i * 10
+    fns.push(def() -> j)
+end
+print(map(def(f) -> f(), fns))
+
+# recursion via CurrentClosure (named lambda?)
+def fact(n)
+    if n <= 1
+        return 1
+    end
+    return n * fact(n - 1)
+end
+print(fact(6))
+
+# string interpolation of collections + nested
+print("d=${{"a": [1, "x"]}} n=${1 + 2}")
+
+# not a function
+try
+    let z = 5
+    z(1)
+catch e
+    print("notfn:", e)
+end
+
+# wrong arity
+def two(a, b)
+    return a + b
+end
+try
+    two(1)
+catch e
+    print("arity:", e)
+end
+
+# sort stability/mixed error
+try
+    [1, "a"].sort()
+catch e
+    print("sort:", e)
+end
+let ml = [3.5, 1, 2.5, 2]
+ml.sort()
+print(ml)
+
+# division semantics
+print(7 % -2, -7 % 2, 7.5 % 2, -7 / 2)
+try
+    print(1 / 0)
+catch e
+    print("div:", e)
+end
+try
+    print(1.5 / 0.0)
+catch e
+    print("fdiv:", e)
+end

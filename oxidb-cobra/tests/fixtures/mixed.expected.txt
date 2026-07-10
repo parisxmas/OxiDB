@@ -1,0 +1,12 @@
+{"b": 1, 1: "int", 1.0: "float", true: "bool", "a": 2}
+5 true true
+["b", 1.0, true, "a"]
+19.90 20.00 2
+0.333333
+19.9 19.9
+i 5 il
+[4, 1, 5] [5, 1]
+6 ["hello", "world"] 3
+true true true
+5 true false
+3.0 1e+16 1e-05

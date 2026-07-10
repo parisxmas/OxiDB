@@ -1,0 +1,55 @@
+# try/catch/finally mechanics, incl. rethrow through finally
+try
+    print("t1")
+    throw "boom"
+    print("never")
+catch e
+    print("caught:", e)
+finally
+    print("finally1")
+end
+
+# runtime error caught as its message string
+try
+    let x = [1, 2]
+    print(x[5])
+catch e
+    print("idx:", e)
+end
+
+# finally-only: the error rethrows to the outer catch
+def g()
+    try
+        throw {"code": 7}
+    finally
+        print("g finally")
+    end
+end
+try
+    g()
+catch e
+    print("outer:", e["code"])
+end
+
+# return through finally still runs it
+def f()
+    try
+        return "ret"
+    finally
+        print("f finally")
+    end
+end
+print(f())
+
+# nested try, inner rethrow
+try
+    try
+        throw "inner"
+    catch e
+        print("inner caught:", e)
+        throw "again"
+    end
+catch e
+    print("outer caught:", e)
+end
+print("done")

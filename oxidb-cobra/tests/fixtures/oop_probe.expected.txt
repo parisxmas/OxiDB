@@ -1,0 +1,21 @@
+Rex makes a sound (woof, lab)
+I am Rex
+Dog{name: "Rex", breed: "lab"}
+Dog
+Point{x: 1, y: 2} Point{x: 1, y: 9} true false
+frozen: line 41: cannot modify immutable record Point
+with: line 46: Point has no field 'z'
+100 212
+sealed: line 69: Temp has no field 'cc' (did you mean 'c'?)
+nofield: line 74: Temp has no field 'speed'
+hint: line 81: Dog.speak is a method — call it with parentheses
+[20, 20, 20]
+720
+d={"a": [1, "x"]} n=3
+notfn: line 109: not a function: INTEGER
+arity: line 119: wrong number of arguments to two: want=2, got=1
+sort: line 126: cannot sort list of mixed types
+[1, 2, 2.5, 3.5]
+1 -1 1.5 -3
+div: line 137: division by zero
+fdiv: line 142: division by zero

@@ -1,0 +1,11 @@
+t1
+caught: boom
+finally1
+idx: line 15: list index out of range: 5
+g finally
+outer: 7
+f finally
+ret
+inner caught: inner
+outer caught: again
+done

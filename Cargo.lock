@@ -2319,6 +2319,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxidb-cobra"
+version = "0.1.0"
+
+[[package]]
 name = "oxidb-embedded-ffi"
 version = "0.34.0"
 dependencies = [
