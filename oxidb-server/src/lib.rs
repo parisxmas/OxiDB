@@ -17,6 +17,7 @@ pub mod scram;
 pub mod scram_client;
 pub mod session;
 pub mod sql_bridge;
+pub mod tsdb_bridge;
 pub mod tls;
 pub mod udp_ingest;
 

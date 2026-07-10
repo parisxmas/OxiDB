@@ -239,7 +239,9 @@ async fn dispatch_request(
                     cmd
                 ));
             }
-            sql_readonly = cmd == "sql" && effective_role == Role::Read;
+            // Read role → SQL/TSDB are query-only (bridges reject writes).
+            sql_readonly =
+                matches!(cmd.as_str(), "sql" | "tsdb") && effective_role == Role::Read;
         }
     }
 

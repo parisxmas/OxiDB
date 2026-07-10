@@ -210,11 +210,18 @@ fn handle_request_session_inner(
         Some("sql") => {
             return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly, db_name, sql_tx);
         }
+        // Third engine (oxidb-tsdb): time-series, entirely separate storage.
+        Some("tsdb") => {
+            return crate::tsdb_bridge::handle_tsdb(&cmd, &request, sql_readonly, db_name);
+        }
         Some("doc") | None => {}
         Some(other) => return err_bytes(&format!("unknown engine: {other:?}")),
     }
     if cmd == "sql" {
         return crate::sql_bridge::handle_sql(&cmd, &request, sql_readonly, db_name, sql_tx);
+    }
+    if cmd == "tsdb" {
+        return crate::tsdb_bridge::handle_tsdb(&cmd, &request, sql_readonly, db_name);
     }
 
     // FDW v1: if the targeted collection is registered as a linked

@@ -43,6 +43,7 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "fts_status"
                 | "proc_status"
                 | "sql"
+                | "tsdb"
                 | "call_procedure"
                 | "enable_schedule"
                 | "disable_schedule"
@@ -62,6 +63,9 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 // SELECT-only: the session layer flags Read-role sql requests
                 // and the SQL bridge rejects any non-SELECT statement.
                 | "sql"
+                // Read role runs tsdb queries only (writes/retention rejected
+                // by the bridge via the read-only flag).
+                | "tsdb"
                 | "list_collections"
                 | "list_buckets"
                 | "list_objects"
