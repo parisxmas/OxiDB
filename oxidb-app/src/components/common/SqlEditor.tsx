@@ -43,8 +43,12 @@ export function SqlEditor({
 
   return (
     <Editor
+      // key forces a fresh mount (and a fresh model) when the language
+      // changes, so Monaco actually re-tokenizes instead of keeping the
+      // model created with the initial defaultLanguage.
+      key={language}
       height={height}
-      defaultLanguage="sql"
+      defaultLanguage={language}
       language={language}
       value={value}
       onChange={(v) => onChange?.(v || "")}
