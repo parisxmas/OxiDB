@@ -86,6 +86,10 @@ export const executeRawCommand = (command: JsonValue) =>
 export const runSql = (sql: string, params?: JsonValue[], db?: string) =>
   invoke<JsonValue>("run_sql", { sql, params, db });
 
+// Filesystem — read a user-picked file's text (for import)
+export const readFileText = (path: string) =>
+  invoke<string>("read_file_text", { path });
+
 // OxiMem (Redis-compatible KV, separate port)
 export const oximemConnect = (host: string, port: number) =>
   invoke<JsonValue>("oximem_connect", { host, port });

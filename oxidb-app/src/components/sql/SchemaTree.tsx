@@ -8,6 +8,7 @@ import { CreateTableDialog } from "./CreateTableDialog";
 import { AlterTableDialog } from "./AlterTableDialog";
 import { IndexDialog } from "./IndexDialog";
 import { ProcedureDialog, type ProcInfo } from "./ProcedureDialog";
+import { ImportDialog } from "./ImportDialog";
 import { useToast } from "../common/Toast";
 
 interface StmtResult {
@@ -62,6 +63,7 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [procs, setProcs] = useState<ProcInfo[]>([]);
   const [procsOpen, setProcsOpen] = useState(true);
   const [viewProc, setViewProc] = useState<ProcInfo | null>(null);
+  const [showImport, setShowImport] = useState(false);
 
   const loadTables = useCallback(async () => {
     setLoading(true);
@@ -206,6 +208,13 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
       <div className="schema-tree-head">
         <span>SCHEMA</span>
         <div style={{ display: "flex", gap: 2 }}>
+          <button
+            className="schema-refresh"
+            title="Import CSV / JSON"
+            onClick={() => setShowImport(true)}
+          >
+            ⇪
+          </button>
           <button
             className="schema-refresh"
             title="New table"
@@ -412,6 +421,17 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
           table={indexTable}
           onClose={() => setIndexTable(null)}
           onChanged={loadTables}
+        />
+      )}
+
+      {showImport && (
+        <ImportDialog
+          tables={tables.map((t) => t.name)}
+          onClose={() => setShowImport(false)}
+          onDone={() => {
+            setCols({});
+            loadTables();
+          }}
         />
       )}
 
