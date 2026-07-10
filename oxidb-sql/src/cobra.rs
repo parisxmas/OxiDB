@@ -231,6 +231,60 @@ impl<S: Store> DbHandle<'_, S> {
         op(self.store, name).map_err(sql_err)?;
         Ok(CValue::Null)
     }
+
+    /// `db.call(name)` / `db.call(name, [args])` — invoke another stored
+    /// procedure (SQL or Cobra) in the SAME transaction and return its result
+    /// as a Cobra value (SELECT → list of dicts, DML → affected count, other →
+    /// null). Recursion is bounded by the executor's call-depth guard; the
+    /// inner procedure's print notices are not surfaced through the return.
+    fn call_proc(&self, args: &[CValue]) -> std::result::Result<CValue, NativeError> {
+        let (name, values) = match args {
+            [CValue::Str(n)] => (n, Vec::new()),
+            [CValue::Str(n), CValue::List(l)] => {
+                let borrowed = l.borrow();
+                let values = borrowed
+                    .iter()
+                    .map(cobra_to_sql_param)
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                (n, values)
+            }
+            _ => {
+                return Err(NativeError::new(
+                    "db.call(name) or db.call(name, [args]) — name must be a string, args a list",
+                ));
+            }
+        };
+        let result =
+            crate::executor::exec_call_values(self.store, name, values).map_err(sql_err)?;
+        Ok(query_result_to_cobra(result))
+    }
+}
+
+/// Shape a procedure result as a Cobra return value (mirror of the run()
+/// return shaping): SELECT → list of row-dicts, DML → affected count,
+/// DDL/transaction → null. A nested `Called` result unwraps to its inner
+/// result (notices are dropped).
+fn query_result_to_cobra(result: QueryResult) -> CValue {
+    match result {
+        QueryResult::Select { columns, rows, .. } => {
+            let out: Vec<CValue> = rows
+                .into_iter()
+                .map(|row| {
+                    let mut dict = Dict::new();
+                    for (col, cell) in columns.iter().zip(row) {
+                        let key = CValue::Str(Rc::from(col.as_str()));
+                        let hk = hash_key(&key).expect("strings are hashable");
+                        dict.set(hk, key, sql_to_cobra(&cell));
+                    }
+                    CValue::Dict(Rc::new(RefCell::new(dict)))
+                })
+                .collect();
+            CValue::List(Rc::new(RefCell::new(out)))
+        }
+        QueryResult::Mutation { affected, .. } => CValue::Int(affected as i64),
+        QueryResult::Called { inner, .. } => query_result_to_cobra(*inner),
+        _ => CValue::Null,
+    }
 }
 
 impl<S: Store> NativeObject for DbHandle<'_, S> {
@@ -248,6 +302,7 @@ impl<S: Store> NativeObject for DbHandle<'_, S> {
             "savepoint" => self.savepoint_op(name, args, |s, n| s.savepoint(n)),
             "rollback_to" => self.savepoint_op(name, args, |s, n| s.rollback_to_savepoint(n)),
             "release" => self.savepoint_op(name, args, |s, n| s.release_savepoint(n)),
+            "call" => self.call_proc(args),
             _ => Err(NativeError::new(format!("db has no method '{name}'"))),
         }
     }

@@ -769,6 +769,7 @@ fn translate_create_procedure(
             | sp::Statement::Update { .. }
             | sp::Statement::Delete(_)
             | sp::Statement::Query(_)
+            | sp::Statement::Call(_)
             | sp::Statement::Savepoint { .. }
             | sp::Statement::ReleaseSavepoint { .. } => {}
             // `ROLLBACK TO SAVEPOINT` is a Rollback statement carrying a
@@ -778,7 +779,7 @@ fn translate_create_procedure(
             } => {}
             other => {
                 return Err(SqlError::Unsupported(format!(
-                    "statement in procedure body: {other} (bodies are DML/SELECT + savepoints)"
+                    "statement in procedure body: {other} (bodies are DML/SELECT, CALL, savepoints)"
                 )));
             }
         }

@@ -356,36 +356,91 @@ pub(crate) fn exec_call<S: Store>(
     args: &[Expr],
     params: &[Value],
 ) -> Result<QueryResult> {
-    let def = store
-        .procedure_def(name)
-        .ok_or_else(|| SqlError::NoSuchProcedure(name.to_string()))?;
-    if args.len() != def.params.len() {
-        return Err(SqlError::Eval(format!(
-            "procedure {name:?} takes {} argument(s), got {}",
-            def.params.len(),
-            args.len()
-        )));
-    }
+    // Evaluate the argument expressions against the caller's parameters (a
+    // nested CALL's args may reference the outer procedure's $N). Coercion to
+    // the declared types happens in exec_call_values, once the def is known.
     let empty: &[ColRef] = &[];
     let no_row: &[Value] = &[];
     let mut values = Vec::with_capacity(args.len());
-    for (arg, (pname, ty)) in args.iter().zip(&def.params) {
+    for arg in args {
         let bound = bind_expr(arg, empty)?;
-        let v = eval_scalar(&bound, empty, no_row, params)?;
-        values.push(coerce_call_arg(v, *ty, pname)?);
+        values.push(eval_scalar(&bound, empty, no_row, params)?);
+    }
+    exec_call_values(store, name, values)
+}
+
+/// Nested-CALL recursion guard. Both the SQL-text body path (a `CALL` in the
+/// body flows through `execute` → `exec_call`) and the Cobra `db.call` handle
+/// go through [`exec_call_values`], so one thread-local depth counter bounds
+/// every recursion shape. A procedure and everything it calls share the
+/// caller's transaction.
+const MAX_CALL_DEPTH: u32 = 64;
+
+thread_local! {
+    static CALL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct DepthGuard;
+impl DepthGuard {
+    fn enter() -> Result<DepthGuard> {
+        let d = CALL_DEPTH.with(|c| {
+            let d = c.get() + 1;
+            c.set(d);
+            d
+        });
+        if d > MAX_CALL_DEPTH {
+            CALL_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+            return Err(SqlError::Eval(format!(
+                "maximum procedure call depth ({MAX_CALL_DEPTH}) exceeded (infinite recursion?)"
+            )));
+        }
+        Ok(DepthGuard)
+    }
+}
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        CALL_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Run a procedure with pre-evaluated argument values (the shared core of a
+/// top-level/nested `CALL` and the Cobra `db.call` handle). Coerces the values
+/// to the declared parameter types, then dispatches to the SQL-text body or
+/// the Cobra VM.
+pub(crate) fn exec_call_values<S: Store>(
+    store: &S,
+    name: &str,
+    values: Vec<Value>,
+) -> Result<QueryResult> {
+    let _guard = DepthGuard::enter()?;
+
+    let def = store
+        .procedure_def(name)
+        .ok_or_else(|| SqlError::NoSuchProcedure(name.to_string()))?;
+    if values.len() != def.params.len() {
+        return Err(SqlError::Eval(format!(
+            "procedure {name:?} takes {} argument(s), got {}",
+            def.params.len(),
+            values.len()
+        )));
+    }
+    let mut coerced = Vec::with_capacity(values.len());
+    for (v, (pname, ty)) in values.into_iter().zip(&def.params) {
+        coerced.push(coerce_call_arg(v, *ty, pname)?);
     }
 
     // A COBRA procedure executes its stored bytecode (ADR-0014); the SQL
     // path below re-parses the stored text as before.
     if def.language == crate::catalog::ProcLanguage::Cobra {
-        return crate::cobra::exec_call_cobra(store, name, &def, values);
+        return crate::cobra::exec_call_cobra(store, name, &def, coerced);
     }
 
     let statements = crate::parser::parse(&def.body)?;
     let mut last = QueryResult::Ddl;
     for stmt in statements {
-        // The body was restricted to DML/SELECT at creation; keep the check
-        // as a defensive backstop for definitions from older catalogs.
+        // Body statements were restricted at creation; keep the check as a
+        // defensive backstop. A nested CALL recurses through execute →
+        // exec_call (bounded by the depth guard above).
         match &stmt {
             Statement::Insert { .. }
             | Statement::Update { .. }
@@ -393,14 +448,15 @@ pub(crate) fn exec_call<S: Store>(
             | Statement::Select(_)
             | Statement::Savepoint(_)
             | Statement::RollbackToSavepoint(_)
-            | Statement::ReleaseSavepoint(_) => {}
+            | Statement::ReleaseSavepoint(_)
+            | Statement::Call { .. } => {}
             _ => {
                 return Err(SqlError::Corrupt(format!(
-                    "procedure {name:?} body contains a non-DML statement"
+                    "procedure {name:?} body contains a disallowed statement"
                 )));
             }
         }
-        last = execute(store, stmt, &values)?;
+        last = execute(store, stmt, &coerced)?;
     }
     Ok(last)
 }

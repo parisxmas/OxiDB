@@ -53,3 +53,32 @@ fn savepoint_outside_a_transaction_errors() {
     let err = e.execute("SAVEPOINT lonely").unwrap_err().to_string();
     assert!(err.contains("SAVEPOINT"), "got: {err}");
 }
+
+#[test]
+fn nested_call_sql_to_sql_shares_transaction() {
+    let e = eng();
+    run(&e, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+    run(
+        &e,
+        "CREATE PROCEDURE leaf(x INT) AS BEGIN INSERT INTO t VALUES (x, 'z'); END",
+    );
+    run(
+        &e,
+        "CREATE PROCEDURE parent() AS BEGIN CALL leaf(1); CALL leaf(2); END",
+    );
+    run(&e, "CALL parent()");
+    assert_eq!(count(&e), 2);
+}
+
+#[test]
+fn nested_call_recursion_is_bounded() {
+    let e = eng();
+    run(&e, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)");
+    // Self-recursive with no base case → the depth guard must stop it.
+    run(
+        &e,
+        "CREATE PROCEDURE loop_forever() AS BEGIN CALL loop_forever(); END",
+    );
+    let err = e.execute("CALL loop_forever()").unwrap_err().to_string();
+    assert!(err.contains("call depth"), "got: {err}");
+}

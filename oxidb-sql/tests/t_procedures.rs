@@ -185,12 +185,19 @@ fn body_restrictions() {
     for bad in [
         "CREATE PROCEDURE b1() AS BEGIN CREATE TABLE x (a INT); END",
         "CREATE PROCEDURE b2() AS BEGIN BEGIN; SELECT 1 FROM hesap; COMMIT; END",
-        "CREATE PROCEDURE b3() AS BEGIN CALL b1(); END",
         "CREATE PROCEDURE b4(n INT) AS BEGIN SELECT $1 FROM hesap; END",
         "CREATE PROCEDURE b5() AS BEGIN END",
     ] {
         assert!(db.execute(bad).is_err(), "should be rejected: {bad}");
     }
+    // A nested CALL is now allowed (bounded by the runtime call-depth guard).
+    db.execute("CREATE PROCEDURE b1ok() AS BEGIN SELECT 1 FROM hesap; END")
+        .unwrap();
+    assert!(
+        db.execute("CREATE PROCEDURE b3() AS BEGIN CALL b1ok(); END")
+            .is_ok(),
+        "nested CALL should now be accepted"
+    );
     // Bodies referencing missing tables fail at creation (trial parse only
     // covers syntax; execution of the body is deferred to CALL — but the
     // statement must at least translate).
@@ -232,11 +239,12 @@ fn show_procedures() {
     db.execute("CREATE PROCEDURE p(a INT, b TEXT) AS BEGIN SELECT a, b FROM hesap; END")
         .unwrap();
     let (cols, rws) = cols_rows(&db, "SHOW PROCEDURES");
-    assert_eq!(cols, vec!["procedure", "params", "definition"]);
+    assert_eq!(cols, vec!["procedure", "params", "language", "definition"]);
     assert_eq!(rws.len(), 1);
     assert_eq!(rws[0][0], t("p"));
     assert_eq!(rws[0][1], t("a INT, b TEXT"));
-    let def = match &rws[0][2] {
+    assert_eq!(rws[0][2], t("sql"));
+    let def = match &rws[0][3] {
         Value::Text(s) => s.clone(),
         other => panic!("expected text definition, got {other:?}"),
     };
