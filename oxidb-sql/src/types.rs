@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::decimal::Decimal;
 use crate::error::{Result, SqlError};
 
 /// The static type of a column.
@@ -23,6 +24,8 @@ pub enum SqlType {
     Timestamp,
     /// Binary data (`BLOB`/`BYTEA`/`BINARY`). JSON wire form is base64.
     Blob,
+    /// Exact base-10 fixed-point (`DECIMAL`/`NUMERIC`). Backed by [`Decimal`].
+    Decimal,
 }
 
 /// A single typed cell value.
@@ -37,6 +40,8 @@ pub enum Value {
     Bool(bool),
     /// Epoch milliseconds.
     Timestamp(i64),
+    /// Exact base-10 fixed-point value.
+    Decimal(Decimal),
 }
 
 impl Value {
@@ -52,15 +57,20 @@ impl Value {
                 | (Value::Bool(_), SqlType::Bool)
                 | (Value::Timestamp(_), SqlType::Timestamp)
                 | (Value::Bytes(_), SqlType::Blob)
+                | (Value::Decimal(_), SqlType::Decimal)
         )
     }
 
-    /// Numeric view of Int/Double/Timestamp, for cross-numeric comparison.
+    /// Numeric view of Int/Double/Timestamp/Decimal, for cross-numeric
+    /// comparison. Decimal is viewed lossily as `f64` here; exact Decimal
+    /// comparisons go through [`Value::total_order`] / the executor's
+    /// `cmp_values`.
     fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Int(n) => Some(*n as f64),
             Value::Double(f) => Some(*f),
             Value::Timestamp(t) => Some(*t as f64),
+            Value::Decimal(d) => Some(d.to_f64()),
             _ => None,
         }
     }
@@ -77,7 +87,7 @@ impl Value {
             match v {
                 Value::Null => 0,
                 Value::Bool(_) => 1,
-                Value::Int(_) | Value::Double(_) | Value::Timestamp(_) => 2,
+                Value::Int(_) | Value::Double(_) | Value::Timestamp(_) | Value::Decimal(_) => 2,
                 Value::Text(_) => 3,
                 Value::Bytes(_) => 4,
             }
@@ -87,6 +97,11 @@ impl Value {
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Text(x), Value::Text(y)) => x.cmp(y),
             (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+            // Exact ordering among Decimal / Int so equal values (e.g. 2 and
+            // 2.00) sort together and index keys stay precise.
+            (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
+            (Value::Decimal(x), Value::Int(y)) => x.cmp(&Decimal::from_i64(*y)),
+            (Value::Int(x), Value::Decimal(y)) => Decimal::from_i64(*x).cmp(y),
             _ if rank(a) == 2 && rank(b) == 2 => a
                 .as_f64()
                 .unwrap()
@@ -122,6 +137,7 @@ const TAG_TEXT: u8 = 3;
 const TAG_BOOL: u8 = 4;
 const TAG_TIMESTAMP: u8 = 5;
 const TAG_BYTES: u8 = 6;
+const TAG_DECIMAL: u8 = 7;
 
 /// Append the binary encoding of a single cell to `buf`.
 ///
@@ -160,6 +176,12 @@ pub fn encode_cell(v: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
             buf.extend_from_slice(b);
         }
+        // Mantissa (i128 LE, 16 bytes) + scale (u32 LE, 4 bytes).
+        Value::Decimal(d) => {
+            buf.push(TAG_DECIMAL);
+            buf.extend_from_slice(&d.mantissa().to_le_bytes());
+            buf.extend_from_slice(&d.scale().to_le_bytes());
+        }
     }
 }
 
@@ -190,6 +212,11 @@ fn decode_cell(bytes: &[u8], pos: &mut usize) -> Result<Value> {
                 .to_vec();
             *pos = end;
             Ok(Value::Bytes(raw))
+        }
+        TAG_DECIMAL => {
+            let mantissa = i128::from_le_bytes(read_16(bytes, pos)?);
+            let scale = u32::from_le_bytes(read_4(bytes, pos)?);
+            Ok(Value::Decimal(Decimal::new(mantissa, scale)))
         }
         TAG_TEXT => {
             let len = u32::from_le_bytes(read_4(bytes, pos)?) as usize;
@@ -241,6 +268,15 @@ fn read_8(bytes: &[u8], pos: &mut usize) -> Result<[u8; 8]> {
     Ok(slice.try_into().unwrap())
 }
 
+fn read_16(bytes: &[u8], pos: &mut usize) -> Result<[u8; 16]> {
+    let end = *pos + 16;
+    let slice = bytes
+        .get(*pos..end)
+        .ok_or_else(|| SqlError::Corrupt("truncated 16-byte field".into()))?;
+    *pos = end;
+    Ok(slice.try_into().unwrap())
+}
+
 fn read_4(bytes: &[u8], pos: &mut usize) -> Result<[u8; 4]> {
     let end = *pos + 4;
     let slice = bytes
@@ -267,6 +303,7 @@ mod tests {
             Value::Bool(true),
             Value::Text("héllo".into()),
             Value::Timestamp(1_700_000_000_000),
+            Value::Decimal(Decimal::parse("-19.90").unwrap()),
         ];
         let bytes = encode_row(&cells);
         let back = decode_row(&bytes, cells.len()).unwrap();

@@ -77,7 +77,7 @@ fn decimal_and_blob_types() {
     let (_d, db) = open();
     db.execute("CREATE TABLE p (id INT PRIMARY KEY, para DECIMAL(10,2), veri BLOB)")
         .unwrap();
-    // DECIMAL stores as DOUBLE; BLOB accepts base64 text on the JSON-ish path.
+    // DECIMAL is exact fixed-point; BLOB accepts base64 text on the JSON-ish path.
     db.execute("INSERT INTO p VALUES (1, 12.50, 'aGVsbG8=')")
         .unwrap(); // "hello"
     let r = db
@@ -91,11 +91,15 @@ fn decimal_and_blob_types() {
     assert_eq!(
         types,
         vec![
-            Some(oxidb_sql::SqlType::Double),
+            Some(oxidb_sql::SqlType::Decimal),
             Some(oxidb_sql::SqlType::Blob)
         ]
     );
-    assert_eq!(rows[0][0], Value::Double(12.5));
+    // Exact, and the 2-digit scale of the literal is preserved on reload.
+    assert_eq!(
+        rows[0][0],
+        Value::Decimal(oxidb_sql::Decimal::parse("12.50").unwrap())
+    );
     assert_eq!(rows[0][1], Value::Bytes(b"hello".to_vec()));
 }
 

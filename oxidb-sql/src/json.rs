@@ -158,6 +158,12 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::Bytes(b) => json!(crate::catalog::base64_encode(b)),
         // Timestamps are epoch milliseconds on the wire.
         Value::Timestamp(t) => json!(t),
+        // DECIMAL renders as a clean JSON number (paired with type "DECIMAL").
+        // The engine computed it exactly; typical money results are
+        // float-representable, so display is clean (e.g. 26149000, not
+        // 26148999.999990743). Full cross-wire exactness would need a string
+        // form; f64 is chosen here for clean numeric display in clients.
+        Value::Decimal(d) => json!(d.to_f64()),
     }
 }
 

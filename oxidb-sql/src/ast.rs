@@ -331,6 +331,9 @@ pub enum ScalarFunc {
     /// `REPLACE(s, from, to)`.
     Replace,
     Abs,
+    /// `ROUND(x)` (to integer) or `ROUND(x, n)` (to `n` fractional digits,
+    /// half-up). Exact for DECIMAL, IEEE-754 for DOUBLE, identity for INT.
+    Round,
     /// `CAST(expr AS type)`.
     Cast(SqlType),
     /// `expr [NOT] LIKE pattern [ESCAPE c]` — args: `[expr, pattern]`.

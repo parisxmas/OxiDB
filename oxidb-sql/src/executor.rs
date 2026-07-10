@@ -18,6 +18,7 @@ use crate::ast::{
     AggFunc, BinOp, Expr, Join, JoinKind, LimitExpr, QueryBody, QueryResult, ScalarFunc,
     SelectItem, SelectQuery, SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
 };
+use crate::decimal::Decimal;
 use crate::error::{Result, SqlError};
 use crate::store::{Chunk, Store};
 use crate::types::{IndexKey, SqlType, Value};
@@ -474,7 +475,28 @@ fn coerce_call_arg(v: Value, ty: SqlType, pname: &str) -> Result<Value> {
         | (SqlType::Text, v @ Value::Text(_))
         | (SqlType::Bool, v @ Value::Bool(_))
         | (SqlType::Timestamp, v @ Value::Timestamp(_))
-        | (SqlType::Blob, v @ Value::Bytes(_)) => v,
+        | (SqlType::Blob, v @ Value::Bytes(_))
+        | (SqlType::Decimal, v @ Value::Decimal(_)) => v,
+        // DECIMAL parameters accept exact widenings (Int/Text) and a
+        // best-effort Double conversion; a Decimal into a DOUBLE drops to float.
+        (SqlType::Decimal, Value::Int(i)) => Value::Decimal(Decimal::from_i64(i)),
+        (SqlType::Decimal, Value::Text(t)) => match Decimal::parse(&t) {
+            Some(d) => Value::Decimal(d),
+            None => {
+                return Err(SqlError::Eval(format!(
+                    "parameter {pname:?}: invalid DECIMAL {t:?}"
+                )));
+            }
+        },
+        (SqlType::Decimal, Value::Double(f)) => match Decimal::parse(&format!("{f}")) {
+            Some(d) => Value::Decimal(d),
+            None => {
+                return Err(SqlError::Eval(format!(
+                    "parameter {pname:?}: cannot convert {f} to DECIMAL"
+                )));
+            }
+        },
+        (SqlType::Double, Value::Decimal(d)) => Value::Double(d.to_f64()),
         (SqlType::Blob, Value::Text(t)) => match crate::catalog::base64_decode(&t) {
             Ok(b) => Value::Bytes(b),
             Err(()) => {
@@ -1745,16 +1767,8 @@ fn compute_window(
                         }
                         let v = match agg {
                             AggFunc::Count => Value::Int(count),
-                            AggFunc::Sum => match &sum {
-                                SumAcc::Empty => Value::Null,
-                                SumAcc::Int(i) => Value::Int(*i),
-                                SumAcc::Float(f) => Value::Double(*f),
-                            },
-                            AggFunc::Avg => match &sum {
-                                SumAcc::Empty => Value::Null,
-                                SumAcc::Int(i) => Value::Double(*i as f64 / count as f64),
-                                SumAcc::Float(f) => Value::Double(*f / count as f64),
-                            },
+                            AggFunc::Sum => sum.clone().into_sum(),
+                            AggFunc::Avg => sum.clone().into_avg(count),
                             AggFunc::Min | AggFunc::Max => best.clone().unwrap_or(Value::Null),
                         };
                         for &i in &part[start..end] {
@@ -2413,6 +2427,9 @@ fn hash_key_component(v: &Value) -> Option<HashKey> {
         Value::Double(f) if f.is_nan() => None,
         Value::Double(f) => Some(HashKey::Num(norm(*f))),
         Value::Timestamp(t) => Some(HashKey::Num(norm(*t as f64))),
+        // Decimal joins on its numeric value (consistent with total_order,
+        // which treats 2 and 2.00 as equal — both hash to the same f64 bits).
+        Value::Decimal(d) => Some(HashKey::Num(norm(d.to_f64()))),
         Value::Bool(b) => Some(HashKey::Bool(*b)),
         Value::Text(s) => Some(HashKey::Text(s.clone())),
     }
@@ -3121,7 +3138,7 @@ fn hash_value_norm(v: &Value, h: &mut impl Hasher) {
             h.write_u8(1);
             h.write_u8(*b as u8);
         }
-        Value::Int(_) | Value::Double(_) | Value::Timestamp(_) => {
+        Value::Int(_) | Value::Double(_) | Value::Timestamp(_) | Value::Decimal(_) => {
             let f = as_f64(v).expect("numeric");
             let bits = if f.is_nan() {
                 f64::NAN.to_bits()
@@ -3202,6 +3219,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             Value::Bool(_) => Some(SqlType::Bool),
             Value::Timestamp(_) => Some(SqlType::Timestamp),
             Value::Bytes(_) => Some(SqlType::Blob),
+            Value::Decimal(_) => Some(SqlType::Decimal),
             Value::Null => None,
         },
         Expr::Binary { op, left, right } => match op {
@@ -3256,7 +3274,9 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             ScalarFunc::Length => Some(SqlType::Int),
             ScalarFunc::Like { .. } => Some(SqlType::Bool),
             ScalarFunc::Cast(t) => Some(*t),
-            ScalarFunc::Abs | ScalarFunc::NullIf => args.first().and_then(|a| expr_type(a, schema)),
+            ScalarFunc::Abs | ScalarFunc::Round | ScalarFunc::NullIf => {
+                args.first().and_then(|a| expr_type(a, schema))
+            }
             ScalarFunc::Coalesce => args.iter().find_map(|a| expr_type(a, schema)),
             ScalarFunc::Case { has_else } => {
                 // Value slots are the odd positions (+ trailing ELSE).
@@ -3297,6 +3317,7 @@ fn default_name(expr: &Expr) -> String {
             ScalarFunc::Rtrim => "rtrim".to_string(),
             ScalarFunc::Replace => "replace".to_string(),
             ScalarFunc::Abs => "abs".to_string(),
+            ScalarFunc::Round => "round".to_string(),
             ScalarFunc::Cast(_) => "cast".to_string(),
             ScalarFunc::Like { .. } => "like".to_string(),
             ScalarFunc::Case { .. } => "case".to_string(),
@@ -3441,6 +3462,7 @@ where
             Value::Int(n) => Ok(Some(n.to_string())),
             Value::Double(f) => Ok(Some(f.to_string())),
             Value::Bool(b) => Ok(Some(b.to_string())),
+            Value::Decimal(d) => Ok(Some(d.to_string())),
             other => Err(SqlError::Eval(format!("{what} of {other:?}"))),
         }
     }
@@ -3558,8 +3580,38 @@ where
             Value::Null => Value::Null,
             Value::Int(n) => Value::Int(n.abs()),
             Value::Double(f) => Value::Double(f.abs()),
+            Value::Decimal(d) => Value::Decimal(if d.mantissa() < 0 { d.neg() } else { d }),
             other => return Err(SqlError::Eval(format!("ABS of {other:?}"))),
         }),
+        ScalarFunc::Round => {
+            let x = eval(&args[0])?;
+            if matches!(x, Value::Null) {
+                return Ok(Value::Null);
+            }
+            // Optional second argument: the number of fractional digits.
+            let places = match args.get(1) {
+                None => 0u32,
+                Some(e) => match eval(e)? {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Int(n) if n >= 0 => n as u32,
+                    _ => {
+                        return Err(SqlError::Eval(
+                            "ROUND scale must be a non-negative integer".into(),
+                        ));
+                    }
+                },
+            };
+            Ok(match x {
+                Value::Decimal(d) => Value::Decimal(d.round(places)),
+                Value::Double(f) => {
+                    let m = 10f64.powi(places as i32);
+                    Value::Double((f * m).round() / m)
+                }
+                // Integers are already whole; the scale is irrelevant.
+                Value::Int(n) => Value::Int(n),
+                other => return Err(SqlError::Eval(format!("ROUND of {other:?}"))),
+            })
+        }
         ScalarFunc::Cast(ty) => cast_value(eval(&args[0])?, ty),
         ScalarFunc::Like { negated, escape } => {
             let s = eval(&args[0])?;
@@ -3585,7 +3637,21 @@ fn cast_value(v: Value, ty: SqlType) -> Result<Value> {
         | (v @ Value::Double(_), T::Double)
         | (v @ Value::Text(_), T::Text)
         | (v @ Value::Bool(_), T::Bool)
-        | (v @ Value::Timestamp(_), T::Timestamp) => v,
+        | (v @ Value::Timestamp(_), T::Timestamp)
+        | (v @ Value::Decimal(_), T::Decimal) => v,
+        // → DECIMAL (exact from Int/Text; best-effort from a Double via its
+        // shortest decimal string — the float's origin caveat carries through).
+        (Value::Int(n), T::Decimal) => Value::Decimal(Decimal::from_i64(n)),
+        (Value::Text(s), T::Decimal) => {
+            Value::Decimal(Decimal::parse(s.trim()).ok_or_else(|| fail(&Value::Text(s.clone())))?)
+        }
+        (Value::Double(f), T::Decimal) => {
+            Value::Decimal(Decimal::parse(&format!("{f}")).ok_or_else(|| fail(&Value::Double(f)))?)
+        }
+        // DECIMAL → other numeric / text.
+        (Value::Decimal(d), T::Int) => Value::Int(d.to_i64()),
+        (Value::Decimal(d), T::Double) => Value::Double(d.to_f64()),
+        (Value::Decimal(d), T::Text) => Value::Text(d.to_string()),
         (Value::Int(n), T::Double) => Value::Double(n as f64),
         (Value::Int(n), T::Bool) => Value::Bool(n != 0),
         (Value::Int(n), T::Timestamp) => Value::Timestamp(n),
@@ -3909,65 +3975,86 @@ fn eval_aggregate(
                 sum.add(&v)?;
                 n += 1;
             }
-            let sum = match sum {
-                SumAcc::Empty => return Ok(Value::Null),
-                SumAcc::Int(i) => Value::Int(i),
-                SumAcc::Float(f) => Value::Double(f),
-            };
             if func == AggFunc::Sum {
-                return Ok(sum);
+                Ok(sum.into_sum())
+            } else {
+                Ok(sum.into_avg(n))
             }
-            let s = match sum {
-                Value::Int(i) => i as f64,
-                Value::Double(d) => d,
-                _ => unreachable!(),
-            };
-            Ok(Value::Double(s / n as f64))
         }
     }
 }
 
-/// Streaming SUM accumulator: integer until the first Double, then float
-/// (matching SQL's numeric widening; Int sums use wrapping arithmetic as
-/// before).
+/// Streaming SUM accumulator. Starts integer, promotes to exact Decimal when a
+/// Decimal is summed (so DECIMAL columns stay lossless), or to float when a
+/// Double is involved. A Double always wins over Decimal (float is contagious).
+#[derive(Clone)]
 enum SumAcc {
     Empty,
     Int(i64),
     Float(f64),
+    Dec(Decimal),
 }
 
 impl SumAcc {
     fn add(&mut self, v: &Value) -> Result<()> {
-        let vf = match v {
-            Value::Int(i) => {
+        match v {
+            Value::Int(i) | Value::Timestamp(i) => {
+                let i = *i;
                 match self {
-                    SumAcc::Empty => *self = SumAcc::Int(*i),
-                    SumAcc::Int(acc) => *acc = acc.wrapping_add(*i),
-                    SumAcc::Float(acc) => *acc += *i as f64,
+                    SumAcc::Empty => *self = SumAcc::Int(i),
+                    SumAcc::Int(acc) => *acc = acc.wrapping_add(i),
+                    SumAcc::Float(acc) => *acc += i as f64,
+                    SumAcc::Dec(acc) => *acc = acc.add(&Decimal::from_i64(i)),
                 }
-                return Ok(());
+                Ok(())
             }
-            Value::Timestamp(t) => {
+            Value::Decimal(dv) => {
                 match self {
-                    SumAcc::Empty => *self = SumAcc::Int(*t),
-                    SumAcc::Int(acc) => *acc = acc.wrapping_add(*t),
-                    SumAcc::Float(acc) => *acc += *t as f64,
+                    SumAcc::Empty => *self = SumAcc::Dec(dv.clone()),
+                    SumAcc::Int(acc) => *self = SumAcc::Dec(Decimal::from_i64(*acc).add(dv)),
+                    SumAcc::Dec(acc) => *acc = acc.add(dv),
+                    SumAcc::Float(acc) => *acc += dv.to_f64(),
                 }
-                return Ok(());
+                Ok(())
             }
-            Value::Double(d) => *d,
-            other => {
-                return Err(SqlError::Eval(format!(
-                    "SUM over non-numeric value {other:?}"
-                )));
+            Value::Double(d) => {
+                let d = *d;
+                match self {
+                    SumAcc::Empty => *self = SumAcc::Float(d),
+                    SumAcc::Int(acc) => *self = SumAcc::Float(*acc as f64 + d),
+                    SumAcc::Dec(acc) => *self = SumAcc::Float(acc.to_f64() + d),
+                    SumAcc::Float(acc) => *acc += d,
+                }
+                Ok(())
             }
-        };
-        match self {
-            SumAcc::Empty => *self = SumAcc::Float(vf),
-            SumAcc::Int(acc) => *self = SumAcc::Float(*acc as f64 + vf),
-            SumAcc::Float(acc) => *acc += vf,
+            other => Err(SqlError::Eval(format!(
+                "SUM over non-numeric value {other:?}"
+            ))),
         }
-        Ok(())
+    }
+
+    /// The SUM result value for this accumulator (`NULL` when empty).
+    fn into_sum(self) -> Value {
+        match self {
+            SumAcc::Empty => Value::Null,
+            SumAcc::Int(i) => Value::Int(i),
+            SumAcc::Float(f) => Value::Double(f),
+            SumAcc::Dec(d) => Value::Decimal(d),
+        }
+    }
+
+    /// The AVG result value: sum / `count`. Decimal sums stay Decimal (division
+    /// to scale-6, half-up); Int/Double sums yield Double as before.
+    fn into_avg(self, count: i64) -> Value {
+        match self {
+            SumAcc::Empty => Value::Null,
+            SumAcc::Int(i) => Value::Double(i as f64 / count as f64),
+            SumAcc::Float(f) => Value::Double(f / count as f64),
+            SumAcc::Dec(d) => {
+                let cnt = Decimal::from_i64(count);
+                Value::Decimal(d.div(&cnt, d.div_scale(&cnt)).unwrap_or_else(|| d.clone()))
+            }
+        }
     }
 }
 
@@ -3994,6 +4081,7 @@ fn apply_unary(op: UnOp, v: Value) -> Result<Value> {
             Value::Null => Ok(Value::Null),
             Value::Int(n) => Ok(Value::Int(-n)),
             Value::Double(f) => Ok(Value::Double(-f)),
+            Value::Decimal(d) => Ok(Value::Decimal(d.neg())),
             other => Err(SqlError::Eval(format!("negation of {other:?}"))),
         },
     }
@@ -4010,6 +4098,7 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
                         Value::Int(n) => n.to_string(),
                         Value::Double(f) => f.to_string(),
                         Value::Bool(b) => b.to_string(),
+                        Value::Decimal(d) => d.to_string(),
                         other => return Err(SqlError::Eval(format!("|| of {other:?}"))),
                     })
                 };
@@ -4064,6 +4153,16 @@ fn as_bool(v: &Value) -> Option<bool> {
     }
 }
 
+/// A value that participates in exact Decimal arithmetic: a Decimal, or an
+/// Int (promoted). Doubles are excluded — they force the float path.
+fn as_decimal_operand(v: &Value) -> Option<Decimal> {
+    match v {
+        Value::Decimal(d) => Some(d.clone()),
+        Value::Int(n) => Some(Decimal::from_i64(*n)),
+        _ => None,
+    }
+}
+
 fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
@@ -4080,6 +4179,21 @@ fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
                 }
                 a / b
             }
+            _ => unreachable!(),
+        }));
+    }
+    // Exact Decimal path: either operand is a Decimal and neither is a Double
+    // (a Double drags the whole expression onto the lossy float path below).
+    if (matches!(l, Value::Decimal(_)) || matches!(r, Value::Decimal(_)))
+        && let (Some(a), Some(b)) = (as_decimal_operand(&l), as_decimal_operand(&r))
+    {
+        return Ok(Value::Decimal(match op {
+            BinOp::Add => a.add(&b),
+            BinOp::Sub => a.sub(&b),
+            BinOp::Mul => a.mul(&b),
+            BinOp::Div => a
+                .div(&b, a.div_scale(&b))
+                .ok_or_else(|| SqlError::Eval("division by zero".into()))?,
             _ => unreachable!(),
         }));
     }
@@ -4104,6 +4218,7 @@ fn as_f64(v: &Value) -> Option<f64> {
         Value::Int(n) => Some(*n as f64),
         Value::Double(f) => Some(*f),
         Value::Timestamp(t) => Some(*t as f64),
+        Value::Decimal(d) => Some(d.to_f64()),
         _ => None,
     }
 }
@@ -4113,6 +4228,10 @@ fn cmp_values(a: &Value, b: &Value) -> Option<Ordering> {
         (Value::Text(x), Value::Text(y)) => Some(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
         (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)),
+        // Exact Decimal vs Decimal/Int (a Double drops to the f64 path below).
+        (Value::Decimal(x), Value::Decimal(y)) => Some(x.cmp(y)),
+        (Value::Decimal(x), Value::Int(y)) => Some(x.cmp(&Decimal::from_i64(*y))),
+        (Value::Int(x), Value::Decimal(y)) => Some(Decimal::from_i64(*x).cmp(y)),
         _ => {
             let (x, y) = (as_f64(a)?, as_f64(b)?);
             x.partial_cmp(&y)

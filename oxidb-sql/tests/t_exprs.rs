@@ -96,11 +96,23 @@ fn integer_arithmetic() {
 fn float_arithmetic_and_promotion() {
     let (_d, db) = open();
     nums(&db);
-    // int * double -> double
+    // A fractional literal (1.5) is now an exact DECIMAL, so int * decimal ->
+    // decimal (15.0), not a lossy Double.
     assert_eq!(
         rows(&db, "SELECT v * 1.5 AS x FROM n WHERE id = 1"),
+        r1(vec![oxidb_sql::Value::Decimal(
+            oxidb_sql::Decimal::parse("15.0").unwrap()
+        )])
+    );
+    // Forcing the literal to DOUBLE keeps the old float-promotion path.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT v * CAST(1.5 AS DOUBLE) AS x FROM n WHERE id = 1"
+        ),
         r1(vec![d(15.0)])
     );
+    // A DOUBLE column stays on the float path.
     assert_eq!(
         rows(&db, "SELECT f + f AS x FROM n WHERE id = 1"),
         r1(vec![d(3.0)])

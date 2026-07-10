@@ -108,6 +108,25 @@ impl Table {
                         *cell = Value::Bytes(b);
                     }
                 }
+                // DECIMAL columns accept exact conversions: Int and Text
+                // ('12.34') widen to Decimal; a Double converts best-effort
+                // via its shortest decimal string. A bad Text/Double string is
+                // left as-is so validation reports the type mismatch.
+                (SqlType::Decimal, Value::Int(i)) => {
+                    *cell = Value::Decimal(crate::decimal::Decimal::from_i64(*i));
+                }
+                (SqlType::Decimal, Value::Text(s)) => {
+                    if let Some(d) = crate::decimal::Decimal::parse(s) {
+                        *cell = Value::Decimal(d);
+                    }
+                }
+                (SqlType::Decimal, Value::Double(f)) => {
+                    if let Some(d) = crate::decimal::Decimal::parse(&format!("{f}")) {
+                        *cell = Value::Decimal(d);
+                    }
+                }
+                // A Decimal destined for a DOUBLE column drops to float.
+                (SqlType::Double, Value::Decimal(d)) => *cell = Value::Double(d.to_f64()),
                 _ => {}
             }
         }

@@ -13,6 +13,7 @@
 mod ast;
 mod catalog;
 mod cobra;
+mod decimal;
 mod error;
 mod executor;
 pub mod json;
@@ -30,6 +31,7 @@ use std::sync::Mutex;
 
 pub use ast::QueryResult;
 pub use catalog::{Column, IndexDef, Table};
+pub use decimal::Decimal;
 pub use error::{Result, SqlError};
 pub use parser::{
     DatabaseStatement, UserStatement, parse_database_statement, parse_user_statement,

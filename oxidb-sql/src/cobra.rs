@@ -16,6 +16,7 @@ use oxidb_cobra::value::{Dict, NativeError, NativeObject, hash_key, inspect};
 
 use crate::ast::{QueryResult, Statement};
 use crate::catalog::{ProcLanguage, ProcedureDef, base64_decode, base64_encode};
+use crate::decimal::Decimal;
 use crate::error::{Result, SqlError};
 use crate::store::Store;
 use crate::types::Value;
@@ -327,6 +328,12 @@ fn sql_to_cobra(v: &Value) -> CValue {
         // Epoch milliseconds, exactly as stored (and as the JSON wire shows).
         Value::Timestamp(t) => CValue::Int(*t),
         Value::Bytes(b) => CValue::Str(Rc::from(base64_encode(b).as_str())),
+        // The Cobra VM has its own exact decimal; bridge through the string so
+        // the value stays exact across the boundary.
+        Value::Decimal(d) => match oxidb_cobra::decimal::Decimal::parse(&d.to_string()) {
+            Some(cd) => CValue::Decimal(Rc::new(cd)),
+            None => CValue::Float(d.to_f64()),
+        },
     }
 }
 
@@ -338,7 +345,10 @@ fn cobra_to_sql_param(v: &CValue) -> std::result::Result<Value, NativeError> {
         CValue::Float(f) => Value::Double(*f),
         CValue::Str(s) => Value::Text(s.to_string()),
         CValue::Bool(b) => Value::Bool(*b),
-        CValue::Decimal(d) => Value::Double(d.to_f64()),
+        CValue::Decimal(d) => match Decimal::parse(&d.inspect()) {
+            Some(dec) => Value::Decimal(dec),
+            None => Value::Double(d.to_f64()),
+        },
         other => {
             return Err(NativeError::new(format!(
                 "unsupported parameter type: {}",
@@ -357,7 +367,10 @@ fn cobra_to_sql_cell(name: &str, v: &CValue) -> Result<Value> {
         CValue::Float(f) => Value::Double(*f),
         CValue::Str(s) => Value::Text(s.to_string()),
         CValue::Bool(b) => Value::Bool(*b),
-        CValue::Decimal(d) => Value::Double(d.to_f64()),
+        CValue::Decimal(d) => match Decimal::parse(&d.inspect()) {
+            Some(dec) => Value::Decimal(dec),
+            None => Value::Double(d.to_f64()),
+        },
         CValue::List(_) | CValue::Dict(_) => Value::Text(inspect(v)),
         other => {
             return Err(SqlError::Eval(format!(

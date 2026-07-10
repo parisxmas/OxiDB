@@ -1054,9 +1054,11 @@ fn map_data_type(dt: &sp::DataType) -> Result<SqlType> {
         | D::Nvarchar(_) => SqlType::Text,
         D::Bool | D::Boolean => SqlType::Bool,
         D::Timestamp(_, _) | D::Datetime(_) => SqlType::Timestamp,
-        // DECIMAL/NUMERIC store as DOUBLE (documented: no fixed-point
-        // arithmetic; precision/scale are accepted and ignored).
-        D::Decimal(_) | D::Numeric(_) | D::Dec(_) => SqlType::Double,
+        // DECIMAL/NUMERIC are exact fixed-point (backed by `Decimal`).
+        // A declared precision/scale is accepted but not enforced.
+        D::Decimal(_) | D::Numeric(_) | D::Dec(_) | D::BigNumeric(_) | D::BigDecimal(_) => {
+            SqlType::Decimal
+        }
         D::Blob(_) | D::Bytea | D::Binary(_) | D::Varbinary(_) => SqlType::Blob,
         other => return Err(SqlError::Unsupported(format!("data type {other:?}"))),
     };
@@ -1705,6 +1707,7 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
         "rtrim" => Some(ScalarFunc::Rtrim),
         "replace" => Some(ScalarFunc::Replace),
         "abs" => Some(ScalarFunc::Abs),
+        "round" => Some(ScalarFunc::Round),
         _ => None,
     } {
         if f.over.is_some() {
@@ -1732,6 +1735,7 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             | ScalarFunc::Ltrim
             | ScalarFunc::Rtrim
             | ScalarFunc::Abs => exprs.len() == 1,
+            ScalarFunc::Round => exprs.len() == 1 || exprs.len() == 2,
             ScalarFunc::Substring => exprs.len() == 2 || exprs.len() == 3,
             // Cast/Like/Case never arrive through the function-name path.
             ScalarFunc::Cast(_) | ScalarFunc::Like { .. } | ScalarFunc::Case { .. } => false,
@@ -1872,15 +1876,29 @@ fn literal_from_value(v: &sp::Value) -> Result<Value> {
 }
 
 fn parse_number(s: &str) -> Result<Value> {
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        s.parse::<f64>()
+    let has_exp = s.contains('e') || s.contains('E');
+    if s.contains('.') && !has_exp {
+        // A plain fractional literal (`9.99`) is an *exact* DECIMAL, matching
+        // standard SQL numeric literals — so money math stays lossless.
+        if let Some(dec) = crate::decimal::Decimal::parse(s) {
+            return Ok(Value::Decimal(dec));
+        }
+        // Fall back to float if it somehow isn't exactly representable.
+        return s
+            .parse::<f64>()
             .map(Value::Double)
-            .map_err(|_| SqlError::Parse(format!("bad number literal {s:?}")))
-    } else {
-        s.parse::<i64>()
-            .map(Value::Int)
-            .map_err(|_| SqlError::Parse(format!("bad integer literal {s:?}")))
+            .map_err(|_| SqlError::Parse(format!("bad number literal {s:?}")));
     }
+    if has_exp {
+        // Exponent form stays a float (IEEE-754), like `1e3`.
+        return s
+            .parse::<f64>()
+            .map(Value::Double)
+            .map_err(|_| SqlError::Parse(format!("bad number literal {s:?}")));
+    }
+    s.parse::<i64>()
+        .map(Value::Int)
+        .map_err(|_| SqlError::Parse(format!("bad integer literal {s:?}")))
 }
 
 fn expr_to_u64(expr: &sp::Expr) -> Result<u64> {
