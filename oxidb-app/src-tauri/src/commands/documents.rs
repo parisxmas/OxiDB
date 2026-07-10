@@ -18,6 +18,7 @@ pub struct FindParams {
 #[tauri::command]
 pub fn find_documents(
     params: FindParams,
+    db: Option<String>,
     state: State<'_, Mutex<DbBackend>>,
 ) -> Result<Vec<Value>, String> {
     let mut backend = state.lock().unwrap();
@@ -61,6 +62,7 @@ pub fn find_documents(
             if let Some(limit) = params.limit {
                 req["limit"] = json!(limit);
             }
+            crate::state::inject_db(&mut req, &db);
             let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp
@@ -84,6 +86,7 @@ pub fn find_documents(
 pub fn insert_document(
     collection: String,
     doc: Value,
+    db: Option<String>,
     state: State<'_, Mutex<DbBackend>>,
 ) -> Result<Value, String> {
     let mut backend = state.lock().unwrap();
@@ -93,7 +96,8 @@ pub fn insert_document(
             Ok(json!({"id": id}))
         }
         DbBackend::Client { stream, host, port, user, password } => {
-            let req = json!({"cmd": "insert", "collection": collection, "doc": doc});
+            let mut req = json!({"cmd": "insert", "collection": collection, "doc": doc});
+            crate::state::inject_db(&mut req, &db);
             let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!(null)))
@@ -114,6 +118,7 @@ pub fn update_documents(
     collection: String,
     query: Value,
     update: Value,
+    db: Option<String>,
     state: State<'_, Mutex<DbBackend>>,
 ) -> Result<Value, String> {
     let mut backend = state.lock().unwrap();
@@ -125,12 +130,13 @@ pub fn update_documents(
             Ok(json!({"modified": count}))
         }
         DbBackend::Client { stream, host, port, user, password } => {
-            let req = json!({
+            let mut req = json!({
                 "cmd": "update",
                 "collection": collection,
                 "query": query,
                 "update": update,
             });
+            crate::state::inject_db(&mut req, &db);
             let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!(null)))
@@ -150,6 +156,7 @@ pub fn update_documents(
 pub fn delete_documents(
     collection: String,
     query: Value,
+    db: Option<String>,
     state: State<'_, Mutex<DbBackend>>,
 ) -> Result<Value, String> {
     let mut backend = state.lock().unwrap();
@@ -161,11 +168,12 @@ pub fn delete_documents(
             Ok(json!({"deleted": count}))
         }
         DbBackend::Client { stream, host, port, user, password } => {
-            let req = json!({
+            let mut req = json!({
                 "cmd": "delete",
                 "collection": collection,
                 "query": query,
             });
+            crate::state::inject_db(&mut req, &db);
             let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp.get("data").cloned().unwrap_or(json!(null)))
@@ -185,6 +193,7 @@ pub fn delete_documents(
 pub fn count_documents(
     collection: String,
     query: Option<Value>,
+    db: Option<String>,
     state: State<'_, Mutex<DbBackend>>,
 ) -> Result<usize, String> {
     let mut backend = state.lock().unwrap();
@@ -194,7 +203,8 @@ pub fn count_documents(
             db.count(&collection, &query).map_err(|e| e.to_string())
         }
         DbBackend::Client { stream, host, port, user, password } => {
-            let req = json!({"cmd": "count", "collection": collection, "query": query});
+            let mut req = json!({"cmd": "count", "collection": collection, "query": query});
+            crate::state::inject_db(&mut req, &db);
             let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             resp.pointer("/data/count")
                 .and_then(|v| v.as_u64())

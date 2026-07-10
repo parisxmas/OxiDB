@@ -16,6 +16,7 @@ import { JsonViewer } from "../common/JsonViewer";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 import { Pagination } from "../common/Pagination";
 import { useToast } from "../common/Toast";
+import { useDatabase } from "../../context/DatabaseContext";
 
 function downloadJson(name: string, data: unknown) {
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -29,6 +30,7 @@ function downloadJson(name: string, data: unknown) {
 
 export function CollectionBrowser() {
   const toast = useToast();
+  const { db } = useDatabase();
   const [collections, setCollections] = useState<string[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
   const [selected, setSelected] = useState<string | null>(null);
@@ -73,9 +75,14 @@ export function CollectionBrowser() {
     }
   }, [toast]);
 
+  // Reload (and clear the current selection) when the database changes.
   useEffect(() => {
+    setSelected(null);
+    setDocs([]);
+    setTotal(null);
     loadCollections();
-  }, [loadCollections]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadCollections, db]);
 
   const parseFilter = useCallback((): Record<string, JsonValue> | null => {
     const t = filter.trim();

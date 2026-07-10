@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { ThemeProvider } from "./context/ThemeContext";
 import { FontScaleProvider } from "./context/FontScaleContext";
 import { ConnectionProvider, useConnection } from "./context/ConnectionContext";
+import { DatabaseProvider } from "./context/DatabaseContext";
 import { ToastProvider } from "./components/common/Toast";
 import { AppLayout } from "./components/layout/AppLayout";
 import { ConnectionScreen } from "./components/connection/ConnectionScreen";
@@ -51,11 +52,13 @@ export default function App() {
     <ThemeProvider>
       <FontScaleProvider>
         <ConnectionProvider>
-          <ToastProvider>
-            <BrowserRouter>
-              <AppRoutes />
-            </BrowserRouter>
-          </ToastProvider>
+          <DatabaseProvider>
+            <ToastProvider>
+              <BrowserRouter>
+                <AppRoutes />
+              </BrowserRouter>
+            </ToastProvider>
+          </DatabaseProvider>
         </ConnectionProvider>
       </FontScaleProvider>
     </ThemeProvider>

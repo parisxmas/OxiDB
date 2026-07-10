@@ -1,12 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
-import {
-  runSql,
-  listDatabases,
-  createDatabase,
-  dropDatabase,
-  setCurrentDb,
-  getCurrentDb,
-} from "../../api/tauri";
+import { runSql } from "../../api/tauri";
+import { useDatabase } from "../../context/DatabaseContext";
 import type { JsonValue } from "../../api/types";
 import { ContextMenu } from "../common/ContextMenu";
 import type { MenuItem } from "../common/ContextMenu";
@@ -71,60 +65,16 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
   const [procsOpen, setProcsOpen] = useState(true);
   const [viewProc, setViewProc] = useState<ProcInfo | null>(null);
   const [showImport, setShowImport] = useState(false);
-  const [databases, setDatabases] = useState<string[]>([]);
-  const [db, setDb] = useState<string>(() => getCurrentDb() || "");
+  const { db } = useDatabase();
 
-  // Load the database list once; select the current/default.
+  // The global database selector (header) drives `db`; reload the tree when
+  // it changes.
   useEffect(() => {
-    listDatabases()
-      .then((dbs) => {
-        setDatabases(dbs);
-        if (!db && dbs.length) {
-          const def = dbs.includes("oxidb") ? "oxidb" : dbs[0];
-          setDb(def);
-          setCurrentDb(def);
-        }
-      })
-      .catch(() => setDatabases([]));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const switchDb = useCallback((name: string) => {
-    setDb(name);
-    setCurrentDb(name);
     setCols({});
     setProcs([]);
     loadTables();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  const newDatabase = useCallback(async () => {
-    const name = window.prompt("New database name:");
-    if (!name?.trim()) return;
-    try {
-      await createDatabase(name.trim());
-      const dbs = await listDatabases();
-      setDatabases(dbs);
-      switchDb(name.trim());
-      toast("Database created", "success");
-    } catch (e) {
-      toast(String(e), "error");
-    }
-  }, [toast, switchDb]);
-
-  const removeDatabase = useCallback(async () => {
-    if (!db) return;
-    if (!window.confirm(`Drop database "${db}" and everything in it?`)) return;
-    try {
-      await dropDatabase(db);
-      const dbs = await listDatabases();
-      setDatabases(dbs);
-      switchDb(dbs.includes("oxidb") ? "oxidb" : dbs[0] || "");
-      toast("Database dropped", "success");
-    } catch (e) {
-      toast(String(e), "error");
-    }
-  }, [db, toast, switchDb]);
+  }, [db]);
 
   const loadTables = useCallback(async () => {
     setLoading(true);
@@ -266,34 +216,6 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
 
   return (
     <div className="schema-tree">
-      {databases.length > 0 && (
-        <div className="schema-db-bar">
-          <select
-            className="schema-db-select"
-            value={db}
-            onChange={(e) => switchDb(e.target.value)}
-            title="Current database"
-          >
-            {databases.map((d) => (
-              <option key={d} value={d}>
-                {d}
-              </option>
-            ))}
-          </select>
-          <button className="schema-refresh" title="New database" onClick={newDatabase}>
-            +
-          </button>
-          <button
-            className="schema-refresh"
-            title="Drop database"
-            onClick={removeDatabase}
-            disabled={db === "oxidb" || db === "postgres"}
-          >
-            🗑
-          </button>
-        </div>
-      )}
-
       <div className="schema-tree-head">
         <span>SCHEMA</span>
         <div style={{ display: "flex", gap: 2 }}>

@@ -6,12 +6,14 @@ use tauri::State;
 use crate::state::DbBackend;
 
 #[tauri::command]
-pub fn list_collections(state: State<'_, Mutex<DbBackend>>) -> Result<Vec<String>, String> {
+pub fn list_collections(db: Option<String>, state: State<'_, Mutex<DbBackend>>) -> Result<Vec<String>, String> {
     let mut backend = state.lock().unwrap();
     match &mut *backend {
         DbBackend::Embedded { db, .. } => Ok(db.list_collections()),
         DbBackend::Client { stream, host, port, user, password } => {
-            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &json!({"cmd": "list_collections"}))?;
+            let mut req = json!({"cmd": "list_collections"});
+            crate::state::inject_db(&mut req, &db);
+            let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             resp.get("data")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .ok_or_else(|| "invalid response".to_string())
@@ -23,6 +25,7 @@ pub fn list_collections(state: State<'_, Mutex<DbBackend>>) -> Result<Vec<String
 #[tauri::command]
 pub fn create_collection(
     name: String,
+    db: Option<String>,
     state: State<'_, Mutex<DbBackend>>,
 ) -> Result<String, String> {
     let mut backend = state.lock().unwrap();
@@ -33,13 +36,10 @@ pub fn create_collection(
             Ok("collection created".to_string())
         }
         DbBackend::Client { stream, host, port, user, password } => {
+            let mut req = json!({"cmd": "create_collection", "collection": name});
+            crate::state::inject_db(&mut req, &db);
             let resp = DbBackend::send_or_reconnect(
-                stream,
-                host,
-                *port,
-                user.as_deref(),
-                password.as_deref(),
-                &json!({"cmd": "create_collection", "collection": name}),
+                stream, host, *port, user.as_deref(), password.as_deref(), &req,
             )?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok("collection created".to_string())
@@ -58,6 +58,7 @@ pub fn create_collection(
 #[tauri::command]
 pub fn drop_collection(
     name: String,
+    db: Option<String>,
     state: State<'_, Mutex<DbBackend>>,
 ) -> Result<String, String> {
     let mut backend = state.lock().unwrap();
@@ -67,13 +68,10 @@ pub fn drop_collection(
             Ok("collection dropped".to_string())
         }
         DbBackend::Client { stream, host, port, user, password } => {
+            let mut req = json!({"cmd": "drop_collection", "collection": name});
+            crate::state::inject_db(&mut req, &db);
             let resp = DbBackend::send_or_reconnect(
-                stream,
-                host,
-                *port,
-                user.as_deref(),
-                password.as_deref(),
-                &json!({"cmd": "drop_collection", "collection": name}),
+                stream, host, *port, user.as_deref(), password.as_deref(), &req,
             )?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok("collection dropped".to_string())

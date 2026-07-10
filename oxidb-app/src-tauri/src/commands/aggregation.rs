@@ -9,6 +9,7 @@ use crate::state::DbBackend;
 pub fn run_aggregation(
     collection: String,
     pipeline: Value,
+    db: Option<String>,
     state: State<'_, Mutex<DbBackend>>,
 ) -> Result<Vec<Value>, String> {
     let mut backend = state.lock().unwrap();
@@ -17,11 +18,12 @@ pub fn run_aggregation(
             .aggregate(&collection, &pipeline)
             .map_err(|e| e.to_string()),
         DbBackend::Client { stream, host, port, user, password } => {
-            let req = json!({
+            let mut req = json!({
                 "cmd": "aggregate",
                 "collection": collection,
                 "pipeline": pipeline,
             });
+            crate::state::inject_db(&mut req, &db);
             let resp = DbBackend::send_or_reconnect(stream, host, *port, user.as_deref(), password.as_deref(), &req)?;
             if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
                 Ok(resp

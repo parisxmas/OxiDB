@@ -3,6 +3,7 @@ import { useTheme } from "../../context/ThemeContext";
 import { useFontScale } from "../../context/FontScaleContext";
 import { disconnect as apiDisconnect } from "../../api/tauri";
 import { useNavigate } from "react-router-dom";
+import { DatabaseSelector } from "./DatabaseSelector";
 
 export function Header() {
   const { status, setStatus } = useConnection();
@@ -41,6 +42,7 @@ export function Header() {
         )}
       </div>
       <div className="header-right">
+        {status.connected && <DatabaseSelector />}
         <div className="font-scale" title="Font size (⌘+ / ⌘- / ⌘0)">
           <button className="font-scale-btn" onClick={dec} aria-label="Smaller">
             A−

@@ -875,3 +875,47 @@ tr:hover .row-del { opacity: 1; }
   border: 1px solid var(--border-color);
   border-radius: var(--radius-sm);
 }
+
+/* ── Header database selector ───────────────────────────────────────── */
+.db-selector {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 4px 2px 6px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+}
+.db-selector-icon { font-size: 12px; opacity: 0.7; }
+.db-selector select {
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-family: var(--font-mono);
+  padding: 2px 4px;
+  max-width: 140px;
+}
+.db-selector-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 2px 4px;
+}
+.db-selector-btn:hover:not(:disabled) { color: var(--accent); }
+.db-selector-btn:disabled { opacity: 0.3; cursor: default; }
+
+/* ── Aggregation stage move buttons ─────────────────────────────────── */
+.stage-move {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 4px;
+}
+.stage-move:hover:not(:disabled) { color: var(--accent); }
+.stage-move:disabled { opacity: 0.3; cursor: default; }
+.stage-card-header { display: flex; align-items: center; }

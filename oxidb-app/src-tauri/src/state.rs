@@ -23,6 +23,16 @@ pub enum DbBackend {
     Disconnected,
 }
 
+/// Scope a document/SQL request to a database (ADR-0012) by adding the `db`
+/// field, unless the name is empty/None (→ server default database).
+pub fn inject_db(req: &mut Value, db: &Option<String>) {
+    if let Some(d) = db {
+        if !d.is_empty() {
+            req["db"] = Value::String(d.clone());
+        }
+    }
+}
+
 impl DbBackend {
     fn try_send(stream: &mut TcpStream, request: &Value) -> Result<Value, String> {
         let payload = request.to_string();

@@ -6,6 +6,15 @@ import type {
   JsonValue,
 } from "./types";
 
+// Current database (ADR-0012). SQL and document commands scope to it unless
+// an explicit `db` is passed, so every db-aware surface targets the selected
+// database without threading it through each call site.
+let currentDb: string | undefined;
+export const setCurrentDb = (db: string | undefined) => {
+  currentDb = db;
+};
+export const getCurrentDb = () => currentDb;
+
 // Connection
 export const openEmbedded = (path: string) =>
   invoke<ConnectionStatus>("open_embedded", { path });
@@ -27,37 +36,37 @@ export const getConnectionStatus = () =>
 export const getDashboardStats = () =>
   invoke<DashboardStats>("get_dashboard_stats");
 
-// Collections
+// Collections (db-scoped to the current database, ADR-0012)
 export const listCollections = () =>
-  invoke<string[]>("list_collections");
+  invoke<string[]>("list_collections", { db: currentDb });
 
 export const createCollection = (name: string) =>
-  invoke<string>("create_collection", { name });
+  invoke<string>("create_collection", { name, db: currentDb });
 
 export const dropCollection = (name: string) =>
-  invoke<string>("drop_collection", { name });
+  invoke<string>("drop_collection", { name, db: currentDb });
 
 export const compactCollection = (name: string) =>
   invoke<JsonValue>("compact_collection", { name });
 
-// Documents
+// Documents (db-scoped)
 export const findDocuments = (params: FindParams) =>
-  invoke<JsonValue[]>("find_documents", { params });
+  invoke<JsonValue[]>("find_documents", { params, db: currentDb });
 
 export const insertDocument = (collection: string, doc: JsonValue) =>
-  invoke<JsonValue>("insert_document", { collection, doc });
+  invoke<JsonValue>("insert_document", { collection, doc, db: currentDb });
 
 export const updateDocuments = (
   collection: string,
   query: JsonValue,
   update: JsonValue
-) => invoke<JsonValue>("update_documents", { collection, query, update });
+) => invoke<JsonValue>("update_documents", { collection, query, update, db: currentDb });
 
 export const deleteDocuments = (collection: string, query: JsonValue) =>
-  invoke<JsonValue>("delete_documents", { collection, query });
+  invoke<JsonValue>("delete_documents", { collection, query, db: currentDb });
 
 export const countDocuments = (collection: string, query?: JsonValue) =>
-  invoke<number>("count_documents", { collection, query });
+  invoke<number>("count_documents", { collection, query, db: currentDb });
 
 // Indexes
 export const listIndexes = (collection: string) =>
@@ -81,15 +90,6 @@ export const dropIndex = (collection: string, index: string) =>
 // Query
 export const executeRawCommand = (command: JsonValue) =>
   invoke<JsonValue>("execute_raw_command", { command });
-
-// Current database (ADR-0012). SQL commands default to it unless a `db`
-// is passed explicitly, so every SQL surface scopes to the selected database
-// without threading it through each call.
-let currentDb: string | undefined;
-export const setCurrentDb = (db: string | undefined) => {
-  currentDb = db;
-};
-export const getCurrentDb = () => currentDb;
 
 // SQL engine (ADR-0010) — { ok, data: [ per-statement result ] }
 export const runSql = (sql: string, params?: JsonValue[], db?: string) =>
@@ -127,7 +127,7 @@ export const oximemExec = (args: string[]) =>
 
 // Aggregation
 export const runAggregation = (collection: string, pipeline: JsonValue) =>
-  invoke<JsonValue[]>("run_aggregation", { collection, pipeline });
+  invoke<JsonValue[]>("run_aggregation", { collection, pipeline, db: currentDb });
 
 // Blobs
 export const listBuckets = () => invoke<string[]>("list_buckets");
