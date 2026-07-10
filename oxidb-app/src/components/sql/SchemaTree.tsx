@@ -13,6 +13,7 @@ import { ProcedureDialog, type ProcInfo } from "./ProcedureDialog";
 import { ImportDialog } from "./ImportDialog";
 import { NewProcedureDialog } from "./NewProcedureDialog";
 import { NewSqlProcedureDialog } from "./NewSqlProcedureDialog";
+import { formatSql } from "../../utils/formatSql";
 import { IconSql, IconTable, IconKey, IconFunction } from "../layout/NavIcons";
 import { useToast } from "../common/Toast";
 
@@ -580,12 +581,13 @@ export function SchemaTree({ onInsert, onQuery, onBrowse, refreshKey }: Props) {
             } else {
               // SHOW returns the body with parameters rewritten to $1..$N;
               // turn them back into names so the edit form + re-CREATE parse
-              // (the engine re-rewrites names → $N on save).
-              const body = p.definition.replace(
+              // (the engine re-rewrites names → $N on save). The body is stored
+              // on one line, so pretty-print it for editing.
+              const named = p.definition.replace(
                 /\$(\d+)/g,
                 (m, n) => params[Number(n) - 1]?.name ?? m
               );
-              setEditSqlProc({ name: p.name, params, body });
+              setEditSqlProc({ name: p.name, params, body: formatSql(named) });
             }
           }}
           onDrop={(procName) => {

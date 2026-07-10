@@ -1,5 +1,6 @@
 import { SqlEditor } from "../common/SqlEditor";
 import { useEscapeClose } from "../common/useEscapeClose";
+import { formatSql } from "../../utils/formatSql";
 
 export interface ProcInfo {
   name: string;
@@ -88,7 +89,9 @@ export function ProcedureDialog({ proc, onClose, onInsert, onDrop, onEdit }: Pro
         </div>
         <div style={{ flex: 1, minHeight: 160, border: "1px solid var(--border-color)", borderRadius: "var(--radius-sm)", overflow: "hidden", marginBottom: 12 }}>
           <SqlEditor
-            value={proc.definition}
+            value={
+              proc.language === "cobra" ? proc.definition : formatSql(proc.definition)
+            }
             readOnly
             height="100%"
             language={proc.language === "cobra" && hasSource ? "python" : "sql"}
