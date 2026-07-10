@@ -134,6 +134,12 @@ pub fn handle_tsdb(cmd: &str, request: &Value, readonly: bool, db_name: &str) ->
             }
             write_points(&engine, request)
         }
+        "write_lp" => {
+            if readonly {
+                return err_bytes("permission denied: read-only role cannot write time-series");
+            }
+            write_line_protocol(&engine, request)
+        }
         "query" => query(&engine, request),
         "stats" => {
             let db = engine.read().unwrap();
@@ -193,7 +199,12 @@ fn write_points(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
             return err_bytes("each point needs a 'fields' object");
         };
         for (k, v) in fields {
-            if let Some(f) = v.as_f64() {
+            // JSON bool → boolean field, integer → integer field, else float.
+            if let Some(b) = v.as_bool() {
+                point = point.field_bool(k, b);
+            } else if v.is_i64() {
+                point = point.field_int(k, v.as_i64().unwrap());
+            } else if let Some(f) = v.as_f64() {
                 point = point.field(k, f);
             }
         }
@@ -201,6 +212,27 @@ fn write_points(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
         written += 1;
     }
     ok_bytes(json!({ "written": written }))
+}
+
+/// Ingest InfluxDB line protocol from the `lp` field. Lines without a
+/// timestamp use the server's current time (epoch ms).
+fn write_line_protocol(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
+    let Some(lp) = request.get("lp").and_then(|v| v.as_str()) else {
+        return err_bytes("write_lp requires an 'lp' string");
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let points = match oxidb_tsdb::parse_line_protocol(lp, now_ms) {
+        Ok(p) => p,
+        Err(e) => return err_bytes(&format!("line protocol: {e}")),
+    };
+    let mut db = engine.write().unwrap();
+    for p in &points {
+        db.write(p);
+    }
+    ok_bytes(json!({ "written": points.len() }))
 }
 
 fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
@@ -229,7 +261,8 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let agg = match request.get("agg").and_then(|v| v.as_str()).unwrap_or("mean") {
+    let agg_str = request.get("agg").and_then(|v| v.as_str()).unwrap_or("mean");
+    let agg = match agg_str {
         "mean" | "avg" => Agg::Mean,
         "sum" => Agg::Sum,
         "min" => Agg::Min,
@@ -237,6 +270,17 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
         "count" => Agg::Count,
         "first" => Agg::First,
         "last" => Agg::Last,
+        "rate" => Agg::Rate,
+        "percentile" | "quantile" => {
+            let Some(p) = request.get("p").and_then(|v| v.as_f64()) else {
+                return err_bytes("percentile requires a 'p' (0..=100)");
+            };
+            Agg::Percentile(p)
+        }
+        // Shorthand p50 / p90 / p95 / p99 / p99.9 …
+        s if s.starts_with('p') && s[1..].parse::<f64>().is_ok() => {
+            Agg::Percentile(s[1..].parse::<f64>().unwrap())
+        }
         other => return err_bytes(&format!("unknown agg: {other:?}")),
     };
     let spec = QuerySpec {
@@ -260,6 +304,7 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
                 .collect();
             json!({
                 "tags": tags,
+                "type": r.ftype.as_str(),
                 "points": r.points.into_iter()
                     .map(|p| json!({ "ts": p.ts, "value": p.value }))
                     .collect::<Vec<_>>(),

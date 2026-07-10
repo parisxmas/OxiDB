@@ -13,11 +13,13 @@
 
 mod bits;
 mod gorilla;
+mod line_protocol;
 mod model;
 mod persist;
 mod store;
 
-pub use model::{Point, SeriesKey};
+pub use line_protocol::parse as parse_line_protocol;
+pub use model::{FieldType, FieldValue, Point, SeriesKey};
 pub use store::{Agg, Block, GroupPoint, QuerySpec, ResultSeries, TagPredicate};
 
 use std::collections::BTreeMap;
@@ -79,11 +81,15 @@ impl Tsdb {
     pub fn write(&mut self, p: &Point) {
         for (fname, fval) in &p.fields {
             let key = SeriesKey::new(&p.measurement, p.tags.clone(), fname);
+            let f = fval.as_f64();
+            let ft = fval.ftype();
             if let Some(persist) = &mut self.persist {
-                let _ = persist.wal_append(&key, p.ts, *fval);
+                let _ = persist.wal_append(&key, ft, p.ts, f);
             }
             let bp = self.block_points;
-            self.series.entry(key).or_default().push(p.ts, *fval, bp);
+            let s = self.series.entry(key).or_default();
+            s.set_ftype(ft);
+            s.push(p.ts, f, bp);
         }
         if let Some(persist) = &mut self.persist {
             let _ = persist.flush();

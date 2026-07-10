@@ -20,7 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::model::SeriesKey;
+use crate::model::{FieldType, SeriesKey};
 use crate::store::{Block, Series};
 
 pub struct Persist {
@@ -73,15 +73,19 @@ impl Persist {
         // Load the snapshot's sealed blocks.
         if let Ok(f) = File::open(blocks_path(dir, generation)) {
             let mut r = BufReader::new(f);
-            while let Some((key, block)) = read_block(&mut r)? {
-                series.entry(key).or_default().push_block(block);
+            while let Some((key, ftype, block)) = read_block(&mut r)? {
+                let s = series.entry(key).or_default();
+                s.set_ftype(ftype);
+                s.push_block(block);
             }
         }
         // Replay the WAL (points written after the snapshot).
         if let Ok(f) = File::open(wal_path(dir, generation)) {
             let mut r = BufReader::new(f);
-            while let Some((key, ts, val)) = read_wal_rec(&mut r)? {
-                series.entry(key).or_default().push(ts, val, block_points);
+            while let Some((key, ftype, ts, val)) = read_wal_rec(&mut r)? {
+                let s = series.entry(key).or_default();
+                s.set_ftype(ftype);
+                s.push(ts, val, block_points);
             }
         }
 
@@ -99,9 +103,16 @@ impl Persist {
     }
 
     /// Append one sample to the WAL.
-    pub fn wal_append(&mut self, key: &SeriesKey, ts: i64, val: f64) -> io::Result<()> {
+    pub fn wal_append(
+        &mut self,
+        key: &SeriesKey,
+        ftype: FieldType,
+        ts: i64,
+        val: f64,
+    ) -> io::Result<()> {
         let mut buf = Vec::with_capacity(64);
         write_key(&mut buf, key);
+        buf.push(ftype.to_u8());
         buf.extend_from_slice(&ts.to_le_bytes());
         buf.extend_from_slice(&val.to_bits().to_le_bytes());
         self.wal.write_all(&buf)?;
@@ -122,7 +133,7 @@ impl Persist {
             let mut w = BufWriter::new(f);
             for (key, s) in series {
                 for b in s.sealed_blocks() {
-                    write_block(&mut w, key, b)?;
+                    write_block(&mut w, key, s.ftype(), b)?;
                 }
             }
             w.flush()?;
@@ -161,9 +172,15 @@ fn write_key(buf: &mut Vec<u8>, key: &SeriesKey) {
     write_str(buf, &key.field);
 }
 
-fn write_block<W: Write>(w: &mut W, key: &SeriesKey, b: &Block) -> io::Result<()> {
+fn write_block<W: Write>(
+    w: &mut W,
+    key: &SeriesKey,
+    ftype: FieldType,
+    b: &Block,
+) -> io::Result<()> {
     let mut buf = Vec::with_capacity(32 + b.bytes.len());
     write_key(&mut buf, key);
+    buf.push(ftype.to_u8());
     buf.extend_from_slice(&b.min_ts.to_le_bytes());
     buf.extend_from_slice(&b.max_ts.to_le_bytes());
     buf.extend_from_slice(&(b.count as u32).to_le_bytes());
@@ -229,8 +246,19 @@ fn read_key<R: Read>(r: &mut R) -> io::Result<Option<SeriesKey>> {
     }))
 }
 
-fn read_block<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, Block)>> {
+fn read_u8<R: Read>(r: &mut R) -> io::Result<Option<u8>> {
+    let mut b = [0u8; 1];
+    if !read_exact_opt(r, &mut b)? {
+        return Ok(None);
+    }
+    Ok(Some(b[0]))
+}
+
+fn read_block<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, FieldType, Block)>> {
     let Some(key) = read_key(r)? else {
+        return Ok(None);
+    };
+    let Some(ft) = read_u8(r)? else {
         return Ok(None);
     };
     let mut hdr = [0u8; 8 + 8 + 4 + 4];
@@ -247,6 +275,7 @@ fn read_block<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, Block)>> {
     }
     Ok(Some((
         key,
+        FieldType::from_u8(ft),
         Block {
             bytes,
             min_ts,
@@ -256,8 +285,11 @@ fn read_block<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, Block)>> {
     )))
 }
 
-fn read_wal_rec<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, i64, f64)>> {
+fn read_wal_rec<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, FieldType, i64, f64)>> {
     let Some(key) = read_key(r)? else {
+        return Ok(None);
+    };
+    let Some(ft) = read_u8(r)? else {
         return Ok(None);
     };
     let mut b = [0u8; 16];
@@ -266,5 +298,5 @@ fn read_wal_rec<R: Read>(r: &mut R) -> io::Result<Option<(SeriesKey, i64, f64)>>
     }
     let ts = i64::from_le_bytes(b[0..8].try_into().unwrap());
     let val = f64::from_bits(u64::from_le_bytes(b[8..16].try_into().unwrap()));
-    Ok(Some((key, ts, val)))
+    Ok(Some((key, FieldType::from_u8(ft), ts, val)))
 }

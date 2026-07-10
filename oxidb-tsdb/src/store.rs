@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use crate::gorilla;
-use crate::model::SeriesKey;
+use crate::model::{FieldType, SeriesKey};
 
 /// A sealed, compressed run of points, with its time span for pruning.
 pub struct Block {
@@ -19,6 +19,7 @@ pub struct Block {
 pub struct Series {
     sealed: Vec<Block>,
     active: Vec<(i64, f64)>,
+    ftype: FieldType,
 }
 
 impl Series {
@@ -27,6 +28,13 @@ impl Series {
         if self.active.len() >= block_points {
             self.seal();
         }
+    }
+
+    pub fn ftype(&self) -> FieldType {
+        self.ftype
+    }
+    pub fn set_ftype(&mut self, t: FieldType) {
+        self.ftype = t;
     }
 
     /// Sealed blocks (for persistence snapshots).
@@ -122,7 +130,7 @@ pub struct TagPredicate {
 }
 
 /// Aggregation applied per (tag-group, time-bucket).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Agg {
     Mean,
     Sum,
@@ -131,6 +139,18 @@ pub enum Agg {
     Count,
     First,
     Last,
+    /// Per-second rate of change across the bucket: `(last - first) / span_s`.
+    /// For counter-style series. 0 with fewer than two points.
+    Rate,
+    /// The `p`-th percentile (0..=100) of the bucket's values (linear
+    /// interpolation between closest ranks).
+    Percentile(f64),
+}
+
+impl Agg {
+    fn needs_values(self) -> bool {
+        matches!(self, Agg::Percentile(_))
+    }
 }
 
 /// A query: what to select, filter, group and aggregate.
@@ -161,6 +181,8 @@ pub struct GroupPoint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResultSeries {
     pub tags: Vec<(String, String)>,
+    /// The field's logical type (float/integer/boolean).
+    pub ftype: FieldType,
     pub points: Vec<GroupPoint>,
 }
 
@@ -174,9 +196,17 @@ struct Acc {
     first_val: f64,
     last_ts: i64,
     last_val: f64,
+    /// Buffered values, only when the aggregation needs them (percentile).
+    vals: Option<Vec<f64>>,
 }
 
 impl Acc {
+    fn new(collect: bool) -> Self {
+        Acc {
+            vals: if collect { Some(Vec::new()) } else { None },
+            ..Default::default()
+        }
+    }
     fn add(&mut self, ts: i64, v: f64) {
         if self.count == 0 {
             self.min = v;
@@ -203,6 +233,9 @@ impl Acc {
         }
         self.sum += v;
         self.count += 1;
+        if let Some(vs) = &mut self.vals {
+            vs.push(v);
+        }
     }
     fn value(&self, agg: Agg) -> f64 {
         match agg {
@@ -213,13 +246,41 @@ impl Acc {
             Agg::Count => self.count as f64,
             Agg::First => self.first_val,
             Agg::Last => self.last_val,
+            Agg::Rate => {
+                let span = (self.last_ts - self.first_ts) as f64 / 1000.0;
+                if span > 0.0 {
+                    (self.last_val - self.first_val) / span
+                } else {
+                    0.0
+                }
+            }
+            Agg::Percentile(p) => percentile(self.vals.as_deref().unwrap_or(&[]), p),
         }
     }
+}
+
+/// Linear-interpolation percentile (`p` in 0..=100), like numpy's default.
+fn percentile(vals: &[f64], p: f64) -> f64 {
+    if vals.is_empty() {
+        return f64::NAN;
+    }
+    let mut v = vals.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if v.len() == 1 {
+        return v[0];
+    }
+    let rank = (p / 100.0) * (v.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f64;
+    v[lo] + (v[hi] - v[lo]) * frac
 }
 
 pub fn run_query(series: &BTreeMap<SeriesKey, Series>, spec: &QuerySpec) -> Vec<ResultSeries> {
     // group values (in group_tags order) → bucket ts → accumulator
     let mut groups: BTreeMap<Vec<String>, BTreeMap<i64, Acc>> = BTreeMap::new();
+    let mut group_ftype: BTreeMap<Vec<String>, FieldType> = BTreeMap::new();
+    let collect = spec.agg.needs_values();
 
     for (key, s) in series {
         if key.measurement != spec.measurement || key.field != spec.field {
@@ -237,19 +298,24 @@ pub fn run_query(series: &BTreeMap<SeriesKey, Series>, spec: &QuerySpec) -> Vec<
             .iter()
             .map(|k| key.tag(k).unwrap_or("").to_string())
             .collect();
+        group_ftype.entry(gvals.clone()).or_insert(s.ftype());
         let buckets = groups.entry(gvals).or_default();
         s.for_each_in(spec.start, spec.end, |t, v| {
             let bucket = match spec.interval {
                 Some(iv) if iv > 0 => t - t.rem_euclid(iv),
                 _ => spec.start,
             };
-            buckets.entry(bucket).or_default().add(t, v);
+            buckets
+                .entry(bucket)
+                .or_insert_with(|| Acc::new(collect))
+                .add(t, v);
         });
     }
 
     groups
         .into_iter()
         .map(|(gvals, buckets)| ResultSeries {
+            ftype: group_ftype.get(&gvals).copied().unwrap_or_default(),
             tags: spec.group_tags.iter().cloned().zip(gvals).collect(),
             points: buckets
                 .into_iter()
