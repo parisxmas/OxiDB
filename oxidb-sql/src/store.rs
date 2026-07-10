@@ -72,6 +72,28 @@ pub(crate) trait Store {
     }
     fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()>;
     fn delete(&self, table: &str, row_id: u64) -> Result<bool>;
+
+    // Savepoints — meaningful only inside a transaction. The autocommit engine
+    // uses the default impls (an error); [`Transaction`] overrides them. This
+    // lets a statement or a stored procedure roll back part of its work without
+    // aborting the whole transaction. Deterministic (identical per node), so
+    // safe on the Raft-replicated CALL path.
+    fn savepoint(&self, _name: &str) -> Result<()> {
+        Err(crate::error::SqlError::Unsupported(
+            "SAVEPOINT requires an open transaction".into(),
+        ))
+    }
+    fn rollback_to_savepoint(&self, _name: &str) -> Result<()> {
+        Err(crate::error::SqlError::Unsupported(
+            "ROLLBACK TO SAVEPOINT requires an open transaction".into(),
+        ))
+    }
+    fn release_savepoint(&self, _name: &str) -> Result<()> {
+        Err(crate::error::SqlError::Unsupported(
+            "RELEASE SAVEPOINT requires an open transaction".into(),
+        ))
+    }
+
     fn create_table(&self, table: Table) -> Result<()>;
     fn drop_table(&self, name: &str) -> Result<()>;
     /// `ALTER TABLE` — one operation (autocommit only in v1).

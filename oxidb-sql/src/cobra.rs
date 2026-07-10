@@ -214,6 +214,23 @@ impl<S: Store> DbHandle<'_, S> {
         };
         Ok(CValue::Int(affected as i64))
     }
+
+    /// `db.savepoint(name)` / `db.rollback_to(name)` / `db.release(name)` —
+    /// one string argument (the savepoint name); returns null.
+    fn savepoint_op(
+        &self,
+        method: &str,
+        args: &[CValue],
+        op: impl Fn(&S, &str) -> Result<()>,
+    ) -> std::result::Result<CValue, NativeError> {
+        let [CValue::Str(name)] = args else {
+            return Err(NativeError::new(format!(
+                "db.{method}(name) takes one string argument"
+            )));
+        };
+        op(self.store, name).map_err(sql_err)?;
+        Ok(CValue::Null)
+    }
 }
 
 impl<S: Store> NativeObject for DbHandle<'_, S> {
@@ -225,6 +242,12 @@ impl<S: Store> NativeObject for DbHandle<'_, S> {
         match name {
             "query" => self.query(args),
             "execute" => self.execute(args),
+            // Savepoints let a procedure undo part of its own work (past a
+            // named point) without aborting the whole CALL — the deterministic
+            // building block for nested error recovery.
+            "savepoint" => self.savepoint_op(name, args, |s, n| s.savepoint(n)),
+            "rollback_to" => self.savepoint_op(name, args, |s, n| s.rollback_to_savepoint(n)),
+            "release" => self.savepoint_op(name, args, |s, n| s.release_savepoint(n)),
             _ => Err(NativeError::new(format!("db has no method '{name}'"))),
         }
     }

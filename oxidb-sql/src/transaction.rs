@@ -255,6 +255,20 @@ impl Store for Transaction<'_> {
         self.visible_def(name)
     }
 
+    // Savepoints operate on this transaction's buffered overlay (see the
+    // inherent methods above); exposing them through Store lets `execute`
+    // and the Cobra `db` handle reach them uniformly.
+    fn savepoint(&self, name: &str) -> Result<()> {
+        Transaction::savepoint(self, name);
+        Ok(())
+    }
+    fn rollback_to_savepoint(&self, name: &str) -> Result<()> {
+        Transaction::rollback_to_savepoint(self, name)
+    }
+    fn release_savepoint(&self, name: &str) -> Result<()> {
+        Transaction::release_savepoint(self, name)
+    }
+
     fn scan(&self, table: &str) -> Result<Vec<(u64, Vec<Value>)>> {
         if self.state.borrow().dropped.contains(table) {
             return Err(SqlError::NoSuchTable(table.to_string()));

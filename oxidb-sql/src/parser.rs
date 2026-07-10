@@ -759,17 +759,26 @@ fn translate_create_procedure(
         ));
     }
     // v1 body surface: DML + SELECT. The body runs inside a transaction (a
-    // CALL is atomic), which rules out DDL; transaction control would break
-    // the wrapping; nested CALL is rejected to keep recursion out of v1.
+    // CALL is atomic), which rules out DDL and BEGIN/COMMIT/ROLLBACK (they'd
+    // break the wrapping); nested CALL is rejected to keep recursion out of
+    // v1. Savepoints ARE allowed — they roll back part of the CALL's work
+    // without touching the outer transaction boundary.
     for stmt in &statements {
         match stmt {
             sp::Statement::Insert(_)
             | sp::Statement::Update { .. }
             | sp::Statement::Delete(_)
-            | sp::Statement::Query(_) => {}
+            | sp::Statement::Query(_)
+            | sp::Statement::Savepoint { .. }
+            | sp::Statement::ReleaseSavepoint { .. } => {}
+            // `ROLLBACK TO SAVEPOINT` is a Rollback statement carrying a
+            // savepoint name; a plain ROLLBACK (no savepoint) is rejected.
+            sp::Statement::Rollback {
+                savepoint: Some(_), ..
+            } => {}
             other => {
                 return Err(SqlError::Unsupported(format!(
-                    "statement in procedure body: {other} (bodies are DML/SELECT only)"
+                    "statement in procedure body: {other} (bodies are DML/SELECT + savepoints)"
                 )));
             }
         }

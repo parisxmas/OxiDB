@@ -144,14 +144,26 @@ pub(crate) fn execute<S: Store>(
             Ok(QueryResult::Ddl)
         }
         Statement::Call { name, args } => exec_call(store, &name, &args, params),
-        Statement::Begin
-        | Statement::Commit
-        | Statement::Rollback
-        | Statement::Savepoint(_)
-        | Statement::RollbackToSavepoint(_)
-        | Statement::ReleaseSavepoint(_) => Err(SqlError::Unsupported(
+        // BEGIN/COMMIT/ROLLBACK change the transaction lifecycle and stay
+        // session-level. Savepoints operate *within* the current transaction,
+        // so they dispatch to the store — which makes them work both at the
+        // top level and inside a stored-procedure body (the store is the
+        // active transaction there).
+        Statement::Begin | Statement::Commit | Statement::Rollback => Err(SqlError::Unsupported(
             "transaction control must be a top-level statement".into(),
         )),
+        Statement::Savepoint(name) => {
+            store.savepoint(&name)?;
+            Ok(QueryResult::Transaction)
+        }
+        Statement::RollbackToSavepoint(name) => {
+            store.rollback_to_savepoint(&name)?;
+            Ok(QueryResult::Transaction)
+        }
+        Statement::ReleaseSavepoint(name) => {
+            store.release_savepoint(&name)?;
+            Ok(QueryResult::Transaction)
+        }
         Statement::Show(kind) => exec_show(store, kind),
     }
 }
@@ -378,7 +390,10 @@ pub(crate) fn exec_call<S: Store>(
             Statement::Insert { .. }
             | Statement::Update { .. }
             | Statement::Delete { .. }
-            | Statement::Select(_) => {}
+            | Statement::Select(_)
+            | Statement::Savepoint(_)
+            | Statement::RollbackToSavepoint(_)
+            | Statement::ReleaseSavepoint(_) => {}
             _ => {
                 return Err(SqlError::Corrupt(format!(
                     "procedure {name:?} body contains a non-DML statement"
