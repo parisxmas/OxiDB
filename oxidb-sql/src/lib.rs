@@ -1614,6 +1614,69 @@ mod tests {
     }
 
     #[test]
+    fn index_nested_loop_join_matches_full_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqlEngine::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE small (id INT PRIMARY KEY, tag TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE big (id INT PRIMARY KEY, sid INT, v INT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_big_sid ON big(sid)").unwrap();
+        db.execute("INSERT INTO small VALUES (1,'a'),(2,'b'),(3,'c')")
+            .unwrap();
+        // big has rows for sid 1 and 2 (multiple), none for 3; plus an orphan sid 9.
+        db.execute("INSERT INTO big VALUES (10,1,100),(11,1,101),(12,2,200),(13,9,900)")
+            .unwrap();
+
+        // INNER join: small ⋈ big on sid — the index-nested-loop path prunes
+        // big to only sid ∈ {1,2,3}. Must equal the set-based result.
+        let inner = select_rows(
+            &db,
+            "SELECT s.id, s.tag, b.v FROM small s JOIN big b ON b.sid = s.id \
+             ORDER BY s.id, b.v",
+        );
+        assert_eq!(
+            inner,
+            vec![
+                vec![Value::Int(1), Value::Text("a".into()), Value::Int(100)],
+                vec![Value::Int(1), Value::Text("a".into()), Value::Int(101)],
+                vec![Value::Int(2), Value::Text("b".into()), Value::Int(200)],
+            ]
+        );
+
+        // LEFT join: small=3 has no big row → one NULL-extended row. The INL
+        // prune must not drop it.
+        let left = select_rows(
+            &db,
+            "SELECT s.id, b.v FROM small s LEFT JOIN big b ON b.sid = s.id \
+             ORDER BY s.id, b.v",
+        );
+        assert_eq!(
+            left,
+            vec![
+                vec![Value::Int(1), Value::Int(100)],
+                vec![Value::Int(1), Value::Int(101)],
+                vec![Value::Int(2), Value::Int(200)],
+                vec![Value::Int(3), Value::Null],
+            ]
+        );
+
+        // Aggregate over the joined result (the fraud-scan shape).
+        let agg = select_rows(
+            &db,
+            "SELECT s.id, COUNT(b.id) AS n, SUM(b.v) AS tot \
+             FROM small s JOIN big b ON b.sid = s.id GROUP BY s.id ORDER BY s.id",
+        );
+        assert_eq!(
+            agg,
+            vec![
+                vec![Value::Int(1), Value::Int(2), Value::Int(201)],
+                vec![Value::Int(2), Value::Int(1), Value::Int(200)],
+            ]
+        );
+    }
+
+    #[test]
     fn indexed_lookup_inside_transaction_sees_overlay() {
         let dir = tempfile::tempdir().unwrap();
         let db = SqlEngine::open(dir.path()).unwrap();

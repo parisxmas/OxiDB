@@ -2261,6 +2261,84 @@ fn build_source<S: Store>(
 /// to a nested-loop join (O(N·M)). A hash-bucket hit already proves the
 /// equi-key conjuncts (HashMap key equality), so only the residual (non-equi)
 /// part of the ON — if any — is re-evaluated on candidate pairs.
+/// The largest left (outer) side for which an index-nested-loop join is
+/// attempted. Above this, one full scan of the right table plus a hash join
+/// beats many index probes.
+const INL_MAX_LEFT: usize = 8_192;
+
+/// Try an index-nested-loop build of the right chunk: instead of scanning the
+/// whole right base table, probe its index with each distinct left-side key
+/// value and gather only the matching rows. Returns `Ok(None)` (caller
+/// full-scans) unless every precondition holds:
+/// - INNER or LEFT join (RIGHT/FULL must see unmatched right rows),
+/// - exactly one equi-key whose right side is a plain column,
+/// - a small left side, and
+/// - the right column is actually indexed (probe returns `Some`).
+#[allow(clippy::too_many_arguments)]
+fn index_nested_loop_chunk<S: Store>(
+    store: &S,
+    join: &Join,
+    keys: &[(Expr, Expr)],
+    left_schema: &[ColRef],
+    src: &Sources,
+    tuples: &Tuples,
+    keep: &[usize],
+    params: &[Value],
+) -> Result<Option<Chunk>> {
+    if matches!(join.kind, JoinKind::Right | JoinKind::Full) || keys.len() != 1 {
+        return Ok(None);
+    }
+    let n_left = if tuples.stride == 0 {
+        0
+    } else {
+        tuples.data.len() / tuples.stride
+    };
+    if n_left == 0 || n_left > INL_MAX_LEFT {
+        return Ok(None);
+    }
+    // The right key must be a plain column reference (its unqualified name is
+    // what the index is keyed on).
+    let Expr::Column {
+        name: right_col, ..
+    } = &keys[0].1
+    else {
+        return Ok(None);
+    };
+    let right_col = right_col.clone();
+
+    // Distinct left key values (NULLs never equi-match, so skip them).
+    let left_key = bind_expr(&keys[0].0, left_schema)?;
+    let mut distinct: std::collections::BTreeSet<IndexKey> = std::collections::BTreeSet::new();
+    for lt in tuples.data.chunks_exact(tuples.stride) {
+        let view = View { src, tuple: lt };
+        let v = eval_scalar(&left_key, left_schema, &view, params)?;
+        if !matches!(v, Value::Null) {
+            distinct.insert(IndexKey(v));
+        }
+    }
+    if distinct.is_empty() {
+        return Ok(Some(Chunk::from_rows(std::iter::empty(), keep)));
+    }
+
+    // Probe the index per distinct value, deduping right rows by row_id. The
+    // first probe decides whether the column is indexed at all.
+    let mut rows: std::collections::BTreeMap<u64, Vec<Value>> = std::collections::BTreeMap::new();
+    for (i, key) in distinct.into_iter().enumerate() {
+        let hit = store.index_lookup_eq(&join.table.name, &[(right_col.clone(), key.0)])?;
+        match hit {
+            Some(matched) => {
+                for (rid, cells) in matched {
+                    rows.entry(rid).or_insert(cells);
+                }
+            }
+            // No index on the right column — abandon on the very first probe.
+            None if i == 0 => return Ok(None),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(Chunk::from_rows(rows.into_values(), keep)))
+}
+
 fn join_into<S: Store>(
     store: &S,
     join: &Join,
@@ -2270,21 +2348,31 @@ fn join_into<S: Store>(
     params: &[Value],
     needed: &Needed,
 ) -> Result<()> {
-    let (right_schema, chunk) = if let Some(sub) = &join.table.subquery {
-        derived_source(store, &join.table, sub, needed, params)?
+    // Resolve the right schema up front, but defer materializing its rows for a
+    // base table: an index-nested-loop join can then prune the scan to only the
+    // rows the (small) left side needs.
+    enum RightSrc {
+        Ready(Chunk),
+        Base { keep: Vec<usize> },
+    }
+    let (right_schema, right_src) = if let Some(sub) = &join.table.subquery {
+        let (rs, chunk) = derived_source(store, &join.table, sub, needed, params)?;
+        (rs, RightSrc::Ready(chunk))
     } else {
         match store.table_def(&join.table.name) {
             Some(def) => {
                 let full = qualified_schema(join.table.key(), &def);
                 let keep = keep_indices(&full, join.table.key(), needed);
                 let right_schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
-                (right_schema, store.scan_pruned(&join.table.name, &keep)?)
+                (right_schema, RightSrc::Base { keep })
             }
-            None => view_source(store, &join.table, needed)?
-                .ok_or_else(|| SqlError::NoSuchTable(join.table.name.clone()))?,
+            None => {
+                let (rs, chunk) = view_source(store, &join.table, needed)?
+                    .ok_or_else(|| SqlError::NoSuchTable(join.table.name.clone()))?;
+                (rs, RightSrc::Ready(chunk))
+            }
         }
     };
-    let nright = chunk.n;
 
     let left_len = schema.len();
     let mut combined = schema.clone();
@@ -2292,6 +2380,19 @@ fn join_into<S: Store>(
 
     // Split the raw (named) ON into equi-key pairs and a residual predicate.
     let (keys, residual) = split_on(&join.on, left_len, &combined);
+
+    // Materialize the right rows. For a base table, try an index-nested-loop
+    // prune first (below); otherwise fall back to a full scan.
+    let chunk = match right_src {
+        RightSrc::Ready(chunk) => chunk,
+        RightSrc::Base { keep } => {
+            match index_nested_loop_chunk(store, join, &keys, schema, src, tuples, &keep, params)? {
+                Some(chunk) => chunk,
+                None => store.scan_pruned(&join.table.name, &keep)?,
+            }
+        }
+    };
+    let nright = chunk.n;
     let residual = residual
         .as_ref()
         .map(|r| bind_expr(r, &combined))
