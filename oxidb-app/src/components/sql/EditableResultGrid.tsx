@@ -91,10 +91,14 @@ export function EditableResultGrid({ result, sql }: Props) {
     (c: number): boolean => {
       const t = (types[c] || "").toUpperCase();
       if (t) return /^(INT|INTEGER|BIGINT|SMALLINT|TINYINT|DECIMAL|NUMERIC|DOUBLE|FLOAT|REAL)/.test(t);
+      // No declared type (e.g. a Cobra procedure's result set): infer from the
+      // first non-null value. Exact decimals arrive as strings like "2391.00"
+      // to keep trailing zeros, so a plain numeric string counts as numeric too.
       for (const row of rows) {
         const v = row[c];
         if (v === null || v === undefined) continue;
-        return typeof v === "number";
+        if (typeof v === "number") return true;
+        return typeof v === "string" && /^-?\d+(\.\d+)?$/.test(v);
       }
       return false;
     },
