@@ -34,10 +34,9 @@ export function SqlEditor({
   const { scale } = useFontScale();
 
   const handleMount: OnMount = (editor, monaco) => {
-    editor.addCommand(
-      monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
-      () => onRun?.()
-    );
+    // Run the query: F5, or ⌘/Ctrl+Enter.
+    editor.addCommand(monaco.KeyCode.F5, () => onRun?.());
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => onRun?.());
     onReady?.(editor);
   };
 

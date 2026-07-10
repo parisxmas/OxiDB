@@ -262,7 +262,7 @@ export function SqlPage() {
             <div style={{ flex: 1 }} />
             <button className="btn btn-primary btn-sm" onClick={run} disabled={t.loading}>
               {t.loading ? <span className="spinner" /> : null}
-              Run (⌘+Enter)
+              Run (F5)
             </button>
           </div>
           <div style={{ flex: 1, minHeight: 0 }}>
