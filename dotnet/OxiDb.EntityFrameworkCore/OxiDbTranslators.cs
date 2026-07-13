@@ -6,21 +6,33 @@ using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
 
 namespace OxiDb.EntityFrameworkCore;
 
-/// <summary>Adds the string-method translations on top of the defaults.</summary>
+/// <summary>Adds the string/math/DateTime method translations on top of the defaults.</summary>
 public sealed class OxiDbMethodCallTranslatorProvider : RelationalMethodCallTranslatorProvider
 {
     public OxiDbMethodCallTranslatorProvider(
         RelationalMethodCallTranslatorProviderDependencies dependencies)
         : base(dependencies) =>
-        AddTranslators([new OxiDbStringMethodTranslator(dependencies.SqlExpressionFactory)]);
+        AddTranslators(
+        [
+            new OxiDbStringMethodTranslator(dependencies.SqlExpressionFactory),
+            new OxiDbMathMethodTranslator(dependencies.SqlExpressionFactory),
+            new OxiDbDateTimeMethodTranslator(dependencies.SqlExpressionFactory),
+        ]);
 }
 
-/// <summary>Adds <c>string.Length</c> → <c>LENGTH()</c> on top of the defaults.</summary>
+/// <summary>
+/// Adds <c>string.Length</c> → <c>LENGTH()</c> and the <c>DateTime</c>
+/// member translations on top of the defaults.
+/// </summary>
 public sealed class OxiDbMemberTranslatorProvider : RelationalMemberTranslatorProvider
 {
     public OxiDbMemberTranslatorProvider(RelationalMemberTranslatorProviderDependencies dependencies)
         : base(dependencies) =>
-        AddTranslators([new OxiDbStringLengthTranslator(dependencies.SqlExpressionFactory)]);
+        AddTranslators(
+        [
+            new OxiDbStringLengthTranslator(dependencies.SqlExpressionFactory),
+            new OxiDbDateTimeMemberTranslator(dependencies.SqlExpressionFactory),
+        ]);
 }
 
 /// <summary>
@@ -73,14 +85,170 @@ internal sealed class OxiDbStringMethodTranslator : IMethodCallTranslator
                     ? Fn("SUBSTRING", instance, from)
                     : Fn("SUBSTRING", instance, from, arguments[1]);
             }
+            // CLR IndexOf is 0-based (-1 = absent); STRPOS is 1-based (0 = absent).
+            case nameof(string.IndexOf) when arguments is [{ Type: var t }] && t == typeof(string):
+                return _sql.Subtract(
+                    _sql.Function("STRPOS", [instance, arguments[0]], nullable: true,
+                        argumentsPropagateNullability: [true, true], typeof(int)),
+                    _sql.Constant(1));
+            case nameof(string.PadLeft) when arguments.Count is 1 or 2:
+            case nameof(string.PadRight) when arguments.Count is 1 or 2:
+            {
+                var fn = method.Name == nameof(string.PadLeft) ? "LPAD" : "RPAD";
+                // The char overload's fill argument becomes a one-char string.
+                var args = arguments.Count == 1
+                    ? new[] { instance, arguments[0] }
+                    : [instance, arguments[0], Stringify(arguments[1])];
+                return _sql.Function(fn, args, nullable: true,
+                    argumentsPropagateNullability: args.Select(_ => true).ToArray(),
+                    typeof(string), instance.TypeMapping);
+            }
             default:
                 return null;
         }
+
+        SqlExpression Stringify(SqlExpression e) =>
+            e is SqlConstantExpression { Value: char c }
+                ? _sql.Constant(c.ToString(), instance!.TypeMapping)
+                : e;
 
         SqlExpression Fn(string name, params SqlExpression[] args) =>
             _sql.Function(name, args, nullable: true,
                 argumentsPropagateNullability: args.Select(_ => true).ToArray(),
                 method.ReturnType, instance!.TypeMapping);
+    }
+}
+
+/// <summary>
+/// <c>Math</c>/<c>MathF</c> → engine scalars: Abs/Floor/Ceiling/Round already
+/// exist engine-side as ABS/FLOOR/CEILING/ROUND; Pow → POWER; Sqrt → SQRT.
+/// </summary>
+internal sealed class OxiDbMathMethodTranslator : IMethodCallTranslator
+{
+    private static readonly Dictionary<string, string> Names = new()
+    {
+        [nameof(Math.Abs)] = "ABS",
+        [nameof(Math.Floor)] = "FLOOR",
+        [nameof(Math.Ceiling)] = "CEILING",
+        [nameof(Math.Round)] = "ROUND",
+        [nameof(Math.Pow)] = "POWER",
+        [nameof(Math.Sqrt)] = "SQRT",
+    };
+
+    private readonly ISqlExpressionFactory _sql;
+
+    public OxiDbMathMethodTranslator(ISqlExpressionFactory sql) => _sql = sql;
+
+    public SqlExpression? Translate(
+        SqlExpression? instance,
+        MethodInfo method,
+        IReadOnlyList<SqlExpression> arguments,
+        IDiagnosticsLogger<DbLoggerCategory.Query> logger)
+    {
+        if (method.DeclaringType != typeof(Math) || !Names.TryGetValue(method.Name, out var fn))
+            return null;
+        // ROUND(x) / ROUND(x, digits) / the single- and two-argument shapes above.
+        if (arguments.Count is not (1 or 2))
+            return null;
+        return _sql.Function(fn, arguments, nullable: true,
+            argumentsPropagateNullability: arguments.Select(_ => true).ToArray(),
+            method.ReturnType);
+    }
+}
+
+/// <summary>
+/// <c>DateTime.AddDays/AddHours/AddMinutes/AddSeconds/AddMilliseconds</c> →
+/// timestamp + milliseconds (the engine folds INTERVALs to ms integers, and
+/// <c>timestamp ± double</c> rounds to the nearest ms).
+/// </summary>
+internal sealed class OxiDbDateTimeMethodTranslator : IMethodCallTranslator
+{
+    private static readonly Dictionary<string, double> MsPerUnit = new()
+    {
+        [nameof(DateTime.AddDays)] = 86_400_000d,
+        [nameof(DateTime.AddHours)] = 3_600_000d,
+        [nameof(DateTime.AddMinutes)] = 60_000d,
+        [nameof(DateTime.AddSeconds)] = 1_000d,
+        [nameof(DateTime.AddMilliseconds)] = 1d,
+    };
+
+    private readonly ISqlExpressionFactory _sql;
+
+    public OxiDbDateTimeMethodTranslator(ISqlExpressionFactory sql) => _sql = sql;
+
+    public SqlExpression? Translate(
+        SqlExpression? instance,
+        MethodInfo method,
+        IReadOnlyList<SqlExpression> arguments,
+        IDiagnosticsLogger<DbLoggerCategory.Query> logger)
+    {
+        if (method.DeclaringType != typeof(DateTime) || instance is null
+            || arguments.Count != 1 || !MsPerUnit.TryGetValue(method.Name, out var factor))
+            return null;
+        // Pin the ms expression to its own (double) mapping so the timestamp
+        // mapping of `instance` can't be inferred onto it.
+        var ms = _sql.ApplyDefaultTypeMapping(_sql.Multiply(
+            _sql.Convert(arguments[0], typeof(double)),
+            _sql.Constant(factor)));
+        return _sql.Add(instance, ms, instance.TypeMapping);
+    }
+}
+
+/// <summary>
+/// <c>DateTime</c> members → <c>date_part</c>/<c>date_trunc</c>, plus
+/// <c>DateTime.Now/UtcNow</c> → <c>NOW()</c> (the engine clock is UTC).
+/// </summary>
+internal sealed class OxiDbDateTimeMemberTranslator : IMemberTranslator
+{
+    private static readonly Dictionary<string, string> Parts = new()
+    {
+        [nameof(DateTime.Year)] = "year",
+        [nameof(DateTime.Month)] = "month",
+        [nameof(DateTime.Day)] = "day",
+        [nameof(DateTime.Hour)] = "hour",
+        [nameof(DateTime.Minute)] = "minute",
+        [nameof(DateTime.Second)] = "second",
+        [nameof(DateTime.DayOfYear)] = "doy",
+    };
+
+    private readonly ISqlExpressionFactory _sql;
+
+    public OxiDbDateTimeMemberTranslator(ISqlExpressionFactory sql) => _sql = sql;
+
+    public SqlExpression? Translate(
+        SqlExpression? instance,
+        MemberInfo member,
+        Type returnType,
+        IDiagnosticsLogger<DbLoggerCategory.Query> logger)
+    {
+        if (member.DeclaringType != typeof(DateTime))
+            return null;
+        if (instance is null)
+        {
+            // Static members. NOW() is UTC on the engine.
+            return member.Name is nameof(DateTime.Now) or nameof(DateTime.UtcNow)
+                ? _sql.Function("NOW", [], nullable: false,
+                    argumentsPropagateNullability: [], returnType)
+                : null;
+        }
+        if (Parts.TryGetValue(member.Name, out var part))
+            return DatePart(part);
+        return member.Name switch
+        {
+            nameof(DateTime.Date) => _sql.Function("date_trunc",
+                [_sql.Constant("day"), instance], nullable: true,
+                argumentsPropagateNullability: [false, true],
+                returnType, instance.TypeMapping),
+            // Engine 'millisecond' includes the seconds field (PostgreSQL
+            // semantics); CLR Millisecond is 0..999.
+            nameof(DateTime.Millisecond) =>
+                _sql.Modulo(DatePart("millisecond"), _sql.Constant(1000)),
+            _ => null,
+        };
+
+        SqlExpression DatePart(string p) =>
+            _sql.Function("date_part", [_sql.Constant(p), instance!], nullable: true,
+                argumentsPropagateNullability: [false, true], typeof(int));
     }
 }
 

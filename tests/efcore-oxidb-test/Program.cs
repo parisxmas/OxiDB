@@ -2,11 +2,12 @@
 using Microsoft.EntityFrameworkCore;
 using OxiDb.EntityFrameworkCore;
 
+var port = int.Parse(Environment.GetEnvironmentVariable("OXIDB_PORT") ?? "4444");
 var cs = Environment.GetEnvironmentVariable("OXIDB_CS")
-    ?? "Host=127.0.0.1;Port=4444;Database=efcore_test";
+    ?? $"Host=127.0.0.1;Port={port};Database=efcore_test";
 
 // A dedicated database so EnsureCreated sees a blank slate.
-await using (var boot = await OxiDb.Client.Tcp.OxiDbTcpClient.ConnectAsync("127.0.0.1", 4444))
+await using (var boot = await OxiDb.Client.Tcp.OxiDbTcpClient.ConnectAsync("127.0.0.1", port))
 {
     await boot.SqlAsync("DROP DATABASE IF EXISTS efcore_test");
     await boot.SqlAsync("CREATE DATABASE efcore_test");
@@ -82,6 +83,37 @@ using (var db = new ShopContext(cs))
     Console.WriteLine($"rollback preserved  : {db.Musteriler.Count()} musteri");
 }
 
+using (var db = new ShopContext(cs))
+{
+    // Date/time surface: date_part members, NOW() + interval arithmetic,
+    // date_trunc via .Date.
+    var subat = db.Musteriler.Count(m => m.Kayit.Year == 2026 && m.Kayit.Month == 2);
+    var eski = db.Musteriler.Count(m => m.Kayit < DateTime.UtcNow.AddDays(-1));
+    var gun = db.Musteriler.Count(m => m.Kayit.Date == new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc));
+    Console.WriteLine($"datetime            : subat={subat} eski={eski} gun={gun}");
+
+    // COUNT(DISTINCT), math scalars, % and the new string scalars.
+    var farkli = db.Siparisler.Select(s => s.MusteriId).Distinct().Count();
+    var kok = db.Siparisler.Count(s => Math.Sqrt(s.Tutar) > 3);
+    var tek = db.Musteriler.Count(m => m.Puan % 2 == 1);
+    var idx = db.Musteriler.Count(m => m.Ad.IndexOf("y") == 1);
+    var pad = db.Musteriler.OrderBy(m => m.Ad).Select(m => m.Ad.PadLeft(6, '.')).First();
+    Console.WriteLine($"distinct/math/string: farkli={farkli} kok={kok} tek={tek} idx={idx} pad={pad}");
+
+    // Correlated collection projection → OUTER/CROSS APPLY → JOIN LATERAL.
+    var enBuyuk = db.Musteriler.OrderBy(m => m.Ad)
+        .Select(m => new
+        {
+            m.Ad,
+            Max = db.Siparisler.Where(s => s.MusteriId == m.Id)
+                .OrderByDescending(s => s.Tutar)
+                .Select(s => (double?)s.Tutar)
+                .FirstOrDefault(),
+        })
+        .ToList();
+    Console.WriteLine($"lateral             : {string.Join(",", enBuyuk.Select(x => $"{x.Ad}={x.Max?.ToString() ?? "yok"}"))}");
+}
+
 Console.WriteLine("EFCORE OK");
 
 public sealed class ShopContext(string cs) : DbContext
@@ -89,7 +121,13 @@ public sealed class ShopContext(string cs) : DbContext
     public DbSet<Musteri> Musteriler => Set<Musteri>();
     public DbSet<Siparis> Siparisler => Set<Siparis>();
 
-    protected override void OnConfiguring(DbContextOptionsBuilder options) => options.UseOxiDb(cs);
+    protected override void OnConfiguring(DbContextOptionsBuilder options)
+    {
+        options.UseOxiDb(cs);
+        if (Environment.GetEnvironmentVariable("EF_LOG") == "1")
+            options.LogTo(Console.WriteLine,
+                [Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.CommandExecuting]);
+    }
 
     protected override void OnModelCreating(ModelBuilder mb)
     {

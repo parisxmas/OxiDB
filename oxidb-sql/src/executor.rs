@@ -15,8 +15,9 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
-    AggFunc, BinOp, Expr, Join, JoinKind, LimitExpr, QueryBody, QueryResult, ScalarFunc,
-    SelectItem, SelectQuery, SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
+    AggFunc, BinOp, DatePart, Expr, Join, JoinKind, LimitExpr, QueryBody, QueryResult, ScalarFunc,
+    SelectItem, SelectQuery, SelectStmt, SetOpKind, ShowKind, Statement, TableRef, UnOp,
+    WindowFunc,
 };
 use crate::decimal::Decimal;
 use crate::error::{Result, SqlError};
@@ -913,7 +914,7 @@ fn outer_sort_pos(e: &Expr, columns: &[String]) -> Result<usize> {
             Ok(*n as usize - 1)
         }
         _ => Err(SqlError::Unsupported(
-            "UNION ORDER BY must be an output column name or 1-based position".into(),
+            "set-operation ORDER BY must be an output column name or 1-based position".into(),
         )),
     }
 }
@@ -930,24 +931,74 @@ fn exec_body<S: Store>(
             QueryResult::Select { columns, rows, .. } => Ok((columns, rows)),
             _ => unreachable!("SELECT produced a non-select result"),
         },
-        QueryBody::SetOp { all, left, right } => {
+        QueryBody::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => {
+            use std::collections::{BTreeMap, BTreeSet};
             let (columns, mut rows) = exec_body(store, *left, params)?;
             let (rcols, rrows) = exec_body(store, *right, params)?;
             if columns.len() != rcols.len() {
                 return Err(SqlError::SchemaMismatch(format!(
-                    "UNION arms have {} and {} columns",
+                    "{} arms have {} and {} columns",
+                    op.name(),
                     columns.len(),
                     rcols.len()
                 )));
             }
-            rows.extend(rrows);
-            if !all {
-                // UNION (distinct): keep the first occurrence of each row.
-                let mut seen: std::collections::BTreeSet<Vec<IndexKey>> =
-                    std::collections::BTreeSet::new();
-                rows.retain(|row| {
-                    seen.insert(row.iter().cloned().map(IndexKey).collect::<Vec<_>>())
-                });
+            let key = |row: &[Value]| row.iter().cloned().map(IndexKey).collect::<Vec<_>>();
+            // Bag (ALL) variants count right-arm rows; each count cancels or
+            // admits one matching left row. Distinct variants keep the first
+            // occurrence, membership-tested against the right arm as a set.
+            let mut right_counts: BTreeMap<Vec<IndexKey>, usize> = BTreeMap::new();
+            if op != SetOpKind::Union && all {
+                for r in &rrows {
+                    *right_counts.entry(key(r)).or_insert(0) += 1;
+                }
+            }
+            match (op, all) {
+                (SetOpKind::Union, true) => rows.extend(rrows),
+                (SetOpKind::Union, false) => {
+                    rows.extend(rrows);
+                    let mut seen = BTreeSet::new();
+                    rows.retain(|row| seen.insert(key(row)));
+                }
+                (SetOpKind::Except, true) => {
+                    rows.retain(|row| match right_counts.get_mut(&key(row)) {
+                        Some(n) if *n > 0 => {
+                            *n -= 1;
+                            false
+                        }
+                        _ => true,
+                    });
+                }
+                (SetOpKind::Except, false) => {
+                    let right: BTreeSet<Vec<IndexKey>> = rrows.iter().map(|r| key(r)).collect();
+                    let mut seen = BTreeSet::new();
+                    rows.retain(|row| {
+                        let k = key(row);
+                        !right.contains(&k) && seen.insert(k)
+                    });
+                }
+                (SetOpKind::Intersect, true) => {
+                    rows.retain(|row| match right_counts.get_mut(&key(row)) {
+                        Some(n) if *n > 0 => {
+                            *n -= 1;
+                            true
+                        }
+                        _ => false,
+                    });
+                }
+                (SetOpKind::Intersect, false) => {
+                    let right: BTreeSet<Vec<IndexKey>> = rrows.iter().map(|r| key(r)).collect();
+                    let mut seen = BTreeSet::new();
+                    rows.retain(|row| {
+                        let k = key(row);
+                        right.contains(&k) && seen.insert(k)
+                    });
+                }
             }
             Ok((columns, rows))
         }
@@ -966,10 +1017,10 @@ fn exec_body<S: Store>(
 // Correlation reaches one level up (a subquery may reference its immediate
 // enclosing query only).
 
-/// The tables (key + definition) a column reference can resolve against in
+/// The tables (key + column names) a column reference can resolve against in
 /// one query scope.
 struct Scope {
-    tables: Vec<(String, crate::catalog::Table)>,
+    tables: Vec<(String, Vec<String>)>,
 }
 
 impl Scope {
@@ -978,12 +1029,25 @@ impl Scope {
             Some(t) => self
                 .tables
                 .iter()
-                .any(|(k, def)| k == t && def.columns.iter().any(|c| c.name == name)),
+                .any(|(k, cols)| k == t && cols.iter().any(|c| c == name)),
             None => self
                 .tables
                 .iter()
-                .any(|(_, def)| def.columns.iter().any(|c| c.name == name)),
+                .any(|(_, cols)| cols.iter().any(|c| c == name)),
         }
+    }
+
+    /// A scope over an already-materialized combined schema (used for the
+    /// left side of a LATERAL join, which may include derived tables).
+    fn from_schema(schema: &[ColRef]) -> Scope {
+        let mut tables: Vec<(String, Vec<String>)> = Vec::new();
+        for c in schema {
+            match tables.iter_mut().find(|(k, _)| *k == c.table) {
+                Some((_, cols)) => cols.push(c.name.clone()),
+                None => tables.push((c.table.clone(), vec![c.name.clone()])),
+            }
+        }
+        Scope { tables }
     }
 }
 
@@ -991,10 +1055,13 @@ fn scope_of<S: Store>(store: &S, s: &SelectStmt) -> Scope {
     let mut tables = Vec::new();
     let mut add = |r: &TableRef| {
         if let Some(def) = store.table_def(&r.name) {
-            tables.push((r.key().to_string(), def));
+            let cols = def.columns.iter().map(|c| c.name.clone()).collect();
+            tables.push((r.key().to_string(), cols));
         }
     };
-    add(&s.from);
+    if let Some(from) = &s.from {
+        add(from);
+    }
     for j in &s.joins {
         add(&j.table);
     }
@@ -1004,7 +1071,8 @@ fn scope_of<S: Store>(store: &S, s: &SelectStmt) -> Scope {
 fn scope_of_table<S: Store>(store: &S, table: &str) -> Scope {
     let mut tables = Vec::new();
     if let Some(def) = store.table_def(table) {
-        tables.push((table.to_string(), def));
+        let cols = def.columns.iter().map(|c| c.name.clone()).collect();
+        tables.push((table.to_string(), cols));
     }
     Scope { tables }
 }
@@ -1479,12 +1547,17 @@ fn resolve_corr_row<S: Store, R: RowLike + ?Sized>(
                 .collect::<Result<_>>()?,
             negated: *negated,
         },
-        Expr::Aggregate { func, arg } => Expr::Aggregate {
+        Expr::Aggregate {
+            func,
+            arg,
+            distinct,
+        } => Expr::Aggregate {
             func: *func,
             arg: match arg {
                 Some(a) => Some(Box::new(resolve_corr_row(store, a, schema, row, params)?)),
                 None => None,
             },
+            distinct: *distinct,
         },
         Expr::Func { func, args } => Expr::Func {
             func: *func,
@@ -1717,8 +1790,16 @@ fn compute_window(
             }
             WindowFunc::Agg(agg, arg) => {
                 if order_by.is_empty() {
-                    let v =
-                        eval_aggregate(*agg, arg.as_deref(), schema, src, tuples, &part, params)?;
+                    let v = eval_aggregate(
+                        *agg,
+                        arg.as_deref(),
+                        false,
+                        schema,
+                        src,
+                        tuples,
+                        &part,
+                        params,
+                    )?;
                     for &i in &part {
                         out[i as usize] = v.clone();
                     }
@@ -1962,6 +2043,13 @@ fn collect_needed(select: &SelectStmt) -> Needed {
     }
     for j in &select.joins {
         collect_col_refs(&j.on, &mut refs);
+        // A LATERAL body may reference left-side columns; keep every column
+        // it names (references to its own tables are harmless extras here).
+        if j.table.lateral
+            && let Some(sub) = &j.table.subquery
+        {
+            collect_body_col_refs(&sub.body, &mut refs);
+        }
     }
     for e in &select.group_by {
         collect_col_refs(e, &mut refs);
@@ -2210,25 +2298,41 @@ fn build_source<S: Store>(
     params: &[Value],
 ) -> Result<(Vec<ColRef>, Sources, Tuples)> {
     let needed = collect_needed(select);
-    let (mut schema, chunk) = if let Some(sub) = &select.from.subquery {
-        derived_source(store, &select.from, sub, &needed, params)?
+    let Some(from) = &select.from else {
+        // FROM-less SELECT: one implicit row with no columns. Expressions are
+        // evaluated once against it; WHERE can still drop it. (The parser
+        // guarantees there are no joins without a FROM.)
+        let mut src = Sources::default();
+        src.push_table(Chunk {
+            width: 0,
+            n: 1,
+            cells: Vec::new(),
+        });
+        let tuples = Tuples {
+            stride: 1,
+            data: vec![0],
+        };
+        return Ok((Vec::new(), src, tuples));
+    };
+    let (mut schema, chunk) = if let Some(sub) = &from.subquery {
+        derived_source(store, from, sub, &needed, params)?
     } else {
-        match store.table_def(&select.from.name) {
+        match store.table_def(&from.name) {
             Some(base_def) => {
-                let full = qualified_schema(select.from.key(), &base_def);
-                let keep = keep_indices(&full, select.from.key(), &needed);
+                let full = qualified_schema(from.key(), &base_def);
+                let keep = keep_indices(&full, from.key(), &needed);
                 let schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
                 // Base rows: use an index when there are no joins and WHERE has a
                 // usable equality on an indexed column; otherwise full scan.
                 let chunk = if select.joins.is_empty() {
-                    base_chunk(store, &select.from, &select.filter, params, &keep)?
+                    base_chunk(store, from, &select.filter, params, &keep)?
                 } else {
-                    store.scan_pruned(&select.from.name, &keep)?
+                    store.scan_pruned(&from.name, &keep)?
                 };
                 (schema, chunk)
             }
-            None => view_source(store, &select.from, &needed)?
-                .ok_or_else(|| SqlError::NoSuchTable(select.from.name.clone()))?,
+            None => view_source(store, from, &needed)?
+                .ok_or_else(|| SqlError::NoSuchTable(from.name.clone()))?,
         }
     };
 
@@ -2240,16 +2344,27 @@ fn build_source<S: Store>(
         data: (0..n as u32).collect(),
     };
 
-    for join in reorder_joins(store, &select.from, &select.joins) {
-        join_into(
-            store,
-            join,
-            &mut schema,
-            &mut src,
-            &mut tuples,
-            params,
-            &needed,
-        )?;
+    // A LATERAL right side must run after every table it references, so keep
+    // the written order when any join is lateral.
+    let ordered: Vec<&Join> = if select.joins.iter().any(|j| j.table.lateral) {
+        select.joins.iter().collect()
+    } else {
+        reorder_joins(store, from, &select.joins)
+    };
+    for join in ordered {
+        if join.table.lateral && join.table.subquery.is_some() {
+            lateral_join_into(store, join, &mut schema, &mut src, &mut tuples, params)?;
+        } else {
+            join_into(
+                store,
+                join,
+                &mut schema,
+                &mut src,
+                &mut tuples,
+                params,
+                &needed,
+            )?;
+        }
     }
     Ok((schema, src, tuples))
 }
@@ -2337,6 +2452,135 @@ fn index_nested_loop_chunk<S: Store>(
         }
     }
     Ok(Some(Chunk::from_rows(rows.into_values(), keep)))
+}
+
+/// A materialized subquery result: (columns, types, rows).
+type SubRows = (Vec<String>, Vec<Option<SqlType>>, Vec<Vec<Value>>);
+
+/// Join a LATERAL derived table into the working set: rewrite its references
+/// to left-side columns into synthetic parameter slots (the same machinery as
+/// correlated subqueries), then re-execute the subquery once per left tuple
+/// with those slots bound to the tuple's values.
+fn lateral_join_into<S: Store>(
+    store: &S,
+    join: &Join,
+    schema: &mut Vec<ColRef>,
+    src: &mut Sources,
+    tuples: &mut Tuples,
+    params: &[Value],
+) -> Result<()> {
+    let sub = join
+        .table
+        .subquery
+        .as_deref()
+        .expect("lateral without a subquery");
+    let mut sub = sub.clone();
+    let base = params.len();
+    let outer = extract_outer(store, &mut sub, &Scope::from_schema(schema), base);
+    let sub = Statement::Select(sub);
+
+    // Run the subquery with the outer slots bound; returns (columns, types,
+    // rows). The schema comes from the first run (or a NULL-bound probe when
+    // there are no left tuples at all).
+    let run = |vals: Vec<Value>| -> Result<SubRows> {
+        let mut p2 = Vec::with_capacity(base + vals.len());
+        p2.extend_from_slice(params);
+        p2.extend(vals);
+        match execute(store, sub.clone(), &p2)? {
+            QueryResult::Select {
+                columns,
+                types,
+                rows,
+            } => Ok((columns, types, rows)),
+            _ => unreachable!("subquery produced a non-select result"),
+        }
+    };
+
+    let stride = tuples.stride;
+    let n_left = if stride == 0 {
+        0
+    } else {
+        tuples.data.len() / stride
+    };
+    let mut header: Option<(Vec<String>, Vec<Option<SqlType>>)> = None;
+    let mut right_rows: Vec<Vec<Value>> = Vec::new();
+    // Right-row span per left tuple.
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(n_left);
+    for lt in tuples.data.chunks_exact(stride.max(1)).take(n_left) {
+        let view = View { src, tuple: lt };
+        let vals = outer
+            .iter()
+            .map(|o| eval_scalar(o, schema, &view, params))
+            .collect::<Result<Vec<_>>>()?;
+        let (columns, types, rows) = run(vals)?;
+        if header.is_none() {
+            header = Some((columns, types));
+        }
+        let start = right_rows.len();
+        right_rows.extend(rows);
+        ranges.push((start, right_rows.len()));
+    }
+    let (columns, types) = match header {
+        Some(h) => h,
+        // No left tuples: probe with NULL slots only to learn the columns.
+        None => {
+            let (columns, types, _) = run(vec![Value::Null; outer.len()])?;
+            (columns, types)
+        }
+    };
+
+    let right_schema: Vec<ColRef> = columns
+        .iter()
+        .zip(&types)
+        .map(|(c, ty)| ColRef {
+            table: join.table.key().to_string(),
+            name: c.clone(),
+            ty: *ty,
+        })
+        .collect();
+    let width = right_schema.len();
+    let mut combined = schema.clone();
+    combined.extend(right_schema);
+
+    let on_trivial = matches!(join.on, Expr::Literal(Value::Bool(true)));
+    let on = bind_expr(&join.on, &combined)?;
+    let want_left = matches!(join.kind, JoinKind::Left);
+
+    let keep: Vec<usize> = (0..width).collect();
+    src.push_table(Chunk::from_rows(right_rows, &keep));
+    let mut out: Vec<u32> = Vec::new();
+    let mut cand: Vec<u32> = vec![0; stride + 1];
+    for (li, lt) in tuples
+        .data
+        .chunks_exact(stride.max(1))
+        .take(n_left)
+        .enumerate()
+    {
+        cand[..stride].copy_from_slice(lt);
+        let (start, end) = ranges[li];
+        let mut matched = false;
+        for ri in start..end {
+            cand[stride] = ri as u32;
+            let ok = on_trivial || {
+                let view = View { src, tuple: &cand };
+                truthy(&eval_scalar(&on, &combined, &view, params)?)
+            };
+            if ok {
+                matched = true;
+                out.extend_from_slice(&cand);
+            }
+        }
+        if want_left && !matched {
+            cand[stride] = NULL_ROW;
+            out.extend_from_slice(&cand);
+        }
+    }
+    *schema = combined;
+    *tuples = Tuples {
+        stride: stride + 1,
+        data: out,
+    };
+    Ok(())
 }
 
 fn join_into<S: Store>(
@@ -2901,6 +3145,47 @@ fn expr_side(e: &Expr, left_len: usize, combined: &[ColRef]) -> Option<Side> {
     side
 }
 
+/// Collect every column reference in a query body's own expressions (used to
+/// keep the left-side columns a LATERAL subquery names).
+fn collect_body_col_refs<'a>(body: &'a QueryBody, refs: &mut Vec<(&'a Option<String>, &'a str)>) {
+    match body {
+        QueryBody::Select(s) => {
+            for item in &s.projection {
+                if let SelectItem::Expr { expr, .. } = item {
+                    collect_col_refs(expr, refs);
+                }
+            }
+            if let Some(f) = &s.filter {
+                collect_col_refs(f, refs);
+            }
+            if let Some(from) = &s.from
+                && let Some(sub) = &from.subquery
+            {
+                collect_body_col_refs(&sub.body, refs);
+            }
+            for j in &s.joins {
+                collect_col_refs(&j.on, refs);
+                if let Some(sub) = &j.table.subquery {
+                    collect_body_col_refs(&sub.body, refs);
+                }
+            }
+            for e in &s.group_by {
+                collect_col_refs(e, refs);
+            }
+            if let Some(h) = &s.having {
+                collect_col_refs(h, refs);
+            }
+            for (e, _) in &s.order_by {
+                collect_col_refs(e, refs);
+            }
+        }
+        QueryBody::SetOp { left, right, .. } => {
+            collect_body_col_refs(left, refs);
+            collect_body_col_refs(right, refs);
+        }
+    }
+}
+
 fn collect_col_refs<'a>(e: &'a Expr, out: &mut Vec<(&'a Option<String>, &'a str)>) {
     match e {
         Expr::Column { table, name } => out.push((table, name)),
@@ -3385,8 +3670,20 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             | BinOp::And
             | BinOp::Or => Some(SqlType::Bool),
             BinOp::Concat => Some(SqlType::Text),
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                 match (expr_type(left, schema), expr_type(right, schema)) {
+                    // ts ± ms → ts; ts - ts → ms (see `arithmetic`).
+                    (Some(SqlType::Timestamp), Some(SqlType::Timestamp))
+                        if matches!(op, BinOp::Sub) =>
+                    {
+                        Some(SqlType::Int)
+                    }
+                    (Some(SqlType::Timestamp), Some(SqlType::Int | SqlType::Double))
+                    | (Some(SqlType::Int | SqlType::Double), Some(SqlType::Timestamp))
+                        if matches!(op, BinOp::Add | BinOp::Sub) =>
+                    {
+                        Some(SqlType::Timestamp)
+                    }
                     (Some(SqlType::Double), _) | (_, Some(SqlType::Double)) => {
                         Some(SqlType::Double)
                     }
@@ -3402,7 +3699,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
         Expr::IsNull { .. } | Expr::In { .. } | Expr::InSubquery { .. } | Expr::CorrIn { .. } => {
             Some(SqlType::Bool)
         }
-        Expr::Aggregate { func, arg } => match func {
+        Expr::Aggregate { func, arg, .. } => match func {
             AggFunc::Count => Some(SqlType::Int),
             AggFunc::Avg => Some(SqlType::Double),
             AggFunc::Sum | AggFunc::Min | AggFunc::Max | AggFunc::Mode => {
@@ -3441,6 +3738,16 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
                 }
                 it.into_iter().find_map(|a| expr_type(a, schema))
             }
+            ScalarFunc::Now | ScalarFunc::DateTrunc(_) => Some(SqlType::Timestamp),
+            ScalarFunc::Extract(part) => Some(if matches!(part, DatePart::Epoch) {
+                SqlType::Double
+            } else {
+                SqlType::Int
+            }),
+            ScalarFunc::Floor | ScalarFunc::Ceil => args.first().and_then(|a| expr_type(a, schema)),
+            ScalarFunc::Power | ScalarFunc::Sqrt => Some(SqlType::Double),
+            ScalarFunc::Position => Some(SqlType::Int),
+            ScalarFunc::Lpad | ScalarFunc::Rpad => Some(SqlType::Text),
         },
         Expr::Param(_) | Expr::Subquery(_) | Expr::CorrScalar { .. } => None,
     }
@@ -3479,6 +3786,16 @@ fn default_name(expr: &Expr) -> String {
             ScalarFunc::Cast(_) => "cast".to_string(),
             ScalarFunc::Like { .. } => "like".to_string(),
             ScalarFunc::Case { .. } => "case".to_string(),
+            ScalarFunc::Now => "now".to_string(),
+            ScalarFunc::Extract(_) => "extract".to_string(),
+            ScalarFunc::DateTrunc(_) => "date_trunc".to_string(),
+            ScalarFunc::Floor => "floor".to_string(),
+            ScalarFunc::Ceil => "ceiling".to_string(),
+            ScalarFunc::Power => "power".to_string(),
+            ScalarFunc::Sqrt => "sqrt".to_string(),
+            ScalarFunc::Position => "position".to_string(),
+            ScalarFunc::Lpad => "lpad".to_string(),
+            ScalarFunc::Rpad => "rpad".to_string(),
         },
         Expr::Window { func, .. } => match func {
             WindowFunc::RowNumber => "row_number".to_string(),
@@ -3807,6 +4124,112 @@ where
                 (a, b) => Err(SqlError::Eval(format!("LIKE on {a:?} / {b:?}"))),
             }
         }
+        ScalarFunc::Now => {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            Ok(Value::Timestamp(ms))
+        }
+        ScalarFunc::Extract(part) => match eval(&args[0])? {
+            Value::Null => Ok(Value::Null),
+            Value::Timestamp(ms) => Ok(extract_part(part, ms)),
+            other => Err(SqlError::Eval(format!(
+                "EXTRACT from {other:?} (TIMESTAMP required)"
+            ))),
+        },
+        ScalarFunc::DateTrunc(part) => match eval(&args[0])? {
+            Value::Null => Ok(Value::Null),
+            Value::Timestamp(ms) => Ok(Value::Timestamp(date_trunc_ms(part, ms)?)),
+            other => Err(SqlError::Eval(format!(
+                "DATE_TRUNC of {other:?} (TIMESTAMP required)"
+            ))),
+        },
+        ScalarFunc::Floor | ScalarFunc::Ceil => {
+            let up = matches!(func, ScalarFunc::Ceil);
+            Ok(match eval(&args[0])? {
+                Value::Null => Value::Null,
+                Value::Int(n) => Value::Int(n),
+                Value::Double(f) => Value::Double(if up { f.ceil() } else { f.floor() }),
+                Value::Decimal(d) => {
+                    // Integer floor/ceil of mantissa/10^scale, exactly.
+                    let unit = 10i128.pow(d.scale());
+                    let m = d.mantissa();
+                    let q = if up {
+                        -(-m).div_euclid(unit)
+                    } else {
+                        m.div_euclid(unit)
+                    };
+                    Value::Decimal(Decimal::new(q, 0))
+                }
+                other => return Err(SqlError::Eval(format!("FLOOR/CEILING of {other:?}"))),
+            })
+        }
+        ScalarFunc::Power => {
+            let (a, b) = (eval(&args[0])?, eval(&args[1])?);
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let x = as_f64(&a).ok_or_else(|| SqlError::Eval(format!("POWER of {a:?}")))?;
+            let y = as_f64(&b).ok_or_else(|| SqlError::Eval(format!("POWER of {b:?}")))?;
+            Ok(Value::Double(x.powf(y)))
+        }
+        ScalarFunc::Sqrt => {
+            let a = eval(&args[0])?;
+            if matches!(a, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let x = as_f64(&a).ok_or_else(|| SqlError::Eval(format!("SQRT of {a:?}")))?;
+            if x < 0.0 {
+                return Err(SqlError::Eval("SQRT of a negative number".into()));
+            }
+            Ok(Value::Double(x.sqrt()))
+        }
+        ScalarFunc::Position => {
+            let (s, sub) = (
+                as_text(eval(&args[0])?, "POSITION")?,
+                as_text(eval(&args[1])?, "POSITION")?,
+            );
+            Ok(match (s, sub) {
+                // 1-based character index; 0 = not found; empty needle → 1.
+                (Some(s), Some(sub)) => Value::Int(match s.find(&sub) {
+                    Some(byte) => s[..byte].chars().count() as i64 + 1,
+                    None => 0,
+                }),
+                _ => Value::Null,
+            })
+        }
+        ScalarFunc::Lpad | ScalarFunc::Rpad => {
+            let Some(s) = as_text(eval(&args[0])?, "LPAD")? else {
+                return Ok(Value::Null);
+            };
+            let len = match eval(&args[1])? {
+                Value::Null => return Ok(Value::Null),
+                Value::Int(n) => n.max(0) as usize,
+                other => return Err(SqlError::Eval(format!("LPAD length {other:?}"))),
+            };
+            let fill = match args.get(2) {
+                None => " ".to_string(),
+                Some(e) => match as_text(eval(e)?, "LPAD")? {
+                    Some(f) => f,
+                    None => return Ok(Value::Null),
+                },
+            };
+            let n = s.chars().count();
+            Ok(Value::Text(if n >= len {
+                // Longer input truncates to `len` (PostgreSQL semantics).
+                s.chars().take(len).collect()
+            } else if fill.is_empty() {
+                s
+            } else {
+                let pad: String = fill.chars().cycle().take(len - n).collect();
+                if matches!(func, ScalarFunc::Lpad) {
+                    format!("{pad}{s}")
+                } else {
+                    format!("{s}{pad}")
+                }
+            }))
+        }
     }
 }
 
@@ -3943,12 +4366,17 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
             expr: Box::new(bind_expr(expr, schema)?),
             negated: *negated,
         },
-        Expr::Aggregate { func, arg } => Expr::Aggregate {
+        Expr::Aggregate {
+            func,
+            arg,
+            distinct,
+        } => Expr::Aggregate {
             func: *func,
             arg: match arg {
                 Some(a) => Some(Box::new(bind_expr(a, schema)?)),
                 None => None,
             },
+            distinct: *distinct,
         },
         Expr::In {
             expr,
@@ -4036,9 +4464,20 @@ fn eval_agg(
     params: &[Value],
 ) -> Result<Value> {
     match expr {
-        Expr::Aggregate { func, arg } => {
-            eval_aggregate(*func, arg.as_deref(), schema, src, tuples, group, params)
-        }
+        Expr::Aggregate {
+            func,
+            arg,
+            distinct,
+        } => eval_aggregate(
+            *func,
+            arg.as_deref(),
+            *distinct,
+            schema,
+            src,
+            tuples,
+            group,
+            params,
+        ),
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Param(i) => params
             .get(*i)
@@ -4095,9 +4534,121 @@ fn eval_agg(
     }
 }
 
+// ── calendar helpers (UTC, epoch-millisecond timestamps) ────────────────────
+
+/// Split epoch ms into (days since 1970-01-01, ms within that day), flooring.
+fn ms_to_days(ms: i64) -> (i64, i64) {
+    (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000))
+}
+
+/// Civil date from days since epoch (Howard Hinnant's civil-from-days).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Days since epoch for a civil date (the inverse of [`civil_from_days`];
+/// mirrors the math in `parser::parse_timestamp`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// ISO 8601 weekday: Monday = 1 .. Sunday = 7 (1970-01-01 was a Thursday).
+fn iso_weekday(days: i64) -> i64 {
+    (days + 3).rem_euclid(7) + 1
+}
+
+/// ISO 8601 week number (1..=53).
+fn iso_week(days: i64) -> i64 {
+    let weeks_in = |year: i64| -> i64 {
+        let jan1 = iso_weekday(days_from_civil(year, 1, 1));
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        // 53-week years start on Thursday, or on Wednesday when leap.
+        if jan1 == 4 || (leap && jan1 == 3) {
+            53
+        } else {
+            52
+        }
+    };
+    let (y, _, _) = civil_from_days(days);
+    let doy = days - days_from_civil(y, 1, 1) + 1;
+    let w = (doy - iso_weekday(days) + 10) / 7;
+    if w < 1 {
+        weeks_in(y - 1)
+    } else if w > weeks_in(y) {
+        1
+    } else {
+        w
+    }
+}
+
+/// `EXTRACT(part FROM ts)` over epoch ms, in UTC. PostgreSQL numbering:
+/// DOW Sunday = 0; MILLISECONDS includes the seconds field; EPOCH is
+/// fractional seconds (DOUBLE); everything else is an integer.
+fn extract_part(part: DatePart, ms: i64) -> Value {
+    let (days, in_day) = ms_to_days(ms);
+    match part {
+        DatePart::Epoch => Value::Double(ms as f64 / 1_000.0),
+        DatePart::Year => Value::Int(civil_from_days(days).0),
+        DatePart::Month => Value::Int(civil_from_days(days).1),
+        DatePart::Day => Value::Int(civil_from_days(days).2),
+        DatePart::Hour => Value::Int(in_day / 3_600_000),
+        DatePart::Minute => Value::Int(in_day / 60_000 % 60),
+        DatePart::Second => Value::Int(in_day / 1_000 % 60),
+        DatePart::Millisecond => Value::Int(in_day % 60_000),
+        DatePart::Dow => Value::Int(iso_weekday(days) % 7),
+        DatePart::Doy => {
+            let (y, _, _) = civil_from_days(days);
+            Value::Int(days - days_from_civil(y, 1, 1) + 1)
+        }
+        DatePart::Week => Value::Int(iso_week(days)),
+    }
+}
+
+/// `DATE_TRUNC('part', ts)` over epoch ms, in UTC. Weeks start on Monday
+/// (ISO 8601, like PostgreSQL).
+fn date_trunc_ms(part: DatePart, ms: i64) -> Result<i64> {
+    let (days, in_day) = ms_to_days(ms);
+    Ok(match part {
+        DatePart::Millisecond => ms,
+        DatePart::Second => days * 86_400_000 + in_day / 1_000 * 1_000,
+        DatePart::Minute => days * 86_400_000 + in_day / 60_000 * 60_000,
+        DatePart::Hour => days * 86_400_000 + in_day / 3_600_000 * 3_600_000,
+        DatePart::Day => days * 86_400_000,
+        DatePart::Week => (days - (iso_weekday(days) - 1)) * 86_400_000,
+        DatePart::Month => {
+            let (y, m, _) = civil_from_days(days);
+            days_from_civil(y, m, 1) * 86_400_000
+        }
+        DatePart::Year => {
+            let (y, _, _) = civil_from_days(days);
+            days_from_civil(y, 1, 1) * 86_400_000
+        }
+        DatePart::Dow | DatePart::Doy | DatePart::Epoch => {
+            return Err(SqlError::Eval(format!("date_trunc part {part:?}")));
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn eval_aggregate(
     func: AggFunc,
     arg: Option<&Expr>,
+    distinct: bool,
     schema: &[ColRef],
     src: &Sources,
     tuples: &Tuples,
@@ -4106,6 +4657,8 @@ fn eval_aggregate(
 ) -> Result<Value> {
     // COUNT(*) counts all rows; COUNT(expr) counts non-null; others fold
     // values. All folds stream — no per-group buffering of evaluated values.
+    // DISTINCT folds (COUNT/SUM/AVG) additionally keep a set of seen values;
+    // it is a no-op for MIN/MAX.
     if func == AggFunc::Count && arg.is_none() {
         return Ok(Value::Int(group.len() as i64));
     }
@@ -4114,11 +4667,16 @@ fn eval_aggregate(
         src,
         tuple: tuples.row(*i as usize),
     };
+    let mut seen: std::collections::BTreeSet<IndexKey> = std::collections::BTreeSet::new();
+    // True when this non-null value should be folded (always without
+    // DISTINCT; first occurrence only with it).
+    let mut admit = |v: &Value| !distinct || seen.insert(IndexKey(v.clone()));
     match func {
         AggFunc::Count => {
             let mut n: i64 = 0;
             for i in group {
-                if !matches!(eval_scalar(arg, schema, &view_of(i), params)?, Value::Null) {
+                let v = eval_scalar(arg, schema, &view_of(i), params)?;
+                if !matches!(v, Value::Null) && admit(&v) {
                     n += 1;
                 }
             }
@@ -4152,7 +4710,7 @@ fn eval_aggregate(
             let mut n: i64 = 0;
             for i in group {
                 let v = eval_scalar(arg, schema, &view_of(i), params)?;
-                if matches!(v, Value::Null) {
+                if matches!(v, Value::Null) || !admit(&v) {
                     continue;
                 }
                 sum.add(&v)?;
@@ -4340,7 +4898,7 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
                 None => Err(SqlError::Eval(format!("cannot compare {l:?} and {r:?}"))),
             }
         }
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => arithmetic(op, l, r),
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => arithmetic(op, l, r),
     }
 }
 
@@ -4383,6 +4941,34 @@ fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
     }
+    // Timestamp arithmetic: ts ± <ms> stays a timestamp; ts - ts is the
+    // difference in milliseconds. (INTERVAL literals fold to ms integers.)
+    match (&l, &r, op) {
+        (Value::Timestamp(t), Value::Int(ms), BinOp::Add) => {
+            return Ok(Value::Timestamp(t.wrapping_add(*ms)));
+        }
+        (Value::Timestamp(t), Value::Int(ms), BinOp::Sub) => {
+            return Ok(Value::Timestamp(t.wrapping_sub(*ms)));
+        }
+        (Value::Int(ms), Value::Timestamp(t), BinOp::Add) => {
+            return Ok(Value::Timestamp(t.wrapping_add(*ms)));
+        }
+        (Value::Timestamp(a), Value::Timestamp(b), BinOp::Sub) => {
+            return Ok(Value::Int(a.wrapping_sub(*b)));
+        }
+        // Fractional ms (e.g. an EF `AddDays(0.5)` → `ts + days*86400000.0`)
+        // round to the nearest millisecond.
+        (Value::Timestamp(t), Value::Double(ms), BinOp::Add) => {
+            return Ok(Value::Timestamp(t.wrapping_add(ms.round() as i64)));
+        }
+        (Value::Timestamp(t), Value::Double(ms), BinOp::Sub) => {
+            return Ok(Value::Timestamp(t.wrapping_sub(ms.round() as i64)));
+        }
+        (Value::Double(ms), Value::Timestamp(t), BinOp::Add) => {
+            return Ok(Value::Timestamp(t.wrapping_add(ms.round() as i64)));
+        }
+        _ => {}
+    }
     if let (Value::Int(a), Value::Int(b)) = (&l, &r) {
         let (a, b) = (*a, *b);
         return Ok(Value::Int(match op {
@@ -4394,6 +4980,12 @@ fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
                     return Err(SqlError::Eval("division by zero".into()));
                 }
                 a / b
+            }
+            BinOp::Mod => {
+                if b == 0 {
+                    return Err(SqlError::Eval("division by zero".into()));
+                }
+                a % b
             }
             _ => unreachable!(),
         }));
@@ -4410,6 +5002,9 @@ fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
             BinOp::Div => a
                 .div(&b, a.div_scale(&b))
                 .ok_or_else(|| SqlError::Eval("division by zero".into()))?,
+            BinOp::Mod => a
+                .rem(&b)
+                .ok_or_else(|| SqlError::Eval("division by zero".into()))?,
             _ => unreachable!(),
         }));
     }
@@ -4424,6 +5019,12 @@ fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
                 return Err(SqlError::Eval("division by zero".into()));
             }
             a / b
+        }
+        BinOp::Mod => {
+            if b == 0.0 {
+                return Err(SqlError::Eval("division by zero".into()));
+            }
+            a % b
         }
         _ => unreachable!(),
     }))

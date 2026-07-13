@@ -140,11 +140,24 @@ fn join_with_where_filter() {
 }
 
 #[test]
-fn cross_join_style_unsupported_without_on() {
+fn cross_join_is_a_cartesian_product() {
     let (_d, db) = open();
     seed(&db);
-    // CROSS JOIN (no ON) is not supported -> clean error, not a panic.
-    assert!(db.execute("SELECT c.id FROM c CROSS JOIN o").is_err());
+    // CROSS JOIN = INNER ... ON TRUE; comma joins are still rejected.
+    let n = match rows(&db, "SELECT COUNT(*) AS n FROM c CROSS JOIN o")[0][0] {
+        oxidb_sql::Value::Int(n) => n,
+        ref other => panic!("count returned {other:?}"),
+    };
+    let c = match rows(&db, "SELECT COUNT(*) AS n FROM c")[0][0] {
+        oxidb_sql::Value::Int(n) => n,
+        ref other => panic!("count returned {other:?}"),
+    };
+    let o = match rows(&db, "SELECT COUNT(*) AS n FROM o")[0][0] {
+        oxidb_sql::Value::Int(n) => n,
+        ref other => panic!("count returned {other:?}"),
+    };
+    assert_eq!(n, c * o);
+    assert!(db.execute("SELECT * FROM c, o").is_err());
 }
 
 /// Composite equi-join key (`a.k1 = b.k1 AND a.k2 = b.k2`) — exercises the

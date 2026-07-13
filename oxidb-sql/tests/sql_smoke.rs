@@ -163,9 +163,10 @@ fn errors_surface_cleanly() {
     assert!(db.execute("SELECT * FROM nope").is_err());
     // unknown column
     assert!(db.execute("SELECT missing FROM t").is_err());
-    // unsupported set operation should error, not panic (UNION is supported)
+    // EXCEPT/INTERSECT are supported set operations now; a mismatched arity
+    // still errors cleanly, and it names the operation.
     assert!(
-        db.execute("SELECT id FROM t EXCEPT SELECT id FROM t")
+        db.execute("SELECT id FROM t EXCEPT SELECT id, id FROM t")
             .is_err()
     );
     // parse error

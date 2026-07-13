@@ -65,22 +65,22 @@ fn drop_missing_table() {
 fn unsupported_select_features() {
     let (_d, db) = open();
     t1(&db);
-    // UNION and OFFSET are supported now; EXCEPT/INTERSECT are not.
+    // UNION, EXCEPT, INTERSECT, and OFFSET are all supported now.
     assert!(
         db.execute("SELECT id FROM t EXCEPT SELECT id FROM t")
-            .is_err()
+            .is_ok()
     );
     assert!(
         db.execute("SELECT id FROM t INTERSECT SELECT id FROM t")
-            .is_err()
+            .is_ok()
     );
-    // SELECT DISTINCT (Phase A) and DISTINCT ON (argmax) are supported; aggregate
-    // DISTINCT still is not.
+    // SELECT DISTINCT (Phase A), DISTINCT ON (argmax), and aggregate DISTINCT
+    // are all supported.
     assert!(
         db.execute("SELECT DISTINCT ON (id) id FROM t ORDER BY id")
             .is_ok()
     );
-    assert!(db.execute("SELECT COUNT(DISTINCT id) FROM t").is_err());
+    assert!(db.execute("SELECT COUNT(DISTINCT id) FROM t").is_ok());
     // Derived tables are supported since ADR-0013 Phase E; an alias is required.
     assert!(db.execute("SELECT * FROM (SELECT id FROM t) x").is_ok());
     assert!(db.execute("SELECT * FROM (SELECT id FROM t)").is_err());

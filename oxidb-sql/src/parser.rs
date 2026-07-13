@@ -8,8 +8,9 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    AggFunc, AlterOp, BinOp, Expr, Join, JoinKind, LimitExpr, QueryBody, ScalarFunc, SelectItem,
-    SelectQuery, SelectStmt, ShowKind, Statement, TableRef, UnOp, WindowFunc,
+    AggFunc, AlterOp, BinOp, DatePart, Expr, Join, JoinKind, LimitExpr, QueryBody, ScalarFunc,
+    SelectItem, SelectQuery, SelectStmt, SetOpKind, ShowKind, Statement, TableRef, UnOp,
+    WindowFunc,
 };
 use crate::catalog::{Column, Table};
 use crate::error::{Result, SqlError};
@@ -1211,7 +1212,9 @@ fn inline_ctes_body(b: &mut QueryBody, ctes: &[(String, SelectQuery)]) {
 }
 
 fn inline_ctes_select(s: &mut SelectStmt, ctes: &[(String, SelectQuery)]) {
-    inline_ctes_tableref(&mut s.from, ctes);
+    if let Some(from) = &mut s.from {
+        inline_ctes_tableref(from, ctes);
+    }
     for j in &mut s.joins {
         inline_ctes_tableref(&mut j.table, ctes);
         inline_ctes_expr(&mut j.on, ctes);
@@ -1323,17 +1326,24 @@ fn translate_set_expr(e: sp::SetExpr, p: &mut usize) -> Result<QueryBody> {
             left,
             right,
         } => {
-            if op != sp::SetOperator::Union {
-                return Err(SqlError::Unsupported(format!("set operation {op}")));
-            }
+            let op = match op {
+                sp::SetOperator::Union => SetOpKind::Union,
+                sp::SetOperator::Except => SetOpKind::Except,
+                sp::SetOperator::Intersect => SetOpKind::Intersect,
+                other => return Err(SqlError::Unsupported(format!("set operation {other}"))),
+            };
             let all = match set_quantifier {
                 sp::SetQuantifier::All => true,
                 sp::SetQuantifier::None | sp::SetQuantifier::Distinct => false,
                 other => {
-                    return Err(SqlError::Unsupported(format!("UNION quantifier {other}")));
+                    return Err(SqlError::Unsupported(format!(
+                        "{} quantifier {other}",
+                        op.name()
+                    )));
                 }
             };
             Ok(QueryBody::SetOp {
+                op,
                 all,
                 left: Box::new(translate_set_expr(*left, p)?),
                 right: Box::new(translate_set_expr(*right, p)?),
@@ -1344,7 +1354,7 @@ fn translate_set_expr(e: sp::SetExpr, p: &mut usize) -> Result<QueryBody> {
         sp::SetExpr::Query(inner) => {
             if inner.order_by.is_some() || inner.limit_clause.is_some() {
                 return Err(SqlError::Unsupported(
-                    "ORDER BY / LIMIT inside a UNION branch".into(),
+                    "ORDER BY / LIMIT inside a set-operation branch".into(),
                 ));
             }
             translate_set_expr(*inner.body, p)
@@ -1354,7 +1364,7 @@ fn translate_set_expr(e: sp::SetExpr, p: &mut usize) -> Result<QueryBody> {
 }
 
 fn translate_select_core(select: sp::Select, p: &mut usize) -> Result<SelectStmt> {
-    if select.from.len() != 1 {
+    if select.from.len() > 1 {
         return Err(SqlError::Unsupported(
             "SELECT must reference exactly one table in FROM (use JOIN)".into(),
         ));
@@ -1376,12 +1386,28 @@ fn translate_select_core(select: sp::Select, p: &mut usize) -> Result<SelectStmt
         }
     };
 
-    let from = table_ref_from_factor(&select.from[0].relation, p)?;
+    // FROM-less SELECT (`SELECT 1`): no source, no joins.
+    let from = match select.from.first() {
+        Some(twj) => Some(table_ref_from_factor(&twj.relation, p)?),
+        None => None,
+    };
 
     // JOINs: INNER / LEFT / RIGHT / FULL, all with an ON predicate.
     let mut joins = Vec::new();
-    for j in &select.from[0].joins {
+    for j in select.from.first().map(|twj| &twj.joins[..]).unwrap_or(&[]) {
         let table = table_ref_from_factor(&j.relation, p)?;
+        // CROSS JOIN desugars to INNER ... ON TRUE (a cartesian product).
+        if matches!(
+            j.join_operator,
+            sp::JoinOperator::CrossJoin(sp::JoinConstraint::None)
+        ) {
+            joins.push(Join {
+                table,
+                kind: JoinKind::Inner,
+                on: Expr::Literal(Value::Bool(true)),
+            });
+            continue;
+        }
         let (kind, constraint) = match &j.join_operator {
             sp::JoinOperator::Inner(c) | sp::JoinOperator::Join(c) => (JoinKind::Inner, c),
             sp::JoinOperator::Left(c) | sp::JoinOperator::LeftOuter(c) => (JoinKind::Left, c),
@@ -1401,6 +1427,11 @@ fn translate_select_core(select: sp::Select, p: &mut usize) -> Result<SelectStmt
                 )));
             }
         };
+        if table.lateral && matches!(kind, JoinKind::Right | JoinKind::Full) {
+            // The right side would need rows for unmatched left rows it can't
+            // see — PostgreSQL rejects these too.
+            return Err(SqlError::Unsupported("RIGHT/FULL JOIN LATERAL".into()));
+        }
         joins.push(Join { table, kind, on });
     }
 
@@ -1730,6 +1761,41 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
                 negated,
             })
         }
+        sp::Expr::Extract { field, expr, .. } => Ok(Expr::Func {
+            func: ScalarFunc::Extract(map_date_part(&field)?),
+            args: vec![translate_expr(*expr, p)?],
+        }),
+        // FLOOR/CEIL parse as dedicated nodes, not function calls. Only the
+        // plain numeric form (no `TO <field>` / scale) is supported.
+        e @ (sp::Expr::Floor { .. } | sp::Expr::Ceil { .. }) => {
+            let up = matches!(e, sp::Expr::Ceil { .. });
+            let (sp::Expr::Floor { expr, field } | sp::Expr::Ceil { expr, field }) = e else {
+                unreachable!()
+            };
+            if !matches!(
+                field,
+                sp::CeilFloorKind::DateTimeField(sp::DateTimeField::NoDateTime)
+            ) {
+                return Err(SqlError::Unsupported("FLOOR/CEIL TO <field>".into()));
+            }
+            Ok(Expr::Func {
+                func: if up {
+                    ScalarFunc::Ceil
+                } else {
+                    ScalarFunc::Floor
+                },
+                args: vec![translate_expr(*expr, p)?],
+            })
+        }
+        // `POSITION(sub IN s)` — engine arg order is `[s, sub]` (STRPOS order).
+        sp::Expr::Position { expr, r#in } => Ok(Expr::Func {
+            func: ScalarFunc::Position,
+            args: vec![translate_expr(*r#in, p)?, translate_expr(*expr, p)?],
+        }),
+        // `INTERVAL '...'` — a fixed-length duration folded to a millisecond
+        // integer literal, so `ts + INTERVAL '1 hour'` is plain arithmetic.
+        // Calendar units (month/year) have no fixed length and are rejected.
+        sp::Expr::Interval(iv) => Ok(Expr::Literal(Value::Int(interval_ms(&iv)?))),
         other => Err(SqlError::Unsupported(format!("expression {other:?}"))),
     }
 }
@@ -1818,6 +1884,87 @@ pub(crate) fn parse_timestamp(s: &str) -> Result<i64> {
     Ok(secs * 1_000 + millis)
 }
 
+/// Map a sqlparser date-time field to an engine [`DatePart`].
+fn map_date_part(f: &sp::DateTimeField) -> Result<DatePart> {
+    use sp::DateTimeField as F;
+    Ok(match f {
+        F::Year | F::Years => DatePart::Year,
+        F::Month | F::Months => DatePart::Month,
+        F::Day | F::Days => DatePart::Day,
+        F::Hour | F::Hours => DatePart::Hour,
+        F::Minute | F::Minutes => DatePart::Minute,
+        F::Second | F::Seconds => DatePart::Second,
+        F::Millisecond | F::Milliseconds => DatePart::Millisecond,
+        F::Dow | F::DayOfWeek => DatePart::Dow,
+        F::Doy | F::DayOfYear => DatePart::Doy,
+        F::Week(None) | F::Weeks => DatePart::Week,
+        F::Epoch => DatePart::Epoch,
+        other => {
+            return Err(SqlError::Unsupported(format!("date part {other}")));
+        }
+    })
+}
+
+/// Milliseconds per fixed-length interval unit; `None` for calendar units.
+fn fixed_unit_ms(unit: &str) -> Option<i64> {
+    Some(match unit.trim_end_matches('s') {
+        "millisecond" | "msec" | "ms" => 1,
+        "second" | "sec" => 1_000,
+        "minute" | "min" => 60_000,
+        "hour" => 3_600_000,
+        "day" => 86_400_000,
+        "week" => 604_800_000,
+        _ => return None,
+    })
+}
+
+/// Fold an `INTERVAL` literal to milliseconds. Two source shapes:
+/// `INTERVAL '7' DAY` (unit in `leading_field`) and the PostgreSQL string
+/// form `INTERVAL '7 days'` / `'1 day 2 hours'` (units inside the string).
+fn interval_ms(iv: &sp::Interval) -> Result<i64> {
+    let calendar =
+        |u: &str| SqlError::Unsupported(format!("calendar INTERVAL unit {u} (month/year)"));
+    let bad = || SqlError::Parse(format!("bad INTERVAL literal {:?}", iv.value));
+    if iv.last_field.is_some() {
+        return Err(SqlError::Unsupported("INTERVAL ... TO ... ranges".into()));
+    }
+    let body = match iv.value.as_ref() {
+        sp::Expr::Value(v) => match &v.value {
+            sp::Value::SingleQuotedString(s) | sp::Value::DoubleQuotedString(s) => s.clone(),
+            sp::Value::Number(n, _) => n.clone(),
+            other => return Err(SqlError::Unsupported(format!("INTERVAL value {other}"))),
+        },
+        other => return Err(SqlError::Unsupported(format!("INTERVAL value {other}"))),
+    };
+    if let Some(field) = &iv.leading_field {
+        // `INTERVAL '7' DAY` — the whole string is the count.
+        let n: f64 = body.trim().parse().map_err(|_| bad())?;
+        let unit = match map_date_part(field)? {
+            DatePart::Millisecond => 1i64,
+            DatePart::Second => 1_000,
+            DatePart::Minute => 60_000,
+            DatePart::Hour => 3_600_000,
+            DatePart::Day => 86_400_000,
+            DatePart::Week => 604_800_000,
+            _ => return Err(calendar(&format!("{field}"))),
+        };
+        return Ok((n * unit as f64).round() as i64);
+    }
+    // String form: one or more `<number> <unit>` pairs.
+    let tokens: Vec<&str> = body.split_whitespace().collect();
+    if tokens.is_empty() || tokens.len() % 2 != 0 {
+        return Err(bad());
+    }
+    let mut total = 0i64;
+    for pair in tokens.chunks(2) {
+        let n: f64 = pair[0].parse().map_err(|_| bad())?;
+        let unit = pair[1].to_ascii_lowercase();
+        let ms = fixed_unit_ms(&unit).ok_or_else(|| calendar(&unit))?;
+        total += (n * ms as f64).round() as i64;
+    }
+    Ok(total)
+}
+
 /// Rewrite an EXISTS subquery body's projection to the literal `1` (its
 /// output values are irrelevant; only row existence matters). Aggregated
 /// bodies keep their aggregate-driven row count semantics and are rejected.
@@ -1844,18 +1991,115 @@ fn exists_projection(body: &mut QueryBody) -> Result<()> {
 
 fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
     let fname = object_name_to_string(&f.name)?.to_ascii_lowercase();
-    let args = match f.args {
+    let (args, distinct) = match f.args {
         sp::FunctionArguments::List(list) => {
-            if list.duplicate_treatment == Some(sp::DuplicateTreatment::Distinct) {
-                return Err(SqlError::Unsupported("aggregate DISTINCT".into()));
-            }
-            list.args
+            let distinct = list.duplicate_treatment == Some(sp::DuplicateTreatment::Distinct);
+            (list.args, distinct)
         }
-        sp::FunctionArguments::None => Vec::new(),
+        sp::FunctionArguments::None => (Vec::new(), false),
         sp::FunctionArguments::Subquery(_) => {
             return Err(SqlError::Unsupported("aggregate over subquery".into()));
         }
     };
+    if distinct && !matches!(fname.as_str(), "count" | "sum" | "avg" | "min" | "max") {
+        return Err(SqlError::Unsupported(format!("{fname}(DISTINCT ...)")));
+    }
+    // Functions whose engine form is resolved from their arguments.
+    let unnamed_args = |args: Vec<sp::FunctionArg>, p: &mut usize| -> Result<Vec<Expr>> {
+        args.into_iter()
+            .map(|a| match a {
+                sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(e)) => translate_expr(e, p),
+                other => Err(SqlError::Unsupported(format!(
+                    "{fname}() argument {other:?}"
+                ))),
+            })
+            .collect()
+    };
+    if fname == "date_part" {
+        // `date_part('year', ts)` — the function form of EXTRACT (PostgreSQL).
+        if f.over.is_some() {
+            return Err(SqlError::Unsupported("date_part() OVER (...)".into()));
+        }
+        let mut exprs = unnamed_args(args, p)?;
+        if exprs.len() != 2 {
+            return Err(SqlError::Unsupported(format!(
+                "date_part() with {} arguments",
+                exprs.len()
+            )));
+        }
+        let Expr::Literal(Value::Text(unit)) = &exprs[0] else {
+            return Err(SqlError::Unsupported(
+                "date_part() part must be a string literal".into(),
+            ));
+        };
+        let part = match unit.to_ascii_lowercase().trim_end_matches('s') {
+            "year" => DatePart::Year,
+            "month" => DatePart::Month,
+            "day" => DatePart::Day,
+            "hour" => DatePart::Hour,
+            "minute" | "min" => DatePart::Minute,
+            "second" | "sec" => DatePart::Second,
+            "millisecond" | "m" => DatePart::Millisecond,
+            "dow" => DatePart::Dow,
+            "doy" => DatePart::Doy,
+            "week" => DatePart::Week,
+            "epoch" => DatePart::Epoch,
+            other => {
+                return Err(SqlError::Unsupported(format!("date_part part {other:?}")));
+            }
+        };
+        return Ok(Expr::Func {
+            func: ScalarFunc::Extract(part),
+            args: vec![exprs.remove(1)],
+        });
+    }
+    if fname == "date_trunc" {
+        // `DATE_TRUNC('day', ts)` — the unit must be a string literal so the
+        // part is fixed at parse time.
+        if f.over.is_some() {
+            return Err(SqlError::Unsupported("date_trunc() OVER (...)".into()));
+        }
+        let mut exprs = unnamed_args(args, p)?;
+        if exprs.len() != 2 {
+            return Err(SqlError::Unsupported(format!(
+                "date_trunc() with {} arguments",
+                exprs.len()
+            )));
+        }
+        let Expr::Literal(Value::Text(unit)) = &exprs[0] else {
+            return Err(SqlError::Unsupported(
+                "date_trunc() unit must be a string literal".into(),
+            ));
+        };
+        let part = match unit.to_ascii_lowercase().trim_end_matches('s') {
+            "year" => DatePart::Year,
+            "month" => DatePart::Month,
+            "week" => DatePart::Week,
+            "day" => DatePart::Day,
+            "hour" => DatePart::Hour,
+            "minute" | "min" => DatePart::Minute,
+            "second" | "sec" => DatePart::Second,
+            "millisecond" | "ms" => DatePart::Millisecond,
+            other => {
+                return Err(SqlError::Unsupported(format!("date_trunc unit {other:?}")));
+            }
+        };
+        return Ok(Expr::Func {
+            func: ScalarFunc::DateTrunc(part),
+            args: vec![exprs.remove(1)],
+        });
+    }
+    if fname == "mod" {
+        // `MOD(a, b)` — the `%` operator in function form.
+        let exprs = unnamed_args(args, p)?;
+        let [a, b] = <[Expr; 2]>::try_from(exprs)
+            .map_err(|v| SqlError::Unsupported(format!("mod() with {} arguments", v.len())))?;
+        return Ok(Expr::Binary {
+            op: BinOp::Mod,
+            left: Box::new(a),
+            right: Box::new(b),
+        });
+    }
     // Row-scalar functions (before the single-argument aggregate path).
     if let Some(func) = match fname.as_str() {
         "coalesce" | "ifnull" => Some(ScalarFunc::Coalesce),
@@ -1873,6 +2117,14 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
         "replace" => Some(ScalarFunc::Replace),
         "abs" => Some(ScalarFunc::Abs),
         "round" => Some(ScalarFunc::Round),
+        "now" | "current_timestamp" => Some(ScalarFunc::Now),
+        "floor" => Some(ScalarFunc::Floor),
+        "ceil" | "ceiling" => Some(ScalarFunc::Ceil),
+        "power" | "pow" => Some(ScalarFunc::Power),
+        "sqrt" => Some(ScalarFunc::Sqrt),
+        "strpos" | "position" => Some(ScalarFunc::Position),
+        "lpad" => Some(ScalarFunc::Lpad),
+        "rpad" => Some(ScalarFunc::Rpad),
         _ => None,
     } {
         if f.over.is_some() {
@@ -1905,8 +2157,17 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             | ScalarFunc::Abs => exprs.len() == 1,
             ScalarFunc::Round => exprs.len() == 1 || exprs.len() == 2,
             ScalarFunc::Substring => exprs.len() == 2 || exprs.len() == 3,
-            // Cast/Like/Case never arrive through the function-name path.
-            ScalarFunc::Cast(_) | ScalarFunc::Like { .. } | ScalarFunc::Case { .. } => false,
+            ScalarFunc::Now => exprs.is_empty(),
+            ScalarFunc::Floor | ScalarFunc::Ceil | ScalarFunc::Sqrt => exprs.len() == 1,
+            ScalarFunc::Power | ScalarFunc::Position => exprs.len() == 2,
+            ScalarFunc::Lpad | ScalarFunc::Rpad => exprs.len() == 2 || exprs.len() == 3,
+            // Cast/Like/Case/Extract/DateTrunc never arrive through the
+            // function-name path.
+            ScalarFunc::Cast(_)
+            | ScalarFunc::Like { .. }
+            | ScalarFunc::Case { .. }
+            | ScalarFunc::Extract(_)
+            | ScalarFunc::DateTrunc(_) => false,
         };
         if !ok_arity {
             return Err(SqlError::Unsupported(format!(
@@ -1937,6 +2198,7 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
         return Ok(Expr::Aggregate {
             func: AggFunc::Mode,
             arg: Some(Box::new(arg)),
+            distinct: false,
         });
     }
     if !f.within_group.is_empty() {
@@ -1965,6 +2227,11 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
 
     // Window function? (`... OVER (...)`)
     if let Some(over) = f.over {
+        if distinct {
+            return Err(SqlError::Unsupported(
+                "DISTINCT in a window aggregate".into(),
+            ));
+        }
         let spec = match over {
             sp::WindowType::WindowSpec(spec) => spec,
             sp::WindowType::NamedWindow(_) => {
@@ -2014,7 +2281,14 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
         "max" => AggFunc::Max,
         other => return Err(SqlError::Unsupported(format!("function {other}()"))),
     };
-    Ok(Expr::Aggregate { func, arg })
+    if distinct && arg.is_none() {
+        return Err(SqlError::Unsupported("COUNT(DISTINCT *)".into()));
+    }
+    Ok(Expr::Aggregate {
+        func,
+        arg,
+        distinct,
+    })
 }
 
 fn map_binary_op(op: &sp::BinaryOperator) -> Result<BinOp> {
@@ -2032,6 +2306,7 @@ fn map_binary_op(op: &sp::BinaryOperator) -> Result<BinOp> {
         B::Minus => BinOp::Sub,
         B::Multiply => BinOp::Mul,
         B::Divide => BinOp::Div,
+        B::Modulo => BinOp::Mod,
         B::StringConcat => BinOp::Concat,
         other => return Err(SqlError::Unsupported(format!("binary operator {other:?}"))),
     };
@@ -2133,15 +2408,13 @@ fn table_ref_from_factor(factor: &sp::TableFactor, p: &mut usize) -> Result<Tabl
             name: object_name_to_string(name)?,
             alias: alias.as_ref().map(|a| a.name.value.clone()),
             subquery: None,
+            lateral: false,
         }),
         sp::TableFactor::Derived {
             lateral,
             subquery,
             alias,
         } => {
-            if *lateral {
-                return Err(SqlError::Unsupported("LATERAL subquery in FROM".into()));
-            }
             let Some(alias) = alias else {
                 return Err(SqlError::Unsupported(
                     "derived table without an alias (add `AS name`)".into(),
@@ -2152,6 +2425,7 @@ fn table_ref_from_factor(factor: &sp::TableFactor, p: &mut usize) -> Result<Tabl
                 name: alias.name.value.clone(),
                 alias: Some(alias.name.value.clone()),
                 subquery: Some(Box::new(q)),
+                lateral: *lateral,
             })
         }
         other => Err(SqlError::Unsupported(format!("table factor {other:?}"))),

@@ -149,12 +149,32 @@ pub enum LimitExpr {
     Param(usize),
 }
 
-/// The body of a query: one SELECT, or a UNION [ALL] of two bodies.
+/// Which set operation combines two query bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpKind {
+    Union,
+    Except,
+    Intersect,
+}
+
+impl SetOpKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            SetOpKind::Union => "UNION",
+            SetOpKind::Except => "EXCEPT",
+            SetOpKind::Intersect => "INTERSECT",
+        }
+    }
+}
+
+/// The body of a query: one SELECT, or a set operation
+/// (UNION/EXCEPT/INTERSECT [ALL]) of two bodies.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryBody {
     Select(Box<SelectStmt>),
     SetOp {
-        /// `true` = UNION ALL (keep duplicates); `false` = UNION (distinct).
+        op: SetOpKind,
+        /// `true` = ALL (bag semantics); `false` = distinct (set semantics).
         all: bool,
         left: Box<QueryBody>,
         right: Box<QueryBody>,
@@ -170,7 +190,9 @@ pub struct SelectStmt {
     /// `SELECT DISTINCT ON (exprs)`: keep the first row of each group of these
     /// expressions after ORDER BY (Postgres semantics). Empty = not used.
     pub distinct_on: Vec<Expr>,
-    pub from: TableRef,
+    /// `None` = FROM-less SELECT (`SELECT 1`): expressions are evaluated once
+    /// against a single implicit row with no columns.
+    pub from: Option<TableRef>,
     pub joins: Vec<Join>,
     pub projection: Vec<SelectItem>,
     pub filter: Option<Expr>,
@@ -190,6 +212,10 @@ pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
     pub subquery: Option<Box<SelectQuery>>,
+    /// `JOIN LATERAL (SELECT ...)`: the subquery may reference columns of the
+    /// tables to its left and is re-executed per left row. Only meaningful on
+    /// a join's derived table.
+    pub lateral: bool,
 }
 
 impl TableRef {
@@ -258,9 +284,12 @@ pub enum Expr {
         negated: bool,
     },
     /// An aggregate function call. `arg` is `None` for `COUNT(*)`.
+    /// `distinct` folds each distinct value once (`COUNT(DISTINCT x)`,
+    /// `SUM(DISTINCT x)`, `AVG(DISTINCT x)`; a no-op for MIN/MAX).
     Aggregate {
         func: AggFunc,
         arg: Option<Box<Expr>>,
+        distinct: bool,
     },
     /// A scalar function evaluated per row (`COALESCE`, `NULLIF`, ...).
     Func {
@@ -353,6 +382,51 @@ pub enum ScalarFunc {
     Case {
         has_else: bool,
     },
+    /// `NOW()` / `CURRENT_TIMESTAMP` — the current UTC timestamp
+    /// (millisecond precision; evaluated at expression time).
+    Now,
+    /// `EXTRACT(part FROM ts)` — one component of a timestamp, in UTC.
+    /// Integer for every part except EPOCH (fractional seconds, DOUBLE).
+    Extract(DatePart),
+    /// `DATE_TRUNC('part', ts)` — the timestamp truncated to the start of
+    /// `part`, in UTC. The part is resolved from the literal at parse time.
+    DateTrunc(DatePart),
+    /// `FLOOR(x)` / `CEILING(x)` — integer-valued result in the argument's
+    /// numeric type (like ABS).
+    Floor,
+    Ceil,
+    /// `POWER(x, y)` — always DOUBLE.
+    Power,
+    /// `SQRT(x)` — always DOUBLE; negative argument errors.
+    Sqrt,
+    /// `POSITION(sub IN s)` / `STRPOS(s, sub)` — 1-based character index of
+    /// the first occurrence, 0 when absent. args: `[s, sub]`.
+    Position,
+    /// `LPAD(s, len [, fill])` / `RPAD(s, len [, fill])` — pad (or truncate)
+    /// `s` to `len` characters; `fill` defaults to a space.
+    Lpad,
+    Rpad,
+}
+
+/// A date/time component for [`ScalarFunc::Extract`] / [`ScalarFunc::DateTrunc`].
+/// All computation is calendar-UTC over epoch-millisecond timestamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatePart {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+    /// Day of week, PostgreSQL numbering: Sunday = 0 .. Saturday = 6.
+    Dow,
+    /// Day of year: 1..=366.
+    Doy,
+    /// ISO 8601 week number (EXTRACT only).
+    Week,
+    /// Seconds since epoch including the fractional part (EXTRACT only).
+    Epoch,
 }
 
 /// The function of a window expression.
@@ -393,6 +467,8 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// `%` — remainder (integer or float; sign follows the dividend).
+    Mod,
     /// `||` — string concatenation (NULL-propagating).
     Concat,
 }

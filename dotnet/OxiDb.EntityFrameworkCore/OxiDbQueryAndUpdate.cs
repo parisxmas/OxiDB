@@ -32,6 +32,27 @@ public sealed class OxiDbQuerySqlGenerator : QuerySqlGenerator
             Visit(selectExpression.Offset);
         }
     }
+
+    // EF's correlated-collection shapes arrive as CROSS/OUTER APPLY (SQL
+    // Server syntax); the engine speaks the PostgreSQL form of the same
+    // operator: [LEFT] JOIN LATERAL ... ON TRUE.
+    protected override System.Linq.Expressions.Expression VisitCrossApply(
+        CrossApplyExpression crossApplyExpression)
+    {
+        Sql.Append("JOIN LATERAL ");
+        Visit(crossApplyExpression.Table);
+        Sql.Append(" ON TRUE");
+        return crossApplyExpression;
+    }
+
+    protected override System.Linq.Expressions.Expression VisitOuterApply(
+        OuterApplyExpression outerApplyExpression)
+    {
+        Sql.Append("LEFT JOIN LATERAL ");
+        Visit(outerApplyExpression.Table);
+        Sql.Append(" ON TRUE");
+        return outerApplyExpression;
+    }
 }
 
 public sealed class OxiDbQuerySqlGeneratorFactory : IQuerySqlGeneratorFactory

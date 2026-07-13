@@ -210,6 +210,118 @@ fn union_order_limit_offset_apply_to_combined_result() {
     );
 }
 
+// ── FROM-less SELECT ────────────────────────────────────────────────────────
+
+#[test]
+fn from_less_select_evaluates_expressions_once() {
+    let (_d, db) = open();
+    assert_eq!(rows(&db, "SELECT 1"), vec![vec![i(1)]]);
+    let (cols, r) = cols_rows(&db, "SELECT 1 + 2 * 3 AS x, 'hi' AS s");
+    assert_eq!(cols, vec!["x", "s"]);
+    assert_eq!(r, vec![vec![i(7), t("hi")]]);
+    // Bind parameters work without a table.
+    assert_eq!(
+        rows_p(&db, "SELECT ? + 1", &[Value::Int(41)]),
+        vec![vec![i(42)]]
+    );
+}
+
+#[test]
+fn from_less_select_where_and_aggregates() {
+    let (_d, db) = open();
+    // WHERE can drop the implicit row.
+    assert!(rows(&db, "SELECT 1 WHERE 1 = 0").is_empty());
+    assert_eq!(rows(&db, "SELECT 1 WHERE 1 = 1"), vec![vec![i(1)]]);
+    // Aggregates see the single implicit row (PostgreSQL: SELECT COUNT(*) → 1).
+    assert_eq!(rows(&db, "SELECT COUNT(*) AS n"), vec![vec![i(1)]]);
+    // Column references still error — there is nothing to resolve against.
+    assert!(db.execute("SELECT missing").is_err());
+}
+
+#[test]
+fn from_less_select_in_set_operations() {
+    let (_d, db) = open();
+    assert_eq!(
+        rows(&db, "SELECT 1 UNION ALL SELECT 2 ORDER BY 1"),
+        vec![vec![i(1)], vec![i(2)]]
+    );
+    db.execute("CREATE TABLE a (x INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1),(3)").unwrap();
+    // Mixed arms: table SELECT vs FROM-less SELECT.
+    assert_eq!(
+        rows(&db, "SELECT x FROM a EXCEPT SELECT 1"),
+        vec![vec![i(3)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT x FROM a INTERSECT SELECT 1"),
+        vec![vec![i(1)]]
+    );
+}
+
+#[test]
+fn except_distinct_and_all() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE a (x INT)").unwrap();
+    db.execute("CREATE TABLE b (x INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1),(2),(2),(2),(3)")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (2),(3),(4)").unwrap();
+    // EXCEPT: distinct left rows not present in the right arm.
+    assert_eq!(
+        rows(&db, "SELECT x FROM a EXCEPT SELECT x FROM b ORDER BY x"),
+        vec![vec![i(1)]]
+    );
+    // EXCEPT ALL: bag difference — each right row cancels one left copy
+    // (three 2s minus one 2 leaves two).
+    assert_eq!(
+        rows(&db, "SELECT x FROM a EXCEPT ALL SELECT x FROM b ORDER BY x"),
+        vec![vec![i(1)], vec![i(2)], vec![i(2)]]
+    );
+}
+
+#[test]
+fn intersect_distinct_and_all() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE a (x INT)").unwrap();
+    db.execute("CREATE TABLE b (x INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1),(2),(2),(2),(3)")
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (2),(2),(3),(4)").unwrap();
+    // INTERSECT: distinct rows present in both arms.
+    assert_eq!(
+        rows(&db, "SELECT x FROM a INTERSECT SELECT x FROM b ORDER BY x"),
+        vec![vec![i(2)], vec![i(3)]]
+    );
+    // INTERSECT ALL: bag intersection — min(3, 2) copies of 2.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT x FROM a INTERSECT ALL SELECT x FROM b ORDER BY x"
+        ),
+        vec![vec![i(2)], vec![i(2)], vec![i(3)]]
+    );
+}
+
+#[test]
+fn intersect_binds_tighter_than_union() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE a (x INT)").unwrap();
+    db.execute("CREATE TABLE b (x INT)").unwrap();
+    db.execute("CREATE TABLE c (x INT)").unwrap();
+    db.execute("INSERT INTO a VALUES (1)").unwrap();
+    db.execute("INSERT INTO b VALUES (2)").unwrap();
+    db.execute("INSERT INTO c VALUES (3)").unwrap();
+    // Standard precedence: a UNION (b INTERSECT c) = {1}, not (a UNION b)
+    // INTERSECT c = {}.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT x FROM a UNION SELECT x FROM b INTERSECT SELECT x FROM c"
+        ),
+        vec![vec![i(1)]]
+    );
+}
+
 #[test]
 fn union_arity_mismatch_errors() {
     let (_d, db) = open();
@@ -483,11 +595,12 @@ fn view_ddl_rules() {
         db.execute("CREATE VIEW bad AS SELECT x FROM ghost")
             .is_err()
     );
-    // A view body must be a single SELECT.
-    assert!(
-        db.execute("CREATE VIEW bad AS SELECT a FROM t; SELECT 1")
-            .is_err()
-    );
+    // A semicolon ends the view body: the trailing SELECT is a separate
+    // statement of the batch, not part of the view (PostgreSQL semantics).
+    db.execute("CREATE VIEW single AS SELECT a FROM t; SELECT 1")
+        .unwrap();
+    assert_eq!(rows(&db, "SELECT a FROM single"), vec![vec![i(1)]]);
+    db.execute("DROP VIEW single").unwrap();
 
     // Writes against a view fail.
     assert!(db.execute("INSERT INTO v VALUES (9)").is_err());
