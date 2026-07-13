@@ -27,6 +27,7 @@ public static class OxiDbServiceCollectionExtensions
             .TryAdd<IUpdateSqlGenerator, OxiDbUpdateSqlGenerator>()
             .TryAdd<IQuerySqlGeneratorFactory, OxiDbQuerySqlGeneratorFactory>()
             .TryAdd<IMethodCallTranslatorProvider, OxiDbMethodCallTranslatorProvider>()
+            .TryAdd<IRelationalSqlTranslatingExpressionVisitorFactory, OxiDbSqlTranslatingExpressionVisitorFactory>()
             .TryAdd<IMemberTranslatorProvider, OxiDbMemberTranslatorProvider>()
             .TryAdd<IRelationalDatabaseCreator, OxiDbDatabaseCreator>()
             .TryAdd<IHistoryRepository, OxiDbHistoryRepository>()

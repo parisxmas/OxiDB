@@ -879,12 +879,18 @@ fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
             // not enforced in v1, but EF/PG-style DDL must parse.
             sp::TableConstraint::ForeignKey { .. } => {}
             // Table-level `[CONSTRAINT name] PRIMARY KEY (col)` — the form
-            // EF Core migrations and pg_dump emit. Single column only.
+            // EF Core migrations and pg_dump emit. A single column gets full
+            // PK semantics; composite keys are accepted and not enforced
+            // (documented, like FKs) so EF models with composite keys create.
             sp::TableConstraint::PrimaryKey { columns, .. } => {
-                pk_col = Some(single_index_column(columns, "PRIMARY KEY")?);
+                if let [_] = columns.as_slice() {
+                    pk_col = Some(single_index_column(columns, "PRIMARY KEY")?);
+                }
             }
             sp::TableConstraint::Unique { columns, .. } => {
-                unique_cols.push(single_index_column(columns, "UNIQUE")?);
+                if let [_] = columns.as_slice() {
+                    unique_cols.push(single_index_column(columns, "UNIQUE")?);
+                }
             }
             other => {
                 return Err(SqlError::Unsupported(format!("table constraint {other:?}")));
@@ -1210,6 +1216,7 @@ fn inline_ctes_body(b: &mut QueryBody, ctes: &[(String, SelectQuery)]) {
             inline_ctes_body(left, ctes);
             inline_ctes_body(right, ctes);
         }
+        QueryBody::Values(_) => {}
     }
 }
 
@@ -1360,6 +1367,23 @@ fn translate_set_expr(e: sp::SetExpr, p: &mut usize) -> Result<QueryBody> {
                 ));
             }
             translate_set_expr(*inner.body, p)
+        }
+        sp::SetExpr::Values(values) => {
+            let width = values.rows.first().map(|r| r.len()).unwrap_or(0);
+            let mut rows = Vec::with_capacity(values.rows.len());
+            for row in values.rows {
+                if row.len() != width {
+                    return Err(SqlError::Unsupported(
+                        "VALUES rows with different widths".into(),
+                    ));
+                }
+                rows.push(
+                    row.into_iter()
+                        .map(|e| translate_expr(e, p))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+            Ok(QueryBody::Values(rows))
         }
         other => Err(SqlError::Unsupported(format!("query body {other}"))),
     }
@@ -1742,15 +1766,23 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
             trim_what,
             trim_characters,
         } => {
-            if trim_where.is_some() || trim_what.is_some() || trim_characters.is_some() {
-                return Err(SqlError::Unsupported(
-                    "TRIM with LEADING/TRAILING/characters".into(),
-                ));
+            let func = match trim_where {
+                Some(sp::TrimWhereField::Leading) => ScalarFunc::Ltrim,
+                Some(sp::TrimWhereField::Trailing) => ScalarFunc::Rtrim,
+                Some(sp::TrimWhereField::Both) | None => ScalarFunc::Trim,
+            };
+            let mut args = vec![translate_expr(*expr, p)?];
+            // The character set comes as `TRIM(LEADING 'x' FROM s)`
+            // (trim_what) or as `TRIM(s, 'x')` (trim_characters).
+            if let Some(what) = trim_what {
+                args.push(translate_expr(*what, p)?);
+            } else if let Some(chars) = trim_characters {
+                let [c] = <[sp::Expr; 1]>::try_from(chars).map_err(|v| {
+                    SqlError::Unsupported(format!("TRIM with {} character lists", v.len()))
+                })?;
+                args.push(translate_expr(c, p)?);
             }
-            Ok(Expr::Func {
-                func: ScalarFunc::Trim,
-                args: vec![translate_expr(*expr, p)?],
-            })
+            Ok(Expr::Func { func, args })
         }
         sp::Expr::Exists { subquery, negated } => {
             // `EXISTS (SELECT ...)` == `1 IN (SELECT 1 ...)` — reuses the
@@ -1988,6 +2020,8 @@ fn exists_projection(body: &mut QueryBody) -> Result<()> {
             exists_projection(left)?;
             exists_projection(right)
         }
+        // Row existence of VALUES is static; leave the rows as they are.
+        QueryBody::Values(_) => Ok(()),
     }
 }
 
@@ -2128,6 +2162,22 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
         "lpad" => Some(ScalarFunc::Lpad),
         "rpad" => Some(ScalarFunc::Rpad),
         "add_months" => Some(ScalarFunc::AddMonths),
+        "sin" => Some(ScalarFunc::Sin),
+        "cos" => Some(ScalarFunc::Cos),
+        "tan" => Some(ScalarFunc::Tan),
+        "asin" => Some(ScalarFunc::Asin),
+        "acos" => Some(ScalarFunc::Acos),
+        "atan" => Some(ScalarFunc::Atan),
+        "atan2" => Some(ScalarFunc::Atan2),
+        "exp" => Some(ScalarFunc::Exp),
+        "ln" => Some(ScalarFunc::Ln),
+        "log10" => Some(ScalarFunc::Log10),
+        "log" => Some(ScalarFunc::Log),
+        "degrees" => Some(ScalarFunc::Degrees),
+        "radians" => Some(ScalarFunc::Radians),
+        "sign" => Some(ScalarFunc::Sign),
+        "trunc" | "truncate" => Some(ScalarFunc::Trunc),
+        "regexp_like" => Some(ScalarFunc::RegexpLike),
         _ => None,
     } {
         if f.over.is_some() {
@@ -2151,18 +2201,38 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             ScalarFunc::NullIf | ScalarFunc::Replace => {
                 exprs.len() == if func == ScalarFunc::Replace { 3 } else { 2 }
             }
-            ScalarFunc::Upper
-            | ScalarFunc::Lower
-            | ScalarFunc::Length
-            | ScalarFunc::Trim
-            | ScalarFunc::Ltrim
-            | ScalarFunc::Rtrim
-            | ScalarFunc::Abs => exprs.len() == 1,
+            ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::Length | ScalarFunc::Abs => {
+                exprs.len() == 1
+            }
+            // Optional second argument: the set of characters to strip.
+            ScalarFunc::Trim | ScalarFunc::Ltrim | ScalarFunc::Rtrim => {
+                exprs.len() == 1 || exprs.len() == 2
+            }
             ScalarFunc::Round => exprs.len() == 1 || exprs.len() == 2,
             ScalarFunc::Substring => exprs.len() == 2 || exprs.len() == 3,
             ScalarFunc::Now => exprs.is_empty(),
-            ScalarFunc::Floor | ScalarFunc::Ceil | ScalarFunc::Sqrt => exprs.len() == 1,
-            ScalarFunc::Power | ScalarFunc::Position | ScalarFunc::AddMonths => exprs.len() == 2,
+            ScalarFunc::Floor
+            | ScalarFunc::Ceil
+            | ScalarFunc::Sqrt
+            | ScalarFunc::Sin
+            | ScalarFunc::Cos
+            | ScalarFunc::Tan
+            | ScalarFunc::Asin
+            | ScalarFunc::Acos
+            | ScalarFunc::Atan
+            | ScalarFunc::Exp
+            | ScalarFunc::Ln
+            | ScalarFunc::Log10
+            | ScalarFunc::Degrees
+            | ScalarFunc::Radians
+            | ScalarFunc::Sign
+            | ScalarFunc::Trunc => exprs.len() == 1,
+            ScalarFunc::Power
+            | ScalarFunc::Position
+            | ScalarFunc::AddMonths
+            | ScalarFunc::Atan2
+            | ScalarFunc::Log
+            | ScalarFunc::RegexpLike => exprs.len() == 2,
             ScalarFunc::Lpad | ScalarFunc::Rpad => exprs.len() == 2 || exprs.len() == 3,
             // Cast/Like/Case/Extract/DateTrunc never arrive through the
             // function-name path.
@@ -2310,6 +2380,7 @@ fn map_binary_op(op: &sp::BinaryOperator) -> Result<BinOp> {
         B::Multiply => BinOp::Mul,
         B::Divide => BinOp::Div,
         B::Modulo => BinOp::Mod,
+        B::BitwiseXor => BinOp::BitXor,
         B::StringConcat => BinOp::Concat,
         other => return Err(SqlError::Unsupported(format!("binary operator {other:?}"))),
     };
@@ -2412,6 +2483,7 @@ fn table_ref_from_factor(factor: &sp::TableFactor, p: &mut usize) -> Result<Tabl
             alias: alias.as_ref().map(|a| a.name.value.clone()),
             subquery: None,
             lateral: false,
+            alias_columns: Vec::new(),
         }),
         sp::TableFactor::Derived {
             lateral,
@@ -2429,14 +2501,11 @@ fn table_ref_from_factor(factor: &sp::TableFactor, p: &mut usize) -> Result<Tabl
                 alias: Some(alias.name.value.clone()),
                 subquery: Some(Box::new(q)),
                 lateral: *lateral,
+                alias_columns: alias.columns.iter().map(|c| c.name.value.clone()).collect(),
             })
         }
         other => Err(SqlError::Unsupported(format!("table factor {other:?}"))),
     }
-}
-
-fn table_name_from_twj(twj: &sp::TableWithJoins) -> Result<String> {
-    Ok(table_and_alias_from_twj(twj)?.0)
 }
 
 fn table_and_alias_from_twj(twj: &sp::TableWithJoins) -> Result<(String, Option<String>)> {

@@ -52,7 +52,7 @@ public sealed class OxiDbTypeMappingSource : RelationalTypeMappingSource
         var f32 = new FloatTypeMapping("DOUBLE", System.Data.DbType.Single);
         var dec = new DecimalTypeMapping("DOUBLE", System.Data.DbType.Double);
         var text = new StringTypeMapping("TEXT", System.Data.DbType.String);
-        var boolean = new BoolTypeMapping("BOOL", System.Data.DbType.Boolean);
+        var boolean = new OxiDbBoolTypeMapping();
         var ts = new DateTimeTypeMapping("TIMESTAMP", System.Data.DbType.DateTime);
         var guid = new GuidTypeMapping("TEXT", System.Data.DbType.String);
         var blob = new ByteArrayTypeMapping("BLOB", System.Data.DbType.Binary);
@@ -101,6 +101,26 @@ public sealed class OxiDbTypeMappingSource : RelationalTypeMappingSource
             return byStore;
         return base.FindMapping(mappingInfo);
     }
+}
+
+/// <summary>
+/// Bool literals must render as TRUE/FALSE — the default's 1/0 is not a
+/// boolean to the engine (`WHERE CASE ... THEN 1 ELSE 0 END` would never
+/// match).
+/// </summary>
+public sealed class OxiDbBoolTypeMapping : BoolTypeMapping
+{
+    public OxiDbBoolTypeMapping()
+        : base("BOOL", System.Data.DbType.Boolean) { }
+
+    private OxiDbBoolTypeMapping(RelationalTypeMappingParameters parameters)
+        : base(parameters) { }
+
+    protected override RelationalTypeMapping Clone(RelationalTypeMappingParameters parameters) =>
+        new OxiDbBoolTypeMapping(parameters);
+
+    protected override string GenerateNonNullSqlLiteral(object value) =>
+        (bool)value ? "TRUE" : "FALSE";
 }
 
 /// <summary>

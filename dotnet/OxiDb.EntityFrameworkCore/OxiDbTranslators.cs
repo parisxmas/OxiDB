@@ -6,6 +6,47 @@ using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
 
 namespace OxiDb.EntityFrameworkCore;
 
+/// <summary>
+/// SQL translating visitor: opts in to LEAST/GREATEST generation
+/// (EF normalizes <c>Math.Min/Max</c> and <c>EF.Functions.Least/Greatest</c>
+/// through these hooks).
+/// </summary>
+public class OxiDbSqlTranslatingExpressionVisitor : RelationalSqlTranslatingExpressionVisitor
+{
+    public OxiDbSqlTranslatingExpressionVisitor(
+        RelationalSqlTranslatingExpressionVisitorDependencies dependencies,
+        QueryCompilationContext queryCompilationContext,
+        QueryableMethodTranslatingExpressionVisitor queryableMethodTranslatingExpressionVisitor)
+        : base(dependencies, queryCompilationContext, queryableMethodTranslatingExpressionVisitor)
+    {
+    }
+
+    public override SqlExpression? GenerateLeast(
+        IReadOnlyList<SqlExpression> expressions, Type resultType) =>
+        Dependencies.SqlExpressionFactory.Function("LEAST", expressions, nullable: true,
+            argumentsPropagateNullability: expressions.Select(_ => false).ToArray(), resultType);
+
+    public override SqlExpression? GenerateGreatest(
+        IReadOnlyList<SqlExpression> expressions, Type resultType) =>
+        Dependencies.SqlExpressionFactory.Function("GREATEST", expressions, nullable: true,
+            argumentsPropagateNullability: expressions.Select(_ => false).ToArray(), resultType);
+}
+
+public class OxiDbSqlTranslatingExpressionVisitorFactory : IRelationalSqlTranslatingExpressionVisitorFactory
+{
+    private readonly RelationalSqlTranslatingExpressionVisitorDependencies _dependencies;
+
+    public OxiDbSqlTranslatingExpressionVisitorFactory(
+        RelationalSqlTranslatingExpressionVisitorDependencies dependencies) =>
+        _dependencies = dependencies;
+
+    public virtual RelationalSqlTranslatingExpressionVisitor Create(
+        QueryCompilationContext queryCompilationContext,
+        QueryableMethodTranslatingExpressionVisitor queryableMethodTranslatingExpressionVisitor) =>
+        new OxiDbSqlTranslatingExpressionVisitor(
+            _dependencies, queryCompilationContext, queryableMethodTranslatingExpressionVisitor);
+}
+
 /// <summary>Adds the string/math/DateTime method translations on top of the defaults.</summary>
 public sealed class OxiDbMethodCallTranslatorProvider : RelationalMethodCallTranslatorProvider
 {
@@ -17,6 +58,9 @@ public sealed class OxiDbMethodCallTranslatorProvider : RelationalMethodCallTran
             new OxiDbStringMethodTranslator(dependencies.SqlExpressionFactory),
             new OxiDbMathMethodTranslator(dependencies.SqlExpressionFactory),
             new OxiDbDateTimeMethodTranslator(dependencies.SqlExpressionFactory),
+            new OxiDbToStringTranslator(dependencies.SqlExpressionFactory),
+            new OxiDbRegexTranslator(dependencies.SqlExpressionFactory),
+            new OxiDbStringEnumerableTranslator(dependencies.SqlExpressionFactory),
         ]);
 }
 
@@ -53,8 +97,30 @@ internal sealed class OxiDbStringMethodTranslator : IMethodCallTranslator
         IReadOnlyList<SqlExpression> arguments,
         IDiagnosticsLogger<DbLoggerCategory.Query> logger)
     {
-        if (method.DeclaringType != typeof(string) || instance is null)
+        if (method.DeclaringType != typeof(string))
             return null;
+        // Statics.
+        if (instance is null)
+        {
+            return method.Name switch
+            {
+                nameof(string.IsNullOrEmpty) when arguments.Count == 1 =>
+                    _sql.OrElse(
+                        _sql.IsNull(arguments[0]),
+                        _sql.Equal(arguments[0], _sql.Constant(string.Empty))),
+                nameof(string.IsNullOrWhiteSpace) when arguments.Count == 1 =>
+                    _sql.OrElse(
+                        _sql.IsNull(arguments[0]),
+                        _sql.Equal(
+                            _sql.Function("TRIM", [arguments[0]], nullable: true,
+                                argumentsPropagateNullability: [true], typeof(string),
+                                arguments[0].TypeMapping),
+                            _sql.Constant(string.Empty))),
+                _ => null,
+            };
+        }
+        // string.FirstOrDefault()/LastOrDefault() arrive as Enumerable
+        // extension calls, handled below; instance methods from here on.
 
         SqlExpression Pct() => _sql.Constant("%");
         SqlExpression Concat(params SqlExpression[] args) =>
@@ -83,6 +149,33 @@ internal sealed class OxiDbStringMethodTranslator : IMethodCallTranslator
                 return Fn("LOWER", instance);
             case nameof(string.Trim) when arguments.Count == 0:
                 return Fn("TRIM", instance);
+            // Trim family with a char / char[] argument → the engine's
+            // two-argument TRIM/LTRIM/RTRIM (second arg = character set).
+            case nameof(string.Trim) or nameof(string.TrimStart) or nameof(string.TrimEnd):
+            {
+                var fn = method.Name switch
+                {
+                    nameof(string.TrimStart) => "LTRIM",
+                    nameof(string.TrimEnd) => "RTRIM",
+                    _ => "TRIM",
+                };
+                if (arguments.Count == 0)
+                    return Fn(fn, instance);
+                if (arguments is [SqlConstantExpression { Value: var v }])
+                {
+                    var set = v switch
+                    {
+                        char c => c.ToString(),
+                        char[] { Length: > 0 } cs => new string(cs),
+                        char[] or null => null, // empty/null array = whitespace
+                        _ => "\0", // unreachable sentinel
+                    };
+                    return set is null
+                        ? Fn(fn, instance)
+                        : Fn(fn, instance, _sql.Constant(set, instance.TypeMapping));
+                }
+                return null;
+            }
             case nameof(string.Replace) when arguments.Count == 2:
                 return Fn("REPLACE", instance, arguments[0], arguments[1]);
             case nameof(string.Substring) when arguments.Count is 1 or 2:
@@ -127,6 +220,101 @@ internal sealed class OxiDbStringMethodTranslator : IMethodCallTranslator
 }
 
 /// <summary>
+/// <c>Regex.IsMatch(input, pattern)</c> → the engine's REGEXP_LIKE (Rust
+/// regex syntax; .NET syntax is compatible for the common subset). Only the
+/// no-options overload translates.
+/// </summary>
+internal sealed class OxiDbRegexTranslator : IMethodCallTranslator
+{
+    private readonly ISqlExpressionFactory _sql;
+
+    public OxiDbRegexTranslator(ISqlExpressionFactory sql) => _sql = sql;
+
+    public SqlExpression? Translate(
+        SqlExpression? instance,
+        MethodInfo method,
+        IReadOnlyList<SqlExpression> arguments,
+        IDiagnosticsLogger<DbLoggerCategory.Query> logger)
+    {
+        if (method.DeclaringType != typeof(System.Text.RegularExpressions.Regex)
+            || method.Name != nameof(System.Text.RegularExpressions.Regex.IsMatch)
+            || arguments.Count != 2)
+            return null;
+        return _sql.Function("regexp_like", arguments, nullable: true,
+            argumentsPropagateNullability: [true, true], typeof(bool));
+    }
+}
+
+/// <summary>
+/// <c>str.FirstOrDefault()</c> / <c>str.LastOrDefault()</c> (Enumerable over
+/// a string) → SUBSTRING of the first/last character.
+/// </summary>
+internal sealed class OxiDbStringEnumerableTranslator : IMethodCallTranslator
+{
+    private readonly ISqlExpressionFactory _sql;
+
+    public OxiDbStringEnumerableTranslator(ISqlExpressionFactory sql) => _sql = sql;
+
+    public SqlExpression? Translate(
+        SqlExpression? instance,
+        MethodInfo method,
+        IReadOnlyList<SqlExpression> arguments,
+        IDiagnosticsLogger<DbLoggerCategory.Query> logger)
+    {
+        if (method.DeclaringType != typeof(Enumerable)
+            || arguments.Count != 1
+            || arguments[0].Type != typeof(string))
+            return null;
+        var s = arguments[0];
+        var from = method.Name switch
+        {
+            nameof(Enumerable.FirstOrDefault) => (SqlExpression)_sql.Constant(1),
+            nameof(Enumerable.LastOrDefault) => _sql.Function("LENGTH", [s], nullable: true,
+                argumentsPropagateNullability: [true], typeof(int)),
+            _ => null!,
+        };
+        if (from is null)
+            return null;
+        return _sql.Function("SUBSTRING", [s, from, _sql.Constant(1)], nullable: true,
+            argumentsPropagateNullability: [true, true, true], method.ReturnType);
+    }
+}
+
+/// <summary>
+/// <c>x.ToString()</c> on integral types and <c>Guid</c> → <c>CAST(x AS
+/// TEXT)</c>. Floating/decimal/DateTime are left untranslated: their CLR
+/// string formats are culture-dependent and would not match the cast.
+/// </summary>
+internal sealed class OxiDbToStringTranslator : IMethodCallTranslator
+{
+    private static readonly HashSet<Type> Castable =
+    [
+        typeof(int), typeof(long), typeof(short), typeof(byte),
+        typeof(uint), typeof(ulong), typeof(ushort), typeof(sbyte),
+        typeof(Guid),
+    ];
+
+    private readonly ISqlExpressionFactory _sql;
+
+    public OxiDbToStringTranslator(ISqlExpressionFactory sql) => _sql = sql;
+
+    public SqlExpression? Translate(
+        SqlExpression? instance,
+        MethodInfo method,
+        IReadOnlyList<SqlExpression> arguments,
+        IDiagnosticsLogger<DbLoggerCategory.Query> logger)
+    {
+        if (method.Name != nameof(ToString) || arguments.Count != 0 || instance is null)
+            return null;
+        if (instance.Type == typeof(string))
+            return instance;
+        return Castable.Contains(Nullable.GetUnderlyingType(instance.Type) ?? instance.Type)
+            ? _sql.Convert(instance, typeof(string))
+            : null;
+    }
+}
+
+/// <summary>
 /// <c>Math</c>/<c>MathF</c> → engine scalars: Abs/Floor/Ceiling/Round already
 /// exist engine-side as ABS/FLOOR/CEILING/ROUND; Pow → POWER; Sqrt → SQRT.
 /// </summary>
@@ -140,6 +328,19 @@ internal sealed class OxiDbMathMethodTranslator : IMethodCallTranslator
         [nameof(Math.Round)] = "ROUND",
         [nameof(Math.Pow)] = "POWER",
         [nameof(Math.Sqrt)] = "SQRT",
+        [nameof(Math.Sin)] = "sin",
+        [nameof(Math.Cos)] = "cos",
+        [nameof(Math.Tan)] = "tan",
+        [nameof(Math.Asin)] = "asin",
+        [nameof(Math.Acos)] = "acos",
+        [nameof(Math.Atan)] = "atan",
+        [nameof(Math.Atan2)] = "atan2",
+        [nameof(Math.Exp)] = "exp",
+        [nameof(Math.Log10)] = "log10",
+        [nameof(Math.Truncate)] = "trunc",
+        [nameof(Math.Sign)] = "sign",
+        [nameof(Math.Min)] = "LEAST",
+        [nameof(Math.Max)] = "GREATEST",
     };
 
     private readonly ISqlExpressionFactory _sql;
@@ -152,14 +353,40 @@ internal sealed class OxiDbMathMethodTranslator : IMethodCallTranslator
         IReadOnlyList<SqlExpression> arguments,
         IDiagnosticsLogger<DbLoggerCategory.Query> logger)
     {
-        if (method.DeclaringType != typeof(Math) || !Names.TryGetValue(method.Name, out var fn))
+        // double.RadiansToDegrees / DegreesToRadians (and float.*) are the
+        // .NET 8+ shapes EF produces for degree/radian conversion.
+        if ((method.DeclaringType == typeof(double) || method.DeclaringType == typeof(float))
+            && arguments.Count == 1)
+        {
+            return method.Name switch
+            {
+                "RadiansToDegrees" => _sql.Function("degrees", arguments, nullable: true,
+                    argumentsPropagateNullability: [true], method.ReturnType),
+                "DegreesToRadians" => _sql.Function("radians", arguments, nullable: true,
+                    argumentsPropagateNullability: [true], method.ReturnType),
+                _ => null,
+            };
+        }
+        if (method.DeclaringType != typeof(Math) && method.DeclaringType != typeof(MathF))
             return null;
-        // ROUND(x) / ROUND(x, digits) / the single- and two-argument shapes above.
         if (arguments.Count is not (1 or 2))
             return null;
-        return _sql.Function(fn, arguments, nullable: true,
-            argumentsPropagateNullability: arguments.Select(_ => true).ToArray(),
-            method.ReturnType);
+        // Math.Log(x) is the natural log; Math.Log(x, base) → LOG(base, x)
+        // (the engine's PostgreSQL argument order).
+        if (method.Name == nameof(Math.Log))
+        {
+            return arguments.Count == 1
+                ? Fn("ln", [arguments[0]])
+                : Fn("log", [arguments[1], arguments[0]]);
+        }
+        if (!Names.TryGetValue(method.Name, out var fn))
+            return null;
+        return Fn(fn, arguments);
+
+        SqlExpression Fn(string name, IReadOnlyList<SqlExpression> args) =>
+            _sql.Function(name, args, nullable: true,
+                argumentsPropagateNullability: args.Select(_ => true).ToArray(),
+                method.ReturnType);
     }
 }
 
@@ -246,10 +473,17 @@ internal sealed class OxiDbDateTimeMemberTranslator : IMemberTranslator
         if (instance is null)
         {
             // Static members. NOW() is UTC on the engine.
-            return member.Name is nameof(DateTime.Now) or nameof(DateTime.UtcNow)
-                ? _sql.Function("NOW", [], nullable: false,
-                    argumentsPropagateNullability: [], returnType)
-                : null;
+            return member.Name switch
+            {
+                nameof(DateTime.Now) or nameof(DateTime.UtcNow) => Now(),
+                nameof(DateTime.Today) => _sql.Function("date_trunc",
+                    [_sql.Constant("day"), Now()], nullable: false,
+                    argumentsPropagateNullability: [false, false], returnType),
+                _ => null,
+            };
+
+            SqlExpression Now() => _sql.Function("NOW", [], nullable: false,
+                argumentsPropagateNullability: [], typeof(DateTime));
         }
         if (Parts.TryGetValue(member.Name, out var part))
             return DatePart(part);

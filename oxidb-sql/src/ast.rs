@@ -184,6 +184,10 @@ pub enum QueryBody {
         left: Box<QueryBody>,
         right: Box<QueryBody>,
     },
+    /// A `VALUES (a, b), (c, d)` table constructor (EF renders local
+    /// `Contains` lists this way). Columns are named `column1..columnN`
+    /// unless a derived-table alias renames them.
+    Values(Vec<Vec<Expr>>),
 }
 
 /// A SELECT, possibly with inner joins and aggregation.
@@ -221,6 +225,9 @@ pub struct TableRef {
     /// tables to its left and is re-executed per left row. Only meaningful on
     /// a join's derived table.
     pub lateral: bool,
+    /// `AS alias(c1, c2)` — renames the derived table's output columns
+    /// (EF names VALUES columns this way).
+    pub alias_columns: Vec<String>,
 }
 
 impl TableRef {
@@ -415,6 +422,30 @@ pub enum ScalarFunc {
     /// clamps to the target month's length, like PostgreSQL `+ INTERVAL`).
     /// Also serves `AddYears` (n × 12). Negative `n` subtracts.
     AddMonths,
+    /// One-argument float math (`SIN`..`RADIANS`): evaluated over f64,
+    /// always DOUBLE.
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    /// `ATAN2(y, x)`.
+    Atan2,
+    Exp,
+    /// `LN(x)` — natural log; non-positive argument errors.
+    Ln,
+    Log10,
+    /// `LOG(base, x)` (PostgreSQL argument order).
+    Log,
+    Degrees,
+    Radians,
+    /// `SIGN(x)` → -1 / 0 / 1 as INT.
+    Sign,
+    /// `TRUNC(x)` — toward zero; exact for DECIMAL, identity for INT.
+    Trunc,
+    /// `REGEXP_LIKE(s, pattern)` — Rust regex syntax, unanchored search.
+    RegexpLike,
 }
 
 /// A date/time component for [`ScalarFunc::Extract`] / [`ScalarFunc::DateTrunc`].
@@ -478,6 +509,8 @@ pub enum BinOp {
     Div,
     /// `%` — remainder (integer or float; sign follows the dividend).
     Mod,
+    /// `^` — bitwise XOR (integers; booleans XOR as inequality).
+    BitXor,
     /// `||` — string concatenation (NULL-propagating).
     Concat,
 }

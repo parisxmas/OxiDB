@@ -946,6 +946,25 @@ fn exec_body<S: Store>(
             QueryResult::Select { columns, rows, .. } => Ok((columns, rows)),
             _ => unreachable!("SELECT produced a non-select result"),
         },
+        QueryBody::Values(rows) => {
+            // Rows of literal/parameter expressions; PostgreSQL column names.
+            let width = rows.first().map(|r| r.len()).unwrap_or(0);
+            let columns: Vec<String> = (1..=width).map(|i| format!("column{i}")).collect();
+            let empty = Sources::default();
+            let view = View {
+                src: &empty,
+                tuple: &[],
+            };
+            let out: Vec<Vec<Value>> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| eval_scalar(e, &[], &view, params))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .collect::<Result<_>>()?;
+            Ok((columns, out))
+        }
         QueryBody::SetOp {
             op,
             all,
@@ -1083,10 +1102,6 @@ fn scope_of<S: Store>(store: &S, s: &SelectStmt) -> Scope {
     Scope { tables }
 }
 
-fn scope_of_table<S: Store>(store: &S, table: &str) -> Scope {
-    scope_of_dml(store, table, None)
-}
-
 /// The scope of a single-table DML statement: the table's columns, qualified
 /// by the alias when one is present (`UPDATE t AS a ... WHERE a.col`).
 fn scope_of_dml<S: Store>(store: &S, table: &str, alias: Option<&str>) -> Scope {
@@ -1169,6 +1184,14 @@ fn resolve_body<S: Store>(
         QueryBody::SetOp { left, right, .. } => {
             resolve_body(store, left, params, floor)?;
             resolve_body(store, right, params, floor)
+        }
+        QueryBody::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    resolve_expr(store, e, params, None, floor)?;
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -1396,6 +1419,9 @@ fn extract_outer_body<S: Store>(
             extract_outer_body(store, left, outer, base, out);
             extract_outer_body(store, right, outer, base, out);
         }
+        // VALUES rows are literal/parameter expressions; nothing resolves
+        // against a table scope.
+        QueryBody::Values(_) => {}
     }
 }
 
@@ -1492,6 +1518,25 @@ fn run_query_rows<S: Store>(
 // ── correlated evaluation ───────────────────────────────────────────────────
 
 /// Whether an expression contains a correlated subquery node.
+/// Like [`has_corr`], but correlation *inside an aggregate's argument* does
+/// not count: aggregates evaluate their argument per source row, where a
+/// correlated subquery is well-defined.
+fn has_corr_outside_agg(e: &Expr) -> bool {
+    match e {
+        Expr::Aggregate { .. } => false,
+        Expr::CorrScalar { .. } | Expr::CorrIn { .. } => true,
+        Expr::Binary { left, right, .. } => {
+            has_corr_outside_agg(left) || has_corr_outside_agg(right)
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_corr_outside_agg(expr),
+        Expr::Func { args, .. } => args.iter().any(has_corr_outside_agg),
+        Expr::In { expr, list, .. } => {
+            has_corr_outside_agg(expr) || list.iter().any(has_corr_outside_agg)
+        }
+        other => has_corr(other),
+    }
+}
+
 fn has_corr(e: &Expr) -> bool {
     match e {
         Expr::CorrScalar { .. } | Expr::CorrIn { .. } => true,
@@ -1746,7 +1791,8 @@ fn replace_windows(e: &mut Expr, windows: &mut Vec<Expr>, win_base: usize) {
 
 /// Compute one window expression's value for every tuple (aligned with tuple
 /// order).
-fn compute_window(
+fn compute_window<S: Store>(
+    store: &S,
     schema: &[ColRef],
     src: &Sources,
     tuples: &Tuples,
@@ -1832,6 +1878,7 @@ fn compute_window(
             WindowFunc::Agg(agg, arg) => {
                 if order_by.is_empty() {
                     let v = eval_aggregate(
+                        store,
                         *agg,
                         arg.as_deref(),
                         false,
@@ -1989,11 +2036,12 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
 
     let out_rows = if aggregating {
         // Correlated subqueries are per-row constructs; grouped evaluation
-        // has no single row to correlate against.
-        if proj.iter().any(|(_, e)| has_corr(e))
+        // has no single row to correlate against — except inside an
+        // aggregate's argument, which folds per source row.
+        if proj.iter().any(|(_, e)| has_corr_outside_agg(e))
             || select.group_by.iter().any(has_corr)
-            || select.having.as_ref().is_some_and(has_corr)
-            || select.order_by.iter().any(|(e, _)| has_corr(e))
+            || select.having.as_ref().is_some_and(has_corr_outside_agg)
+            || select.order_by.iter().any(|(e, _)| has_corr_outside_agg(e))
         {
             return Err(SqlError::Unsupported(
                 "correlated subquery in an aggregated query".into(),
@@ -2008,7 +2056,7 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
                 "window function in an aggregated query (use a view or an outer query)".into(),
             ));
         }
-        select_aggregated(&schema, &src, &tuples, &select, &proj, params)?
+        select_aggregated(store, &schema, &src, &tuples, &select, &proj, params)?
     } else {
         select_simple(store, &schema, &src, &tuples, &select, &proj, params)?
     };
@@ -2133,6 +2181,8 @@ fn derived_source<S: Store>(
         } => (columns, types, rows),
         _ => unreachable!("subquery produced a non-select result"),
     };
+    // `AS alias(c1, c2)` renames the output columns.
+    let columns = rename_columns(columns, &r.alias_columns, r.key())?;
     let full: Vec<ColRef> = columns
         .iter()
         .zip(&types)
@@ -2146,6 +2196,25 @@ fn derived_source<S: Store>(
     let schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
     let chunk = Chunk::from_rows(rows, &keep);
     Ok((schema, chunk))
+}
+
+/// Apply a derived table's `AS alias(c1, c2)` column renames.
+fn rename_columns(
+    columns: Vec<String>,
+    alias_columns: &[String],
+    what: &str,
+) -> Result<Vec<String>> {
+    if alias_columns.is_empty() {
+        return Ok(columns);
+    }
+    if alias_columns.len() != columns.len() {
+        return Err(SqlError::SchemaMismatch(format!(
+            "{what}: alias names {} columns, the subquery returns {}",
+            alias_columns.len(),
+            columns.len()
+        )));
+    }
+    Ok(alias_columns.to_vec())
 }
 
 /// `Ok(None)` when no view with this name exists.
@@ -2569,6 +2638,7 @@ fn lateral_join_into<S: Store>(
             (columns, types)
         }
     };
+    let columns = rename_columns(columns, &join.table.alias_columns, join.table.key())?;
 
     let right_schema: Vec<ColRef> = columns
         .iter()
@@ -3224,6 +3294,7 @@ fn collect_body_col_refs<'a>(body: &'a QueryBody, refs: &mut Vec<(&'a Option<Str
             collect_body_col_refs(left, refs);
             collect_body_col_refs(right, refs);
         }
+        QueryBody::Values(_) => {}
     }
 }
 
@@ -3392,7 +3463,7 @@ fn select_simple<S: Store>(
                     "correlated subquery inside a window function".into(),
                 ));
             }
-            compute_window(schema, src, tuples, w, params)
+            compute_window(store, schema, src, tuples, w, params)
         })
         .collect::<Result<_>>()?;
 
@@ -3485,7 +3556,8 @@ fn select_simple<S: Store>(
 }
 
 /// Aggregated projection: group tuples, compute aggregates per group.
-fn select_aggregated(
+fn select_aggregated<S: Store>(
+    store: &S,
     schema: &[ColRef],
     src: &Sources,
     tuples: &Tuples,
@@ -3504,23 +3576,25 @@ fn select_aggregated(
         Vec::with_capacity(groups.len());
     for group in &groups {
         if let Some(having) = &select.having
-            && !truthy(&eval_agg(having, schema, src, tuples, group, params)?)
+            && !truthy(&eval_agg(
+                store, having, schema, src, tuples, group, params,
+            )?)
         {
             continue;
         }
         let out: Vec<Value> = proj
             .iter()
-            .map(|(_, e)| eval_agg(e, schema, src, tuples, group, params))
+            .map(|(_, e)| eval_agg(store, e, schema, src, tuples, group, params))
             .collect::<Result<_>>()?;
         // Evaluate the sort keys once per group (not per comparison).
         let keys: Vec<Value> = select
             .order_by
             .iter()
-            .map(|(e, _)| eval_agg(e, schema, src, tuples, group, params))
+            .map(|(e, _)| eval_agg(store, e, schema, src, tuples, group, params))
             .collect::<Result<_>>()?;
         let dk: Vec<IndexKey> = don
             .iter()
-            .map(|e| eval_agg(e, schema, src, tuples, group, params).map(IndexKey))
+            .map(|e| eval_agg(store, e, schema, src, tuples, group, params).map(IndexKey))
             .collect::<Result<_>>()?;
         prepared.push((keys, dk, out));
     }
@@ -3711,8 +3785,16 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             | BinOp::And
             | BinOp::Or => Some(SqlType::Bool),
             BinOp::Concat => Some(SqlType::Text),
+            BinOp::BitXor => match expr_type(left, schema) {
+                Some(SqlType::Bool) => Some(SqlType::Bool),
+                _ => Some(SqlType::Int),
+            },
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                 match (expr_type(left, schema), expr_type(right, schema)) {
+                    // `text + text` concatenates (see `arithmetic`).
+                    (Some(SqlType::Text), Some(SqlType::Text)) if matches!(op, BinOp::Add) => {
+                        Some(SqlType::Text)
+                    }
                     // ts ± ms → ts; ts - ts → ms (see `arithmetic`).
                     (Some(SqlType::Timestamp), Some(SqlType::Timestamp))
                         if matches!(op, BinOp::Sub) =>
@@ -3787,8 +3869,26 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             } else {
                 SqlType::Int
             }),
-            ScalarFunc::Floor | ScalarFunc::Ceil => args.first().and_then(|a| expr_type(a, schema)),
-            ScalarFunc::Power | ScalarFunc::Sqrt => Some(SqlType::Double),
+            ScalarFunc::Floor | ScalarFunc::Ceil | ScalarFunc::Trunc => {
+                args.first().and_then(|a| expr_type(a, schema))
+            }
+            ScalarFunc::Power
+            | ScalarFunc::Sqrt
+            | ScalarFunc::Sin
+            | ScalarFunc::Cos
+            | ScalarFunc::Tan
+            | ScalarFunc::Asin
+            | ScalarFunc::Acos
+            | ScalarFunc::Atan
+            | ScalarFunc::Atan2
+            | ScalarFunc::Exp
+            | ScalarFunc::Ln
+            | ScalarFunc::Log10
+            | ScalarFunc::Log
+            | ScalarFunc::Degrees
+            | ScalarFunc::Radians => Some(SqlType::Double),
+            ScalarFunc::Sign => Some(SqlType::Int),
+            ScalarFunc::RegexpLike => Some(SqlType::Bool),
             ScalarFunc::Position => Some(SqlType::Int),
             ScalarFunc::Lpad | ScalarFunc::Rpad => Some(SqlType::Text),
         },
@@ -3840,6 +3940,22 @@ fn default_name(expr: &Expr) -> String {
             ScalarFunc::Lpad => "lpad".to_string(),
             ScalarFunc::Rpad => "rpad".to_string(),
             ScalarFunc::AddMonths => "add_months".to_string(),
+            ScalarFunc::Sin => "sin".to_string(),
+            ScalarFunc::Cos => "cos".to_string(),
+            ScalarFunc::Tan => "tan".to_string(),
+            ScalarFunc::Asin => "asin".to_string(),
+            ScalarFunc::Acos => "acos".to_string(),
+            ScalarFunc::Atan => "atan".to_string(),
+            ScalarFunc::Atan2 => "atan2".to_string(),
+            ScalarFunc::Exp => "exp".to_string(),
+            ScalarFunc::Ln => "ln".to_string(),
+            ScalarFunc::Log10 => "log10".to_string(),
+            ScalarFunc::Log => "log".to_string(),
+            ScalarFunc::Degrees => "degrees".to_string(),
+            ScalarFunc::Radians => "radians".to_string(),
+            ScalarFunc::Sign => "sign".to_string(),
+            ScalarFunc::Trunc => "trunc".to_string(),
+            ScalarFunc::RegexpLike => "regexp_like".to_string(),
         },
         Expr::Window { func, .. } => match func {
             WindowFunc::RowNumber => "row_number".to_string(),
@@ -4056,14 +4172,30 @@ where
             None => Value::Null,
         }),
         ScalarFunc::Trim | ScalarFunc::Ltrim | ScalarFunc::Rtrim => {
-            Ok(match as_text(eval(&args[0])?, "TRIM")? {
-                Some(s) => Value::Text(match func {
-                    ScalarFunc::Ltrim => s.trim_start().to_string(),
-                    ScalarFunc::Rtrim => s.trim_end().to_string(),
-                    _ => s.trim().to_string(),
-                }),
-                None => Value::Null,
-            })
+            let Some(s) = as_text(eval(&args[0])?, "TRIM")? else {
+                return Ok(Value::Null);
+            };
+            // Optional second argument: the set of characters to strip
+            // (default: whitespace).
+            let charset: Option<Vec<char>> = match args.get(1) {
+                None => None,
+                Some(e) => match as_text(eval(e)?, "TRIM")? {
+                    Some(cs) => Some(cs.chars().collect()),
+                    None => return Ok(Value::Null),
+                },
+            };
+            let pred = |c: char| match &charset {
+                Some(set) => set.contains(&c),
+                None => c.is_whitespace(),
+            };
+            Ok(Value::Text(
+                match func {
+                    ScalarFunc::Ltrim => s.trim_start_matches(pred),
+                    ScalarFunc::Rtrim => s.trim_end_matches(pred),
+                    _ => s.trim_matches(pred),
+                }
+                .to_string(),
+            ))
         }
         ScalarFunc::Concat => {
             let mut out = String::new();
@@ -4273,6 +4405,105 @@ where
                     format!("{s}{pad}")
                 }
             }))
+        }
+        ScalarFunc::Sin
+        | ScalarFunc::Cos
+        | ScalarFunc::Tan
+        | ScalarFunc::Asin
+        | ScalarFunc::Acos
+        | ScalarFunc::Atan
+        | ScalarFunc::Exp
+        | ScalarFunc::Ln
+        | ScalarFunc::Log10
+        | ScalarFunc::Degrees
+        | ScalarFunc::Radians => {
+            let v = eval(&args[0])?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let x = as_f64(&v).ok_or_else(|| SqlError::Eval(format!("math function of {v:?}")))?;
+            let y = match func {
+                ScalarFunc::Sin => x.sin(),
+                ScalarFunc::Cos => x.cos(),
+                ScalarFunc::Tan => x.tan(),
+                ScalarFunc::Asin => x.asin(),
+                ScalarFunc::Acos => x.acos(),
+                ScalarFunc::Atan => x.atan(),
+                ScalarFunc::Exp => x.exp(),
+                // Out-of-domain logs yield NULL (SQLite semantics — WHERE
+                // predicates over mixed rows must not abort the scan).
+                ScalarFunc::Ln => {
+                    if x <= 0.0 {
+                        return Ok(Value::Null);
+                    }
+                    x.ln()
+                }
+                ScalarFunc::Log10 => {
+                    if x <= 0.0 {
+                        return Ok(Value::Null);
+                    }
+                    x.log10()
+                }
+                ScalarFunc::Degrees => x.to_degrees(),
+                _ => x.to_radians(),
+            };
+            Ok(Value::Double(y))
+        }
+        ScalarFunc::Atan2 | ScalarFunc::Log => {
+            let (a, b) = (eval(&args[0])?, eval(&args[1])?);
+            if matches!(a, Value::Null) || matches!(b, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let x = as_f64(&a).ok_or_else(|| SqlError::Eval(format!("math function of {a:?}")))?;
+            let y = as_f64(&b).ok_or_else(|| SqlError::Eval(format!("math function of {b:?}")))?;
+            Ok(Value::Double(if matches!(func, ScalarFunc::Atan2) {
+                // ATAN2(y, x).
+                x.atan2(y)
+            } else {
+                // LOG(base, x) — PostgreSQL argument order; NULL out of domain.
+                if x <= 0.0 || x == 1.0 || y <= 0.0 {
+                    return Ok(Value::Null);
+                }
+                y.log(x)
+            }))
+        }
+        ScalarFunc::Sign => Ok(match eval(&args[0])? {
+            Value::Null => Value::Null,
+            Value::Int(n) => Value::Int(n.signum()),
+            Value::Double(f) => Value::Int(if f > 0.0 {
+                1
+            } else if f < 0.0 {
+                -1
+            } else {
+                0
+            }),
+            Value::Decimal(d) => Value::Int(d.mantissa().signum() as i64),
+            other => return Err(SqlError::Eval(format!("SIGN of {other:?}"))),
+        }),
+        ScalarFunc::Trunc => Ok(match eval(&args[0])? {
+            Value::Null => Value::Null,
+            Value::Int(n) => Value::Int(n),
+            Value::Double(f) => Value::Double(f.trunc()),
+            Value::Decimal(d) => {
+                // Integer part toward zero, exactly.
+                let unit = 10i128.pow(d.scale());
+                Value::Decimal(Decimal::new(d.mantissa() / unit, 0))
+            }
+            other => return Err(SqlError::Eval(format!("TRUNC of {other:?}"))),
+        }),
+        ScalarFunc::RegexpLike => {
+            let (s, pat) = (
+                as_text(eval(&args[0])?, "REGEXP_LIKE")?,
+                as_text(eval(&args[1])?, "REGEXP_LIKE")?,
+            );
+            match (s, pat) {
+                (Some(s), Some(p)) => {
+                    let re = regex::Regex::new(&p)
+                        .map_err(|e| SqlError::Eval(format!("bad regex: {e}")))?;
+                    Ok(Value::Bool(re.is_match(&s)))
+                }
+                _ => Ok(Value::Null),
+            }
         }
         ScalarFunc::AddMonths => {
             let (ts, n) = (eval(&args[0])?, eval(&args[1])?);
@@ -4519,7 +4750,9 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
 /// Evaluate an expression that may contain aggregates, over a group of tuple
 /// indices. Non-aggregate leaves are evaluated on the group's first row (as
 /// SQL requires them to be group keys).
-fn eval_agg(
+#[allow(clippy::too_many_arguments)]
+fn eval_agg<S: Store>(
+    store: &S,
     expr: &Expr,
     schema: &[ColRef],
     src: &Sources,
@@ -4533,6 +4766,7 @@ fn eval_agg(
             arg,
             distinct,
         } => eval_aggregate(
+            store,
             *func,
             arg.as_deref(),
             *distinct,
@@ -4561,16 +4795,16 @@ fn eval_agg(
             }
         }
         Expr::IsNull { expr, negated } => {
-            let v = eval_agg(expr, schema, src, tuples, group, params)?;
+            let v = eval_agg(store, expr, schema, src, tuples, group, params)?;
             Ok(Value::Bool(matches!(v, Value::Null) != *negated))
         }
         Expr::Unary { op, expr } => {
-            let v = eval_agg(expr, schema, src, tuples, group, params)?;
+            let v = eval_agg(store, expr, schema, src, tuples, group, params)?;
             apply_unary(*op, v)
         }
         Expr::Binary { op, left, right } => {
-            let l = eval_agg(left, schema, src, tuples, group, params)?;
-            let r = eval_agg(right, schema, src, tuples, group, params)?;
+            let l = eval_agg(store, left, schema, src, tuples, group, params)?;
+            let r = eval_agg(store, right, schema, src, tuples, group, params)?;
             eval_binary(*op, l, r)
         }
         Expr::In {
@@ -4578,13 +4812,13 @@ fn eval_agg(
             list,
             negated,
         } => {
-            let v = eval_agg(expr, schema, src, tuples, group, params)?;
+            let v = eval_agg(store, expr, schema, src, tuples, group, params)?;
             eval_in(&v, list, *negated, |item| {
-                eval_agg(item, schema, src, tuples, group, params)
+                eval_agg(store, item, schema, src, tuples, group, params)
             })
         }
         Expr::Func { func, args } => eval_scalar_func(*func, args, |e| {
-            eval_agg(e, schema, src, tuples, group, params)
+            eval_agg(store, e, schema, src, tuples, group, params)
         }),
         Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::Eval(
             "internal: unresolved subquery reached evaluation".into(),
@@ -4724,7 +4958,8 @@ fn date_trunc_ms(part: DatePart, ms: i64) -> Result<i64> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn eval_aggregate(
+fn eval_aggregate<S: Store>(
+    store: &S,
     func: AggFunc,
     arg: Option<&Expr>,
     distinct: bool,
@@ -4742,6 +4977,8 @@ fn eval_aggregate(
         return Ok(Value::Int(group.len() as i64));
     }
     let arg = arg.ok_or_else(|| SqlError::Eval("aggregate requires an argument".into()))?;
+    // Correlated subqueries inside the argument re-execute per source row.
+    let corr = has_corr(arg);
     let view_of = |i: &u32| View {
         src,
         tuple: tuples.row(*i as usize),
@@ -4754,7 +4991,7 @@ fn eval_aggregate(
         AggFunc::Count => {
             let mut n: i64 = 0;
             for i in group {
-                let v = eval_scalar(arg, schema, &view_of(i), params)?;
+                let v = eval_scalar_corr(store, corr, arg, schema, &view_of(i), params)?;
                 if !matches!(v, Value::Null) && admit(&v) {
                     n += 1;
                 }
@@ -4769,7 +5006,7 @@ fn eval_aggregate(
             };
             let mut best: Option<Value> = None;
             for i in group {
-                let v = eval_scalar(arg, schema, &view_of(i), params)?;
+                let v = eval_scalar_corr(store, corr, arg, schema, &view_of(i), params)?;
                 if matches!(v, Value::Null) {
                     continue;
                 }
@@ -4788,7 +5025,7 @@ fn eval_aggregate(
             let mut sum = SumAcc::Empty;
             let mut n: i64 = 0;
             for i in group {
-                let v = eval_scalar(arg, schema, &view_of(i), params)?;
+                let v = eval_scalar_corr(store, corr, arg, schema, &view_of(i), params)?;
                 if matches!(v, Value::Null) || !admit(&v) {
                     continue;
                 }
@@ -4806,7 +5043,7 @@ fn eval_aggregate(
             // (SQL-standard `mode() WITHIN GROUP`). Tally by total order.
             let mut counts: Vec<(Value, i64)> = Vec::new();
             for i in group {
-                let v = eval_scalar(arg, schema, &view_of(i), params)?;
+                let v = eval_scalar_corr(store, corr, arg, schema, &view_of(i), params)?;
                 if matches!(v, Value::Null) {
                     continue;
                 }
@@ -4978,6 +5215,12 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
             }
         }
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => arithmetic(op, l, r),
+        BinOp::BitXor => match (l, r) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a ^ b)),
+            (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a != b)),
+            (a, b) => Err(SqlError::Eval(format!("XOR of {a:?} / {b:?}"))),
+        },
     }
 }
 
@@ -5019,6 +5262,11 @@ fn as_decimal_operand(v: &Value) -> Option<Decimal> {
 fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
+    }
+    // `text + text` is concatenation (SQL Server style; EF's default string
+    // Add renders as `+`).
+    if let (Value::Text(a), Value::Text(b), BinOp::Add) = (&l, &r, op) {
+        return Ok(Value::Text(format!("{a}{b}")));
     }
     // Timestamp arithmetic: ts ± <ms> stays a timestamp; ts - ts is the
     // difference in milliseconds. (INTERVAL literals fold to ms integers.)

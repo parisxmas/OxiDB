@@ -116,9 +116,12 @@ INTERVAL literals (fixed units up to weeks; calendar month/year rejected —
 use add_months), timestamp ± interval arithmetic, ts - ts → milliseconds.
 All calendar math is UTC. UPDATE/DELETE accept a table alias
 (`UPDATE t AS a ... WHERE a.col`).
-Scalar functions: UPPER LOWER LENGTH SUBSTRING CONCAT TRIM LTRIM RTRIM
-REPLACE ABS ROUND FLOOR CEILING POWER SQRT POSITION/STRPOS LPAD RPAD
-COALESCE NULLIF LEAST GREATEST, `%`/MOD, `||` concatenation.
+Scalar functions: UPPER LOWER LENGTH SUBSTRING CONCAT TRIM/LTRIM/RTRIM
+(optional char-set arg) REPLACE ABS ROUND FLOOR CEILING TRUNC SIGN POWER
+SQRT SIN COS TAN ASIN ACOS ATAN ATAN2 EXP LN LOG10 LOG(base,x) DEGREES
+RADIANS POSITION/STRPOS LPAD RPAD REGEXP_LIKE COALESCE NULLIF LEAST
+GREATEST, `%`/MOD, `^` (int XOR), `||` and `text + text` concatenation.
+VALUES table constructors (`FROM (VALUES (1),(2)) AS v(x)`).
 Index usage: PRIMARY KEY point lookups, secondary-index equality (also
 inside transactions), and index-nested-loop joins (small side ⋈ indexed
 base table). Full-table aggregations scan all rows, as in PostgreSQL.

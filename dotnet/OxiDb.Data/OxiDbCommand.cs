@@ -142,7 +142,11 @@ public sealed class OxiDbCommand : DbCommand
     private static object? ToWire(object? v) => v switch
     {
         null or DBNull => null,
-        DateTime dt => new DateTimeOffset(dt.ToUniversalTime()).ToUnixTimeMilliseconds(),
+        // Unspecified kinds are taken as UTC (the store is epoch ms); only a
+        // Local kind is actually converted.
+        DateTime dt => new DateTimeOffset(
+            dt.Kind == DateTimeKind.Local ? dt.ToUniversalTime() : DateTime.SpecifyKind(dt, DateTimeKind.Utc)
+        ).ToUnixTimeMilliseconds(),
         DateTimeOffset dto => dto.ToUnixTimeMilliseconds(),
         Guid g => g.ToString(),
         char c => c.ToString(),
