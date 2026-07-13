@@ -413,6 +413,27 @@ fn cross_join_cartesian_product() {
 }
 
 #[test]
+fn add_months_calendar_math() {
+    let (_d, db) = open();
+    let eq = |sql: &str| {
+        assert_eq!(
+            rows(&db, &format!("SELECT {sql}")),
+            vec![vec![b(true)]],
+            "{sql}"
+        );
+    };
+    eq("add_months(TIMESTAMP '2026-07-13 10:30:00', 1) = TIMESTAMP '2026-08-13 10:30:00'");
+    // Day clamps to the target month's length.
+    eq("add_months(TIMESTAMP '2026-01-31', 1) = TIMESTAMP '2026-02-28'");
+    eq("add_months(TIMESTAMP '2024-01-31', 1) = TIMESTAMP '2024-02-29'"); // leap
+    // Negative months and year rollover.
+    eq("add_months(TIMESTAMP '2026-01-15', -2) = TIMESTAMP '2025-11-15'");
+    // AddYears is n * 12.
+    eq("add_months(TIMESTAMP '2024-02-29', 12) = TIMESTAMP '2025-02-28'");
+    assert!(db.execute("SELECT add_months(NOW(), 'x')").is_err());
+}
+
+#[test]
 fn ef_generated_shapes_smoke() {
     let (_d, db) = open();
     db.execute("CREATE TABLE m (id INT, kayit TIMESTAMP, ad TEXT, puan INT)")
@@ -435,5 +456,47 @@ fn ef_generated_shapes_smoke() {
             "SELECT COUNT(*) FROM m WHERE kayit < NOW() + -1.0 * 86400000.0"
         ),
         vec![vec![i(1)]]
+    );
+}
+
+#[test]
+fn dml_table_alias() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (id INT, tag TEXT, score INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1,'rt',30),(2,'lang',90)")
+        .unwrap();
+    // EF ExecuteUpdate/ExecuteDelete shapes: UPDATE/DELETE with an alias.
+    db.execute(
+        "UPDATE \"t\" AS \"c\" SET \"score\" = \"c\".\"score\" + 1 WHERE \"c\".\"tag\" = 'rt'",
+    )
+    .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT score FROM t WHERE id = 1"),
+        vec![vec![i(31)]]
+    );
+    db.execute("DELETE FROM \"t\" AS \"c\" WHERE \"c\".\"tag\" = 'lang'")
+        .unwrap();
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM t"), vec![vec![i(1)]]);
+}
+
+#[test]
+fn correlated_ref_inside_derived_table() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE b (id INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE p (bid INT, score INT)").unwrap();
+    db.execute("INSERT INTO b VALUES (1,'x'),(2,'y')").unwrap();
+    db.execute("INSERT INTO p VALUES (1,90),(1,70),(1,40),(2,80)")
+        .unwrap();
+    // The EF collection-projection shape: the outer ref sits inside a
+    // LIMIT'd derived table inside a scalar subquery.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT (SELECT COUNT(*) FROM (SELECT 1 AS one FROM p \
+                     WHERE b.id = p.bid ORDER BY p.score DESC LIMIT 2) AS q) \
+             FROM b ORDER BY b.name"
+        ),
+        vec![vec![i(2)], vec![i(1)]]
     );
 }

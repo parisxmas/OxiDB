@@ -66,6 +66,13 @@ internal sealed class OxiDbStringMethodTranslator : IMethodCallTranslator
         {
             case nameof(string.Contains) when arguments is [{ Type: var t }] && t == typeof(string):
                 return _sql.Like(instance, Concat(Pct(), arguments[0], Pct()));
+            // The char overload: position of the one-char needle, not LIKE
+            // (a char like '%' must not act as a wildcard).
+            case nameof(string.Contains) when arguments is [{ Type: var t }] && t == typeof(char):
+                return _sql.GreaterThan(
+                    _sql.Function("STRPOS", [instance, Stringify(arguments[0])], nullable: true,
+                        argumentsPropagateNullability: [true, true], typeof(int)),
+                    _sql.Constant(0));
             case nameof(string.StartsWith) when arguments is [{ Type: var t }] && t == typeof(string):
                 return _sql.Like(instance, Concat(arguments[0], Pct()));
             case nameof(string.EndsWith) when arguments is [{ Type: var t }] && t == typeof(string):
@@ -182,8 +189,21 @@ internal sealed class OxiDbDateTimeMethodTranslator : IMethodCallTranslator
         IReadOnlyList<SqlExpression> arguments,
         IDiagnosticsLogger<DbLoggerCategory.Query> logger)
     {
-        if (method.DeclaringType != typeof(DateTime) || instance is null
-            || arguments.Count != 1 || !MsPerUnit.TryGetValue(method.Name, out var factor))
+        if (method.DeclaringType != typeof(DateTime) || instance is null || arguments.Count != 1)
+            return null;
+        // Calendar units go through the engine's ADD_MONTHS (day clamps to
+        // the target month, like PostgreSQL `+ INTERVAL`).
+        if (method.Name is nameof(DateTime.AddMonths) or nameof(DateTime.AddYears))
+        {
+            var months = method.Name == nameof(DateTime.AddYears)
+                ? _sql.Multiply(arguments[0], _sql.Constant(12))
+                : arguments[0];
+            return _sql.Function("add_months",
+                [instance, _sql.ApplyDefaultTypeMapping(months)], nullable: true,
+                argumentsPropagateNullability: [true, true],
+                method.ReturnType, instance.TypeMapping);
+        }
+        if (!MsPerUnit.TryGetValue(method.Name, out var factor))
             return null;
         // Pin the ms expression to its own (double) mapping so the timestamp
         // mapping of `instance` can't be inferred onto it.
@@ -243,6 +263,12 @@ internal sealed class OxiDbDateTimeMemberTranslator : IMemberTranslator
             // semantics); CLR Millisecond is 0..999.
             nameof(DateTime.Millisecond) =>
                 _sql.Modulo(DatePart("millisecond"), _sql.Constant(1000)),
+            // Engine DOW numbering (Sunday = 0) matches System.DayOfWeek.
+            nameof(DateTime.DayOfWeek) => _sql.Convert(
+                _sql.Function("date_part", [_sql.Constant("dow"), instance],
+                    nullable: true, argumentsPropagateNullability: [false, true],
+                    typeof(int)),
+                returnType),
             _ => null,
         };
 

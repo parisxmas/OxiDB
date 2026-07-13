@@ -634,7 +634,7 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
             if from.is_some() {
                 return Err(SqlError::Unsupported("UPDATE ... FROM".into()));
             }
-            let table = table_name_from_twj(&table)?;
+            let (table, alias) = table_and_alias_from_twj(&table)?;
             let assignments = assignments
                 .into_iter()
                 .map(|a| translate_assignment(a, p))
@@ -643,6 +643,7 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
             let returning = translate_returning(returning.as_ref(), p)?;
             Ok(Statement::Update {
                 table,
+                alias,
                 assignments,
                 filter,
                 returning,
@@ -1122,11 +1123,12 @@ fn translate_delete(del: sp::Delete, p: &mut usize) -> Result<Statement> {
     if twjs.len() != 1 {
         return Err(SqlError::Unsupported("DELETE from multiple tables".into()));
     }
-    let table = table_name_from_twj(&twjs[0])?;
+    let (table, alias) = table_and_alias_from_twj(&twjs[0])?;
     let filter = del.selection.map(|e| translate_expr(e, p)).transpose()?;
     let returning = translate_returning(del.returning.as_ref(), p)?;
     Ok(Statement::Delete {
         table,
+        alias,
         filter,
         returning,
     })
@@ -2125,6 +2127,7 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
         "strpos" | "position" => Some(ScalarFunc::Position),
         "lpad" => Some(ScalarFunc::Lpad),
         "rpad" => Some(ScalarFunc::Rpad),
+        "add_months" => Some(ScalarFunc::AddMonths),
         _ => None,
     } {
         if f.over.is_some() {
@@ -2159,7 +2162,7 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             ScalarFunc::Substring => exprs.len() == 2 || exprs.len() == 3,
             ScalarFunc::Now => exprs.is_empty(),
             ScalarFunc::Floor | ScalarFunc::Ceil | ScalarFunc::Sqrt => exprs.len() == 1,
-            ScalarFunc::Power | ScalarFunc::Position => exprs.len() == 2,
+            ScalarFunc::Power | ScalarFunc::Position | ScalarFunc::AddMonths => exprs.len() == 2,
             ScalarFunc::Lpad | ScalarFunc::Rpad => exprs.len() == 2 || exprs.len() == 3,
             // Cast/Like/Case/Extract/DateTrunc never arrive through the
             // function-name path.
@@ -2433,6 +2436,10 @@ fn table_ref_from_factor(factor: &sp::TableFactor, p: &mut usize) -> Result<Tabl
 }
 
 fn table_name_from_twj(twj: &sp::TableWithJoins) -> Result<String> {
+    Ok(table_and_alias_from_twj(twj)?.0)
+}
+
+fn table_and_alias_from_twj(twj: &sp::TableWithJoins) -> Result<(String, Option<String>)> {
     if !twj.joins.is_empty() {
         return Err(SqlError::Unsupported("JOIN not allowed here".into()));
     }
@@ -2440,5 +2447,5 @@ fn table_name_from_twj(twj: &sp::TableWithJoins) -> Result<String> {
     if r.subquery.is_some() {
         return Err(SqlError::Unsupported("subquery not allowed here".into()));
     }
-    Ok(r.name)
+    Ok((r.name, r.alias))
 }

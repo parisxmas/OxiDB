@@ -111,9 +111,11 @@ non-recursive `WITH` CTEs, LEAST/GREATEST, CASE, LIKE, CAST,
 parameterized queries, per-engine transactions (BEGIN/COMMIT/ROLLBACK).
 Date/time: NOW()/CURRENT_TIMESTAMP, EXTRACT / date_part('year'|'month'|
 'day'|'hour'|'minute'|'second'|'dow'|'doy'|'week'|'epoch', ts),
-date_trunc('unit', ts), INTERVAL literals (fixed units up to weeks;
-calendar month/year rejected), timestamp ± interval arithmetic,
-ts - ts → milliseconds. All calendar math is UTC.
+date_trunc('unit', ts), add_months(ts, n) (calendar-correct, day clamps),
+INTERVAL literals (fixed units up to weeks; calendar month/year rejected —
+use add_months), timestamp ± interval arithmetic, ts - ts → milliseconds.
+All calendar math is UTC. UPDATE/DELETE accept a table alias
+(`UPDATE t AS a ... WHERE a.col`).
 Scalar functions: UPPER LOWER LENGTH SUBSTRING CONCAT TRIM LTRIM RTRIM
 REPLACE ABS ROUND FLOOR CEILING POWER SQRT POSITION/STRPOS LPAD RPAD
 COALESCE NULLIF LEAST GREATEST, `%`/MOD, `||` concatenation.
@@ -263,7 +265,8 @@ Clustering:
   auth, CRUD, SQL, aggregation, procedures, onSnapshot)
 - .NET: NuGet `OxiDb.Client.Tcp`, `OxiDb.Client.Embedded`, `OxiDb.Linq`,
   `OxiDb.Data` (ADO.NET, Dapper-ready), `OxiDb.EntityFrameworkCore`
-  (EF Core 9 provider)
+  (EF Core 9 provider: LINQ incl. LATERAL collection projections,
+  Database.Migrate() migrations, `dotnet ef dbcontext scaffold`)
 - Go, Julia (Tables.jl-compatible), Swift/iOS, PHP (TCP + FFI) clients,
   plus a WordPress db.php drop-in.
 - WebAssembly: in-browser, in-memory engine (npm package built with

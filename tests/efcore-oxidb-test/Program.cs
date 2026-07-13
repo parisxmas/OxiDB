@@ -100,6 +100,13 @@ using (var db = new ShopContext(cs))
     var pad = db.Musteriler.OrderBy(m => m.Ad).Select(m => m.Ad.PadLeft(6, '.')).First();
     Console.WriteLine($"distinct/math/string: farkli={farkli} kok={kok} tek={tek} idx={idx} pad={pad}");
 
+    // Calendar methods, DayOfWeek, Contains(char).
+    var ayEkle = db.Musteriler.Count(m => m.Kayit.AddMonths(1) <= new DateTime(2026, 3, 1, 0, 0, 0, DateTimeKind.Utc));
+    var yilEkle = db.Musteriler.Count(m => m.Kayit.AddYears(1) >= new DateTime(2027, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+    var pazar = db.Musteriler.Count(m => m.Kayit.DayOfWeek == DayOfWeek.Sunday); // 2026-02-01 pazar
+    var harf = db.Musteriler.Count(m => m.Ad.Contains('y'));
+    Console.WriteLine($"calendar/char       : ayekle={ayEkle} yilekle={yilEkle} pazar={pazar} harf={harf}");
+
     // Correlated collection projection → OUTER/CROSS APPLY → JOIN LATERAL.
     var enBuyuk = db.Musteriler.OrderBy(m => m.Ad)
         .Select(m => new

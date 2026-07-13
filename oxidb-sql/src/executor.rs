@@ -115,15 +115,25 @@ pub(crate) fn execute<S: Store>(
         Statement::Select(query) => exec_query(store, query, params),
         Statement::Update {
             table,
+            alias,
             assignments,
             filter,
             returning,
-        } => exec_update(store, &table, assignments, filter, returning, params),
-        Statement::Delete {
-            table,
+        } => exec_update(
+            store,
+            &table,
+            alias.as_deref(),
+            assignments,
             filter,
             returning,
-        } => exec_delete(store, &table, filter, returning, params),
+            params,
+        ),
+        Statement::Delete {
+            table,
+            alias,
+            filter,
+            returning,
+        } => exec_delete(store, &table, alias.as_deref(), filter, returning, params),
         Statement::CreateProcedure {
             name,
             mut def,
@@ -640,9 +650,11 @@ fn returning_result(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn exec_update<S: Store>(
     store: &S,
     table: &str,
+    alias: Option<&str>,
     assignments: Vec<(String, Expr)>,
     filter: Option<Expr>,
     returning: Option<Vec<SelectItem>>,
@@ -651,7 +663,8 @@ fn exec_update<S: Store>(
     let def = store
         .table_def(table)
         .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
-    let schema = table_schema(table, &def);
+    // With `UPDATE t AS a`, qualified references use the alias.
+    let schema = table_schema(alias.unwrap_or(table), &def);
     let targets: Vec<(usize, Expr)> = assignments
         .into_iter()
         .map(|(col, expr)| {
@@ -704,6 +717,7 @@ fn exec_update<S: Store>(
 fn exec_delete<S: Store>(
     store: &S,
     table: &str,
+    alias: Option<&str>,
     filter: Option<Expr>,
     returning: Option<Vec<SelectItem>>,
     params: &[Value],
@@ -711,7 +725,8 @@ fn exec_delete<S: Store>(
     let def = store
         .table_def(table)
         .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
-    let schema = table_schema(table, &def);
+    // With `DELETE FROM t AS a`, qualified references use the alias.
+    let schema = table_schema(alias.unwrap_or(table), &def);
 
     let filter_corr = filter.as_ref().is_some_and(has_corr);
     let mut to_delete = Vec::new();
@@ -1069,10 +1084,16 @@ fn scope_of<S: Store>(store: &S, s: &SelectStmt) -> Scope {
 }
 
 fn scope_of_table<S: Store>(store: &S, table: &str) -> Scope {
+    scope_of_dml(store, table, None)
+}
+
+/// The scope of a single-table DML statement: the table's columns, qualified
+/// by the alias when one is present (`UPDATE t AS a ... WHERE a.col`).
+fn scope_of_dml<S: Store>(store: &S, table: &str, alias: Option<&str>) -> Scope {
     let mut tables = Vec::new();
     if let Some(def) = store.table_def(table) {
         let cols = def.columns.iter().map(|c| c.name.clone()).collect();
-        tables.push((table.to_string(), cols));
+        tables.push((alias.unwrap_or(table).to_string(), cols));
     }
     Scope { tables }
 }
@@ -1098,11 +1119,12 @@ fn resolve_subqueries_stmt<S: Store>(
         Statement::Select(q) => resolve_query(store, q, params, floor),
         Statement::Update {
             table,
+            alias,
             assignments,
             filter,
             ..
         } => {
-            let scope = scope_of_table(store, table);
+            let scope = scope_of_dml(store, table, alias.as_deref());
             for (_, e) in assignments {
                 resolve_expr(store, e, params, Some(&scope), floor)?;
             }
@@ -1111,8 +1133,13 @@ fn resolve_subqueries_stmt<S: Store>(
             }
             Ok(())
         }
-        Statement::Delete { table, filter, .. } => {
-            let scope = scope_of_table(store, table);
+        Statement::Delete {
+            table,
+            alias,
+            filter,
+            ..
+        } => {
+            let scope = scope_of_dml(store, table, alias.as_deref());
             if let Some(f) = filter {
                 resolve_expr(store, f, params, Some(&scope), floor)?;
             }
@@ -1349,6 +1376,20 @@ fn extract_outer_body<S: Store>(
             }
             for (e, _) in &mut s.order_by {
                 rewrite(e);
+            }
+            // Outer references may sit inside derived tables (EF nests a
+            // LIMIT'd correlated collection in a FROM subquery). Descend with
+            // the same outer scope; names resolving in the derived body's own
+            // scope are left alone by its recursive `inner` check.
+            if let Some(from) = &mut s.from
+                && let Some(sub) = &mut from.subquery
+            {
+                extract_outer_body(store, &mut sub.body, outer, base, out);
+            }
+            for j in &mut s.joins {
+                if let Some(sub) = &mut j.table.subquery {
+                    extract_outer_body(store, &mut sub.body, outer, base, out);
+                }
             }
         }
         QueryBody::SetOp { left, right, .. } => {
@@ -3738,7 +3779,9 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
                 }
                 it.into_iter().find_map(|a| expr_type(a, schema))
             }
-            ScalarFunc::Now | ScalarFunc::DateTrunc(_) => Some(SqlType::Timestamp),
+            ScalarFunc::Now | ScalarFunc::DateTrunc(_) | ScalarFunc::AddMonths => {
+                Some(SqlType::Timestamp)
+            }
             ScalarFunc::Extract(part) => Some(if matches!(part, DatePart::Epoch) {
                 SqlType::Double
             } else {
@@ -3796,6 +3839,7 @@ fn default_name(expr: &Expr) -> String {
             ScalarFunc::Position => "position".to_string(),
             ScalarFunc::Lpad => "lpad".to_string(),
             ScalarFunc::Rpad => "rpad".to_string(),
+            ScalarFunc::AddMonths => "add_months".to_string(),
         },
         Expr::Window { func, .. } => match func {
             WindowFunc::RowNumber => "row_number".to_string(),
@@ -4230,6 +4274,26 @@ where
                 }
             }))
         }
+        ScalarFunc::AddMonths => {
+            let (ts, n) = (eval(&args[0])?, eval(&args[1])?);
+            match (ts, n) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Timestamp(ms), Value::Int(n)) => {
+                    let (days, in_day) = ms_to_days(ms);
+                    let (y, m, d) = civil_from_days(days);
+                    let total = y * 12 + (m - 1) + n;
+                    let (ny, nm) = (total.div_euclid(12), total.rem_euclid(12) + 1);
+                    // Clamp the day to the target month (Jan 31 + 1mo = Feb 28).
+                    let nd = d.min(days_in_month(ny, nm));
+                    Ok(Value::Timestamp(
+                        days_from_civil(ny, nm, nd) * 86_400_000 + in_day,
+                    ))
+                }
+                (a, b) => Err(SqlError::Eval(format!(
+                    "ADD_MONTHS of {a:?}, {b:?} (TIMESTAMP, INT required)"
+                ))),
+            }
+        }
     }
 }
 
@@ -4565,6 +4629,21 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+/// Days in a civil month (Gregorian leap rules).
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+    }
 }
 
 /// ISO 8601 weekday: Monday = 1 .. Sunday = 7 (1970-01-01 was a Thursday).

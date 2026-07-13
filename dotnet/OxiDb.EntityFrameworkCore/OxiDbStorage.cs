@@ -1,6 +1,7 @@
 using System.Data.Common;
 using System.Text;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Migrations.Operations;
@@ -137,6 +138,36 @@ public sealed class OxiDbDatabaseCreator : RelationalDatabaseCreator
     }
 }
 
+/// <summary>Provider annotation names.</summary>
+public static class OxiDbAnnotations
+{
+    public const string AutoIncrement = "OxiDb:AutoIncrement";
+}
+
+/// <summary>
+/// Emits the <c>OxiDb:AutoIncrement</c> column annotation for store-generated
+/// integer keys, so migrations carry the fact without needing the model.
+/// </summary>
+public sealed class OxiDbAnnotationProvider : RelationalAnnotationProvider
+{
+    public OxiDbAnnotationProvider(RelationalAnnotationProviderDependencies dependencies)
+        : base(dependencies) { }
+
+    public override IEnumerable<IAnnotation> For(IColumn column, bool designTime)
+    {
+        foreach (var a in base.For(column, designTime))
+            yield return a;
+        var property = column.PropertyMappings.Select(m => m.Property).FirstOrDefault();
+        if (property is { ValueGenerated: ValueGenerated.OnAdd }
+            && property.IsPrimaryKey()
+            && (property.ClrType == typeof(long) || property.ClrType == typeof(int)
+                || property.ClrType == typeof(short)))
+        {
+            yield return new Annotation(OxiDbAnnotations.AutoIncrement, true);
+        }
+    }
+}
+
 /// <summary>Migrations history over a plain table (CRUD only).</summary>
 public sealed class OxiDbHistoryRepository : HistoryRepository
 {
@@ -162,11 +193,11 @@ public sealed class OxiDbHistoryRepository : HistoryRepository
         }
     }
 
-    public override IMigrationsDatabaseLock AcquireDatabaseLock() => new NoopLock();
+    public override IMigrationsDatabaseLock AcquireDatabaseLock() => new NoopLock(this);
 
     public override Task<IMigrationsDatabaseLock> AcquireDatabaseLockAsync(
         CancellationToken cancellationToken = default) =>
-        Task.FromResult<IMigrationsDatabaseLock>(new NoopLock());
+        Task.FromResult<IMigrationsDatabaseLock>(new NoopLock(this));
 
     public override LockReleaseBehavior LockReleaseBehavior => LockReleaseBehavior.Transaction;
 
@@ -182,17 +213,20 @@ public sealed class OxiDbHistoryRepository : HistoryRepository
     public override string GetEndIfScript() =>
         throw new NotSupportedException("conditional migration scripts");
 
-    private sealed class NoopLock : IMigrationsDatabaseLock
+    private sealed class NoopLock(IHistoryRepository owner) : IMigrationsDatabaseLock
     {
-        public IHistoryRepository HistoryRepository => null!;
+        public IHistoryRepository HistoryRepository => owner;
         public void Dispose() { }
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
 
 /// <summary>
-/// Standard relational DDL is already in the engine's dialect; the one
-/// addition is <c>AUTO_INCREMENT</c> on store-generated integer keys.
+/// Standard relational DDL is already in the engine's dialect; additions are
+/// <c>AUTO_INCREMENT</c> on store-generated integer keys and the
+/// engine-dialect forms of the operations the relational base leaves to the
+/// provider (RENAME COLUMN, DROP INDEX). ALTER COLUMN and table renames have
+/// no engine DDL and fail with a clear message.
 /// </summary>
 public sealed class OxiDbMigrationsSqlGenerator : MigrationsSqlGenerator
 {
@@ -213,12 +247,95 @@ public sealed class OxiDbMigrationsSqlGenerator : MigrationsSqlGenerator
             .FindColumn(name)?
             .PropertyMappings.Select(m => m.Property)
             .FirstOrDefault();
-        if (property is { ValueGenerated: ValueGenerated.OnAdd }
-            && property.IsPrimaryKey()
-            && (property.ClrType == typeof(long) || property.ClrType == typeof(int)
-                || property.ClrType == typeof(short)))
+        // Two sources: the target model (EF-generated migrations carry it in
+        // the designer file) or an explicit column annotation (hand-written
+        // migrations, and what OxiDbAnnotationProvider emits).
+        if ((property is { ValueGenerated: ValueGenerated.OnAdd }
+                && property.IsPrimaryKey()
+                && (property.ClrType == typeof(long) || property.ClrType == typeof(int)
+                    || property.ClrType == typeof(short)))
+            || operation.FindAnnotation(OxiDbAnnotations.AutoIncrement)?.Value is true)
         {
             builder.Append(" AUTO_INCREMENT");
         }
     }
+
+    // The engine rejects ALTER TABLE / DROP INDEX inside a transaction, so
+    // those commands are emitted with suppressTransaction: the migrator
+    // commits the surrounding transaction, runs them standalone, and resumes.
+
+    protected override void Generate(
+        AddColumnOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder,
+        bool terminate = true)
+    {
+        base.Generate(operation, model, builder, terminate: false);
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            EndStatement(builder, suppressTransaction: true);
+        }
+    }
+
+    protected override void Generate(
+        DropColumnOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder,
+        bool terminate = true)
+    {
+        base.Generate(operation, model, builder, terminate: false);
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            EndStatement(builder, suppressTransaction: true);
+        }
+    }
+
+    protected override void Generate(
+        RenameColumnOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder)
+    {
+        builder
+            .Append("ALTER TABLE ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Table, operation.Schema))
+            .Append(" RENAME COLUMN ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Name))
+            .Append(" TO ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.NewName))
+            .AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+        EndStatement(builder, suppressTransaction: true);
+    }
+
+    protected override void Generate(
+        DropIndexOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder,
+        bool terminate = true)
+    {
+        // Engine indexes are database-global by name: DROP INDEX <name>.
+        builder
+            .Append("DROP INDEX ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(operation.Name));
+        if (terminate)
+        {
+            builder.AppendLine(Dependencies.SqlGenerationHelper.StatementTerminator);
+            EndStatement(builder, suppressTransaction: true);
+        }
+    }
+
+    protected override void Generate(
+        RenameTableOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder) =>
+        throw new NotSupportedException(
+            "OxiDB has no table-rename DDL. Create the new table, copy the rows, drop the old one.");
+
+    protected override void Generate(
+        AlterColumnOperation operation,
+        IModel? model,
+        MigrationCommandListBuilder builder) =>
+        throw new NotSupportedException(
+            "OxiDB cannot alter a column in place. Add a new column, copy the values, drop the old one.");
 }

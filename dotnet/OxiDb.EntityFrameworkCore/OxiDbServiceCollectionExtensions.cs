@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.EntityFrameworkCore.Metadata.Conventions;
 using Microsoft.EntityFrameworkCore.Metadata.Conventions.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
@@ -30,6 +31,7 @@ public static class OxiDbServiceCollectionExtensions
             .TryAdd<IRelationalDatabaseCreator, OxiDbDatabaseCreator>()
             .TryAdd<IHistoryRepository, OxiDbHistoryRepository>()
             .TryAdd<IMigrationsSqlGenerator, OxiDbMigrationsSqlGenerator>()
+            .TryAdd<IRelationalAnnotationProvider, OxiDbAnnotationProvider>()
             .TryAdd<IRelationalConnection>(p => p.GetRequiredService<IOxiDbRelationalConnection>())
             .TryAddProviderSpecificServices(b =>
                 b.TryAddScoped<IOxiDbRelationalConnection, OxiDbRelationalConnection>())

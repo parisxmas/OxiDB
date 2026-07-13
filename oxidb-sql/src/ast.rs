@@ -75,6 +75,9 @@ pub enum Statement {
     Select(SelectQuery),
     Update {
         table: String,
+        /// `UPDATE t AS a`: qualified column references resolve against the
+        /// alias (EF's ExecuteUpdate emits this shape).
+        alias: Option<String>,
         assignments: Vec<(String, Expr)>,
         filter: Option<Expr>,
         /// `RETURNING <items>`: project the updated rows back as a result
@@ -83,6 +86,8 @@ pub enum Statement {
     },
     Delete {
         table: String,
+        /// `DELETE FROM t AS a`, see [`Statement::Update::alias`].
+        alias: Option<String>,
         filter: Option<Expr>,
         /// `RETURNING <items>`: project the deleted rows back as a result set.
         returning: Option<Vec<SelectItem>>,
@@ -406,6 +411,10 @@ pub enum ScalarFunc {
     /// `s` to `len` characters; `fill` defaults to a space.
     Lpad,
     Rpad,
+    /// `ADD_MONTHS(ts, n)` — calendar-correct month addition in UTC (the day
+    /// clamps to the target month's length, like PostgreSQL `+ INTERVAL`).
+    /// Also serves `AddYears` (n × 12). Negative `n` subtracts.
+    AddMonths,
 }
 
 /// A date/time component for [`ScalarFunc::Extract`] / [`ScalarFunc::DateTrunc`].
