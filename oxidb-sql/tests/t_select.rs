@@ -115,3 +115,50 @@ fn table_alias_qualified_columns() {
         r1(vec![i(3)])
     );
 }
+
+/// ORDER BY + LIMIT takes the bounded top-N path; results must be identical
+/// to a full sort — including stable ties, OFFSET, parameterized limits, and
+/// DISTINCT (which must NOT use it: dedup happens before LIMIT).
+#[test]
+fn order_by_limit_top_n_matches_full_sort() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT, v TEXT)")
+        .unwrap();
+    // k cycles 0..5 so every key group has many ties; id is insertion order.
+    let vals: Vec<String> = (1..=200)
+        .map(|i| format!("({i}, {}, 'v{}')", i % 5, i % 3))
+        .collect();
+    db.execute(&format!("INSERT INTO t VALUES {}", vals.join(", ")))
+        .unwrap();
+
+    // Full sort (no LIMIT) as the oracle.
+    let all = rows(&db, "SELECT id FROM t ORDER BY k, id DESC");
+    let top7 = rows(&db, "SELECT id FROM t ORDER BY k, id DESC LIMIT 7");
+    assert_eq!(top7, all[..7].to_vec());
+    let off = rows(&db, "SELECT id FROM t ORDER BY k, id DESC LIMIT 5 OFFSET 10");
+    assert_eq!(off, all[10..15].to_vec());
+
+    // Stable ties: equal keys keep input order.
+    let ties = rows(&db, "SELECT id FROM t ORDER BY k LIMIT 3");
+    assert_eq!(ties, vec![vec![i(5)], vec![i(10)], vec![i(15)]]);
+
+    // Parameterized LIMIT/OFFSET (the EF Skip/Take shape).
+    let p = rows_p(
+        &db,
+        "SELECT id FROM t ORDER BY k, id DESC LIMIT $1 OFFSET $2",
+        &[i(4), i(2)],
+    );
+    assert_eq!(p, all[2..6].to_vec());
+
+    // LIMIT 0 and LIMIT past the end.
+    assert!(rows(&db, "SELECT id FROM t ORDER BY k LIMIT 0").is_empty());
+    assert_eq!(
+        rows(&db, "SELECT id FROM t ORDER BY k, id DESC LIMIT 9999").len(),
+        200
+    );
+
+    // DISTINCT dedups BEFORE LIMIT: 3 distinct v values exist, so LIMIT 3
+    // must yield all 3 (a top-3-rows-then-dedup shortcut would yield fewer).
+    let d = rows(&db, "SELECT DISTINCT v FROM t ORDER BY v LIMIT 3");
+    assert_eq!(d.len(), 3);
+}

@@ -9,10 +9,13 @@ namespace OxiDb.Data;
 /// ADO.NET connection to the OxiDB SQL engine (ADR-0013 Phase C).
 ///
 /// Connection string keys: <c>Host</c> (default 127.0.0.1), <c>Port</c>
-/// (default 4444), <c>Database</c> (default the server's default database).
-/// One <see cref="OxiDbConnection"/> maps to one wire connection, so the
-/// server-side session (current database, interactive SQL transaction)
-/// behaves exactly like any other OxiDB client connection.
+/// (default 4444), <c>Database</c> (default the server's default database),
+/// <c>Pooling</c> (default true). One open <see cref="OxiDbConnection"/> maps
+/// to one wire connection, so the server-side session (current database,
+/// interactive SQL transaction) behaves exactly like any other OxiDB client
+/// connection. Close returns the wire connection to a process-wide pool
+/// (EF Core opens/closes around every query — without pooling each query
+/// would pay a TCP connect plus a use_db round trip).
 /// </summary>
 public sealed class OxiDbConnection : DbConnection
 {
@@ -20,9 +23,12 @@ public sealed class OxiDbConnection : DbConnection
     private string _host = "127.0.0.1";
     private int _port = 4444;
     private string _database = "";
+    private bool _pooling = true;
     private OxiDbTcpClient? _client;
     private ConnectionState _state = ConnectionState.Closed;
     internal OxiDbTransaction? ActiveTransaction;
+
+    private string PoolKey => $"{_host}:{_port}/{_database}";
 
     public OxiDbConnection() { }
 
@@ -49,6 +55,7 @@ public sealed class OxiDbConnection : DbConnection
                     case "host" or "server" or "data source": _host = val; break;
                     case "port": _port = int.Parse(val); break;
                     case "database" or "initial catalog": _database = val; break;
+                    case "pooling": _pooling = !val.Equals("false", StringComparison.OrdinalIgnoreCase); break;
                 }
             }
         }
@@ -70,22 +77,36 @@ public sealed class OxiDbConnection : DbConnection
         // Exact OperationCanceledException for an already-canceled token (an
         // awaited connect would surface TaskCanceledException instead).
         ct.ThrowIfCancellationRequested();
-        _client = await OxiDbTcpClient.ConnectAsync(_host, _port, ct: ct).ConfigureAwait(false);
-        if (!string.IsNullOrEmpty(_database))
+        _client = _pooling ? OxiDbClientPool.TryRent(PoolKey) : null;
+        if (_client is null)
         {
-            // Session default: every subsequent request targets this database.
-            await _client.ExecRawAsync(
-                new() { ["cmd"] = "use_db", ["name"] = _database },
-                ct
-            ).ConfigureAwait(false);
+            _client = await OxiDbTcpClient.ConnectAsync(_host, _port, ct: ct).ConfigureAwait(false);
+            if (!string.IsNullOrEmpty(_database))
+            {
+                // Session default: every subsequent request targets this
+                // database. Pooled clients already carry it (it's the key).
+                await _client.ExecRawAsync(
+                    new() { ["cmd"] = "use_db", ["name"] = _database },
+                    ct
+                ).ConfigureAwait(false);
+            }
         }
         _state = ConnectionState.Open;
     }
 
     public override void Close()
     {
+        if (_client is not null)
+        {
+            // Only a session-clean connection may be pooled: no interactive
+            // transaction (the server rolls one back on disconnect — a pooled
+            // socket would leak it into the next renter instead).
+            if (_pooling && ActiveTransaction is null && _client.IsAlive)
+                OxiDbClientPool.Return(PoolKey, _client);
+            else
+                _client.Dispose();
+        }
         ActiveTransaction = null;
-        _client?.Dispose(); // server rolls back any open transaction
         _client = null;
         _state = ConnectionState.Closed;
     }

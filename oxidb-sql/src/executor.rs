@@ -3859,6 +3859,72 @@ fn select_simple<S: Store>(
 
     // Evaluate the sort keys once per row (not per comparison), then sort.
     let keys_corr = order_by.iter().any(|(e, _)| has_corr(e));
+
+    // ORDER BY + LIMIT without DISTINCT / DISTINCT ON: top-N. Keep a bounded
+    // buffer of the best `offset + limit` (sort keys, tuple index) pairs and
+    // project only the survivors — a 20-row LIMIT over 50k rows must not
+    // sort (or project) 50k rows. Ties keep the earlier tuple, matching the
+    // stable full sort below; the caller still applies OFFSET/LIMIT.
+    let top = if don.is_empty() && !select.distinct
+        && let Some(l) = resolve_limit(select.limit, params, "LIMIT")?
+    {
+        Some(l.saturating_add(resolve_limit(select.offset, params, "OFFSET")?.unwrap_or(0)))
+    } else {
+        None
+    };
+    if let Some(k) = top {
+        // Sorted ascending by (keys, tuple index); the last element is the
+        // current cutoff. Keys are evaluated into a reused buffer and only
+        // cloned for rows that actually enter the buffer — on large scans
+        // almost every row fails the cutoff test.
+        let mut best: Vec<(Vec<Value>, usize)> = Vec::with_capacity(k.min(n) + 1);
+        let mut kbuf: Vec<Value> = Vec::with_capacity(order_by.len());
+        for i in 0..n {
+            row_params(i, &mut pbuf);
+            let p: &[Value] = if win_vals.is_empty() { params } else { &pbuf };
+            let view = View {
+                src,
+                tuple: tuples.row(i),
+            };
+            kbuf.clear();
+            for (e, _) in &order_by {
+                kbuf.push(eval_scalar_corr(store, keys_corr, e, schema, &view, p)?);
+            }
+            if best.len() >= k {
+                match best.last() {
+                    Some(last) if cmp_keys(&order_by, &kbuf, &last.0) == Ordering::Less => {}
+                    _ => continue, // not better than the cutoff (or k == 0)
+                }
+            }
+            let pos = best.partition_point(|(bk, bi)| {
+                match cmp_keys(&order_by, bk, &kbuf) {
+                    Ordering::Less => true,
+                    Ordering::Equal => *bi < i,
+                    Ordering::Greater => false,
+                }
+            });
+            best.insert(pos, (std::mem::take(&mut kbuf), i));
+            if best.len() > k {
+                best.pop();
+            }
+        }
+        let mut out = Vec::with_capacity(best.len());
+        for (_, i) in best {
+            row_params(i, &mut pbuf);
+            let p: &[Value] = if win_vals.is_empty() { params } else { &pbuf };
+            let view = View {
+                src,
+                tuple: tuples.row(i),
+            };
+            let row: Vec<Value> = proj
+                .iter()
+                .map(|(_, e)| eval_scalar_corr(store, proj_corr, e, schema, &view, p))
+                .collect::<Result<_>>()?;
+            out.push(row);
+        }
+        return Ok(out);
+    }
+
     let mut keyed: Vec<(Vec<Value>, Vec<IndexKey>, Vec<Value>)> = Vec::with_capacity(n);
     for i in 0..n {
         row_params(i, &mut pbuf);

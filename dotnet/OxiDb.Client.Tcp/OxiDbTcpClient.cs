@@ -15,6 +15,7 @@ public sealed class OxiDbTcpClient : IOxiDbClient
     private readonly NetworkStream _stream;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private bool _disposed;
+    private bool _broken;
     private bool _useOxiWire;
 
     private OxiDbTcpClient(TcpClient tcp)
@@ -74,6 +75,51 @@ public sealed class OxiDbTcpClient : IOxiDbClient
     /// Requests and responses use OxiDB's custom binary format instead of JSON.
     /// </summary>
     public void UseOxiWire() => _useOxiWire = true;
+
+    /// <summary>
+    /// Cheap liveness probe (no round trip): false once the peer has closed
+    /// its end (e.g. the server's idle timeout), an exchange was interrupted
+    /// mid-conversation, or this client is disposed. Connection pools use it
+    /// to discard entries that must not be handed to another consumer.
+    /// </summary>
+    public bool IsAlive
+    {
+        get
+        {
+            if (_disposed || _broken || !_tcp.Connected) return false;
+            try
+            {
+                // Any readable state disqualifies: readable-with-zero-bytes
+                // is an orderly remote close, and pending bytes on an idle
+                // strict request/response socket are a stale response that
+                // would cross-talk into the next consumer's first request.
+                return !_tcp.Client.Poll(0, SelectMode.SelectRead);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// One request/response exchange. Any transport failure (or cancellation)
+    /// in between leaves the stream mid-conversation — an unsent, unread, or
+    /// half-read frame — so the client is permanently marked broken.
+    /// </summary>
+    private async Task<byte[]> ExchangeAsync(byte[] reqBytes, CancellationToken ct)
+    {
+        try
+        {
+            await SendAsync(reqBytes, ct);
+            return await ReceiveAsync(ct);
+        }
+        catch
+        {
+            _broken = true;
+            throw;
+        }
+    }
 
     // ── Low-level protocol ──────────────────────────────────────────────
 
@@ -136,8 +182,7 @@ public sealed class OxiDbTcpClient : IOxiDbClient
                 ? OxiWire.EncodeRequest(payload)
                 : JsonSerializer.SerializeToUtf8Bytes(payload);
 
-            await SendAsync(reqBytes, ct);
-            var respBytes = await ReceiveAsync(ct);
+            var respBytes = await ExchangeAsync(reqBytes, ct);
 
             // For OxiWire-encoded responses, DecodeResponse already
             // returns the full envelope as a JsonElement.
@@ -188,8 +233,7 @@ public sealed class OxiDbTcpClient : IOxiDbClient
             else
                 reqBytes = JsonSerializer.SerializeToUtf8Bytes(payload);
 
-            await SendAsync(reqBytes, ct);
-            var respBytes = await ReceiveAsync(ct);
+            var respBytes = await ExchangeAsync(reqBytes, ct);
 
             if (_useOxiWire && OxiWire.IsOxiWire(respBytes))
             {
