@@ -10,7 +10,8 @@ namespace OxiDb.Data;
 ///
 /// Connection string keys: <c>Host</c> (default 127.0.0.1), <c>Port</c>
 /// (default 4444), <c>Database</c> (default the server's default database),
-/// <c>Pooling</c> (default true). One open <see cref="OxiDbConnection"/> maps
+/// <c>Pooling</c> (default true), <c>OxiWire</c> (default true — binary wire
+/// format; JSON when false). One open <see cref="OxiDbConnection"/> maps
 /// to one wire connection, so the server-side session (current database,
 /// interactive SQL transaction) behaves exactly like any other OxiDB client
 /// connection. Close returns the wire connection to a process-wide pool
@@ -24,11 +25,13 @@ public sealed class OxiDbConnection : DbConnection
     private int _port = 4444;
     private string _database = "";
     private bool _pooling = true;
+    private bool _oxiwire = true;
     private OxiDbTcpClient? _client;
     private ConnectionState _state = ConnectionState.Closed;
     internal OxiDbTransaction? ActiveTransaction;
 
-    private string PoolKey => $"{_host}:{_port}/{_database}";
+    // The wire format is sticky per socket, so it's part of the pool key.
+    private string PoolKey => $"{_host}:{_port}/{_database}#{(_oxiwire ? "w" : "j")}";
 
     public OxiDbConnection() { }
 
@@ -56,6 +59,7 @@ public sealed class OxiDbConnection : DbConnection
                     case "port": _port = int.Parse(val); break;
                     case "database" or "initial catalog": _database = val; break;
                     case "pooling": _pooling = !val.Equals("false", StringComparison.OrdinalIgnoreCase); break;
+                    case "oxiwire": _oxiwire = !val.Equals("false", StringComparison.OrdinalIgnoreCase); break;
                 }
             }
         }
@@ -81,6 +85,10 @@ public sealed class OxiDbConnection : DbConnection
         if (_client is null)
         {
             _client = await OxiDbTcpClient.ConnectAsync(_host, _port, ct: ct).ConfigureAwait(false);
+            // Binary requests; the server replies in kind per request, and the
+            // client falls back to parsing JSON responses, so an older server
+            // that ignores the magic byte still works. `OxiWire=false` opts out.
+            if (_oxiwire) _client.UseOxiWire();
             if (!string.IsNullOrEmpty(_database))
             {
                 // Session default: every subsequent request targets this
