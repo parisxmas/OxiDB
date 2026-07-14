@@ -15,6 +15,19 @@ public class NorthwindSelectQueryOxiDbTest
     {
     }
 
+    private Task KnownLimit2(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
+
+    // SQLite-parity (ApplyNotSupported there): post-distinct correlated
+    // collections, Reverse in projection, non-mapped-property APPLY shapes.
+    public override Task Reverse_in_projection_subquery(bool async)
+        => KnownLimit2(() => base.Reverse_in_projection_subquery(async));
+
+    public override Task Correlated_collection_after_distinct_with_complex_projection_not_containing_original_identifier(bool async)
+        => KnownLimit2(() => base.Correlated_collection_after_distinct_with_complex_projection_not_containing_original_identifier(async));
+
+    public override Task SelectMany_with_collection_being_correlated_subquery_which_references_non_mapped_properties_from_inner_and_outer_entity(bool async)
+        => KnownLimit2(() => base.SelectMany_with_collection_being_correlated_subquery_which_references_non_mapped_properties_from_inner_and_outer_entity(async));
+
     // ── known engine limitation: correlation reaches one level up ───────────
     // These shapes need an outer reference from two or more scopes down
     // (nested correlated collections / aggregates over subqueries of
@@ -22,35 +35,15 @@ public class NorthwindSelectQueryOxiDbTest
     // support at all); OxiDB runs the single-level shapes.
     private Task KnownMultiLevelCorrelation(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
 
-    public override Task Select_nested_collection_multi_level5(bool async)
-        => KnownMultiLevelCorrelation(() => base.Select_nested_collection_multi_level5(async));
 
-    public override Task Select_nested_collection_multi_level6(bool async)
-        => KnownMultiLevelCorrelation(() => base.Select_nested_collection_multi_level6(async));
 
-    public override Task Select_nested_collection_deep(bool async)
-        => KnownMultiLevelCorrelation(() => base.Select_nested_collection_deep(async));
 
-    public override Task Select_nested_collection_deep_distinct_no_identifiers(bool async)
-        => KnownMultiLevelCorrelation(() => base.Select_nested_collection_deep_distinct_no_identifiers(async));
 
-    public override Task SelectMany_correlated_with_outer_1(bool async)
-        => KnownMultiLevelCorrelation(() => base.SelectMany_correlated_with_outer_1(async));
 
-    public override Task SelectMany_correlated_with_outer_3(bool async)
-        => KnownMultiLevelCorrelation(() => base.SelectMany_correlated_with_outer_3(async));
 
-    public override Task SelectMany_correlated_with_outer_5(bool async)
-        => KnownMultiLevelCorrelation(() => base.SelectMany_correlated_with_outer_5(async));
 
-    public override Task SelectMany_with_collection_being_correlated_subquery_which_references_non_mapped_properties_from_inner_and_outer_entity(bool async)
-        => KnownMultiLevelCorrelation(() => base.SelectMany_with_collection_being_correlated_subquery_which_references_non_mapped_properties_from_inner_and_outer_entity(async));
 
-    public override Task Reverse_in_projection_subquery(bool async)
-        => KnownMultiLevelCorrelation(() => base.Reverse_in_projection_subquery(async));
 
-    public override Task Projecting_after_navigation_and_distinct(bool async)
-        => KnownMultiLevelCorrelation(() => base.Projecting_after_navigation_and_distinct(async));
 
 
 
@@ -66,11 +59,7 @@ public class NorthwindSelectQueryOxiDbTest
 
 
 
-    public override Task Correlated_collection_after_distinct_with_complex_projection_not_containing_original_identifier(bool async)
-        => KnownMultiLevelCorrelation(() => base.Correlated_collection_after_distinct_with_complex_projection_not_containing_original_identifier(async));
 
-    public override Task Collection_projection_selecting_outer_element_followed_by_take(bool async)
-        => KnownMultiLevelCorrelation(() => base.Collection_projection_selecting_outer_element_followed_by_take(async));
 
 }
 
@@ -145,32 +134,21 @@ public class NorthwindAggregateOperatorsQueryOxiDbTest
     // two-level outer reference.
     private Task KnownMultiLevelCorrelation(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
 
-    public override Task Multiple_collection_navigation_with_FirstOrDefault_chained(bool async)
-        => KnownMultiLevelCorrelation(() => base.Multiple_collection_navigation_with_FirstOrDefault_chained(async));
 
-    public override Task Multiple_collection_navigation_with_FirstOrDefault_chained_projecting_scalar(bool async)
-        => KnownMultiLevelCorrelation(() => base.Multiple_collection_navigation_with_FirstOrDefault_chained_projecting_scalar(async));
 
-    public override Task Min_over_nested_subquery(bool async)
-        => KnownMultiLevelCorrelation(() => base.Min_over_nested_subquery(async));
 
-    public override Task Min_over_max_subquery(bool async)
-        => KnownMultiLevelCorrelation(() => base.Min_over_max_subquery(async));
 
-    public override Task Max_over_nested_subquery(bool async)
-        => KnownMultiLevelCorrelation(() => base.Max_over_nested_subquery(async));
 
-    public override Task Max_over_sum_subquery(bool async)
-        => KnownMultiLevelCorrelation(() => base.Max_over_sum_subquery(async));
 
-    public override Task Average_over_nested_subquery(bool async)
-        => KnownMultiLevelCorrelation(() => base.Average_over_nested_subquery(async));
 
-    public override Task Average_over_max_subquery(bool async)
-        => KnownMultiLevelCorrelation(() => base.Average_over_max_subquery(async));
+
+    private Task KnownLimit(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
 
     // Documented storage limitation: DECIMAL is stored as DOUBLE, so exact
     // decimal aggregates differ in the last few digits.
+    public override Task Average_over_max_subquery(bool async)
+        => KnownLimit(() => base.Average_over_max_subquery(async));
+
     public override async Task Type_casting_inside_sum(bool async)
         => await Assert.ThrowsAnyAsync<Exception>(() => base.Type_casting_inside_sum(async));
 
@@ -178,6 +156,11 @@ public class NorthwindAggregateOperatorsQueryOxiDbTest
         => await Assert.ThrowsAnyAsync<Exception>(() => base.Contains_inside_Average_without_GroupBy(async));
 
     // Expected translation failures, matching the SQLite provider.
+    // EF's parameterized-collection mix needs a provider collection
+    // translation (SQLite uses json_each); engine follow-up.
+    public override Task Contains_with_local_enumerable_inline_closure_mix(bool async)
+        => KnownLimit(() => base.Contains_with_local_enumerable_inline_closure_mix(async));
+
     public override Task Contains_with_local_tuple_array_closure(bool async)
         => AssertTranslationFailed(() => base.Contains_with_local_tuple_array_closure(async));
 
@@ -185,8 +168,6 @@ public class NorthwindAggregateOperatorsQueryOxiDbTest
         => AssertTranslationFailed(() => base.Contains_with_local_anonymous_type_array_closure(async));
 
 
-    public override Task Contains_with_local_enumerable_inline_closure_mix(bool async)
-        => KnownMultiLevelCorrelation(() => base.Contains_with_local_enumerable_inline_closure_mix(async));
 }
 
 public class NorthwindJoinQueryOxiDbTest
@@ -199,29 +180,20 @@ public class NorthwindJoinQueryOxiDbTest
     {
     }
 
+    // Engine follow-up: joining a parameterized local collection needs a
+    // provider collection translation (SQLite uses json_each).
+    public override Task Join_local_collection_int_closure_is_cached_correctly(bool async)
+        => KnownLimit(() => base.Join_local_collection_int_closure_is_cached_correctly(async));
+
     // SQLite-parity: the client-eval SelectMany family needs APPLY shapes
     // whose outer references sit deeper than one correlation level.
     private Task KnownLimit(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
 
-    public override Task SelectMany_with_client_eval(bool async)
-        => KnownLimit(() => base.SelectMany_with_client_eval(async));
 
-    public override Task SelectMany_with_client_eval_with_collection_shaper(bool async)
-        => KnownLimit(() => base.SelectMany_with_client_eval_with_collection_shaper(async));
 
-    public override Task SelectMany_with_client_eval_with_collection_shaper_ignored(bool async)
-        => KnownLimit(() => base.SelectMany_with_client_eval_with_collection_shaper_ignored(async));
 
-    public override Task SelectMany_with_selecting_outer_entity(bool async)
-        => KnownLimit(() => base.SelectMany_with_selecting_outer_entity(async));
 
-    public override Task SelectMany_with_selecting_outer_entity_column_and_inner_column(bool async)
-        => KnownLimit(() => base.SelectMany_with_selecting_outer_entity_column_and_inner_column(async));
 
-    // Engine limit (SQLite passes): a local int collection joined via a
-    // cached VALUES query plan.
-    public override Task Join_local_collection_int_closure_is_cached_correctly(bool async)
-        => KnownLimit(() => base.Join_local_collection_int_closure_is_cached_correctly(async));
 }
 
 public class NorthwindGroupByQueryOxiDbTest
@@ -236,18 +208,10 @@ public class NorthwindGroupByQueryOxiDbTest
 
     private Task KnownLimit(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
 
-    // SQLite-parity: APPLY shapes.
-    public override Task Complex_query_with_groupBy_in_subquery4(bool async)
-        => KnownLimit(() => base.Complex_query_with_groupBy_in_subquery4(async));
-
-
-
-    // Engine limits (SQLite passes): grouped derived-key / agg-in-agg shapes.
+    // Engine follow-up: an aggregate whose argument nests another
+    // aggregate-bearing correlated subquery.
     public override Task GroupBy_with_aggregate_containing_complex_where(bool async)
         => KnownLimit(() => base.GroupBy_with_aggregate_containing_complex_where(async));
-
-    public override Task GroupBy_complex_key_aggregate_2(bool async)
-        => KnownLimit(() => base.GroupBy_complex_key_aggregate_2(async));
 }
 
 public class NorthwindMiscellaneousQueryOxiDbTest
@@ -277,6 +241,8 @@ public class NorthwindMiscellaneousQueryOxiDbTest
     public override Task Select_subquery_recursive_trivial(bool async)
         => KnownLimit(() => base.Select_subquery_recursive_trivial(async));
 
+
+
     public override Task Complex_nested_query_doesnt_try_binding_to_grandparent_when_parent_returns_complex_result(bool async)
         => Task.CompletedTask; // disabled in the SQLite provider too
 
@@ -302,35 +268,15 @@ public class NorthwindMiscellaneousQueryOxiDbTest
 
     // ── known engine limits: correlation reaches one level up ───────────────
 
-    public override Task Subquery_member_pushdown_does_not_change_original_subquery_model(bool async)
-        => KnownLimit(() => base.Subquery_member_pushdown_does_not_change_original_subquery_model(async));
 
-    public override Task Subquery_member_pushdown_does_not_change_original_subquery_model2(bool async)
-        => KnownLimit(() => base.Subquery_member_pushdown_does_not_change_original_subquery_model2(async));
 
-    public override Task Select_Where_Subquery_Equality(bool async)
-        => KnownLimit(() => base.Select_Where_Subquery_Equality(async));
 
-    public override Task Complex_nested_query_properly_binds_to_grandparent_when_parent_returns_scalar_result(bool async)
-        => KnownLimit(() => base.Complex_nested_query_properly_binds_to_grandparent_when_parent_returns_scalar_result(async));
 
-    public override Task All_top_level_subquery(bool async)
-        => KnownLimit(() => base.All_top_level_subquery(async));
 
-    public override Task All_top_level_subquery_ef_property(bool async)
-        => KnownLimit(() => base.All_top_level_subquery_ef_property(async));
 
-    public override Task Where_query_composition_is_null(bool async)
-        => KnownLimit(() => base.Where_query_composition_is_null(async));
 
-    public override Task Where_query_composition_is_not_null(bool async)
-        => KnownLimit(() => base.Where_query_composition_is_not_null(async));
 
-    public override Task Pending_selector_in_cardinality_reducing_method_is_applied_before_expanding_collection_navigation_member(bool async)
-        => KnownLimit(() => base.Pending_selector_in_cardinality_reducing_method_is_applied_before_expanding_collection_navigation_member(async));
 
-    public override Task Subquery_with_navigation_inside_inline_collection(bool async)
-        => KnownLimit(() => base.Subquery_with_navigation_inside_inline_collection(async));
 }
 
 public class NorthwindSetOperationsQueryOxiDbTest
@@ -369,10 +315,6 @@ public class NorthwindNavigationsQueryOxiDbTest
     {
     }
 
-    // Known engine limit: multi-level correlation.
-    public override Task Project_single_scalar_value_subquery_in_query_with_optional_navigation_works(bool async)
-        => Assert.ThrowsAnyAsync<Exception>(
-            () => base.Project_single_scalar_value_subquery_in_query_with_optional_navigation_works(async));
 }
 
 public class NorthwindKeylessEntitiesQueryOxiDbTest
@@ -389,9 +331,6 @@ public class NorthwindKeylessEntitiesQueryOxiDbTest
     public override Task KeylessEntity_with_nav_defining_query(bool async)
         => Assert.ThrowsAnyAsync<Exception>(() => base.KeylessEntity_with_nav_defining_query(async));
 
-    // Known engine limit: multi-level correlation.
-    public override Task Collection_correlated_with_keyless_entity_in_predicate_works(bool async)
-        => Assert.ThrowsAnyAsync<Exception>(() => base.Collection_correlated_with_keyless_entity_in_predicate_works(async));
 }
 
 public class NorthwindDbFunctionsQueryOxiDbTest

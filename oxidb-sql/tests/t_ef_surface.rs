@@ -555,3 +555,55 @@ fn collate_nocase_and_binary() {
             .is_err()
     );
 }
+
+#[test]
+fn multi_level_correlation() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE c (id INT, tag TEXT)").unwrap();
+    db.execute("CREATE TABLE o (id INT, cid INT)").unwrap();
+    db.execute("CREATE TABLE od (oid INT, tag TEXT)").unwrap();
+    db.execute("INSERT INTO c VALUES (1,'a'), (2,'b')").unwrap();
+    db.execute("INSERT INTO o VALUES (10,1),(11,1),(20,2)")
+        .unwrap();
+    db.execute("INSERT INTO od VALUES (10,'a'),(10,'a'),(11,'b'),(20,'b')")
+        .unwrap();
+
+    // Level-2 subquery referencing level-0 (`c.tag`) THROUGH level-1 (`o`):
+    // count of order details whose tag matches the customer's tag, maxed
+    // over the customer's orders.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT c.id, (SELECT MAX((SELECT COUNT(*) FROM od \
+                                       WHERE od.oid = o.id AND od.tag = c.tag)) \
+                          FROM o WHERE o.cid = c.id) \
+             FROM c ORDER BY c.id"
+        ),
+        vec![vec![i(1), i(2)], vec![i(2), i(1)]]
+    );
+
+    // The EF aggregate-over-nested-subquery shape: outer ref inside a
+    // derived table inside a scalar subquery inside an aggregate.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT MIN((SELECT SUM(n) FROM \
+                          (SELECT COUNT(*) AS n FROM o WHERE o.cid = c.id) x)) \
+             FROM c"
+        ),
+        vec![vec![i(1)]]
+    );
+
+    // Shadowing: the intervening scope's own `tag` column wins; only the
+    // truly unresolvable ref correlates to level 0.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT c.id FROM c WHERE EXISTS \
+               (SELECT 1 FROM o WHERE o.cid = c.id AND EXISTS \
+                  (SELECT 1 FROM od WHERE od.oid = o.id AND od.tag = c.tag)) \
+             ORDER BY c.id"
+        ),
+        vec![vec![i(1)], vec![i(2)]]
+    );
+}

@@ -1071,6 +1071,14 @@ impl Scope {
         }
     }
 
+    /// A scope containing both sides' tables (used when descending through
+    /// nested subqueries: intervening scopes shadow the outermost one).
+    fn merged(&self, other: &Scope) -> Scope {
+        let mut tables = self.tables.clone();
+        tables.extend(other.tables.iter().cloned());
+        Scope { tables }
+    }
+
     /// A scope over an already-materialized combined schema (used for the
     /// left side of a LATERAL join, which may include derived tables).
     fn from_schema(schema: &[ColRef]) -> Scope {
@@ -1088,8 +1096,10 @@ impl Scope {
 fn scope_of<S: Store>(store: &S, s: &SelectStmt) -> Scope {
     let mut tables = Vec::new();
     let mut add = |r: &TableRef| {
-        if let Some(def) = store.table_def(&r.name) {
-            let cols = def.columns.iter().map(|c| c.name.clone()).collect();
+        // Derived tables resolve to their (aliased) projection columns;
+        // base tables to the catalog definition.
+        let cols = table_columns(store, r);
+        if !cols.is_empty() {
             tables.push((r.key().to_string(), cols));
         }
     };
@@ -1100,6 +1110,63 @@ fn scope_of<S: Store>(store: &S, s: &SelectStmt) -> Scope {
         add(&j.table);
     }
     Scope { tables }
+}
+
+/// The output column names of a query body, derived statically from the AST
+/// (for name resolution before anything executes). Mirrors the executor's
+/// naming: alias > bare column name > the function's default name.
+fn derived_columns<S: Store>(store: &S, body: &QueryBody) -> Vec<String> {
+    match body {
+        QueryBody::Select(s) => {
+            let mut cols = Vec::new();
+            for item in &s.projection {
+                match item {
+                    SelectItem::Expr { alias: Some(a), .. } => cols.push(a.clone()),
+                    SelectItem::Expr { expr, .. } => cols.push(default_name(expr)),
+                    SelectItem::Wildcard => {
+                        if let Some(from) = &s.from {
+                            cols.extend(table_columns(store, from));
+                        }
+                        for j in &s.joins {
+                            cols.extend(table_columns(store, &j.table));
+                        }
+                    }
+                    SelectItem::QualifiedWildcard(t) => {
+                        let matching = s
+                            .from
+                            .iter()
+                            .chain(s.joins.iter().map(|j| &j.table))
+                            .find(|r| r.key() == t);
+                        if let Some(r) = matching {
+                            cols.extend(table_columns(store, r));
+                        }
+                    }
+                }
+            }
+            cols
+        }
+        QueryBody::SetOp { left, .. } => derived_columns(store, left),
+        QueryBody::Values(rows) => {
+            let width = rows.first().map(|r| r.len()).unwrap_or(0);
+            (1..=width).map(|i| format!("column{i}")).collect()
+        }
+    }
+}
+
+/// A table reference's column names (catalog for base tables, projection for
+/// derived tables).
+fn table_columns<S: Store>(store: &S, r: &TableRef) -> Vec<String> {
+    if let Some(sub) = &r.subquery {
+        if r.alias_columns.is_empty() {
+            derived_columns(store, &sub.body)
+        } else {
+            r.alias_columns.clone()
+        }
+    } else if let Some(def) = store.table_def(&r.name) {
+        def.columns.iter().map(|c| c.name.clone()).collect()
+    } else {
+        Vec::new()
+    }
 }
 
 /// The scope of a single-table DML statement: the table's columns, qualified
@@ -1162,6 +1229,75 @@ fn resolve_subqueries_stmt<S: Store>(
         }
         _ => Ok(()),
     }
+}
+
+/// True when the query contains a bind-parameter slot at or above `floor` —
+/// i.e. a synthetic slot for an enclosing scope's value. Such a query must
+/// not be materialized at resolve time (the slot is only bound per outer
+/// row), even when it has no direct correlation of its own.
+fn query_has_param_ge(q: &SelectQuery, floor: usize) -> bool {
+    fn expr_has(e: &Expr, floor: usize) -> bool {
+        match e {
+            Expr::Param(i) => *i >= floor,
+            Expr::Binary { left, right, .. } => expr_has(left, floor) || expr_has(right, floor),
+            Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => expr_has(expr, floor),
+            Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(|a| expr_has(a, floor)),
+            Expr::Func { args, .. } => args.iter().any(|a| expr_has(a, floor)),
+            Expr::In { expr, list, .. } => {
+                expr_has(expr, floor) || list.iter().any(|i| expr_has(i, floor))
+            }
+            Expr::Subquery(q) => query_has_param_ge(q, floor),
+            Expr::InSubquery { expr, query, .. } => {
+                expr_has(expr, floor) || query_has_param_ge(query, floor)
+            }
+            Expr::CorrScalar { query, outer, .. } => {
+                outer.iter().any(|o| expr_has(o, floor)) || query_has_param_ge(query, floor)
+            }
+            Expr::CorrIn {
+                expr, query, outer, ..
+            } => {
+                expr_has(expr, floor)
+                    || outer.iter().any(|o| expr_has(o, floor))
+                    || query_has_param_ge(query, floor)
+            }
+            Expr::Window {
+                func,
+                partition_by,
+                order_by,
+            } => {
+                partition_by.iter().any(|e| expr_has(e, floor))
+                    || order_by.iter().any(|(e, _)| expr_has(e, floor))
+                    || matches!(func, WindowFunc::Agg(_, Some(a)) if expr_has(a, floor))
+            }
+            _ => false,
+        }
+    }
+    fn body_has(b: &QueryBody, floor: usize) -> bool {
+        match b {
+            QueryBody::Select(s) => {
+                s.projection.iter().any(
+                    |item| matches!(item, SelectItem::Expr { expr, .. } if expr_has(expr, floor)),
+                ) || s.filter.as_ref().is_some_and(|e| expr_has(e, floor))
+                    || s.joins.iter().any(|j| {
+                        expr_has(&j.on, floor)
+                            || j.table
+                                .subquery
+                                .as_deref()
+                                .is_some_and(|q| query_has_param_ge(q, floor))
+                    })
+                    || s.from
+                        .as_ref()
+                        .and_then(|f| f.subquery.as_deref())
+                        .is_some_and(|q| query_has_param_ge(q, floor))
+                    || s.group_by.iter().any(|e| expr_has(e, floor))
+                    || s.having.as_ref().is_some_and(|e| expr_has(e, floor))
+                    || s.order_by.iter().any(|(e, _)| expr_has(e, floor))
+            }
+            QueryBody::SetOp { left, right, .. } => body_has(left, floor) || body_has(right, floor),
+            QueryBody::Values(rows) => rows.iter().flatten().any(|e| expr_has(e, floor)),
+        }
+    }
+    body_has(&q.body, floor)
 }
 
 fn resolve_query<S: Store>(
@@ -1244,7 +1380,7 @@ fn resolve_expr<S: Store>(
             // Nested subqueries inside `q` resolve with q's own selects as
             // their outer scope; their synthetic params start above ours.
             resolve_query(store, q, params, floor + outer.len())?;
-            if outer.is_empty() {
+            if outer.is_empty() && !query_has_param_ge(q, params.len()) {
                 let (columns, mut rows) = run_query_rows(store, (**q).clone(), params)?;
                 if columns.len() != 1 {
                     return Err(SqlError::Unsupported(
@@ -1278,7 +1414,7 @@ fn resolve_expr<S: Store>(
                 None => Vec::new(),
             };
             resolve_query(store, query, params, floor + outer.len())?;
-            if outer.is_empty() {
+            if outer.is_empty() && !query_has_param_ge(query, params.len()) {
                 let (columns, rows) = run_query_rows(store, (**query).clone(), params)?;
                 if columns.len() != 1 {
                     return Err(SqlError::Unsupported(
@@ -1365,21 +1501,38 @@ fn extract_outer<S: Store>(
     base: usize,
 ) -> Vec<Expr> {
     let mut out: Vec<Expr> = Vec::new();
-    extract_outer_body(store, &mut q.body, outer, base, &mut out);
+    let empty = Scope { tables: Vec::new() };
+    extract_outer_body(store, &mut q.body, outer, base, &mut out, &empty);
     out
 }
 
+/// `inherited` carries the scopes of every select between the extraction
+/// root and `body` — a reference resolving against ANY intervening scope is
+/// that level's correlation, not the root's (SQL shadowing across levels).
 fn extract_outer_body<S: Store>(
     store: &S,
     body: &mut QueryBody,
     outer: &Scope,
     base: usize,
     out: &mut Vec<Expr>,
+    inherited: &Scope,
 ) {
     match body {
         QueryBody::Select(s) => {
-            let inner = scope_of(store, s);
-            let mut rewrite = |e: &mut Expr| rewrite_outer_refs(e, &inner, outer, base, out);
+            let inner = scope_of(store, s).merged(inherited);
+            // A bare outer-column projection keeps its output name after the
+            // rewrite turns it into a parameter (`SELECT "c"."City"` must
+            // still surface as column `City`).
+            for item in &mut s.projection {
+                if let SelectItem::Expr {
+                    expr: Expr::Column { name, .. },
+                    alias: alias @ None,
+                } = item
+                {
+                    *alias = Some(name.clone());
+                }
+            }
+            let mut rewrite = |e: &mut Expr| rewrite_outer_refs(store, e, &inner, outer, base, out);
             for item in &mut s.projection {
                 if let SelectItem::Expr { expr, .. } = item {
                     rewrite(expr);
@@ -1407,25 +1560,32 @@ fn extract_outer_body<S: Store>(
             if let Some(from) = &mut s.from
                 && let Some(sub) = &mut from.subquery
             {
-                extract_outer_body(store, &mut sub.body, outer, base, out);
+                extract_outer_body(store, &mut sub.body, outer, base, out, &inner);
             }
             for j in &mut s.joins {
                 if let Some(sub) = &mut j.table.subquery {
-                    extract_outer_body(store, &mut sub.body, outer, base, out);
+                    extract_outer_body(store, &mut sub.body, outer, base, out, &inner);
                 }
             }
         }
         QueryBody::SetOp { left, right, .. } => {
-            extract_outer_body(store, left, outer, base, out);
-            extract_outer_body(store, right, outer, base, out);
+            extract_outer_body(store, left, outer, base, out, inherited);
+            extract_outer_body(store, right, outer, base, out, inherited);
         }
-        // VALUES rows are literal/parameter expressions; nothing resolves
-        // against a table scope.
-        QueryBody::Values(_) => {}
+        // VALUES rows may carry correlated expressions (EF inlines
+        // navigation subqueries into collection literals).
+        QueryBody::Values(rows) => {
+            for row in rows {
+                for e in row {
+                    rewrite_outer_refs(store, e, inherited, outer, base, out);
+                }
+            }
+        }
     }
 }
 
-fn rewrite_outer_refs(
+fn rewrite_outer_refs<S: Store>(
+    store: &S,
     e: &mut Expr,
     inner: &Scope,
     outer: &Scope,
@@ -1451,33 +1611,39 @@ fn rewrite_outer_refs(
             *e = Expr::Param(base + k);
         }
         Expr::Binary { left, right, .. } => {
-            rewrite_outer_refs(left, inner, outer, base, out);
-            rewrite_outer_refs(right, inner, outer, base, out);
+            rewrite_outer_refs(store, left, inner, outer, base, out);
+            rewrite_outer_refs(store, right, inner, outer, base, out);
         }
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
-            rewrite_outer_refs(expr, inner, outer, base, out);
+            rewrite_outer_refs(store, expr, inner, outer, base, out);
         }
         Expr::Aggregate { arg, .. } => {
             if let Some(a) = arg {
-                rewrite_outer_refs(a, inner, outer, base, out);
+                rewrite_outer_refs(store, a, inner, outer, base, out);
             }
         }
         Expr::Func { args, .. } => {
             for a in args {
-                rewrite_outer_refs(a, inner, outer, base, out);
+                rewrite_outer_refs(store, a, inner, outer, base, out);
             }
         }
         Expr::In { expr, list, .. } => {
-            rewrite_outer_refs(expr, inner, outer, base, out);
+            rewrite_outer_refs(store, expr, inner, outer, base, out);
             for item in list {
-                rewrite_outer_refs(item, inner, outer, base, out);
+                rewrite_outer_refs(store, item, inner, outer, base, out);
             }
         }
-        // The probe of a nested IN-subquery belongs to *this* scope; the
-        // nested query body's references are handled when it is itself
-        // resolved (with this subquery as its outer scope).
-        Expr::InSubquery { expr, .. } => {
-            rewrite_outer_refs(expr, inner, outer, base, out);
+        // The probe of a nested IN-subquery belongs to *this* scope. The
+        // nested BODY is descended too: a reference resolving against no
+        // intervening scope but against the extraction root's outer scope is
+        // multi-level correlation and must be captured here (the nested
+        // query's own resolution only sees one level up).
+        Expr::InSubquery { expr, query, .. } => {
+            rewrite_outer_refs(store, expr, inner, outer, base, out);
+            extract_outer_body(store, &mut query.body, outer, base, out, inner);
+        }
+        Expr::Subquery(query) => {
+            extract_outer_body(store, &mut query.body, outer, base, out, inner);
         }
         Expr::Window {
             func,
@@ -1485,17 +1651,16 @@ fn rewrite_outer_refs(
             order_by,
         } => {
             for e in partition_by {
-                rewrite_outer_refs(e, inner, outer, base, out);
+                rewrite_outer_refs(store, e, inner, outer, base, out);
             }
             for (e, _) in order_by {
-                rewrite_outer_refs(e, inner, outer, base, out);
+                rewrite_outer_refs(store, e, inner, outer, base, out);
             }
             if let WindowFunc::Agg(_, Some(a)) = func {
-                rewrite_outer_refs(a, inner, outer, base, out);
+                rewrite_outer_refs(store, a, inner, outer, base, out);
             }
         }
-        Expr::Subquery(_)
-        | Expr::CorrScalar { .. }
+        Expr::CorrScalar { .. }
         | Expr::CorrIn { .. }
         | Expr::Col(_)
         | Expr::Literal(_)
