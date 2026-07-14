@@ -238,6 +238,90 @@ public static class OxiWire
     }
 
     /// <summary>
+    /// Decode a response envelope straight to CLR values — no JSON round
+    /// trip. Maps become <c>Dictionary&lt;string, object?&gt;</c>, arrays
+    /// <c>object?[]</c>, scalars <c>long</c>/<c>double</c>/<c>string</c>/
+    /// <c>bool</c>/<c>null</c>. This is the hot read path for
+    /// <c>OxiDb.Data</c>'s reader; <see cref="DecodeResponse"/> (via JSON)
+    /// remains for JsonElement consumers.
+    /// </summary>
+    public static (bool Ok, object? Data) DecodeResponseClr(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length < 2 || payload[0] != Magic)
+            throw new OxiDbProtocolException("OxiWire: invalid magic byte");
+        var status = payload[1];
+        var pos = 2;
+        var value = DecodeValueClr(payload, ref pos);
+        return (status == 0, value);
+    }
+
+    private static object? DecodeValueClr(ReadOnlySpan<byte> buf, ref int pos)
+    {
+        if (pos >= buf.Length)
+            throw new OxiDbProtocolException("OxiWire: unexpected end of input");
+        var tag = buf[pos++];
+        switch (tag)
+        {
+            case TagNull:
+                return null;
+            case TagFalse:
+                return false;
+            case TagTrue:
+                return true;
+            case TagInt64:
+                EnsureBytes(buf, pos, 8);
+                var i = BinaryPrimitives.ReadInt64LittleEndian(buf[pos..]);
+                pos += 8;
+                return i;
+            case TagUint64:
+                EnsureBytes(buf, pos, 8);
+                var u = BinaryPrimitives.ReadUInt64LittleEndian(buf[pos..]);
+                pos += 8;
+                // Long-range values stay long (the common case: row ids, ints).
+                return u <= long.MaxValue ? (long)u : (object)u;
+            case TagFloat:
+                EnsureBytes(buf, pos, 8);
+                var bits = BinaryPrimitives.ReadUInt64LittleEndian(buf[pos..]);
+                pos += 8;
+                return BitConverter.UInt64BitsToDouble(bits);
+            case TagString:
+                EnsureBytes(buf, pos, 4);
+                var strLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(buf[pos..]);
+                pos += 4;
+                EnsureBytes(buf, pos, strLen);
+                var s = Encoding.UTF8.GetString(buf.Slice(pos, strLen));
+                pos += strLen;
+                return s;
+            case TagArray:
+                EnsureBytes(buf, pos, 4);
+                var arrCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(buf[pos..]);
+                pos += 4;
+                var arr = new object?[arrCount];
+                for (var k = 0; k < arrCount; k++)
+                    arr[k] = DecodeValueClr(buf, ref pos);
+                return arr;
+            case TagMap:
+                EnsureBytes(buf, pos, 4);
+                var mapCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(buf[pos..]);
+                pos += 4;
+                var map = new Dictionary<string, object?>(mapCount);
+                for (var k = 0; k < mapCount; k++)
+                {
+                    EnsureBytes(buf, pos, 4);
+                    var keyLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(buf[pos..]);
+                    pos += 4;
+                    EnsureBytes(buf, pos, keyLen);
+                    var key = Encoding.UTF8.GetString(buf.Slice(pos, keyLen));
+                    pos += keyLen;
+                    map[key] = DecodeValueClr(buf, ref pos);
+                }
+                return map;
+            default:
+                throw new OxiDbProtocolException($"OxiWire: unknown tag 0x{tag:X2} at position {pos - 1}");
+        }
+    }
+
+    /// <summary>
     /// Decode an OxiWire value and write it as JSON to a Utf8JsonWriter.
     /// This avoids building intermediate objects — goes straight from binary to JSON.
     /// </summary>

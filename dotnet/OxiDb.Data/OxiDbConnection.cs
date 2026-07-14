@@ -26,12 +26,14 @@ public sealed class OxiDbConnection : DbConnection
     private string _database = "";
     private bool _pooling = true;
     private bool _oxiwire = true;
+    private string? _poolKey;
     private OxiDbTcpClient? _client;
     private ConnectionState _state = ConnectionState.Closed;
     internal OxiDbTransaction? ActiveTransaction;
 
     // The wire format is sticky per socket, so it's part of the pool key.
-    private string PoolKey => $"{_host}:{_port}/{_database}#{(_oxiwire ? "w" : "j")}";
+    // Cached: EF cycles Open/Close around every query on one connection.
+    private string PoolKey => _poolKey ??= $"{_host}:{_port}/{_database}#{(_oxiwire ? "w" : "j")}";
 
     public OxiDbConnection() { }
 
@@ -47,6 +49,7 @@ public sealed class OxiDbConnection : DbConnection
         set
         {
             _connectionString = value ?? "";
+            _poolKey = null;
             foreach (var part in _connectionString.Split(';', StringSplitOptions.RemoveEmptyEntries))
             {
                 var idx = part.IndexOf('=');
@@ -108,8 +111,9 @@ public sealed class OxiDbConnection : DbConnection
         {
             // Only a session-clean connection may be pooled: no interactive
             // transaction (the server rolls one back on disconnect — a pooled
-            // socket would leak it into the next renter instead).
-            if (_pooling && ActiveTransaction is null && _client.IsAlive)
+            // socket would leak it into the next renter instead). Flag-only
+            // check here; the rent side probes liveness for aged entries.
+            if (_pooling && ActiveTransaction is null && _client.IsUsable)
                 OxiDbClientPool.Return(PoolKey, _client);
             else
                 _client.Dispose();
@@ -124,6 +128,7 @@ public sealed class OxiDbConnection : DbConnection
         Client.ExecRawAsync(new() { ["cmd"] = "use_db", ["name"] = databaseName })
             .GetAwaiter().GetResult();
         _database = databaseName;
+        _poolKey = null;
     }
 
     protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
@@ -140,6 +145,14 @@ public sealed class OxiDbConnection : DbConnection
     /// <summary>Run SQL on this connection's session and return the per-statement results array.</summary>
     internal Task<JsonElement> SqlAsync(string sql, object?[]? parameters, CancellationToken ct) =>
         Client.SqlAsync(sql, parameters, ct);
+
+    /// <summary>Run SQL and return the raw response frame (hot read path).</summary>
+    internal Task<byte[]> SqlRawAsync(string sql, object?[]? parameters, CancellationToken ct) =>
+        Client.SqlRawBytesAsync(sql, parameters, ct);
+
+    /// <summary>Synchronous twin of <see cref="SqlRawAsync"/> (blocking I/O).</summary>
+    internal byte[] SqlRaw(string sql, object?[]? parameters) =>
+        Client.SqlRawBytes(sql, parameters);
 
     protected override void Dispose(bool disposing)
     {

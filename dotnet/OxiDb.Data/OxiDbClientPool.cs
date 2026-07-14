@@ -15,11 +15,23 @@ namespace OxiDb.Data;
 /// </summary>
 internal static class OxiDbClientPool
 {
-    private sealed record Entry(OxiDbTcpClient Client, long ReturnedAtTicks);
+    private readonly struct Entry(OxiDbTcpClient client, long returnedAtMs)
+    {
+        public readonly OxiDbTcpClient Client = client;
+        public readonly long ReturnedAtMs = returnedAtMs;
+    }
 
     private static readonly ConcurrentDictionary<string, ConcurrentQueue<Entry>> Pools = new();
     private const int MaxPerKey = 32;
-    private static readonly TimeSpan MaxIdle = TimeSpan.FromSeconds(10);
+    private const long MaxIdleMs = 10_000;
+    /// <summary>
+    /// Under this idle age a rented client skips the liveness `Poll`
+    /// syscall: EF opens/closes around every query, so the hot loop re-rents
+    /// a connection it returned microseconds ago — a socket the server
+    /// killed that recently will surface as one failed query, exactly like a
+    /// non-pooled connection dying mid-use.
+    /// </summary>
+    private const long TrustIdleMs = 1_000;
 
     /// <summary>A live pooled client for `key`, or null (caller connects).</summary>
     public static OxiDbTcpClient? TryRent(string key)
@@ -28,8 +40,10 @@ internal static class OxiDbClientPool
             return null;
         while (queue.TryDequeue(out var entry))
         {
-            var idle = TimeSpan.FromTicks(DateTime.UtcNow.Ticks - entry.ReturnedAtTicks);
-            if (idle <= MaxIdle && entry.Client.IsAlive)
+            var idle = Environment.TickCount64 - entry.ReturnedAtMs;
+            if (idle <= TrustIdleMs)
+                return entry.Client;
+            if (idle <= MaxIdleMs && entry.Client.IsAlive)
                 return entry.Client;
             entry.Client.Dispose();
         }
@@ -39,12 +53,12 @@ internal static class OxiDbClientPool
     /// <summary>Return a session-clean client to the pool (or dispose it when full).</summary>
     public static void Return(string key, OxiDbTcpClient client)
     {
-        var queue = Pools.GetOrAdd(key, _ => new ConcurrentQueue<Entry>());
+        var queue = Pools.GetOrAdd(key, static _ => new ConcurrentQueue<Entry>());
         if (queue.Count >= MaxPerKey)
         {
             client.Dispose();
             return;
         }
-        queue.Enqueue(new Entry(client, DateTime.UtcNow.Ticks));
+        queue.Enqueue(new Entry(client, Environment.TickCount64));
     }
 }

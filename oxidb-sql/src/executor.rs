@@ -4662,6 +4662,30 @@ fn eval_scalar<R: RowLike + ?Sized>(
             apply_unary(*op, v)
         }
         Expr::Binary { op, left, right } => {
+            // Comparison of two ref-transparent operands: compare in place.
+            // The owned path below clones both sides per row — for a TEXT
+            // column that is a heap allocation just to run a comparison.
+            if matches!(
+                op,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+            ) && let (Some(l), Some(r)) = (val_ref(left, row, params), val_ref(right, row, params))
+            {
+                if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                return match cmp_values(l, r) {
+                    Some(ord) => Ok(Value::Bool(match op {
+                        BinOp::Eq => ord == Ordering::Equal,
+                        BinOp::Ne => ord != Ordering::Equal,
+                        BinOp::Lt => ord == Ordering::Less,
+                        BinOp::Le => ord != Ordering::Greater,
+                        BinOp::Gt => ord == Ordering::Greater,
+                        BinOp::Ge => ord != Ordering::Less,
+                        _ => unreachable!(),
+                    })),
+                    None => Err(SqlError::Eval(format!("cannot compare {l:?} and {r:?}"))),
+                };
+            }
             let l = eval_scalar(left, schema, row, params)?;
             let r = eval_scalar(right, schema, row, params)?;
             eval_binary(*op, l, r)
@@ -4677,6 +4701,9 @@ fn eval_scalar<R: RowLike + ?Sized>(
             })
         }
         Expr::Func { func, args } => {
+            if let Some(v) = eval_func_ref(func, args, row, params) {
+                return v;
+            }
             eval_scalar_func(*func, args, |e| eval_scalar(e, schema, row, params))
         }
         Expr::Aggregate { .. } => Err(SqlError::Eval(
@@ -4691,6 +4718,75 @@ fn eval_scalar<R: RowLike + ?Sized>(
         Expr::Window { .. } => Err(SqlError::Unsupported(
             "window function only allowed in the SELECT list".into(),
         )),
+    }
+}
+
+/// Borrow a ref-transparent expression's value (a bound column, literal, or
+/// parameter) without cloning; `None` = computed expression (the caller
+/// falls back to owned evaluation).
+#[inline]
+fn val_ref<'a, R: RowLike + ?Sized>(
+    e: &'a Expr,
+    row: &'a R,
+    params: &'a [Value],
+) -> Option<&'a Value> {
+    match e {
+        Expr::Col(i) => row.val(*i),
+        Expr::Literal(v) => Some(v),
+        Expr::Param(i) => params.get(*i),
+        _ => None,
+    }
+}
+
+/// Zero-clone fast paths for the hot string predicates when every argument
+/// is a ref-transparent TEXT (or NULL) value. `None` falls back to the
+/// generic implementation (which owns, coerces non-text, and must match
+/// these semantics exactly for TEXT inputs).
+fn eval_func_ref<R: RowLike + ?Sized>(
+    func: &ScalarFunc,
+    args: &[Expr],
+    row: &R,
+    params: &[Value],
+) -> Option<Result<Value>> {
+    // Outer None = not a fast-path shape; inner None = SQL NULL.
+    fn text<'a, R: RowLike + ?Sized>(
+        e: &'a Expr,
+        row: &'a R,
+        params: &'a [Value],
+    ) -> Option<Option<&'a str>> {
+        match val_ref(e, row, params)? {
+            Value::Text(s) => Some(Some(s.as_str())),
+            Value::Null => Some(None),
+            _ => None,
+        }
+    }
+    match func {
+        ScalarFunc::Position if args.len() == 2 => {
+            let (s, sub) = (text(&args[0], row, params)?, text(&args[1], row, params)?);
+            Some(Ok(match (s, sub) {
+                // 1-based character index; 0 = not found; empty needle → 1.
+                (Some(s), Some(sub)) => Value::Int(match s.find(sub) {
+                    Some(byte) => s[..byte].chars().count() as i64 + 1,
+                    None => 0,
+                }),
+                _ => Value::Null,
+            }))
+        }
+        ScalarFunc::Like { negated, escape } if args.len() == 2 => {
+            let (s, p) = (text(&args[0], row, params)?, text(&args[1], row, params)?);
+            Some(Ok(match (s, p) {
+                (Some(s), Some(p)) => Value::Bool(like_match(s, p, *escape) != *negated),
+                _ => Value::Null,
+            }))
+        }
+        ScalarFunc::Length if args.len() == 1 => {
+            let s = text(&args[0], row, params)?;
+            Some(Ok(match s {
+                Some(s) => Value::Int(s.chars().count() as i64),
+                None => Value::Null,
+            }))
+        }
+        _ => None,
     }
 }
 

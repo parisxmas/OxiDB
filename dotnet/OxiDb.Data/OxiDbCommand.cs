@@ -34,8 +34,12 @@ public sealed class OxiDbCommand : DbCommand
     public override void Prepare() { }
     protected override DbParameter CreateDbParameter() => new OxiDbParameter();
 
-    protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior) =>
-        ExecuteDbDataReaderAsync(behavior, default).GetAwaiter().GetResult();
+    protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
+    {
+        // True sync path: blocking socket I/O, no async-machinery thread hops.
+        var (sql, args) = BindParameters();
+        return OxiDbDataReader.Parse(Conn.SqlRaw(sql, args));
+    }
 
     protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(
         CommandBehavior behavior,
@@ -43,24 +47,21 @@ public sealed class OxiDbCommand : DbCommand
     {
         ct.ThrowIfCancellationRequested();
         var (sql, args) = BindParameters();
-        var results = await Conn.SqlAsync(sql, args, ct).ConfigureAwait(false);
-        return new OxiDbDataReader(results);
+        var raw = await Conn.SqlRawAsync(sql, args, ct).ConfigureAwait(false);
+        return OxiDbDataReader.Parse(raw);
     }
 
-    public override int ExecuteNonQuery() =>
-        ExecuteNonQueryAsync(default).GetAwaiter().GetResult();
+    public override int ExecuteNonQuery()
+    {
+        using var reader = ExecuteDbDataReader(CommandBehavior.Default);
+        return reader.RecordsAffected;
+    }
 
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken ct)
     {
-        var (sql, args) = BindParameters();
-        var results = await Conn.SqlAsync(sql, args, ct).ConfigureAwait(false);
-        var affected = 0;
-        foreach (var r in results.EnumerateArray())
-        {
-            if (r.TryGetProperty("affected", out var a))
-                affected += a.GetInt32();
-        }
-        return affected;
+        using var reader = await ExecuteDbDataReaderAsync(CommandBehavior.Default, ct)
+            .ConfigureAwait(false);
+        return reader.RecordsAffected;
     }
 
     public override object? ExecuteScalar() =>

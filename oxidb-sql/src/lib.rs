@@ -312,7 +312,18 @@ pub struct SqlEngine {
     /// between requests; execution takes it out and puts it back.
     session_txns: Mutex<std::collections::HashMap<u64, transaction::TxnState>>,
     next_session_txn: std::sync::atomic::AtomicU64,
+    /// Parsed-statement cache: SQL text -> AST. Applications loop over a
+    /// small set of parameterized texts, and parsing costs more than an AST
+    /// clone; execution works on a clone, so the cached AST is never touched.
+    /// Text -> AST is pure, making invalidation a non-issue; the map is
+    /// cleared wholesale if it ever grows past a cap.
+    stmt_cache: Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<ast::Statement>>>>,
 }
+
+/// Statement-cache entry cap: past this the whole map is dropped (workloads
+/// have few distinct texts; unbounded growth would only come from literals
+/// inlined into SQL, which shouldn't be cached anyway).
+const STMT_CACHE_CAP: usize = 512;
 
 impl SqlEngine {
     /// Open (creating if needed) a SQL engine rooted at `dir` (e.g.
@@ -392,6 +403,7 @@ impl SqlEngine {
         Ok(SqlEngine {
             session_txns: Mutex::new(std::collections::HashMap::new()),
             next_session_txn: std::sync::atomic::AtomicU64::new(1),
+            stmt_cache: Mutex::new(std::collections::HashMap::new()),
             inner: Mutex::new(Inner {
                 dir,
                 catalog,
@@ -1249,6 +1261,22 @@ impl SqlEngine {
     }
 
     /// Execute one statement batch against an optional open transaction.
+    /// Parse `sql`, serving repeats from the statement cache (text -> AST is
+    /// pure; execution clones the statements, so cached ASTs are immutable).
+    /// Only successful parses are cached.
+    fn cached_parse(&self, sql: &str) -> Result<std::sync::Arc<Vec<ast::Statement>>> {
+        if let Some(hit) = self.stmt_cache.lock().unwrap().get(sql) {
+            return Ok(hit.clone());
+        }
+        let parsed = std::sync::Arc::new(parser::parse(sql)?);
+        let mut cache = self.stmt_cache.lock().unwrap();
+        if cache.len() >= STMT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(sql.to_string(), parsed.clone());
+        Ok(parsed)
+    }
+
     fn run_session_batch<'a>(
         &'a self,
         sql: &str,
@@ -1256,10 +1284,10 @@ impl SqlEngine {
         txn: &mut Option<Transaction<'a>>,
     ) -> Result<Vec<QueryResult>> {
         use ast::Statement;
-        let statements = parser::parse(sql)?;
+        let statements = self.cached_parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
 
-        for stmt in statements {
+        for stmt in statements.iter().cloned() {
             match stmt {
                 Statement::Begin => {
                     if txn.is_some() {

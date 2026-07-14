@@ -77,6 +77,13 @@ public sealed class OxiDbTcpClient : IOxiDbClient
     public void UseOxiWire() => _useOxiWire = true;
 
     /// <summary>
+    /// Flag-only usability check (no syscall): false when disposed, marked
+    /// broken by an interrupted exchange, or locally known-disconnected.
+    /// Cannot see a server-side close — use <see cref="IsAlive"/> for that.
+    /// </summary>
+    public bool IsUsable => !_disposed && !_broken && _tcp.Connected;
+
+    /// <summary>
     /// Cheap liveness probe (no round trip): false once the peer has closed
     /// its end (e.g. the server's idle timeout), an exchange was interrupted
     /// mid-conversation, or this client is disposed. Connection pools use it
@@ -103,6 +110,103 @@ public sealed class OxiDbTcpClient : IOxiDbClient
     }
 
     /// <summary>
+    /// Execute SQL and return the raw response frame (OxiWire envelope when
+    /// this connection is in OxiWire mode, JSON otherwise). The hot path for
+    /// <c>OxiDb.Data</c>: the caller decodes straight to CLR values with no
+    /// JsonDocument round trip. Error envelopes are returned, not thrown.
+    /// </summary>
+    public async Task<byte[]> SqlRawBytesAsync(
+        string sql,
+        object?[]? @params = null,
+        CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ct.ThrowIfCancellationRequested();
+        var payload = new Dictionary<string, object?>
+        {
+            ["engine"] = "sql",
+            ["cmd"] = "sql",
+            ["sql"] = sql,
+        };
+        if (@params is not null)
+        {
+            payload["params"] = @params;
+        }
+        var reqBytes = _useOxiWire
+            ? OxiWire.EncodeRequest(payload)
+            : JsonSerializer.SerializeToUtf8Bytes(payload);
+        await _lock.WaitAsync(ct);
+        try
+        {
+            return await ExchangeAsync(reqBytes, ct);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Synchronous twin of <see cref="SqlRawBytesAsync"/>: blocking socket
+    /// I/O, no async state machine or thread-pool hop. This is the ADO sync
+    /// path (`ExecuteReader` et al.) — worth real microseconds per query.
+    /// </summary>
+    public byte[] SqlRawBytes(string sql, object?[]? @params = null)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var payload = new Dictionary<string, object?>
+        {
+            ["engine"] = "sql",
+            ["cmd"] = "sql",
+            ["sql"] = sql,
+        };
+        if (@params is not null)
+        {
+            payload["params"] = @params;
+        }
+        var reqBytes = _useOxiWire
+            ? OxiWire.EncodeRequest(payload)
+            : JsonSerializer.SerializeToUtf8Bytes(payload);
+        _lock.Wait();
+        try
+        {
+            try
+            {
+                var frame = new byte[4 + reqBytes.Length];
+                BinaryPrimitives.WriteUInt32LittleEndian(frame, (uint)reqBytes.Length);
+                reqBytes.CopyTo(frame, 4);
+                _stream.Write(frame);
+                Span<byte> lenBuf = stackalloc byte[4];
+                ReadExact(lenBuf);
+                var resp = new byte[BinaryPrimitives.ReadUInt32LittleEndian(lenBuf)];
+                ReadExact(resp);
+                return resp;
+            }
+            catch
+            {
+                _broken = true; // mid-conversation stream state — never pool
+                throw;
+            }
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    private void ReadExact(Span<byte> buffer)
+    {
+        var offset = 0;
+        while (offset < buffer.Length)
+        {
+            var read = _stream.Read(buffer[offset..]);
+            if (read == 0)
+                throw new OxiDbConnectionException("Connection closed by server");
+            offset += read;
+        }
+    }
+
+    /// <summary>
     /// One request/response exchange. Any transport failure (or cancellation)
     /// in between leaves the stream mid-conversation — an unsent, unread, or
     /// half-read frame — so the client is permanently marked broken.
@@ -125,11 +229,12 @@ public sealed class OxiDbTcpClient : IOxiDbClient
 
     private async Task SendAsync(byte[] data, CancellationToken ct)
     {
-        var lenBuf = new byte[4];
-        BinaryPrimitives.WriteUInt32LittleEndian(lenBuf, (uint)data.Length);
-        await _stream.WriteAsync(lenBuf, ct);
-        await _stream.WriteAsync(data, ct);
-        await _stream.FlushAsync(ct);
+        // One buffer, one write: a separate 4-byte length write costs an
+        // extra syscall and (with NoDelay) its own TCP segment.
+        var frame = new byte[4 + data.Length];
+        BinaryPrimitives.WriteUInt32LittleEndian(frame, (uint)data.Length);
+        data.CopyTo(frame, 4);
+        await _stream.WriteAsync(frame, ct);
     }
 
     private async Task<byte[]> ReceiveAsync(CancellationToken ct)
