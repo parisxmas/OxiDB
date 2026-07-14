@@ -129,11 +129,21 @@ public sealed class OxiDbCommand : DbCommand
             i = j - 1;
         }
 
+        // One pass over the collection (a per-placeholder Find would be an
+        // allocating O(n) scan — batched commands carry hundreds of params).
+        var byName = new Dictionary<string, OxiDbParameter>(
+            _parameters.Count, StringComparer.OrdinalIgnoreCase);
+        for (var k = 0; k < _parameters.Count; k++)
+        {
+            var p = (OxiDbParameter)_parameters[k];
+            byName[p.BareName] = p;
+        }
+
         var args = new object?[order.Count];
         for (var k = 0; k < order.Count; k++)
         {
-            var p = _parameters.Find(order[k])
-                ?? throw new InvalidOperationException($"missing parameter @{order[k]}");
+            if (!byName.TryGetValue(order[k], out var p))
+                throw new InvalidOperationException($"missing parameter @{order[k]}");
             args[k] = ToWire(p.Value);
         }
         return (sb.ToString(), args);

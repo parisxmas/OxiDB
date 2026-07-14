@@ -30,25 +30,39 @@ public sealed class OxiDbOptionsExtension : RelationalOptionsExtension
     }
 }
 
+/// <summary>
+/// Provider-specific options (`UseOxiDb(cs, o => o.MaxBatchSize(100))`); the
+/// relational base supplies MaxBatchSize/MinBatchSize/CommandTimeout.
+/// </summary>
+public sealed class OxiDbDbContextOptionsBuilder
+    : RelationalDbContextOptionsBuilder<OxiDbDbContextOptionsBuilder, OxiDbOptionsExtension>
+{
+    public OxiDbDbContextOptionsBuilder(DbContextOptionsBuilder optionsBuilder)
+        : base(optionsBuilder) { }
+}
+
 /// <summary>`optionsBuilder.UseOxiDb("Host=...;Port=...")`.</summary>
 public static class OxiDbDbContextOptionsBuilderExtensions
 {
     public static DbContextOptionsBuilder UseOxiDb(
         this DbContextOptionsBuilder optionsBuilder,
-        string connectionString)
+        string connectionString,
+        Action<OxiDbDbContextOptionsBuilder>? oxiDbOptionsAction = null)
     {
         var extension = (optionsBuilder.Options.FindExtension<OxiDbOptionsExtension>()
                 ?? new OxiDbOptionsExtension())
             .WithConnectionString(connectionString);
         ((IDbContextOptionsBuilderInfrastructure)optionsBuilder)
             .AddOrUpdateExtension((OxiDbOptionsExtension)extension);
+        oxiDbOptionsAction?.Invoke(new OxiDbDbContextOptionsBuilder(optionsBuilder));
         return optionsBuilder;
     }
 
     public static DbContextOptionsBuilder<TContext> UseOxiDb<TContext>(
         this DbContextOptionsBuilder<TContext> optionsBuilder,
-        string connectionString)
+        string connectionString,
+        Action<OxiDbDbContextOptionsBuilder>? oxiDbOptionsAction = null)
         where TContext : DbContext =>
         (DbContextOptionsBuilder<TContext>)UseOxiDb(
-            (DbContextOptionsBuilder)optionsBuilder, connectionString);
+            (DbContextOptionsBuilder)optionsBuilder, connectionString, oxiDbOptionsAction);
 }

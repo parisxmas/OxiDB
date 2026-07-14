@@ -1,3 +1,4 @@
+using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Query;
 using Microsoft.EntityFrameworkCore.Query.SqlExpressions;
 using Microsoft.EntityFrameworkCore.Update;
@@ -86,15 +87,47 @@ public sealed class OxiDbUpdateSqlGenerator : UpdateSqlGenerator
         : base(dependencies) { }
 }
 
-/// <summary>One modification command per batch (no batching in v1).</summary>
+/// <summary>
+/// Statement batching: many modification commands ride one wire round-trip.
+/// The statements are joined with the statement terminator and sent as a
+/// single multi-statement request; the engine executes each against the same
+/// batch-level <c>$N</c> parameter array and returns one result per
+/// statement, which <see cref="OxiDb.Data.OxiDbDataReader"/> exposes as
+/// consecutive result sets — exactly the shape
+/// <see cref="AffectedCountModificationCommandBatch"/> consumes (RETURNING
+/// rows for generated keys and affected-count checks; plain-INSERT results
+/// carry no result set and are skipped).
+/// </summary>
+public sealed class OxiDbModificationCommandBatch : AffectedCountModificationCommandBatch
+{
+    /// <summary>
+    /// Default statement cap per batch. Keeps the request comfortably under
+    /// the wire's 16 MiB frame for ordinary rows; tune per context with
+    /// <c>UseOxiDb(cs, o => o.MaxBatchSize(n))</c>.
+    /// </summary>
+    public const int DefaultMaxBatchSize = 500;
+
+    public OxiDbModificationCommandBatch(
+        ModificationCommandBatchFactoryDependencies dependencies,
+        int? maxBatchSize)
+        : base(dependencies, maxBatchSize ?? DefaultMaxBatchSize) { }
+}
+
 public sealed class OxiDbModificationCommandBatchFactory : IModificationCommandBatchFactory
 {
     private readonly ModificationCommandBatchFactoryDependencies _dependencies;
+    private readonly IDbContextOptions _options;
 
     public OxiDbModificationCommandBatchFactory(
-        ModificationCommandBatchFactoryDependencies dependencies) =>
+        ModificationCommandBatchFactoryDependencies dependencies,
+        IDbContextOptions options)
+    {
         _dependencies = dependencies;
+        _options = options;
+    }
 
     public ModificationCommandBatch Create() =>
-        new SingularModificationCommandBatch(_dependencies);
+        new OxiDbModificationCommandBatch(
+            _dependencies,
+            _options.Extensions.OfType<OxiDbOptionsExtension>().FirstOrDefault()?.MaxBatchSize);
 }

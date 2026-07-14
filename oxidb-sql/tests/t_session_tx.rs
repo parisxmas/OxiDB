@@ -137,3 +137,64 @@ fn savepoint_outside_transaction_errors() {
     assert!(sess(&db, &mut tx, "ROLLBACK TO SAVEPOINT s").is_err());
     assert!(sess(&db, &mut tx, "RELEASE SAVEPOINT s").is_err());
 }
+
+/// The in-transaction uniqueness check probes the engine's committed
+/// PK/UNIQUE maps plus the transaction's own writes (no full-table seeding);
+/// every visibility combination must still hold.
+#[test]
+fn txn_uniqueness_against_base_and_overlay() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, tag TEXT UNIQUE, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'a', 0), (2, 'b', 0)")
+        .unwrap();
+    let mut tx = None;
+
+    // Base-row collisions are caught (PK and UNIQUE), statement errors abort.
+    sess(&db, &mut tx, "BEGIN").unwrap();
+    assert!(sess(&db, &mut tx, "INSERT INTO u VALUES (1, 'x', 0)").is_err());
+    assert!(tx.is_none(), "duplicate aborts the transaction");
+    sess(&db, &mut tx, "BEGIN").unwrap();
+    assert!(sess(&db, &mut tx, "INSERT INTO u VALUES (9, 'b', 0)").is_err());
+
+    // Deleting a base row frees its keys for reuse within the transaction.
+    let mut tx = None;
+    sess(&db, &mut tx, "BEGIN").unwrap();
+    sess(&db, &mut tx, "DELETE FROM u WHERE id = 1").unwrap();
+    sess(&db, &mut tx, "INSERT INTO u VALUES (1, 'a', 1)").unwrap();
+    // ... but the reused keys collide again inside the same transaction.
+    assert!(sess(&db, &mut tx, "INSERT INTO u VALUES (1, 'z', 2)").is_err());
+
+    // An update that moves a key frees the old one and claims the new one.
+    let mut tx = None;
+    sess(&db, &mut tx, "BEGIN").unwrap();
+    sess(&db, &mut tx, "UPDATE u SET tag = 'c' WHERE id = 2").unwrap();
+    sess(&db, &mut tx, "INSERT INTO u VALUES (3, 'b', 0)").unwrap();
+    assert!(sess(&db, &mut tx, "INSERT INTO u VALUES (4, 'c', 0)").is_err());
+
+    // A no-op key rewrite (same value onto the same row) never self-collides.
+    let mut tx = None;
+    sess(&db, &mut tx, "BEGIN").unwrap();
+    sess(&db, &mut tx, "UPDATE u SET tag = 'b', v = 5 WHERE id = 2").unwrap();
+    sess(&db, &mut tx, "COMMIT").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT v FROM u WHERE id = 2"),
+        vec![vec![Value::Int(5)]]
+    );
+}
+
+/// DROP TABLE inside a transaction discards the table's constraint keys: a
+/// re-created table accepts values the old one held.
+#[test]
+fn txn_drop_create_resets_uniqueness() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u2 (id INT PRIMARY KEY)").unwrap();
+    let mut tx = None;
+    sess(&db, &mut tx, "BEGIN").unwrap();
+    sess(&db, &mut tx, "INSERT INTO u2 VALUES (7)").unwrap();
+    sess(&db, &mut tx, "DROP TABLE u2").unwrap();
+    sess(&db, &mut tx, "CREATE TABLE u2 (id INT PRIMARY KEY)").unwrap();
+    sess(&db, &mut tx, "INSERT INTO u2 VALUES (7)").unwrap();
+    sess(&db, &mut tx, "COMMIT").unwrap();
+    assert_eq!(rows(&db, "SELECT id FROM u2"), vec![vec![Value::Int(7)]]);
+}

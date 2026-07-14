@@ -44,9 +44,12 @@ pub(crate) struct TxnState {
     /// Indexes created / dropped within the transaction.
     indexes_created: BTreeMap<String, IndexDef>,
     indexes_dropped: BTreeSet<String>,
-    /// Uniqueness state per table, seeded lazily from the visible rows on
-    /// first write, then maintained by the overlay: one `(column position,
-    /// value -> row_id)` map for the PRIMARY KEY and each UNIQUE column.
+    /// Uniqueness state per table: one `(column position, value -> row_id)`
+    /// map for the PRIMARY KEY and each UNIQUE column, holding ONLY keys
+    /// written by this transaction. Committed base rows are probed through
+    /// the engine's persistent maps at check time (with this overlay
+    /// superseding base ownership), so cost scales with the transaction's
+    /// writes — never with table size.
     pk_seen: BTreeMap<String, UniqueMaps>,
     /// The ordered operations to flush on commit.
     ops: Vec<WalRecord>,
@@ -174,9 +177,13 @@ impl<'a> Transaction<'a> {
         next
     }
 
-    /// Enforce PRIMARY KEY uniqueness for a candidate row against the rows
-    /// visible to this transaction. `exclude` is the row being replaced (for
-    /// updates). The per-table key map is seeded from a scan on first use.
+    /// Enforce PRIMARY KEY / UNIQUE uniqueness for a candidate row against
+    /// the rows visible to this transaction. `exclude` is the row being
+    /// replaced (for updates). Keys written by this transaction live in the
+    /// per-table map; committed base ownership is probed through the engine's
+    /// persistent maps, with any overlay entry (rewrite or delete) for the
+    /// owning row superseding it — a rewrite that kept the key is caught by
+    /// the transaction map.
     fn check_pk(
         &self,
         table: &str,
@@ -195,43 +202,51 @@ impl<'a> Transaction<'a> {
         if positions.is_empty() {
             return Ok(());
         }
-        if !self.state.borrow().pk_seen.contains_key(table) {
-            let rows = self.scan(table)?;
-            let mut maps: UniqueMaps = positions.iter().map(|&p| (p, BTreeMap::new())).collect();
-            for (rid, row) in rows {
-                for (p, map) in maps.iter_mut() {
-                    if !matches!(row[*p], Value::Null) {
-                        map.insert(IndexKey(row[*p].clone()), rid);
-                    }
-                }
-            }
-            self.state
-                .borrow_mut()
-                .pk_seen
-                .insert(table.to_string(), maps);
-        }
+        self.state
+            .borrow_mut()
+            .pk_seen
+            .entry(table.to_string())
+            .or_insert_with(|| positions.iter().map(|&p| (p, BTreeMap::new())).collect());
+
+        let dup = |p: usize| {
+            let is_pk = def.pk_pos() == Some(p);
+            Err(SqlError::DuplicateKey(format!(
+                "{} value {:?} already exists in {table:?}",
+                if is_pk { "PRIMARY KEY" } else { "UNIQUE" },
+                cells[p]
+            )))
+        };
         let st = self.state.borrow();
-        let maps = st.pk_seen.get(table).expect("seeded");
+        let maps = st.pk_seen.get(table).expect("initialized above");
+        let overlay = st.rows.get(table);
+        let base_exists = !st.created.contains_key(table);
         for (p, map) in maps {
             if matches!(cells[*p], Value::Null) {
                 continue; // NULLs never collide (and the PK is NOT NULL anyway)
             }
-            if let Some(&rid) = map.get(&IndexKey(cells[*p].clone()))
+            let key = IndexKey(cells[*p].clone());
+            // Owned by a row this transaction wrote?
+            if let Some(&rid) = map.get(&key)
                 && Some(rid) != exclude
             {
-                let is_pk = def.pk_pos() == Some(*p);
-                return Err(SqlError::DuplicateKey(format!(
-                    "{} value {:?} already exists in {table:?}",
-                    if is_pk { "PRIMARY KEY" } else { "UNIQUE" },
-                    cells[*p]
-                )));
+                return dup(*p);
+            }
+            // Owned by a committed base row this transaction hasn't touched?
+            if base_exists
+                && let Some(rid) = self.engine.unique_owner(table, *p, &key)
+                && Some(rid) != exclude
+                && overlay.is_none_or(|o| !o.contains_key(&rid))
+            {
+                return dup(*p);
             }
         }
         Ok(())
     }
 
-    /// Record a write's effect on the seeded PK map (no-op when the table has
-    /// no PK or the map was never seeded).
+    /// Record a write's effect on the transaction's key maps (no-op when the
+    /// table has no PK/UNIQUE or nothing constrained was written yet — a
+    /// first-op delete needs no map: the overlay entry itself supersedes the
+    /// base row's ownership in `check_pk`).
     fn pk_apply(&self, table: &str, _def: &Table, row_id: u64, cells: Option<&[Value]>) {
         let mut st = self.state.borrow_mut();
         let Some(maps) = st.pk_seen.get_mut(table) else {
@@ -239,7 +254,8 @@ impl<'a> Transaction<'a> {
         };
         for (p, map) in maps.iter_mut() {
             // Any prior key owned by this row is gone (update changes the
-            // key, delete removes the row).
+            // key, delete removes the row). The map holds only this
+            // transaction's writes, so the sweep is small.
             map.retain(|_, rid| *rid != row_id);
             if let Some(cells) = cells
                 && !matches!(cells[*p], Value::Null)
@@ -377,6 +393,9 @@ impl Store for Transaction<'_> {
         let mut st = self.state.borrow_mut();
         st.created.remove(name);
         st.rows.remove(name);
+        // Constraint keys die with the table — a re-created table must not
+        // collide with them.
+        st.pk_seen.remove(name);
         st.dropped.insert(name.to_string());
         st.ops.push(WalRecord::DropTable(name.to_string()));
         Ok(())

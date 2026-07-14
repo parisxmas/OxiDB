@@ -935,6 +935,23 @@ impl SqlEngine {
             .collect())
     }
 
+    /// The committed row currently owning `key` in a table's PRIMARY KEY or
+    /// UNIQUE map at column position `pos` (`None` for unknown tables — e.g.
+    /// ones created inside an open transaction). Transactions probe this for
+    /// uniqueness checks instead of seeding a snapshot of the whole table.
+    pub(crate) fn unique_owner(&self, table: &str, pos: usize, key: &IndexKey) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        let state = inner.tables.get(table)?;
+        if state.pk_pos == Some(pos) {
+            return state.pk_map.get(key).copied();
+        }
+        state
+            .uniques
+            .iter()
+            .find(|(p, _)| *p == pos)
+            .and_then(|(_, map)| map.get(key).copied())
+    }
+
     /// Look up rows using a secondary index whose columns are all present in
     /// the `column = value` pairs `eqs`. `Ok(None)` when no index qualifies.
     fn index_lookup_eq(&self, table: &str, eqs: &[(String, Value)]) -> Result<Option<store::Rows>> {
