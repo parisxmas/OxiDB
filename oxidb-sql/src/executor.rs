@@ -2762,10 +2762,11 @@ fn build_source<S: Store>(
                 let full = qualified_schema(from.key(), &base_def);
                 let keep = keep_indices(&full, from.key(), &needed);
                 let schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
-                // Base rows: use an index when there are no joins and WHERE has a
-                // usable equality on an indexed column; otherwise full scan.
+                // Base rows: with no joins, an index probe when WHERE has a
+                // usable equality, else a streamed scan pushing WHERE (and a
+                // LIMIT cutoff) down; otherwise a plain pruned scan.
                 let chunk = if select.joins.is_empty() {
-                    base_chunk(store, from, &select.filter, params, &keep)?
+                    base_chunk(store, from, select, params, &keep, &full)?
                 } else {
                     store.scan_pruned(&from.name, &keep)?
                 };
@@ -3692,11 +3693,12 @@ fn collect_col_refs<'a>(e: &'a Expr, out: &mut Vec<(&'a Option<String>, &'a str)
 fn base_chunk<S: Store>(
     store: &S,
     from: &TableRef,
-    filter: &Option<Expr>,
+    select: &SelectStmt,
     params: &[Value],
     keep: &[usize],
+    full: &[ColRef],
 ) -> Result<Chunk> {
-    if let Some(expr) = filter {
+    if let Some(expr) = &select.filter {
         let eqs = eq_conjuncts(expr, from.key(), params);
         if !eqs.is_empty()
             && let Some(rows) = store.index_lookup_eq(&from.name, &eqs)?
@@ -3704,7 +3706,198 @@ fn base_chunk<S: Store>(
             return Ok(Chunk::from_rows(rows.into_iter().map(|(_, c)| c), keep));
         }
     }
+    if let Some(chunk) = streamed_chunk(store, from, select, params, keep, full)? {
+        return Ok(chunk);
+    }
     store.scan_pruned(&from.name, keep)
+}
+
+/// Whether an expression may be evaluated inside a streamed scan: no
+/// correlation and no windows (both would re-enter machinery a borrowed row
+/// can't serve — correlated subqueries would deadlock on the engine's table
+/// lock), every param slot user-bound (a higher slot is a synthetic
+/// correlation slot), and no volatile functions (a streamed predicate is
+/// re-evaluated by the normal pipeline, and `random()` must not be sampled
+/// twice per row).
+fn streamable(e: &Expr, params: &[Value]) -> bool {
+    !has_corr(e) && !has_window(e) && max_param_slot(e) <= params.len() && !has_volatile(e)
+}
+
+/// Whether an expression contains a function whose value can differ between
+/// two evaluations on the same row (`random()`, `NOW()`).
+fn has_volatile(e: &Expr) -> bool {
+    match e {
+        Expr::Func { func, args } => {
+            matches!(func, ScalarFunc::Random | ScalarFunc::Now) || args.iter().any(has_volatile)
+        }
+        Expr::Binary { left, right, .. } => has_volatile(left) || has_volatile(right),
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_volatile(expr),
+        Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(has_volatile),
+        Expr::In { expr, list, .. } => has_volatile(expr) || list.iter().any(has_volatile),
+        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::CorrScalar { .. } | Expr::CorrIn { .. } => {
+            true // subqueries are opaque here; the caller must not stream them
+        }
+        Expr::Window {
+            func,
+            partition_by,
+            order_by,
+        } => {
+            partition_by.iter().any(has_volatile)
+                || order_by.iter().any(|(e, _)| has_volatile(e))
+                || matches!(func, WindowFunc::Agg(_, Some(a)) if has_volatile(a))
+        }
+        Expr::Column { .. } | Expr::Col(_) | Expr::Literal(_) | Expr::Param(_) => false,
+    }
+}
+
+/// Whether the SELECT's output rows are its input rows one-for-one (no
+/// grouping, aggregates, windows, or DISTINCT) — the precondition for
+/// pushing LIMIT-derived cutoffs into the scan.
+fn select_is_plain_rows(select: &SelectStmt) -> bool {
+    select.group_by.is_empty()
+        && select.having.is_none()
+        && !select.distinct
+        && select.distinct_on.is_empty()
+        && !select.projection.iter().any(|item| match item {
+            SelectItem::Expr { expr, .. } => has_aggregate(expr) || has_window(expr),
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+        })
+        && !select
+            .order_by
+            .iter()
+            .any(|(e, _)| has_aggregate(e) || has_window(e))
+}
+
+/// Ordered cutoffs larger than this fall back to a full scan + sort: the
+/// bounded buffer pays an O(cutoff) insert per surviving row, which loses to
+/// one big sort well before this size.
+const STREAM_TOP_N_CAP: usize = 1024;
+
+/// A streamed single-table scan: evaluate the WHERE on rows **borrowed from
+/// the store** and clone only what qualifies — plus, when the query is a
+/// plain row stream with a LIMIT, stop early (unordered) or keep only the
+/// top `OFFSET + LIMIT` rows under the ORDER BY (a bounded buffer, exactly
+/// like `select_simple`'s top-N but before any materialization).
+///
+/// Returns a chunk the ordinary pipeline treats like any scan: the WHERE is
+/// re-applied (cheap — only matching rows remain), the stable sort re-orders
+/// the top-N rows (they are emitted in scan order), and OFFSET/LIMIT slice
+/// as usual. `None` means nothing could be pushed down; the caller does a
+/// plain pruned scan.
+fn streamed_chunk<S: Store>(
+    store: &S,
+    from: &TableRef,
+    select: &SelectStmt,
+    params: &[Value],
+    keep: &[usize],
+    full: &[ColRef],
+) -> Result<Option<Chunk>> {
+    let filter = match &select.filter {
+        Some(f) if streamable(f, params) => match bind_expr(f, full) {
+            Ok(b) => Some(b),
+            // An unbindable column will error identically in the normal
+            // pipeline; let it surface there.
+            Err(_) => return Ok(None),
+        },
+        // Nothing may be pushed below a WHERE we can't evaluate in-scan.
+        Some(_) => return Ok(None),
+        None => None,
+    };
+
+    let plain = select_is_plain_rows(select);
+    let cap = if plain
+        && let Some(l) = resolve_limit(select.limit, params, "LIMIT")?
+    {
+        Some(l.saturating_add(resolve_limit(select.offset, params, "OFFSET")?.unwrap_or(0)))
+    } else {
+        None
+    };
+
+    // Bound ORDER BY keys for an in-scan top-N cutoff.
+    let ordered = !select.order_by.is_empty();
+    let keys: Option<Vec<(Expr, bool)>> = if ordered
+        && cap.is_some_and(|c| c <= STREAM_TOP_N_CAP)
+        && select.order_by.iter().all(|(e, _)| streamable(e, params))
+    {
+        select
+            .order_by
+            .iter()
+            .map(|(e, asc)| bind_expr(e, full).map(|b| (b, *asc)))
+            .collect::<Result<Vec<_>>>()
+            .ok() // e.g. ORDER BY <projection alias>: resolved later, not here
+    } else {
+        None
+    };
+    let early_stop = if ordered { None } else { cap };
+
+    if filter.is_none() && keys.is_none() && early_stop.is_none() {
+        return Ok(None); // a plain pruned scan is already optimal
+    }
+
+    let width = keep.len();
+    if let Some(keys) = keys {
+        let k = cap.expect("keys imply a resolved cutoff");
+        // Sorted ascending by (sort keys, scan sequence); the last element is
+        // the cutoff. Rows are cloned only when they enter the buffer.
+        let mut best: Vec<(Vec<Value>, usize, Vec<Value>)> = Vec::with_capacity(k.min(64) + 1);
+        let mut kbuf: Vec<Value> = Vec::with_capacity(keys.len());
+        let mut seq = 0usize;
+        store.scan_visit(&from.name, &mut |row| {
+            if let Some(f) = &filter
+                && !truthy(&eval_scalar(f, full, row, params)?)
+            {
+                return Ok(true);
+            }
+            let i = seq;
+            seq += 1;
+            kbuf.clear();
+            for (e, _) in &keys {
+                kbuf.push(eval_scalar(e, full, row, params)?);
+            }
+            if best.len() >= k {
+                match best.last() {
+                    Some(last) if cmp_keys(&keys, &kbuf, &last.0) == Ordering::Less => {}
+                    _ => return Ok(true), // not better than the cutoff (or k == 0)
+                }
+            }
+            let pos = best.partition_point(|(bk, bi, _)| match cmp_keys(&keys, bk, &kbuf) {
+                Ordering::Less => true,
+                Ordering::Equal => *bi < i,
+                Ordering::Greater => false,
+            });
+            let kept: Vec<Value> = keep.iter().map(|&c| row[c].clone()).collect();
+            best.insert(pos, (std::mem::take(&mut kbuf), i, kept));
+            if best.len() > k {
+                kbuf = best.pop().expect("longer than k").0; // recycle the buffer
+            }
+            Ok(true)
+        })?;
+        // Emit survivors in scan order: the pipeline's stable sort then
+        // reproduces exactly what a full scan would have produced.
+        best.sort_by_key(|&(_, i, _)| i);
+        let n = best.len();
+        let mut cells = Vec::with_capacity(n * width);
+        for (_, _, kept) in best {
+            cells.extend(kept);
+        }
+        Ok(Some(Chunk { width, n, cells }))
+    } else {
+        let mut cells = Vec::new();
+        let mut n = 0usize;
+        store.scan_visit(&from.name, &mut |row| {
+            if let Some(f) = &filter
+                && !truthy(&eval_scalar(f, full, row, params)?)
+            {
+                return Ok(true);
+            }
+            for &c in keep {
+                cells.push(row[c].clone());
+            }
+            n += 1;
+            Ok(early_stop.is_none_or(|c| n < c))
+        })?;
+        Ok(Some(Chunk { width, n, cells }))
+    }
 }
 
 /// Collect `column = constant` conjuncts (split on AND) usable for an index seek.

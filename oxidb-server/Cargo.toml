@@ -1,6 +1,6 @@
 [package]
 name = "oxidb-server"
-version = "0.34.38"
+version = "0.34.39"
 edition = "2024"
 description = "TCP server for OxiDB document database"
 license-file = "../LICENSE"

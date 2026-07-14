@@ -59,6 +59,25 @@ pub(crate) trait Store {
             keep,
         ))
     }
+    /// Stream a table's live rows through `visit` (full row cells, in
+    /// `row_id` order; return `false` to stop early). The engine
+    /// implementation hands out rows **borrowed in place under its lock**,
+    /// so a streamed scan clones nothing the visitor doesn't keep — but the
+    /// visitor MUST NOT call back into the store (the executor only streams
+    /// expressions proven free of subqueries/correlation).
+    fn scan_visit(
+        &self,
+        table: &str,
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<()> {
+        for (_, cells) in self.scan(table)? {
+            if !visit(&cells)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64>;
     /// Insert many rows as one durable unit (a single WAL fsync where the
     /// implementation supports it). Returns the number of rows inserted.

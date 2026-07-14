@@ -162,3 +162,99 @@ fn order_by_limit_top_n_matches_full_sort() {
     let d = rows(&db, "SELECT DISTINCT v FROM t ORDER BY v LIMIT 3");
     assert_eq!(d.len(), 3);
 }
+
+/// Streamed single-table scans (WHERE push-down, LIMIT early-stop, in-scan
+/// top-N) must be invisible: every shape here compares against semantics a
+/// full materialized scan would produce.
+#[test]
+fn streamed_scan_shapes_match_materialized_semantics() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE s (id INT PRIMARY KEY, grp INT, name TEXT)")
+        .unwrap();
+    let vals: Vec<String> = (1..=300)
+        .map(|i| format!("({i}, {}, 'name{:03}')", i % 3, i % 50))
+        .collect();
+    db.execute(&format!("INSERT INTO s VALUES {}", vals.join(", ")))
+        .unwrap();
+
+    // WHERE push-down on a string predicate (evaluated on borrowed rows).
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM s WHERE name = 'name007'"),
+        vec![vec![i(6)]]
+    );
+
+    // LIMIT early-stop: first N rows in scan order.
+    assert_eq!(
+        rows(&db, "SELECT id FROM s WHERE grp = 1 LIMIT 3"),
+        vec![vec![i(1)], vec![i(4)], vec![i(7)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT id FROM s WHERE grp = 1 LIMIT 3 OFFSET 2"),
+        vec![vec![i(7)], vec![i(10)], vec![i(13)]]
+    );
+
+    // DISTINCT + LIMIT: dedup happens before LIMIT, so the scan must NOT
+    // stop after 3 raw rows — all 3 distinct groups exist.
+    let d = rows(&db, "SELECT DISTINCT grp FROM s LIMIT 3");
+    assert_eq!(d.len(), 3);
+
+    // GROUP BY + WHERE + LIMIT: the LIMIT counts groups, not scanned rows —
+    // aggregates must still see every matching row.
+    let g = rows(
+        &db,
+        "SELECT grp, COUNT(*) FROM s WHERE id <= 299 GROUP BY grp ORDER BY grp LIMIT 2",
+    );
+    assert_eq!(g, vec![vec![i(0), i(99)], vec![i(1), i(100)]]);
+
+    // Window + WHERE + LIMIT: the window runs over all post-WHERE rows.
+    let w = rows(
+        &db,
+        "SELECT id, COUNT(*) OVER () FROM s WHERE grp = 2 LIMIT 2",
+    );
+    assert_eq!(w, vec![vec![i(2), i(100)], vec![i(5), i(100)]]);
+
+    // In-scan top-N with WHERE + OFFSET, against the no-LIMIT oracle.
+    let all = rows(&db, "SELECT id, name FROM s WHERE grp = 0 ORDER BY name, id DESC");
+    let top = rows(
+        &db,
+        "SELECT id, name FROM s WHERE grp = 0 ORDER BY name, id DESC LIMIT 5 OFFSET 3",
+    );
+    assert_eq!(top, all[3..8].to_vec());
+
+    // LIMIT 0 and volatile predicates (never pushed into the scan).
+    assert!(rows(&db, "SELECT id FROM s ORDER BY name LIMIT 0").is_empty());
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM s WHERE random() < 2.0"),
+        vec![vec![i(300)]]
+    );
+}
+
+/// Streamed shapes inside an open transaction: the overlay (buffered writes)
+/// must be visible to pushed-down filters and cutoffs.
+#[test]
+fn streamed_scan_sees_transaction_overlay() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE so (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("INSERT INTO so VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+    let mut tx = None;
+    db.execute_params_in_session("BEGIN", &[], &mut tx).unwrap();
+    db.execute_params_in_session("INSERT INTO so VALUES (4, 40)", &[], &mut tx)
+        .unwrap();
+    db.execute_params_in_session("UPDATE so SET v = 99 WHERE id = 2", &[], &mut tx)
+        .unwrap();
+    let r = db
+        .execute_params_in_session("SELECT id FROM so WHERE v > 25 ORDER BY v DESC LIMIT 2", &[], &mut tx)
+        .unwrap();
+    match r.last().unwrap() {
+        oxidb_sql::QueryResult::Select { rows, .. } => {
+            assert_eq!(
+                rows,
+                &vec![vec![oxidb_sql::Value::Int(2)], vec![oxidb_sql::Value::Int(4)]],
+                "sees the in-txn update (v=99) and insert (v=40)"
+            );
+        }
+        other => panic!("expected Select, got {other:?}"),
+    }
+    db.execute_params_in_session("ROLLBACK", &[], &mut tx).unwrap();
+}

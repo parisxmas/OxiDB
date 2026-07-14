@@ -1516,6 +1516,26 @@ impl Store for SqlEngine {
             cells,
         })
     }
+    fn scan_visit(
+        &self,
+        table: &str,
+        visit: &mut dyn FnMut(&[Value]) -> Result<bool>,
+    ) -> Result<()> {
+        // Rows are handed to the visitor borrowed, under the table lock: a
+        // streamed scan allocates nothing per row. The executor guarantees
+        // the visitor never re-enters this engine (the lock is not reentrant).
+        let inner = self.inner.lock().unwrap();
+        let state = inner
+            .tables
+            .get(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        for (_, row) in state.rows.iter() {
+            if !visit(row.as_ref())? {
+                break;
+            }
+        }
+        Ok(())
+    }
     fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
         SqlEngine::insert(self, table, cells)
     }
