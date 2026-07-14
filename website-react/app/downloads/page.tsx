@@ -357,6 +357,39 @@ mkdir wasm && tar xzf oxidb-wasm.tar.gz -C wasm/</code></pre>
       </div>
     </div>
 
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">The Book</h3>
+        <span class="version-date">2026</span>
+        <span class="version-badge latest">free</span>
+      </div>
+      <p class="release-notes"><strong>Her Şeyin Veritabanı</strong> — a free 235-page book (in Turkish) on how a database works inside, from first principles to OxiDB's document, SQL and time-series engines. <a href="/book/">Details</a></p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Format</th><th>File</th><th>Size</th><th>Language</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>PDF</td>
+              <td><code>her-seyin-veritabani.pdf</code></td>
+              <td>6.3 MB</td>
+              <td>Türkçe</td>
+              <td><a href="/kitap/her-seyin-veritabani.pdf" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td>EPUB</td>
+              <td><code>her-seyin-veritabani.epub</code></td>
+              <td>965 KB</td>
+              <td>Türkçe</td>
+              <td><a href="/kitap/her-seyin-veritabani.epub" class="dl-btn">Download</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
   </div>
 </section>` }} />
 }
