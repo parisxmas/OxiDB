@@ -437,7 +437,9 @@ internal sealed class OxiDbDateTimeMethodTranslator : IMethodCallTranslator
         var ms = _sql.ApplyDefaultTypeMapping(_sql.Multiply(
             _sql.Convert(arguments[0], typeof(double)),
             _sql.Constant(factor)));
-        return _sql.Add(instance, ms, instance.TypeMapping);
+        // A constant instance may carry no mapping yet; the result must be a
+        // timestamp for the shaper.
+        return _sql.ApplyDefaultTypeMapping(_sql.Add(instance, ms, instance.TypeMapping));
     }
 }
 

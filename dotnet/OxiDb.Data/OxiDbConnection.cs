@@ -67,6 +67,9 @@ public sealed class OxiDbConnection : DbConnection
     public override async Task OpenAsync(CancellationToken ct)
     {
         if (_state == ConnectionState.Open) return;
+        // Exact OperationCanceledException for an already-canceled token (an
+        // awaited connect would surface TaskCanceledException instead).
+        ct.ThrowIfCancellationRequested();
         _client = await OxiDbTcpClient.ConnectAsync(_host, _port, ct: ct).ConfigureAwait(false);
         if (!string.IsNullOrEmpty(_database))
         {

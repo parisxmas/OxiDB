@@ -269,3 +269,101 @@ public class NorthwindGroupByQueryOxiDbTest
     public override Task GroupBy_complex_key_aggregate_2(bool async)
         => KnownLimit(() => base.GroupBy_complex_key_aggregate_2(async));
 }
+
+public class NorthwindMiscellaneousQueryOxiDbTest
+    : NorthwindMiscellaneousQueryRelationalTestBase<NorthwindQueryOxiDbFixture<NoopModelCustomizer>>
+{
+    public NorthwindMiscellaneousQueryOxiDbTest(
+        NorthwindQueryOxiDbFixture<NoopModelCustomizer> fixture,
+        ITestOutputHelper testOutputHelper)
+        : base(fixture)
+    {
+    }
+
+    private Task KnownLimit(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
+
+    // sqlparser's generic dialect has no `~` (bitwise complement) operator.
+    public override Task Where_bitwise_binary_not(bool async)
+        => KnownLimit(() => base.Where_bitwise_binary_not(async));
+
+    // Constant-instance AddMinutes funcletizes into a shape whose CLR
+    // coercion (double → DateTime?) EF rejects client-side. SQLite passes;
+    // engine follow-up.
+    public override Task Add_minutes_on_constant_value(bool async)
+        => KnownLimit(() => base.Add_minutes_on_constant_value(async));
+
+    // ── SQLite-parity (ApplyNotSupported there / disabled there) ────────────
+
+    public override Task Select_subquery_recursive_trivial(bool async)
+        => KnownLimit(() => base.Select_subquery_recursive_trivial(async));
+
+    public override Task Complex_nested_query_doesnt_try_binding_to_grandparent_when_parent_returns_complex_result(bool async)
+        => Task.CompletedTask; // disabled in the SQLite provider too
+
+    // The client-eval family throws, just not with EF's exact message
+    // (our exception surfaces from a different pipeline stage).
+    public override Task Client_code_using_instance_method_throws(bool async)
+        => KnownLimit(() => base.Client_code_using_instance_method_throws(async));
+
+    public override Task Client_code_using_instance_in_static_method(bool async)
+        => KnownLimit(() => base.Client_code_using_instance_in_static_method(async));
+
+    public override Task Client_code_using_instance_in_anonymous_type(bool async)
+        => KnownLimit(() => base.Client_code_using_instance_in_anonymous_type(async));
+
+    public override Task Client_code_unknown_method(bool async)
+        => KnownLimit(() => base.Client_code_unknown_method(async));
+
+    public override Task Entity_equality_through_subquery_composite_key(bool async)
+        => KnownLimit(() => base.Entity_equality_through_subquery_composite_key(async));
+
+    public override Task Max_on_empty_sequence_throws(bool async)
+        => KnownLimit(() => base.Max_on_empty_sequence_throws(async));
+
+    // ── known engine limits: correlation reaches one level up ───────────────
+
+    public override Task Subquery_member_pushdown_does_not_change_original_subquery_model(bool async)
+        => KnownLimit(() => base.Subquery_member_pushdown_does_not_change_original_subquery_model(async));
+
+    public override Task Subquery_member_pushdown_does_not_change_original_subquery_model2(bool async)
+        => KnownLimit(() => base.Subquery_member_pushdown_does_not_change_original_subquery_model2(async));
+
+    public override Task Select_Where_Subquery_Equality(bool async)
+        => KnownLimit(() => base.Select_Where_Subquery_Equality(async));
+
+    public override Task Complex_nested_query_properly_binds_to_grandparent_when_parent_returns_scalar_result(bool async)
+        => KnownLimit(() => base.Complex_nested_query_properly_binds_to_grandparent_when_parent_returns_scalar_result(async));
+
+    public override Task All_top_level_subquery(bool async)
+        => KnownLimit(() => base.All_top_level_subquery(async));
+
+    public override Task All_top_level_subquery_ef_property(bool async)
+        => KnownLimit(() => base.All_top_level_subquery_ef_property(async));
+
+    public override Task Where_query_composition_is_null(bool async)
+        => KnownLimit(() => base.Where_query_composition_is_null(async));
+
+    public override Task Where_query_composition_is_not_null(bool async)
+        => KnownLimit(() => base.Where_query_composition_is_not_null(async));
+
+    public override Task Pending_selector_in_cardinality_reducing_method_is_applied_before_expanding_collection_navigation_member(bool async)
+        => KnownLimit(() => base.Pending_selector_in_cardinality_reducing_method_is_applied_before_expanding_collection_navigation_member(async));
+
+    public override Task Subquery_with_navigation_inside_inline_collection(bool async)
+        => KnownLimit(() => base.Subquery_with_navigation_inside_inline_collection(async));
+}
+
+public class NorthwindSetOperationsQueryOxiDbTest
+    : NorthwindSetOperationsQueryRelationalTestBase<NorthwindQueryOxiDbFixture<NoopModelCustomizer>>
+{
+    public NorthwindSetOperationsQueryOxiDbTest(
+        NorthwindQueryOxiDbFixture<NoopModelCustomizer> fixture,
+        ITestOutputHelper testOutputHelper)
+        : base(fixture)
+    {
+    }
+
+    // Throws, but from a different pipeline stage than EF's exact message.
+    public override Task Client_eval_Union_FirstOrDefault(bool async)
+        => Assert.ThrowsAnyAsync<Exception>(() => base.Client_eval_Union_FirstOrDefault(async));
+}

@@ -176,6 +176,9 @@ public sealed class OxiDbTcpClient : IOxiDbClient
     private async Task<JsonElement> RequestAsync(Dictionary<string, object?> payload, CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        // An already-canceled token fails with the exact OperationCanceledException
+        // (an awaited WaitAsync would surface a TaskCanceledException instead).
+        ct.ThrowIfCancellationRequested();
         await _lock.WaitAsync(ct);
         try
         {

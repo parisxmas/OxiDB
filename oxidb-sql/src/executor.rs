@@ -3762,7 +3762,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             | BinOp::And
             | BinOp::Or => Some(SqlType::Bool),
             BinOp::Concat => Some(SqlType::Text),
-            BinOp::BitXor => match expr_type(left, schema) {
+            BinOp::BitXor | BinOp::BitAnd | BinOp::BitOr => match expr_type(left, schema) {
                 Some(SqlType::Bool) => Some(SqlType::Bool),
                 _ => Some(SqlType::Int),
             },
@@ -3794,7 +3794,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
         },
         Expr::Unary { op, expr } => match op {
             UnOp::Not => Some(SqlType::Bool),
-            UnOp::Neg => expr_type(expr, schema),
+            UnOp::Neg | UnOp::BitNot => expr_type(expr, schema),
         },
         Expr::IsNull { .. } | Expr::In { .. } | Expr::InSubquery { .. } | Expr::CorrIn { .. } => {
             Some(SqlType::Bool)
@@ -5161,6 +5161,12 @@ fn apply_unary(op: UnOp, v: Value) -> Result<Value> {
             Value::Decimal(d) => Ok(Value::Decimal(d.neg())),
             other => Err(SqlError::Eval(format!("negation of {other:?}"))),
         },
+        UnOp::BitNot => match v {
+            Value::Null => Ok(Value::Null),
+            Value::Int(n) => Ok(Value::Int(!n)),
+            Value::Bool(b) => Ok(Value::Bool(!b)),
+            other => Err(SqlError::Eval(format!("bitwise NOT of {other:?}"))),
+        },
     }
 }
 
@@ -5202,11 +5208,19 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
             }
         }
         BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => arithmetic(op, l, r),
-        BinOp::BitXor => match (l, r) {
+        BinOp::BitXor | BinOp::BitAnd | BinOp::BitOr => match (l, r) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(a ^ b)),
-            (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a != b)),
-            (a, b) => Err(SqlError::Eval(format!("XOR of {a:?} / {b:?}"))),
+            (Value::Int(a), Value::Int(b)) => Ok(Value::Int(match op {
+                BinOp::BitXor => a ^ b,
+                BinOp::BitAnd => a & b,
+                _ => a | b,
+            })),
+            (Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(match op {
+                BinOp::BitXor => a != b,
+                BinOp::BitAnd => a && b,
+                _ => a || b,
+            })),
+            (a, b) => Err(SqlError::Eval(format!("bitwise op on {a:?} / {b:?}"))),
         },
     }
 }

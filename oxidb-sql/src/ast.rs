@@ -511,6 +511,9 @@ pub enum BinOp {
     Mod,
     /// `^` — bitwise XOR (integers; booleans XOR as inequality).
     BitXor,
+    /// `&` / `|` — bitwise AND/OR on integers; logical on booleans.
+    BitAnd,
+    BitOr,
     /// `||` — string concatenation (NULL-propagating).
     Concat,
 }
@@ -519,6 +522,8 @@ pub enum BinOp {
 pub enum UnOp {
     Not,
     Neg,
+    /// `~` — bitwise complement (integers).
+    BitNot,
 }
 
 /// The result of executing one statement.

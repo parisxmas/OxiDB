@@ -41,6 +41,7 @@ public sealed class OxiDbCommand : DbCommand
         CommandBehavior behavior,
         CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         var (sql, args) = BindParameters();
         var results = await Conn.SqlAsync(sql, args, ct).ConfigureAwait(false);
         return new OxiDbDataReader(results);

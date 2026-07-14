@@ -1624,6 +1624,7 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
                 sp::UnaryOperator::Not => UnOp::Not,
                 sp::UnaryOperator::Minus => UnOp::Neg,
                 sp::UnaryOperator::Plus => return translate_expr(*expr, p),
+                sp::UnaryOperator::PGBitwiseNot => UnOp::BitNot,
                 other => return Err(SqlError::Unsupported(format!("unary operator {other:?}"))),
             };
             Ok(Expr::Unary {
@@ -2410,6 +2411,8 @@ fn map_binary_op(op: &sp::BinaryOperator) -> Result<BinOp> {
         B::Divide => BinOp::Div,
         B::Modulo => BinOp::Mod,
         B::BitwiseXor => BinOp::BitXor,
+        B::BitwiseAnd => BinOp::BitAnd,
+        B::BitwiseOr => BinOp::BitOr,
         B::StringConcat => BinOp::Concat,
         other => return Err(SqlError::Unsupported(format!("binary operator {other:?}"))),
     };
