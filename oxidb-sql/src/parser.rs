@@ -1796,6 +1796,45 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
                 negated,
             })
         }
+        // sqlparser quirk: `"t"."col" COLLATE "X"` parses as a compound
+        // field access whose dotted member is the Collate node. Rebuild it
+        // as Collate(t.col) and translate that.
+        sp::Expr::CompoundFieldAccess { root, access_chain } => {
+            if let sp::Expr::Identifier(tbl) = root.as_ref()
+                && let [sp::AccessExpr::Dot(sp::Expr::Collate { expr, collation })] =
+                    access_chain.as_slice()
+                && let sp::Expr::Identifier(col) = expr.as_ref()
+            {
+                return translate_expr(
+                    sp::Expr::Collate {
+                        expr: Box::new(sp::Expr::CompoundIdentifier(vec![
+                            tbl.clone(),
+                            col.clone(),
+                        ])),
+                        collation: collation.clone(),
+                    },
+                    p,
+                );
+            }
+            Err(SqlError::Unsupported(format!(
+                "expression {:?}",
+                sp::Expr::CompoundFieldAccess { root, access_chain }
+            )))
+        }
+        sp::Expr::Collate { expr, collation } => {
+            let name = object_name_to_string(&collation)?.to_ascii_lowercase();
+            let case_insensitive = match name.as_str() {
+                "nocase" => true,
+                "binary" => false,
+                other => {
+                    return Err(SqlError::Unsupported(format!("collation {other:?}")));
+                }
+            };
+            Ok(Expr::Func {
+                func: ScalarFunc::Collate { case_insensitive },
+                args: vec![translate_expr(*expr, p)?],
+            })
+        }
         sp::Expr::Extract { field, expr, .. } => Ok(Expr::Func {
             func: ScalarFunc::Extract(map_date_part(&field)?),
             args: vec![translate_expr(*expr, p)?],
@@ -2265,13 +2304,14 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             | ScalarFunc::Log
             | ScalarFunc::RegexpLike => exprs.len() == 2,
             ScalarFunc::Lpad | ScalarFunc::Rpad => exprs.len() == 2 || exprs.len() == 3,
-            // Cast/Like/Case/Extract/DateTrunc never arrive through the
-            // function-name path.
+            // Cast/Like/Case/Extract/DateTrunc/Collate never arrive through
+            // the function-name path.
             ScalarFunc::Cast(_)
             | ScalarFunc::Like { .. }
             | ScalarFunc::Case { .. }
             | ScalarFunc::Extract(_)
-            | ScalarFunc::DateTrunc(_) => false,
+            | ScalarFunc::DateTrunc(_)
+            | ScalarFunc::Collate { .. } => false,
         };
         if !ok_arity {
             return Err(SqlError::Unsupported(format!(

@@ -53,6 +53,17 @@ public sealed class OxiDbQuerySqlGenerator : QuerySqlGenerator
         Sql.Append(" ON TRUE");
         return outerApplyExpression;
     }
+
+    // The engine's parser wants the collation name delimited:
+    // `expr COLLATE "NOCASE"` (the base emits it bare).
+    protected override System.Linq.Expressions.Expression VisitCollate(
+        CollateExpression collateExpression)
+    {
+        Visit(collateExpression.Operand);
+        Sql.Append(" COLLATE ")
+            .Append(Dependencies.SqlGenerationHelper.DelimitIdentifier(collateExpression.Collation));
+        return collateExpression;
+    }
 }
 
 public sealed class OxiDbQuerySqlGeneratorFactory : IQuerySqlGeneratorFactory

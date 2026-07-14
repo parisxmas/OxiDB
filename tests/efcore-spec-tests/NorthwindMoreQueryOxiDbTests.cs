@@ -411,18 +411,7 @@ public class NorthwindDbFunctionsQueryOxiDbTest
 
     private Task KnownLimit(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
 
-    // No COLLATE support in the engine.
-    public override Task Collate_case_insensitive(bool async)
-        => KnownLimit(() => base.Collate_case_insensitive(async));
 
-    public override Task Collate_case_sensitive(bool async)
-        => KnownLimit(() => base.Collate_case_sensitive(async));
 
-    public override Task Collate_case_sensitive_constant(bool async)
-        => KnownLimit(() => base.Collate_case_sensitive_constant(async));
 
-    // Engine LIKE is case-sensitive (PostgreSQL semantics); the expected
-    // counts assume SQL Server/SQLite's case-insensitive LIKE.
-    public override Task Like_literal(bool async)
-        => KnownLimit(() => base.Like_literal(async));
 }

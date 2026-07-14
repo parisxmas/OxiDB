@@ -122,27 +122,41 @@ internal sealed class OxiDbStringMethodTranslator : IMethodCallTranslator
         // string.FirstOrDefault()/LastOrDefault() arrive as Enumerable
         // extension calls, handled below; instance methods from here on.
 
-        SqlExpression Pct() => _sql.Constant("%");
-        SqlExpression Concat(params SqlExpression[] args) =>
-            _sql.Function("CONCAT", args, nullable: true,
-                argumentsPropagateNullability: args.Select(_ => true).ToArray(),
-                typeof(string), instance!.TypeMapping);
+        SqlExpression Len(SqlExpression e) =>
+            _sql.Function("LENGTH", [e], nullable: true,
+                argumentsPropagateNullability: [true], typeof(int));
 
         switch (method.Name)
         {
-            case nameof(string.Contains) when arguments is [{ Type: var t }] && t == typeof(string):
-                return _sql.Like(instance, Concat(Pct(), arguments[0], Pct()));
-            // The char overload: position of the one-char needle, not LIKE
-            // (a char like '%' must not act as a wildcard).
-            case nameof(string.Contains) when arguments is [{ Type: var t }] && t == typeof(char):
+            // Contains/StartsWith/EndsWith are ordinal (case-sensitive) in
+            // .NET; the engine's LIKE is case-insensitive, so these translate
+            // via STRPOS/SUBSTRING instead (also no wildcard-escaping hazard).
+            case nameof(string.Contains)
+                when arguments is [{ Type: var t }] && (t == typeof(string) || t == typeof(char)):
                 return _sql.GreaterThan(
                     _sql.Function("STRPOS", [instance, Stringify(arguments[0])], nullable: true,
                         argumentsPropagateNullability: [true, true], typeof(int)),
                     _sql.Constant(0));
             case nameof(string.StartsWith) when arguments is [{ Type: var t }] && t == typeof(string):
-                return _sql.Like(instance, Concat(arguments[0], Pct()));
+                return _sql.Equal(
+                    _sql.Function("SUBSTRING",
+                        [instance, _sql.Constant(1), Len(arguments[0])], nullable: true,
+                        argumentsPropagateNullability: [true, false, true],
+                        typeof(string), instance.TypeMapping),
+                    arguments[0]);
             case nameof(string.EndsWith) when arguments is [{ Type: var t }] && t == typeof(string):
-                return _sql.Like(instance, Concat(Pct(), arguments[0]));
+                return _sql.Equal(
+                    _sql.Function("SUBSTRING",
+                        [
+                            instance,
+                            _sql.Add(
+                                _sql.Subtract(Len(instance), Len(arguments[0])),
+                                _sql.Constant(1)),
+                            Len(arguments[0]),
+                        ], nullable: true,
+                        argumentsPropagateNullability: [true, false, true],
+                        typeof(string), instance.TypeMapping),
+                    arguments[0]);
             case nameof(string.ToUpper) when arguments.Count == 0:
                 return Fn("UPPER", instance);
             case nameof(string.ToLower) when arguments.Count == 0:

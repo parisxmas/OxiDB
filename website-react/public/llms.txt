@@ -121,6 +121,7 @@ Scalar functions: UPPER LOWER LENGTH SUBSTRING CONCAT TRIM/LTRIM/RTRIM
 SQRT SIN COS TAN ASIN ACOS ATAN ATAN2 EXP LN LOG10 LOG(base,x) DEGREES
 RADIANS POSITION/STRPOS LPAD RPAD REGEXP_LIKE COALESCE NULLIF LEAST
 GREATEST, `%`/MOD, `^` (int XOR), `||` and `text + text` concatenation.
+LIKE is ASCII case-insensitive (SQLite-style); COLLATE "NOCASE"/"BINARY".
 VALUES table constructors (`FROM (VALUES (1),(2)) AS v(x)`).
 Index usage: PRIMARY KEY point lookups, secondary-index equality (also
 inside transactions), and index-nested-loop joins (small side ⋈ indexed

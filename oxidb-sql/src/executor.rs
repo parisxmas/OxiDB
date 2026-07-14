@@ -3866,6 +3866,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             | ScalarFunc::Radians => Some(SqlType::Double),
             ScalarFunc::Sign => Some(SqlType::Int),
             ScalarFunc::Random => Some(SqlType::Double),
+            ScalarFunc::Collate { .. } => Some(SqlType::Text),
             ScalarFunc::RegexpLike => Some(SqlType::Bool),
             ScalarFunc::Position => Some(SqlType::Int),
             ScalarFunc::Lpad | ScalarFunc::Rpad => Some(SqlType::Text),
@@ -3935,6 +3936,7 @@ fn default_name(expr: &Expr) -> String {
             ScalarFunc::Trunc => "trunc".to_string(),
             ScalarFunc::RegexpLike => "regexp_like".to_string(),
             ScalarFunc::Random => "random".to_string(),
+            ScalarFunc::Collate { .. } => "collate".to_string(),
         },
         Expr::Window { func, .. } => match func {
             WindowFunc::RowNumber => "row_number".to_string(),
@@ -4470,6 +4472,15 @@ where
             }
             other => return Err(SqlError::Eval(format!("TRUNC of {other:?}"))),
         }),
+        ScalarFunc::Collate { case_insensitive } => Ok(match eval(&args[0])? {
+            Value::Null => Value::Null,
+            Value::Text(s) => Value::Text(if case_insensitive {
+                s.to_lowercase()
+            } else {
+                s
+            }),
+            other => return Err(SqlError::Eval(format!("COLLATE on {other:?}"))),
+        }),
         ScalarFunc::Random => {
             use std::sync::atomic::{AtomicU64, Ordering as AOrd};
             static STATE: AtomicU64 = AtomicU64::new(0);
@@ -4575,7 +4586,9 @@ fn cast_value(v: Value, ty: SqlType) -> Result<Value> {
 }
 
 /// SQL LIKE: `%` matches any sequence, `_` any single character; `escape`
-/// makes the following character literal. Case-sensitive, character-based.
+/// makes the following character literal. ASCII case-insensitive
+/// (SQLite/SQL-Server-style — what EF and its providers expect),
+/// character-based.
 fn like_match(s: &str, pattern: &str, escape: Option<char>) -> bool {
     fn rec(s: &[char], p: &[char], escape: Option<char>) -> bool {
         match p.split_first() {
@@ -4595,9 +4608,9 @@ fn like_match(s: &str, pattern: &str, escape: Option<char>) -> bool {
                 .is_some_and(|(&sc, srest)| sc == c && rec(srest, rest, escape)),
         }
     }
-    let sc: Vec<char> = s.chars().collect();
-    let pc: Vec<char> = pattern.chars().collect();
-    rec(&sc, &pc, escape)
+    let sc: Vec<char> = s.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let pc: Vec<char> = pattern.chars().map(|c| c.to_ascii_lowercase()).collect();
+    rec(&sc, &pc, escape.map(|c| c.to_ascii_lowercase()))
 }
 
 /// SQL `IN` with three-valued logic: true if any element equals `v`; NULL if

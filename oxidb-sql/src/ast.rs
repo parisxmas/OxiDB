@@ -448,6 +448,11 @@ pub enum ScalarFunc {
     RegexpLike,
     /// `RANDOM()` / `RAND()` — uniform double in [0, 1).
     Random,
+    /// `expr COLLATE "NOCASE"` — case-folds the text so comparisons and
+    /// ordering become case-insensitive; `COLLATE "BINARY"` is the identity.
+    Collate {
+        case_insensitive: bool,
+    },
 }
 
 /// A date/time component for [`ScalarFunc::Extract`] / [`ScalarFunc::DateTrunc`].

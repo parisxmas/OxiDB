@@ -500,3 +500,58 @@ fn correlated_ref_inside_derived_table() {
         vec![vec![i(2)], vec![i(1)]]
     );
 }
+
+#[test]
+fn like_is_ascii_case_insensitive() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (s TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES ('Maria Anders'), ('ANA TRUJILLO'), ('bolido')")
+        .unwrap();
+    // SQLite/SQL-Server-style ASCII case-insensitivity (what EF expects).
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM t WHERE s LIKE '%an%'"),
+        vec![vec![i(2)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM t WHERE s LIKE 'maria%'"),
+        vec![vec![i(1)]]
+    );
+    // ESCAPE still works case-insensitively.
+    db.execute("INSERT INTO t VALUES ('50% OFF')").unwrap();
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT COUNT(*) FROM t WHERE s LIKE '%!% off' ESCAPE '!'"
+        ),
+        vec![vec![i(1)]]
+    );
+}
+
+#[test]
+fn collate_nocase_and_binary() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (s TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES ('Maria Anders'), ('maria anders'), ('Ana')")
+        .unwrap();
+    // NOCASE folds; equality becomes case-insensitive when both sides fold.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT COUNT(*) FROM t WHERE s COLLATE \"NOCASE\" = 'maria anders'"
+        ),
+        vec![vec![i(2)]]
+    );
+    // BINARY is the identity (case-sensitive).
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT COUNT(*) FROM t WHERE s COLLATE \"BINARY\" = 'maria anders'"
+        ),
+        vec![vec![i(1)]]
+    );
+    // Unknown collations are rejected.
+    assert!(
+        db.execute("SELECT COUNT(*) FROM t WHERE s COLLATE \"tr_TR\" = 'x'")
+            .is_err()
+    );
+}
