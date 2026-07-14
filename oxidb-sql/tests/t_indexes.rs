@@ -194,3 +194,35 @@ fn programmatic_index_api() {
     db.drop_index("t_tag").unwrap();
     assert!(db.drop_index("t_tag").is_err());
 }
+
+#[test]
+fn dml_index_probe_reapplies_residual_filter() {
+    // UPDATE/DELETE seek their WHERE through the PK / a secondary index when
+    // an equality allows it; the probe may return a superset, so the rest of
+    // the predicate must still be applied to every candidate.
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, status INT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0), (2, 5)").unwrap();
+    // PK matches, residual doesn't: nothing updated.
+    assert_eq!(
+        affected(&db, "UPDATE t SET status = 9 WHERE id = 1 AND status = 5"),
+        0
+    );
+    assert_eq!(
+        affected(&db, "UPDATE t SET status = 9 WHERE id = 2 AND status = 5"),
+        1
+    );
+    assert_eq!(
+        affected(&db, "DELETE FROM t WHERE id = 1 AND status = 99"),
+        0
+    );
+    assert_eq!(
+        affected(&db, "DELETE FROM t WHERE id = 2 AND status = 9"),
+        1
+    );
+    assert_eq!(
+        rows(&db, "SELECT id, status FROM t"),
+        vec![vec![i(1), i(0)]]
+    );
+}

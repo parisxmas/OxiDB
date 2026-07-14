@@ -681,7 +681,7 @@ fn exec_update<S: Store>(
     let targets_corr = targets.iter().any(|(_, e)| has_corr(e));
     let mut affected = 0;
     let mut touched: Vec<Vec<Value>> = Vec::new();
-    for (row_id, cells) in store.scan(table)? {
+    for (row_id, cells) in dml_candidates(store, table, alias.unwrap_or(table), &filter, params)? {
         if let Some(pred) = &filter
             && !truthy(&eval_scalar_corr(
                 store,
@@ -714,6 +714,28 @@ fn exec_update<S: Store>(
     })
 }
 
+/// Candidate rows for a DML statement's WHERE: a PK / secondary-index probe
+/// when the filter carries a usable equality (`UPDATE t SET ... WHERE id = ?`
+/// must not scan the table), else a full scan. A probe may return a superset —
+/// the caller re-applies the filter to every candidate row.
+fn dml_candidates<S: Store>(
+    store: &S,
+    table: &str,
+    key: &str,
+    filter: &Option<Expr>,
+    params: &[Value],
+) -> Result<Vec<(u64, Vec<Value>)>> {
+    if let Some(expr) = filter {
+        let eqs = eq_conjuncts(expr, key, params);
+        if !eqs.is_empty()
+            && let Some(rows) = store.index_lookup_eq(table, &eqs)?
+        {
+            return Ok(rows);
+        }
+    }
+    store.scan(table)
+}
+
 fn exec_delete<S: Store>(
     store: &S,
     table: &str,
@@ -730,7 +752,7 @@ fn exec_delete<S: Store>(
 
     let filter_corr = filter.as_ref().is_some_and(has_corr);
     let mut to_delete = Vec::new();
-    for (row_id, cells) in store.scan(table)? {
+    for (row_id, cells) in dml_candidates(store, table, alias.unwrap_or(table), &filter, params)? {
         let matches = match &filter {
             Some(pred) => truthy(&eval_scalar_corr(
                 store,
@@ -3731,6 +3753,16 @@ fn const_value(e: &Expr, params: &[Value]) -> Option<Value> {
     match e {
         Expr::Literal(v) => Some(v.clone()),
         Expr::Param(i) => params.get(*i).cloned(),
+        // A negative number literal parses as Neg(Literal): `WHERE id = -1`
+        // must still be probe-able.
+        Expr::Unary {
+            op: UnOp::Neg,
+            expr,
+        } => match const_value(expr, params)? {
+            Value::Int(n) => Some(Value::Int(-n)),
+            Value::Double(f) => Some(Value::Double(-f)),
+            _ => None,
+        },
         _ => None,
     }
 }
