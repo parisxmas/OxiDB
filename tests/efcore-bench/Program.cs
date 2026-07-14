@@ -89,10 +89,36 @@ if (!skipSeed)
                 });
             db.SaveChanges();
         }
+        using (var db = Open(provider))
+        {
+            for (var p = 1; p <= 500; p++)
+                db.Products.Add(new Product
+                {
+                    Id = p,
+                    Sku = $"SKU-{p:D4}",
+                    Category = p % 20,
+                    Price = (p * 97 % 1000) / 10.0 + 1,
+                });
+            db.SaveChanges();
+        }
+        var lines = orders * 3;
+        for (var lo = 1; lo <= lines; lo += 3000)
+        {
+            using var db = Open(provider);
+            for (var i = lo; i < lo + 3000 && i <= lines; i++)
+                db.OrderLines.Add(new OrderLine
+                {
+                    Id = i,
+                    OrderId = (i - 1) / 3 + 1,
+                    ProductId = (i * 31) % 500 + 1,
+                    Qty = i % 5 + 1,
+                });
+            db.SaveChanges();
+        }
         sw.Stop();
         seedSeconds[provider] = sw.Elapsed.TotalSeconds;
         Console.WriteLine(
-            $"seeded {provider,-8} {customers} customers + {orders} orders in {sw.Elapsed.TotalSeconds:F1}s");
+            $"seeded {provider,-8} {customers} customers + {orders} orders + 500 products + {lines} lines in {sw.Elapsed.TotalSeconds:F1}s");
     }
 }
 
@@ -116,6 +142,16 @@ void Run(string name, int iterations, Action<Bench, int> op, int warmup = 15)
         currentProvider = provider;
         using var db = Open(provider);
         db.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
+        try
+        {
+            op(db, 0); // translation smoke test — a failed shape is a finding, not a crash
+        }
+        catch (Exception e)
+        {
+            results.Add(new BenchResult(name, provider, double.NaN, double.NaN, double.NaN, 0));
+            Console.WriteLine($"  {name,-28} {provider,-8} FAILED: {Head(e)}");
+            continue;
+        }
         for (var i = 0; i < warmup; i++)
         {
             op(db, i);
@@ -144,7 +180,14 @@ void Run(string name, int iterations, Action<Bench, int> op, int warmup = 15)
     }
 }
 
-static string Fmt(double us) => us < 1000 ? $"{us:F0} µs" : $"{us / 1000.0:F2} ms";
+static string Fmt(double us) =>
+    double.IsNaN(us) ? "FAIL" : us < 1000 ? $"{us:F0} µs" : $"{us / 1000.0:F2} ms";
+
+static string Head(Exception e)
+{
+    var m = (e.GetBaseException().Message ?? "").ReplaceLineEndings(" ");
+    return m.Length > 120 ? m[..120] + "…" : m;
+}
 
 Console.WriteLine("\n── simple benches ─────────────────────────────────────────");
 
@@ -210,6 +253,88 @@ Run("delete_point", 200, (db, i) =>
     var id = IdBase() + i + 1;
     db.Orders.Where(o => o.Id == id).ExecuteDelete();
 });
+
+// ── complex benches ─────────────────────────────────────────────────────────
+
+Console.WriteLine("\n── complex benches ────────────────────────────────────────");
+
+// Two-way join + GROUP BY + ORDER BY aggregate: revenue per city, top 5.
+Run("join_groupby_top5", 30, (db, i) =>
+    db.Orders.Join(db.Customers, o => o.CustomerId, c => c.Id, (o, c) => new { c.City, o.Amount })
+        .GroupBy(x => x.City)
+        .Select(g => new { City = g.Key, Total = g.Sum(x => x.Amount) })
+        .OrderByDescending(x => x.Total)
+        .Take(5)
+        .ToList());
+
+// Per-customer aggregates over the Orders navigation, top spenders.
+Run("nav_aggregate_top10", 20, (db, i) =>
+    db.Customers
+        .Select(c => new { c.Name, Total = c.Orders.Sum(o => o.Amount), Cnt = c.Orders.Count() })
+        .Where(x => x.Cnt > 0)
+        .OrderByDescending(x => x.Total)
+        .Take(10)
+        .ToList());
+
+// Include: parent rows with their full child collections rehydrated.
+Run("include_collection", 30, (db, i) =>
+    db.Customers.Include(c => c.Orders).Where(c => c.City == "City03").ToList());
+
+// EXISTS over a filtered child collection.
+Run("exists_any", 30, (db, i) =>
+    db.Customers.Count(c => c.Orders.Any(o => o.Amount > 995)));
+
+// Parameterized IN list (EF renders a VALUES table or IN).
+Run("in_list_count", 50, (db, i) =>
+{
+    var wanted = new[] { "City01", "City05", "City09", "City13" };
+    db.Customers.Count(c => wanted.Contains(c.City));
+});
+
+// Three-way join through navigations + arithmetic aggregate.
+Run("three_way_join_sum", 15, (db, i) =>
+    db.OrderLines
+        .Where(l => l.Product.Category == 7 && l.Order.Status == 1)
+        .Sum(l => l.Qty * l.Product.Price));
+
+// Correlated top-1 per row (EF renders LATERAL / APPLY).
+Run("top1_per_customer", 20, (db, i) =>
+    db.Customers.Where(c => c.Id <= 100)
+        .Select(c => new
+        {
+            c.Name,
+            Best = c.Orders.OrderByDescending(o => o.Amount).Select(o => o.Amount).FirstOrDefault(),
+        })
+        .ToList());
+
+// Deep OFFSET paging (past the engine's bounded top-N cutoff).
+Run("deep_paging", 20, (db, i) =>
+    db.Orders.OrderBy(o => o.Created).Skip(5000).Take(50).ToList());
+
+// DISTINCT projection under a predicate.
+Run("distinct_projection", 50, (db, i) =>
+    db.Customers.Where(c => c.Segment == 2).Select(c => c.City).Distinct().Count());
+
+// Set operation over two filtered projections.
+Run("union_projection", 30, (db, i) =>
+    db.Customers.Where(c => c.Segment == 0).Select(c => c.City)
+        .Union(db.Customers.Where(c => c.Segment == 1).Select(c => c.City))
+        .Count());
+
+// GROUP BY a computed date part (EXTRACT) with two aggregates.
+Run("month_histogram", 20, (db, i) =>
+    db.Orders.GroupBy(o => o.Created.Month)
+        .Select(g => new { Month = g.Key, Cnt = g.Count(), Total = g.Sum(x => x.Amount) })
+        .OrderBy(x => x.Month)
+        .ToList());
+
+// GROUP BY + HAVING on the group aggregate.
+Run("groupby_having", 20, (db, i) =>
+    db.Orders.GroupBy(o => o.CustomerId).Where(g => g.Count() >= 15).Count());
+
+// Combined string predicates (prefix + suffix).
+Run("string_multi", 30, (db, i) =>
+    db.Customers.Count(c => c.Name.StartsWith("Customer 00") && c.Name.EndsWith("7")));
 
 // ── report ──────────────────────────────────────────────────────────────────
 
@@ -277,12 +402,33 @@ class Order
     public int Status { get; set; }
     public DateTime Created { get; set; }
     public Customer? Customer { get; set; }
+    public List<OrderLine> Lines { get; set; } = [];
+}
+
+class Product
+{
+    public int Id { get; set; }
+    public string Sku { get; set; } = "";
+    public int Category { get; set; }
+    public double Price { get; set; }
+}
+
+class OrderLine
+{
+    public int Id { get; set; }
+    public int OrderId { get; set; }
+    public int ProductId { get; set; }
+    public int Qty { get; set; }
+    public Order? Order { get; set; }
+    public Product? Product { get; set; }
 }
 
 class Bench(DbContextOptions<Bench> options) : DbContext(options)
 {
     public DbSet<Customer> Customers => Set<Customer>();
     public DbSet<Order> Orders => Set<Order>();
+    public DbSet<Product> Products => Set<Product>();
+    public DbSet<OrderLine> OrderLines => Set<OrderLine>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -292,5 +438,15 @@ class Bench(DbContextOptions<Bench> options) : DbContext(options)
         b.Entity<Order>()
             .HasOne(o => o.Customer).WithMany(c => c.Orders)
             .HasForeignKey(o => o.CustomerId);
+        b.Entity<Product>().Property(p => p.Id).ValueGeneratedNever();
+        b.Entity<OrderLine>().Property(l => l.Id).ValueGeneratedNever();
+        b.Entity<OrderLine>().HasIndex(l => l.OrderId);
+        b.Entity<OrderLine>().HasIndex(l => l.ProductId);
+        b.Entity<OrderLine>()
+            .HasOne(l => l.Order).WithMany(o => o.Lines)
+            .HasForeignKey(l => l.OrderId);
+        b.Entity<OrderLine>()
+            .HasOne(l => l.Product).WithMany()
+            .HasForeignKey(l => l.ProductId);
     }
 }

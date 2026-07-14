@@ -334,6 +334,17 @@ pub enum Expr {
         list: Vec<Expr>,
         negated: bool,
     },
+    /// `expr [NOT] IN <materialized value set>`: the resolved form of a
+    /// large `IN (SELECT ...)` list — O(log n) membership instead of a
+    /// per-row list walk. Same three-valued semantics as [`Expr::In`]
+    /// (`has_null` = the set also contained NULLs). Produced by the
+    /// executor's resolution pass; never by the parser.
+    InSet {
+        expr: Box<Expr>,
+        set: std::sync::Arc<std::collections::BTreeSet<crate::types::IndexKey>>,
+        has_null: bool,
+        negated: bool,
+    },
     /// An uncorrelated scalar subquery (`(SELECT ...)`): one column, at most
     /// one row (zero rows evaluate to NULL). Resolved to a `Literal` before
     /// row evaluation.

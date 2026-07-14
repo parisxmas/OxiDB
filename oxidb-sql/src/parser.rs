@@ -1308,6 +1308,7 @@ fn expr_references(e: &Expr, name: &str) -> bool {
         Expr::In { expr, list, .. } => {
             expr_references(expr, name) || list.iter().any(|x| expr_references(x, name))
         }
+        Expr::InSet { expr, .. } => expr_references(expr, name),
         Expr::Func { args, .. } => args.iter().any(|a| expr_references(a, name)),
         Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(|a| expr_references(a, name)),
         Expr::Window {
@@ -1428,6 +1429,7 @@ fn inline_ctes_expr(e: &mut Expr, ctes: &[(String, SelectQuery, Vec<String>)]) {
                 inline_ctes_expr(x, ctes);
             }
         }
+        Expr::InSet { expr, .. } => inline_ctes_expr(expr, ctes),
         Expr::Func { args, .. } => {
             for a in args {
                 inline_ctes_expr(a, ctes);

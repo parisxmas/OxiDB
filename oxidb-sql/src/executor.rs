@@ -1438,6 +1438,7 @@ fn query_has_param_ge(q: &SelectQuery, floor: usize) -> bool {
             Expr::In { expr, list, .. } => {
                 expr_has(expr, floor) || list.iter().any(|i| expr_has(i, floor))
             }
+            Expr::InSet { expr, .. } => expr_has(expr, floor),
             Expr::Subquery(q) => query_has_param_ge(q, floor),
             Expr::InSubquery { expr, query, .. } => {
                 expr_has(expr, floor) || query_has_param_ge(query, floor)
@@ -1627,6 +1628,17 @@ fn resolve_expr<S: Store>(
                     negated: *negated,
                 };
             } else {
+                // EXISTS-shaped semi-join decorrelation: the parser encodes
+                // `EXISTS(...)` as `1 IN (SELECT 1 ... WHERE $slot = key AND
+                // residual)`. Lifting the correlation equality out leaves an
+                // UNCORRELATED set query — materialized once instead of
+                // re-executed per outer row.
+                if let Some(rewritten) =
+                    decorrelate_exists(store, expr, query, &outer, floor, *negated, params)?
+                {
+                    *e = rewritten;
+                    return Ok(());
+                }
                 *e = Expr::CorrIn {
                     expr: expr.clone(),
                     query: query.clone(),
@@ -1644,6 +1656,7 @@ fn resolve_expr<S: Store>(
             }
             Ok(())
         }
+        Expr::InSet { expr, .. } => resolve_expr(store, expr, params, scope, floor),
         Expr::Binary { left, right, .. } => {
             resolve_expr(store, left, params, scope, floor)?;
             resolve_expr(store, right, params, scope, floor)
@@ -1823,6 +1836,9 @@ fn rewrite_outer_refs<S: Store>(
                 rewrite_outer_refs(store, a, inner, outer, base, out);
             }
         }
+        Expr::InSet { expr, .. } => {
+            rewrite_outer_refs(store, expr, inner, outer, base, out);
+        }
         Expr::In { expr, list, .. } => {
             rewrite_outer_refs(store, expr, inner, outer, base, out);
             for item in list {
@@ -1887,6 +1903,7 @@ fn has_corr(e: &Expr) -> bool {
         Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(has_corr),
         Expr::Func { args, .. } => args.iter().any(has_corr),
         Expr::In { expr, list, .. } => has_corr(expr) || list.iter().any(has_corr),
+        Expr::InSet { expr, .. } => has_corr(expr),
         Expr::Window {
             func,
             partition_by,
@@ -1898,6 +1915,141 @@ fn has_corr(e: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+/// Try to decorrelate the parser's EXISTS encoding — `1 IN (SELECT 1 FROM
+/// ... WHERE $slot = key AND residual)` with exactly one outer reference —
+/// into `COALESCE(outer IN <set>, FALSE)` over the one-shot materialized
+/// `SELECT key FROM ... WHERE residual` (`NOT` wrapped for NOT EXISTS).
+///
+/// COALESCE pins the NULL cases to what the correlated form produces: a
+/// NULL outer value (`NULL = key` matches nothing → EXISTS is FALSE) and
+/// NULL keys in the set (never equal to anything) both surface as a NULL
+/// `IN`, which COALESCE folds back to FALSE — making the rewrite exact,
+/// including under negation and in projections.
+fn decorrelate_exists<S: Store>(
+    store: &S,
+    probe: &Expr,
+    query: &SelectQuery,
+    outer: &[Expr],
+    base: usize,
+    negated: bool,
+    params: &[Value],
+) -> Result<Option<Expr>> {
+    if outer.len() != 1
+        || !matches!(probe, Expr::Literal(Value::Int(1)))
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
+        || !query.ctes.is_empty()
+    {
+        return Ok(None);
+    }
+    let QueryBody::Select(sel) = &query.body else {
+        return Ok(None);
+    };
+    // The EXISTS projection marker (`SELECT 1`), un-aggregated, un-deduped,
+    // and — crucially — without a row-slicing LIMIT/OFFSET: those apply per
+    // outer row in the correlated form (EF's ElementAt renders EXISTS with
+    // an OFFSET), but would apply once globally after decorrelation.
+    if !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || sel.distinct
+        || !sel.distinct_on.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+        || !sel.order_by.is_empty()
+    {
+        return Ok(None);
+    }
+    match sel.projection.as_slice() {
+        [SelectItem::Expr {
+            expr: Expr::Literal(Value::Int(1)),
+            ..
+        }] => {}
+        _ => return Ok(None),
+    }
+    // Find the correlation equality among the WHERE's top-level conjuncts.
+    let Some(filter) = &sel.filter else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(filter, &mut conjuncts);
+    let mut key: Option<&Expr> = None;
+    let mut residual: Vec<&Expr> = Vec::new();
+    for c in conjuncts {
+        if key.is_none()
+            && let Expr::Binary {
+                op: BinOp::Eq,
+                left,
+                right,
+            } = c
+        {
+            match (left.as_ref(), right.as_ref()) {
+                (Expr::Param(p), k) | (k, Expr::Param(p)) if *p == base => {
+                    key = Some(k);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        residual.push(c);
+    }
+    let Some(key) = key else {
+        return Ok(None);
+    };
+    let mut set_query = query.clone();
+    let QueryBody::Select(sel2) = &mut set_query.body else {
+        unreachable!("shape checked above");
+    };
+    sel2.projection = vec![SelectItem::Expr {
+        expr: key.clone(),
+        alias: None,
+    }];
+    sel2.filter = residual.into_iter().cloned().reduce(|l, r| Expr::Binary {
+        op: BinOp::And,
+        left: Box::new(l),
+        right: Box::new(r),
+    });
+    // Any remaining synthetic slot means the correlation ran deeper than the
+    // one equality (or the slot was used twice) — stay correlated.
+    if query_has_param_ge(&set_query, params.len()) {
+        return Ok(None);
+    }
+    let (columns, rows) = run_query_rows(store, set_query, params)?;
+    if columns.len() != 1 {
+        return Ok(None);
+    }
+    let mut set = std::collections::BTreeSet::new();
+    let mut has_null = false;
+    for mut r in rows {
+        match r.remove(0) {
+            Value::Null => has_null = true,
+            v => {
+                set.insert(IndexKey(v));
+            }
+        }
+    }
+    let membership = Expr::Func {
+        func: ScalarFunc::Coalesce,
+        args: vec![
+            Expr::InSet {
+                expr: Box::new(outer[0].clone()),
+                set: std::sync::Arc::new(set),
+                has_null,
+                negated: false,
+            },
+            Expr::Literal(Value::Bool(false)),
+        ],
+    };
+    Ok(Some(if negated {
+        Expr::Unary {
+            op: UnOp::Not,
+            expr: Box::new(membership),
+        }
+    } else {
+        membership
+    }))
 }
 
 /// Replace every correlated subquery node in `e` with its result for this
@@ -1961,6 +2113,17 @@ fn resolve_corr_row<S: Store, R: RowLike + ?Sized>(
         },
         Expr::IsNull { expr, negated } => Expr::IsNull {
             expr: Box::new(resolve_corr_row(store, expr, schema, row, params)?),
+            negated: *negated,
+        },
+        Expr::InSet {
+            expr,
+            set,
+            has_null,
+            negated,
+        } => Expr::InSet {
+            expr: Box::new(resolve_corr_row(store, expr, schema, row, params)?),
+            set: set.clone(),
+            has_null: *has_null,
             negated: *negated,
         },
         Expr::In {
@@ -2055,6 +2218,7 @@ fn has_window(e: &Expr) -> bool {
         Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(has_window),
         Expr::Func { args, .. } => args.iter().any(has_window),
         Expr::In { expr, list, .. } => has_window(expr) || list.iter().any(has_window),
+        Expr::InSet { expr, .. } => has_window(expr),
         _ => false,
     }
 }
@@ -2072,6 +2236,7 @@ fn max_param_slot(e: &Expr) -> usize {
             .iter()
             .map(max_param_slot)
             .fold(max_param_slot(expr), usize::max),
+        Expr::InSet { expr, .. } => max_param_slot(expr),
         Expr::CorrScalar { outer, base, .. } => base + outer.len(),
         Expr::CorrIn {
             expr, outer, base, ..
@@ -2121,6 +2286,7 @@ fn replace_windows(e: &mut Expr, windows: &mut Vec<Expr>, win_base: usize) {
                 replace_windows(a, windows, win_base);
             }
         }
+        Expr::InSet { expr, .. } => replace_windows(expr, windows, win_base),
         Expr::In { expr, list, .. } => {
             replace_windows(expr, windows, win_base);
             for item in list {
@@ -2764,11 +2930,27 @@ fn build_source<S: Store>(
                 let schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
                 // Base rows: with no joins, an index probe when WHERE has a
                 // usable equality, else a streamed scan pushing WHERE (and a
-                // LIMIT cutoff) down; otherwise a plain pruned scan.
+                // LIMIT cutoff) down. With joins, push this table's own WHERE
+                // conjuncts into its scan — unless an outer join can NULL-pad
+                // it (a RIGHT/FULL join pads the FROM side).
                 let chunk = if select.joins.is_empty() {
                     base_chunk(store, from, select, params, &keep, &full)?
                 } else {
-                    store.scan_pruned(&from.name, &keep)?
+                    let paddable = select
+                        .joins
+                        .iter()
+                        .any(|j| matches!(j.kind, JoinKind::Right | JoinKind::Full));
+                    let pushed = if paddable {
+                        None
+                    } else {
+                        pushdown_filter(select.filter.as_ref(), &full, params)
+                    };
+                    match pushed {
+                        Some(f) => {
+                            filtered_scan(store, &from.name, Some(&f), &full, &keep, params, None)?
+                        }
+                        None => store.scan_pruned(&from.name, &keep)?,
+                    }
                 };
                 (schema, chunk)
             }
@@ -2792,6 +2974,13 @@ fn build_source<S: Store>(
     } else {
         reorder_joins(store, from, &select.joins)
     };
+    // WHERE conjuncts may be pushed into an INNER join's table scan only
+    // when no outer join anywhere can NULL-pad rows (conservative; the full
+    // WHERE is re-applied after joining either way).
+    let any_outer = select
+        .joins
+        .iter()
+        .any(|j| !matches!(j.kind, JoinKind::Inner));
     for join in ordered {
         if join.table.lateral && join.table.subquery.is_some() {
             lateral_join_into(store, join, &mut schema, &mut src, &mut tuples, params)?;
@@ -2804,6 +2993,8 @@ fn build_source<S: Store>(
                 &mut tuples,
                 params,
                 &needed,
+                select.filter.as_ref(),
+                !any_outer,
             )?;
         }
     }
@@ -3033,13 +3224,15 @@ fn join_into<S: Store>(
     tuples: &mut Tuples,
     params: &[Value],
     needed: &Needed,
+    where_filter: Option<&Expr>,
+    filter_pushable: bool,
 ) -> Result<()> {
     // Resolve the right schema up front, but defer materializing its rows for a
     // base table: an index-nested-loop join can then prune the scan to only the
     // rows the (small) left side needs.
     enum RightSrc {
         Ready(Chunk),
-        Base { keep: Vec<usize> },
+        Base { keep: Vec<usize>, full: Vec<ColRef> },
     }
     let (right_schema, right_src) = if let Some(sub) = &join.table.subquery {
         let (rs, chunk) = derived_source(store, &join.table, sub, needed, params)?;
@@ -3050,7 +3243,7 @@ fn join_into<S: Store>(
                 let full = qualified_schema(join.table.key(), &def);
                 let keep = keep_indices(&full, join.table.key(), needed);
                 let right_schema: Vec<ColRef> = keep.iter().map(|&i| full[i].clone()).collect();
-                (right_schema, RightSrc::Base { keep })
+                (right_schema, RightSrc::Base { keep, full })
             }
             None => {
                 let (rs, chunk) = view_source(store, &join.table, needed)?
@@ -3071,10 +3264,30 @@ fn join_into<S: Store>(
     // prune first (below); otherwise fall back to a full scan.
     let chunk = match right_src {
         RightSrc::Ready(chunk) => chunk,
-        RightSrc::Base { keep } => {
+        RightSrc::Base { keep, full } => {
             match index_nested_loop_chunk(store, join, &keys, schema, src, tuples, &keep, params)? {
                 Some(chunk) => chunk,
-                None => store.scan_pruned(&join.table.name, &keep)?,
+                None => {
+                    // Push this table's own WHERE conjuncts into the scan
+                    // (INNER side only; the caller re-applies the full WHERE).
+                    let pushed = if filter_pushable {
+                        pushdown_filter(where_filter, &full, params)
+                    } else {
+                        None
+                    };
+                    match pushed {
+                        Some(f) => filtered_scan(
+                            store,
+                            &join.table.name,
+                            Some(&f),
+                            &full,
+                            &keep,
+                            params,
+                            None,
+                        )?,
+                        None => store.scan_pruned(&join.table.name, &keep)?,
+                    }
+                }
             }
         }
     };
@@ -3647,6 +3860,7 @@ fn collect_col_refs<'a>(e: &'a Expr, out: &mut Vec<(&'a Option<String>, &'a str)
                 collect_col_refs(a, out);
             }
         }
+        Expr::InSet { expr, .. } => collect_col_refs(expr, out),
         Expr::In { expr, list, .. } => {
             collect_col_refs(expr, out);
             for item in list {
@@ -3734,6 +3948,7 @@ fn has_volatile(e: &Expr) -> bool {
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_volatile(expr),
         Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(has_volatile),
         Expr::In { expr, list, .. } => has_volatile(expr) || list.iter().any(has_volatile),
+        Expr::InSet { expr, .. } => has_volatile(expr),
         Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::CorrScalar { .. } | Expr::CorrIn { .. } => {
             true // subqueries are opaque here; the caller must not stream them
         }
@@ -3882,21 +4097,89 @@ fn streamed_chunk<S: Store>(
         }
         Ok(Some(Chunk { width, n, cells }))
     } else {
-        let mut cells = Vec::new();
-        let mut n = 0usize;
-        store.scan_visit(&from.name, &mut |row| {
-            if let Some(f) = &filter
-                && !truthy(&eval_scalar(f, full, row, params)?)
-            {
-                return Ok(true);
-            }
-            for &c in keep {
-                cells.push(row[c].clone());
-            }
-            n += 1;
-            Ok(early_stop.is_none_or(|c| n < c))
-        })?;
-        Ok(Some(Chunk { width, n, cells }))
+        Ok(Some(filtered_scan(
+            store,
+            &from.name,
+            filter.as_ref(),
+            full,
+            keep,
+            params,
+            early_stop,
+        )?))
+    }
+}
+
+/// Scan `table` keeping only rows that pass `filter` (already bound against
+/// the table's full schema), cloning just the `keep` columns. Rows are
+/// evaluated borrowed via [`Store::scan_visit`]; `stop_after` ends the scan
+/// once that many rows matched.
+fn filtered_scan<S: Store>(
+    store: &S,
+    table: &str,
+    filter: Option<&Expr>,
+    full: &[ColRef],
+    keep: &[usize],
+    params: &[Value],
+    stop_after: Option<usize>,
+) -> Result<Chunk> {
+    let mut cells = Vec::new();
+    let mut n = 0usize;
+    store.scan_visit(table, &mut |row| {
+        if let Some(f) = filter
+            && !truthy(&eval_scalar(f, full, row, params)?)
+        {
+            return Ok(true);
+        }
+        for &c in keep {
+            cells.push(row[c].clone());
+        }
+        n += 1;
+        Ok(stop_after.is_none_or(|c| n < c))
+    })?;
+    Ok(Chunk {
+        width: keep.len(),
+        n,
+        cells,
+    })
+}
+
+/// The AND-conjuncts of the WHERE that can be pushed into one table's scan:
+/// each must be streamable (see [`streamable`]) and reference only columns
+/// that bind against that table's schema alone. Returns the conjunction,
+/// bound. The caller must re-apply the full WHERE after joining (pushdown is
+/// a superset-safe row reduction, never a replacement) and must not push
+/// into any table that an outer join can NULL-pad — a pushed predicate
+/// would manufacture padded rows the real WHERE (e.g. `x IS NULL`) then
+/// treats differently.
+fn pushdown_filter(
+    filter: Option<&Expr>,
+    full: &[ColRef],
+    params: &[Value],
+) -> Option<Expr> {
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(filter?, &mut conjuncts);
+    conjuncts
+        .into_iter()
+        .filter(|c| streamable(c, params))
+        .filter_map(|c| bind_expr(c, full).ok())
+        .reduce(|l, r| Expr::Binary {
+            op: BinOp::And,
+            left: Box::new(l),
+            right: Box::new(r),
+        })
+}
+
+fn collect_conjuncts<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+    match e {
+        Expr::Binary {
+            op: BinOp::And,
+            left,
+            right,
+        } => {
+            collect_conjuncts(left, out);
+            collect_conjuncts(right, out);
+        }
+        _ => out.push(e),
     }
 }
 
@@ -4426,7 +4709,11 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             UnOp::Not => Some(SqlType::Bool),
             UnOp::Neg | UnOp::BitNot => expr_type(expr, schema),
         },
-        Expr::IsNull { .. } | Expr::In { .. } | Expr::InSubquery { .. } | Expr::CorrIn { .. } => {
+        Expr::IsNull { .. }
+        | Expr::In { .. }
+        | Expr::InSet { .. }
+        | Expr::InSubquery { .. }
+        | Expr::CorrIn { .. } => {
             Some(SqlType::Bool)
         }
         Expr::Aggregate { func, arg, .. } => match func {
@@ -4662,19 +4949,17 @@ fn eval_scalar<R: RowLike + ?Sized>(
             apply_unary(*op, v)
         }
         Expr::Binary { op, left, right } => {
-            // Comparison of two ref-transparent operands: compare in place.
-            // The owned path below clones both sides per row — for a TEXT
-            // column that is a heap allocation just to run a comparison.
+            // Comparisons of borrowable operands compare in place. The owned
+            // path below clones both sides per row — for a TEXT column that
+            // is a heap allocation just to run a comparison, and for
+            // SUBSTRING-of-a-column (EF's StartsWith/EndsWith) an extra
+            // intermediate string on top.
             if matches!(
                 op,
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-            ) && let (Some(l), Some(r)) = (val_ref(left, row, params), val_ref(right, row, params))
-            {
-                if matches!(l, Value::Null) || matches!(r, Value::Null) {
-                    return Ok(Value::Null);
-                }
-                return match cmp_values(l, r) {
-                    Some(ord) => Ok(Value::Bool(match op {
+            ) {
+                let map_ord = |ord: Ordering| {
+                    Value::Bool(match op {
                         BinOp::Eq => ord == Ordering::Equal,
                         BinOp::Ne => ord != Ordering::Equal,
                         BinOp::Lt => ord == Ordering::Less,
@@ -4682,9 +4967,28 @@ fn eval_scalar<R: RowLike + ?Sized>(
                         BinOp::Gt => ord == Ordering::Greater,
                         BinOp::Ge => ord != Ordering::Less,
                         _ => unreachable!(),
-                    })),
-                    None => Err(SqlError::Eval(format!("cannot compare {l:?} and {r:?}"))),
+                    })
                 };
+                if let (Some(l), Some(r)) = (
+                    str_ref(left, schema, row, params),
+                    str_ref(right, schema, row, params),
+                ) {
+                    return Ok(match (l?, r?) {
+                        (Some(l), Some(r)) => map_ord(l.cmp(r)),
+                        _ => Value::Null,
+                    });
+                }
+                if let (Some(l), Some(r)) =
+                    (val_ref(left, row, params), val_ref(right, row, params))
+                {
+                    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+                        return Ok(Value::Null);
+                    }
+                    return match cmp_values(l, r) {
+                        Some(ord) => Ok(map_ord(ord)),
+                        None => Err(SqlError::Eval(format!("cannot compare {l:?} and {r:?}"))),
+                    };
+                }
             }
             let l = eval_scalar(left, schema, row, params)?;
             let r = eval_scalar(right, schema, row, params)?;
@@ -4695,9 +4999,40 @@ fn eval_scalar<R: RowLike + ?Sized>(
             list,
             negated,
         } => {
+            // Probe value borrowed when possible (IN lists loop per row).
+            if let Some(v) = val_ref(expr, row, params) {
+                return eval_in(v, list, *negated, |item| {
+                    eval_scalar(item, schema, row, params)
+                });
+            }
             let v = eval_scalar(expr, schema, row, params)?;
             eval_in(&v, list, *negated, |item| {
                 eval_scalar(item, schema, row, params)
+            })
+        }
+        Expr::InSet {
+            expr,
+            set,
+            has_null,
+            negated,
+        } => {
+            let owned;
+            let v: &Value = match val_ref(expr, row, params) {
+                Some(v) => v,
+                None => {
+                    owned = eval_scalar(expr, schema, row, params)?;
+                    &owned
+                }
+            };
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            Ok(if set.contains(&IndexKey(v.clone())) {
+                Value::Bool(!*negated)
+            } else if *has_null {
+                Value::Null
+            } else {
+                Value::Bool(*negated)
             })
         }
         Expr::Func { func, args } => {
@@ -4735,6 +5070,78 @@ fn val_ref<'a, R: RowLike + ?Sized>(
         Expr::Literal(v) => Some(v),
         Expr::Param(i) => params.get(*i),
         _ => None,
+    }
+}
+
+/// A borrowed string view of an expression, produced without allocating: a
+/// ref-transparent TEXT value, or SUBSTRING over one (the result is a slice
+/// of the original). Outer `None` = not borrowable this way (the caller
+/// falls back to owned evaluation — e.g. non-text inputs that the generic
+/// path coerces); `Some(Ok(None))` = SQL NULL.
+fn str_ref<'a, R: RowLike + ?Sized>(
+    e: &'a Expr,
+    schema: &[ColRef],
+    row: &'a R,
+    params: &'a [Value],
+) -> Option<Result<Option<&'a str>>> {
+    match e {
+        Expr::Func {
+            func: ScalarFunc::Substring,
+            args,
+        } if args.len() >= 2 => {
+            let s = match str_ref(&args[0], schema, row, params)? {
+                Ok(Some(s)) => s,
+                other => return Some(other), // NULL (or error) propagates
+            };
+            let start = match eval_scalar(&args[1], schema, row, params) {
+                Ok(Value::Null) => return Some(Ok(None)),
+                Ok(Value::Int(n)) => n,
+                Ok(other) => {
+                    return Some(Err(SqlError::Eval(format!("SUBSTRING start {other:?}"))));
+                }
+                Err(e) => return Some(Err(e)),
+            };
+            let len = match args.get(2) {
+                None => None,
+                Some(le) => match eval_scalar(le, schema, row, params) {
+                    Ok(Value::Null) => return Some(Ok(None)),
+                    Ok(Value::Int(n)) if n >= 0 => Some(n as usize),
+                    Ok(Value::Int(_)) => {
+                        return Some(Err(SqlError::Eval("SUBSTRING with negative length".into())));
+                    }
+                    Ok(other) => {
+                        return Some(Err(SqlError::Eval(format!("SUBSTRING length {other:?}"))));
+                    }
+                    Err(e) => return Some(Err(e)),
+                },
+            };
+            Some(Ok(Some(substr_slice(s, start, len))))
+        }
+        _ => match val_ref(e, row, params)? {
+            Value::Text(s) => Some(Ok(Some(s.as_str()))),
+            Value::Null => Some(Ok(None)),
+            _ => None,
+        },
+    }
+}
+
+/// `SUBSTRING` as a borrowed slice — mirrors the owned implementation
+/// exactly (1-based, character-based, out-of-range clamps to empty, a start
+/// below 1 consumes length before the string begins).
+fn substr_slice(s: &str, start: i64, len: Option<usize>) -> &str {
+    let skip = (start.max(1) - 1) as usize;
+    let begin = s.char_indices().nth(skip).map_or(s.len(), |(b, _)| b);
+    match len {
+        None => &s[begin..],
+        Some(l) => {
+            let consumed = (1 - start.min(1)) as usize;
+            let take = l.saturating_sub(consumed);
+            let end = s[begin..]
+                .char_indices()
+                .nth(take)
+                .map_or(s.len(), |(b, _)| begin + b);
+            &s[begin..end]
+        }
     }
 }
 
@@ -5404,6 +5811,17 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
             },
             distinct: *distinct,
         },
+        Expr::InSet {
+            expr,
+            set,
+            has_null,
+            negated,
+        } => Expr::InSet {
+            expr: Box::new(bind_expr(expr, schema)?),
+            set: set.clone(),
+            has_null: *has_null,
+            negated: *negated,
+        },
         Expr::In {
             expr,
             list,
@@ -5537,6 +5955,24 @@ fn eval_agg<S: Store>(
             let l = eval_agg(store, left, schema, src, tuples, group, params)?;
             let r = eval_agg(store, right, schema, src, tuples, group, params)?;
             eval_binary(*op, l, r)
+        }
+        Expr::InSet {
+            expr,
+            set,
+            has_null,
+            negated,
+        } => {
+            let v = eval_agg(store, expr, schema, src, tuples, group, params)?;
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            return Ok(if set.contains(&IndexKey(v.clone())) {
+                Value::Bool(!*negated)
+            } else if *has_null {
+                Value::Null
+            } else {
+                Value::Bool(*negated)
+            });
         }
         Expr::In {
             expr,
@@ -5895,6 +6331,7 @@ fn has_aggregate(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } => has_aggregate(left) || has_aggregate(right),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_aggregate(expr),
         Expr::In { expr, list, .. } => has_aggregate(expr) || list.iter().any(has_aggregate),
+        Expr::InSet { expr, .. } => has_aggregate(expr),
         Expr::Func { args, .. } => args.iter().any(has_aggregate),
         Expr::CorrIn { expr, .. } => has_aggregate(expr),
         _ => false,

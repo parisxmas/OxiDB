@@ -224,3 +224,96 @@ fn hash_join_null_keys_do_not_match() {
         vec![vec![i(1), i(99)], vec![i(2), NULL], vec![i(3), i(99)]]
     );
 }
+
+/// WHERE push-down into join scans must be invisible — especially around
+/// outer joins, where pushing a predicate into a NULL-paddable side would
+/// manufacture padded rows (`IS NULL` anti-joins are the classic casualty).
+#[test]
+fn join_filter_pushdown_semantics() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE pa (id INT PRIMARY KEY, city TEXT)").unwrap();
+    db.execute("CREATE TABLE pb (id INT PRIMARY KEY, pa_id INT, amt INT)").unwrap();
+    db.execute("INSERT INTO pa VALUES (1,'x'), (2,'y'), (3,'x')").unwrap();
+    db.execute("INSERT INTO pb VALUES (10,1,5), (11,1,50), (12,2,50)").unwrap();
+
+    // INNER join, conjuncts on both tables (both pushed).
+    assert_eq!(
+        rows(&db, "SELECT pa.id, pb.id FROM pa JOIN pb ON pa.id = pb.pa_id \
+                   WHERE pa.city = 'x' AND pb.amt > 10 ORDER BY pb.id"),
+        vec![vec![i(1), i(11)]]
+    );
+
+    // LEFT JOIN anti-join: WHERE on the nullable side must NOT be pushed —
+    // pa=3 has no pb rows and must survive via the padded row.
+    assert_eq!(
+        rows(&db, "SELECT pa.id FROM pa LEFT JOIN pb ON pa.id = pb.pa_id \
+                   WHERE pb.id IS NULL"),
+        vec![vec![i(3)]]
+    );
+
+    // LEFT JOIN with a FROM-side conjunct (pushable) plus a nullable-side
+    // predicate in the same WHERE.
+    assert_eq!(
+        rows(&db, "SELECT pa.id, pb.id FROM pa LEFT JOIN pb ON pa.id = pb.pa_id \
+                   WHERE pa.city = 'x' AND pb.amt = 50"),
+        vec![vec![i(1), i(11)]]
+    );
+
+    // RIGHT JOIN: FROM side is paddable — its conjuncts must not be pushed.
+    assert_eq!(
+        rows(&db, "SELECT pb.id FROM pa RIGHT JOIN pb ON pa.id = pb.pa_id AND pa.city = 'zzz' \
+                   WHERE pa.id IS NULL ORDER BY pb.id"),
+        vec![vec![i(10)], vec![i(11)], vec![i(12)]]
+    );
+}
+
+/// Correlated EXISTS with a single outer-equality decorrelates into a
+/// materialized semi-join set; semantics must stay exact — including NULL
+/// keys, NOT EXISTS, and value (projection) context.
+#[test]
+fn exists_decorrelation_semantics() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE ca (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE ob (id INT PRIMARY KEY, ca_id INT, amt INT)").unwrap();
+    db.execute("INSERT INTO ca VALUES (1,'a'), (2,'b'), (3,'c')").unwrap();
+    // ca=1 has a big order; ca=2 only small; a NULL ca_id row exists.
+    db.execute("INSERT INTO ob VALUES (10,1,900), (11,2,5), (12,NULL,900)").unwrap();
+
+    assert_eq!(
+        rows(&db, "SELECT ca.id FROM ca WHERE EXISTS \
+                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id AND ob.amt > 100)"),
+        vec![vec![i(1)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT ca.id FROM ca WHERE NOT EXISTS \
+                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id AND ob.amt > 100) ORDER BY ca.id"),
+        vec![vec![i(2)], vec![i(3)]]
+    );
+    // Projection context: the rewritten form must yield booleans, not NULLs.
+    assert_eq!(
+        rows(&db, "SELECT ca.id, EXISTS (SELECT 1 FROM ob WHERE ob.ca_id = ca.id) AS h \
+                   FROM ca ORDER BY ca.id"),
+        vec![
+            vec![i(1), oxidb_sql::Value::Bool(true)],
+            vec![i(2), oxidb_sql::Value::Bool(true)],
+            vec![i(3), oxidb_sql::Value::Bool(false)],
+        ]
+    );
+    // A row-slicing EXISTS (EF's ElementAtOrDefault renders OFFSET inside
+    // EXISTS): the slice applies PER OUTER ROW — must not decorrelate.
+    // ca=1 has two matching orders (skip 1 leaves one); ca=2 has one (none left).
+    db.execute("INSERT INTO ob VALUES (13,1,50)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT ca.id FROM ca WHERE EXISTS \
+                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id OFFSET 1)"),
+        vec![vec![i(1)]]
+    );
+
+    // Correlation used twice (not a single-eq shape): must stay correlated
+    // and still be correct.
+    assert_eq!(
+        rows(&db, "SELECT ca.id FROM ca WHERE EXISTS \
+                   (SELECT 1 FROM ob WHERE ob.ca_id = ca.id AND ob.id > ca.id)"),
+        vec![vec![i(1)], vec![i(2)]]
+    );
+}
