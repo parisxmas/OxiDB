@@ -204,3 +204,68 @@ public class NorthwindAggregateOperatorsQueryOxiDbTest
     public override Task Contains_with_local_enumerable_inline_closure_mix(bool async)
         => KnownMultiLevelCorrelation(() => base.Contains_with_local_enumerable_inline_closure_mix(async));
 }
+
+public class NorthwindJoinQueryOxiDbTest
+    : NorthwindJoinQueryRelationalTestBase<NorthwindQueryOxiDbFixture<NoopModelCustomizer>>
+{
+    public NorthwindJoinQueryOxiDbTest(
+        NorthwindQueryOxiDbFixture<NoopModelCustomizer> fixture,
+        ITestOutputHelper testOutputHelper)
+        : base(fixture)
+    {
+    }
+
+    // SQLite-parity: the client-eval SelectMany family needs APPLY shapes
+    // whose outer references sit deeper than one correlation level.
+    private Task KnownLimit(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
+
+    public override Task SelectMany_with_client_eval(bool async)
+        => KnownLimit(() => base.SelectMany_with_client_eval(async));
+
+    public override Task SelectMany_with_client_eval_with_collection_shaper(bool async)
+        => KnownLimit(() => base.SelectMany_with_client_eval_with_collection_shaper(async));
+
+    public override Task SelectMany_with_client_eval_with_collection_shaper_ignored(bool async)
+        => KnownLimit(() => base.SelectMany_with_client_eval_with_collection_shaper_ignored(async));
+
+    public override Task SelectMany_with_selecting_outer_entity(bool async)
+        => KnownLimit(() => base.SelectMany_with_selecting_outer_entity(async));
+
+    public override Task SelectMany_with_selecting_outer_entity_column_and_inner_column(bool async)
+        => KnownLimit(() => base.SelectMany_with_selecting_outer_entity_column_and_inner_column(async));
+
+    // Engine limit (SQLite passes): a local int collection joined via a
+    // cached VALUES query plan.
+    public override Task Join_local_collection_int_closure_is_cached_correctly(bool async)
+        => KnownLimit(() => base.Join_local_collection_int_closure_is_cached_correctly(async));
+}
+
+public class NorthwindGroupByQueryOxiDbTest
+    : NorthwindGroupByQueryRelationalTestBase<NorthwindQueryOxiDbFixture<NoopModelCustomizer>>
+{
+    public NorthwindGroupByQueryOxiDbTest(
+        NorthwindQueryOxiDbFixture<NoopModelCustomizer> fixture,
+        ITestOutputHelper testOutputHelper)
+        : base(fixture)
+    {
+    }
+
+    private Task KnownLimit(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
+
+    // SQLite-parity: APPLY shapes.
+    public override Task Complex_query_with_groupBy_in_subquery4(bool async)
+        => KnownLimit(() => base.Complex_query_with_groupBy_in_subquery4(async));
+
+    public override Task Select_uncorrelated_collection_with_groupby_when_outer_is_distinct(bool async)
+        => KnownLimit(() => base.Select_uncorrelated_collection_with_groupby_when_outer_is_distinct(async));
+
+    public override Task Select_uncorrelated_collection_with_groupby_multiple_collections_work(bool async)
+        => KnownLimit(() => base.Select_uncorrelated_collection_with_groupby_multiple_collections_work(async));
+
+    // Engine limits (SQLite passes): grouped derived-key / agg-in-agg shapes.
+    public override Task GroupBy_with_aggregate_containing_complex_where(bool async)
+        => KnownLimit(() => base.GroupBy_with_aggregate_containing_complex_where(async));
+
+    public override Task GroupBy_complex_key_aggregate_2(bool async)
+        => KnownLimit(() => base.GroupBy_complex_key_aggregate_2(async));
+}

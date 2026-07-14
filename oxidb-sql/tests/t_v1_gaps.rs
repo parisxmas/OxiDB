@@ -509,19 +509,20 @@ fn correlated_inner_scope_shadows_outer() {
 }
 
 #[test]
-fn correlated_in_aggregated_query_is_rejected() {
+fn correlated_in_aggregated_query_uses_group_keys() {
     let (_d, db) = open();
     db.execute("CREATE TABLE t (g INT, v INT)").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
-    let err = db
-        .execute(
+    db.execute("INSERT INTO t VALUES (1, 1), (1, 2), (2, 5)")
+        .unwrap();
+    // The correlated subquery references the group key; it evaluates once
+    // per group (against the group's first row).
+    assert_eq!(
+        rows(
+            &db,
             "SELECT g, SUM(v) FROM t o GROUP BY g \
-             HAVING SUM(v) > (SELECT v FROM t x WHERE x.g = o.g)",
-        )
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("correlated"),
-        "unexpected error: {err}"
+             HAVING SUM(v) > (SELECT MIN(v) FROM t x WHERE x.g = o.g) ORDER BY g"
+        ),
+        vec![vec![i(1), i(3)]]
     );
 }
 

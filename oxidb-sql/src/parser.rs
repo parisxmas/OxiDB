@@ -2006,9 +2006,38 @@ fn exists_projection(body: &mut QueryBody) -> Result<()> {
     match body {
         QueryBody::Select(sel) => {
             if !sel.group_by.is_empty() || sel.having.is_some() {
-                return Err(SqlError::Unsupported(
-                    "EXISTS over an aggregated subquery".into(),
-                ));
+                // An aggregated body's row count is aggregate-driven, so its
+                // projection can't simply be replaced. Wrap it instead:
+                // `SELECT 1 FROM (<original>) AS __exists`.
+                let inner = (**sel).clone();
+                **sel = SelectStmt {
+                    distinct: false,
+                    distinct_on: Vec::new(),
+                    from: Some(TableRef {
+                        name: "__exists".into(),
+                        alias: Some("__exists".into()),
+                        subquery: Some(Box::new(SelectQuery {
+                            body: QueryBody::Select(Box::new(inner)),
+                            order_by: Vec::new(),
+                            limit: None,
+                            offset: None,
+                        })),
+                        lateral: false,
+                        alias_columns: Vec::new(),
+                    }),
+                    joins: Vec::new(),
+                    projection: vec![SelectItem::Expr {
+                        expr: Expr::Literal(Value::Int(1)),
+                        alias: None,
+                    }],
+                    filter: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                };
+                return Ok(());
             }
             sel.projection = vec![SelectItem::Expr {
                 expr: Expr::Literal(Value::Int(1)),

@@ -180,10 +180,14 @@ fn exists_plain_correlated_and_negated() {
         ),
         vec![vec![Value::Int(2)]]
     );
-    // Aggregated EXISTS bodies are rejected, not mis-answered.
-    assert!(
-        db.execute("SELECT id FROM p WHERE EXISTS (SELECT COUNT(*) FROM emir GROUP BY p_id)")
-            .is_err()
+    // Aggregated EXISTS bodies are wrapped in a derived table: the grouped
+    // row count drives existence.
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT COUNT(*) FROM p WHERE EXISTS (SELECT COUNT(*) FROM emir GROUP BY p_id)"
+        ),
+        rows(&db, "SELECT COUNT(*) FROM p")
     );
 }
 

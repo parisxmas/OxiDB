@@ -1518,25 +1518,6 @@ fn run_query_rows<S: Store>(
 // ── correlated evaluation ───────────────────────────────────────────────────
 
 /// Whether an expression contains a correlated subquery node.
-/// Like [`has_corr`], but correlation *inside an aggregate's argument* does
-/// not count: aggregates evaluate their argument per source row, where a
-/// correlated subquery is well-defined.
-fn has_corr_outside_agg(e: &Expr) -> bool {
-    match e {
-        Expr::Aggregate { .. } => false,
-        Expr::CorrScalar { .. } | Expr::CorrIn { .. } => true,
-        Expr::Binary { left, right, .. } => {
-            has_corr_outside_agg(left) || has_corr_outside_agg(right)
-        }
-        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => has_corr_outside_agg(expr),
-        Expr::Func { args, .. } => args.iter().any(has_corr_outside_agg),
-        Expr::In { expr, list, .. } => {
-            has_corr_outside_agg(expr) || list.iter().any(has_corr_outside_agg)
-        }
-        other => has_corr(other),
-    }
-}
-
 fn has_corr(e: &Expr) -> bool {
     match e {
         Expr::CorrScalar { .. } | Expr::CorrIn { .. } => true,
@@ -1810,7 +1791,7 @@ fn compute_window<S: Store>(
     let n = tuples.n();
     let mut out = vec![Value::Null; n];
 
-    let partitions = group_tuples(schema, src, tuples, partition_by, params)?;
+    let partitions = group_tuples(store, schema, src, tuples, partition_by, params)?;
     for mut part in partitions {
         // Sort the partition by the window ORDER BY (stable).
         let mut keys: Vec<Vec<Value>> = Vec::new();
@@ -2035,18 +2016,6 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
     }
 
     let out_rows = if aggregating {
-        // Correlated subqueries are per-row constructs; grouped evaluation
-        // has no single row to correlate against — except inside an
-        // aggregate's argument, which folds per source row.
-        if proj.iter().any(|(_, e)| has_corr_outside_agg(e))
-            || select.group_by.iter().any(has_corr)
-            || select.having.as_ref().is_some_and(has_corr_outside_agg)
-            || select.order_by.iter().any(|(e, _)| has_corr_outside_agg(e))
-        {
-            return Err(SqlError::Unsupported(
-                "correlated subquery in an aggregated query".into(),
-            ));
-        }
         if proj.iter().any(|(_, e)| has_window(e))
             || select.group_by.iter().any(has_window)
             || select.having.as_ref().is_some_and(has_window)
@@ -3566,7 +3535,7 @@ fn select_aggregated<S: Store>(
     params: &[Value],
 ) -> Result<Vec<Vec<Value>>> {
     // Group by the group-by key (empty group-by => single group over all rows).
-    let groups = group_tuples(schema, src, tuples, &select.group_by, params)?;
+    let groups = group_tuples(store, schema, src, tuples, &select.group_by, params)?;
 
     // DISTINCT ON over aggregated output: the ON expressions are evaluated per
     // group (like the projection). This is the argmax idiom — GROUP BY (a, b),
@@ -3617,7 +3586,8 @@ fn select_aggregated<S: Store>(
 /// Group tuple indices by the evaluated group-by key, preserving first-seen
 /// group order. Streams over the tuples once; group keys are only cloned when
 /// a new group is created.
-fn group_tuples(
+fn group_tuples<S: Store>(
+    store: &S,
     schema: &[ColRef],
     src: &Sources,
     tuples: &Tuples,
@@ -3651,7 +3621,14 @@ fn group_tuples(
                     .push(Cow::Borrowed(view.val_ref(*p).ok_or_else(|| {
                         SqlError::Eval(format!("bound column {p} out of range"))
                     })?)),
-                _ => scratch.push(Cow::Owned(eval_scalar(e, schema, &view, params)?)),
+                _ => scratch.push(Cow::Owned(eval_scalar_corr(
+                    store,
+                    has_corr(e),
+                    e,
+                    schema,
+                    &view,
+                    params,
+                )?)),
             }
         }
 
@@ -4823,9 +4800,19 @@ fn eval_agg<S: Store>(
         Expr::Subquery(_) | Expr::InSubquery { .. } => Err(SqlError::Eval(
             "internal: unresolved subquery reached evaluation".into(),
         )),
-        Expr::CorrScalar { .. } | Expr::CorrIn { .. } => Err(SqlError::Unsupported(
-            "correlated subquery in an aggregated query".into(),
-        )),
+        // A correlated subquery outside an aggregate's argument correlates
+        // against the group keys, which are constant across the group:
+        // evaluate it on the group's first row.
+        Expr::CorrScalar { .. } | Expr::CorrIn { .. } => match group.first() {
+            Some(&i) => {
+                let view = View {
+                    src,
+                    tuple: tuples.row(i as usize),
+                };
+                eval_scalar_corr(store, true, expr, schema, &view, params)
+            }
+            None => Ok(Value::Null),
+        },
         Expr::Window { .. } => Err(SqlError::Unsupported(
             "window function in an aggregated query (use a view or an outer query)".into(),
         )),
