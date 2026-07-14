@@ -143,6 +143,26 @@ pub struct SelectQuery {
     pub order_by: Vec<(Expr, bool)>,
     pub limit: Option<LimitExpr>,
     pub offset: Option<LimitExpr>,
+    /// `WITH RECURSIVE` CTEs, in declaration order. Non-recursive CTEs are
+    /// inlined at parse time and never appear here; a self-referencing CTE is
+    /// materialized by fixpoint iteration before the body executes.
+    pub ctes: Vec<RecursiveCte>,
+}
+
+/// A self-referencing CTE: `WITH RECURSIVE name(columns) AS (anchor UNION
+/// [ALL] step)`. The anchor arm must not reference `name`; the step arm is
+/// re-executed with `name` bound to the previous iteration's rows until it
+/// produces nothing new.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveCte {
+    pub name: String,
+    /// Explicit output column names (`t(n, path)`); empty = the anchor's.
+    pub columns: Vec<String>,
+    pub anchor: QueryBody,
+    pub step: QueryBody,
+    /// `true` = UNION ALL (keep duplicates); `false` = UNION (rows already
+    /// produced are dropped and don't re-enter the working set).
+    pub union_all: bool,
 }
 
 /// A LIMIT/OFFSET operand: a literal count, or a bind parameter (EF Core

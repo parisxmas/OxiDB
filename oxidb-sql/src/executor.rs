@@ -15,9 +15,9 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
-    AggFunc, BinOp, DatePart, Expr, Join, JoinKind, LimitExpr, QueryBody, QueryResult, ScalarFunc,
-    SelectItem, SelectQuery, SelectStmt, SetOpKind, ShowKind, Statement, TableRef, UnOp,
-    WindowFunc,
+    AggFunc, BinOp, DatePart, Expr, Join, JoinKind, LimitExpr, QueryBody, QueryResult,
+    RecursiveCte, ScalarFunc, SelectItem, SelectQuery, SelectStmt, SetOpKind, ShowKind, Statement,
+    TableRef, UnOp, WindowFunc,
 };
 use crate::decimal::Decimal;
 use crate::error::{Result, SqlError};
@@ -1039,6 +1039,176 @@ fn exec_body<S: Store>(
     }
 }
 
+// ── recursive CTEs ──────────────────────────────────────────────────────────
+
+/// Guards against a non-terminating recursion: fail with a clear error
+/// instead of hanging or exhausting memory.
+const RECURSIVE_MAX_ITERATIONS: usize = 1_000_000;
+const RECURSIVE_MAX_ROWS: usize = 10_000_000;
+
+/// Materialize every recursive CTE of `q` by fixpoint iteration and inline
+/// the results into the query as VALUES-derived tables, so the rest of the
+/// executor only ever sees plain derived tables. No-op when `q.ctes` is
+/// empty. A later CTE may reference any earlier one.
+fn materialize_recursive_ctes<S: Store>(
+    store: &S,
+    q: &mut SelectQuery,
+    params: &[Value],
+) -> Result<()> {
+    if q.ctes.is_empty() {
+        return Ok(());
+    }
+    let mut resolved: Vec<(String, SelectQuery, Vec<String>)> = Vec::new();
+    for cte in std::mem::take(&mut q.ctes) {
+        let name = cte.name.clone();
+        let (columns, rows) = fixpoint_cte(store, cte, &resolved, params)?;
+        let width = columns.len();
+        resolved.push((name, values_query(width, &rows), columns));
+    }
+    crate::parser::inline_ctes_query(q, &resolved);
+    Ok(())
+}
+
+/// Evaluate one recursive CTE to a fixpoint: run the anchor, then re-run the
+/// step arm with the CTE name bound to the previous iteration's rows until an
+/// iteration produces nothing new. UNION (distinct) drops rows already seen —
+/// the standard termination device for cyclic data; UNION ALL keeps every row
+/// and relies on the step's own termination condition.
+fn fixpoint_cte<S: Store>(
+    store: &S,
+    cte: RecursiveCte,
+    earlier: &[(String, SelectQuery, Vec<String>)],
+    params: &[Value],
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    use std::collections::BTreeSet;
+    let RecursiveCte {
+        name,
+        columns,
+        anchor,
+        step,
+        union_all,
+    } = cte;
+    let run = |body: QueryBody,
+               binds: &[(String, SelectQuery, Vec<String>)]|
+     -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        let mut q = SelectQuery {
+            body,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            ctes: Vec::new(),
+        };
+        crate::parser::inline_ctes_query(&mut q, binds);
+        match execute(store, Statement::Select(q), params)? {
+            QueryResult::Select { columns, rows, .. } => Ok((columns, rows)),
+            _ => unreachable!("SELECT produced a non-select result"),
+        }
+    };
+
+    let (anchor_cols, anchor_rows) = run(anchor, earlier)?;
+    let columns = if columns.is_empty() {
+        anchor_cols
+    } else {
+        if columns.len() != anchor_cols.len() {
+            return Err(SqlError::SchemaMismatch(format!(
+                "recursive CTE {name} declares {} columns but its anchor produces {}",
+                columns.len(),
+                anchor_cols.len()
+            )));
+        }
+        columns
+    };
+
+    let key = |row: &[Value]| row.iter().cloned().map(IndexKey).collect::<Vec<_>>();
+    let mut seen: BTreeSet<Vec<IndexKey>> = BTreeSet::new();
+    let mut all: Vec<Vec<Value>> = Vec::new();
+    let mut working: Vec<Vec<Value>> = Vec::new();
+    for row in anchor_rows {
+        if union_all || seen.insert(key(&row)) {
+            all.push(row.clone());
+            working.push(row);
+        }
+    }
+
+    let mut iterations = 0usize;
+    while !working.is_empty() {
+        iterations += 1;
+        if iterations > RECURSIVE_MAX_ITERATIONS {
+            return Err(SqlError::Eval(format!(
+                "recursive CTE {name} exceeded {RECURSIVE_MAX_ITERATIONS} iterations — check its termination condition"
+            )));
+        }
+        let mut binds = earlier.to_vec();
+        binds.push((
+            name.clone(),
+            values_query(columns.len(), &working),
+            columns.clone(),
+        ));
+        let (step_cols, step_rows) = run(step.clone(), &binds)?;
+        if step_cols.len() != columns.len() {
+            return Err(SqlError::SchemaMismatch(format!(
+                "recursive CTE {name}: arms have {} and {} columns",
+                columns.len(),
+                step_cols.len()
+            )));
+        }
+        working = Vec::new();
+        for row in step_rows {
+            if union_all || seen.insert(key(&row)) {
+                all.push(row.clone());
+                working.push(row);
+            }
+        }
+        if all.len() > RECURSIVE_MAX_ROWS {
+            return Err(SqlError::Eval(format!(
+                "recursive CTE {name} exceeded {RECURSIVE_MAX_ROWS} rows"
+            )));
+        }
+    }
+    Ok((columns, all))
+}
+
+/// A query producing exactly `rows` as literals. Materialized recursive CTEs
+/// are substituted into their referencing queries in this form. An empty row
+/// set still needs the right width (the derived table's column renames must
+/// line up), so it becomes a one-NULL-row VALUES filtered by FALSE.
+fn values_query(width: usize, rows: &[Vec<Value>]) -> SelectQuery {
+    let plain = |body: QueryBody| SelectQuery {
+        body,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+        ctes: Vec::new(),
+    };
+    if rows.is_empty() {
+        let nulls: Vec<Expr> = (0..width).map(|_| Expr::Literal(Value::Null)).collect();
+        return plain(QueryBody::Select(Box::new(SelectStmt {
+            distinct: false,
+            distinct_on: Vec::new(),
+            from: Some(TableRef {
+                name: "__empty".into(),
+                alias: Some("__empty".into()),
+                subquery: Some(Box::new(plain(QueryBody::Values(vec![nulls])))),
+                lateral: false,
+                alias_columns: Vec::new(),
+            }),
+            joins: Vec::new(),
+            projection: vec![SelectItem::Wildcard],
+            filter: Some(Expr::Literal(Value::Bool(false))),
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        })));
+    }
+    plain(QueryBody::Values(
+        rows.iter()
+            .map(|r| r.iter().map(|v| Expr::Literal(v.clone())).collect())
+            .collect(),
+    ))
+}
+
 // ── subquery resolution ─────────────────────────────────────────────────────
 //
 // Subqueries are handled before row evaluation. An **uncorrelated** subquery
@@ -1306,6 +1476,10 @@ fn resolve_query<S: Store>(
     params: &[Value],
     floor: usize,
 ) -> Result<()> {
+    // A nested WITH RECURSIVE (expression subquery, derived table) is
+    // materialized before its body's names are resolved: the CTE arms only
+    // ever bind user params, so this is safe at any resolve depth.
+    materialize_recursive_ctes(store, q, params)?;
     resolve_body(store, &mut q.body, params, floor)
 }
 

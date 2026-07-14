@@ -8,9 +8,9 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use crate::ast::{
-    AggFunc, AlterOp, BinOp, DatePart, Expr, Join, JoinKind, LimitExpr, QueryBody, ScalarFunc,
-    SelectItem, SelectQuery, SelectStmt, SetOpKind, ShowKind, Statement, TableRef, UnOp,
-    WindowFunc,
+    AggFunc, AlterOp, BinOp, DatePart, Expr, Join, JoinKind, LimitExpr, QueryBody, RecursiveCte,
+    ScalarFunc, SelectItem, SelectQuery, SelectStmt, SetOpKind, ShowKind, Statement, TableRef,
+    UnOp, WindowFunc,
 };
 use crate::catalog::{Column, Table};
 use crate::error::{Result, SqlError};
@@ -1148,21 +1148,29 @@ fn translate_query(query: sp::Query, p: &mut usize) -> Result<SelectQuery> {
     // tables. Translate each CTE body first (so positional `?` params bind in
     // textual order), inlining earlier CTEs into it, then inline the whole set
     // into the main query. A CTE referenced N times is inlined N times.
-    let resolved: Vec<(String, SelectQuery)> = if let Some(with) = query.with {
-        if with.recursive {
-            return Err(SqlError::Unsupported("WITH RECURSIVE".into()));
-        }
-        let mut resolved: Vec<(String, SelectQuery)> = Vec::new();
+    //
+    // Under WITH RECURSIVE, a CTE whose body references its own name must be
+    // shaped `anchor UNION [ALL] step`; it is split here and materialized by
+    // fixpoint iteration at execution time. References to it (in later CTEs
+    // and the main query) stay bare table names until then.
+    let mut rec_ctes: Vec<RecursiveCte> = Vec::new();
+    let resolved: Vec<(String, SelectQuery, Vec<String>)> = if let Some(with) = query.with {
+        let mut resolved: Vec<(String, SelectQuery, Vec<String>)> = Vec::new();
         for cte in with.cte_tables {
-            if !cte.alias.columns.is_empty() {
-                return Err(SqlError::Unsupported(
-                    "WITH column aliases (`WITH c(a, b) AS ...`)".into(),
-                ));
-            }
             let name = cte.alias.name.value.clone();
+            let columns: Vec<String> = cte
+                .alias
+                .columns
+                .iter()
+                .map(|c| c.name.value.clone())
+                .collect();
             let mut q = translate_query(*cte.query, p)?;
             inline_ctes_query(&mut q, &resolved);
-            resolved.push((name, q));
+            if with.recursive && query_references(&q, &name) {
+                rec_ctes.push(split_recursive_cte(name, columns, q)?);
+            } else {
+                resolved.push((name, q, columns));
+            }
         }
         resolved
     } else {
@@ -1182,6 +1190,7 @@ fn translate_query(query: sp::Query, p: &mut usize) -> Result<SelectQuery> {
                 order_by: Vec::new(),
                 limit: None,
                 offset: None,
+                ctes: Vec::new(),
             }
         }
         body @ (sp::SetExpr::SetOperation { .. } | sp::SetExpr::Values(_)) => SelectQuery {
@@ -1189,27 +1198,144 @@ fn translate_query(query: sp::Query, p: &mut usize) -> Result<SelectQuery> {
             order_by,
             limit,
             offset,
+            ctes: Vec::new(),
         },
         other => return Err(SqlError::Unsupported(format!("query body {other}"))),
     };
     if !resolved.is_empty() {
         inline_ctes_query(&mut result, &resolved);
     }
+    result.ctes = rec_ctes;
     Ok(result)
+}
+
+/// Split a self-referencing CTE body into its anchor and step arms. Only the
+/// canonical shape is accepted: a top-level `UNION [ALL]` whose left arm does
+/// not reference the CTE and whose right arm does.
+fn split_recursive_cte(name: String, columns: Vec<String>, q: SelectQuery) -> Result<RecursiveCte> {
+    if !q.order_by.is_empty() || q.limit.is_some() || q.offset.is_some() {
+        return Err(SqlError::Unsupported(
+            "ORDER BY / LIMIT / OFFSET in a recursive CTE body".into(),
+        ));
+    }
+    if !q.ctes.is_empty() {
+        return Err(SqlError::Unsupported(
+            "nested WITH RECURSIVE inside a recursive CTE body".into(),
+        ));
+    }
+    match q.body {
+        QueryBody::SetOp {
+            op: SetOpKind::Union,
+            all,
+            left,
+            right,
+        } => {
+            if body_references(&left, &name) {
+                return Err(SqlError::Unsupported(format!(
+                    "recursive CTE {name}: self-reference in the anchor (first UNION arm)"
+                )));
+            }
+            Ok(RecursiveCte {
+                name,
+                columns,
+                anchor: *left,
+                step: *right,
+                union_all: all,
+            })
+        }
+        _ => Err(SqlError::Unsupported(format!(
+            "recursive CTE {name} must be `anchor UNION [ALL] recursive-term`"
+        ))),
+    }
+}
+
+/// Whether a query references table `name` as a bare (non-derived) FROM/JOIN
+/// table, anywhere: set-op arms, derived tables, and expression subqueries.
+fn query_references(q: &SelectQuery, name: &str) -> bool {
+    body_references(&q.body, name)
+}
+
+fn body_references(b: &QueryBody, name: &str) -> bool {
+    match b {
+        QueryBody::Select(s) => {
+            let table_refs = |t: &TableRef| {
+                if let Some(sub) = &t.subquery {
+                    query_references(sub, name)
+                } else {
+                    t.name == name
+                }
+            };
+            s.from.as_ref().is_some_and(table_refs)
+                || s.joins
+                    .iter()
+                    .any(|j| table_refs(&j.table) || expr_references(&j.on, name))
+                || s.projection.iter().any(|item| match item {
+                    SelectItem::Expr { expr, .. } => expr_references(expr, name),
+                    _ => false,
+                })
+                || s.filter.as_ref().is_some_and(|e| expr_references(e, name))
+                || s.group_by.iter().any(|e| expr_references(e, name))
+                || s.having.as_ref().is_some_and(|e| expr_references(e, name))
+                || s.order_by.iter().any(|(e, _)| expr_references(e, name))
+        }
+        QueryBody::SetOp { left, right, .. } => {
+            body_references(left, name) || body_references(right, name)
+        }
+        QueryBody::Values(rows) => rows.iter().flatten().any(|e| expr_references(e, name)),
+    }
+}
+
+fn expr_references(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Subquery(q) => query_references(q, name),
+        Expr::InSubquery { expr, query, .. } => {
+            expr_references(expr, name) || query_references(query, name)
+        }
+        Expr::CorrScalar { query, outer, .. } => {
+            query_references(query, name) || outer.iter().any(|o| expr_references(o, name))
+        }
+        Expr::CorrIn {
+            expr, query, outer, ..
+        } => {
+            expr_references(expr, name)
+                || query_references(query, name)
+                || outer.iter().any(|o| expr_references(o, name))
+        }
+        Expr::Binary { left, right, .. } => {
+            expr_references(left, name) || expr_references(right, name)
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => expr_references(expr, name),
+        Expr::In { expr, list, .. } => {
+            expr_references(expr, name) || list.iter().any(|x| expr_references(x, name))
+        }
+        Expr::Func { args, .. } => args.iter().any(|a| expr_references(a, name)),
+        Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(|a| expr_references(a, name)),
+        Expr::Window {
+            partition_by,
+            order_by,
+            ..
+        } => {
+            partition_by.iter().any(|e| expr_references(e, name))
+                || order_by.iter().any(|(e, _)| expr_references(e, name))
+        }
+        Expr::Column { .. } | Expr::Col(_) | Expr::Literal(_) | Expr::Param(_) => false,
+    }
 }
 
 /// Inline CTE definitions into a query: any bare table reference whose name
 /// matches a CTE becomes a derived table wrapping that CTE's (already fully
-/// resolved) query. Recurses through joins, derived tables, and subqueries so
-/// a CTE is visible everywhere in the query it scopes.
-fn inline_ctes_query(q: &mut SelectQuery, ctes: &[(String, SelectQuery)]) {
+/// resolved) query, with the CTE's column aliases (when given) as the derived
+/// table's column renames. Recurses through joins, derived tables, and
+/// subqueries so a CTE is visible everywhere in the query it scopes. Also
+/// used by the executor to substitute materialized recursive CTEs.
+pub(crate) fn inline_ctes_query(q: &mut SelectQuery, ctes: &[(String, SelectQuery, Vec<String>)]) {
     inline_ctes_body(&mut q.body, ctes);
     for (e, _) in &mut q.order_by {
         inline_ctes_expr(e, ctes);
     }
 }
 
-fn inline_ctes_body(b: &mut QueryBody, ctes: &[(String, SelectQuery)]) {
+pub(crate) fn inline_ctes_body(b: &mut QueryBody, ctes: &[(String, SelectQuery, Vec<String>)]) {
     match b {
         QueryBody::Select(s) => inline_ctes_select(s, ctes),
         QueryBody::SetOp { left, right, .. } => {
@@ -1220,7 +1346,7 @@ fn inline_ctes_body(b: &mut QueryBody, ctes: &[(String, SelectQuery)]) {
     }
 }
 
-fn inline_ctes_select(s: &mut SelectStmt, ctes: &[(String, SelectQuery)]) {
+fn inline_ctes_select(s: &mut SelectStmt, ctes: &[(String, SelectQuery, Vec<String>)]) {
     if let Some(from) = &mut s.from {
         inline_ctes_tableref(from, ctes);
     }
@@ -1250,23 +1376,26 @@ fn inline_ctes_select(s: &mut SelectStmt, ctes: &[(String, SelectQuery)]) {
     }
 }
 
-fn inline_ctes_tableref(t: &mut TableRef, ctes: &[(String, SelectQuery)]) {
+fn inline_ctes_tableref(t: &mut TableRef, ctes: &[(String, SelectQuery, Vec<String>)]) {
     // An existing derived table shadows any same-named CTE within it — recurse
     // rather than replace.
     if let Some(sub) = &mut t.subquery {
         inline_ctes_query(sub, ctes);
         return;
     }
-    if let Some((_, q)) = ctes.iter().find(|(n, _)| n == &t.name) {
+    if let Some((_, q, cols)) = ctes.iter().find(|(n, _, _)| n == &t.name) {
         // The derived-table convention is name == alias == the visible key.
         let key = t.alias.clone().unwrap_or_else(|| t.name.clone());
         t.subquery = Some(Box::new(q.clone()));
         t.name = key.clone();
         t.alias = Some(key);
+        if !cols.is_empty() {
+            t.alias_columns = cols.clone();
+        }
     }
 }
 
-fn inline_ctes_expr(e: &mut Expr, ctes: &[(String, SelectQuery)]) {
+fn inline_ctes_expr(e: &mut Expr, ctes: &[(String, SelectQuery, Vec<String>)]) {
     match e {
         Expr::Subquery(q) => inline_ctes_query(q, ctes),
         Expr::InSubquery { expr, query, .. } => {
@@ -2061,6 +2190,7 @@ fn exists_projection(body: &mut QueryBody) -> Result<()> {
                             order_by: Vec::new(),
                             limit: None,
                             offset: None,
+                            ctes: Vec::new(),
                         })),
                         lateral: false,
                         alias_columns: Vec::new(),
