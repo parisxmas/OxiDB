@@ -270,3 +270,27 @@ fn user_statements_parse() {
     assert_eq!(p("ALTER USER ali"), None);
     assert_eq!(p("CREATE USER ali"), None);
 }
+
+/// `SHOW INDEXES` has no sqlparser variant; a whole-input fast path handles
+/// the single-statement form. Inside a multi-statement batch it must work
+/// too — a client sending `SHOW TABLES; SHOW INDEXES FROM t` is ordinary SQL.
+#[test]
+fn show_indexes_inside_a_batch() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY, tag TEXT)")
+        .unwrap();
+    db.execute("CREATE INDEX b_tag ON b (tag)").unwrap();
+
+    let r = db
+        .execute("SHOW TABLES; DESCRIBE b; SHOW INDEXES FROM b")
+        .unwrap();
+    assert_eq!(r.len(), 3, "her ifade bir sonuç döndürür");
+    match r.last().unwrap() {
+        oxidb_sql::QueryResult::Select { rows, .. } => {
+            assert_eq!(rows.len(), 1, "b tablosunun tek ikincil indeksi");
+        }
+        other => panic!("Select bekleniyordu, {other:?} geldi"),
+    }
+    // Tablosuz biçim de bir küme içinde çalışır.
+    assert!(db.execute("SHOW TABLES; SHOW INDEXES").is_ok());
+}

@@ -83,7 +83,7 @@ Isolation: backward-validating OCC over item read-sets — committed transaction
 Background worker thread receives indexing jobs via `sync_channel(256)`. Supports HTML, XML, JSON, PDF, DOCX, XLSX, images (OCR with `ocr` feature). TF-IDF ranking. Persisted as `_fts/index.json`.
 
 ### Blob Storage (`src/blob.rs`)
-S3-style bucket interface. Objects stored as `_blobs/<bucket>/<id>.data` + `<id>.meta`. CRC32 etags.
+S3-style bucket interface. Objects stored as `_blobs/<bucket>/<id>.data` + `<id>.meta`. ETags are the first 16 bytes of the payload's SHA-256, hex-encoded (not S3's MD5). A full S3-compatible HTTP API (`OXIDB_S3_PORT`) covers Put/Get/Head/Delete/Copy, ListObjectsV2 (prefix/delimiter/continuation), multipart upload, Range + If-[None-]Match, object tagging, `Expiration/Days` lifecycle, SSE-S3/SSE-C, and SigV4 auth (headers + presigned URLs) — so `aws-cli`, `boto3` and the MinIO SDKs work unmodified. No versioning/ACL/S3-Select; path-style addressing only.
 
 ### Encryption (`src/crypto.rs`)
 Transparent AES-GCM encryption at the storage layer. Optional—enabled by passing an encryption key to the engine.

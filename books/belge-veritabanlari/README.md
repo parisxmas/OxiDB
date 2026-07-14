@@ -1,7 +1,7 @@
-# OxiDB Doküman Veritabanı
+# Her Şeyin Veritabanı
 
-**Ölçeklenebilir, NoSQL Doküman Tabanlı Çözümler Rehberi** — Barış AKIN ve
-Anthropic (2026).
+**OxiDB: Belge, SQL ve Zaman Serisi Motorları, S3 Nesne Depolama ve OxiMem
+Anahtar-Değer Katmanı** — Barış AKIN (2026).
 
 ### 📖 [PDF'i indir](https://github.com/parisxmas/OxiDB/raw/master/books/belge-veritabanlari/belge-veritabanlari.pdf)
 
@@ -10,10 +10,12 @@ dizinde `belge-veritabanlari.pdf` olarak bulunur. Yukarıdaki bağlantı dosyay�
 doğrudan indirir. (GitHub PDF'leri dosya listesinde önizlemez; ya bu bağlantıyı
 kullanın ya da dosyaya tıklayıp **"Download"** deyin.)
 
-Bu dizin, belge (doküman) veritabanlarını **sıfırdan** anlatan, ardından
-OxiDB'nin nasıl çalıştığını **adım adım** açıklayan Türkçe bir kitabın
-kaynağıdır. Kitap düz metindir (örnek kod içermez); O'Reilly tarzında,
-kavramları temelden kurarak ilerler.
+Bu dizin, veritabanlarını **sıfırdan** anlatan, ardından OxiDB'nin — belge, SQL
+ve zaman serisi motorlarıyla, S3 nesne depolaması ve OxiMem anahtar-değer
+katmanıyla — nasıl çalıştığını **adım adım** açıklayan Türkçe bir kitabın
+kaynağıdır. İlk iki kısım düz metindir (örnek kod içermez) ve O'Reilly tarzında
+kavramları temelden kurar; üçüncü kısım ise çalışan sisteme karşı denenmiş **bol
+örnek** içerir (wire JSON, SQL, Python, C#, JavaScript, kabuk).
 
 ## Kapak
 
@@ -92,9 +94,17 @@ Kitap üç kısımdan oluşur. Tamamlanan bölümlerin yanında ✅ vardır.
 26. Uyumluluk katmanları ve istemciler ✅
 27. Bellek optimizasyonu ve karşılaştırmalı değerlendirme ✅
 
+### Kısım IV — Diğer Motorlar ve Katmanlar
+28. İkinci motor: ilişkisel SQL motoru ✅
+29. Üçüncü motor: zaman serisi motoru (Gorilla sıkıştırma, rollup) ✅
+30. OxiMem: RESP protokollü bellek-içi anahtar-değer katmanı ✅
+31. S3 uyumlu nesne depolama ✅
+32. Motorları birlikte kullanmak: tek uygulamada bütünleşik tasarım ✅
+
 **Ek A** — Sözlük ✅ · **Ek B** — Kaynaklar ✅
 
 ---
 
-**Durum:** Kitabın tamamı yazıldı — Önsöz + 27 bölüm + 2 ek. `./build.sh` ile
+**Durum:** Kitabın tamamı yazıldı — Önsöz + 32 bölüm + 2 ek. `./build.sh` ile
 (kapak `kapak.png` dizinde olduğunda) tek bir PDF/EPUB/HTML olarak derlenebilir.
+Üçüncü ve dördüncü kısımdaki tüm örnekler, çalışan sunucuya karşı denenmiştir.

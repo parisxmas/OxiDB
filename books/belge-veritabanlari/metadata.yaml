@@ -1,9 +1,9 @@
 ---
-title: "OxiDB Doküman Veritabanı"
-subtitle: "Ölçeklenebilir, NoSQL Doküman Tabanlı Çözümler Rehberi"
-author: "Barış AKIN ve Anthropic"
+title: "Her Şeyin Veritabanı"
+subtitle: "OxiDB: Belge, SQL ve Zaman Serisi Motorları, S3 Nesne Depolama ve OxiMem Anahtar-Değer Katmanı"
+author: "Barış AKIN"
 date: "2026"
-rights: "© 2026 Barış AKIN ve Anthropic. Tüm hakları saklıdır."
+rights: "© 2026 Barış AKIN. Tüm hakları saklıdır."
 lang: tr-TR
 toc: true
 toc-depth: 2

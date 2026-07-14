@@ -13,14 +13,31 @@ nasıl bağlanır?
 
 ## OxiDB nedir
 
-OxiDB, Rust dilinde yazılmış, hızlı ve gömülebilir bir belge veritabanı
-motorudur. Verisini, ikinci kısımda tanıdığımız anlamda belgeler — iç içe
-geçebilen, alanlardan oluşan, kendini tanımlayan nesneler — halinde tutar ve
-bunları JSON tabanlı bir sorgu diliyle sorgular. OxiDB, bilinçli bir tercihle,
-yalnızca belge modeline odaklanır; ilişkisel tablolar ve onların sorgu dili,
-tasarımının bir parçası değildir. Bu, ikinci bölümde gördüğümüz "her model bir
-ödünleşimdir" ilkesinin somut bir uygulamasıdır: OxiDB, belge modelinin güçlü
-olduğu yerde ustalaşmayı, her şeye birden yetişmeye çalışmaya yeğler.
+OxiDB, Rust dilinde yazılmış, hızlı ve gömülebilir bir veritabanı motorudur.
+Kalbinde belge modeli yatar: verisini, ikinci kısımda tanıdığımız anlamda
+belgeler — iç içe geçebilen, alanlardan oluşan, kendini tanımlayan nesneler —
+halinde tutar ve bunları JSON tabanlı bir sorgu diliyle sorgular. Kitabın bu
+kısmının büyük bölümü, işte bu belge motorunu enine boyuna inceler.
+
+Ne var ki OxiDB, tek bir modele hapsolmuş değildir. Belge motorunun yanında, aynı
+sunucunun içinde, **birbirinden bağımsız iki motor daha** yaşar: satırları,
+tabloları ve join'leri olan bir **ilişkisel SQL motoru** ve yüksek hacimli ölçüm
+akışları için sütunsal, sıkıştırmalı bir **zaman serisi motoru**. Bunlara, büyük
+ikili nesneler için S3 uyumlu bir nesne depolama katmanı ile sıcak ve geçici
+durum için bellek-içi bir anahtar-değer katmanı eşlik eder. Bu motorlar ortak bir
+depolamayı paylaşmaz; her biri kendi dosyalarına, kendi isim uzayına ve kendi
+sorgu diline sahiptir. Bir koleksiyon adı ile bir SQL tablosu adı asla
+çakışmaz.^[Her motor varsayılan olarak kapalıdır ve yalnızca bir ortam değişkeniyle
+açılır; kapalı bir motor ne bellek ne de disk maliyeti doğurur. Motorların
+ayrıntıları 28. ve sonraki bölümlerdedir.]
+
+Bu, ikinci bölümde gördüğümüz "her model bir ödünleşimdir" ilkesinin
+reddi değil, ona verilen olgun bir yanıttır: OxiDB, tek bir modeli her veri
+şekline zorla giydirmek yerine, her veri şekline kendi doğasına uygun bir motorla
+karşılık verir — ve bunu, uygulamanın beş ayrı sistemi ayrı ayrı işletmesine
+gerek kalmadan, tek bir sunucu, tek bir bağlantı ve tek bir işletim disiplini
+içinde yapar. Hangi verinin hangi motora ait olduğu sorusu ise ciddi bir tasarım
+sorusudur; kitabın kapanış bölümü tümüyle buna ayrılmıştır.
 
 OxiDB'yi diğer birçok veritabanından ayıran ilk şey, **tek bir kimliğe sıkışıp
 kalmamasıdır**. Birinci bölümde, bir veritabanının uygulamayla iki uçtan

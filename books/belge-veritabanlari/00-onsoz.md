@@ -39,14 +39,43 @@ isteyen mühendisler; ve bir veri sisteminin altındaki ilkeleri kavramak isteye
 dair temel bir aşinalık — bir dosyanın diskte durduğunu, belleğin geçici
 olduğunu, bir programın komutları sırayla yürüttüğünü bilmek — yeterlidir.
 
+## Kitabın adı üzerine {-}
+
+Fizikçiler bir asırdır *her şeyin teorisi* peşinde koşar: doğanın birbirinden
+kopuk görünen kuvvetlerini tek bir çerçevede toplayan bir formül. Bu kitabın adı,
+o arayışa göz kırpar — ama bir iddia olarak değil, bir soru olarak. Veri
+dünyasında da uzun süre benzer bir bölünmüşlük yaşandı: belgeler bir sistemde,
+tablolar başkasında, ölçüm akışları bir üçüncüsünde, dosyalar bir nesne
+deposunda, sıcak geçici durum ise bir önbellek sunucusunda durdu. Her biri kendi
+protokolünü, kendi işletim yükünü, kendi yedekleme planını getirdi.
+
+*Her şeyin veritabanı* diye bir şey var mıdır? Dürüst yanıt: yoktur — ve bu
+kitap size bunun neden böyle olduğunu, her modelin hangi ödünleşimin bedelini
+ödediğini anlatacak. Ama bir sistemin, bu farklı veri şekillerinin her birine
+kendi doğasına uygun bir motorla karşılık verip hepsini tek bir çatı altında,
+tek bir bağlantı ve tek bir işletim disiplini içinde sunması mümkündür. OxiDB'nin
+yaptığı budur: belge motoru, ilişkisel SQL motoru ve zaman serisi motoru; yanına
+S3 uyumlu nesne depolama ve bellek-içi anahtar-değer katmanı. Tek formül değil,
+bir arada yaşamayı bilen birkaç motor. Kitabın adı, o arayışın hem hedefini hem
+de sınırını anmak içindir.
+
 ## Bu kitabın yöntemi {-}
 
-Bilinçli bir tercihle, kitapta **örnek kod yoktur**. Amaç, sizi belirli bir
-sözdizimine bağlamadan, kavramların kendisini anlatmaktır. Bir fikrin özünü
-düz metinle, benzetmelerle ve adım adım akıl yürütmeyle anlatmak, çoğu zaman
-bir kod parçasından daha kalıcı bir kavrayış bırakır. Kod ezberlenir ve
-unutulur; bir mekanizmanın *neden* öyle çalıştığını bir kez gerçekten
+Kitabın ilk iki kısmında **örnek kod yoktur**. Bu bilinçli bir tercihtir: amaç,
+sizi belirli bir sözdizimine bağlamadan kavramların kendisini anlatmaktır. Bir
+fikrin özünü düz metinle, benzetmelerle ve adım adım akıl yürütmeyle anlatmak,
+çoğu zaman bir kod parçasından daha kalıcı bir kavrayış bırakır. Kod ezberlenir
+ve unutulur; bir mekanizmanın *neden* öyle çalıştığını bir kez gerçekten
 anladığınızda ise o bilgi sizinle kalır.
+
+Üçüncü kısımda ise tutum değişir. Orada artık soyut bir ilkeyi değil, çalışan bir
+sistemi anlatıyoruz; ve bir motorun yüzeyini — hangi sorguyu kabul ettiğini,
+hangi yanıtı döndürdüğünü, bir işlemin nasıl açılıp kapandığını — sözcüklerle
+tarif etmek, onu göstermekten hem daha uzun hem daha bulanıktır. Bu yüzden
+üçüncü kısımda **bol örnek** bulacaksınız: tel üzerindeki JSON istekleri, SQL
+ifadeleri, Python, C#, JavaScript ve kabuk komutları. Bu örnekler metnin yerine
+geçmez; kavram önce düzyazıyla kurulur, örnek onu somutlaştırır. Hepsi de
+sistemin o an çalışan sürümüne karşı denenmiştir.
 
 Kitap kademeli ilerler. Her kavram, kendinden öncekilerin üzerine kurulur:
 dayanıklılığı anlamadan işlemleri, indekslemeyi anlamadan sorgu işlemeyi tam
@@ -57,18 +86,12 @@ kısaca hatırlatarak yazılmıştır.
 ## Yazardan bir not: OxiDB ve bu kitap {-}
 
 Bu kitabın üçüncü kısmında adım adım incelenen sistem, OxiDB, benim — Barış
-AKIN'ın — sıfırdan tasarlayıp yazmaya başladığım bir belge veritabanı motorudur.
+AKIN'ın — sıfırdan tasarlayıp yazmaya başladığım bir veritabanı motorudur.
 OxiDB'yi yazmaya başladığım günden bu yana, bir veritabanının içinde verdiğim her
 kararın — verinin diske nasıl yerleştiğinden bir çökmeden nasıl geri dönüleceğine,
 bir indeksin nasıl yapılandırılacağından bir işlemin tutarlılığının nasıl
 korunacağına kadar — kitabın ikinci kısmında anlatılan o soyut ilkelerin somut
 bir karşılığı olduğunu gördüm. Bu kitap, işte o deneyimden doğdu.
-
-OxiDB'nin geliştirilmesi, yalnız bir uğraş da değildi. Sistemin kodu, Anthropic'in
-yapay zekâ modelleriyle — Claude'un Opus serisiyle — birlikte, bir eşlik ve
-yardımlaşma içinde yazıldı. Mimari kararlar tartışıldı, ödünleşimler birlikte
-değerlendirildi, kod birlikte üretildi ve sınandı. Bu kitabın iki yazarlı oluşu
-(Barış AKIN ve Anthropic) da bu ortak çalışmanın doğal bir yansımasıdır.
 
 Önemli bir noktanın altını çizmek isterim: bu kitap, OxiDB'nin **gerçek kod
 tabanına** (codebase) dayanılarak yazılmıştır. Üçüncü kısımda OxiDB hakkında
@@ -89,6 +112,15 @@ herhangi bir belge veritabanının içeride nasıl çalıştığını genel ilke
 düzeyinde anlatır — depolama, dayanıklılık, indeksleme, sorgu, işlemler ve
 ölçeklendirme. **Üçüncü Kısım**, tüm bu ilkelerin OxiDB'de nasıl somutlaştığını
 adım adım gösterir.
+
+Üçüncü kısmın son bölümleri, kitabın adındaki iddiayı sınar. Belge motorunu
+enine boyuna inceledikten sonra, aynı sunucunun içinde yaşayan diğer motorlara
+geçeriz: satırları, tabloları ve join'leri olan **ilişkisel SQL motoru**; saniyede
+yüz binlerce ölçümü sıkıştırarak yutan **zaman serisi motoru**; büyük ikili
+nesneler için **S3 uyumlu nesne depolama**; ve sıcak, geçici durum için Redis'in
+telini konuşan **bellek-içi anahtar-değer katmanı**. Kapanış bölümü hepsini tek
+bir çalışan uygulamada buluşturur ve asıl soruyu yanıtlar: hangi veri hangi
+motora gider, ve neden?
 
 Şimdi başlayalım. İlk durağımız, sandığınızdan daha derin bir soru: aslında bir
 veritabanı tam olarak nedir ve onu basit bir dosyadan ayıran nedir?

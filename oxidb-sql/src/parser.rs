@@ -703,6 +703,25 @@ fn translate(stmt: sp::Statement, p: &mut usize) -> Result<Statement> {
         {
             Ok(Statement::Show(ShowKind::Procedures))
         }
+        // `SHOW INDEXES [FROM t]` also parses as a generic SHOW <variable>
+        // (sqlparser has no dedicated variant). The whole-input fast path in
+        // `parse` catches the single-statement form; this arm is what makes
+        // it work inside a multi-statement batch.
+        sp::Statement::ShowVariable { variable }
+            if matches!(variable.first(),
+                Some(v) if v.value.eq_ignore_ascii_case("indexes")
+                    || v.value.eq_ignore_ascii_case("index")) =>
+        {
+            match variable.as_slice() {
+                [_] => Ok(Statement::Show(ShowKind::Indexes(None))),
+                [_, from, table] if from.value.eq_ignore_ascii_case("from") => Ok(Statement::Show(
+                    ShowKind::Indexes(Some(table.value.clone())),
+                )),
+                _ => Err(SqlError::Unsupported(
+                    "SHOW INDEXES takes an optional FROM <table>".into(),
+                )),
+            }
+        }
         sp::Statement::ShowViews { .. } => Ok(Statement::Show(ShowKind::Views)),
         sp::Statement::ShowColumns { show_options, .. } => {
             let table = show_options
