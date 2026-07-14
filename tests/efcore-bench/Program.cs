@@ -100,10 +100,20 @@ if (!skipSeed)
 
 var results = new List<BenchResult>();
 
+// Deterministic id sequence for point lookups / writes. Inserted ids live in
+// a per-provider range so delete_point removes rows that actually exist for
+// THAT provider (a shared counter would make one side's deletes no-ops).
+int Rnd(int i, int mod) => (int)((i * 48271L) % mod) + 1;
+var currentProvider = "oxidb";
+int IdBase() => currentProvider == "oxidb" ? 10_000_000 : 20_000_000;
+var insertSeq = new Dictionary<string, int> { ["oxidb"] = 0, ["postgres"] = 0 };
+int NextId() => IdBase() + ++insertSeq[currentProvider];
+
 void Run(string name, int iterations, Action<Bench, int> op, int warmup = 15)
 {
     foreach (var provider in new[] { "oxidb", "postgres" })
     {
+        currentProvider = provider;
         using var db = Open(provider);
         db.ChangeTracker.QueryTrackingBehavior = QueryTrackingBehavior.NoTracking;
         for (var i = 0; i < warmup; i++)
@@ -135,10 +145,6 @@ void Run(string name, int iterations, Action<Bench, int> op, int warmup = 15)
 }
 
 static string Fmt(double us) => us < 1000 ? $"{us:F0} µs" : $"{us / 1000.0:F2} ms";
-
-// Deterministic id sequence for point lookups / writes.
-int Rnd(int i, int mod) => (int)((i * 48271L) % mod) + 1;
-var insertId = 10_000_000;
 
 Console.WriteLine("\n── simple benches ─────────────────────────────────────────");
 
@@ -174,7 +180,7 @@ Run("insert_single", 200, (db, i) =>
 {
     db.Orders.Add(new Order
     {
-        Id = ++insertId, CustomerId = Rnd(i, customers),
+        Id = NextId(), CustomerId = Rnd(i, customers),
         Amount = 42.5, Status = 1, Created = Utc(2026, 1, 1),
     });
     db.SaveChanges();
@@ -185,7 +191,7 @@ Run("insert_batch_100", 30, (db, i) =>
     for (var k = 0; k < 100; k++)
         db.Orders.Add(new Order
         {
-            Id = ++insertId, CustomerId = Rnd(i * 100 + k, customers),
+            Id = NextId(), CustomerId = Rnd(i * 100 + k, customers),
             Amount = 17.25, Status = 2, Created = Utc(2026, 1, 2),
         });
     db.SaveChanges();
@@ -198,8 +204,12 @@ Run("update_point", 200, (db, i) =>
         .ExecuteUpdate(s => s.SetProperty(o => o.Status, 3));
 });
 
+// Deletes insert_single's rows for this provider (ids IdBase()+1..+215).
 Run("delete_point", 200, (db, i) =>
-    db.Orders.Where(o => o.Id == 10_000_000 + i + 1).ExecuteDelete());
+{
+    var id = IdBase() + i + 1;
+    db.Orders.Where(o => o.Id == id).ExecuteDelete();
+});
 
 // ── report ──────────────────────────────────────────────────────────────────
 
