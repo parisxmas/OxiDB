@@ -41,6 +41,7 @@ case "$fmt" in
     pandoc metadata.yaml "${chapters[@]}" \
       --toc --number-sections --top-level-division=chapter \
       --pdf-engine=xelatex \
+      --include-in-header=unicode-duzelt.tex \
       "${cover_opt[@]}" \
       -V classoption=oneside \
       -V mainfont="$mainfont" \

@@ -1,0 +1,6 @@
+% Gövde yazı tipi (Georgia) bazı Unicode simgelerini içermez; xelatex bunları
+% sessizce boş basar. Aşağıdaki eşlemeler o karakterleri matematik yazı
+% tipinden alır, böylece Markdown kaynağı bozulmadan PDF'te doğru görünürler.
+\usepackage{newunicodechar}
+\newunicodechar{→}{\ensuremath{\rightarrow}}
+\newunicodechar{⋈}{\ensuremath{\bowtie}}

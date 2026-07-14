@@ -31,16 +31,16 @@ export default function Page() {
             <tr>
               <td>PDF</td>
               <td><code>her-seyin-veritabani.pdf</code></td>
-              <td>6.3 MB</td>
+              <td>5.3 MB</td>
               <td>235 pages, print-ready</td>
-              <td><a href="/kitap/her-seyin-veritabani.pdf?v=20260715" class="dl-btn">Download</a></td>
+              <td><a href="/kitap/her-seyin-veritabani.pdf?v=20260715b" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>EPUB</td>
               <td><code>her-seyin-veritabani.epub</code></td>
               <td>965 KB</td>
               <td>e-readers, reflowable</td>
-              <td><a href="/kitap/her-seyin-veritabani.epub?v=20260715" class="dl-btn">Download</a></td>
+              <td><a href="/kitap/her-seyin-veritabani.epub?v=20260715b" class="dl-btn">Download</a></td>
             </tr>
           </tbody>
         </table>
