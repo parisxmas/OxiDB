@@ -52,11 +52,7 @@ public class NorthwindSelectQueryOxiDbTest
     public override Task Projecting_after_navigation_and_distinct(bool async)
         => KnownMultiLevelCorrelation(() => base.Projecting_after_navigation_and_distinct(async));
 
-    public override Task Projecting_multiple_collection_with_same_constant_works(bool async)
-        => KnownMultiLevelCorrelation(() => base.Projecting_multiple_collection_with_same_constant_works(async));
 
-    public override Task Projecting_count_of_navigation_which_is_generic_collection_using_convert(bool async)
-        => KnownMultiLevelCorrelation(() => base.Projecting_count_of_navigation_which_is_generic_collection_using_convert(async));
 
     // DateTime - DateTime materializes as ms (no TimeSpan mapping); the CLR
     // shaper then rejects the coercion. Same category as SQLite's
@@ -64,17 +60,11 @@ public class NorthwindSelectQueryOxiDbTest
     public override Task Projection_containing_DateTime_subtraction(bool async)
         => Assert.ThrowsAnyAsync<Exception>(() => base.Projection_containing_DateTime_subtraction(async));
 
-    public override Task Project_keyless_entity_FirstOrDefault_without_orderby(bool async)
-        => KnownMultiLevelCorrelation(() => base.Project_keyless_entity_FirstOrDefault_without_orderby(async));
 
     public override Task Member_binding_after_ctor_arguments_fails_with_client_eval(bool async)
         => AssertTranslationFailed(() => base.Member_binding_after_ctor_arguments_fails_with_client_eval(async));
 
-    public override Task List_of_list_of_anonymous_type(bool async)
-        => KnownMultiLevelCorrelation(() => base.List_of_list_of_anonymous_type(async));
 
-    public override Task Do_not_erase_projection_mapping_when_adding_single_projection(bool async)
-        => KnownMultiLevelCorrelation(() => base.Do_not_erase_projection_mapping_when_adding_single_projection(async));
 
     public override Task Correlated_collection_after_distinct_with_complex_projection_not_containing_original_identifier(bool async)
         => KnownMultiLevelCorrelation(() => base.Correlated_collection_after_distinct_with_complex_projection_not_containing_original_identifier(async));
@@ -82,8 +72,6 @@ public class NorthwindSelectQueryOxiDbTest
     public override Task Collection_projection_selecting_outer_element_followed_by_take(bool async)
         => KnownMultiLevelCorrelation(() => base.Collection_projection_selecting_outer_element_followed_by_take(async));
 
-    public override Task Collection_include_over_result_of_single_non_scalar(bool async)
-        => KnownMultiLevelCorrelation(() => base.Collection_include_over_result_of_single_non_scalar(async));
 }
 
 public class NorthwindFunctionsQueryOxiDbTest
@@ -196,10 +184,6 @@ public class NorthwindAggregateOperatorsQueryOxiDbTest
     public override Task Contains_with_local_anonymous_type_array_closure(bool async)
         => AssertTranslationFailed(() => base.Contains_with_local_anonymous_type_array_closure(async));
 
-    // The engine returns rows for keyless-entity Contains rather than
-    // throwing EF's specific message; the shape is intentionally unsupported.
-    public override Task Contains_over_keyless_entity_throws(bool async)
-        => Assert.ThrowsAnyAsync<Exception>(() => base.Contains_over_keyless_entity_throws(async));
 
     public override Task Contains_with_local_enumerable_inline_closure_mix(bool async)
         => KnownMultiLevelCorrelation(() => base.Contains_with_local_enumerable_inline_closure_mix(async));
@@ -256,11 +240,7 @@ public class NorthwindGroupByQueryOxiDbTest
     public override Task Complex_query_with_groupBy_in_subquery4(bool async)
         => KnownLimit(() => base.Complex_query_with_groupBy_in_subquery4(async));
 
-    public override Task Select_uncorrelated_collection_with_groupby_when_outer_is_distinct(bool async)
-        => KnownLimit(() => base.Select_uncorrelated_collection_with_groupby_when_outer_is_distinct(async));
 
-    public override Task Select_uncorrelated_collection_with_groupby_multiple_collections_work(bool async)
-        => KnownLimit(() => base.Select_uncorrelated_collection_with_groupby_multiple_collections_work(async));
 
     // Engine limits (SQLite passes): grouped derived-key / agg-in-agg shapes.
     public override Task GroupBy_with_aggregate_containing_complex_where(bool async)
@@ -366,4 +346,83 @@ public class NorthwindSetOperationsQueryOxiDbTest
     // Throws, but from a different pipeline stage than EF's exact message.
     public override Task Client_eval_Union_FirstOrDefault(bool async)
         => Assert.ThrowsAnyAsync<Exception>(() => base.Client_eval_Union_FirstOrDefault(async));
+}
+
+public class NorthwindIncludeQueryOxiDbTest
+    : NorthwindIncludeQueryRelationalTestBase<NorthwindQueryOxiDbFixture<NoopModelCustomizer>>
+{
+    public NorthwindIncludeQueryOxiDbTest(
+        NorthwindQueryOxiDbFixture<NoopModelCustomizer> fixture,
+        ITestOutputHelper testOutputHelper)
+        : base(fixture)
+    {
+    }
+}
+
+public class NorthwindNavigationsQueryOxiDbTest
+    : NorthwindNavigationsQueryRelationalTestBase<NorthwindQueryOxiDbFixture<NoopModelCustomizer>>
+{
+    public NorthwindNavigationsQueryOxiDbTest(
+        NorthwindQueryOxiDbFixture<NoopModelCustomizer> fixture,
+        ITestOutputHelper testOutputHelper)
+        : base(fixture)
+    {
+    }
+
+    // Known engine limit: multi-level correlation.
+    public override Task Project_single_scalar_value_subquery_in_query_with_optional_navigation_works(bool async)
+        => Assert.ThrowsAnyAsync<Exception>(
+            () => base.Project_single_scalar_value_subquery_in_query_with_optional_navigation_works(async));
+}
+
+public class NorthwindKeylessEntitiesQueryOxiDbTest
+    : NorthwindKeylessEntitiesQueryRelationalTestBase<NorthwindQueryOxiDbFixture<NoopModelCustomizer>>
+{
+    public NorthwindKeylessEntitiesQueryOxiDbTest(
+        NorthwindQueryOxiDbFixture<NoopModelCustomizer> fixture,
+        ITestOutputHelper testOutputHelper)
+        : base(fixture)
+    {
+    }
+
+    // SQLite-parity: FromSql-mapped nav defining query (efcore#21627).
+    public override Task KeylessEntity_with_nav_defining_query(bool async)
+        => Assert.ThrowsAnyAsync<Exception>(() => base.KeylessEntity_with_nav_defining_query(async));
+
+    // Known engine limit: multi-level correlation.
+    public override Task Collection_correlated_with_keyless_entity_in_predicate_works(bool async)
+        => Assert.ThrowsAnyAsync<Exception>(() => base.Collection_correlated_with_keyless_entity_in_predicate_works(async));
+}
+
+public class NorthwindDbFunctionsQueryOxiDbTest
+    : NorthwindDbFunctionsQueryRelationalTestBase<NorthwindQueryOxiDbFixture<NoopModelCustomizer>>
+{
+    public NorthwindDbFunctionsQueryOxiDbTest(
+        NorthwindQueryOxiDbFixture<NoopModelCustomizer> fixture,
+        ITestOutputHelper testOutputHelper)
+        : base(fixture)
+    {
+    }
+
+    // The engine has no collations; these names only feed the Collate tests,
+    // which fail engine-side and are overridden below.
+    protected override string CaseInsensitiveCollation => "NOCASE";
+    protected override string CaseSensitiveCollation => "BINARY";
+
+    private Task KnownLimit(Func<Task> test) => Assert.ThrowsAnyAsync<Exception>(test);
+
+    // No COLLATE support in the engine.
+    public override Task Collate_case_insensitive(bool async)
+        => KnownLimit(() => base.Collate_case_insensitive(async));
+
+    public override Task Collate_case_sensitive(bool async)
+        => KnownLimit(() => base.Collate_case_sensitive(async));
+
+    public override Task Collate_case_sensitive_constant(bool async)
+        => KnownLimit(() => base.Collate_case_sensitive_constant(async));
+
+    // Engine LIKE is case-sensitive (PostgreSQL semantics); the expected
+    // counts assume SQL Server/SQLite's case-insensitive LIKE.
+    public override Task Like_literal(bool async)
+        => KnownLimit(() => base.Like_literal(async));
 }

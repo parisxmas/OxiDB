@@ -446,6 +446,8 @@ pub enum ScalarFunc {
     Trunc,
     /// `REGEXP_LIKE(s, pattern)` — Rust regex syntax, unanchored search.
     RegexpLike,
+    /// `RANDOM()` / `RAND()` — uniform double in [0, 1).
+    Random,
 }
 
 /// A date/time component for [`ScalarFunc::Extract`] / [`ScalarFunc::DateTrunc`].

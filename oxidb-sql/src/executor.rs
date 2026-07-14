@@ -3865,6 +3865,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             | ScalarFunc::Degrees
             | ScalarFunc::Radians => Some(SqlType::Double),
             ScalarFunc::Sign => Some(SqlType::Int),
+            ScalarFunc::Random => Some(SqlType::Double),
             ScalarFunc::RegexpLike => Some(SqlType::Bool),
             ScalarFunc::Position => Some(SqlType::Int),
             ScalarFunc::Lpad | ScalarFunc::Rpad => Some(SqlType::Text),
@@ -3933,6 +3934,7 @@ fn default_name(expr: &Expr) -> String {
             ScalarFunc::Sign => "sign".to_string(),
             ScalarFunc::Trunc => "trunc".to_string(),
             ScalarFunc::RegexpLike => "regexp_like".to_string(),
+            ScalarFunc::Random => "random".to_string(),
         },
         Expr::Window { func, .. } => match func {
             WindowFunc::RowNumber => "row_number".to_string(),
@@ -4468,6 +4470,19 @@ where
             }
             other => return Err(SqlError::Eval(format!("TRUNC of {other:?}"))),
         }),
+        ScalarFunc::Random => {
+            use std::sync::atomic::{AtomicU64, Ordering as AOrd};
+            static STATE: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64 | 1)
+                .unwrap_or(1);
+            let mut x = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, AOrd::Relaxed) ^ nanos;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            Ok(Value::Double((x >> 11) as f64 / (1u64 << 53) as f64))
+        }
         ScalarFunc::RegexpLike => {
             let (s, pat) = (
                 as_text(eval(&args[0])?, "REGEXP_LIKE")?,

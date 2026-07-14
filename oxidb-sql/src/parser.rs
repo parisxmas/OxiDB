@@ -1184,7 +1184,7 @@ fn translate_query(query: sp::Query, p: &mut usize) -> Result<SelectQuery> {
                 offset: None,
             }
         }
-        body @ sp::SetExpr::SetOperation { .. } => SelectQuery {
+        body @ (sp::SetExpr::SetOperation { .. } | sp::SetExpr::Values(_)) => SelectQuery {
             body: translate_set_expr(body, p)?,
             order_by,
             limit,
@@ -2208,6 +2208,7 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
         "sign" => Some(ScalarFunc::Sign),
         "trunc" | "truncate" => Some(ScalarFunc::Trunc),
         "regexp_like" => Some(ScalarFunc::RegexpLike),
+        "random" | "rand" => Some(ScalarFunc::Random),
         _ => None,
     } {
         if f.over.is_some() {
@@ -2240,7 +2241,7 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             }
             ScalarFunc::Round => exprs.len() == 1 || exprs.len() == 2,
             ScalarFunc::Substring => exprs.len() == 2 || exprs.len() == 3,
-            ScalarFunc::Now => exprs.is_empty(),
+            ScalarFunc::Now | ScalarFunc::Random => exprs.is_empty(),
             ScalarFunc::Floor
             | ScalarFunc::Ceil
             | ScalarFunc::Sqrt
