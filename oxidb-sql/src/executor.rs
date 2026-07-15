@@ -5594,6 +5594,20 @@ fn str_ref<'a, R: RowLike + ?Sized>(
 /// below 1 consumes length before the string begins).
 fn substr_slice(s: &str, start: i64, len: Option<usize>) -> &str {
     let skip = (start.max(1) - 1) as usize;
+    // ASCII fast path: byte index == char index, so slice in O(1) instead of
+    // walking char boundaries — the hot path for EF's StartsWith/EndsWith,
+    // which are SUBSTRING-of-an-ASCII-column comparisons.
+    if s.is_ascii() {
+        let begin = skip.min(s.len());
+        return match len {
+            None => &s[begin..],
+            Some(l) => {
+                let consumed = (1 - start.min(1)) as usize;
+                let end = (begin + l.saturating_sub(consumed)).min(s.len());
+                &s[begin..end]
+            }
+        };
+    }
     let begin = s.char_indices().nth(skip).map_or(s.len(), |(b, _)| b);
     match len {
         None => &s[begin..],
