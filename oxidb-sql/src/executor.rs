@@ -4778,7 +4778,6 @@ enum AggAcc {
 fn compute_streamable_aggs<S: Store>(
     _store: &S,
     aggs: &[Expr],
-    compiled: &[Option<RowProg>],
     schema: &[ColRef],
     src: &Sources,
     tuples: &Tuples,
@@ -4800,13 +4799,12 @@ fn compute_streamable_aggs<S: Store>(
             _ => unreachable!("non-aggregate collected as streamable"),
         })
         .collect();
-    let mut stack: Vec<Value> = Vec::with_capacity(8);
     for &ri in group {
         let view = View {
             src,
             tuple: tuples.row(ri as usize),
         };
-        for (idx, (acc, agg)) in accs.iter_mut().zip(aggs).enumerate() {
+        for (acc, agg) in accs.iter_mut().zip(aggs) {
             let Expr::Aggregate { arg, .. } = agg else {
                 unreachable!()
             };
@@ -4814,11 +4812,7 @@ fn compute_streamable_aggs<S: Store>(
                 *n += 1;
                 continue;
             }
-            let arg = arg.as_deref().expect("non-* has arg");
-            let v = match &compiled[idx] {
-                Some(prog) => prog.eval(&view, params, &mut stack)?,
-                None => eval_scalar(arg, schema, &view, params)?,
-            };
+            let v = eval_scalar(arg.as_deref().expect("non-* has arg"), schema, &view, params)?;
             if matches!(v, Value::Null) {
                 continue;
             }
@@ -4919,24 +4913,6 @@ fn select_aggregated<S: Store>(
         collect_streamable_aggs(e, &mut streamable);
     }
 
-    // Adaptive expression compilation: over a high row count, the per-node
-    // dispatch of eval_scalar on each aggregate's argument dominates. Compile
-    // each argument once into a stack-machine program (None = not compilable /
-    // below threshold, keep eval_scalar). Threshold keeps small groups on the
-    // interpreter, where the one-time compile would not amortise.
-    const COMPILE_ROWS: usize = 8192;
-    let compiled: Vec<Option<RowProg>> = if tuples.n() >= COMPILE_ROWS {
-        streamable
-            .iter()
-            .map(|agg| match agg {
-                Expr::Aggregate { arg: Some(a), .. } => RowProg::compile(a),
-                _ => None,
-            })
-            .collect()
-    } else {
-        streamable.iter().map(|_| None).collect()
-    };
-
     let mut prepared: Vec<(Vec<Value>, Vec<IndexKey>, Vec<Value>)> =
         Vec::with_capacity(groups.len());
     for group in &groups {
@@ -4944,9 +4920,8 @@ fn select_aggregated<S: Store>(
         let precomp: Vec<(Expr, Value)> = if streamable.is_empty() {
             Vec::new()
         } else {
-            let vals = compute_streamable_aggs(
-                store, &streamable, &compiled, schema, src, tuples, group, params,
-            )?;
+            let vals =
+                compute_streamable_aggs(store, &streamable, schema, src, tuples, group, params)?;
             streamable.iter().cloned().zip(vals).collect()
         };
         let eval_grp = |e: &Expr| -> Result<Value> {
@@ -6952,118 +6927,6 @@ fn apply_unary(op: UnOp, v: Value) -> Result<Value> {
             Value::Bool(b) => Ok(Value::Bool(!b)),
             other => Err(SqlError::Eval(format!("bitwise NOT of {other:?}"))),
         },
-    }
-}
-
-// ── compiled scalar expressions (stack machine) ──────────────────────────────
-//
-// eval_scalar walks the Expr tree per row: one recursive call and one big match
-// per node, every row. On hot, high-row-count paths (streaming aggregate
-// arguments over 100k+ tuples) that per-node dispatch dominates. RowProg
-// flattens the arithmetic/logical core of an expression into a postfix
-// instruction stream, compiled ONCE, then run per row as a tight loop over a
-// small operand stack — no recursion, no per-node Expr match.
-//
-// Only the pure value core compiles (columns, params, literals, arithmetic,
-// unary, IS NULL). Anything needing more context — subqueries, aggregates,
-// functions, or the borrowed-string comparison fast path in eval_scalar —
-// makes `compile` return None and the caller keeps eval_scalar. Adaptive: the
-// caller only compiles when the row count clears a threshold so the one-time
-// compile amortises.
-enum RowInstr {
-    Col(usize),
-    Lit(u16),
-    Param(usize),
-    Bin(BinOp),
-    Un(UnOp),
-    IsNull(bool),
-}
-
-struct RowProg {
-    code: Vec<RowInstr>,
-    pool: Vec<Value>,
-}
-
-impl RowProg {
-    /// Compile `e`, or return None if it contains anything outside the value
-    /// core (the caller then keeps eval_scalar for that expression).
-    fn compile(e: &Expr) -> Option<RowProg> {
-        fn emit(e: &Expr, code: &mut Vec<RowInstr>, pool: &mut Vec<Value>) -> Option<()> {
-            match e {
-                Expr::Col(i) => code.push(RowInstr::Col(*i)),
-                Expr::Param(i) => code.push(RowInstr::Param(*i)),
-                Expr::Literal(v) => {
-                    if pool.len() >= u16::MAX as usize {
-                        return None;
-                    }
-                    let idx = pool.len() as u16;
-                    pool.push(v.clone());
-                    code.push(RowInstr::Lit(idx));
-                }
-                Expr::Binary { op, left, right } => {
-                    emit(left, code, pool)?;
-                    emit(right, code, pool)?;
-                    code.push(RowInstr::Bin(*op));
-                }
-                Expr::Unary { op, expr } => {
-                    emit(expr, code, pool)?;
-                    code.push(RowInstr::Un(*op));
-                }
-                Expr::IsNull { expr, negated } => {
-                    emit(expr, code, pool)?;
-                    code.push(RowInstr::IsNull(*negated));
-                }
-                _ => return None,
-            }
-            Some(())
-        }
-        let mut code = Vec::new();
-        let mut pool = Vec::new();
-        emit(e, &mut code, &mut pool)?;
-        Some(RowProg { code, pool })
-    }
-
-    /// Evaluate over `row`. `stack` is caller-owned scratch, reused across rows.
-    #[inline]
-    fn eval<R: RowLike + ?Sized>(
-        &self,
-        row: &R,
-        params: &[Value],
-        stack: &mut Vec<Value>,
-    ) -> Result<Value> {
-        stack.clear();
-        for ins in &self.code {
-            match ins {
-                RowInstr::Col(i) => {
-                    let v = row
-                        .val(*i)
-                        .cloned()
-                        .ok_or_else(|| SqlError::Eval(format!("bound column {i} out of range")))?;
-                    stack.push(v);
-                }
-                RowInstr::Lit(i) => stack.push(self.pool[*i as usize].clone()),
-                RowInstr::Param(i) => {
-                    let v = params.get(*i).cloned().ok_or_else(|| {
-                        SqlError::Eval(format!("missing bind parameter ${}", i + 1))
-                    })?;
-                    stack.push(v);
-                }
-                RowInstr::Bin(op) => {
-                    let r = stack.pop().unwrap();
-                    let l = stack.pop().unwrap();
-                    stack.push(eval_binary(*op, l, r)?);
-                }
-                RowInstr::Un(op) => {
-                    let v = stack.pop().unwrap();
-                    stack.push(apply_unary(*op, v)?);
-                }
-                RowInstr::IsNull(neg) => {
-                    let v = stack.pop().unwrap();
-                    stack.push(Value::Bool(matches!(v, Value::Null) != *neg));
-                }
-            }
-        }
-        Ok(stack.pop().unwrap_or(Value::Null))
     }
 }
 
