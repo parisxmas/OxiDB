@@ -6027,14 +6027,42 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
             expr,
             list,
             negated,
-        } => Expr::In {
-            expr: Box::new(bind_expr(expr, schema)?),
-            list: list
+        } => {
+            let bexpr = bind_expr(expr, schema)?;
+            let blist: Vec<Expr> = list
                 .iter()
                 .map(|e| bind_expr(e, schema))
-                .collect::<Result<_>>()?,
-            negated: *negated,
-        },
+                .collect::<Result<_>>()?;
+            // An all-literal IN list (EF's `Contains` over a constant array)
+            // becomes a set: one O(log n) membership test per row instead of
+            // a list walk that clones every element every row. Same
+            // three-valued semantics (`has_null` tracks NULL members).
+            if !blist.is_empty() && blist.iter().all(|e| matches!(e, Expr::Literal(_))) {
+                let mut set = std::collections::BTreeSet::new();
+                let mut has_null = false;
+                for e in &blist {
+                    if let Expr::Literal(v) = e {
+                        if matches!(v, Value::Null) {
+                            has_null = true;
+                        } else {
+                            set.insert(IndexKey(v.clone()));
+                        }
+                    }
+                }
+                Expr::InSet {
+                    expr: Box::new(bexpr),
+                    set: std::sync::Arc::new(set),
+                    has_null,
+                    negated: *negated,
+                }
+            } else {
+                Expr::In {
+                    expr: Box::new(bexpr),
+                    list: blist,
+                    negated: *negated,
+                }
+            }
+        }
         Expr::Func { func, args } => Expr::Func {
             func: *func,
             args: args
