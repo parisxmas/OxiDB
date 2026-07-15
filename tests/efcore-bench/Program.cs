@@ -285,7 +285,7 @@ Run("exists_any", 30, (db, i) =>
     db.Customers.Count(c => c.Orders.Any(o => o.Amount > 995)));
 
 // Parameterized IN list (EF renders a VALUES table or IN).
-Run("in_list_count", 50, (db, i) =>
+Run("in_list_count", 150, (db, i) =>
 {
     var wanted = new[] { "City01", "City05", "City09", "City13" };
     db.Customers.Count(c => wanted.Contains(c.City));
@@ -298,7 +298,7 @@ Run("three_way_join_sum", 15, (db, i) =>
         .Sum(l => l.Qty * l.Product.Price));
 
 // Correlated top-1 per row (EF renders LATERAL / APPLY).
-Run("top1_per_customer", 20, (db, i) =>
+Run("top1_per_customer", 60, (db, i) =>
     db.Customers.Where(c => c.Id <= 100)
         .Select(c => new
         {
@@ -312,11 +312,11 @@ Run("deep_paging", 20, (db, i) =>
     db.Orders.OrderBy(o => o.Created).Skip(5000).Take(50).ToList());
 
 // DISTINCT projection under a predicate.
-Run("distinct_projection", 50, (db, i) =>
+Run("distinct_projection", 150, (db, i) =>
     db.Customers.Where(c => c.Segment == 2).Select(c => c.City).Distinct().Count());
 
 // Set operation over two filtered projections.
-Run("union_projection", 30, (db, i) =>
+Run("union_projection", 100, (db, i) =>
     db.Customers.Where(c => c.Segment == 0).Select(c => c.City)
         .Union(db.Customers.Where(c => c.Segment == 1).Select(c => c.City))
         .Count());
@@ -342,7 +342,7 @@ Console.WriteLine("\n── advanced benches ───────────�
 
 // Correlated scalar subquery in projection: each customer with the size of
 // their largest single order (EF renders a correlated aggregate subquery).
-Run("correlated_scalar", 20, (db, i) =>
+Run("correlated_scalar", 80, (db, i) =>
     db.Customers.Where(c => c.Id <= 200)
         .Select(c => new
         {
@@ -373,7 +373,7 @@ Run("window_rank_per_city", 15, (db, i) =>
 
 // Conditional aggregation: per status, count and the sum of only the large
 // orders (EF renders SUM(CASE WHEN ... THEN amount ELSE 0 END)).
-Run("conditional_aggregate", 20, (db, i) =>
+Run("conditional_aggregate", 60, (db, i) =>
     db.Orders.GroupBy(o => o.Status)
         .Select(g => new
         {
@@ -400,7 +400,7 @@ Run("paged_with_total", 25, (db, i) =>
 
 // Self-join: count customer pairs in the same city with the same segment
 // (a join of a table to itself, filtered to avoid the trivial/self pairs).
-Run("self_join_pairs", 15, (db, i) =>
+Run("self_join_pairs", 80, (db, i) =>
     db.Customers.Where(c => c.City == "City05")
         .Join(db.Customers.Where(c => c.City == "City05"),
             a => a.Segment, b => b.Segment, (a, b) => new { a, b })
@@ -446,18 +446,18 @@ Run("category_revenue", 12, (db, i) =>
         .ToList());
 
 // EXCEPT: cities that have segment-0 customers but no segment-3 customers.
-Run("except_sets", 25, (db, i) =>
+Run("except_sets", 100, (db, i) =>
     db.Customers.Where(c => c.Segment == 0).Select(c => c.City)
         .Except(db.Customers.Where(c => c.Segment == 3).Select(c => c.City))
         .Count());
 
 // Any with a compound correlated predicate: customers with at least one
 // large, recent order.
-Run("any_compound", 25, (db, i) =>
+Run("any_compound", 80, (db, i) =>
     db.Customers.Count(c => c.Orders.Any(o => o.Amount > 900 && o.Status == 1)));
 
 // Ordered join projection with a computed sort key across two tables.
-Run("join_computed_sort", 20, (db, i) =>
+Run("join_computed_sort", 40, (db, i) =>
     db.OrderLines
         .Where(l => l.Order.CustomerId <= 500)
         .Select(l => new { l.Id, Line = l.Qty * l.Product.Price })
