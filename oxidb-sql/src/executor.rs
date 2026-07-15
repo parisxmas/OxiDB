@@ -2652,6 +2652,11 @@ fn compute_window<S: Store>(
 
 fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Result<QueryResult> {
     let mut select = select;
+    // 0. Pick the smallest base table as the driver (FROM): a query written
+    //    `FROM big JOIN small` (EF Core routinely emits this) should start
+    //    from `small` so the big table is reached by an index probe, not a
+    //    full materialization. Safe only across all-INNER base-table joins.
+    choose_driver(store, &mut select, params);
     // 1. Build the source: base table, then joins (the join ON is bound inside).
     let (schema, src, mut tuples) = build_source(store, &select, params)?;
 
@@ -3082,6 +3087,92 @@ fn reorder_joins<'a, S: Store>(store: &S, from: &TableRef, joins: &'a [Join]) ->
         order.push(&joins[ji]);
     }
     order
+}
+
+/// Make the smallest base table the driver (FROM), swapping it with a join
+/// entry when that shrinks the starting side. Only fires when every join is a
+/// plain INNER join over a base table (no subqueries/LATERAL/outer joins),
+/// where the swap can never change the result — the join graph and its ON
+/// predicates are unchanged, only which table the planner scans first. The
+/// swapped-in join keeps the same ON clause (it still relates the same two
+/// tables), and `reorder_joins` re-sequences the rest.
+fn choose_driver<S: Store>(store: &S, select: &mut SelectStmt, params: &[Value]) {
+    let Some(from) = &select.from else {
+        return;
+    };
+    if select.joins.is_empty() || from.subquery.is_some() {
+        return;
+    }
+    if select.joins.iter().any(|j| {
+        j.kind != JoinKind::Inner || j.table.subquery.is_some() || j.table.lateral
+    }) {
+        return;
+    }
+    let Some(from_size) = store.row_count_hint(&from.name) else {
+        return;
+    };
+    // Only worth swapping toward a table the WHERE actually shrinks: a raw
+    // row-count is misleading (a 500-row table with no equality filter is a
+    // worse driver than a 150k table, because it feeds 500 index probes that
+    // fan back out). Require a `col = const` filter on the candidate — and
+    // none on the current FROM (else FROM is already a fine driver).
+    let has_eq = |key: &str| {
+        select
+            .filter
+            .as_ref()
+            .is_some_and(|f| !eq_conjuncts(f, key, params).is_empty())
+    };
+    if has_eq(from.key()) {
+        return;
+    }
+    // Smallest *selectively-filtered* join table by row-count estimate.
+    let mut best: Option<(usize, usize)> = None;
+    for (i, j) in select.joins.iter().enumerate() {
+        if has_eq(j.table.key())
+            && let Some(sz) = store.row_count_hint(&j.table.name)
+            && best.is_none_or(|(_, bs)| sz < bs)
+        {
+            best = Some((i, sz));
+        }
+    }
+    if let Some((ji, jsize)) = best
+        && jsize < from_size
+    {
+        // Swap FROM with joins[ji].table; the join's ON still relates the two.
+        let old_from = select.from.take().expect("from present");
+        let new_from = std::mem::replace(&mut select.joins[ji].table, old_from);
+        let new_key = new_from.key().to_string();
+        select.from = Some(new_from);
+        // A swap is only safe if every join is still reachable from the new
+        // driver by its ON predicates — otherwise the chosen table sat mid-
+        // chain and the swap orphaned a table (its columns become unresolvable).
+        // Undo when that happens.
+        if !joins_reachable(&new_key, &select.joins) {
+            let restored = select.from.take().expect("from present");
+            let orig = std::mem::replace(&mut select.joins[ji].table, restored);
+            select.from = Some(orig);
+        }
+    }
+}
+
+/// Whether every join can be sequenced starting from `driver_key`, each
+/// becoming placeable (its ON references only already-available tables) as
+/// the ones before it are added. This is exactly `reorder_joins`' loop, used
+/// here only to validate a candidate driver swap.
+fn joins_reachable(driver_key: &str, joins: &[Join]) -> bool {
+    let mut avail: std::collections::HashSet<String> =
+        std::iter::once(driver_key.to_string()).collect();
+    let mut pending: Vec<usize> = (0..joins.len()).collect();
+    while !pending.is_empty() {
+        let Some(pos) = pending.iter().position(|&ji| {
+            join_placeable(&joins[ji].on, &avail, joins[ji].table.key())
+        }) else {
+            return false;
+        };
+        let ji = pending.remove(pos);
+        avail.insert(joins[ji].table.key().to_string());
+    }
+    true
 }
 
 /// Build the combined (schema, sources, tuples) for FROM + joins.

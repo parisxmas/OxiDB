@@ -365,3 +365,36 @@ fn scalar_aggregate_decorrelation_semantics() {
         vec![vec![i(2)], vec![i(3)]]
     );
 }
+
+/// `FROM big JOIN small` ile `FROM small JOIN big` aynı sonucu vermeli:
+/// planlayıcı en küçük tabloyu sürücü seçer (choose_driver), sonuç
+/// yazım sırasından bağımsız olmalı — filtreler, çoklu join ve
+/// projeksiyon dahil.
+#[test]
+fn driver_choice_is_result_preserving() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE kucuk (id INT PRIMARY KEY, kat INT)").unwrap();
+    db.execute("CREATE TABLE buyuk (id INT PRIMARY KEY, kid INT, deger INT)")
+        .unwrap();
+    db.execute("CREATE INDEX b_kid ON buyuk (kid)").unwrap();
+    db.execute("INSERT INTO kucuk VALUES (1,7), (2,9), (3,7)").unwrap();
+    let vals: Vec<String> = (1..=60).map(|i| format!("({i}, {}, {})", i % 3 + 1, i)).collect();
+    db.execute(&format!("INSERT INTO buyuk VALUES {}", vals.join(", ")))
+        .unwrap();
+
+    // İki tablolu join, küçük tarafta filtre — iki yazım da aynı toplamı verir.
+    let a = rows(&db, "SELECT SUM(b.deger) FROM buyuk b JOIN kucuk k ON b.kid = k.id WHERE k.kat = 7");
+    let b = rows(&db, "SELECT SUM(b.deger) FROM kucuk k JOIN buyuk b ON b.kid = k.id WHERE k.kat = 7");
+    assert_eq!(a, b);
+    assert_eq!(a, rows(&db, "SELECT SUM(deger) FROM buyuk WHERE kid IN (1, 3)"));
+
+    // GROUP BY + üç yol (üçüncü tablo) sonuç sırası korunur.
+    db.execute("CREATE TABLE etiket (id INT PRIMARY KEY, ad TEXT)").unwrap();
+    db.execute("INSERT INTO etiket VALUES (1,'a'), (2,'b'), (3,'c')").unwrap();
+    let g = rows(
+        &db,
+        "SELECT k.kat, COUNT(*) FROM buyuk b JOIN kucuk k ON b.kid = k.id \
+         JOIN etiket e ON k.id = e.id WHERE k.kat = 7 GROUP BY k.kat",
+    );
+    assert_eq!(g, vec![vec![i(7), i(40)]]);
+}
