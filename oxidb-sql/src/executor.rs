@@ -2749,13 +2749,24 @@ fn exec_select<S: Store>(store: &S, select: SelectStmt, params: &[Value]) -> Res
         select_simple(store, &schema, &src, &tuples, &select, &proj, params)?
     };
 
-    // DISTINCT: dedup after projection + ordering, before OFFSET/LIMIT.
+    // DISTINCT: dedup after projection + ordering, before OFFSET/LIMIT. A
+    // single output column (the common `SELECT DISTINCT city` / set-op arm)
+    // keys on the scalar directly — no per-row Vec allocation.
     let out_rows = if select.distinct {
-        let mut seen: std::collections::BTreeSet<Vec<IndexKey>> = std::collections::BTreeSet::new();
-        out_rows
-            .into_iter()
-            .filter(|row| seen.insert(row.iter().cloned().map(IndexKey).collect()))
-            .collect()
+        if columns.len() == 1 {
+            let mut seen: std::collections::BTreeSet<IndexKey> = std::collections::BTreeSet::new();
+            out_rows
+                .into_iter()
+                .filter(|row| seen.insert(IndexKey(row[0].clone())))
+                .collect()
+        } else {
+            let mut seen: std::collections::BTreeSet<Vec<IndexKey>> =
+                std::collections::BTreeSet::new();
+            out_rows
+                .into_iter()
+                .filter(|row| seen.insert(row.iter().cloned().map(IndexKey).collect()))
+                .collect()
+        }
     } else {
         out_rows
     };
