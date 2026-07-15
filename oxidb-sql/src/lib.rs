@@ -1277,6 +1277,98 @@ impl SqlEngine {
         Ok(parsed)
     }
 
+    /// EF Core's HiLo value generation emits `CREATE SEQUENCE`, `DROP
+    /// SEQUENCE`, and `SELECT NEXT VALUE FOR seq` — none of which sqlparser's
+    /// GenericDialect parses. Handle those three shapes directly (EF sends one
+    /// per command) before the SQL reaches the parser; returns None for
+    /// anything else so the normal path runs. Sequences persist in the catalog.
+    fn try_sequence_stmt(&self, sql: &str) -> Result<Option<QueryResult>> {
+        let t = sql.trim().trim_end_matches(';').trim();
+        let up = t.to_ascii_uppercase();
+        if !(up.starts_with("CREATE SEQUENCE")
+            || up.starts_with("DROP SEQUENCE")
+            || up.starts_with("SELECT NEXT VALUE FOR"))
+        {
+            return Ok(None);
+        }
+        let strip =
+            |s: &str| s.trim_matches(|c| matches!(c, '"' | '[' | ']' | '`')).to_string();
+        let toks: Vec<&str> = t.split_whitespace().collect();
+        let num = |s: &str| -> i64 {
+            s.trim_matches(|c: char| !c.is_ascii_digit() && c != '-')
+                .parse()
+                .unwrap_or(1)
+        };
+
+        if up.starts_with("CREATE SEQUENCE") {
+            // CREATE SEQUENCE <name> [AS type] [START WITH n] [INCREMENT BY n] ...
+            let name = strip(
+                toks.get(2)
+                    .ok_or_else(|| SqlError::Parse("CREATE SEQUENCE: missing name".into()))?,
+            );
+            let (mut start, mut inc) = (1i64, 1i64);
+            for i in 0..toks.len() {
+                let w = toks[i].to_ascii_uppercase();
+                if w == "START" && toks.get(i + 1).is_some_and(|s| s.eq_ignore_ascii_case("WITH")) {
+                    if let Some(v) = toks.get(i + 2) {
+                        start = num(v);
+                    }
+                }
+                if w == "INCREMENT" && toks.get(i + 1).is_some_and(|s| s.eq_ignore_ascii_case("BY"))
+                {
+                    if let Some(v) = toks.get(i + 2) {
+                        inc = num(v);
+                    }
+                }
+            }
+            let mut inner = self.inner.lock().unwrap();
+            inner
+                .catalog
+                .sequences
+                .insert(name, catalog::SequenceDef { next: start, increment: inc });
+            let dir = inner.dir.clone();
+            inner.catalog.save(&dir)?;
+            return Ok(Some(QueryResult::Ddl));
+        }
+
+        if up.starts_with("DROP SEQUENCE") {
+            let name = strip(
+                toks.last()
+                    .ok_or_else(|| SqlError::Parse("DROP SEQUENCE: missing name".into()))?,
+            );
+            let mut inner = self.inner.lock().unwrap();
+            let existed = inner.catalog.sequences.remove(&name).is_some();
+            if existed {
+                let dir = inner.dir.clone();
+                inner.catalog.save(&dir)?;
+            } else if !up.contains("IF EXISTS") {
+                return Err(SqlError::Unsupported(format!("no such sequence: {name}")));
+            }
+            return Ok(Some(QueryResult::Ddl));
+        }
+
+        // SELECT NEXT VALUE FOR <name>
+        let name = strip(
+            toks.get(4)
+                .ok_or_else(|| SqlError::Parse("NEXT VALUE FOR: missing sequence".into()))?,
+        );
+        let mut inner = self.inner.lock().unwrap();
+        let seq = inner
+            .catalog
+            .sequences
+            .get_mut(&name)
+            .ok_or_else(|| SqlError::Unsupported(format!("no such sequence: {name}")))?;
+        let v = seq.next;
+        seq.next = seq.next.saturating_add(seq.increment);
+        let dir = inner.dir.clone();
+        inner.catalog.save(&dir)?;
+        Ok(Some(QueryResult::Select {
+            columns: vec![String::new()],
+            types: vec![Some(types::SqlType::Int)],
+            rows: vec![vec![Value::Int(v)]],
+        }))
+    }
+
     fn run_session_batch<'a>(
         &'a self,
         sql: &str,
@@ -1284,6 +1376,13 @@ impl SqlEngine {
         txn: &mut Option<Transaction<'a>>,
     ) -> Result<Vec<QueryResult>> {
         use ast::Statement;
+        // HiLo sequence SQL that the parser can't handle, dispatched before it.
+        // Sequences are non-transactional (a value handed out is not rolled
+        // back), so this runs whether or not a transaction is open — EF wraps
+        // EnsureCreated's CREATE SEQUENCE commands in one.
+        if let Some(r) = self.try_sequence_stmt(sql)? {
+            return Ok(vec![r]);
+        }
         let statements = self.cached_parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
 

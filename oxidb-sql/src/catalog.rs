@@ -285,6 +285,18 @@ pub struct Catalog {
     /// Stored procedures, keyed by name (their own namespace).
     #[serde(default)]
     pub procedures: BTreeMap<String, ProcedureDef>,
+    /// Sequences, keyed by name. Backs EF Core's HiLo value generation
+    /// (`CREATE SEQUENCE` + `NEXT VALUE FOR`).
+    #[serde(default)]
+    pub sequences: BTreeMap<String, SequenceDef>,
+}
+
+/// A named integer sequence. `next` is the value the next `NEXT VALUE FOR`
+/// hands out; each call returns `next` then advances it by `increment`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SequenceDef {
+    pub next: i64,
+    pub increment: i64,
 }
 
 impl Catalog {
