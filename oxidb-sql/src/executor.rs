@@ -4716,6 +4716,147 @@ fn select_simple<S: Store>(
 }
 
 /// Aggregated projection: group tuples, compute aggregates per group.
+/// Collect the aggregates that can be computed in a single group pass: plain
+/// COUNT/SUM/AVG/MIN/MAX with no DISTINCT and no correlated argument (mode and
+/// distinct/correlated aggregates keep the per-aggregate path). Deduped by
+/// structural equality so `COUNT(*)` written twice folds one accumulator.
+fn collect_streamable_aggs(e: &Expr, out: &mut Vec<Expr>) {
+    match e {
+        Expr::Aggregate { func, arg, distinct }
+            if !*distinct
+                && !matches!(func, AggFunc::Mode)
+                && arg.as_deref().is_none_or(|a| !has_corr(a)) =>
+        {
+            if !out.contains(e) {
+                out.push(e.clone());
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_streamable_aggs(left, out);
+            collect_streamable_aggs(right, out);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            collect_streamable_aggs(expr, out);
+        }
+        Expr::Func { args, .. } => args.iter().for_each(|a| collect_streamable_aggs(a, out)),
+        Expr::In { expr, list, .. } => {
+            collect_streamable_aggs(expr, out);
+            list.iter().for_each(|i| collect_streamable_aggs(i, out));
+        }
+        Expr::InSet { expr, .. } => collect_streamable_aggs(expr, out),
+        _ => {}
+    }
+}
+
+/// One accumulator per streamable aggregate.
+enum AggAcc {
+    CountStar(i64),
+    Count(i64),
+    Sum(SumAcc),
+    Avg(SumAcc, i64),
+    MinMax(Option<Value>, Ordering),
+}
+
+/// Compute all `aggs` for one group in a single pass over its rows. Values
+/// line up with `aggs` positionally.
+fn compute_streamable_aggs<S: Store>(
+    store: &S,
+    aggs: &[Expr],
+    schema: &[ColRef],
+    src: &Sources,
+    tuples: &Tuples,
+    group: &[u32],
+    params: &[Value],
+) -> Result<Vec<Value>> {
+    let mut accs: Vec<AggAcc> = aggs
+        .iter()
+        .map(|a| match a {
+            Expr::Aggregate { func, arg, .. } => match func {
+                AggFunc::Count if arg.is_none() => AggAcc::CountStar(0),
+                AggFunc::Count => AggAcc::Count(0),
+                AggFunc::Sum => AggAcc::Sum(SumAcc::Empty),
+                AggFunc::Avg => AggAcc::Avg(SumAcc::Empty, 0),
+                AggFunc::Min => AggAcc::MinMax(None, Ordering::Less),
+                AggFunc::Max => AggAcc::MinMax(None, Ordering::Greater),
+                AggFunc::Mode => unreachable!("mode is not streamable"),
+            },
+            _ => unreachable!("non-aggregate collected as streamable"),
+        })
+        .collect();
+    for &ri in group {
+        let view = View {
+            src,
+            tuple: tuples.row(ri as usize),
+        };
+        for (acc, agg) in accs.iter_mut().zip(aggs) {
+            let Expr::Aggregate { arg, .. } = agg else {
+                unreachable!()
+            };
+            if let AggAcc::CountStar(n) = acc {
+                *n += 1;
+                continue;
+            }
+            let v = eval_scalar(arg.as_deref().expect("non-* has arg"), schema, &view, params)?;
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            match acc {
+                AggAcc::CountStar(_) => unreachable!(),
+                AggAcc::Count(n) => *n += 1,
+                AggAcc::Sum(s) => s.add(&v)?,
+                AggAcc::Avg(s, n) => {
+                    s.add(&v)?;
+                    *n += 1;
+                }
+                AggAcc::MinMax(best, want) => match best {
+                    None => *best = Some(v),
+                    Some(cur) if Value::total_order(&v, cur) == *want => *best = Some(v),
+                    _ => {}
+                },
+            }
+        }
+    }
+    Ok(accs
+        .into_iter()
+        .map(|acc| match acc {
+            AggAcc::CountStar(n) | AggAcc::Count(n) => Value::Int(n),
+            AggAcc::Sum(s) => s.into_sum(),
+            AggAcc::Avg(s, n) => {
+                if n == 0 {
+                    Value::Null
+                } else {
+                    s.into_avg(n)
+                }
+            }
+            AggAcc::MinMax(best, _) => best.unwrap_or(Value::Null),
+        })
+        .collect())
+}
+
+/// Replace each streamable aggregate node in `e` with its precomputed value.
+fn substitute_aggs(e: &mut Expr, precomp: &[(Expr, Value)]) {
+    if matches!(e, Expr::Aggregate { .. })
+        && let Some((_, v)) = precomp.iter().find(|(a, _)| a == e)
+    {
+        *e = Expr::Literal(v.clone());
+        return;
+    }
+    match e {
+        Expr::Binary { left, right, .. } => {
+            substitute_aggs(left, precomp);
+            substitute_aggs(right, precomp);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => substitute_aggs(expr, precomp),
+        Expr::Func { args, .. } => args.iter_mut().for_each(|a| substitute_aggs(a, precomp)),
+        Expr::In { expr, list, .. } => {
+            substitute_aggs(expr, precomp);
+            list.iter_mut().for_each(|i| substitute_aggs(i, precomp));
+        }
+        Expr::InSet { expr, .. } => substitute_aggs(expr, precomp),
+        _ => {}
+    }
+}
+
 fn select_aggregated<S: Store>(
     store: &S,
     schema: &[ColRef],
@@ -4741,19 +4882,50 @@ fn select_aggregated<S: Store>(
         .iter()
         .map(|(e, _)| proj.iter().position(|(_, pe)| pe == e))
         .collect();
+
+    // Streamable aggregates across the whole projection/having/order-by: these
+    // are computed in ONE pass per group (not one pass per aggregate), then
+    // substituted as literals before evaluating the surrounding expressions.
+    let mut streamable: Vec<Expr> = Vec::new();
+    for (_, e) in proj {
+        collect_streamable_aggs(e, &mut streamable);
+    }
+    if let Some(h) = &select.having {
+        collect_streamable_aggs(h, &mut streamable);
+    }
+    for (e, _) in &select.order_by {
+        collect_streamable_aggs(e, &mut streamable);
+    }
+
     let mut prepared: Vec<(Vec<Value>, Vec<IndexKey>, Vec<Value>)> =
         Vec::with_capacity(groups.len());
     for group in &groups {
+        // One-pass values for the streamable aggregates of this group.
+        let precomp: Vec<(Expr, Value)> = if streamable.is_empty() {
+            Vec::new()
+        } else {
+            let vals =
+                compute_streamable_aggs(store, &streamable, schema, src, tuples, group, params)?;
+            streamable.iter().cloned().zip(vals).collect()
+        };
+        let eval_grp = |e: &Expr| -> Result<Value> {
+            if precomp.is_empty() {
+                eval_agg(store, e, schema, src, tuples, group, params)
+            } else {
+                let mut e2 = e.clone();
+                substitute_aggs(&mut e2, &precomp);
+                eval_agg(store, &e2, schema, src, tuples, group, params)
+            }
+        };
+
         if let Some(having) = &select.having
-            && !truthy(&eval_agg(
-                store, having, schema, src, tuples, group, params,
-            )?)
+            && !truthy(&eval_grp(having)?)
         {
             continue;
         }
         let out: Vec<Value> = proj
             .iter()
-            .map(|(_, e)| eval_agg(store, e, schema, src, tuples, group, params))
+            .map(|(_, e)| eval_grp(e))
             .collect::<Result<_>>()?;
         // Evaluate the sort keys once per group (not per comparison); a key
         // that duplicates a projection reuses that already-computed value.
@@ -4763,12 +4935,12 @@ fn select_aggregated<S: Store>(
             .enumerate()
             .map(|(k, (e, _))| match key_from_proj[k] {
                 Some(j) => Ok(out[j].clone()),
-                None => eval_agg(store, e, schema, src, tuples, group, params),
+                None => eval_grp(e),
             })
             .collect::<Result<_>>()?;
         let dk: Vec<IndexKey> = don
             .iter()
-            .map(|e| eval_agg(store, e, schema, src, tuples, group, params).map(IndexKey))
+            .map(|e| eval_grp(e).map(IndexKey))
             .collect::<Result<_>>()?;
         prepared.push((keys, dk, out));
     }
