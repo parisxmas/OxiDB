@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -13,11 +12,11 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, List, ListItem, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation,
     ScrollbarState, Table,
 };
 use serde_json::{Value, json};
@@ -898,7 +897,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             app.auto_scroll = false;
-                            let filtered = app.filtered_logs();
                             if app.selected > 0 {
                                 app.selected -= 1;
                             }

@@ -186,9 +186,6 @@ fn audit_log_age_resets_on_rotation() {
 #[test]
 fn audit_log_age_fires_independently_of_size() {
     let dir = tempdir().unwrap();
-    let policy = RotationPolicy::size_or_age(512 * 1024, 0); // placeholder
-    drop(policy);
-
     let policy = RotationPolicy {
         max_bytes: Some(512 * 1024),
         max_age: Some(Duration::from_millis(300)),

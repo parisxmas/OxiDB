@@ -822,6 +822,7 @@ const DB_FUNCTIONS: &[&str] = &[
 
 pub struct Compiler {
     /// Counter for auto-generated variable names.
+    #[allow(dead_code)]
     var_counter: usize,
     /// Parameter names for the current procedure — used to emit `$param.x` references.
     params: Vec<String>,
@@ -835,6 +836,7 @@ impl Compiler {
         }
     }
 
+    #[allow(dead_code)]
     fn fresh_var(&mut self) -> String {
         self.var_counter += 1;
         format!("_t{}", self.var_counter)

@@ -532,6 +532,7 @@ impl BTreeCollection {
     /// Encode a Value to OxiWire bytes and pre-populate the bytes cache.
     /// Called from the insert path so subsequent reads of the same doc can
     /// skip the JSONB→Value→OxiWire round trip.
+    #[allow(dead_code)]
     fn populate_bytes_cache(&self, id: DocumentId, value: &Value) {
         let bytes = crate::wire_oxiwire::encode_value_owned(value);
         self.bytes_cache.put(id, Arc::<[u8]>::from(bytes));
@@ -972,12 +973,14 @@ impl BTreeCollection {
     /// Stream all documents sequentially via B-tree cursor.
     /// Does NOT populate the LRU cache (avoids thrashing for large scans).
     /// Collect all doc IDs from storage (lightweight, no value cloning).
+    #[allow(dead_code)]
     fn collect_doc_ids(&self) -> Vec<u64> {
         let mut ids = Vec::new();
         self.storage.scan_keys(|k| ids.push(k));
         ids
     }
 
+    #[allow(dead_code)]
     fn for_each_doc_streaming<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(&Value) -> Result<bool>,
@@ -993,6 +996,7 @@ impl BTreeCollection {
     }
 
     /// Unsorted doc iteration — faster for aggregation where order doesn't matter.
+    #[allow(dead_code)]
     fn for_each_doc_unordered<F>(&self, mut f: F) -> Result<()>
     where
         F: FnMut(&Value) -> Result<bool>,
@@ -3366,7 +3370,7 @@ impl BTreeCollection {
         // winning. `old_data` is the effective (staged) value too, so
         // apply_prepared's index maintenance chains correctly across the
         // per-doc mutation sequence.
-        let mut process_candidate =
+        let process_candidate =
             |id: DocumentId,
              committed: &Value,
              mutations: &mut Vec<crate::collection::PreparedMutation>,
@@ -3431,7 +3435,7 @@ impl BTreeCollection {
             // Re-acquire for unique checks in process_candidate
             let fi = self.field_indexes.read();
             let _ci = self.composite_indexes.read();
-            let mut process_candidate_reborrowed =
+            let process_candidate_reborrowed =
                 |id: DocumentId,
                  committed: &Value,
                  mutations: &mut Vec<crate::collection::PreparedMutation>,
@@ -4282,7 +4286,7 @@ mod tests {
 
         // doc_cache should NOT have been polluted by the cold path.
         let doc_stats = col.doc_cache_stats();
-        assert!(doc_stats.hits + doc_stats.misses >= 0); // smoke; no fixed assertion
+        let _ = doc_stats.hits + doc_stats.misses; // smoke: stats erişilebilir (panik yok)
     }
 
     #[test]

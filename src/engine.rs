@@ -442,6 +442,7 @@ pub struct OxiDb {
     active_transactions: RwLock<HashMap<TransactionId, Mutex<Transaction>>>,
     encryption: Option<Arc<EncryptionKey>>,
     verbose: bool,
+    #[allow(dead_code)]
     log_callback: Option<LogCallback>,
     change_broker: ChangeStreamBroker,
     #[cfg(not(target_arch = "wasm32"))]

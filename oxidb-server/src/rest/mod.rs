@@ -472,23 +472,6 @@ fn handle_drop_collection(name: &str, state: &RestState) -> Result<Value, (u16, 
     Ok(json!({"dropped": name}))
 }
 
-fn handle_insert(
-    col: &str,
-    req: &HttpRequest,
-    state: &RestState,
-) -> Result<Value, (u16, &'static str)> {
-    let body = parse_json_body(req)?;
-    if let Some(doc) = body.get("doc") {
-        let id = state.db.insert(col, doc.clone()).map_err(db_err)?;
-        Ok(json!({"id": id}))
-    } else if let Some(docs) = body.get("docs").and_then(|v| v.as_array()) {
-        let ids = state.db.insert_many(col, docs.clone()).map_err(db_err)?;
-        Ok(json!({"ids": ids}))
-    } else {
-        Err((400, "missing 'doc' or 'docs'"))
-    }
-}
-
 fn handle_find(
     col: &str,
     req: &HttpRequest,
@@ -525,41 +508,6 @@ fn handle_find(
         .find_with_options(col, &query, &opts)
         .map_err(db_err)?;
     Ok(json!(docs))
-}
-
-fn handle_update(
-    col: &str,
-    req: &HttpRequest,
-    state: &RestState,
-) -> Result<Value, (u16, &'static str)> {
-    let body = parse_json_body(req)?;
-    let query = body.get("query").ok_or((400, "missing 'query'"))?;
-    let update = body.get("update").ok_or((400, "missing 'update'"))?;
-    let one = body.get("one").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    if one {
-        let n = state.db.update_one(col, query, update).map_err(db_err)?;
-        Ok(json!({"modified": n}))
-    } else {
-        let n = state.db.update(col, query, update).map_err(db_err)?;
-        Ok(json!({"modified": n}))
-    }
-}
-
-fn handle_delete(
-    col: &str,
-    req: &HttpRequest,
-    state: &RestState,
-) -> Result<Value, (u16, &'static str)> {
-    let body = if req.body.is_empty() {
-        let q = query_param_json(&req.query, "q").unwrap_or(json!({}));
-        json!({"query": q})
-    } else {
-        parse_json_body(req)?
-    };
-    let query = body.get("query").ok_or((400, "missing 'query'"))?;
-    let n = state.db.delete(col, query).map_err(db_err)?;
-    Ok(json!({"deleted": n}))
 }
 
 fn handle_count(

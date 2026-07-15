@@ -201,8 +201,11 @@ pub fn inspect(data_dir: &Path) -> Result<Vec<FileReport>, String> {
 #[derive(Debug, Default)]
 pub struct RunOptions {
     pub dry_run: bool,
+    #[allow(dead_code)]
     pub no_backup: bool,
+    #[allow(dead_code)]
     pub in_place: bool,
+    #[allow(dead_code)]
     pub out: Option<PathBuf>,
 }
 

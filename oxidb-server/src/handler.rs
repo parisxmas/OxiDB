@@ -1480,7 +1480,7 @@ fn handle_request_session_inner(
                 Some(n) => n,
                 None => return err_bytes("missing 'name'"),
             };
-            let mut def = request.clone();
+            let def = request.clone();
             match db.create_alert(name, def) {
                 Ok(()) => ok_bytes(json!(format!("alert created: {name}"))),
                 Err(e) => err_bytes(&e.to_string()),

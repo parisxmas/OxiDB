@@ -3,7 +3,6 @@
 // delta over the time between calls, so the first poll always returns
 // 0.0 and subsequent polls report the average since the previous one.
 
-use std::fs;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Instant;

@@ -1969,6 +1969,7 @@ impl Collection {
     /// Execute a streaming `$group` aggregation without materializing all docs.
     /// Compute segment boundaries for parallel scanning.
     /// Returns a list of (start_offset, end_offset) pairs covering the whole file.
+    #[allow(dead_code)]
     fn compute_scan_segments(&self, num_threads: usize) -> Vec<(u64, u64)> {
         let file_size = self.storage.file_size();
         if file_size == 0 || num_threads <= 1 {
@@ -1997,6 +1998,7 @@ impl Collection {
     ///
     /// For large collections (>= 100K docs) with raw-eligible pipelines,
     /// uses parallel segmented scanning for significant speedup.
+    #[allow(dead_code)]
     pub(crate) fn aggregate_streaming(
         &self,
         match_query_json: Option<&Value>,
@@ -2221,6 +2223,7 @@ impl Collection {
     }
 
     /// Indexed match path — batch pread + raw JSONB path (extracted for reuse).
+    #[allow(dead_code)]
     fn aggregate_streaming_indexed(
         &self,
         query: &Query,

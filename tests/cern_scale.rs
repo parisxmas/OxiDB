@@ -117,7 +117,6 @@ fn hep_workload_scale_invariants_hold() {
     // resolution should be O(log n + result_size). Without, it'd
     // walk the whole corpus.
     let narrow_query = json!({ "energy": 42 });
-    let expected_count = total_docs / 1000; // rough — exact below
 
     let idx_query_t0 = Instant::now();
     let idx_hits = db.find("events", &narrow_query).expect("index query");

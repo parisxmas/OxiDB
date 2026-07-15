@@ -3698,6 +3698,7 @@ fn finalize_accumulator(state: AccumulatorState) -> Value {
 
 /// Merge two accumulator states (for parallel aggregation).
 /// `self_state` is from the earlier segment, `other` from the later.
+#[allow(dead_code)]
 fn merge_accumulator_state(self_state: &mut AccumulatorState, other: AccumulatorState) {
     match (self_state, other) {
         (AccumulatorState::Sum(s), AccumulatorState::Sum(o)) => *s += o,
@@ -3850,6 +3851,7 @@ fn hash_raw_owned<H: Hasher>(owned: &jsonb::OwnedJsonb, state: &mut H) -> bool {
 
 /// Check if all expressions in the pipeline are raw-JSONB-compatible
 /// (only FieldRef and Literal — no arithmetic expressions).
+#[allow(dead_code)]
 pub(crate) fn is_raw_eligible(key: &GroupKey, accumulators: &[(String, Accumulator)]) -> bool {
     let key_ok = match key {
         GroupKey::Null => true,
@@ -4082,6 +4084,7 @@ impl StreamingGroup {
     /// Merge another StreamingGroup into this one (for combining parallel results).
     /// The `other` group should come from a later segment so that First/Last
     /// semantics are preserved (self = earlier, other = later).
+    #[allow(dead_code)]
     pub(crate) fn merge(&mut self, other: Self) {
         for (key_val, other_states) in other.group_data {
             // Recompute the hash from the materialized key — both sides

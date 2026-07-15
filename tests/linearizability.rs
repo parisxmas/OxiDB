@@ -64,7 +64,7 @@ fn run_txn(
     value_ctr: &Arc<AtomicU64>,
 ) -> Option<TxnRecord> {
     // xorshift
-    let mut next = |rng: &mut u64| {
+    let next = |rng: &mut u64| {
         *rng ^= *rng << 13;
         *rng ^= *rng >> 7;
         *rng ^= *rng << 17;

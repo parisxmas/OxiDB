@@ -36,7 +36,7 @@ use sha1::Digest;
 use crate::auth;
 use crate::jwt;
 use oxidb::OxiDb;
-use oxidb::change_stream::{SubscriberId, WatchFilter, WatchHandle};
+use oxidb::change_stream::{WatchFilter, WatchHandle};
 
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
@@ -307,6 +307,7 @@ fn send_json(stream: &mut TcpStream, val: &Value) -> bool {
 
 struct Subscription {
     handle: WatchHandle,
+    #[allow(dead_code)]
     collection: Option<String>,
     query: Option<Value>,
     /// The engine this watch was registered on (its database).

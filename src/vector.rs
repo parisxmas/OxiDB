@@ -501,6 +501,7 @@ struct FlatVectorCache {
     inner: std::sync::Mutex<FlatVectorCacheInner>,
 }
 
+#[allow(dead_code)]
 struct FlatVectorCacheInner {
     data: Vec<f32>,
     doc_ids: Vec<DocumentId>,

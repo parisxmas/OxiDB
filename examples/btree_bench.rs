@@ -78,7 +78,7 @@ fn main() {
 
     // ── B-tree ──
     println!("\n--- B-tree storage ---");
-    let mut col_bt =
+    let col_bt =
         oxidb::btree_collection::BTreeCollection::open("bench_btree", data_dir, None).unwrap();
 
     let t0 = Instant::now();

@@ -5,7 +5,6 @@
 //!
 //! Enabled when `OXIDB_JWT_SECRET` is set. Without it, REST/WS APIs are open.
 
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;

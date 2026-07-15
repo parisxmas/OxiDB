@@ -929,7 +929,6 @@ fn is_known_command(name: &str) -> bool {
             | "HVALS" | "HLEN" | "HINCRBY" | "LPUSH" | "RPUSH" | "LPOP" | "RPOP"
             | "LLEN" | "LRANGE" | "LINDEX" | "SADD" | "SREM" | "SMEMBERS" | "SISMEMBER"
             | "SCARD" | "ZADD" | "ZREM" | "ZSCORE" | "ZCARD" | "ZCOUNT" | "ZINCRBY"
-            | "DECRBYFLOATGE"
             | "ZRANK" | "ZREVRANK" | "ZRANGE" | "ZREVRANGE" | "ZRANGEBYSCORE"
             | "ZREVRANGEBYSCORE" | "ZPOPMIN" | "ZPOPMAX" | "PUBLISH" | "HELLO"
             | "GETDEL" | "SETRANGE" | "PEXPIREAT" | "COPY" | "SINTER" | "SUNION"

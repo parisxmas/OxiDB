@@ -4760,7 +4760,7 @@ enum AggAcc {
 /// Compute all `aggs` for one group in a single pass over its rows. Values
 /// line up with `aggs` positionally.
 fn compute_streamable_aggs<S: Store>(
-    store: &S,
+    _store: &S,
     aggs: &[Expr],
     schema: &[ColRef],
     src: &Sources,
