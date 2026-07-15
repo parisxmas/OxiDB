@@ -6,7 +6,7 @@ use common::*;
 use oxidb_sql::Value;
 
 fn t(s: &str) -> Value {
-    Value::Text(s.to_string())
+    Value::Text(s.to_string().into())
 }
 
 fn setup() -> (tempfile::TempDir, oxidb_sql::SqlEngine) {

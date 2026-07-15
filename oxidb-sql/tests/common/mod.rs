@@ -73,7 +73,7 @@ pub fn i(n: i64) -> Value {
     Value::Int(n)
 }
 pub fn t(s: &str) -> Value {
-    Value::Text(s.to_string())
+    Value::Text(s.to_string().into())
 }
 pub fn d(f: f64) -> Value {
     Value::Double(f)

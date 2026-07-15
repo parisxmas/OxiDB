@@ -183,7 +183,7 @@ pub(crate) fn execute<S: Store>(
 /// Answer a `SHOW ...` / `DESCRIBE ...` introspection statement from the
 /// catalog as an ordinary result set.
 fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
-    let text = |s: &str| Value::Text(s.to_string());
+    let text = |s: &str| Value::Text((s.to_string()).into());
     match kind {
         ShowKind::Tables => Ok(QueryResult::Select {
             columns: vec!["table".into(), "rows".into()],
@@ -205,7 +205,7 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
             rows: store
                 .list_views()
                 .into_iter()
-                .map(|(name, sql)| vec![Value::Text(name), Value::Text(sql)])
+                .map(|(name, sql)| vec![Value::Text((name).into()), Value::Text((sql).into())])
                 .collect(),
         }),
         ShowKind::Procedures => Ok(QueryResult::Select {
@@ -238,10 +238,10 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
                         def.body
                     };
                     vec![
-                        Value::Text(name),
-                        Value::Text(params),
+                        Value::Text((name).into()),
+                        Value::Text((params).into()),
                         text(def.language.as_str()),
-                        Value::Text(definition),
+                        Value::Text((definition).into()),
                     ]
                 })
                 .collect(),
@@ -509,7 +509,7 @@ fn coerce_call_arg(v: Value, ty: SqlType, pname: &str) -> Result<Value> {
         },
         (SqlType::Double, Value::Decimal(d)) => Value::Double(d.to_f64()),
         (SqlType::Blob, Value::Text(t)) => match crate::catalog::base64_decode(&t) {
-            Ok(b) => Value::Bytes(b),
+            Ok(b) => Value::Bytes((b).into()),
             Err(()) => {
                 return Err(SqlError::Eval(format!(
                     "parameter {pname:?}: invalid base64 for BLOB"
@@ -3717,7 +3717,7 @@ fn hash_key_component(v: &Value) -> Option<HashKey> {
     let norm = |f: f64| (if f == 0.0 { 0.0 } else { f }).to_bits();
     match v {
         Value::Null => None,
-        Value::Bytes(b) => Some(HashKey::Bytes(b.clone())),
+        Value::Bytes(b) => Some(HashKey::Bytes(b.to_vec())),
         Value::Int(n) => Some(HashKey::Num(norm(*n as f64))),
         // NaN = NaN is not true in SQL, so a NaN key can never equi-match —
         // exclude it (like NULL) rather than let bit-equality pair two NaNs.
@@ -3728,7 +3728,7 @@ fn hash_key_component(v: &Value) -> Option<HashKey> {
         // which treats 2 and 2.00 as equal — both hash to the same f64 bits).
         Value::Decimal(d) => Some(HashKey::Num(norm(d.to_f64()))),
         Value::Bool(b) => Some(HashKey::Bool(*b)),
-        Value::Text(s) => Some(HashKey::Text(s.clone())),
+        Value::Text(s) => Some(HashKey::Text(s.to_string())),
     }
 }
 
@@ -5598,7 +5598,7 @@ fn str_ref<'a, R: RowLike + ?Sized>(
             Some(Ok(Some(substr_slice(s, start, len))))
         }
         _ => match val_ref(e, row, params)? {
-            Value::Text(s) => Some(Ok(Some(s.as_str()))),
+            Value::Text(s) => Some(Ok(Some(&**s))),
             Value::Null => Some(Ok(None)),
             _ => None,
         },
@@ -5656,7 +5656,7 @@ fn eval_func_ref<R: RowLike + ?Sized>(
         params: &'a [Value],
     ) -> Option<Option<&'a str>> {
         match val_ref(e, row, params)? {
-            Value::Text(s) => Some(Some(s.as_str())),
+            Value::Text(s) => Some(Some(&**s)),
             Value::Null => Some(None),
             _ => None,
         }
@@ -5701,7 +5701,7 @@ where
     fn as_text(v: Value, what: &str) -> Result<Option<String>> {
         match v {
             Value::Null => Ok(None),
-            Value::Text(s) => Ok(Some(s)),
+            Value::Text(s) => Ok(Some(s.into())),
             Value::Int(n) => Ok(Some(n.to_string())),
             Value::Double(f) => Ok(Some(f.to_string())),
             Value::Bool(b) => Ok(Some(b.to_string())),
@@ -5768,11 +5768,11 @@ where
             }
         }
         ScalarFunc::Upper => Ok(match as_text(eval(&args[0])?, "UPPER")? {
-            Some(s) => Value::Text(s.to_uppercase()),
+            Some(s) => Value::Text((s.to_uppercase()).into()),
             None => Value::Null,
         }),
         ScalarFunc::Lower => Ok(match as_text(eval(&args[0])?, "LOWER")? {
-            Some(s) => Value::Text(s.to_lowercase()),
+            Some(s) => Value::Text((s.to_lowercase()).into()),
             None => Value::Null,
         }),
         ScalarFunc::Length => Ok(match as_text(eval(&args[0])?, "LENGTH")? {
@@ -5802,7 +5802,7 @@ where
                     ScalarFunc::Rtrim => s.trim_end_matches(pred),
                     _ => s.trim_matches(pred),
                 }
-                .to_string(),
+                .into(),
             ))
         }
         ScalarFunc::Concat => {
@@ -5813,7 +5813,7 @@ where
                     None => return Ok(Value::Null),
                 }
             }
-            Ok(Value::Text(out))
+            Ok(Value::Text((out).into()))
         }
         ScalarFunc::Replace => {
             let (s, from, to) = (
@@ -5822,8 +5822,8 @@ where
                 as_text(eval(&args[2])?, "REPLACE")?,
             );
             Ok(match (s, from, to) {
-                (Some(s), Some(f), Some(t)) if !f.is_empty() => Value::Text(s.replace(&f, &t)),
-                (Some(s), Some(_), Some(_)) => Value::Text(s),
+                (Some(s), Some(f), Some(t)) if !f.is_empty() => Value::Text((s.replace(&f, &t)).into()),
+                (Some(s), Some(_), Some(_)) => Value::Text((s).into()),
                 _ => Value::Null,
             })
         }
@@ -5858,7 +5858,7 @@ where
                 }
                 None => it.collect(),
             };
-            Ok(Value::Text(out))
+            Ok(Value::Text((out).into()))
         }
         ScalarFunc::Abs => Ok(match eval(&args[0])? {
             Value::Null => Value::Null,
@@ -6012,7 +6012,8 @@ where
                 } else {
                     format!("{s}{pad}")
                 }
-            }))
+            }
+            .into()))
         }
         ScalarFunc::Sin
         | ScalarFunc::Cos
@@ -6102,7 +6103,7 @@ where
         ScalarFunc::Collate { case_insensitive } => Ok(match eval(&args[0])? {
             Value::Null => Value::Null,
             Value::Text(s) => Value::Text(if case_insensitive {
-                s.to_lowercase()
+                s.to_lowercase().into()
             } else {
                 s
             }),
@@ -6182,17 +6183,17 @@ fn cast_value(v: Value, ty: SqlType) -> Result<Value> {
         // DECIMAL → other numeric / text.
         (Value::Decimal(d), T::Int) => Value::Int(d.to_i64()),
         (Value::Decimal(d), T::Double) => Value::Double(d.to_f64()),
-        (Value::Decimal(d), T::Text) => Value::Text(d.to_string()),
+        (Value::Decimal(d), T::Text) => Value::Text((d.to_string()).into()),
         (Value::Int(n), T::Double) => Value::Double(n as f64),
         (Value::Int(n), T::Bool) => Value::Bool(n != 0),
         (Value::Int(n), T::Timestamp) => Value::Timestamp(n),
         (Value::Double(f), T::Int) => Value::Int(f.trunc() as i64),
         (Value::Bool(b), T::Int) => Value::Int(b as i64),
         (Value::Timestamp(t), T::Int) => Value::Int(t),
-        (Value::Int(n), T::Text) => Value::Text(n.to_string()),
-        (Value::Double(f), T::Text) => Value::Text(f.to_string()),
-        (Value::Bool(b), T::Text) => Value::Text(b.to_string()),
-        (Value::Timestamp(t), T::Text) => Value::Text(t.to_string()),
+        (Value::Int(n), T::Text) => Value::Text((n.to_string()).into()),
+        (Value::Double(f), T::Text) => Value::Text((f.to_string()).into()),
+        (Value::Bool(b), T::Text) => Value::Text((b.to_string()).into()),
+        (Value::Timestamp(t), T::Text) => Value::Text((t.to_string()).into()),
         (Value::Text(s), T::Int) => Value::Int(
             s.trim()
                 .parse()
@@ -6936,7 +6937,7 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
             (l, r) => {
                 let to_s = |v: Value| -> Result<String> {
                     Ok(match v {
-                        Value::Text(s) => s,
+                        Value::Text(s) => s.into(),
                         Value::Int(n) => n.to_string(),
                         Value::Double(f) => f.to_string(),
                         Value::Bool(b) => b.to_string(),
@@ -6944,7 +6945,7 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value> {
                         other => return Err(SqlError::Eval(format!("|| of {other:?}"))),
                     })
                 };
-                Value::Text(format!("{}{}", to_s(l)?, to_s(r)?))
+                Value::Text((format!("{}{}", to_s(l)?, to_s(r)?)).into())
             }
         }),
         BinOp::And => Ok(three_valued(l, r, false)),
@@ -7026,7 +7027,7 @@ fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
     // `text + text` is concatenation (SQL Server style; EF's default string
     // Add renders as `+`).
     if let (Value::Text(a), Value::Text(b), BinOp::Add) = (&l, &r, op) {
-        return Ok(Value::Text(format!("{a}{b}")));
+        return Ok(Value::Text((format!("{a}{b}")).into()));
     }
     // Timestamp arithmetic: ts ± <ms> stays a timestamp; ts - ts is the
     // difference in milliseconds. (INTERVAL literals fold to ms integers.)

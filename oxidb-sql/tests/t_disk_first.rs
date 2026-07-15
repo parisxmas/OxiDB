@@ -10,7 +10,7 @@ use common::*;
 use oxidb_sql::{SqlEngine, SqlOptions, Value};
 
 fn t(s: &str) -> Value {
-    Value::Text(s.to_string())
+    Value::Text(s.to_string().into())
 }
 
 fn disk_opts() -> SqlOptions {

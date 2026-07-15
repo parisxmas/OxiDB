@@ -323,7 +323,7 @@ fn sql_to_cobra(v: &Value) -> CValue {
         Value::Null => CValue::Null,
         Value::Int(n) => CValue::Int(*n),
         Value::Double(f) => CValue::Float(*f),
-        Value::Text(s) => CValue::Str(Rc::from(s.as_str())),
+        Value::Text(s) => CValue::Str(Rc::from(&**s)),
         Value::Bool(b) => CValue::Bool(*b),
         // Epoch milliseconds, exactly as stored (and as the JSON wire shows).
         Value::Timestamp(t) => CValue::Int(*t),
@@ -343,7 +343,7 @@ fn cobra_to_sql_param(v: &CValue) -> std::result::Result<Value, NativeError> {
         CValue::Null => Value::Null,
         CValue::Int(n) => Value::Int(*n),
         CValue::Float(f) => Value::Double(*f),
-        CValue::Str(s) => Value::Text(s.to_string()),
+        CValue::Str(s) => Value::Text((s.to_string()).into()),
         CValue::Bool(b) => Value::Bool(*b),
         CValue::Decimal(d) => match Decimal::parse(&d.inspect()) {
             Some(dec) => Value::Decimal(Box::new(dec)),
@@ -365,13 +365,13 @@ fn cobra_to_sql_cell(name: &str, v: &CValue) -> Result<Value> {
         CValue::Null => Value::Null,
         CValue::Int(n) => Value::Int(*n),
         CValue::Float(f) => Value::Double(*f),
-        CValue::Str(s) => Value::Text(s.to_string()),
+        CValue::Str(s) => Value::Text((s.to_string()).into()),
         CValue::Bool(b) => Value::Bool(*b),
         CValue::Decimal(d) => match Decimal::parse(&d.inspect()) {
             Some(dec) => Value::Decimal(Box::new(dec)),
             None => Value::Double(d.to_f64()),
         },
-        CValue::List(_) | CValue::Dict(_) => Value::Text(inspect(v)),
+        CValue::List(_) | CValue::Dict(_) => Value::Text((inspect(v)).into()),
         other => {
             return Err(SqlError::Eval(format!(
                 "procedure {name:?}: unsupported result value: {}",

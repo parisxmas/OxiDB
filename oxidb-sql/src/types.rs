@@ -33,10 +33,14 @@ pub enum SqlType {
 #[serde(tag = "t", content = "v", rename_all = "lowercase")]
 pub enum Value {
     Null,
-    Bytes(Vec<u8>),
+    // Text/Bytes are boxed slices, not String/Vec: they drop the unused
+    // capacity word, keeping `Value` at 24 bytes (the hot per-row cell type).
+    // They are immutable once built (no push/append anywhere), so a boxed
+    // slice loses nothing.
+    Bytes(Box<[u8]>),
     Int(i64),
     Double(f64),
-    Text(String),
+    Text(Box<str>),
     Bool(bool),
     /// Epoch milliseconds.
     Timestamp(i64),
@@ -215,7 +219,7 @@ fn decode_cell(bytes: &[u8], pos: &mut usize) -> Result<Value> {
                 .ok_or_else(|| SqlError::Corrupt("truncated bytes".into()))?
                 .to_vec();
             *pos = end;
-            Ok(Value::Bytes(raw))
+            Ok(Value::Bytes((raw).into()))
         }
         TAG_DECIMAL => {
             let mantissa = i128::from_le_bytes(read_16(bytes, pos)?);
@@ -232,7 +236,7 @@ fn decode_cell(bytes: &[u8], pos: &mut usize) -> Result<Value> {
                 .map_err(|_| SqlError::Corrupt("invalid utf8 in text cell".into()))?
                 .to_string();
             *pos = end;
-            Ok(Value::Text(s))
+            Ok(Value::Text((s).into()))
         }
         other => Err(SqlError::Corrupt(format!("unknown cell tag {other}"))),
     }

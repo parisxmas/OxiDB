@@ -2637,7 +2637,7 @@ fn literal_from_value(v: &sp::Value) -> Result<Value> {
         sp::Value::Number(s, _) => parse_number(s),
         sp::Value::SingleQuotedString(s)
         | sp::Value::DoubleQuotedString(s)
-        | sp::Value::EscapedStringLiteral(s) => Ok(Value::Text(s.clone())),
+        | sp::Value::EscapedStringLiteral(s) => Ok(Value::Text((s.clone()).into())),
         sp::Value::Boolean(b) => Ok(Value::Bool(*b)),
         sp::Value::Null => Ok(Value::Null),
         other => Err(SqlError::Unsupported(format!("literal {other:?}"))),

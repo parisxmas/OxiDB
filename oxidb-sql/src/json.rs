@@ -84,7 +84,7 @@ pub fn json_to_value(v: &Json) -> Result<Value, String> {
     match v {
         Json::Null => Ok(Value::Null),
         Json::Bool(b) => Ok(Value::Bool(*b)),
-        Json::String(s) => Ok(Value::Text(s.clone())),
+        Json::String(s) => Ok(Value::Text((s.clone()).into())),
         Json::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(Value::Int(i))

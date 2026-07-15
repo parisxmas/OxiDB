@@ -105,7 +105,7 @@ impl Table {
                 // byte type); invalid base64 fails type validation below.
                 (SqlType::Blob, Value::Text(s)) => {
                     if let Ok(b) = base64_decode(s) {
-                        *cell = Value::Bytes(b);
+                        *cell = Value::Bytes((b).into());
                     }
                 }
                 // DECIMAL columns accept exact conversions: Int and Text

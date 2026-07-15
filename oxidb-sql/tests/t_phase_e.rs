@@ -8,7 +8,7 @@ use common::*;
 use oxidb_sql::Value;
 
 fn t(s: &str) -> Value {
-    Value::Text(s.to_string())
+    Value::Text(s.to_string().into())
 }
 
 fn seed(db: &oxidb_sql::SqlEngine) {

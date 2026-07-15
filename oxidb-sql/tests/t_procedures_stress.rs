@@ -33,8 +33,8 @@ fn seed(db: &SqlEngine) {
         db.execute_params(
             "INSERT INTO musteri (ad, segment, puan, bakiye) VALUES ($1, $2, $3, $4)",
             &[
-                Value::Text(format!("musteri{i:02}")),
-                Value::Text(seg.to_string()),
+                Value::Text(format!("musteri{i:02}").into()),
+                Value::Text(seg.to_string().into()),
                 Value::Int((i as i64 * 37) % 500),
                 Value::Double(((i as i64 * 131) % 9000) as f64),
             ],
@@ -47,8 +47,8 @@ fn seed(db: &SqlEngine) {
         db.execute_params(
             "INSERT INTO urun (ad, kategori, fiyat, maliyet, stok) VALUES ($1, $2, $3, $4, $5)",
             &[
-                Value::Text(format!("urun{i:02}")),
-                Value::Text(kat),
+                Value::Text(format!("urun{i:02}").into()),
+                Value::Text(kat.into()),
                 Value::Double(fiyat),
                 Value::Double(fiyat * 0.6),
                 Value::Int(100_000),

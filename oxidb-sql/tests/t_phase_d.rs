@@ -7,7 +7,7 @@ use common::*;
 use oxidb_sql::{QueryResult, SqlEngine, SqlOptions, Value};
 
 fn t(s: &str) -> Value {
-    Value::Text(s.to_string())
+    Value::Text(s.to_string().into())
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn decimal_and_blob_types() {
         rows[0][0],
         Value::Decimal(Box::new(oxidb_sql::Decimal::parse("12.50").unwrap()))
     );
-    assert_eq!(rows[0][1], Value::Bytes(b"hello".to_vec()));
+    assert_eq!(rows[0][1], Value::Bytes(b"hello".to_vec().into()));
 }
 
 #[test]

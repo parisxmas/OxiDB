@@ -48,7 +48,7 @@ fn main() {
             batch.push(vec![
                 oxidb_sql::Value::Int(i as i64),
                 oxidb_sql::Value::Int((i % 9973) as i64),
-                oxidb_sql::Value::Text(format!("kind-{}", i % 17)),
+                oxidb_sql::Value::Text(format!("kind-{}", i % 17).into()),
                 oxidb_sql::Value::Double(i as f64 * 0.5),
             ]);
             if batch.len() == 1000 {

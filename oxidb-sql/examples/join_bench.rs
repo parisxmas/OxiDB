@@ -135,7 +135,7 @@ fn fmt_value(v: &Value) -> String {
         Value::Null => String::new(),
         Value::Int(n) => n.to_string(),
         Value::Double(f) => f.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Timestamp(t) => t.to_string(),
         Value::Bytes(b) => format!("<{} bytes>", b.len()),

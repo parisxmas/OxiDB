@@ -7,7 +7,7 @@ use common::*;
 use oxidb_sql::{QueryResult, SqlEngine, Value};
 
 fn t(s: &str) -> Value {
-    Value::Text(s.to_string())
+    Value::Text(s.to_string().into())
 }
 
 /// Run one INSERT and return (affected, last_insert_id).
