@@ -355,3 +355,36 @@ fn nullif_basics_and_arity_errors() {
     assert!(db.execute("SELECT IFNULL(a, b, 0) FROM t").is_err());
     assert!(db.execute("SELECT COALESCE() FROM t").is_err());
 }
+
+/// Sabit alt ifadeler (EF Core'un satır içine gömdüğü `LENGTH('...')`,
+/// `x * 60000` gibi) bağlama zamanında bir kez katlanır — sonuç, satır başına
+/// hesaplamayla aynı olmalı; kolonlu ifadeler ise değişmeden kalır.
+#[test]
+fn constant_folding_preserves_semantics() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, ad TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'Customer 000007'), (2, 'baska')")
+        .unwrap();
+
+    // LENGTH('Customer 00') = 11 sabiti; SUBSTRING kolon üzerinde çalışmaya
+    // devam eder. Yalnızca 'Customer 00' ile başlayan ad eşleşir.
+    assert_eq!(
+        rows(&db, "SELECT id FROM t WHERE SUBSTRING(ad, 1, LENGTH('Customer 00')) = 'Customer 00'"),
+        vec![vec![i(1)]]
+    );
+    // Aritmetik sabit katlama: 2 * 60000 + 1 = 120001.
+    assert_eq!(
+        rows(&db, "SELECT 2 * 60000 + 1 FROM t WHERE id = 1"),
+        vec![vec![i(120001)]]
+    );
+    // Sabit NULL yayılımı korunur.
+    assert_eq!(
+        rows(&db, "SELECT COALESCE(NULL, LENGTH('abc'), 99) FROM t WHERE id = 1"),
+        vec![vec![i(3)]]
+    );
+    // Kolon içeren ifade katlanmaz ama doğru sonucu verir.
+    assert_eq!(
+        rows(&db, "SELECT LENGTH(ad) FROM t WHERE id = 2"),
+        vec![vec![i(5)]]
+    );
+}

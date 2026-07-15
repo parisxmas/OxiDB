@@ -336,6 +336,135 @@ Run("groupby_having", 20, (db, i) =>
 Run("string_multi", 30, (db, i) =>
     db.Customers.Count(c => c.Name.StartsWith("Customer 00") && c.Name.EndsWith("7")));
 
+// ── advanced benches (harder OLAP / correlated / window shapes) ──────────────
+
+Console.WriteLine("\n── advanced benches ───────────────────────────────────────");
+
+// Correlated scalar subquery in projection: each customer with the size of
+// their largest single order (EF renders a correlated aggregate subquery).
+Run("correlated_scalar", 20, (db, i) =>
+    db.Customers.Where(c => c.Id <= 200)
+        .Select(c => new
+        {
+            c.Name,
+            MaxOrder = db.Orders.Where(o => o.CustomerId == c.Id).Max(o => (double?)o.Amount) ?? 0,
+        })
+        .ToList());
+
+// Subquery in WHERE against a global aggregate: customers whose total spend
+// exceeds the average customer's total spend.
+Run("above_average_spenders", 15, (db, i) =>
+{
+    var avg = db.Orders.Average(o => o.Amount);
+    db.Customers
+        .Where(c => c.Orders.Sum(o => o.Amount) > avg * 10)
+        .Select(c => c.Name)
+        .ToList();
+});
+
+// Window function: rank customers by spend within their city, keep the top of
+// each (ROW_NUMBER() OVER (PARTITION BY city ORDER BY spend DESC)).
+Run("window_rank_per_city", 15, (db, i) =>
+    db.Customers
+        .Select(c => new { c.City, c.Name, Spend = c.Orders.Sum(o => o.Amount) })
+        .GroupBy(x => x.City)
+        .Select(g => g.OrderByDescending(x => x.Spend).First())
+        .ToList());
+
+// Conditional aggregation: per status, count and the sum of only the large
+// orders (EF renders SUM(CASE WHEN ... THEN amount ELSE 0 END)).
+Run("conditional_aggregate", 20, (db, i) =>
+    db.Orders.GroupBy(o => o.Status)
+        .Select(g => new
+        {
+            Status = g.Key,
+            Total = g.Count(),
+            BigSum = g.Sum(o => o.Amount > 500 ? o.Amount : 0),
+            BigCount = g.Count(o => o.Amount > 500),
+        })
+        .OrderBy(x => x.Status)
+        .ToList());
+
+// Paged listing with a total count — the classic "page N of M" shape: two
+// round trips (COUNT + a windowed/limited page) EF issues per grid.
+Run("paged_with_total", 25, (db, i) =>
+{
+    var total = db.Orders.Count(o => o.Status == 1);
+    db.Orders.Where(o => o.Status == 1)
+        .OrderByDescending(o => o.Created)
+        .Skip(40).Take(20)
+        .Select(o => new { o.Id, o.Amount })
+        .ToList();
+    _ = total;
+});
+
+// Self-join: count customer pairs in the same city with the same segment
+// (a join of a table to itself, filtered to avoid the trivial/self pairs).
+Run("self_join_pairs", 15, (db, i) =>
+    db.Customers.Where(c => c.City == "City05")
+        .Join(db.Customers.Where(c => c.City == "City05"),
+            a => a.Segment, b => b.Segment, (a, b) => new { a, b })
+        .Count(p => p.a.Id < p.b.Id));
+
+// Left join with null handling: every customer, with their order count —
+// including the ones with zero orders (GroupJoin + DefaultIfEmpty).
+Run("left_join_counts", 20, (db, i) =>
+    db.Customers
+        .GroupJoin(db.Orders, c => c.Id, o => o.CustomerId, (c, os) => new { c.Name, N = os.Count() })
+        .Where(x => x.N < 5)
+        .Count());
+
+// Multi-key grouping with HAVING and an ordered top: revenue by (city,
+// segment), only busy cells, top 10 by revenue.
+Run("multikey_group_having", 15, (db, i) =>
+    db.Orders.Join(db.Customers, o => o.CustomerId, c => c.Id, (o, c) => new { c.City, c.Segment, o.Amount })
+        .GroupBy(x => new { x.City, x.Segment })
+        .Select(g => new { g.Key.City, g.Key.Segment, Revenue = g.Sum(x => x.Amount), N = g.Count() })
+        .Where(x => x.N >= 40)
+        .OrderByDescending(x => x.Revenue)
+        .Take(10)
+        .ToList());
+
+// Top-N per group via a correlated count: for each product category, the
+// products priced above the category's own average (EF: correlated subquery
+// in the predicate + join).
+Run("top_per_group_correlated", 15, (db, i) =>
+    db.Products
+        .Where(p => p.Price > db.Products.Where(q => q.Category == p.Category).Average(q => q.Price))
+        .Select(p => new { p.Sku, p.Category, p.Price })
+        .ToList());
+
+// Deep three-level navigation aggregate: revenue per product category, going
+// OrderLine -> Product and OrderLine -> Order for the status filter.
+Run("category_revenue", 12, (db, i) =>
+    db.OrderLines
+        .Where(l => l.Order.Status != 3)
+        .GroupBy(l => l.Product.Category)
+        .Select(g => new { Category = g.Key, Revenue = g.Sum(l => l.Qty * l.Product.Price), Units = g.Sum(l => l.Qty) })
+        .OrderByDescending(x => x.Revenue)
+        .Take(10)
+        .ToList());
+
+// EXCEPT: cities that have segment-0 customers but no segment-3 customers.
+Run("except_sets", 25, (db, i) =>
+    db.Customers.Where(c => c.Segment == 0).Select(c => c.City)
+        .Except(db.Customers.Where(c => c.Segment == 3).Select(c => c.City))
+        .Count());
+
+// Any with a compound correlated predicate: customers with at least one
+// large, recent order.
+Run("any_compound", 25, (db, i) =>
+    db.Customers.Count(c => c.Orders.Any(o => o.Amount > 900 && o.Status == 1)));
+
+// Ordered join projection with a computed sort key across two tables.
+Run("join_computed_sort", 20, (db, i) =>
+    db.OrderLines
+        .Where(l => l.Order.CustomerId <= 500)
+        .Select(l => new { l.Id, Line = l.Qty * l.Product.Price })
+        .OrderByDescending(x => x.Line)
+        .Take(25)
+        .ToList());
+
 // ── report ──────────────────────────────────────────────────────────────────
 
 Console.WriteLine("\n── results ────────────────────────────────────────────────");

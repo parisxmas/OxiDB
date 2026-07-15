@@ -4454,6 +4454,15 @@ fn select_aggregated<S: Store>(
     // group (like the projection). This is the argmax idiom — GROUP BY (a, b),
     // ORDER BY a, agg DESC, DISTINCT ON (a) keeps the top b per a.
     let don = &select.distinct_on;
+    // Reuse a projection's value for an ORDER BY key that is the identical
+    // expression: EF Core emits the very same (often heavy, correlated)
+    // subquery in both SELECT and ORDER BY, and computing it twice per group
+    // dominates some analytic queries.
+    let key_from_proj: Vec<Option<usize>> = select
+        .order_by
+        .iter()
+        .map(|(e, _)| proj.iter().position(|(_, pe)| pe == e))
+        .collect();
     let mut prepared: Vec<(Vec<Value>, Vec<IndexKey>, Vec<Value>)> =
         Vec::with_capacity(groups.len());
     for group in &groups {
@@ -4468,11 +4477,16 @@ fn select_aggregated<S: Store>(
             .iter()
             .map(|(_, e)| eval_agg(store, e, schema, src, tuples, group, params))
             .collect::<Result<_>>()?;
-        // Evaluate the sort keys once per group (not per comparison).
+        // Evaluate the sort keys once per group (not per comparison); a key
+        // that duplicates a projection reuses that already-computed value.
         let keys: Vec<Value> = select
             .order_by
             .iter()
-            .map(|(e, _)| eval_agg(store, e, schema, src, tuples, group, params))
+            .enumerate()
+            .map(|(k, (e, _))| match key_from_proj[k] {
+                Some(j) => Ok(out[j].clone()),
+                None => eval_agg(store, e, schema, src, tuples, group, params),
+            })
             .collect::<Result<_>>()?;
         let dk: Vec<IndexKey> = don
             .iter()
@@ -5781,7 +5795,7 @@ where
 /// against `schema`, so later per-row evaluation is O(1). Also validates that
 /// all columns exist / are unambiguous (replacing the old check_columns pass).
 fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
-    Ok(match expr {
+    let bound = match expr {
         Expr::Column { table, name } => Expr::Col(resolve_col(schema, table, name)?),
         Expr::Col(i) => Expr::Col(*i),
         Expr::Literal(v) => Expr::Literal(v.clone()),
@@ -5893,7 +5907,47 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
                 "internal: unresolved subquery reached binding".into(),
             ));
         }
-    })
+    };
+    Ok(fold_constant(bound))
+}
+
+/// Whether an expression depends only on literals — no columns, params,
+/// aggregates, windows, subqueries or correlation. Such a subtree evaluates
+/// to the same value on every row.
+fn is_const_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) => true,
+        Expr::Col(_)
+        | Expr::Column { .. }
+        | Expr::Param(_)
+        | Expr::Aggregate { .. }
+        | Expr::Window { .. }
+        | Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::CorrScalar { .. }
+        | Expr::CorrIn { .. }
+        | Expr::InSet { .. } => false,
+        Expr::Binary { left, right, .. } => is_const_expr(left) && is_const_expr(right),
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => is_const_expr(expr),
+        Expr::Func { args, .. } => args.iter().all(is_const_expr),
+        Expr::In { expr, list, .. } => is_const_expr(expr) && list.iter().all(is_const_expr),
+    }
+}
+
+/// Fold a fully-constant subexpression to its literal value. EF Core inlines
+/// call arguments as literals (`LENGTH('Customer 00')`, `x * 60000`), and
+/// evaluating those once at bind time instead of per row is a real win on
+/// large scans. Volatile calls (`NOW()`, `random()`) are never folded, and a
+/// fold that would error (e.g. a domain error) is left for per-row handling.
+fn fold_constant(e: Expr) -> Expr {
+    if matches!(e, Expr::Literal(_)) || !is_const_expr(&e) || has_volatile(&e) {
+        return e;
+    }
+    let empty: &[Value] = &[];
+    match eval_scalar(&e, &[], empty, empty) {
+        Ok(v) => Expr::Literal(v),
+        Err(_) => e,
+    }
 }
 
 /// Evaluate an expression that may contain aggregates, over a group of tuple
