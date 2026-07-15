@@ -54,10 +54,25 @@ pub(crate) trait Store {
     /// (indices into the table's column order). Implementations can override
     /// this to skip the per-row allocations of [`scan`](Store::scan).
     fn scan_pruned(&self, table: &str, keep: &[usize]) -> Result<Chunk> {
-        Ok(Chunk::from_rows(
-            self.scan(table)?.into_iter().map(|(_, c)| c),
-            keep,
-        ))
+        // Clone only the kept columns straight out of the borrowed rows
+        // (scan_visit hands them out under the lock without cloning), instead of
+        // scan()'s full-row clone followed by a projection that throws the rest
+        // away. A wide table read for a few columns (a grouped aggregate over 2
+        // of N columns) then clones only what it uses.
+        let mut cells = Vec::new();
+        let mut n = 0usize;
+        self.scan_visit(table, &mut |row| {
+            for &k in keep {
+                cells.push(row[k].clone());
+            }
+            n += 1;
+            Ok(true)
+        })?;
+        Ok(Chunk {
+            width: keep.len(),
+            n,
+            cells,
+        })
     }
     /// Stream a table's live rows through `visit` (full row cells, in
     /// `row_id` order; return `false` to stop early). The engine

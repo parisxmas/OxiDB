@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.34.58"
+version = "0.34.59"
 dependencies = [
  "aes-gcm",
  "argon2",
