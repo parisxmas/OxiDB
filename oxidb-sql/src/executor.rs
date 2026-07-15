@@ -2524,7 +2524,7 @@ fn compute_window<S: Store>(
                     };
                     order_by
                         .iter()
-                        .map(|(e, _)| eval_scalar(e, schema, &view, params))
+                        .map(|(e, _)| eval_scalar_corr(store, has_corr(e), e, schema, &view, params))
                         .collect::<Result<Vec<Value>>>()
                 })
                 .collect::<Result<_>>()?;
@@ -2606,7 +2606,9 @@ fn compute_window<S: Store>(
                                 tuple: tuples.row(i as usize),
                             };
                             let v = match arg {
-                                Some(a) => eval_scalar(a, schema, &view, params)?,
+                                Some(a) => {
+                                    eval_scalar_corr(store, has_corr(a), a, schema, &view, params)?
+                                }
                                 // COUNT(*): every row counts.
                                 None => Value::Int(1),
                             };
@@ -4565,16 +4567,14 @@ fn select_simple<S: Store>(
     for (e, _) in order_by.iter_mut() {
         replace_windows(e, &mut windows, win_base);
     }
+    // Correlated subqueries inside a window's PARTITION BY / ORDER BY / agg
+    // argument are resolved per row: group_tuples and compute_window both go
+    // through eval_scalar_corr, so the outer row is in scope (this is how EF
+    // renders argmax-per-group, `GroupBy(...).Select(g => g.OrderBy(...).First())`,
+    // as ROW_NUMBER() OVER(ORDER BY (correlated subquery))).
     let win_vals: Vec<Vec<Value>> = windows
         .iter()
-        .map(|w| {
-            if has_corr(w) {
-                return Err(SqlError::Unsupported(
-                    "correlated subquery inside a window function".into(),
-                ));
-            }
-            compute_window(store, schema, src, tuples, w, params)
-        })
+        .map(|w| compute_window(store, schema, src, tuples, w, params))
         .collect::<Result<_>>()?;
 
     // Per-row parameter list: the user params (padded), then window values.
