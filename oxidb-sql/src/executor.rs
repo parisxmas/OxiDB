@@ -6230,6 +6230,31 @@ fn cast_value(v: Value, ty: SqlType) -> Result<Value> {
 /// (SQLite/SQL-Server-style — what EF and its providers expect),
 /// character-based.
 fn like_match(s: &str, pattern: &str, escape: Option<char>) -> bool {
+    // Fast path for the wildcard-free / single-boundary-`%` patterns EF emits
+    // for StartsWith/EndsWith/Contains, over ASCII: byte-level
+    // `eq_ignore_ascii_case` (matching the general path's ASCII case-fold) with
+    // NO per-call Vec<char> allocation and no backtracking. This is the hot
+    // path for LIKE-heavy scans (e.g. `Name LIKE 'x%' AND Name LIKE '%y'`).
+    if escape.is_none() && s.is_ascii() && pattern.is_ascii() && !pattern.contains('_') {
+        let pct = pattern.bytes().filter(|&b| b == b'%').count();
+        let sb = s.as_bytes();
+        match pct {
+            0 => return s.eq_ignore_ascii_case(pattern),
+            1 if pattern.ends_with('%') => {
+                let pre = &pattern.as_bytes()[..pattern.len() - 1];
+                return sb.len() >= pre.len() && sb[..pre.len()].eq_ignore_ascii_case(pre);
+            }
+            1 if pattern.starts_with('%') => {
+                let suf = &pattern.as_bytes()[1..];
+                return sb.len() >= suf.len() && sb[sb.len() - suf.len()..].eq_ignore_ascii_case(suf);
+            }
+            2 if pattern.starts_with('%') && pattern.ends_with('%') => {
+                let mid = pattern[1..pattern.len() - 1].to_ascii_lowercase();
+                return s.to_ascii_lowercase().contains(&mid);
+            }
+            _ => {}
+        }
+    }
     fn rec(s: &[char], p: &[char], escape: Option<char>) -> bool {
         match p.split_first() {
             None => s.is_empty(),
