@@ -317,3 +317,51 @@ fn exists_decorrelation_semantics() {
         vec![vec![i(1)], vec![i(2)]]
     );
 }
+
+/// Tekil eşitlik korelasyonlu skaler-aggregate alt sorgular, satır başına
+/// yeniden çalışmak yerine bir kez GROUP BY'a decorrelate edilir. Semantik
+/// birebir korunmalı: eksik anahtar için COUNT 0 / SUM NULL, NULL dış değer,
+/// residual filtre ve COALESCE-varsayılanı dahil.
+#[test]
+fn scalar_aggregate_decorrelation_semantics() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE mus (id INT PRIMARY KEY, ad TEXT)").unwrap();
+    db.execute("CREATE TABLE sip (id INT PRIMARY KEY, mid INT, tutar INT, durum INT)")
+        .unwrap();
+    // mus 3'ün hiç siparişi yok; mus 4 NULL (ilişkisiz).
+    db.execute("INSERT INTO mus VALUES (1,'a'), (2,'b'), (3,'c')").unwrap();
+    db.execute("INSERT INTO sip VALUES (10,1,100,1), (11,1,50,0), (12,2,900,1)")
+        .unwrap();
+
+    // COUNT: eksik anahtar (mus 3) -> 0, NULL değil.
+    assert_eq!(
+        rows(&db, "SELECT id, (SELECT COUNT(*) FROM sip WHERE sip.mid = mus.id) \
+                   FROM mus ORDER BY id"),
+        vec![vec![i(1), i(2)], vec![i(2), i(1)], vec![i(3), i(0)]]
+    );
+    // SUM: eksik anahtar -> NULL.
+    assert_eq!(
+        rows(&db, "SELECT id FROM mus WHERE \
+                   (SELECT SUM(tutar) FROM sip WHERE sip.mid = mus.id) IS NULL"),
+        vec![vec![i(3)]]
+    );
+    // Residual filtre (durum = 1) korelasyon eşitliğinin yanında: mus 1 için
+    // yalnızca 100'lük sipariş sayılır.
+    assert_eq!(
+        rows(&db, "SELECT id, (SELECT COALESCE(SUM(tutar),0) FROM sip \
+                   WHERE sip.mid = mus.id AND durum = 1) FROM mus ORDER BY id"),
+        vec![vec![i(1), i(100)], vec![i(2), i(900)], vec![i(3), i(0)]]
+    );
+    // MAX: eksik -> NULL; var olan doğru değer.
+    assert_eq!(
+        rows(&db, "SELECT id, (SELECT MAX(tutar) FROM sip WHERE sip.mid = mus.id) \
+                   FROM mus WHERE id <= 2 ORDER BY id"),
+        vec![vec![i(1), i(100)], vec![i(2), i(900)]]
+    );
+    // WHERE'de kullanım: siparişi 2'den az olan müşteriler (decorrelate + filtre).
+    assert_eq!(
+        rows(&db, "SELECT id FROM mus WHERE \
+                   (SELECT COUNT(*) FROM sip WHERE sip.mid = mus.id) < 2 ORDER BY id"),
+        vec![vec![i(2)], vec![i(3)]]
+    );
+}

@@ -286,6 +286,39 @@ pub enum SelectItem {
     Expr { expr: Expr, alias: Option<String> },
 }
 
+/// A decorrelatable scalar-aggregate subquery, prepared but evaluated
+/// lazily. The single outer equality has been lifted out to leave an
+/// uncorrelated `SELECT key, agg ... GROUP BY key` (`map_query`); the first
+/// few per-row evaluations still run the original correlated subquery (cheap
+/// when the outer side is small and the key is indexed), and only once the
+/// call count crosses [`LazyCorrAgg::THRESHOLD`] — i.e. the outer side is
+/// large enough that one grouped pass beats N lookups — is `map_query` run
+/// once and cached in `map`. `default` is the value for an absent key
+/// (`COUNT` -> 0, else NULL). Shared behind an `Arc`.
+#[derive(Debug)]
+pub struct LazyCorrAgg {
+    pub map_query: SelectQuery,
+    pub params: Vec<Value>,
+    pub default: Value,
+    pub calls: std::sync::atomic::AtomicUsize,
+    pub map: std::sync::OnceLock<std::collections::BTreeMap<crate::types::IndexKey, Value>>,
+}
+
+impl LazyCorrAgg {
+    /// Per-row correlated evaluations before switching to the grouped map.
+    pub const THRESHOLD: usize = 256;
+}
+
+// The cached map/counter are derived state, not identity: two CorrScalars are
+// equal when they wrap the same query shape.
+impl PartialEq for LazyCorrAgg {
+    fn eq(&self, other: &Self) -> bool {
+        self.map_query == other.map_query
+            && self.params == other.params
+            && self.default == other.default
+    }
+}
+
 /// A scalar (or aggregate) expression.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
@@ -364,6 +397,14 @@ pub enum Expr {
         query: Box<SelectQuery>,
         outer: Vec<Expr>,
         base: usize,
+        /// A decorrelated scalar-aggregate subquery: the single outer equality
+        /// (`inner.key = outer`) is lifted out and the whole subquery is
+        /// evaluated once as `SELECT key, agg ... GROUP BY key`, producing this
+        /// `key -> value` map. When present, per-row evaluation is an O(log n)
+        /// lookup of `outer[0]` instead of re-running the subquery; an absent
+        /// key (or a NULL outer) yields `default` (`COUNT` -> 0, else NULL).
+        /// Produced by the executor's resolution pass; never by the parser.
+        agg_map: Option<std::sync::Arc<LazyCorrAgg>>,
     },
     /// A **correlated** `expr [NOT] IN (SELECT ...)`, same mechanism as
     /// [`Expr::CorrScalar`].

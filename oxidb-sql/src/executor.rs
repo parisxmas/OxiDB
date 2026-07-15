@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
-    AggFunc, BinOp, DatePart, Expr, Join, JoinKind, LimitExpr, QueryBody, QueryResult,
+    AggFunc, BinOp, DatePart, Expr, LazyCorrAgg, Join, JoinKind, LimitExpr, QueryBody, QueryResult,
     RecursiveCte, ScalarFunc, SelectItem, SelectQuery, SelectStmt, SetOpKind, ShowKind, Statement,
     TableRef, UnOp, WindowFunc,
 };
@@ -1592,10 +1592,15 @@ fn resolve_expr<S: Store>(
                 let v = rows.pop().map(|mut r| r.remove(0)).unwrap_or(Value::Null);
                 *e = Expr::Literal(v);
             } else {
+                // A single-equality-correlated scalar aggregate decorrelates
+                // into one grouped pass + a per-row map lookup, instead of
+                // re-running the subquery for every outer row.
+                let agg_map = decorrelate_corr_agg(store, q, &outer, floor, params)?;
                 *e = Expr::CorrScalar {
                     query: q.clone(),
                     outer,
                     base: floor,
+                    agg_map,
                 };
             }
             Ok(())
@@ -1917,6 +1922,164 @@ fn has_corr(e: &Expr) -> bool {
     }
 }
 
+/// Try to decorrelate a scalar-aggregate subquery — `(SELECT agg(...) FROM
+/// ... WHERE key = $slot AND residual)` with exactly one outer reference and
+/// no grouping — into a one-shot `SELECT key, agg(...) ... WHERE residual
+/// GROUP BY key`, returning that `key -> value` map plus the default for an
+/// absent key. `None` when the shape does not qualify (the caller keeps the
+/// row-by-row correlated form).
+///
+/// The projection must be a single aggregate, optionally wrapped in
+/// `COALESCE(agg, literal)` (EF Core's `SUM` → `COALESCE(SUM(x), 0)`); the
+/// default is that literal, or `0` for a bare `COUNT`, else NULL — matching
+/// the value the correlated subquery yields over the empty group.
+fn decorrelate_corr_agg<S: Store>(
+    _store: &S,
+    query: &SelectQuery,
+    outer: &[Expr],
+    base: usize,
+    params: &[Value],
+) -> Result<Option<std::sync::Arc<LazyCorrAgg>>> {
+    if outer.len() != 1
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
+        || !query.ctes.is_empty()
+    {
+        return Ok(None);
+    }
+    let QueryBody::Select(sel) = &query.body else {
+        return Ok(None);
+    };
+    if !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || sel.distinct
+        || !sel.distinct_on.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+        || !sel.order_by.is_empty()
+        || !sel.joins.is_empty()
+    {
+        return Ok(None);
+    }
+    // The single projection must be an aggregate (optionally COALESCE-wrapped).
+    let [SelectItem::Expr { expr: proj, .. }] = sel.projection.as_slice() else {
+        return Ok(None);
+    };
+    let (is_count, default) = match proj {
+        Expr::Aggregate {
+            func: AggFunc::Count,
+            ..
+        } => (true, Value::Null),
+        Expr::Aggregate { .. } => (false, Value::Null),
+        Expr::Func {
+            func: ScalarFunc::Coalesce,
+            args,
+        } if args.len() == 2
+            && matches!(args[0], Expr::Aggregate { .. })
+            && matches!(args[1], Expr::Literal(_)) =>
+        {
+            let Expr::Literal(d) = &args[1] else {
+                unreachable!()
+            };
+            (false, d.clone())
+        }
+        _ => return Ok(None),
+    };
+    let default = if is_count { Value::Int(0) } else { default };
+
+    // Find the single correlation equality `key = $base` among the top-level
+    // WHERE conjuncts; the rest is residual (must not touch the outer slot).
+    let Some(filter) = &sel.filter else {
+        return Ok(None);
+    };
+    let mut conjuncts = Vec::new();
+    collect_conjuncts(filter, &mut conjuncts);
+    let mut key: Option<&Expr> = None;
+    let mut residual: Vec<&Expr> = Vec::new();
+    for c in conjuncts {
+        if key.is_none()
+            && let Expr::Binary {
+                op: BinOp::Eq,
+                left,
+                right,
+            } = c
+        {
+            match (left.as_ref(), right.as_ref()) {
+                (Expr::Param(p), k) | (k, Expr::Param(p)) if *p == base => {
+                    key = Some(k);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        residual.push(c);
+    }
+    let Some(key) = key else {
+        return Ok(None);
+    };
+
+    // Build `SELECT key AS __k, <proj> AS __v FROM ... WHERE residual GROUP BY key`.
+    let mut map_query = query.clone();
+    let QueryBody::Select(sel2) = &mut map_query.body else {
+        unreachable!("shape checked above");
+    };
+    sel2.projection = vec![
+        SelectItem::Expr {
+            expr: key.clone(),
+            alias: Some("__k".into()),
+        },
+        SelectItem::Expr {
+            expr: proj.clone(),
+            alias: Some("__v".into()),
+        },
+    ];
+    sel2.filter = residual.into_iter().cloned().reduce(|l, r| Expr::Binary {
+        op: BinOp::And,
+        left: Box::new(l),
+        right: Box::new(r),
+    });
+    sel2.group_by = vec![key.clone()];
+    // A remaining synthetic slot means the correlation is more than the one
+    // equality — keep the row-by-row form.
+    if query_has_param_ge(&map_query, params.len()) {
+        return Ok(None);
+    }
+    // Prepared, not run: the map materializes only if enough rows hit it (see
+    // LazyCorrAgg). Small/indexed outer sides never pay for the grouped pass.
+    Ok(Some(std::sync::Arc::new(LazyCorrAgg {
+        map_query,
+        params: params.to_vec(),
+        default,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        map: std::sync::OnceLock::new(),
+    })))
+}
+
+/// Build (or fetch the cached) decorrelated map for a `LazyCorrAgg`.
+fn lazy_corr_map<'a, S: Store>(
+    store: &S,
+    lazy: &'a LazyCorrAgg,
+) -> Result<&'a std::collections::BTreeMap<IndexKey, Value>> {
+    if let Some(m) = lazy.map.get() {
+        return Ok(m);
+    }
+    let (columns, rows) = run_query_rows(store, lazy.map_query.clone(), &lazy.params)?;
+    let mut map = std::collections::BTreeMap::new();
+    if columns.len() == 2 {
+        for mut r in rows {
+            let v = r.pop().unwrap_or(Value::Null);
+            let k = r.pop().unwrap_or(Value::Null);
+            if !matches!(k, Value::Null) {
+                map.insert(IndexKey(k), v);
+            }
+        }
+    }
+    // Another evaluation of the same Arc may have raced us; keep the winner.
+    let _ = lazy.map.set(map);
+    Ok(lazy.map.get().expect("just set"))
+}
+
 /// Try to decorrelate the parser's EXISTS encoding — `1 IN (SELECT 1 FROM
 /// ... WHERE $slot = key AND residual)` with exactly one outer reference —
 /// into `COALESCE(outer IN <set>, FALSE)` over the one-shot materialized
@@ -2063,7 +2226,31 @@ fn resolve_corr_row<S: Store, R: RowLike + ?Sized>(
     params: &[Value],
 ) -> Result<Expr> {
     Ok(match e {
-        Expr::CorrScalar { query, outer, base } => {
+        Expr::CorrScalar {
+            query,
+            outer,
+            base,
+            agg_map,
+        } => {
+            // Decorrelatable aggregate: run the subquery row-by-row for the
+            // first THRESHOLD rows (cheap for a small/indexed outer side);
+            // past that, build the grouped map once and look keys up in it.
+            if let Some(lazy) = agg_map {
+                let n = lazy.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n >= LazyCorrAgg::THRESHOLD || lazy.map.get().is_some() {
+                    let aug = corr_params(schema, row, params, outer, *base)?;
+                    let key = &aug[*base];
+                    let map = lazy_corr_map(store, lazy)?;
+                    let v = if matches!(key, Value::Null) {
+                        lazy.default.clone()
+                    } else {
+                        map.get(&IndexKey(key.clone()))
+                            .cloned()
+                            .unwrap_or_else(|| lazy.default.clone())
+                    };
+                    return Ok(Expr::Literal(v));
+                }
+            }
             let aug = corr_params(schema, row, params, outer, *base)?;
             let (columns, mut rows) = run_query_rows(store, (**query).clone(), &aug)?;
             if columns.len() != 1 {
@@ -5858,13 +6045,19 @@ fn bind_expr(expr: &Expr, schema: &[ColRef]) -> Result<Expr> {
         // A correlated node's outer refs and probe belong to the outer schema
         // and bind here; the inner query binds against its own tables when it
         // executes per row.
-        Expr::CorrScalar { query, outer, base } => Expr::CorrScalar {
+        Expr::CorrScalar {
+            query,
+            outer,
+            base,
+            agg_map,
+        } => Expr::CorrScalar {
             query: query.clone(),
             outer: outer
                 .iter()
                 .map(|o| bind_expr(o, schema))
                 .collect::<Result<_>>()?,
             base: *base,
+            agg_map: agg_map.clone(),
         },
         Expr::CorrIn {
             expr,
