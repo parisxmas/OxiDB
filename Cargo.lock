@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.34.49"
+version = "0.34.50"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2384,6 +2384,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "smallvec",
  "sqlparser",
  "tempfile",
  "thiserror 2.0.18",

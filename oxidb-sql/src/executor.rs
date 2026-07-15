@@ -1004,11 +1004,16 @@ fn exec_body<S: Store>(
                     rcols.len()
                 )));
             }
-            let key = |row: &[Value]| row.iter().cloned().map(IndexKey).collect::<Vec<_>>();
+            // A one-column arm (the common `... EXCEPT SELECT city` shape)
+            // keys on the scalar inline — a 1-elem SmallVec stays on the
+            // stack, so no per-row heap allocation; wider arms spill to heap
+            // exactly like the old Vec key.
+            type SetKey = smallvec::SmallVec<[IndexKey; 1]>;
+            let key = |row: &[Value]| row.iter().cloned().map(IndexKey).collect::<SetKey>();
             // Bag (ALL) variants count right-arm rows; each count cancels or
             // admits one matching left row. Distinct variants keep the first
             // occurrence, membership-tested against the right arm as a set.
-            let mut right_counts: BTreeMap<Vec<IndexKey>, usize> = BTreeMap::new();
+            let mut right_counts: BTreeMap<SetKey, usize> = BTreeMap::new();
             if op != SetOpKind::Union && all {
                 for r in &rrows {
                     *right_counts.entry(key(r)).or_insert(0) += 1;
@@ -1031,7 +1036,7 @@ fn exec_body<S: Store>(
                     });
                 }
                 (SetOpKind::Except, false) => {
-                    let right: BTreeSet<Vec<IndexKey>> = rrows.iter().map(|r| key(r)).collect();
+                    let right: BTreeSet<SetKey> = rrows.iter().map(|r| key(r)).collect();
                     let mut seen = BTreeSet::new();
                     rows.retain(|row| {
                         let k = key(row);
@@ -1048,7 +1053,7 @@ fn exec_body<S: Store>(
                     });
                 }
                 (SetOpKind::Intersect, false) => {
-                    let right: BTreeSet<Vec<IndexKey>> = rrows.iter().map(|r| key(r)).collect();
+                    let right: BTreeSet<SetKey> = rrows.iter().map(|r| key(r)).collect();
                     let mut seen = BTreeSet::new();
                     rows.retain(|row| {
                         let k = key(row);
