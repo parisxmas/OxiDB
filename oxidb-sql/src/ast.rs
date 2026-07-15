@@ -302,11 +302,19 @@ pub struct LazyCorrAgg {
     pub default: Value,
     pub calls: std::sync::atomic::AtomicUsize,
     pub map: std::sync::OnceLock<std::collections::BTreeMap<crate::types::IndexKey, Value>>,
+    /// Per-row correlated evaluations before switching to the grouped map.
+    /// Low for an expensive subquery (one that joins / scans big tables, where
+    /// even a few per-row re-executions cost more than one grouped pass), high
+    /// for a cheap indexed one.
+    pub threshold: usize,
 }
 
 impl LazyCorrAgg {
-    /// Per-row correlated evaluations before switching to the grouped map.
+    /// Default per-row threshold for a cheap (single-table, indexable) subquery.
     pub const THRESHOLD: usize = 256;
+    /// Threshold for an expensive subquery (joins big tables): build the grouped
+    /// map almost immediately — one pass beats a handful of full re-scans.
+    pub const THRESHOLD_JOINED: usize = 1;
 }
 
 // The cached map/counter are derived state, not identity: two CorrScalars are

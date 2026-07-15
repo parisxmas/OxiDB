@@ -1963,10 +1963,21 @@ fn decorrelate_corr_agg<S: Store>(
         || sel.limit.is_some()
         || sel.offset.is_some()
         || !sel.order_by.is_empty()
-        || !sel.joins.is_empty()
+        // Non-lateral joins are fine: the grouped rewrite (map_query clones the
+        // whole subquery, joins included, and only re-projects/groups) runs them
+        // once. A LATERAL join re-executes per left row and may itself be
+        // correlated, so keep those on the row-by-row path.
+        || sel.joins.iter().any(|j| j.table.lateral)
     {
         return Ok(None);
     }
+    // An expensive (joined) subquery must not pay N per-row re-executions before
+    // the grouped map kicks in — each re-execution is a full join+scan.
+    let threshold = if sel.joins.is_empty() {
+        LazyCorrAgg::THRESHOLD
+    } else {
+        LazyCorrAgg::THRESHOLD_JOINED
+    };
     // The single projection must be an aggregate (optionally COALESCE-wrapped).
     let [SelectItem::Expr { expr: proj, .. }] = sel.projection.as_slice() else {
         return Ok(None);
@@ -2058,6 +2069,7 @@ fn decorrelate_corr_agg<S: Store>(
         default,
         calls: std::sync::atomic::AtomicUsize::new(0),
         map: std::sync::OnceLock::new(),
+        threshold,
     })))
 }
 
@@ -2242,7 +2254,7 @@ fn resolve_corr_row<S: Store, R: RowLike + ?Sized>(
             // past that, build the grouped map once and look keys up in it.
             if let Some(lazy) = agg_map {
                 let n = lazy.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n >= LazyCorrAgg::THRESHOLD || lazy.map.get().is_some() {
+                if n >= lazy.threshold || lazy.map.get().is_some() {
                     let aug = corr_params(schema, row, params, outer, *base)?;
                     let key = &aug[*base];
                     let map = lazy_corr_map(store, lazy)?;
