@@ -8,7 +8,7 @@ use common::*;
 use oxidb_sql::{Decimal, SqlEngine, Value};
 
 fn dec(s: &str) -> Value {
-    Value::Decimal(Decimal::parse(s).unwrap())
+    Value::Decimal(Box::new(Decimal::parse(s).unwrap()))
 }
 
 /// A one-row table so scalar expressions can be evaluated (the engine requires

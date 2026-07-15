@@ -490,9 +490,9 @@ fn coerce_call_arg(v: Value, ty: SqlType, pname: &str) -> Result<Value> {
         | (SqlType::Decimal, v @ Value::Decimal(_)) => v,
         // DECIMAL parameters accept exact widenings (Int/Text) and a
         // best-effort Double conversion; a Decimal into a DOUBLE drops to float.
-        (SqlType::Decimal, Value::Int(i)) => Value::Decimal(Decimal::from_i64(i)),
+        (SqlType::Decimal, Value::Int(i)) => Value::Decimal(Box::new(Decimal::from_i64(i))),
         (SqlType::Decimal, Value::Text(t)) => match Decimal::parse(&t) {
-            Some(d) => Value::Decimal(d),
+            Some(d) => Value::Decimal(Box::new(d)),
             None => {
                 return Err(SqlError::Eval(format!(
                     "parameter {pname:?}: invalid DECIMAL {t:?}"
@@ -500,7 +500,7 @@ fn coerce_call_arg(v: Value, ty: SqlType, pname: &str) -> Result<Value> {
             }
         },
         (SqlType::Decimal, Value::Double(f)) => match Decimal::parse(&format!("{f}")) {
-            Some(d) => Value::Decimal(d),
+            Some(d) => Value::Decimal(Box::new(d)),
             None => {
                 return Err(SqlError::Eval(format!(
                     "parameter {pname:?}: cannot convert {f} to DECIMAL"
@@ -5864,7 +5864,7 @@ where
             Value::Null => Value::Null,
             Value::Int(n) => Value::Int(n.abs()),
             Value::Double(f) => Value::Double(f.abs()),
-            Value::Decimal(d) => Value::Decimal(if d.mantissa() < 0 { d.neg() } else { d }),
+            Value::Decimal(d) => Value::Decimal(if d.mantissa() < 0 { Box::new(d.neg()) } else { d }),
             other => return Err(SqlError::Eval(format!("ABS of {other:?}"))),
         }),
         ScalarFunc::Round => {
@@ -5886,7 +5886,7 @@ where
                 },
             };
             Ok(match x {
-                Value::Decimal(d) => Value::Decimal(d.round(places)),
+                Value::Decimal(d) => Value::Decimal(Box::new(d.round(places))),
                 Value::Double(f) => {
                     let m = 10f64.powi(places as i32);
                     Value::Double((f * m).round() / m)
@@ -5944,7 +5944,7 @@ where
                     } else {
                         m.div_euclid(unit)
                     };
-                    Value::Decimal(Decimal::new(q, 0))
+                    Value::Decimal(Box::new(Decimal::new(q, 0)))
                 }
                 other => return Err(SqlError::Eval(format!("FLOOR/CEILING of {other:?}"))),
             })
@@ -6095,7 +6095,7 @@ where
             Value::Decimal(d) => {
                 // Integer part toward zero, exactly.
                 let unit = 10i128.pow(d.scale());
-                Value::Decimal(Decimal::new(d.mantissa() / unit, 0))
+                Value::Decimal(Box::new(Decimal::new(d.mantissa() / unit, 0)))
             }
             other => return Err(SqlError::Eval(format!("TRUNC of {other:?}"))),
         }),
@@ -6172,12 +6172,12 @@ fn cast_value(v: Value, ty: SqlType) -> Result<Value> {
         | (v @ Value::Decimal(_), T::Decimal) => v,
         // → DECIMAL (exact from Int/Text; best-effort from a Double via its
         // shortest decimal string — the float's origin caveat carries through).
-        (Value::Int(n), T::Decimal) => Value::Decimal(Decimal::from_i64(n)),
+        (Value::Int(n), T::Decimal) => Value::Decimal(Box::new(Decimal::from_i64(n))),
         (Value::Text(s), T::Decimal) => {
-            Value::Decimal(Decimal::parse(s.trim()).ok_or_else(|| fail(&Value::Text(s.clone())))?)
+            Value::Decimal(Box::new(Decimal::parse(s.trim()).ok_or_else(|| fail(&Value::Text(s.clone())))?))
         }
         (Value::Double(f), T::Decimal) => {
-            Value::Decimal(Decimal::parse(&format!("{f}")).ok_or_else(|| fail(&Value::Double(f)))?)
+            Value::Decimal(Box::new(Decimal::parse(&format!("{f}")).ok_or_else(|| fail(&Value::Double(f)))?))
         }
         // DECIMAL → other numeric / text.
         (Value::Decimal(d), T::Int) => Value::Int(d.to_i64()),
@@ -6845,7 +6845,7 @@ impl SumAcc {
             }
             Value::Decimal(dv) => {
                 match self {
-                    SumAcc::Empty => *self = SumAcc::Dec(dv.clone()),
+                    SumAcc::Empty => *self = SumAcc::Dec((**dv).clone()),
                     SumAcc::Int(acc) => *self = SumAcc::Dec(Decimal::from_i64(*acc).add(dv)),
                     SumAcc::Dec(acc) => *acc = acc.add(dv),
                     SumAcc::Float(acc) => *acc += dv.to_f64(),
@@ -6874,7 +6874,7 @@ impl SumAcc {
             SumAcc::Empty => Value::Null,
             SumAcc::Int(i) => Value::Int(i),
             SumAcc::Float(f) => Value::Double(f),
-            SumAcc::Dec(d) => Value::Decimal(d),
+            SumAcc::Dec(d) => Value::Decimal(Box::new(d)),
         }
     }
 
@@ -6887,7 +6887,7 @@ impl SumAcc {
             SumAcc::Float(f) => Value::Double(f / count as f64),
             SumAcc::Dec(d) => {
                 let cnt = Decimal::from_i64(count);
-                Value::Decimal(d.div(&cnt, d.div_scale(&cnt)).unwrap_or_else(|| d.clone()))
+                Value::Decimal(Box::new(d.div(&cnt, d.div_scale(&cnt)).unwrap_or_else(|| d.clone())))
             }
         }
     }
@@ -6917,7 +6917,7 @@ fn apply_unary(op: UnOp, v: Value) -> Result<Value> {
             Value::Null => Ok(Value::Null),
             Value::Int(n) => Ok(Value::Int(-n)),
             Value::Double(f) => Ok(Value::Double(-f)),
-            Value::Decimal(d) => Ok(Value::Decimal(d.neg())),
+            Value::Decimal(d) => Ok(Value::Decimal(Box::new(d.neg()))),
             other => Err(SqlError::Eval(format!("negation of {other:?}"))),
         },
         UnOp::BitNot => match v {
@@ -7013,7 +7013,7 @@ fn as_bool(v: &Value) -> Option<bool> {
 /// Int (promoted). Doubles are excluded — they force the float path.
 fn as_decimal_operand(v: &Value) -> Option<Decimal> {
     match v {
-        Value::Decimal(d) => Some(d.clone()),
+        Value::Decimal(d) => Some((**d).clone()),
         Value::Int(n) => Some(Decimal::from_i64(*n)),
         _ => None,
     }
@@ -7082,7 +7082,7 @@ fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
     if (matches!(l, Value::Decimal(_)) || matches!(r, Value::Decimal(_)))
         && let (Some(a), Some(b)) = (as_decimal_operand(&l), as_decimal_operand(&r))
     {
-        return Ok(Value::Decimal(match op {
+        return Ok(Value::Decimal(Box::new(match op {
             BinOp::Add => a.add(&b),
             BinOp::Sub => a.sub(&b),
             BinOp::Mul => a.mul(&b),
@@ -7093,7 +7093,7 @@ fn arithmetic(op: BinOp, l: Value, r: Value) -> Result<Value> {
                 .rem(&b)
                 .ok_or_else(|| SqlError::Eval("division by zero".into()))?,
             _ => unreachable!(),
-        }));
+        })));
     }
     let a = as_f64(&l).ok_or_else(|| SqlError::Eval(format!("non-numeric operand {l:?}")))?;
     let b = as_f64(&r).ok_or_else(|| SqlError::Eval(format!("non-numeric operand {r:?}")))?;

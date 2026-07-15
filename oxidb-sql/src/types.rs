@@ -40,8 +40,12 @@ pub enum Value {
     Bool(bool),
     /// Epoch milliseconds.
     Timestamp(i64),
-    /// Exact base-10 fixed-point value.
-    Decimal(Decimal),
+    /// Exact base-10 fixed-point value. Boxed because `Decimal` holds an
+    /// `i128` (32-byte struct); inlining it would make every `Value` 48 bytes
+    /// even for the common Int/Double/Text cases. Boxing keeps `Value` small
+    /// (the hot per-row cell type), at the cost of one allocation per Decimal
+    /// value — which is rare relative to how often Values are cloned/scanned.
+    Decimal(Box<Decimal>),
 }
 
 impl Value {
@@ -216,7 +220,7 @@ fn decode_cell(bytes: &[u8], pos: &mut usize) -> Result<Value> {
         TAG_DECIMAL => {
             let mantissa = i128::from_le_bytes(read_16(bytes, pos)?);
             let scale = u32::from_le_bytes(read_4(bytes, pos)?);
-            Ok(Value::Decimal(Decimal::new(mantissa, scale)))
+            Ok(Value::Decimal(Box::new(Decimal::new(mantissa, scale))))
         }
         TAG_TEXT => {
             let len = u32::from_le_bytes(read_4(bytes, pos)?) as usize;
@@ -303,7 +307,7 @@ mod tests {
             Value::Bool(true),
             Value::Text("héllo".into()),
             Value::Timestamp(1_700_000_000_000),
-            Value::Decimal(Decimal::parse("-19.90").unwrap()),
+            Value::Decimal(Box::new(Decimal::parse("-19.90").unwrap())),
         ];
         let bytes = encode_row(&cells);
         let back = decode_row(&bytes, cells.len()).unwrap();

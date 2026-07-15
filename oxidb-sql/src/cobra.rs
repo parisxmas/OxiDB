@@ -346,7 +346,7 @@ fn cobra_to_sql_param(v: &CValue) -> std::result::Result<Value, NativeError> {
         CValue::Str(s) => Value::Text(s.to_string()),
         CValue::Bool(b) => Value::Bool(*b),
         CValue::Decimal(d) => match Decimal::parse(&d.inspect()) {
-            Some(dec) => Value::Decimal(dec),
+            Some(dec) => Value::Decimal(Box::new(dec)),
             None => Value::Double(d.to_f64()),
         },
         other => {
@@ -368,7 +368,7 @@ fn cobra_to_sql_cell(name: &str, v: &CValue) -> Result<Value> {
         CValue::Str(s) => Value::Text(s.to_string()),
         CValue::Bool(b) => Value::Bool(*b),
         CValue::Decimal(d) => match Decimal::parse(&d.inspect()) {
-            Some(dec) => Value::Decimal(dec),
+            Some(dec) => Value::Decimal(Box::new(dec)),
             None => Value::Double(d.to_f64()),
         },
         CValue::List(_) | CValue::Dict(_) => Value::Text(inspect(v)),

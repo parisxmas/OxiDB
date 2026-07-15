@@ -113,16 +113,16 @@ impl Table {
                 // via its shortest decimal string. A bad Text/Double string is
                 // left as-is so validation reports the type mismatch.
                 (SqlType::Decimal, Value::Int(i)) => {
-                    *cell = Value::Decimal(crate::decimal::Decimal::from_i64(*i));
+                    *cell = Value::Decimal(Box::new(crate::decimal::Decimal::from_i64(*i)));
                 }
                 (SqlType::Decimal, Value::Text(s)) => {
                     if let Some(d) = crate::decimal::Decimal::parse(s) {
-                        *cell = Value::Decimal(d);
+                        *cell = Value::Decimal(Box::new(d));
                     }
                 }
                 (SqlType::Decimal, Value::Double(f)) => {
                     if let Some(d) = crate::decimal::Decimal::parse(&format!("{f}")) {
-                        *cell = Value::Decimal(d);
+                        *cell = Value::Decimal(Box::new(d));
                     }
                 }
                 // A Decimal destined for a DOUBLE column drops to float.

@@ -98,7 +98,7 @@ fn decimal_and_blob_types() {
     // Exact, and the 2-digit scale of the literal is preserved on reload.
     assert_eq!(
         rows[0][0],
-        Value::Decimal(oxidb_sql::Decimal::parse("12.50").unwrap())
+        Value::Decimal(Box::new(oxidb_sql::Decimal::parse("12.50").unwrap()))
     );
     assert_eq!(rows[0][1], Value::Bytes(b"hello".to_vec()));
 }

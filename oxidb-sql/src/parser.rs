@@ -2650,7 +2650,7 @@ fn parse_number(s: &str) -> Result<Value> {
         // A plain fractional literal (`9.99`) is an *exact* DECIMAL, matching
         // standard SQL numeric literals — so money math stays lossless.
         if let Some(dec) = crate::decimal::Decimal::parse(s) {
-            return Ok(Value::Decimal(dec));
+            return Ok(Value::Decimal(Box::new(dec)));
         }
         // Fall back to float if it somehow isn't exactly representable.
         return s
