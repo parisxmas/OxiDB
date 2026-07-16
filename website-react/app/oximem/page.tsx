@@ -81,7 +81,7 @@ r.incr(<span class="str">"visits"</span>)
 <span class="kw">with</span> r.pipeline() <span class="kw">as</span> p:          <span class="co"># pipelined writes beat Redis</span>
     <span class="kw">for</span> i <span class="kw">in</span> range(<span class="num">1000</span>): p.set(<span class="str">f"k{i}"</span>, i)
     p.execute()</code></pre>
-    <p>The keyspace is global (shared across databases). See also the built-in <strong>MQTT broker</strong> for cross-protocol pub/sub on the <a href="/streams/">Streams</a> page.</p>
+    <p>The keyspace is global (shared across databases). Pub/sub is <strong>cross-protocol</strong>: a message published here can reach subscribers on the built-in <a href="/mqtt/">MQTT broker</a>.</p>
   </div>
 </section>` }} />
 }

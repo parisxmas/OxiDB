@@ -34,8 +34,11 @@ const navGroups = [
     items: [{ href: '/tsdb', label: 'Time-Series' }],
   },
   {
-    title: 'OxiMem',
-    items: [{ href: '/oximem', label: 'Redis-compatible store' }],
+    title: 'In-Memory & Messaging',
+    items: [
+      { href: '/oximem', label: 'OxiMem (Redis)' },
+      { href: '/mqtt', label: 'MQTT Broker' },
+    ],
   },
   {
     title: 'Storage & Realtime',
