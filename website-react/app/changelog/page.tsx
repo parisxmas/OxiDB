@@ -208,7 +208,7 @@ export default function Page() {
         <h4 class="change-type added">Benchmark</h4>
         <ul>
           <li>
-            <strong>OxiDB sweeps MongoDB at 1M docs.</strong> The full <code>tests/comparison-mongodb</code> bench at 1M-document scale (in-network Docker harness, no port-forward artifact) goes <strong>OxiDB 24 &ndash; MongoDB 0</strong> across 24 measured workloads. Largest wins: count-all 2189&times;, Top-5 cities aggregation 1262&times;, composite-indexed compound 4.1&times;. Smallest wins: bulk insert 1.1&times;, range-10K-rows-each 1.2&times;. Resource footprint at peak: OxiDB 1.71 GiB RSS / 741 MB disk vs MongoDB 1.00 GiB / 626 MB. See <a href="/benchmarks/">Benchmarks</a>.
+            <strong>OxiDB sweeps MongoDB at 1M docs.</strong> The full <code>tests/comparison-mongodb</code> bench at 1M-document scale (in-network Docker harness, no port-forward artifact) goes <strong>OxiDB 24 &ndash; MongoDB 0</strong> across 24 measured workloads. Largest wins: count-all 2189&times;, Top-5 cities aggregation 1262&times;, composite-indexed compound 4.1&times;. Smallest wins: bulk insert 1.1&times;, range-10K-rows-each 1.2&times;. Resource footprint at peak: OxiDB 1.71 GiB RSS / 741 MB disk vs MongoDB 1.00 GiB / 626 MB.
           </li>
         </ul>
       </div>

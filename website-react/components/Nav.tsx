@@ -203,7 +203,6 @@ const navGroups: {
       { href: '/server', label: 'Server', icon: 'server' },
       { href: '/clients', label: 'Clients', icon: 'code' },
       { href: '/wasm', label: 'WebAssembly', icon: 'box' },
-      { href: '/benchmarks', label: 'Benchmarks', icon: 'bars' },
     ],
   },
   {
