@@ -9,20 +9,102 @@ export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<section class="section">
   <div class="container">
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> .NET Examples</h2>
-    <p class="section-desc">Three NuGet packages — TCP client, embedded (in-process FFI) client, and the standalone <strong>OxiDb.Linq</strong> provider. Targets <code>net10.0+</code>. OxiDB is a <strong>document database</strong> — no SQL, no EF Core.</p>
+    <p class="section-desc">A full .NET stack for OxiDB &mdash; a TCP client, an embedded (in-process FFI) client, a standalone <strong>OxiDb.Linq</strong> provider for the document engine, and a complete <strong>Entity Framework Core</strong> provider (with ADO.NET / Dapper) for the SQL engine. Targets <code>net10.0+</code>.</p>
 
     <!-- Install -->
     <div class="doc-block">
       <h3>Install</h3>
-      <pre><code><span class="co"># Pure managed TCP client</span>
+      <pre><code><span class="co"># Document engine — TCP client, embedded client, LINQ provider</span>
 dotnet add package OxiDb.Client.Tcp
-
-<span class="co"># Embedded (in-process via native FFI) — bundles platform runtimes</span>
 dotnet add package OxiDb.Client.Embedded
+dotnet add package OxiDb.Linq
 
-<span class="co"># Standalone LINQ provider (typed queries over either client)</span>
-dotnet add package OxiDb.Linq</code></pre>
-      <p>Available on nuget.org. Latest: <strong>v0.34.0</strong>. Source &amp; samples in <code>dotnet/</code>.</p>
+<span class="co"># SQL engine — Entity Framework Core provider + ADO.NET (Dapper-ready)</span>
+dotnet add package OxiDb.EntityFrameworkCore
+dotnet add package OxiDb.Data</code></pre>
+      <p>Latest: <strong>v0.35.0</strong>. The EF Core packages are hosted on this site &mdash; add it as a NuGet source, or download the <code>.nupkg</code> files directly:</p>
+      <pre><code class="lang-bash"><span class="co"># download the EF Core provider + its dependencies</span>
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.EntityFrameworkCore.0.35.0.nupkg
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Data.0.35.0.nupkg
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Client.Tcp.0.35.0.nupkg
+
+<span class="co"># add the folder as a source, then install</span>
+dotnet nuget add source $(pwd) --name oxidb
+dotnet add package OxiDb.EntityFrameworkCore</code></pre>
+    </div>
+
+    <!-- EF Core -->
+    <div class="doc-block">
+      <h3>Entity Framework Core <span class="version-badge latest">SQL engine</span></h3>
+      <p>A complete EF Core provider for the OxiDB <a href="/sql/">SQL engine</a> &mdash; it passes all <strong>3832 official EF Core relational specification tests</strong> and beats PostgreSQL across the EF Core benchmark. Migrations, design-time scaffolding, LINQ translation, <code>Include</code>, and <code>ExecuteUpdate</code>/<code>ExecuteDelete</code> all work. Start the server with <code>OXIDB_SQL=1</code>.</p>
+
+      <h4>DbContext</h4>
+      <pre><code><span class="kw">using</span> Microsoft.EntityFrameworkCore;
+<span class="kw">using</span> OxiDb.EntityFrameworkCore;
+
+<span class="kw">public class</span> Blog {
+    <span class="kw">public int</span> Id { <span class="kw">get; set;</span> }
+    <span class="kw">public string</span> Url { <span class="kw">get; set;</span> } = <span class="str">""</span>;
+    <span class="kw">public int</span> Rating { <span class="kw">get; set;</span> }
+    <span class="kw">public</span> List&lt;Post&gt; Posts { <span class="kw">get;</span> } = <span class="kw">new</span>();
+}
+<span class="kw">public class</span> Post {
+    <span class="kw">public int</span> Id { <span class="kw">get; set;</span> }
+    <span class="kw">public string</span> Title { <span class="kw">get; set;</span> } = <span class="str">""</span>;
+    <span class="kw">public int</span> BlogId { <span class="kw">get; set;</span> }
+}
+
+<span class="kw">public class</span> BloggingContext : DbContext {
+    <span class="kw">public</span> DbSet&lt;Blog&gt; Blogs =&gt; Set&lt;Blog&gt;();
+    <span class="kw">public</span> DbSet&lt;Post&gt; Posts =&gt; Set&lt;Post&gt;();
+
+    <span class="kw">protected override void</span> OnConfiguring(DbContextOptionsBuilder o) =&gt;
+        o.UseOxiDb(<span class="str">"Host=127.0.0.1;Port=4444"</span>);
+}</code></pre>
+
+      <h4>Migrate &amp; query</h4>
+      <pre><code><span class="kw">using var</span> db = <span class="kw">new</span> BloggingContext();
+db.Database.Migrate();                         <span class="co">// real __EFMigrationsHistory</span>
+
+db.Blogs.Add(<span class="kw">new</span> Blog { Url = <span class="str">"https://oxidb.dev"</span>, Rating = <span class="num">5</span> });
+<span class="kw">await</span> db.SaveChangesAsync();
+
+<span class="co">// LINQ with Include + ordering (translated to SQL joins)</span>
+<span class="kw">var</span> top = <span class="kw">await</span> db.Blogs
+    .Where(b =&gt; b.Rating &gt;= <span class="num">4</span>)
+    .Include(b =&gt; b.Posts)
+    .OrderByDescending(b =&gt; b.Rating)
+    .ToListAsync();
+
+<span class="co">// Bulk update / delete — one UPDATE / DELETE round trip</span>
+<span class="kw">await</span> db.Posts.Where(p =&gt; p.BlogId == <span class="num">1</span>)
+    .ExecuteUpdateAsync(s =&gt; s.SetProperty(p =&gt; p.Title, <span class="str">"Updated"</span>));
+<span class="kw">await</span> db.Blogs.Where(b =&gt; b.Rating &lt; <span class="num">2</span>).ExecuteDeleteAsync();</code></pre>
+
+      <h4>Migrations &amp; scaffolding (dotnet ef)</h4>
+      <pre><code class="lang-bash">dotnet ef migrations add Init
+dotnet ef database update
+
+<span class="co"># reverse-engineer a DbContext from an existing database</span>
+dotnet ef dbcontext scaffold <span class="str">"Host=127.0.0.1;Port=4444"</span> OxiDb.EntityFrameworkCore</code></pre>
+
+      <h4>Raw SQL &mdash; ADO.NET &amp; Dapper</h4>
+      <pre><code><span class="kw">using</span> OxiDb.Data;
+<span class="kw">using</span> Dapper;
+
+<span class="kw">using var</span> conn = <span class="kw">new</span> OxiDbConnection(<span class="str">"Host=127.0.0.1;Port=4444"</span>);
+conn.Open();
+
+<span class="co">// Dapper</span>
+<span class="kw">var</span> blogs = conn.Query&lt;Blog&gt;(<span class="str">"SELECT * FROM Blogs WHERE Rating &gt;= @r"</span>, <span class="kw">new</span> { r = <span class="num">4</span> });
+
+<span class="co">// or plain ADO.NET</span>
+<span class="kw">using var</span> cmd = conn.CreateCommand();
+cmd.CommandText = <span class="str">"INSERT INTO Blogs (Url, Rating) VALUES (?, ?)"</span>;
+cmd.Parameters.Add(<span class="kw">new</span> OxiDbParameter { Value = <span class="str">"https://x.io"</span> });
+cmd.Parameters.Add(<span class="kw">new</span> OxiDbParameter { Value = <span class="num">4</span> });
+cmd.ExecuteNonQuery();</code></pre>
+      <p>Full SQL surface &mdash; joins, CTEs, window functions, transactions, instant online <code>ALTER TABLE</code> &mdash; on the <a href="/sql/">SQL Engine</a> page.</p>
     </div>
 
     <!-- OxiDb.Linq -->

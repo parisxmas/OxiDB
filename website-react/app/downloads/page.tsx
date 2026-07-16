@@ -207,6 +207,58 @@ curl -LO https://oxidb.baltavista.com/releases/studio/OxiDB-Studio-0.3.0-macos-a
       </div>
     </div>
 
+    <!-- .NET / EF Core NuGet v0.35.0 -->
+    <div class="release-block">
+      <div class="release-header">
+        <h3 class="version-tag">.NET / EF Core v0.35.0</h3>
+        <span class="version-date">2026-07-16</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <p class="release-notes">Entity Framework Core provider for the OxiDB SQL engine (with ADO.NET / Dapper) — passes all 3832 official EF Core spec tests and beats PostgreSQL. See <a href="/dotnet-examples/">.NET / EF Core examples</a>.</p>
+
+      <div class="table-wrap">
+        <table class="dl-table">
+          <thead>
+            <tr><th>Package</th><th>Purpose</th><th>File</th><th>Size</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>OxiDb.EntityFrameworkCore</code></td>
+              <td>EF Core provider (SQL engine)</td>
+              <td><code>.nupkg</code></td>
+              <td>23 KB</td>
+              <td><a href="/nuget/OxiDb.EntityFrameworkCore.0.35.0.nupkg" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td><code>OxiDb.Data</code></td>
+              <td>ADO.NET (Dapper-ready)</td>
+              <td><code>.nupkg</code></td>
+              <td>18 KB</td>
+              <td><a href="/nuget/OxiDb.Data.0.35.0.nupkg" class="dl-btn">Download</a></td>
+            </tr>
+            <tr>
+              <td><code>OxiDb.Client.Tcp</code></td>
+              <td>TCP client (dependency)</td>
+              <td><code>.nupkg</code></td>
+              <td>31 KB</td>
+              <td><a href="/nuget/OxiDb.Client.Tcp.0.35.0.nupkg" class="dl-btn">Download</a></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="install-hint">
+        <h4>Install</h4>
+        <pre><code><span class="co"># download all three, then add the folder as a NuGet source</span>
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.EntityFrameworkCore.0.35.0.nupkg
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Data.0.35.0.nupkg
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Client.Tcp.0.35.0.nupkg
+
+dotnet nuget add source $(pwd) --name oxidb
+dotnet add package OxiDb.EntityFrameworkCore</code></pre>
+      </div>
+    </div>
+
     <!-- WebAssembly v0.34.0 -->
     <div class="release-block">
       <div class="release-header">

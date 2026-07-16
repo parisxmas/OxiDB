@@ -55,6 +55,7 @@ const navGroups = [
     items: [
       { href: '/docs', label: 'Docs' },
       { href: '/book', label: 'Book' },
+      { href: '/dotnet-examples', label: '.NET / EF Core' },
       { href: '/go-examples', label: 'Go Examples' },
       { href: '/python-examples', label: 'Python Examples' },
       { href: '/changelog', label: 'Changelog' },
