@@ -242,3 +242,158 @@ fn alter_table_disk_first() {
         vec![vec![Value::Int(7)], vec![Value::Int(7)]]
     );
 }
+
+/// ADD COLUMN is metadata-only: it does not rewrite the stored rows, yet every
+/// existing row reads back the new column's default (padded on read), and the
+/// column is fully usable in WHERE / aggregates / ORDER BY immediately.
+#[test]
+fn add_column_metadata_only_reads_back_default() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, ad TEXT)")
+        .unwrap();
+    for i in 1..=50 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, 'r{i}')"))
+            .unwrap();
+    }
+
+    // Instant on a populated table — no per-row rewrite.
+    db.execute("ALTER TABLE u ADD COLUMN puan INT DEFAULT 5")
+        .unwrap();
+    // A nullable column with no default reads back NULL.
+    db.execute("ALTER TABLE u ADD COLUMN note TEXT").unwrap();
+
+    // Old rows padded with the defaults.
+    assert_eq!(
+        rows(&db, "SELECT id, ad, puan, note FROM u WHERE id = 1"),
+        vec![vec![Value::Int(1), t("r1"), Value::Int(5), Value::Null]]
+    );
+    // The new column filters and aggregates.
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM u WHERE puan = 5"),
+        vec![vec![Value::Int(50)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT SUM(puan) FROM u"),
+        vec![vec![Value::Int(250)]]
+    );
+
+    // Writes to the new column heal individual rows; others stay padded.
+    db.execute("UPDATE u SET puan = 100, note = 'hot' WHERE id = 1")
+        .unwrap();
+    db.execute("INSERT INTO u (id, ad, puan) VALUES (51, 'new', 9)")
+        .unwrap();
+    assert_eq!(
+        rows(&db, "SELECT puan, note FROM u WHERE id = 1"),
+        vec![vec![Value::Int(100), t("hot")]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT puan, note FROM u WHERE id = 2"),
+        vec![vec![Value::Int(5), Value::Null]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT SUM(puan) FROM u"),
+        vec![vec![Value::Int(250 - 5 + 100 + 9)]]
+    );
+}
+
+/// An index created over a lazily-added column is built correctly (from the
+/// padded rows) and its point lookups return the default-bearing rows.
+#[test]
+fn index_over_lazily_added_column() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, ad TEXT)")
+        .unwrap();
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, 'r{i}')"))
+            .unwrap();
+    }
+    db.execute("ALTER TABLE u ADD COLUMN tag INT DEFAULT 42")
+        .unwrap();
+    db.execute("CREATE INDEX i_tag ON u (tag)").unwrap();
+
+    // Every existing row indexed under the default.
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM u WHERE tag = 42"),
+        vec![vec![Value::Int(10)]]
+    );
+    db.execute("UPDATE u SET tag = 7 WHERE id = 3").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id FROM u WHERE tag = 7"),
+        vec![vec![Value::Int(3)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM u WHERE tag = 42"),
+        vec![vec![Value::Int(9)]]
+    );
+}
+
+/// Two metadata-only ADDs (leaving rows physically narrow) followed by a DROP:
+/// the DROP's row rewrite must widen each row first, so removing a column by
+/// position is correct even for never-materialized rows.
+#[test]
+fn multiple_lazy_adds_then_drop() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, a TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
+    db.execute("ALTER TABLE u ADD COLUMN b INT DEFAULT 10")
+        .unwrap();
+    db.execute("ALTER TABLE u ADD COLUMN c INT DEFAULT 20")
+        .unwrap();
+    // Rows are still width 2 on disk; padded to width 4 on read.
+    assert_eq!(
+        rows(&db, "SELECT id, a, b, c FROM u ORDER BY id"),
+        vec![
+            vec![Value::Int(1), t("x"), Value::Int(10), Value::Int(20)],
+            vec![Value::Int(2), t("y"), Value::Int(10), Value::Int(20)],
+        ]
+    );
+    // DROP a middle column — rewrite must not panic on the narrow rows.
+    db.execute("ALTER TABLE u DROP COLUMN a").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, b, c FROM u ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(10), Value::Int(20)],
+            vec![Value::Int(2), Value::Int(10), Value::Int(20)],
+        ]
+    );
+    assert!(db.execute("SELECT a FROM u").is_err());
+}
+
+/// A metadata-only ADD deliberately skips the checkpoint, so its durability
+/// rides entirely on the WAL record. Reopening (WAL replay over the old-arity
+/// snapshot) must reconstruct the padded rows.
+#[test]
+fn add_column_survives_reopen_without_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqlEngine::open(dir.path()).unwrap();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, ad TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'ali'), (2, 'veli')")
+        .unwrap();
+    db.checkpoint().unwrap(); // snapshot at the OLD arity
+    db.execute("ALTER TABLE u ADD COLUMN puan INT DEFAULT 5")
+        .unwrap();
+    db.execute("INSERT INTO u (id, ad, puan) VALUES (3, 'can', 9)")
+        .unwrap();
+    drop(db); // no checkpoint after the ALTER
+
+    let db = SqlEngine::open(dir.path()).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, ad, puan FROM u ORDER BY id"),
+        vec![
+            vec![Value::Int(1), t("ali"), Value::Int(5)],
+            vec![Value::Int(2), t("veli"), Value::Int(5)],
+            vec![Value::Int(3), t("can"), Value::Int(9)],
+        ]
+    );
+    // A checkpoint now folds the lazy add into the snapshot; still correct.
+    db.checkpoint().unwrap();
+    drop(db);
+    let db = SqlEngine::open(dir.path()).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT SUM(puan) FROM u"),
+        vec![vec![Value::Int(19)]]
+    );
+}

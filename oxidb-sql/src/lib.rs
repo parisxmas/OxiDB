@@ -146,7 +146,7 @@ impl TableState {
             .filter(|(_, c)| c.unique && !c.primary_key)
             .map(|(i, _)| (i, BTreeMap::new()))
             .collect();
-        TableState {
+        let mut state = TableState {
             def,
             rows: RowStore::new(disk_first),
             next_row_id: 1,
@@ -158,7 +158,22 @@ impl TableState {
             uniques,
             scan_cache: None,
             scan_seen_gen: None,
-        }
+        };
+        state.sync_fill();
+        state
+    }
+
+    /// Refresh the row store's pad template to the current schema, so rows
+    /// left physically narrow by a metadata-only `ADD COLUMN` read back with
+    /// each new column's default. Called at open and after every `ALTER TABLE`.
+    fn sync_fill(&mut self) {
+        let fill: Vec<Value> = self
+            .def
+            .columns
+            .iter()
+            .map(|c| c.default_value.clone().unwrap_or(Value::Null))
+            .collect();
+        self.rows.set_fill(fill);
     }
 
     /// Recompute the schema-derived positions and reseed every constraint
@@ -443,13 +458,17 @@ impl SqlEngine {
                     return;
                 };
                 use ast::AlterOp;
+                // A column is only ever appended, so ADD COLUMN shifts no
+                // existing position: constraint maps and secondary indexes stay
+                // valid, and the stored rows need no rewrite (they read back
+                // padded with the new column's default). That makes it O(1) —
+                // skip the full-table row rewrite and index rebuild below.
+                let metadata_only = matches!(op, AlterOp::AddColumn(_));
                 match op {
                     AlterOp::AddColumn(col) => {
                         def.columns.push(col.clone());
                         if let Some(state) = tables.get_mut(table) {
                             state.def = def.clone();
-                            let fill = col.default_value.clone().unwrap_or(Value::Null);
-                            state.rows.rewrite_all(|cells| cells.push(fill.clone()));
                         }
                     }
                     AlterOp::DropColumn(name) => {
@@ -487,19 +506,28 @@ impl SqlEngine {
                         }
                     }
                 }
-                // Positions may have shifted: rebuild constraint maps and the
-                // table's secondary indexes from the (possibly rewritten) rows.
-                let defs: Vec<IndexDef> = catalog
-                    .indexes
-                    .values()
-                    .filter(|d| &d.table == table)
-                    .cloned()
-                    .collect();
+                // Keep the row store's pad template in step with the new
+                // schema (also invalidates any stale scan cache). Cheap for
+                // every op.
                 if let Some(state) = tables.get_mut(table) {
-                    state.rebuild_meta();
-                    state.indexes.clear();
-                    for d in defs {
-                        let _ = state.build_index(&d.name, &d.columns);
+                    state.sync_fill();
+                }
+                // DROP/RENAME may shift positions: rebuild constraint maps and
+                // secondary indexes from the rewritten rows. ADD appends only,
+                // so it skips this O(n) pass.
+                if !metadata_only {
+                    let defs: Vec<IndexDef> = catalog
+                        .indexes
+                        .values()
+                        .filter(|d| &d.table == table)
+                        .cloned()
+                        .collect();
+                    if let Some(state) = tables.get_mut(table) {
+                        state.rebuild_meta();
+                        state.indexes.clear();
+                        for d in defs {
+                            let _ = state.build_index(&d.name, &d.columns);
+                        }
                     }
                 }
             }
@@ -1550,6 +1578,14 @@ impl SqlEngine {
             &rec,
             inner.disk_first,
         );
+        // Metadata-only ADD COLUMN is O(1): the WAL record is durable on its
+        // own and the stored rows are untouched (read back padded), so skip the
+        // checkpoint — which would write the whole table's snapshot and defeat
+        // the point. A later auto/manual checkpoint folds it in lazily. Every
+        // other ALTER rewrites rows, so it checkpoints eagerly as before.
+        if matches!(op, AlterOp::AddColumn(_)) {
+            return Ok(());
+        }
         Self::checkpoint_locked(inner)
     }
 

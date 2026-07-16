@@ -29,6 +29,27 @@ enum RowMode {
 pub(crate) struct RowStore {
     mode: RowMode,
     wgen: u64,
+    /// Per-column default template at the table's *current* arity. A row
+    /// physically narrower than this (an existing row after a metadata-only
+    /// `ALTER TABLE ADD COLUMN`, which does not rewrite the stored rows) is
+    /// padded up to this width on read, its missing trailing cells filled from
+    /// here. Empty until [`set_fill`](RowStore::set_fill) is called; a row at
+    /// or above `fill.len()` is served verbatim, so full-width rows (the norm)
+    /// pay only a length compare and stay borrowed.
+    fill: Vec<Value>,
+}
+
+/// Widen `row` to the schema's full width, filling any missing trailing cells
+/// from `fill`. A row already at (or past) full width is returned untouched —
+/// still borrowed in the resident scan path, so the common case never clones.
+fn pad_cow<'a>(fill: &[Value], row: Cow<'a, [Value]>) -> Cow<'a, [Value]> {
+    if row.len() < fill.len() {
+        let mut v = row.into_owned();
+        v.extend_from_slice(&fill[v.len()..]);
+        Cow::Owned(v)
+    } else {
+        row
+    }
 }
 
 pub(crate) struct DiskRows {
@@ -51,13 +72,26 @@ impl RowStore {
         } else {
             RowMode::Resident(BTreeMap::new())
         };
-        RowStore { mode, wgen: 0 }
+        RowStore {
+            mode,
+            wgen: 0,
+            fill: Vec::new(),
+        }
     }
 
     /// The mutation generation — bumped on every write. A scan cache built at
     /// this value stays valid until it changes.
     pub fn generation(&self) -> u64 {
         self.wgen
+    }
+
+    /// Set the per-column default template used to pad narrow rows on read
+    /// (see [`fill`](RowStore::fill)). Bumps the generation so any scan cache
+    /// built at the old schema width is discarded. Called whenever the table's
+    /// column set changes (`ALTER TABLE`) and once at open.
+    pub fn set_fill(&mut self, fill: Vec<Value>) {
+        self.wgen = self.wgen.wrapping_add(1);
+        self.fill = fill;
     }
 
     /// True for the RAM-resident mode (the only mode a contiguous scan cache
@@ -95,16 +129,21 @@ impl RowStore {
         }
     }
 
-    /// The row's cells, decoded/cloned into an owned vector.
+    /// The row's cells, decoded/cloned into an owned vector, padded to the
+    /// current schema width (see [`fill`](RowStore::fill)).
     pub fn get(&self, row_id: u64) -> Option<Vec<Value>> {
-        match &self.mode {
+        let mut cells = match &self.mode {
             RowMode::Resident(m) => m.get(&row_id).cloned(),
             RowMode::DiskFirst(d) => match d.overlay.get(&row_id) {
                 Some(Some(cells)) => Some(cells.clone()),
                 Some(None) => None,
                 None => d.base.as_ref().and_then(|b| b.get(row_id)),
             },
+        }?;
+        if cells.len() < self.fill.len() {
+            cells.extend_from_slice(&self.fill[cells.len()..]);
         }
+        Some(cells)
     }
 
     pub fn insert(&mut self, row_id: u64, cells: Vec<Value>) {
@@ -164,11 +203,23 @@ impl RowStore {
     /// disk-first mode the mmap'd base is immutable, so its rows materialize
     /// into the overlay with the new shape (the caller checkpoints right
     /// after, folding everything into a fresh snapshot).
+    ///
+    /// Each row is first widened to the current `fill` width, so a structural
+    /// rewrite (e.g. `DROP COLUMN`, which removes a cell by position) always
+    /// operates on a full-width row even if earlier metadata-only `ADD COLUMN`s
+    /// left it physically narrow.
     pub fn rewrite_all(&mut self, f: impl Fn(&mut Vec<Value>)) {
-        self.wgen = self.wgen.wrapping_add(1);
-        match &mut self.mode {
+        let Self { mode, wgen, fill } = self;
+        *wgen = wgen.wrapping_add(1);
+        let pad = |cells: &mut Vec<Value>| {
+            if cells.len() < fill.len() {
+                cells.extend_from_slice(&fill[cells.len()..]);
+            }
+        };
+        match mode {
             RowMode::Resident(m) => {
                 for cells in m.values_mut() {
+                    pad(cells);
                     f(cells);
                 }
             }
@@ -180,6 +231,7 @@ impl RowStore {
                 }
                 d.overlay.retain(|_, change| change.is_some());
                 for cells in d.overlay.values_mut().flatten() {
+                    pad(cells);
                     f(cells);
                 }
                 d.live = d.overlay.len();
@@ -187,10 +239,13 @@ impl RowStore {
         }
     }
 
-    /// All live rows in ascending `row_id` order. Resident rows are borrowed;
-    /// disk-first base rows are decoded on the fly.
+    /// All live rows in ascending `row_id` order, each padded to the current
+    /// schema width (see [`fill`](RowStore::fill)). Resident full-width rows
+    /// are borrowed; disk-first base rows are decoded on the fly; only rows
+    /// left narrow by a metadata-only `ADD COLUMN` are widened (and so owned).
     pub fn iter(&self) -> Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> {
-        match &self.mode {
+        let fill = self.fill.as_slice();
+        let inner: Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> = match &self.mode {
             RowMode::Resident(m) => {
                 Box::new(m.iter().map(|(id, c)| (*id, Cow::Borrowed(c.as_slice()))))
             }
@@ -199,7 +254,8 @@ impl RowStore {
                 base_pos: 0,
                 overlay: d.overlay.iter().peekable(),
             }),
-        }
+        };
+        Box::new(inner.map(move |(id, c)| (id, pad_cow(fill, c))))
     }
 }
 
