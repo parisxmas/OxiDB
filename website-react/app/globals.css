@@ -243,6 +243,17 @@ a:hover { text-decoration: underline; }
 /* Push body content to the right of sidebar */
 body { margin-left: 200px; }
 
+/* Under-development banner (top of content area) */
+.dev-banner{position:sticky;top:0;z-index:90;display:flex;align-items:center;
+  justify-content:center;gap:9px;padding:8px 16px;font-size:13px;text-align:center;
+  color:var(--warn);background:rgba(214,177,74,0.09);
+  border-bottom:1px solid rgba(214,177,74,0.28);backdrop-filter:blur(6px)}
+.dev-banner strong{color:var(--warn);font-weight:650}
+.dev-banner-dot{width:7px;height:7px;border-radius:50%;background:var(--warn);
+  flex-shrink:0;box-shadow:0 0 0 0 rgba(214,177,74,0.5);animation:devpulse 2.4s ease-out infinite}
+@keyframes devpulse{0%{box-shadow:0 0 0 0 rgba(214,177,74,0.5)}
+  70%{box-shadow:0 0 0 6px rgba(214,177,74,0)}100%{box-shadow:0 0 0 0 rgba(214,177,74,0)}}
+
 /* =========== HERO =========== */
 .hero {
   padding: 88px 0 56px;

@@ -53,6 +53,13 @@ export default function RootLayout({
     <html lang="en">
       <body>
         <Nav />
+        <div className="dev-banner" role="alert">
+          <span className="dev-banner-dot" />
+          <span>
+            <strong>Under active development.</strong> OxiDB is not yet
+            recommended for production use.
+          </span>
+        </div>
         {children}
         <Footer />
       </body>
