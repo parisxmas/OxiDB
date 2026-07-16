@@ -51,6 +51,17 @@ impl Manifest {
         }
     }
 
+    /// Serialize a manifest for `(generation, wal_seq)` to JSON bytes — used to
+    /// inject a synthesized MANIFEST (pointing at a pinned generation) into a
+    /// low-lock backup archive without touching the live one.
+    pub fn to_bytes(generation: u64, wal_seq: u64) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&Manifest {
+            version: MANIFEST_VERSION,
+            generation,
+            wal_seq,
+        })?)
+    }
+
     /// Atomically commit `(generation, wal_seq)`: write a temp file, fsync it,
     /// then rename it over `MANIFEST`. This rename is the checkpoint's single
     /// commit point.

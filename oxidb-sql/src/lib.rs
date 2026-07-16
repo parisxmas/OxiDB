@@ -373,6 +373,16 @@ struct Inner {
     disk_first: bool,
     /// Auto-checkpoint threshold in WAL bytes (0 = manual only).
     checkpoint_bytes: u64,
+    /// The WAL watermark committed with the current `generation` — the highest
+    /// seq folded into its snapshots. A low-lock backup records it in the
+    /// archive's synthesized `MANIFEST`.
+    committed_wal_seq: u64,
+    /// Generations pinned by in-progress low-lock backups, refcounted (two
+    /// backups can pin the same generation). GC never removes a pinned
+    /// generation, and while any pin is held the WAL is not truncated — so a
+    /// backup can archive a committed generation and a stable WAL prefix
+    /// without holding the engine lock across the (slow) compression.
+    pinned_gens: std::collections::BTreeMap<u64, usize>,
 }
 
 /// The public SQL engine handle. Cheap to share behind an `Arc`.
@@ -504,6 +514,8 @@ impl SqlEngine {
                 wal,
                 disk_first: opts.disk_first,
                 checkpoint_bytes: opts.checkpoint_bytes,
+                committed_wal_seq: watermark,
+                pinned_gens: std::collections::BTreeMap::new(),
             }),
         })
     }
@@ -1280,6 +1292,8 @@ impl SqlEngine {
             tables,
             wal,
             disk_first,
+            committed_wal_seq,
+            pinned_gens,
             ..
         } = inner;
 
@@ -1339,6 +1353,7 @@ impl SqlEngine {
         let watermark = wal.last_seq();
         manifest::Manifest::commit(dir, new_gen, watermark)?;
         *generation = new_gen;
+        *committed_wal_seq = watermark;
 
         // Disk-first: adopt the new generation's snapshots as the bases and drop
         // the RAM overlays they absorbed.
@@ -1352,12 +1367,18 @@ impl SqlEngine {
             }
         }
 
-        // Reclaim the superseded generation (or the legacy root files) and the
+        // Reclaim the superseded generation (unless a backup pinned it) and the
         // WAL prefix now captured in the snapshot. Both are best-effort: the
         // committed MANIFEST already makes recovery correct, so a failure here
-        // only leaves reclaimable disk behind.
-        Self::gc_superseded(dir, old_gen);
-        let _ = wal.truncate();
+        // only leaves reclaimable disk behind. While a backup is pinning any
+        // generation, skip the WAL truncation too — the backup is archiving a
+        // stable prefix of it.
+        if !pinned_gens.contains_key(&old_gen) {
+            Self::gc_superseded(dir, old_gen);
+        }
+        if pinned_gens.is_empty() {
+            let _ = wal.truncate();
+        }
         Ok(())
     }
 
@@ -1810,11 +1831,15 @@ impl SqlEngine {
         self.inner.lock().unwrap().dir.clone()
     }
 
-    /// Write a consistent, compressed (`.tar.gz`) backup of this engine's whole
-    /// data directory to `out`. Holds the engine lock across a checkpoint (so
-    /// the WAL is folded into a committed generation) and the archiving (so no
-    /// concurrent write can slip in), yielding a snapshot that restores cleanly.
-    /// Returns the archive's on-disk size in bytes.
+    /// Write a consistent, compressed (`.tar.gz`) backup of this engine's data
+    /// to `out`. **Low-lock**: the engine lock is held only for two O(1)
+    /// phases — pinning a committed generation and reading the WAL length up
+    /// front, then unpinning at the end — while the slow compression runs with
+    /// the lock released, so concurrent queries and writes are not blocked by
+    /// the archive. The archived image is consistent as of the moment the
+    /// generation was pinned (a crash-consistent point): pinning keeps that
+    /// generation from being GC'd and freezes the WAL from truncation, so the
+    /// snapshot + a stable WAL prefix restore cleanly. Returns the archive size.
     pub fn backup(&self, out: &Path) -> Result<u64> {
         if out.exists() {
             return Err(SqlError::Unsupported(format!(
@@ -1827,25 +1852,110 @@ impl SqlEngine {
         {
             std::fs::create_dir_all(parent)?;
         }
-        // Hold the lock across checkpoint + archive: the committed generation
-        // and its snapshots can't be GC'd or advanced mid-tar.
-        let mut inner = self.inner.lock().unwrap();
-        Self::checkpoint_locked(&mut inner)?;
-        let dir = inner.dir.clone();
+
+        // Phase 1 (brief lock): choose a committed generation, pin it, and read
+        // its watermark + the current WAL length. A never-checkpointed database
+        // (generation 0) is checkpointed once here to materialize `gen.1`.
+        let (generation, watermark, wal_len, dir) = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.generation == 0 {
+                Self::checkpoint_locked(&mut inner)?;
+            }
+            let generation = inner.generation;
+            *inner.pinned_gens.entry(generation).or_insert(0) += 1;
+            (
+                generation,
+                inner.committed_wal_seq,
+                inner.wal.bytes(),
+                inner.dir.clone(),
+            )
+        };
+
+        // Phase 2 (no lock): compress. While pinned, `gen.<generation>` is safe
+        // from GC and the WAL prefix `[0, wal_len)` is frozen (no truncation),
+        // so this reads a stable, consistent image even as writes continue.
+        let result = Self::write_backup_archive(&dir, generation, watermark, wal_len, out);
+
+        // Phase 3 (brief lock): drop the pin, and reclaim the generation if a
+        // checkpoint superseded it during the backup (GC skipped it while
+        // pinned).
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(count) = inner.pinned_gens.get_mut(&generation) {
+                *count -= 1;
+                if *count == 0 {
+                    inner.pinned_gens.remove(&generation);
+                }
+            }
+            if generation != inner.generation && !inner.pinned_gens.contains_key(&generation) {
+                let _ = std::fs::remove_dir_all(manifest::gen_dir(&inner.dir, generation));
+            }
+        }
+
+        result?;
+        Ok(std::fs::metadata(out)?.len())
+    }
+
+    /// Assemble a backup archive (no lock held): a synthesized `MANIFEST`
+    /// pointing at the pinned `generation`, that generation's directory, a
+    /// stable prefix `[0, wal_len)` of the live WAL, and `sequences.json`.
+    fn write_backup_archive(
+        root: &Path,
+        generation: u64,
+        watermark: u64,
+        wal_len: u64,
+        out: &Path,
+    ) -> Result<()> {
+        use std::io::Read;
+        let map_tar =
+            |e: std::io::Error| SqlError::Unsupported(format!("backup archive failed: {e}"));
 
         let file = std::fs::File::create(out)?;
         let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut ar = tar::Builder::new(enc);
-        ar.append_dir_all(".", &dir)
-            .map_err(|e| SqlError::Unsupported(format!("backup archive failed: {e}")))?;
-        let enc = ar
-            .into_inner()
-            .map_err(|e| SqlError::Unsupported(format!("backup finalize failed: {e}")))?;
-        enc.finish()
-            .map_err(|e| SqlError::Unsupported(format!("backup gzip failed: {e}")))?;
-        drop(inner);
 
-        Ok(std::fs::metadata(out)?.len())
+        // Synthesized MANIFEST — points at the pinned generation, not the live
+        // one (which a concurrent checkpoint may have advanced past).
+        let manifest_bytes = manifest::Manifest::to_bytes(generation, watermark)?;
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_size(manifest_bytes.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        ar.append_data(&mut hdr, "MANIFEST", &manifest_bytes[..])
+            .map_err(map_tar)?;
+
+        // The pinned generation directory (immutable once committed).
+        ar.append_dir_all(
+            format!("gen.{generation}"),
+            manifest::gen_dir(root, generation),
+        )
+        .map_err(map_tar)?;
+
+        // A stable prefix of the WAL. Truncation is frozen while pinned, so the
+        // file is at least `wal_len` bytes and its prefix never changes.
+        let wal_path = root.join("wal").join("live.wal");
+        if wal_len > 0 && wal_path.exists() {
+            let f = std::fs::File::open(&wal_path)?;
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(wal_len);
+            hdr.set_mode(0o644);
+            hdr.set_cksum();
+            ar.append_data(&mut hdr, "wal/live.wal", f.take(wal_len))
+                .map_err(map_tar)?;
+        }
+
+        // Sequences persist outside the generation.
+        let seq_path = root.join("sequences.json");
+        if seq_path.exists() {
+            ar.append_path_with_name(&seq_path, "sequences.json")
+                .map_err(map_tar)?;
+        }
+
+        ar.into_inner()
+            .map_err(map_tar)?
+            .finish()
+            .map_err(map_tar)?;
+        Ok(())
     }
 
     /// Extract a `.tar.gz` backup produced by [`backup`](SqlEngine::backup) into
