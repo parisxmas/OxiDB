@@ -47,7 +47,7 @@
           font-family="'Geist Mono', ui-monospace, monospace"
           font-size="13"
           letter-spacing="0.18em"
-          fill="#6c7585">DOCUMENT&#160;DATABASE</text>
+          fill="#6c7585">MULTI&#8209;MODEL&#160;DATABASE</text>
   </g>
 
   <!-- Version chip (top right) -->
@@ -78,7 +78,7 @@
         font-size="32"
         font-weight="400"
         letter-spacing="-0.01em"
-        fill="#e7e9ed">A fast, versatile document database.</text>
+        fill="#e7e9ed">A fast, multi-model database.</text>
 
   <!-- Feature pills row -->
   <g transform="translate(80, 430)" font-family="'Geist Mono', ui-monospace, monospace" font-size="14" letter-spacing="0.06em">

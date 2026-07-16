@@ -130,6 +130,23 @@ a:hover { text-decoration: underline; }
   overflow-x: visible;
   padding: 0 8px;
 }
+.nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.nav-group-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  opacity: 0.65;
+  padding: 14px 8px 4px;
+}
+.nav-group:first-child .nav-group-title {
+  padding-top: 4px;
+}
 .nav-links a {
   font-size: 13px;
   font-weight: 500;

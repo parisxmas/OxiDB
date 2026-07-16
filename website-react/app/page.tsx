@@ -1,7 +1,7 @@
 import type { Metadata } from "next"
 
 export const metadata: Metadata = {
-  title: "Fast Embeddable Document Database",
+  title: "Fast Multi-Model Database — Document, SQL & Time-Series",
 }
 
 export default function Page() {
@@ -9,7 +9,7 @@ export default function Page() {
   <div class="container">
     <p class="hero-kicker"><span class="hero-pulse"></span>v0.35 &middot; instant online ALTER TABLE &middot; crash-atomic checkpoints &middot; EF Core beats PostgreSQL &middot; TSDB engine</p>
     <h1>OxiDB</h1>
-    <p class="tagline">A fast, versatile document database.</p>
+    <p class="tagline">A fast, multi-model database.</p>
     <p class="sub">MongoDB-style JSON queries <strong>and a full SQL engine</strong> &mdash; window functions, CTEs, <code>WITH&nbsp;RECURSIVE</code>, LATERAL joins, and an <strong>EF&nbsp;Core provider that beats PostgreSQL</strong> (3832/3832 spec tests). Instant, online <code>ALTER&nbsp;TABLE&nbsp;ADD/DROP&nbsp;COLUMN</code> and crash-atomic checkpoints. ACID transactions with SELECT&nbsp;FOR&nbsp;UPDATE and group commit. A <strong>Redis-compatible in-memory store</strong> (MULTI/EXEC/WATCH + EVAL) and an <strong>MQTT broker</strong>. A built-in <strong>time-series engine</strong> (InfluxDB-style, Gorilla-compressed, line-protocol ingest). Full-text &amp; vector search. S3-compatible blob storage. Raft replication. Encryption at rest.</p>
     <div class="hero-actions">
       <a href="/quickstart/" class="btn btn-primary">Get Started</a>
@@ -111,49 +111,64 @@ dotnet add package OxiDb.Client.Tcp</code></pre>
     <h2>Why OxiDB</h2>
     <div class="feature-grid">
       <div class="feature-card">
-        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
-        <h3>Fast</h3>
-        <p>2-3x faster than MongoDB on indexed queries at 1M docs, 2189x faster on indexed counts. Bytes-first wire path and direct JSONB&rarr;OxiWire converter eliminate the Value-tree intermediate.</p>
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg></div>
+        <h3>Three engines, one binary</h3>
+        <p>A MongoDB-style document store, a full relational SQL engine, and an InfluxDB-style time-series engine &mdash; in one process, one file, no glue. Use one or all three; each owns separate storage.</p>
       </div>
       <div class="feature-card">
-        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg></div>
-        <h3>Flexible Deployment</h3>
-        <p>Embed as a Rust library with zero network overhead, or run as a TCP server with auth, TLS, and RBAC.</p>
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></div>
+        <h3>Fast</h3>
+        <p>2-3x faster than MongoDB on indexed queries at 1M docs, 2189x on indexed counts &mdash; and beats PostgreSQL across the EF Core benchmark. A bytes-first wire path with a direct JSONB&rarr;OxiWire converter.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></div>
-        <h3>JSON document queries</h3>
-        <p>MongoDB-style JSON queries with $eq, $gt, $in, $regex, $or, $elemMatch, $expr, plus an aggregation pipeline (JOINs via $lookup, GROUP BY via $group).</p>
+        <h3>MongoDB-style documents</h3>
+        <p>JSON queries with $eq, $gt, $in, $regex, $or, $elemMatch, $expr, plus a 16-stage aggregation pipeline (JOINs via $lookup, GROUP BY via $group, window &amp; time-series stages).</p>
       </div>
       <div class="feature-card">
-        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
-        <h3>ACID Transactions</h3>
-        <p>Multi-collection OCC transactions. 3-phase commit with WAL. Crash recovery with CRC32 checksums.</p>
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div>
+        <h3>Full SQL engine</h3>
+        <p>INNER/LEFT/RIGHT/FULL joins, GROUP BY, window functions, CTEs (incl. WITH RECURSIVE) and LATERAL. An EF Core provider passing all 3832 official spec tests, with ADO.NET, Dapper, and migrations. Instant, online ALTER TABLE.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
+        <h3>Time-series engine</h3>
+        <p>InfluxDB-style, with Gorilla-compressed columnar streams (~0.3 bytes/point), line-protocol ingest, continuous-aggregate rollups, and rate() / percentile aggregations.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg></div>
+        <h3>ACID + crash-safe backups</h3>
+        <p>Multi-collection OCC transactions, 3-phase commit with WAL, CRC32 crash recovery. Crash-atomic MANIFEST checkpoints, low-lock online backup/restore, and point-in-time recovery.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
         <h3>Full-Text & Vector Search</h3>
-        <p>TF-IDF ranked search across 8 document formats. HNSW vector index with cosine, euclidean, and dot product.</p>
+        <p>TF-IDF ranked full-text search across 8 document formats (PDF, DOCX, XLSX, HTML, XML, JSON, images/OCR). HNSW vector index with cosine, euclidean, and dot product.</p>
       </div>
       <div class="feature-card">
-        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><line x1="7" y1="7" x2="10" y2="10"/><line x1="14" y1="10" x2="17" y2="7"/><line x1="7" y1="17" x2="10" y2="14"/><line x1="14" y1="14" x2="17" y2="17"/></svg></div>
-        <h3>Sharding + Raft Replication</h3>
-        <p>Horizontal sharding via oxipool (CRC32 routing, scatter-gather) on top of per-shard Raft groups. Persistent log survives container restarts. Verified at 1M records under mid-stream failover.</p>
-      </div>
-      <div class="feature-card">
-        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 22h14a2 2 0 002-2V7.5L14.5 2H6a2 2 0 00-2 2v4"/><polyline points="14 2 14 8 20 8"/><path d="M2 15h10"/><path d="M9 18l3-3-3-3"/></svg></div>
-        <h3>Document Indexing</h3>
-        <p>Full-text index PDF, DOCX, XLSX, HTML, XML, JSON, and images (OCR). Search across all your documents with TF-IDF ranking.</p>
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M4.93 19.07a10 10 0 010-14.14"/><path d="M7.76 16.24a6 6 0 010-8.49"/><path d="M16.24 7.76a6 6 0 010 8.49"/><path d="M19.07 4.93a10 10 0 010 14.14"/></svg></div>
+        <h3>Redis-compatible + MQTT</h3>
+        <p>OxiMem &mdash; a Redis-compatible in-memory store (RESP, MULTI/EXEC/WATCH, EVAL/Lua, persistence) &mdash; plus a full MQTT 3.1.1 broker (wildcards, retained, QoS, LWT).</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div>
         <h3>S3 Blob Storage</h3>
-        <p>S3-style bucket and object API for binary data. Store files alongside documents with CRC32 integrity checks.</p>
+        <p>A full S3-compatible HTTP API (SigV4, multipart, Range, lifecycle) &mdash; aws-cli, boto3, and the MinIO SDKs work unmodified. Store files alongside documents.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="6" r="2"/><circle cx="19" cy="6" r="2"/><circle cx="5" cy="18" r="2"/><circle cx="19" cy="18" r="2"/><line x1="7" y1="7" x2="10" y2="10"/><line x1="14" y1="10" x2="17" y2="7"/><line x1="7" y1="17" x2="10" y2="14"/><line x1="14" y1="14" x2="17" y2="17"/></svg></div>
+        <h3>Sharding + Raft Replication</h3>
+        <p>Horizontal sharding via oxipool (CRC32 routing, scatter-gather) on per-shard Raft groups. Persistent log survives restarts. Verified at 1M records under mid-stream failover.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1"/><circle cx="6" cy="18" r="1"/></svg></div>
+        <h3>Flexible Deployment</h3>
+        <p>Embed as a Rust library with zero network overhead, or run as a single static TCP server with SCRAM auth, TLS, and RBAC. One binary, no dependencies, no installer.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
         <h3>Multi-Language</h3>
-        <p>Official clients for Rust, Python, Go, .NET (TCP + Embedded + LINQ), Java, Julia, and Swift.</p>
+        <p>Official clients for Rust, Python, Go, .NET (ADO.NET + EF Core + LINQ + Embedded), Java, Julia, Swift, PHP/WordPress, and JS/TS &mdash; plus a WebAssembly build.</p>
       </div>
     </div>
   </div>

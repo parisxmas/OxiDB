@@ -4,30 +4,63 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useState } from 'react'
 
-const navItems = [
-  { href: '/downloads', label: 'Downloads' },
-  { href: '/book', label: 'Book' },
-  { href: '/features', label: 'Features' },
-  { href: '/quickstart', label: 'Quick Start' },
-  { href: '/docs', label: 'Docs' },
-  { href: '/queries', label: 'Queries' },
-  { href: '/updates', label: 'Updates' },
-  { href: '/aggregation', label: 'Aggregation' },
-  { href: '/indexes', label: 'Indexes' },
-  { href: '/transactions', label: 'Transactions' },
-  { href: '/search', label: 'Search' },
-  { href: '/vectors', label: 'Vectors' },
-  { href: '/blobs', label: 'Blobs' },
-  { href: '/streams', label: 'Streams' },
-  { href: '/server', label: 'Server' },
-  { href: '/clients', label: 'Clients' },
-  { href: '/wasm', label: 'WebAssembly' },
-  { href: '/go-examples', label: 'Go Examples' },
-  { href: '/python-examples', label: 'Python Examples' },
-  { href: '/storage', label: 'Storage' },
-  { href: '/benchmarks', label: 'Benchmarks' },
-  { href: '/changelog', label: 'Changelog' },
-  { href: '/license', label: 'License' },
+const navGroups = [
+  {
+    title: 'Getting Started',
+    items: [
+      { href: '/quickstart', label: 'Quick Start' },
+      { href: '/features', label: 'Features' },
+      { href: '/downloads', label: 'Downloads' },
+    ],
+  },
+  {
+    title: 'Document Engine',
+    items: [
+      { href: '/queries', label: 'Queries' },
+      { href: '/updates', label: 'Updates' },
+      { href: '/aggregation', label: 'Aggregation' },
+      { href: '/indexes', label: 'Indexes' },
+      { href: '/transactions', label: 'Transactions' },
+      { href: '/search', label: 'Search' },
+      { href: '/vectors', label: 'Vectors' },
+    ],
+  },
+  {
+    title: 'SQL Engine',
+    items: [{ href: '/sql', label: 'SQL Reference' }],
+  },
+  {
+    title: 'Time-Series Engine',
+    items: [{ href: '/tsdb', label: 'Time-Series' }],
+  },
+  {
+    title: 'Storage & Realtime',
+    items: [
+      { href: '/blobs', label: 'Blobs (S3)' },
+      { href: '/streams', label: 'Streams' },
+      { href: '/storage', label: 'Storage' },
+    ],
+  },
+  {
+    title: 'Server & Clients',
+    items: [
+      { href: '/server', label: 'Server' },
+      { href: '/clients', label: 'Clients' },
+      { href: '/wasm', label: 'WebAssembly' },
+      { href: '/benchmarks', label: 'Benchmarks' },
+    ],
+  },
+  {
+    title: 'Reference',
+    items: [
+      { href: '/docs', label: 'Docs' },
+      { href: '/book', label: 'Book' },
+      { href: '/go-examples', label: 'Go Examples' },
+      { href: '/python-examples', label: 'Python Examples' },
+      { href: '/changelog', label: 'Changelog' },
+      { href: '/license', label: 'License' },
+    ],
+  },
 ]
 
 export default function Nav() {
@@ -41,15 +74,20 @@ export default function Nav() {
           Oxi<span>DB</span>
         </Link>
         <div className="nav-links">
-          {navItems.map(({ href, label }) => (
-            <Link
-              key={href}
-              href={href}
-              className={pathname === href || pathname === href + '/' ? 'active' : ''}
-              onClick={() => setOpen(false)}
-            >
-              {label}
-            </Link>
+          {navGroups.map((group) => (
+            <div className="nav-group" key={group.title}>
+              <div className="nav-group-title">{group.title}</div>
+              {group.items.map(({ href, label }) => (
+                <Link
+                  key={href}
+                  href={href}
+                  className={pathname === href || pathname === href + '/' ? 'active' : ''}
+                  onClick={() => setOpen(false)}
+                >
+                  {label}
+                </Link>
+              ))}
+            </div>
           ))}
         </div>
         <button

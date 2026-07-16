@@ -19,30 +19,30 @@ export default function Page() {
     <p>Pre-built static binaries — no runtime, no installer, no dependencies. Pick your platform:</p>
 
     <h4>Linux (x86_64)</h4>
-    <pre><code class="lang-bash">curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-server-v0.34.0-linux-amd64.tar.gz
-tar xzf oxidb-server-v0.34.0-linux-amd64.tar.gz
+    <pre><code class="lang-bash">curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-server-v0.35.0-linux-amd64.tar.gz
+tar xzf oxidb-server-v0.35.0-linux-amd64.tar.gz
 sudo mv oxidb-server /usr/local/bin/
 oxidb-server --version</code></pre>
 
     <h4>Linux (ARM64)</h4>
-    <pre><code class="lang-bash">curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-server-v0.34.0-linux-arm64.tar.gz
-tar xzf oxidb-server-v0.34.0-linux-arm64.tar.gz
+    <pre><code class="lang-bash">curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-server-v0.35.0-linux-arm64.tar.gz
+tar xzf oxidb-server-v0.35.0-linux-arm64.tar.gz
 sudo mv oxidb-server /usr/local/bin/</code></pre>
 
     <h4>macOS (Apple Silicon / Intel)</h4>
     <pre><code class="lang-bash"><span class="co"># Apple Silicon</span>
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-server-v0.34.0-darwin-arm64.tar.gz
-tar xzf oxidb-server-v0.34.0-darwin-arm64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-server-v0.35.0-darwin-arm64.tar.gz
+tar xzf oxidb-server-v0.35.0-darwin-arm64.tar.gz
 
 <span class="co"># Intel</span>
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-server-v0.34.0-darwin-amd64.tar.gz
-tar xzf oxidb-server-v0.34.0-darwin-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-server-v0.35.0-darwin-amd64.tar.gz
+tar xzf oxidb-server-v0.35.0-darwin-amd64.tar.gz
 
 sudo mv oxidb-server /usr/local/bin/</code></pre>
 
     <h4>Windows (x86_64)</h4>
     <pre><code class="lang-bash"><span class="co"># PowerShell</span>
-Invoke-WebRequest -Uri https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-server-v0.34.0-windows-amd64.zip -OutFile oxidb-server.zip
+Invoke-WebRequest -Uri https://oxidb.baltavista.com/releases/v0.35.0/oxidb-server-v0.35.0-windows-amd64.zip -OutFile oxidb-server.zip
 Expand-Archive oxidb-server.zip -DestinationPath .
 .\\oxidb-server.exe --version</code></pre>
 
@@ -58,7 +58,7 @@ cargo build --release -p oxidb-server
   -v $(pwd)/data:/data \\
   -e OXIDB_DATA=/data \\
   -e OXIDB_ADDR=0.0.0.0:4444 \\
-  ghcr.io/parisxmas/oxidb:0.34.0</code></pre>
+  ghcr.io/parisxmas/oxidb:0.35.0</code></pre>
 
     <h3>2. Start the server</h3>
     <pre><code class="lang-bash"><span class="co"># Defaults: listens on 127.0.0.1:4444, data directory ./oxidb_data</span>
@@ -84,8 +84,8 @@ oxidb-server</code></pre>
 
     <h3>3. Install the CLI &amp; run your first query</h3>
     <pre><code class="lang-bash"><span class="co"># Linux example — pick the matching CLI archive from /downloads/ for your OS</span>
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-cli-v0.34.0-linux-amd64.tar.gz
-tar xzf oxidb-cli-v0.34.0-linux-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-v0.35.0-linux-amd64.tar.gz
+tar xzf oxidb-v0.35.0-linux-amd64.tar.gz
 sudo mv oxidb /usr/local/bin/
 
 <span class="co"># Open the REPL against the running server</span>
@@ -136,6 +136,32 @@ builder.Services.AddOxiDb(options => {
 
     <p>Other languages: <a href="/clients/">Julia, Swift, JavaScript/TypeScript</a>.</p>
 
+    <h3 id="engines">5. Use all three engines</h3>
+    <p>OxiDB bundles three engines in one server. The <strong>document</strong> engine is always on; enable the <strong>SQL</strong> and <strong>time-series</strong> engines with env vars (zero cost when off). Each owns entirely separate files.</p>
+    <pre><code class="lang-bash">OXIDB_SQL=1 OXIDB_TSDB=1 oxidb-server</code></pre>
+
+    <h4>Document &mdash; MongoDB-style</h4>
+    <pre><code class="lang-python">db.insert(<span class="str">"users"</span>, {<span class="str">"name"</span>: <span class="str">"Alice"</span>, <span class="str">"age"</span>: <span class="num">30</span>})
+db.find(<span class="str">"users"</span>, {<span class="str">"age"</span>: {<span class="str">"$gte"</span>: <span class="num">18</span>}})
+db.aggregate(<span class="str">"orders"</span>, [{<span class="str">"$group"</span>: {<span class="str">"_id"</span>: <span class="str">"$user"</span>, <span class="str">"total"</span>: {<span class="str">"$sum"</span>: <span class="str">"$amount"</span>}}}])</code></pre>
+
+    <h4>SQL &mdash; relational</h4>
+    <pre><code class="lang-python"><span class="co"># the Python client has a .sql() helper (server started with OXIDB_SQL=1)</span>
+db.sql(<span class="str">"CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)"</span>)
+db.sql(<span class="str">"INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25)"</span>)
+rows = db.sql(<span class="str">"SELECT name, age FROM users WHERE age &gt;= ? ORDER BY age"</span>, [<span class="num">18</span>])
+db.sql(<span class="str">"ALTER TABLE users ADD COLUMN score INT DEFAULT 0"</span>)   <span class="co"># instant, online</span></code></pre>
+    <p>Joins, CTEs, window functions, transactions, and the EF Core provider are on the <a href="/sql/">SQL Engine</a> page.</p>
+
+    <h4>Time-series &mdash; InfluxDB-style</h4>
+    <p>Send an <code>engine: "tsdb"</code> request (any client that speaks the JSON protocol; the Go client has native helpers):</p>
+    <pre><code class="lang-json"><span class="co">// write a point</span>
+{"engine":"tsdb","cmd":"tsdb","op":"write","measurement":"cpu","tags":{"host":"a"},"fields":{"usage":0.63},"ts":1700000000000}
+
+<span class="co">// query — mean over 10-minute buckets</span>
+{"engine":"tsdb","cmd":"tsdb","op":"query","measurement":"cpu","field":"usage","interval":600000,"agg":"mean"}</code></pre>
+    <p>Line protocol, rollups, and retention are on the <a href="/tsdb/">Time-Series Engine</a> page.</p>
+
     <h3 id="embedded">Embed in your app (no server)</h3>
     <p>Skip the TCP layer entirely — link OxiDB into your process, talk to it via function calls, zero network overhead.</p>
 
@@ -168,7 +194,7 @@ db.insert(<span class="str">"users"</span>, {<span class="str">"name"</span>: <s
     <h4>WebAssembly (browser)</h4>
     <p>Run the full engine in the browser — in-memory, no server. See <a href="/wasm/">WebAssembly</a>.</p>
 
-    <h3>Production: 3-node Raft cluster <span class="version-badge latest">v0.34.0</span></h3>
+    <h3>Production: 3-node Raft cluster <span class="version-badge latest">v0.35.0</span></h3>
     <p>Each node sets a unique <code>OXIDB_NODE_ID</code> and the same <code>OXIDB_RAFT_PEERS</code> list. After all three are up, bootstrap once via the leader candidate. Raft state is persisted to disk, so nodes survive container restarts.</p>
     <pre><code class="lang-bash"><span class="co"># node 1 — initial leader candidate</span>
 OXIDB_NODE_ID=1 OXIDB_RAFT_ADDR=0.0.0.0:5000 \\
@@ -188,7 +214,8 @@ oxidb raft_change_membership --members=1,2,3</code></pre>
     <ul>
       <li><a href="/queries/">Query operators</a> — JSON query language reference</li>
       <li><a href="/aggregation/">Aggregation</a> — pipeline stages, JOINs via $lookup, GROUP BY via $group</li>
-      <li><a href="/indexes/">Indexes</a> — single-field, composite, unique, vector</li>
+      <li><a href="/sql/">SQL Engine</a> — joins, CTEs, window functions, EF Core, online ALTER</li>
+      <li><a href="/tsdb/">Time-Series Engine</a> — line protocol, downsampling, rollups</li>
       <li><a href="/transactions/">Transactions</a> — multi-collection ACID with OCC</li>
       <li><a href="/server/">Server</a> — TLS, auth, RBAC, sharding, Raft</li>
       <li><a href="/clients/">Clients</a> — every language binding</li>
