@@ -53,6 +53,104 @@ Postgres + Mongo + Redis + Elastic + S3. 14 MB.</pre>
 
 <section class="section section-alt">
   <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> Architecture</h2>
+    <p class="section-desc">One binary, one server process. Every client speaks its own <strong>native wire protocol</strong>; the router authenticates and dispatches each request to the right engine; all engines share one <strong>durable storage foundation</strong>.</p>
+
+    <div class="arch">
+      <div class="arch-layer">
+        <div class="arch-label">Clients &amp; tools</div>
+        <div class="arch-row">
+          <span class="arch-chip">Python</span>
+          <span class="arch-chip">Go</span>
+          <span class="arch-chip">.NET / EF&nbsp;Core</span>
+          <span class="arch-chip">JS / TS</span>
+          <span class="arch-chip">Julia</span>
+          <span class="arch-chip">Swift</span>
+          <span class="arch-chip">PHP</span>
+          <span class="arch-chip alt">redis-cli</span>
+          <span class="arch-chip alt">mosquitto</span>
+          <span class="arch-chip alt">aws-cli / boto3</span>
+          <span class="arch-chip alt">Browser</span>
+        </div>
+      </div>
+
+      <div class="arch-flow"><span class="arch-flow-txt">speak native wire protocols</span></div>
+
+      <div class="arch-layer">
+        <div class="arch-label">Wire protocols</div>
+        <div class="arch-row">
+          <span class="arch-proto">TCP&nbsp;+&nbsp;JSON</span>
+          <span class="arch-proto">RESP</span>
+          <span class="arch-proto">MQTT&nbsp;3.1.1</span>
+          <span class="arch-proto">S3&nbsp;HTTP&nbsp;+&nbsp;SigV4</span>
+          <span class="arch-proto">REST</span>
+          <span class="arch-proto">WebSocket</span>
+        </div>
+      </div>
+
+      <div class="arch-flow"></div>
+
+      <div class="arch-core">
+        <strong>OxiDB Server</strong>
+        <span>request router &middot; RBAC &middot; SCRAM-SHA-256 auth &middot; TLS &middot; audit log &middot; multi-database</span>
+      </div>
+
+      <div class="arch-flow"><span class="arch-flow-txt">routes each request to an engine</span></div>
+
+      <div class="arch-engines">
+        <div class="arch-engine e-doc">
+          <div class="arch-engine-h">Document Engine</div>
+          <div class="arch-engine-b">Mongo-style JSON queries, aggregation pipeline, full-text &amp; vector search</div>
+          <div class="arch-engine-p">TCP &middot; REST &middot; WS</div>
+        </div>
+        <div class="arch-engine e-sql">
+          <div class="arch-engine-h">SQL Engine</div>
+          <div class="arch-engine-b">Joins, CTEs, window functions, stored procedures, EF&nbsp;Core provider</div>
+          <div class="arch-engine-p">TCP</div>
+        </div>
+        <div class="arch-engine e-tsdb">
+          <div class="arch-engine-h">Time-Series Engine</div>
+          <div class="arch-engine-b">Gorilla-compressed columns, line-protocol ingest, continuous rollups</div>
+          <div class="arch-engine-p">TCP</div>
+        </div>
+        <div class="arch-engine e-mem">
+          <div class="arch-engine-h">OxiMem</div>
+          <div class="arch-engine-b">Redis-compatible KV, MULTI/EXEC/WATCH, EVAL/Lua, pub/sub</div>
+          <div class="arch-engine-p">RESP</div>
+        </div>
+        <div class="arch-engine e-mqtt">
+          <div class="arch-engine-h">MQTT Broker</div>
+          <div class="arch-engine-b">Topic wildcards, retained messages, QoS&nbsp;0/1/2, Last&nbsp;Will</div>
+          <div class="arch-engine-p">MQTT</div>
+        </div>
+        <div class="arch-engine e-s3">
+          <div class="arch-engine-h">S3 Blob Store</div>
+          <div class="arch-engine-b">Buckets, multipart upload, lifecycle, presigned URLs</div>
+          <div class="arch-engine-p">S3 HTTP</div>
+        </div>
+      </div>
+
+      <div class="arch-flow"><span class="arch-flow-txt">shared durable foundation</span></div>
+
+      <div class="arch-layer arch-storage">
+        <div class="arch-label">Storage &amp; durability</div>
+        <div class="arch-row">
+          <span class="arch-chip">WAL &mdash; CRC32, 3-fsync</span>
+          <span class="arch-chip">MANIFEST checkpoints</span>
+          <span class="arch-chip">AES-GCM at rest</span>
+          <span class="arch-chip">Raft replication</span>
+          <span class="arch-chip">Point-in-time recovery</span>
+          <span class="arch-chip">TTL indexes</span>
+        </div>
+      </div>
+    </div>
+
+    <p class="arch-note"><strong>Cross-protocol pub/sub:</strong> a message published over RESP (OxiMem) reaches MQTT subscribers, and vice-versa &mdash; one bus, two protocols. The three query engines are <strong>per-database</strong>; OxiMem's keyspace and S3 buckets are global. Everything above runs <strong>embedded in-process</strong> too, with no server or protocol at all.</p>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container">
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Install OxiDB in 60 seconds</h2>
     <p class="section-desc">From zero to a running server. Single static binary, no dependencies, no installer.</p>
 
@@ -106,7 +204,7 @@ dotnet add package OxiDb.Client.Tcp</code></pre>
   </div>
 </section>
 
-<section class="section">
+<section class="section section-alt">
   <div class="container">
     <h2>Why OxiDB</h2>
     <div class="feature-grid">
@@ -174,7 +272,7 @@ dotnet add package OxiDb.Client.Tcp</code></pre>
   </div>
 </section>
 
-<section class="section section-alt">
+<section class="section">
   <div class="container">
     <h2>At a Glance</h2>
     <div class="glance-grid">

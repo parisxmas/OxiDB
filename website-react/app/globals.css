@@ -197,17 +197,30 @@ a:hover { text-decoration: underline; }
   border-radius: var(--radius);
   white-space: nowrap;
   text-decoration: none;
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.nav-icon {
+  flex-shrink: 0;
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
 }
 .nav-links a:hover {
   color: var(--text);
   background: var(--bg-alt);
   text-decoration: none;
 }
+.nav-links a:hover .nav-icon {
+  opacity: 0.85;
+}
 .nav-links a.active {
   color: var(--accent);
   background: var(--accent-light);
   font-weight: 600;
+}
+.nav-links a.active .nav-icon {
+  opacity: 1;
 }
 .nav-gh {
   margin-left: 0;
@@ -898,3 +911,64 @@ tbody td code {
 .termblock pre{margin:0;padding:22px 26px;color:#4ade80;background:transparent;border:0;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14.5px;line-height:1.75;
   white-space:pre-wrap;overflow-x:auto}
+
+/* ---- Architecture diagram ---- */
+.arch{display:flex;flex-direction:column;align-items:stretch;gap:0;margin-top:26px}
+.arch-layer{background:var(--bg-card);border:1px solid var(--border-2);border-radius:10px;
+  padding:14px 16px}
+.arch-storage{border-color:var(--border-3)}
+.arch-label{font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--text-mute);margin-bottom:10px}
+.arch-row{display:flex;flex-wrap:wrap;gap:8px}
+.arch-chip{font-size:13px;color:var(--text-dim);background:var(--bg-elev);
+  border:1px solid var(--border-2);border-radius:20px;padding:5px 12px;white-space:nowrap}
+.arch-chip.alt{color:var(--steel);border-color:var(--steel-light);
+  background:var(--steel-light)}
+.arch-proto{font-family:var(--font-mono);font-size:12.5px;color:var(--accent);
+  background:var(--accent-light);border:1px solid rgba(226,120,74,.28);
+  border-radius:6px;padding:6px 12px;white-space:nowrap}
+
+/* vertical connectors between layers */
+.arch-flow{position:relative;height:34px;display:flex;align-items:center;justify-content:center;
+  font-size:11.5px;color:var(--text-mute);font-family:var(--font-mono)}
+.arch-flow::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;
+  transform:translateX(-1px);
+  background:linear-gradient(to bottom,var(--border-3),var(--accent),var(--border-3))}
+.arch-flow:not(:empty){padding:0 12px}
+.arch-flow::after{content:"";position:absolute;left:50%;bottom:2px;width:7px;height:7px;
+  transform:translateX(-50%) rotate(45deg);border-right:2px solid var(--accent);
+  border-bottom:2px solid var(--accent)}
+.arch-flow-txt{position:relative;z-index:1;background:var(--bg);padding:2px 10px;
+  border-radius:20px}
+.section-alt .arch-flow-txt{background:var(--bg-alt)}
+
+.arch-core{background:linear-gradient(180deg,var(--bg-card),var(--bg-elev));
+  border:1.5px solid var(--accent);border-radius:10px;padding:16px;text-align:center;
+  box-shadow:0 0 0 4px var(--accent-light)}
+.arch-core strong{display:block;font-size:16px;color:var(--text);margin-bottom:3px}
+.arch-core span{font-size:12.5px;color:var(--text-dim)}
+
+.arch-engines{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.arch-engine{background:var(--bg-card);border:1px solid var(--border-2);border-radius:10px;
+  padding:14px;border-top:3px solid var(--accent);display:flex;flex-direction:column;gap:6px}
+.arch-engine-h{font-size:14.5px;font-weight:650;color:var(--text)}
+.arch-engine-b{font-size:12.5px;color:var(--text-dim);line-height:1.5;flex:1}
+.arch-engine-p{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.04em;
+  color:var(--text-mute);text-transform:uppercase}
+.e-doc{border-top-color:var(--accent)}
+.e-sql{border-top-color:var(--steel)}
+.e-tsdb{border-top-color:var(--good)}
+.e-mem{border-top-color:var(--bad)}
+.e-mqtt{border-top-color:var(--warn)}
+.e-s3{border-top-color:#9b7cb4}
+
+.arch-note{margin-top:22px;font-size:13px;color:var(--text-dim);line-height:1.65;
+  background:var(--bg-alt);border:1px solid var(--border);border-left:3px solid var(--accent);
+  border-radius:6px;padding:12px 16px}
+
+@media(max-width:640px){
+  .arch-engines{grid-template-columns:1fr 1fr}
+}
+@media(max-width:440px){
+  .arch-engines{grid-template-columns:1fr}
+}
