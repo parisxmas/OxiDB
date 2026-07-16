@@ -11,12 +11,55 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.35.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.35.0</h3>
+        <span class="version-date">2026-07-16</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; instant, online schema changes</h4>
+        <ul>
+          <li><strong><code>ALTER TABLE ADD COLUMN</code> / <code>DROP COLUMN</code> are O(1)</strong> &mdash; metadata-only, no row rewrite, no checkpoint. Add or drop a column on a 500M-row live table with zero downtime. ADD pads old rows with the default on read; DROP tombstones the column in place and projects it out.</li>
+          <li><strong>Checkpoint compaction</strong> reclaims a dropped column's space, folded into a checkpoint that rewrites every row anyway.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type changed">Changed &mdash; crash-atomic durability</h4>
+        <ul>
+          <li><strong>MANIFEST + generation checkpoints</strong> &mdash; each checkpoint writes a whole new <code>gen.&lt;N&gt;/</code> and promotes it with a single atomic MANIFEST rename. A crash before it leaves the previous generation whole; catalog and snapshot arities can never disagree after a crash. Recovery replays only WAL records past a watermark.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; EF Core provider &amp; SQL performance</h4>
+        <ul>
+          <li><strong>Official EF Core specification tests: 3832/3832 green</strong> across all 12 Northwind suites, with full migrations and design-time scaffolding.</li>
+          <li><strong>OxiDB beats PostgreSQL on the EF Core benchmark</strong> &mdash; contiguous scan cache, correlated-subquery decorrelation, streamed scans with push-down, single-pass GROUP BY, index-nested-loop joins, a 48&rarr;24-byte <code>Value</code>, and an OxiWire binary wire format.</li>
+          <li><strong>Analytics surface</strong> &mdash; <code>WITH</code> / <code>WITH RECURSIVE</code> CTEs, set operations (<code>UNION</code>/<code>EXCEPT</code>/<code>INTERSECT</code>), <code>LATERAL</code> joins, <code>DISTINCT ON</code>, <code>mode() WITHIN GROUP</code>, <code>CREATE SEQUENCE</code> / <code>NEXT VALUE FOR</code>, multi-level correlation, case-insensitive <code>LIKE</code> + <code>COLLATE</code>.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; TSDB time-series engine</h4>
+        <ul>
+          <li>A standalone <code>oxidb-tsdb</code> engine (mounted like SQL, <code>engine: "tsdb"</code>) &mdash; Gorilla-compressed columnar streams (~0.3 bytes/point), typed fields, InfluxDB line-protocol ingest, <code>rate()</code>/<code>percentile</code>, continuous-aggregate rollups, and MANIFEST-atomic persistence. Go client included.</li>
+          <li><strong>OxiDB Studio</strong> desktop app &mdash; visual Query Designer, schema tree, editable result grids (macOS build on the <a href="/downloads/">downloads page</a>).</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed</h4>
+        <ul>
+          <li>Linux (musl) build: qualified <code>std::fs</code> in the <code>/proc</code> stats readers.</li>
+          <li>Sequences persist in a separate <code>sequences.json</code> so a <code>NEXT VALUE FOR</code> can never desync a generation's catalog from its snapshots.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.34.7 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.34.7</h3>
         <span class="version-date">2026-07-09</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Added &mdash; full MQTT 3.1.1 broker</h4>
