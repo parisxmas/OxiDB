@@ -10,7 +10,7 @@ export default function Page() {
     <p class="hero-kicker"><span class="hero-pulse"></span>v0.35 &middot; instant online ALTER TABLE &middot; crash-atomic checkpoints &middot; EF Core beats PostgreSQL &middot; TSDB engine</p>
     <h1>OxiDB</h1>
     <p class="tagline">A fast, versatile document database.</p>
-    <p class="sub">MongoDB-style JSON queries. Full SQL engine. ACID transactions with SELECT&nbsp;FOR&nbsp;UPDATE and group commit. <strong>Redis-compatible in-memory store with MULTI/EXEC/WATCH and EVAL. MQTT broker.</strong> Full-text &amp; vector search. S3-compatible blob storage. Raft replication. Encryption at rest.</p>
+    <p class="sub">MongoDB-style JSON queries <strong>and a full SQL engine</strong> &mdash; window functions, CTEs, <code>WITH&nbsp;RECURSIVE</code>, LATERAL joins, and an <strong>EF&nbsp;Core provider that beats PostgreSQL</strong> (3832/3832 spec tests). Instant, online <code>ALTER&nbsp;TABLE&nbsp;ADD/DROP&nbsp;COLUMN</code> and crash-atomic checkpoints. ACID transactions with SELECT&nbsp;FOR&nbsp;UPDATE and group commit. A <strong>Redis-compatible in-memory store</strong> (MULTI/EXEC/WATCH + EVAL) and an <strong>MQTT broker</strong>. A built-in <strong>time-series engine</strong> (InfluxDB-style, Gorilla-compressed, line-protocol ingest). Full-text &amp; vector search. S3-compatible blob storage. Raft replication. Encryption at rest.</p>
     <div class="hero-actions">
       <a href="/quickstart/" class="btn btn-primary">Get Started</a>
       <a href="/downloads/" class="btn btn-secondary">Downloads v0.35.0</a>
