@@ -60,6 +60,41 @@ fn parse_agg(s: &str, p: Option<f64>) -> Result<Agg, String> {
 }
 
 /// Define a rollup rule: `{measurement, label, interval, aggs:[...]}`.
+/// `{ "engine": "tsdb", "cmd": "backup", "path": "..." }` — a consistent
+/// `.tar.gz` of the TSDB database `db_name`'s data directory. Holds the engine
+/// write lock across the checkpoint + archive so nothing writes mid-tar.
+fn tsdb_backup(request: &Value, db_name: &str) -> Vec<u8> {
+    let Some(path) = request.get("path").and_then(|v| v.as_str()) else {
+        return err_bytes("missing 'path'");
+    };
+    let engine = match engine_for(db_name) {
+        Ok(e) => e,
+        Err(msg) => return err_bytes(&msg),
+    };
+    match engine.write().unwrap().backup(std::path::Path::new(path)) {
+        Ok(size_bytes) => ok_bytes(json!({ "path": path, "size_bytes": size_bytes })),
+        Err(e) => err_bytes(&e.to_string()),
+    }
+}
+
+/// `{ "engine": "tsdb", "cmd": "restore", "archive": "...", "target": "..." }` —
+/// extract a TSDB backup into an empty target directory.
+fn tsdb_restore(request: &Value) -> Vec<u8> {
+    let Some(archive) = request.get("archive").and_then(|v| v.as_str()) else {
+        return err_bytes("missing 'archive'");
+    };
+    let Some(target) = request.get("target").and_then(|v| v.as_str()) else {
+        return err_bytes("missing 'target'");
+    };
+    match Tsdb::restore(std::path::Path::new(archive), std::path::Path::new(target)) {
+        Ok(()) => ok_bytes(json!({
+            "path": target,
+            "message": "TSDB restore complete; open a fresh TSDB engine on this directory to use",
+        })),
+        Err(e) => err_bytes(&e.to_string()),
+    }
+}
+
 fn rollup_add(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
     let Some(measurement) = request.get("measurement").and_then(|v| v.as_str()) else {
         return err_bytes("rollup_add requires a 'measurement'");
@@ -183,8 +218,13 @@ pub fn forget_database(db_name: &str) {
 }
 
 pub fn handle_tsdb(cmd: &str, request: &Value, readonly: bool, db_name: &str) -> Vec<u8> {
-    if cmd != "tsdb" {
-        return err_bytes("TSDB engine requests must use cmd \"tsdb\"");
+    // Engine-aware backup/restore. Like the document and SQL engines, "backup"
+    // and "restore" are admin-only in the RBAC table, so they arrive pre-gated.
+    match cmd {
+        "backup" => return tsdb_backup(request, db_name),
+        "restore" => return tsdb_restore(request),
+        "tsdb" => {}
+        _ => return err_bytes("TSDB engine requests must use cmd \"tsdb\""),
     }
     let op = request.get("op").and_then(|v| v.as_str()).unwrap_or("");
     let engine = match engine_for(db_name) {

@@ -31,7 +31,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use oxidb::database_manager::DEFAULT_DATABASE;
 use oxidb_sql::SqlEngine;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::handler::{err_bytes, ok_bytes};
 
@@ -155,8 +155,14 @@ pub fn handle_sql(
     db_name: &str,
     session_tx: &mut Option<u64>,
 ) -> Vec<u8> {
-    if cmd != "sql" {
-        return err_bytes("SQL engine requests must use cmd \"sql\"");
+    // Engine-aware backup/restore. `cmd` reaches here already gated: "backup"
+    // and "restore" are admin-only in the RBAC table (like the document
+    // engine's), so no extra role check is needed.
+    match cmd {
+        "backup" => return sql_backup(request, db_name),
+        "restore" => return sql_restore(request),
+        "sql" => {}
+        _ => return err_bytes("SQL engine requests must use cmd \"sql\""),
     }
     let Some(sql) = request.get("sql").and_then(|v| v.as_str()) else {
         return err_bytes("missing 'sql' field");
@@ -174,6 +180,42 @@ pub fn handle_sql(
     ) {
         Ok(results) => ok_bytes(results),
         Err(msg) => err_bytes(&msg),
+    }
+}
+
+/// `{ "engine": "sql", "cmd": "backup", "path": "..." }` — a consistent
+/// `.tar.gz` of the SQL database `db_name`'s data directory.
+fn sql_backup(request: &Value, db_name: &str) -> Vec<u8> {
+    let Some(path) = request.get("path").and_then(|v| v.as_str()) else {
+        return err_bytes("missing 'path'");
+    };
+    let engine = match engine_for(db_name) {
+        Ok(e) => e,
+        Err(msg) => return err_bytes(&msg),
+    };
+    match engine.backup(std::path::Path::new(path)) {
+        Ok(size_bytes) => ok_bytes(json!({ "path": path, "size_bytes": size_bytes })),
+        Err(e) => err_bytes(&e.to_string()),
+    }
+}
+
+/// `{ "engine": "sql", "cmd": "restore", "archive": "...", "target": "..." }` —
+/// extract a SQL backup into an empty target directory. Static: point a fresh
+/// engine (or restart the server) at `target` to use the restored database.
+fn sql_restore(request: &Value) -> Vec<u8> {
+    let Some(archive) = request.get("archive").and_then(|v| v.as_str()) else {
+        return err_bytes("missing 'archive'");
+    };
+    let Some(target) = request.get("target").and_then(|v| v.as_str()) else {
+        return err_bytes("missing 'target'");
+    };
+    match oxidb_sql::SqlEngine::restore(std::path::Path::new(archive), std::path::Path::new(target))
+    {
+        Ok(()) => ok_bytes(json!({
+            "path": target,
+            "message": "SQL restore complete; open a fresh SQL engine on this directory to use",
+        })),
+        Err(e) => err_bytes(&e.to_string()),
     }
 }
 

@@ -1809,6 +1809,72 @@ impl SqlEngine {
     pub fn dir(&self) -> PathBuf {
         self.inner.lock().unwrap().dir.clone()
     }
+
+    /// Write a consistent, compressed (`.tar.gz`) backup of this engine's whole
+    /// data directory to `out`. Holds the engine lock across a checkpoint (so
+    /// the WAL is folded into a committed generation) and the archiving (so no
+    /// concurrent write can slip in), yielding a snapshot that restores cleanly.
+    /// Returns the archive's on-disk size in bytes.
+    pub fn backup(&self, out: &Path) -> Result<u64> {
+        if out.exists() {
+            return Err(SqlError::Unsupported(format!(
+                "backup target already exists: {}",
+                out.display()
+            )));
+        }
+        if let Some(parent) = out.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Hold the lock across checkpoint + archive: the committed generation
+        // and its snapshots can't be GC'd or advanced mid-tar.
+        let mut inner = self.inner.lock().unwrap();
+        Self::checkpoint_locked(&mut inner)?;
+        let dir = inner.dir.clone();
+
+        let file = std::fs::File::create(out)?;
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut ar = tar::Builder::new(enc);
+        ar.append_dir_all(".", &dir)
+            .map_err(|e| SqlError::Unsupported(format!("backup archive failed: {e}")))?;
+        let enc = ar
+            .into_inner()
+            .map_err(|e| SqlError::Unsupported(format!("backup finalize failed: {e}")))?;
+        enc.finish()
+            .map_err(|e| SqlError::Unsupported(format!("backup gzip failed: {e}")))?;
+        drop(inner);
+
+        Ok(std::fs::metadata(out)?.len())
+    }
+
+    /// Extract a `.tar.gz` backup produced by [`backup`](SqlEngine::backup) into
+    /// `target` (which must be empty or absent). Static: open a fresh
+    /// `SqlEngine` on `target` afterward to use the restored database.
+    pub fn restore(archive: &Path, target: &Path) -> Result<()> {
+        if !archive.exists() {
+            return Err(SqlError::Unsupported(format!(
+                "backup archive not found: {}",
+                archive.display()
+            )));
+        }
+        if target.exists() {
+            if std::fs::read_dir(target)?.next().is_some() {
+                return Err(SqlError::Unsupported(format!(
+                    "restore target is not empty: {}",
+                    target.display()
+                )));
+            }
+        } else {
+            std::fs::create_dir_all(target)?;
+        }
+        let file = std::fs::File::open(archive)?;
+        let dec = flate2::read::GzDecoder::new(file);
+        tar::Archive::new(dec)
+            .unpack(target)
+            .map_err(|e| SqlError::Unsupported(format!("restore extract failed: {e}")))?;
+        Ok(())
+    }
 }
 
 /// Whether every statement in `sql` is a read (a SELECT — possibly with set

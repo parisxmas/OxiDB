@@ -228,6 +228,69 @@ impl Tsdb {
         persist.checkpoint(&self.series, &self.str_series, &self.watermark)
     }
 
+    /// The on-disk data directory, or `None` for an in-memory database.
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.persist.as_ref().map(|p| p.dir())
+    }
+
+    /// Write a consistent, compressed (`.tar.gz`) backup of this engine's data
+    /// directory to `out`. Checkpoints first (folding the WAL into a fresh
+    /// snapshot) so the archive is a clean, restorable image; the caller holds
+    /// the engine exclusively (`&mut self`), so nothing writes mid-archive.
+    /// Returns the archive's size in bytes. Errors for an in-memory database.
+    pub fn backup(&mut self, out: &Path) -> std::io::Result<u64> {
+        let Some(dir) = self.data_dir().map(|d| d.to_path_buf()) else {
+            return Err(std::io::Error::other(
+                "in-memory TSDB has no on-disk data to back up",
+            ));
+        };
+        if out.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("backup target already exists: {}", out.display()),
+            ));
+        }
+        if let Some(parent) = out.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        self.checkpoint()?;
+
+        let file = std::fs::File::create(out)?;
+        let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut ar = tar::Builder::new(enc);
+        ar.append_dir_all(".", &dir)?;
+        ar.into_inner()?.finish()?;
+        Ok(std::fs::metadata(out)?.len())
+    }
+
+    /// Extract a `.tar.gz` backup produced by [`backup`](Tsdb::backup) into
+    /// `target` (which must be empty or absent). Static: open a fresh `Tsdb` on
+    /// `target` afterward to use the restored database.
+    pub fn restore(archive: &Path, target: &Path) -> std::io::Result<()> {
+        if !archive.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("backup archive not found: {}", archive.display()),
+            ));
+        }
+        if target.exists() {
+            if std::fs::read_dir(target)?.next().is_some() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("restore target is not empty: {}", target.display()),
+                ));
+            }
+        } else {
+            std::fs::create_dir_all(target)?;
+        }
+        let file = std::fs::File::open(archive)?;
+        let dec = flate2::read::GzDecoder::new(file);
+        tar::Archive::new(dec).unpack(target)?;
+        Ok(())
+    }
+
     /// True when a text field with this measurement+field name exists.
     pub fn is_string_field(&self, measurement: &str, field: &str) -> bool {
         self.str_series

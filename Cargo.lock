@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.35.0"
+version = "0.35.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2377,6 +2377,7 @@ version = "0.35.0"
 dependencies = [
  "base64",
  "crc32fast",
+ "flate2",
  "libc",
  "memmap2",
  "oxidb-cobra",
@@ -2386,6 +2387,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "sqlparser",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -2405,8 +2407,10 @@ dependencies = [
 name = "oxidb-tsdb"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "serde",
  "serde_json",
+ "tar",
 ]
 
 [[package]]
