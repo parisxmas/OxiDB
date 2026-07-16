@@ -23,25 +23,34 @@ enum RowMode {
 }
 
 /// A per-table row store plus a monotonic `gen` bumped on every mutation. All
-/// row writes funnel through insert/remove/rewrite_all/attach_base — a single
+/// row writes funnel through insert/remove/attach_base/set_layout — a single
 /// choke point — so a contiguous scan cache keyed on `gen` can never miss a
 /// write and serve stale rows.
 pub(crate) struct RowStore {
     mode: RowMode,
     wgen: u64,
-    /// Per-column default template at the table's *current* arity. A row
-    /// physically narrower than this (an existing row after a metadata-only
-    /// `ALTER TABLE ADD COLUMN`, which does not rewrite the stored rows) is
-    /// padded up to this width on read, its missing trailing cells filled from
-    /// here. Empty until [`set_fill`](RowStore::set_fill) is called; a row at
-    /// or above `fill.len()` is served verbatim, so full-width rows (the norm)
-    /// pay only a length compare and stay borrowed.
+    /// Per-**physical**-slot default template, at the table's full physical
+    /// arity (including tombstoned columns). A stored row physically narrower
+    /// than this — an existing row after a metadata-only `ADD COLUMN`, which
+    /// does not rewrite stored rows — is padded up to this width on read, its
+    /// missing trailing cells filled from here. Empty until
+    /// [`set_layout`](RowStore::set_layout) is called.
     fill: Vec<Value>,
+    /// Physical slot indices of the live columns, in logical order — the read
+    /// projection from a stored (physical) row to the query-visible (logical)
+    /// row. The identity `0..fill.len()` until a `DROP COLUMN` tombstones a
+    /// slot; [`projected`](RowStore::projected) caches whether it still is.
+    live: Vec<usize>,
+    /// `true` once `live` is no longer the contiguous identity — i.e. a column
+    /// has been dropped, so logical reads must gather cells by `live` rather
+    /// than serve the stored row (padded) as-is. Keeps the no-drop path a plain
+    /// length compare with no per-row projection.
+    projected: bool,
 }
 
-/// Widen `row` to the schema's full width, filling any missing trailing cells
-/// from `fill`. A row already at (or past) full width is returned untouched —
-/// still borrowed in the resident scan path, so the common case never clones.
+/// Widen `row` to full physical width, filling any missing trailing cells from
+/// `fill`. A row already at (or past) full width is returned untouched — still
+/// borrowed in the resident scan path, so the common case never clones.
 fn pad_cow<'a>(fill: &[Value], row: Cow<'a, [Value]>) -> Cow<'a, [Value]> {
     if row.len() < fill.len() {
         let mut v = row.into_owned();
@@ -50,6 +59,15 @@ fn pad_cow<'a>(fill: &[Value], row: Cow<'a, [Value]>) -> Cow<'a, [Value]> {
     } else {
         row
     }
+}
+
+/// Project a stored (physical) row down to the live columns named by `live`,
+/// taking each slot's value or its `fill` default when the row is too short to
+/// hold it (a narrow row from an earlier lazy `ADD COLUMN`).
+fn project_row(fill: &[Value], live: &[usize], row: &[Value]) -> Vec<Value> {
+    live.iter()
+        .map(|&s| row.get(s).cloned().unwrap_or_else(|| fill[s].clone()))
+        .collect()
 }
 
 pub(crate) struct DiskRows {
@@ -76,6 +94,8 @@ impl RowStore {
             mode,
             wgen: 0,
             fill: Vec::new(),
+            live: Vec::new(),
+            projected: false,
         }
     }
 
@@ -85,13 +105,20 @@ impl RowStore {
         self.wgen
     }
 
-    /// Set the per-column default template used to pad narrow rows on read
-    /// (see [`fill`](RowStore::fill)). Bumps the generation so any scan cache
-    /// built at the old schema width is discarded. Called whenever the table's
+    /// Set the read layout: the per-physical-slot default template (`fill`) and
+    /// the live-slot projection (`live`). Bumps the generation so any scan
+    /// cache built at the old schema is discarded. Called whenever the table's
     /// column set changes (`ALTER TABLE`) and once at open.
-    pub fn set_fill(&mut self, fill: Vec<Value>) {
+    pub fn set_layout(&mut self, live: Vec<usize>, fill: Vec<Value>) {
         self.wgen = self.wgen.wrapping_add(1);
+        self.projected = live.iter().copied().ne(0..fill.len());
+        self.live = live;
         self.fill = fill;
+    }
+
+    /// The query-visible (logical) width — the number of live columns.
+    pub fn logical_width(&self) -> usize {
+        self.live.len()
     }
 
     /// True for the RAM-resident mode (the only mode a contiguous scan cache
@@ -129,17 +156,38 @@ impl RowStore {
         }
     }
 
-    /// The row's cells, decoded/cloned into an owned vector, padded to the
-    /// current schema width (see [`fill`](RowStore::fill)).
-    pub fn get(&self, row_id: u64) -> Option<Vec<Value>> {
-        let mut cells = match &self.mode {
+    /// The stored (physical) cells for `row_id`, exactly as written — no
+    /// padding, no projection.
+    fn raw(&self, row_id: u64) -> Option<Vec<Value>> {
+        match &self.mode {
             RowMode::Resident(m) => m.get(&row_id).cloned(),
             RowMode::DiskFirst(d) => match d.overlay.get(&row_id) {
                 Some(Some(cells)) => Some(cells.clone()),
                 Some(None) => None,
                 None => d.base.as_ref().and_then(|b| b.get(row_id)),
             },
-        }?;
+        }
+    }
+
+    /// The row's **query-visible** (logical) cells: the stored physical row
+    /// projected down to the live columns, tombstoned slots removed and any
+    /// narrow row padded from `fill`. This is what the executor consumes.
+    pub fn get(&self, row_id: u64) -> Option<Vec<Value>> {
+        let mut cells = self.raw(row_id)?;
+        if self.projected {
+            return Some(project_row(&self.fill, &self.live, &cells));
+        }
+        if cells.len() < self.fill.len() {
+            cells.extend_from_slice(&self.fill[cells.len()..]);
+        }
+        Some(cells)
+    }
+
+    /// The row's full **physical** cells, padded to the physical arity — used
+    /// for index/constraint maintenance, which addresses cells by physical
+    /// slot (and must see tombstoned slots too).
+    pub fn get_physical(&self, row_id: u64) -> Option<Vec<Value>> {
+        let mut cells = self.raw(row_id)?;
         if cells.len() < self.fill.len() {
             cells.extend_from_slice(&self.fill[cells.len()..]);
         }
@@ -166,8 +214,18 @@ impl RowStore {
         }
     }
 
-    /// Remove a row, returning its previous cells (needed for index upkeep).
+    /// Remove a row, returning its previous **physical** cells padded to the
+    /// physical arity — index/constraint upkeep addresses them by physical
+    /// slot, so a narrow row must be widened the same way it was when indexed.
     pub fn remove(&mut self, row_id: u64) -> Option<Vec<Value>> {
+        let mut old = self.remove_raw(row_id)?;
+        if old.len() < self.fill.len() {
+            old.extend_from_slice(&self.fill[old.len()..]);
+        }
+        Some(old)
+    }
+
+    fn remove_raw(&mut self, row_id: u64) -> Option<Vec<Value>> {
         self.wgen = self.wgen.wrapping_add(1);
         match &mut self.mode {
             RowMode::Resident(m) => m.remove(&row_id),
@@ -199,53 +257,11 @@ impl RowStore {
         }
     }
 
-    /// Rewrite every live row in place (`ALTER TABLE` shape changes). In
-    /// disk-first mode the mmap'd base is immutable, so its rows materialize
-    /// into the overlay with the new shape (the caller checkpoints right
-    /// after, folding everything into a fresh snapshot).
-    ///
-    /// Each row is first widened to the current `fill` width, so a structural
-    /// rewrite (e.g. `DROP COLUMN`, which removes a cell by position) always
-    /// operates on a full-width row even if earlier metadata-only `ADD COLUMN`s
-    /// left it physically narrow.
-    pub fn rewrite_all(&mut self, f: impl Fn(&mut Vec<Value>)) {
-        let Self { mode, wgen, fill } = self;
-        *wgen = wgen.wrapping_add(1);
-        let pad = |cells: &mut Vec<Value>| {
-            if cells.len() < fill.len() {
-                cells.extend_from_slice(&fill[cells.len()..]);
-            }
-        };
-        match mode {
-            RowMode::Resident(m) => {
-                for cells in m.values_mut() {
-                    pad(cells);
-                    f(cells);
-                }
-            }
-            RowMode::DiskFirst(d) => {
-                if let Some(base) = d.base.take() {
-                    for (id, cells) in base.entries() {
-                        d.overlay.entry(id).or_insert(Some(cells));
-                    }
-                }
-                d.overlay.retain(|_, change| change.is_some());
-                for cells in d.overlay.values_mut().flatten() {
-                    pad(cells);
-                    f(cells);
-                }
-                d.live = d.overlay.len();
-            }
-        }
-    }
-
-    /// All live rows in ascending `row_id` order, each padded to the current
-    /// schema width (see [`fill`](RowStore::fill)). Resident full-width rows
-    /// are borrowed; disk-first base rows are decoded on the fly; only rows
-    /// left narrow by a metadata-only `ADD COLUMN` are widened (and so owned).
-    pub fn iter(&self) -> Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> {
-        let fill = self.fill.as_slice();
-        let inner: Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> = match &self.mode {
+    /// Raw stored (physical) rows in ascending `row_id` order — resident rows
+    /// borrowed, disk-first base rows decoded on the fly. No padding, no
+    /// projection.
+    fn iter_raw(&self) -> Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> {
+        match &self.mode {
             RowMode::Resident(m) => {
                 Box::new(m.iter().map(|(id, c)| (*id, Cow::Borrowed(c.as_slice()))))
             }
@@ -254,8 +270,32 @@ impl RowStore {
                 base_pos: 0,
                 overlay: d.overlay.iter().peekable(),
             }),
-        };
-        Box::new(inner.map(move |(id, c)| (id, pad_cow(fill, c))))
+        }
+    }
+
+    /// All live rows in ascending `row_id` order, projected to the
+    /// **query-visible** (logical) schema — tombstoned columns removed, narrow
+    /// rows padded from `fill`. Resident full-width rows with nothing dropped
+    /// stay borrowed (the common case); dropped-column tables and narrow rows
+    /// materialize owned projected rows.
+    pub fn iter(&self) -> Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> {
+        let fill = self.fill.as_slice();
+        if self.projected {
+            let live = self.live.as_slice();
+            return Box::new(
+                self.iter_raw()
+                    .map(move |(id, c)| (id, Cow::Owned(project_row(fill, live, &c)))),
+            );
+        }
+        Box::new(self.iter_raw().map(move |(id, c)| (id, pad_cow(fill, c))))
+    }
+
+    /// All live rows in ascending `row_id` order, in full **physical** layout
+    /// (tombstoned slots included, narrow rows padded to physical arity). Used
+    /// for index rebuilds and snapshot writes, which work in physical space.
+    pub fn iter_physical(&self) -> Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> {
+        let fill = self.fill.as_slice();
+        Box::new(self.iter_raw().map(move |(id, c)| (id, pad_cow(fill, c))))
     }
 }
 

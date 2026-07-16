@@ -198,3 +198,65 @@ fn txn_drop_create_resets_uniqueness() {
     sess(&db, &mut tx, "COMMIT").unwrap();
     assert_eq!(rows(&db, "SELECT id FROM u2"), vec![vec![Value::Int(7)]]);
 }
+
+/// A transaction on a table whose column was lazily dropped before the txn
+/// began: inserts/updates run in the logical schema but commit as the physical
+/// layout the engine stores. Read-your-writes and the committed result agree.
+#[test]
+fn txn_on_dropped_column_table() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, a TEXT, b INT)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'x', 10)").unwrap();
+    db.execute("ALTER TABLE u DROP COLUMN a").unwrap(); // live schema: (id, b)
+
+    let mut tx = None;
+    sess(&db, &mut tx, "BEGIN").unwrap();
+    sess(&db, &mut tx, "INSERT INTO u VALUES (2, 20)").unwrap();
+    sess(&db, &mut tx, "UPDATE u SET b = 11 WHERE id = 1").unwrap();
+    // Read-your-writes inside the txn sees the logical (2-column) rows.
+    let r = sess(&db, &mut tx, "SELECT id, b FROM u ORDER BY id").unwrap();
+    assert_eq!(
+        sel(&r),
+        vec![
+            vec![Value::Int(1), Value::Int(11)],
+            vec![Value::Int(2), Value::Int(20)],
+        ]
+    );
+    sess(&db, &mut tx, "COMMIT").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, b FROM u ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(11)],
+            vec![Value::Int(2), Value::Int(20)],
+        ]
+    );
+}
+
+/// A UNIQUE column shifted by a dropped column keeps its constraint inside a
+/// transaction — the engine's base-ownership probe translates the logical
+/// position to the physical slot.
+#[test]
+fn txn_unique_after_dropped_column() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, junk TEXT, email TEXT UNIQUE)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'j', 'a@x')").unwrap();
+    db.execute("ALTER TABLE u DROP COLUMN junk").unwrap();
+
+    let mut tx = None;
+    sess(&db, &mut tx, "BEGIN").unwrap();
+    // Colliding with a committed base row's email must be rejected — this
+    // aborts and clears the transaction.
+    assert!(sess(&db, &mut tx, "INSERT INTO u VALUES (2, 'a@x')").is_err());
+    assert_eq!(tx, None);
+
+    // A fresh transaction inserting a distinct email commits fine.
+    sess(&db, &mut tx, "BEGIN").unwrap();
+    sess(&db, &mut tx, "INSERT INTO u VALUES (2, 'b@x')").unwrap();
+    sess(&db, &mut tx, "COMMIT").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM u"),
+        vec![vec![Value::Int(2)]]
+    );
+}

@@ -158,6 +158,37 @@ impl<'a> Transaction<'a> {
         self.engine.table_def(name)
     }
 
+    /// The physical layout `(live_slots, physical_arity)` for `table`, or
+    /// `None` when it stores logical == physical (a table created in this
+    /// transaction, or one with no dropped columns). Used to translate the
+    /// transaction's logical rows/positions into the physical space the
+    /// engine's WAL and constraint maps use.
+    fn phys_layout(&self, table: &str) -> Option<(Vec<usize>, usize)> {
+        if self.state.borrow().created.contains_key(table) {
+            return None; // in-txn tables can't have been altered
+        }
+        match self.engine.table_layout(table) {
+            Some((live, arity)) if live.len() != arity => Some((live, arity)),
+            _ => None,
+        }
+    }
+
+    /// Expand a logical row (live columns) into the physical layout the engine
+    /// stores — tombstoned slots get a `NULL` placeholder. Identity when the
+    /// table has no dropped columns.
+    fn to_physical(&self, table: &str, logical: Vec<Value>) -> Vec<Value> {
+        match self.phys_layout(table) {
+            Some((live, arity)) => {
+                let mut phys = vec![Value::Null; arity];
+                for (val, &slot) in logical.into_iter().zip(live.iter()) {
+                    phys[slot] = val;
+                }
+                phys
+            }
+            None => logical,
+        }
+    }
+
     /// Seed and bump the row-id allocator for `table`.
     fn alloc_row_id(&self, table: &str) -> u64 {
         let mut st = self.state.borrow_mut();
@@ -216,6 +247,9 @@ impl<'a> Transaction<'a> {
                 cells[p]
             )))
         };
+        // The engine's constraint maps key on physical positions; `p` is a
+        // logical position. They differ only when a column has been dropped.
+        let layout = self.phys_layout(table);
         let st = self.state.borrow();
         let maps = st.pk_seen.get(table).expect("initialized above");
         let overlay = st.rows.get(table);
@@ -232,8 +266,10 @@ impl<'a> Transaction<'a> {
                 return dup(*p);
             }
             // Owned by a committed base row this transaction hasn't touched?
+            // The engine's constraint maps key on physical positions.
+            let phys_p = layout.as_ref().map(|(live, _)| live[*p]).unwrap_or(*p);
             if base_exists
-                && let Some(rid) = self.engine.unique_owner(table, *p, &key)
+                && let Some(rid) = self.engine.unique_owner(table, phys_p, &key)
                 && Some(rid) != exclude
                 && overlay.is_none_or(|o| !o.contains_key(&rid))
             {
@@ -322,15 +358,18 @@ impl Store for Transaction<'_> {
         self.check_pk(table, &def, &cells, None)?;
         let row_id = self.alloc_row_id(table);
         self.pk_apply(table, &def, row_id, Some(&cells));
+        // The overlay (read back within the txn) holds logical rows; the WAL op
+        // (applied at commit) holds the physical layout the engine stores.
+        let phys = self.to_physical(table, cells.clone());
         let mut st = self.state.borrow_mut();
         st.rows
             .entry(table.to_string())
             .or_default()
-            .insert(row_id, Some(cells.clone()));
+            .insert(row_id, Some(cells));
         st.ops.push(WalRecord::Insert {
             table: table.to_string(),
             row_id,
-            cells,
+            cells: phys,
         });
         Ok(row_id)
     }
@@ -344,15 +383,16 @@ impl Store for Transaction<'_> {
         def.validate_row(&cells)?;
         self.check_pk(table, &def, &cells, Some(row_id))?;
         self.pk_apply(table, &def, row_id, Some(&cells));
+        let phys = self.to_physical(table, cells.clone());
         let mut st = self.state.borrow_mut();
         st.rows
             .entry(table.to_string())
             .or_default()
-            .insert(row_id, Some(cells.clone()));
+            .insert(row_id, Some(cells));
         st.ops.push(WalRecord::Insert {
             table: table.to_string(),
             row_id,
-            cells,
+            cells: phys,
         });
         Ok(())
     }

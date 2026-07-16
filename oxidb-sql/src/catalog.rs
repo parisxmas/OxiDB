@@ -5,6 +5,7 @@
 //! crash never leaves a half-written catalog. Table *data* lives elsewhere (the
 //! per-table `.rdat` snapshots and the WAL); the catalog only holds structure.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,16 @@ pub struct Column {
     /// per SQL).
     #[serde(default)]
     pub unique: bool,
+    /// Set by a metadata-only `ALTER TABLE DROP COLUMN`: the column keeps its
+    /// physical slot in every stored row (so the drop rewrites nothing) but is
+    /// invisible to queries — filtered out of the schema the executor sees.
+    /// Old catalogs deserialize as `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dropped: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Column {
@@ -48,6 +59,7 @@ impl Column {
             auto_increment: false,
             default_value: None,
             unique: false,
+            dropped: false,
         }
     }
 
@@ -83,7 +95,9 @@ impl Table {
         }
     }
 
-    /// Number of columns; a valid row has exactly this many cells.
+    /// Number of *physical* columns; a stored row has exactly this many cells.
+    /// Includes columns tombstoned by a lazy `DROP COLUMN` (they keep their
+    /// slot on disk), so this is the arity `.rdat` snapshots decode at.
     pub fn arity(&self) -> usize {
         self.columns.len()
     }
@@ -91,6 +105,40 @@ impl Table {
     /// Position of the PRIMARY KEY column, if the table has one.
     pub fn pk_pos(&self) -> Option<usize> {
         self.columns.iter().position(|c| c.primary_key)
+    }
+
+    /// Physical slot indices of the live (non-dropped) columns, in order. Maps
+    /// a logical column position to its physical cell position. The identity
+    /// `0..arity` until a column is dropped.
+    pub fn live_slots(&self) -> Vec<usize> {
+        (0..self.columns.len())
+            .filter(|&i| !self.columns[i].dropped)
+            .collect()
+    }
+
+    /// Whether any column has been tombstoned by a lazy `DROP COLUMN`.
+    pub fn has_dropped(&self) -> bool {
+        self.columns.iter().any(|c| c.dropped)
+    }
+
+    /// The query-visible schema: the physical columns with tombstoned ones
+    /// removed. This is what the executor sees via `table_def`, so it never
+    /// has to know about dropped columns. Borrowed (free) when nothing is
+    /// dropped — the overwhelmingly common case.
+    pub fn logical(&self) -> Cow<'_, Table> {
+        if self.has_dropped() {
+            Cow::Owned(Table {
+                name: self.name.clone(),
+                columns: self
+                    .columns
+                    .iter()
+                    .filter(|c| !c.dropped)
+                    .cloned()
+                    .collect(),
+            })
+        } else {
+            Cow::Borrowed(self)
+        }
     }
 
     /// Apply implicit numeric coercions a SQL user expects: an integer value

@@ -397,3 +397,220 @@ fn add_column_survives_reopen_without_checkpoint() {
         vec![vec![Value::Int(19)]]
     );
 }
+
+/// DROP COLUMN is metadata-only: the stored rows keep the column's cell (no
+/// rewrite), but it's projected out of every query — invisible to SELECT *,
+/// DESCRIBE, and by name — while the survivors read back correctly.
+#[test]
+fn drop_column_metadata_only_projects_out() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, a TEXT, b INT, c TEXT)")
+        .unwrap();
+    for i in 1..=20 {
+        db.execute(&format!(
+            "INSERT INTO u VALUES ({i}, 'a{i}', {}, 'c{i}')",
+            i * 10
+        ))
+        .unwrap();
+    }
+    // Drop a middle column — instant, no row rewrite.
+    db.execute("ALTER TABLE u DROP COLUMN b").unwrap();
+
+    // Gone from the schema: unreferenceable, and SELECT * / DESCRIBE skip it.
+    assert!(db.execute("SELECT b FROM u").is_err());
+    let (cols, r) = cols_rows(&db, "SELECT * FROM u WHERE id = 3");
+    assert_eq!(cols, vec!["id", "a", "c"]);
+    assert_eq!(r, vec![vec![Value::Int(3), t("a3"), t("c3")]]);
+    let names: Vec<Value> = rows(&db, "DESCRIBE u")
+        .iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(names, vec![t("id"), t("a"), t("c")]);
+
+    // The survivors still read/aggregate correctly.
+    assert_eq!(
+        rows(&db, "SELECT id, a, c FROM u WHERE id = 7"),
+        vec![vec![Value::Int(7), t("a7"), t("c7")]]
+    );
+    // New INSERT binds to the live (3-column) arity.
+    db.execute("INSERT INTO u VALUES (99, 'z', 'zz')").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT a, c FROM u WHERE id = 99"),
+        vec![vec![t("z"), t("zz")]]
+    );
+    // UPDATE a survivor by its new logical position.
+    db.execute("UPDATE u SET c = 'C7' WHERE id = 7").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT c FROM u WHERE id = 7"),
+        vec![vec![t("C7")]]
+    );
+}
+
+/// A lazy ADD leaves rows physically narrow; a following DROP must project a
+/// row that is missing BOTH a tombstoned middle slot and a trailing slot.
+#[test]
+fn add_then_drop_projects_gap_and_trailing() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, a TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'x'), (2, 'y')")
+        .unwrap();
+    // Rows are physically [id, a] (width 2); b lives only in the schema.
+    db.execute("ALTER TABLE u ADD COLUMN b INT DEFAULT 5")
+        .unwrap();
+    // Drop the middle column a (slot 1); live slots become [0, 2].
+    db.execute("ALTER TABLE u DROP COLUMN a").unwrap();
+    assert!(db.execute("SELECT a FROM u").is_err());
+    // Old narrow row [id, a]: slot 0 = id, slot 2 = absent -> b's default.
+    assert_eq!(
+        rows(&db, "SELECT id, b FROM u ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(5)],
+            vec![Value::Int(2), Value::Int(5)],
+        ]
+    );
+    // A fresh insert stores the full physical layout with a placeholder.
+    db.execute("INSERT INTO u VALUES (3, 9)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, b FROM u WHERE id = 3"),
+        vec![vec![Value::Int(3), Value::Int(9)]]
+    );
+}
+
+/// A dropped column's name is free to reuse — the re-added column is a fresh
+/// slot with its own default, independent of the tombstoned one.
+#[test]
+fn drop_then_readd_same_name() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, a INT)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 100)").unwrap();
+    db.execute("ALTER TABLE u DROP COLUMN a").unwrap();
+    db.execute("ALTER TABLE u ADD COLUMN a INT DEFAULT 7")
+        .unwrap();
+    // The old value is gone; the re-added column reads its default.
+    assert_eq!(
+        rows(&db, "SELECT id, a FROM u"),
+        vec![vec![Value::Int(1), Value::Int(7)]]
+    );
+    db.execute("INSERT INTO u VALUES (2, 9)").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT a FROM u ORDER BY id"),
+        vec![vec![Value::Int(7)], vec![Value::Int(9)]]
+    );
+}
+
+/// An index over a surviving column keeps working after a DROP (physical
+/// positions are stable), including index upkeep on DELETE.
+#[test]
+fn drop_column_keeps_other_index_and_delete() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, a INT, tag INT)")
+        .unwrap();
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, {i}, {})", i % 3))
+            .unwrap();
+    }
+    db.execute("CREATE INDEX i_tag ON u (tag)").unwrap();
+    db.execute("ALTER TABLE u DROP COLUMN a").unwrap();
+    // tag = 0 for i in {3, 6, 9}.
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM u WHERE tag = 0"),
+        vec![vec![Value::Int(3)]]
+    );
+    db.execute("DELETE FROM u WHERE id = 3").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id FROM u WHERE tag = 0 ORDER BY id"),
+        vec![vec![Value::Int(6)], vec![Value::Int(9)]]
+    );
+}
+
+/// A UNIQUE column sitting *after* a dropped one keeps its constraint: the
+/// engine still checks it at the shifted physical slot.
+#[test]
+fn unique_after_dropped_column_still_enforced() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, junk TEXT, email TEXT UNIQUE)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'j', 'a@x')").unwrap();
+    // email is physical slot 2, but logical position 1 after the drop.
+    db.execute("ALTER TABLE u DROP COLUMN junk").unwrap();
+    assert!(db.execute("INSERT INTO u VALUES (2, 'a@x')").is_err());
+    db.execute("INSERT INTO u VALUES (2, 'b@x')").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id FROM u WHERE email = 'b@x'"),
+        vec![vec![Value::Int(2)]]
+    );
+}
+
+/// The lazy DROP skips the checkpoint, so its durability rides on the WAL
+/// record; reopening (replay over the pre-drop, full-arity snapshot) must
+/// tombstone the column and project it out.
+#[test]
+fn drop_column_survives_reopen_without_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqlEngine::open(dir.path()).unwrap();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, a TEXT, b INT)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'x', 10), (2, 'y', 20)")
+        .unwrap();
+    db.checkpoint().unwrap(); // snapshot at the full (pre-drop) arity
+    db.execute("ALTER TABLE u DROP COLUMN a").unwrap();
+    db.execute("INSERT INTO u VALUES (3, 30)").unwrap(); // live arity = (id, b)
+    drop(db); // no checkpoint after the drop
+
+    let db = SqlEngine::open(dir.path()).unwrap();
+    assert!(db.execute("SELECT a FROM u").is_err());
+    assert_eq!(
+        rows(&db, "SELECT id, b FROM u ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)],
+        ]
+    );
+    // A checkpoint now persists the tombstoned layout; still correct on reopen.
+    db.checkpoint().unwrap();
+    drop(db);
+    let db = SqlEngine::open(dir.path()).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT SUM(b) FROM u"),
+        vec![vec![Value::Int(60)]]
+    );
+    assert!(db.execute("SELECT a FROM u").is_err());
+}
+
+/// DROP COLUMN in disk-first mode: base rows live in the mmap at full physical
+/// arity; the drop projects the tombstoned slot out on read, across a reopen.
+#[test]
+fn drop_column_disk_first_reopen() {
+    let opts = SqlOptions {
+        disk_first: true,
+        checkpoint_bytes: 0,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqlEngine::open_with_options(dir.path(), opts.clone()).unwrap();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, a TEXT, b INT)")
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'x', 10), (2, 'y', 20)")
+        .unwrap();
+    db.checkpoint().unwrap(); // rows now in the mmap'd base at full arity
+    db.execute("ALTER TABLE u DROP COLUMN a").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, b FROM u ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+        ]
+    );
+    drop(db);
+    let db = SqlEngine::open_with_options(dir.path(), opts).unwrap();
+    assert!(db.execute("SELECT a FROM u").is_err());
+    assert_eq!(
+        rows(&db, "SELECT id, b FROM u ORDER BY id"),
+        vec![
+            vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)],
+        ]
+    );
+}

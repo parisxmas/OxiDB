@@ -122,6 +122,10 @@ struct TableState {
     /// Column-level `UNIQUE` constraints: `(column position, value -> row_id)`.
     /// NULLs are exempt (per SQL).
     uniques: Vec<(usize, BTreeMap<IndexKey, u64>)>,
+    /// Cached `def.has_dropped()` — true once a lazy `DROP COLUMN` tombstoned
+    /// a column, so writes must expand logical rows to physical layout. False
+    /// keeps the write path a no-op fast path.
+    has_dropped: bool,
     /// Contiguous row-major scan cache (resident mode only): `(generation,
     /// width, flat cells)`. A full-table scan streams this instead of chasing
     /// the BTreeMap's scattered per-row Vecs; rebuilt lazily when the store's
@@ -156,24 +160,55 @@ impl TableState {
             pk_pos,
             pk_map: BTreeMap::new(),
             uniques,
+            has_dropped: false,
             scan_cache: None,
             scan_seen_gen: None,
         };
-        state.sync_fill();
+        state.sync_layout();
         state
     }
 
-    /// Refresh the row store's pad template to the current schema, so rows
-    /// left physically narrow by a metadata-only `ADD COLUMN` read back with
-    /// each new column's default. Called at open and after every `ALTER TABLE`.
-    fn sync_fill(&mut self) {
+    /// Refresh the row store's read layout (live-slot projection + per-slot
+    /// default template) and the cached `has_dropped` flag from the current
+    /// physical schema. A narrow row from a lazy `ADD COLUMN` then reads back
+    /// its new column's default, and a tombstoned column from a lazy `DROP
+    /// COLUMN` is projected out. Called at open and after every `ALTER TABLE`.
+    fn sync_layout(&mut self) {
+        self.has_dropped = self.def.has_dropped();
+        let live = self.def.live_slots();
         let fill: Vec<Value> = self
             .def
             .columns
             .iter()
             .map(|c| c.default_value.clone().unwrap_or(Value::Null))
             .collect();
-        self.rows.set_fill(fill);
+        self.rows.set_layout(live, fill);
+    }
+
+    /// Expand a **logical** row (live columns, as the executor builds it) into
+    /// the full **physical** layout stored on disk: each live value goes to its
+    /// physical slot, tombstoned slots get a `NULL` placeholder. Identity (no
+    /// clone) when nothing is dropped — the common case.
+    fn to_physical(&self, logical: Vec<Value>) -> Vec<Value> {
+        if !self.has_dropped {
+            return logical;
+        }
+        let mut phys = vec![Value::Null; self.def.columns.len()];
+        for (val, &slot) in logical.into_iter().zip(self.def.live_slots().iter()) {
+            phys[slot] = val;
+        }
+        phys
+    }
+
+    /// Coerce and validate a logical row (as the executor built it) against the
+    /// query-visible schema, then expand it to the physical layout that gets
+    /// logged and stored. The caller still runs the PRIMARY KEY / UNIQUE checks
+    /// (they key on physical slots, so run them on the returned row).
+    fn prepare_write(&self, mut cells: Vec<Value>) -> Result<Vec<Value>> {
+        let ldef = self.def.logical();
+        ldef.coerce_row(&mut cells);
+        ldef.validate_row(&cells)?;
+        Ok(self.to_physical(cells))
     }
 
     /// Recompute the schema-derived positions and reseed every constraint
@@ -191,8 +226,10 @@ impl TableState {
             .collect();
         self.pk_map.clear();
         self.next_auto = 1;
+        // Constraint maps key on physical cell positions, so seed from the
+        // physical rows (tombstoned slots present, narrow rows padded).
         let mut seeds: Vec<(u64, Vec<Value>)> = Vec::new();
-        for (rid, cells) in self.rows.iter() {
+        for (rid, cells) in self.rows.iter_physical() {
             seeds.push((rid, cells.into_owned()));
         }
         for (rid, cells) in seeds {
@@ -241,7 +278,8 @@ impl TableState {
             col_pos,
             map: BTreeMap::new(),
         };
-        for (rid, cells) in self.rows.iter() {
+        // `col_pos` are physical positions, so index the physical rows.
+        for (rid, cells) in self.rows.iter_physical() {
             let key = idx.key_of(&cells);
             idx.map.entry(key).or_default().insert(rid);
         }
@@ -463,7 +501,12 @@ impl SqlEngine {
                 // valid, and the stored rows need no rewrite (they read back
                 // padded with the new column's default). That makes it O(1) —
                 // skip the full-table row rewrite and index rebuild below.
-                let metadata_only = matches!(op, AlterOp::AddColumn(_));
+                // ADD appends a slot; DROP tombstones one in place. Neither
+                // shifts an existing physical position, so constraint maps and
+                // secondary indexes stay valid and the stored rows need no
+                // rewrite — old rows read back padded (ADD) or projected (DROP).
+                // Both are O(1); only RENAME falls through to the rebuild below.
+                let metadata_only = matches!(op, AlterOp::AddColumn(_) | AlterOp::DropColumn(_));
                 match op {
                     AlterOp::AddColumn(col) => {
                         def.columns.push(col.clone());
@@ -472,24 +515,27 @@ impl SqlEngine {
                         }
                     }
                     AlterOp::DropColumn(name) => {
-                        let Some(pos) = def.columns.iter().position(|c| &c.name == name) else {
+                        // Tombstone the live column of this name (a re-added
+                        // column can share a dropped one's name; target the
+                        // live one so replay stays deterministic).
+                        let Some(pos) = def
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == name && !c.dropped)
+                        else {
                             return;
                         };
-                        def.columns.remove(pos);
-                        // Indexes over the column go with it (replay-lenient;
-                        // the engine-level command validates first).
-                        catalog
-                            .indexes
-                            .retain(|_, d| !(&d.table == table && d.columns.contains(name)));
+                        def.columns[pos].dropped = true;
                         if let Some(state) = tables.get_mut(table) {
                             state.def = def.clone();
-                            state.rows.rewrite_all(|cells| {
-                                cells.remove(pos);
-                            });
                         }
                     }
                     AlterOp::RenameColumn { old, new } => {
-                        if let Some(c) = def.columns.iter_mut().find(|c| &c.name == old) {
+                        if let Some(c) = def
+                            .columns
+                            .iter_mut()
+                            .find(|c| &c.name == old && !c.dropped)
+                        {
                             c.name = new.clone();
                         }
                         for d in catalog.indexes.values_mut() {
@@ -506,15 +552,15 @@ impl SqlEngine {
                         }
                     }
                 }
-                // Keep the row store's pad template in step with the new
-                // schema (also invalidates any stale scan cache). Cheap for
-                // every op.
+                // Keep the row store's read layout (projection + pad template)
+                // and the cached has_dropped flag in step with the new schema
+                // (also invalidates any stale scan cache). Cheap for every op.
                 if let Some(state) = tables.get_mut(table) {
-                    state.sync_fill();
+                    state.sync_layout();
                 }
-                // DROP/RENAME may shift positions: rebuild constraint maps and
-                // secondary indexes from the rewritten rows. ADD appends only,
-                // so it skips this O(n) pass.
+                // RENAME leaves index/constraint column names stale in the
+                // maps; rebuild them. ADD/DROP shift no positions, so they skip
+                // this O(n) pass.
                 if !metadata_only {
                     let defs: Vec<IndexDef> = catalog
                         .indexes
@@ -574,7 +620,10 @@ impl SqlEngine {
                 cells,
             } => {
                 if let Some(state) = tables.get_mut(table) {
-                    if let Some(old) = state.rows.get(*row_id) {
+                    // `cells` are physical (expanded before logging); index and
+                    // constraint maps address physical slots, so the prior row
+                    // must be read physical too.
+                    if let Some(old) = state.rows.get_physical(*row_id) {
                         state.index_remove(*row_id, &old);
                     }
                     state.observe_row_id(*row_id);
@@ -827,14 +876,12 @@ impl SqlEngine {
     /// schema (arity, types, nullability, PRIMARY KEY uniqueness) before it
     /// is logged; integer values widen into DOUBLE/TIMESTAMP columns.
     pub fn insert(&self, table: &str, cells: Vec<Value>) -> Result<u64> {
-        let mut cells = cells;
         let mut inner = self.inner.lock().unwrap();
         let state = inner
             .tables
             .get(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
-        state.def.coerce_row(&mut cells);
-        state.def.validate_row(&cells)?;
+        let cells = state.prepare_write(cells)?;
         state.check_pk(&cells, None)?;
 
         let row_id = inner.tables.get(table).expect("present").next_row_id;
@@ -862,17 +909,16 @@ impl SqlEngine {
         if rows.is_empty() {
             return Ok(0);
         }
-        let mut rows = rows;
         let mut inner = self.inner.lock().unwrap();
         let state = inner
             .tables
             .get(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
         let mut batch_keys: BTreeSet<IndexKey> = BTreeSet::new();
-        for cells in &mut rows {
-            state.def.coerce_row(cells);
-            state.def.validate_row(cells)?;
-            state.check_pk(cells, None)?;
+        let mut phys_rows: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        for cells in rows {
+            let cells = state.prepare_write(cells)?;
+            state.check_pk(&cells, None)?;
             if let Some(p) = state.pk_pos
                 && !batch_keys.insert(IndexKey(cells[p].clone()))
             {
@@ -881,11 +927,12 @@ impl SqlEngine {
                     cells[p]
                 )));
             }
+            phys_rows.push(cells);
         }
 
         let first_id = inner.tables.get(table).expect("present").next_row_id;
-        let n = rows.len() as u64;
-        let ops: Vec<WalRecord> = rows
+        let n = phys_rows.len() as u64;
+        let ops: Vec<WalRecord> = phys_rows
             .into_iter()
             .enumerate()
             .map(|(i, cells)| WalRecord::Insert {
@@ -909,14 +956,12 @@ impl SqlEngine {
     /// Overwrite the cells of an existing row, keeping its `row_id`. Logged as
     /// an idempotent `Insert` record for `row_id`.
     pub fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()> {
-        let mut cells = cells;
         let mut inner = self.inner.lock().unwrap();
         let state = inner
             .tables
             .get(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
-        state.def.coerce_row(&mut cells);
-        state.def.validate_row(&cells)?;
+        let cells = state.prepare_write(cells)?;
         state.check_pk(&cells, Some(row_id))?;
         if !inner
             .tables
@@ -1076,10 +1121,27 @@ impl SqlEngine {
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))
     }
 
-    /// The table definition, if it exists.
+    /// The **query-visible** table definition, if it exists: the physical
+    /// schema with columns tombstoned by a lazy `DROP COLUMN` filtered out. The
+    /// executor only ever sees this logical view, so it addresses live columns
+    /// by contiguous position and never has to know a dropped column exists.
     pub fn table_def(&self, name: &str) -> Option<Table> {
         let inner = self.inner.lock().unwrap();
-        inner.catalog.get(name).cloned()
+        inner.catalog.get(name).map(|t| t.logical().into_owned())
+    }
+
+    /// The physical storage layout of `table`: `(live_slots, physical_arity)`.
+    /// `live_slots[k]` is the physical cell position of the k-th live column;
+    /// it equals `k` (and its length equals the arity) until a column is
+    /// dropped. Transactions use it to map their logical rows/positions to the
+    /// physical layout the engine's WAL and constraint maps speak.
+    pub(crate) fn table_layout(&self, table: &str) -> Option<(Vec<usize>, usize)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .catalog
+            .tables
+            .get(table)
+            .map(|t| (t.live_slots(), t.columns.len()))
     }
 
     /// All table names, sorted.
@@ -1175,7 +1237,10 @@ impl SqlEngine {
         } = inner;
 
         for (name, state) in tables.iter() {
-            storage::write_snapshot(dir, name, state.rows.iter())?;
+            // Snapshots persist the physical layout (tombstoned slots kept),
+            // so reopen decodes at the catalog's physical arity and the
+            // projection is reconstructed from the stored `dropped` flags.
+            storage::write_snapshot(dir, name, state.rows.iter_physical())?;
         }
         for entry in std::fs::read_dir(&*dir)? {
             let entry = entry?;
@@ -1511,7 +1576,9 @@ impl SqlEngine {
         };
         match op {
             AlterOp::AddColumn(col) => {
-                if def.columns.iter().any(|c| c.name == col.name) {
+                // A tombstoned column's name is free to reuse — only a live
+                // column of the same name collides.
+                if def.columns.iter().any(|c| c.name == col.name && !c.dropped) {
                     return Err(SqlError::SchemaMismatch(format!(
                         "column {:?} already exists in {table:?}",
                         col.name
@@ -1535,7 +1602,11 @@ impl SqlEngine {
                 }
             }
             AlterOp::DropColumn(name) => {
-                let Some(pos) = def.columns.iter().position(|c| &c.name == name) else {
+                let Some(pos) = def
+                    .columns
+                    .iter()
+                    .position(|c| &c.name == name && !c.dropped)
+                else {
                     return Err(SqlError::NoSuchColumn(name.clone()));
                 };
                 if def.columns[pos].primary_key {
@@ -1556,10 +1627,10 @@ impl SqlEngine {
                 }
             }
             AlterOp::RenameColumn { old, new } => {
-                if !def.columns.iter().any(|c| &c.name == old) {
+                if !def.columns.iter().any(|c| &c.name == old && !c.dropped) {
                     return Err(SqlError::NoSuchColumn(old.clone()));
                 }
-                if def.columns.iter().any(|c| &c.name == new) {
+                if def.columns.iter().any(|c| &c.name == new && !c.dropped) {
                     return Err(SqlError::SchemaMismatch(format!(
                         "column {new:?} already exists in {table:?}"
                     )));
@@ -1578,12 +1649,12 @@ impl SqlEngine {
             &rec,
             inner.disk_first,
         );
-        // Metadata-only ADD COLUMN is O(1): the WAL record is durable on its
-        // own and the stored rows are untouched (read back padded), so skip the
-        // checkpoint — which would write the whole table's snapshot and defeat
-        // the point. A later auto/manual checkpoint folds it in lazily. Every
-        // other ALTER rewrites rows, so it checkpoints eagerly as before.
-        if matches!(op, AlterOp::AddColumn(_)) {
+        // Metadata-only ADD/DROP COLUMN are O(1): the WAL record is durable on
+        // its own and the stored rows are untouched (read back padded for ADD,
+        // projected for DROP), so skip the checkpoint — which would write the
+        // whole table's snapshot and defeat the point. A later auto/manual
+        // checkpoint folds it in lazily. RENAME still checkpoints eagerly.
+        if matches!(op, AlterOp::AddColumn(_) | AlterOp::DropColumn(_)) {
             return Ok(());
         }
         Self::checkpoint_locked(inner)
@@ -1710,7 +1781,9 @@ impl Store for SqlEngine {
         // scattered per-row Vecs (the dominant cost of a large scan). The
         // buffer is keyed on the store's mutation generation, so any write
         // rebuilds it; repeated scans of an unchanged table reuse it.
-        let width = state.def.columns.len();
+        // `scan`/`iter` yield the logical (projected) row, so the cache width
+        // is the logical column count — not the physical arity.
+        let width = state.rows.logical_width();
         if width > 0 && state.rows.is_resident() && state.rows.len() >= 1024 {
             let generation = state.rows.generation();
             let hit = matches!(&state.scan_cache, Some((g, _, _)) if *g == generation);
