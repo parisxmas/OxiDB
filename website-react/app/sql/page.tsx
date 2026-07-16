@@ -91,14 +91,47 @@ UPDATE accounts SET balance = balance - 100 WHERE id = 1;
 UPDATE accounts SET balance = balance + 100 WHERE id = 2;
 COMMIT;   <span class="co">-- or ROLLBACK; SAVEPOINT / ROLLBACK TO also supported</span></code></pre>
 
-    <h3>Sequences &amp; stored procedures</h3>
+    <h3>Sequences</h3>
     <pre><code class="lang-sql">CREATE SEQUENCE order_seq START WITH 1000;
-SELECT NEXT VALUE FOR order_seq;               <span class="co">-- EF Core HiLo keys</span>
+SELECT NEXT VALUE FOR order_seq;               <span class="co">-- EF Core HiLo keys</span></code></pre>
 
-CREATE PROCEDURE give_raise AS BEGIN
-  UPDATE users SET age = age + 1;
+    <h3>Stored procedures &mdash; two languages</h3>
+    <p>Procedures come in two flavours (ADR-0014). Both are registered with <code>CREATE PROCEDURE</code>, invoked with <code>CALL</code>, run inside the caller's transaction, and replicate under Raft.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Language</th><th>Body</th><th>Best for</th></tr></thead>
+        <tbody>
+          <tr><td><strong>SQL text</strong></td><td><code>AS BEGIN &hellip; END</code>, re-parsed per <code>CALL</code></td><td>Zero toolchain &mdash; just SQL statements</td></tr>
+          <tr><td><strong>Cobra</strong></td><td>Compiled <code>.cobrac</code> bytecode, run by the in-server VM</td><td>Real control flow &mdash; loops, branches, locals</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h4>SQL-text procedures</h4>
+    <pre><code class="lang-sql">CREATE PROCEDURE give_raise(pct INT) AS BEGIN
+  UPDATE users SET salary = salary + salary * pct / 100;
 END;
-CALL give_raise();</code></pre>
+CALL give_raise(5);</code></pre>
+
+    <h3>Cobra &mdash; compiled procedures</h3>
+    <p><strong>Cobra</strong> is the compiled procedure language. You author a small program, compile it to portable <code>.cobrac</code> bytecode, and the server runs it on a built-in Rust VM &mdash; no toolchain on the server, no <code>cgo</code>, no sidecar. The program defines <code>run(db, &hellip;params)</code>; <code>db.query</code> / <code>db.execute</code> go through the same executor, so they <strong>join the <code>CALL</code>'s transaction</strong> and every write is atomic with the rest.</p>
+    <pre><code class="lang-python"><span class="co"># transfer.cobra — real logic, then compiled to bytecode</span>
+<span class="kw">def</span> run(db, from_id, to_id, amount):
+    db.execute(<span class="str">"UPDATE accounts SET balance = balance - ? WHERE id = ?"</span>, [amount, from_id])
+    db.execute(<span class="str">"UPDATE accounts SET balance = balance + ? WHERE id = ?"</span>, [amount, to_id])
+    rows = db.query(<span class="str">"SELECT balance FROM accounts WHERE id = ?"</span>, [from_id])
+    print(<span class="str">"remaining:"</span>, rows[<span class="num">0</span>][<span class="str">"balance"</span>])   <span class="co"># print() -> query notices</span>
+    <span class="kw">return</span> rows                                   <span class="co"># list of dicts -> a result set</span></code></pre>
+    <pre><code class="lang-bash"><span class="co"># 1. compile to portable bytecode, then base64 it</span>
+cobra build --portable transfer.cobra transfer.cobrac
+B64=$(base64 -i transfer.cobrac)</code></pre>
+    <pre><code class="lang-sql"><span class="co">-- 2. register the compiled procedure and call it</span>
+CREATE PROCEDURE transfer(from_id INT, to_id INT, amount DECIMAL)
+  LANGUAGE COBRA AS '&lt;base64 of transfer.cobrac&gt;';
+
+CALL transfer(1, 2, 100);      <span class="co">-- both UPDATEs + the SELECT run in ONE transaction</span>
+SHOW PROCEDURES;               <span class="co">-- lists each proc with its language column</span></code></pre>
+    <p>Return shaping: a returned list-of-dicts becomes a table, a single dict becomes one row, a scalar becomes a one-column result; anything <code>print</code>ed comes back as <strong>notices</strong> alongside the rows. Cobra procedures are <strong>deterministic by construction</strong> &mdash; async, imports, and all I/O are rejected at <code>CREATE</code> time and a 100M-instruction fuel cap bounds every <code>CALL</code>, so a procedure replicates identically on every Raft node.</p>
 
     <h3>EF Core &amp; ADO.NET (.NET)</h3>
     <p>A full EF Core provider passes all <strong>3832 official EF Core relational specification tests</strong> and beats PostgreSQL across the EF Core benchmark. Migrations, scaffolding, LINQ, and <code>ExecuteUpdate</code>/<code>ExecuteDelete</code> all work.</p>
