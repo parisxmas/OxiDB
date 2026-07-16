@@ -17,9 +17,18 @@ use std::collections::BTreeMap;
 use crate::storage::MappedSnapshot;
 use crate::types::Value;
 
-pub(crate) enum RowStore {
+enum RowMode {
     Resident(BTreeMap<u64, Vec<Value>>),
     DiskFirst(DiskRows),
+}
+
+/// A per-table row store plus a monotonic `gen` bumped on every mutation. All
+/// row writes funnel through insert/remove/rewrite_all/attach_base — a single
+/// choke point — so a contiguous scan cache keyed on `gen` can never miss a
+/// write and serve stale rows.
+pub(crate) struct RowStore {
+    mode: RowMode,
+    wgen: u64,
 }
 
 pub(crate) struct DiskRows {
@@ -33,21 +42,35 @@ pub(crate) struct DiskRows {
 
 impl RowStore {
     pub fn new(disk_first: bool) -> RowStore {
-        if disk_first {
-            RowStore::DiskFirst(DiskRows {
+        let mode = if disk_first {
+            RowMode::DiskFirst(DiskRows {
                 base: None,
                 overlay: BTreeMap::new(),
                 live: 0,
             })
         } else {
-            RowStore::Resident(BTreeMap::new())
-        }
+            RowMode::Resident(BTreeMap::new())
+        };
+        RowStore { mode, wgen: 0 }
+    }
+
+    /// The mutation generation — bumped on every write. A scan cache built at
+    /// this value stays valid until it changes.
+    pub fn generation(&self) -> u64 {
+        self.wgen
+    }
+
+    /// True for the RAM-resident mode (the only mode a contiguous scan cache
+    /// materializes for; disk-first stays lazy over its mmap).
+    pub fn is_resident(&self) -> bool {
+        matches!(self.mode, RowMode::Resident(_))
     }
 
     /// Adopt `snap` as the new base (after open or a checkpoint). The overlay
     /// is cleared: the snapshot it was folded into now carries those changes.
     pub fn attach_base(&mut self, snap: MappedSnapshot) {
-        if let RowStore::DiskFirst(d) = self {
+        self.wgen = self.wgen.wrapping_add(1);
+        if let RowMode::DiskFirst(d) = &mut self.mode {
             d.live = snap.len();
             d.base = Some(snap);
             d.overlay.clear();
@@ -55,16 +78,16 @@ impl RowStore {
     }
 
     pub fn len(&self) -> usize {
-        match self {
-            RowStore::Resident(m) => m.len(),
-            RowStore::DiskFirst(d) => d.live,
+        match &self.mode {
+            RowMode::Resident(m) => m.len(),
+            RowMode::DiskFirst(d) => d.live,
         }
     }
 
     pub fn contains(&self, row_id: u64) -> bool {
-        match self {
-            RowStore::Resident(m) => m.contains_key(&row_id),
-            RowStore::DiskFirst(d) => match d.overlay.get(&row_id) {
+        match &self.mode {
+            RowMode::Resident(m) => m.contains_key(&row_id),
+            RowMode::DiskFirst(d) => match d.overlay.get(&row_id) {
                 Some(Some(_)) => true,
                 Some(None) => false,
                 None => d.base.as_ref().is_some_and(|b| b.contains(row_id)),
@@ -74,9 +97,9 @@ impl RowStore {
 
     /// The row's cells, decoded/cloned into an owned vector.
     pub fn get(&self, row_id: u64) -> Option<Vec<Value>> {
-        match self {
-            RowStore::Resident(m) => m.get(&row_id).cloned(),
-            RowStore::DiskFirst(d) => match d.overlay.get(&row_id) {
+        match &self.mode {
+            RowMode::Resident(m) => m.get(&row_id).cloned(),
+            RowMode::DiskFirst(d) => match d.overlay.get(&row_id) {
                 Some(Some(cells)) => Some(cells.clone()),
                 Some(None) => None,
                 None => d.base.as_ref().and_then(|b| b.get(row_id)),
@@ -85,11 +108,12 @@ impl RowStore {
     }
 
     pub fn insert(&mut self, row_id: u64, cells: Vec<Value>) {
-        match self {
-            RowStore::Resident(m) => {
+        self.wgen = self.wgen.wrapping_add(1);
+        match &mut self.mode {
+            RowMode::Resident(m) => {
                 m.insert(row_id, cells);
             }
-            RowStore::DiskFirst(d) => {
+            RowMode::DiskFirst(d) => {
                 let existed = match d.overlay.get(&row_id) {
                     Some(Some(_)) => true,
                     Some(None) => false,
@@ -105,9 +129,10 @@ impl RowStore {
 
     /// Remove a row, returning its previous cells (needed for index upkeep).
     pub fn remove(&mut self, row_id: u64) -> Option<Vec<Value>> {
-        match self {
-            RowStore::Resident(m) => m.remove(&row_id),
-            RowStore::DiskFirst(d) => {
+        self.wgen = self.wgen.wrapping_add(1);
+        match &mut self.mode {
+            RowMode::Resident(m) => m.remove(&row_id),
+            RowMode::DiskFirst(d) => {
                 let in_base = d.base.as_ref().is_some_and(|b| b.contains(row_id));
                 match d.overlay.get(&row_id) {
                     Some(None) => None, // already deleted
@@ -140,13 +165,14 @@ impl RowStore {
     /// into the overlay with the new shape (the caller checkpoints right
     /// after, folding everything into a fresh snapshot).
     pub fn rewrite_all(&mut self, f: impl Fn(&mut Vec<Value>)) {
-        match self {
-            RowStore::Resident(m) => {
+        self.wgen = self.wgen.wrapping_add(1);
+        match &mut self.mode {
+            RowMode::Resident(m) => {
                 for cells in m.values_mut() {
                     f(cells);
                 }
             }
-            RowStore::DiskFirst(d) => {
+            RowMode::DiskFirst(d) => {
                 if let Some(base) = d.base.take() {
                     for (id, cells) in base.entries() {
                         d.overlay.entry(id).or_insert(Some(cells));
@@ -164,11 +190,11 @@ impl RowStore {
     /// All live rows in ascending `row_id` order. Resident rows are borrowed;
     /// disk-first base rows are decoded on the fly.
     pub fn iter(&self) -> Box<dyn Iterator<Item = (u64, Cow<'_, [Value]>)> + '_> {
-        match self {
-            RowStore::Resident(m) => {
+        match &self.mode {
+            RowMode::Resident(m) => {
                 Box::new(m.iter().map(|(id, c)| (*id, Cow::Borrowed(c.as_slice()))))
             }
-            RowStore::DiskFirst(d) => Box::new(MergeIter {
+            RowMode::DiskFirst(d) => Box::new(MergeIter {
                 base: d.base.as_ref(),
                 base_pos: 0,
                 overlay: d.overlay.iter().peekable(),

@@ -122,6 +122,17 @@ struct TableState {
     /// Column-level `UNIQUE` constraints: `(column position, value -> row_id)`.
     /// NULLs are exempt (per SQL).
     uniques: Vec<(usize, BTreeMap<IndexKey, u64>)>,
+    /// Contiguous row-major scan cache (resident mode only): `(generation,
+    /// width, flat cells)`. A full-table scan streams this instead of chasing
+    /// the BTreeMap's scattered per-row Vecs; rebuilt lazily when the store's
+    /// generation moves (any write). Repeated scans of an unchanged table
+    /// (the common analytic read loop) then run over contiguous memory.
+    scan_cache: Option<(u64, usize, Vec<Value>)>,
+    /// The store generation seen at the last uncached scan. The cache is built
+    /// only on the SECOND scan at the same generation, so a table scanned once
+    /// or written-then-scanned never pays the build/memory cost — only a
+    /// genuinely repeatedly-scanned (read-mostly) table caches.
+    scan_seen_gen: Option<u64>,
 }
 
 impl TableState {
@@ -145,6 +156,8 @@ impl TableState {
             pk_pos,
             pk_map: BTreeMap::new(),
             uniques,
+            scan_cache: None,
+            scan_seen_gen: None,
         }
     }
 
@@ -1651,11 +1664,41 @@ impl Store for SqlEngine {
         // Rows are handed to the visitor borrowed, under the table lock: a
         // streamed scan allocates nothing per row. The executor guarantees
         // the visitor never re-enters this engine (the lock is not reentrant).
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         let state = inner
             .tables
-            .get(table)
+            .get_mut(table)
             .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        // Contiguous scan cache: for a resident table big enough to matter,
+        // stream a flat row-major buffer instead of chasing the BTreeMap's
+        // scattered per-row Vecs (the dominant cost of a large scan). The
+        // buffer is keyed on the store's mutation generation, so any write
+        // rebuilds it; repeated scans of an unchanged table reuse it.
+        let width = state.def.columns.len();
+        if width > 0 && state.rows.is_resident() && state.rows.len() >= 1024 {
+            let generation = state.rows.generation();
+            let hit = matches!(&state.scan_cache, Some((g, _, _)) if *g == generation);
+            if !hit && state.scan_seen_gen == Some(generation) {
+                // Second scan at an unchanged generation: worth caching now.
+                let mut flat = Vec::with_capacity(state.rows.len() * width);
+                for (_, cells) in state.rows.iter() {
+                    flat.extend_from_slice(&cells);
+                }
+                state.scan_cache = Some((generation, width, flat));
+            }
+            if let Some((g, w, flat)) = &state.scan_cache
+                && *g == generation
+            {
+                for chunk in flat.chunks_exact(*w) {
+                    if !visit(chunk)? {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+            // First sight of this generation (or just recorded): iterate direct.
+            state.scan_seen_gen = Some(generation);
+        }
         for (_, row) in state.rows.iter() {
             if !visit(row.as_ref())? {
                 break;
