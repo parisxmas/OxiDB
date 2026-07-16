@@ -7,13 +7,13 @@ export const metadata: Metadata = {
 export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<header class="hero">
   <div class="container">
-    <p class="hero-kicker"><span class="hero-pulse"></span>v0.34 &middot; OxiMem transactions + Lua scripting &middot; full MQTT broker &middot; ~1,800 tests</p>
+    <p class="hero-kicker"><span class="hero-pulse"></span>v0.35 &middot; instant online ALTER TABLE &middot; crash-atomic checkpoints &middot; EF Core beats PostgreSQL &middot; TSDB engine</p>
     <h1>OxiDB</h1>
     <p class="tagline">A fast, versatile document database.</p>
     <p class="sub">MongoDB-style JSON queries. Full SQL engine. ACID transactions with SELECT&nbsp;FOR&nbsp;UPDATE and group commit. <strong>Redis-compatible in-memory store with MULTI/EXEC/WATCH and EVAL. MQTT broker.</strong> Full-text &amp; vector search. S3-compatible blob storage. Raft replication. Encryption at rest.</p>
     <div class="hero-actions">
       <a href="/quickstart/" class="btn btn-primary">Get Started</a>
-      <a href="/downloads/" class="btn btn-secondary">Downloads v0.34.0</a>
+      <a href="/downloads/" class="btn btn-secondary">Downloads v0.35.0</a>
     </div>
     <div class="hero-install">
       <code>one 14 MB binary &middot; zero dependencies &middot; embed or run as a server</code>
@@ -58,14 +58,14 @@ Postgres + Mongo + Redis + Elastic + S3. 14 MB.</pre>
 
     <h3>1. Download the server</h3>
     <pre><code class="lang-bash"><span class="co"># Linux (x86_64)</span>
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-server-v0.34.0-linux-amd64.tar.gz
-tar xzf oxidb-server-v0.34.0-linux-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-server-v0.35.0-linux-amd64.tar.gz
+tar xzf oxidb-server-v0.35.0-linux-amd64.tar.gz
 
 <span class="co"># macOS (Apple Silicon)</span>
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-server-v0.34.0-darwin-arm64.tar.gz
-tar xzf oxidb-server-v0.34.0-darwin-arm64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-server-v0.35.0-darwin-arm64.tar.gz
+tar xzf oxidb-server-v0.35.0-darwin-arm64.tar.gz
 
-<span class="co"># Windows: download oxidb-server-v0.34.0-windows-amd64.zip from /downloads/</span></code></pre>
+<span class="co"># Windows: download oxidb-server-v0.35.0-windows-amd64.zip from /downloads/</span></code></pre>
 
     <h3>2. Start the server</h3>
     <pre><code class="lang-bash"><span class="co"># Listens on 127.0.0.1:4444 by default; data goes to ./oxidb_data</span>
@@ -76,8 +76,8 @@ OXIDB_ADDR=0.0.0.0:4444 OXIDB_DATA=/var/lib/oxidb ./oxidb-server</code></pre>
 
     <h3>3. Connect and run your first query</h3>
     <pre><code class="lang-bash"><span class="co"># Download the CLI</span>
-curl -LO https://github.com/parisxmas/OxiDB/releases/download/v0.34.0/oxidb-cli-v0.34.0-linux-amd64.tar.gz
-tar xzf oxidb-cli-v0.34.0-linux-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-v0.35.0-linux-amd64.tar.gz
+tar xzf oxidb-v0.35.0-linux-amd64.tar.gz
 
 <span class="co"># Open the REPL against the running server</span>
 ./oxidb --host 127.0.0.1 --port 4444
