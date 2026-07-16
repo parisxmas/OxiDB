@@ -23,7 +23,7 @@ export const metadata: Metadata = {
     type: 'website',
     images: [
       {
-        url: '/og-card.png',
+        url: '/og-card.png?v=0350',
         width: 1200,
         height: 630,
         alt: 'OxiDB v0.35.0 — sharded, Raft-replicated, persistent. 1M records verified under failover.',
@@ -35,7 +35,7 @@ export const metadata: Metadata = {
     title: 'OxiDB - Fast Versatile Document Database',
     description:
       'MongoDB-style JSON queries. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. v0.35.0.',
-    images: ['/og-card.png'],
+    images: ['/og-card.png?v=0350'],
   },
   icons: {
     icon: '/logo.png',
