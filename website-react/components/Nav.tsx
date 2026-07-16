@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 
 const navGroups = [
   {
@@ -63,37 +63,84 @@ const navGroups = [
   },
 ]
 
+const isActive = (pathname: string, href: string) =>
+  pathname === href || pathname === href + '/'
+
+function groupOf(pathname: string) {
+  const g = navGroups.find((grp) => grp.items.some((i) => isActive(pathname, i.href)))
+  return g ? g.title : 'Getting Started'
+}
+
 export default function Nav() {
   const pathname = usePathname()
   const [open, setOpen] = useState(false)
+  // Only the group holding the current page is expanded by default — keeps the
+  // sidebar short (no scrollbar). Any group can be toggled open/closed.
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({})
+
+  // Expand the group of the current page whenever navigation happens.
+  useEffect(() => {
+    const active = groupOf(pathname)
+    setExpanded((e) => (e[active] ? e : { ...e, [active]: true }))
+  }, [pathname])
+
+  const isOpen = (title: string) =>
+    expanded[title] ?? title === groupOf(pathname)
+  const toggle = (title: string) =>
+    setExpanded((e) => ({ ...e, [title]: !isOpen(title) }))
 
   return (
     <nav className={`nav${open ? ' open' : ''}`}>
       <div className="container nav-inner">
-        <Link href="/" className="logo">
+        <Link href="/" className="logo" onClick={() => setOpen(false)}>
           Oxi<span>DB</span>
         </Link>
         <div className="nav-links">
-          {navGroups.map((group) => (
-            <div className="nav-group" key={group.title}>
-              <div className="nav-group-title">{group.title}</div>
-              {group.items.map(({ href, label }) => (
-                <Link
-                  key={href}
-                  href={href}
-                  className={pathname === href || pathname === href + '/' ? 'active' : ''}
-                  onClick={() => setOpen(false)}
+          {navGroups.map((group) => {
+            const groupOpen = isOpen(group.title)
+            return (
+              <div className={`nav-group${groupOpen ? ' expanded' : ''}`} key={group.title}>
+                <button
+                  className="nav-group-title"
+                  onClick={() => toggle(group.title)}
+                  aria-expanded={groupOpen}
                 >
-                  {label}
-                </Link>
-              ))}
-            </div>
-          ))}
+                  <span>{group.title}</span>
+                  <svg
+                    className="nav-chevron"
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </button>
+                <div className="nav-group-items">
+                  {group.items.map(({ href, label }) => (
+                    <Link
+                      key={href}
+                      href={href}
+                      className={isActive(pathname, href) ? 'active' : ''}
+                      onClick={() => setOpen(false)}
+                    >
+                      {label}
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            )
+          })}
         </div>
         <button
           className="nav-toggle"
           onClick={() => setOpen(!open)}
           aria-label="Menu"
+          aria-expanded={open}
         >
           <svg width="20" height="20" viewBox="0 0 20 20" fill="none">
             <path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" strokeWidth="1.5" />

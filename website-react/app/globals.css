@@ -93,7 +93,23 @@ a:hover { text-decoration: underline; }
   background: var(--bg);
   border-right: 1px solid var(--border);
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 20px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.nav::-webkit-scrollbar {
+  width: 6px;
+}
+.nav::-webkit-scrollbar-track {
+  background: transparent;
+}
+.nav::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+.nav:hover::-webkit-scrollbar-thumb {
+  background: var(--text-dim);
 }
 .nav.scrolled { box-shadow: none; }
 
@@ -136,16 +152,42 @@ a:hover { text-decoration: underline; }
   gap: 1px;
 }
 .nav-group-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-dim);
   opacity: 0.65;
-  padding: 14px 8px 4px;
+  padding: 11px 8px 4px;
+  transition: opacity 0.15s, color 0.15s;
 }
-.nav-group:first-child .nav-group-title {
-  padding-top: 4px;
+.nav-group-title:hover {
+  opacity: 1;
+  color: var(--text);
+}
+.nav-chevron {
+  flex-shrink: 0;
+  opacity: 0.55;
+  transition: transform 0.2s ease;
+}
+.nav-group.expanded .nav-chevron {
+  transform: rotate(180deg);
+}
+.nav-group-items {
+  display: none;
+  flex-direction: column;
+  gap: 1px;
+}
+.nav-group.expanded .nav-group-items {
+  display: flex;
 }
 .nav-links a {
   font-size: 13px;
