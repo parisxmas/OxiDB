@@ -90,7 +90,7 @@ fn clk_tck() -> f64 {
 
 #[cfg(target_os = "linux")]
 fn read_cpu_ticks() -> Option<u64> {
-    let s = fs::read_to_string("/proc/self/stat").ok()?;
+    let s = std::fs::read_to_string("/proc/self/stat").ok()?;
     // Format: "pid (comm) state ppid ... utime stime ...". The comm
     // field can contain spaces and parens, so use the LAST ')' to mark
     // its end and tokenize what follows. After comm, indexes are
@@ -105,7 +105,7 @@ fn read_cpu_ticks() -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn read_vm_rss_kb() -> Option<u64> {
-    let s = fs::read_to_string("/proc/self/status").ok()?;
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("VmRSS:") {
             return rest.trim().split_whitespace().next()?.parse().ok();
@@ -116,7 +116,7 @@ fn read_vm_rss_kb() -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn read_threads() -> Option<u32> {
-    let s = fs::read_to_string("/proc/self/status").ok()?;
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("Threads:") {
             return rest.trim().split_whitespace().next()?.parse().ok();
