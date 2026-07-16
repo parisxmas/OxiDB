@@ -173,7 +173,10 @@ const navGroups: {
   },
   {
     title: 'SQL Engine',
-    items: [{ href: '/sql', label: 'SQL Reference', icon: 'database' }],
+    items: [
+      { href: '/sql', label: 'SQL Reference', icon: 'database' },
+      { href: '/procedures', label: 'Stored Procedures', icon: 'code' },
+    ],
   },
   {
     title: 'Time-Series Engine',
