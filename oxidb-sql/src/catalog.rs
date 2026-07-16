@@ -347,6 +347,35 @@ pub struct SequenceDef {
     pub increment: i64,
 }
 
+fn sequences_path(root: &Path) -> PathBuf {
+    root.join("sequences.json")
+}
+
+/// Persist the sequence counters to `root/sequences.json`, atomically. They
+/// live outside the generationed catalog because they change on every
+/// `NEXT VALUE FOR` — far more often than a checkpoint — and are independent of
+/// table arity, so a direct in-place save can never desync a generation's
+/// catalog from its snapshots.
+pub fn save_sequences(root: &Path, sequences: &BTreeMap<String, SequenceDef>) -> Result<()> {
+    let path = sequences_path(root);
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(sequences)?)?;
+    fs::File::open(&tmp)?.sync_all()?;
+    fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+/// Load the sequence counters, or `None` when the file is absent (no sequence
+/// has ever been created, or a legacy database that still keeps them inside
+/// `catalog.json`).
+pub fn load_sequences(root: &Path) -> Result<Option<BTreeMap<String, SequenceDef>>> {
+    match fs::read(sequences_path(root)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl Catalog {
     /// Load `catalog.json` from `dir`, or return an empty catalog if absent.
     pub fn load(dir: &Path) -> Result<Catalog> {

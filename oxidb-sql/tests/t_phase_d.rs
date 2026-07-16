@@ -10,6 +10,20 @@ fn t(s: &str) -> Value {
     Value::Text(s.to_string().into())
 }
 
+/// Size of a table's committed `.rdat` snapshot, which lives under the current
+/// generation directory (`gen.<N>/`). Only the committed generation survives on
+/// disk after a checkpoint, so the max over any present ones is the live size.
+fn snapshot_len(root: &std::path::Path, table: &str) -> u64 {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| std::fs::metadata(e.path().join(format!("{table}.rdat"))).ok())
+        .map(|m| m.len())
+        .max()
+        .unwrap_or(0)
+}
+
 #[test]
 fn defaults_fill_omitted_columns() {
     let (_d, db) = open();
@@ -595,13 +609,12 @@ fn checkpoint_compacts_dropped_column_space() {
             .unwrap();
     }
     db.checkpoint().unwrap();
-    let rdat = dir.path().join("u.rdat");
-    let size_before = std::fs::metadata(&rdat).unwrap().len();
+    let size_before = snapshot_len(dir.path(), "u");
 
     // Instant drop, then a checkpoint that compacts away the big column.
     db.execute("ALTER TABLE u DROP COLUMN big").unwrap();
     db.checkpoint().unwrap();
-    let size_after = std::fs::metadata(&rdat).unwrap().len();
+    let size_after = snapshot_len(dir.path(), "u");
     assert!(
         size_after * 2 < size_before,
         "expected the snapshot to shrink markedly after compaction: {size_before} -> {size_after}"
@@ -719,12 +732,11 @@ fn checkpoint_compacts_disk_first() {
             .unwrap();
     }
     db.checkpoint().unwrap(); // base at full arity
-    let rdat = dir.path().join("u.rdat");
-    let size_before = std::fs::metadata(&rdat).unwrap().len();
+    let size_before = snapshot_len(dir.path(), "u");
 
     db.execute("ALTER TABLE u DROP COLUMN big").unwrap();
     db.checkpoint().unwrap(); // compacts base rows into a fresh snapshot
-    let size_after = std::fs::metadata(&rdat).unwrap().len();
+    let size_after = snapshot_len(dir.path(), "u");
     assert!(
         size_after * 2 < size_before,
         "expected disk-first compaction to shrink the base: {size_before} -> {size_after}"

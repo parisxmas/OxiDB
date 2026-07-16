@@ -217,16 +217,6 @@ impl MappedSnapshot {
     }
 }
 
-/// Delete a table's snapshot file if present (used when a table is dropped).
-pub fn remove_snapshot(dir: &Path, table: &str) -> Result<()> {
-    let path = rdat_path(dir, table);
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

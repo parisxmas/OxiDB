@@ -30,6 +30,10 @@ const WAL_MAGIC: &[u8; 4] = b"OXSW";
 const WAL_VERSION: u16 = 1;
 const HEADER_LEN: u64 = 8;
 
+/// A WAL replay result: the `(seq, record)` pairs, the byte offset past the
+/// last intact record (for trimming a torn tail), and the highest seq seen.
+type Replayed = (Vec<(u64, WalRecord)>, u64, u64);
+
 /// A single logical mutation recorded before it is applied.
 ///
 /// All variants are **idempotent by identity** (table name + `row_id`) so that
@@ -128,15 +132,23 @@ pub struct Wal {
 }
 
 impl Wal {
-    /// Open (creating if needed) the WAL under `dir` (`dir` is the SQL root),
-    /// replaying existing records. Returns the writer and the replayed records
-    /// in log order.
-    pub fn open(dir: &Path) -> Result<(Wal, Vec<WalRecord>)> {
+    /// Open the WAL, returning only the records whose sequence is strictly
+    /// greater than `min_seq` — the checkpoint watermark from the manifest.
+    /// Records at or below it are already folded into the loaded snapshots, so
+    /// replaying them would double-apply (and is unnecessary). The writer's
+    /// next sequence still continues past the highest seq *in the file*, so
+    /// sequences stay monotonic even across an untruncated WAL.
+    pub fn open_since(dir: &Path, min_seq: u64) -> Result<(Wal, Vec<WalRecord>)> {
         let wal_dir = dir.join("wal");
         fs::create_dir_all(&wal_dir)?;
         let path = wal_dir.join("live.wal");
 
-        let (records, valid_end, max_seq) = Self::replay(&path)?;
+        let (all, valid_end, max_seq) = Self::replay(&path)?;
+        let records: Vec<WalRecord> = all
+            .into_iter()
+            .filter(|(seq, _)| *seq > min_seq)
+            .map(|(_, rec)| rec)
+            .collect();
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -169,6 +181,13 @@ impl Wal {
         self.bytes
     }
 
+    /// The highest sequence appended so far (0 if none). A checkpoint records
+    /// this as the manifest watermark: its snapshots reflect every record up to
+    /// and including it.
+    pub fn last_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+
     fn write_header(file: &mut File) -> Result<()> {
         let mut hdr = Vec::with_capacity(HEADER_LEN as usize);
         hdr.extend_from_slice(WAL_MAGIC);
@@ -179,10 +198,10 @@ impl Wal {
         Ok(())
     }
 
-    /// Read all valid records. Returns `(records, valid_end_offset, max_seq)`.
-    /// `valid_end_offset` is the byte offset just past the last intact record,
-    /// used to trim a torn tail.
-    fn replay(path: &Path) -> Result<(Vec<WalRecord>, u64, u64)> {
+    /// Read all valid records as `(seq, record)`. Returns `(records,
+    /// valid_end_offset, max_seq)`. `valid_end_offset` is the byte offset just
+    /// past the last intact record, used to trim a torn tail.
+    fn replay(path: &Path) -> Result<Replayed> {
         let file = match File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0, 0)),
@@ -235,7 +254,7 @@ impl Wal {
             }
 
             let rec: WalRecord = serde_json::from_slice(&payload)?;
-            records.push(rec);
+            records.push((seq, rec));
             max_seq = max_seq.max(seq);
             offset += 16 + plen as u64;
         }
@@ -326,7 +345,7 @@ mod tests {
     fn append_and_replay() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let (mut wal, replayed) = Wal::open(dir.path()).unwrap();
+            let (mut wal, replayed) = Wal::open_since(dir.path(), 0).unwrap();
             assert!(replayed.is_empty());
             wal.append(&rec_create()).unwrap();
             wal.append(&WalRecord::Insert {
@@ -336,7 +355,7 @@ mod tests {
             })
             .unwrap();
         }
-        let (_wal, replayed) = Wal::open(dir.path()).unwrap();
+        let (_wal, replayed) = Wal::open_since(dir.path(), 0).unwrap();
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[0], rec_create());
     }
@@ -345,7 +364,7 @@ mod tests {
     fn torn_tail_is_trimmed() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let (mut wal, _) = Wal::open(dir.path()).unwrap();
+            let (mut wal, _) = Wal::open_since(dir.path(), 0).unwrap();
             wal.append(&rec_create()).unwrap();
         }
         // Simulate a crash mid-write: append garbage bytes (a partial frame).
@@ -357,18 +376,18 @@ mod tests {
             f.write_all(&[0xAB, 0xCD, 0xEF]).unwrap(); // 3 bytes: shorter than a frame prefix
             f.sync_all().unwrap();
         }
-        let (_wal, replayed) = Wal::open(dir.path()).unwrap();
+        let (_wal, replayed) = Wal::open_since(dir.path(), 0).unwrap();
         assert_eq!(replayed.len(), 1, "torn tail must be ignored");
     }
 
     #[test]
     fn truncate_clears_log() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut wal, _) = Wal::open(dir.path()).unwrap();
+        let (mut wal, _) = Wal::open_since(dir.path(), 0).unwrap();
         wal.append(&rec_create()).unwrap();
         wal.truncate().unwrap();
         drop(wal);
-        let (_wal, replayed) = Wal::open(dir.path()).unwrap();
+        let (_wal, replayed) = Wal::open_since(dir.path(), 0).unwrap();
         assert!(replayed.is_empty());
     }
 }

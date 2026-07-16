@@ -17,6 +17,7 @@ mod decimal;
 mod error;
 mod executor;
 pub mod json;
+mod manifest;
 mod parser;
 mod rows;
 mod storage;
@@ -362,6 +363,10 @@ impl TableState {
 
 struct Inner {
     dir: PathBuf,
+    /// The committed generation whose `gen.<N>/` holds the live catalog +
+    /// snapshots. `0` means the legacy flat layout (catalog + snapshots at the
+    /// root, no MANIFEST yet); the first checkpoint migrates it to `gen.1`.
+    generation: u64,
     catalog: Catalog,
     tables: BTreeMap<String, TableState>,
     wal: Wal,
@@ -405,17 +410,38 @@ impl SqlEngine {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
-        // 1. Durable schema snapshot.
-        let mut catalog = Catalog::load(&dir)?;
+        // 1. Find the committed generation. The MANIFEST is the atomic pointer;
+        //    its absence means a fresh or legacy database (catalog + snapshots
+        //    still at the root), loaded as generation 0.
+        let manifest = manifest::Manifest::load(&dir)?;
+        let (generation, load_dir, watermark) = match &manifest {
+            Some(m) => (
+                m.generation,
+                manifest::gen_dir(&dir, m.generation),
+                m.wal_seq,
+            ),
+            None => (0, dir.clone(), 0),
+        };
 
-        // 2. Load each table's row snapshot. Resident mode materializes every
+        // Sweep orphan generation dirs — a crashed checkpoint or a failed GC —
+        // so only the committed generation survives on disk.
+        Self::sweep_orphan_generations(&dir, generation);
+
+        // 2. Durable schema snapshot for that generation. Sequences persist
+        //    separately (see `sequences.json`), so overlay them last.
+        let mut catalog = Catalog::load(&load_dir)?;
+        if let Some(seqs) = catalog::load_sequences(&dir)? {
+            catalog.sequences = seqs;
+        }
+
+        // 3. Load each table's row snapshot. Resident mode materializes every
         //    row; disk-first maps the snapshot and makes one decoding pass to
         //    seed `next_row_id` and the PK map without retaining the rows.
         let mut tables: BTreeMap<String, TableState> = BTreeMap::new();
         for (name, def) in &catalog.tables {
             let mut state = TableState::empty(def.clone(), opts.disk_first);
             if opts.disk_first {
-                if let Some(snap) = storage::MappedSnapshot::open(&dir, name, def.arity())? {
+                if let Some(snap) = storage::MappedSnapshot::open(&load_dir, name, def.arity())? {
                     for (row_id, cells) in snap.entries() {
                         state.observe_row_id(row_id);
                         state.observe_auto(&cells);
@@ -431,7 +457,7 @@ impl SqlEngine {
                     state.rows.attach_base(snap);
                 }
             } else {
-                for (row_id, cells) in storage::read_snapshot(&dir, name, def.arity())? {
+                for (row_id, cells) in storage::read_snapshot(&load_dir, name, def.arity())? {
                     state.observe_row_id(row_id);
                     state.observe_auto(&cells);
                     if let Some(p) = state.pk_pos {
@@ -448,15 +474,15 @@ impl SqlEngine {
             tables.insert(name.clone(), state);
         }
 
-        // 3. Replay the WAL tail over the snapshots (idempotent).
-        let (wal, records) = Wal::open(&dir)?;
+        // 4. Replay the WAL past the manifest watermark (idempotent). Records at
+        //    or below it are already folded into the snapshots above.
+        let (wal, records) = Wal::open_since(&dir, watermark)?;
         for rec in &records {
             Self::apply_live(&mut catalog, &mut tables, rec, opts.disk_first);
         }
 
-        // 4. Build any indexes that existed before the last checkpoint (they are
-        //    in the loaded catalog but not in the truncated WAL, so replay didn't
-        //    reconstruct them).
+        // 5. Build any indexes that existed before the last checkpoint (they are
+        //    in the loaded catalog but not in the replayed WAL tail).
         let defs: Vec<IndexDef> = catalog.indexes.values().cloned().collect();
         for def in defs {
             if let Some(state) = tables.get_mut(&def.table)
@@ -472,6 +498,7 @@ impl SqlEngine {
             stmt_cache: Mutex::new(std::collections::HashMap::new()),
             inner: Mutex::new(Inner {
                 dir,
+                generation,
                 catalog,
                 tables,
                 wal,
@@ -479,6 +506,22 @@ impl SqlEngine {
                 checkpoint_bytes: opts.checkpoint_bytes,
             }),
         })
+    }
+
+    /// Delete every `gen.<N>/` directory except the committed generation —
+    /// leftovers from a checkpoint that crashed before committing its MANIFEST,
+    /// or a GC that never ran. Best-effort: a failure only wastes disk.
+    fn sweep_orphan_generations(root: &Path, keep: u64) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if let Some(rest) = entry.file_name().to_string_lossy().strip_prefix("gen.")
+                && rest.parse::<u64>().ok() != Some(keep)
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     /// Apply a WAL record to the in-memory catalog + tables, maintaining
@@ -1219,8 +1262,11 @@ impl SqlEngine {
         Ok(())
     }
 
-    /// Durably capture current state into `.rdat` snapshots + `catalog.json`,
-    /// then truncate the WAL.
+    /// Durably capture current state into a fresh generation (`gen.<N+1>/`
+    /// catalog + snapshots), atomically promote it by committing the MANIFEST,
+    /// then re-attach disk-first bases, GC the old generation, and truncate the
+    /// WAL. The MANIFEST rename is the single commit point: a crash anywhere
+    /// before it leaves the previous generation whole and in force.
     pub fn checkpoint(&self) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         Self::checkpoint_locked(&mut inner)
@@ -1229,6 +1275,7 @@ impl SqlEngine {
     fn checkpoint_locked(inner: &mut Inner) -> Result<()> {
         let Inner {
             dir,
+            generation,
             catalog,
             tables,
             wal,
@@ -1274,37 +1321,63 @@ impl SqlEngine {
             }
         }
 
+        // Write the whole new generation into its own directory — nothing here
+        // touches the currently-committed generation, so a crash mid-write is
+        // harmless (the MANIFEST still names the old one).
+        let old_gen = *generation;
+        let new_gen = old_gen + 1;
+        let new_dir = manifest::gen_dir(dir, new_gen);
+        std::fs::create_dir_all(&new_dir)?;
         for (name, state) in tables.iter() {
-            // Post-compaction the physical layout has no tombstones; reopen
-            // decodes at the catalog's arity and reconstructs the projection
-            // from any `dropped` flags (only present between a DROP and its
-            // next checkpoint).
-            storage::write_snapshot(dir, name, state.rows.iter_physical())?;
+            storage::write_snapshot(&new_dir, name, state.rows.iter_physical())?;
         }
-        for entry in std::fs::read_dir(&*dir)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let name = file_name.to_string_lossy();
-            if let Some(table) = name.strip_suffix(".rdat")
-                && !catalog.contains(table)
-            {
-                storage::remove_snapshot(dir, table)?;
-            }
-        }
-        catalog.save(dir)?;
-        wal.truncate()?;
+        catalog.save(&new_dir)?;
 
-        // Disk-first: adopt the freshly written snapshots as the new bases and
-        // drop the RAM overlays they absorbed. On failure the old base +
-        // overlay stay live — still correct, just not yet compacted.
+        // Commit: this rename atomically switches the live generation. The
+        // watermark is the highest WAL seq folded into these snapshots, so a
+        // not-yet-truncated WAL replays only what came after.
+        let watermark = wal.last_seq();
+        manifest::Manifest::commit(dir, new_gen, watermark)?;
+        *generation = new_gen;
+
+        // Disk-first: adopt the new generation's snapshots as the bases and drop
+        // the RAM overlays they absorbed.
         if *disk_first {
             for (name, state) in tables.iter_mut() {
-                if let Some(snap) = storage::MappedSnapshot::open(dir, name, state.def.arity())? {
+                if let Some(snap) =
+                    storage::MappedSnapshot::open(&new_dir, name, state.def.arity())?
+                {
                     state.rows.attach_base(snap);
                 }
             }
         }
+
+        // Reclaim the superseded generation (or the legacy root files) and the
+        // WAL prefix now captured in the snapshot. Both are best-effort: the
+        // committed MANIFEST already makes recovery correct, so a failure here
+        // only leaves reclaimable disk behind.
+        Self::gc_superseded(dir, old_gen);
+        let _ = wal.truncate();
         Ok(())
+    }
+
+    /// Remove the storage the just-committed checkpoint superseded: the old
+    /// `gen.<old>/` directory, or — on the first checkpoint of a legacy
+    /// database (`old_gen == 0`) — the flat root-level `catalog.json` and
+    /// `<table>.rdat` files it migrated from.
+    fn gc_superseded(root: &Path, old_gen: u64) {
+        if old_gen >= 1 {
+            let _ = std::fs::remove_dir_all(manifest::gen_dir(root, old_gen));
+            return;
+        }
+        let _ = std::fs::remove_file(root.join("catalog.json"));
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(".rdat") {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     /// Checkpoint if the live WAL has grown past the configured threshold.
@@ -1472,7 +1545,7 @@ impl SqlEngine {
                 .sequences
                 .insert(name, catalog::SequenceDef { next: start, increment: inc });
             let dir = inner.dir.clone();
-            inner.catalog.save(&dir)?;
+            catalog::save_sequences(&dir, &inner.catalog.sequences)?;
             return Ok(Some(QueryResult::Ddl));
         }
 
@@ -1485,7 +1558,7 @@ impl SqlEngine {
             let existed = inner.catalog.sequences.remove(&name).is_some();
             if existed {
                 let dir = inner.dir.clone();
-                inner.catalog.save(&dir)?;
+                catalog::save_sequences(&dir, &inner.catalog.sequences)?;
             } else if !up.contains("IF EXISTS") {
                 return Err(SqlError::Unsupported(format!("no such sequence: {name}")));
             }
@@ -1506,7 +1579,7 @@ impl SqlEngine {
         let v = seq.next;
         seq.next = seq.next.saturating_add(seq.increment);
         let dir = inner.dir.clone();
-        inner.catalog.save(&dir)?;
+        catalog::save_sequences(&dir, &inner.catalog.sequences)?;
         Ok(Some(QueryResult::Select {
             columns: vec![String::new()],
             types: vec![Some(types::SqlType::Int)],

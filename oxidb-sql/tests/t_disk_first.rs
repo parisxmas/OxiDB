@@ -32,6 +32,19 @@ fn wal_bytes(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// A table's `.rdat` snapshot now lives under the committed generation dir
+/// (`gen.<N>/`); a checkpoint writes a fresh one and GCs the old generation.
+fn snapshot_exists(root: &Path, table: &str) -> bool {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| {
+            e.file_name().to_string_lossy().starts_with("gen.")
+                && e.path().join(format!("{table}.rdat")).exists()
+        })
+}
+
 fn seed(db: &SqlEngine) {
     db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, age INT)")
         .unwrap();
@@ -71,7 +84,7 @@ fn disk_first_base_rows_come_from_mmap_after_checkpoint() {
     let (d, db) = open_disk();
     seed(&db);
     db.checkpoint().unwrap(); // rows now live in the mmap'd .rdat base
-    assert!(d.path().join("users.rdat").exists());
+    assert!(snapshot_exists(d.path(), "users"));
     assert_eq!(wal_bytes(d.path()), 8); // header only
 
     // Reads hit the base.
@@ -246,7 +259,7 @@ fn auto_checkpoint_truncates_wal_at_threshold() {
     for i in 0..200 {
         db.execute(&format!("INSERT INTO kv VALUES ({i}, 'value-{i}')"))
             .unwrap();
-        if dir.path().join("kv.rdat").exists() && wal_bytes(dir.path()) <= 4096 {
+        if snapshot_exists(dir.path(), "kv") && wal_bytes(dir.path()) <= 4096 {
             auto_fired = true;
         }
     }
@@ -296,7 +309,7 @@ fn auto_checkpoint_bounds_disk_first_overlay() {
     }
     // Rows written before the last auto-checkpoint are served from mmap;
     // everything is still queryable and correctly counted.
-    assert!(dir.path().join("kv.rdat").exists());
+    assert!(snapshot_exists(dir.path(), "kv"));
     assert_eq!(
         rows(&db, "SELECT COUNT(*) FROM kv"),
         vec![vec![Value::Int(300)]]
@@ -327,7 +340,7 @@ fn zero_threshold_disables_auto_checkpoint() {
         db.execute(&format!("INSERT INTO kv VALUES ({i})")).unwrap();
     }
     assert!(
-        !dir.path().join("kv.rdat").exists(),
+        !snapshot_exists(dir.path(), "kv"),
         "checkpoint ran unbidden"
     );
     assert!(wal_bytes(dir.path()) > 8);
