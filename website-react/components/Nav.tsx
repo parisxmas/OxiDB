@@ -34,6 +34,10 @@ const navGroups = [
     items: [{ href: '/tsdb', label: 'Time-Series' }],
   },
   {
+    title: 'OxiMem',
+    items: [{ href: '/oximem', label: 'Redis-compatible store' }],
+  },
+  {
     title: 'Storage & Realtime',
     items: [
       { href: '/blobs', label: 'Blobs (S3)' },
