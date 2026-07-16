@@ -28,6 +28,10 @@ pub struct Persist {
     pub generation: u64,
     wal: BufWriter<File>,
     pub wal_bytes: u64,
+    /// Generations pinned by in-progress low-lock backups, refcounted. A
+    /// checkpoint never deletes a pinned generation's files, so a backup can
+    /// archive them (and a stable WAL prefix) with the engine lock released.
+    pinned: BTreeMap<u64, usize>,
 }
 
 fn manifest_path(dir: &Path) -> PathBuf {
@@ -145,7 +149,36 @@ impl Persist {
             generation,
             wal: BufWriter::new(wal_file),
             wal_bytes,
+            pinned: BTreeMap::new(),
         })
+    }
+
+    /// Pin the current generation for a low-lock backup: flush the WAL so its
+    /// on-disk length is up to date, bump the generation's pin refcount, and
+    /// return `(generation, wal_len)`. While pinned, a checkpoint won't delete
+    /// this generation's files, and its WAL prefix `[0, wal_len)` never
+    /// changes (the per-generation WAL is only appended to or rotated, never
+    /// truncated in place) — so the archiver can read them with the lock down.
+    pub fn pin_for_backup(&mut self) -> io::Result<(u64, u64)> {
+        self.flush()?;
+        *self.pinned.entry(self.generation).or_insert(0) += 1;
+        Ok((self.generation, self.wal_bytes))
+    }
+
+    /// Release a backup pin. If a checkpoint superseded `gen` while it was
+    /// pinned (and no other backup still holds it), reclaim its files now.
+    pub fn unpin_after_backup(&mut self, generation: u64) {
+        if let Some(count) = self.pinned.get_mut(&generation) {
+            *count -= 1;
+            if *count == 0 {
+                self.pinned.remove(&generation);
+            }
+        }
+        if generation != self.generation && !self.pinned.contains_key(&generation) {
+            let _ = fs::remove_file(blocks_path(&self.dir, generation));
+            let _ = fs::remove_file(wal_path(&self.dir, generation));
+            let _ = fs::remove_file(wm_path(&self.dir, generation));
+        }
     }
 
     /// Append one sample to the WAL.
@@ -226,9 +259,13 @@ impl Persist {
                 .open(wal_path(&self.dir, next))?,
         );
         self.wal_bytes = 0;
-        let _ = fs::remove_file(blocks_path(&self.dir, self.generation));
-        let _ = fs::remove_file(wal_path(&self.dir, self.generation));
-        let _ = fs::remove_file(wm_path(&self.dir, self.generation));
+        // Reclaim the superseded generation — unless a backup pinned it, in
+        // which case its files stay until the backup unpins them.
+        if !self.pinned.contains_key(&self.generation) {
+            let _ = fs::remove_file(blocks_path(&self.dir, self.generation));
+            let _ = fs::remove_file(wal_path(&self.dir, self.generation));
+            let _ = fs::remove_file(wm_path(&self.dir, self.generation));
+        }
         self.generation = next;
         Ok(())
     }

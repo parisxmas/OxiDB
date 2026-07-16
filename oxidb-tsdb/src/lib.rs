@@ -42,6 +42,16 @@ pub struct RollupSpec {
     pub aggs: Vec<Agg>,
 }
 
+/// A pinned generation to archive, produced by
+/// [`Tsdb::backup_begin`] and consumed by [`Tsdb::backup_write`] /
+/// [`Tsdb::backup_end`]. Holding it keeps that generation's files pinned, so
+/// the archiving in between runs with the engine lock released.
+pub struct TsdbBackup {
+    generation: u64,
+    wal_len: u64,
+    dir: std::path::PathBuf,
+}
+
 /// The time-series database: a set of compressed series streams, optionally
 /// persisted to disk.
 #[derive(Default)]
@@ -233,17 +243,51 @@ impl Tsdb {
         self.persist.as_ref().map(|p| p.dir())
     }
 
-    /// Write a consistent, compressed (`.tar.gz`) backup of this engine's data
-    /// directory to `out`. Checkpoints first (folding the WAL into a fresh
-    /// snapshot) so the archive is a clean, restorable image; the caller holds
-    /// the engine exclusively (`&mut self`), so nothing writes mid-archive.
-    /// Returns the archive's size in bytes. Errors for an in-memory database.
+    /// Consistent, compressed (`.tar.gz`) backup of this engine's data to `out`.
+    /// Convenience wrapper around the low-lock [`backup_begin`](Tsdb::backup_begin)
+    /// / [`backup_write`](Tsdb::backup_write) / [`backup_end`](Tsdb::backup_end)
+    /// phases — safe to call while holding the engine exclusively. Returns the
+    /// archive size; errors for an in-memory database.
     pub fn backup(&mut self, out: &Path) -> std::io::Result<u64> {
-        let Some(dir) = self.data_dir().map(|d| d.to_path_buf()) else {
+        let plan = self.backup_begin()?;
+        let result = Self::backup_write(&plan, out);
+        self.backup_end(&plan);
+        result
+    }
+
+    /// Phase 1 (holds the caller's exclusive lock, O(1)): pin a committed
+    /// generation and snapshot the WAL length. The returned plan can then be
+    /// archived with [`backup_write`](Tsdb::backup_write) — with the engine lock
+    /// **released** — because the pin keeps that generation's files on disk and
+    /// its WAL prefix stable while writes and checkpoints continue.
+    pub fn backup_begin(&mut self) -> std::io::Result<TsdbBackup> {
+        let Some(p) = self.persist.as_mut() else {
             return Err(std::io::Error::other(
                 "in-memory TSDB has no on-disk data to back up",
             ));
         };
+        let (generation, wal_len) = p.pin_for_backup()?;
+        Ok(TsdbBackup {
+            generation,
+            wal_len,
+            dir: p.dir().to_path_buf(),
+        })
+    }
+
+    /// Phase 3 (holds the caller's exclusive lock, O(1)): release the pin taken
+    /// by [`backup_begin`](Tsdb::backup_begin), reclaiming the generation if a
+    /// checkpoint superseded it during the backup.
+    pub fn backup_end(&mut self, plan: &TsdbBackup) {
+        if let Some(p) = self.persist.as_mut() {
+            p.unpin_after_backup(plan.generation);
+        }
+    }
+
+    /// Phase 2 (**no lock**): compress the pinned generation into `out` — a
+    /// synthesized `MANIFEST`, that generation's block snapshot, a stable prefix
+    /// of its WAL, and the rollup sidecars. Reads only pinned/immutable files.
+    pub fn backup_write(plan: &TsdbBackup, out: &Path) -> std::io::Result<u64> {
+        use std::io::Read;
         if out.exists() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
@@ -255,12 +299,48 @@ impl Tsdb {
         {
             std::fs::create_dir_all(parent)?;
         }
-        self.checkpoint()?;
+        let (dir, g) = (&plan.dir, plan.generation);
 
         let file = std::fs::File::create(out)?;
         let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
         let mut ar = tar::Builder::new(enc);
-        ar.append_dir_all(".", &dir)?;
+
+        // Synthesized MANIFEST → the pinned generation.
+        let manifest = serde_json::to_vec(&serde_json::json!({ "generation": g }))?;
+        let mut hdr = tar::Header::new_gnu();
+        hdr.set_size(manifest.len() as u64);
+        hdr.set_mode(0o644);
+        hdr.set_cksum();
+        ar.append_data(&mut hdr, "MANIFEST", &manifest[..])?;
+
+        // Block snapshot (absent until the first checkpoint — recovery then
+        // rebuilds from the WAL alone).
+        let blocks = dir.join(format!("blocks.{g}.tsb"));
+        if blocks.exists() {
+            ar.append_path_with_name(&blocks, format!("blocks.{g}.tsb"))?;
+        }
+
+        // Stable prefix of the per-generation WAL.
+        let wal = dir.join(format!("wal.{g}.log"));
+        if plan.wal_len > 0 && wal.exists() {
+            let f = std::fs::File::open(&wal)?;
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_size(plan.wal_len);
+            hdr.set_mode(0o644);
+            hdr.set_cksum();
+            ar.append_data(&mut hdr, format!("wal.{g}.log"), f.take(plan.wal_len))?;
+        }
+
+        // Rollup watermark sidecar (per-generation) + rule set (global).
+        let wm = dir.join(format!("rollup_wm.{g}.json"));
+        if wm.exists() {
+            ar.append_path_with_name(&wm, format!("rollup_wm.{g}.json"))?;
+        }
+        let rollups = dir.join("rollups.json");
+        if rollups.exists() {
+            ar.append_path_with_name(&rollups, "rollups.json")?;
+        }
+
         ar.into_inner()?.finish()?;
         Ok(std::fs::metadata(out)?.len())
     }

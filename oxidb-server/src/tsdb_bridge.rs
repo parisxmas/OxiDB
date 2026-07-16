@@ -71,7 +71,16 @@ fn tsdb_backup(request: &Value, db_name: &str) -> Vec<u8> {
         Ok(e) => e,
         Err(msg) => return err_bytes(&msg),
     };
-    match engine.write().unwrap().backup(std::path::Path::new(path)) {
+    // Low-lock: pin under the write lock (phase 1), compress with the lock
+    // released (phase 2), then unpin under the write lock (phase 3). Writes and
+    // checkpoints run concurrently with the compression.
+    let plan = match engine.write().unwrap().backup_begin() {
+        Ok(p) => p,
+        Err(e) => return err_bytes(&e.to_string()),
+    };
+    let result = Tsdb::backup_write(&plan, std::path::Path::new(path));
+    engine.write().unwrap().backup_end(&plan);
+    match result {
         Ok(size_bytes) => ok_bytes(json!({ "path": path, "size_bytes": size_bytes })),
         Err(e) => err_bytes(&e.to_string()),
     }
