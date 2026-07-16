@@ -121,6 +121,48 @@ impl RowStore {
         self.live.len()
     }
 
+    /// Physically drop the tombstoned columns: rewrite every stored row down to
+    /// its live columns and return to an identity layout, so the space a lazy
+    /// `DROP COLUMN` left occupied is reclaimed. The O(n) rewrite the instant
+    /// DROP deferred happens here (called at checkpoint). In disk-first mode the
+    /// immutable mmap'd base rows materialize (projected) into the overlay; the
+    /// caller writes a fresh snapshot and re-attaches right after. A no-op when
+    /// nothing is dropped.
+    pub fn compact(&mut self) {
+        if !self.projected {
+            return;
+        }
+        self.wgen = self.wgen.wrapping_add(1);
+        let old_live = std::mem::take(&mut self.live);
+        let old_fill = std::mem::take(&mut self.fill);
+        let project = |row: &[Value]| project_row(&old_fill, &old_live, row);
+        match &mut self.mode {
+            RowMode::Resident(m) => {
+                for cells in m.values_mut() {
+                    *cells = project(cells);
+                }
+            }
+            RowMode::DiskFirst(d) => {
+                if let Some(base) = d.base.take() {
+                    for (id, cells) in base.entries() {
+                        d.overlay.entry(id).or_insert(Some(cells));
+                    }
+                }
+                d.overlay.retain(|_, change| change.is_some());
+                for cells in d.overlay.values_mut().flatten() {
+                    *cells = project(cells);
+                }
+                d.live = d.overlay.len();
+            }
+        }
+        // Identity layout at the new (live) width; the caller re-derives the
+        // same layout authoritatively from the compacted schema via set_layout.
+        let new_fill: Vec<Value> = old_live.iter().map(|&s| old_fill[s].clone()).collect();
+        self.live = (0..new_fill.len()).collect();
+        self.fill = new_fill;
+        self.projected = false;
+    }
+
     /// True for the RAM-resident mode (the only mode a contiguous scan cache
     /// materializes for; disk-first stays lazy over its mmap).
     pub fn is_resident(&self) -> bool {

@@ -1236,10 +1236,49 @@ impl SqlEngine {
             ..
         } = inner;
 
+        // Compaction: physically reclaim the slots left by lazy `DROP COLUMN`s
+        // before persisting, returning each affected table to a plain identity
+        // layout. This is the O(n) rewrite the instant DROP deferred — done
+        // here, off the critical path, so its cost is folded into the
+        // checkpoint that was going to rewrite every row anyway. After it, the
+        // snapshot and catalog carry no tombstones; the space is freed.
+        let compacting: Vec<String> = catalog
+            .tables
+            .iter()
+            .filter(|(_, t)| t.has_dropped())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &compacting {
+            if let Some(state) = tables.get_mut(name) {
+                state.rows.compact(); // rewrite rows physical -> live-only
+            }
+            if let Some(t) = catalog.tables.get_mut(name) {
+                t.columns.retain(|c| !c.dropped); // drop the tombstones
+            }
+            // Positions shifted: rebuild constraint maps and secondary indexes
+            // (which reference surviving columns by name) at the new layout.
+            let index_defs: Vec<IndexDef> = catalog
+                .indexes
+                .values()
+                .filter(|d| &d.table == name)
+                .cloned()
+                .collect();
+            if let Some(state) = tables.get_mut(name) {
+                state.def = catalog.tables[name].clone();
+                state.sync_layout();
+                state.rebuild_meta();
+                state.indexes.clear();
+                for d in index_defs {
+                    let _ = state.build_index(&d.name, &d.columns);
+                }
+            }
+        }
+
         for (name, state) in tables.iter() {
-            // Snapshots persist the physical layout (tombstoned slots kept),
-            // so reopen decodes at the catalog's physical arity and the
-            // projection is reconstructed from the stored `dropped` flags.
+            // Post-compaction the physical layout has no tombstones; reopen
+            // decodes at the catalog's arity and reconstructs the projection
+            // from any `dropped` flags (only present between a DROP and its
+            // next checkpoint).
             storage::write_snapshot(dir, name, state.rows.iter_physical())?;
         }
         for entry in std::fs::read_dir(&*dir)? {

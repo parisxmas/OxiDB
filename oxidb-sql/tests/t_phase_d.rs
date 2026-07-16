@@ -580,6 +580,91 @@ fn drop_column_survives_reopen_without_checkpoint() {
     assert!(db.execute("SELECT a FROM u").is_err());
 }
 
+/// A checkpoint after a lazy DROP compacts the table — physically rewriting
+/// rows to the live columns — so the dropped column's space is reclaimed on
+/// disk, while query results are unchanged and the tombstone is gone.
+#[test]
+fn checkpoint_compacts_dropped_column_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqlEngine::open(dir.path()).unwrap();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, big TEXT, keep INT)")
+        .unwrap();
+    let filler = "x".repeat(200);
+    for i in 1..=200 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, '{filler}', {i})"))
+            .unwrap();
+    }
+    db.checkpoint().unwrap();
+    let rdat = dir.path().join("u.rdat");
+    let size_before = std::fs::metadata(&rdat).unwrap().len();
+
+    // Instant drop, then a checkpoint that compacts away the big column.
+    db.execute("ALTER TABLE u DROP COLUMN big").unwrap();
+    db.checkpoint().unwrap();
+    let size_after = std::fs::metadata(&rdat).unwrap().len();
+    assert!(
+        size_after * 2 < size_before,
+        "expected the snapshot to shrink markedly after compaction: {size_before} -> {size_after}"
+    );
+
+    // Results are unchanged, and the column stays gone across a reopen.
+    let total: i64 = (1..=200).sum();
+    assert_eq!(
+        rows(&db, "SELECT SUM(keep) FROM u"),
+        vec![vec![Value::Int(total)]]
+    );
+    drop(db);
+    let db = SqlEngine::open(dir.path()).unwrap();
+    assert!(db.execute("SELECT big FROM u").is_err());
+    assert_eq!(
+        rows(&db, "SELECT id, keep FROM u WHERE id = 100"),
+        vec![vec![Value::Int(100), Value::Int(100)]]
+    );
+    assert_eq!(
+        rows(&db, "SELECT SUM(keep) FROM u"),
+        vec![vec![Value::Int(total)]]
+    );
+}
+
+/// Compaction preserves the PRIMARY KEY and secondary indexes: their positions
+/// shift when the dropped column is physically removed, and they're rebuilt.
+#[test]
+fn checkpoint_compaction_preserves_indexes() {
+    let (_d, db) = open();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, junk TEXT, tag INT)")
+        .unwrap();
+    for i in 1..=10 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, 'j{i}', {})", i % 3))
+            .unwrap();
+    }
+    db.execute("CREATE INDEX i_tag ON u (tag)").unwrap();
+    db.execute("ALTER TABLE u DROP COLUMN junk").unwrap();
+    db.checkpoint().unwrap(); // compacts: tag moves from slot 2 to slot 1
+
+    // Secondary index still resolves at the shifted position.
+    assert_eq!(
+        rows(&db, "SELECT id FROM u WHERE tag = 0 ORDER BY id"),
+        vec![
+            vec![Value::Int(3)],
+            vec![Value::Int(6)],
+            vec![Value::Int(9)]
+        ]
+    );
+    // PRIMARY KEY uniqueness still enforced.
+    assert!(db.execute("INSERT INTO u VALUES (3, 0)").is_err());
+    // Writes and index upkeep keep working post-compaction.
+    db.execute("INSERT INTO u VALUES (11, 0)").unwrap();
+    db.execute("DELETE FROM u WHERE id = 3").unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id FROM u WHERE tag = 0 ORDER BY id"),
+        vec![
+            vec![Value::Int(6)],
+            vec![Value::Int(9)],
+            vec![Value::Int(11)]
+        ]
+    );
+}
+
 /// DROP COLUMN in disk-first mode: base rows live in the mmap at full physical
 /// arity; the drop projects the tombstoned slot out on read, across a reopen.
 #[test]
@@ -612,5 +697,51 @@ fn drop_column_disk_first_reopen() {
             vec![Value::Int(1), Value::Int(10)],
             vec![Value::Int(2), Value::Int(20)],
         ]
+    );
+}
+
+/// Compaction in disk-first mode: the tombstoned base rows (mmap'd, immutable)
+/// materialize projected into a fresh snapshot, which is re-attached as the new
+/// base. Survives a reopen with the column reclaimed.
+#[test]
+fn checkpoint_compacts_disk_first() {
+    let opts = SqlOptions {
+        disk_first: true,
+        checkpoint_bytes: 0,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let db = SqlEngine::open_with_options(dir.path(), opts.clone()).unwrap();
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, big TEXT, keep INT)")
+        .unwrap();
+    let filler = "y".repeat(200);
+    for i in 1..=100 {
+        db.execute(&format!("INSERT INTO u VALUES ({i}, '{filler}', {i})"))
+            .unwrap();
+    }
+    db.checkpoint().unwrap(); // base at full arity
+    let rdat = dir.path().join("u.rdat");
+    let size_before = std::fs::metadata(&rdat).unwrap().len();
+
+    db.execute("ALTER TABLE u DROP COLUMN big").unwrap();
+    db.checkpoint().unwrap(); // compacts base rows into a fresh snapshot
+    let size_after = std::fs::metadata(&rdat).unwrap().len();
+    assert!(
+        size_after * 2 < size_before,
+        "expected disk-first compaction to shrink the base: {size_before} -> {size_after}"
+    );
+
+    let total: i64 = (1..=100).sum();
+    assert_eq!(
+        rows(&db, "SELECT SUM(keep) FROM u"),
+        vec![vec![Value::Int(total)]]
+    );
+    // The compacted base is usable for further writes, then reopen.
+    db.execute("INSERT INTO u VALUES (101, 7)").unwrap();
+    drop(db);
+    let db = SqlEngine::open_with_options(dir.path(), opts).unwrap();
+    assert!(db.execute("SELECT big FROM u").is_err());
+    assert_eq!(
+        rows(&db, "SELECT SUM(keep) FROM u"),
+        vec![vec![Value::Int(total + 7)]]
     );
 }
