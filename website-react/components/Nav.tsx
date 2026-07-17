@@ -201,6 +201,7 @@ const navGroups: {
     title: 'Server & Clients',
     items: [
       { href: '/server', label: 'Server', icon: 'server' },
+      { href: '/clustering', label: 'Clustering & Sharding', icon: 'target' },
       { href: '/clients', label: 'Clients', icon: 'code' },
       { href: '/wasm', label: 'WebAssembly', icon: 'box' },
     ],
