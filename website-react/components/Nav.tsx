@@ -199,6 +199,7 @@ const navGroups: {
     items: [
       { href: '/oximem', label: 'OxiMem (Redis)', icon: 'zap' },
       { href: '/mqtt', label: 'MQTT Broker', icon: 'wifi' },
+      { href: '/amqp', label: 'AMQP (RabbitMQ)', icon: 'radio' },
     ],
   },
   {

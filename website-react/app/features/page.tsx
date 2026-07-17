@@ -30,6 +30,11 @@ export default function Page() {
         <p>Built-in MQTT 3.1.1: wildcards (+/#), retained messages, QoS 1/2, Last Will, keepalive, auth &mdash; sharing pub/sub channels with the RESP side, so IoT devices and Redis clients see the same messages.</p>
       </div>
       <div class="feature-card">
+        <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 019 9"/><path d="M4 4a16 16 0 0116 16"/><circle cx="5" cy="19" r="1"/></svg></div>
+        <h3>AMQP &mdash; RabbitMQ protocol</h3>
+        <p>AMQP 0-9-1 work queues: competing consumers, direct/fanout/topic exchanges, prefetch, publisher confirms, durable queues that survive SIGKILL. pika, amqplib, RabbitMQ.Client and amqp091-go work unmodified; bridged to MQTT via amq.topic.</p>
+      </div>
+      <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
         <h3>Time-Series</h3>
         <p>$ohlcv tick&rarr;candle aggregation, range/time window functions, $densify gap generation and $fill (locf/linear) &mdash; a gapless candlestick pipeline in one aggregation.</p>

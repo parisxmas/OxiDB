@@ -37,7 +37,7 @@ OxiDB &mdash; a database engine in Rust:
  &#9642; ACID transactions &mdash; OCC + SELECT FOR UPDATE + group commit
  &#9642; Raft clustering &amp; replication
  &#9642; Redis-compatible in-memory store (RESP) with MULTI/EXEC/WATCH + EVAL
- &#9642; MQTT broker + cross-protocol pub/sub
+ &#9642; MQTT + AMQP (RabbitMQ) brokers, bridged, cross-protocol pub/sub
  &#9642; Full-text search: HTML, PDF, DOCX, XLSX, OCR
  &#9642; S3-compatible blob storage (SigV4, multipart, lifecycle)
  &#9642; Time-series: OHLCV candles, window functions, gap filling
@@ -72,6 +72,7 @@ Postgres + Mongo + Redis + Elastic + S3. 20 MB.</pre>
           <span class="arch-chip">PHP</span>
           <span class="arch-chip alt">redis-cli</span>
           <span class="arch-chip alt">mosquitto</span>
+          <span class="arch-chip alt">pika / RabbitMQ.Client</span>
           <span class="arch-chip alt">aws-cli / boto3</span>
           <span class="arch-chip alt">Browser</span>
         </div>
@@ -85,6 +86,7 @@ Postgres + Mongo + Redis + Elastic + S3. 20 MB.</pre>
           <span class="arch-proto">TCP&nbsp;+&nbsp;JSON</span>
           <span class="arch-proto">RESP</span>
           <span class="arch-proto">MQTT&nbsp;3.1.1</span>
+          <span class="arch-proto">AMQP&nbsp;0-9-1</span>
           <span class="arch-proto">S3&nbsp;HTTP&nbsp;+&nbsp;SigV4</span>
           <span class="arch-proto">REST</span>
           <span class="arch-proto">WebSocket</span>
@@ -278,7 +280,7 @@ dotnet add package OxiDb.Client.Tcp</code></pre>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M4.93 19.07a10 10 0 010-14.14"/><path d="M7.76 16.24a6 6 0 010-8.49"/><path d="M16.24 7.76a6 6 0 010 8.49"/><path d="M19.07 4.93a10 10 0 010 14.14"/></svg></div>
         <h3>Redis-compatible + MQTT</h3>
-        <p>OxiMem &mdash; a Redis-compatible in-memory store (RESP, MULTI/EXEC/WATCH, EVAL/Lua, persistence) &mdash; plus a full MQTT 3.1.1 broker (wildcards, retained, QoS, LWT).</p>
+        <p>OxiMem &mdash; a Redis-compatible in-memory store (RESP, MULTI/EXEC/WATCH, EVAL/Lua, persistence) &mdash; plus a full MQTT 3.1.1 broker (wildcards, retained, QoS, LWT) and an AMQP 0-9-1 (RabbitMQ-protocol) work-queue broker, bridged through amq.topic.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div>

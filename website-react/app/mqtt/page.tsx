@@ -62,6 +62,8 @@ mosquitto_pub -h 127.0.0.1 -p 1883 -u iot -P secret -t t -m hi</code></pre>
 redis-cli -p 6379 PUBLISH sensors/temp "22.4"
 <span class="co"># ...an MQTT client subscribed to sensors/temp receives it</span></code></pre>
 
+    <p>It also bridges to <a href="/amqp/">AMQP</a> through the pre-declared <code>amq.topic</code> exchange (the RabbitMQ MQTT-plugin mapping, <code>/</code>&nbsp;&harr;&nbsp;<code>.</code>): a sensor publishes MQTT, a RabbitMQ-client worker pool consumes it as a work queue.</p>
+
     <p>For real-time document subscriptions over WebSocket (Firebase-style <code>onSnapshot</code>), see <a href="/streams/">Streams</a>.</p>
   </div>
 </section>` }} />

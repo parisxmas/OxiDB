@@ -43,6 +43,10 @@ export default function Page() {
           <tr><td><code>OXIDB_DATA</code></td><td><code>./oxidb_data</code></td><td>Data directory (also holds <code>raft_meta.json</code> + <code>raft_log.jsonl</code>)</td></tr>
           <tr><td><code>OXIDB_POOL_SIZE</code></td><td><code>4</code></td><td>Worker thread count</td></tr>
           <tr><td><code>OXIDB_IDLE_TIMEOUT</code></td><td><code>30</code></td><td>Connection timeout (seconds, 0 = never)</td></tr>
+          <tr><td><code>OXIDB_WAL_CHECKPOINT_BYTES</code></td><td><code>67108864</code></td><td>Checkpoint the document WAL online past this size (64&nbsp;MiB; <code>0</code> = only at shutdown)</td></tr>
+          <tr><td colspan="3" style="padding-top:10px;color:var(--text-mute);font-family:var(--font-mono);font-size:11px;letter-spacing:0.16em;text-transform:uppercase">Protocol listeners (off unless set)</td></tr>
+          <tr><td><code>OXIDB_MQTT_PORT</code></td><td>—</td><td><a href="/mqtt/">MQTT 3.1.1 broker</a> (+ <code>OXIDB_MQTT_USER</code>/<code>_PASSWORD</code>, <code>OXIDB_MQTT_PERSIST</code>)</td></tr>
+          <tr><td><code>OXIDB_AMQP_PORT</code></td><td>—</td><td><a href="/amqp/">AMQP 0-9-1 (RabbitMQ protocol)</a> (+ <code>OXIDB_AMQP_USER</code>/<code>_PASSWORD</code>); durable queues persist via the document engine</td></tr>
           <tr><td colspan="3" style="padding-top:10px;color:var(--text-mute);font-family:var(--font-mono);font-size:11px;letter-spacing:0.16em;text-transform:uppercase">Cluster mode (--features cluster)</td></tr>
           <tr><td><code>OXIDB_NODE_ID</code></td><td>—</td><td>Required to enable cluster mode. Unique <code>u64</code> per node within a Raft group.</td></tr>
           <tr><td><code>OXIDB_RAFT_ADDR</code></td><td><code>127.0.0.1:4445</code></td><td>Bind address for Raft RPC (separate from client port)</td></tr>

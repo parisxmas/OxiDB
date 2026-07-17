@@ -11,12 +11,42 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.36.12 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.36.12</h3>
+        <span class="version-date">2026-07-17</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; AMQP: the RabbitMQ protocol</h4>
+        <ul>
+          <li><strong><a href="/amqp/">AMQP 0-9-1 listener</a></strong> (<code>OXIDB_AMQP_PORT</code>, off by default) &mdash; RabbitMQ client code works unmodified, verified end-to-end with <strong>pika</strong> (Python), <strong>RabbitMQ.Client</strong> (.NET) and <strong>amqp091-go</strong> (Go). Work queues with competing consumers (the semantic MQTT cannot express), default + <code>direct</code>/<code>fanout</code>/<code>topic</code> exchanges, <code>Basic.Qos</code> prefetch, publisher confirms, mandatory <code>Basic.Return</code>, nack/reject. Anything outside the subset is refused with a clear channel error, never silently accepted.</li>
+          <li><strong>Durability follows the protocol</strong>: a durable queue holding <code>delivery_mode=2</code> messages is written through the document engine&apos;s WAL &mdash; the confirm is only sent after the fsync, and messages survive a <code>SIGKILL</code> (crash-tested; acknowledged messages stay consumed).</li>
+          <li><strong>MQTT &harr; AMQP bridge</strong> via the pre-declared <code>amq.topic</code> exchange, the same mapping RabbitMQ&apos;s MQTT plugin uses (<code>/</code>&nbsp;&harr;&nbsp;<code>.</code>, QoS&nbsp;&ge;1 &harr; persistent): a sensor publishes MQTT, a worker pool consumes AMQP, one binary.</li>
+          <li><strong>Faster than RabbitMQ on 5 of 6 benchmark scenarios</strong> (same Go client both sides): pipelined confirms 1.50&times;, confirm latency 1.74&times;, end-to-end throughput 1.29&times;, end-to-end latency 1.52&times;, 8-connection durable 1.11&times;. Behind it: per-burst fsync batching (one <code>insert_many</code> per pipeline burst; 264&nbsp;&rarr;&nbsp;53k&nbsp;msg/s), a cross-connection group committer (concurrent bursts share fsync rounds), and a cross-thread wake pipe in each connection&apos;s <code>poll(2)</code> set (delivery latency 51&nbsp;ms&nbsp;&rarr;&nbsp;0.02&nbsp;ms). The one loss &mdash; single-connection durable &mdash; is the price of a real <code>F_FULLFSYNC</code> behind every confirm, which RabbitMQ&apos;s lazy interval flush does not pay.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; engine &amp; clients</h4>
+        <ul>
+          <li><strong>Online WAL checkpointing</strong> for the document engine &mdash; the write-ahead log is sealed and folded into the snapshot <em>while writers run</em>, so it no longer grows unboundedly between restarts. Size-triggered via <code>OXIDB_WAL_CHECKPOINT_BYTES</code> (default 64&nbsp;MiB, <code>0</code> restores the old behaviour); crash-tested against <code>SIGKILL</code> mid-checkpoint.</li>
+          <li><strong>Typed time-series surface in <code>OxiDb.Client.Tcp</code></strong> (.NET) &mdash; <code>TsdbWriteAsync</code>, <code>TsdbWriteLineProtocolAsync</code> and <code>TsdbQueryAsync</code> with typed points, aggregations (<code>TsdbAgg.Mean</code> &hellip; <code>Percentile(p)</code>) and epoch-ms helpers, replacing hand-rolled raw commands.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed</h4>
+        <ul>
+          <li><strong>S3 ETags are now real MD5s</strong> &mdash; the previous ETag (truncated SHA-256) broke the AWS SDK for .NET, which re-computes the MD5 of what it uploaded and refuses a disagreeing ETag. <code>aws-cli</code>, <code>boto3</code>, MinIO SDKs and the AWS .NET SDK now all verify uploads cleanly, with no workaround flags.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.36.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.36.0</h3>
         <span class="version-date">2026-07-17</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type fixed">Fixed &mdash; WebAssembly is back</h4>
