@@ -1127,6 +1127,13 @@ PROTOCOLS (off unless set):
     OXIDB_MQTT_PERSIST     persist MQTT sessions, queued QoS-1 messages and
                            retained topics via the document engine (they
                            survive a crash); default off
+    OXIDB_AMQP_PORT        AMQP 0-9-1 (RabbitMQ protocol) listener; durable
+                           queues + delivery_mode=2 messages persist via the
+                           document engine and survive a crash. When the MQTT
+                           listener is also on, the amq.topic exchange bridges
+                           the two protocols ('/' <-> '.')
+    OXIDB_AMQP_USER        require PLAIN auth with this user (with _PASSWORD)
+    OXIDB_AMQP_PASSWORD    the password for OXIDB_AMQP_USER
     OXIDB_S3_PORT          S3-compatible HTTP listener
     OXIDB_HTTP_PORT        REST listener (also serves GET /metrics)
     OXIDB_WS_PORT          WebSocket listener
@@ -1635,7 +1642,9 @@ fn main() {
             server_log!(
                 state,
                 GelfLevel::Notice,
-                format!("MQTT persistence on — recovered {sessions} sessions, {msgs} pending messages")
+                format!(
+                    "MQTT persistence on — recovered {sessions} sessions, {msgs} pending messages"
+                )
             );
         }
 
@@ -1678,6 +1687,60 @@ fn main() {
                             format!("[mqtt] accept error: {e}")
                         );
                     }
+                }
+            }
+        });
+    }
+
+    // AMQP 0-9-1 listener (optional, enabled via OXIDB_AMQP_PORT). ADR-0016.
+    let amqp_port: u16 = env::var("OXIDB_AMQP_PORT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("OXIDB_AMQP_PORT must be a valid u16");
+    if amqp_port > 0 {
+        let amqp_addr = format!("0.0.0.0:{amqp_port}");
+        let amqp_listener = TcpListener::bind(&amqp_addr).expect("failed to bind AMQP listener");
+
+        // Durability follows the protocol (durable queues + delivery_mode=2),
+        // not an env var, so the doc engine is attached unconditionally and
+        // recovery runs before the first client connects.
+        let broker = oxidb_server::amqp_queue::AmqpBroker::global();
+        let (queues, msgs) = broker.enable(Arc::clone(&state.db));
+        // MQTT ↔ AMQP bridge (ADR-0016 Phase 3): AMQP publishes to amq.topic
+        // reach MQTT/RESP subscribers through the shared bus.
+        broker.attach_mqtt(Arc::clone(&shared_store));
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            format!(
+                "AMQP listening on {amqp_addr} — recovered {queues} durable queues, {msgs} messages"
+            )
+        );
+
+        let amqp_log = log_commands;
+        std::thread::spawn(move || {
+            for stream in amqp_listener.incoming() {
+                match stream {
+                    Ok(s) => {
+                        let _ = s.set_nodelay(true);
+                        std::thread::spawn(move || {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    oxidb_server::amqp::handle_client(s, amqp_log);
+                                }));
+                            if let Err(e) = result {
+                                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else if let Some(s) = e.downcast_ref::<String>() {
+                                    s.clone()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                eprintln!("[amqp] connection handler panicked: {msg}");
+                            }
+                        });
+                    }
+                    Err(e) => eprintln!("[amqp] accept error: {e}"),
                 }
             }
         });

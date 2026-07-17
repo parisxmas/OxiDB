@@ -245,7 +245,8 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
     // session's state is mirrored to the doc engine and its deliveries come from
     // the durable queue rather than the in-memory bus.
     let durable = persistent && sessions.wants_persist_globally();
-    let (session_present, generation) = sessions.attach_durable(&session_key, clean_session, durable);
+    let (session_present, generation) =
+        sessions.attach_durable(&session_key, clean_session, durable);
 
     // CONNACK: bit 0 of the ack flags is session_present — now it means something.
     let ack_flags = if session_present { 0x01 } else { 0x00 };
@@ -314,7 +315,12 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                 return;
             }
             if log {
-                eprintln!("[mqtt] >> PUBLISH topic=\"{}\" qos={} len={}", d.topic, d.qos, d.message.len());
+                eprintln!(
+                    "[mqtt] >> PUBLISH topic=\"{}\" qos={} len={}",
+                    d.topic,
+                    d.qos,
+                    d.message.len()
+                );
             }
             wrote = true;
         }
@@ -397,6 +403,15 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     // below honest.
                     store.publish(&topic, &message);
                     sessions.persist_incoming(&topic, &message, qos);
+                    // MQTT → AMQP bridge (ADR-0016 Phase 3): into the
+                    // amq.topic exchange, before the ack below so its durable
+                    // queue writes are covered by it too. One atomic no-op
+                    // when AMQP is off.
+                    crate::amqp_queue::AmqpBroker::global().publish_from_mqtt(
+                        &topic,
+                        message.as_bytes(),
+                        qos,
+                    );
                     // The dedup id itself must survive a crash for a durable
                     // publisher, or its post-restart retransmission fans out a
                     // second copy — exactly-once has to hold across the crash.
@@ -626,7 +641,8 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                 // Phase two acknowledged: the QoS-2 exchange is complete.
                 if payload.len() >= 2 {
                     let pid = u16::from_be_bytes([payload[0], payload[1]]);
-                    let removed = sessions.with(&session_key, |sess| sess.pubrel_pending.remove(&pid));
+                    let removed =
+                        sessions.with(&session_key, |sess| sess.pubrel_pending.remove(&pid));
                     if durable && removed == Some(true) {
                         sessions.forget_rel(&session_key, pid);
                     }
@@ -665,6 +681,8 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                 store.retain_set(wt, wm);
             }
             store.publish(wt, wm);
+            // The will crosses the bridge like any other publish would have.
+            crate::amqp_queue::AmqpBroker::global().publish_from_mqtt(wt, wm.as_bytes(), 0);
             if log {
                 eprintln!("[mqtt] will published topic=\"{wt}\"");
             }

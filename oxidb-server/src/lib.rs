@@ -1,3 +1,6 @@
+pub mod amqp;
+pub mod amqp_queue;
+pub mod amqp_wire;
 pub mod audit;
 pub mod auth;
 pub mod db_admin;
@@ -18,8 +21,8 @@ pub mod scram;
 pub mod scram_client;
 pub mod session;
 pub mod sql_bridge;
-pub mod tsdb_bridge;
 pub mod tls;
+pub mod tsdb_bridge;
 pub mod udp_ingest;
 
 pub mod jwt;

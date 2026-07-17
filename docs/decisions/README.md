@@ -45,3 +45,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0013](0013-dotnet-ef-core.md) | Full .NET EF Core support for the SQL engine | Accepted |
 | [0014](0014-cobra-stored-procedures.md) | Cobra as the compiled stored-procedure language | Accepted |
 | [0015](0015-durable-mqtt-qos.md) | Durable MQTT — persistent sessions and honest QoS 1 | Accepted |
+| [0016](0016-amqp-protocol.md) | AMQP 0-9-1 (RabbitMQ protocol) on the shared broker substrate | Accepted |
