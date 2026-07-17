@@ -151,6 +151,35 @@ Postgres + Mongo + Redis + Elastic + S3. 14 MB.</pre>
 
 <section class="section">
   <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg> Showcase &mdash; ColdChain</h2>
+    <p class="section-desc">A cold-chain compliance system running on <strong>every engine at once</strong>, live. Sensors in trucks report temperature over MQTT; two years later an auditor asks you to <em>prove</em> a shipment never left its contracted range.</p>
+
+    <div class="showcase">
+      <div class="showcase-main">
+        <p>The point is not that OxiDB <em>can</em> do these things &mdash; the list above already says that. It is that ColdChain is an <strong>ordinary .NET application</strong>. It uses EF&nbsp;Core, MQTTnet, StackExchange.Redis and the AWS SDK: four libraries that have never heard of OxiDB and are not configured to know. They are pointed at localhost ports and behave exactly as they would against the systems they were written for.</p>
+
+        <p>So the interesting number is not a benchmark. It is the count of things you did <strong>not</strong> deploy:</p>
+
+        <div class="showcase-swap">
+          <div class="swap-row"><span class="swap-was">Mosquitto</span><span class="swap-arrow">&rarr;</span><span class="swap-now">MQTT broker</span><span class="swap-for">sensors publishing readings</span></div>
+          <div class="swap-row"><span class="swap-was">InfluxDB</span><span class="swap-arrow">&rarr;</span><span class="swap-now">time-series engine</span><span class="swap-for">the readings themselves</span></div>
+          <div class="swap-row"><span class="swap-was">Redis</span><span class="swap-arrow">&rarr;</span><span class="swap-now">OxiMem</span><span class="swap-for">live state + pub/sub</span></div>
+          <div class="swap-row"><span class="swap-was">PostgreSQL</span><span class="swap-arrow">&rarr;</span><span class="swap-now">SQL engine</span><span class="swap-for">shipments, customers, penalties</span></div>
+          <div class="swap-row"><span class="swap-was">MongoDB</span><span class="swap-arrow">&rarr;</span><span class="swap-now">document engine</span><span class="swap-for">raw events, verbatim</span></div>
+          <div class="swap-row"><span class="swap-was">MinIO</span><span class="swap-arrow">&rarr;</span><span class="swap-now">S3 API + full-text</span><span class="swap-for">certificates, searchable</span></div>
+        </div>
+
+        <p>Six systems to install, secure, monitor, back up, upgrade on six schedules and keep consistent with each other &mdash; against five ports on one binary, where the backup is one archive taken at one instant with one restore. The dashboard shows what the two processes actually cost while it does it.</p>
+
+        <p class="showcase-cta"><a href="https://coldchain.baltavista.com" class="btn btn-primary">Open the live demo</a> <span class="showcase-cta-note">runs continuously &middot; six probes &middot; two of them broken on purpose</span></p>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container">
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Install OxiDB in 60 seconds</h2>
     <p class="section-desc">From zero to a running server. Single static binary, no dependencies, no installer.</p>
 

@@ -990,3 +990,54 @@ tbody td code {
 @media(max-width:440px){
   .arch-engines{grid-template-columns:1fr}
 }
+
+/* ── ColdChain showcase ─────────────────────────────────────────────── */
+.showcase { max-width: 780px; }
+.showcase-main p { color: var(--text-dim); line-height: 1.75; margin: 0 0 15px; }
+.showcase-main strong { color: var(--text); }
+
+/* The six systems you did not deploy. A table would imply the columns are
+   comparable quantities; they are a swap, so it is drawn as one. */
+.showcase-swap {
+  margin: 20px 0 22px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.swap-row {
+  display: grid;
+  grid-template-columns: 108px 20px 1fr 1.15fr;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 15px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13.5px;
+}
+.swap-row:last-child { border-bottom: 0; }
+.swap-was {
+  color: var(--text-mute);
+  text-decoration: line-through;
+  text-decoration-color: rgba(226,120,74,0.55);
+  font-family: var(--mono, ui-monospace, monospace);
+}
+.swap-arrow { color: var(--accent); opacity: 0.65; }
+.swap-now { color: var(--text); font-weight: 600; }
+.swap-for { color: var(--text-mute); font-size: 12.5px; }
+
+.showcase-cta { display: flex; align-items: center; gap: 15px; flex-wrap: wrap; margin-top: 22px; }
+.showcase-cta-note { color: var(--text-mute); font-size: 12.5px; }
+
+
+
+
+
+
+
+
+
+
+
+@media (max-width: 900px) {
+  .swap-row { grid-template-columns: 96px 16px 1fr; }
+  .swap-for { display: none; }   /* the swap is the point; the gloss is not */
+}
