@@ -9,8 +9,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.oxidb
-      args:
-        OXIDB_URL: https://oxidb.baltavista.com/releases/v0.36.0/oxidb-server-v0.36.0-linux-amd64.tar.gz
     environment:
       OXIDB_SQL: "1"
       OXIDB_TSDB: "1"
@@ -25,6 +23,11 @@ services:
       OXIDB_AUDIT_MAX_BYTES: "33554432"
       OXIDB_AUDIT_COMPRESS: "1"
       OXIDB_IDLE_TIMEOUT: "0"
+      # The document WAL now seals + snapshots itself once it reaches this,
+      # instead of growing until the process exits. 64 MiB is the default; at
+      # this demo's ~130 MB/day that would checkpoint twice a day, so cap it
+      # lower and keep the ceiling obvious.
+      OXIDB_WAL_CHECKPOINT_BYTES: "16777216"
     volumes:
       - oxidb-data:/data
     restart: unless-stopped

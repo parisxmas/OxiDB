@@ -170,24 +170,28 @@ and still proves the case — `max` over a minute cannot hide a breach. So the
 rollup is kept forever and the raw stream is dropped after 30 days. That is not
 a compromise to save disk; it is the retention rule the regulation implies.
 
-**The engine limitation:** the document engine truncates its write-ahead log
-only on a graceful shutdown. It deliberately will not checkpoint online —
-doing so was found to lose acknowledged writes, and the code says so plainly
-(`btree_collection.rs::sync_writes`). The live data is bounded by the TTL; the
-WAL is not, so a server that runs for a year accumulates one. Here that is
-~130 MB/day.
+**What this demo changed in the engine:** the document engine used to truncate
+its write-ahead log only on a graceful shutdown. It deliberately refused to
+checkpoint online — an earlier attempt lost acknowledged writes, and the code
+said so plainly. So the live data was bounded by the TTL and the WAL was not:
+~130 MB/day, forever. The mitigation was a weekly `docker compose restart`,
+because `SIGTERM` runs the final checkpoint.
 
 A TTL does **not** save you: eviction is logical, and in the default (in-RAM)
 mode `compact` is a no-op — auto-compaction only applies to disk-first storage.
 Measured: 4,000 documents, TTL'd to zero, and the directory did not shrink by a
 byte until the process exited.
 
-The mitigation is what the engine's own comment implies — restart it. `SIGTERM`
-runs the final checkpoint, so `/etc/cron.weekly/coldchain-checkpoint` does a
-`docker compose restart`. Verified on the live stack: `readings.wal` went from
-628 KB to 32 KB. The real fix is safe online checkpointing in the engine.
+Restarting a database on a cron schedule to reclaim disk is not an answer, so
+0.36.1 implemented online checkpointing properly (`OXIDB_WAL_CHECKPOINT_BYTES`,
+default 64 MiB; this stack runs 16 MiB). The reason the old attempt lost writes
+is that a writer appends to the WAL and *then* applies to the tree — seal the
+WAL in that window and the write is in neither. The fix is a barrier the
+checkpoint drains before sealing, so no write is ever mid-flight across it. The
+cron job is gone.
 
-## Two things this demo found
+
+## Three things this demo found
 
 Writing it surfaced real gaps, which is what a showcase is good for:
 
@@ -200,5 +204,22 @@ Writing it surfaced real gaps, which is what a showcase is good for:
    happy, but the .NET SDK throws on the response, so `PutObjectRequest` needs
    `DisableMD5Stream = true`. Worth either matching S3's MD5 or documenting
    loudly for .NET users.
+3. **The unbounded WAL**, above — the demo is the reason the engine can now
+   checkpoint while open. Running something for weeks asks questions a
+   benchmark never does.
+
+## It survives its own dependencies restarting
+
+The engine restarting underneath the pipeline — a deploy, a checkpoint, a crash
+— broke ingest silently: MQTT dropped, the OxiDB TCP socket died with it, and
+MQTTnet swallows exceptions thrown from a message handler. Every container went
+on reporting healthy while nothing was written. That is the worst failure mode
+there is, because it looks fine.
+
+So both connections now heal themselves (MQTT reconnects *and re-subscribes* —
+subscriptions do not survive the broker; the OxiDB client is rebuilt on demand),
+and the handler can no longer fail quietly. Verified the way it should be: kill
+the engine under the running stack and watch the dashboard come back **without
+touching anything**. It takes about ten seconds.
 
 > OxiDB is under active development and not yet recommended for production use.

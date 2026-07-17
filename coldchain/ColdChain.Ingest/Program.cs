@@ -19,7 +19,26 @@ using StackExchange.Redis;
 
 var mqttFactory = new MqttFactory();
 using var mqtt = mqttFactory.CreateMqttClient();
-await using var oxi = await OxiDbTcpClient.ConnectAsync(Endpoints.Host, Endpoints.Tcp);
+// The engine restarts (a checkpoint, a deploy) and this socket dies with it.
+// OxiDbTcpClient is a plain TCP client with no reconnect of its own, so the
+// first write after a restart throws — and MQTTnet swallows exceptions thrown
+// from a message handler, so the whole pipeline goes silent while every
+// container still reports healthy. That is the worst possible failure: it
+// looks fine. Rebuild the connection on demand instead.
+var oxiLock = new SemaphoreSlim(1, 1);
+OxiDbTcpClient? oxiConn = null;
+async Task<OxiDbTcpClient> Oxi()
+{
+    if (oxiConn is { } c) return c;
+    await oxiLock.WaitAsync();
+    try { return oxiConn ??= await OxiDbTcpClient.ConnectAsync(Endpoints.Host, Endpoints.Tcp); }
+    finally { oxiLock.Release(); }
+}
+void DropOxi()
+{
+    var c = Interlocked.Exchange(ref oxiConn, null);
+    if (c is not null) _ = c.DisposeAsync().AsTask();
+}
 var redis = await ConnectionMultiplexer.ConnectAsync(Endpoints.RedisConfiguration);
 var live = redis.GetDatabase();
 
@@ -40,6 +59,17 @@ var readings = 0;
 var breaches = 0;
 
 mqtt.ApplicationMessageReceivedAsync += async e =>
+{
+    try { await Handle(e); }
+    catch (Exception ex)
+    {
+        // Say so, and drop the connection so the next reading rebuilds it.
+        Console.WriteLine($"  ingest error: {ex.GetType().Name}: {ex.Message}");
+        DropOxi();
+    }
+};
+
+async Task Handle(MqttApplicationMessageReceivedEventArgs e)
 {
     var topic = e.ApplicationMessage.Topic;
     if (topic.StartsWith("fleet/gateway/"))
@@ -62,7 +92,7 @@ mqtt.ApplicationMessageReceivedAsync += async e =>
     // invent a dead battery that nobody measured.
     var fields = new Dictionary<string, object> { ["celsius"] = r.celsius };
     if (!double.IsNaN(r.battery)) fields["battery"] = r.battery;
-    await Tsdb.WriteAsync(oxi, "temperature",
+    await Tsdb.WriteAsync(await Oxi(), "temperature",
         new() { ["device"] = r.device, ["truck"] = r.truck }, fields, at);
 
     // 2. OXIMEM — current state, and a live feed for any dashboard. Expires on
@@ -85,7 +115,7 @@ mqtt.ApplicationMessageReceivedAsync += async e =>
     //    extra fields are not noise — `door_open` names the CAUSE of the breach
     //    the time-series can only show as a number going up. Flattening it into
     //    columns we chose today throws that away forever.
-    await oxi.ExecRawAsync(new Dictionary<string, object?>
+    await (await Oxi()).ExecRawAsync(new Dictionary<string, object?>
     {
         ["cmd"] = "insert",
         ["collection"] = "readings",
@@ -121,10 +151,38 @@ mqtt.ApplicationMessageReceivedAsync += async e =>
     }
 };
 
-await mqtt.ConnectAsync(new MqttClientOptionsBuilder()
+// A broker restart must not end the service. Without this the client stays
+// "up" forever with a dead socket, silently consuming nothing — which is
+// exactly what happened the first time the engine container was restarted:
+// the simulator came back, the ingest didn't, and the dashboard went empty
+// while every container still reported healthy.
+var mqttOptions = new MqttClientOptionsBuilder()
     .WithTcpServer(Endpoints.Host, Endpoints.Mqtt)
     .WithClientId("coldchain-ingest")
-    .Build());
+    .WithCleanSession(false)
+    .Build();
+
+mqtt.DisconnectedAsync += async e =>
+{
+    Console.WriteLine($"  mqtt disconnected ({e.Reason}) — reconnecting");
+    while (true)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(2));
+        try
+        {
+            await mqtt.ConnectAsync(mqttOptions);
+            // Subscriptions do not survive the broker; re-establish them or we
+            // reconnect into silence, which looks identical to being down.
+            await mqtt.SubscribeAsync("sensors/+/+/temperature");
+            await mqtt.SubscribeAsync("fleet/gateway/#");
+            Console.WriteLine("  mqtt reconnected");
+            return;
+        }
+        catch (Exception ex) { Console.WriteLine($"  mqtt reconnect failed: {ex.Message}"); }
+    }
+};
+
+await mqtt.ConnectAsync(mqttOptions);
 // '+' is one level, '#' is the rest — every probe on every truck.
 await mqtt.SubscribeAsync("sensors/+/+/temperature");
 await mqtt.SubscribeAsync("fleet/gateway/#");

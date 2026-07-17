@@ -29,14 +29,27 @@ var devices = new (string Id, string Truck, double Target, bool Faulty, string M
 
 var factory = new MqttFactory();
 using var client = factory.CreateMqttClient();
-await client.ConnectAsync(new MqttClientOptionsBuilder()
+var options = new MqttClientOptionsBuilder()
     .WithTcpServer(Endpoints.Host, Endpoints.Mqtt)
     .WithClientId("coldchain-simulator")
     // If the fleet gateway dies, the broker announces it for us.
     .WithWillTopic("fleet/gateway/status")
     .WithWillPayload("offline")
     .WithWillRetain(true)
-    .Build());
+    .Build();
+
+// The fleet keeps reporting across a broker restart; sensors in the real world
+// do not give up because the far end blinked.
+client.DisconnectedAsync += async _ =>
+{
+    while (true)
+    {
+        await Task.Delay(TimeSpan.FromSeconds(2));
+        try { await client.ConnectAsync(options); Console.WriteLine("  reconnected"); return; }
+        catch { /* keep trying */ }
+    }
+};
+await client.ConnectAsync(options);
 
 Console.WriteLine($"simulator → mqtt://{Endpoints.Host}:{Endpoints.Mqtt}");
 await client.PublishStringAsync("fleet/gateway/status", "online", retain: true);

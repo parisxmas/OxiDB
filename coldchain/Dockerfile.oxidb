@@ -1,12 +1,12 @@
-# The released 0.36.0 server, unmodified. It is a static musl build, so there is
-# nothing to install around it.
+# The server binary, unmodified. Built from this repo for
+# x86_64-unknown-linux-musl (static, so alpine needs nothing around it) and
+# copied in rather than fetched: the demo tracks master, which is ahead of the
+# last published release.
+#
+#   cargo build --release -p oxidb-server --target x86_64-unknown-linux-musl
+#   cp target/x86_64-unknown-linux-musl/release/oxidb-server coldchain/
 FROM alpine:3.20
-ARG OXIDB_URL
-RUN apk add --no-cache curl \
- && curl -fsSL "$OXIDB_URL" -o /tmp/s.tar.gz \
- && tar xzf /tmp/s.tar.gz -C /usr/local/bin \
- && rm /tmp/s.tar.gz \
- && chmod +x /usr/local/bin/oxidb-server \
- && /usr/local/bin/oxidb-server --version
+COPY oxidb-server /usr/local/bin/oxidb-server
+RUN chmod +x /usr/local/bin/oxidb-server && /usr/local/bin/oxidb-server --version
 EXPOSE 4444 1883 6379 9000
 ENTRYPOINT ["/usr/local/bin/oxidb-server"]
