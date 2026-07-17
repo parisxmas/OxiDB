@@ -42,9 +42,20 @@ impl Drop for Broker {
     }
 }
 
+/// Every test gets its own port pair (port, port+1). Deriving from the pid
+/// alone gives every test in the binary the SAME port: under the default
+/// parallel runner the extra brokers fail to bind and the tests silently talk
+/// to whichever broker won — the exact bug s3_etag.rs already documents. The
+/// bands (21xxx/22xxx/23xxx per file) stay clear of the other suites' ranges.
+fn test_port(base: u16, span_per_pid: u16) -> u16 {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    base + (std::process::id() % 97) as u16 * span_per_pid + NEXT.fetch_add(2, Ordering::SeqCst)
+}
+
 fn start_broker() -> Broker {
     let dir = tempfile::tempdir().unwrap();
-    let port = 15400 + (std::process::id() % 500) as u16;
+    let port = test_port(21000, 8);
     let bin = env!("CARGO_BIN_EXE_oxidb-server");
     let child = Command::new(bin)
         .env("OXIDB_MQTT_PORT", port.to_string())
@@ -55,7 +66,7 @@ fn start_broker() -> Broker {
         .spawn()
         .expect("start oxidb-server");
 
-    for _ in 0..100 {
+    for _ in 0..600 {  // 60s: see oximem_tx_wire on why readiness must tolerate suite-wide load
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             return Broker { child, port, _dir: dir };
         }

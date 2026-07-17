@@ -48,7 +48,11 @@ fn spawn_server() -> ServerGuard {
         oximem_port,
     };
     // Wait for the OxiMem listener to come up.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // 60s, not 15: the full suite starts dozens of fsync-every-commit servers
+    // concurrently, and under that disk load a cold engine open can genuinely
+    // take tens of seconds. A readiness deadline is not a performance
+    // assertion; a tight one just converts contention into flakes.
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if TcpStream::connect(("127.0.0.1", guard.oximem_port)).is_ok() {
             return guard;

@@ -276,7 +276,7 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
         // the lock released so slow socket I/O never blocks the reaper or other
         // sessions. If our generation moved, a newer connection took the
         // session over (MQTT-3.1.4-2) and we must exit rather than double-deliver.
-        let batch = match sessions.with(&session_key, |sess| {
+        let (batch, rels) = match sessions.with(&session_key, |sess| {
             if sess.generation != generation {
                 None // superseded
             } else {
@@ -289,13 +289,22 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
         resend_inflight = false;
 
         let mut wrote = false;
+        // Pending PUBRELs first (QoS-2 deliveries whose PUBREC we saw before the
+        // reconnect): they are older than anything in the batch, and the
+        // subscriber's state machine is waiting on exactly these ids.
+        for pid in rels {
+            // MQTT-3.6.1-1: PUBREL's fixed-header flags MUST be 0b0010.
+            if write_packet(&mut writer, PUBREL, 0x02, &pid.to_be_bytes()).is_err() {
+                return;
+            }
+            wrote = true;
+        }
         for d in batch {
             let mut buf = Vec::new();
             write_utf8(&mut buf, &d.topic);
-            let mut flags = 0u8;
+            let mut flags = d.qos.min(2) << 1; // QoS bits (1 -> 0x02, 2 -> 0x04)
             if d.qos >= 1 {
                 buf.extend_from_slice(&d.pkt_id.to_be_bytes());
-                flags |= 0x02; // QoS 1
                 if d.dup {
                     flags |= 0x08; // DUP — a redelivery, not a new message
                 }
@@ -305,7 +314,7 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                 return;
             }
             if log {
-                eprintln!("[mqtt] >> PUBLISH topic=\"{}\" len={}", d.topic, d.message.len());
+                eprintln!("[mqtt] >> PUBLISH topic=\"{}\" qos={} len={}", d.topic, d.qos, d.message.len());
             }
             wrote = true;
         }
@@ -361,21 +370,42 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                 };
                 let message = String::from_utf8_lossy(&payload[off..]).to_string();
                 if log {
-                    eprintln!("[mqtt] << PUBLISH topic=\"{topic}\" msg=\"{message}\"");
+                    eprintln!("[mqtt] << PUBLISH topic=\"{topic}\" qos={qos} msg=\"{message}\"");
                 }
-                if retain {
-                    if message.is_empty() {
-                        store.retain_clear(&topic); // empty retained = clear
-                    } else {
-                        store.retain_set(&topic, &message);
+                // Inbound QoS-2 dedup: `rx2.insert` returns false if the id is
+                // already pending, i.e. this PUBLISH is the publisher's
+                // retransmission of one we already fanned out. Re-ack it, fan
+                // out NOTHING — this branch is the "exactly" in exactly-once.
+                let duplicate = qos == 2
+                    && ack_pkt_id.is_some_and(|pid| {
+                        sessions
+                            .with(&session_key, |sess| !sess.rx2.insert(pid))
+                            .unwrap_or(false)
+                    });
+                if !duplicate {
+                    if retain {
+                        if message.is_empty() {
+                            store.retain_clear(&topic); // empty retained = clear
+                        } else {
+                            store.retain_set(&topic, &message);
+                        }
+                        sessions.persist_retained(&topic, &message);
                     }
-                    sessions.persist_retained(&topic, &message);
+                    // Fan out to the in-memory bus (clean sessions + RESP +
+                    // retained), then durably route to persistent sessions —
+                    // the fsync inside persist_incoming is what makes the ack
+                    // below honest.
+                    store.publish(&topic, &message);
+                    sessions.persist_incoming(&topic, &message, qos);
+                    // The dedup id itself must survive a crash for a durable
+                    // publisher, or its post-restart retransmission fans out a
+                    // second copy — exactly-once has to hold across the crash.
+                    if qos == 2 && durable {
+                        if let Some(pid) = ack_pkt_id {
+                            sessions.persist_rx2(&session_key, pid);
+                        }
+                    }
                 }
-                // Fan out to the in-memory bus (clean sessions + RESP + retained),
-                // then durably route to persistent sessions — the fsync inside
-                // persist_incoming is what makes the ack below honest.
-                store.publish(&topic, &message);
-                sessions.persist_incoming(&topic, &message);
 
                 // Now acknowledge — the message is on disk for every durable
                 // subscriber that will need it.
@@ -408,7 +438,7 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     if log {
                         eprintln!("[mqtt] << SUBSCRIBE topic=\"{topic}\"");
                     }
-                    let granted = req_qos.min(1); // QoS 2 subscriptions granted at 1
+                    let granted = req_qos.min(2); // full outbound QoS 0/1/2
                     // Compile the filter's matcher. For a DURABLE session the
                     // delivery path is the durable queue (fed by persist_incoming
                     // under the registry lock), NOT the in-memory bus — so it
@@ -468,7 +498,12 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                                     sess.next_pkt_id = id;
                                     sess.inflight.insert(
                                         id,
-                                        crate::mqtt_session::Inflight { topic: rt.clone(), message: rm.clone(), seq: None },
+                                        crate::mqtt_session::Inflight {
+                                            topic: rt.clone(),
+                                            message: rm.clone(),
+                                            seq: None,
+                                            qos: granted,
+                                        },
                                     );
                                     id
                                 })
@@ -482,7 +517,10 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                             buf.extend_from_slice(&pkt_id.to_be_bytes());
                         }
                         buf.extend_from_slice(rm.as_bytes());
-                        let flags = 0x01 | if granted >= 1 { 0x02 } else { 0 };
+                        // retain bit + the granted QoS bits — a QoS-2 grant gets
+                        // a QoS-2 retained delivery, same state machine as any
+                        // other inflight.
+                        let flags = 0x01 | (granted << 1);
                         let _ = write_packet(&mut writer, PUBLISH, flags, &buf);
                     }
                     let _ = writer.flush();
@@ -545,9 +583,53 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
             }
 
             PUBREL => {
+                // The publisher finishing its QoS-2 send: the dedup window for
+                // this id closes here.
                 if payload.len() >= 2 {
+                    let pid = u16::from_be_bytes([payload[0], payload[1]]);
+                    sessions.with(&session_key, |sess| sess.rx2.remove(&pid));
+                    if durable {
+                        sessions.forget_rx2(&session_key, pid);
+                    }
                     let _ = write_packet(&mut writer, PUBCOMP, 0, &payload[..2]);
                     let _ = writer.flush();
+                }
+            }
+
+            PUBREC => {
+                // The subscriber acknowledging phase one of a QoS-2 delivery.
+                // From this moment the receiver owns the message — delete its
+                // durable record — and we owe a PUBREL until PUBCOMP, which is
+                // an obligation that must survive a crash (persist_rel).
+                if payload.len() >= 2 {
+                    let pid = u16::from_be_bytes([payload[0], payload[1]]);
+                    let acked = sessions.with(&session_key, |sess| {
+                        sess.inflight.remove(&pid).map(|inf| {
+                            sess.pubrel_pending.insert(pid);
+                            inf.seq
+                        })
+                    });
+                    if durable {
+                        if let Some(Some(seq)) = acked {
+                            sessions.ack_durable(&session_key, seq);
+                            sessions.persist_rel(&session_key, pid);
+                        }
+                    }
+                    // Always answer — a duplicate PUBREC means our PUBREL was
+                    // lost, and the reply is the same either way (MQTT-4.3.3).
+                    let _ = write_packet(&mut writer, PUBREL, 0x02, &pid.to_be_bytes());
+                    let _ = writer.flush();
+                }
+            }
+
+            PUBCOMP => {
+                // Phase two acknowledged: the QoS-2 exchange is complete.
+                if payload.len() >= 2 {
+                    let pid = u16::from_be_bytes([payload[0], payload[1]]);
+                    let removed = sessions.with(&session_key, |sess| sess.pubrel_pending.remove(&pid));
+                    if durable && removed == Some(true) {
+                        sessions.forget_rel(&session_key, pid);
+                    }
                 }
             }
 

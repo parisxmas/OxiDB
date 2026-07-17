@@ -23,7 +23,7 @@
 //! In-memory only in this phase: a restart is a clean slate, and the docs say
 //! so. ADR-0015 Phase 2 mirrors this through the doc-engine WAL for durability.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -65,6 +65,9 @@ pub struct Inflight {
     /// match would delete both records, quietly breaking at-least-once for the
     /// second copy.
     pub seq: Option<u64>,
+    /// Delivery QoS (1 or 2). Decides which acknowledgement retires it: PUBACK
+    /// for QoS 1, PUBREC (into `pubrel_pending`) for QoS 2.
+    pub qos: u8,
 }
 
 /// Everything about a client that must outlive its socket.
@@ -96,6 +99,18 @@ pub struct Session {
     /// durable queue, so it does not also subscribe to the in-memory bus —
     /// otherwise a publish would arrive twice.
     pub durable: bool,
+    /// Outbound QoS-2, phase two: packet ids we have received a PUBREC for and
+    /// owe a PUBCOMP on. The message itself is gone (PUBREC is the moment the
+    /// receiver owns it — that is the exactly-once point); what must survive is
+    /// the obligation to (re)send PUBREL until PUBCOMP arrives, or the
+    /// subscriber's own state machine wedges on a forever-pending id.
+    pub pubrel_pending: BTreeSet<u16>,
+    /// Inbound QoS-2 dedup: packet ids of publisher PUBLISHes we have already
+    /// fanned out but not yet seen the PUBREL for. A retransmitted PUBLISH
+    /// (DUP) with an id in here is re-acked with PUBREC and NOT fanned out
+    /// again — this set is the entire difference between "exactly once" and
+    /// "at least once with a fancier handshake".
+    pub rx2: BTreeSet<u16>,
 }
 
 impl Session {
@@ -109,6 +124,8 @@ impl Session {
             next_pkt_id: 0,
             dropped: 0,
             durable: false,
+            pubrel_pending: BTreeSet::new(),
+            rx2: BTreeSet::new(),
         }
     }
 
@@ -129,8 +146,16 @@ impl Session {
     }
 
     fn next_id(&mut self) -> u16 {
-        self.next_pkt_id = self.next_pkt_id.wrapping_add(1).max(1);
-        self.next_pkt_id
+        // Skip ids still owned by an unacked delivery or a pending PUBREL —
+        // reusing one would splice two unrelated messages into one handshake.
+        for _ in 0..=u16::MAX {
+            self.next_pkt_id = self.next_pkt_id.wrapping_add(1).max(1);
+            let id = self.next_pkt_id;
+            if !self.inflight.contains_key(&id) && !self.pubrel_pending.contains(&id) {
+                return id;
+            }
+        }
+        self.next_pkt_id // 65535 simultaneously-busy ids: unreachable in practice
     }
 
     /// Build the next batch of PUBLISHes to write to the socket, and record the
@@ -141,30 +166,36 @@ impl Session {
     /// `resend_inflight` is set on the first call after a (re)connect: every
     /// message not yet PUBACK'd goes out again with DUP set, reusing its
     /// original packet id (MQTT-4.3.2-1).
-    pub fn take_deliveries(&mut self, resend_inflight: bool) -> Vec<Delivery> {
+    /// Returns `(publishes, pubrels)`: the PUBLISH frames to write, and — on
+    /// the first poll after a reconnect — the packet ids to resend PUBREL for
+    /// (QoS-2 deliveries whose PUBREC we saw but whose PUBCOMP we did not).
+    pub fn take_deliveries(&mut self, resend_inflight: bool) -> (Vec<Delivery>, Vec<u16>) {
         let mut out = Vec::new();
+        let mut rels = Vec::new();
         if resend_inflight {
             for (pid, inf) in &self.inflight {
                 out.push(Delivery {
                     topic: inf.topic.clone(),
                     message: inf.message.clone(),
-                    qos: 1,
+                    qos: inf.qos.max(1),
                     pkt_id: *pid,
                     dup: true,
                 });
             }
+            rels.extend(self.pubrel_pending.iter().copied());
         }
         self.drain_into_queue(); // receivers -> bounded queue
         while let Some((topic, message, qos, seq)) = self.queue.pop_front() {
             if qos >= 1 {
+                let qos = qos.min(2);
                 let pid = self.next_id();
-                self.inflight.insert(pid, Inflight { topic: topic.clone(), message: message.clone(), seq });
-                out.push(Delivery { topic, message, qos: 1, pkt_id: pid, dup: false });
+                self.inflight.insert(pid, Inflight { topic: topic.clone(), message: message.clone(), seq, qos });
+                out.push(Delivery { topic, message, qos, pkt_id: pid, dup: false });
             } else {
                 out.push(Delivery { topic, message, qos: 0, pkt_id: 0, dup: false });
             }
         }
-        out
+        (out, rels)
     }
 }
 
@@ -311,6 +342,27 @@ impl MqttSessions {
                 }
             }
         }
+        // The QoS-2 halves: PUBREL debts (outbound) and dedup ids (inbound).
+        // Both are per-client sets; a client can have these with no live subs
+        // (it unsubscribed mid-handshake), so entries create sessions too.
+        for kind in ["rel", "rx2"] {
+            for doc in db.find(MQTT_COLLECTION, &json!({ "_kind": kind })).unwrap_or_default() {
+                let (Some(client), Some(pkt_id)) = (
+                    doc.get("client").and_then(|v| v.as_str()),
+                    doc.get("pkt_id").and_then(|v| v.as_u64()),
+                ) else {
+                    continue;
+                };
+                let sess = map.entry(client.to_string()).or_insert_with(Session::new);
+                sess.durable = true;
+                sess.connected = false;
+                if kind == "rel" {
+                    sess.pubrel_pending.insert(pkt_id as u16);
+                } else {
+                    sess.rx2.insert(pkt_id as u16);
+                }
+            }
+        }
         self.seq.store(max_seq + 1, Ordering::SeqCst);
         self.has_durable.store(!map.is_empty(), Ordering::Relaxed);
         (map.len(), restored_msgs)
@@ -421,7 +473,7 @@ impl MqttSessions {
     ///
     /// Cheap when idle: one atomic load rejects the common case where no durable
     /// session exists, before any lock or disk touch.
-    pub fn persist_incoming(&self, topic: &str, message: &str) {
+    pub fn persist_incoming(&self, topic: &str, message: &str, pub_qos: u8) {
         if !self.wants_persist() {
             return;
         }
@@ -446,6 +498,13 @@ impl MqttSessions {
                     }
                 }
                 let Some(qos) = qos else { continue };
+                // MQTT delivers at min(publish qos, granted qos): a QoS-0
+                // publish does not acquire a handshake by matching a QoS-2
+                // subscription. It is still QUEUED for the offline session —
+                // the broker may store QoS-0 for offline delivery, and doing
+                // so is the point of a persistent session at an ingestion
+                // edge — it just delivers without one.
+                let qos = qos.min(pub_qos);
                 let seq = self.seq.fetch_add(1, Ordering::SeqCst);
                 writes.push((client.clone(), seq, qos));
                 // Enqueue in memory now so a connected session delivers promptly;
@@ -493,6 +552,52 @@ impl MqttSessions {
             let _ = db.delete(
                 MQTT_COLLECTION,
                 &json!({ "_kind": "msg", "client": client_id, "seq": seq }),
+            );
+        }
+    }
+
+    /// Persist a pending-PUBREL obligation (outbound QoS 2, after PUBREC). The
+    /// message doc is deleted at PUBREC — the receiver owns the message from
+    /// that moment — but the PUBREL debt must survive a crash or the
+    /// subscriber's state machine wedges on the id.
+    pub fn persist_rel(&self, client_id: &str, pkt_id: u16) {
+        if let Some(db) = self.db() {
+            let _ = db.insert(
+                MQTT_COLLECTION,
+                json!({ "_kind": "rel", "client": client_id, "pkt_id": pkt_id }),
+            );
+        }
+    }
+
+    /// PUBCOMP arrived — the QoS-2 exchange is complete.
+    pub fn forget_rel(&self, client_id: &str, pkt_id: u16) {
+        if let Some(db) = self.db() {
+            let _ = db.delete(
+                MQTT_COLLECTION,
+                &json!({ "_kind": "rel", "client": client_id, "pkt_id": pkt_id }),
+            );
+        }
+    }
+
+    /// Persist an inbound QoS-2 dedup id (between the publisher's PUBLISH and
+    /// its PUBREL). Without this a durable publisher that reconnects after a
+    /// broker crash and retransmits gets its message fanned out twice —
+    /// exactly-once has to survive the crash too.
+    pub fn persist_rx2(&self, client_id: &str, pkt_id: u16) {
+        if let Some(db) = self.db() {
+            let _ = db.insert(
+                MQTT_COLLECTION,
+                json!({ "_kind": "rx2", "client": client_id, "pkt_id": pkt_id }),
+            );
+        }
+    }
+
+    /// The publisher's PUBREL arrived — the dedup window for this id is over.
+    pub fn forget_rx2(&self, client_id: &str, pkt_id: u16) {
+        if let Some(db) = self.db() {
+            let _ = db.delete(
+                MQTT_COLLECTION,
+                &json!({ "_kind": "rx2", "client": client_id, "pkt_id": pkt_id }),
             );
         }
     }
@@ -586,7 +691,7 @@ mod tests {
         assert!(!present, "first connect has nothing to resume");
         reg.with("c2", |s| {
             s.subs.push(sub("topic"));
-            s.inflight.insert(7, Inflight { topic: "t".into(), message: "m".into(), seq: None });
+            s.inflight.insert(7, Inflight { topic: "t".into(), message: "m".into(), seq: None, qos: 1 });
         });
         reg.detach("c2", g, true); // persistent
 
