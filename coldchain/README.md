@@ -1,0 +1,117 @@
+# ColdChain — every OxiDB engine, one process
+
+A cold-chain compliance demo: sensors in trucks report temperature, and two
+years later you have to **prove** a shipment never left its contracted range.
+
+The point is not that OxiDB *can* do these things. It is that this application
+is an ordinary .NET application — EF Core, MQTTnet, StackExchange.Redis, the
+AWS SDK — and every one of those libraries is pointed at **the same single
+binary**. Nothing here is an OxiDB-specific client except the document and
+time-series calls.
+
+Normally you would deploy six systems:
+
+| This demo uses | Instead of | For |
+|---|---|---|
+| MQTT broker | Mosquitto | sensors publishing readings |
+| Time-series engine | InfluxDB | the readings themselves |
+| OxiMem (RESP) | Redis | live state + pub/sub |
+| SQL engine | PostgreSQL | shipments, customers, penalties |
+| Document engine | MongoDB | raw events, verbatim |
+| S3 API | MinIO | certificates and photos |
+
+## Why this domain
+
+Because compliance justifies the features a normal demo cannot. "Replay what
+this probe reported during a three-hour window fourteen months ago, and prove
+the record wasn't altered" is a real question in pharma logistics, and it is
+what point-in-time recovery, the audit log, WORM storage and encryption at rest
+are *for*. Most demos have no reason to switch them on.
+
+## Which engine holds what, and why
+
+Each engine is here because it is the right tool, not to complete a set. The
+test applied to every one: *would you reach for this if OxiDB didn't bundle it?*
+
+- **Time-series** — millions of readings. Gorilla compression and rollups mean
+  a month of 10-second samples answers as a chart without a table scan.
+- **SQL** — shipments, customers, excursions. Genuinely relational: a breach
+  joins to a shipment, which joins to a customer, who has a contracted penalty.
+  EF Core is how .NET teams already write this.
+- **Document** — the raw event as the device sent it. Probe models disagree
+  about their extra fields, and an auditor wants what was actually sent, not
+  our interpretation of it. Schemaless is the honest answer.
+- **OxiMem** — "what is probe-04 doing right now", plus the flag that keeps one
+  failing sensor from writing a breach row every second. State with a TTL: a
+  probe silent for five minutes should read as *unknown*, not as its last
+  temperature.
+- **MQTT** — how sensors talk. Retained messages carry the gateway's status to
+  whoever connects next; a Last Will announces it if the gateway dies.
+- **S3** — signed certificates and inspection photos. Blobs belong in a blob
+  store.
+
+Deliberately **not** used: vector search would be a stretch here, and WASM
+belongs in a different demo. Forcing them in would make the showcase less
+convincing, not more.
+
+## Run it
+
+```bash
+# 1. one binary, every engine
+OXIDB_SQL=1 OXIDB_TSDB=1 OXIDB_DATA=./data \
+OXIDB_ADDR=127.0.0.1:4444 OXIDB_MQTT_PORT=1883 \
+OXIDB_OXIMEM_PORT=6379 OXIDB_S3_PORT=9000 OXIDB_AUDIT=1 \
+  oxidb-server
+
+# 2. schema + shipments (EF Core creates the tables)
+dotnet run --project ColdChain.Api -- seed
+
+# 3. the fan-out: MQTT in, four engines out
+dotnet run --project ColdChain.Ingest &
+
+# 4. the fleet (two of six probes are faulty on purpose)
+dotnet run --project ColdChain.Simulator
+
+# 5. the API
+dotnet run --project ColdChain.Api
+```
+
+## The one request that needs all of it
+
+```
+GET /audit/4
+```
+
+```
+  shipment : SHP-1004 · Nordfresh Foods
+  contract : -20..-15°C
+  VERDICT  : BREACHED
+    breach → -14.8°C (limit -15)          ← SQL: joined to the customer's contract
+  cost     : 400                          ← SQL: penalty × breaches
+  evidence :
+    raw events kept (document) : 27       ← document: verbatim, as sent
+    peak celsius (time-series) : -14.23   ← time-series: max over the journey
+    chart points (downsampled) : 30       ← time-series: rolled up for the chart
+    certificate (S3)           : 63 bytes ← S3: the signed paperwork
+```
+
+One request. One process. Five stores' worth of work.
+
+Other endpoints: `GET /shipments` (SQL), `GET /live` (OxiMem),
+`GET /history/{device}` (time-series), `POST /certificate/{id}` (S3).
+
+## Two things this demo found
+
+Writing it surfaced real gaps, which is what a showcase is good for:
+
+1. **There is no TSDB helper in the .NET packages.** `ColdChain.Shared/Tsdb.cs`
+   wraps `ExecRawAsync` — the client's escape hatch — into something typed.
+   That shim probably belongs in `OxiDb.Client.Tcp` itself.
+2. **The AWS .NET SDK rejects OxiDB's ETag.** It verifies the returned ETag as
+   an MD5 of what it sent; OxiDB's is deliberately the first 16 bytes of the
+   payload's SHA-256. The object stores correctly and `aws-cli`/`boto3` are
+   happy, but the .NET SDK throws on the response, so `PutObjectRequest` needs
+   `DisableMD5Stream = true`. Worth either matching S3's MD5 or documenting
+   loudly for .NET users.
+
+> OxiDB is under active development and not yet recommended for production use.

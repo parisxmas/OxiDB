@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The whole point of this demo: every one of these is a STANDARD
+         library, and all of them talk to the same single OxiDB process. -->
+    <ProjectReference Include="..\..\dotnet\OxiDb.EntityFrameworkCore\OxiDb.EntityFrameworkCore.csproj" />
+    <ProjectReference Include="..\..\dotnet\OxiDb.Client.Tcp\OxiDb.Client.Tcp.csproj" />
+  </ItemGroup>
+</Project>

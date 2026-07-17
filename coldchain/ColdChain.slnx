@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="ColdChain.Api/ColdChain.Api.csproj" />
+  <Project Path="ColdChain.Ingest/ColdChain.Ingest.csproj" />
+  <Project Path="ColdChain.Shared/ColdChain.Shared.csproj" />
+  <Project Path="ColdChain.Simulator/ColdChain.Simulator.csproj" />
+</Solution>
