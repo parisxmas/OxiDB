@@ -178,8 +178,9 @@
 <div id="essay-en">
 <p class="lede">Everything above is served by <strong>one process</strong>. Not one
 cluster, not one docker-compose file — one <code>oxidb-server</code>, about 14&nbsp;MB
-on disk, holding four different kinds of data at once and answering four
-different wire protocols to do it.</p>
+on disk, holding five different kinds of data at once — readings, documents,
+rows, live state and blobs — and answering four different wire protocols to do
+it.</p>
 
 <h3>What this is</h3>
 <p>A cold-chain compliance system, in miniature. Trucks carry vaccines and frozen
@@ -238,6 +239,17 @@ didn't bundle it?</strong> Anything that fails that test makes the showcase
 weaker, not stronger — nobody is impressed that vector search was squeezed in;
 they are only impressed when it was already the right answer.</p>
 
+<p>None of the six probes is a copy of another, because a fleet is not six
+copies. Each sits at its own point inside its contracted band — one by the door
+runs warmer than one deep in the load, and both are compliant — and each has its
+own compressor duty cycle, which is why a healthy trace on the chart is a slow
+wave rather than a flat line. The two broken units fail in different shapes, on
+periods that are coprime, so they never resynchronise: a door left ajar is a
+sharp rise and a long clawback that only just breaches; a failing compressor is
+a slow climb, a plateau at ambient where it is simply not cooling, then a fast
+drop when it catches. Telling those two apart from the trace alone is the entire
+job of the person reading it.</p>
+
 <p>The <strong>document engine</strong> is the one that had to earn it hardest,
 and the fleet is what earns it. Three vendors, no two agreeing: an old probe
 reports a temperature and nothing else, a newer one adds humidity, a door switch
@@ -262,6 +274,16 @@ stops it writing a database row every second lives there, with a one-minute
 expiry. State that should evaporate belongs somewhere that forgets. It is also
 why a silent probe fades out on this page instead of showing its last
 temperature: absent is <em>unknown</em>, not <em>fine</em>.</p>
+
+<p><strong>S3</strong> earns it, and then earns it again. A certificate is prose
+a person signs and an auditor reads — its value <em>is</em> the text, which is
+exactly why it belongs in a blob store and not a column. What was not planned is
+the second half: the engine full-text indexes an object's text when it is PUT,
+without being asked, so the paperwork panel above searches <em>inside</em> the
+certificates. "nordfresh breached" ranks the one certificate matching both terms
+above the ones matching either. That is the same binary holding the readings,
+answering a question about documents it was only ever handed through an S3
+client.</p>
 
 <p class="note">Deliberately absent: <strong>vector search</strong> and
 <strong>WASM</strong>. Both would have been possible and neither would have been
@@ -304,15 +326,21 @@ things turned up. Three of them changed the engine or its client libraries.</p>
       reporting healthy while nothing at all was being written. That is the worst
       failure there is, because it looks fine. The connections heal themselves
       now, and failures are loud.</li>
-  <li><strong>The AWS .NET SDK rejects OxiDB's ETag.</strong> It verifies the
-      returned tag as an MD5 of what it sent; OxiDB's is deliberately the first
-      16&nbsp;bytes of a SHA-256. The object stores perfectly, <code>aws-cli</code>
-      and <code>boto3</code> never notice, and the .NET SDK throws on the way
-      home. Everything else here talks to OxiDB with zero accommodation; that one
-      needs a flag. Still open.</li>
+  <li><strong>The AWS .NET SDK rejected OxiDB's ETag</strong>, and it was right
+      to. S3 defines an ETag as an MD5 and every client enforces it; OxiDB's was
+      the first 16&nbsp;bytes of a SHA-256 — the same <em>shape</em> as an MD5,
+      32 hex characters. That is what made it harmful rather than merely
+      non-standard: a client cannot tell it apart, so it does not conclude
+      "unknown digest", it concludes the upload corrupted. This demo needed a
+      flag to file a certificate at all. The ETag is an MD5 now, the flag is
+      deleted, and fixing it exposed that multipart was never S3-shaped either —
+      its part tags were CRC32s, eight hex characters where a client expects
+      thirty-two.</li>
 </ul>
 <p>All four are written down rather than papered over, because a demo that only
-demonstrates the parts that already worked is marketing, not evidence.</p>
+demonstrates the parts that already worked is marketing, not evidence. All four
+are also now closed — which is the argument for building the thing: none of them
+was going to be found by a test suite or a benchmark.</p>
 
 <h3>What it does not do</h3>
 <p>There are no transactions spanning two engines — each commits on its own.
@@ -329,8 +357,9 @@ production use. This is a demonstration, not a reference deployment.</p>
 <div id="essay-tr" hidden>
 <p class="lede">Yukarıdaki her şeyi <strong>tek bir süreç</strong> yanıtlıyor. Tek
 bir küme değil, tek bir docker-compose dosyası değil — diskte yaklaşık 14&nbsp;MB
-tutan tek bir <code>oxidb-server</code>; aynı anda dört ayrı türde veri tutuyor ve
-bunun için dört ayrı kablo protokolü konuşuyor.</p>
+tutan tek bir <code>oxidb-server</code>; aynı anda beş ayrı türde veri tutuyor —
+okumalar, belgeler, satırlar, canlı durum ve blob'lar — ve bunun için dört ayrı
+kablo protokolü konuşuyor.</p>
 
 <h3>Bu nedir</h3>
 <p>Küçük ölçekte bir soğuk zincir uygunluk sistemi. Kamyonlar aşı ve donmuş gıda
@@ -389,6 +418,18 @@ buna uzanır mıydınız?</strong> Bu sınavı geçemeyen her şey vitrini
 güçlendirmez, zayıflatır — kimse vektör aramanın araya sıkıştırılmasından
 etkilenmez; ancak zaten doğru cevap olduğunda etkilenir.</p>
 
+<p>Altı probun hiçbiri diğerinin kopyası değil, çünkü bir filo altı kopyadan
+oluşmaz. Her biri sözleşmeli aralığının içinde kendi noktasında duruyor —
+kapının yanındaki, yükün derinindekinden daha sıcak çalışır ve ikisi de
+uygundur — ve her birinin kendi kompresör çevrimi var; grafikteki sağlıklı bir
+izin düz çizgi değil yavaş bir dalga olmasının sebebi bu. İki bozuk ünite farklı
+şekillerde ve aralarında asal periyotlarda arızalanıyor, yani asla
+senkronlanmıyorlar: aralık kalan bir kapı, keskin bir yükseliş ve uzun bir geri
+kazanımdır, kıl payı ihlal eder; bozulan bir kompresör ise yavaş bir tırmanış,
+hiç soğutmadığı için ortam sıcaklığında bir plato, sonra tuttuğunda hızlı bir
+düşüştür. Bu ikisini yalnızca ize bakarak ayırt etmek, o grafiği okuyan kişinin
+bütün işidir.</p>
+
 <p>Bunu en zor kazanan <strong>belge motoru</strong> oldu, ve kazandıran şey filo.
 Üç üretici, hiçbiri diğeriyle anlaşmıyor: eski bir prob yalnızca sıcaklık
 bildiriyor, yenisi nem, kapı sensörü ve iç içe bir GPS konumu ekliyor, üçüncüsü
@@ -412,6 +453,16 @@ saniyede bir veritabanı satırı yazmasını engelleyen bayrak, bir dakikalık 
 orada durur. Buharlaşması gereken durum, unutan bir yere aittir. Sessizleşen bir
 probun bu sayfada son sıcaklığını göstermek yerine solmasının sebebi de bu:
 yokluk <em>bilinmiyor</em> demektir, <em>iyi</em> değil.</p>
+
+<p><strong>S3</strong> hakkını veriyor, sonra bir kez daha veriyor. Sertifika,
+bir insanın imzaladığı ve bir denetçinin okuduğu bir metindir — değeri
+<em>metnin kendisidir</em>, ki blob deposuna ait olmasının sebebi tam olarak bu,
+bir sütuna değil. Planlanmamış olan ikinci yarısı: motor bir nesnenin metnini
+PUT edildiği anda, kimse söylemeden full-text indeksliyor — bu yüzden yukarıdaki
+evrak paneli sertifikaların <em>içinde</em> arıyor. "nordfresh breached" araması,
+iki terimi birden içeren tek sertifikayı yalnızca birini içerenlerin üstüne
+koyuyor. Bu, okumaları tutan aynı ikili dosyanın, yalnızca bir S3 istemcisine
+verilmiş belgeler hakkında soru yanıtlaması demek.</p>
 
 <p class="note">Bilinçli olarak yok: <strong>vektör arama</strong> ve
 <strong>WASM</strong>. İkisi de mümkündü ve ikisi de dürüst olmazdı — "benzer ihlal
@@ -453,15 +504,20 @@ değiştirdi.</p>
       yazılmazken dört konteyner de "sağlıklı" raporlamaya devam etti. Bu, var olan
       en kötü hatadır, çünkü iyi görünür. Bağlantılar artık kendini onarıyor ve
       hatalar sesli.</li>
-  <li><strong>AWS .NET SDK'sı OxiDB'nin ETag'ini reddediyor.</strong> Dönen etiketi
-      gönderdiğinin MD5'i olarak doğruluyor; OxiDB'ninki ise bilinçli olarak bir
-      SHA-256'nın ilk 16&nbsp;baytı. Nesne kusursuz saklanıyor, <code>aws-cli</code>
-      ve <code>boto3</code> hiç fark etmiyor, .NET SDK'sı dönüş yolunda fırlatıyor.
-      Buradaki her şey OxiDB ile sıfır uyarlamayla konuşuyor; bu bir bayrak
-      istiyor. Hâlâ açık.</li>
+  <li><strong>AWS .NET SDK'sı OxiDB'nin ETag'ini reddediyordu</strong>, ve haklıydı.
+      S3 bir ETag'i MD5 olarak tanımlar ve her istemci bunu zorlar; OxiDB'ninki
+      ise bir SHA-256'nın ilk 16&nbsp;baytıydı — bir MD5 ile aynı <em>şekilde</em>,
+      32 onaltılık karakter. Onu standart dışı olmaktan öte zararlı yapan da buydu:
+      istemci ayırt edemediği için "bilmediğim bir özet" demiyor,
+      <em>yüklemenin bozulduğu</em> sonucuna varıyor. Bu demo, bir sertifikayı
+      dosyalayabilmek için bir bayrağa muhtaçtı. ETag artık bir MD5, bayrak silindi,
+      ve düzeltmek multipart'ın da hiç S3 şeklinde olmadığını ortaya çıkardı: parça
+      etiketleri CRC32'ydi — istemcinin 32 beklediği yerde sekiz karakter.</li>
 </ul>
 <p>Dördü de üstü örtülmek yerine yazıya geçirildi, çünkü yalnızca zaten çalışan
-kısımları gösteren bir demo kanıt değil, pazarlamadır.</p>
+kısımları gösteren bir demo kanıt değil, pazarlamadır. Dördü de artık kapandı —
+ki bu, o şeyi inşa etmenin savunmasıdır: hiçbiri bir test takımı ya da bir
+kıyaslama tarafından bulunacak değildi.</p>
 
 <h3>Neleri yapmıyor</h3>
 <p>İki motora yayılan işlemler yok — her biri kendi başına commit ediyor. Burada

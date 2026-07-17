@@ -68,8 +68,12 @@ ajar is a sharp rise and a long clawback that only just breaches; a failing
 compressor is a slow climb, a plateau at ambient where it is simply not cooling,
 then a fast drop when it catches. Telling those two apart from the trace alone
 is the entire job of the person reading the chart.
-- **S3** — signed certificates and inspection photos. Blobs belong in a blob
-  store.
+- **S3** — the certificates. A certificate is prose a person signs and an auditor
+  reads: its value *is* the text, which is why it belongs in a blob store and not
+  a column. The unplanned half is that the engine full-text indexes an object's
+  text on PUT without being asked, so the dashboard searches *inside* the
+  certificates — "nordfresh breached" ranks the one matching both terms above the
+  ones matching either.
 
 Deliberately **not** used: vector search would be a stretch here, and WASM
 belongs in a different demo. Forcing them in would make the showcase less
@@ -212,12 +216,13 @@ Writing it surfaced real gaps, which is what a showcase is good for:
    (`TsdbWriteAsync`/`TsdbQueryAsync`/rollups/retention), and the demo uses it.
    Writing the shim is what showed it was needed; deleting it is what showed
    the real one was enough.
-2. **The AWS .NET SDK rejects OxiDB's ETag.** It verifies the returned ETag as
-   an MD5 of what it sent; OxiDB's is deliberately the first 16 bytes of the
-   payload's SHA-256. The object stores correctly and `aws-cli`/`boto3` are
-   happy, but the .NET SDK throws on the response, so `PutObjectRequest` needs
-   `DisableMD5Stream = true`. Worth either matching S3's MD5 or documenting
-   loudly for .NET users.
+2. **The AWS .NET SDK rejected OxiDB's ETag** — and it was right to. S3 defines
+   an ETag as an MD5 and every client enforces it; OxiDB's was the first 16
+   bytes of a SHA-256, which is the same *shape* as an MD5 (32 hex characters).
+   That is what made it harmful rather than merely non-standard: a client cannot
+   tell it apart, so it concludes the upload corrupted. Fixed in 0.36.2 — the
+   ETag is an MD5, `DisableMD5Stream` is gone, and the fix exposed that
+   multipart was never S3-shaped either (its part tags were CRC32s).
 3. **The unbounded WAL**, above — the demo is the reason the engine can now
    checkpoint while open. Running something for weeks asks questions a
    benchmark never does.
