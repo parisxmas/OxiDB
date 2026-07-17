@@ -17,8 +17,16 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::amqp_queue::{AmqpBroker, ChannelError, PreparedPublish, QMsg, NOT_IMPLEMENTED};
+use crate::amqp_queue::{AmqpBroker, ChannelError, PreparedPublish, QMsg, Waker, NOT_IMPLEMENTED};
 use crate::amqp_wire::*;
+
+/// The read half of this connection's wake pipe (see `Waker` in
+/// `amqp_queue.rs`). None = pipe creation failed or non-unix; the poll tick
+/// bounds latency instead.
+#[cfg(unix)]
+type WakeRx = Option<std::os::unix::net::UnixStream>;
+#[cfg(not(unix))]
+type WakeRx = ();
 
 /// Our side of the Tune negotiation. Frame-max leaves room for large bodies
 /// without letting a client demand unbounded buffers.
@@ -70,18 +78,76 @@ struct BatchedPublish {
     ret: Option<(Vec<u8>, Vec<u8>, String, String)>,
 }
 
-/// Read one frame with poll semantics: `poll_ms` for the first byte (so the
-/// loop can interleave deliveries — 5ms when this connection feeds consumers,
-/// 50ms otherwise), then a generous timeout for the REST of the frame — once
-/// a frame has started, a mid-frame timeout would desynchronise the stream
+/// Wait until the TCP stream is readable, the wake pipe fires, or the
+/// timeout lapses. Returns whether TCP has input. A wake means "poll the
+/// broker for deliveries now" — the pipe is drained here; the caller's next
+/// loop iteration does the delivery pass. This is what makes delivery
+/// latency push-like: a publisher on another thread pokes our pipe instead
+/// of us discovering the message at the next tick.
+#[cfg(unix)]
+fn wait_input(stream: &TcpStream, wake_rx: &WakeRx, timeout_ms: i32) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut fds = [
+        libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wake_rx.as_ref().map(|w| w.as_raw_fd()).unwrap_or(-1),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let nfds = if wake_rx.is_some() { 2 } else { 1 };
+    let n = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
+    if n < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::Interrupted {
+            return Ok(false); // EINTR: treat as a tick, loop again
+        }
+        return Err(e);
+    }
+    if fds[1].revents & libc::POLLIN != 0 {
+        if let Some(rx) = wake_rx {
+            // Drain: the pipe's only meaning is "now", not "n times".
+            let mut buf = [0u8; 64];
+            loop {
+                match (&*rx).read(&mut buf) {
+                    Ok(n) if n == buf.len() => continue,
+                    _ => break,
+                }
+            }
+        }
+    }
+    Ok(fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+}
+
+/// Read one frame with poll semantics: wait up to `poll_ms` for input (on
+/// unix a wake-pipe poke ends the wait instantly — deliveries do not sit out
+/// a tick), then a generous timeout for the REST of the frame — once a frame
+/// has started, a mid-frame timeout would desynchronise the stream
 /// permanently, so the tail must be allowed to arrive.
 fn read_frame_polled(
     stream: &TcpStream,
     r: &mut BufReader<&TcpStream>,
     max: usize,
     poll_ms: u64,
+    wake_rx: &WakeRx,
 ) -> io::Result<Option<Frame>> {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(poll_ms)));
+    #[cfg(unix)]
+    {
+        // Only enter the kernel wait when nothing is already buffered.
+        if r.buffer().is_empty() && !wait_input(stream, wake_rx, poll_ms as i32)? {
+            return Ok(None);
+        }
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = wake_rx;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(poll_ms)));
+    }
     let mut first = [0u8; 1];
     match r.read_exact(&mut first) {
         Ok(()) => {}
@@ -317,6 +383,22 @@ pub fn handle_client(stream: TcpStream, log: bool) {
     let mut batch: Vec<BatchedPublish> = Vec::new();
     let mut last_delivery = Instant::now();
 
+    // Wake pipe: publishes from other connections poke this to end our
+    // kernel wait instantly instead of at the next tick (unix only —
+    // elsewhere the adaptive tick below bounds latency).
+    #[cfg(unix)]
+    let wake_rx: WakeRx = match std::os::unix::net::UnixStream::pair() {
+        Ok((rx, tx)) => {
+            let _ = rx.set_nonblocking(true);
+            let _ = tx.set_nonblocking(true);
+            broker.register_waker(conn_id, Waker::new(tx));
+            Some(rx)
+        }
+        Err(_) => None,
+    };
+    #[cfg(not(unix))]
+    let wake_rx: WakeRx = ();
+
     'conn: loop {
         // Deliveries owed to this connection's consumers.
         let outs = broker.poll(conn_id);
@@ -389,19 +471,22 @@ pub fn handle_client(stream: TcpStream, log: bool) {
             last_write = Instant::now();
         }
 
-        // Feeding consumers wants a tight delivery tick — 1ms while
-        // deliveries are actually flowing, decaying to 5ms after a quiet
-        // second; an idle or publisher-only connection does not need one at
-        // all. This is what bounds delivery latency in a poll-model broker.
+        // On unix the wake pipe ends the wait the moment a delivery exists,
+        // so the tick only paces heartbeats. Elsewhere the tick is what
+        // bounds delivery latency: 1ms while deliveries flow, 5ms after a
+        // quiet second, 50ms with no consumers at all.
         let has_consumers = channels.values().any(|c| !c.consumer_tags.is_empty());
-        let poll_ms = if !has_consumers {
+        let poll_ms: u64 = if cfg!(unix) {
+            // Wakeups make delivery instant; the tick only paces heartbeats.
+            50
+        } else if !has_consumers {
             50
         } else if last_delivery.elapsed() < Duration::from_secs(1) {
             1
         } else {
             5
         };
-        let frame = match read_frame_polled(&stream, &mut reader, frame_max, poll_ms) {
+        let frame = match read_frame_polled(&stream, &mut reader, frame_max, poll_ms, &wake_rx) {
             Ok(Some(f)) => f,
             Ok(None) => {
                 // The stream went quiet: whatever publishes are pending are

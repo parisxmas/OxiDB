@@ -180,6 +180,38 @@ pub struct OutMsg {
     pub msg: QMsg,
 }
 
+/// A consuming connection's wake handle: one end of a nonblocking pipe whose
+/// other end sits in that connection's `poll(2)` set. A publish that lands in
+/// a queue pokes every consumer's pipe, so delivery happens NOW instead of at
+/// the next poll tick — the cross-thread wakeup that takes end-to-end latency
+/// from tick-bounded to push-like. Unix only; elsewhere it is a no-op and the
+/// adaptive tick in `amqp.rs` bounds latency instead.
+pub struct Waker {
+    #[cfg(unix)]
+    tx: std::os::unix::net::UnixStream,
+}
+
+impl Waker {
+    #[cfg(unix)]
+    pub fn new(tx: std::os::unix::net::UnixStream) -> Self {
+        Waker { tx }
+    }
+    #[cfg(not(unix))]
+    pub fn new() -> Self {
+        Waker {}
+    }
+
+    fn wake(&self) {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            // Nonblocking; a full pipe means a wake is already pending,
+            // which is exactly as good as another byte would be.
+            let _ = (&self.tx).write(&[1]);
+        }
+    }
+}
+
 #[derive(Default)]
 struct BrokerState {
     exchanges: HashMap<String, Exchange>,
@@ -203,6 +235,10 @@ pub struct AmqpBroker {
     /// The OxiMem/MQTT bus, when the bridge is attached — the AMQP → MQTT
     /// direction publishes into it.
     mqtt: RwLock<Option<Arc<OxiMemStore>>>,
+    /// Per-connection wake handles (see `Waker`). NEVER locked while `inner`
+    /// is held the other way around: callers collect conn ids under `inner`,
+    /// release it, then wake.
+    wakers: Mutex<HashMap<u64, Waker>>,
     seq: AtomicU64,
     gen_name: AtomicU64,
 }
@@ -214,8 +250,28 @@ impl AmqpBroker {
             persist: RwLock::new(None),
             active: AtomicBool::new(false),
             mqtt: RwLock::new(None),
+            wakers: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
             gen_name: AtomicU64::new(1),
+        }
+    }
+
+    /// Register a connection's wake handle. Removed by `connection_closed`.
+    pub fn register_waker(&self, conn_id: u64, w: Waker) {
+        self.wakers.lock().unwrap().insert(conn_id, w);
+    }
+
+    /// Poke each listed connection's wake pipe. Callers collect the ids under
+    /// the `inner` lock, RELEASE it, then call this.
+    fn wake_conns(&self, ids: &std::collections::HashSet<u64>) {
+        if ids.is_empty() {
+            return;
+        }
+        let wakers = self.wakers.lock().unwrap();
+        for id in ids {
+            if let Some(w) = wakers.get(id) {
+                w.wake();
+            }
         }
     }
 
@@ -621,6 +677,7 @@ impl AmqpBroker {
         let mut results = Vec::with_capacity(batch.len());
         let mut bridge_out: Vec<(usize, String, String, u8)> = Vec::new();
         let mut dead_docs: Vec<u64> = Vec::new();
+        let mut wake_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
         let mut st = self.inner.lock().unwrap();
         for (idx, p) in batch.into_iter().enumerate() {
             let mut routed = 0usize;
@@ -635,6 +692,9 @@ impl AmqpBroker {
                     continue;
                 };
                 routed += 1;
+                for c in &q.consumers {
+                    wake_ids.insert(c.conn_id);
+                }
                 q.ready.push_back(QMsg {
                     seq: *seq,
                     exchange: p.exchange.clone(),
@@ -666,6 +726,9 @@ impl AmqpBroker {
             results.push(routed);
         }
         drop(st);
+        // Wake consumers NOW — before the slower doc deletes and bridge
+        // forwards below — so their delivery pass overlaps with our tail work.
+        self.wake_conns(&wake_ids);
 
         if !dead_docs.is_empty() {
             if let Some(db) = self.db() {
@@ -714,11 +777,18 @@ impl AmqpBroker {
     pub fn cancel_consumer(&self, conn_id: u64, ctag: &str) {
         let mut st = self.inner.lock().unwrap();
         let mut auto_deleted = Vec::new();
+        let mut wake_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (name, q) in st.queues.iter_mut() {
             q.consumers
                 .retain(|c| !(c.conn_id == conn_id && c.ctag == ctag));
             if q.auto_delete && q.had_consumer && q.consumers.is_empty() {
                 auto_deleted.push(name.clone());
+            } else if !q.ready.is_empty() {
+                // The cancelled consumer may have been the round-robin turn:
+                // wake the survivors so the backlog does not sit a tick.
+                for c in &q.consumers {
+                    wake_ids.insert(c.conn_id);
+                }
             }
         }
         for name in &auto_deleted {
@@ -726,6 +796,7 @@ impl AmqpBroker {
         }
         Self::strip_bindings(&mut st, &auto_deleted);
         drop(st);
+        self.wake_conns(&wake_ids);
         self.forget_queues(&auto_deleted);
     }
 
@@ -860,11 +931,17 @@ impl AmqpBroker {
     pub fn requeue(&self, queue: &str, mut msg: QMsg) {
         msg.redelivered = true;
         let mut st = self.inner.lock().unwrap();
+        let mut wake_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
         if let Some(q) = st.queues.get_mut(queue) {
             q.ready.push_front(msg);
+            for c in &q.consumers {
+                wake_ids.insert(c.conn_id);
+            }
         }
         // Queue gone (deleted while the delivery was in flight): the message
         // goes with it, matching RabbitMQ.
+        drop(st);
+        self.wake_conns(&wake_ids);
     }
 
     /// Connection teardown: drop its consumers, fire auto-delete, delete its
@@ -872,12 +949,19 @@ impl AmqpBroker {
     pub fn connection_closed(&self, conn_id: u64) {
         let mut st = self.inner.lock().unwrap();
         let mut gone = Vec::new();
+        let mut wake_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (name, q) in st.queues.iter_mut() {
             q.consumers.retain(|c| c.conn_id != conn_id);
             let exclusive_dies = q.exclusive_conn == Some(conn_id);
             let auto_dies = q.auto_delete && q.had_consumer && q.consumers.is_empty();
             if exclusive_dies || auto_dies {
                 gone.push(name.clone());
+            } else if !q.ready.is_empty() {
+                // The dead connection may have owned the round-robin turn:
+                // wake the survivors so the backlog does not sit a tick.
+                for c in &q.consumers {
+                    wake_ids.insert(c.conn_id);
+                }
             }
         }
         for name in &gone {
@@ -887,6 +971,8 @@ impl AmqpBroker {
         st.prefetch.retain(|(c, _), _| *c != conn_id);
         st.inflight.retain(|(c, _), _| *c != conn_id);
         drop(st);
+        self.wakers.lock().unwrap().remove(&conn_id);
+        self.wake_conns(&wake_ids);
         self.forget_queues(&gone);
     }
 
@@ -1219,6 +1305,30 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_millis(100))
                 .is_err(),
             "only amq.topic bridges to MQTT"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_publish_pokes_the_consuming_connections_wake_pipe() {
+        use std::io::Read;
+        let b = broker();
+        let (rx, tx) = std::os::unix::net::UnixStream::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        tx.set_nonblocking(true).unwrap();
+        b.register_waker(7, Waker::new(tx));
+        b.declare_queue("q", false, false, false, false, 7).unwrap();
+        b.register_consumer("q", 7, 1, "c".into(), true).unwrap();
+
+        let mut buf = [0u8; 8];
+        assert!(
+            (&rx).read(&mut buf).is_err(),
+            "no wake before any publish (nonblocking read must return WouldBlock)"
+        );
+        publish(&b, "q", b"x");
+        assert!(
+            (&rx).read(&mut buf).map(|n| n > 0).unwrap_or(false),
+            "the publish must poke the consumer's wake pipe"
         );
     }
 
