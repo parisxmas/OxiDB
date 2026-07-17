@@ -532,6 +532,13 @@ fn finish_publish(
                         .shortstr(&p.routing_key)
                         .finish();
                     write_content(writer, ch_id, &m, &rprops, &rbody, frame_max)?;
+                    // Flush HERE, not only via the confirm below: on a
+                    // non-confirm channel there is no ack to ride out on, and
+                    // an unflushed Return sits invisible until the next
+                    // heartbeat. Found by RabbitMQ.Client (.NET), which
+                    // listens for returns without confirm mode — pika's
+                    // confirm-mode flush masked it.
+                    writer.flush()?;
                 }
             }
             if ch.confirms {
