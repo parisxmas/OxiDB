@@ -195,9 +195,12 @@ cron job is gone.
 
 Writing it surfaced real gaps, which is what a showcase is good for:
 
-1. **There is no TSDB helper in the .NET packages.** `ColdChain.Shared/Tsdb.cs`
-   wraps `ExecRawAsync` — the client's escape hatch — into something typed.
-   That shim probably belongs in `OxiDb.Client.Tcp` itself.
+1. **There was no TSDB helper in the .NET packages** — so this demo wrapped
+   `ExecRawAsync`, the client's escape hatch, in a shim of its own. That shim
+   is now gone: `OxiDb.Client.Tcp` has a typed time-series surface
+   (`TsdbWriteAsync`/`TsdbQueryAsync`/rollups/retention), and the demo uses it.
+   Writing the shim is what showed it was needed; deleting it is what showed
+   the real one was enough.
 2. **The AWS .NET SDK rejects OxiDB's ETag.** It verifies the returned ETag as
    an MD5 of what it sent; OxiDB's is deliberately the first 16 bytes of the
    payload's SHA-256. The object stores correctly and `aws-cli`/`boto3` are

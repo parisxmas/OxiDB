@@ -83,9 +83,11 @@ app.MapGet("/history/{device}", async (string device, OxiConnection oxi, int? mi
 {
     var end = DateTime.UtcNow;
     var start = end.AddMinutes(-(minutes ?? 60));
-    var pts = await oxi.ReadAsync(c => Tsdb.QueryAsync(c, "temperature", "celsius",
-        new() { ["device"] = device }, start, end, bucketMs ?? 10_000, "mean"));
-    return Results.Ok(pts.Select(p => new { at = p.At, celsius = Math.Round(p.Value, 2) }));
+    var pts = await oxi.ReadAsync(c => c.TsdbQuerySeriesAsync("temperature", "celsius",
+        new Dictionary<string, string> { ["device"] = device }, start, end,
+        TimeSpan.FromMilliseconds(bucketMs ?? 10_000), TsdbAgg.Mean));
+    return Results.Ok(pts.Where(p => p.Value is not null)
+                         .Select(p => new { at = p.At, celsius = Math.Round(p.Value!.Value, 2) }));
 });
 
 // ── Document: the events as sent, whatever shape that was. ────────────────
@@ -150,10 +152,12 @@ app.MapGet("/audit/{shipmentId:int}", async (
     if (shipment is null) return Results.NotFound();
 
     var end = DateTime.UtcNow;
-    var readings = await oxi.ReadAsync(c => Tsdb.QueryAsync(c, "temperature", "celsius",
-        new() { ["device"] = shipment.DeviceId }, shipment.DepartedUtc, end, 60_000, "mean"));
-    var peak = await oxi.ReadAsync(c => Tsdb.QueryAsync(c, "temperature", "celsius",
-        new() { ["device"] = shipment.DeviceId }, shipment.DepartedUtc, end, null, "max"));
+    var probe = new Dictionary<string, string> { ["device"] = shipment.DeviceId };
+    var readings = await oxi.ReadAsync(c => c.TsdbQuerySeriesAsync("temperature", "celsius",
+        probe, shipment.DepartedUtc, end, TimeSpan.FromMinutes(1), TsdbAgg.Mean));
+    // No interval: the whole journey reduced to its single hottest moment.
+    var peak = await oxi.ReadAsync(c => c.TsdbQuerySeriesAsync("temperature", "celsius",
+        probe, shipment.DepartedUtc, end, agg: TsdbAgg.Max));
 
     // The raw events, verbatim — what the device actually sent.
     var raw = await oxi.ReadAsync(c => c.CountAsync("readings", new { device = shipment.DeviceId }));
@@ -179,8 +183,12 @@ app.MapGet("/audit/{shipmentId:int}", async (
         Evidence = new
         {
             RawEventsKept = raw,
-            PeakCelsius = peak.Count == 0 ? (double?)null : Math.Round(peak.Max(p => p.Value), 2),
-            Chart = readings.Select(p => new { at = p.At, celsius = Math.Round(p.Value, 2) }),
+            // A sample's value is nullable because a text series carries text
+            // instead — the compiler now makes that impossible to ignore, which
+            // on a compliance report is exactly right: no reading is not 0°C.
+            PeakCelsius = peak.FirstOrDefault()?.Value is { } pk ? Math.Round(pk, 2) : (double?)null,
+            Chart = readings.Where(p => p.Value is not null)
+                            .Select(p => new { at = p.At, celsius = Math.Round(p.Value!.Value, 2) }),
             Certificate = certificate ?? "not filed",
         },
     });

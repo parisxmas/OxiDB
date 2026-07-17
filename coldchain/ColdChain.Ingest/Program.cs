@@ -75,8 +75,8 @@ async Task Handle(MqttApplicationMessageReceivedEventArgs e)
     // invent a dead battery that nobody measured.
     var fields = new Dictionary<string, object> { ["celsius"] = r.celsius };
     if (!double.IsNaN(r.battery)) fields["battery"] = r.battery;
-    await Tsdb.WriteAsync(await oxi.GetAsync(), "temperature",
-        new() { ["device"] = r.device, ["truck"] = r.truck }, fields, at);
+    await (await oxi.GetAsync()).TsdbWriteAsync("temperature",
+        new Dictionary<string, string> { ["device"] = r.device, ["truck"] = r.truck }, fields, at);
 
     // 2. OXIMEM — current state, and a live feed for any dashboard. Expires on
     //    its own: a probe silent for 5 minutes should read as unknown, not as

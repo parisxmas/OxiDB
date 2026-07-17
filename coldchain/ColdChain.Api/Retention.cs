@@ -28,14 +28,8 @@ public sealed class Retention(ILogger<Retention> log) : BackgroundService
             await using var c = await OxiDbTcpClient.ConnectAsync(Endpoints.Host, Endpoints.Tcp, ct: ct);
             // min/max matter as much as mean: an average hides a spike, and a
             // spike is the whole point.
-            await c.ExecRawAsync(new Dictionary<string, object?>
-            {
-                ["engine"] = "tsdb", ["cmd"] = "tsdb", ["op"] = "rollup_add",
-                ["measurement"] = "temperature",
-                ["label"] = "1m",
-                ["interval"] = 60_000,
-                ["aggs"] = new[] { "mean", "min", "max" },
-            }, ct);
+            await c.TsdbAddRollupAsync("temperature", TimeSpan.FromMinutes(1),
+                [TsdbAgg.Mean, TsdbAgg.Min, TsdbAgg.Max], label: "1m", ct: ct);
             log.LogInformation("rollup temperature@1m registered (kept forever)");
         }
         catch (Exception e) { log.LogWarning("rollup registration failed: {m}", e.Message); }
@@ -49,17 +43,14 @@ public sealed class Retention(ILogger<Retention> log) : BackgroundService
 
                 // Roll up completed buckets. Only closed minutes are folded, so
                 // this is safe to run as often as we like.
-                await c.ExecRawAsync(new Dictionary<string, object?>
-                { ["engine"] = "tsdb", ["cmd"] = "tsdb", ["op"] = "rollup_refresh" }, ct);
+                await c.TsdbRefreshRollupsAsync(ct: ct);
 
                 // Drop raw points the rollup has long since captured.
                 if (DateTime.UtcNow - lastRetention > TimeSpan.FromHours(6))
                 {
-                    var cutoff = Tsdb.Ms(DateTime.UtcNow.AddDays(-KeepRawDays));
-                    var r = await c.ExecRawAsync(new Dictionary<string, object?>
-                    { ["engine"] = "tsdb", ["cmd"] = "tsdb", ["op"] = "retention", ["cutoff"] = cutoff }, ct);
+                    var r = await c.TsdbEnforceRetentionAsync(DateTime.UtcNow.AddDays(-KeepRawDays), ct);
                     lastRetention = DateTime.UtcNow;
-                    log.LogInformation("retention: raw older than {d}d dropped {r}", KeepRawDays, r);
+                    log.LogInformation("retention: raw older than {d}d dropped {r} blocks", KeepRawDays, r);
                 }
             }
             catch (Exception e) when (!ct.IsCancellationRequested)
