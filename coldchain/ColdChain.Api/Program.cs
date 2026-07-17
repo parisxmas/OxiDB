@@ -191,23 +191,78 @@ app.MapGet("/audit/{shipmentId:int}", async (
 // Ingest PUBLISHes every reading to OxiMem; this relays that channel to the
 // page as Server-Sent Events. Nothing polls: the dashboard updates because the
 // sensor published, one hop away.
-app.MapGet("/stream", async (HttpContext ctx, IConnectionMultiplexer redis, CancellationToken ct) =>
+app.MapGet("/stream", async (HttpContext ctx, IConnectionMultiplexer redis, ILoggerFactory lf, CancellationToken ct) =>
 {
+    var log = lf.CreateLogger("stream");
     ctx.Response.Headers.ContentType = "text/event-stream";
     ctx.Response.Headers.CacheControl = "no-cache";
-    var sub = redis.GetSubscriber();
-    var queue = await sub.SubscribeAsync(RedisChannel.Literal("live.readings"));
+    // Tell nginx not to buffer even if the vhost forgets to.
+    ctx.Response.Headers["X-Accel-Buffering"] = "no";
+
+    // Send the headers NOW. Without this the response does not begin until the
+    // first WriteAsync, and the first write waits on the first reading — so the
+    // browser sees no 200 and fires no `onopen` until a probe happens to tick.
+    // That is where the ~2.6s "connect" time came from: not latency, just the
+    // gap to the next reading. The connection was ready the whole time.
+    await ctx.Response.Body.FlushAsync(ct);
+
+    // Then paint what is already true. A dashboard that opens into an empty
+    // grid and fills in over the next two seconds looks like it is loading;
+    // OxiMem already knows every probe's last reading, so say so at once.
+    // This is the same state /live serves, pushed instead of polled.
     try
     {
+        var kv = redis.GetDatabase();
+        foreach (var key in redis.GetServer(redis.GetEndPoints()[0]).Keys(pattern: "live:*"))
+        {
+            var v = await kv.StringGetAsync(key);
+            if (v.HasValue) await ctx.Response.WriteAsync($"data: {v}\n\n", ct);
+        }
+        await ctx.Response.Body.FlushAsync(ct);
+    }
+    catch (Exception e) { log.LogDebug("snapshot skipped: {m}", e.Message); }
+
+    var sub = redis.GetSubscriber();
+    ChannelMessageQueue? queue = null;
+    try
+    {
+        queue = await sub.SubscribeAsync(RedisChannel.Literal("live.readings"));
         while (!ct.IsCancellationRequested)
         {
-            var msg = await queue.ReadAsync(ct);
-            await ctx.Response.WriteAsync($"data: {msg.Message}\n\n", ct);
+            string payload;
+            try
+            {
+                payload = (await queue.ReadAsync(ct).AsTask().WaitAsync(TimeSpan.FromSeconds(20), ct)).Message.ToString();
+            }
+            catch (TimeoutException)
+            {
+                // An SSE comment: ignored by EventSource, but it is bytes on the
+                // wire. Cloudflare and nginx both drop a stream that goes quiet,
+                // and a fleet can legitimately go quiet, so never let it.
+                payload = null!;
+            }
+            await ctx.Response.WriteAsync(payload is null ? ": ping\n\n" : $"data: {payload}\n\n", ct);
             await ctx.Response.Body.FlushAsync(ct);
         }
     }
-    catch (OperationCanceledException) { /* client went away */ }
-    finally { await sub.UnsubscribeAsync(RedisChannel.Literal("live.readings")); }
+    catch (OperationCanceledException) { /* client went away — normal */ }
+    catch (Exception e)
+    {
+        // The 200 and the headers are already on the wire, so an exception
+        // escaping this handler leaves Kestrel one option: RESET the stream.
+        // The browser then reports ERR_HTTP2_PROTOCOL_ERROR against a request
+        // it already saw succeed, and EventSource treats a reset as a hard
+        // error rather than a stream that ended. Ending the body cleanly makes
+        // it reconnect on its own instead.
+        log.LogWarning("stream ended early: {t}: {m}", e.GetType().Name, e.Message);
+    }
+    finally
+    {
+        // OxiMem may be the very thing that just died; unsubscribing must not
+        // throw on the way out and re-raise the problem it is cleaning up after.
+        if (queue is not null)
+            try { await queue.UnsubscribeAsync(); } catch (Exception e) { log.LogDebug("unsubscribe: {m}", e.Message); }
+    }
 });
 
 app.UseDefaultFiles();

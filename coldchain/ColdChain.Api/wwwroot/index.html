@@ -354,7 +354,10 @@ function draw(pts, lim) {
 // ── The live feed ──────────────────────────────────────────────────────────
 const es = new EventSource('/stream');
 es.onopen = () => el('status').textContent = 'live — readings arriving over MQTT';
-es.onerror = () => el('status').textContent = 'disconnected — is the ingest running?';
+// EventSource retries on its own, so this is a state, not a failure — and
+// blaming the ingest was wrong anyway: the stream can end for reasons the
+// sensors know nothing about.
+es.onerror = () => el('status').textContent = 'reconnecting…';
 es.onmessage = e => {
   const r = JSON.parse(e.data);
   probes[r.device] = r;
