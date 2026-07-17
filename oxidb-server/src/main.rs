@@ -1618,6 +1618,12 @@ fn main() {
             format!("MQTT listening on {mqtt_addr}")
         );
 
+        // One reaper for the whole broker (like the TTL evictor): it drains
+        // offline persistent sessions' buffered messages into their bounded
+        // queues, which is what enforces the per-session cap against a publisher
+        // that keeps sending while nobody is connected. ADR-0015.
+        oxidb_server::mqtt_session::spawn_reaper();
+
         let state_mqtt = Arc::clone(&state);
         let mqtt_store = Arc::clone(&shared_store);
         let mqtt_log = log_commands;

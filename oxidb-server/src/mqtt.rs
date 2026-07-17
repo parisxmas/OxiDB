@@ -8,6 +8,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
+use crate::mqtt_session::MqttSessions;
 use crate::oximem::OxiMemStore;
 
 // MQTT packet types (upper 4 bits of fixed header byte)
@@ -226,8 +227,25 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
         }
     }
 
-    // CONNACK: session_present=0 (stateless broker by design), accepted.
-    if write_packet(&mut writer, CONNACK, 0, &[0x00, 0x00]).is_err() {
+    // clean_session (conn flag bit 1). false => resume a persistent session and
+    // keep it after this socket closes; true => a fresh, forgotten-on-close one.
+    let clean_session = conn_flags & 0x02 != 0;
+    let persistent = !clean_session;
+
+    // Attach to (or resume) the session. A client with no id MUST use
+    // clean_session (MQTT-3.1.3-7); we synthesise a per-connection id so an
+    // anonymous clean client still works without colliding with a named one.
+    let session_key = if client_id.is_empty() {
+        format!("__anon__{peer}")
+    } else {
+        client_id.clone()
+    };
+    let sessions = MqttSessions::global();
+    let (session_present, generation) = sessions.attach(&session_key, clean_session);
+
+    // CONNACK: bit 0 of the ack flags is session_present — now it means something.
+    let ack_flags = if session_present { 0x01 } else { 0x00 };
+    if write_packet(&mut writer, CONNACK, 0, &[ack_flags, 0x00]).is_err() {
         return;
     }
     if writer.flush().is_err() {
@@ -235,10 +253,10 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
     }
 
     // --- Main loop ---
-    // (filter, granted_qos, receiver)
-    let mut receivers: Vec<(String, u8, std::sync::mpsc::Receiver<(String, String)>)> = Vec::new();
     let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-    let mut next_pkt_id: u16 = 1;
+    // On the first delivery poll after connecting, resend anything left inflight
+    // from a previous session (with DUP set). After that, normal delivery.
+    let mut resend_inflight = session_present;
     let mut last_activity = std::time::Instant::now();
     let mut clean_close = false;
     // MQTT-3.1.2-24: disconnect after 1.5 × keepalive of silence.
@@ -249,28 +267,43 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
     };
 
     loop {
-        // Deliver queued messages to subscribed client
-        let mut wrote = false;
-        for (_topic, granted_qos, rx) in &receivers {
-            while let Ok((topic, message)) = rx.try_recv() {
-                let mut buf = Vec::new();
-                write_utf8(&mut buf, &topic);
-                let flags = if *granted_qos >= 1 {
-                    buf.extend_from_slice(&next_pkt_id.to_be_bytes());
-                    next_pkt_id = next_pkt_id.wrapping_add(1).max(1);
-                    0x02 // QoS 1
-                } else {
-                    0x00
-                };
-                buf.extend_from_slice(message.as_bytes());
-                if write_packet(&mut writer, PUBLISH, flags, &buf).is_err() {
-                    return;
-                }
-                if log {
-                    eprintln!("[mqtt] >> PUBLISH topic=\"{topic}\" len={}", message.len());
-                }
-                wrote = true;
+        // Collect the batch to deliver under the registry lock — packet-id
+        // assignment and inflight recording must be atomic — then write it with
+        // the lock released so slow socket I/O never blocks the reaper or other
+        // sessions. If our generation moved, a newer connection took the
+        // session over (MQTT-3.1.4-2) and we must exit rather than double-deliver.
+        let batch = match sessions.with(&session_key, |sess| {
+            if sess.generation != generation {
+                None // superseded
+            } else {
+                Some(sess.take_deliveries(resend_inflight))
             }
+        }) {
+            Some(Some(b)) => b,
+            _ => return, // session gone or taken over
+        };
+        resend_inflight = false;
+
+        let mut wrote = false;
+        for d in batch {
+            let mut buf = Vec::new();
+            write_utf8(&mut buf, &d.topic);
+            let mut flags = 0u8;
+            if d.qos >= 1 {
+                buf.extend_from_slice(&d.pkt_id.to_be_bytes());
+                flags |= 0x02; // QoS 1
+                if d.dup {
+                    flags |= 0x08; // DUP — a redelivery, not a new message
+                }
+            }
+            buf.extend_from_slice(d.message.as_bytes());
+            if write_packet(&mut writer, PUBLISH, flags, &buf).is_err() {
+                return;
+            }
+            if log {
+                eprintln!("[mqtt] >> PUBLISH topic=\"{}\" len={}", d.topic, d.message.len());
+            }
+            wrote = true;
         }
         if wrote && writer.flush().is_err() {
             return;
@@ -366,31 +399,63 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     // topics use the fast exact-channel map.
                     let (rx, re) = if has_wildcard(&topic) {
                         match filter_to_regex(&topic) {
-                            Some(re) => (store.psubscribe_regex(&topic, re.clone()), Some(re)),
+                            Some(re) => (store.psubscribe_regex(&topic, re.clone()), re),
                             None => {
                                 return_codes.push(0x80); // failure
                                 continue;
                             }
                         }
                     } else {
-                        (store.subscribe(&topic), regex::Regex::new(&format!("^{}$", regex::escape(&topic))).ok())
-                    };
-                    // Deliver matching retained messages immediately (retain=1).
-                    if let Some(re) = &re {
-                        for (rt, rm) in store.retained_matching(re) {
-                            let mut buf = Vec::new();
-                            write_utf8(&mut buf, &rt);
-                            if granted >= 1 {
-                                buf.extend_from_slice(&next_pkt_id.to_be_bytes());
-                                next_pkt_id = next_pkt_id.wrapping_add(1).max(1);
+                        match regex::Regex::new(&format!("^{}$", regex::escape(&topic))) {
+                            Ok(re) => (store.subscribe(&topic), re),
+                            Err(_) => {
+                                return_codes.push(0x80);
+                                continue;
                             }
-                            buf.extend_from_slice(rm.as_bytes());
-                            let flags = 0x01 | if granted >= 1 { 0x02 } else { 0 };
-                            let _ = write_packet(&mut writer, PUBLISH, flags, &buf);
                         }
-                        let _ = writer.flush();
+                    };
+                    // The subscription's receiver goes into the SESSION, not this
+                    // stack frame, so it outlives the socket and keeps buffering
+                    // while the client is offline. Replace an existing sub on the
+                    // same filter (a re-SUBSCRIBE updates QoS — MQTT-3.8.4-3).
+                    sessions.with(&session_key, |sess| {
+                        sess.subs.retain(|s| s.filter != topic);
+                        sess.subs.push(crate::mqtt_session::Subscription {
+                            filter: topic.clone(),
+                            qos: granted,
+                            regex: re.clone(),
+                            rx,
+                        });
+                    });
+                    // Deliver matching retained messages immediately (retain=1),
+                    // recording QoS-1 ones as inflight so they too are resent if
+                    // unacked.
+                    for (rt, rm) in store.retained_matching(&re) {
+                        let pkt_id = if granted >= 1 {
+                            sessions
+                                .with(&session_key, |sess| {
+                                    let id = sess.next_pkt_id.wrapping_add(1).max(1);
+                                    sess.next_pkt_id = id;
+                                    sess.inflight.insert(
+                                        id,
+                                        crate::mqtt_session::Inflight { topic: rt.clone(), message: rm.clone() },
+                                    );
+                                    id
+                                })
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let mut buf = Vec::new();
+                        write_utf8(&mut buf, &rt);
+                        if granted >= 1 {
+                            buf.extend_from_slice(&pkt_id.to_be_bytes());
+                        }
+                        buf.extend_from_slice(rm.as_bytes());
+                        let flags = 0x01 | if granted >= 1 { 0x02 } else { 0 };
+                        let _ = write_packet(&mut writer, PUBLISH, flags, &buf);
                     }
-                    receivers.push((topic, granted, rx));
+                    let _ = writer.flush();
                     return_codes.push(granted);
                 }
                 let mut suback = Vec::new();
@@ -414,7 +479,9 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     if log {
                         eprintln!("[mqtt] << UNSUBSCRIBE topic=\"{topic}\"");
                     }
-                    receivers.retain(|(name, _, _)| name != &topic);
+                    sessions.with(&session_key, |sess| {
+                        sess.subs.retain(|s| s.filter != topic);
+                    });
                     if has_wildcard(&topic) {
                         store.punsubscribe(&topic);
                     } else {
@@ -423,6 +490,19 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                 }
                 let _ = write_packet(&mut writer, UNSUBACK, 0, &pkt_id.to_be_bytes());
                 let _ = writer.flush();
+            }
+
+            PUBACK => {
+                // A subscriber acknowledged a QoS-1 delivery — clear it from
+                // inflight so it is not resent. Without this the message would
+                // be redelivered forever, which is precisely the machinery that
+                // was missing: the id was allocated and then forgotten.
+                if payload.len() >= 2 {
+                    let pkt_id = u16::from_be_bytes([payload[0], payload[1]]);
+                    sessions.with(&session_key, |sess| {
+                        sess.inflight.remove(&pkt_id);
+                    });
+                }
             }
 
             PUBREL => {
@@ -448,6 +528,13 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
             _ => {} // ignore unknown packets
         }
     }
+
+    // Detach: a clean_session client is forgotten; a persistent one is left
+    // offline for the reaper to keep draining into its bounded queue, so its
+    // subscriptions and inflight survive until it reconnects. The generation
+    // guard means a connection that was already superseded does not tear down
+    // the session a newer one now owns.
+    sessions.detach(&session_key, generation, persistent);
 
     // Last Will: published on any abnormal termination (socket error or
     // keepalive expiry) — a clean DISCONNECT discards it (MQTT-3.14.4-3).

@@ -7,6 +7,7 @@ pub mod gelf_ingest;
 pub mod handler;
 pub mod hello;
 pub mod mqtt;
+pub mod mqtt_session;
 pub mod oximem;
 pub mod oxiwire;
 pub mod protocol;
