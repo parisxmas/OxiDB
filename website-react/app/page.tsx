@@ -19,7 +19,7 @@ export default function Page() {
       <a href="/downloads/" class="btn btn-secondary">Downloads v0.36.0</a>
     </div>
     <div class="hero-install">
-      <code>one 14 MB binary &middot; zero dependencies &middot; embed or run as a server</code>
+      <code>one 20 MB binary &middot; zero dependencies &middot; embed or run as a server</code>
     </div>
   </div>
 </header>
@@ -28,7 +28,7 @@ export default function Page() {
   <div class="container">
     <div class="termblock">
       <div class="termbar"><span></span><span></span><span></span></div>
-      <pre>One 14 MB binary. Zero dependencies. Everything below:
+      <pre>One 20 MB binary. Zero dependencies. Everything below:
 
 OxiDB &mdash; a database engine in Rust:
 
@@ -49,7 +49,7 @@ OxiDB &mdash; a database engine in Rust:
  &#9642; Runs embedded too &mdash; Python, Go, .NET (EF Core), JS, Julia, Swift, PHP
  &#9642; Compiles to WASM
 
-Postgres + Mongo + Redis + Elastic + S3. 14 MB.</pre>
+Postgres + Mongo + Redis + Elastic + S3. 20 MB.</pre>
     </div>
   </div>
 </section>
