@@ -450,6 +450,14 @@ pub enum ScalarFunc {
     Length,
     /// `SUBSTRING(s, start [, len])` — 1-based, character-based.
     Substring,
+    /// `STARTS_WITH(s, prefix)` / `ENDS_WITH(s, suffix)` — exact, literal
+    /// affix tests. Unlike `LIKE` these are **case-sensitive** and treat the
+    /// affix as plain text (no wildcards, nothing to escape), which is what
+    /// .NET's ordinal `String.StartsWith`/`EndsWith` mean. Spelling them as
+    /// functions keeps that semantics reachable without a per-row
+    /// `SUBSTRING`/`LENGTH` dance (`starts_with` also exists in PostgreSQL).
+    StartsWith,
+    EndsWith,
     /// Variadic string concatenation (NULL-propagating, like `||`).
     Concat,
     Trim,

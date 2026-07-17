@@ -2366,6 +2366,8 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
         "lower" | "lcase" => Some(ScalarFunc::Lower),
         "length" | "char_length" | "character_length" | "len" => Some(ScalarFunc::Length),
         "substring" | "substr" => Some(ScalarFunc::Substring),
+        "starts_with" | "startswith" => Some(ScalarFunc::StartsWith),
+        "ends_with" | "endswith" => Some(ScalarFunc::EndsWith),
         "concat" => Some(ScalarFunc::Concat),
         "trim" => Some(ScalarFunc::Trim),
         "ltrim" => Some(ScalarFunc::Ltrim),
@@ -2431,6 +2433,7 @@ fn translate_function(f: sp::Function, p: &mut usize) -> Result<Expr> {
             }
             ScalarFunc::Round => exprs.len() == 1 || exprs.len() == 2,
             ScalarFunc::Substring => exprs.len() == 2 || exprs.len() == 3,
+            ScalarFunc::StartsWith | ScalarFunc::EndsWith => exprs.len() == 2,
             ScalarFunc::Now | ScalarFunc::Random => exprs.is_empty(),
             ScalarFunc::Floor
             | ScalarFunc::Ceil

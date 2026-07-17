@@ -5243,6 +5243,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
             | ScalarFunc::Replace => Some(SqlType::Text),
             ScalarFunc::Length => Some(SqlType::Int),
             ScalarFunc::Like { .. } => Some(SqlType::Bool),
+            ScalarFunc::StartsWith | ScalarFunc::EndsWith => Some(SqlType::Bool),
             ScalarFunc::Cast(t) => Some(*t),
             ScalarFunc::Abs | ScalarFunc::Round | ScalarFunc::NullIf => {
                 args.first().and_then(|a| expr_type(a, schema))
@@ -5335,6 +5336,8 @@ fn default_name(expr: &Expr) -> String {
             ScalarFunc::Ceil => "ceiling".to_string(),
             ScalarFunc::Power => "power".to_string(),
             ScalarFunc::Sqrt => "sqrt".to_string(),
+            ScalarFunc::StartsWith => "starts_with".to_string(),
+            ScalarFunc::EndsWith => "ends_with".to_string(),
             ScalarFunc::Position => "position".to_string(),
             ScalarFunc::Lpad => "lpad".to_string(),
             ScalarFunc::Rpad => "rpad".to_string(),
@@ -5728,6 +5731,20 @@ fn eval_func_ref<R: RowLike + ?Sized>(
                 None => Value::Null,
             }))
         }
+        // Affix tests compare borrowed bytes in place: no substring is
+        // materialised and the string is never scanned to count characters,
+        // which is what a `SUBSTRING(s, LENGTH(s) - n + 1, n) = affix`
+        // rendering costs per row.
+        ScalarFunc::StartsWith | ScalarFunc::EndsWith if args.len() == 2 => {
+            let (s, affix) = (text(&args[0], row, params)?, text(&args[1], row, params)?);
+            Some(Ok(match (s, affix) {
+                (Some(s), Some(a)) => Value::Bool(match func {
+                    ScalarFunc::StartsWith => s.starts_with(a),
+                    _ => s.ends_with(a),
+                }),
+                _ => Value::Null,
+            }))
+        }
         _ => None,
     }
 }
@@ -5954,6 +5971,20 @@ where
                 }
                 (a, b) => Err(SqlError::Eval(format!("LIKE on {a:?} / {b:?}"))),
             }
+        }
+        // Case-sensitive, literal affix tests. Non-TEXT arguments coerce the
+        // same way the other string functions do; the borrowed fast path in
+        // `eval_func_ref` must agree with this for TEXT inputs.
+        ScalarFunc::StartsWith | ScalarFunc::EndsWith => {
+            let s = as_text(eval(&args[0])?, "starts_with/ends_with")?;
+            let affix = as_text(eval(&args[1])?, "starts_with/ends_with")?;
+            Ok(match (s, affix) {
+                (Some(s), Some(a)) => Value::Bool(match func {
+                    ScalarFunc::StartsWith => s.starts_with(&a),
+                    _ => s.ends_with(&a),
+                }),
+                _ => Value::Null,
+            })
         }
         ScalarFunc::Now => {
             let ms = std::time::SystemTime::now()
