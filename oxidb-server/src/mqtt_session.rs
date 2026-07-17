@@ -24,8 +24,17 @@
 //! so. ADR-0015 Phase 2 mirrors this through the doc-engine WAL for durability.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+use oxidb::OxiDb;
+use serde_json::json;
+
+/// The document collection every persistent-MQTT record lives in. One
+/// collection, discriminated by `_kind`: "sub" (a subscription), "msg" (an
+/// unacked message), "retain" (a retained payload).
+pub const MQTT_COLLECTION: &str = "_mqtt";
 
 /// Per-session cap on buffered offline messages. A slow or vanished consumer
 /// must not grow without bound — the same discipline as a bounded WAL. When the
@@ -50,6 +59,12 @@ pub struct Subscription {
 pub struct Inflight {
     pub topic: String,
     pub message: String,
+    /// The durable record's sequence number, when one exists. The PUBACK path
+    /// deletes by (client, seq) — exact — because deleting by content collapses
+    /// duplicates: publish the same payload twice, ack once, and a content
+    /// match would delete both records, quietly breaking at-least-once for the
+    /// second copy.
+    pub seq: Option<u64>,
 }
 
 /// Everything about a client that must outlive its socket.
@@ -65,16 +80,22 @@ pub struct Session {
     /// packet id → message awaiting PUBACK. BTreeMap so redelivery is ordered.
     pub inflight: BTreeMap<u16, Inflight>,
     /// Messages that arrived while offline, oldest first — (topic, payload,
-    /// qos). Bounded by MAX_QUEUED. The qos rides along so a message resumed
-    /// from the queue is delivered at the guarantee its subscription was
-    /// granted, not downgraded to 0.
-    pub queue: VecDeque<(String, String, u8)>,
+    /// qos, durable seq). Bounded by MAX_QUEUED. The qos rides along so a
+    /// message resumed from the queue is delivered at the guarantee its
+    /// subscription was granted; the seq (None for non-durable bus messages)
+    /// ties the entry to its on-disk record.
+    pub queue: VecDeque<(String, String, u8, Option<u64>)>,
     /// Next packet id to hand out for a QoS-1 delivery. Per-session, so ids do
     /// not collide across a resume.
     pub next_pkt_id: u16,
     /// How many messages the bound has discarded — surfaced for observability
     /// so a silently-lossy session is not invisible.
     pub dropped: u64,
+    /// True when this session's state is mirrored to the doc engine (persist on
+    /// and clean_session=false). A durable session's deliveries come from the
+    /// durable queue, so it does not also subscribe to the in-memory bus —
+    /// otherwise a publish would arrive twice.
+    pub durable: bool,
 }
 
 impl Session {
@@ -87,6 +108,7 @@ impl Session {
             queue: VecDeque::new(),
             next_pkt_id: 0,
             dropped: 0,
+            durable: false,
         }
     }
 
@@ -97,7 +119,7 @@ impl Session {
         for sub in &self.subs {
             let qos = sub.qos;
             while let Ok((topic, message)) = sub.rx.try_recv() {
-                self.queue.push_back((topic, message, qos));
+                self.queue.push_back((topic, message, qos, None));
                 while self.queue.len() > MAX_QUEUED {
                     self.queue.pop_front();
                     self.dropped += 1;
@@ -133,10 +155,10 @@ impl Session {
             }
         }
         self.drain_into_queue(); // receivers -> bounded queue
-        while let Some((topic, message, qos)) = self.queue.pop_front() {
+        while let Some((topic, message, qos, seq)) = self.queue.pop_front() {
             if qos >= 1 {
                 let pid = self.next_id();
-                self.inflight.insert(pid, Inflight { topic: topic.clone(), message: message.clone() });
+                self.inflight.insert(pid, Inflight { topic: topic.clone(), message: message.clone(), seq });
                 out.push(Delivery { topic, message, qos: 1, pkt_id: pid, dup: false });
             } else {
                 out.push(Delivery { topic, message, qos: 0, pkt_id: 0, dup: false });
@@ -160,13 +182,138 @@ pub struct Delivery {
 /// sharding, no per-connection plumbing.
 pub struct MqttSessions {
     inner: Mutex<HashMap<String, Session>>,
+    /// The doc engine, when persistence is enabled (`OXIDB_MQTT_PERSIST`).
+    /// Durable sessions mirror their subscriptions and unacked messages here so
+    /// they survive a crash — the same WAL the document engine already fsyncs.
+    persist: RwLock<Option<Arc<OxiDb>>>,
+    /// A single atomic read on the publish hot path: skip all persistence work
+    /// unless persistence is on AND at least one durable session exists.
+    has_durable: AtomicBool,
+    /// Monotonic message sequence, so a durable message has a total order that
+    /// survives a restart (resumed past the max seen at recovery).
+    seq: AtomicU64,
 }
 
 impl MqttSessions {
     fn new() -> Self {
         MqttSessions {
             inner: Mutex::new(HashMap::new()),
+            persist: RwLock::new(None),
+            has_durable: AtomicBool::new(false),
+            seq: AtomicU64::new(0),
         }
+    }
+
+    /// Whether a durable session might want this publish. One atomic load —
+    /// callable from the publish hot path without touching the registry lock.
+    pub fn wants_persist(&self) -> bool {
+        self.has_durable.load(Ordering::Relaxed)
+    }
+
+    /// Whether persistence is enabled at all (regardless of whether any durable
+    /// session exists yet). Checked at CONNECT to decide if a persistent session
+    /// should be durable.
+    pub fn wants_persist_globally(&self) -> bool {
+        self.persist.read().unwrap().is_some()
+    }
+
+    fn db(&self) -> Option<Arc<OxiDb>> {
+        self.persist.read().unwrap().clone()
+    }
+
+    /// Enable persistence and recover any sessions the doc engine remembers.
+    /// Called once at startup when `OXIDB_MQTT_PERSIST` is set. Returns how many
+    /// sessions and messages were restored.
+    pub fn enable_persistence(&self, db: Arc<OxiDb>) -> (usize, usize) {
+        *self.persist.write().unwrap() = Some(Arc::clone(&db));
+        self.recover(&db)
+    }
+
+    /// Rebuild sessions from the doc engine: each "sub" record recreates an
+    /// offline durable session with its filter, and each "msg" record becomes a
+    /// queued message to redeliver. A durable session has no in-memory bus
+    /// subscription — its receiver is a dead channel — so recovery does not need
+    /// the store at all.
+    fn recover(&self, db: &Arc<OxiDb>) -> (usize, usize) {
+        let subs = db.find(MQTT_COLLECTION, &json!({ "_kind": "sub" })).unwrap_or_default();
+        let msgs = db.find(MQTT_COLLECTION, &json!({ "_kind": "msg" })).unwrap_or_default();
+
+        let mut map = self.inner.lock().unwrap();
+        let mut max_seq = 0u64;
+        for doc in &subs {
+            let (Some(client), Some(filter), Some(qos)) = (
+                doc.get("client").and_then(|v| v.as_str()),
+                doc.get("filter").and_then(|v| v.as_str()),
+                doc.get("qos").and_then(|v| v.as_u64()),
+            ) else {
+                continue;
+            };
+            let re = if crate::mqtt::has_wildcard(filter) {
+                match crate::mqtt::filter_to_regex(filter) {
+                    Some(re) => re,
+                    None => continue,
+                }
+            } else {
+                match regex::Regex::new(&format!("^{}$", regex::escape(filter))) {
+                    Ok(re) => re,
+                    Err(_) => continue,
+                }
+            };
+            let (_dead_tx, dead_rx) = std::sync::mpsc::channel();
+            let sess = map.entry(client.to_string()).or_insert_with(Session::new);
+            sess.durable = true;
+            sess.connected = false;
+            sess.subs.push(Subscription {
+                filter: filter.to_string(),
+                qos: qos as u8,
+                regex: re,
+                rx: dead_rx,
+            });
+        }
+        let mut restored_msgs = 0;
+        let mut per_client: HashMap<String, Vec<(u64, String, String, u8)>> = HashMap::new();
+        for doc in &msgs {
+            let (Some(client), Some(seq), Some(topic), Some(payload)) = (
+                doc.get("client").and_then(|v| v.as_str()),
+                doc.get("seq").and_then(|v| v.as_u64()),
+                doc.get("topic").and_then(|v| v.as_str()),
+                doc.get("payload").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let qos = doc.get("qos").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
+            max_seq = max_seq.max(seq);
+            per_client.entry(client.to_string()).or_default().push((
+                seq,
+                topic.to_string(),
+                payload.to_string(),
+                qos,
+            ));
+        }
+        for (client, mut list) in per_client {
+            list.sort_by_key(|(seq, ..)| *seq); // redeliver in receipt order
+            // Enforce the bound at recovery too: a crash window can leave more
+            // records than MAX_QUEUED, and restoring past the bound would undo
+            // it. Keep the newest, delete the rest from disk (drop-oldest, the
+            // same policy as the live path).
+            let excess = list.len().saturating_sub(MAX_QUEUED);
+            if let Some(sess) = map.get_mut(&client) {
+                for (seq, _t, _p, _q) in list.drain(..excess) {
+                    let _ = db.delete(
+                        MQTT_COLLECTION,
+                        &json!({ "_kind": "msg", "client": client, "seq": seq }),
+                    );
+                    sess.dropped += 1;
+                }
+                for (seq, topic, payload, qos) in list {
+                    sess.queue.push_back((topic, payload, qos, Some(seq)));
+                    restored_msgs += 1;
+                }
+            }
+        }
+        self.seq.store(max_seq + 1, Ordering::SeqCst);
+        self.has_durable.store(!map.is_empty(), Ordering::Relaxed);
+        (map.len(), restored_msgs)
     }
 
     /// The shared registry.
@@ -182,6 +329,18 @@ impl MqttSessions {
     /// session keeps its subscriptions, its inflight messages and its offline
     /// queue — that is the whole point.
     pub fn attach(&self, client_id: &str, clean_start: bool) -> (bool, u64) {
+        self.attach_durable(client_id, clean_start, false)
+    }
+
+    /// `attach`, marking the session durable (persistence on + persistent). A
+    /// clean_start on a durable client also wipes its persisted records, so a
+    /// deliberate fresh start does not silently resume from disk.
+    pub fn attach_durable(&self, client_id: &str, clean_start: bool, durable: bool) -> (bool, u64) {
+        if clean_start && durable {
+            if let Some(db) = self.db() {
+                let _ = db.delete(MQTT_COLLECTION, &json!({ "client": client_id }));
+            }
+        }
         let mut map = self.inner.lock().unwrap();
         if clean_start {
             map.remove(client_id);
@@ -189,7 +348,11 @@ impl MqttSessions {
         let existed = map.contains_key(client_id);
         let sess = map.entry(client_id.to_string()).or_insert_with(Session::new);
         sess.connected = true;
+        sess.durable = durable;
         sess.generation = sess.generation.wrapping_add(1);
+        if durable {
+            self.has_durable.store(true, Ordering::Relaxed);
+        }
         (existed && !clean_start, sess.generation)
     }
 
@@ -218,6 +381,146 @@ impl MqttSessions {
                 sess.drain_into_queue();
             } else {
                 map.remove(client_id);
+            }
+        }
+    }
+
+    /// Persist a durable session's subscription so it is restored on restart.
+    /// A no-op when persistence is off.
+    pub fn persist_subscription(&self, client_id: &str, filter: &str, qos: u8) {
+        if let Some(db) = self.db() {
+            // Replace any prior record for this (client, filter) so a QoS change
+            // does not leave two.
+            let _ = db.delete(
+                MQTT_COLLECTION,
+                &json!({ "_kind": "sub", "client": client_id, "filter": filter }),
+            );
+            let _ = db.insert(
+                MQTT_COLLECTION,
+                json!({ "_kind": "sub", "client": client_id, "filter": filter, "qos": qos }),
+            );
+            self.has_durable.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Remove a durable subscription (on UNSUBSCRIBE).
+    pub fn forget_subscription(&self, client_id: &str, filter: &str) {
+        if let Some(db) = self.db() {
+            let _ = db.delete(
+                MQTT_COLLECTION,
+                &json!({ "_kind": "sub", "client": client_id, "filter": filter }),
+            );
+        }
+    }
+
+    /// Route a publish to every durable session whose subscription matches, and
+    /// **make it durable before returning**. The caller (the PUBLISH handler)
+    /// only PUBACKs the publisher after this returns, so an acknowledged QoS-1
+    /// message is on disk before the publisher is told it was accepted — the
+    /// write-before-ack ordering QoS 1 requires. ADR-0015.
+    ///
+    /// Cheap when idle: one atomic load rejects the common case where no durable
+    /// session exists, before any lock or disk touch.
+    pub fn persist_incoming(&self, topic: &str, message: &str) {
+        if !self.wants_persist() {
+            return;
+        }
+        let Some(db) = self.db() else { return };
+
+        // Collect the durable sessions this matches, and the seq to stamp each,
+        // under the registry lock; do the fsync insert outside it so a slow disk
+        // does not stall every other session.
+        let mut writes: Vec<(String, u64, u8)> = Vec::new();
+        let mut overflow: Vec<(String, u64)> = Vec::new();
+        {
+            let mut map = self.inner.lock().unwrap();
+            for (client, sess) in map.iter_mut() {
+                if !sess.durable {
+                    continue;
+                }
+                // Highest granted qos among matching filters (deliver once).
+                let mut qos: Option<u8> = None;
+                for sub in &sess.subs {
+                    if sub.regex.is_match(topic) {
+                        qos = Some(qos.map_or(sub.qos, |q| q.max(sub.qos)));
+                    }
+                }
+                let Some(qos) = qos else { continue };
+                let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+                writes.push((client.clone(), seq, qos));
+                // Enqueue in memory now so a connected session delivers promptly;
+                // the durable record below is what survives a crash.
+                sess.queue.push_back((topic.to_string(), message.to_string(), qos, Some(seq)));
+                while sess.queue.len() > MAX_QUEUED {
+                    // The bound applies to disk too: a dropped message's durable
+                    // record must go with it, or a dead consumer grows the
+                    // collection forever and a restart resurrects messages the
+                    // bound already discarded.
+                    if let Some((_, _, _, Some(dropped_seq))) = sess.queue.pop_front() {
+                        overflow.push((client.clone(), dropped_seq));
+                    }
+                    sess.dropped += 1;
+                }
+            }
+        }
+        for (client, seq, qos) in writes {
+            // fsync'd insert — durable on return (strict ACID-D).
+            let _ = db.insert(
+                MQTT_COLLECTION,
+                json!({
+                    "_kind": "msg", "client": client, "seq": seq,
+                    "topic": topic, "payload": message, "qos": qos,
+                }),
+            );
+        }
+        for (client, seq) in overflow {
+            let _ = db.delete(
+                MQTT_COLLECTION,
+                &json!({ "_kind": "msg", "client": client, "seq": seq }),
+            );
+        }
+    }
+
+    /// A durable message was acknowledged by its subscriber (PUBACK) — delete
+    /// exactly its record, by (client, seq), so it is not redelivered after a
+    /// restart. Inflight carries the seq precisely so this can be exact; a
+    /// content match would collapse duplicate payloads (see `Inflight::seq`).
+    /// No seq (a retained-delivery inflight, or a non-durable session) — no
+    /// record to delete.
+    pub fn ack_durable(&self, client_id: &str, seq: Option<u64>) {
+        let Some(seq) = seq else { return };
+        if let Some(db) = self.db() {
+            let _ = db.delete(
+                MQTT_COLLECTION,
+                &json!({ "_kind": "msg", "client": client_id, "seq": seq }),
+            );
+        }
+    }
+
+    /// Persist / clear a retained message so the last value on a topic survives a
+    /// restart. Empty payload clears (MQTT-3.3.1-11).
+    pub fn persist_retained(&self, topic: &str, message: &str) {
+        if let Some(db) = self.db() {
+            let _ = db.delete(MQTT_COLLECTION, &json!({ "_kind": "retain", "topic": topic }));
+            if !message.is_empty() {
+                let _ = db.insert(
+                    MQTT_COLLECTION,
+                    json!({ "_kind": "retain", "topic": topic, "payload": message }),
+                );
+            }
+        }
+    }
+
+    /// Restore retained messages into the store on startup.
+    pub fn recover_retained(&self, store: &crate::oximem::OxiMemStore) {
+        if let Some(db) = self.db() {
+            for doc in db.find(MQTT_COLLECTION, &json!({ "_kind": "retain" })).unwrap_or_default() {
+                if let (Some(t), Some(p)) = (
+                    doc.get("topic").and_then(|v| v.as_str()),
+                    doc.get("payload").and_then(|v| v.as_str()),
+                ) {
+                    store.retain_set(t, p);
+                }
             }
         }
     }
@@ -283,7 +586,7 @@ mod tests {
         assert!(!present, "first connect has nothing to resume");
         reg.with("c2", |s| {
             s.subs.push(sub("topic"));
-            s.inflight.insert(7, Inflight { topic: "t".into(), message: "m".into() });
+            s.inflight.insert(7, Inflight { topic: "t".into(), message: "m".into(), seq: None });
         });
         reg.detach("c2", g, true); // persistent
 

@@ -1124,6 +1124,9 @@ ENGINES (off unless set):
 PROTOCOLS (off unless set):
     OXIDB_OXIMEM_PORT      Redis-compatible (RESP) listener
     OXIDB_MQTT_PORT        MQTT 3.1.1 broker listener
+    OXIDB_MQTT_PERSIST     persist MQTT sessions, queued QoS-1 messages and
+                           retained topics via the document engine (they
+                           survive a crash); default off
     OXIDB_S3_PORT          S3-compatible HTTP listener
     OXIDB_HTTP_PORT        REST listener (also serves GET /metrics)
     OXIDB_WS_PORT          WebSocket listener
@@ -1617,6 +1620,24 @@ fn main() {
             GelfLevel::Notice,
             format!("MQTT listening on {mqtt_addr}")
         );
+
+        // Durable sessions (ADR-0015 Phase 2): when OXIDB_MQTT_PERSIST is set,
+        // session state and unacked QoS-1 messages are mirrored to the document
+        // engine, so they survive a crash. Recovery runs here, before the
+        // listener accepts, so a reconnecting client resumes cleanly.
+        let persist = env::var("OXIDB_MQTT_PERSIST")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if persist {
+            let reg = oxidb_server::mqtt_session::MqttSessions::global();
+            let (sessions, msgs) = reg.enable_persistence(Arc::clone(&state.db));
+            reg.recover_retained(&shared_store);
+            server_log!(
+                state,
+                GelfLevel::Notice,
+                format!("MQTT persistence on — recovered {sessions} sessions, {msgs} pending messages")
+            );
+        }
 
         // One reaper for the whole broker (like the TTL evictor): it drains
         // offline persistent sessions' buffered messages into their bounded

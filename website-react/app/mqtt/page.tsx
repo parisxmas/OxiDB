@@ -42,7 +42,7 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -t status/device1   <span class="co"># gets "
     <h3>QoS &amp; Last Will</h3>
     <ul>
       <li><strong>QoS&nbsp;1 &mdash; genuine at-least-once</strong>: a delivered message is held until the subscriber PUBACKs it, and retransmitted with DUP on reconnect if it does not. Inbound QoS&nbsp;2 completes the PUBREC / PUBREL / PUBCOMP handshake.</li>
-      <li><strong>Persistent sessions</strong> (<code>clean_session=false</code>) &mdash; a subscriber that drops keeps its subscriptions, and messages published while it is offline are queued (bounded) and delivered on reconnect, with <code>session_present=1</code>. Sessions are in-memory: a broker restart is a clean slate.</li>
+      <li><strong>Persistent sessions</strong> (<code>clean_session=false</code>) &mdash; a subscriber that drops keeps its subscriptions, and messages published while it is offline are queued (bounded) and delivered on reconnect, with <code>session_present=1</code>. With <code>OXIDB_MQTT_PERSIST=1</code>, sessions, queued messages and retained topics are written through the document engine&apos;s WAL and survive a crash &mdash; an acknowledged QoS&nbsp;1 message outlives a <code>SIGKILL</code>. Without it, sessions are in-memory and a restart is a clean slate.</li>
       <li><strong>Last Will &amp; Testament</strong> &mdash; a client's will message is published automatically on an abnormal disconnect or keepalive expiry (enforced at 1.5&times; the keepalive).</li>
     </ul>
     <pre><code class="lang-bash"><span class="co"># will published if this client drops without a clean DISCONNECT</span>

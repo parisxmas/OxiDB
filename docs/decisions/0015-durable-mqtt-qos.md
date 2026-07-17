@@ -1,6 +1,6 @@
 # ADR-0015: Durable MQTT — persistent sessions and honest QoS 1
 
-**Status:** Accepted — 2026-07-17 (Phase 1 in progress)
+**Status:** Accepted — 2026-07-17 (Phases 1–2 shipped in 0.36.4/0.36.5; Phase 3 open)
 
 ## Context
 

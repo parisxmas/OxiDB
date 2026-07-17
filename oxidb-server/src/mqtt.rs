@@ -105,7 +105,7 @@ fn write_packet(
 
 /// MQTT topic filter → anchored regex: `+` matches one level, `#` (only as
 /// the final level) matches the rest of the topic.
-fn filter_to_regex(filter: &str) -> Option<regex::Regex> {
+pub(crate) fn filter_to_regex(filter: &str) -> Option<regex::Regex> {
     let mut out = String::from("^");
     let levels: Vec<&str> = filter.split('/').collect();
     for (i, lv) in levels.iter().enumerate() {
@@ -135,7 +135,7 @@ fn filter_to_regex(filter: &str) -> Option<regex::Regex> {
 }
 
 /// True if the filter contains MQTT wildcards.
-fn has_wildcard(f: &str) -> bool {
+pub(crate) fn has_wildcard(f: &str) -> bool {
     f.split('/').any(|l| l == "+" || l == "#")
 }
 
@@ -241,7 +241,11 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
         client_id.clone()
     };
     let sessions = MqttSessions::global();
-    let (session_present, generation) = sessions.attach(&session_key, clean_session);
+    // Durable = persistence is on AND this is a persistent session. A durable
+    // session's state is mirrored to the doc engine and its deliveries come from
+    // the durable queue rather than the in-memory bus.
+    let durable = persistent && sessions.wants_persist_globally();
+    let (session_present, generation) = sessions.attach_durable(&session_key, clean_session, durable);
 
     // CONNACK: bit 0 of the ack flags is session_present — now it means something.
     let ack_flags = if session_present { 0x01 } else { 0x00 };
@@ -346,18 +350,15 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                 };
                 let qos = (hdr[0] >> 1) & 0x03;
                 let retain = hdr[0] & 0x01 != 0;
-                if qos > 0 && off + 2 <= payload.len() {
+                // Read the packet id but do NOT ack yet: an acknowledged QoS-1
+                // message must be durable first (write-before-ack, ADR-0015).
+                let ack_pkt_id = if qos > 0 && off + 2 <= payload.len() {
                     let pkt_id = u16::from_be_bytes([payload[off], payload[off + 1]]);
                     off += 2;
-                    if qos == 1 {
-                        let _ = write_packet(&mut writer, PUBACK, 0, &pkt_id.to_be_bytes());
-                        let _ = writer.flush();
-                    } else if qos == 2 {
-                        // Method A: publish now, complete the 4-way handshake.
-                        let _ = write_packet(&mut writer, PUBREC, 0, &pkt_id.to_be_bytes());
-                        let _ = writer.flush();
-                    }
-                }
+                    Some(pkt_id)
+                } else {
+                    None
+                };
                 let message = String::from_utf8_lossy(&payload[off..]).to_string();
                 if log {
                     eprintln!("[mqtt] << PUBLISH topic=\"{topic}\" msg=\"{message}\"");
@@ -368,8 +369,21 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     } else {
                         store.retain_set(&topic, &message);
                     }
+                    sessions.persist_retained(&topic, &message);
                 }
+                // Fan out to the in-memory bus (clean sessions + RESP + retained),
+                // then durably route to persistent sessions — the fsync inside
+                // persist_incoming is what makes the ack below honest.
                 store.publish(&topic, &message);
+                sessions.persist_incoming(&topic, &message);
+
+                // Now acknowledge — the message is on disk for every durable
+                // subscriber that will need it.
+                if let Some(pkt_id) = ack_pkt_id {
+                    let reply = if qos == 1 { PUBACK } else { PUBREC };
+                    let _ = write_packet(&mut writer, reply, 0, &pkt_id.to_be_bytes());
+                    let _ = writer.flush();
+                }
             }
 
             SUBSCRIBE => {
@@ -395,11 +409,14 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                         eprintln!("[mqtt] << SUBSCRIBE topic=\"{topic}\"");
                     }
                     let granted = req_qos.min(1); // QoS 2 subscriptions granted at 1
-                    // Wildcard filters go through the pattern layer; exact
-                    // topics use the fast exact-channel map.
-                    let (rx, re) = if has_wildcard(&topic) {
+                    // Compile the filter's matcher. For a DURABLE session the
+                    // delivery path is the durable queue (fed by persist_incoming
+                    // under the registry lock), NOT the in-memory bus — so it
+                    // takes a dead receiver and never double-subscribes. A clean
+                    // session subscribes to the bus as before.
+                    let re = if has_wildcard(&topic) {
                         match filter_to_regex(&topic) {
-                            Some(re) => (store.psubscribe_regex(&topic, re.clone()), re),
+                            Some(re) => re,
                             None => {
                                 return_codes.push(0x80); // failure
                                 continue;
@@ -407,12 +424,20 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                         }
                     } else {
                         match regex::Regex::new(&format!("^{}$", regex::escape(&topic))) {
-                            Ok(re) => (store.subscribe(&topic), re),
+                            Ok(re) => re,
                             Err(_) => {
                                 return_codes.push(0x80);
                                 continue;
                             }
                         }
+                    };
+                    let rx = if durable {
+                        let (_dead_tx, dead_rx) = std::sync::mpsc::channel();
+                        dead_rx
+                    } else if has_wildcard(&topic) {
+                        store.psubscribe_regex(&topic, re.clone())
+                    } else {
+                        store.subscribe(&topic)
                     };
                     // The subscription's receiver goes into the SESSION, not this
                     // stack frame, so it outlives the socket and keeps buffering
@@ -427,6 +452,11 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                             rx,
                         });
                     });
+                    // Durable session: persist the subscription so it is restored
+                    // on restart.
+                    if durable {
+                        sessions.persist_subscription(&session_key, &topic, granted);
+                    }
                     // Deliver matching retained messages immediately (retain=1),
                     // recording QoS-1 ones as inflight so they too are resent if
                     // unacked.
@@ -438,7 +468,7 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                                     sess.next_pkt_id = id;
                                     sess.inflight.insert(
                                         id,
-                                        crate::mqtt_session::Inflight { topic: rt.clone(), message: rm.clone() },
+                                        crate::mqtt_session::Inflight { topic: rt.clone(), message: rm.clone(), seq: None },
                                     );
                                     id
                                 })
@@ -482,6 +512,9 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
                     sessions.with(&session_key, |sess| {
                         sess.subs.retain(|s| s.filter != topic);
                     });
+                    if durable {
+                        sessions.forget_subscription(&session_key, &topic);
+                    }
                     if has_wildcard(&topic) {
                         store.punsubscribe(&topic);
                     } else {
@@ -494,14 +527,20 @@ pub fn handle_client(stream: TcpStream, store: &OxiMemStore, log: bool) {
 
             PUBACK => {
                 // A subscriber acknowledged a QoS-1 delivery — clear it from
-                // inflight so it is not resent. Without this the message would
-                // be redelivered forever, which is precisely the machinery that
-                // was missing: the id was allocated and then forgotten.
+                // inflight so it is not resent, and (durable session) delete its
+                // on-disk record so it is not redelivered after a restart. The
+                // ack carries only a packet id; inflight maps that back to the
+                // topic+payload the durable record is keyed on.
                 if payload.len() >= 2 {
                     let pkt_id = u16::from_be_bytes([payload[0], payload[1]]);
-                    sessions.with(&session_key, |sess| {
-                        sess.inflight.remove(&pkt_id);
+                    let acked = sessions.with(&session_key, |sess| {
+                        sess.inflight.remove(&pkt_id).map(|inf| inf.seq)
                     });
+                    if durable {
+                        if let Some(Some(seq)) = acked {
+                            sessions.ack_durable(&session_key, seq);
+                        }
+                    }
                 }
             }
 

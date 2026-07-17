@@ -22,8 +22,11 @@ fn have_mosquitto() -> bool {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        // Present = the spawn succeeded. NOT `.success()`: mosquitto's clients
+        // exit nonzero on --help, which made this return false with mosquitto
+        // installed — and every test in this file then skipped, passing
+        // vacuously in 0.02s. A skip that looks like a pass is the worst kind.
+        .is_ok()
 }
 
 struct Broker {
