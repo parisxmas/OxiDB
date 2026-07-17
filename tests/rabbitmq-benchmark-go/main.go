@@ -66,6 +66,7 @@ func main() {
 		{"publish confirms, pipelined", func(u string) (result, error) { return benchPipelined(u, *msgs, body, false) }, true},
 		{"publish confirm, sequential", func(u string) (result, error) { return benchSequentialConfirm(u, *latIters, body) }, false},
 		{"durable publish, pipelined", func(u string) (result, error) { return benchPipelined(u, *durMsgs, body, true) }, true},
+		{"durable publish, 8 connections", func(u string) (result, error) { return benchDurableConcurrent(u, *durMsgs, 8, body) }, true},
 		{"end-to-end throughput", func(u string) (result, error) { return benchE2EThroughput(u, *msgs, body) }, true},
 		{"end-to-end latency", func(u string) (result, error) { return benchE2ELatency(u, *latIters, body) }, false},
 	}
@@ -174,6 +175,81 @@ func benchPipelined(url string, n int, body []byte, durable bool) (result, error
 	}
 	elapsed := time.Since(start)
 	return result{rate: float64(n) / elapsed.Seconds()}, nil
+}
+
+// benchDurableConcurrent splits n persistent messages across `conns`
+// connections publishing to one durable queue at once — the cross-connection
+// fsync-grouping (group commit) scenario: without it every connection's
+// burst pays its own serialized fsync, with it concurrent bursts share one.
+func benchDurableConcurrent(url string, n, conns int, body []byte) (result, error) {
+	q := fmt.Sprintf("bench-gc-%d", time.Now().UnixNano())
+
+	// Declare once, on a setup connection.
+	setup, err := amqp.Dial(url)
+	if err != nil {
+		return result{}, err
+	}
+	defer setup.Close()
+	sch, err := setup.Channel()
+	if err != nil {
+		return result{}, err
+	}
+	if _, err := sch.QueueDeclare(q, true, false, false, false, nil); err != nil {
+		return result{}, err
+	}
+	defer sch.QueueDelete(q, false, false, false)
+
+	per := n / conns
+	errs := make(chan error, conns)
+	start := time.Now()
+	for c := 0; c < conns; c++ {
+		go func() {
+			conn, err := amqp.Dial(url)
+			if err != nil {
+				errs <- err
+				return
+			}
+			defer conn.Close()
+			ch, err := conn.Channel()
+			if err != nil {
+				errs <- err
+				return
+			}
+			if err := ch.Confirm(false); err != nil {
+				errs <- err
+				return
+			}
+			confirms := ch.NotifyPublish(make(chan amqp.Confirmation, per))
+			pub := amqp.Publishing{DeliveryMode: amqp.Persistent, Body: body}
+			ctx := context.Background()
+			for i := 0; i < per; i++ {
+				if err := ch.PublishWithContext(ctx, "", q, false, false, pub); err != nil {
+					errs <- err
+					return
+				}
+			}
+			for i := 0; i < per; i++ {
+				select {
+				case c := <-confirms:
+					if !c.Ack {
+						errs <- fmt.Errorf("broker nacked message %d", c.DeliveryTag)
+						return
+					}
+				case <-time.After(120 * time.Second):
+					errs <- fmt.Errorf("confirm stream stalled at %d/%d", i, per)
+					return
+				}
+			}
+			errs <- nil
+		}()
+	}
+	for c := 0; c < conns; c++ {
+		if err := <-errs; err != nil {
+			return result{}, err
+		}
+	}
+	elapsed := time.Since(start)
+	return result{rate: float64(per*conns) / elapsed.Seconds()}, nil
 }
 
 // benchSequentialConfirm waits for each publish's confirm before sending the

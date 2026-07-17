@@ -16,12 +16,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use oxidb::OxiDb;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::oximem::OxiMemStore;
 
@@ -180,6 +180,65 @@ pub struct OutMsg {
     pub msg: QMsg,
 }
 
+/// Cross-CONNECTION fsync grouping for durable publishes. Each connection
+/// already batches its own pipeline burst into one `insert_many`; this layer
+/// merges bursts arriving from different connections at the same time.
+/// Whoever finds no commit in flight becomes the leader and keeps taking
+/// rounds — everything in `pending` — until it is empty; everyone else piles
+/// on and waits for the round carrying their docs. Concurrency IS the batch
+/// window (the fsync's own duration), so a lone publisher is its own leader
+/// immediately and pays nothing for this.
+#[derive(Default)]
+struct GroupCommit {
+    state: Mutex<GcState>,
+    done: Condvar,
+}
+
+#[derive(Default)]
+struct GcState {
+    pending: Vec<Value>,
+    leader_running: bool,
+    /// Generation the current `pending` set will commit under.
+    next_gen: u64,
+    committed_gen: u64,
+}
+
+impl GroupCommit {
+    /// Block until `docs` are committed — possibly by another connection's
+    /// leader round. `commit` runs WITHOUT the lock held; the leader may run
+    /// it several times (one per round).
+    fn submit<F: Fn(Vec<Value>)>(&self, docs: Vec<Value>, commit: F) {
+        let mut st = self.state.lock().unwrap();
+        st.pending.extend(docs);
+        let my_gen = st.next_gen;
+        if st.leader_running {
+            // A leader is on the disk right now; it (or its successor round)
+            // will carry our docs. Wait for our generation.
+            while st.committed_gen < my_gen {
+                st = self.done.wait(st).unwrap();
+            }
+            return;
+        }
+        st.leader_running = true;
+        loop {
+            let round = std::mem::take(&mut st.pending);
+            let round_gen = st.next_gen;
+            st.next_gen += 1;
+            drop(st);
+            commit(round);
+            st = self.state.lock().unwrap();
+            st.committed_gen = round_gen;
+            self.done.notify_all();
+            if st.pending.is_empty() {
+                st.leader_running = false;
+                return;
+            }
+            // More piled up while we were on disk: take another round — we
+            // are still the leader, and they are already waiting on us.
+        }
+    }
+}
+
 /// A consuming connection's wake handle: one end of a nonblocking pipe whose
 /// other end sits in that connection's `poll(2)` set. A publish that lands in
 /// a queue pokes every consumer's pipe, so delivery happens NOW instead of at
@@ -239,6 +298,10 @@ pub struct AmqpBroker {
     /// is held the other way around: callers collect conn ids under `inner`,
     /// release it, then wake.
     wakers: Mutex<HashMap<u64, Waker>>,
+    /// Cross-connection fsync grouping for durable publishes (see
+    /// `GroupCommit`). Its lock is independent of `inner` and never held
+    /// together with it.
+    group: GroupCommit,
     seq: AtomicU64,
     gen_name: AtomicU64,
 }
@@ -251,6 +314,7 @@ impl AmqpBroker {
             active: AtomicBool::new(false),
             mqtt: RwLock::new(None),
             wakers: Mutex::new(HashMap::new()),
+            group: GroupCommit::default(),
             seq: AtomicU64::new(1),
             gen_name: AtomicU64::new(1),
         }
@@ -669,7 +733,13 @@ impl AmqpBroker {
         }
         if !docs.is_empty() {
             if let Some(db) = self.db() {
-                let _ = db.insert_many(AMQP_COLLECTION, docs);
+                // Through the group committer: bursts arriving from OTHER
+                // connections while a commit is on the disk share the next
+                // round's insert_many — cross-connection fsync grouping. A
+                // lone publisher leads its own round immediately.
+                self.group.submit(docs, |round| {
+                    let _ = db.insert_many(AMQP_COLLECTION, round);
+                });
             }
         }
 
@@ -1305,6 +1375,41 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_millis(100))
                 .is_err(),
             "only amq.topic bridges to MQTT"
+        );
+    }
+
+    #[test]
+    fn group_commit_merges_concurrent_submitters_into_fewer_rounds() {
+        use std::sync::atomic::AtomicUsize;
+        let gc = Arc::new(GroupCommit::default());
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let committed = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let gc = Arc::clone(&gc);
+            let rounds = Arc::clone(&rounds);
+            let committed = Arc::clone(&committed);
+            handles.push(std::thread::spawn(move || {
+                gc.submit(vec![json!({ "i": i })], |round| {
+                    rounds.fetch_add(1, Ordering::SeqCst);
+                    committed.fetch_add(round.len(), Ordering::SeqCst);
+                    // A slow "fsync": the window concurrency piles into.
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                });
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            committed.load(Ordering::SeqCst),
+            8,
+            "every submitted doc must be committed exactly once"
+        );
+        let r = rounds.load(Ordering::SeqCst);
+        assert!(
+            r < 8,
+            "concurrent submitters must share commit rounds; 8 submissions took {r} rounds"
         );
     }
 
