@@ -4,7 +4,8 @@ use super::S3State;
 use super::encryption::{
     SseMode, add_encryption_headers, encrypt_data, parse_sse_headers, sse_metadata_marker,
 };
-use super::helpers::{crc32, xml_escape};
+use super::helpers::{md5_hex, xml_escape};
+use md5::{Digest, Md5};
 use super::http::{HttpRequest, HttpResponse, error_response};
 
 pub fn handle_create_multipart(
@@ -118,7 +119,9 @@ pub fn handle_upload_part(
                     "",
                 );
             }
-            let etag = format!("{:08x}", crc32(&part_bytes));
+            // S3: a part's ETag is the hex MD5 of that part's bytes. This was
+            // a CRC32 — eight hex characters where a client expects thirty-two.
+            let etag = md5_hex(&part_bytes);
             upload.total_bytes = new_total;
             upload.parts.insert(part_number, part_bytes);
             HttpResponse::ok_xml(String::new()).with_header("ETag", &format!("\"{etag}\""))
@@ -220,12 +223,29 @@ pub fn handle_complete_multipart(
         metadata.insert(mk, mv);
     }
 
-    match state.db.put_object(
+    // S3 does not define a completed multipart object's ETag as the MD5 of the
+    // object. It is the MD5 of the concatenated part MD5 *digests*, suffixed with
+    // the part count — which is why a multipart ETag has a `-N` on the end, and
+    // why it cannot be recomputed from the assembled bytes once the boundaries
+    // are gone. It has to be computed here and stored, because clients keep it
+    // and send it back as If-Match.
+    let multipart_etag = {
+        let mut digests = Vec::with_capacity(part_nums.len() * 16);
+        for num in &part_nums {
+            if let Some(part) = upload.parts.get(num) {
+                digests.extend_from_slice(&Md5::digest(part));
+            }
+        }
+        format!("{}-{}", md5_hex(&digests), part_nums.len())
+    };
+
+    match state.db.put_object_with_etag(
         &upload.bucket,
         &upload.key,
         &data_to_store,
         &upload.content_type,
         metadata,
+        Some(multipart_etag),
     ) {
         Ok(meta) => {
             let etag = meta.get("etag").and_then(|v| v.as_str()).unwrap_or("");

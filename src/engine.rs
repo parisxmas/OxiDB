@@ -2790,6 +2790,33 @@ impl OxiDb {
         Ok(serde_json::to_value(&meta)?)
     }
 
+    /// `put_object` with a caller-supplied ETag — see
+    /// [`BlobStore::put_object_with_etag`]. Multipart is the only caller.
+    pub fn put_object_with_etag(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: HashMap<String, String>,
+        etag: Option<String>,
+    ) -> Result<Value> {
+        let meta = self
+            .blob_store
+            .put_object_with_etag(bucket, key, data, content_type, metadata, etag)?;
+
+        if let Err(e) = self.fts_tx.send(FtsJob::Index {
+            data: data.to_vec(),
+            content_type: content_type.to_string(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        }) {
+            eprintln!("[fts] failed to queue index job: {e}");
+        }
+
+        Ok(serde_json::to_value(&meta)?)
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn get_object(&self, bucket: &str, key: &str) -> Result<(Vec<u8>, Value)> {
         let (data, meta) = self.blob_store.get_object(bucket, key)?;

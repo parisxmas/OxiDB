@@ -23,6 +23,9 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 crc32fast = "1"
 sha2 = "0.10"
+# S3 defines the ETag of a single-part object as the MD5 of its bytes. Not a
+# security choice — an ETag is an identity, and every S3 client verifies it as one.
+md-5 = "0.10"
 aes-gcm = "0.10"
 rand = "0.9"
 leptess = { version = "0.14", optional = true }

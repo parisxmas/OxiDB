@@ -2268,6 +2268,7 @@ dependencies = [
  "leptess",
  "lru",
  "lz4_flex",
+ "md-5",
  "memmap2",
  "oxidb-agg-merge",
  "parking_lot",
@@ -2335,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "oxidb-server"
-version = "0.36.1"
+version = "0.36.2"
 dependencies = [
  "aes-gcm",
  "argon2",

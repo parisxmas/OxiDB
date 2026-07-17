@@ -126,12 +126,6 @@ app.MapPost("/certificate/{shipmentId:int}", async (
     await s3.PutObjectAsync(new PutObjectRequest
     {
         BucketName = bucket, Key = key, InputStream = body, ContentType = "text/plain",
-        // The AWS .NET SDK verifies the returned ETag as an MD5 of what it
-        // sent. OxiDB's ETag is deliberately not an MD5 — it is the first 16
-        // bytes of the payload's SHA-256 — so the check fails even though the
-        // object stored fine. aws-cli and boto3 don't do this; the .NET SDK
-        // does, and this is the knob for it.
-        DisableMD5Stream = true,
     });
     return Results.Ok(new { bucket, key, bytes });
 });

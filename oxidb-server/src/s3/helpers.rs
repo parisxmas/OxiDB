@@ -1,19 +1,12 @@
 use std::collections::HashMap;
 
-pub fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFFFFFF;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xEDB88320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
+use md5::{Digest, Md5};
+
+/// Hex MD5 — the form S3 uses for every ETag it hands out.
+pub fn md5_hex(data: &[u8]) -> String {
+    Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
+
 
 pub fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -184,9 +177,10 @@ mod tests {
     }
 
     #[test]
-    fn test_crc32() {
-        let data = b"hello world";
-        let c = crc32(data);
-        assert_eq!(format!("{:08x}", c), "0d4a1185");
+    fn md5_hex_matches_the_known_vector() {
+        // The canonical MD5 of "hello world" — if this drifts, every S3 client
+        // that verifies an ETag starts reporting corrupted uploads.
+        assert_eq!(md5_hex(b"hello world"), "5eb63bbbe01eeed093cb22bb8f5acdc3");
+        assert_eq!(md5_hex(b"").len(), 32, "even an empty object has a 32-char ETag");
     }
 }

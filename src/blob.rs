@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use md5::{Digest, Md5};
 
 use crate::crypto::EncryptionKey;
 use crate::error::{Error, Result};
@@ -586,6 +586,26 @@ impl BlobStore {
         content_type: &str,
         metadata: HashMap<String, String>,
     ) -> Result<ObjectMeta> {
+        self.put_object_with_etag(bucket, key, data, content_type, metadata, None)
+    }
+
+    /// `put_object`, but the caller supplies the ETag.
+    ///
+    /// Only multipart needs this. S3 does not define a completed multipart
+    /// object's ETag as the MD5 of the object — it is the MD5 of the
+    /// concatenated part MD5s, suffixed `-<partcount>`, and that is not
+    /// recoverable from the assembled bytes once the part boundaries are gone.
+    /// The tag has to persist, not just be returned: clients keep it from
+    /// CompleteMultipartUpload and send it back as `If-Match`.
+    pub fn put_object_with_etag(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: HashMap<String, String>,
+        etag_override: Option<String>,
+    ) -> Result<ObjectMeta> {
         Self::validate_bucket_name(bucket)?;
         // Auto-create bucket if it doesn't exist
         std::fs::create_dir_all(self.bucket_path(bucket))?;
@@ -605,8 +625,20 @@ impl BlobStore {
         }; // outer lock released — only this bucket is locked below
 
         // Phase 1: expensive work outside any lock (hash, encrypt, write temp files)
-        let hash = Sha256::digest(data);
-        let etag: String = hash.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        //
+        // S3 defines a single-part object's ETag as the hex MD5 of its bytes, and
+        // real clients enforce that: the AWS SDK for .NET re-computes the MD5 of
+        // what it sent and throws when the response disagrees. This used to be the
+        // first 16 bytes of a SHA-256, which is the same SHAPE as an MD5 — 32 hex
+        // characters — so clients could not tell it apart and simply concluded the
+        // upload had corrupted. A tag that looks like an MD5 and isn't is worse
+        // than one that looks like neither.
+        //
+        // MD5 is broken for signatures; an ETag is not one. It identifies bytes.
+        // Callers who want an integrity guarantee want a checksum, not this.
+        let etag: String = etag_override.unwrap_or_else(|| {
+            Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+        });
         let created_at = now_rfc3339();
 
         // Compression first (so encryption — if any — operates on the
@@ -670,7 +702,7 @@ impl BlobStore {
         // Phase 2b: renames outside any lock. Two distinct concurrent
         // writers to the SAME key would race here, but that case is
         // effectively impossible for content-addressed callers (the
-        // key is a sha256 of the data → identical bytes → identical
+        // key is the etag (an MD5 of the data) → identical bytes → identical
         // result). Mismatched keys can't collide on id because the
         // counter increment under the lock above guarantees uniqueness.
         //
@@ -952,6 +984,10 @@ mod tests {
         assert_eq!(meta.size, 11);
         assert_eq!(meta.content_type, "text/plain");
         assert!(!meta.etag.is_empty());
+        // S3 defines it as the hex MD5 of the bytes, and clients enforce that —
+        // the AWS SDK for .NET recomputes it and throws on a mismatch.
+        assert_eq!(meta.etag, format!("{:x}", Md5::digest(data)));
+        assert_eq!(meta.etag.len(), 32, "an ETag is 32 hex characters");
 
         let (got_data, got_meta) = store.get_object("docs", "hello.txt").unwrap();
         assert_eq!(got_data, data);
