@@ -26,6 +26,9 @@ builder.Services.AddSingleton<IAmazonS3>(_ => new AmazonS3Client(
     }));
 builder.Services.AddSingleton<OxiConnection>();
 builder.Services.AddHostedService<Retention>();
+builder.Services.AddHostedService<Paperwork>();
+
+const string CertBucket = Paperwork.Bucket;
 
 var app = builder.Build();
 
@@ -109,17 +112,19 @@ app.MapGet("/events/{device}", async (string device, OxiConnection oxi, int? lim
 app.MapPost("/certificate/{shipmentId:int}", async (
     int shipmentId, ColdChainDb db, IAmazonS3 s3, HttpRequest req) =>
 {
-    var shipment = await db.Shipments.FindAsync(shipmentId);
+    var shipment = await db.Shipments
+        .Include(s => s.Customer).Include(s => s.Excursions)
+        .FirstOrDefaultAsync(s => s.Id == shipmentId);
     if (shipment is null) return Results.NotFound();
 
     using var body = new MemoryStream();
     await req.Body.CopyToAsync(body);
     if (body.Length == 0)
-        body.Write(Encoding.UTF8.GetBytes($"CERTIFICATE OF CONFORMITY\nShipment {shipment.Reference}\nIssued {DateTime.UtcNow:O}\n"));
+        body.Write(Encoding.UTF8.GetBytes(Certificate.For(shipment)));
     body.Position = 0;
     var bytes = body.Length; // read it before the SDK disposes the stream
 
-    const string bucket = "coldchain-certificates";
+    const string bucket = CertBucket;
     try { await s3.PutBucketAsync(bucket); } catch (AmazonS3Exception) { /* exists */ }
 
     var key = $"{shipment.Reference}/certificate.txt";
@@ -186,6 +191,65 @@ app.MapGet("/audit/{shipmentId:int}", async (
             Certificate = certificate ?? "not filed",
         },
     });
+});
+
+// ── S3 + full-text search: the paperwork, and finding it again. ────────────
+//
+// The engine indexes an object's TEXT when it is PUT — nothing here asks it to.
+// So the same binary that holds the readings can answer "which certificates
+// mention Nordfresh", over documents that were only ever handed to an S3 client.
+// That is the half of compliance that is not numbers.
+app.MapGet("/documents", async (IAmazonS3 s3) =>
+{
+    try
+    {
+        var r = await s3.ListObjectsV2Async(new ListObjectsV2Request { BucketName = CertBucket });
+        return Results.Ok(r.S3Objects
+            .OrderBy(o => o.Key)
+            .Select(o => new { key = o.Key, size = o.Size, at = o.LastModified, etag = o.ETag?.Trim('"') }));
+    }
+    catch (AmazonS3Exception) { return Results.Ok(Array.Empty<object>()); }
+});
+
+app.MapGet("/documents/search", async (string q, OxiConnection oxi) =>
+{
+    if (string.IsNullOrWhiteSpace(q)) return Results.Ok(Array.Empty<object>());
+
+    // The engine's own index — TF-IDF, with snippets around the hit. Extracting
+    // text is expensive, so highlight is opt-in and we opt in: a compliance
+    // search that returns filenames is not an answer.
+    var r = await oxi.ReadAsync(c => c.ExecRawAsync(new Dictionary<string, object?>
+    {
+        ["cmd"] = "search",
+        ["query"] = q,
+        ["bucket"] = CertBucket,
+        ["limit"] = 10,
+        ["highlight"] = true,
+    }));
+
+    if (r.ValueKind != JsonValueKind.Array) return Results.Ok(Array.Empty<object>());
+    return Results.Ok(r.EnumerateArray().Select(h => new
+    {
+        key = h.TryGetProperty("key", out var k) ? k.GetString() : null,
+        score = h.TryGetProperty("score", out var sc) ? Math.Round(sc.GetDouble(), 3) : 0,
+        // The engine calls them "highlights", and wraps the matched terms in
+        // <mark>. Guessing "snippets" got a silently empty list — the search
+        // worked and looked resultless.
+        snippets = h.TryGetProperty("highlights", out var sn) && sn.ValueKind == JsonValueKind.Array
+            ? sn.EnumerateArray().Select(x => x.GetString()).ToArray()
+            : [],
+    }));
+});
+
+app.MapGet("/documents/{*key}", async (string key, IAmazonS3 s3) =>
+{
+    try
+    {
+        using var o = await s3.GetObjectAsync(CertBucket, key);
+        using var sr = new StreamReader(o.ResponseStream);
+        return Results.Text(await sr.ReadToEndAsync());
+    }
+    catch (AmazonS3Exception) { return Results.NotFound(); }
 });
 
 // ── What the two processes cost. ───────────────────────────────────────────
