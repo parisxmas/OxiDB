@@ -25,7 +25,7 @@ public static class Seed
                 ["cmd"] = "create_ttl_index",
                 ["collection"] = "readings",
                 ["field"] = "_at",
-                ["expireAfterSeconds"] = 7 * 24 * 3600,
+                ["expireAfterSeconds"] = 2 * 24 * 3600,   // 2 days: the page shows the last few
             });
         }
 

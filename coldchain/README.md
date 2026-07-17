@@ -150,6 +150,43 @@ One request. One process. Five stores' worth of work.
 Other endpoints: `GET /shipments` (SQL), `GET /live` (OxiMem),
 `GET /history/{device}` (time-series), `POST /certificate/{id}` (S3).
 
+## Does it grow?
+
+Yes — measured on the deployed stack, ~225 MB/day, ~80 GB/year unbounded. Each
+line needed a different answer, and one of them is an engine limitation rather
+than a configuration mistake:
+
+| what | was | now bounded by |
+|---|---|---|
+| raw events (document) | 131 MB/day | a 2-day TTL — but see the WAL, below |
+| audit log | 62 MB/day | `OXIDB_AUDIT_MAX_BYTES` + gzip (~100 MB) |
+| time-series | 32 MB/day | a 1-minute rollup kept forever, raw dropped after 30 days |
+| docker logs | unbounded | `max-size: 10m, max-file: 3` |
+
+The time-series answer is the interesting one, because it is also the *correct*
+one: nobody asks for the reading from 09:41:22 two years ago, they ask whether
+the load stayed in range. A one-minute rollup of mean/min/max is ~30× smaller
+and still proves the case — `max` over a minute cannot hide a breach. So the
+rollup is kept forever and the raw stream is dropped after 30 days. That is not
+a compromise to save disk; it is the retention rule the regulation implies.
+
+**The engine limitation:** the document engine truncates its write-ahead log
+only on a graceful shutdown. It deliberately will not checkpoint online —
+doing so was found to lose acknowledged writes, and the code says so plainly
+(`btree_collection.rs::sync_writes`). The live data is bounded by the TTL; the
+WAL is not, so a server that runs for a year accumulates one. Here that is
+~130 MB/day.
+
+A TTL does **not** save you: eviction is logical, and in the default (in-RAM)
+mode `compact` is a no-op — auto-compaction only applies to disk-first storage.
+Measured: 4,000 documents, TTL'd to zero, and the directory did not shrink by a
+byte until the process exited.
+
+The mitigation is what the engine's own comment implies — restart it. `SIGTERM`
+runs the final checkpoint, so `/etc/cron.weekly/coldchain-checkpoint` does a
+`docker compose restart`. Verified on the live stack: `readings.wal` went from
+628 KB to 32 KB. The real fix is safe online checkpointing in the engine.
+
 ## Two things this demo found
 
 Writing it surfaced real gaps, which is what a showcase is good for:

@@ -25,6 +25,7 @@ builder.Services.AddSingleton<IAmazonS3>(_ => new AmazonS3Client(
         AuthenticationRegion = "us-east-1",
     }));
 builder.Services.AddSingleton(_ => OxiDbTcpClient.ConnectAsync(Endpoints.Host, Endpoints.Tcp).Result);
+builder.Services.AddHostedService<Retention>();
 
 var app = builder.Build();
 

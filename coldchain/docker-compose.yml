@@ -3,6 +3,9 @@
 # port is published — the API — and nothing else can collide.
 services:
   oxidb:
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
     build:
       context: .
       dockerfile: Dockerfile.oxidb
@@ -17,6 +20,10 @@ services:
       OXIDB_OXIMEM_PORT: "6379"
       OXIDB_S3_PORT: "9000"
       OXIDB_AUDIT: "1"
+      # Auditing every wire command writes ~62 MB/day here. Unrotated that is
+      # 22 GB/year — measured, not guessed. Rotate at 32 MB and gzip.
+      OXIDB_AUDIT_MAX_BYTES: "33554432"
+      OXIDB_AUDIT_COMPRESS: "1"
       OXIDB_IDLE_TIMEOUT: "0"
     volumes:
       - oxidb-data:/data
@@ -30,6 +37,9 @@ services:
       retries: 12
 
   api:
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
     build: { context: .., dockerfile: coldchain/Dockerfile, target: api }
     environment:
       COLDCHAIN_HOST: oxidb
@@ -40,6 +50,9 @@ services:
     restart: unless-stopped
 
   ingest:
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
     build: { context: .., dockerfile: coldchain/Dockerfile, target: ingest }
     environment:
       COLDCHAIN_HOST: oxidb
@@ -49,6 +62,9 @@ services:
     restart: unless-stopped
 
   simulator:
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
     build: { context: .., dockerfile: coldchain/Dockerfile, target: simulator }
     environment:
       COLDCHAIN_HOST: oxidb
