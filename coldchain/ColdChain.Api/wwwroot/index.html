@@ -44,7 +44,18 @@
   #events b { color:var(--text); font-weight:500 }
   /* The fields no other engine has anywhere — the reason this one exists. */
   #events u { color:var(--accent); text-decoration:none }
-  #chart { background:var(--card); border:1px solid var(--line); border-radius:10px; width:100%; height:260px }
+  .swatch {
+  display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+  margin-right: 6px; vertical-align: middle;
+}
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 10px; }
+.leg {
+  font: 13px ui-monospace, monospace; color: var(--dim); cursor: pointer;
+  padding: 2px 7px; border-radius: 5px; border: 1px solid transparent;
+}
+.leg:hover { color: var(--fg); }
+.leg.on { color: var(--fg); border-color: var(--line); background: rgba(255,255,255,.03); }
+#chart { background:var(--card); border:1px solid var(--line); border-radius:10px; width:100%; height:260px }
   .essay { border-top:1px solid var(--line); margin-top:8px; padding:34px 26px 60px }
   .essay-in { max-width:760px; margin:0 auto; color:#b8c0cc; font-size:16px; line-height:1.72 }
   .essay h3 { color:var(--text); font-size:17px; margin:30px 0 8px; font-weight:620 }
@@ -77,8 +88,9 @@
   </section>
 
   <section>
-    <h2>Temperature — <em>time-series engine</em> <span id="chartFor"></span> <span style="color:var(--dim);text-transform:none;letter-spacing:0">— click a probe</span></h2>
+    <h2>Temperature — <em>time-series engine</em> <span id="chartFor"></span> <span style="color:var(--dim);text-transform:none;letter-spacing:0">— all six probes; click one for its contract</span></h2>
     <canvas id="chart"></canvas>
+    <div id="legend" class="legend"></div>
   </section>
 
   <section>
@@ -224,7 +236,18 @@ production use. This is a demonstration, not a reference deployment.</p>
 <script>
 const probes = {};       // device → last reading
 const limits = {};       // device → contracted range, from the SQL panel
-let selected = null;     // which probe the chart is showing
+let selected = null;     // which probe the chart emphasises
+const series = {};       // device → history, for the chart
+
+// One colour per probe, assigned by sorted position so a probe keeps its
+// colour across reloads. Red is deliberately absent: it means breach.
+const WIRE = ['#e2784a', '#5aa9e6', '#4ecdc4', '#e6b800', '#c77dff', '#f78fb3'];
+const colourOf = id => {
+  // Fall back to the id's own ordering: /shipments may not have answered yet,
+  // and an undefined stroke paints nothing at all.
+  const i = Object.keys(limits).sort().indexOf(id);
+  return WIRE[(i < 0 ? Object.keys(probes).sort().indexOf(id) : i) % WIRE.length] || WIRE[0];
+};
 
 const el = id => document.getElementById(id);
 const fmt = n => (n > 0 ? '+' : '') + n.toFixed(2);
@@ -260,18 +283,27 @@ function renderProbes() {
     if (!selected) pick(id);
     return `<div class="probe ${breach ? 'breach' : ''} ${stale ? 'stale' : ''}"
                  onclick="pick('${id}')" style="cursor:pointer">
-      <div class="id">${id} · ${p.truck}</div>
+      <div class="id"><span class="swatch" style="background:${colourOf(id)}"></span>${id} · ${p.truck}</div>
       <div class="t">${p.celsius.toFixed(1)}<span style="font-size:14px;color:var(--dim)">°C</span></div>
       <div class="meta">${lim ? `limit ${lim.lo}..${lim.hi}` : 'unassigned'} · bat ${p.battery == null ? '—' : p.battery + '%'}</div>
     </div>`;
   }).join('');
 }
 
+function renderLegend() {
+  const ids = Object.keys(limits).sort();
+  el('legend').innerHTML = ids.map(id => `
+    <span class="leg ${id === selected ? 'on' : ''}" onclick="pick('${id}')">
+      <span class="swatch" style="background:${colourOf(id)}"></span>${id}
+    </span>`).join('');
+}
+
 function pick(id) {
   selected = id;
+  renderLegend();
   el('chartFor').textContent = '· ' + id;
   el('eventsFor').textContent = '· ' + id;
-  loadChart(); loadEvents();
+  draw(); loadEvents();
 }
 
 // ── Document panel ─────────────────────────────────────────────────────────
@@ -296,32 +328,48 @@ async function loadEvents() {
 
 // ── Time-series panel ──────────────────────────────────────────────────────
 async function loadChart() {
-  if (!selected) return;
-  const pts = await (await fetch(`/history/${selected}?minutes=15&bucketMs=5000`)).json();
-  draw(pts, limits[selected]);
+  const ids = Object.keys(limits).sort();
+  if (!ids.length) return;
+  // Every probe, in parallel — the engine downsamples each to ~180 points, so
+  // six series is still a small answer.
+  const got = await Promise.all(ids.map(id =>
+    fetch(`/history/${id}?minutes=15&bucketMs=5000`).then(r => r.json()).catch(() => [])));
+  ids.forEach((id, i) => series[id] = got[i]);
+  draw();
 }
 
-function draw(pts, lim) {
+function draw() {
   const c = el('chart'), dpr = devicePixelRatio || 1;
   c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
   const g = c.getContext('2d'); g.scale(dpr, dpr);
   const W = c.clientWidth, H = c.clientHeight, pad = 34;
   g.clearRect(0, 0, W, H);
-  if (!pts.length) {
+
+  const ids = Object.keys(series).filter(id => series[id]?.length);
+  if (!ids.length) {
     g.fillStyle = '#8b95a5'; g.font = '14px system-ui';
     g.fillText('no readings yet — start the simulator', pad, H / 2);
     return;
   }
 
-  const vals = pts.map(p => p.celsius);
-  let lo = Math.min(...vals, lim ? lim.lo : Infinity);
-  let hi = Math.max(...vals, lim ? lim.hi : -Infinity);
-  const m = (hi - lo) * 0.2 || 1; lo -= m; hi += m;
-  const x = i => pad + (i / Math.max(1, pts.length - 1)) * (W - pad * 2);
+  // One scale for every probe. The fleet runs two contracts — frozen at -20
+  // and chilled at +4 — so the series settle into two bands on their own, and
+  // that separation is the point: you can see at a glance which is which.
+  const all = ids.flatMap(id => series[id].map(p => p.celsius));
+  const lim = limits[selected];
+  let lo = Math.min(...all, lim ? lim.lo : Infinity);
+  let hi = Math.max(...all, lim ? lim.hi : -Infinity);
+  const m = (hi - lo) * 0.1 || 1; lo -= m; hi += m;
+
+  // Time, not point index: the probes do not report in lockstep and their
+  // series are different lengths, so indexing would slide them against each
+  // other and invent a story the data does not tell.
+  const times = ids.flatMap(id => series[id].map(p => +new Date(p.at)));
+  const t0 = Math.min(...times), t1 = Math.max(...times);
+  const x = t => pad + ((t - t0) / Math.max(1, t1 - t0)) * (W - pad * 2);
   const y = v => H - pad - ((v - lo) / (hi - lo)) * (H - pad * 2);
 
-  // The contracted band: everything inside is compliant, and the eye should
-  // see a breach without reading a number.
+  // The band belongs to ONE contract, so it can only be the selected probe's.
   if (lim) {
     g.fillStyle = 'rgba(130,169,138,.09)';
     g.fillRect(pad, y(lim.hi), W - pad * 2, y(lim.lo) - y(lim.hi));
@@ -332,18 +380,32 @@ function draw(pts, lim) {
     g.setLineDash([]);
   }
 
-  g.strokeStyle = '#e2784a'; g.lineWidth = 2; g.beginPath();
-  pts.forEach((p, i) => i ? g.lineTo(x(i), y(p.celsius)) : g.moveTo(x(i), y(p.celsius)));
-  g.stroke();
-
-  // Mark the readings that actually broke the contract.
-  if (lim) {
-    g.fillStyle = '#d96b6b';
-    pts.forEach((p, i) => {
-      if (p.celsius < lim.lo || p.celsius > lim.hi) {
-        g.beginPath(); g.arc(x(i), y(p.celsius), 3, 0, 7); g.fill();
-      }
+  // Unselected probes first, so the selected one is never drawn under another.
+  for (const id of [...ids.filter(i => i !== selected), ...ids.filter(i => i === selected)]) {
+    const on = id === selected;
+    g.strokeStyle = colourOf(id);
+    // Faded enough that the selected probe still reads as selected, solid
+    // enough that "show me all six" actually shows six.
+    g.globalAlpha = on ? 1 : 0.8;
+    g.lineWidth = on ? 2.6 : 1.6;
+    g.beginPath();
+    series[id].forEach((p, i) => {
+      const px = x(+new Date(p.at)), py = y(p.celsius);
+      i ? g.lineTo(px, py) : g.moveTo(px, py);
     });
+    g.stroke();
+    g.globalAlpha = 1;
+  }
+
+  // Breach marks, for the selected probe only — a reading is a breach against
+  // ITS contract, and -18°C is perfect for one probe and catastrophic for another.
+  if (lim && selected && series[selected]) {
+    g.fillStyle = '#d96b6b';
+    for (const p of series[selected]) {
+      if (p.celsius < lim.lo || p.celsius > lim.hi) {
+        g.beginPath(); g.arc(x(+new Date(p.at)), y(p.celsius), 3, 0, 7); g.fill();
+      }
+    }
   }
 
   g.fillStyle = '#8b95a5'; g.font = '12.5px ui-monospace';
@@ -364,7 +426,7 @@ es.onmessage = e => {
   renderProbes();
 };
 
-loadShipments().then(renderProbes);
+loadShipments().then(() => { renderLegend(); renderProbes(); loadChart(); });
 setInterval(loadShipments, 5000);   // breach counts come from SQL
 setInterval(loadChart, 3000);
 setInterval(loadEvents, 3000);
