@@ -830,7 +830,14 @@ fn handle_oximem_client(stream: TcpStream, store: &oximem::OxiMemStore, log: boo
                             items[1..].iter().filter_map(|a| a.as_str()).collect();
                         eprintln!("[oximem] << SUBSCRIBE {}", channels.join(" "));
                     }
-                    handle_oximem_subscribe(&stream, store, &mut reader, &mut writer, &items[1..], is_pattern);
+                    handle_oximem_subscribe(
+                        &stream,
+                        store,
+                        &mut reader,
+                        &mut writer,
+                        &items[1..],
+                        is_pattern,
+                    );
                     return;
                 }
             }
@@ -936,7 +943,11 @@ fn handle_oximem_subscribe(
                 store.subscribe(ch)
             };
             receivers.push((ch.to_string(), is_pattern, rx));
-            let kind = if is_pattern { "psubscribe" } else { "subscribe" };
+            let kind = if is_pattern {
+                "psubscribe"
+            } else {
+                "subscribe"
+            };
             let msg = resp::array(vec![
                 resp::bulk_string(kind),
                 resp::bulk_string(ch),
@@ -986,8 +997,10 @@ fn handle_oximem_subscribe(
             Ok(value) => {
                 if let resp::RespValue::Array(ref items) = value {
                     if let Some(cmd) = items.first().and_then(|a| a.as_str()) {
-                        if cmd.eq_ignore_ascii_case("SUBSCRIBE") || cmd.eq_ignore_ascii_case("PSUBSCRIBE") {
-                    let is_pattern = cmd.eq_ignore_ascii_case("PSUBSCRIBE");
+                        if cmd.eq_ignore_ascii_case("SUBSCRIBE")
+                            || cmd.eq_ignore_ascii_case("PSUBSCRIBE")
+                        {
+                            let is_pattern = cmd.eq_ignore_ascii_case("PSUBSCRIBE");
                             for arg in &items[1..] {
                                 if let Some(ch) = arg.as_str() {
                                     let rx = if is_pattern {
@@ -999,7 +1012,11 @@ fn handle_oximem_subscribe(
                                         store.subscribe(ch)
                                     };
                                     receivers.push((ch.to_string(), is_pattern, rx));
-                                    let kind = if is_pattern { "psubscribe" } else { "subscribe" };
+                                    let kind = if is_pattern {
+                                        "psubscribe"
+                                    } else {
+                                        "subscribe"
+                                    };
                                     let msg = resp::array(vec![
                                         resp::bulk_string(kind),
                                         resp::bulk_string(ch),
@@ -1012,9 +1029,7 @@ fn handle_oximem_subscribe(
                         } else if cmd.eq_ignore_ascii_case("PUNSUBSCRIBE") {
                             for arg in &items[1..] {
                                 if let Some(pat) = arg.as_str() {
-                                    receivers.retain(|(name, is_pat, _)| {
-                                        !(*is_pat && name == pat)
-                                    });
+                                    receivers.retain(|(name, is_pat, _)| !(*is_pat && name == pat));
                                     store.punsubscribe(pat);
                                     let msg = resp::array(vec![
                                         resp::bulk_string("punsubscribe"),
@@ -1076,7 +1091,69 @@ fn handle_oximem_subscribe(
     }
 }
 
+/// Usage text for `--help`. The server is configured entirely by environment
+/// variable; this lists the ones worth knowing, not every knob.
+fn print_help() {
+    println!(
+        "\
+oxidb-server {version} — document, SQL and time-series engines in one binary
+
+USAGE:
+    oxidb-server [--verbose]
+
+    The server takes no positional arguments; it is configured by environment
+    variable. It runs in the foreground and serves until terminated.
+
+FLAGS:
+    -V, --version    Print version and exit
+    -h, --help       Print this help and exit
+        --verbose    Verbose startup logging
+
+CORE:
+    OXIDB_ADDR             listen address           (default 127.0.0.1:4444)
+    OXIDB_DATA             data directory           (default ./oxidb_data)
+    OXIDB_POOL_SIZE        worker threads           (default 4)
+    OXIDB_IDLE_TIMEOUT     idle disconnect secs     (default 30, 0 = never)
+
+ENGINES (off unless set):
+    OXIDB_SQL=1            enable the SQL engine
+    OXIDB_SQL_DATA         SQL data dir             (default $OXIDB_DATA/sql)
+    OXIDB_TSDB=1           enable the time-series engine
+    OXIDB_TSDB_DATA        TSDB data dir            (default $OXIDB_DATA/tsdb)
+
+PROTOCOLS (off unless set):
+    OXIDB_OXIMEM_PORT      Redis-compatible (RESP) listener
+    OXIDB_MQTT_PORT        MQTT 3.1.1 broker listener
+    OXIDB_S3_PORT          S3-compatible HTTP listener
+    OXIDB_HTTP_PORT        REST listener (also serves GET /metrics)
+    OXIDB_WS_PORT          WebSocket listener
+
+OPERATIONS:
+    OXIDB_AUDIT=1          audit log
+    OXIDB_SLOW_QUERY_MS    record slower commands into _profile
+    OXIDB_PITR=1           point-in-time recovery (WAL archiving)
+    OXIDB_NODE_ID          run in Raft cluster mode
+
+Docs: https://oxidb.baltavista.com",
+        version = env!("CARGO_PKG_VERSION"),
+    );
+}
+
 fn main() {
+    // `--version` / `--help` short-circuit before any startup work. Everything
+    // else is configured by environment variable; unknown arguments stay
+    // ignored, exactly as before, so existing deployments are unaffected.
+    if let Some(flag) = env::args()
+        .skip(1)
+        .find(|a| matches!(a.as_str(), "--version" | "-V" | "--help" | "-h"))
+    {
+        match flag.as_str() {
+            "--version" | "-V" => println!("oxidb-server {}", env!("CARGO_PKG_VERSION")),
+            _ => print_help(),
+        }
+        return;
+    }
+
     // Anchor the process-stats clock at startup — PROC_STATS is lazy, and
     // without this the /metrics uptime would measure "since first scrape".
     std::sync::LazyLock::force(&oxidb_server::proc_stats::PROC_STATS);
@@ -1441,11 +1518,16 @@ fn main() {
                     let _ = store.sweep_expired();
                     let counts = store.key_counts();
                     let m = &oxidb_server::metrics::METRICS;
-                    m.oximem_keys_strings.store(counts[0], std::sync::atomic::Ordering::Relaxed);
-                    m.oximem_keys_hashes.store(counts[1], std::sync::atomic::Ordering::Relaxed);
-                    m.oximem_keys_lists.store(counts[2], std::sync::atomic::Ordering::Relaxed);
-                    m.oximem_keys_sets.store(counts[3], std::sync::atomic::Ordering::Relaxed);
-                    m.oximem_keys_zsets.store(counts[4], std::sync::atomic::Ordering::Relaxed);
+                    m.oximem_keys_strings
+                        .store(counts[0], std::sync::atomic::Ordering::Relaxed);
+                    m.oximem_keys_hashes
+                        .store(counts[1], std::sync::atomic::Ordering::Relaxed);
+                    m.oximem_keys_lists
+                        .store(counts[2], std::sync::atomic::Ordering::Relaxed);
+                    m.oximem_keys_sets
+                        .store(counts[3], std::sync::atomic::Ordering::Relaxed);
+                    m.oximem_keys_zsets
+                        .store(counts[4], std::sync::atomic::Ordering::Relaxed);
                 }
             });
         }
@@ -1458,7 +1540,11 @@ fn main() {
             let path = std::path::Path::new(&data_dir).join("_oximem.snap");
             if let Ok(data) = std::fs::read_to_string(&path) {
                 shared_store.load_snapshot_json(&data);
-                server_log!(state, GelfLevel::Notice, "OxiMem snapshot loaded".to_string());
+                server_log!(
+                    state,
+                    GelfLevel::Notice,
+                    "OxiMem snapshot loaded".to_string()
+                );
             }
             let store = Arc::clone(&shared_store);
             std::thread::spawn(move || {
