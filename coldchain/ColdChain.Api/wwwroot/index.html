@@ -1,0 +1,200 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ColdChain — one OxiDB process</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg:#0a0c10; --card:#14181f; --line:#242b36; --text:#e7e9ed;
+    --dim:#8b95a5; --accent:#e2784a; --ok:#82a98a; --bad:#d96b6b; --warn:#d6b14a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:15px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+  header { padding:22px 26px; border-bottom:1px solid var(--line); }
+  h1 { margin:0; font-size:19px; font-weight:650; }
+  h1 span { color:var(--accent) }
+  .sub { color:var(--dim); font-size:13px; margin-top:4px }
+  .wrap { padding:22px 26px; display:grid; gap:22px; max-width:1200px; margin:0 auto }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.07em;
+       color:var(--dim); margin:0 0 10px; font-family:var(--mono); font-weight:500 }
+  /* Each panel names the engine that answered it — the whole point. */
+  h2 em { font-style:normal; color:var(--accent) }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:12px }
+  .probe { background:var(--card); border:1px solid var(--line); border-radius:10px;
+           padding:13px 14px; border-left:3px solid var(--ok); transition:border-color .2s }
+  .probe.breach { border-left-color:var(--bad) }
+  .probe.stale  { border-left-color:var(--dim); opacity:.55 }
+  .probe .id { font-family:var(--mono); font-size:12px; color:var(--dim) }
+  .probe .t  { font-size:26px; font-weight:600; margin:3px 0; font-variant-numeric:tabular-nums }
+  .probe.breach .t { color:var(--bad) }
+  .probe .meta { font-size:11.5px; color:var(--dim); font-family:var(--mono) }
+  table { width:100%; border-collapse:collapse; background:var(--card);
+          border:1px solid var(--line); border-radius:10px; overflow:hidden }
+  th,td { text-align:left; padding:9px 13px; border-bottom:1px solid var(--line); font-size:13.5px }
+  th { color:var(--dim); font-weight:500; font-size:11.5px; text-transform:uppercase; letter-spacing:.05em }
+  tr:last-child td { border-bottom:none }
+  td.num { text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums }
+  .pill { font-family:var(--mono); font-size:11px; padding:2px 7px; border-radius:20px;
+          background:rgba(130,169,138,.14); color:var(--ok) }
+  .pill.bad { background:rgba(217,107,107,.14); color:var(--bad) }
+  #chart { background:var(--card); border:1px solid var(--line); border-radius:10px; width:100%; height:230px }
+  .foot { color:var(--dim); font-size:12px; border-top:1px solid var(--line); padding:16px 26px }
+  .live { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--ok);
+          margin-right:6px; animation:p 2s infinite }
+  @keyframes p { 0%,100%{opacity:1} 50%{opacity:.25} }
+</style>
+
+<header>
+  <h1>Cold<span>Chain</span></h1>
+  <div class="sub"><span class="live"></span><span id="status">connecting…</span>
+    — every panel below is answered by a different engine in <strong>one</strong> oxidb-server process</div>
+</header>
+
+<div class="wrap">
+  <section>
+    <h2>Live probes — <em>OxiMem</em> (pub/sub → SSE; nothing is polling)</h2>
+    <div class="grid" id="probes"></div>
+  </section>
+
+  <section>
+    <h2>Temperature — <em>time-series engine</em> <span id="chartFor"></span> <span style="color:var(--dim);text-transform:none;letter-spacing:0">— click a probe</span></h2>
+    <canvas id="chart"></canvas>
+  </section>
+
+  <section>
+    <h2>Shipments — <em>SQL engine</em> via EF Core (joined to each customer's contract)</h2>
+    <table id="shipments">
+      <thead><tr><th>Reference</th><th>Customer</th><th>Contract</th><th>Device</th>
+        <th class="num">Breaches</th><th class="num">Penalty</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+</div>
+
+<div class="foot">
+  MQTT in · time-series, document, OxiMem and SQL out · S3 holds the certificates.
+  Replacing this would be Mosquitto + InfluxDB + Redis + PostgreSQL + MongoDB + MinIO.
+</div>
+
+<script>
+const probes = {};       // device → last reading
+const limits = {};       // device → contracted range, from the SQL panel
+let selected = null;     // which probe the chart is showing
+
+const el = id => document.getElementById(id);
+const fmt = n => (n > 0 ? '+' : '') + n.toFixed(2);
+
+// ── SQL panel ──────────────────────────────────────────────────────────────
+async function loadShipments() {
+  const rows = await (await fetch('/shipments')).json();
+  el('shipments').tBodies[0].innerHTML = rows.map(s => `
+    <tr>
+      <td>${s.reference}</td><td>${s.customer}</td>
+      <td><code>${s.contract}</code></td>
+      <td><code>${s.deviceId}</code></td>
+      <td class="num">${s.breaches
+        ? `<span class="pill bad">${s.breaches}</span>` : `<span class="pill">0</span>`}</td>
+      <td class="num">${s.penalty ? s.penalty.toLocaleString() : '—'}</td>
+    </tr>`).join('');
+  // The contract is what makes a reading a breach — the live tiles need it.
+  for (const s of rows) {
+    const [lo, hi] = s.contract.replace('°C', '').split('..').map(Number);
+    limits[s.deviceId] = { lo, hi };
+  }
+}
+
+// ── OxiMem panel: rendered from the SSE feed ───────────────────────────────
+function renderProbes() {
+  const ids = Object.keys(probes).sort();
+  el('probes').innerHTML = ids.map(id => {
+    const p = probes[id], lim = limits[id];
+    const breach = lim && (p.celsius < lim.lo || p.celsius > lim.hi);
+    // A probe that stops reporting is unknown, not fine — same rule as the
+    // TTL on its OxiMem key.
+    const stale = Date.now() - p.ts > 15000;
+    if (!selected) { selected = id; el('chartFor').textContent = '· ' + id; loadChart(); }
+    return `<div class="probe ${breach ? 'breach' : ''} ${stale ? 'stale' : ''}"
+                 onclick="pick('${id}')" style="cursor:pointer">
+      <div class="id">${id} · ${p.truck}</div>
+      <div class="t">${p.celsius.toFixed(1)}<span style="font-size:14px;color:var(--dim)">°C</span></div>
+      <div class="meta">${lim ? `limit ${lim.lo}..${lim.hi}` : 'unassigned'} · bat ${p.battery}%</div>
+    </div>`;
+  }).join('');
+}
+
+function pick(id) { selected = id; el('chartFor').textContent = '· ' + id; loadChart(); }
+
+// ── Time-series panel ──────────────────────────────────────────────────────
+async function loadChart() {
+  if (!selected) return;
+  const pts = await (await fetch(`/history/${selected}?minutes=15&bucketMs=5000`)).json();
+  draw(pts, limits[selected]);
+}
+
+function draw(pts, lim) {
+  const c = el('chart'), dpr = devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr);
+  const W = c.clientWidth, H = c.clientHeight, pad = 34;
+  g.clearRect(0, 0, W, H);
+  if (!pts.length) {
+    g.fillStyle = '#8b95a5'; g.font = '13px system-ui';
+    g.fillText('no readings yet — start the simulator', pad, H / 2);
+    return;
+  }
+
+  const vals = pts.map(p => p.celsius);
+  let lo = Math.min(...vals, lim ? lim.lo : Infinity);
+  let hi = Math.max(...vals, lim ? lim.hi : -Infinity);
+  const m = (hi - lo) * 0.2 || 1; lo -= m; hi += m;
+  const x = i => pad + (i / Math.max(1, pts.length - 1)) * (W - pad * 2);
+  const y = v => H - pad - ((v - lo) / (hi - lo)) * (H - pad * 2);
+
+  // The contracted band: everything inside is compliant, and the eye should
+  // see a breach without reading a number.
+  if (lim) {
+    g.fillStyle = 'rgba(130,169,138,.09)';
+    g.fillRect(pad, y(lim.hi), W - pad * 2, y(lim.lo) - y(lim.hi));
+    g.strokeStyle = 'rgba(217,107,107,.5)'; g.setLineDash([4, 4]); g.lineWidth = 1;
+    for (const b of [lim.lo, lim.hi]) {
+      g.beginPath(); g.moveTo(pad, y(b)); g.lineTo(W - pad, y(b)); g.stroke();
+    }
+    g.setLineDash([]);
+  }
+
+  g.strokeStyle = '#e2784a'; g.lineWidth = 2; g.beginPath();
+  pts.forEach((p, i) => i ? g.lineTo(x(i), y(p.celsius)) : g.moveTo(x(i), y(p.celsius)));
+  g.stroke();
+
+  // Mark the readings that actually broke the contract.
+  if (lim) {
+    g.fillStyle = '#d96b6b';
+    pts.forEach((p, i) => {
+      if (p.celsius < lim.lo || p.celsius > lim.hi) {
+        g.beginPath(); g.arc(x(i), y(p.celsius), 3, 0, 7); g.fill();
+      }
+    });
+  }
+
+  g.fillStyle = '#8b95a5'; g.font = '11px ui-monospace';
+  g.fillText(hi.toFixed(1) + '°', 4, y(hi) + 4);
+  g.fillText(lo.toFixed(1) + '°', 4, y(lo) + 4);
+}
+
+// ── The live feed ──────────────────────────────────────────────────────────
+const es = new EventSource('/stream');
+es.onopen = () => el('status').textContent = 'live — readings arriving over MQTT';
+es.onerror = () => el('status').textContent = 'disconnected — is the ingest running?';
+es.onmessage = e => {
+  const r = JSON.parse(e.data);
+  probes[r.device] = r;
+  renderProbes();
+};
+
+loadShipments().then(renderProbes);
+setInterval(loadShipments, 5000);   // breach counts come from SQL
+setInterval(loadChart, 3000);
+setInterval(renderProbes, 2000);    // re-evaluate staleness
+addEventListener('resize', loadChart);
+</script>

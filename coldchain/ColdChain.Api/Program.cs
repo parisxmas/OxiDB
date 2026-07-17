@@ -28,7 +28,7 @@ builder.Services.AddSingleton(_ => OxiDbTcpClient.ConnectAsync(Endpoints.Host, E
 
 var app = builder.Build();
 
-app.MapGet("/", () => Results.Ok(new
+app.MapGet("/api", () => Results.Ok(new
 {
     demo = "ColdChain — one OxiDB process behind every engine",
     endpoints = new[]
@@ -164,5 +164,32 @@ app.MapGet("/audit/{shipmentId:int}", async (
         },
     });
 });
+
+// ── Live feed: OxiMem pub/sub → the browser. ───────────────────────────────
+//
+// Ingest PUBLISHes every reading to OxiMem; this relays that channel to the
+// page as Server-Sent Events. Nothing polls: the dashboard updates because the
+// sensor published, one hop away.
+app.MapGet("/stream", async (HttpContext ctx, IConnectionMultiplexer redis, CancellationToken ct) =>
+{
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache";
+    var sub = redis.GetSubscriber();
+    var queue = await sub.SubscribeAsync(RedisChannel.Literal("live.readings"));
+    try
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var msg = await queue.ReadAsync(ct);
+            await ctx.Response.WriteAsync($"data: {msg.Message}\n\n", ct);
+            await ctx.Response.Body.FlushAsync(ct);
+        }
+    }
+    catch (OperationCanceledException) { /* client went away */ }
+    finally { await sub.UnsubscribeAsync(RedisChannel.Literal("live.readings")); }
+});
+
+app.UseDefaultFiles();
+app.UseStaticFiles();
 
 app.Run();

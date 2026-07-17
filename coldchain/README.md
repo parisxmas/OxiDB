@@ -76,6 +76,23 @@ dotnet run --project ColdChain.Simulator
 dotnet run --project ColdChain.Api
 ```
 
+## The dashboard
+
+`dotnet run --project ColdChain.Api`, then open <http://localhost:5077>.
+
+Every panel names the engine that answered it, because that is the whole point:
+
+- **Live probes** — OxiMem. Ingest `PUBLISH`es each reading; the API relays that
+  channel to the page as Server-Sent Events. Nothing polls — a tile changes
+  because a sensor published, one hop away. A probe that goes quiet fades out
+  rather than showing a stale temperature, the same rule as the TTL on its key.
+- **Temperature** — the time-series engine, downsampled into 5-second buckets.
+  The contracted range is drawn as a band and the readings outside it are marked
+  in red, so a breach is visible without reading a number. Click any probe.
+- **Shipments** — the SQL engine through EF Core. The penalty column is the
+  reason this half is relational: the same breach costs 2,500 for the pharma
+  customer and 400 for the grocer, because it joins to *their* contract.
+
 ## The one request that needs all of it
 
 ```
