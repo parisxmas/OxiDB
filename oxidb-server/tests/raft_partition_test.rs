@@ -72,6 +72,12 @@ use oxidb_server::raft::types::{OxiRaft, TypeConfig};
 #[derive(Default)]
 struct Partitioner {
     blocked: Mutex<HashSet<(u64, u64)>>,
+    /// Edges where the request is DELIVERED but the reply is lost. Strictly
+    /// nastier than `blocked`: the callee acts on the RPC (records a vote,
+    /// appends entries) while the caller concludes it never happened. A
+    /// request/response wrapper cannot express this by refusing the call —
+    /// it has to make it and throw the answer away.
+    reply_lost: Mutex<HashSet<(u64, u64)>>,
 }
 
 impl Partitioner {
@@ -87,12 +93,30 @@ impl Partitioner {
         }
     }
 
+    /// Block ONE direction only: `to` stops hearing from `from`, while
+    /// `from` still hears `to`. Real networks fail this way (a dropped
+    /// inbound rule, a half-open NAT), and it is strictly nastier than a
+    /// clean split — the two ends disagree about whether the peer is alive.
+    fn cut_one_way(&self, from: u64, to: u64) {
+        self.blocked.lock().unwrap().insert((from, to));
+    }
+
     fn heal(&self) {
         self.blocked.lock().unwrap().clear();
+        self.reply_lost.lock().unwrap().clear();
+    }
+
+    /// `to` will act on `from`'s RPCs, but `from` never hears the answer.
+    fn lose_replies(&self, from: u64, to: u64) {
+        self.reply_lost.lock().unwrap().insert((from, to));
     }
 
     fn is_blocked(&self, from: u64, to: u64) -> bool {
         self.blocked.lock().unwrap().contains(&(from, to))
+    }
+
+    fn drops_reply(&self, from: u64, to: u64) -> bool {
+        self.reply_lost.lock().unwrap().contains(&(from, to))
     }
 }
 
@@ -142,6 +166,11 @@ impl RaftNetwork<TypeConfig> for PartitionedNetwork {
         if self.ctrl.is_blocked(self.from, self.to) {
             return Err(unreachable(self.from, self.to));
         }
+        if self.ctrl.drops_reply(self.from, self.to) {
+            // Deliver it for real — the peer acts on it — then lose the answer.
+            let _ = self.inner.append_entries(rpc, option).await;
+            return Err(unreachable(self.from, self.to));
+        }
         self.inner.append_entries(rpc, option).await
     }
 
@@ -156,6 +185,11 @@ impl RaftNetwork<TypeConfig> for PartitionedNetwork {
         if self.ctrl.is_blocked(self.from, self.to) {
             return Err(unreachable(self.from, self.to));
         }
+        if self.ctrl.drops_reply(self.from, self.to) {
+            // Deliver it for real — the peer acts on it — then lose the answer.
+            let _ = self.inner.install_snapshot(rpc, option).await;
+            return Err(unreachable(self.from, self.to));
+        }
         self.inner.install_snapshot(rpc, option).await
     }
 
@@ -165,6 +199,11 @@ impl RaftNetwork<TypeConfig> for PartitionedNetwork {
         option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
         if self.ctrl.is_blocked(self.from, self.to) {
+            return Err(unreachable(self.from, self.to));
+        }
+        if self.ctrl.drops_reply(self.from, self.to) {
+            // Deliver it for real — the peer acts on it — then lose the answer.
+            let _ = self.inner.vote(rpc, option).await;
             return Err(unreachable(self.from, self.to));
         }
         self.inner.vote(rpc, option).await
@@ -876,4 +915,209 @@ async fn bootstrap_without_an_addr_is_refused() {
 fn m_err(resp: &Value) -> String {
     resp["error"].as_str().unwrap_or_default().to_string()
         + resp["message"].as_str().unwrap_or_default()
+}
+
+// ── Asymmetric partitions ───────────────────────────────────────────────────
+//
+// A clean split cuts both directions; real networks are messier. One side of
+// an edge can fail on its own (a dropped inbound rule, a half-open NAT), and
+// then the two ends DISAGREE about whether the peer is alive — which is worse
+// than agreeing it is dead. Two shapes, both nastier than `cut`:
+//
+//   * **deaf** — a node receives nothing but sends fine. It hears no
+//     heartbeats, so it campaigns; its own RPCs work, so it can win.
+//   * **reply-loss disruptor** — its requests LAND (peers grant its votes and
+//     bump nothing) but it never hears the answers, so it can never win and
+//     campaigns forever at an ever-climbing term. This is the "disruptive
+//     server" of Raft §4.2.3, and the reason PreVote exists.
+//
+// What keeps the second one harmless here is leader stickiness: a follower
+// that heard from a live leader within the election timeout rejects a vote
+// request WITHOUT adopting its term. If that ever regresses, the healthy
+// nodes' terms would chase the disruptor's and the cluster would lose its
+// leader on every one of its campaigns — so that is what these assert.
+
+/// A node that receives nothing but sends fine must not cost availability.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn asymmetric_deaf_node_keeps_cluster_available() {
+    const N: u64 = 5;
+    const COLL: &str = "deaf";
+    let ctrl = Arc::new(Partitioner::default());
+    let (mut nodes, mut clients) = form_cluster(N, Arc::clone(&ctrl)).await;
+    let all: Vec<usize> = (0..N as usize).collect();
+    let mut acked: HashSet<i64> = HashSet::new();
+    let mut next_key: i64 = 0;
+
+    let leader_idx = wait_for_leader_among(&mut clients, &all, Duration::from_secs(10))
+        .await
+        .expect("leader");
+    let leader_id = nodes[leader_idx].node_id;
+    commit_writes(
+        &mut clients[leader_idx],
+        COLL,
+        10,
+        &mut next_key,
+        &mut acked,
+    )
+    .await;
+    wait_converged(
+        &mut clients,
+        COLL,
+        acked.len() as u64,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let deaf_id = if leader_id == 1 { 2 } else { 1 };
+    for id in 1..=N {
+        if id != deaf_id {
+            ctrl.cut_one_way(id, deaf_id);
+        }
+    }
+
+    // The cluster must keep committing throughout — a node that can still
+    // reach everyone is not a quorum loss, whichever way its edges point.
+    for round in 0..3 {
+        let ldr = wait_for_leader_among(&mut clients, &all, Duration::from_secs(15))
+            .await
+            .unwrap_or_else(|| panic!("round {round}: no leader with node{deaf_id} deaf"));
+        let ok = commit_writes(&mut clients[ldr], COLL, 5, &mut next_key, &mut acked).await;
+        assert!(
+            ok >= 4,
+            "round {round}: only {ok}/5 committed while node{deaf_id} was deaf"
+        );
+    }
+
+    ctrl.heal();
+    wait_converged(
+        &mut clients,
+        COLL,
+        acked.len() as u64,
+        Duration::from_secs(30),
+    )
+    .await;
+    for i in 0..N as usize {
+        let keys = keys_on(&mut clients[i], COLL).await;
+        assert_eq!(
+            keys,
+            acked,
+            "node{} diverged after heal — missing {:?}, extra {:?}",
+            i + 1,
+            acked.difference(&keys).collect::<Vec<_>>(),
+            keys.difference(&acked).collect::<Vec<_>>(),
+        );
+    }
+    println!(
+        "deaf-node: OK — {} docs, all {N} nodes converged",
+        acked.len()
+    );
+    for node in &mut nodes {
+        node.kill().await;
+    }
+}
+
+/// A node whose votes are counted but whose answers never arrive campaigns
+/// forever. The healthy majority must ignore it completely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn asymmetric_reply_loss_disruptor_is_ignored() {
+    const N: u64 = 5;
+    const COLL: &str = "disrupt";
+    let ctrl = Arc::new(Partitioner::default());
+    let (mut nodes, mut clients) = form_cluster(N, Arc::clone(&ctrl)).await;
+    let all: Vec<usize> = (0..N as usize).collect();
+    let mut acked: HashSet<i64> = HashSet::new();
+    let mut next_key: i64 = 0;
+
+    let leader_idx = wait_for_leader_among(&mut clients, &all, Duration::from_secs(10))
+        .await
+        .expect("leader");
+    let leader_id = nodes[leader_idx].node_id;
+    commit_writes(
+        &mut clients[leader_idx],
+        COLL,
+        10,
+        &mut next_key,
+        &mut acked,
+    )
+    .await;
+    wait_converged(
+        &mut clients,
+        COLL,
+        acked.len() as u64,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let dis = if leader_id == 1 { 2 } else { 1 };
+    let dis_idx = (dis - 1) as usize;
+    let healthy: Vec<usize> = (0..N as usize).filter(|i| *i != dis_idx).collect();
+    for id in 1..=N {
+        if id != dis {
+            ctrl.lose_replies(dis, id); // its RPCs land; the answers vanish
+            ctrl.cut_one_way(id, dis); // and it hears nothing inbound
+        }
+    }
+
+    let term_of =
+        |nodes: &Vec<TestNode>, idx: usize| nodes[idx].raft.metrics().borrow().current_term;
+
+    // Let the cut settle: the disruptor starts campaigning, and the healthy
+    // side may legitimately re-elect once if it just lost its leader.
+    sleep(Duration::from_secs(3)).await;
+    let base_healthy = term_of(&nodes, healthy[0]);
+    let base_dis = term_of(&nodes, dis_idx);
+
+    for round in 0..3 {
+        sleep(Duration::from_secs(2)).await;
+        let ldr = wait_for_leader_among(&mut clients, &healthy, Duration::from_secs(15))
+            .await
+            .unwrap_or_else(|| panic!("round {round}: the disruptor cost the cluster its leader"));
+        let ok = commit_writes(&mut clients[ldr], COLL, 5, &mut next_key, &mut acked).await;
+        assert!(
+            ok >= 4,
+            "round {round}: only {ok}/5 committed while node{dis} disrupted"
+        );
+    }
+
+    // The point of the test, stated as growth rather than absolute terms:
+    // the disruptor's term must run away while the healthy side's stays put.
+    // If leader stickiness regressed, the healthy nodes would adopt each vote
+    // request's term and the two would climb together.
+    let dis_growth = term_of(&nodes, dis_idx).saturating_sub(base_dis);
+    assert!(
+        dis_growth >= 3,
+        "the disruptor only advanced {dis_growth} terms — it never really \
+         campaigned, so this test proved nothing"
+    );
+    for &h in &healthy {
+        let growth = term_of(&nodes, h).saturating_sub(base_healthy);
+        assert!(
+            growth <= 2,
+            "healthy node{} advanced {growth} terms while the disruptor advanced \
+             {dis_growth} — it is chasing the disruptor's term, so every campaign \
+             unseats the leader (leader stickiness regressed)",
+            h + 1
+        );
+    }
+
+    ctrl.heal();
+    wait_converged(
+        &mut clients,
+        COLL,
+        acked.len() as u64,
+        Duration::from_secs(40),
+    )
+    .await;
+    for i in 0..N as usize {
+        let keys = keys_on(&mut clients[i], COLL).await;
+        assert_eq!(keys, acked, "node{} diverged after heal", i + 1);
+    }
+    println!(
+        "reply-loss disruptor: OK — {} docs, all {N} nodes converged; disruptor reached term {}",
+        acked.len(),
+        term_of(&nodes, dis_idx)
+    );
+    for node in &mut nodes {
+        node.kill().await;
+    }
 }
