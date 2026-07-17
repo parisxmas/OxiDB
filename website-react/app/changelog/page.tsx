@@ -11,10 +11,10 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
-    <!-- v0.36.12 -->
+    <!-- v0.37.0 -->
     <div class="version-block">
       <div class="version-header">
-        <h3 class="version-tag">v0.36.12</h3>
+        <h3 class="version-tag">v0.37.0</h3>
         <span class="version-date">2026-07-17</span>
         <span class="version-badge latest">latest</span>
       </div>

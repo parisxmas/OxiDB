@@ -2792,6 +2792,9 @@ impl OxiDb {
 
     /// `put_object` with a caller-supplied ETag — see
     /// [`BlobStore::put_object_with_etag`]. Multipart is the only caller.
+    /// Native-only, like every blob method: wasm32 has no `blob_store` (the
+    /// break that made v0.35.0 ship binary-only was exactly a forgotten cfg).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn put_object_with_etag(
         &self,
         bucket: &str,
