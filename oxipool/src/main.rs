@@ -399,13 +399,28 @@ fn classify_command(payload: &[u8]) -> CmdRoute {
     }
 }
 
+/// Route a `sql` request to a replica only if it cannot write.
+///
+/// The statement text lives in `sql` — the field the engine itself reads
+/// (`{"engine":"sql","cmd":"sql","sql":"SELECT ..."}`). This used to look for
+/// `query`, which the SQL wire shape has never had: every statement therefore
+/// read as an empty string, matched no SELECT prefix, and fell through to
+/// Write. Correct, but it pinned ALL SQL — reads included — to the master, so
+/// replicas never served a single SQL query.
+///
+/// Anything not recognised as read-only stays a write: sending a mutation to
+/// a replica is a real bug, while sending a read to the master is only a lost
+/// optimisation.
 fn classify_sql(json: &serde_json::Value) -> CmdRoute {
-    let query = json.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    let trimmed = query.trim_start().to_uppercase();
-    if trimmed.starts_with("SELECT")
-        || trimmed.starts_with("SHOW")
-        || trimmed.starts_with("DESCRIBE")
-        || trimmed.starts_with("EXPLAIN")
+    let sql = json.get("sql").and_then(|v| v.as_str()).unwrap_or("");
+    // Leading comments/whitespace are common in generated SQL.
+    let trimmed = sql.trim_start().to_uppercase();
+    let head = trimmed.trim_start_matches(|c: char| c.is_whitespace() || c == '(');
+    if head.starts_with("SELECT")
+        || head.starts_with("SHOW")
+        || head.starts_with("DESCRIBE")
+        || head.starts_with("EXPLAIN")
+        || head.starts_with("WITH")
     {
         CmdRoute::Read
     } else {
@@ -1320,5 +1335,71 @@ async fn main() {
                 drop(permit);
             });
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn route(req: serde_json::Value) -> CmdRoute {
+        classify_command(&serde_json::to_vec(&req).unwrap())
+    }
+
+    /// The statement text is in `sql`, not `query`. Reading the wrong field
+    /// made every statement look empty — and therefore a write — which sent
+    /// all SQL, reads included, to the master.
+    #[test]
+    fn sql_reads_go_to_a_replica() {
+        for stmt in [
+            "SELECT * FROM users",
+            "  select 1",
+            "\n\tSELECT COUNT(*) FROM t",
+            "SHOW TABLES",
+            "DESCRIBE users",
+            "EXPLAIN SELECT 1",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+        ] {
+            assert!(
+                matches!(route(json!({"engine": "sql", "cmd": "sql", "sql": stmt})), CmdRoute::Read),
+                "{stmt:?} should be replica-routable"
+            );
+        }
+    }
+
+    /// Anything that can mutate must reach the master — routing a write to a
+    /// replica is a real bug, not a lost optimisation.
+    #[test]
+    fn sql_writes_go_to_the_master() {
+        for stmt in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "CREATE TABLE t (a INT)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN b INT",
+            "CALL p()",
+            "BEGIN",
+            "", // missing/blank text: unknown → master, the safe side
+        ] {
+            assert!(
+                matches!(route(json!({"engine": "sql", "cmd": "sql", "sql": stmt})), CmdRoute::Write),
+                "{stmt:?} must go to the master"
+            );
+        }
+        // A `sql` command with no text at all is still a write.
+        assert!(matches!(route(json!({"cmd": "sql"})), CmdRoute::Write));
+    }
+
+    /// The classifier reads the `cmd` field, never user data — a document
+    /// containing the word "insert" must not reroute a read.
+    #[test]
+    fn user_data_cannot_influence_routing() {
+        assert!(matches!(
+            route(json!({"cmd": "find", "collection": "c", "query": {"note": "insert update begin_tx"}})),
+            CmdRoute::Read
+        ));
     }
 }
