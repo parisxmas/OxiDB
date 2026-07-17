@@ -89,3 +89,5 @@ telco-test
 monitoring/.oxidb-data/
 monitoring/.oxidb-server.log
 monitoring/.load.log
+tests/rabbitmq-go-test/rabbitmq-go-test
+tests/rabbitmq-benchmark-go/rabbitmq-benchmark-go

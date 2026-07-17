@@ -18,8 +18,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use oxidb::OxiDb;
 use serde_json::json;
 
@@ -153,6 +153,22 @@ struct Exchange {
     /// exchange "" is not stored here — it routes by queue name and cannot be
     /// declared, bound or deleted.
     bindings: Vec<(String, String)>,
+}
+
+/// One wire publish, routed but not yet committed: which queues it goes to
+/// and the durable seq reserved per durable target. Produced by
+/// `prepare_publish`, consumed by `commit_publishes` — the split that lets
+/// the connection layer batch a pipeline burst into one fsync.
+pub struct PreparedPublish {
+    exchange: String,
+    routing_key: String,
+    props_raw: Vec<u8>,
+    body: Vec<u8>,
+    targets: Vec<(String, Option<u64>)>,
+    /// Forward to MQTT on commit (wire publishes to amq.topic only — an
+    /// MQTT-origin publish must not loop back out).
+    bridge: bool,
+    delivery_mode: Option<u8>,
 }
 
 /// One message the connection layer should write to a consumer.
@@ -468,13 +484,12 @@ impl AmqpBroker {
 
     // ── Publish path ────────────────────────────────────────────────────
 
-    /// A wire publish (from an AMQP client). Routes into queues, and — the
-    /// AMQP → MQTT half of the ADR-0016 Phase 3 bridge — a message addressed
-    /// to `amq.topic` also comes out on the MQTT/OxiMem bus with `.` → `/`,
-    /// live subscribers via the bus and durable MQTT sessions via their
-    /// fsync'd queue, all BEFORE this returns, so the publisher's confirm
-    /// covers the bridged copies too. Returns how many destinations accepted
-    /// the message (the mandatory-flag decision).
+    /// A wire publish (from an AMQP client): prepare + commit as a batch of
+    /// one. Routes into queues, and — the AMQP → MQTT half of the ADR-0016
+    /// Phase 3 bridge — a message addressed to `amq.topic` also comes out on
+    /// the MQTT/OxiMem bus with `.` → `/`, all BEFORE this returns, so the
+    /// publisher's confirm covers the bridged copies too. Returns how many
+    /// destinations accepted the message (the mandatory-flag decision).
     pub fn publish(
         &self,
         exchange: &str,
@@ -483,32 +498,16 @@ impl AmqpBroker {
         body: Vec<u8>,
         delivery_mode: Option<u8>,
     ) -> Result<usize, ChannelError> {
-        let bridge = if exchange == BRIDGE_EXCHANGE {
-            self.mqtt.read().unwrap().clone()
-        } else {
-            None
-        };
-        let text = bridge
-            .as_ref()
-            .map(|_| String::from_utf8_lossy(&body).to_string());
-        let mut n = self.route(exchange, routing_key, props_raw, body, delivery_mode)?;
-        if let (Some(store), Some(text)) = (bridge, text) {
-            let topic = routing_key.replace('.', "/");
-            n += store.publish(&topic, &text).max(0) as usize;
-            // Persistent AMQP message → QoS-1 MQTT delivery, the plugin's
-            // mapping; write-before-confirm crosses the bridge intact because
-            // persist_incoming fsyncs before returning.
-            let qos = if delivery_mode == Some(2) { 1 } else { 0 };
-            crate::mqtt_session::MqttSessions::global().persist_incoming(&topic, &text, qos);
-        }
-        Ok(n)
+        let p =
+            self.prepare_publish(exchange, routing_key, props_raw, body, delivery_mode, true)?;
+        Ok(self.commit_publishes(vec![p])[0])
     }
 
     /// The MQTT → AMQP half of the bridge: an MQTT publish routes into the
     /// `amq.topic` exchange with `/` → `.`, so a worker pool consumes over
-    /// AMQP what a sensor publishes over MQTT. Routing ONLY — never forwarded
-    /// back out to MQTT, which is the loop this split with `publish` exists
-    /// to prevent. A QoS ≥ 1 publish arrives with a durability promise and
+    /// AMQP what a sensor publishes over MQTT. `bridge: false` — never
+    /// forwarded back out to MQTT, which is the loop this flag exists to
+    /// prevent. A QoS ≥ 1 publish arrives with a durability promise and
     /// keeps it: delivery_mode=2 into durable queues (and the props carry it,
     /// so an AMQP consumer sees a persistent message).
     pub fn publish_from_mqtt(&self, topic: &str, payload: &[u8], qos: u8) {
@@ -522,22 +521,29 @@ impl AmqpBroker {
         } else {
             (Vec::new(), None)
         };
-        let _ = self.route(BRIDGE_EXCHANGE, &rkey, props, payload.to_vec(), dm);
+        if let Ok(p) =
+            self.prepare_publish(BRIDGE_EXCHANGE, &rkey, props, payload.to_vec(), dm, false)
+        {
+            self.commit_publishes(vec![p]);
+        }
     }
 
-    /// Route and enqueue. Returns how many queues accepted the message. The
-    /// durable inserts happen BEFORE this returns — the caller sends the
-    /// publisher confirm after, which is the write-before-ack ordering.
-    fn route(
+    /// Route one wire publish under the broker lock WITHOUT touching disk or
+    /// queues: which queues it goes to, and a reserved durable seq per
+    /// durable target. The connection layer batches prepared publishes and
+    /// commits them together — that batch is what turns one fsync per
+    /// message into one fsync per pipeline burst.
+    pub fn prepare_publish(
         &self,
         exchange: &str,
         routing_key: &str,
         props_raw: Vec<u8>,
         body: Vec<u8>,
         delivery_mode: Option<u8>,
-    ) -> Result<usize, ChannelError> {
-        let mut st = self.inner.lock().unwrap();
-        let targets: Vec<String> = if exchange.is_empty() {
+        bridge: bool,
+    ) -> Result<PreparedPublish, ChannelError> {
+        let st = self.inner.lock().unwrap();
+        let target_names: Vec<String> = if exchange.is_empty() {
             // Default exchange: the routing key IS the queue name.
             if st.queues.contains_key(routing_key) {
                 vec![routing_key.to_string()]
@@ -564,67 +570,121 @@ impl AmqpBroker {
             ts.dedup();
             ts
         };
-
-        // Decide durability and collect the inserts while holding the lock,
-        // write them after releasing it — a slow fsync must not stall every
-        // other connection's poll (the same split as the MQTT session store).
-        let mut writes: Vec<(String, u64)> = Vec::new();
-        let mut dropped_docs: Vec<u64> = Vec::new();
-        let mut routed = 0usize;
-        for qname in &targets {
-            // A binding can outlive its queue only transiently (removal strips
-            // bindings), but a publish racing that removal must drop the copy,
-            // not panic and poison the broker lock.
-            let Some(q) = st.queues.get_mut(qname) else {
+        let mut targets = Vec::with_capacity(target_names.len());
+        for qname in target_names {
+            let Some(q) = st.queues.get(&qname) else {
                 continue;
             };
-            routed += 1;
-            let seq = if q.durable && delivery_mode == Some(2) {
-                let s = self.seq.fetch_add(1, Ordering::SeqCst);
-                writes.push((qname.clone(), s));
-                Some(s)
-            } else {
-                None
-            };
-            q.ready.push_back(QMsg {
-                seq,
-                exchange: exchange.to_string(),
-                routing_key: routing_key.to_string(),
-                props_raw: props_raw.clone(),
-                body: body.clone(),
-                redelivered: false,
-            });
-            while q.ready.len() > MAX_READY {
-                // Drop-oldest, counted, and the durable record goes with it —
-                // the bound must bind the disk too or a restart resurrects
-                // what the bound discarded (the MQTT lesson, applied here).
-                if let Some(old) = q.ready.pop_front() {
-                    if let Some(s) = old.seq {
-                        dropped_docs.push(s);
-                    }
+            let seq = (q.durable && delivery_mode == Some(2))
+                .then(|| self.seq.fetch_add(1, Ordering::SeqCst));
+            targets.push((qname, seq));
+        }
+        drop(st);
+        Ok(PreparedPublish {
+            exchange: exchange.to_string(),
+            routing_key: routing_key.to_string(),
+            props_raw,
+            body,
+            targets,
+            bridge: bridge && exchange == BRIDGE_EXCHANGE,
+            delivery_mode,
+        })
+    }
+
+    /// Commit a batch of prepared publishes: ONE `insert_many` (one fsync)
+    /// for every durable record in the batch, then enqueue, then the MQTT
+    /// bridge forwards. Returns each publish's routed-destination count, in
+    /// input order. The disk write comes FIRST — an ack racing the enqueue
+    /// must never delete a record that has not been written yet, or a crash
+    /// resurrects a consumed message (the order the per-message path used to
+    /// have was wrong in exactly that window).
+    pub fn commit_publishes(&self, batch: Vec<PreparedPublish>) -> Vec<usize> {
+        let mut docs = Vec::new();
+        for p in &batch {
+            for (qname, seq) in &p.targets {
+                if let Some(s) = seq {
+                    docs.push(json!({
+                        "_kind": "qmsg", "queue": qname, "seq": s,
+                        "exchange": p.exchange, "rkey": p.routing_key,
+                        "props": B64.encode(&p.props_raw), "body": B64.encode(&p.body),
+                    }));
                 }
-                q.dropped += 1;
             }
         }
-        let n = routed;
+        if !docs.is_empty() {
+            if let Some(db) = self.db() {
+                let _ = db.insert_many(AMQP_COLLECTION, docs);
+            }
+        }
+
+        let mqtt = self.mqtt.read().unwrap().clone();
+        let mut results = Vec::with_capacity(batch.len());
+        let mut bridge_out: Vec<(usize, String, String, u8)> = Vec::new();
+        let mut dead_docs: Vec<u64> = Vec::new();
+        let mut st = self.inner.lock().unwrap();
+        for (idx, p) in batch.into_iter().enumerate() {
+            let mut routed = 0usize;
+            for (qname, seq) in &p.targets {
+                // A queue can vanish between prepare and commit (auto-delete,
+                // exclusive teardown): drop the copy — and its already-written
+                // durable record, or a restart resurrects it into nowhere.
+                let Some(q) = st.queues.get_mut(qname) else {
+                    if let Some(s) = seq {
+                        dead_docs.push(*s);
+                    }
+                    continue;
+                };
+                routed += 1;
+                q.ready.push_back(QMsg {
+                    seq: *seq,
+                    exchange: p.exchange.clone(),
+                    routing_key: p.routing_key.clone(),
+                    props_raw: p.props_raw.clone(),
+                    body: p.body.clone(),
+                    redelivered: false,
+                });
+                while q.ready.len() > MAX_READY {
+                    // Drop-oldest, counted, and the durable record goes with
+                    // it — the bound must bind the disk too or a restart
+                    // resurrects what the bound discarded (the MQTT lesson).
+                    if let Some(old) = q.ready.pop_front() {
+                        if let Some(s) = old.seq {
+                            dead_docs.push(s);
+                        }
+                    }
+                    q.dropped += 1;
+                }
+            }
+            if p.bridge && mqtt.is_some() {
+                bridge_out.push((
+                    idx,
+                    p.routing_key.replace('.', "/"),
+                    String::from_utf8_lossy(&p.body).to_string(),
+                    if p.delivery_mode == Some(2) { 1 } else { 0 },
+                ));
+            }
+            results.push(routed);
+        }
         drop(st);
 
-        if let Some(db) = self.db() {
-            for (qname, seq) in writes {
-                let _ = db.insert(
-                    AMQP_COLLECTION,
-                    json!({
-                        "_kind": "qmsg", "queue": qname, "seq": seq,
-                        "exchange": exchange, "rkey": routing_key,
-                        "props": B64.encode(&props_raw), "body": B64.encode(&body),
-                    }),
-                );
-            }
-            for seq in dropped_docs {
-                let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "qmsg", "seq": seq }));
+        if !dead_docs.is_empty() {
+            if let Some(db) = self.db() {
+                for seq in dead_docs {
+                    let _ = db.delete(AMQP_COLLECTION, &json!({ "_kind": "qmsg", "seq": seq }));
+                }
             }
         }
-        Ok(n)
+        if let Some(store) = mqtt {
+            for (idx, topic, text, qos) in bridge_out {
+                // Live MQTT/RESP subscribers via the bus; durable MQTT
+                // sessions via their fsync'd queue — still before the
+                // caller's confirm, so write-before-confirm crosses the
+                // bridge intact.
+                results[idx] += store.publish(&topic, &text).max(0) as usize;
+                crate::mqtt_session::MqttSessions::global().persist_incoming(&topic, &text, qos);
+            }
+        }
+        results
     }
 
     // ── Consume path ────────────────────────────────────────────────────

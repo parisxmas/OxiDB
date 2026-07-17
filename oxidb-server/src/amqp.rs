@@ -17,7 +17,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::amqp_queue::{AmqpBroker, ChannelError, NOT_IMPLEMENTED, QMsg};
+use crate::amqp_queue::{AmqpBroker, ChannelError, PreparedPublish, QMsg, NOT_IMPLEMENTED};
 use crate::amqp_wire::*;
 
 /// Our side of the Tune negotiation. Frame-max leaves room for large bodies
@@ -58,16 +58,30 @@ struct Ch {
     closing: bool,
 }
 
-/// Read one frame with poll semantics: 50ms for the first byte (so the loop
-/// can interleave deliveries), then a generous timeout for the REST of the
-/// frame — once a frame has started, a mid-frame timeout would desynchronise
-/// the stream permanently, so the tail must be allowed to arrive.
+/// A publish routed but not yet committed, waiting in the connection's
+/// batch: its channel, its confirm tag (assigned at completion so the ack
+/// order matches the publish order), and — mandatory only — the content
+/// needed to hand it back as Basic.Return.
+struct BatchedPublish {
+    ch_id: u16,
+    prepared: PreparedPublish,
+    confirm_tag: Option<u64>,
+    /// (props, body, exchange, routing-key), kept only when mandatory.
+    ret: Option<(Vec<u8>, Vec<u8>, String, String)>,
+}
+
+/// Read one frame with poll semantics: `poll_ms` for the first byte (so the
+/// loop can interleave deliveries — 5ms when this connection feeds consumers,
+/// 50ms otherwise), then a generous timeout for the REST of the frame — once
+/// a frame has started, a mid-frame timeout would desynchronise the stream
+/// permanently, so the tail must be allowed to arrive.
 fn read_frame_polled(
     stream: &TcpStream,
     r: &mut BufReader<&TcpStream>,
     max: usize,
+    poll_ms: u64,
 ) -> io::Result<Option<Frame>> {
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(poll_ms)));
     let mut first = [0u8; 1];
     match r.read_exact(&mut first) {
         Ok(()) => {}
@@ -165,7 +179,10 @@ pub fn handle_client(stream: TcpStream, log: bool) {
         .unwrap_or_default();
     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
     let broker = AmqpBroker::global();
-    let mut reader = BufReader::new(&stream);
+    // 64 KiB read buffer: a pipelined publish burst lands here in big chunks,
+    // and the publish batch (one fsync per burst) is bounded by what is
+    // already buffered when the stream momentarily runs dry.
+    let mut reader = BufReader::with_capacity(64 * 1024, &stream);
     let mut writer = BufWriter::new(&stream);
 
     // ── Handshake ───────────────────────────────────────────────────────
@@ -294,6 +311,11 @@ pub fn handle_client(stream: TcpStream, log: bool) {
     // ── Main loop ───────────────────────────────────────────────────────
     let mut channels: HashMap<u16, Ch> = HashMap::new();
     let mut last_write = Instant::now();
+    // Completed publishes routed but not yet committed. Flushed — one
+    // batched durable write, then the confirms in publish order — whenever
+    // the read buffer runs dry, before any method frame, or at 256 pending.
+    let mut batch: Vec<BatchedPublish> = Vec::new();
+    let mut last_delivery = Instant::now();
 
     'conn: loop {
         // Deliveries owed to this connection's consumers.
@@ -352,6 +374,7 @@ pub fn handle_client(stream: TcpStream, log: bool) {
         }
         if wrote {
             last_write = Instant::now();
+            last_delivery = last_write;
         }
 
         // Heartbeat: the negotiated interval is a promise to emit SOMETHING
@@ -366,9 +389,28 @@ pub fn handle_client(stream: TcpStream, log: bool) {
             last_write = Instant::now();
         }
 
-        let frame = match read_frame_polled(&stream, &mut reader, frame_max) {
+        // Feeding consumers wants a tight delivery tick — 1ms while
+        // deliveries are actually flowing, decaying to 5ms after a quiet
+        // second; an idle or publisher-only connection does not need one at
+        // all. This is what bounds delivery latency in a poll-model broker.
+        let has_consumers = channels.values().any(|c| !c.consumer_tags.is_empty());
+        let poll_ms = if !has_consumers {
+            50
+        } else if last_delivery.elapsed() < Duration::from_secs(1) {
+            1
+        } else {
+            5
+        };
+        let frame = match read_frame_polled(&stream, &mut reader, frame_max, poll_ms) {
             Ok(Some(f)) => f,
-            Ok(None) => continue,
+            Ok(None) => {
+                // The stream went quiet: whatever publishes are pending are
+                // all we are going to batch.
+                if flush_batch(&mut writer, broker, &mut channels, &mut batch, frame_max).is_err() {
+                    break 'conn;
+                }
+                continue;
+            }
             Err(_) => break 'conn,
         };
 
@@ -390,18 +432,33 @@ pub fn handle_client(stream: TcpStream, log: bool) {
                     Ok(h) => {
                         let complete = h.body_size == 0;
                         pending.header = Some(h);
-                        if complete
-                            && finish_publish(
-                                &mut writer,
-                                broker,
-                                conn_id,
-                                &mut channels,
-                                ch_id,
-                                frame_max,
-                            )
-                            .is_err()
-                        {
-                            break 'conn;
+                        if complete {
+                            if let Err(e) =
+                                complete_publish(broker, &mut channels, ch_id, &mut batch)
+                            {
+                                if flush_batch(
+                                    &mut writer,
+                                    broker,
+                                    &mut channels,
+                                    &mut batch,
+                                    frame_max,
+                                )
+                                .is_err()
+                                    || channel_error(
+                                        &mut writer,
+                                        broker,
+                                        conn_id,
+                                        &mut channels,
+                                        ch_id,
+                                        e,
+                                        CLASS_BASIC,
+                                        BASIC_PUBLISH,
+                                    )
+                                    .is_err()
+                                {
+                                    break 'conn;
+                                }
+                            }
                         }
                     }
                     Err(_) => break 'conn,
@@ -421,18 +478,25 @@ pub fn handle_client(stream: TcpStream, log: bool) {
                     .header
                     .as_ref()
                     .is_some_and(|h| pending.body.len() as u64 >= h.body_size);
-                if done
-                    && finish_publish(
-                        &mut writer,
-                        broker,
-                        conn_id,
-                        &mut channels,
-                        ch_id,
-                        frame_max,
-                    )
-                    .is_err()
-                {
-                    break 'conn;
+                if done {
+                    if let Err(e) = complete_publish(broker, &mut channels, ch_id, &mut batch) {
+                        if flush_batch(&mut writer, broker, &mut channels, &mut batch, frame_max)
+                            .is_err()
+                            || channel_error(
+                                &mut writer,
+                                broker,
+                                conn_id,
+                                &mut channels,
+                                ch_id,
+                                e,
+                                CLASS_BASIC,
+                                BASIC_PUBLISH,
+                            )
+                            .is_err()
+                        {
+                            break 'conn;
+                        }
+                    }
                 }
             }
 
@@ -442,6 +506,19 @@ pub fn handle_client(stream: TcpStream, log: bool) {
                     break 'conn;
                 };
                 let ch_id = frame.channel;
+
+                // A method frame (Get, Qos, Close, …) must observe every
+                // publish that preceded it: commit the batch first. EXCEPT
+                // Basic.Publish — it is the start of the batch's next item,
+                // and flushing on it would cap every batch at one message
+                // (found the hard way: the durable benchmark pinned at one
+                // fsync per message until this exception existed).
+                if !(class == CLASS_BASIC && method == BASIC_PUBLISH)
+                    && flush_batch(&mut writer, broker, &mut channels, &mut batch, frame_max)
+                        .is_err()
+                {
+                    break 'conn;
+                }
 
                 // Connection-class methods ride channel 0.
                 if class == CLASS_CONNECTION {
@@ -483,9 +560,22 @@ pub fn handle_client(stream: TcpStream, log: bool) {
 
             _ => break 'conn,
         }
+
+        // Commit when the pipeline burst has fully landed in our buffer (or
+        // the batch is big enough): everything still buffered will follow
+        // immediately, so waiting would only grow the batch, not stall it.
+        if batch.len() >= 256 || (!batch.is_empty() && reader.buffer().is_empty()) {
+            if flush_batch(&mut writer, broker, &mut channels, &mut batch, frame_max).is_err() {
+                break 'conn;
+            }
+        }
     }
 
     // ── Teardown: nothing a consumer failed to ack may be lost ─────────
+    // Publishes still in the batch were fully received — commit them; their
+    // confirms are unsendable now, which AMQP permits (an unconfirmed publish
+    // may or may not have taken effect).
+    let _ = flush_batch(&mut writer, broker, &mut channels, &mut batch, frame_max);
     for (_id, ch) in channels.iter_mut() {
         for (_dtag, (queue, msg, _counted)) in std::mem::take(&mut ch.unacked) {
             broker.requeue(&queue, msg);
@@ -497,19 +587,17 @@ pub fn handle_client(stream: TcpStream, log: bool) {
     }
 }
 
-/// A completed publish: route it, and in confirm mode acknowledge it — AFTER
-/// the broker call, whose durable insert is fsync'd. Write-before-confirm.
-/// An unroutable mandatory publish comes back as Basic.Return (312 NO_ROUTE)
-/// BEFORE the confirm — pika collects the return, sees the ack, and raises
-/// UnroutableError, matching RabbitMQ's ordering.
-fn finish_publish(
-    writer: &mut BufWriter<&TcpStream>,
+/// A completed publish: route it (broker lock only, no disk) and put it in
+/// the connection's batch. Its confirm tag is assigned NOW so the eventual
+/// acks keep the publish order. Errors (unknown exchange) surface for the
+/// caller to turn into a channel error — after flushing the batch, so
+/// earlier publishes still commit.
+fn complete_publish(
     broker: &AmqpBroker,
-    conn_id: u64,
     channels: &mut HashMap<u16, Ch>,
     ch_id: u16,
-    frame_max: usize,
-) -> io::Result<()> {
+    batch: &mut Vec<BatchedPublish>,
+) -> Result<(), ChannelError> {
     let Some(ch) = channels.get_mut(&ch_id) else {
         return Ok(());
     };
@@ -520,49 +608,85 @@ fn finish_publish(
     let props = p.header.map(|h| h.props_raw).unwrap_or_default();
     // A mandatory publish may need its content handed back; the clone is paid
     // only when the flag is set.
-    let ret = p.mandatory.then(|| (props.clone(), p.body.clone()));
-    match broker.publish(&p.exchange, &p.routing_key, props, p.body, dm) {
-        Ok(routed) => {
-            if routed == 0 {
-                if let Some((rprops, rbody)) = ret {
-                    let m = ArgsW::method(CLASS_BASIC, BASIC_RETURN)
-                        .u16(312)
-                        .shortstr("NO_ROUTE")
-                        .shortstr(&p.exchange)
-                        .shortstr(&p.routing_key)
-                        .finish();
-                    write_content(writer, ch_id, &m, &rprops, &rbody, frame_max)?;
-                    // Flush HERE, not only via the confirm below: on a
-                    // non-confirm channel there is no ack to ride out on, and
-                    // an unflushed Return sits invisible until the next
-                    // heartbeat. Found by RabbitMQ.Client (.NET), which
-                    // listens for returns without confirm mode — pika's
-                    // confirm-mode flush masked it.
-                    writer.flush()?;
-                }
+    let ret = p.mandatory.then(|| {
+        (
+            props.clone(),
+            p.body.clone(),
+            p.exchange.clone(),
+            p.routing_key.clone(),
+        )
+    });
+    let prepared = broker.prepare_publish(&p.exchange, &p.routing_key, props, p.body, dm, true)?;
+    let confirm_tag = ch.confirms.then(|| {
+        ch.publish_seq += 1;
+        ch.publish_seq
+    });
+    batch.push(BatchedPublish {
+        ch_id,
+        prepared,
+        confirm_tag,
+        ret,
+    });
+    Ok(())
+}
+
+/// Commit the batch: ONE durable write for every persistent message in it,
+/// then, per publish in order — Basic.Return for an unroutable mandatory one
+/// (BEFORE its confirm: pika collects the return, sees the ack, and raises
+/// UnroutableError, matching RabbitMQ), then the confirm. Acks are written
+/// after the commit, which is the write-before-confirm ordering; one flush
+/// carries them all. The flush is unconditional on having written — the
+/// .NET client taught us a Return with no ack behind it must not sit in the
+/// buffer until a heartbeat.
+fn flush_batch(
+    writer: &mut BufWriter<&TcpStream>,
+    broker: &AmqpBroker,
+    channels: &mut HashMap<u16, Ch>,
+    batch: &mut Vec<BatchedPublish>,
+    frame_max: usize,
+) -> io::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let items = std::mem::take(batch);
+    let (metas, prepared): (Vec<_>, Vec<_>) = items
+        .into_iter()
+        .map(|b| ((b.ch_id, b.confirm_tag, b.ret), b.prepared))
+        .unzip();
+    let routed = broker.commit_publishes(prepared);
+
+    let mut wrote = false;
+    for ((ch_id, tag, ret), n) in metas.into_iter().zip(routed) {
+        // A channel that died mid-batch gets no frames; its publishes are
+        // committed regardless (unconfirmed = may have taken effect, per AMQP).
+        let alive = channels.get(&ch_id).is_some_and(|c| !c.closing);
+        if n == 0 && alive {
+            if let Some((rprops, rbody, exchange, rkey)) = ret {
+                let m = ArgsW::method(CLASS_BASIC, BASIC_RETURN)
+                    .u16(312)
+                    .shortstr("NO_ROUTE")
+                    .shortstr(&exchange)
+                    .shortstr(&rkey)
+                    .finish();
+                write_content(writer, ch_id, &m, &rprops, &rbody, frame_max)?;
+                wrote = true;
             }
-            if ch.confirms {
-                ch.publish_seq += 1;
+        }
+        if alive {
+            if let Some(t) = tag {
                 let ack = ArgsW::method(CLASS_BASIC, BASIC_ACK)
-                    .u64(ch.publish_seq)
+                    .u64(t)
                     .u8(0) // multiple = false
                     .finish();
                 write_frame(writer, FRAME_METHOD, ch_id, &ack)?;
-                writer.flush()?;
+                wrote = true;
             }
-            Ok(())
         }
-        Err(e) => channel_error(
-            writer,
-            broker,
-            conn_id,
-            channels,
-            ch_id,
-            e,
-            CLASS_BASIC,
-            BASIC_PUBLISH,
-        ),
     }
+    if wrote {
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
