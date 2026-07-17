@@ -45,7 +45,20 @@
   /* The fields no other engine has anywhere — the reason this one exists. */
   #events u { color:var(--accent); text-decoration:none }
   #chart { background:var(--card); border:1px solid var(--line); border-radius:10px; width:100%; height:230px }
-  .foot { color:var(--dim); font-size:12px; border-top:1px solid var(--line); padding:16px 26px }
+  .essay { border-top:1px solid var(--line); margin-top:8px; padding:34px 26px 60px }
+  .essay-in { max-width:720px; margin:0 auto; color:#b8c0cc; font-size:14.5px; line-height:1.72 }
+  .essay h3 { color:var(--text); font-size:15px; margin:30px 0 8px; font-weight:620 }
+  .essay h3:first-child { margin-top:0 }
+  .essay p { margin:0 0 13px }
+  .essay strong { color:var(--text); font-weight:600 }
+  .essay code { font-family:var(--mono); font-size:12.5px; color:var(--accent);
+                background:rgba(226,120,74,.08); padding:1px 5px; border-radius:4px }
+  .essay .lede { font-size:16px; color:var(--text); line-height:1.65; margin-bottom:22px }
+  .essay ul { margin:0 0 13px; padding-left:19px }
+  .essay li { margin-bottom:7px }
+  .essay .note { border-left:2px solid var(--line); padding:2px 0 2px 15px; color:var(--dim);
+                 font-size:13.5px; margin:18px 0 }
+  .essay .warn { color:var(--warn) }
   .live { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--ok);
           margin-right:6px; animation:p 2s infinite }
   @keyframes p { 0%,100%{opacity:1} 50%{opacity:.25} }
@@ -84,10 +97,129 @@
   </section>
 </div>
 
-<div class="foot">
-  MQTT in · time-series, document, OxiMem and SQL out · S3 holds the certificates.
-  Replacing this would be Mosquitto + InfluxDB + Redis + PostgreSQL + MongoDB + MinIO.
-</div>
+<div class="essay"><div class="essay-in">
+
+<p class="lede">Everything above is served by <strong>one process</strong>. Not one
+cluster, not one docker-compose file — one <code>oxidb-server</code>, about 14&nbsp;MB
+on disk, holding four different kinds of data at once and answering four
+different wire protocols to do it.</p>
+
+<h3>What this is</h3>
+<p>A cold-chain compliance system, in miniature. Trucks carry vaccines and frozen
+food; probes inside them report temperature; the load has a contracted range it
+must never leave. That is the easy half. The hard half arrives two years later,
+when an auditor asks you to <strong>prove</strong> shipment SHP-1004 stayed in range
+for its entire journey — and to prove the record you are showing them has not
+been edited since.</p>
+
+<p>The domain was not chosen because it is exciting. It was chosen because it is
+the rare application that genuinely needs all of this: a firehose of numeric
+readings, heterogeneous device events, live state, relational contracts and
+money, and immutable paperwork. Most demos have to invent a reason to switch on
+half their features. This one has to be talked out of using more.</p>
+
+<h3>What it is arguing</h3>
+<p>Not that OxiDB <em>can</em> do these things — a feature list would say that
+more cheaply. The argument is that <strong>this is an ordinary .NET
+application</strong>. The code above uses EF&nbsp;Core, MQTTnet,
+StackExchange.Redis and the AWS SDK: four libraries that have never heard of
+OxiDB and are not configured to know. They are pointed at localhost ports and
+they behave exactly as they would against the systems they were written for.</p>
+
+<p>Which means the interesting number is not a benchmark. It is the count of
+things you did <em>not</em> deploy. This dashboard would ordinarily sit on top of
+<strong>Mosquitto</strong> for MQTT, <strong>InfluxDB</strong> for the readings,
+<strong>Redis</strong> for live state, <strong>PostgreSQL</strong> for shipments
+and penalties, <strong>MongoDB</strong> for raw events, and <strong>MinIO</strong>
+for certificates. Six systems to install, secure, monitor, back up, upgrade on
+six schedules, and keep consistent with each other. Here they are five ports on
+one binary — and the backup is one archive, taken at one instant, with one
+restore.</p>
+
+<h3>What actually happens, one reading at a time</h3>
+<p>A probe publishes a JSON payload to <code>sensors/TR-06-XYZ/probe-04/temperature</code>.
+The ingest service is subscribed to <code>sensors/+/+/temperature</code> — one
+wildcard for the truck, one for the probe — and from that single message it
+fans out to four stores, each getting the shape of the data it is good at:</p>
+<ul>
+  <li>the <strong>time-series engine</strong> takes the number, tagged by device
+      and truck, where a month of ten-second samples compresses to something a
+      chart can read without a table scan;</li>
+  <li><strong>OxiMem</strong> takes the current state under a five-minute TTL, and
+      publishes it on a channel — which is how the tiles above update. Nothing on
+      this page polls: a tile changes because a sensor published, one hop away;</li>
+  <li>the <strong>document engine</strong> takes the event verbatim, whatever
+      shape it arrived in;</li>
+  <li>and if the reading broke the contract, the <strong>SQL engine</strong> takes
+      an excursion row — because a breach has money attached and must join to a
+      shipment, and that shipment to a customer.</li>
+</ul>
+
+<h3>Why each engine is here</h3>
+<p>Every one had to pass a single test: <strong>would you reach for this if OxiDB
+didn't bundle it?</strong> Anything that fails that test makes the showcase
+weaker, not stronger — nobody is impressed that vector search was squeezed in;
+they are only impressed when it was already the right answer.</p>
+
+<p>The <strong>document engine</strong> is the one that had to earn it hardest,
+and the fleet is what earns it. Three vendors, no two agreeing: an old probe
+reports a temperature and nothing else, a newer one adds humidity, a door switch
+and a nested GPS fix, and a third calls its fields <code>sensor_id</code> and
+<code>temp_c</code> and carries an alarm list. No fixed schema fits all three.
+And the extra fields are not decoration — look at probe-04 above: the chart shows
+its temperature climbing out of the band, which tells you <em>that</em> it
+breached. The raw events show <code>door_open: true</code>, which tells you
+<em>why</em>. The time-series engine can never hold that, and a schema designed
+today cannot anticipate it. Keeping the event exactly as sent is the only honest
+answer, and it is that engine's entire job.</p>
+
+<p>The <strong>SQL engine</strong> earns it in the table above. Look at the penalty
+column: the same single breach costs 2,500 for the pharma customer and 400 for
+the grocer. Nothing about that is a document lookup — it is a join, from an
+excursion to a shipment to a customer to the contract they signed. That is what
+relational databases are for, and EF&nbsp;Core is how .NET teams already write it.</p>
+
+<p><strong>OxiMem</strong> earns it twice: once as the live view, and once
+invisibly — a failing probe reports a breach every second, and the flag that
+stops it writing a database row every second lives there, with a one-minute
+expiry. State that should evaporate belongs somewhere that forgets. It is also
+why a silent probe fades out on this page instead of showing its last
+temperature: absent is <em>unknown</em>, not <em>fine</em>.</p>
+
+<p class="note">Deliberately absent: <strong>vector search</strong> and
+<strong>WASM</strong>. Both would have been possible and neither would have been
+honest — "find similar excursion patterns" is a sentence nobody in this industry
+has said. Leaving them out is the same discipline that let the other six in.</p>
+
+<h3>What building it found</h3>
+<p>A showcase is worth writing because it puts weight on things a test suite
+never does. Two real gaps turned up while this one was being built:</p>
+<ul>
+  <li>the .NET packages have <strong>no time-series helper</strong>, so this demo
+      wraps the client's raw escape hatch in one — a shim that probably belongs in
+      the client library itself;</li>
+  <li>the <strong>AWS .NET SDK rejects OxiDB's ETag</strong>. It verifies the
+      returned tag as an MD5 of what it sent; OxiDB's is deliberately the first
+      16&nbsp;bytes of a SHA-256. The object stores perfectly, <code>aws-cli</code>
+      and <code>boto3</code> never notice, and the .NET SDK throws on the way
+      home. Everything else here talks to OxiDB with zero accommodation; that one
+      needs a flag.</li>
+</ul>
+<p>Both are written down rather than papered over, because a demo that only
+demonstrates the parts that already worked is marketing, not evidence.</p>
+
+<h3>What it does not do</h3>
+<p>There are no transactions spanning two engines — each commits on its own.
+Nothing here is sharded; that is a separate axis, and this data would not need it
+until the fleet was very large. And the compliance story has one more chapter
+still unwritten on this page: the engine supports point-in-time recovery, an
+audit log, WORM storage and encryption at rest, which is the actual answer to the
+auditor's question, and which no ordinary demo ever has a reason to switch on.</p>
+
+<p class="warn">OxiDB is under active development and is not yet recommended for
+production use. This is a demonstration, not a reference deployment.</p>
+
+</div></div>
 
 <script>
 const probes = {};       // device → last reading
