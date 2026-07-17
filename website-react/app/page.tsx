@@ -7,13 +7,13 @@ export const metadata: Metadata = {
 export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<header class="hero">
   <div class="container">
-    <p class="hero-kicker"><span class="hero-pulse"></span>v0.35 &middot; instant online ALTER TABLE &middot; crash-atomic checkpoints &middot; EF Core beats PostgreSQL &middot; TSDB engine</p>
+    <p class="hero-kicker"><span class="hero-pulse"></span>v0.36 &middot; WebAssembly restored &middot; faster compound SQL predicates &middot; cluster fixes &middot; low-lock backups</p>
     <h1>OxiDB</h1>
     <p class="tagline">A fast, multi-model database.</p>
     <p class="sub">MongoDB-style JSON queries <strong>and a full SQL engine</strong> &mdash; window functions, CTEs, <code>WITH&nbsp;RECURSIVE</code>, LATERAL joins, and an <strong>EF&nbsp;Core provider that beats PostgreSQL</strong> (3832/3832 spec tests). Instant, online <code>ALTER&nbsp;TABLE&nbsp;ADD/DROP&nbsp;COLUMN</code> and crash-atomic checkpoints. ACID transactions with SELECT&nbsp;FOR&nbsp;UPDATE and group commit. A <strong>Redis-compatible in-memory store</strong> (MULTI/EXEC/WATCH + EVAL) and an <strong>MQTT broker</strong>. A built-in <strong>time-series engine</strong> (InfluxDB-style, Gorilla-compressed, line-protocol ingest). Full-text &amp; vector search. S3-compatible blob storage. Raft replication. Encryption at rest.</p>
     <div class="hero-actions">
       <a href="/quickstart/" class="btn btn-primary">Get Started</a>
-      <a href="/downloads/" class="btn btn-secondary">Downloads v0.35.0</a>
+      <a href="/downloads/" class="btn btn-secondary">Downloads v0.36.0</a>
     </div>
     <div class="hero-install">
       <code>one 14 MB binary &middot; zero dependencies &middot; embed or run as a server</code>
@@ -156,14 +156,14 @@ Postgres + Mongo + Redis + Elastic + S3. 14 MB.</pre>
 
     <h3>1. Download the server</h3>
     <pre><code class="lang-bash"><span class="co"># Linux (x86_64)</span>
-curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-server-v0.35.0-linux-amd64.tar.gz
-tar xzf oxidb-server-v0.35.0-linux-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.36.0/oxidb-server-v0.36.0-linux-amd64.tar.gz
+tar xzf oxidb-server-v0.36.0-linux-amd64.tar.gz
 
 <span class="co"># macOS (Apple Silicon)</span>
-curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-server-v0.35.0-darwin-arm64.tar.gz
-tar xzf oxidb-server-v0.35.0-darwin-arm64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.36.0/oxidb-server-v0.36.0-darwin-arm64.tar.gz
+tar xzf oxidb-server-v0.36.0-darwin-arm64.tar.gz
 
-<span class="co"># Windows: download oxidb-server-v0.35.0-windows-amd64.zip from /downloads/</span></code></pre>
+<span class="co"># Windows: download oxidb-server-v0.36.0-windows-amd64.zip from /downloads/</span></code></pre>
 
     <h3>2. Start the server</h3>
     <pre><code class="lang-bash"><span class="co"># Listens on 127.0.0.1:4444 by default; data goes to ./oxidb_data</span>
@@ -174,8 +174,8 @@ OXIDB_ADDR=0.0.0.0:4444 OXIDB_DATA=/var/lib/oxidb ./oxidb-server</code></pre>
 
     <h3>3. Connect and run your first query</h3>
     <pre><code class="lang-bash"><span class="co"># Download the CLI</span>
-curl -LO https://oxidb.baltavista.com/releases/v0.35.0/oxidb-v0.35.0-linux-amd64.tar.gz
-tar xzf oxidb-v0.35.0-linux-amd64.tar.gz
+curl -LO https://oxidb.baltavista.com/releases/v0.36.0/oxidb-v0.36.0-linux-amd64.tar.gz
+tar xzf oxidb-v0.36.0-linux-amd64.tar.gz
 
 <span class="co"># Open the REPL against the running server</span>
 ./oxidb --host 127.0.0.1 --port 4444

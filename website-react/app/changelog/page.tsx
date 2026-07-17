@@ -11,12 +11,55 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.36.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.36.0</h3>
+        <span class="version-date">2026-07-17</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed &mdash; WebAssembly is back</h4>
+        <ul>
+          <li><strong>The wasm32 build is repaired</strong> &mdash; v0.35.0 shipped binary-only because it had been broken for a while. <strong>2.2 MB raw, 0.76 MB gzipped</strong>, verified in a browser. <code>TransactionId</code> (a <code>u64</code>) lived in the native-only <code>tx_log</code> module, so five portable modules each duplicated it behind a <code>cfg</code> and the sixth broke the build; it now has one portable home. Also fixed: explain's <code>Instant</code> (wasm32 has no monotonic clock) and a <code>shutdown()</code> that assumed background threads.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed &mdash; clustering</h4>
+        <ul>
+          <li><strong>The bootstrap node published an empty Raft address.</strong> <code>raft_init</code> registered the initial member with no address while every learner got a real one. Invisible for as long as that node leads &mdash; nobody dials the leader &mdash; but once it loses leadership no new leader can ever reach it, and it silently freezes at its old log while the cluster commits without it. Bootstrapping with no address is now refused outright.</li>
+          <li><strong>oxipool sent every SQL read to the master.</strong> The read/write classifier looked for the statement in a field the SQL wire shape does not have, so everything read as a write and replicas never served a SQL query.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Performance &mdash; compound predicates &amp; string affixes</h4>
+        <ul>
+          <li><strong><code>AND</code> / <code>OR</code> now short-circuit.</strong> Both sides were always evaluated &mdash; <code>x &gt; 995 AND TRUE</code> cost 52% more than <code>x &gt; 995</code> alone. Every compound <code>WHERE</code> in the engine gains.</li>
+          <li><strong><code>STARTS_WITH</code> / <code>ENDS_WITH</code></strong> &mdash; exact, literal, case-sensitive affix tests that compare borrowed bytes in place. Ordinal <code>StartsWith</code>/<code>EndsWith</code> previously rendered as per-row <code>SUBSTRING</code>+<code>LENGTH</code>, because <code>LIKE</code> is case-insensitive and a needle containing <code>%</code> would become a wildcard. Faster than <code>LIKE</code> without giving up the semantics that ruled it out.</li>
+          <li>Against PostgreSQL over EF Core both shapes flipped from losses to wins: <code>any_compound</code> 0.79x&rarr;1.21x, <code>string_multi</code> 0.67x&rarr;2.07x.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added</h4>
+        <ul>
+          <li><strong><code>oxidb-server --version</code> / <code>--help</code></strong> &mdash; probing the binary with <code>--version</code> used to <em>start a server</em> on the default port. <code>--help</code> is also the only in-binary documentation of the env-var configuration.</li>
+          <li><strong>Engine-aware backup &amp; restore for the SQL and time-series engines</strong>, both <strong>low-lock</strong>: the engine lock is held only to pin a generation, and the archive compresses with it released, so queries and writes continue throughout.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type changed">Tested</h4>
+        <ul>
+          <li><strong>p99 soak harness</strong> (plus a stdlib-only driver for hosts with no Rust toolchain). On Linux alongside live instances: 1.6M ops at 5,387 ops/s, read p99 3.9 ms, zero errors, no latency drift, RSS flat.</li>
+          <li><strong>Partition tests</strong> for the sharded router &mdash; a missing shard must fail loudly, never return a plausible undercount &mdash; and for <strong>asymmetric</strong> network failures, where one direction dies and the two ends disagree about whether the peer is alive.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.35.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.35.0</h3>
         <span class="version-date">2026-07-16</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Added &mdash; instant, online schema changes</h4>

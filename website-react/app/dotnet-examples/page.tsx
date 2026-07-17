@@ -22,11 +22,11 @@ dotnet add package OxiDb.Linq
 <span class="co"># SQL engine — Entity Framework Core provider + ADO.NET (Dapper-ready)</span>
 dotnet add package OxiDb.EntityFrameworkCore
 dotnet add package OxiDb.Data</code></pre>
-      <p>Latest: <strong>v0.35.0</strong>. The EF Core packages are hosted on this site &mdash; add it as a NuGet source, or download the <code>.nupkg</code> files directly:</p>
+      <p>Latest: <strong>v0.36.0</strong>. The EF Core packages are hosted on this site &mdash; add it as a NuGet source, or download the <code>.nupkg</code> files directly:</p>
       <pre><code class="lang-bash"><span class="co"># download the EF Core provider + its dependencies</span>
-curl -LO https://oxidb.baltavista.com/nuget/OxiDb.EntityFrameworkCore.0.35.0.nupkg
-curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Data.0.35.0.nupkg
-curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Client.Tcp.0.35.0.nupkg
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.EntityFrameworkCore.0.36.0.nupkg
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Data.0.36.0.nupkg
+curl -LO https://oxidb.baltavista.com/nuget/OxiDb.Client.Tcp.0.36.0.nupkg
 
 <span class="co"># add the folder as a source, then install</span>
 dotnet nuget add source $(pwd) --name oxidb
