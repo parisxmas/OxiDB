@@ -23,6 +23,17 @@
 //!   cargo test -p oxidb-server --test p99_soak -- --ignored --nocapture
 //! ```
 //!
+//! On a host with no Rust toolchain (e.g. a production Linux box), use the
+//! stdlib-only companion driver instead — same workload, same report, same env
+//! knobs, but it takes a prebuilt server binary and needs nothing installed:
+//!
+//! ```bash
+//! # cross-compile a current server, ship it, run the soak against it
+//! cargo build --release -p oxidb-server --target x86_64-unknown-linux-musl
+//! scp target/x86_64-unknown-linux-musl/release/oxidb-server scripts/p99_soak.py host:/root/soak/
+//! ssh host 'cd /root/soak && SOAK_SECS=300 python3 p99_soak.py ./oxidb-server'
+//! ```
+//!
 //! Env knobs (all optional):
 //!   SOAK_SECS            total run seconds                 (default 20)
 //!   SOAK_CONNS           concurrent worker connections     (default 16)
