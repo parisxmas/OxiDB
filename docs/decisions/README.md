@@ -40,7 +40,7 @@ Don't rewrite an old ADR — write a new one that references it
 | [0008](0008-cross-shard-aggregation-merge.md) | Correct cross-shard aggregation merge in OxiPool | Accepted |
 | [0009](0009-disk-first-storage.md) | Disk-first storage mode (opt-in) | Accepted |
 | [0010](0010-sql-engine-crate.md) | Standalone SQL engine crate mounted as a second engine | Accepted |
-| [0011](0011-cross-engine-transactions.md) | Cross-engine transactions (document + SQL) | Proposed |
+| [0011](0011-cross-engine-transactions.md) | Cross-engine transactions (document + SQL) | Deferred |
 | [0012](0012-multi-database.md) | Multiple databases, shared by both engines | Accepted |
 | [0013](0013-dotnet-ef-core.md) | Full .NET EF Core support for the SQL engine | Accepted |
 | [0014](0014-cobra-stored-procedures.md) | Cobra as the compiled stored-procedure language | Accepted |

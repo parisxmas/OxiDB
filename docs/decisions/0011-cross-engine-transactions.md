@@ -1,9 +1,33 @@
 # ADR-0011: Cross-engine transactions (document + SQL)
 
-**Status:** Proposed — 2026-07-02 (design only; no implementation)
+**Status:** Deferred — 2026-07-17 (design only; not wanted, will not be built
+unless a real use case appears; first proposed 2026-07-02)
 **Related:** [ADR-0010](0010-sql-engine-crate.md),
 [`src/pitr.rs`](../../src/pitr.rs), [`src/transaction.rs`](../../src/transaction.rs),
 [`oxidb-sql/src/transaction.rs`](../../oxidb-sql/src/transaction.rs)
+
+## Why this is deferred (2026-07-17)
+
+The design below stands; nothing about it was found wrong. It is deferred
+because **nobody needs it**:
+
+- **Real usage is one engine at a time.** Every workload driven at OxiDB so
+  far — eShopOnWeb, the EF Core provider and its benchmarks, the live
+  exchange, the crypto feeder — picks an engine and stays there. No caller has
+  asked to write a document collection and a SQL table atomically.
+- **It would be single-node only.** This ADR scopes cluster mode out (the
+  decision record would have to be Raft-coordinated). Meanwhile SQL writes
+  *already* replicate through Raft, so a cross-engine transaction would be a
+  feature you must leave the cluster to use — the wrong direction.
+- **The cost is not the code, it is the surface.** Two WAL record types, a
+  format bump in both engines, a shared sequencer, and a two-log recovery
+  path — permanent complexity in the crash path, the one place complexity is
+  least affordable, bought for a use case that does not exist.
+
+The status quo is honest and documented: each engine is atomic on its own,
+and a crash between two single-engine commits can leave one applied. If a
+concrete workload ever needs the two to move together, this design is ready
+to pick up — that is why it is kept rather than deleted.
 
 ## Context
 
