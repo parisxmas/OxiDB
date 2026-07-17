@@ -8,7 +8,10 @@ export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<header class="hero">
   <div class="container">
     <p class="hero-kicker"><span class="hero-pulse"></span>v0.36 &middot; WebAssembly restored &middot; faster compound SQL predicates &middot; cluster fixes &middot; low-lock backups</p>
-    <h1>OxiDB</h1>
+    <div class="hero-lockup">
+      <img src="/oxidb-logo.svg" class="hero-logo" alt="OxiDB logo" width="96" height="96" />
+      <h1>OxiDB</h1>
+    </div>
     <p class="tagline">A fast, multi-model database.</p>
     <p class="sub">MongoDB-style JSON queries <strong>and a full SQL engine</strong> &mdash; window functions, CTEs, <code>WITH&nbsp;RECURSIVE</code>, LATERAL joins, and an <strong>EF&nbsp;Core provider that beats PostgreSQL</strong> (3832/3832 spec tests). Instant, online <code>ALTER&nbsp;TABLE&nbsp;ADD/DROP&nbsp;COLUMN</code> and crash-atomic checkpoints. ACID transactions with SELECT&nbsp;FOR&nbsp;UPDATE and group commit. A <strong>Redis-compatible in-memory store</strong> (MULTI/EXEC/WATCH + EVAL) and an <strong>MQTT broker</strong>. A built-in <strong>time-series engine</strong> (InfluxDB-style, Gorilla-compressed, line-protocol ingest). Full-text &amp; vector search. S3-compatible blob storage. Raft replication. Encryption at rest.</p>
     <div class="hero-actions">

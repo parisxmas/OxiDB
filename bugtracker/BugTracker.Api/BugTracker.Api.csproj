@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Google's own token-validation library — the whole auth story. -->
+    <PackageReference Include="Google.Apis.Auth" Version="1.68.0" />
+    <!-- Standard EF Core, pointed at OxiDB's SQL engine. -->
+    <ProjectReference Include="..\..\dotnet\OxiDb.EntityFrameworkCore\OxiDb.EntityFrameworkCore.csproj" />
+    <!-- The raw client — used once at startup to CREATE DATABASE before EF
+         touches it (the SQL engine is per-database). -->
+    <ProjectReference Include="..\..\dotnet\OxiDb.Client.Tcp\OxiDb.Client.Tcp.csproj" />
+  </ItemGroup>
+</Project>

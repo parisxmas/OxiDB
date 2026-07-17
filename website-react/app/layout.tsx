@@ -52,6 +52,13 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body>
+        {/* Set the theme before first paint so there is no flash. Defaults to
+            dark; light only when the visitor has chosen it. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var t=localStorage.getItem('theme');if(t!=='light'&&t!=='dark'){t='dark';}document.documentElement.setAttribute('data-theme',t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();`,
+          }}
+        />
         <Nav />
         <div className="dev-banner" role="alert">
           <span className="dev-banner-dot" />
@@ -61,6 +68,14 @@ export default function RootLayout({
           </span>
         </div>
         {children}
+        {/* Site-wide: a quick link to the bug tracker from any page. */}
+        <a href="/bugs/" className="report-tab" aria-label="Report an issue">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="8" y="6" width="8" height="14" rx="4" />
+            <path d="M19 7l-3 2M5 7l3 2M18 13h3M3 13h3M19 18l-3-1.5M5 18l3-1.5M12 2v4M9 4l1.5 2M15 4l-1.5 2" />
+          </svg>
+          <span>Report Issue</span>
+        </a>
         <Footer />
       </body>
     </html>

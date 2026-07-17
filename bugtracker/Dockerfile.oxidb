@@ -1,0 +1,11 @@
+# The server binary, unmodified. Built from this repo for
+# x86_64-unknown-linux-musl (static, so alpine needs nothing around it) and
+# copied in rather than fetched: this tracks master, ahead of the last release.
+#
+#   cargo build --release -p oxidb-server --target x86_64-unknown-linux-musl
+#   cp target/x86_64-unknown-linux-musl/release/oxidb-server bugtracker/
+FROM alpine:3.20
+COPY oxidb-server /usr/local/bin/oxidb-server
+RUN chmod +x /usr/local/bin/oxidb-server && /usr/local/bin/oxidb-server --version
+EXPOSE 4444
+ENTRYPOINT ["/usr/local/bin/oxidb-server"]

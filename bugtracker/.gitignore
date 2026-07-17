@@ -1,0 +1,10 @@
+# The server binary is built from this repo and copied in at deploy time
+# (see Dockerfile.oxidb) — never committed.
+oxidb-server
+
+# Secrets: the Google client id + admin list live here, not in git.
+.env
+
+# .NET build output
+**/bin/
+**/obj/

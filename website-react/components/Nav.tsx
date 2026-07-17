@@ -145,14 +145,22 @@ const ICON: Record<string, ReactNode> = {
       <polyline points="14 2 14 8 20 8" />
     </>
   ),
+  bug: (
+    <>
+      <rect x="8" y="6" width="8" height="14" rx="4" />
+      <path d="M19 7l-3 2M5 7l3 2M18 13h3M3 13h3M19 18l-3-1.5M5 18l3-1.5M12 2v4M9 4l1.5 2M15 4l-1.5 2" />
+    </>
+  ),
 }
 
 const navGroups: {
   title: string
+  icon: string
   items: { href: string; label: string; icon: string }[]
 }[] = [
   {
     title: 'Getting Started',
+    icon: 'zap',
     items: [
       { href: '/quickstart', label: 'Quick Start', icon: 'zap' },
       { href: '/features', label: 'Features', icon: 'grid' },
@@ -161,6 +169,7 @@ const navGroups: {
   },
   {
     title: 'Document Engine',
+    icon: 'file',
     items: [
       { href: '/queries', label: 'Queries', icon: 'search' },
       { href: '/updates', label: 'Updates', icon: 'edit' },
@@ -173,6 +182,7 @@ const navGroups: {
   },
   {
     title: 'SQL Engine',
+    icon: 'database',
     items: [
       { href: '/sql', label: 'SQL Reference', icon: 'database' },
       { href: '/procedures', label: 'Stored Procedures', icon: 'code' },
@@ -180,10 +190,12 @@ const navGroups: {
   },
   {
     title: 'Time-Series Engine',
+    icon: 'clock',
     items: [{ href: '/tsdb', label: 'Time-Series', icon: 'clock' }],
   },
   {
     title: 'In-Memory & Messaging',
+    icon: 'wifi',
     items: [
       { href: '/oximem', label: 'OxiMem (Redis)', icon: 'zap' },
       { href: '/mqtt', label: 'MQTT Broker', icon: 'wifi' },
@@ -191,6 +203,7 @@ const navGroups: {
   },
   {
     title: 'Storage & Realtime',
+    icon: 'box',
     items: [
       { href: '/blobs', label: 'Blobs (S3)', icon: 'database' },
       { href: '/streams', label: 'Streams', icon: 'radio' },
@@ -199,6 +212,7 @@ const navGroups: {
   },
   {
     title: 'Server & Clients',
+    icon: 'server',
     items: [
       { href: '/server', label: 'Server', icon: 'server' },
       { href: '/clustering', label: 'Clustering & Sharding', icon: 'target' },
@@ -208,6 +222,7 @@ const navGroups: {
   },
   {
     title: 'Reference',
+    icon: 'book',
     items: [
       { href: '/docs', label: 'Docs', icon: 'file' },
       { href: '/book', label: 'Book', icon: 'book' },
@@ -215,6 +230,7 @@ const navGroups: {
       { href: '/go-examples', label: 'Go Examples', icon: 'terminal' },
       { href: '/python-examples', label: 'Python Examples', icon: 'terminal' },
       { href: '/changelog', label: 'Changelog', icon: 'clock' },
+      { href: '/bugs', label: 'Bug Reports', icon: 'bug' },
       { href: '/license', label: 'License', icon: 'file' },
     ],
   },
@@ -235,6 +251,19 @@ export default function Nav() {
   // sidebar short (no scrollbar). Any group can be toggled open/closed.
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
+  // Light/dark theme. The blocking script in layout.tsx set data-theme before
+  // paint; which icon shows is driven purely by that attribute in CSS (see
+  // .theme-toggle rules), so there is no React state to fall out of sync on
+  // navigation. The click just reads the live attribute and flips it.
+  const toggleTheme = () => {
+    const current = document.documentElement.getAttribute('data-theme')
+    const next = current === 'light' ? 'dark' : 'light'
+    document.documentElement.setAttribute('data-theme', next)
+    try {
+      localStorage.setItem('theme', next)
+    } catch {}
+  }
+
   // Expand the group of the current page whenever navigation happens.
   useEffect(() => {
     const active = groupOf(pathname)
@@ -249,9 +278,27 @@ export default function Nav() {
   return (
     <nav className={`nav${open ? ' open' : ''}`}>
       <div className="container nav-inner">
-        <Link href="/" className="logo" onClick={() => setOpen(false)}>
-          Oxi<span>DB</span>
-        </Link>
+        <div className="nav-brand">
+          <Link href="/" className="logo" onClick={() => setOpen(false)}>
+            Oxi<span>DB</span>
+          </Link>
+          <button
+            className="theme-toggle"
+            onClick={toggleTheme}
+            aria-label="Toggle light/dark theme"
+            title="Toggle theme"
+          >
+            {/* Both rendered; CSS shows the one for the active theme. In dark we
+                show the sun (tap → light); in light the moon (tap → dark). */}
+            <svg className="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" />
+            </svg>
+            <svg className="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" />
+            </svg>
+          </button>
+        </div>
         <div className="nav-links">
           {navGroups.map((group) => {
             const groupOpen = isOpen(group.title)
@@ -262,7 +309,22 @@ export default function Nav() {
                   onClick={() => toggle(group.title)}
                   aria-expanded={groupOpen}
                 >
-                  <span>{group.title}</span>
+                  <span className="nav-group-label">
+                    <svg
+                      className="nav-group-icon"
+                      width="14"
+                      height="14"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth="2"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      {ICON[group.icon]}
+                    </svg>
+                    <span>{group.title}</span>
+                  </span>
                   <svg
                     className="nav-chevron"
                     width="12"

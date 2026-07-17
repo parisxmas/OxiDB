@@ -41,6 +41,52 @@
   --radius-sm: 4px;
 }
 
+/* ============================================
+   Light theme — set via data-theme="light" on <html>.
+   Only the page chrome flips; code & terminal blocks stay
+   dark in both themes (--code-bg/--code-border unchanged),
+   which reads as intended and keeps syntax colors legible.
+   ============================================ */
+:root[data-theme="light"] {
+  --bg:        #ffffff;
+  --bg-alt:    #f3f4f6;
+  --bg-elev:   #ffffff;
+  --bg-card:   #f7f8fa;
+  --text:      #1a1d24;
+  --text-dim:  #4b5563;
+  --text-mute: #7b8494;
+  --border:    #e4e7ec;
+  --border-2:  #d6dae1;
+  --border-3:  #c3c9d1;
+  --code-bg:   #14181f;
+  --code-border: #262d39;
+  --accent-light: rgba(226,120,74,0.13);
+  --steel-light:  rgba(124,158,180,0.14);
+  --link:      #b04a1a;
+}
+:root[data-theme="light"] body {
+  background:
+    radial-gradient(ellipse 1100px 500px at 30% -10%, rgba(226,120,74,0.06), transparent 70%),
+    radial-gradient(ellipse 800px 400px at 80% 0%, rgba(124,158,180,0.05), transparent 70%),
+    var(--bg);
+}
+/* The grain overlay is white noise for the dark theme; drop it on light. */
+:root[data-theme="light"] body::before { opacity: 0; }
+/* The H1 gradient starts white for the dark theme — start dark on light. */
+:root[data-theme="light"] .hero h1 {
+  background: linear-gradient(180deg, #11141a 0%, var(--text) 55%, var(--accent) 135%);
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+/* Code & terminal surfaces stay dark in light theme, so their text (which
+   otherwise follows --text and would go dark-on-dark) must stay light. Syntax
+   spans (.kw/.fn/.str/.co) and .termblock keep their own explicit colors. */
+:root[data-theme="light"] pre,
+:root[data-theme="light"] code,
+:root[data-theme="light"] .hero-install code {
+  color: #e7e9ed;
+}
+
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
 html, body { background: var(--bg); }
@@ -135,6 +181,68 @@ a:hover { text-decoration: underline; }
   margin-bottom: 12px;
 }
 .logo span { color: var(--accent); }
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px 16px 16px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.nav-brand .logo {
+  padding: 0;
+  border-bottom: 0;
+  margin-bottom: 0;
+}
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.theme-toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent-dark);
+  background: var(--accent-light);
+}
+/* Icon follows the live data-theme attribute — no React state to desync. */
+.theme-toggle .icon-moon { display: none; }
+.theme-toggle .icon-sun { display: inline-flex; }
+:root[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+:root[data-theme="light"] .theme-toggle .icon-moon { display: inline-flex; }
+
+/* Site-wide "Report Issue" tab, fixed to the top-right on every page. */
+.report-tab {
+  position: fixed;
+  top: 52px;
+  right: 22px;
+  z-index: 60;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 9px 15px;
+  background: var(--accent);
+  color: #0a0c10;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  text-decoration: none;
+  box-shadow: 0 6px 24px rgba(226,120,74,.35);
+  transition: filter .15s ease, transform .15s ease;
+}
+.report-tab:hover { filter: brightness(1.08); transform: translateY(-1px); }
+@media (max-width: 768px) { .report-tab { top: auto; bottom: 16px; right: 16px; } }
 .logo:hover { text-decoration: none; }
 
 .nav-links {
@@ -160,15 +268,29 @@ a:hover { text-decoration: underline; }
   border: none;
   cursor: pointer;
   font-family: inherit;
-  font-size: 10px;
-  font-weight: 700;
+  font-size: 10.5px;
+  font-weight: 800;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--text-dim);
-  opacity: 0.65;
+  color: var(--text);
+  opacity: 0.9;
   padding: 11px 8px 4px;
   transition: opacity 0.15s, color 0.15s;
 }
+.nav-group-title:hover { opacity: 1; color: var(--accent); }
+.nav-group-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  text-align: left;
+}
+.nav-group-icon {
+  flex-shrink: 0;
+  color: var(--accent);
+  opacity: 0.9;
+}
+.nav-group-title { text-align: left; }
 .nav-group-title:hover {
   opacity: 1;
   color: var(--text);
@@ -185,6 +307,9 @@ a:hover { text-decoration: underline; }
   display: none;
   flex-direction: column;
   gap: 1px;
+  /* Indent the children so they align under the parent's TEXT (past its icon),
+     giving a clear nested hierarchy. 22px = parent icon width (14) + gap (8). */
+  padding-left: 22px;
 }
 .nav-group.expanded .nav-group-items {
   display: flex;
@@ -268,6 +393,29 @@ body { margin-left: 200px; }
   background: linear-gradient(90deg, transparent, var(--accent-dark), transparent);
   opacity: 0.5;
 }
+.hero-lockup {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  margin-bottom: 16px;
+}
+.hero-logo {
+  width: 96px;
+  height: 96px;
+  flex-shrink: 0;
+  filter: drop-shadow(0 8px 24px var(--accent-glow));
+  animation: hero-logo-in 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes hero-logo-in {
+  from { opacity: 0; transform: scale(0.8) rotate(-12deg); }
+  to   { opacity: 1; transform: scale(1) rotate(0); }
+}
+.hero-lockup h1 { margin-bottom: 0; }
+@media (max-width: 560px) {
+  .hero-logo { width: 68px; height: 68px; }
+  .hero-lockup { gap: 16px; }
+}
+
 .hero h1 {
   font-family: var(--font-sans);
   font-size: 84px;

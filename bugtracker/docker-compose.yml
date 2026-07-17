@@ -1,0 +1,52 @@
+# A self-contained bug tracker: its OWN oxidb-server (separate process + volume
+# from every production instance) plus the .NET API. Everything talks over the
+# internal network; exactly ONE port is published — the API — so nothing can
+# collide with the other instances on the host.
+services:
+  oxidb:
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    build:
+      context: .
+      dockerfile: Dockerfile.oxidb
+    environment:
+      # SQL engine only — the tracker is relational (EF Core). No TSDB/MQTT/S3.
+      OXIDB_SQL: "1"
+      OXIDB_DATA: /data
+      OXIDB_ADDR: 0.0.0.0:4444
+      OXIDB_IDLE_TIMEOUT: "0"
+      # Seal + snapshot the document WAL instead of letting it grow unbounded.
+      OXIDB_WAL_CHECKPOINT_BYTES: "16777216"
+    volumes:
+      - bugtracker-data:/data
+    restart: unless-stopped
+    healthcheck:
+      # 127.0.0.1, not localhost — the alpine image does not resolve the name.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4444"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    build: { context: .., dockerfile: bugtracker/Dockerfile, target: api }
+    environment:
+      BUGS_HOST: oxidb
+      # REQUIRED — the OAuth 2.0 Web client id from Google Cloud Console. Set it
+      # in a .env file next to this compose file (BUGS_GOOGLE_CLIENT_ID=...).
+      BUGS_GOOGLE_CLIENT_ID: "${BUGS_GOOGLE_CLIENT_ID}"
+      # Who may close/reopen bugs. Comma-separated emails.
+      BUGS_ADMIN_EMAILS: "${BUGS_ADMIN_EMAILS:-barisakin@gmail.com}"
+      # Same-origin in production via nginx; this covers `next dev` too.
+      BUGS_ALLOWED_ORIGINS: "${BUGS_ALLOWED_ORIGINS:-https://oxidb.baltavista.com,http://localhost:3000}"
+    ports:
+      - "127.0.0.1:8124:8080"   # the only published port; nginx proxies to it
+    depends_on:
+      oxidb: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  bugtracker-data:
