@@ -83,6 +83,33 @@ impl CollectionMemory {
     }
 }
 
+/// Seal + snapshot + drop the WAL once the live file reaches this many bytes.
+/// `OXIDB_WAL_CHECKPOINT_BYTES`, default 64 MiB; `0` disables online
+/// checkpointing entirely (the WAL then only truncates at shutdown, which is
+/// how this behaved before).
+#[cfg(not(target_arch = "wasm32"))]
+fn wal_checkpoint_bytes() -> u64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("OXIDB_WAL_CHECKPOINT_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64 * 1024 * 1024)
+    })
+}
+
+/// Test-only: milliseconds to stall a writer between its WAL append and its
+/// B-tree apply — precisely the window `apply_barrier` exists to close.
+///
+/// The window is microseconds wide in reality, so no amount of hammering hits
+/// it by chance: a concurrency test can run millions of writes against a
+/// deliberately broken checkpoint and never see the loss. Widening it on
+/// demand is the only way to prove the barrier is load-bearing rather than
+/// decorative. Zero (the default) is a single relaxed load on the write path.
+#[doc(hidden)]
+pub static STALL_BEFORE_APPLY_MS: AtomicU64 = AtomicU64::new(0);
+
 pub struct BTreeCollection {
     #[allow(dead_code)]
     name: String,
@@ -106,6 +133,22 @@ pub struct BTreeCollection {
     in_memory: bool,
     ttl_index: Mutex<std::collections::BTreeMap<u64, Vec<DocumentId>>>,
     ttl_configs: RwLock<Vec<TtlIndexConfig>>,
+    /// Held shared by every writer across its WAL-append → B-tree-apply
+    /// window, and exclusively (for an instant) by `online_checkpoint` while
+    /// it seals the WAL.
+    ///
+    /// This is what makes online checkpointing safe. A writer appends to the
+    /// WAL *before* it touches the B-tree, so a WAL record can exist for a
+    /// document the tree does not have yet — which is exactly why truncating
+    /// the WAL after a snapshot used to lose acknowledged writes. Taking this
+    /// exclusively drains those in-flight writers, so at the instant of the
+    /// seal every record in the sealed segment is already in the tree, and a
+    /// snapshot taken afterwards is guaranteed to contain it.
+    ///
+    /// Writers hold it for a few microseconds and never contend with each
+    /// other (a read lock); only the checkpoint blocks them, only across the
+    /// seal — a rename, not the snapshot write.
+    apply_barrier: RwLock<()>,
     /// Dirty flag: set on write, cleared after persist.
     dirty: AtomicBool,
     /// Lazy-sync mode: when true, WAL writes skip per-commit fsync and
@@ -347,6 +390,7 @@ impl BTreeCollection {
             in_memory: false,
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             ttl_configs: RwLock::new(ttl_configs),
+            apply_barrier: RwLock::new(()),
             dirty: AtomicBool::new(false),
             lazy_sync: AtomicBool::new(false),
             wal: wal_backend,
@@ -370,6 +414,7 @@ impl BTreeCollection {
             in_memory: true,
             ttl_index: Mutex::new(std::collections::BTreeMap::new()),
             ttl_configs: RwLock::new(Vec::new()),
+            apply_barrier: RwLock::new(()),
             dirty: AtomicBool::new(false),
             lazy_sync: AtomicBool::new(false),
             wal: WalBackend::Memory,
@@ -750,21 +795,27 @@ impl BTreeCollection {
         }
         // Capture the current btree state to disk via atomic rename.
         //
-        // Critically, do NOT checkpoint (truncate) the WAL here.
-        // Concurrent inserts can append to the WAL and update the
-        // in-memory btree _after_ persist has begun iterating the
-        // tree but _before_ checkpoint runs — those entries would
-        // be lost (their WAL record erased, but the btree image on
-        // disk doesn't yet reflect them). Tested empirically:
-        // crash-recovery-go lost ~3/2000 acks before the WAL
-        // truncation was removed.
+        // This used to persist WITHOUT touching the WAL, because truncating
+        // it here lost writes: a writer appends its record before it updates
+        // the tree, so a snapshot taken concurrently can miss a document whose
+        // record is about to be erased (crash-recovery-go lost ~3/2000 acks).
+        // The WAL was therefore left to grow until a graceful shutdown — no
+        // bound at all for a server that runs for months.
         //
-        // The cost is unbounded WAL growth between snapshots, which
-        // we bound elsewhere: graceful shutdown does a final persist
-        // and only THEN can safely truncate (no concurrent writers).
-        // Recovery on startup is idempotent — the WAL replays on top
-        // of the snapshot, double-applying inserts is a no-op via
-        // doc_id deduplication.
+        // `online_checkpoint` bounds it safely by sealing rather than
+        // truncating: it drains in-flight writers for the instant of the seal,
+        // so the sealed segment is provably covered by the snapshot that
+        // follows, and writes resume before the slow part. See it for the
+        // crash-point argument.
+        // Sealing on every tick would rename the WAL once a second for no
+        // reason; the snapshot below is the cheap part. So checkpoint only
+        // once the WAL has actually grown — the same shape as the SQL
+        // engine's OXIDB_SQL_CHECKPOINT_BYTES.
+        #[cfg(not(target_arch = "wasm32"))]
+        if wal_checkpoint_bytes() > 0 && self.wal.size_bytes() >= wal_checkpoint_bytes() {
+            return self.online_checkpoint();
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         self.storage.persist()?;
         #[cfg(not(target_arch = "wasm32"))]
@@ -791,6 +842,74 @@ impl BTreeCollection {
         for idx in fi.values_mut() {
             let _ = idx.persist_disk();
         }
+    }
+
+    /// A guard proving its holder is between a WAL append and the matching
+    /// B-tree apply. The transaction path logs and applies from `engine.rs`,
+    /// two calls apart, so it has to hold this across both — the in-collection
+    /// writers take it for themselves.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn in_flight_guard(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.apply_barrier.read()
+    }
+
+    /// Checkpoint the WAL **without stopping writes**, and without the data
+    /// loss that made the naive version unsafe.
+    ///
+    /// The old `sync_writes` could not truncate: a writer appends its WAL
+    /// record before it touches the B-tree, so a snapshot taken concurrently
+    /// might miss a document whose record was about to be erased. Truncating
+    /// anyway lost ~3 in 2000 acknowledged writes. So the WAL was left to grow
+    /// until a graceful shutdown — which is no bound at all for a server that
+    /// runs for months.
+    ///
+    /// Sealing instead of truncating is what makes it safe:
+    ///
+    /// 1. Take `apply_barrier` exclusively. Every in-flight writer finishes
+    ///    its apply; new ones wait. This is the only moment writes pause, and
+    ///    it spans a rename — not the snapshot.
+    /// 2. `seal()` the WAL: the live file is atomically renamed to a numbered
+    ///    segment and a fresh empty one takes its place. Every record in that
+    ///    segment is now, by construction, already in the B-tree.
+    /// 3. Release the barrier. Writes resume immediately, into the new live
+    ///    WAL, and are *not* covered by what follows.
+    /// 4. Persist the B-tree. The snapshot necessarily contains everything in
+    ///    the sealed segment (step 1 guaranteed it) and possibly more.
+    /// 5. Drop the sealed segment. Its contents are in the snapshot.
+    ///
+    /// Every crash point is safe because recovery replays sealed segments as
+    /// well as the live WAL (`replay_wal_includes_sealed_segments`): crash
+    /// before the persist and the segment is replayed onto the old snapshot;
+    /// crash between persist and delete and it is replayed onto the new one,
+    /// which is idempotent via doc-id dedup.
+    ///
+    /// With PITR on, the sealed segments belong to the archiver — it copies
+    /// and removes them itself, so step 5 leaves them alone.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn online_checkpoint(&self) -> Result<()> {
+        // Segments already on disk before this seal are either the archiver's
+        // or a previous checkpoint's; leave them to their owner.
+        let pre_existing: std::collections::HashSet<PathBuf> =
+            self.wal.list_sealed_segments().into_iter().collect();
+
+        {
+            let _drained = self.apply_barrier.write();
+            self.wal.seal()?;
+        } // writes resume here — before the slow part
+
+        self.storage.persist()?;
+        self.persist_disk_indexes();
+
+        // Ours are the ones that appeared under the barrier. With PITR on the
+        // archiver owns them; it copies to `_archive/` and removes them.
+        if !self.wal.pitr_enabled() {
+            for seg in self.wal.list_sealed_segments() {
+                if !pre_existing.contains(&seg) {
+                    let _ = std::fs::remove_file(&seg);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Final checkpoint at shutdown only: persist BTree, then truncate
@@ -1077,6 +1196,11 @@ impl BTreeCollection {
         // same ordering `delete` uses. With unique indexes the
         // validate→WAL→apply order must hold: a WAL entry must never exist
         // for a rejected insert (replay would resurrect it).
+        // From here to the B-tree apply below, this writer is "in flight": its
+        // WAL record may exist while the tree does not have the document yet.
+        // `online_checkpoint` waits for this guard before it seals.
+        let _in_flight = self.apply_barrier.read();
+
         let has_unique = {
             let fi = self.field_indexes.read();
             fi.values().any(|idx| idx.unique)
@@ -1101,6 +1225,12 @@ impl BTreeCollection {
                     return Err(e);
                 }
             }
+        }
+
+        // Test hook: hold this writer in the WAL-written-but-not-applied state.
+        let stall = STALL_BEFORE_APPLY_MS.load(Ordering::Relaxed);
+        if stall > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(stall));
         }
 
         // Insert directly into B-tree (the B-tree IS the storage)
@@ -1142,6 +1272,9 @@ impl BTreeCollection {
 
     /// Insert multiple documents atomically.
     pub fn insert_many(&self, docs: Vec<Value>) -> Result<Vec<DocumentId>> {
+        // In flight: WAL record written, tree not updated yet — see insert().
+        let _in_flight = self.apply_barrier.read();
+
         if docs.is_empty() {
             return Ok(vec![]);
         }
@@ -1297,6 +1430,9 @@ impl BTreeCollection {
         &self,
         prepared: Vec<(DocumentId, Value, Vec<u8>)>,
     ) -> Result<Vec<DocumentId>> {
+        // In flight: WAL record written, tree not updated yet — see insert().
+        let _in_flight = self.apply_barrier.read();
+
         if prepared.is_empty() {
             return Ok(vec![]);
         }
@@ -1975,6 +2111,8 @@ impl BTreeCollection {
         update_json: &Value,
         limit: Option<usize>,
     ) -> Result<Vec<DocumentId>> {
+        // In flight: WAL record written, tree not updated yet — see insert().
+        let _in_flight = self.apply_barrier.read();
         let update_obj = update_json
             .as_object()
             .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
@@ -2214,6 +2352,8 @@ impl BTreeCollection {
         query_json: &Value,
         update_json: &Value,
     ) -> Result<Option<Value>> {
+        // In flight: WAL record written, tree not updated yet — see insert().
+        let _in_flight = self.apply_barrier.read();
         let update_obj = update_json
             .as_object()
             .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
@@ -2324,6 +2464,8 @@ impl BTreeCollection {
 
     /// Delete documents matching a query. Returns IDs of deleted documents.
     pub fn delete(&self, query_json: &Value, limit: Option<usize>) -> Result<Vec<DocumentId>> {
+        // In flight: WAL record written, tree not updated yet — see insert().
+        let _in_flight = self.apply_barrier.read();
         let query = query::parse_query(query_json)?;
 
         // Phase 1: Find matching docs
@@ -3370,52 +3512,50 @@ impl BTreeCollection {
         // winning. `old_data` is the effective (staged) value too, so
         // apply_prepared's index maintenance chains correctly across the
         // per-doc mutation sequence.
-        let process_candidate =
-            |id: DocumentId,
-             committed: &Value,
-             mutations: &mut Vec<crate::collection::PreparedMutation>,
-             staged: &mut std::collections::HashMap<DocumentId, Value>|
-             -> Result<()> {
-                let effective = staged.get(&id).unwrap_or(committed);
-                if !query::matches_value(&query, effective) {
-                    return Ok(());
-                }
-                let old_data = effective.clone();
-                let mut data = effective.clone();
+        let process_candidate = |id: DocumentId,
+                                 committed: &Value,
+                                 mutations: &mut Vec<crate::collection::PreparedMutation>,
+                                 staged: &mut std::collections::HashMap<DocumentId, Value>|
+         -> Result<()> {
+            let effective = staged.get(&id).unwrap_or(committed);
+            if !query::matches_value(&query, effective) {
+                return Ok(());
+            }
+            let old_data = effective.clone();
+            let mut data = effective.clone();
 
-                crate::update::apply_update(&mut data, update_json)?;
+            crate::update::apply_update(&mut data, update_json)?;
 
-                let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                let new_version = old_version + 1;
-                data.as_object_mut()
-                    .unwrap()
-                    .insert("_version".to_string(), Value::Number(new_version.into()));
+            let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
+            let new_version = old_version + 1;
+            data.as_object_mut()
+                .unwrap()
+                .insert("_version".to_string(), Value::Number(new_version.into()));
 
-                Self::check_unique_constraints_with(&fi, &data, Some(id))?;
+            Self::check_unique_constraints_with(&fi, &data, Some(id))?;
 
-                staged.insert(id, data.clone());
-                let new_bytes = codec::encode_doc(&data)?;
-                mutations.push(crate::collection::PreparedMutation {
-                    wal_entry: crate::wal::WalEntry::Update {
-                        doc_id: id,
-                        doc_bytes: new_bytes.clone(),
-                        tx_id,
-                    },
+            staged.insert(id, data.clone());
+            let new_bytes = codec::encode_doc(&data)?;
+            mutations.push(crate::collection::PreparedMutation {
+                wal_entry: crate::wal::WalEntry::Update {
                     doc_id: id,
-                    new_bytes,
-                    old_loc: None, // No DocLocation in B-tree mode
-                    old_data: Some(old_data),
-                    new_data: data,
-                    is_delete: false,
-                });
-                Ok(())
-            };
+                    doc_bytes: new_bytes.clone(),
+                    tx_id,
+                },
+                doc_id: id,
+                new_bytes,
+                old_loc: None, // No DocLocation in B-tree mode
+                old_data: Some(old_data),
+                new_data: data,
+                is_delete: false,
+            });
+            Ok(())
+        };
 
         // Committed-candidate ids we examined, so the staged-only pass
         // below (for docs inserted earlier in THIS tx, absent from the
         // committed index) doesn't double-process them.
-        let mut processed: std::collections::HashSet<DocumentId> =
-            std::collections::HashSet::new();
+        let mut processed: std::collections::HashSet<DocumentId> = std::collections::HashSet::new();
 
         if let Some(ref indexed_ids) = candidate_ids {
             for &id in indexed_ids {
@@ -3499,9 +3639,10 @@ impl BTreeCollection {
                 let mut data = effective.clone();
                 crate::update::apply_update(&mut data, update_json)?;
                 let old_version = data.get("_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                data.as_object_mut()
-                    .unwrap()
-                    .insert("_version".to_string(), Value::Number((old_version + 1).into()));
+                data.as_object_mut().unwrap().insert(
+                    "_version".to_string(),
+                    Value::Number((old_version + 1).into()),
+                );
                 Self::check_unique_constraints_with(&fi, &data, Some(id))?;
                 staged.insert(id, data.clone());
                 let new_bytes = codec::encode_doc(&data)?;

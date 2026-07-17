@@ -482,6 +482,20 @@ impl Wal {
     /// the live WAL to `<path>.<seq>` and start a fresh empty one. Holds
     /// the `inner` lock for the whole rotation, so no acknowledged write
     /// can fall between the sealed segment and the new live WAL.
+    /// Bytes in the live WAL. What the online checkpoint watches: this is the
+    /// number that used to only ever go up.
+    pub fn size_bytes(&self) -> u64 {
+        let file = self.inner.lock();
+        file.metadata().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Whether an archive sequencer is attached (PITR on). When it is, sealed
+    /// segments belong to the archiver — it copies them to `_archive/` and
+    /// removes them — so nobody else may delete them.
+    pub fn pitr_enabled(&self) -> bool {
+        self.sequencer.is_some()
+    }
+
     pub fn seal(&self) -> Result<()> {
         let mut file = self.inner.lock();
         self.seal_locked(&mut file)

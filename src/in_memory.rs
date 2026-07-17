@@ -502,6 +502,33 @@ impl WalBackend {
         }
     }
 
+    /// Bytes in the live WAL; 0 in memory.
+    pub fn size_bytes(&self) -> u64 {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::File(w) => w.size_bytes(),
+            Self::Memory => 0,
+        }
+    }
+
+    /// Sealed segments on disk, oldest first. Empty in memory — nothing to seal.
+    pub fn list_sealed_segments(&self) -> Vec<std::path::PathBuf> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::File(w) => w.list_sealed_segments(),
+            Self::Memory => Vec::new(),
+        }
+    }
+
+    /// Whether PITR's archiver owns the sealed segments.
+    pub fn pitr_enabled(&self) -> bool {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::File(w) => w.pitr_enabled(),
+            Self::Memory => false,
+        }
+    }
+
     pub fn log_batch(&self, entries: &[WalEntry]) -> Result<()> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]

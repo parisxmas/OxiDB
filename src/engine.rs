@@ -1076,6 +1076,21 @@ impl OxiDb {
     }
 
     /// Flush all index data to disk for every loaded collection.
+    /// Snapshot every collection now, checkpointing any WAL that has grown
+    /// past `OXIDB_WAL_CHECKPOINT_BYTES`. The background sync thread does this
+    /// on a timer; this is the same work on demand, for callers that want a
+    /// durable point without shutting down.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn sync_all(&self) -> Result<()> {
+        let cols = self.collections.read();
+        for col in cols.values() {
+            col.sync_writes()?;
+        }
+        drop(cols);
+        self.flush_indexes();
+        Ok(())
+    }
+
     pub fn flush_indexes(&self) {
         let cols = self.collections.read();
         for col_arc in cols.values() {
