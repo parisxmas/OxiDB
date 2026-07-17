@@ -1761,6 +1761,36 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
         }
         sp::Expr::Value(v) => translate_value(&v.value, p),
         sp::Expr::Nested(inner) => translate_expr(*inner, p),
+        // BETWEEN is defined by the standard as exactly this conjunction, so
+        // desugaring here costs nothing and means the executor never learns the
+        // word. The NULL semantics fall out for free: `NULL BETWEEN 1 AND 2`
+        // becomes `NULL >= 1 AND NULL <= 2` = NULL, which is what it must be —
+        // and that is precisely why `NOT BETWEEN` is `< OR >` rather than
+        // `NOT (a >= x AND a <= y)`... which is the same thing under de
+        // Morgan, but written this way it is obvious it stays NULL.
+        sp::Expr::Between { expr, negated, low, high } => {
+            let val = translate_expr(*expr, p)?;
+            let lo = translate_expr(*low, p)?;
+            let hi = translate_expr(*high, p)?;
+            let (l_op, h_op, join) = if negated {
+                (BinOp::Lt, BinOp::Gt, BinOp::Or)
+            } else {
+                (BinOp::Ge, BinOp::Le, BinOp::And)
+            };
+            Ok(Expr::Binary {
+                op: join,
+                left: Box::new(Expr::Binary {
+                    op: l_op,
+                    left: Box::new(val.clone()),
+                    right: Box::new(lo),
+                }),
+                right: Box::new(Expr::Binary {
+                    op: h_op,
+                    left: Box::new(val),
+                    right: Box::new(hi),
+                }),
+            })
+        }
         sp::Expr::IsNull(inner) => Ok(Expr::IsNull {
             expr: Box::new(translate_expr(*inner, p)?),
             negated: false,
