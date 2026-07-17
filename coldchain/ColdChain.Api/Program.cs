@@ -24,7 +24,7 @@ builder.Services.AddSingleton<IAmazonS3>(_ => new AmazonS3Client(
         ForcePathStyle = true,          // OxiDB is path-style only
         AuthenticationRegion = "us-east-1",
     }));
-builder.Services.AddSingleton(_ => OxiDbTcpClient.ConnectAsync(Endpoints.Host, Endpoints.Tcp).Result);
+builder.Services.AddSingleton<OxiConnection>();
 builder.Services.AddHostedService<Retention>();
 
 var app = builder.Build();
@@ -79,12 +79,12 @@ app.MapGet("/live", async (IConnectionMultiplexer redis) =>
 });
 
 // ── Time-series: a month of readings, answered as a chart. ──────────────────
-app.MapGet("/history/{device}", async (string device, OxiDbTcpClient oxi, int? minutes, long? bucketMs) =>
+app.MapGet("/history/{device}", async (string device, OxiConnection oxi, int? minutes, long? bucketMs) =>
 {
     var end = DateTime.UtcNow;
     var start = end.AddMinutes(-(minutes ?? 60));
-    var pts = await Tsdb.QueryAsync(oxi, "temperature", "celsius",
-        new() { ["device"] = device }, start, end, bucketMs ?? 10_000, "mean");
+    var pts = await oxi.ReadAsync(c => Tsdb.QueryAsync(c, "temperature", "celsius",
+        new() { ["device"] = device }, start, end, bucketMs ?? 10_000, "mean"));
     return Results.Ok(pts.Select(p => new { at = p.At, celsius = Math.Round(p.Value, 2) }));
 });
 
@@ -96,10 +96,10 @@ app.MapGet("/history/{device}", async (string device, OxiDbTcpClient oxi, int? m
 // sensor_id/temp_c and carries an alarm list. The time-series engine holds the
 // number; only this holds what the device actually SAID — including the
 // `door_open` that explains WHY the number moved.
-app.MapGet("/events/{device}", async (string device, OxiDbTcpClient oxi, int? limit) =>
+app.MapGet("/events/{device}", async (string device, OxiConnection oxi, int? limit) =>
 {
-    var docs = await oxi.FindAsync("readings", new { _device = device },
-        sort: new Dictionary<string, int> { ["_at"] = -1 }, limit: limit ?? 6);
+    var docs = await oxi.ReadAsync(c => c.FindAsync("readings", new { _device = device },
+        sort: new Dictionary<string, int> { ["_at"] = -1 }, limit: limit ?? 6));
     return Results.Ok(docs);
 });
 
@@ -142,7 +142,7 @@ app.MapPost("/certificate/{shipmentId:int}", async (
 // they cost (SQL), the raw events as sent (document), and the signed paperwork
 // (S3). One request, one process, five stores' worth of work.
 app.MapGet("/audit/{shipmentId:int}", async (
-    int shipmentId, ColdChainDb db, OxiDbTcpClient oxi, IAmazonS3 s3) =>
+    int shipmentId, ColdChainDb db, OxiConnection oxi, IAmazonS3 s3) =>
 {
     var shipment = await db.Shipments
         .Include(s => s.Customer).Include(s => s.Excursions)
@@ -150,13 +150,13 @@ app.MapGet("/audit/{shipmentId:int}", async (
     if (shipment is null) return Results.NotFound();
 
     var end = DateTime.UtcNow;
-    var readings = await Tsdb.QueryAsync(oxi, "temperature", "celsius",
-        new() { ["device"] = shipment.DeviceId }, shipment.DepartedUtc, end, 60_000, "mean");
-    var peak = await Tsdb.QueryAsync(oxi, "temperature", "celsius",
-        new() { ["device"] = shipment.DeviceId }, shipment.DepartedUtc, end, null, "max");
+    var readings = await oxi.ReadAsync(c => Tsdb.QueryAsync(c, "temperature", "celsius",
+        new() { ["device"] = shipment.DeviceId }, shipment.DepartedUtc, end, 60_000, "mean"));
+    var peak = await oxi.ReadAsync(c => Tsdb.QueryAsync(c, "temperature", "celsius",
+        new() { ["device"] = shipment.DeviceId }, shipment.DepartedUtc, end, null, "max"));
 
     // The raw events, verbatim — what the device actually sent.
-    var raw = await oxi.CountAsync("readings", new { device = shipment.DeviceId });
+    var raw = await oxi.ReadAsync(c => c.CountAsync("readings", new { device = shipment.DeviceId }));
 
     string? certificate = null;
     try
