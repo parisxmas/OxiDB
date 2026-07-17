@@ -667,6 +667,49 @@ code {
 }
 pre code { background: none; padding: 0; font-size: inherit; }
 
+/* ---- Code blocks: copy button + highlight.js palette ---- */
+pre { position: relative; }
+.code-copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 6px;
+  color: #cbd2dc;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .15s, background .15s, color .15s, border-color .15s;
+}
+pre:hover .code-copy,
+.code-copy:focus-visible { opacity: 1; }
+.code-copy:hover { background: rgba(255, 255, 255, 0.13); color: #fff; }
+.code-copy.copied { opacity: 1; color: #82a98a; border-color: rgba(130, 169, 138, 0.5); }
+/* Touch: no hover, so always show it. */
+@media (hover: none) { .code-copy { opacity: .8; } }
+
+/* highlight.js tokens mapped to OxiDB's existing manual-highlight palette
+   (rust keywords, purple names, green strings). Works on the dark code
+   surface in both themes. */
+.hljs-keyword, .hljs-built_in, .hljs-type, .hljs-literal,
+.hljs-symbol, .hljs-meta, .hljs-selector-tag { color: #f2986e; }
+.hljs-string, .hljs-regexp, .hljs-meta .hljs-string { color: #82a98a; }
+.hljs-comment, .hljs-quote { color: var(--text-mute); font-style: italic; }
+.hljs-number { color: #d6b14a; }
+.hljs-title, .hljs-title.class_, .hljs-title.function_,
+.hljs-section, .hljs-name { color: #c4a8d6; }
+.hljs-attr, .hljs-attribute, .hljs-property,
+.hljs-variable, .hljs-template-variable, .hljs-selector-attr { color: #7c9eb4; }
+.hljs-operator, .hljs-punctuation { color: var(--text-dim); }
+.hljs-deletion { color: #d96b6b; }
+.hljs-addition { color: #82a98a; }
+
 /* =========== CHANGELOG =========== */
 .version-block {
   margin-top: 32px;

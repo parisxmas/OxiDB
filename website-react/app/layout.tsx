@@ -1,6 +1,7 @@
 import type { Metadata } from 'next'
 import Nav from '@/components/Nav'
 import Footer from '@/components/Footer'
+import CodeEnhance from '@/components/CodeEnhance'
 import './globals.css'
 
 export const metadata: Metadata = {
@@ -77,6 +78,7 @@ export default function RootLayout({
           <span>Report Issue</span>
         </a>
         <Footer />
+        <CodeEnhance />
       </body>
     </html>
   )
