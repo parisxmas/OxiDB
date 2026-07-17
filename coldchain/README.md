@@ -57,6 +57,17 @@ test applied to every one: *would you reach for this if OxiDB didn't bundle it?*
   temperature.
 - **MQTT** — how sensors talk. Retained messages carry the gateway's status to
   whoever connects next; a Last Will announces it if the gateway dies.
+
+The six probes are deliberately not six copies of each other. Each sits at its
+own point inside its contracted band — a probe by the door runs warmer than one
+deep in the load, and both are compliant — with its own compressor duty cycle,
+so a healthy trace is a slow wave rather than a flat line. The two broken units
+fail in different shapes and on coprime periods (173 and 211 ticks), so they
+never resynchronise and the pattern takes twenty hours to repeat. A door left
+ajar is a sharp rise and a long clawback that only just breaches; a failing
+compressor is a slow climb, a plateau at ambient where it is simply not cooling,
+then a fast drop when it catches. Telling those two apart from the trace alone
+is the entire job of the person reading the chart.
 - **S3** — signed certificates and inspection photos. Blobs belong in a blob
   store.
 
@@ -79,7 +90,7 @@ dotnet run --project ColdChain.Api -- seed
 # 3. the fan-out: MQTT in, four engines out
 dotnet run --project ColdChain.Ingest &
 
-# 4. the fleet (two of six probes are faulty on purpose)
+# 4. the fleet (six probes, each its own unit; two of them are broken)
 dotnet run --project ColdChain.Simulator
 
 # 5. the API
