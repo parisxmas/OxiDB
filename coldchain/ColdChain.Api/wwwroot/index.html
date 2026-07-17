@@ -44,7 +44,20 @@
   #events b { color:var(--text); font-weight:500 }
   /* The fields no other engine has anywhere — the reason this one exists. */
   #events u { color:var(--accent); text-decoration:none }
-  .swatch {
+  .res { display:flex; flex-wrap:wrap; gap:10px }
+.res-card {
+  flex:1 1 200px; border:1px solid var(--line); border-radius:8px;
+  padding:12px 14px; background:rgba(255,255,255,.015);
+}
+.res-name { font:600 12.5px var(--mono); color:var(--dim); letter-spacing:.04em; text-transform:uppercase }
+.res-nums { display:flex; gap:18px; margin-top:8px; align-items:baseline }
+.res-n { font:600 23px system-ui; color:var(--text) }
+.res-u { font-size:12.5px; color:var(--dim); margin-left:3px }
+.res-meta { font:12.5px var(--mono); color:var(--dim); margin-top:7px }
+.bar { height:3px; border-radius:2px; background:rgba(255,255,255,.07); margin-top:9px; overflow:hidden }
+.bar > i { display:block; height:100%; background:var(--accent); transition:width .4s }
+
+.swatch {
   display: inline-block; width: 9px; height: 9px; border-radius: 2px;
   margin-right: 6px; vertical-align: middle;
 }
@@ -112,6 +125,11 @@
         <th class="num">Breaches</th><th class="num">Penalty</th></tr></thead>
       <tbody></tbody>
     </table>
+  </section>
+
+  <section>
+    <h2>Cost — <em>what these two processes are using</em> <span style="color:var(--dim);text-transform:none;letter-spacing:0">— the engine reports its own; live</span></h2>
+    <div class="res" id="res"></div>
   </section>
 </div>
 
@@ -632,7 +650,34 @@ es.onmessage = e => {
   renderProbes();
 };
 
+// ── Cost panel ─────────────────────────────────────────────────────────────
+const ago = s => s < 90 ? `${s}s` : s < 5400 ? `${Math.round(s/60)}m` : `${(s/3600).toFixed(1)}h`;
+
+async function loadResources() {
+  let r;
+  try { r = await (await fetch('/resources')).json(); }
+  catch { return; }   // a blip should leave the last numbers up, not blank the panel
+
+  el('res').innerHTML = [
+    ['oxidb-server', r.oxidb, 'every engine: MQTT · time-series · OxiMem · SQL · document · S3'],
+    ['coldchain-api', r.api, '.NET — EF Core, MQTTnet, StackExchange.Redis, AWS SDK'],
+  ].map(([name, u, note]) => `
+    <div class="res-card">
+      <div class="res-name">${name}</div>
+      <div class="res-nums">
+        <span><span class="res-n">${u.cpuPercent.toFixed(1)}</span><span class="res-u">% cpu</span></span>
+        <span><span class="res-n">${u.memoryMb.toFixed(0)}</span><span class="res-u">MB rss</span></span>
+      </div>
+      <div class="bar"><i style="width:${Math.min(100, u.cpuPercent)}%"></i></div>
+      <div class="res-meta">${u.threads} threads · up ${ago(u.uptimeSeconds)}</div>
+      <div class="res-meta">${note}</div>
+    </div>`).join('');
+}
+
 loadShipments().then(() => { renderLegend(); renderProbes(); loadChart(); });
+loadResources();
+// CPU is a delta since the previous sample, so the interval IS the window.
+setInterval(loadResources, 3000);
 setInterval(loadShipments, 5000);   // breach counts come from SQL
 setInterval(loadChart, 3000);
 setInterval(loadEvents, 3000);

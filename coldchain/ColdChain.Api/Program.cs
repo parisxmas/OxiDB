@@ -188,6 +188,36 @@ app.MapGet("/audit/{shipmentId:int}", async (
     });
 });
 
+// ── What the two processes cost. ───────────────────────────────────────────
+//
+// The whole claim of this demo is "one small binary instead of six systems", so
+// the number belongs on the page rather than in the prose. The engine measures
+// itself — `proc_status` is the same source its Prometheus endpoint uses — so we
+// ask it instead of guessing from the outside.
+app.MapGet("/resources", async (OxiConnection oxi) =>
+{
+    var engine = await oxi.ReadAsync(c => c.ExecRawAsync(
+        new Dictionary<string, object?> { ["cmd"] = "proc_status" }));
+
+    double D(string n) => engine.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.Number
+        ? v.GetDouble() : 0;
+    int I(string n) => engine.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.Number
+        ? v.GetInt32() : 0;
+
+    var api = SelfUsage.Sample();
+    return Results.Ok(new
+    {
+        Oxidb = new
+        {
+            CpuPercent = D("cpu_percent"),
+            MemoryMb = D("mem_rss_mb"),
+            Threads = I("threads"),
+            UptimeSeconds = I("uptime_s"),
+        },
+        Api = api,
+    });
+});
+
 // ── Live feed: OxiMem pub/sub → the browser. ───────────────────────────────
 //
 // Ingest PUBLISHes every reading to OxiMem; this relays that channel to the
