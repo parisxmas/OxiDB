@@ -49,29 +49,49 @@ mqtt.ApplicationMessageReceivedAsync += async e =>
     }
 
     var json = e.ApplicationMessage.ConvertPayloadToString();
-    var r = JsonSerializer.Deserialize<Reading>(json);
-    if (r is null) return;
+    // Three vendors, three dialects. Normalise what the numeric engines need —
+    // and keep the original, because we cannot know today which of tomorrow's
+    // fields will matter, and an auditor asks what the device SAID, not what we
+    // decided to keep.
+    var r = Normalise(json);
+    if (r is null) { Console.WriteLine($"  unparsable payload on {topic}"); return; }
     var at = DateTimeOffset.FromUnixTimeMilliseconds(r.ts).UtcDateTime;
 
     // 1. TIME-SERIES — the reading. Tags are the dimensions we slice by.
+    // The v1 probe reports no battery. Absent is not zero — writing a 0 would
+    // invent a dead battery that nobody measured.
+    var fields = new Dictionary<string, object> { ["celsius"] = r.celsius };
+    if (!double.IsNaN(r.battery)) fields["battery"] = r.battery;
     await Tsdb.WriteAsync(oxi, "temperature",
-        new() { ["device"] = r.device, ["truck"] = r.truck },
-        new() { ["celsius"] = r.celsius, ["battery"] = r.battery },
-        at);
+        new() { ["device"] = r.device, ["truck"] = r.truck }, fields, at);
 
     // 2. OXIMEM — current state, and a live feed for any dashboard. Expires on
     //    its own: a probe silent for 5 minutes should read as unknown, not as
     //    its last-known temperature. TTL is the honest default here.
-    await live.StringSetAsync($"live:{r.device}", json, TimeSpan.FromMinutes(5));
-    await live.PublishAsync(RedisChannel.Literal("live.readings"), json);
-
-    // 3. DOCUMENT — the raw event, verbatim, schemaless. Different probe models
-    //    send different extra fields; the auditor wants what was actually sent,
-    //    not our interpretation of it.
-    await oxi.InsertAsync("readings", new
+    // Live state is the NORMALISED view — a dashboard should not have to learn
+    // three vendors' field names. The original is not lost; it is in the
+    // document engine, which is the half that promises to keep it.
+    var norm = JsonSerializer.Serialize(new
     {
         device = r.device, truck = r.truck, celsius = r.celsius,
-        battery = r.battery, at = at.ToString("O"), raw = json,
+        battery = double.IsNaN(r.battery) ? (double?)null : r.battery,
+        ts = r.ts,
+    });
+    await live.StringSetAsync($"live:{r.device}", norm, TimeSpan.FromMinutes(5));
+    await live.PublishAsync(RedisChannel.Literal("live.readings"), norm);
+
+    // 3. DOCUMENT — the event exactly as it arrived. This is the engine that
+    //    earns its place here: no fixed schema fits all three dialects, and the
+    //    extra fields are not noise — `door_open` names the CAUSE of the breach
+    //    the time-series can only show as a number going up. Flattening it into
+    //    columns we chose today throws that away forever.
+    await oxi.ExecRawAsync(new Dictionary<string, object?>
+    {
+        ["cmd"] = "insert",
+        ["collection"] = "readings",
+        // Merge, don't wrap: the payload's own fields stay top-level and
+        // queryable, and we add only what routing needs.
+        ["doc"] = MergeEnvelope(json, r.device, at),
     });
 
     readings++;
@@ -115,3 +135,46 @@ await Task.Delay(TimeSpan.FromSeconds(seconds));
 Console.WriteLine($"ingest: {readings} readings, {breaches} excursions recorded");
 
 record Reading(string device, string truck, double celsius, double battery, long ts);
+
+partial class Program
+{
+    /// Map any vendor's dialect onto the one shape the time-series and SQL
+    /// sides need. Only this function knows the dialects exist.
+    static Reading? Normalise(string json)
+    {
+        try
+        {
+            var e = JsonDocument.Parse(json).RootElement;
+
+            // v1 / v2 speak `device`/`truck`/`celsius`; acme speaks
+            // `sensor_id`/`vehicle`/`temp_c`. Same reading, different words.
+            var device = Str(e, "device") ?? Str(e, "sensor_id");
+            var truck = Str(e, "truck") ?? Str(e, "vehicle");
+            var celsius = Num(e, "celsius") ?? Num(e, "temp_c");
+            var ts = e.TryGetProperty("ts", out var t) && t.TryGetInt64(out var ms) ? ms : 0;
+            if (device is null || truck is null || celsius is null || ts == 0) return null;
+
+            // v1 doesn't report battery at all — absent is not zero.
+            var battery = Num(e, "battery") ?? Num(e, "batt_pct") ?? double.NaN;
+            return new Reading(device, truck, celsius.Value, battery, ts);
+        }
+        catch (JsonException) { return null; }
+
+        static string? Str(JsonElement e, string p) =>
+            e.TryGetProperty(p, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+        static double? Num(JsonElement e, string p) =>
+            e.TryGetProperty(p, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetDouble() : null;
+    }
+
+    /// Keep every field the device sent, top-level, and add the two the
+    /// platform needs to find it again.
+    static Dictionary<string, object?> MergeEnvelope(string json, string device, DateTime at)
+    {
+        var doc = new Dictionary<string, object?>();
+        foreach (var p in JsonDocument.Parse(json).RootElement.EnumerateObject())
+            doc[p.Name] = p.Value.Clone();
+        doc["_device"] = device;           // normalised, whatever the dialect called it
+        doc["_at"] = at.ToString("O");
+        return doc;
+    }
+}

@@ -9,14 +9,22 @@ using MQTTnet.Client;
 // Two of the six devices are told to misbehave, because a cold-chain demo
 // where nothing ever breaches proves nothing.
 
-var devices = new (string Id, string Truck, double Target, bool Faulty)[]
+// Three vendors, three dialects. This is not a contrivance — a real fleet is
+// whatever was cheapest each year, and their firmwares do not agree on field
+// names, let alone on which extra fields exist. It is the reason the raw event
+// is kept verbatim instead of being flattened into a schema we chose today.
+//
+//   v1        — an old probe: temperature and nothing else
+//   v2        — newer: humidity, a door switch, a nested GPS fix
+//   acme      — a different vendor entirely: its own field NAMES, plus alarms
+var devices = new (string Id, string Truck, double Target, bool Faulty, string Model)[]
 {
-    ("probe-01", "TR-34-ABC", 4.0, false),
-    ("probe-02", "TR-34-ABC", 4.0, false),
-    ("probe-03", "TR-06-XYZ", -18.0, false),
-    ("probe-04", "TR-06-XYZ", -18.0, true),   // freezer door left ajar
-    ("probe-05", "TR-35-DEF", 4.0, false),
-    ("probe-06", "TR-35-DEF", 4.0, true),     // failing compressor
+    ("probe-01", "TR-34-ABC",   4.0, false, "v1"),
+    ("probe-02", "TR-34-ABC",   4.0, false, "v2"),
+    ("probe-03", "TR-06-XYZ", -18.0, false, "acme"),
+    ("probe-04", "TR-06-XYZ", -18.0, true,  "v2"),    // freezer door left ajar
+    ("probe-05", "TR-35-DEF",   4.0, false, "acme"),
+    ("probe-06", "TR-35-DEF",   4.0, true,  "v1"),    // failing compressor
 };
 
 var factory = new MqttFactory();
@@ -48,15 +56,34 @@ while (DateTime.UtcNow < deadline)
         var fault = d.Faulty ? Math.Max(0, tick - 15) * 0.35 : 0;
         var celsius = Math.Round(d.Target + drift + fault, 2);
 
-        var payload = JsonSerializer.Serialize(new
+        var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var battery = Math.Round(100 - tick * 0.05, 1);
+
+        // Each model serialises its OWN shape. Nothing normalises here — the
+        // fleet has no incentive to agree, and the platform has to cope.
+        object body = d.Model switch
         {
-            device = d.Id,
-            truck = d.Truck,
-            celsius,
-            battery = Math.Round(100 - tick * 0.05, 1),
-            ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-        });
-        // Topic carries the routing: sensors/<truck>/<device>/temperature
+            "v1" => new { device = d.Id, truck = d.Truck, celsius, ts },
+
+            "v2" => new
+            {
+                device = d.Id, truck = d.Truck, celsius, battery, ts,
+                humidity = Math.Round(55 + rng.NextDouble() * 10, 1),
+                door_open = d.Faulty && tick > 15,      // the door that caused it
+                gps = new { lat = Math.Round(41.0 + rng.NextDouble() * 0.1, 5),
+                            lon = Math.Round(29.0 + rng.NextDouble() * 0.1, 5) },
+            },
+
+            // Different vendor, different names: sensor_id/vehicle/temp_c.
+            _ => new
+            {
+                sensor_id = d.Id, vehicle = d.Truck, temp_c = celsius, ts,
+                batt_pct = battery,
+                alarms = celsius > 8 || celsius < -20 ? new[] { "TEMP_HIGH" } : Array.Empty<string>(),
+            },
+        };
+        var payload = JsonSerializer.Serialize(body);
+
         await client.PublishStringAsync($"sensors/{d.Truck}/{d.Id}/temperature", payload);
     }
     tick++;

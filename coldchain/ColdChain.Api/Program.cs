@@ -82,6 +82,21 @@ app.MapGet("/history/{device}", async (string device, OxiDbTcpClient oxi, int? m
     return Results.Ok(pts.Select(p => new { at = p.At, celsius = Math.Round(p.Value, 2) }));
 });
 
+// ── Document: the events as sent, whatever shape that was. ────────────────
+//
+// The engine the other three cannot replace. A fleet is three vendors and four
+// firmwares, so no fixed schema fits: one probe reports only a temperature,
+// another adds humidity, a door switch and a GPS fix, a third calls its fields
+// sensor_id/temp_c and carries an alarm list. The time-series engine holds the
+// number; only this holds what the device actually SAID — including the
+// `door_open` that explains WHY the number moved.
+app.MapGet("/events/{device}", async (string device, OxiDbTcpClient oxi, int? limit) =>
+{
+    var docs = await oxi.FindAsync("readings", new { _device = device },
+        sort: new Dictionary<string, int> { ["_at"] = -1 }, limit: limit ?? 6);
+    return Results.Ok(docs);
+});
+
 // ── S3: the paperwork. Blobs belong in a blob store, not in a row. ─────────
 app.MapPost("/certificate/{shipmentId:int}", async (
     int shipmentId, ColdChainDb db, IAmazonS3 s3, HttpRequest req) =>

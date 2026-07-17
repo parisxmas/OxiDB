@@ -38,9 +38,19 @@ test applied to every one: *would you reach for this if OxiDB didn't bundle it?*
 - **SQL** — shipments, customers, excursions. Genuinely relational: a breach
   joins to a shipment, which joins to a customer, who has a contracted penalty.
   EF Core is how .NET teams already write this.
-- **Document** — the raw event as the device sent it. Probe models disagree
-  about their extra fields, and an auditor wants what was actually sent, not
-  our interpretation of it. Schemaless is the honest answer.
+- **Document** — the event exactly as the device sent it. The fleet is three
+  vendors and no two agree: one probe reports a temperature and nothing else, a
+  newer one adds humidity, a door switch and a nested GPS fix, and a third
+  vendor calls its fields `sensor_id`/`temp_c` and carries an alarm list. No
+  fixed schema fits all three, and the extra fields are not noise — when
+  probe-04 breaches, the time-series shows the number climbing and only the
+  document shows `door_open: true`, which is *why*. Flattening events into
+  columns chosen today throws that away permanently.
+
+  Ingest normalises what the numeric engines need (that mapping is the only
+  code that knows the dialects exist) and stores the original untouched. Live
+  state in OxiMem is the normalised view — a dashboard should not have to learn
+  three vendors' field names — while the document engine keeps what was said.
 - **OxiMem** — "what is probe-04 doing right now", plus the flag that keeps one
   failing sensor from writing a breach row every second. State with a TTL: a
   probe silent for five minutes should read as *unknown*, not as its last
@@ -89,6 +99,11 @@ Every panel names the engine that answered it, because that is the whole point:
 - **Temperature** — the time-series engine, downsampled into 5-second buckets.
   The contracted range is drawn as a band and the readings outside it are marked
   in red, so a breach is visible without reading a number. Click any probe.
+- **Raw events** — the document engine. The fields no other engine holds are
+  picked out: humidity, a door switch, a GPS fix, another vendor's alarms. Put
+  it next to the chart above and the pair tells the whole story — the chart
+  shows probe-04's temperature leaving its band, the events show `door_open:
+  true` next to it.
 - **Shipments** — the SQL engine through EF Core. The penalty column is the
   reason this half is relational: the same breach costs 2,500 for the pharma
   customer and 400 for the grocer, because it joins to *their* contract.
