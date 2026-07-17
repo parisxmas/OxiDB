@@ -70,6 +70,9 @@ pub fn update(collection: &str, query: &str, update_doc: &str) -> Result<u32, Js
 }
 
 /// Delete documents matching a query. Returns number of deleted documents.
+///
+/// Exported to JavaScript as **`_delete`**: `delete` is a reserved word
+/// there, so wasm-bindgen renames it.
 #[wasm_bindgen]
 pub fn delete(collection: &str, query: &str) -> Result<u32, JsValue> {
     let q: Value = serde_json::from_str(query).map_err(|e| JsValue::from_str(&e.to_string()))?;

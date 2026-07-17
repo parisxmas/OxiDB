@@ -37,12 +37,10 @@ use crate::fts::{self, FtsIndex};
 use crate::links::{LinkConfig, LinksTable};
 use crate::pipeline::Pipeline;
 use crate::query::FindOptions;
-use crate::transaction::{ReadRecord, Transaction, WriteOp};
+use crate::transaction::{ReadRecord, Transaction, TransactionId, WriteOp};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::tx_log::{TransactionId, TxCommitLog};
+use crate::tx_log::TxCommitLog;
 use crate::value::IndexValue;
-#[cfg(target_arch = "wasm32")]
-type TransactionId = u64;
 
 /// Callback type for forwarding engine log messages to an external sink.
 pub type LogCallback = Arc<dyn Fn(&str) + Send + Sync>;
@@ -1092,6 +1090,12 @@ impl OxiDb {
     /// skips Drop on Arc'd state held by spawned threads). Idempotent:
     /// once shutdown channels are taken they stay None on the second
     /// call, and the per-collection flushes are safe to repeat.
+    /// No-op on wasm32: that target spawns no background threads, so there is
+    /// nothing to signal or flush. Defined so callers (e.g. dropping a
+    /// database) stay target-independent.
+    #[cfg(target_arch = "wasm32")]
+    pub fn shutdown(&self) {}
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn shutdown(&self) {
         // Drop the senders → background sync/scheduler/alert/TTL threads
@@ -1719,9 +1723,16 @@ impl OxiDb {
             None => Value::Null,
         };
 
+        // wasm32 has no usable monotonic clock — `Instant::now()` is not
+        // supported there — so the plan reports its own run as 0 ms rather
+        // than explain not existing at all on that target.
+        #[cfg(not(target_arch = "wasm32"))]
         let start = Instant::now();
         let results = self.aggregate(collection, pipeline_json)?;
+        #[cfg(not(target_arch = "wasm32"))]
         let duration_us = start.elapsed().as_micros() as u64;
+        #[cfg(target_arch = "wasm32")]
+        let duration_us = 0u64;
 
         Ok(json!({
             "stages": stages,
@@ -3560,8 +3571,13 @@ mod tests {
         db.insert("acc", json!({"id": "x", "bal": 100})).unwrap();
 
         let tx = db.begin_transaction();
-        db.tx_update(tx, "acc", &json!({"id": "x"}), &json!({"$inc": {"bal": -2}}))
-            .unwrap();
+        db.tx_update(
+            tx,
+            "acc",
+            &json!({"id": "x"}),
+            &json!({"$inc": {"bal": -2}}),
+        )
+        .unwrap();
         db.tx_update(tx, "acc", &json!({"id": "x"}), &json!({"$inc": {"bal": 1}}))
             .unwrap();
         db.commit_transaction(tx).unwrap();
@@ -3576,7 +3592,8 @@ mod tests {
         // must see the inserted value.
         let db = temp_db();
         let tx = db.begin_transaction();
-        db.tx_insert(tx, "acc", json!({"id": "y", "bal": 10})).unwrap();
+        db.tx_insert(tx, "acc", json!({"id": "y", "bal": 10}))
+            .unwrap();
         db.tx_update(tx, "acc", &json!({"id": "y"}), &json!({"$inc": {"bal": 5}}))
             .unwrap();
         db.commit_transaction(tx).unwrap();
@@ -3596,12 +3613,22 @@ mod tests {
 
         // from==to==a: debit amount+fee (2), credit amount (1), fee +1.
         let tx = db.begin_transaction();
-        db.tx_update(tx, "acc", &json!({"id": "a"}), &json!({"$inc": {"bal": -2}}))
-            .unwrap();
+        db.tx_update(
+            tx,
+            "acc",
+            &json!({"id": "a"}),
+            &json!({"$inc": {"bal": -2}}),
+        )
+        .unwrap();
         db.tx_update(tx, "acc", &json!({"id": "a"}), &json!({"$inc": {"bal": 1}}))
             .unwrap();
-        db.tx_update(tx, "acc", &json!({"id": "fee"}), &json!({"$inc": {"bal": 1}}))
-            .unwrap();
+        db.tx_update(
+            tx,
+            "acc",
+            &json!({"id": "fee"}),
+            &json!({"$inc": {"bal": 1}}),
+        )
+        .unwrap();
         db.commit_transaction(tx).unwrap();
 
         let total: i64 = db
@@ -3620,13 +3647,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = OxiDb::open(dir.path()).unwrap();
         for i in 0..50 {
-            db.insert("orders", json!({"status": if i % 2 == 0 { "open" } else { "done" }, "n": i}))
-                .unwrap();
+            db.insert(
+                "orders",
+                json!({"status": if i % 2 == 0 { "open" } else { "done" }, "n": i}),
+            )
+            .unwrap();
         }
 
         // No index: full scan, post-filter.
         let plan = db
-            .explain_find("orders", &json!({"status": "open"}), &FindOptions::default())
+            .explain_find(
+                "orders",
+                &json!({"status": "open"}),
+                &FindOptions::default(),
+            )
             .unwrap();
         assert_eq!(plan["strategy"], "COLLSCAN");
         assert_eq!(plan["examined"], 50);
@@ -3636,7 +3670,11 @@ mod tests {
         // With an index: index scan, candidates narrowed to the match.
         db.create_index("orders", "status").unwrap();
         let plan = db
-            .explain_find("orders", &json!({"status": "open"}), &FindOptions::default())
+            .explain_find(
+                "orders",
+                &json!({"status": "open"}),
+                &FindOptions::default(),
+            )
             .unwrap();
         assert_eq!(plan["strategy"], "INDEX_SCAN");
         assert_eq!(plan["candidates"], 25);
@@ -3647,14 +3685,20 @@ mod tests {
         // Post-filter-only operator: index can't serve $mod, and the
         // plan says so.
         let plan = db
-            .explain_find("orders", &json!({"n": {"$mod": [7, 0]}}), &FindOptions::default())
+            .explain_find(
+                "orders",
+                &json!({"n": {"$mod": [7, 0]}}),
+                &FindOptions::default(),
+            )
             .unwrap();
         assert_eq!(plan["strategy"], "COLLSCAN");
         assert_eq!(plan["post_filter"], true);
         assert_eq!(plan["post_filter_ops"], json!(["$mod"]));
 
         // Index-only count.
-        let plan = db.explain_count("orders", &json!({"status": "open"})).unwrap();
+        let plan = db
+            .explain_count("orders", &json!({"status": "open"}))
+            .unwrap();
         assert_eq!(plan["strategy"], "INDEX_ONLY_COUNT");
         assert_eq!(plan["count"], 25);
 

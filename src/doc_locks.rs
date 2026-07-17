@@ -26,7 +26,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
-use crate::tx_log::TransactionId;
+use crate::transaction::TransactionId;
 
 #[derive(Default)]
 struct State {

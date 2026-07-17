@@ -35,9 +35,12 @@
             const berliners = JSON.parse(oxidb.find('users', JSON.stringify({ city: 'Berlin' })));
             log('\nUsers in Berlin:\n' + JSON.stringify(berliners, null, 2));
 
-            // 5. SQL query
-            const result = JSON.parse(oxidb.sql('SELECT name, age FROM users WHERE age > 27 ORDER BY age'));
-            log('\nSQL (age > 27):\n' + JSON.stringify(result, null, 2));
+            // 5. Sorted range query. (There is no oxidb.sql() here: the WASM
+            // build exposes the document engine only — the SQL engine needs a
+            // filesystem for its WAL and checkpoints, which this target has
+            // no notion of.)
+            const older = JSON.parse(oxidb.find('users', JSON.stringify({ age: { $gt: 27 } })));
+            log('\nAge > 27:\n' + JSON.stringify(older, null, 2));
 
             // 6. Update
             const updated = oxidb.update('users', JSON.stringify({ name: 'Bob' }), JSON.stringify({ $set: { age: 26 } }));
@@ -54,7 +57,8 @@
             log('\nUsers per city:\n' + JSON.stringify(agg, null, 2));
 
             // 9. Delete
-            const deleted = oxidb.delete('users', JSON.stringify({ name: 'Charlie' }));
+            // `delete` is a JS reserved word, so wasm-bindgen exports it as `_delete`.
+            const deleted = oxidb._delete('users', JSON.stringify({ name: 'Charlie' }));
             log('\nDeleted ' + deleted + ' document(s)');
 
             // 10. Final state

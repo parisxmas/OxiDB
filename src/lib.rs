@@ -70,8 +70,5 @@ pub use engine::{BackupInfo, LogCallback, OxiDb, PitrRestoreInfo, RestoreInfo};
 pub use error::{Error, Result};
 #[cfg(not(target_arch = "wasm32"))]
 pub use pitr::PitrTarget;
-#[cfg(not(target_arch = "wasm32"))]
-pub use tx_log::TransactionId;
-#[cfg(target_arch = "wasm32")]
-pub type TransactionId = u64;
+pub use transaction::TransactionId;
 pub use vector::DistanceMetric;

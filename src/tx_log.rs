@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 
 use crate::error::{Error, Result};
 
-pub type TransactionId = u64;
+pub use crate::transaction::TransactionId;
 
 // ── On-disk header (Phase 1b of ADR-0003 / docs/format/tx-commit-log.md) ──
 //
