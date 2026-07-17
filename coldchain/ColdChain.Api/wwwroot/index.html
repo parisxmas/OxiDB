@@ -57,19 +57,25 @@
 .leg.on { color: var(--fg); border-color: var(--line); background: rgba(255,255,255,.03); }
 #chart { background:var(--card); border:1px solid var(--line); border-radius:10px; width:100%; height:260px }
   .essay { border-top:1px solid var(--line); margin-top:8px; padding:34px 26px 60px }
-  .essay-in { max-width:760px; margin:0 auto; color:#b8c0cc; font-size:16px; line-height:1.72 }
-  .essay h3 { color:var(--text); font-size:17px; margin:30px 0 8px; font-weight:620 }
+  .essay-in { max-width:800px; margin:0 auto; color:#b8c0cc; font-size:18.5px; line-height:1.75 }
+  .essay h3 { color:var(--text); font-size:21px; margin:36px 0 10px; font-weight:620 }
   .essay h3:first-child { margin-top:0 }
   .essay p { margin:0 0 13px }
   .essay strong { color:var(--text); font-weight:600 }
-  .essay code { font-family:var(--mono); font-size:13.5px; color:var(--accent);
+  .essay code { font-family:var(--mono); font-size:15.5px; color:var(--accent);
                 background:rgba(226,120,74,.08); padding:1px 5px; border-radius:4px }
-  .essay .lede { font-size:17.5px; color:var(--text); line-height:1.65; margin-bottom:22px }
+  .essay .lede { font-size:21px; color:var(--text); line-height:1.62; margin-bottom:26px }
   .essay ul { margin:0 0 13px; padding-left:19px }
   .essay li { margin-bottom:7px }
   .essay .note { border-left:2px solid var(--line); padding:2px 0 2px 15px; color:var(--dim);
                  font-size:15px; margin:18px 0 }
   .essay .warn { color:var(--warn) }
+  .lang-tabs { display:flex; gap:6px; margin-bottom:26px }
+  .lang { font:600 13px var(--mono); letter-spacing:.03em; color:var(--dim);
+    background:none; border:1px solid var(--line); border-radius:6px;
+    padding:6px 14px; cursor:pointer }
+  .lang:hover { color:var(--text) }
+  .lang.on { color:var(--text); background:rgba(255,255,255,.05); border-color:#3a4150 }
   .live { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--ok);
           margin-right:6px; animation:p 2s infinite }
   @keyframes p { 0%,100%{opacity:1} 50%{opacity:.25} }
@@ -111,6 +117,12 @@
 
 <div class="essay"><div class="essay-in">
 
+<div class="lang-tabs">
+  <button class="lang on" onclick="setLang('en')" id="lang-en">English</button>
+  <button class="lang" onclick="setLang('tr')" id="lang-tr">Türkçe</button>
+</div>
+
+<div id="essay-en">
 <p class="lede">Everything above is served by <strong>one process</strong>. Not one
 cluster, not one docker-compose file — one <code>oxidb-server</code>, about 14&nbsp;MB
 on disk, holding four different kinds of data at once and answering four
@@ -203,21 +215,50 @@ temperature: absent is <em>unknown</em>, not <em>fine</em>.</p>
 honest — "find similar excursion patterns" is a sentence nobody in this industry
 has said. Leaving them out is the same discipline that let the other six in.</p>
 
+<h3>What it costs to run forever</h3>
+<p>Left alone, this stack grew about <strong>225&nbsp;MB a day</strong> — roughly
+80&nbsp;GB a year, for six probes. Each line of that needed a different answer,
+and the time-series one is worth stating because it is not a compromise: nobody
+asks for the reading from 09:41:22 two years ago, they ask whether the load
+stayed in range. A one-minute rollup of mean/min/max is about thirty times
+smaller and still proves the case, because a <em>maximum</em> over a minute
+cannot hide a spike. So the rollup is kept forever and the raw stream is dropped
+after thirty days. That is not disk economics; it is the retention rule the
+regulation already implies.</p>
+
 <h3>What building it found</h3>
-<p>A showcase is worth writing because it puts weight on things a test suite
-never does. Two real gaps turned up while this one was being built:</p>
+<p>A showcase earns its keep by putting weight on things a test suite never does,
+and by running for weeks — which asks questions a benchmark never asks. Four
+things turned up. Three of them changed the engine or its client libraries.</p>
 <ul>
-  <li>the .NET packages have <strong>no time-series helper</strong>, so this demo
-      wraps the client's raw escape hatch in one — a shim that probably belongs in
-      the client library itself;</li>
-  <li>the <strong>AWS .NET SDK rejects OxiDB's ETag</strong>. It verifies the
+  <li><strong>The write-ahead log grew forever.</strong> The document engine
+      truncated it only on a graceful shutdown, so this stack accumulated
+      ~130&nbsp;MB a day and the workaround was a weekly restart. Restarting a
+      database on a cron schedule to reclaim disk is not an answer, so the engine
+      now checkpoints while open. The reason an earlier attempt lost acknowledged
+      writes: a writer appends to the log and <em>then</em> applies to the tree, so
+      sealing the log in that window leaves the write in neither. A barrier the
+      checkpoint drains before sealing closes it. <strong>This demo is why that
+      exists.</strong></li>
+  <li><strong>There was no time-series helper in the .NET packages</strong>, so
+      this demo wrapped the client's raw escape hatch in a shim of its own. That
+      shim is now gone: the client library has a typed surface and the demo uses
+      it. Writing the shim is what showed the gap; deleting it is what showed the
+      real one was enough.</li>
+  <li><strong>The pipeline did not survive its own database restarting.</strong>
+      MQTT dropped, the TCP sockets died with it, and the MQTT library swallows
+      exceptions thrown from a message handler — so every container went on
+      reporting healthy while nothing at all was being written. That is the worst
+      failure there is, because it looks fine. The connections heal themselves
+      now, and failures are loud.</li>
+  <li><strong>The AWS .NET SDK rejects OxiDB's ETag.</strong> It verifies the
       returned tag as an MD5 of what it sent; OxiDB's is deliberately the first
       16&nbsp;bytes of a SHA-256. The object stores perfectly, <code>aws-cli</code>
       and <code>boto3</code> never notice, and the .NET SDK throws on the way
       home. Everything else here talks to OxiDB with zero accommodation; that one
-      needs a flag.</li>
+      needs a flag. Still open.</li>
 </ul>
-<p>Both are written down rather than papered over, because a demo that only
+<p>All four are written down rather than papered over, because a demo that only
 demonstrates the parts that already worked is marketing, not evidence.</p>
 
 <h3>What it does not do</h3>
@@ -230,6 +271,156 @@ auditor's question, and which no ordinary demo ever has a reason to switch on.</
 
 <p class="warn">OxiDB is under active development and is not yet recommended for
 production use. This is a demonstration, not a reference deployment.</p>
+</div>
+
+<div id="essay-tr" hidden>
+<p class="lede">Yukarıdaki her şeyi <strong>tek bir süreç</strong> yanıtlıyor. Tek
+bir küme değil, tek bir docker-compose dosyası değil — diskte yaklaşık 14&nbsp;MB
+tutan tek bir <code>oxidb-server</code>; aynı anda dört ayrı türde veri tutuyor ve
+bunun için dört ayrı kablo protokolü konuşuyor.</p>
+
+<h3>Bu nedir</h3>
+<p>Küçük ölçekte bir soğuk zincir uygunluk sistemi. Kamyonlar aşı ve donmuş gıda
+taşıyor; içlerindeki problar sıcaklık bildiriyor; yükün asla çıkmaması gereken,
+sözleşmeye bağlanmış bir aralığı var. Kolay yarısı bu. Zor yarısı iki yıl sonra
+geliyor: bir denetçi SHP-1004 sevkiyatının yolculuğu boyunca aralıkta kaldığını
+<strong>kanıtlamanızı</strong> istiyor — ve gösterdiğiniz kaydın o günden beri
+değiştirilmediğini de.</p>
+
+<p>Bu alan heyecan verici olduğu için seçilmedi. Bütün bunlara gerçekten ihtiyaç
+duyan o ender uygulama olduğu için seçildi: sayısal okuma seli, birbirini tutmayan
+cihaz olayları, canlı durum, ilişkisel sözleşmeler ve para, bir de değiştirilemez
+evrak. Çoğu demo özelliklerinin yarısını açmak için bahane uydurmak zorundadır.
+Bunu ise daha fazlasını kullanmaktan vazgeçirmek gerekiyor.</p>
+
+<h3>Neyi savunuyor</h3>
+<p>OxiDB'nin bunları <em>yapabildiğini</em> değil — onu bir özellik listesi çok daha
+ucuza söylerdi. Savı şu: <strong>bu, sıradan bir .NET uygulamasıdır</strong>.
+Yukarıdaki kod EF&nbsp;Core, MQTTnet, StackExchange.Redis ve AWS SDK kullanıyor:
+OxiDB'yi hiç duymamış, duyacak şekilde de yapılandırılmamış dört kütüphane.
+Localhost portlarına yönlendirildiler ve yazıldıkları sistemlere karşı nasıl
+davranıyorlarsa aynen öyle davranıyorlar.</p>
+
+<p>Dolayısıyla ilgi çekici sayı bir kıyaslama sonucu değil. Kurmak
+<em>zorunda kalmadığınız</em> şeylerin sayısı. Bu panel normalde MQTT için
+<strong>Mosquitto</strong>, okumalar için <strong>InfluxDB</strong>, canlı durum
+için <strong>Redis</strong>, sevkiyat ve cezalar için <strong>PostgreSQL</strong>,
+ham olaylar için <strong>MongoDB</strong> ve sertifikalar için
+<strong>MinIO</strong> üzerinde otururdu. Kurulacak, güvenliği sağlanacak,
+izlenecek, yedeklenecek, altı ayrı takvimde yükseltilecek ve birbiriyle tutarlı
+tutulacak altı sistem. Burada ise tek bir ikili dosya üzerinde beş port — ve yedek
+tek bir arşiv, tek bir an itibarıyla alınmış, tek bir geri yüklemeyle.</p>
+
+<h3>Tek bir okumada gerçekte ne oluyor</h3>
+<p>Bir prob <code>sensors/TR-06-XYZ/probe-04/temperature</code> adresine JSON
+yayınlıyor. Ingest servisi <code>sensors/+/+/temperature</code> aboneliğiyle
+dinliyor — biri kamyon, biri prob için iki joker — ve tek bir mesajdan dört
+depoya dağıtıyor; her biri iyi olduğu veri biçimini alıyor:</p>
+<ul>
+  <li><strong>zaman-serisi motoru</strong> sayıyı alıyor, cihaz ve kamyonla
+      etiketlenmiş hâlde; burada bir aylık on saniyelik örnekler, tablo taraması
+      yapmadan bir grafiğin okuyabileceği kadar sıkışıyor;</li>
+  <li><strong>OxiMem</strong> güncel durumu beş dakikalık TTL ile alıyor ve bir
+      kanalda yayınlıyor — yukarıdaki kartlar böyle güncelleniyor. Bu sayfada
+      hiçbir şey yoklama yapmıyor: bir kart, bir sensör yayın yaptığı için, bir
+      sıçrama ötede değişiyor;</li>
+  <li><strong>belge motoru</strong> olayı geldiği biçimde, harfi harfine alıyor;</li>
+  <li>ve okuma sözleşmeyi kırdıysa <strong>SQL motoru</strong> bir ihlal satırı
+      alıyor — çünkü ihlalin parası vardır ve bir sevkiyata, o sevkiyat da bir
+      müşteriye bağlanmak zorundadır.</li>
+</ul>
+
+<h3>Her motor neden burada</h3>
+<p>Her biri tek bir sınavdan geçmek zorundaydı: <strong>OxiDB paketlemeseydi
+buna uzanır mıydınız?</strong> Bu sınavı geçemeyen her şey vitrini
+güçlendirmez, zayıflatır — kimse vektör aramanın araya sıkıştırılmasından
+etkilenmez; ancak zaten doğru cevap olduğunda etkilenir.</p>
+
+<p>Bunu en zor kazanan <strong>belge motoru</strong> oldu, ve kazandıran şey filo.
+Üç üretici, hiçbiri diğeriyle anlaşmıyor: eski bir prob yalnızca sıcaklık
+bildiriyor, yenisi nem, kapı sensörü ve iç içe bir GPS konumu ekliyor, üçüncüsü
+alanlarını <code>sensor_id</code> ve <code>temp_c</code> diye adlandırıp bir alarm
+listesi taşıyor. Üçüne birden uyan sabit bir şema yok. Üstelik fazladan alanlar
+süs değil — yukarıdaki probe-04'e bakın: grafik sıcaklığın banttan çıktığını
+gösteriyor, yani ihlalin <em>olduğunu</em>. Ham olaylar
+<code>door_open: true</code> gösteriyor, yani <em>nedenini</em>. Zaman-serisi motoru
+bunu asla tutamaz, bugün tasarlanan bir şema da bunu öngöremez. Olayı tam
+gönderildiği gibi saklamak tek dürüst cevap, ve o motorun bütün işi bu.</p>
+
+<p><strong>SQL motoru</strong> hakkını yukarıdaki tabloda veriyor. Ceza sütununa
+bakın: aynı tek ihlal, ilaç müşterisi için 2.500, market müşterisi için 400.
+Bunun hiçbir yanı belge araması değil — bir birleştirme: ihlalden sevkiyata,
+sevkiyattan müşteriye, müşteriden imzaladığı sözleşmeye. İlişkisel veritabanları
+bunun içindir, ve EF&nbsp;Core .NET ekiplerinin bunu zaten yazma biçimidir.</p>
+
+<p><strong>OxiMem</strong> hakkını iki kez veriyor: bir kez canlı görünüm olarak,
+bir kez de görünmeden — bozulan bir prob saniyede bir ihlal bildirir, ve onun
+saniyede bir veritabanı satırı yazmasını engelleyen bayrak, bir dakikalık ömürle
+orada durur. Buharlaşması gereken durum, unutan bir yere aittir. Sessizleşen bir
+probun bu sayfada son sıcaklığını göstermek yerine solmasının sebebi de bu:
+yokluk <em>bilinmiyor</em> demektir, <em>iyi</em> değil.</p>
+
+<p class="note">Bilinçli olarak yok: <strong>vektör arama</strong> ve
+<strong>WASM</strong>. İkisi de mümkündü ve ikisi de dürüst olmazdı — "benzer ihlal
+desenlerini bul" bu sektörde kimsenin kurmadığı bir cümle. Onları dışarıda bırakan
+disiplin, diğer altısını içeri alan disiplinin aynısı.</p>
+
+<h3>Sürekli çalışmanın maliyeti</h3>
+<p>Kendi hâline bırakıldığında bu yığın günde yaklaşık <strong>225&nbsp;MB</strong>
+büyüyordu — altı prob için yılda kabaca 80&nbsp;GB. Bunun her kalemi ayrı bir
+cevap gerektirdi; zaman-serisi olanını söylemeye değer, çünkü bir taviz değil:
+kimse iki yıl önceki 09:41:22 okumasını sormaz, yükün aralıkta kalıp kalmadığını
+sorar. Bir dakikalık ortalama/min/maks özeti otuz kat küçüktür ve olayı yine de
+kanıtlar, çünkü bir dakikadaki <em>maksimum</em> bir sıçramayı gizleyemez. Bu
+yüzden özet sonsuza dek saklanıyor, ham akış otuz gün sonra atılıyor. Bu disk
+ekonomisi değil; düzenlemenin zaten ima ettiği saklama kuralı.</p>
+
+<h3>Bunu yazmak neyi buldu</h3>
+<p>Bir vitrin, hiçbir test takımının yüklemediği yerlere yük bindirdiği için ve
+haftalarca çalıştığı için hakkını verir — ki bu, hiçbir kıyaslamanın sormadığı
+soruları sorar. Dört şey çıktı. Üçü motoru ya da istemci kütüphanelerini
+değiştirdi.</p>
+<ul>
+  <li><strong>Yazma-öncesi günlük sonsuza dek büyüyordu.</strong> Belge motoru onu
+      yalnızca düzgün kapanışta kırpıyordu, dolayısıyla bu yığın günde ~130&nbsp;MB
+      biriktiriyordu ve geçici çözüm haftalık yeniden başlatmaydı. Disk geri
+      kazanmak için bir veritabanını cron ile yeniden başlatmak bir cevap değildir;
+      bu yüzden motor artık açıkken checkpoint alıyor. Daha önceki bir denemenin
+      onaylanmış yazmaları kaybetme sebebi şuydu: yazan taraf önce günlüğe ekler,
+      <em>sonra</em> ağaca uygular — günlüğü tam o pencerede mühürlerseniz yazma
+      ikisinde de bulunmaz. Checkpoint'in mühürlemeden önce boşalttığı bir bariyer
+      bunu kapatıyor. <strong>Bu demo, onun var olma sebebi.</strong></li>
+  <li><strong>.NET paketlerinde zaman-serisi yardımcısı yoktu</strong>, bu yüzden bu
+      demo istemcinin ham kaçış kapısını kendi sarmalayıcısına sardı. O sarmalayıcı
+      artık yok: istemci kütüphanesinin tipli bir yüzeyi var ve demo onu kullanıyor.
+      Sarmalayıcıyı yazmak boşluğu gösterdi; silmek ise gerçek olanın yettiğini.</li>
+  <li><strong>Boru hattı, kendi veritabanının yeniden başlamasına dayanamadı.</strong>
+      MQTT koptu, TCP soketleri onunla birlikte öldü, ve MQTT kütüphanesi mesaj
+      handler'ından fırlayan istisnaları yutuyor — dolayısıyla hiçbir şey
+      yazılmazken dört konteyner de "sağlıklı" raporlamaya devam etti. Bu, var olan
+      en kötü hatadır, çünkü iyi görünür. Bağlantılar artık kendini onarıyor ve
+      hatalar sesli.</li>
+  <li><strong>AWS .NET SDK'sı OxiDB'nin ETag'ini reddediyor.</strong> Dönen etiketi
+      gönderdiğinin MD5'i olarak doğruluyor; OxiDB'ninki ise bilinçli olarak bir
+      SHA-256'nın ilk 16&nbsp;baytı. Nesne kusursuz saklanıyor, <code>aws-cli</code>
+      ve <code>boto3</code> hiç fark etmiyor, .NET SDK'sı dönüş yolunda fırlatıyor.
+      Buradaki her şey OxiDB ile sıfır uyarlamayla konuşuyor; bu bir bayrak
+      istiyor. Hâlâ açık.</li>
+</ul>
+<p>Dördü de üstü örtülmek yerine yazıya geçirildi, çünkü yalnızca zaten çalışan
+kısımları gösteren bir demo kanıt değil, pazarlamadır.</p>
+
+<h3>Neleri yapmıyor</h3>
+<p>İki motora yayılan işlemler yok — her biri kendi başına commit ediyor. Burada
+hiçbir şey parçalanmış (sharded) değil; o ayrı bir eksen ve bu veri, filo çok
+büyümeden buna ihtiyaç duymazdı. Uygunluk hikâyesinin bu sayfada henüz yazılmamış
+bir bölümü daha var: motor zaman-noktasına geri yükleme, denetim günlüğü, WORM
+depolama ve disk üzerinde şifreleme destekliyor — denetçinin sorusunun asıl cevabı
+bunlar, ve sıradan bir demonun bunları açmak için hiçbir sebebi olmaz.</p>
+
+<p class="warn">OxiDB aktif geliştirme aşamasındadır ve henüz üretim kullanımı için
+önerilmez. Bu bir gösterimdir, referans kurulum değildir.</p>
+</div>
 
 </div></div>
 
@@ -250,6 +441,21 @@ const colourOf = id => {
 };
 
 const el = id => document.getElementById(id);
+
+// ── The essay, in two languages ────────────────────────────────────────────
+function setLang(l) {
+  for (const k of ['en', 'tr']) {
+    el('essay-' + k).hidden = k !== l;
+    el('lang-' + k).classList.toggle('on', k === l);
+  }
+  try { localStorage.setItem('coldchain-lang', l); } catch {}
+}
+// Remember the choice; a reader who picked Türkçe did not mean "just this once".
+// Otherwise follow the browser, and fall back to English.
+try {
+  const saved = localStorage.getItem('coldchain-lang');
+  setLang(saved || ((navigator.language || '').startsWith('tr') ? 'tr' : 'en'));
+} catch { setLang('en'); }
 const fmt = n => (n > 0 ? '+' : '') + n.toFixed(2);
 
 // ── SQL panel ──────────────────────────────────────────────────────────────
