@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use openraft::BasicNode;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
@@ -48,9 +49,8 @@ use openraft::raft::{
     VoteRequest, VoteResponse,
 };
 use openraft::storage::Adaptor;
-use openraft::BasicNode;
 use oxidb::OxiDb;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -59,6 +59,7 @@ use tokio::time::sleep;
 
 use oxidb_server::async_server::{self, ServerState};
 use oxidb_server::raft::log_store::OxiDbStore;
+use oxidb_server::raft::management;
 use oxidb_server::raft::network::{OxiDbNetwork, OxiDbNetworkFactory};
 use oxidb_server::raft::types::{OxiRaft, TypeConfig};
 
@@ -125,10 +126,7 @@ struct PartitionedNetwork {
     inner: OxiDbNetwork,
 }
 
-fn unreachable<E: std::error::Error + 'static>(
-    from: u64,
-    to: u64,
-) -> RPCError<u64, BasicNode, E> {
+fn unreachable<E: std::error::Error + 'static>(from: u64, to: u64) -> RPCError<u64, BasicNode, E> {
     RPCError::Unreachable(Unreachable::new(&std::io::Error::new(
         std::io::ErrorKind::Other,
         format!("partitioned: {from} -> {to}"),
@@ -279,12 +277,15 @@ async fn start_node(
         audit_log: None,
         auth_enabled: false,
         raft: Some(Arc::clone(&raft)),
+        raft_addr: Some(raft_addr.to_string()),
     });
 
     let mut tasks = Vec::new();
 
     let raft_clone = Arc::clone(&raft);
-    let raft_listener = TcpListener::bind(raft_addr).await.expect("bind raft listener");
+    let raft_listener = TcpListener::bind(raft_addr)
+        .await
+        .expect("bind raft listener");
     tasks.push(tokio::spawn(async move {
         loop {
             match raft_listener.accept().await {
@@ -357,7 +358,10 @@ async fn form_cluster(count: u64, ctrl: Arc<Partitioner>) -> (Vec<TestNode>, Vec
                 "addr": nodes[idx].raft_addr.to_string(),
             }))
             .await;
-        assert!(resp["ok"].as_bool().unwrap_or(false), "add_learner {id}: {resp}");
+        assert!(
+            resp["ok"].as_bool().unwrap_or(false),
+            "add_learner {id}: {resp}"
+        );
     }
 
     let members: Vec<u64> = (1..=count).collect();
@@ -369,9 +373,13 @@ async fn form_cluster(count: u64, ctrl: Arc<Partitioner>) -> (Vec<TestNode>, Vec
         "change_membership: {resp}"
     );
 
-    wait_for_leader_among(&mut clients, &(0..count as usize).collect::<Vec<_>>(), Duration::from_secs(15))
-        .await
-        .expect("initial leader");
+    wait_for_leader_among(
+        &mut clients,
+        &(0..count as usize).collect::<Vec<_>>(),
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("initial leader");
 
     (nodes, clients)
 }
@@ -512,8 +520,17 @@ async fn raft_survives_follower_partition() {
             .expect("leader");
         commit_writes(&mut clients[leader], COLL, 10, &mut next_key, &mut acked).await;
     }
-    wait_converged(&mut clients, COLL, acked.len() as u64, Duration::from_secs(10)).await;
-    println!("\nfollower-partition test — {N} nodes, baseline {} docs", acked.len());
+    wait_converged(
+        &mut clients,
+        COLL,
+        acked.len() as u64,
+        Duration::from_secs(10),
+    )
+    .await;
+    println!(
+        "\nfollower-partition test — {N} nodes, baseline {} docs",
+        acked.len()
+    );
 
     for round in 1..=3u32 {
         let leader_idx = wait_for_leader_among(&mut clients, &all, Duration::from_secs(10))
@@ -526,15 +543,25 @@ async fn raft_survives_follower_partition() {
         let majority_ids: Vec<u64> = (1..=N).filter(|id| !minority_ids.contains(id)).collect();
         let minority_idx: Vec<usize> = minority_ids.iter().map(|id| (*id - 1) as usize).collect();
         let majority_idx: Vec<usize> = majority_ids.iter().map(|id| (*id - 1) as usize).collect();
-        println!("round {round}: leader=node{leader_id}; minority {minority_ids:?} | majority {majority_ids:?}");
+        println!(
+            "round {round}: leader=node{leader_id}; minority {minority_ids:?} | majority {majority_ids:?}"
+        );
 
         ctrl.cut(&minority_ids, &majority_ids);
 
         // (3) Majority stays available.
-        let maj_leader = wait_for_leader_among(&mut clients, &majority_idx, Duration::from_secs(15))
-            .await
-            .expect("majority keeps a leader");
-        let ok = commit_writes(&mut clients[maj_leader], COLL, 10, &mut next_key, &mut acked).await;
+        let maj_leader =
+            wait_for_leader_among(&mut clients, &majority_idx, Duration::from_secs(15))
+                .await
+                .expect("majority keeps a leader");
+        let ok = commit_writes(
+            &mut clients[maj_leader],
+            COLL,
+            10,
+            &mut next_key,
+            &mut acked,
+        )
+        .await;
         assert!(ok >= 8, "round {round}: majority only committed {ok}/10");
 
         // (2) No split-brain.
@@ -542,20 +569,30 @@ async fn raft_survives_follower_partition() {
 
         // (4) Heal → full convergence.
         ctrl.heal();
-        wait_converged(&mut clients, COLL, acked.len() as u64, Duration::from_secs(30)).await;
+        wait_converged(
+            &mut clients,
+            COLL,
+            acked.len() as u64,
+            Duration::from_secs(30),
+        )
+        .await;
 
         // (1) Exact-set agreement on every node.
         for (i, client) in clients.iter_mut().enumerate() {
             let keys = keys_on(client, COLL).await;
             assert_eq!(
-                keys, acked,
+                keys,
+                acked,
                 "round {round}: node{} diverged — missing {:?}, extra {:?}",
                 i + 1,
                 acked.difference(&keys).collect::<Vec<_>>(),
                 keys.difference(&acked).collect::<Vec<_>>(),
             );
         }
-        println!("round {round}: OK — {} docs, all {N} nodes converged, minority rejected", acked.len());
+        println!(
+            "round {round}: OK — {} docs, all {N} nodes converged, minority rejected",
+            acked.len()
+        );
     }
 
     for node in &mut nodes {
@@ -573,13 +610,17 @@ async fn raft_survives_follower_partition() {
 // available, and every write the majority ACKs survives on the whole
 // majority quorum after heal.
 //
-// LIVENESS caveat: openraft 0.9 has no PreVote, so an isolated ex-leader
-// inflates its term and, on heal, becomes a disruptive stale-log
-// candidate the quorum ignores — it does NOT catch up without a restart.
-// This test therefore asserts convergence of the MAJORITY quorum only,
-// and asserts the stranded node never shows uncommitted/phantom data
-// (its keys stay a subset of `acked`). If openraft gains PreVote and the
-// ex-leader converges too, tighten this to full-cluster convergence.
+// This test used to assert convergence of the MAJORITY only, blaming a
+// liveness caveat on openraft 0.9 having no PreVote: the stranded ex-leader
+// "inflated its term and never caught up without a restart". That diagnosis
+// was wrong. Its term never moved (an isolated leader does not campaign — it
+// still believes it leads), and on heal it became a clean follower of the new
+// leader within half a second. It simply never received anything, because
+// `raft_init` had registered the bootstrap node with an EMPTY address: no
+// leader could dial it (`connect to ''`), forever. That is invisible while the
+// bootstrap node leads — nobody dials the leader — and only surfaces once it
+// loses leadership. With the address published, the ex-leader converges in
+// ~0.5s, so this now asserts FULL-cluster convergence.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn raft_leader_partition_safety() {
@@ -597,8 +638,17 @@ async fn raft_leader_partition_safety() {
             .expect("leader");
         commit_writes(&mut clients[leader], COLL, 10, &mut next_key, &mut acked).await;
     }
-    wait_converged(&mut clients, COLL, acked.len() as u64, Duration::from_secs(10)).await;
-    println!("\nleader-partition safety test — {N} nodes, baseline {} docs", acked.len());
+    wait_converged(
+        &mut clients,
+        COLL,
+        acked.len() as u64,
+        Duration::from_secs(10),
+    )
+    .await;
+    println!(
+        "\nleader-partition safety test — {N} nodes, baseline {} docs",
+        acked.len()
+    );
 
     for round in 1..=2u32 {
         let leader_idx = wait_for_leader_among(&mut clients, &all, Duration::from_secs(10))
@@ -611,29 +661,49 @@ async fn raft_leader_partition_safety() {
         let majority_ids: Vec<u64> = (1..=N).filter(|id| !minority_ids.contains(id)).collect();
         let minority_idx: Vec<usize> = minority_ids.iter().map(|id| (*id - 1) as usize).collect();
         let majority_idx: Vec<usize> = majority_ids.iter().map(|id| (*id - 1) as usize).collect();
-        println!("round {round}: leader=node{leader_id} (stranded); minority {minority_ids:?} | majority {majority_ids:?}");
+        println!(
+            "round {round}: leader=node{leader_id} (stranded); minority {minority_ids:?} | majority {majority_ids:?}"
+        );
 
         ctrl.cut(&minority_ids, &majority_ids);
 
         // (3) Majority elects a fresh leader and stays available.
-        let maj_leader = wait_for_leader_among(&mut clients, &majority_idx, Duration::from_secs(15))
-            .await
-            .expect("majority elects a new leader after old leader isolated");
-        let ok = commit_writes(&mut clients[maj_leader], COLL, 10, &mut next_key, &mut acked).await;
-        assert!(ok >= 8, "round {round}: majority only committed {ok}/10 after re-election");
+        let maj_leader =
+            wait_for_leader_among(&mut clients, &majority_idx, Duration::from_secs(15))
+                .await
+                .expect("majority elects a new leader after old leader isolated");
+        let ok = commit_writes(
+            &mut clients[maj_leader],
+            COLL,
+            10,
+            &mut next_key,
+            &mut acked,
+        )
+        .await;
+        assert!(
+            ok >= 8,
+            "round {round}: majority only committed {ok}/10 after re-election"
+        );
 
         // (2) No split-brain: neither stranded node can commit.
         assert_minority_cannot_commit(&nodes, &minority_idx, COLL, round).await;
 
         ctrl.heal();
 
-        // (1/4) SAFETY: the surviving majority quorum converges and holds
-        // every acked write. (The stranded ex-leader may lag — see caveat.)
-        wait_converged_subset(&mut clients, &majority_idx, COLL, acked.len() as u64, Duration::from_secs(30)).await;
-        for &mj in &majority_idx {
+        // (1/4) SAFETY + LIVENESS: every node — including the stranded
+        // ex-leader — converges and holds every acked write.
+        wait_converged(
+            &mut clients,
+            COLL,
+            acked.len() as u64,
+            Duration::from_secs(30),
+        )
+        .await;
+        for mj in 0..N as usize {
             let keys = keys_on(&mut clients[mj], COLL).await;
             assert_eq!(
-                keys, acked,
+                keys,
+                acked,
                 "round {round}: majority node{} diverged — missing {:?}, extra {:?}",
                 mj + 1,
                 acked.difference(&keys).collect::<Vec<_>>(),
@@ -641,54 +711,14 @@ async fn raft_leader_partition_safety() {
             );
         }
 
-        // The stranded ex-leader must never surface uncommitted/phantom
-        // data: whatever it holds is a subset of the acked set. (It may
-        // not have caught up — openraft 0.9 no-PreVote liveness caveat.)
-        for &mi in &minority_idx {
-            let keys = keys_on(&mut clients[mi], COLL).await;
-            assert!(
-                keys.is_subset(&acked),
-                "round {round}: stranded node{} shows uncommitted data: {:?}",
-                mi + 1,
-                keys.difference(&acked).collect::<Vec<_>>(),
-            );
-        }
-        println!("round {round}: OK — majority converged ({} docs), no split-brain, no phantom data", acked.len());
+        println!(
+            "round {round}: OK — all {N} nodes converged ({} docs), no split-brain, no phantom data",
+            acked.len()
+        );
     }
 
     for node in &mut nodes {
         node.kill().await;
-    }
-}
-
-/// Wait until the given node indices all reach `expected` count.
-async fn wait_converged_subset(
-    clients: &mut [AsyncClient],
-    indices: &[usize],
-    collection: &str,
-    expected: u64,
-    timeout: Duration,
-) {
-    let start = tokio::time::Instant::now();
-    loop {
-        let mut all = true;
-        for &i in indices {
-            if count_on(&mut clients[i], collection).await != expected {
-                all = false;
-                break;
-            }
-        }
-        if all {
-            return;
-        }
-        if start.elapsed() > timeout {
-            let mut counts = Vec::new();
-            for &i in indices {
-                counts.push(count_on(&mut clients[i], collection).await);
-            }
-            panic!("majority convergence timeout: expected {expected}, got {counts:?}");
-        }
-        sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -733,4 +763,117 @@ async fn wait_converged(
         }
         sleep(Duration::from_millis(200)).await;
     }
+}
+
+// ── bootstrap address regression ────────────────────────────────────────────
+//
+// `raft_init` used to register the initial member as `BasicNode::default()` —
+// an EMPTY address. Nothing complains at the time, because nobody dials the
+// leader and the bootstrap node IS the leader; the damage only appears once it
+// loses leadership, when every future leader's replication to it fails with
+// `connect to ''` forever. `raft_leader_partition_safety` above covers the
+// end-to-end symptom; these pin the cause directly, and cheaply.
+
+/// Parse a handler response (plain JSON, no length prefix).
+fn parse(bytes: Vec<u8>) -> Value {
+    serde_json::from_slice(&bytes).expect("json response")
+}
+
+async fn init_node(id: u64) -> (Arc<OxiRaft>, SocketAddr, TempDir, Vec<JoinHandle<()>>) {
+    let dir = tempfile::tempdir().unwrap();
+    let client_addr = allocate_port().await;
+    let raft_addr = allocate_port().await;
+    let (raft, tasks) = start_node(
+        id,
+        client_addr,
+        raft_addr,
+        dir.path(),
+        Arc::new(Partitioner::default()),
+    )
+    .await;
+    (raft, raft_addr, dir, tasks)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_publishes_a_dialable_addr() {
+    let (raft, raft_addr, _dir, _tasks) = init_node(1).await;
+    let want = raft_addr.to_string();
+
+    let resp = parse(
+        management::handle_raft_command(
+            "raft_init",
+            &json!({"cmd": "raft_init"}),
+            &raft,
+            Some(&want),
+        )
+        .await,
+    );
+    assert!(resp["ok"].as_bool().unwrap_or(false), "raft_init: {resp}");
+
+    // `metrics()` is a watch channel — give it a moment to carry the new
+    // membership rather than racing initialize().
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let addr = loop {
+        let m = raft.metrics().borrow().clone();
+        if let Some((_, node)) = m.membership_config.nodes().next() {
+            break node.addr.clone();
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "membership never appeared after raft_init"
+        );
+        sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        addr, want,
+        "bootstrap member must publish the address peers dial, not {addr:?}"
+    );
+    raft.shutdown().await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bootstrap_without_an_addr_is_refused() {
+    let (raft, _raft_addr, _dir, _tasks) = init_node(1).await;
+
+    // No configured address and none in the request: refuse. Bootstrapping an
+    // unreachable member is a silent, much later failure.
+    let resp = parse(
+        management::handle_raft_command("raft_init", &json!({"cmd": "raft_init"}), &raft, None)
+            .await,
+    );
+    assert!(
+        !resp["ok"].as_bool().unwrap_or(false),
+        "bootstrap with no address must fail: {resp}"
+    );
+    assert!(
+        m_err(&resp).contains("OXIDB_RAFT_ADDR"),
+        "the error should name the knob to set: {resp}"
+    );
+    // An empty string must not sneak through either.
+    let resp = parse(
+        management::handle_raft_command(
+            "raft_init",
+            &json!({"cmd": "raft_init", "addr": "  "}),
+            &raft,
+            None,
+        )
+        .await,
+    );
+    assert!(
+        !resp["ok"].as_bool().unwrap_or(false),
+        "blank address must fail: {resp}"
+    );
+
+    let m = raft.metrics().borrow().clone();
+    assert!(
+        m.membership_config.nodes().next().is_none(),
+        "a refused bootstrap must not initialise the cluster: {:?}",
+        m.membership_config
+    );
+    raft.shutdown().await.ok();
+}
+
+fn m_err(resp: &Value) -> String {
+    resp["error"].as_str().unwrap_or_default().to_string()
+        + resp["message"].as_str().unwrap_or_default()
 }

@@ -30,6 +30,10 @@ pub struct ServerState {
     pub auth_enabled: bool,
     /// Raft node — `None` in standalone mode.
     pub raft: Option<Arc<OxiRaft>>,
+    /// This node's own Raft address (`OXIDB_RAFT_ADDR`). Needed to bootstrap:
+    /// the initial member has to publish an address peers can dial, exactly
+    /// like every learner does.
+    pub raft_addr: Option<String>,
 }
 
 /// Handle a plain TCP connection.
@@ -240,8 +244,7 @@ async fn dispatch_request(
                 ));
             }
             // Read role → SQL/TSDB are query-only (bridges reject writes).
-            sql_readonly =
-                matches!(cmd.as_str(), "sql" | "tsdb") && effective_role == Role::Read;
+            sql_readonly = matches!(cmd.as_str(), "sql" | "tsdb") && effective_role == Role::Read;
         }
     }
 
@@ -251,7 +254,13 @@ async fn dispatch_request(
     if let Some(raft) = &state.raft {
         match cmd.as_str() {
             "raft_init" | "raft_add_learner" | "raft_change_membership" | "raft_metrics" => {
-                let resp = management::handle_raft_command(&cmd, &request, raft).await;
+                let resp = management::handle_raft_command(
+                    &cmd,
+                    &request,
+                    raft,
+                    state.raft_addr.as_deref(),
+                )
+                .await;
                 log_audit(state, session, &cmd, None, "ok", "");
                 return resp;
             }

@@ -1982,6 +1982,7 @@ fn run_cluster_mode() {
             audit_log,
             auth_enabled,
             raft: Some(Arc::clone(&raft)),
+            raft_addr: Some(raft_addr.clone()),
         });
 
         // Spawn Raft RPC listener

@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use openraft::storage::Adaptor;
 use oxidb::OxiDb;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -125,9 +125,15 @@ async fn start_node(
     let store = OxiDbStore::new(Arc::clone(&db));
     let (log_store, sm) = Adaptor::new(store);
     let raft = Arc::new(
-        openraft::Raft::new(node_id, test_openraft_config(), OxiDbNetworkFactory, log_store, sm)
-            .await
-            .expect("raft new"),
+        openraft::Raft::new(
+            node_id,
+            test_openraft_config(),
+            OxiDbNetworkFactory,
+            log_store,
+            sm,
+        )
+        .await
+        .expect("raft new"),
     );
     let state = Arc::new(ServerState {
         db,
@@ -136,6 +142,7 @@ async fn start_node(
         audit_log: None,
         auth_enabled: false,
         raft: Some(Arc::clone(&raft)),
+        raft_addr: Some(raft_addr.to_string()),
     });
     let mut tasks = Vec::new();
     let rc = Arc::clone(&raft);
@@ -151,7 +158,9 @@ async fn start_node(
     tasks.push(tokio::spawn(async move {
         while let Ok((s, _)) = cl.accept().await {
             let st = Arc::clone(&sc);
-            tokio::spawn(async move { async_server::handle_connection(s, st, Duration::ZERO).await });
+            tokio::spawn(
+                async move { async_server::handle_connection(s, st, Duration::ZERO).await },
+            );
         }
     }));
     (raft, tasks)
@@ -177,7 +186,11 @@ async fn form_cluster(count: u64) -> Vec<TestNode> {
     sleep(Duration::from_millis(50)).await;
 
     let mut c0 = AsyncClient::connect(nodes[0].client_addr).await;
-    assert!(c0.send(&json!({"cmd": "raft_init"})).await["ok"].as_bool().unwrap());
+    assert!(
+        c0.send(&json!({"cmd": "raft_init"})).await["ok"]
+            .as_bool()
+            .unwrap()
+    );
     for id in 2..=count {
         let idx = (id - 1) as usize;
         let r = c0
@@ -186,7 +199,9 @@ async fn form_cluster(count: u64) -> Vec<TestNode> {
         assert!(r["ok"].as_bool().unwrap(), "add_learner {id}: {r}");
     }
     let members: Vec<u64> = (1..=count).collect();
-    let r = c0.send(&json!({"cmd": "raft_change_membership", "members": members})).await;
+    let r = c0
+        .send(&json!({"cmd": "raft_change_membership", "members": members}))
+        .await;
     assert!(r["ok"].as_bool().unwrap(), "change_membership: {r}");
     nodes
 }
@@ -215,7 +230,9 @@ async fn find_leader(nodes: &[TestNode], timeout: Duration) -> Option<(usize, As
 /// All `seq` values in the trades collection on one node.
 async fn seqs_on(nodes: &[TestNode], idx: usize) -> Vec<i64> {
     let mut c = AsyncClient::connect(nodes[idx].client_addr).await;
-    let r = c.send(&json!({"cmd": "find", "collection": "trades", "query": {}})).await;
+    let r = c
+        .send(&json!({"cmd": "find", "collection": "trades", "query": {}}))
+        .await;
     r["data"]
         .as_array()
         .map(|a| a.iter().filter_map(|d| d["seq"].as_i64()).collect())
@@ -291,7 +308,11 @@ async fn sequence_stays_monotonic_across_failovers() {
         // Give the new leader a beat to commit a no-op and expose the
         // latest applied state, then re-read.
         sleep(Duration::from_millis(500)).await;
-        let max_seq = seqs_on(&nodes, survivor).await.into_iter().max().unwrap_or(0);
+        let max_seq = seqs_on(&nodes, survivor)
+            .await
+            .into_iter()
+            .max()
+            .unwrap_or(0);
         let last_acked = acked.last().unwrap().0;
         assert_eq!(
             max_seq, last_acked,
@@ -301,7 +322,10 @@ async fn sequence_stays_monotonic_across_failovers() {
         let _ = &mut leader;
 
         append_batch(&nodes, BATCH, &mut next_seq, &mut uid, &mut acked).await;
-        println!("failover {failover}: appended through seq {}", acked.last().unwrap().0);
+        println!(
+            "failover {failover}: appended through seq {}",
+            acked.last().unwrap().0
+        );
     }
 
     // Let the last writes settle on all survivors.
@@ -328,7 +352,9 @@ async fn sequence_stays_monotonic_across_failovers() {
     let mut present: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     {
         let mut c = AsyncClient::connect(nodes[survivors[0]].client_addr).await;
-        let r = c.send(&json!({"cmd": "find", "collection": "trades", "query": {}})).await;
+        let r = c
+            .send(&json!({"cmd": "find", "collection": "trades", "query": {}}))
+            .await;
         for d in r["data"].as_array().unwrap() {
             present.insert(d["seq"].as_i64().unwrap(), d["uid"].as_i64().unwrap());
         }
@@ -345,7 +371,11 @@ async fn sequence_stays_monotonic_across_failovers() {
     for &s in &survivors[1..] {
         let mut other = seqs_on(&nodes, s).await;
         other.sort_unstable();
-        assert_eq!(other, reference, "survivor node {} diverged", nodes[s].node_id);
+        assert_eq!(
+            other, reference,
+            "survivor node {} diverged",
+            nodes[s].node_id
+        );
     }
 
     println!(
@@ -357,7 +387,10 @@ async fn sequence_stays_monotonic_across_failovers() {
     );
 
     // Sanity: reference really is a set of the right size.
-    assert_eq!(reference.len(), BTreeSet::from_iter(reference.iter().copied()).len());
+    assert_eq!(
+        reference.len(),
+        BTreeSet::from_iter(reference.iter().copied()).len()
+    );
 
     for n in &mut nodes {
         if n.alive {

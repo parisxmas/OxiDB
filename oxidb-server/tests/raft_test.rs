@@ -133,6 +133,7 @@ async fn start_node(
         audit_log: None,
         auth_enabled: false,
         raft: Some(Arc::clone(&raft)),
+        raft_addr: Some(raft_addr.to_string()),
     });
 
     let mut tasks = Vec::new();

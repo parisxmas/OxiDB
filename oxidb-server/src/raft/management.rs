@@ -9,9 +9,14 @@ use crate::handler;
 use super::types::OxiRaft;
 
 /// Handle Raft cluster management commands.
-pub async fn handle_raft_command(cmd: &str, request: &Value, raft: &Arc<OxiRaft>) -> Vec<u8> {
+pub async fn handle_raft_command(
+    cmd: &str,
+    request: &Value,
+    raft: &Arc<OxiRaft>,
+    own_addr: Option<&str>,
+) -> Vec<u8> {
     match cmd {
-        "raft_init" => raft_init(raft).await,
+        "raft_init" => raft_init(request, raft, own_addr).await,
         "raft_add_learner" => raft_add_learner(request, raft).await,
         "raft_change_membership" => raft_change_membership(request, raft).await,
         "raft_metrics" => raft_metrics(raft).await,
@@ -20,12 +25,38 @@ pub async fn handle_raft_command(cmd: &str, request: &Value, raft: &Arc<OxiRaft>
 }
 
 /// Initialize a single-node Raft cluster.
-async fn raft_init(raft: &OxiRaft) -> Vec<u8> {
+///
+/// The bootstrap node must publish a dialable address, just like every learner
+/// does. `BasicNode::default()` has an EMPTY one, and that is invisible for as
+/// long as this node stays leader — nobody dials the leader. The moment it
+/// loses leadership (a partition, a restart, any election) no new leader can
+/// ever reach it: replication fails with "connect to ''" forever and the node
+/// silently freezes at its old log while the cluster moves on.
+///
+/// The address comes from the node's own `OXIDB_RAFT_ADDR` (what it actually
+/// listens on); an explicit `addr` in the request overrides it. If neither is
+/// known we refuse rather than bootstrap an unreachable member.
+async fn raft_init(request: &Value, raft: &OxiRaft, own_addr: Option<&str>) -> Vec<u8> {
+    let addr = match request
+        .get("addr")
+        .and_then(|v| v.as_str())
+        .or(own_addr)
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        Some(a) => a.to_string(),
+        None => {
+            return handler::err_bytes(
+                "raft init: no Raft address known for this node — set OXIDB_RAFT_ADDR                  or pass 'addr'. Initialising with an empty address would leave this                  node unreachable to every future leader.",
+            );
+        }
+    };
+
     let mut members = BTreeMap::new();
     // Get node_id from the raft metrics
     let metrics = raft.metrics().borrow().clone();
     let node_id = metrics.id;
-    members.insert(node_id, BasicNode::default());
+    members.insert(node_id, BasicNode { addr });
 
     match raft.initialize(members).await {
         Ok(()) => handler::ok_bytes(json!("cluster initialized")),
