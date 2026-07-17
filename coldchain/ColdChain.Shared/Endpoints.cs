@@ -5,7 +5,9 @@ namespace ColdChain;
 /// — six systems to deploy, secure, back up and keep in sync.
 public static class Endpoints
 {
-    public const string Host = "127.0.0.1";
+    /// `oxidb` inside compose, localhost when run from a terminal.
+    public static readonly string Host =
+        Environment.GetEnvironmentVariable("COLDCHAIN_HOST") ?? "127.0.0.1";
 
     /// Document + SQL + time-series engines (length-prefixed JSON).
     public const int Tcp = 4444;

@@ -1,0 +1,61 @@
+# Everything talks over the internal network. The host is already running eight
+# unrelated OxiDB instances and has 6379/5432/8080/27017 taken, so exactly ONE
+# port is published — the API — and nothing else can collide.
+services:
+  oxidb:
+    build:
+      context: .
+      dockerfile: Dockerfile.oxidb
+      args:
+        OXIDB_URL: https://oxidb.baltavista.com/releases/v0.36.0/oxidb-server-v0.36.0-linux-amd64.tar.gz
+    environment:
+      OXIDB_SQL: "1"
+      OXIDB_TSDB: "1"
+      OXIDB_DATA: /data
+      OXIDB_ADDR: 0.0.0.0:4444
+      OXIDB_MQTT_PORT: "1883"
+      OXIDB_OXIMEM_PORT: "6379"
+      OXIDB_S3_PORT: "9000"
+      OXIDB_AUDIT: "1"
+      OXIDB_IDLE_TIMEOUT: "0"
+    volumes:
+      - oxidb-data:/data
+    restart: unless-stopped
+    healthcheck:
+      # 127.0.0.1, not localhost — the alpine image does not resolve the name,
+      # and the check silently failed on it.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4444"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api:
+    build: { context: .., dockerfile: coldchain/Dockerfile, target: api }
+    environment:
+      COLDCHAIN_HOST: oxidb
+    ports:
+      - "127.0.0.1:8123:8080"   # the only published port; nginx proxies to it
+    depends_on:
+      oxidb: { condition: service_healthy }
+    restart: unless-stopped
+
+  ingest:
+    build: { context: .., dockerfile: coldchain/Dockerfile, target: ingest }
+    environment:
+      COLDCHAIN_HOST: oxidb
+      INGEST_SECONDS: "0"          # 0 = run until the container stops
+    depends_on:
+      api: { condition: service_started }
+    restart: unless-stopped
+
+  simulator:
+    build: { context: .., dockerfile: coldchain/Dockerfile, target: simulator }
+    environment:
+      COLDCHAIN_HOST: oxidb
+      SIM_SECONDS: "0"
+    depends_on:
+      ingest: { condition: service_started }
+    restart: unless-stopped
+
+volumes:
+  oxidb-data:

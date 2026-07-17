@@ -42,8 +42,9 @@ Console.WriteLine($"simulator → mqtt://{Endpoints.Host}:{Endpoints.Mqtt}");
 await client.PublishStringAsync("fleet/gateway/status", "online", retain: true);
 
 var rng = new Random(42);
+// 0 (the container default) means: keep publishing until stopped.
 var seconds = int.TryParse(Environment.GetEnvironmentVariable("SIM_SECONDS"), out var s) ? s : 60;
-var deadline = DateTime.UtcNow.AddSeconds(seconds);
+var deadline = seconds > 0 ? DateTime.UtcNow.AddSeconds(seconds) : DateTime.MaxValue;
 var tick = 0;
 
 while (DateTime.UtcNow < deadline)
@@ -52,8 +53,18 @@ while (DateTime.UtcNow < deadline)
     {
         // Normal drift, plus a slow ramp on the faulty ones so they breach
         // partway through the run rather than immediately.
+        // A faulty unit fails in EPISODES: it drifts out of range for a couple
+        // of minutes, then someone shuts the door / the compressor catches up.
+        // A monotonic ramp would read +1255°C after an hour, and this demo is
+        // meant to run for months.
         var drift = (rng.NextDouble() - 0.5) * 0.4;
-        var fault = d.Faulty ? Math.Max(0, tick - 15) * 0.35 : 0;
+        var fault = 0.0;
+        if (d.Faulty)
+        {
+            var phase = tick % 150;                 // ~5 min at 2s/tick
+            if (phase is > 30 and < 75) fault = (phase - 30) * 0.35;   // going wrong
+            else if (phase is >= 75 and < 105) fault = (105 - phase) * 0.5; // recovering
+        }
         var celsius = Math.Round(d.Target + drift + fault, 2);
 
         var ts = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -69,7 +80,7 @@ while (DateTime.UtcNow < deadline)
             {
                 device = d.Id, truck = d.Truck, celsius, battery, ts,
                 humidity = Math.Round(55 + rng.NextDouble() * 10, 1),
-                door_open = d.Faulty && tick > 15,      // the door that caused it
+                door_open = fault > 0,                  // the door that caused it
                 gps = new { lat = Math.Round(41.0 + rng.NextDouble() * 0.1, 5),
                             lon = Math.Round(29.0 + rng.NextDouble() * 0.1, 5) },
             },
@@ -88,7 +99,7 @@ while (DateTime.UtcNow < deadline)
     }
     tick++;
     if (tick % 10 == 0) Console.WriteLine($"  t={tick,3}s  published {tick * devices.Length} readings");
-    await Task.Delay(1000);
+    await Task.Delay(2000);
 }
 
 await client.PublishStringAsync("fleet/gateway/status", "offline", retain: true);

@@ -28,6 +28,11 @@ builder.Services.AddSingleton(_ => OxiDbTcpClient.ConnectAsync(Endpoints.Host, E
 
 var app = builder.Build();
 
+// Seed on startup — there is no shell to run it from in a container, and it is
+// idempotent, so a restart is harmless.
+try { await Seed.RunAsync(); }
+catch (Exception e) { app.Logger.LogWarning("seed skipped: {msg}", e.Message); }
+
 app.MapGet("/api", () => Results.Ok(new
 {
     demo = "ColdChain — one OxiDB process behind every engine",

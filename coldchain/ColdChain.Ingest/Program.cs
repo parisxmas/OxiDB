@@ -130,8 +130,19 @@ await mqtt.SubscribeAsync("sensors/+/+/temperature");
 await mqtt.SubscribeAsync("fleet/gateway/#");
 Console.WriteLine($"ingest ← mqtt://{Endpoints.Host}:{Endpoints.Mqtt}  (sensors/+/+/temperature)");
 
-var seconds = int.TryParse(Environment.GetEnvironmentVariable("INGEST_SECONDS"), out var s) ? s : 75;
-await Task.Delay(TimeSpan.FromSeconds(seconds));
+// A service runs until it is stopped. `Task.Delay` cannot express "a year"
+// anyway — it caps at ~24.8 days — so waiting on the shutdown signal is both
+// correct and simpler. INGEST_SECONDS stays for the scripted local demo.
+var seconds = int.TryParse(Environment.GetEnvironmentVariable("INGEST_SECONDS"), out var s) ? s : 0;
+using var stopping = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; stopping.Cancel(); };
+AppDomain.CurrentDomain.ProcessExit += (_, _) => stopping.Cancel();
+try
+{
+    if (seconds > 0) await Task.Delay(TimeSpan.FromSeconds(seconds), stopping.Token);
+    else await Task.Delay(Timeout.InfiniteTimeSpan, stopping.Token);
+}
+catch (OperationCanceledException) { /* SIGTERM / Ctrl-C */ }
 Console.WriteLine($"ingest: {readings} readings, {breaches} excursions recorded");
 
 record Reading(string device, string truck, double celsius, double battery, long ts);

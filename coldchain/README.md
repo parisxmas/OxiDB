@@ -86,6 +86,24 @@ dotnet run --project ColdChain.Simulator
 dotnet run --project ColdChain.Api
 ```
 
+## Live
+
+<https://coldchain.baltavista.com> — the compose stack below, running.
+
+## Deploying it
+
+```bash
+docker compose up -d --build
+```
+
+Four containers on an internal network: the released `oxidb-server` (a static
+musl build, fetched and run unmodified), the API, the ingest service and the
+fleet simulator. **Exactly one port is published**, the API's, bound to
+loopback — the host it runs on already has 6379, 5432, 8080 and 27017 taken by
+other things, and an internal network means none of that has to be negotiated.
+nginx terminates TLS and proxies to it, with buffering off on `/stream` so the
+live feed streams instead of being collected into a response that never arrives.
+
 ## The dashboard
 
 `dotnet run --project ColdChain.Api`, then open <http://localhost:5077>.

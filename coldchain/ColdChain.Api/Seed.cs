@@ -15,6 +15,20 @@ public static class Seed
             await boot.SqlAsync("CREATE DATABASE IF NOT EXISTS coldchain");
         }
 
+        // Raw events expire; the time-series keeps the numbers. This is the
+        // real retention rule in this industry — you keep the evidence trail
+        // long, and the every-two-seconds noise only as long as it is useful.
+        await using (var doc = await OxiDbTcpClient.ConnectAsync(Endpoints.Host, Endpoints.Tcp))
+        {
+            await doc.ExecRawAsync(new Dictionary<string, object?>
+            {
+                ["cmd"] = "create_ttl_index",
+                ["collection"] = "readings",
+                ["field"] = "_at",
+                ["expireAfterSeconds"] = 7 * 24 * 3600,
+            });
+        }
+
         var opts = new DbContextOptionsBuilder<ColdChainDb>()
             .UseOxiDb(Endpoints.SqlConnectionString).Options;
         await using var db = new ColdChainDb(opts);
