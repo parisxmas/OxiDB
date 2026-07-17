@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 
 use crate::ast::{
-    AggFunc, BinOp, DatePart, Expr, LazyCorrAgg, Join, JoinKind, LimitExpr, QueryBody, QueryResult,
+    AggFunc, BinOp, DatePart, Expr, Join, JoinKind, LazyCorrAgg, LimitExpr, QueryBody, QueryResult,
     RecursiveCte, ScalarFunc, SelectItem, SelectQuery, SelectStmt, SetOpKind, ShowKind, Statement,
     TableRef, UnOp, WindowFunc,
 };
@@ -2143,10 +2143,12 @@ fn decorrelate_exists<S: Store>(
         return Ok(None);
     }
     match sel.projection.as_slice() {
-        [SelectItem::Expr {
-            expr: Expr::Literal(Value::Int(1)),
-            ..
-        }] => {}
+        [
+            SelectItem::Expr {
+                expr: Expr::Literal(Value::Int(1)),
+                ..
+            },
+        ] => {}
         _ => return Ok(None),
     }
     // Find the correlation equality among the WHERE's top-level conjuncts.
@@ -2253,7 +2255,9 @@ fn resolve_corr_row<S: Store, R: RowLike + ?Sized>(
             // first THRESHOLD rows (cheap for a small/indexed outer side);
             // past that, build the grouped map once and look keys up in it.
             if let Some(lazy) = agg_map {
-                let n = lazy.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let n = lazy
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n >= lazy.threshold || lazy.map.get().is_some() {
                     let aug = corr_params(schema, row, params, outer, *base)?;
                     let key = &aug[*base];
@@ -2536,7 +2540,9 @@ fn compute_window<S: Store>(
                     };
                     order_by
                         .iter()
-                        .map(|(e, _)| eval_scalar_corr(store, has_corr(e), e, schema, &view, params))
+                        .map(|(e, _)| {
+                            eval_scalar_corr(store, has_corr(e), e, schema, &view, params)
+                        })
                         .collect::<Result<Vec<Value>>>()
                 })
                 .collect::<Result<_>>()?;
@@ -3133,9 +3139,11 @@ fn choose_driver<S: Store>(store: &S, select: &mut SelectStmt, params: &[Value])
     if select.joins.is_empty() || from.subquery.is_some() {
         return;
     }
-    if select.joins.iter().any(|j| {
-        j.kind != JoinKind::Inner || j.table.subquery.is_some() || j.table.lateral
-    }) {
+    if select
+        .joins
+        .iter()
+        .any(|j| j.kind != JoinKind::Inner || j.table.subquery.is_some() || j.table.lateral)
+    {
         return;
     }
     let Some(from_size) = store.row_count_hint(&from.name) else {
@@ -3194,9 +3202,10 @@ fn joins_reachable(driver_key: &str, joins: &[Join]) -> bool {
         std::iter::once(driver_key.to_string()).collect();
     let mut pending: Vec<usize> = (0..joins.len()).collect();
     while !pending.is_empty() {
-        let Some(pos) = pending.iter().position(|&ji| {
-            join_placeable(&joins[ji].on, &avail, joins[ji].table.key())
-        }) else {
+        let Some(pos) = pending
+            .iter()
+            .position(|&ji| join_placeable(&joins[ji].on, &avail, joins[ji].table.key()))
+        else {
             return false;
         };
         let ji = pending.remove(pos);
@@ -4257,7 +4266,10 @@ fn has_volatile(e: &Expr) -> bool {
         Expr::Aggregate { arg, .. } => arg.as_deref().is_some_and(has_volatile),
         Expr::In { expr, list, .. } => has_volatile(expr) || list.iter().any(has_volatile),
         Expr::InSet { expr, .. } => has_volatile(expr),
-        Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::CorrScalar { .. } | Expr::CorrIn { .. } => {
+        Expr::Subquery(_)
+        | Expr::InSubquery { .. }
+        | Expr::CorrScalar { .. }
+        | Expr::CorrIn { .. } => {
             true // subqueries are opaque here; the caller must not stream them
         }
         Expr::Window {
@@ -4328,9 +4340,7 @@ fn streamed_chunk<S: Store>(
     };
 
     let plain = select_is_plain_rows(select);
-    let cap = if plain
-        && let Some(l) = resolve_limit(select.limit, params, "LIMIT")?
-    {
+    let cap = if plain && let Some(l) = resolve_limit(select.limit, params, "LIMIT")? {
         Some(l.saturating_add(resolve_limit(select.offset, params, "OFFSET")?.unwrap_or(0)))
     } else {
         None
@@ -4459,11 +4469,7 @@ fn filtered_scan<S: Store>(
 /// into any table that an outer join can NULL-pad — a pushed predicate
 /// would manufacture padded rows the real WHERE (e.g. `x IS NULL`) then
 /// treats differently.
-fn pushdown_filter(
-    filter: Option<&Expr>,
-    full: &[ColRef],
-    params: &[Value],
-) -> Option<Expr> {
+fn pushdown_filter(filter: Option<&Expr>, full: &[ColRef], params: &[Value]) -> Option<Expr> {
     let mut conjuncts = Vec::new();
     collect_conjuncts(filter?, &mut conjuncts);
     conjuncts
@@ -4647,7 +4653,8 @@ fn select_simple<S: Store>(
     // project only the survivors — a 20-row LIMIT over 50k rows must not
     // sort (or project) 50k rows. Ties keep the earlier tuple, matching the
     // stable full sort below; the caller still applies OFFSET/LIMIT.
-    let top = if don.is_empty() && !select.distinct
+    let top = if don.is_empty()
+        && !select.distinct
         && let Some(l) = resolve_limit(select.limit, params, "LIMIT")?
     {
         Some(l.saturating_add(resolve_limit(select.offset, params, "OFFSET")?.unwrap_or(0)))
@@ -4678,12 +4685,10 @@ fn select_simple<S: Store>(
                     _ => continue, // not better than the cutoff (or k == 0)
                 }
             }
-            let pos = best.partition_point(|(bk, bi)| {
-                match cmp_keys(&order_by, bk, &kbuf) {
-                    Ordering::Less => true,
-                    Ordering::Equal => *bi < i,
-                    Ordering::Greater => false,
-                }
+            let pos = best.partition_point(|(bk, bi)| match cmp_keys(&order_by, bk, &kbuf) {
+                Ordering::Less => true,
+                Ordering::Equal => *bi < i,
+                Ordering::Greater => false,
             });
             best.insert(pos, (std::mem::take(&mut kbuf), i));
             if best.len() > k {
@@ -4750,10 +4755,13 @@ fn select_simple<S: Store>(
 /// structural equality so `COUNT(*)` written twice folds one accumulator.
 fn collect_streamable_aggs(e: &Expr, out: &mut Vec<Expr>) {
     match e {
-        Expr::Aggregate { func, arg, distinct }
-            if !*distinct
-                && !matches!(func, AggFunc::Mode)
-                && arg.as_deref().is_none_or(|a| !has_corr(a)) =>
+        Expr::Aggregate {
+            func,
+            arg,
+            distinct,
+        } if !*distinct
+            && !matches!(func, AggFunc::Mode)
+            && arg.as_deref().is_none_or(|a| !has_corr(a)) =>
         {
             if !out.contains(e) {
                 out.push(e.clone());
@@ -4824,7 +4832,12 @@ fn compute_streamable_aggs<S: Store>(
                 *n += 1;
                 continue;
             }
-            let v = eval_scalar(arg.as_deref().expect("non-* has arg"), schema, &view, params)?;
+            let v = eval_scalar(
+                arg.as_deref().expect("non-* has arg"),
+                schema,
+                &view,
+                params,
+            )?;
             if matches!(v, Value::Null) {
                 continue;
             }
@@ -5205,9 +5218,7 @@ fn expr_type(e: &Expr, schema: &[ColRef]) -> Option<SqlType> {
         | Expr::In { .. }
         | Expr::InSet { .. }
         | Expr::InSubquery { .. }
-        | Expr::CorrIn { .. } => {
-            Some(SqlType::Bool)
-        }
+        | Expr::CorrIn { .. } => Some(SqlType::Bool),
         Expr::Aggregate { func, arg, .. } => match func {
             AggFunc::Count => Some(SqlType::Int),
             AggFunc::Avg => Some(SqlType::Double),
@@ -5441,6 +5452,24 @@ fn eval_scalar<R: RowLike + ?Sized>(
             apply_unary(*op, v)
         }
         Expr::Binary { op, left, right } => {
+            // AND/OR short-circuit: once the left operand decides the result,
+            // the right is never evaluated. Only a definitive FALSE (AND) or
+            // TRUE (OR) decides — SQL's three-valued logic makes
+            // `NULL AND FALSE` FALSE and `NULL OR TRUE` TRUE, so a NULL (or
+            // non-boolean, which `three_valued` also treats as unknown) left
+            // still has to evaluate the right. Those two cases mirror
+            // `three_valued`'s `(Some(false), _)` / `(Some(true), _)` arms
+            // exactly, so this only skips work — it never changes a result.
+            if matches!(op, BinOp::And | BinOp::Or) {
+                let l = eval_scalar(left, schema, row, params)?;
+                match (op, &l) {
+                    (BinOp::And, Value::Bool(false)) => return Ok(Value::Bool(false)),
+                    (BinOp::Or, Value::Bool(true)) => return Ok(Value::Bool(true)),
+                    _ => {}
+                }
+                let r = eval_scalar(right, schema, row, params)?;
+                return eval_binary(*op, l, r);
+            }
             // Comparisons of borrowable operands compare in place. The owned
             // path below clones both sides per row — for a TEXT column that
             // is a heap allocation just to run a comparison, and for
@@ -5834,7 +5863,9 @@ where
                 as_text(eval(&args[2])?, "REPLACE")?,
             );
             Ok(match (s, from, to) {
-                (Some(s), Some(f), Some(t)) if !f.is_empty() => Value::Text((s.replace(&f, &t)).into()),
+                (Some(s), Some(f), Some(t)) if !f.is_empty() => {
+                    Value::Text((s.replace(&f, &t)).into())
+                }
                 (Some(s), Some(_), Some(_)) => Value::Text((s).into()),
                 _ => Value::Null,
             })
@@ -5876,7 +5907,11 @@ where
             Value::Null => Value::Null,
             Value::Int(n) => Value::Int(n.abs()),
             Value::Double(f) => Value::Double(f.abs()),
-            Value::Decimal(d) => Value::Decimal(if d.mantissa() < 0 { Box::new(d.neg()) } else { d }),
+            Value::Decimal(d) => Value::Decimal(if d.mantissa() < 0 {
+                Box::new(d.neg())
+            } else {
+                d
+            }),
             other => return Err(SqlError::Eval(format!("ABS of {other:?}"))),
         }),
         ScalarFunc::Round => {
@@ -6012,20 +6047,22 @@ where
                 },
             };
             let n = s.chars().count();
-            Ok(Value::Text(if n >= len {
-                // Longer input truncates to `len` (PostgreSQL semantics).
-                s.chars().take(len).collect()
-            } else if fill.is_empty() {
-                s
-            } else {
-                let pad: String = fill.chars().cycle().take(len - n).collect();
-                if matches!(func, ScalarFunc::Lpad) {
-                    format!("{pad}{s}")
+            Ok(Value::Text(
+                if n >= len {
+                    // Longer input truncates to `len` (PostgreSQL semantics).
+                    s.chars().take(len).collect()
+                } else if fill.is_empty() {
+                    s
                 } else {
-                    format!("{s}{pad}")
+                    let pad: String = fill.chars().cycle().take(len - n).collect();
+                    if matches!(func, ScalarFunc::Lpad) {
+                        format!("{pad}{s}")
+                    } else {
+                        format!("{s}{pad}")
+                    }
                 }
-            }
-            .into()))
+                .into(),
+            ))
         }
         ScalarFunc::Sin
         | ScalarFunc::Cos
@@ -6186,12 +6223,12 @@ fn cast_value(v: Value, ty: SqlType) -> Result<Value> {
         // → DECIMAL (exact from Int/Text; best-effort from a Double via its
         // shortest decimal string — the float's origin caveat carries through).
         (Value::Int(n), T::Decimal) => Value::Decimal(Box::new(Decimal::from_i64(n))),
-        (Value::Text(s), T::Decimal) => {
-            Value::Decimal(Box::new(Decimal::parse(s.trim()).ok_or_else(|| fail(&Value::Text(s.clone())))?))
-        }
-        (Value::Double(f), T::Decimal) => {
-            Value::Decimal(Box::new(Decimal::parse(&format!("{f}")).ok_or_else(|| fail(&Value::Double(f)))?))
-        }
+        (Value::Text(s), T::Decimal) => Value::Decimal(Box::new(
+            Decimal::parse(s.trim()).ok_or_else(|| fail(&Value::Text(s.clone())))?,
+        )),
+        (Value::Double(f), T::Decimal) => Value::Decimal(Box::new(
+            Decimal::parse(&format!("{f}")).ok_or_else(|| fail(&Value::Double(f)))?,
+        )),
         // DECIMAL → other numeric / text.
         (Value::Decimal(d), T::Int) => Value::Int(d.to_i64()),
         (Value::Decimal(d), T::Double) => Value::Double(d.to_f64()),
@@ -6246,7 +6283,8 @@ fn like_match(s: &str, pattern: &str, escape: Option<char>) -> bool {
             }
             1 if pattern.starts_with('%') => {
                 let suf = &pattern.as_bytes()[1..];
-                return sb.len() >= suf.len() && sb[sb.len() - suf.len()..].eq_ignore_ascii_case(suf);
+                return sb.len() >= suf.len()
+                    && sb[sb.len() - suf.len()..].eq_ignore_ascii_case(suf);
             }
             2 if pattern.starts_with('%') && pattern.ends_with('%') => {
                 let mid = pattern[1..pattern.len() - 1].to_ascii_lowercase();
@@ -6925,7 +6963,9 @@ impl SumAcc {
             SumAcc::Float(f) => Value::Double(f / count as f64),
             SumAcc::Dec(d) => {
                 let cnt = Decimal::from_i64(count);
-                Value::Decimal(Box::new(d.div(&cnt, d.div_scale(&cnt)).unwrap_or_else(|| d.clone())))
+                Value::Decimal(Box::new(
+                    d.div(&cnt, d.div_scale(&cnt)).unwrap_or_else(|| d.clone()),
+                ))
             }
         }
     }
