@@ -152,7 +152,19 @@ void Run(string name, int iterations, Action<Bench, int> op, int warmup = 15)
             Console.WriteLine($"  {name,-28} {provider,-8} FAILED: {Head(e)}");
             continue;
         }
-        for (var i = 0; i < warmup; i++)
+        // Warm up for at least `warmup` iterations AND a minimum wall-clock
+        // period. The time floor matters: benches run oxidb-then-postgres, so
+        // whichever server was NOT running the previous bench has been idle —
+        // and after a heavy bench that idle is seconds long. A server coming
+        // back from idle is measurably slower for a while (page faults,
+        // allocator decay, parked threads, CPU clocks), which a fixed 15
+        // iterations cannot absorb: except_sets, which follows the ~9.5s that
+        // PG spends on category_revenue, measured 646µs mean / 992µs p95 that
+        // way against 475µs / 499µs once actually warm. Without the floor the
+        // harness systematically penalises whoever just won the previous bench
+        // — the bigger the win, the longer the idle, the worse the next number.
+        var settle = Stopwatch.StartNew();
+        for (var i = 0; i < warmup || settle.ElapsedMilliseconds < 250; i++)
         {
             op(db, i);
             db.ChangeTracker.Clear();
