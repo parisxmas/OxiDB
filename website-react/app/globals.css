@@ -78,16 +78,35 @@
   -webkit-background-clip: text;
   background-clip: text;
 }
-/* Code & terminal surfaces stay dark in light theme, so their text (which
-   otherwise follows --text and would go dark-on-dark) must stay light. Syntax
-   spans (.kw/.fn/.str/.co) and .termblock keep their own explicit colors. */
+/* Inline code in light theme: a soft light chip with dark, bold text — not the
+   dark box the dark theme uses (which reads as jarring on a white page). */
+:root[data-theme="light"] code {
+  background: #eceef2;
+  color: #1a1d24;
+  font-weight: 600;
+  border: 1px solid #e0e3e8;
+}
+/* Multi-line code blocks and the install pill stay DARK in both themes, so
+   their text (which otherwise follows --text → dark-on-dark) must stay light,
+   and they must opt out of the light inline-chip styling above. Syntax spans
+   (.kw/.fn/.str/.co) and .termblock keep their own explicit colors. */
 :root[data-theme="light"] pre,
-:root[data-theme="light"] code,
+:root[data-theme="light"] pre code,
 :root[data-theme="light"] .hero-install code {
   color: #e7e9ed;
 }
+:root[data-theme="light"] pre code,
+:root[data-theme="light"] .hero-install code {
+  background: none;
+  border: none;
+  font-weight: inherit;
+}
 
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+/* All font sizes are now rem, so scaling the root scales the whole site's
+   type. 150% = 1.5× the browser default (1rem → 24px). */
+html { font-size: 150%; }
 
 html, body { background: var(--bg); }
 
@@ -134,7 +153,7 @@ a:hover { text-decoration: underline; }
   top: 0;
   left: 0;
   bottom: 0;
-  width: 200px;
+  width: 12.5rem;
   z-index: 100;
   background: var(--bg);
   border-right: 1px solid var(--border);
@@ -171,7 +190,7 @@ a:hover { text-decoration: underline; }
 
 .logo {
   font-family: var(--font-mono);
-  font-size: 18px;
+  font-size: 1.125rem;
   font-weight: 700;
   color: var(--text);
   text-decoration: none;
@@ -233,7 +252,7 @@ a:hover { text-decoration: underline; }
   background: var(--accent);
   color: #0a0c10;
   border-radius: 999px;
-  font-size: 12.5px;
+  font-size: 0.7812rem;
   font-weight: 700;
   letter-spacing: .05em;
   text-transform: uppercase;
@@ -268,10 +287,9 @@ a:hover { text-decoration: underline; }
   border: none;
   cursor: pointer;
   font-family: inherit;
-  font-size: 10.5px;
+  font-size: 0.8125rem;
   font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.01em;
   color: var(--text);
   opacity: 0.9;
   padding: 11px 8px 4px;
@@ -315,7 +333,7 @@ a:hover { text-decoration: underline; }
   display: flex;
 }
 .nav-links a {
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 500;
   color: var(--text-dim);
   padding: 6px 8px;
@@ -366,11 +384,11 @@ a:hover { text-decoration: underline; }
 }
 
 /* Push body content to the right of sidebar */
-body { margin-left: 200px; }
+body { margin-left: 12.5rem; }
 
 /* Under-development banner (top of content area) */
 .dev-banner{position:sticky;top:0;z-index:90;display:flex;align-items:center;
-  justify-content:center;gap:9px;padding:8px 16px;font-size:13px;text-align:center;
+  justify-content:center;gap:9px;padding:8px 16px;font-size: 0.8125rem;text-align:center;
   color:var(--warn);background:rgba(214,177,74,0.09);
   border-bottom:1px solid rgba(214,177,74,0.28);backdrop-filter:blur(6px)}
 .dev-banner strong{color:var(--warn);font-weight:650}
@@ -418,7 +436,7 @@ body { margin-left: 200px; }
 
 .hero h1 {
   font-family: var(--font-sans);
-  font-size: 84px;
+  font-size: 5.25rem;
   font-weight: 500;
   letter-spacing: -0.045em;
   line-height: 0.95;
@@ -429,7 +447,7 @@ body { margin-left: 200px; }
   -webkit-text-fill-color: transparent;
 }
 .hero .tagline {
-  font-size: 22px;
+  font-size: 1.375rem;
   color: var(--text);
   font-weight: 400;
   margin-bottom: 12px;
@@ -440,7 +458,7 @@ body { margin-left: 200px; }
   align-items: center;
   gap: 12px;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 0.7188rem;
   letter-spacing: 0.18em;
   text-transform: uppercase;
   color: var(--accent);
@@ -464,9 +482,9 @@ body { margin-left: 200px; }
   50%      { opacity: 1;   transform: scale(1.25); }
 }
 .hero .sub {
-  font-size: 16px;
+  font-size: 1rem;
   color: var(--text-dim);
-  max-width: 640px;
+  max-width: none;
   margin-bottom: 24px;
   line-height: 1.5;
 }
@@ -477,7 +495,7 @@ body { margin-left: 200px; }
 }
 .btn {
   display: inline-block;
-  font-size: 14px;
+  font-size: 0.875rem;
   font-weight: 600;
   padding: 8px 20px;
   border-radius: var(--radius);
@@ -508,7 +526,7 @@ body { margin-left: 200px; }
 }
 .hero-install code {
   font-family: var(--font-mono);
-  font-size: 14px;
+  font-size: 0.875rem;
   color: var(--text);
 }
 
@@ -520,7 +538,7 @@ body { margin-left: 200px; }
 .section-alt { background: var(--bg-alt); }
 
 .section h2 {
-  font-size: 28px;
+  font-size: 1.75rem;
   font-weight: 700;
   margin-bottom: 8px;
   letter-spacing: -0.5px;
@@ -533,14 +551,14 @@ body { margin-left: 200px; }
   flex-shrink: 0;
 }
 .section h3 {
-  font-size: 18px;
+  font-size: 1.125rem;
   font-weight: 600;
   margin-top: 32px;
   margin-bottom: 12px;
   color: var(--text);
 }
 .section h4 {
-  font-size: 14.5px;
+  font-size: 0.9062rem;
   font-weight: 600;
   margin-top: 22px;
   margin-bottom: 10px;
@@ -548,7 +566,7 @@ body { margin-left: 200px; }
 }
 .section-desc {
   color: var(--text-dim);
-  font-size: 16px;
+  font-size: 1rem;
   margin-bottom: 24px;
 }
 
@@ -582,13 +600,13 @@ body { margin-left: 200px; }
   margin-bottom: 10px;
 }
 .feature-card h3 {
-  font-size: 15px;
+  font-size: 0.9375rem;
   font-weight: 600;
   margin: 0 0 6px;
   color: var(--text);
 }
 .feature-card p {
-  font-size: 14px;
+  font-size: 0.875rem;
   color: var(--text-dim);
   margin: 0;
   line-height: 1.5;
@@ -611,7 +629,7 @@ body { margin-left: 200px; }
   background: var(--bg);
   color: var(--text);
   text-decoration: none;
-  font-size: 14px;
+  font-size: 0.875rem;
   font-weight: 500;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
@@ -633,7 +651,7 @@ pre {
   padding: 16px;
   overflow-x: auto;
   margin: 12px 0 16px;
-  font-size: 13px;
+  font-size: 0.8125rem;
   line-height: 1.55;
 }
 pre code {
@@ -666,19 +684,19 @@ pre code { background: none; padding: 0; font-size: inherit; }
 }
 .version-tag {
   font-family: var(--font-mono);
-  font-size: 22px;
+  font-size: 1.375rem;
   font-weight: 700;
   color: var(--text);
   margin: 0;
 }
 .version-date {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text-dim);
 }
 .version-badge {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.6875rem;
   font-weight: 600;
   padding: 2px 8px;
   border-radius: 10px;
@@ -706,7 +724,7 @@ pre code { background: none; padding: 0; font-size: inherit; }
   flex-wrap: wrap;
 }
 .release-notes {
-  font-size: 14px;
+  font-size: 0.875rem;
   color: var(--text-dim);
   margin-bottom: 20px;
 }
@@ -754,20 +772,20 @@ pre code { background: none; padding: 0; font-size: inherit; }
 
 .dl-info { flex: 1; min-width: 0; }
 .dl-platform {
-  font-size: 14px;
+  font-size: 0.875rem;
   font-weight: 600;
   color: var(--text);
 }
 .dl-file {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--text-dim);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .dl-meta {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
   margin-top: 2px;
 }
@@ -779,12 +797,12 @@ pre code { background: none; padding: 0; font-size: inherit; }
 .download-card:hover .dl-arrow { color: var(--accent); }
 
 /* Download table */
-.dl-table td code { font-size: 11px; }
+.dl-table td code { font-size: 0.6875rem; }
 .dl-table td { white-space: nowrap; }
 .dl-table td:nth-child(3) { white-space: normal; word-break: break-all; }
 .dl-btn {
   display: inline-block;
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 600;
   padding: 4px 12px;
   border-radius: var(--radius);
@@ -806,7 +824,7 @@ pre code { background: none; padding: 0; font-size: inherit; }
   margin-top: 24px;
 }
 .install-hint h4 {
-  font-size: 14px;
+  font-size: 0.875rem;
   font-weight: 600;
   margin-bottom: 8px;
 }
@@ -815,7 +833,7 @@ pre code { background: none; padding: 0; font-size: inherit; }
   margin-top: 32px;
 }
 .other-install h3 {
-  font-size: 18px;
+  font-size: 1.125rem;
   font-weight: 600;
   margin-bottom: 12px;
 }
@@ -823,7 +841,7 @@ pre code { background: none; padding: 0; font-size: inherit; }
 .change-group { margin-bottom: 16px; }
 .change-type {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 0.75rem;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 1px;
@@ -834,7 +852,7 @@ pre code { background: none; padding: 0; font-size: inherit; }
 }
 .change-type {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 0.625rem;
   font-weight: 600;
   letter-spacing: 0.16em;
   text-transform: uppercase;
@@ -854,7 +872,7 @@ pre code { background: none; padding: 0; font-size: inherit; }
 }
 .change-group ul li {
   margin-bottom: 8px;
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.55;
 }
 .change-group ul li strong {
@@ -864,7 +882,7 @@ pre code { background: none; padding: 0; font-size: inherit; }
 
 .commit-ref {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--text-dim);
   background: var(--code-bg);
   padding: 1px 6px;
@@ -889,12 +907,12 @@ pre code { background: none; padding: 0; font-size: inherit; }
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 14px;
+  font-size: 0.875rem;
 }
 thead th {
   text-align: left;
   font-weight: 600;
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text-dim);
   border-bottom: 2px solid var(--border);
   padding: 8px 12px;
@@ -906,7 +924,7 @@ tbody td {
 }
 tbody tr:last-child td { border-bottom: none; }
 tbody td code {
-  font-size: 12px;
+  font-size: 0.75rem;
   white-space: nowrap;
 }
 
@@ -914,7 +932,7 @@ tbody td code {
 .win-other { color: var(--text-dim); font-weight: 600; }
 
 .score-line {
-  font-size: 18px;
+  font-size: 1.125rem;
   margin-bottom: 16px;
   font-family: var(--font-mono);
 }
@@ -944,17 +962,17 @@ tbody td code {
   margin-bottom: 8px;
 }
 .client-card h3 {
-  font-size: 15px;
+  font-size: 0.9375rem;
   font-weight: 600;
   margin: 0 0 6px;
 }
 .client-card p {
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text-dim);
   margin-bottom: 8px;
 }
 .client-card pre {
-  font-size: 12px;
+  font-size: 0.75rem;
   margin: 0;
   padding: 10px 12px;
 }
@@ -971,7 +989,7 @@ tbody td code {
   margin-bottom: 32px;
 }
 .footer-brand p {
-  font-size: 14px;
+  font-size: 0.875rem;
   color: var(--text-dim);
   margin-top: 8px;
 }
@@ -980,14 +998,14 @@ tbody td code {
   gap: 48px;
 }
 .footer-links h4 {
-  font-size: 13px;
+  font-size: 0.8125rem;
   font-weight: 600;
   margin-bottom: 8px;
   color: var(--text);
 }
 .footer-links a {
   display: block;
-  font-size: 13px;
+  font-size: 0.8125rem;
   color: var(--text-dim);
   margin-bottom: 4px;
 }
@@ -997,7 +1015,7 @@ tbody td code {
   padding-top: 16px;
 }
 .footer-bottom p {
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--text-dim);
 }
 
@@ -1030,11 +1048,11 @@ tbody td code {
     background: var(--bg);
   }
 
-  .hero h1 { font-size: 32px; }
-  .hero .tagline { font-size: 17px; }
+  .hero h1 { font-size: 2rem; }
+  .hero .tagline { font-size: 1.0625rem; }
   .hero { padding: 64px 0 40px; }
   .section { padding: 40px 0; }
-  .section h2 { font-size: 24px; }
+  .section h2 { font-size: 1.5rem; }
 
   .feature-grid, .client-grid { grid-template-columns: 1fr; }
   .footer-inner { flex-direction: column; gap: 24px; }
@@ -1045,14 +1063,14 @@ tbody td code {
 
 @media (max-width: 480px) {
   .container { padding: 0 16px; }
-  pre { font-size: 12px; padding: 12px; }
-  table { font-size: 13px; }
+  pre { font-size: 0.75rem; padding: 12px; }
+  table { font-size: 0.8125rem; }
   thead th, tbody td { padding: 6px 8px; }
 }
 
 /* =========== DOCS PAGE — Language Tabs =========== */
 .lang-tabs { display: flex; gap: 0; margin-top: 12px; border-bottom: 2px solid var(--border); }
-.lang-tab { padding: 6px 14px; font-size: 12px; font-weight: 600; color: var(--text-dim); cursor: pointer; border: none; background: none; border-bottom: 2px solid transparent; margin-bottom: -2px; font-family: var(--font-mono); }
+.lang-tab { padding: 6px 14px; font-size: 0.75rem; font-weight: 600; color: var(--text-dim); cursor: pointer; border: none; background: none; border-bottom: 2px solid transparent; margin-bottom: -2px; font-family: var(--font-mono); }
 .lang-tab:hover { color: var(--text); }
 .lang-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
 .lang-panel { display: none; }
@@ -1062,10 +1080,10 @@ tbody td code {
 .doc-block:last-child { border-bottom: none; }
 .doc-block h3 { margin-top: 0; }
 .toc { columns: 2; column-gap: 32px; margin: 16px 0 32px; }
-.toc a { display: block; font-size: 13px; padding: 3px 0; color: var(--text-dim); }
+.toc a { display: block; font-size: 0.8125rem; padding: 3px 0; color: var(--text-dim); }
 .toc a:hover { color: var(--accent); }
 .toc-group { break-inside: avoid; margin-bottom: 12px; }
-.toc-group h4 { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text); margin-bottom: 4px; }
+.toc-group h4 { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text); margin-bottom: 4px; }
 
 /* terminal-style feature block (home) */
 .termblock{background:#0a0f0a;border:1px solid #1d2b1d;border-radius:12px;overflow:hidden;
@@ -1075,7 +1093,7 @@ tbody td code {
 .termbar span:first-child{background:#e0483e}.termbar span:nth-child(2){background:#e5c07b}
 .termbar span:nth-child(3){background:#26a269}
 .termblock pre{margin:0;padding:22px 26px;color:#4ade80;background:transparent;border:0;
-  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:14.5px;line-height:1.75;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size: 0.9062rem;line-height:1.75;
   white-space:pre-wrap;overflow-x:auto}
 
 /* ---- Architecture diagram ---- */
@@ -1083,20 +1101,20 @@ tbody td code {
 .arch-layer{background:var(--bg-card);border:1px solid var(--border-2);border-radius:10px;
   padding:14px 16px}
 .arch-storage{border-color:var(--border-3)}
-.arch-label{font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;
+.arch-label{font-family:var(--font-mono);font-size: 0.6875rem;letter-spacing:.08em;
   text-transform:uppercase;color:var(--text-mute);margin-bottom:10px}
 .arch-row{display:flex;flex-wrap:wrap;gap:8px}
-.arch-chip{font-size:13px;color:var(--text-dim);background:var(--bg-elev);
+.arch-chip{font-size: 0.8125rem;color:var(--text-dim);background:var(--bg-elev);
   border:1px solid var(--border-2);border-radius:20px;padding:5px 12px;white-space:nowrap}
 .arch-chip.alt{color:var(--steel);border-color:var(--steel-light);
   background:var(--steel-light)}
-.arch-proto{font-family:var(--font-mono);font-size:12.5px;color:var(--accent);
+.arch-proto{font-family:var(--font-mono);font-size: 0.7812rem;color:var(--accent);
   background:var(--accent-light);border:1px solid rgba(226,120,74,.28);
   border-radius:6px;padding:6px 12px;white-space:nowrap}
 
 /* vertical connectors between layers */
 .arch-flow{position:relative;height:34px;display:flex;align-items:center;justify-content:center;
-  font-size:11.5px;color:var(--text-mute);font-family:var(--font-mono)}
+  font-size: 0.7188rem;color:var(--text-mute);font-family:var(--font-mono)}
 .arch-flow::before{content:"";position:absolute;top:0;bottom:0;left:50%;width:2px;
   transform:translateX(-1px);
   background:linear-gradient(to bottom,var(--border-3),var(--accent),var(--border-3))}
@@ -1111,15 +1129,15 @@ tbody td code {
 .arch-core{background:linear-gradient(180deg,var(--bg-card),var(--bg-elev));
   border:1.5px solid var(--accent);border-radius:10px;padding:16px;text-align:center;
   box-shadow:0 0 0 4px var(--accent-light)}
-.arch-core strong{display:block;font-size:16px;color:var(--text);margin-bottom:3px}
-.arch-core span{font-size:12.5px;color:var(--text-dim)}
+.arch-core strong{display:block;font-size: 1rem;color:var(--text);margin-bottom:3px}
+.arch-core span{font-size: 0.7812rem;color:var(--text-dim)}
 
 .arch-engines{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .arch-engine{background:var(--bg-card);border:1px solid var(--border-2);border-radius:10px;
   padding:14px;border-top:3px solid var(--accent);display:flex;flex-direction:column;gap:6px}
-.arch-engine-h{font-size:14.5px;font-weight:650;color:var(--text)}
-.arch-engine-b{font-size:12.5px;color:var(--text-dim);line-height:1.5;flex:1}
-.arch-engine-p{font-family:var(--font-mono);font-size:10.5px;letter-spacing:.04em;
+.arch-engine-h{font-size: 0.9062rem;font-weight:650;color:var(--text)}
+.arch-engine-b{font-size: 0.7812rem;color:var(--text-dim);line-height:1.5;flex:1}
+.arch-engine-p{font-family:var(--font-mono);font-size: 0.6562rem;letter-spacing:.04em;
   color:var(--text-mute);text-transform:uppercase}
 .e-doc{border-top-color:var(--accent)}
 .e-sql{border-top-color:var(--steel)}
@@ -1128,7 +1146,7 @@ tbody td code {
 .e-mqtt{border-top-color:var(--warn)}
 .e-s3{border-top-color:#9b7cb4}
 
-.arch-note{margin-top:22px;font-size:13px;color:var(--text-dim);line-height:1.65;
+.arch-note{margin-top:22px;font-size: 0.8125rem;color:var(--text-dim);line-height:1.65;
   background:var(--bg-alt);border:1px solid var(--border);border-left:3px solid var(--accent);
   border-radius:6px;padding:12px 16px}
 
@@ -1159,7 +1177,7 @@ tbody td code {
   gap: 10px;
   padding: 10px 15px;
   border-bottom: 1px solid var(--border);
-  font-size: 13.5px;
+  font-size: 0.8438rem;
 }
 .swap-row:last-child { border-bottom: 0; }
 .swap-was {
@@ -1170,10 +1188,10 @@ tbody td code {
 }
 .swap-arrow { color: var(--accent); opacity: 0.65; }
 .swap-now { color: var(--text); font-weight: 600; }
-.swap-for { color: var(--text-mute); font-size: 12.5px; }
+.swap-for { color: var(--text-mute); font-size: 0.7812rem; }
 
 .showcase-cta { display: flex; align-items: center; gap: 15px; flex-wrap: wrap; margin-top: 22px; }
-.showcase-cta-note { color: var(--text-mute); font-size: 12.5px; }
+.showcase-cta-note { color: var(--text-mute); font-size: 0.7812rem; }
 
 
 

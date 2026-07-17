@@ -13,7 +13,7 @@ export default function Page() {
       <h1>OxiDB</h1>
     </div>
     <p class="tagline">A fast, multi-model database.</p>
-    <p class="sub">MongoDB-style JSON queries <strong>and a full SQL engine</strong> &mdash; window functions, CTEs, <code>WITH&nbsp;RECURSIVE</code>, LATERAL joins, and an <strong>EF&nbsp;Core provider that beats PostgreSQL</strong> (3832/3832 spec tests). Instant, online <code>ALTER&nbsp;TABLE&nbsp;ADD/DROP&nbsp;COLUMN</code> and crash-atomic checkpoints. ACID transactions with SELECT&nbsp;FOR&nbsp;UPDATE and group commit. A <strong>Redis-compatible in-memory store</strong> (MULTI/EXEC/WATCH + EVAL) and an <strong>MQTT broker</strong>. A built-in <strong>time-series engine</strong> (InfluxDB-style, Gorilla-compressed, line-protocol ingest). Full-text &amp; vector search. S3-compatible blob storage. Raft replication. Encryption at rest.</p>
+    <p class="sub"><strong>OxiDB is a single, small binary</strong> that speaks every data model your application needs. Query documents with MongoDB-style JSON or a <strong>full SQL engine</strong>, record metrics in a built-in <strong>time-series</strong> store, cache in a <strong>Redis-compatible</strong> key-value layer, publish over <strong>MQTT</strong>, and keep files in <strong>S3-compatible</strong> object storage &mdash; with <strong>full-text &amp; vector search</strong> across all of it. ACID transactions, Raft replication, and encryption at rest are built in. Embed it in your process, or run it as a server.</p>
     <div class="hero-actions">
       <a href="/quickstart/" class="btn btn-primary">Get Started</a>
       <a href="/downloads/" class="btn btn-secondary">Downloads v0.36.0</a>
