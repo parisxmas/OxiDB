@@ -839,10 +839,13 @@ pre:hover .code-copy,
 }
 .download-card:hover .dl-arrow { color: var(--accent); }
 
-/* Download table */
+/* Download table. Only the action column stays rigid — everything else may
+   wrap, and the filename may break anywhere, so the Download buttons never
+   scroll off-screen at the 150% type scale (they did). */
 .dl-table td code { font-size: 0.6875rem; }
-.dl-table td { white-space: nowrap; }
+.dl-table td:last-child { white-space: nowrap; }
 .dl-table td:nth-child(3) { white-space: normal; word-break: break-all; }
+.dl-table td:nth-child(3) code { white-space: normal; word-break: break-all; }
 .dl-btn {
   display: inline-block;
   font-size: 0.75rem;
