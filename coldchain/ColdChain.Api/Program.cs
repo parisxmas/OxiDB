@@ -262,11 +262,18 @@ app.MapGet("/resources", async (OxiConnection oxi) =>
 {
     var engine = await oxi.ReadAsync(c => c.ExecRawAsync(
         new Dictionary<string, object?> { ["cmd"] = "proc_status" }));
+    // What the engines have written: one walk of OXIDB_DATA, attributed per
+    // engine by the server itself ({"cmd": "disk_usage"}).
+    var disk = await oxi.ReadAsync(c => c.ExecRawAsync(
+        new Dictionary<string, object?> { ["cmd"] = "disk_usage" }));
 
     double D(string n) => engine.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.Number
         ? v.GetDouble() : 0;
     int I(string n) => engine.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.Number
         ? v.GetInt32() : 0;
+    long B(JsonElement e, string n) => e.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.Number
+        ? v.GetInt64() : 0;
+    var engines = disk.TryGetProperty("engines", out var eng) ? eng : default;
 
     var api = SelfUsage.Sample();
     return Results.Ok(new
@@ -277,6 +284,19 @@ app.MapGet("/resources", async (OxiConnection oxi) =>
             MemoryMb = D("mem_rss_mb"),
             Threads = I("threads"),
             UptimeSeconds = I("uptime_s"),
+            DiskTotalBytes = B(disk, "total_bytes"),
+            DiskEngines = new
+            {
+                Documents = B(engines, "documents"),
+                Sql = B(engines, "sql"),
+                Tsdb = B(engines, "tsdb"),
+                Blobs = B(engines, "blobs"),
+                Oximem = B(engines, "oximem"),
+                Messaging = B(engines, "messaging"),
+                Fts = B(engines, "fts"),
+                PitrArchive = B(engines, "pitr_archive"),
+                System = B(engines, "system"),
+            },
         },
         Api = api,
     });

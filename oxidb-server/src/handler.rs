@@ -1192,6 +1192,10 @@ fn handle_request_session_inner(
 
         "proc_status" => ok_bytes(crate::proc_stats::PROC_STATS.snapshot()),
 
+        // Per-engine on-disk footprint of OXIDB_DATA — read-only, no data
+        // content, same visibility tier as proc_status.
+        "disk_usage" => ok_bytes(crate::disk_usage::snapshot()),
+
         // -------------------------------------------------------------------
         // Backup & Restore (admin-only via RBAC)
         // -------------------------------------------------------------------

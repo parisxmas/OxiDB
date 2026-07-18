@@ -810,6 +810,21 @@ setInterval(() => { if (!el('q').value.trim()) loadDocs(); }, 30000);
 
 // ── Cost panel ─────────────────────────────────────────────────────────────
 const ago = s => s < 90 ? `${s}s` : s < 5400 ? `${Math.round(s/60)}m` : `${(s/3600).toFixed(1)}h`;
+const fmtB = n => n < 1024 ? `${n} B` : n < 1048576 ? `${(n/1024).toFixed(0)} KB`
+  : n < 1073741824 ? `${(n/1048576).toFixed(1)} MB` : `${(n/1073741824).toFixed(2)} GB`;
+
+// The per-engine on-disk breakdown, biggest first — the numbers behind the
+// "one data directory instead of six" claim.
+const DISK_NAMES = { documents:'document', sql:'SQL', tsdb:'time-series', blobs:'S3 blobs',
+  oximem:'OxiMem', messaging:'MQTT/AMQP', fts:'full-text', pitrArchive:'PITR', system:'system' };
+const diskLine = u => {
+  if (!u.diskEngines) return '';
+  const parts = Object.entries(u.diskEngines)
+    .filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${DISK_NAMES[k] ?? k} ${fmtB(v)}`);
+  return parts.length ? `<div class="res-meta">on disk: ${parts.join(' · ')}</div>` : '';
+};
 
 async function loadResources() {
   let r;
@@ -825,9 +840,11 @@ async function loadResources() {
       <div class="res-nums">
         <span><span class="res-n">${u.cpuPercent.toFixed(1)}</span><span class="res-u">% cpu</span></span>
         <span><span class="res-n">${u.memoryMb.toFixed(0)}</span><span class="res-u">MB rss</span></span>
+        ${u.diskTotalBytes != null ? `<span><span class="res-n">${fmtB(u.diskTotalBytes)}</span><span class="res-u">disk</span></span>` : ''}
       </div>
       <div class="bar"><i style="width:${Math.min(100, u.cpuPercent)}%"></i></div>
       <div class="res-meta">${u.threads} threads · up ${ago(u.uptimeSeconds)}</div>
+      ${diskLine(u)}
       <div class="res-meta">${note}</div>
     </div>`).join('');
 }
