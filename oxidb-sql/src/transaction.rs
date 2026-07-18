@@ -14,12 +14,12 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::SqlEngine;
 use crate::catalog::{IndexDef, Table};
 use crate::error::{Result, SqlError};
 use crate::store::Store;
 use crate::types::{IndexKey, Value};
 use crate::wal::WalRecord;
+use crate::SqlEngine;
 
 /// A row-level change in the overlay: `Some(cells)` upserts, `None` deletes.
 type RowChange = Option<Vec<Value>>;
@@ -56,6 +56,10 @@ pub(crate) struct TxnState {
     /// Savepoint stack: `(name, data snapshot)`. Snapshots exclude the stack
     /// itself, so rolling back to a savepoint keeps earlier savepoints.
     savepoints: Vec<(String, Box<TxnState>)>,
+    /// This transaction's row-lock owner id (`SELECT ... FOR UPDATE`,
+    /// writer-writer exclusion). Allocated at BEGIN, survives parking;
+    /// locks release at commit/rollback via `release_all(lock_owner)`.
+    lock_owner: u64,
 }
 
 impl TxnState {
@@ -63,6 +67,10 @@ impl TxnState {
     /// flush (for replicating a buffered commit as one unit).
     pub(crate) fn take_ops(self) -> Vec<WalRecord> {
         self.ops
+    }
+
+    pub(crate) fn lock_owner(&self) -> u64 {
+        self.lock_owner
     }
 
     /// The transaction's data without its savepoint stack.
@@ -88,9 +96,11 @@ pub(crate) struct Transaction<'a> {
 
 impl<'a> Transaction<'a> {
     pub(crate) fn new(engine: &'a SqlEngine) -> Self {
+        let mut state = TxnState::default();
+        state.lock_owner = engine.alloc_lock_owner();
         Transaction {
             engine,
-            state: RefCell::new(TxnState::default()),
+            state: RefCell::new(state),
         }
     }
 
@@ -141,8 +151,23 @@ impl<'a> Transaction<'a> {
 
     /// Flush all buffered operations to the engine as one atomic batch.
     pub(crate) fn commit(self) -> Result<()> {
-        let ops = self.state.into_inner().ops;
-        self.engine.commit_batch(ops)
+        let engine = self.engine;
+        let state = self.state.into_inner();
+        let owner = state.lock_owner;
+        let r = engine.commit_batch(state.ops);
+        // Either way the transaction is over: success committed, failure
+        // aborted. The locks go with it.
+        engine.row_locks_release(owner);
+        r
+    }
+
+    /// Explicit rollback: discard the overlay, release the row locks. Every
+    /// abandonment path must come here (or through the engine's
+    /// `rollback_session_txn`) — a bare drop would leak the locks until the
+    /// timeout bites someone else.
+    pub(crate) fn rollback(self) {
+        let owner = self.state.borrow().lock_owner;
+        self.engine.row_locks_release(owner);
     }
 
     /// The definition currently visible to the transaction.
@@ -305,6 +330,12 @@ impl<'a> Transaction<'a> {
 impl Store for Transaction<'_> {
     fn table_def(&self, name: &str) -> Option<Table> {
         self.visible_def(name)
+    }
+    fn lock_rows(&self, table: &str, row_ids: &[u64]) -> Result<()> {
+        // Held until commit/rollback. Blocks on contention — the engine's
+        // `inner` mutex is NOT held here.
+        self.engine
+            .row_locks_lock(table, row_ids, self.state.borrow().lock_owner)
     }
 
     // Savepoints operate on this transaction's buffered overlay (see the

@@ -18,7 +18,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SqlError};
-use crate::types::{Value, decode_row, encode_row};
+use crate::types::{decode_row, encode_row, Value};
 
 const RDAT_MAGIC: &[u8; 4] = b"OXSR";
 const RDAT_VERSION: u16 = 1;

@@ -11,11 +11,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use oxidb_cobra::value::{hash_key, inspect, Dict, NativeError, NativeObject};
 use oxidb_cobra::Value as CValue;
-use oxidb_cobra::value::{Dict, NativeError, NativeObject, hash_key, inspect};
 
 use crate::ast::{QueryResult, Statement};
-use crate::catalog::{ProcLanguage, ProcedureDef, base64_decode, base64_encode};
+use crate::catalog::{base64_decode, base64_encode, ProcLanguage, ProcedureDef};
 use crate::decimal::Decimal;
 use crate::error::{Result, SqlError};
 use crate::store::Store;

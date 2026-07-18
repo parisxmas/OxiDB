@@ -677,6 +677,18 @@ fn exec_update<S: Store>(
         })
         .collect::<Result<_>>()?;
 
+    // Writer-writer exclusion: every row this UPDATE matches is locked
+    // before any assignment is evaluated, so a concurrent FOR UPDATE holder
+    // or UPDATE serializes against us instead of losing its write.
+    lock_matching_rows(
+        store,
+        table,
+        alias.unwrap_or(table),
+        &filter,
+        &schema,
+        params,
+    )?;
+
     let filter_corr = filter.as_ref().is_some_and(has_corr);
     let targets_corr = targets.iter().any(|(_, e)| has_corr(e));
     let mut affected = 0;
@@ -718,6 +730,109 @@ fn exec_update<S: Store>(
 /// when the filter carries a usable equality (`UPDATE t SET ... WHERE id = ?`
 /// must not scan the table), else a full scan. A probe may return a superset —
 /// the caller re-applies the filter to every candidate row.
+/// `SELECT ... FOR UPDATE`: validate the shape, then lock every matched
+/// row of the base table until the enclosing transaction commits or rolls
+/// back (statement end when autocommit). Only a plain single-table SELECT
+/// qualifies — anything whose "rows" are not base-table rows (joins,
+/// aggregates, DISTINCT, set operations, views, derived tables) is refused
+/// by name, because locking would silently degrade to theater there. With
+/// LIMIT/OFFSET, every MATCHING row is locked, not only the returned page —
+/// an over-approximation, never an under-approximation.
+fn lock_select_for_update<S: Store>(
+    store: &S,
+    query: &SelectQuery,
+    params: &[Value],
+) -> Result<()> {
+    let unsupported = |what: &str| {
+        Err(SqlError::Unsupported(format!(
+            "FOR UPDATE on {what} (only a plain single-table SELECT can lock rows)"
+        )))
+    };
+    if !query.ctes.is_empty() {
+        return unsupported("a recursive CTE query");
+    }
+    let QueryBody::Select(stmt) = &query.body else {
+        return unsupported("a set operation or VALUES");
+    };
+    if !stmt.joins.is_empty() {
+        return unsupported("a join");
+    }
+    if !stmt.group_by.is_empty() || stmt.having.is_some() {
+        return unsupported("a grouped query");
+    }
+    if stmt.distinct || !stmt.distinct_on.is_empty() {
+        return unsupported("SELECT DISTINCT");
+    }
+    if stmt.projection.iter().any(|item| match item {
+        SelectItem::Expr { expr, .. } => has_aggregate(expr),
+        _ => false,
+    }) {
+        return unsupported("an aggregate query");
+    }
+    let Some(from) = &stmt.from else {
+        return unsupported("a FROM-less SELECT");
+    };
+    if from.subquery.is_some() {
+        return unsupported("a derived table");
+    }
+    if store.view_sql(&from.name).is_some() {
+        return unsupported("a view");
+    }
+    let def = store
+        .table_def(&from.name)
+        .ok_or_else(|| SqlError::NoSuchTable(from.name.clone()))?;
+    let key = from.alias.as_deref().unwrap_or(&from.name);
+    let schema = table_schema(key, &def);
+    lock_matching_rows(store, &from.name, key, &stmt.filter, &schema, params)
+}
+
+/// Lock every row of `table` the filter currently matches, re-evaluating
+/// after each acquisition round until the matched set stabilizes: a row can
+/// start (or stop) matching while we wait on a contended lock, so one pass
+/// is not enough. Rows locked in an earlier round stay locked even if they
+/// no longer match — over-locking is safe, under-locking is the lost-update
+/// hole this exists to close. Bounded at 10 rounds: every row matched in
+/// the final round is locked either way, because a round only ends by
+/// finding nothing new to lock or by locking everything it found.
+fn lock_matching_rows<S: Store>(
+    store: &S,
+    table: &str,
+    key: &str,
+    filter: &Option<Expr>,
+    schema: &[ColRef],
+    params: &[Value],
+) -> Result<()> {
+    let filter_corr = filter.as_ref().is_some_and(has_corr);
+    let mut locked: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for _ in 0..10 {
+        let mut fresh: Vec<u64> = Vec::new();
+        for (row_id, cells) in dml_candidates(store, table, key, filter, params)? {
+            if let Some(pred) = filter
+                && !truthy(&eval_scalar_corr(
+                    store,
+                    filter_corr,
+                    pred,
+                    schema,
+                    cells.as_slice(),
+                    params,
+                )?)
+            {
+                continue;
+            }
+            if !locked.contains(&row_id) {
+                fresh.push(row_id);
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        fresh.sort_unstable();
+        store.lock_rows(table, &fresh)?;
+        locked.extend(fresh);
+    }
+    Ok(())
+}
+
 fn dml_candidates<S: Store>(
     store: &S,
     table: &str,
@@ -749,6 +864,16 @@ fn exec_delete<S: Store>(
         .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
     // With `DELETE FROM t AS a`, qualified references use the alias.
     let schema = table_schema(alias.unwrap_or(table), &def);
+
+    // Writer-writer exclusion — see exec_update.
+    lock_matching_rows(
+        store,
+        table,
+        alias.unwrap_or(table),
+        &filter,
+        &schema,
+        params,
+    )?;
 
     let filter_corr = filter.as_ref().is_some_and(has_corr);
     let mut to_delete = Vec::new();
@@ -899,6 +1024,9 @@ fn resolve_limit(l: Option<LimitExpr>, params: &[Value], what: &str) -> Result<O
 /// Execute a full query: the single-select fast path, or a set-operation tree
 /// with outer ORDER BY / LIMIT / OFFSET applied to the combined result.
 fn exec_query<S: Store>(store: &S, query: SelectQuery, params: &[Value]) -> Result<QueryResult> {
+    if query.for_update {
+        lock_select_for_update(store, &query, params)?;
+    }
     match query.body {
         QueryBody::Select(s)
             if query.order_by.is_empty() && query.limit.is_none() && query.offset.is_none() =>
@@ -1124,6 +1252,7 @@ fn fixpoint_cte<S: Store>(
             limit: None,
             offset: None,
             ctes: Vec::new(),
+            for_update: false,
         };
         crate::parser::inline_ctes_query(&mut q, binds);
         match execute(store, Statement::Select(q), params)? {
@@ -1206,6 +1335,7 @@ fn values_query(width: usize, rows: &[Vec<Value>]) -> SelectQuery {
         limit: None,
         offset: None,
         ctes: Vec::new(),
+        for_update: false,
     };
     if rows.is_empty() {
         let nulls: Vec<Expr> = (0..width).map(|_| Expr::Literal(Value::Null)).collect();
@@ -2143,12 +2273,10 @@ fn decorrelate_exists<S: Store>(
         return Ok(None);
     }
     match sel.projection.as_slice() {
-        [
-            SelectItem::Expr {
-                expr: Expr::Literal(Value::Int(1)),
-                ..
-            },
-        ] => {}
+        [SelectItem::Expr {
+            expr: Expr::Literal(Value::Int(1)),
+            ..
+        }] => {}
         _ => return Ok(None),
     }
     // Find the correlation equality among the WHERE's top-level conjuncts.

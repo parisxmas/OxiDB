@@ -488,31 +488,27 @@ mod tests {
     fn row_validation() {
         let t = users_table();
         // good row
-        assert!(
-            t.validate_row(&[Value::Int(1), Value::Text("ada".into()), Value::Int(30)])
-                .is_ok()
-        );
+        assert!(t
+            .validate_row(&[Value::Int(1), Value::Text("ada".into()), Value::Int(30)])
+            .is_ok());
         // wrong arity
         assert!(t.validate_row(&[Value::Int(1)]).is_err());
         // NOT NULL violation on name
-        assert!(
-            t.validate_row(&[Value::Int(1), Value::Null, Value::Int(30)])
-                .is_err()
-        );
+        assert!(t
+            .validate_row(&[Value::Int(1), Value::Null, Value::Int(30)])
+            .is_err());
         // nullable age accepts NULL
-        assert!(
-            t.validate_row(&[Value::Int(1), Value::Text("ada".into()), Value::Null])
-                .is_ok()
-        );
+        assert!(t
+            .validate_row(&[Value::Int(1), Value::Text("ada".into()), Value::Null])
+            .is_ok());
         // type mismatch on id
-        assert!(
-            t.validate_row(&[
+        assert!(t
+            .validate_row(&[
                 Value::Text("x".into()),
                 Value::Text("ada".into()),
                 Value::Int(30)
             ])
-            .is_err()
-        );
+            .is_err());
     }
 }
 

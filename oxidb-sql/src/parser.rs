@@ -1196,6 +1196,22 @@ fn translate_query(query: sp::Query, p: &mut usize) -> Result<SelectQuery> {
         Vec::new()
     };
 
+    // Locking clauses. FOR UPDATE is real (pessimistic row locks, held to
+    // commit/rollback); every other variant is refused by name — accepting a
+    // locking clause without taking the lock would be the silent no-op this
+    // engine refuses to ship.
+    let mut for_update = false;
+    for lock in &query.locks {
+        match (lock.lock_type, lock.nonblock) {
+            (sp::LockType::Update, None) if lock.of.is_none() => for_update = true,
+            _ => {
+                return Err(SqlError::Unsupported(format!(
+                    "locking clause '{lock}' (only plain FOR UPDATE is supported)"
+                )));
+            }
+        }
+    }
+
     let order_by = translate_order_by(query.order_by, p)?;
     let (limit, offset) = translate_limit(&query.limit_clause, p)?;
     let mut result = match *query.body {
@@ -1210,15 +1226,24 @@ fn translate_query(query: sp::Query, p: &mut usize) -> Result<SelectQuery> {
                 limit: None,
                 offset: None,
                 ctes: Vec::new(),
+                for_update,
             }
         }
-        body @ (sp::SetExpr::SetOperation { .. } | sp::SetExpr::Values(_)) => SelectQuery {
-            body: translate_set_expr(body, p)?,
-            order_by,
-            limit,
-            offset,
-            ctes: Vec::new(),
-        },
+        body @ (sp::SetExpr::SetOperation { .. } | sp::SetExpr::Values(_)) => {
+            if for_update {
+                return Err(SqlError::Unsupported(
+                    "FOR UPDATE on a set operation or VALUES".into(),
+                ));
+            }
+            SelectQuery {
+                body: translate_set_expr(body, p)?,
+                order_by,
+                limit,
+                offset,
+                ctes: Vec::new(),
+                for_update: false,
+            }
+        }
         other => return Err(SqlError::Unsupported(format!("query body {other}"))),
     };
     if !resolved.is_empty() {
@@ -1768,7 +1793,12 @@ fn translate_expr(expr: sp::Expr, p: &mut usize) -> Result<Expr> {
         // and that is precisely why `NOT BETWEEN` is `< OR >` rather than
         // `NOT (a >= x AND a <= y)`... which is the same thing under de
         // Morgan, but written this way it is obvious it stays NULL.
-        sp::Expr::Between { expr, negated, low, high } => {
+        sp::Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
             let val = translate_expr(*expr, p)?;
             let lo = translate_expr(*low, p)?;
             let hi = translate_expr(*high, p)?;
@@ -2242,6 +2272,7 @@ fn exists_projection(body: &mut QueryBody) -> Result<()> {
                             limit: None,
                             offset: None,
                             ctes: Vec::new(),
+                            for_update: false,
                         })),
                         lateral: false,
                         alias_columns: Vec::new(),

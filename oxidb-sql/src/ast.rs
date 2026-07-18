@@ -147,6 +147,11 @@ pub struct SelectQuery {
     /// inlined at parse time and never appear here; a self-referencing CTE is
     /// materialized by fixpoint iteration before the body executes.
     pub ctes: Vec<RecursiveCte>,
+    /// `SELECT ... FOR UPDATE`: pessimistically lock the matched rows until
+    /// the enclosing transaction commits or rolls back (statement end when
+    /// autocommit). Only valid on a plain single-table SELECT; the executor
+    /// rejects anything else rather than silently not locking.
+    pub for_update: bool,
 }
 
 /// A self-referencing CTE: `WITH RECURSIVE name(columns) AS (anchor UNION

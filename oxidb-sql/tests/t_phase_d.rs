@@ -224,6 +224,7 @@ fn alter_table_disk_first() {
         SqlOptions {
             disk_first: true,
             checkpoint_bytes: 0,
+            ..SqlOptions::default()
         },
     )
     .unwrap();
@@ -248,6 +249,7 @@ fn alter_table_disk_first() {
         SqlOptions {
             disk_first: true,
             checkpoint_bytes: 0,
+            ..SqlOptions::default()
         },
     )
     .unwrap();
@@ -685,7 +687,8 @@ fn drop_column_disk_first_reopen() {
     let opts = SqlOptions {
         disk_first: true,
         checkpoint_bytes: 0,
-    };
+            ..SqlOptions::default()
+        };
     let dir = tempfile::tempdir().unwrap();
     let db = SqlEngine::open_with_options(dir.path(), opts.clone()).unwrap();
     db.execute("CREATE TABLE u (id INT PRIMARY KEY, a TEXT, b INT)")
@@ -721,7 +724,8 @@ fn checkpoint_compacts_disk_first() {
     let opts = SqlOptions {
         disk_first: true,
         checkpoint_bytes: 0,
-    };
+            ..SqlOptions::default()
+        };
     let dir = tempfile::tempdir().unwrap();
     let db = SqlEngine::open_with_options(dir.path(), opts.clone()).unwrap();
     db.execute("CREATE TABLE u (id INT PRIMARY KEY, big TEXT, keep INT)")

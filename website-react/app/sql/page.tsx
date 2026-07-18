@@ -91,6 +91,14 @@ UPDATE accounts SET balance = balance - 100 WHERE id = 1;
 UPDATE accounts SET balance = balance + 100 WHERE id = 2;
 COMMIT;   <span class="co">-- or ROLLBACK; SAVEPOINT / ROLLBACK TO also supported</span></code></pre>
 
+    <h3>Row locking &mdash; <code>SELECT ... FOR UPDATE</code></h3>
+    <p>Real pessimistic row locks: the matched rows are locked until the transaction commits or rolls back, and a concurrent <code>UPDATE</code>/<code>DELETE</code>/<code>FOR UPDATE</code> on them <strong>blocks</strong> until then (up to <code>OXIDB_SQL_LOCK_TIMEOUT_MS</code>, default 5000 &mdash; also how a deadlock resolves, as a timeout error on one side). Plain <code>UPDATE</code>/<code>DELETE</code> lock their rows too, so two concurrent read-modify-write transactions serialize instead of losing one write.</p>
+    <pre><code class="lang-sql">BEGIN;
+SELECT * FROM products WHERE id = 42 FOR UPDATE;  <span class="co">-- row 42 is now ours</span>
+UPDATE products SET stock = stock - 1 WHERE id = 42;
+COMMIT;                                           <span class="co">-- lock released, waiters proceed</span></code></pre>
+    <p>Only a plain single-table SELECT can lock rows; <code>FOR UPDATE</code> on a join, aggregate, <code>DISTINCT</code>, set operation, view or derived table is refused with a clear error &mdash; never accepted without taking the lock. <code>FOR SHARE</code>/<code>NOWAIT</code>/<code>SKIP LOCKED</code> are likewise refused. In a cluster, <code>SELECT ... FOR UPDATE</code> classifies as a <em>write</em>, so oxipool never routes it to a replica where the lock would be meaningless.</p>
+
     <h3>Sequences</h3>
     <pre><code class="lang-sql">CREATE SEQUENCE order_seq START WITH 1000;
 SELECT NEXT VALUE FOR order_seq;               <span class="co">-- EF Core HiLo keys</span></code></pre>

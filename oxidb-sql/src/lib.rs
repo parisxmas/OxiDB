@@ -19,6 +19,7 @@ mod executor;
 pub mod json;
 mod manifest;
 mod parser;
+mod row_locks;
 mod rows;
 mod storage;
 mod store;
@@ -35,7 +36,7 @@ pub use catalog::{Column, IndexDef, Table};
 pub use decimal::Decimal;
 pub use error::{Result, SqlError};
 pub use parser::{
-    DatabaseStatement, UserStatement, parse_database_statement, parse_user_statement,
+    parse_database_statement, parse_user_statement, DatabaseStatement, UserStatement,
 };
 pub use types::{SqlType, Value};
 
@@ -60,6 +61,10 @@ pub struct SqlOptions {
     /// overlay in disk-first mode). `0` disables auto-checkpointing.
     /// Env: `OXIDB_SQL_CHECKPOINT_BYTES`.
     pub checkpoint_bytes: u64,
+    /// How long `SELECT ... FOR UPDATE` / UPDATE / DELETE wait on a row lock
+    /// held by another transaction before failing with a lock-timeout error
+    /// (also how a deadlock resolves). Env: `OXIDB_SQL_LOCK_TIMEOUT_MS`.
+    pub lock_timeout_ms: u64,
 }
 
 impl Default for SqlOptions {
@@ -67,6 +72,7 @@ impl Default for SqlOptions {
         SqlOptions {
             disk_first: false,
             checkpoint_bytes: 64 << 20, // 64 MiB
+            lock_timeout_ms: 5_000,
         }
     }
 }
@@ -82,6 +88,11 @@ impl SqlOptions {
             && let Ok(n) = v.trim().parse::<u64>()
         {
             opts.checkpoint_bytes = n;
+        }
+        if let Ok(v) = std::env::var("OXIDB_SQL_LOCK_TIMEOUT_MS")
+            && let Ok(n) = v.trim().parse::<u64>()
+        {
+            opts.lock_timeout_ms = n;
         }
         opts
     }
@@ -399,6 +410,21 @@ pub struct SqlEngine {
     /// Text -> AST is pure, making invalidation a non-issue; the map is
     /// cleared wholesale if it ever grows past a cap.
     stmt_cache: Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<ast::Statement>>>>,
+    /// Pessimistic row locks (`SELECT ... FOR UPDATE`, writer-writer
+    /// exclusion). Waited on ONLY while `inner` is not held.
+    row_locks: row_locks::RowLocks,
+    /// See [`SqlOptions::lock_timeout_ms`].
+    lock_timeout: std::time::Duration,
+}
+
+thread_local! {
+    /// Lock owner of the autocommit statement currently executing on this
+    /// thread (0 = none). Set around each autocommit statement in
+    /// `run_session_batch`; `<SqlEngine as Store>::lock_rows` reads it. A
+    /// thread executes one statement at a time, so this is exact. Statements
+    /// inside a transaction don't use it — the `Transaction` store carries
+    /// its own owner.
+    static STMT_LOCK_OWNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Statement-cache entry cap: past this the whole map is dropped (workloads
@@ -506,6 +532,8 @@ impl SqlEngine {
             session_txns: Mutex::new(std::collections::HashMap::new()),
             next_session_txn: std::sync::atomic::AtomicU64::new(1),
             stmt_cache: Mutex::new(std::collections::HashMap::new()),
+            row_locks: row_locks::RowLocks::default(),
+            lock_timeout: std::time::Duration::from_millis(opts.lock_timeout_ms),
             inner: Mutex::new(Inner {
                 dir,
                 generation,
@@ -1490,9 +1518,11 @@ impl SqlEngine {
                 Ok(results)
             }
             Err(e) => {
-                // A failed statement aborts the transaction (dropped = rolled
-                // back); the session starts clean.
-                drop(txn);
+                // A failed statement aborts the transaction (rolled back,
+                // row locks released); the session starts clean.
+                if let Some(t) = txn.take() {
+                    t.rollback();
+                }
                 *session_tx = None;
                 Err(e)
             }
@@ -1530,8 +1560,10 @@ impl SqlEngine {
         {
             return Ok(None);
         }
-        let strip =
-            |s: &str| s.trim_matches(|c| matches!(c, '"' | '[' | ']' | '`')).to_string();
+        let strip = |s: &str| {
+            s.trim_matches(|c| matches!(c, '"' | '[' | ']' | '`'))
+                .to_string()
+        };
         let toks: Vec<&str> = t.split_whitespace().collect();
         let num = |s: &str| -> i64 {
             s.trim_matches(|c: char| !c.is_ascii_digit() && c != '-')
@@ -1548,12 +1580,19 @@ impl SqlEngine {
             let (mut start, mut inc) = (1i64, 1i64);
             for i in 0..toks.len() {
                 let w = toks[i].to_ascii_uppercase();
-                if w == "START" && toks.get(i + 1).is_some_and(|s| s.eq_ignore_ascii_case("WITH")) {
+                if w == "START"
+                    && toks
+                        .get(i + 1)
+                        .is_some_and(|s| s.eq_ignore_ascii_case("WITH"))
+                {
                     if let Some(v) = toks.get(i + 2) {
                         start = num(v);
                     }
                 }
-                if w == "INCREMENT" && toks.get(i + 1).is_some_and(|s| s.eq_ignore_ascii_case("BY"))
+                if w == "INCREMENT"
+                    && toks
+                        .get(i + 1)
+                        .is_some_and(|s| s.eq_ignore_ascii_case("BY"))
                 {
                     if let Some(v) = toks.get(i + 2) {
                         inc = num(v);
@@ -1561,10 +1600,13 @@ impl SqlEngine {
                 }
             }
             let mut inner = self.inner.lock().unwrap();
-            inner
-                .catalog
-                .sequences
-                .insert(name, catalog::SequenceDef { next: start, increment: inc });
+            inner.catalog.sequences.insert(
+                name,
+                catalog::SequenceDef {
+                    next: start,
+                    increment: inc,
+                },
+            );
             let dir = inner.dir.clone();
             catalog::save_sequences(&dir, &inner.catalog.sequences)?;
             return Ok(Some(QueryResult::Ddl));
@@ -1643,7 +1685,8 @@ impl SqlEngine {
                 }
                 Statement::Rollback => {
                     txn.take()
-                        .ok_or_else(|| SqlError::Unsupported("ROLLBACK without BEGIN".into()))?;
+                        .ok_or_else(|| SqlError::Unsupported("ROLLBACK without BEGIN".into()))?
+                        .rollback();
                     results.push(QueryResult::Transaction);
                 }
                 Statement::Savepoint(name) => {
@@ -1689,7 +1732,17 @@ impl SqlEngine {
                 other => {
                     let r = match &txn {
                         Some(t) => executor::execute(t, other, params)?,
-                        None => executor::execute(self, other, params)?,
+                        None => {
+                            // Autocommit: row locks taken by this statement
+                            // (FOR UPDATE, UPDATE, DELETE) live exactly as
+                            // long as the statement.
+                            let owner = self.alloc_lock_owner();
+                            STMT_LOCK_OWNER.set(owner);
+                            let r = executor::execute(self, other, params);
+                            STMT_LOCK_OWNER.set(0);
+                            self.row_locks.release_all(owner);
+                            r?
+                        }
                     };
                     results.push(r);
                 }
@@ -1822,8 +1875,32 @@ impl SqlEngine {
 
     /// Roll back (discard) a parked session transaction. Safe to call for
     /// ids that no longer exist.
+    /// Allocate a unique lock-owner id (shared counter with session-txn ids;
+    /// 0 is reserved for "none").
+    pub(crate) fn alloc_lock_owner(&self) -> u64 {
+        self.next_session_txn
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// Acquire row locks for `owner` (blocking, engine lock-timeout). The
+    /// `row_locks` field is module-private; these two helpers are the
+    /// cross-module surface `transaction.rs` uses.
+    pub(crate) fn row_locks_lock(&self, table: &str, row_ids: &[u64], owner: u64) -> Result<()> {
+        self.row_locks
+            .lock_many(table, row_ids, owner, self.lock_timeout)
+    }
+
+    pub(crate) fn row_locks_release(&self, owner: u64) {
+        self.row_locks.release_all(owner);
+    }
+
     pub fn rollback_session_txn(&self, id: u64) {
-        self.session_txns.lock().unwrap().remove(&id);
+        // Dropping the state discards the buffered writes; its row locks go
+        // with it.
+        if let Some(state) = self.session_txns.lock().unwrap().remove(&id) {
+            self.row_locks.release_all(state.lock_owner());
+        }
     }
 
     /// Path to the SQL root directory.
@@ -2019,15 +2096,33 @@ pub fn leaves_transaction_open(sql: &str) -> Result<bool> {
 }
 
 pub fn is_read_only(sql: &str) -> Result<bool> {
-    Ok(parser::parse(sql)?
-        .iter()
-        .all(|s| matches!(s, ast::Statement::Select(_) | ast::Statement::Show(_))))
+    Ok(parser::parse(sql)?.iter().all(|s| match s {
+        // FOR UPDATE takes row locks: routing it to a replica would return
+        // rows with no lock behind them, so it must ride the write path.
+        ast::Statement::Select(q) => !q.for_update,
+        ast::Statement::Show(_) => true,
+        _ => false,
+    }))
 }
 
 /// Autocommit `Store`: every operation is applied and logged immediately.
 impl Store for SqlEngine {
     fn table_def(&self, name: &str) -> Option<Table> {
         SqlEngine::table_def(self, name)
+    }
+    fn lock_rows(&self, table: &str, row_ids: &[u64]) -> Result<()> {
+        let owner = STMT_LOCK_OWNER.get();
+        if owner == 0 {
+            // Every public execution path scopes an owner around the
+            // statement; reaching this means a new call path skipped it.
+            return Err(SqlError::Unsupported(
+                "row locking outside a statement scope".into(),
+            ));
+        }
+        // Blocks on contention — `inner` is NOT held here, so the holder can
+        // commit and release while we wait.
+        self.row_locks
+            .lock_many(table, row_ids, owner, self.lock_timeout)
     }
     fn scan(&self, table: &str) -> Result<Vec<(u64, Vec<Value>)>> {
         SqlEngine::scan(self, table)
@@ -2512,10 +2607,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = SqlEngine::open(dir.path()).unwrap();
         db.create_table(users()).unwrap();
-        assert!(
-            db.insert("users", vec![Value::Int(1), Value::Null])
-                .is_err()
-        );
+        assert!(db
+            .insert("users", vec![Value::Int(1), Value::Null])
+            .is_err());
         assert!(db.insert("users", vec![Value::Int(1)]).is_err());
     }
 }

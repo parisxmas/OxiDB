@@ -36,7 +36,8 @@ fn main() {
             SqlOptions {
                 disk_first: false,
                 checkpoint_bytes: 0,
-            },
+            ..SqlOptions::default()
+        },
         )
         .unwrap();
         db.execute(
@@ -71,6 +72,7 @@ fn main() {
         SqlOptions {
             disk_first: disk,
             checkpoint_bytes: 64 << 20,
+            ..SqlOptions::default()
         },
     )
     .unwrap();

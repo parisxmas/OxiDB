@@ -16,8 +16,9 @@ fn t(s: &str) -> Value {
 fn disk_opts() -> SqlOptions {
     SqlOptions {
         disk_first: true,
-        checkpoint_bytes: 0, // manual checkpoints unless a test says otherwise
-    }
+        checkpoint_bytes: 0, // manual checkpoints unless a test says otherwise,
+            ..SqlOptions::default()
+        }
 }
 
 fn open_disk() -> (tempfile::TempDir, SqlEngine) {
@@ -206,7 +207,8 @@ fn mode_switch_round_trip() {
             SqlOptions {
                 disk_first: false,
                 checkpoint_bytes: 0,
-            },
+            ..SqlOptions::default()
+        },
         )
         .unwrap();
         seed(&db);
@@ -230,6 +232,7 @@ fn mode_switch_round_trip() {
         SqlOptions {
             disk_first: false,
             checkpoint_bytes: 0,
+            ..SqlOptions::default()
         },
     )
     .unwrap();
@@ -249,6 +252,7 @@ fn auto_checkpoint_truncates_wal_at_threshold() {
         SqlOptions {
             disk_first: false,
             checkpoint_bytes: 4096,
+            ..SqlOptions::default()
         },
     )
     .unwrap();
@@ -281,6 +285,7 @@ fn auto_checkpoint_truncates_wal_at_threshold() {
         SqlOptions {
             disk_first: false,
             checkpoint_bytes: 4096,
+            ..SqlOptions::default()
         },
     )
     .unwrap();
@@ -298,6 +303,7 @@ fn auto_checkpoint_bounds_disk_first_overlay() {
         SqlOptions {
             disk_first: true,
             checkpoint_bytes: 4096,
+            ..SqlOptions::default()
         },
     )
     .unwrap();
@@ -332,6 +338,7 @@ fn zero_threshold_disables_auto_checkpoint() {
         SqlOptions {
             disk_first: false,
             checkpoint_bytes: 0,
+            ..SqlOptions::default()
         },
     )
     .unwrap();

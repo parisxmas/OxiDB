@@ -106,6 +106,12 @@ pub(crate) trait Store {
     }
     fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()>;
     fn delete(&self, table: &str, row_id: u64) -> Result<bool>;
+    /// Pessimistically lock `row_ids` of `table` for this store's lock owner
+    /// (the enclosing transaction, or the autocommit statement), blocking up
+    /// to the engine's lock timeout on contention. Held until commit/rollback
+    /// (transaction) or statement end (autocommit). No default — silently not
+    /// locking is the failure mode this feature exists to kill.
+    fn lock_rows(&self, table: &str, row_ids: &[u64]) -> Result<()>;
 
     // Savepoints — meaningful only inside a transaction. The autocommit engine
     // uses the default impls (an error); [`Transaction`] overrides them. This

@@ -11,6 +11,13 @@ pub enum SqlError {
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
+    /// A `SELECT ... FOR UPDATE` / UPDATE / DELETE waited on a row lock held
+    /// by another transaction past the lock timeout
+    /// (`OXIDB_SQL_LOCK_TIMEOUT_MS`). Also how a deadlock between two
+    /// transactions resolves: one side times out and aborts.
+    #[error("lock timeout: row {row_id} of '{table}' is locked by another transaction")]
+    LockTimeout { table: String, row_id: u64 },
+
     /// The on-disk catalog or a data/WAL file is structurally invalid.
     #[error("corrupt storage: {0}")]
     Corrupt(String),
