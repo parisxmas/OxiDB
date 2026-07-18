@@ -137,9 +137,12 @@ pub fn archive_pass(
     for (name, path) in list_sealed_segments(data_dir) {
         let len = fs::metadata(&path)?.len();
         if len == 0 {
-            // An empty sealed segment carries nothing — drop it.
-            let _ = fs::remove_file(&path);
-            stats.empty_removed += 1;
+            // An empty sealed segment carries nothing. `.0` stays as the
+            // scanner's sentinel (see `Wal::retire_segment`); the rest go.
+            if sealed_seq(&name) != Some(0) {
+                let _ = fs::remove_file(&path);
+                stats.empty_removed += 1;
+            }
             continue;
         }
         let archived_path = segments_dir.join(format!("{name}.seg"));
@@ -238,7 +241,10 @@ pub fn prune_archive(
                     {
                         let original = dd.join(stem);
                         if original.exists() {
-                            let _ = fs::remove_file(original);
+                            // `.0` is the segment scanner's sentinel:
+                            // truncated, never removed (`Wal::retire_segment`).
+                            let seq = sealed_seq(stem).unwrap_or(u64::MAX);
+                            let _ = crate::wal::Wal::retire_segment(&original, seq);
                         }
                     }
                     pruned += 1;
@@ -854,15 +860,27 @@ mod tests {
     fn empty_sealed_segments_are_dropped_not_archived() {
         let data = TempDir::new().unwrap();
         let archive = TempDir::new().unwrap();
-        // An explicit seal on an empty WAL leaves an empty sealed segment.
+        // Two explicit seals on an empty WAL leave two empty sealed segments.
         let wal = Wal::open(&data.path().join("e.wal")).unwrap();
         wal.seal().unwrap();
+        wal.seal().unwrap();
         assert!(data.path().join("e.wal.0").exists());
+        assert!(data.path().join("e.wal.1").exists());
 
         let stats = archive_pass(data.path(), archive.path(), None).unwrap();
+        // `.1` is dropped; `.0` survives EMPTY — it is the segment scanner's
+        // fast-path sentinel (`Wal::retire_segment`), and an empty `.0` is
+        // never archived, so it cannot ping-pong back into the manifest.
         assert_eq!(stats.empty_removed, 1);
         assert_eq!(stats.archived, 0);
-        assert!(!data.path().join("e.wal.0").exists());
+        assert!(data.path().join("e.wal.0").exists());
+        assert_eq!(
+            std::fs::metadata(data.path().join("e.wal.0"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(!data.path().join("e.wal.1").exists());
         assert!(load_manifest(archive.path()).unwrap().segments.is_empty());
     }
 
@@ -1083,10 +1101,17 @@ mod tests {
         assert_eq!(m.segments.len(), 1);
         assert_eq!(m.segments[0].original, "recent.wal.0");
 
-        // The pruned segment's data-dir original must be gone too —
-        // otherwise the next archive_pass would re-archive it, undoing the
-        // prune every tick.
-        assert!(!data.path().join("old.wal.0").exists());
+        // The pruned segment's data-dir original must not be re-archivable —
+        // otherwise the next archive_pass would undo the prune every tick.
+        // Seq 0 is truncated to the empty scanner sentinel rather than
+        // removed (`Wal::retire_segment`); empty segments never archive.
+        assert_eq!(
+            std::fs::metadata(data.path().join("old.wal.0"))
+                .unwrap()
+                .len(),
+            0,
+            "the pruned original must be the empty sentinel"
+        );
         archive_pass(data.path(), archive.path(), None).unwrap();
         assert_eq!(
             load_manifest(archive.path()).unwrap().segments.len(),

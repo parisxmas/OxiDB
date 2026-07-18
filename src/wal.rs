@@ -66,9 +66,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crc32fast::Hasher;
@@ -818,19 +818,24 @@ impl Wal {
     /// `<file_name>.<n>` siblings where `<n>` parses as a `u64`; the live
     /// WAL itself and `.tmp`-style siblings are skipped.
     fn scan_sealed_segments(wal_path: &Path) -> Vec<(u64, PathBuf)> {
-        // Fast path: sealed segments are allocated consecutively from 0 by
-        // `seal_locked`, and the engine never deletes the lowest live
-        // segment (only the archiver removes empty ones, and only when
-        // PITR is on — in which case `.0` exists alongside any survivor).
-        // If `<path>.0` isn't there, no segments exist on disk and we can
-        // skip the parent-directory scan. This collapses two read_dir
-        // calls per `BTreeCollection::open` (one from `Wal::open`'s
-        // `scan_max_seal_seq`, one from `replay_wal`'s
-        // `list_sealed_segments`) to two `stat` calls when PITR is off —
-        // the common case. At scale 10K collections in one data dir the
-        // dropped work is O(N²) read_dir entries (~456s observed in the
-        // collection-scale bench).
-        if !Self::sealed_segment_path(wal_path, 0).exists() {
+        // Fast path: when no `.0` sentinel exists, no segments exist and the
+        // parent-directory scan can be skipped. This collapses two read_dir
+        // calls per `BTreeCollection::open` to a couple of `stat` calls —
+        // at 10K collections in one data dir the dropped work is O(N²)
+        // read_dir entries (~456s observed in the collection-scale bench).
+        //
+        // The sentinel is an INVARIANT, not an accident: `retire_segment`
+        // truncates `.0` to empty instead of removing it, precisely so this
+        // probe stays truthful. The first version of this fast path assumed
+        // `.0` would always survive while the checkpoint deleted it — after
+        // which every later segment was invisible: never retired (unbounded
+        // growth) and, far worse, never REPLAYED at recovery, losing acked
+        // writes to a crash between a seal and its persist. `.1` is probed
+        // as well for data dirs that bug left behind, whose first surviving
+        // segment is `.1` with no `.0` beside it.
+        if !Self::sealed_segment_path(wal_path, 0).exists()
+            && !Self::sealed_segment_path(wal_path, 1).exists()
+        {
             return Vec::new();
         }
         let (parent, prefix) = match (wal_path.parent(), wal_path.file_name()) {
@@ -860,6 +865,52 @@ impl Wal {
             .map(|(seq, _)| *seq + 1)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Retire one sealed segment whose contents are known to be covered by a
+    /// persisted snapshot (or an archive copy). Sequence 0 is TRUNCATED to
+    /// empty instead of removed: the empty `.0` is the sentinel
+    /// `scan_sealed_segments`' fast path probes, and removing it once made
+    /// the scanner blind to every later segment — see the comment there.
+    pub(crate) fn retire_segment(path: &Path, seq: u64) -> std::io::Result<()> {
+        if seq == 0 {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?;
+            Ok(())
+        } else {
+            fs::remove_file(path)
+        }
+    }
+
+    /// Retire EVERY sealed segment of this WAL. Only correct when the caller
+    /// has just persisted a snapshot taken after a seal barrier: every
+    /// segment on disk was sealed before that barrier, so the snapshot
+    /// covers them all — including orphans an earlier crash (or the
+    /// scanner-blindness bug) left behind, which recovery replayed into the
+    /// tree at open.
+    pub fn retire_covered_segments(&self) -> Result<()> {
+        let segs = Self::scan_sealed_segments(&self.path);
+        if segs.is_empty() {
+            return Ok(());
+        }
+        for (seq, path) in segs {
+            Self::retire_segment(&path, seq)?;
+        }
+        // The sentinel must survive every retire — including on a legacy dir
+        // (from before the sentinel rule) whose first segment was `.1`, where
+        // nothing above ever produced a `.0` to truncate.
+        let sentinel = Self::sealed_segment_path(&self.path, 0);
+        if !sentinel.exists() {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&sentinel)?;
+        }
+        Ok(())
     }
 
     /// Path of the sealed segment with sequence `seq`: `<wal_path>.<seq>`.

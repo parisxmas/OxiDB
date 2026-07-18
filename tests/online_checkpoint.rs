@@ -156,11 +156,9 @@ fn run_victim() -> ! {
     // Hammer the seal path against the writers — the race the design must win.
     {
         let db = Arc::clone(&db);
-        thread::spawn(move || {
-            loop {
-                let _ = db.sync_all();
-                thread::sleep(Duration::from_millis(3));
-            }
+        thread::spawn(move || loop {
+            let _ = db.sync_all();
+            thread::sleep(Duration::from_millis(3));
         });
     }
 
@@ -400,4 +398,148 @@ fn barrier_makes_the_stalled_writer_survive() {
          its WAL append and its B-tree apply — this is exactly what apply_barrier \
          prevents, and it means the barrier is gone or ineffective"
     );
+}
+
+// ── sealed-segment lifecycle: the sentinel bug ─────────────────────────────
+//
+// The segment scanner's fast path probes `<wal>.0` to skip a directory scan.
+// The first checkpoint used to DELETE `.0` — after which the scanner was
+// blind: every later segment was never retired (unbounded growth, rediscovered
+// as a mysteriously climbing "documents" disk bucket on the ColdChain demo)
+// and never replayed at recovery (acked writes lost to a crash between a seal
+// and its persist). `.0` is now truncated to an empty sentinel instead.
+
+/// Segment files `<coll>.wal.N` present in the dir, sorted.
+fn sealed_segments(dir: &std::path::Path, coll: &str) -> Vec<(u64, u64)> {
+    let prefix = format!("{coll}.wal.");
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if let Some(seq) = name
+            .strip_prefix(&prefix)
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            out.push((seq, e.metadata().unwrap().len()));
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// Round after round, sealed segments must be retired — not only the first.
+/// Before the fix this left `.1`, `.2`, `.3`, … behind forever.
+#[test]
+fn every_checkpoint_retires_its_sealed_segment_not_only_the_first() {
+    unsafe { std::env::set_var("OXIDB_WAL_CHECKPOINT_BYTES", "65536") };
+    let dir = tempdir().unwrap();
+    let db = OxiDb::open(dir.path()).unwrap();
+
+    for round in 0..4 {
+        for i in 0..600 {
+            db.insert("c", json!({"r": round, "i": i, "pad": "s".repeat(200)}))
+                .unwrap();
+        }
+        db.sync_all().unwrap();
+        let segs = sealed_segments(dir.path(), "c");
+        assert!(
+            segs.iter().all(|&(seq, len)| seq == 0 && len == 0),
+            "round {round}: sealed segments survived the checkpoint: {segs:?} \
+             (only an EMPTY `.0` sentinel may remain)"
+        );
+    }
+    // The sentinel itself must exist by now (at least one seal happened) and
+    // must not confuse recovery.
+    assert_eq!(sealed_segments(dir.path(), "c"), vec![(0, 0)]);
+    drop(db);
+    let db = OxiDb::open(dir.path()).unwrap();
+    assert_eq!(
+        db.count("c", &json!({})).unwrap(),
+        2400,
+        "data lost across reopen"
+    );
+}
+
+/// An orphaned segment from a data dir the old bug left behind (first
+/// surviving segment `.1`, no `.0` beside it) must be seen again — replayed
+/// at open, retired at the next checkpoint.
+#[test]
+fn legacy_orphan_segments_are_retired_by_the_next_checkpoint() {
+    unsafe { std::env::set_var("OXIDB_WAL_CHECKPOINT_BYTES", "65536") };
+    let dir = tempdir().unwrap();
+    {
+        let db = OxiDb::open(dir.path()).unwrap();
+        db.insert("c", json!({"seed": true})).unwrap();
+        drop(db);
+    }
+    // The shape the leak produced: a (covered, empty-after-truncate-at-
+    // shutdown… here simply empty) orphan at `.1` with no sentinel.
+    std::fs::write(dir.path().join("c.wal.1"), b"").unwrap();
+
+    let db = OxiDb::open(dir.path()).unwrap();
+    for i in 0..600 {
+        db.insert("c", json!({"i": i, "pad": "l".repeat(200)}))
+            .unwrap();
+    }
+    db.sync_all().unwrap();
+    assert_eq!(
+        sealed_segments(dir.path(), "c"),
+        vec![(0, 0)],
+        "the legacy orphan must be retired and replaced by the `.0` sentinel"
+    );
+    assert_eq!(db.count("c", &json!({})).unwrap(), 601);
+}
+
+/// The crash the blindness actually loses data to: seal a segment beyond the
+/// first, die before the persist, reopen. The victim builds the exact
+/// on-disk state (checkpoint once → sentinel exists; write a second batch;
+/// seal it file-level — the same rename `Wal::seal` does; exit with no Drop).
+/// Recovery must replay the sealed batch. Before the fix it silently did not.
+#[test]
+fn a_sealed_segment_beyond_the_first_is_replayed_at_recovery() {
+    if std::env::var("OXIDB_OC_SEAL_VICTIM").as_deref() == Ok("1") {
+        let dir = std::path::PathBuf::from(std::env::var("OXIDB_OC_DIR").unwrap());
+        let db = OxiDb::open(&dir).unwrap();
+        for i in 0..600 {
+            db.insert("c", json!({"batch": 1, "i": i, "pad": "v".repeat(200)}))
+                .unwrap();
+        }
+        db.sync_all().unwrap(); // checkpoint #1: `.0` sentinel now exists
+        for i in 0..50 {
+            db.insert("c", json!({"batch": 2, "i": i})).unwrap(); // stays in live WAL
+        }
+        // Seal exactly as `Wal::seal` would: rename the live WAL to the next
+        // segment, leave a fresh empty one. Then die with no Drop — the
+        // persist that would cover the segment never happens.
+        std::fs::rename(dir.join("c.wal"), dir.join("c.wal.1")).unwrap();
+        std::fs::write(dir.join("c.wal"), b"").unwrap();
+        std::process::exit(0);
+    }
+
+    let dir = tempdir().unwrap();
+    let out = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("a_sealed_segment_beyond_the_first_is_replayed_at_recovery")
+        .env("OXIDB_OC_SEAL_VICTIM", "1")
+        .env("OXIDB_OC_DIR", dir.path())
+        .env("OXIDB_WAL_CHECKPOINT_BYTES", "65536")
+        .output()
+        .expect("spawn victim");
+    assert!(
+        out.status.success(),
+        "victim failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        dir.path().join("c.wal.1").exists(),
+        "test setup broke: no sealed segment left behind"
+    );
+
+    let db = OxiDb::open(dir.path()).unwrap();
+    assert_eq!(
+        db.count("c", &json!({"batch": 2})).unwrap(),
+        50,
+        "the sealed-but-unpersisted batch was not replayed at recovery — \
+         these were acknowledged writes"
+    );
+    assert_eq!(db.count("c", &json!({"batch": 1})).unwrap(), 600);
 }

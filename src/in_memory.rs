@@ -604,6 +604,14 @@ impl WalBackend {
         }
     }
 
+    pub fn retire_covered_segments(&self) -> Result<()> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::File(w) => w.retire_covered_segments(),
+            Self::Memory => Ok(()),
+        }
+    }
+
     /// Write barrier: once this returns, every writer that had allocated
     /// a GSN before the call has finished appending. No-op in memory mode.
     pub fn barrier(&self) {

@@ -12,19 +12,19 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::locks::{Mutex, RwLock};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::btree_storage::BTreeStorage;
 use crate::codec;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::collection::load_index_metadata;
-use crate::collection::{CompactStats, IndexInfo, IndexMetadata, resolve_field_in_value};
+use crate::collection::{resolve_field_in_value, CompactStats, IndexInfo, IndexMetadata};
 use crate::doc_bytes_cache::DocBytesCache;
 use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
@@ -887,11 +887,6 @@ impl BTreeCollection {
     /// and removes them itself, so step 5 leaves them alone.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn online_checkpoint(&self) -> Result<()> {
-        // Segments already on disk before this seal are either the archiver's
-        // or a previous checkpoint's; leave them to their owner.
-        let pre_existing: std::collections::HashSet<PathBuf> =
-            self.wal.list_sealed_segments().into_iter().collect();
-
         {
             let _drained = self.apply_barrier.write();
             self.wal.seal()?;
@@ -900,14 +895,14 @@ impl BTreeCollection {
         self.storage.persist()?;
         self.persist_disk_indexes();
 
-        // Ours are the ones that appeared under the barrier. With PITR on the
-        // archiver owns them; it copies to `_archive/` and removes them.
+        // Every sealed segment on disk was sealed before our barrier, so the
+        // snapshot we just wrote covers them ALL — ours and any orphan an
+        // earlier crash left behind (recovery replayed those into the tree
+        // at open, so nothing in them is newer than the snapshot either).
+        // With PITR on the archiver owns them instead: it copies them to
+        // `_archive/` and retires them itself.
         if !self.wal.pitr_enabled() {
-            for seg in self.wal.list_sealed_segments() {
-                if !pre_existing.contains(&seg) {
-                    let _ = std::fs::remove_file(&seg);
-                }
-            }
+            self.wal.retire_covered_segments()?;
         }
         Ok(())
     }
@@ -4051,7 +4046,11 @@ fn matches_query_partial_jsonb(query: &Query, bytes: &[u8]) -> Option<bool> {
                     None => saw_undecidable = true,
                 }
             }
-            if saw_undecidable { None } else { Some(false) }
+            if saw_undecidable {
+                None
+            } else {
+                Some(false)
+            }
         }
         // Nor/Expr need fuller evaluation — let the caller full-decode.
         Query::Nor(_) | Query::Expr(_) => None,
@@ -4848,11 +4847,10 @@ mod tests {
         assert_eq!(doc.get("v").and_then(|v| v.as_u64()).unwrap(), 42);
 
         // No match → None, nothing written.
-        assert!(
-            col.find_and_modify(&json!({"name": "nope"}), &json!({"$set": {"v": 0}}))
-                .unwrap()
-                .is_none()
-        );
+        assert!(col
+            .find_and_modify(&json!({"name": "nope"}), &json!({"$set": {"v": 0}}))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
