@@ -10,16 +10,17 @@ export const metadata: Metadata = {
     template: '%s | OxiDB',
   },
   description:
-    'A fast, multi-model database — document, SQL, and time-series in one binary. MongoDB-style JSON queries, a full SQL engine with an EF Core provider that beats PostgreSQL, ACID transactions, full-text & vector search, Raft replication.',
+    'A fast, multi-model database — document, SQL, time-series, Redis, MQTT, AMQP (RabbitMQ) and S3 in one binary. MongoDB-style JSON queries, a full SQL engine with an EF Core provider that beats PostgreSQL, ACID transactions, full-text & vector search, Raft replication.',
   keywords: [
     'database', 'multi-model database', 'document database', 'sql database',
     'time series database', 'nosql', 'embedded database', 'rust', 'json',
     'mongodb', 'ef core', 'full-text search', 'vector search', 'transactions',
+    'amqp', 'rabbitmq', 'mqtt', 'message queue', 'work queue',
   ],
   openGraph: {
     title: 'OxiDB - Fast Multi-Model Database',
     description:
-      'MongoDB-style JSON queries. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. Verified at 1M records under failover. v0.36.0.',
+      'MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.37.0.',
     url: 'https://oxidb.baltavista.com',
     siteName: 'OxiDB',
     type: 'website',
@@ -28,7 +29,7 @@ export const metadata: Metadata = {
         url: '/og-card.png?v=0352',
         width: 1200,
         height: 630,
-        alt: 'OxiDB v0.36.0 — sharded, Raft-replicated, persistent. 1M records verified under failover.',
+        alt: 'OxiDB v0.37.0 — multi-model: documents, SQL, time-series, Redis, MQTT, AMQP, S3. One binary.',
       },
     ],
   },
@@ -36,7 +37,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: 'OxiDB - Fast Multi-Model Database',
     description:
-      'MongoDB-style JSON queries. ACID transactions. Sharded routing via oxipool. Persistent Raft replication. v0.36.0.',
+      'MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.37.0.',
     images: ['/og-card.png?v=0352'],
   },
   icons: {
