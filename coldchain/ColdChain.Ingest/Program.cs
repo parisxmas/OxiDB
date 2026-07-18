@@ -145,25 +145,50 @@ var mqttOptions = new MqttClientOptionsBuilder()
     .WithCleanSession(false)
     .Build();
 
-mqtt.DisconnectedAsync += async e =>
+// ONE reconnect supervisor, signalled by disconnect events — never a loop per
+// event. The old shape started a `while (true)` inside every DisconnectedAsync,
+// and a broker restart can fire more than one: the first loop to reconnect
+// wins, every other loop's ConnectAsync then throws "It is not allowed to
+// connect with a server after the connection is established" forever, two
+// seconds at a time, while the log fills and nobody notices whether data
+// flows. (Found live, exactly that way, when the engine container was
+// rebuilt under it.)
+var reconnectSignal = new SemaphoreSlim(0, 1);
+mqtt.DisconnectedAsync += e =>
 {
     Console.WriteLine($"  mqtt disconnected ({e.Reason}) — reconnecting");
+    // Release(1) with a full semaphore just means "already signalled".
+    try { reconnectSignal.Release(); } catch (SemaphoreFullException) { }
+    return Task.CompletedTask;
+};
+
+_ = Task.Run(async () =>
+{
     while (true)
     {
-        await Task.Delay(TimeSpan.FromSeconds(2));
-        try
+        await reconnectSignal.WaitAsync();
+        while (!mqtt.IsConnected)
         {
-            await mqtt.ConnectAsync(mqttOptions);
-            // Subscriptions do not survive the broker; re-establish them or we
-            // reconnect into silence, which looks identical to being down.
-            await mqtt.SubscribeAsync("sensors/+/+/temperature");
-            await mqtt.SubscribeAsync("fleet/gateway/#");
-            Console.WriteLine("  mqtt reconnected");
-            return;
+            await Task.Delay(TimeSpan.FromSeconds(2));
+            if (mqtt.IsConnected) break;   // a racing connect won — that IS success
+            try
+            {
+                await mqtt.ConnectAsync(mqttOptions);
+                // Subscriptions do not survive the broker; re-establish them
+                // or we reconnect into silence, which looks identical to
+                // being down.
+                await mqtt.SubscribeAsync("sensors/+/+/temperature");
+                await mqtt.SubscribeAsync("fleet/gateway/#");
+                Console.WriteLine("  mqtt reconnected");
+            }
+            catch (Exception ex)
+            {
+                if (mqtt.IsConnected) break;   // "already connected" mid-race
+                Console.WriteLine($"  mqtt reconnect failed: {ex.Message}");
+            }
         }
-        catch (Exception ex) { Console.WriteLine($"  mqtt reconnect failed: {ex.Message}"); }
     }
-};
+});
 
 await mqtt.ConnectAsync(mqttOptions);
 // '+' is one level, '#' is the rest — every probe on every truck.
