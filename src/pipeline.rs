@@ -3418,147 +3418,66 @@ pub(crate) fn try_composite_covered_group(
         }
     }
 
-    // A leading $match participates in two shapes: a single equality on the
-    // composite's FIRST slot (the walk covers exactly that prefix range), or
-    // a pure range on ONE materialized field (full walk, entries outside the
-    // bounds skipped). Match values/bounds need no lossiness guard — both
-    // the index and matches_value compare through IndexValue, so the
-    // semantics agree by construction; only OUTPUT slots must be lossless.
-    //
-    // The expected doc count comes from the match field's own single-field
-    // index (count_eq / count_range) — a cheap cross-check standing in for
-    // the full-scan variant's walked==total guard; no such index → decline.
-    // It also catches the {f: null} / missing-field divergence: matches_value
-    // treats missing specially, single-field indexes don't hold missing docs,
-    // composites key them as Null — any disagreement fails the count check.
-    enum MatchPlan {
-        All,
-        Eq(String, IndexValue),
-        Range {
-            field: String,
-            lo: std::ops::Bound<IndexValue>,
-            hi: std::ops::Bound<IndexValue>,
-        },
-        /// Equality prefix + range filter, e.g. {region: "EU", ts: {$gte, $lt}}.
-        /// The lower bound must be bounded: with $lt/$lte alone a Null range
-        /// slot is "in bounds", and the composite cannot tell a missing field
-        /// (which matches_value rejects) from an explicit null (which it
-        /// accepts) — no cheap intersection count exists to cross-check the
-        /// disagreement away, so we forbid the shape that could produce it.
-        /// A bounded lower bound excludes Null on every path.
-        EqRange {
-            eq_field: String,
-            eq_value: IndexValue,
-            range_field: String,
-            lo: std::ops::Bound<IndexValue>,
-            hi: std::ops::Bound<IndexValue>,
-        },
+    // A leading $match participates when it decomposes into equality pins
+    // plus at most one range on a single field. Match values and bounds need
+    // no lossiness guard — matches_value, the single-field index paths, and
+    // this walk all compare through IndexValue, so the semantics agree by
+    // construction; only OUTPUT slots (_id, $min, $max) must be lossless.
+    use std::ops::Bound;
+    struct RangeSpec {
+        field: String,
+        lo: Bound<IndexValue>,
+        hi: Bound<IndexValue>,
     }
-    let match_plan: MatchPlan = match match_query {
-        None => MatchPlan::All,
-        Some(q) => {
-            use std::ops::Bound;
-            let parsed = query::parse_query(q).ok()?;
-            // One pass over the (flat) conditions: collect at most one
-            // equality and at most one range field; anything else declines.
-            let conds: Vec<&query::Query> = match &parsed {
-                query::Query::All => Vec::new(),
-                query::Query::Field { .. } => vec![&parsed],
-                query::Query::And(subs) => subs.iter().collect(),
-                _ => return None,
+    let mut eqs: Vec<(String, IndexValue)> = Vec::new();
+    let mut range: Option<RangeSpec> = None;
+    if let Some(q) = match_query {
+        let parsed = query::parse_query(q).ok()?;
+        let conds: Vec<&query::Query> = match &parsed {
+            query::Query::All => Vec::new(),
+            query::Query::Field { .. } => vec![&parsed],
+            query::Query::And(subs) => subs.iter().collect(),
+            _ => return None,
+        };
+        for c in conds {
+            let query::Query::Field { field, op } = c else {
+                return None;
             };
-            let mut eq: Option<(String, IndexValue)> = None;
-            let mut range_field: Option<&str> = None;
-            let mut lo: Bound<IndexValue> = Bound::Unbounded;
-            let mut hi: Bound<IndexValue> = Bound::Unbounded;
-            for c in conds {
-                let query::Query::Field { field, op } = c else {
-                    return None;
-                };
-                match op {
-                    query::QueryOp::Eq(v) => {
-                        if eq.is_some() {
-                            return None; // multi-eq prefixes: future work
-                        }
-                        eq = Some((field.clone(), v.clone()));
+            match op {
+                query::QueryOp::Eq(v) => eqs.push((field.clone(), v.clone())),
+                query::QueryOp::Gt(v)
+                | query::QueryOp::Gte(v)
+                | query::QueryOp::Lt(v)
+                | query::QueryOp::Lte(v) => {
+                    let r = range.get_or_insert_with(|| RangeSpec {
+                        field: field.clone(),
+                        lo: Bound::Unbounded,
+                        hi: Bound::Unbounded,
+                    });
+                    if &r.field != field {
+                        return None; // ranges on two different fields
                     }
-                    query::QueryOp::Gt(v) | query::QueryOp::Gte(v)
-                        if matches!(lo, Bound::Unbounded)
-                            && range_field.is_none_or(|rf| rf == field) =>
-                    {
-                        range_field = Some(field);
-                        lo = if matches!(op, query::QueryOp::Gt(_)) {
-                            Bound::Excluded(v.clone())
-                        } else {
-                            Bound::Included(v.clone())
-                        };
+                    let is_lower = matches!(op, query::QueryOp::Gt(_) | query::QueryOp::Gte(_));
+                    let bound = if matches!(op, query::QueryOp::Gt(_) | query::QueryOp::Lt(_)) {
+                        Bound::Excluded(v.clone())
+                    } else {
+                        Bound::Included(v.clone())
+                    };
+                    let target = if is_lower { &mut r.lo } else { &mut r.hi };
+                    if !matches!(target, Bound::Unbounded) {
+                        return None; // duplicate bound on the same side
                     }
-                    query::QueryOp::Lt(v) | query::QueryOp::Lte(v)
-                        if matches!(hi, Bound::Unbounded)
-                            && range_field.is_none_or(|rf| rf == field) =>
-                    {
-                        range_field = Some(field);
-                        hi = if matches!(op, query::QueryOp::Lt(_)) {
-                            Bound::Excluded(v.clone())
-                        } else {
-                            Bound::Included(v.clone())
-                        };
-                    }
-                    _ => return None,
+                    *target = bound;
                 }
-            }
-            if eq.as_ref().is_some_and(|(ef, _)| range_field == Some(ef.as_str())) {
-                return None; // eq and range on the same field: not a shape we cover
-            }
-            match (eq, range_field) {
-                (None, None) => MatchPlan::All,
-                (Some((f, iv)), None) => MatchPlan::Eq(f, iv),
-                (None, Some(rf)) => MatchPlan::Range {
-                    field: rf.to_string(),
-                    lo,
-                    hi,
-                },
-                (Some((ef, eiv)), Some(rf)) => {
-                    if matches!(lo, Bound::Unbounded) {
-                        return None; // see EqRange doc comment
-                    }
-                    MatchPlan::EqRange {
-                        eq_field: ef,
-                        eq_value: eiv,
-                        range_field: rf.to_string(),
-                        lo,
-                        hi,
-                    }
-                }
+                _ => return None,
             }
         }
-    };
-    fn bound_ref(b: &std::ops::Bound<IndexValue>) -> std::ops::Bound<&IndexValue> {
-        match b {
-            std::ops::Bound::Included(v) => std::ops::Bound::Included(v),
-            std::ops::Bound::Excluded(v) => std::ops::Bound::Excluded(v),
-            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        if let Some(r) = &range {
+            if eqs.iter().any(|(f, _)| f == &r.field) {
+                return None; // eq and range on the same field: not covered
+            }
         }
     }
-    // What the walk's id count must equal. For Range it is the POST-filter
-    // count (cross-checked against the range field's index); for EqRange it
-    // is the PRE-filter prefix total (cross-checked against the eq field's
-    // index) — the range filter itself then only reads already-verified
-    // slot values, and a bounded lower bound rules out the one case the
-    // verified slots can't decide (missing vs explicit-null, both Null).
-    let expected_ids: usize = match &match_plan {
-        MatchPlan::All => total_docs,
-        MatchPlan::Eq(mf, miv) => field_indexes?.get(mf)?.count_eq(miv),
-        MatchPlan::Range { field, lo, hi } => {
-            field_indexes?.get(field)?.count_range(bound_ref(lo), bound_ref(hi))
-        }
-        MatchPlan::EqRange {
-            eq_field, eq_value, ..
-        } => field_indexes?.get(eq_field)?.count_eq(eq_value),
-    };
-    // Range skips entries outside the bounds; only the pure-Range plan
-    // excludes them from the verified count as well.
-    let count_before_range_skip = !matches!(match_plan, MatchPlan::Range { .. });
 
     let group_field = match key {
         GroupKey::Single(Expression::FieldRef(field)) => field.as_str(),
@@ -3575,36 +3494,56 @@ pub(crate) fn try_composite_covered_group(
         MaxField(usize),
     }
 
-    // Find a composite index whose slot layout fits: an equality match field
-    // first (when present) with the group field right after; a range match
-    // field materialized in ANY slot; and every accumulator-referenced field
-    // materialized in SOME slot.
-    let group_slot = match &match_plan {
-        MatchPlan::Eq(..) | MatchPlan::EqRange { .. } => 1,
-        _ => 0,
-    };
+    // Find a composite index whose slot layout fits. The walk is the prefix
+    // range of ONE equality (when any exists — it must own the first slot);
+    // the other equalities become exact filters on their slots, and the
+    // range filters its slot. Two layout laws keep the single-pass group-run
+    // logic correct:
+    //  - every slot BEFORE the group slot must be pinned to one value
+    //    (prefix or slot equality), so equal group values stay contiguous;
+    //  - the range slot may not precede the group slot (a spread of range
+    //    values before the group would interleave the runs).
+    // Slot-equality values must not be Null and, when the walk's verified
+    // count is prefix-based, the range's LOWER bound must exist: a Null slot
+    // cannot distinguish a missing field (matches_value rejects it) from an
+    // explicit null (matches_value accepts it for range/never for non-null
+    // eq); non-Null pins and a bounded lower bound exclude Null everywhere.
     let found = composite_indexes.iter().find_map(|ci| {
-        match &match_plan {
-            MatchPlan::Eq(mf, _) => {
-                if ci.fields.first() != Some(mf) {
+        let group_slot = ci.fields.iter().position(|f| f == group_field)?;
+        let prefix_idx: Option<usize> = if eqs.is_empty() {
+            None
+        } else {
+            Some(eqs.iter().position(|(f, _)| Some(f) == ci.fields.first())?)
+        };
+        let mut slot_filters: Vec<(usize, &IndexValue)> = Vec::new();
+        for (i, (f, v)) in eqs.iter().enumerate() {
+            if Some(i) == prefix_idx {
+                continue;
+            }
+            if matches!(v, IndexValue::Null) {
+                return None;
+            }
+            slot_filters.push((ci.fields.iter().position(|cf| cf == f)?, v));
+        }
+        for s in 0..group_slot {
+            let pinned =
+                (s == 0 && prefix_idx.is_some()) || slot_filters.iter().any(|(fs, _)| *fs == s);
+            if !pinned {
+                return None;
+            }
+        }
+        let range_slot = match &range {
+            None => None,
+            Some(r) => {
+                let rs = ci.fields.iter().position(|cf| cf == &r.field)?;
+                if rs < group_slot {
                     return None;
                 }
-            }
-            MatchPlan::EqRange { eq_field, .. } => {
-                if ci.fields.first() != Some(eq_field) {
+                if !eqs.is_empty() && matches!(r.lo, Bound::Unbounded) {
                     return None;
                 }
+                Some(rs)
             }
-            _ => {}
-        }
-        if ci.fields.get(group_slot).map(String::as_str) != Some(group_field) {
-            return None;
-        }
-        let range_slot = match &match_plan {
-            MatchPlan::Range { field, .. } | MatchPlan::EqRange { range_field: field, .. } => {
-                Some(ci.fields.iter().position(|cf| cf == field)?)
-            }
-            _ => None,
         };
         let slot_of = |f: &str| ci.fields.iter().position(|cf| cf == f);
         let mut plan = Vec::with_capacity(accumulators.len());
@@ -3622,24 +3561,49 @@ pub(crate) fn try_composite_covered_group(
             };
             plan.push(cov);
         }
-        Some((ci, plan, range_slot))
+        Some((ci, plan, prefix_idx, slot_filters, range_slot, group_slot))
     });
-    let (ci, plan, range_slot) = found?;
+    let (ci, plan, prefix_idx, slot_filters, range_slot, group_slot) = found?;
 
-    // In-bounds test for the range match, shared by the walk. Same
-    // IndexValue ordering as the single-field index's count_range, so the
-    // guard below compares like with like.
+    fn bound_ref(b: &Bound<IndexValue>) -> Bound<&IndexValue> {
+        match b {
+            Bound::Included(v) => Bound::Included(v),
+            Bound::Excluded(v) => Bound::Excluded(v),
+            Bound::Unbounded => Bound::Unbounded,
+        }
+    }
+    // What the walk's id count must equal — the cross-check that an
+    // INDEPENDENT structure (a single-field index) agrees the composite
+    // covers exactly the right doc set; no such index → decline. Slot and
+    // range filters run on slots that check already verified, so only the
+    // walk itself needs verification: the prefix total against the prefix
+    // field's count_eq, a pure range against count_range over the same
+    // bounds (which also catches the missing-vs-null divergence — a
+    // single-field index holds no entry for a missing field), and a full
+    // scan against the collection's doc count.
+    let expected_ids: usize = match (&prefix_idx, &range) {
+        (Some(pi), _) => {
+            let (f, v) = &eqs[*pi];
+            field_indexes?.get(f)?.count_eq(v)
+        }
+        (None, Some(r)) => field_indexes?
+            .get(&r.field)?
+            .count_range(bound_ref(&r.lo), bound_ref(&r.hi)),
+        (None, None) => total_docs,
+    };
+    // The pure-Range plan verifies the POST-filter count; every other plan
+    // verifies the raw walk.
+    let count_post_filter = prefix_idx.is_none() && range.is_some();
+
+    // In-bounds test for the range filter. Same IndexValue ordering as the
+    // single-field index's count_range, so the guard compares like with like.
     let in_bounds = |v: &IndexValue| -> bool {
-        use std::ops::Bound;
-        let (lo, hi) = match &match_plan {
-            MatchPlan::Range { lo, hi, .. } | MatchPlan::EqRange { lo, hi, .. } => (lo, hi),
-            _ => return true,
-        };
-        (match lo {
+        let Some(r) = &range else { return true };
+        (match &r.lo {
             Bound::Unbounded => true,
             Bound::Included(b) => v >= b,
             Bound::Excluded(b) => v > b,
-        }) && (match hi {
+        }) && (match &r.hi {
             Bound::Unbounded => true,
             Bound::Included(b) => v <= b,
             Bound::Excluded(b) => v < b,
@@ -3677,21 +3641,26 @@ pub(crate) fn try_composite_covered_group(
         if n == 0 {
             return true;
         }
-        if count_before_range_skip {
+        if !count_post_filter {
             walked_ids += n;
+        }
+        for (fs, fv) in &slot_filters {
+            if &slots[*fs] != *fv {
+                return true; // fails an equality pin: skip
+            }
         }
         if let Some(rs) = range_slot {
             if !in_bounds(&slots[rs]) {
                 return true; // outside the $match range: skip
             }
         }
+        if count_post_filter {
+            walked_ids += n;
+        }
         let g = &slots[group_slot];
         if lossy_iv(g) {
             bail = true;
             return false;
-        }
-        if !count_before_range_skip {
-            walked_ids += n;
         }
 
         let starts_new_group = match &current {
@@ -3760,11 +3729,9 @@ pub(crate) fn try_composite_covered_group(
         true
     };
 
-    match &match_plan {
-        MatchPlan::Eq(_, miv) | MatchPlan::EqRange { eq_value: miv, .. } => {
-            ci.for_each_prefix_entries(std::slice::from_ref(miv), &mut visit)
-        }
-        MatchPlan::All | MatchPlan::Range { .. } => ci.for_each_entry(&mut visit),
+    match prefix_idx {
+        Some(pi) => ci.for_each_prefix_entries(std::slice::from_ref(&eqs[pi].1), &mut visit),
+        None => ci.for_each_entry(&mut visit),
     }
 
     if bail {
@@ -5884,13 +5851,13 @@ mod tests {
             )
             .is_none()
         );
-        // …declines on match shapes the covered path cannot serve: a range
-        // on a field that is not the group-slot layout's range (the group
-        // field must sit at slot 0 for a pure range), two equalities, and
+        // …declines on match shapes the covered path cannot serve: a pure
+        // range leaving the pre-group slot unpinned, an equality pin with a
+        // Null value (missing vs explicit null undecidable on a slot), and
         // an eq+range whose lower bound is unbounded.
         for bad_match in [
             json!({"region": {"$gt": "A"}}),
-            json!({"region": "EU", "dept": "a"}),
+            json!({"region": "EU", "salary": null}),
             json!({"region": "EU", "salary": {"$lte": 10}}),
         ] {
             let p = Pipeline::parse(&json!([
@@ -6017,6 +5984,50 @@ mod tests {
             let expected = p.execute_from(0, docs, &no_lookup).unwrap();
             assert_eq!(got, expected);
         }
+    }
+
+    #[test]
+    fn covered_group_multi_eq_matches_hash_path() {
+        // Two equality pins: region rides the prefix, status filters its
+        // slot. Includes a doc failing only the second pin, a doc missing
+        // the pinned field (Null slot ≠ "active" → excluded, same as
+        // matches_value's missing-field rejection), and a null group.
+        let docs = vec![
+            json!({"region": "EU", "status": "active", "dept": "eng", "salary": 10}),
+            json!({"region": "EU", "status": "active", "dept": "eng", "salary": 30}),
+            json!({"region": "EU", "status": "left",   "dept": "eng", "salary": 99}),
+            json!({"region": "EU", "status": "active", "dept": "ops", "salary": 5}),
+            json!({"region": "EU", "dept": "ops", "salary": 7}), // status missing
+            json!({"region": "EU", "status": "active", "salary": 3}), // dept missing
+            json!({"region": "US", "status": "active", "dept": "eng", "salary": 999}),
+        ];
+        assert_match_covered_matches_hash(
+            json!({"region": "EU", "status": "active"}),
+            json!({
+                "_id": "$dept",
+                "n": {"$sum": 1},
+                "total": {"$sum": "$salary"},
+            }),
+            &["region", "status", "dept", "salary"],
+            docs,
+        );
+    }
+
+    #[test]
+    fn covered_group_multi_eq_pin_after_group_slot() {
+        // The second pin sits AFTER the group slot — allowed (filtering a
+        // later slot never breaks group-run contiguity).
+        let docs = vec![
+            json!({"region": "EU", "dept": "eng", "status": "active", "salary": 10}),
+            json!({"region": "EU", "dept": "eng", "status": "left",   "salary": 90}),
+            json!({"region": "EU", "dept": "ops", "status": "active", "salary": 4}),
+        ];
+        assert_match_covered_matches_hash(
+            json!({"region": "EU", "status": "active"}),
+            json!({"_id": "$dept", "total": {"$sum": "$salary"}}),
+            &["region", "dept", "status", "salary"],
+            docs,
+        );
     }
 
     #[test]
