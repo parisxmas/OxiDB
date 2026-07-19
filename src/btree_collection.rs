@@ -12,19 +12,19 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::locks::{Mutex, RwLock};
 #[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::btree_storage::BTreeStorage;
 use crate::codec;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::collection::load_index_metadata;
-use crate::collection::{resolve_field_in_value, CompactStats, IndexInfo, IndexMetadata};
+use crate::collection::{CompactStats, IndexInfo, IndexMetadata, resolve_field_in_value};
 use crate::doc_bytes_cache::DocBytesCache;
 use crate::doc_cache::DocCache;
 use crate::document::DocumentId;
@@ -526,6 +526,13 @@ impl BTreeCollection {
         } else {
             self.wal.log_batch(entries)
         }
+    }
+
+    /// Attach the engine's snapshot gate (ADR-0017) — a straight
+    /// passthrough to storage, where every logical mutation reports.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_snap_gate(&self, gate: std::sync::Arc<crate::snapshot::SnapGate>) {
+        self.storage.set_snap_gate(gate);
     }
 
     pub fn set_cache_capacity(&self, capacity: usize) {
@@ -4046,11 +4053,7 @@ fn matches_query_partial_jsonb(query: &Query, bytes: &[u8]) -> Option<bool> {
                     None => saw_undecidable = true,
                 }
             }
-            if saw_undecidable {
-                None
-            } else {
-                Some(false)
-            }
+            if saw_undecidable { None } else { Some(false) }
         }
         // Nor/Expr need fuller evaluation — let the caller full-decode.
         Query::Nor(_) | Query::Expr(_) => None,
@@ -4847,10 +4850,11 @@ mod tests {
         assert_eq!(doc.get("v").and_then(|v| v.as_u64()).unwrap(), 42);
 
         // No match → None, nothing written.
-        assert!(col
-            .find_and_modify(&json!({"name": "nope"}), &json!({"$set": {"v": 0}}))
-            .unwrap()
-            .is_none());
+        assert!(
+            col.find_and_modify(&json!({"name": "nope"}), &json!({"$set": {"v": 0}}))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -470,6 +470,11 @@ pub struct OxiDb {
     /// other (shared lock; per-document atomicity is the collection's
     /// job), they only exclude in-flight commits.
     commit_lock: RwLock<()>,
+    /// MVCC-lite read snapshots (ADR-0017). Snapshots begin under
+    /// `commit_lock.write()`; writers record priors inside their
+    /// `commit_lock.read()` scope — that lock is the visibility boundary.
+    #[cfg(not(target_arch = "wasm32"))]
+    snap_gate: Arc<crate::snapshot::SnapGate>,
     /// Pessimistic per-document locks taken by `tx_find_for_update`.
     /// See `doc_locks.rs` — the hot-document escape hatch from OCC
     /// retry storms. Released on commit (post-apply) and rollback.
@@ -597,6 +602,8 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
             commit_lock: RwLock::new(()),
+            #[cfg(not(target_arch = "wasm32"))]
+            snap_gate: Arc::new(crate::snapshot::SnapGate::new()),
             doc_locks: crate::doc_locks::DocLockManager::default(),
             commit_ticket: AtomicU64::new(0),
             durability_poisoned: AtomicBool::new(false),
@@ -628,6 +635,8 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: true,
             commit_lock: RwLock::new(()),
+            #[cfg(not(target_arch = "wasm32"))]
+            snap_gate: Arc::new(crate::snapshot::SnapGate::new()),
             doc_locks: crate::doc_locks::DocLockManager::default(),
             commit_ticket: AtomicU64::new(0),
             durability_poisoned: AtomicBool::new(false),
@@ -655,12 +664,21 @@ impl OxiDb {
                 loop {
                     match rx.recv_timeout(interval) {
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Time to check for expired documents
+                            // Time to check for expired documents. The
+                            // shared commit lock puts TTL deletes inside the
+                            // MVCC-lite snapshot boundary like any writer: a
+                            // snapshot either wholly sees a doc TTL kept, or
+                            // resolves the recorded prior of one it evicted.
+                            let _occ_guard = db.commit_lock.read();
                             let cols = db.collections.read();
                             for col_arc in cols.values() {
                                 col_arc.evict_expired();
                                 col_arc.evict_ttl_indexed();
                             }
+                            drop(cols);
+                            drop(_occ_guard);
+                            #[cfg(not(target_arch = "wasm32"))]
+                            db.snap_gate.expire_tick();
                         }
                         _ => break, // Shutdown signal or channel closed
                     }
@@ -777,6 +795,8 @@ impl OxiDb {
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             in_memory: false,
             commit_lock: RwLock::new(()),
+            #[cfg(not(target_arch = "wasm32"))]
+            snap_gate: Arc::new(crate::snapshot::SnapGate::new()),
             doc_locks: crate::doc_locks::DocLockManager::default(),
             commit_ticket: AtomicU64::new(0),
             durability_poisoned: AtomicBool::new(false),
@@ -937,6 +957,8 @@ impl OxiDb {
             col.set_lazy_sync(true);
         }
         col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
+        #[cfg(not(target_arch = "wasm32"))]
+        col.set_snap_gate(Arc::clone(&self.snap_gate));
         let arc = Arc::new(col);
         let mut cols = self.collections.write();
         if let Some(existing) = cols.get(name) {
@@ -991,6 +1013,8 @@ impl OxiDb {
             col.set_lazy_sync(true);
         }
         col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
+        #[cfg(not(target_arch = "wasm32"))]
+        col.set_snap_gate(Arc::clone(&self.snap_gate));
 
         // Acquire the write lock only to insert. Re-check existence to
         // handle the race with another writer that won.
@@ -1047,6 +1071,8 @@ impl OxiDb {
             col.set_lazy_sync(true);
         }
         col.set_cache_capacity(self.cache_capacity.load(Ordering::Acquire));
+        #[cfg(not(target_arch = "wasm32"))]
+        col.set_snap_gate(Arc::clone(&self.snap_gate));
 
         let mut cols = self.collections.write();
         if cols.contains_key(name) {
@@ -1501,6 +1527,10 @@ impl OxiDb {
         let col = self.get_or_create_collection(collection)?;
         let emit = self.change_broker.has_subscribers();
         let doc_clone = if emit { Some(doc.clone()) } else { None };
+        // Shared commit lock (see update()): also the MVCC-lite snapshot
+        // boundary — a snapshot begins under the write side, so an insert
+        // is either wholly before it (visible) or wholly after (recorded).
+        let _occ_guard = self.commit_lock.read();
         let id = col.insert(doc)?;
         if let Some(mut d) = doc_clone {
             if let Some(obj) = d.as_object_mut() {
@@ -1526,6 +1556,8 @@ impl OxiDb {
 
         let col = self.get_or_create_collection(collection)?;
         let emit = self.change_broker.has_subscribers();
+        // Shared commit lock — see insert(); also the snapshot boundary.
+        let _occ_guard = self.commit_lock.read();
 
         // Phase 1: Reserve IDs and check unique constraints
         let (first_id, has_unique_indexes, unique_fields, need_values) = {
@@ -2043,13 +2075,63 @@ impl OxiDb {
         col.vector_search(field, query_vector, limit, ef_search)
     }
 
+    /// Aggregate with MVCC-lite snapshot consistency by default (ADR-0017):
+    /// the pipeline's answer is the state of one commit instant, never a mix
+    /// of documents read at different moments. Optimistic about it — the
+    /// existing fast paths run against live state first, and only when a
+    /// writer actually raced the pipeline does the snapshot-correct slow
+    /// path re-run. Uncontended aggregations pay one atomic load.
     pub fn aggregate(&self, collection: &str, pipeline_json: &Value) -> Result<Vec<Value>> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return self.aggregate_latest(collection, pipeline_json, None);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let has_out = Pipeline::parse(pipeline_json)?.out_collection().is_some();
+            let s = self.begin_snapshot();
+            let result = (|| {
+                if has_out {
+                    // $out WRITES its result; an optimistic run cannot be
+                    // retried without writing twice. Straight to the
+                    // snapshot-correct path.
+                    return self.aggregate_snapshot_slow(collection, pipeline_json, s);
+                }
+                let touched = std::cell::RefCell::new(std::collections::HashSet::new());
+                touched.borrow_mut().insert(collection.to_string());
+                let fast = self.aggregate_latest(collection, pipeline_json, Some(&touched))?;
+                let raced = touched
+                    .borrow()
+                    .iter()
+                    .any(|c| self.snap_gate.changed_since(c, s));
+                if !raced {
+                    // Nothing was written to any involved collection while
+                    // the pipeline ran: the live state WAS the snapshot.
+                    return Ok(fast);
+                }
+                self.aggregate_snapshot_slow(collection, pipeline_json, s)
+            })();
+            self.end_snapshot(s);
+            result
+        }
+    }
+
+    fn aggregate_latest(
+        &self,
+        collection: &str,
+        pipeline_json: &Value,
+        touched: Option<&std::cell::RefCell<std::collections::HashSet<String>>>,
+    ) -> Result<Vec<Value>> {
         let pipeline = Pipeline::parse(pipeline_json)?;
         let (leading_match, start_idx) = pipeline.take_leading_match();
         let out_collection = pipeline.out_collection().map(|s| s.to_string());
 
-        let lookup_fn =
-            |foreign: &str, query: &Value| -> Result<Vec<Value>> { self.find(foreign, query) };
+        let lookup_fn = |foreign: &str, query: &Value| -> Result<Vec<Value>> {
+            if let Some(t) = touched {
+                t.borrow_mut().insert(foreign.to_string());
+            }
+            self.find(foreign, query)
+        };
 
         // Streaming fast path: when pipeline is [$match?] -> $group -> [rest],
         // stream docs through storage sequentially instead of materializing
@@ -2116,6 +2198,152 @@ impl OxiDb {
             }
         }
 
+        Ok(result)
+    }
+
+    // ── MVCC-lite read snapshots (ADR-0017) ────────────────────────────
+
+    /// Open a read snapshot pinned to the current commit instant. The write
+    /// side of `commit_lock` excludes every writer's WAL-append→apply→record
+    /// window, so the returned S cleanly splits "visible" from "later".
+    /// Snapshots expire after `OXIDB_SNAPSHOT_MAX_SECS` (default 300) —
+    /// reads through a dead snapshot fail, writers never wait on one.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn begin_snapshot(&self) -> u64 {
+        let _boundary = self.commit_lock.write();
+        self.snap_gate.begin()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn end_snapshot(&self, s: u64) {
+        self.snap_gate.end(s);
+    }
+
+    /// `find` against the state at snapshot `s`. Candidates come from the
+    /// live index paths PLUS everything the gate remembered since `s` (a
+    /// document that matched at `s` but was updated away since is only
+    /// findable through the gate); every candidate is resolved to its state
+    /// at `s` and the query re-applied to THAT value.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn snapshot_find(&self, s: u64, collection: &str, query: &Value) -> Result<Vec<Value>> {
+        self.snap_gate.check(s)?;
+        let col = self.get_or_create_collection(collection)?;
+        let parsed = crate::query::parse_query(query)?;
+
+        let mut out: Vec<Value> = Vec::new();
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let consider = |doc: std::sync::Arc<Value>,
+                        out: &mut Vec<Value>,
+                        seen: &mut std::collections::HashSet<u64>|
+         -> Result<()> {
+            let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) else {
+                return Ok(());
+            };
+            if !seen.insert(id) {
+                return Ok(());
+            }
+            let resolved: Option<Value> = match self.snap_gate.resolve(collection, id, s) {
+                crate::snapshot::Resolved::Current => Some((*doc).clone()),
+                crate::snapshot::Resolved::Prior(Some(bytes)) => {
+                    Some(crate::codec::decode_doc(&bytes)?)
+                }
+                crate::snapshot::Resolved::Prior(None) => None, // born after s
+            };
+            if let Some(v) = resolved {
+                if crate::query::matches_value(&parsed, &v) {
+                    out.push(v);
+                }
+            }
+            Ok(())
+        };
+
+        for doc in col.find_arcs(query)? {
+            consider(doc, &mut out, &mut seen)?;
+        }
+        for id in self.snap_gate.remembered_ids(collection) {
+            if seen.contains(&id) {
+                continue;
+            }
+            if let Some(doc) = col.load_doc_arc(id) {
+                consider(doc, &mut out, &mut seen)?;
+            } else if let crate::snapshot::Resolved::Prior(Some(bytes)) =
+                self.snap_gate.resolve(collection, id, s)
+            {
+                // Deleted after `s`: resurrect and match.
+                seen.insert(id);
+                let v = crate::codec::decode_doc(&bytes)?;
+                if crate::query::matches_value(&parsed, &v) {
+                    out.push(v);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn snapshot_count(&self, s: u64, collection: &str, query: &Value) -> Result<u64> {
+        Ok(self.snapshot_find(s, collection, query)?.len() as u64)
+    }
+
+    /// Aggregate against an explicit snapshot — the always-correct path:
+    /// full snapshot doc set, leading $match applied to the RESOLVED state,
+    /// `$lookup` reads through the same snapshot.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn snapshot_aggregate(
+        &self,
+        s: u64,
+        collection: &str,
+        pipeline_json: &Value,
+    ) -> Result<Vec<Value>> {
+        self.snap_gate.check(s)?;
+        self.aggregate_snapshot_slow(collection, pipeline_json, s)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn aggregate_snapshot_slow(
+        &self,
+        collection: &str,
+        pipeline_json: &Value,
+        s: u64,
+    ) -> Result<Vec<Value>> {
+        let pipeline = Pipeline::parse(pipeline_json)?;
+        let (leading_match, start_idx) = pipeline.take_leading_match();
+        let out_collection = pipeline.out_collection().map(|t| t.to_string());
+        let col = self.get_or_create_collection(collection)?;
+
+        let all = crate::snapshot::snapshot_docs(
+            &self.snap_gate,
+            collection,
+            s,
+            col.find_arcs(&json!({}))?,
+        )?;
+        let docs: Vec<Value> = match leading_match {
+            Some(q) => {
+                let parsed = crate::query::parse_query(q)?;
+                all.into_iter()
+                    .filter(|d| crate::query::matches_value(&parsed, d))
+                    .map(|a| (*a).clone())
+                    .collect()
+            }
+            None => all.into_iter().map(|a| (*a).clone()).collect(),
+        };
+
+        let lookup_fn = |foreign: &str, query: &Value| -> Result<Vec<Value>> {
+            self.snapshot_find(s, foreign, query)
+        };
+        let result = pipeline.execute_from(start_idx, docs, &lookup_fn)?;
+
+        if let Some(target) = out_collection {
+            let target_col = self.get_or_create_collection(&target)?;
+            for doc in &result {
+                let mut clean = doc.clone();
+                if let Some(obj) = clean.as_object_mut() {
+                    obj.remove("_id");
+                    obj.remove("_version");
+                }
+                target_col.insert(clean)?;
+            }
+        }
         Ok(result)
     }
 
@@ -2804,9 +3032,14 @@ impl OxiDb {
         metadata: HashMap<String, String>,
         etag: Option<String>,
     ) -> Result<Value> {
-        let meta = self
-            .blob_store
-            .put_object_with_etag(bucket, key, data, content_type, metadata, etag)?;
+        let meta = self.blob_store.put_object_with_etag(
+            bucket,
+            key,
+            data,
+            content_type,
+            metadata,
+            etag,
+        )?;
 
         if let Err(e) = self.fts_tx.send(FtsJob::Index {
             data: data.to_vec(),

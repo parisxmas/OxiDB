@@ -45,6 +45,7 @@ pub mod pitr;
 pub mod procedure;
 pub mod query;
 pub mod scheduler;
+pub mod snapshot;
 pub mod storage;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stripe;

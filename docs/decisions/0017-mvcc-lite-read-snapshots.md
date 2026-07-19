@@ -1,7 +1,19 @@
 # ADR-0017: MVCC-lite — read snapshots for the document engine
 
-**Status:** Proposed — 2026-07-19 (design only; do not build until a trigger
-below fires)
+**Status:** Accepted — 2026-07-19. Phases 1 and 2 shipped the same day
+(0.38.1): `src/snapshot.rs` (SnapGate), storage-layer prior recording,
+snapshot-by-default `aggregate` with an optimistic fast path, explicit
+snapshot API + wire commands (`snapshot_begin/find/count/aggregate/end`,
+Read-role tier), `OXIDB_SNAPSHOT_MAX_SECS` expiry (default 300). Pinned by
+`tests/snapshot_reads.rs` — the torn-sum test was proven red on the
+pre-feature tree first. Phase 3 (`AS OF`) remains unbuilt, trigger 3 still
+required. One deviation from the sketch below: priors are remembered as
+encoded bytes in an in-memory version map only while a snapshot is open
+(simpler than `.bdat`-offset priors and exactly as correct; the map is
+empty and unfunded when no snapshot exists), and indexes needed no
+deferred-removal machinery — snapshot reads resolve candidates from the
+live index PLUS the gate's remembered ids, then re-verify the predicate
+against the resolved value.
 **Related:** [`docs/isolation.md`](../isolation.md),
 [`src/engine.rs`](../../src/engine.rs) (OCC),
 [`src/btree_storage.rs`](../../src/btree_storage.rs) (disk-first `.bdat`),

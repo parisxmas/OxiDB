@@ -19,8 +19,8 @@
 //!   ... last child_page follows after last entry
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // On native targets the storage map is `scc::HashMap` (lock-free, per-bucket
 // locking). On `wasm32-unknown-unknown` scc is unusable: its first bucket-array
@@ -196,6 +196,11 @@ pub struct BTreeStorage {
     /// resident. `None` = the default in-RAM mode (values live in `tree`).
     #[cfg(not(target_arch = "wasm32"))]
     disk: Option<DiskBackend>,
+    /// MVCC-lite (ADR-0017): the engine's snapshot gate, attached once after
+    /// open (never during recovery replay). Every logical mutation reports
+    /// the displaced value here; free when no snapshot is open.
+    #[cfg(not(target_arch = "wasm32"))]
+    snap_gate: std::sync::OnceLock<Arc<crate::snapshot::SnapGate>>,
     /// Resolved per-collection storage options (compression + compaction
     /// policy). `disk_first` here mirrors `disk.is_some()`.
     opts: StorageOptions,
@@ -444,6 +449,8 @@ impl BTreeStorage {
             persist_mu: crate::locks::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             disk: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            snap_gate: std::sync::OnceLock::new(),
             opts: StorageOptions {
                 disk_first: false,
                 ..StorageOptions::default()
@@ -463,6 +470,8 @@ impl BTreeStorage {
             persist_mu: crate::locks::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             disk: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            snap_gate: std::sync::OnceLock::new(),
             opts: StorageOptions {
                 disk_first: false,
                 ..StorageOptions::default()
@@ -657,6 +666,7 @@ impl BTreeStorage {
                 index,
                 data: crate::locks::RwLock::new(Arc::new(data)),
             }),
+            snap_gate: std::sync::OnceLock::new(),
             opts,
         })
     }
@@ -805,9 +815,23 @@ impl BTreeStorage {
             // serialize writes on the disk and is what the in-RAM path (a plain
             // RAM store) doesn't pay either.
             let data = d.data.read();
+            // MVCC-lite: with a snapshot open, the displaced value must be
+            // remembered BEFORE its location is retired — read it out of the
+            // mmap now (compaction may purge the bytes later). One index
+            // probe + one read, paid only while a snapshot is active.
+            let prior_for_gate = self.recording_gate().map(|g| {
+                let prior = d
+                    .index
+                    .read_sync(&key, |_, loc| *loc)
+                    .and_then(|loc| data.read_lockfree(loc).ok());
+                (Arc::clone(g), prior)
+            });
             match data.append_no_sync(&value) {
                 Ok(new_loc) => {
                     let old_loc = d.index.upsert_sync(key, new_loc);
+                    if let Some((gate, prior)) = prior_for_gate {
+                        gate.record(&self.name, key, prior.as_deref());
+                    }
                     if let Some(old) = old_loc {
                         let _ = data.mark_deleted_no_sync(old);
                         self.total_bytes
@@ -834,6 +858,10 @@ impl BTreeStorage {
         }
         let new_len = value.len() as u64;
         let old = self.tree.upsert_sync(key, value);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = self.recording_gate() {
+            g.record(&self.name, key, old.as_deref());
+        }
         if let Some(ref old_val) = old {
             // Replace: subtract old size, add new size (two atomic ops, no race).
             let old_len = old_val.len() as u64;
@@ -863,6 +891,12 @@ impl BTreeStorage {
         if let Some(d) = &self.disk {
             let data = d.data.read();
             if let Some((_, old)) = d.index.remove_sync(&key) {
+                // MVCC-lite: remember the deleted value while a snapshot is
+                // open — a snapshot older than this delete must still see it.
+                if let Some(g) = self.recording_gate() {
+                    let prior = data.read_lockfree(old).ok();
+                    g.record(&self.name, key, prior.as_deref());
+                }
                 let _ = data.mark_deleted_no_sync(old);
                 self.total_bytes
                     .fetch_sub(old.length as u64, Ordering::AcqRel);
@@ -870,11 +904,33 @@ impl BTreeStorage {
             return None;
         }
         let old = self.tree.remove_sync(&key).map(|(_, v)| v);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = self.recording_gate() {
+            if old.is_some() {
+                g.record(&self.name, key, old.as_deref());
+            }
+        }
         if let Some(ref val) = old {
             let len = val.len() as u64;
             self.total_bytes.fetch_sub(len, Ordering::AcqRel);
         }
         old
+    }
+
+    /// Attach the engine's snapshot gate (ADR-0017). Called once, after
+    /// open — never during recovery replay, so replayed records are not
+    /// mistaken for live changes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_snap_gate(&self, gate: Arc<crate::snapshot::SnapGate>) {
+        let _ = self.snap_gate.set(gate);
+    }
+
+    /// The gate, only when at least one snapshot is open — the single
+    /// relaxed load that keeps the no-snapshot write path free.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline]
+    fn recording_gate(&self) -> Option<&Arc<crate::snapshot::SnapGate>> {
+        self.snap_gate.get().filter(|g| g.is_active())
     }
 
     /// Check if a key exists.
@@ -1197,6 +1253,15 @@ impl BTreeStorage {
     /// IMPORTANT: Only use for new keys (no replacements). If keys might exist,
     /// use the regular `insert()` loop instead.
     pub fn insert_batch(&self, entries: Vec<(u64, Vec<u8>)>) {
+        // MVCC-lite: batch inserts are new keys by contract, so the prior is
+        // None for each — but the insert EVENT must still be remembered, or
+        // a snapshot could see documents born after it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(g) = self.recording_gate() {
+            for (key, _) in &entries {
+                g.record(&self.name, *key, None);
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(d) = &self.disk {
             // New keys only (per contract). One batched, un-synced append for

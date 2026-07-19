@@ -8,6 +8,12 @@ pub enum Error {
     #[error("collection not found: {0}")]
     CollectionNotFound(String),
 
+    /// A read named a snapshot that has ended or outlived
+    /// `OXIDB_SNAPSHOT_MAX_SECS`. Reads through a dead snapshot must fail,
+    /// never silently degrade to latest (ADR-0017).
+    #[error("snapshot {0} has expired or ended")]
+    SnapshotExpired(u64),
+
     #[error("collection already exists: {0}")]
     CollectionAlreadyExists(String),
 

@@ -61,10 +61,10 @@ see mid-commit.
    position) to replace conflict-retry storms with orderly queueing.
 4. **Don't read back your own uncommitted writes** — compute the value
    you wrote instead of re-querying it mid-transaction.
-5. **Reports/monitors that need cross-document consistency** should
-   read inside a transaction and re-read (validation via a no-op write
-   commit), or tolerate torn views — plain reads can observe a commit's
-   partial apply window.
+5. **Reports/monitors that need cross-document consistency**: use
+   `aggregate` (snapshot-protected since ADR-0017 — see below) or an
+   explicit read snapshot. Plain `find`/`count` remain read-committed
+   and can observe a commit's partial apply window.
 
 ## Exactly-once / idempotency (retries, timeouts, crashes)
 
@@ -108,11 +108,43 @@ the normal suite) so a green run is meaningful. This is the empirical
 confirmation of the "serializable w.r.t. the items read/wrote" claim for
 key-addressed access.
 
+## Read snapshots — MVCC-lite (ADR-0017, shipped)
+
+The read path (and only the read path) can now pin a moment. Pinned by
+`tests/snapshot_reads.rs`.
+
+- **`aggregate` is snapshot-consistent by default.** Every aggregation
+  runs against one commit instant: it can no longer see half a
+  transfer, no matter what commits mid-scan (the torn-sum test fails on
+  the pre-feature tree, passes now). Fast path unchanged — when no
+  write raced the scan, the optimistic latest-state run is proven valid
+  and returned as-is; only a raced scan pays the resolve-and-recheck
+  fallback.
+- **Explicit snapshots** (`begin_snapshot` / `snapshot_find` /
+  `snapshot_count` / `snapshot_aggregate` / `end_snapshot`; wire:
+  `snapshot_begin` … `snapshot_end`, Read-role tier) give a multi-query
+  consistent view: every read through snapshot `S` sees exactly the
+  commit state at `S` — updates rolled back, later inserts invisible,
+  deletes resurrected.
+- **Writers never wait.** While a snapshot is open, writers append the
+  displaced prior bytes to an in-memory version map (under their
+  existing `commit_lock.read()` scope) and move on. No snapshot open —
+  the default — costs one relaxed atomic load per write.
+- **Snapshots expire** after `OXIDB_SNAPSHOT_MAX_SECS` (default 300):
+  reads through a dead snapshot fail with `SnapshotExpired`, writers
+  never stall, and the version map is pruned to the oldest live
+  snapshot. A snapshot held open forever is a bloat bug by definition;
+  the ceiling converts it into a client-visible error.
+
+What this changes in the scorecard above: A5A-*observation*, P3 and
+G1b **for snapshot readers and for `aggregate`** are now prevented;
+plain `find`/`count` and mid-tx reads keep the admitted behaviours
+exactly as pinned. The write path — OCC validation, `find_for_update`,
+group commit — is byte-for-byte untouched.
+
 ## Known engine-level gaps (candidates, not bugs)
 
-- **Snapshot reads / MVCC** would close A5A-observation, P3-for-readers
-  and G1b-for-observers in one move.
 - **Predicate validation or SSI** would close phantom write skew
   without the counter-doc pattern.
-- Both are performance/complexity trade-offs; today's model is honest,
-  fast, and sufficient when the rules above are followed.
+- A performance/complexity trade-off; today's model is honest, fast,
+  and sufficient when the rules above are followed.

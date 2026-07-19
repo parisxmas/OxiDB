@@ -911,6 +911,69 @@ fn handle_request_session_inner(
             }
         }
 
+        // -------------------------------------------------------------------
+        // MVCC-lite read snapshots (ADR-0017). The snapshot id is a token,
+        // not session state: the engine refcounts it and expires it after
+        // OXIDB_SNAPSHOT_MAX_SECS, so a client that vanishes without
+        // snapshot_end leaks nothing past that window. Reads through a dead
+        // snapshot fail; writers never wait on one.
+        // -------------------------------------------------------------------
+        "snapshot_begin" => {
+            let s = db.begin_snapshot();
+            ok_bytes(json!({ "snap": s }))
+        }
+
+        "snapshot_end" => match request.get("snap").and_then(|v| v.as_u64()) {
+            Some(s) => {
+                db.end_snapshot(s);
+                ok_bytes(json!("snapshot closed"))
+            }
+            None => err_bytes("missing 'snap'"),
+        },
+
+        "snapshot_find" | "snapshot_count" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let s = match request.get("snap").and_then(|v| v.as_u64()) {
+                Some(s) => s,
+                None => return err_bytes("missing 'snap'"),
+            };
+            let empty = json!({});
+            let query = request.get("query").unwrap_or(&empty);
+            if cmd == "snapshot_count" {
+                match db.snapshot_count(s, col, query) {
+                    Ok(n) => ok_bytes(json!(n)),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
+            } else {
+                match db.snapshot_find(s, col, query) {
+                    Ok(docs) => ok_bytes(json!(docs)),
+                    Err(e) => err_bytes(&e.to_string()),
+                }
+            }
+        }
+
+        "snapshot_aggregate" => {
+            let col = match collection.as_deref() {
+                Some(c) => c,
+                None => return err_bytes("missing 'collection'"),
+            };
+            let s = match request.get("snap").and_then(|v| v.as_u64()) {
+                Some(s) => s,
+                None => return err_bytes("missing 'snap'"),
+            };
+            let pipeline = match request.get("pipeline") {
+                Some(p) => p,
+                None => return err_bytes("missing 'pipeline'"),
+            };
+            match db.snapshot_aggregate(s, col, pipeline) {
+                Ok(docs) => ok_bytes(json!(docs)),
+                Err(e) => err_bytes(&e.to_string()),
+            }
+        }
+
         // Query-plan introspection: {"cmd": "explain", "inner": {"cmd":
         // "find" | "count" | "aggregate", ...}} — reports the plan the
         // engine would choose (strategy, index, post-filter operators)

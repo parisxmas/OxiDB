@@ -28,6 +28,11 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "compact"
                 | "aggregate"
                 | "aggregate_docs"
+                | "snapshot_begin"
+                | "snapshot_find"
+                | "snapshot_count"
+                | "snapshot_aggregate"
+                | "snapshot_end"
                 | "begin_tx"
                 | "commit_tx"
                 | "rollback_tx"
@@ -60,6 +65,13 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "count"
                 | "aggregate"
                 | "aggregate_docs"
+                // Read snapshots are a read-path feature (ADR-0017): begin /
+                // find / count / aggregate / end all sit in the Read tier.
+                | "snapshot_begin"
+                | "snapshot_find"
+                | "snapshot_count"
+                | "snapshot_aggregate"
+                | "snapshot_end"
                 // SELECT-only: the session layer flags Read-role sql requests
                 // and the SQL bridge rejects any non-SELECT statement.
                 | "sql"
