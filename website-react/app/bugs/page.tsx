@@ -242,7 +242,7 @@ export default function BugsPage() {
 
   return (
     <section className="section">
-      <div className="container bug-wide">
+      <div className="container">
         <h2>
           <svg
             className="section-icon"
@@ -492,9 +492,6 @@ export default function BugsPage() {
 function BugStyles() {
   return (
     <style>{`
-      /* This page is a workspace, not an article: let it breathe wider than
-         the site's 960px reading column. */
-      .container.bug-wide { max-width: 1300px; }
       .bug-authbar { display:flex; align-items:center; gap:.75rem; flex-wrap:wrap;
         margin:1.25rem 0; padding:.75rem 1rem; border:1px solid var(--border,#e5e7eb);
         border-radius:12px; background:var(--card,rgba(127,127,127,.04)); }

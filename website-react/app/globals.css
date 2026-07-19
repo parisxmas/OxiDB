@@ -36,7 +36,9 @@
   --font-mono: 'Geist Mono', 'SF Mono', 'JetBrains Mono', ui-monospace, Consolas, Menlo, monospace;
   --font-serif: 'Instrument Serif', 'Iowan Old Style', 'Times New Roman', serif;
 
-  --max-width: 960px;
+  /* Fluid content column: pages fill the viewport (minus the nav), no
+     pixel cap. Inner reading blocks set their own rem-based widths. */
+  --max-width: 100%;
   --radius: 6px;
   --radius-sm: 4px;
 }
@@ -141,7 +143,7 @@ a:hover { color: #f2986e; }
 .container {
   max-width: var(--max-width);
   margin: 0 auto;
-  padding: 0 24px;
+  padding: 0 1rem;
 }
 
 a { color: var(--link); text-decoration: none; }
@@ -1133,7 +1135,7 @@ tbody td code {
 
 /* terminal-style feature block (home) */
 .termblock{background:#0a0f0a;border:1px solid #1d2b1d;border-radius:12px;overflow:hidden;
-  box-shadow:0 8px 30px rgba(0,0,0,.35);max-width:860px;margin:0 auto}
+  box-shadow:0 8px 30px rgba(0,0,0,.35);max-width:36rem;margin:0 auto}
 .termbar{display:flex;gap:7px;padding:11px 14px;background:#101710;border-bottom:1px solid #1d2b1d}
 .termbar span{width:11px;height:11px;border-radius:50%;background:#2e3d2e}
 .termbar span:first-child{background:#e0483e}.termbar span:nth-child(2){background:#e5c07b}
@@ -1204,7 +1206,7 @@ tbody td code {
 }
 
 /* ── ColdChain showcase ─────────────────────────────────────────────── */
-.showcase { max-width: 780px; }
+.showcase { max-width: 32.5rem; }
 .showcase-main p { color: var(--text-dim); line-height: 1.75; margin: 0 0 15px; }
 .showcase-main strong { color: var(--text); }
 
