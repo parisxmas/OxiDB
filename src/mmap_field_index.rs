@@ -132,6 +132,12 @@ pub struct MmapFieldIndex {
     overlay: BTreeMap<IndexValue, DocIdSet>,
     /// Tombstones: doc_id → old IndexValue removed since last persist.
     removed: HashMap<DocumentId, Vec<IndexValue>>,
+    /// Live total of (value, doc_id) pairs: mmap pairs minus tombstoned mmap
+    /// pairs, plus overlay pairs — i.e. exactly what materializing every
+    /// entry and summing set sizes would return. Maintained on every
+    /// insert/remove/persist so `count_all()` is O(1); index-backed sort
+    /// consults it per query, so it must never require an index walk.
+    total_ids: usize,
 }
 
 // ── resolve_value_field (duplicated to avoid circular dep) ───────────────────
@@ -157,6 +163,7 @@ impl MmapFieldIndex {
             unique: false,
             overlay: BTreeMap::new(),
             removed: HashMap::new(),
+            total_ids: 0,
         }
     }
 
@@ -170,6 +177,7 @@ impl MmapFieldIndex {
             unique: true,
             overlay: BTreeMap::new(),
             removed: HashMap::new(),
+            total_ids: 0,
         }
     }
 
@@ -241,8 +249,12 @@ impl MmapFieldIndex {
         // To find the string table size, we look at the max (offset + len) in entries.
         let string_table_offset = entries_end;
 
-        // Find the end of the string table by scanning entries for max string offset+len
+        // Find the end of the string table by scanning entries for max string
+        // offset+len. The same pass sums each entry's doc-id count from its
+        // header — seeding `total_ids` costs nothing extra here, and keeps
+        // `count_all()` O(1) instead of materializing every doc-id set.
         let mut string_table_end: usize = 0;
+        let mut total_ids: usize = 0;
         for i in 0..entry_count as usize {
             let eoff = entry_table_offset + i * ENTRY_HEADER_SIZE;
             let vtype = buf[eoff];
@@ -256,6 +268,7 @@ impl MmapFieldIndex {
                     string_table_end = end;
                 }
             }
+            total_ids = total_ids.saturating_add(read_u32(buf, eoff + 21) as usize);
         }
 
         let docid_section_offset = string_table_offset
@@ -281,6 +294,7 @@ impl MmapFieldIndex {
             unique,
             overlay: BTreeMap::new(),
             removed: HashMap::new(),
+            total_ids,
         })
     }
 
@@ -486,6 +500,17 @@ impl MmapFieldIndex {
     }
 
     /// Iterate mmap entries in a range [start_idx..end_idx), filtering tombstones.
+    /// Drop tombstoned doc ids from a materialized mmap entry's set. The one
+    /// place tombstone-filtering semantics live — range reads and the lazy
+    /// iterators must agree.
+    fn apply_tombstones(&self, val: &IndexValue, ids: &mut DocIdSet) {
+        for (doc_id, removed_vals) in &self.removed {
+            if removed_vals.iter().any(|v| v == val) {
+                ids.remove(doc_id);
+            }
+        }
+    }
+
     fn mmap_range_entries(&self, start_idx: usize, end_idx: usize) -> Vec<(IndexValue, DocIdSet)> {
         let mut result = Vec::new();
         for i in start_idx..end_idx {
@@ -493,12 +518,7 @@ impl MmapFieldIndex {
                 continue;
             };
             let mut ids = self.mmap_entry_docids(i);
-            // Apply tombstones
-            for (doc_id, removed_vals) in &self.removed {
-                if removed_vals.iter().any(|v| v == &val) {
-                    ids.remove(doc_id);
-                }
-            }
+            self.apply_tombstones(&val, &mut ids);
             if !ids.is_empty() {
                 result.push((val, ids));
             }
@@ -512,20 +532,26 @@ impl MmapFieldIndex {
     pub fn insert_value(&mut self, id: DocumentId, data: &Value) {
         if let Some(value) = resolve_value_field(data, &self.field) {
             let key = IndexValue::from_json(value);
-            self.overlay.entry(key).or_default().insert(id);
+            if self.overlay.entry(key).or_default().insert(id) {
+                self.total_ids += 1;
+            }
         }
     }
 
     /// Insert a pre-computed IndexValue directly into the overlay.
     pub fn insert_raw(&mut self, id: DocumentId, key: IndexValue) {
-        self.overlay.entry(key).or_default().insert(id);
+        if self.overlay.entry(key).or_default().insert(id) {
+            self.total_ids += 1;
+        }
     }
 
     /// Insert a Document into the overlay.
     pub fn insert(&mut self, doc: &crate::document::Document) {
         if let Some(value) = doc.get_field(&self.field) {
             let key = IndexValue::from_json(value);
-            self.overlay.entry(key).or_default().insert(doc.id);
+            if self.overlay.entry(key).or_default().insert(doc.id) {
+                self.total_ids += 1;
+            }
         }
     }
 
@@ -533,17 +559,7 @@ impl MmapFieldIndex {
     pub fn remove_value(&mut self, id: DocumentId, data: &Value) {
         if let Some(value) = resolve_value_field(data, &self.field) {
             let key = IndexValue::from_json(value);
-            // Try overlay first
-            if let Some(set) = self.overlay.get_mut(&key) {
-                if set.remove(&id) {
-                    if set.is_empty() {
-                        self.overlay.remove(&key);
-                    }
-                    return;
-                }
-            }
-            // Record tombstone for mmap layer
-            self.removed.entry(id).or_default().push(key);
+            self.remove_pair(id, key);
         }
     }
 
@@ -551,15 +567,39 @@ impl MmapFieldIndex {
     pub fn remove(&mut self, doc: &crate::document::Document) {
         if let Some(value) = doc.get_field(&self.field) {
             let key = IndexValue::from_json(value);
-            if let Some(set) = self.overlay.get_mut(&key) {
-                if set.remove(&doc.id) {
-                    if set.is_empty() {
-                        self.overlay.remove(&key);
-                    }
-                    return;
+            self.remove_pair(doc.id, key);
+        }
+    }
+
+    /// Shared removal path: drop the pair from the overlay if present, else
+    /// tombstone the mmap layer. Keeps `total_ids` in step — it only drops
+    /// when the pair actually disappears from the merged view (overlay hit,
+    /// or a NEW tombstone over a pair the mmap really contains; a duplicate
+    /// tombstone must not double-decrement).
+    fn remove_pair(&mut self, id: DocumentId, key: IndexValue) {
+        // Try overlay first
+        if let Some(set) = self.overlay.get_mut(&key) {
+            if set.remove(&id) {
+                if set.is_empty() {
+                    self.overlay.remove(&key);
                 }
+                self.total_ids = self.total_ids.saturating_sub(1);
+                return;
             }
-            self.removed.entry(doc.id).or_default().push(key);
+        }
+        // Record tombstone for mmap layer (once per (id, value) pair)
+        let already = self
+            .removed
+            .get(&id)
+            .is_some_and(|vals| vals.iter().any(|v| v == &key));
+        if !already {
+            let in_mmap = self
+                .mmap_find_entry(&key)
+                .is_some_and(|idx| self.mmap_entry_contains_docid(idx, id));
+            if in_mmap {
+                self.total_ids = self.total_ids.saturating_sub(1);
+            }
+            self.removed.entry(id).or_default().push(key);
         }
     }
 
@@ -725,23 +765,12 @@ impl MmapFieldIndex {
         count
     }
 
-    /// Total count of all indexed docs.
+    /// Total count of all indexed docs. O(1) — served from the live
+    /// `total_ids` counter (index-backed sort asks this per query; walking
+    /// and materializing every mmap entry here cost ~10ms/query on a 1M-doc
+    /// index).
     pub fn count_all(&self) -> usize {
-        let mut count = 0;
-
-        // Mmap entries
-        if let Some(layout) = &self.layout {
-            for (_, ids) in self.mmap_range_entries(0, layout.entry_count as usize) {
-                count += ids.len();
-            }
-        }
-
-        // Overlay entries
-        for ids in self.overlay.values() {
-            count += ids.len();
-        }
-
-        count
+        self.total_ids
     }
 
     /// Find docs matching any of the given values.
@@ -894,6 +923,7 @@ impl MmapFieldIndex {
         self.removed.clear();
         self.mmap = None;
         self.layout = None;
+        self.total_ids = 0;
     }
 
     // ── Merged range helper (for sorted iteration) ──────────────────────────
@@ -951,7 +981,10 @@ impl MmapFieldIndex {
 
         write_fidx_v2(&self.path, &self.field, self.unique, &entries)?;
 
-        // After persisting, reopen the mmap and clear overlay
+        // After persisting, reopen the mmap and clear overlay. The merge
+        // dedups any (value, id) pair that lived in both mmap and overlay,
+        // so re-derive the counter from what was actually written.
+        self.total_ids = entries.iter().map(|(_, ids)| ids.len()).sum();
         self.overlay.clear();
         self.removed.clear();
 
@@ -1034,6 +1067,7 @@ impl MmapFieldIndex {
             Self::new(old.field.clone())
         };
         for (val, ids) in old.iter_asc() {
+            idx.total_ids += ids.len();
             idx.overlay.insert(val.clone(), ids.clone());
         }
         idx
@@ -1231,21 +1265,44 @@ fn merge_sorted_entries(
 }
 
 // ── Iterators ───────────────────────────────────────────────────────────────
+//
+// Both directions are LAZY (one mmap entry materialized per step) and must
+// yield exactly what `merged_all()` would: tombstones applied to mmap
+// entries, doc-id sets UNIONED when a value exists in both mmap and overlay,
+// fully-tombstoned entries skipped. Sort-with-limit walks only the first few
+// entries of a million-entry index, so an eager merge here turns an O(limit)
+// query into O(index).
 
-/// Ascending iterator over merged (mmap + overlay) entries.
+/// Which side supplies the next merged entry.
+enum MergeSide {
+    Mmap,
+    Overlay,
+    Both,
+}
+
+/// Ascending lazy iterator over merged (mmap + overlay) entries.
 pub struct MmapFieldIndexIter<'a> {
-    entries: Vec<(IndexValue, DocIdSet)>,
-    pos: usize,
-    _marker: std::marker::PhantomData<&'a ()>,
+    index: &'a MmapFieldIndex,
+    /// Next mmap entry to consider (ascending).
+    mmap_pos: usize,
+    mmap_count: usize,
+    /// Overlay snapshot in ascending order.
+    overlay: Vec<(IndexValue, DocIdSet)>,
+    overlay_pos: usize,
 }
 
 impl<'a> MmapFieldIndexIter<'a> {
     fn new(index: &'a MmapFieldIndex) -> Self {
-        let entries = index.merged_all();
+        let mmap_count = index.layout.as_ref().map_or(0, |l| l.entry_count as usize);
+        // Overlay is typically small (recent writes only) — safe to clone.
+        let overlay: Vec<(IndexValue, DocIdSet)> =
+            index.overlay.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         Self {
-            entries,
-            pos: 0,
-            _marker: std::marker::PhantomData,
+            index,
+            mmap_pos: 0,
+            mmap_count,
+            overlay,
+            overlay_pos: 0,
         }
     }
 }
@@ -1254,37 +1311,81 @@ impl<'a> Iterator for MmapFieldIndexIter<'a> {
     type Item = (IndexValue, DocIdSet);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos < self.entries.len() {
-            let entry = std::mem::replace(
-                &mut self.entries[self.pos],
-                (IndexValue::Null, DocIdSet::Empty),
-            );
-            self.pos += 1;
-            Some(entry)
-        } else {
-            None
+        loop {
+            // Peek the next mmap value, skipping unreadable entries (same as
+            // mmap_range_entries' `continue`).
+            let mm_val = loop {
+                if self.mmap_pos >= self.mmap_count {
+                    break None;
+                }
+                match self.index.mmap_entry_value(self.mmap_pos) {
+                    Some(v) => break Some(v),
+                    None => self.mmap_pos += 1,
+                }
+            };
+
+            let side = match (&mm_val, self.overlay.get(self.overlay_pos)) {
+                (None, None) => return None,
+                (Some(_), None) => MergeSide::Mmap,
+                (None, Some(_)) => MergeSide::Overlay,
+                (Some(mv), Some((ov, _))) => match mv.cmp(ov) {
+                    std::cmp::Ordering::Less => MergeSide::Mmap,
+                    std::cmp::Ordering::Equal => MergeSide::Both,
+                    std::cmp::Ordering::Greater => MergeSide::Overlay,
+                },
+            };
+
+            let (val, ids) = match side {
+                MergeSide::Mmap | MergeSide::Both => {
+                    let val = mm_val.expect("mmap side chosen with a value");
+                    let mut ids = self.index.mmap_entry_docids(self.mmap_pos);
+                    self.index.apply_tombstones(&val, &mut ids);
+                    self.mmap_pos += 1;
+                    if matches!(side, MergeSide::Both) {
+                        for &id in &self.overlay[self.overlay_pos].1 {
+                            ids.insert(id);
+                        }
+                        self.overlay_pos += 1;
+                    }
+                    (val, ids)
+                }
+                MergeSide::Overlay => {
+                    let (v, ids) = self.overlay[self.overlay_pos].clone();
+                    self.overlay_pos += 1;
+                    (v, ids)
+                }
+            };
+
+            // A fully-tombstoned entry is invisible in the merged view.
+            if !ids.is_empty() {
+                return Some((val, ids));
+            }
         }
     }
 }
 
-/// Descending iterator over merged (mmap + overlay) entries.
+/// Descending lazy iterator over merged (mmap + overlay) entries.
 pub struct MmapFieldIndexIterDesc<'a> {
     index: &'a MmapFieldIndex,
+    /// One past the next mmap entry to consider (descending); 0 = exhausted.
     mmap_pos: usize,
-    overlay_rev: Vec<(IndexValue, DocIdSet)>,
+    /// Overlay snapshot in ascending order, consumed from the back.
+    overlay: Vec<(IndexValue, DocIdSet)>,
+    /// One past the next overlay entry (descending); 0 = exhausted.
     overlay_pos: usize,
 }
 
 impl<'a> MmapFieldIndexIterDesc<'a> {
     fn new(index: &'a MmapFieldIndex) -> Self {
         let mmap_count = index.layout.as_ref().map_or(0, |l| l.entry_count as usize);
-        // Overlay is typically small (recent writes only) — safe to clone + reverse
-        let overlay_rev: Vec<(IndexValue, DocIdSet)> = index.overlay.clone().into_iter().collect();
-        let overlay_pos = overlay_rev.len();
+        // Overlay is typically small (recent writes only) — safe to clone.
+        let overlay: Vec<(IndexValue, DocIdSet)> =
+            index.overlay.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let overlay_pos = overlay.len();
         Self {
             index,
             mmap_pos: mmap_count,
-            overlay_rev,
+            overlay,
             overlay_pos,
         }
     }
@@ -1294,42 +1395,53 @@ impl<'a> Iterator for MmapFieldIndexIterDesc<'a> {
     type Item = (IndexValue, DocIdSet);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mm_val = if self.mmap_pos > 0 {
-            self.index.mmap_entry_value(self.mmap_pos - 1)
-        } else {
-            None
-        };
-        let ov_val = if self.overlay_pos > 0 {
-            Some(&self.overlay_rev[self.overlay_pos - 1].0)
-        } else {
-            None
-        };
-
-        match (mm_val, ov_val) {
-            (Some(mv), Some(ov)) => {
-                if ov >= &mv {
-                    self.overlay_pos -= 1;
-                    let (v, ids) = self.overlay_rev[self.overlay_pos].clone();
-                    if ov == &mv {
-                        self.mmap_pos -= 1;
-                    } // skip dup
-                    Some((v, ids))
-                } else {
-                    self.mmap_pos -= 1;
-                    let ids = self.index.mmap_entry_docids(self.mmap_pos);
-                    Some((mv, ids))
+        loop {
+            // Peek the next mmap value from the end, skipping unreadable entries.
+            let mm_val = loop {
+                if self.mmap_pos == 0 {
+                    break None;
                 }
+                match self.index.mmap_entry_value(self.mmap_pos - 1) {
+                    Some(v) => break Some(v),
+                    None => self.mmap_pos -= 1,
+                }
+            };
+
+            let side = match (&mm_val, self.overlay_pos.checked_sub(1).map(|i| &self.overlay[i])) {
+                (None, None) => return None,
+                (Some(_), None) => MergeSide::Mmap,
+                (None, Some(_)) => MergeSide::Overlay,
+                (Some(mv), Some((ov, _))) => match mv.cmp(ov) {
+                    std::cmp::Ordering::Greater => MergeSide::Mmap,
+                    std::cmp::Ordering::Equal => MergeSide::Both,
+                    std::cmp::Ordering::Less => MergeSide::Overlay,
+                },
+            };
+
+            let (val, ids) = match side {
+                MergeSide::Mmap | MergeSide::Both => {
+                    let val = mm_val.expect("mmap side chosen with a value");
+                    self.mmap_pos -= 1;
+                    let mut ids = self.index.mmap_entry_docids(self.mmap_pos);
+                    self.index.apply_tombstones(&val, &mut ids);
+                    if matches!(side, MergeSide::Both) {
+                        self.overlay_pos -= 1;
+                        for &id in &self.overlay[self.overlay_pos].1 {
+                            ids.insert(id);
+                        }
+                    }
+                    (val, ids)
+                }
+                MergeSide::Overlay => {
+                    self.overlay_pos -= 1;
+                    let (v, ids) = self.overlay[self.overlay_pos].clone();
+                    (v, ids)
+                }
+            };
+
+            if !ids.is_empty() {
+                return Some((val, ids));
             }
-            (Some(mv), None) => {
-                self.mmap_pos -= 1;
-                let ids = self.index.mmap_entry_docids(self.mmap_pos);
-                Some((mv, ids))
-            }
-            (None, Some(_)) => {
-                self.overlay_pos -= 1;
-                Some(self.overlay_rev[self.overlay_pos].clone())
-            }
-            (None, None) => None,
         }
     }
 }
@@ -1476,6 +1588,139 @@ mod tests {
         idx.insert_value(2, &json!({"x": "b"}));
         idx.insert_value(3, &json!({"x": "a"}));
         assert_eq!(idx.count_all(), 3);
+    }
+
+    /// The old count_all: materialize every mmap entry (tombstones applied)
+    /// and sum set sizes, plus overlay pairs. The live `total_ids` counter
+    /// must agree with this after every kind of mutation.
+    fn count_all_by_materializing(idx: &MmapFieldIndex) -> usize {
+        let mut count = 0;
+        if let Some(layout) = &idx.layout {
+            for (_, ids) in idx.mmap_range_entries(0, layout.entry_count as usize) {
+                count += ids.len();
+            }
+        }
+        for ids in idx.overlay.values() {
+            count += ids.len();
+        }
+        count
+    }
+
+    #[test]
+    fn count_all_counter_tracks_materialized_count() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("counter.fidx2");
+
+        let mut idx = MmapFieldIndex::new("x".into());
+        idx.set_path(path.clone());
+        assert_eq!(idx.count_all(), 0);
+
+        // Overlay-only inserts, including a duplicate (must not double-count).
+        idx.insert_value(1, &json!({"x": 10}));
+        idx.insert_value(2, &json!({"x": 10}));
+        idx.insert_value(3, &json!({"x": 20}));
+        idx.insert_value(3, &json!({"x": 20})); // dup insert
+        assert_eq!(idx.count_all(), 3);
+        assert_eq!(idx.count_all(), count_all_by_materializing(&idx));
+
+        // Overlay remove + remove of a pair that exists nowhere.
+        idx.remove_value(2, &json!({"x": 10}));
+        idx.remove_value(99, &json!({"x": 777})); // phantom remove
+        assert_eq!(idx.count_all(), 2);
+        assert_eq!(idx.count_all(), count_all_by_materializing(&idx));
+
+        // Persist folds overlay into the mmap; counter re-derived.
+        idx.persist().unwrap();
+        assert_eq!(idx.count_all(), 2);
+        assert_eq!(idx.count_all(), count_all_by_materializing(&idx));
+
+        // Reopen seeds the counter from the entry headers.
+        let mut idx = MmapFieldIndex::open(&path).unwrap();
+        idx.set_path(path.clone());
+        assert_eq!(idx.count_all(), 2);
+
+        // Tombstone an mmap-resident pair; a duplicate remove of the same
+        // pair must not decrement twice.
+        idx.remove_value(1, &json!({"x": 10}));
+        idx.remove_value(1, &json!({"x": 10})); // dup tombstone
+        assert_eq!(idx.count_all(), 1);
+        assert_eq!(idx.count_all(), count_all_by_materializing(&idx));
+
+        // Re-insert after tombstone: overlay add while the mmap copy stays
+        // tombstoned — exactly one pair visible again for doc 1.
+        idx.insert_value(1, &json!({"x": 10}));
+        assert_eq!(idx.count_all(), 2);
+        assert_eq!(idx.count_all(), count_all_by_materializing(&idx));
+
+        // Persist again after tombstone + re-insert; then a mixed sequence.
+        idx.persist().unwrap();
+        assert_eq!(idx.count_all(), 2);
+        assert_eq!(idx.count_all(), count_all_by_materializing(&idx));
+
+        idx.insert_value(4, &json!({"x": 30}));
+        idx.remove_value(3, &json!({"x": 20})); // tombstone mmap pair
+        assert_eq!(idx.count_all(), 2);
+        assert_eq!(idx.count_all(), count_all_by_materializing(&idx));
+
+        idx.clear();
+        assert_eq!(idx.count_all(), 0);
+        assert_eq!(idx.count_all(), count_all_by_materializing(&idx));
+    }
+
+    /// The lazy asc/desc iterators must yield exactly what `merged_all()`
+    /// yields — union on mmap/overlay value collisions, tombstones applied,
+    /// fully-tombstoned entries skipped. (The old desc iterator dropped the
+    /// mmap side's doc ids whenever an overlay write collided on the same
+    /// value, and yielded tombstoned ids.)
+    #[test]
+    fn lazy_iterators_match_merged_all() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("lazy.fidx2");
+
+        let mut idx = MmapFieldIndex::new("x".into());
+        idx.set_path(path.clone());
+        for (id, v) in [(1, 10), (2, 10), (3, 20), (4, 30), (5, 40)] {
+            idx.insert_value(id, &json!({ "x": v }));
+        }
+        idx.persist().unwrap();
+
+        let mut idx = MmapFieldIndex::open(&path).unwrap();
+        idx.set_path(path.clone());
+        idx.insert_value(6, &json!({"x": 10})); // collides with mmap value 10
+        idx.insert_value(7, &json!({"x": 25})); // overlay-only value
+        idx.remove_value(4, &json!({"x": 30})); // tombstones the whole 30 entry
+        idx.remove_value(3, &json!({"x": 20})); // tombstones part of the view
+
+        fn normalize(
+            entries: impl IntoIterator<Item = (IndexValue, DocIdSet)>,
+        ) -> Vec<(IndexValue, BTreeSet<DocumentId>)> {
+            entries
+                .into_iter()
+                .map(|(v, ids)| (v, ids.to_btreeset()))
+                .collect()
+        }
+
+        let expected = normalize(idx.merged_all());
+        let asc = normalize(idx.iter_asc());
+        let desc_reversed = {
+            let mut d = normalize(idx.iter_desc());
+            d.reverse();
+            d
+        };
+
+        assert_eq!(asc, expected);
+        assert_eq!(desc_reversed, expected);
+
+        // The collision case explicitly: value 10 must contain BOTH the mmap
+        // ids and the overlay id.
+        let ten = asc
+            .iter()
+            .find(|(v, _)| v == &IndexValue::Integer(10))
+            .unwrap();
+        assert_eq!(ten.1, BTreeSet::from([1, 2, 6]));
+        // 30 is fully tombstoned — absent; 20 lost doc 3.
+        assert!(!asc.iter().any(|(v, _)| v == &IndexValue::Integer(30)));
+        assert!(!asc.iter().any(|(_, ids)| ids.contains(&3) || ids.contains(&4)));
     }
 
     #[test]
