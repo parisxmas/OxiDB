@@ -516,6 +516,10 @@ pub struct CompositeKey(pub Vec<IndexValue>);
 pub struct CompositeIndex {
     pub fields: Vec<String>,
     tree: BTreeMap<CompositeKey, DocIdSet>,
+    /// When `Some`, entries live in an mmap'd `.mcidx` file and `tree` stays
+    /// empty — the disk-first variant (resident memory: write overlay only).
+    #[cfg(not(target_arch = "wasm32"))]
+    disk: Option<crate::mmap_composite_index::MmapCompositeIndex>,
 }
 
 impl CompositeIndex {
@@ -523,6 +527,50 @@ impl CompositeIndex {
         Self {
             fields,
             tree: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            disk: None,
+        }
+    }
+
+    /// Create an empty disk-backed composite index whose entries will live
+    /// in `path` (an mmap'd `.mcidx` file). Used in disk-first mode.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn new_disk(fields: Vec<String>, path: std::path::PathBuf) -> Self {
+        let mut m = crate::mmap_composite_index::MmapCompositeIndex::new(fields.clone());
+        m.set_path(path);
+        Self {
+            fields,
+            tree: BTreeMap::new(),
+            disk: Some(m),
+        }
+    }
+
+    /// Reopen a persisted disk-backed composite by mmap'ing its `.mcidx` —
+    /// instant, no deserialization, empty write overlay.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_disk(path: &std::path::Path) -> io::Result<Self> {
+        let mut m = crate::mmap_composite_index::MmapCompositeIndex::open(path)?;
+        m.set_path(path.to_path_buf());
+        Ok(Self {
+            fields: m.fields.clone(),
+            tree: BTreeMap::new(),
+            disk: Some(m),
+        })
+    }
+
+    /// True when entries live in the mmap'd `.mcidx` backend.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn is_disk(&self) -> bool {
+        self.disk.is_some()
+    }
+
+    /// Flush the disk-backed overlay to its `.mcidx` file. No-op for the
+    /// in-RAM variant and for a clean disk index.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn persist_disk(&mut self) -> io::Result<()> {
+        match &mut self.disk {
+            Some(m) => m.persist(),
+            None => Ok(()),
         }
     }
 
@@ -534,6 +582,10 @@ impl CompositeIndex {
     /// B-tree node storage plus the heap owned by string key components and
     /// large doc-id sets.
     pub fn memory_bytes(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &self.disk {
+            return m.memory_bytes();
+        }
         // Per-entry B-tree overhead: key + value inline sizes + node bookkeeping.
         let per_entry = std::mem::size_of::<CompositeKey>() + std::mem::size_of::<DocIdSet>() + 24;
         let mut total = self.tree.len() * per_entry;
@@ -578,6 +630,11 @@ impl CompositeIndex {
     /// yields group runs. The callback returns `false` to stop early. Used by
     /// the covered-aggregation fast path.
     pub fn for_each_entry<F: FnMut(&[IndexValue], &DocIdSet) -> bool>(&self, mut f: F) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &self.disk {
+            m.for_each_prefix_entries(&[], f);
+            return;
+        }
         for (key, ids) in &self.tree {
             if !f(&key.0, ids) {
                 return;
@@ -587,17 +644,32 @@ impl CompositeIndex {
 
     pub fn insert(&mut self, doc: &Document) {
         let key = self.extract_key(doc);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &mut self.disk {
+            m.insert_key(doc.id, key);
+            return;
+        }
         self.tree.entry(key).or_default().insert(doc.id);
     }
 
     /// Insert using a &Value directly — avoids constructing a Document.
     pub fn insert_value(&mut self, id: DocumentId, data: &Value) {
         let key = self.extract_key_from_value(data);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &mut self.disk {
+            m.insert_key(id, key);
+            return;
+        }
         self.tree.entry(key).or_default().insert(id);
     }
 
     pub fn remove(&mut self, doc: &Document) {
         let key = self.extract_key(doc);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &mut self.disk {
+            m.remove_key(doc.id, key);
+            return;
+        }
         if let Some(set) = self.tree.get_mut(&key) {
             set.remove(&doc.id);
             if set.is_empty() {
@@ -609,6 +681,11 @@ impl CompositeIndex {
     /// Remove using a &Value directly — avoids constructing a Document.
     pub fn remove_value(&mut self, id: DocumentId, data: &Value) {
         let key = self.extract_key_from_value(data);
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &mut self.disk {
+            m.remove_key(id, key);
+            return;
+        }
         if let Some(set) = self.tree.get_mut(&key) {
             set.remove(&id);
             if set.is_empty() {
@@ -620,6 +697,10 @@ impl CompositeIndex {
     /// Remove all entries from the index.
     pub fn clear(&mut self) {
         self.tree.clear();
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &mut self.disk {
+            m.clear();
+        }
     }
 
     // -- Binary serialization -------------------------------------------------
@@ -692,12 +773,28 @@ impl CompositeIndex {
             };
             tree.insert(CompositeKey(key_values), ids);
         }
-        Ok(Self { fields, tree })
+        Ok(Self {
+            fields,
+            tree,
+            #[cfg(not(target_arch = "wasm32"))]
+            disk: None,
+        })
     }
 
     // -- Query helpers -------------------------------------------------------
 
     pub fn find_exact(&self, key: &CompositeKey) -> BTreeSet<DocumentId> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &self.disk {
+            // Slot count is fixed, so the full tuple as a "prefix" matches
+            // exactly the one entry (merged with any overlay twin).
+            let mut result = BTreeSet::new();
+            m.for_each_prefix_entries(&key.0, |_, ids| {
+                result.extend(ids.iter());
+                true
+            });
+            return result;
+        }
         self.tree
             .get(key)
             .map(|ids| ids.to_btreeset())
@@ -708,6 +805,15 @@ impl CompositeIndex {
     /// Works because Vec ordering is lexicographic: keys sharing the prefix
     /// are contiguous in the BTreeMap.
     pub fn find_prefix(&self, prefix: &[IndexValue]) -> BTreeSet<DocumentId> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &self.disk {
+            let mut result = BTreeSet::new();
+            m.for_each_prefix_entries(prefix, |_, ids| {
+                result.extend(ids.iter());
+                true
+            });
+            return result;
+        }
         let mut result = BTreeSet::new();
         let start = CompositeKey(prefix.to_vec());
 
@@ -732,6 +838,11 @@ impl CompositeIndex {
         prefix: &[IndexValue],
         mut f: F,
     ) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &self.disk {
+            m.for_each_prefix_entries(prefix, f);
+            return;
+        }
         let start = CompositeKey(prefix.to_vec());
         for (key, ids) in self.tree.range(start..) {
             if key.0.len() < prefix.len() || key.0[..prefix.len()] != *prefix {
@@ -750,6 +861,21 @@ impl CompositeIndex {
     where
         F: FnMut(DocumentId) -> bool,
     {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &self.disk {
+            let mut cont = true;
+            m.for_each_prefix_entries(prefix, |_, ids| {
+                for &id in ids.iter() {
+                    if !f(id) {
+                        cont = false;
+                        return false;
+                    }
+                }
+                true
+            });
+            let _ = cont;
+            return;
+        }
         let start = CompositeKey(prefix.to_vec());
         for (key, ids) in self.tree.range(start..) {
             if key.0.len() < prefix.len() || key.0[..prefix.len()] != *prefix {
@@ -770,6 +896,26 @@ impl CompositeIndex {
         F: FnMut(DocumentId) -> bool,
     {
         if prefix.is_empty() {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &self.disk {
+            // Collect the prefix range forward, then replay it backwards —
+            // correct, at the cost of materializing the (usually small)
+            // range. A lazy descending mmap walk is a later optimization.
+            let mut entries: Vec<DocIdSet> = Vec::new();
+            m.for_each_prefix_entries(prefix, |_, ids| {
+                entries.push(ids.clone());
+                true
+            });
+            for ids in entries.iter().rev() {
+                let ids: Vec<DocumentId> = ids.iter().copied().collect();
+                for &id in ids.iter().rev() {
+                    if !f(id) {
+                        return;
+                    }
+                }
+            }
             return;
         }
 
@@ -819,6 +965,28 @@ impl CompositeIndex {
         let mut result = BTreeSet::new();
         let prefix_len = prefix.len();
         let range_idx = prefix_len;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &self.disk {
+            m.for_each_prefix_entries(prefix, |slots, ids| {
+                if let Some(val) = slots.get(range_idx) {
+                    let in_range = (match &range_start {
+                        Bound::Unbounded => true,
+                        Bound::Included(s) => val >= *s,
+                        Bound::Excluded(s) => val > *s,
+                    }) && (match &range_end {
+                        Bound::Unbounded => true,
+                        Bound::Included(e) => val <= *e,
+                        Bound::Excluded(e) => val < *e,
+                    });
+                    if in_range {
+                        result.extend(ids.iter());
+                    }
+                }
+                true
+            });
+            return result;
+        }
 
         let scan_start = CompositeKey(prefix.to_vec());
 

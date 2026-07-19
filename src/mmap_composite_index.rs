@@ -327,6 +327,11 @@ impl MmapCompositeIndex {
 
     pub fn insert_value(&mut self, id: DocumentId, data: &Value) {
         let key = self.extract_key(data);
+        self.insert_key(id, key);
+    }
+
+    /// Insert a pre-extracted key (callers that already resolved the slots).
+    pub fn insert_key(&mut self, id: DocumentId, key: CompositeKey) {
         if self.overlay.entry(key).or_default().insert(id) {
             self.total_ids += 1;
         }
@@ -334,6 +339,13 @@ impl MmapCompositeIndex {
 
     pub fn remove_value(&mut self, id: DocumentId, data: &Value) {
         let key = self.extract_key(data);
+        self.remove_key(id, key);
+    }
+
+    /// Remove a pre-extracted key: overlay first, else tombstone the mmap
+    /// layer (once per pair; `total_ids` drops only when the pair really
+    /// exists somewhere).
+    pub fn remove_key(&mut self, id: DocumentId, key: CompositeKey) {
         if let Some(set) = self.overlay.get_mut(&key) {
             if set.remove(&id) {
                 if set.is_empty() {

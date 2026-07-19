@@ -351,9 +351,41 @@ impl BTreeCollection {
 
         let cidx_path = data_dir.join(format!("{}.cidx", name));
         let composite_indexes = if !persisted_indexes.is_empty() {
-            let loaded =
-                index_persist::load_composite_indexes(&cidx_path, doc_count, max_id + 1, None);
-            loaded.unwrap_or_default()
+            if disk_first {
+                // Disk-first composites reopen from their mmap'd `.mcidx`
+                // (instant); a missing/corrupt file rebuilds from a scan and
+                // persists — the same fallback shape as `.mfidx` above.
+                let mut v = Vec::new();
+                for info in persisted_indexes
+                    .iter()
+                    .filter(|i| i.index_type == "composite")
+                {
+                    let mpath =
+                        data_dir.join(format!("{}.{}.mcidx", name, info.fields.join("_")));
+                    let idx = match CompositeIndex::open_disk(&mpath) {
+                        Ok(idx) => idx,
+                        Err(_) => {
+                            let mut idx = CompositeIndex::new_disk(info.fields.clone(), mpath);
+                            storage.scan_all_while(|_id, bytes| {
+                                if let Ok(doc) = crate::codec::decode_doc(bytes) {
+                                    if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
+                                        idx.insert_value(id, &doc);
+                                    }
+                                }
+                                Ok(true)
+                            })?;
+                            let _ = idx.persist_disk();
+                            idx
+                        }
+                    };
+                    v.push(idx);
+                }
+                v
+            } else {
+                let loaded =
+                    index_persist::load_composite_indexes(&cidx_path, doc_count, max_id + 1, None);
+                loaded.unwrap_or_default()
+            }
         } else {
             Vec::new()
         };
@@ -845,8 +877,15 @@ impl BTreeCollection {
         if !self.storage.is_disk_first() {
             return;
         }
-        let mut fi = self.field_indexes.write();
-        for idx in fi.values_mut() {
+        {
+            let mut fi = self.field_indexes.write();
+            for idx in fi.values_mut() {
+                let _ = idx.persist_disk();
+            }
+        }
+        // Composites too — skip-clean persist makes an idle tick free.
+        let mut ci = self.composite_indexes.write();
+        for idx in ci.iter_mut() {
             let _ = idx.persist_disk();
         }
     }
@@ -981,8 +1020,11 @@ impl BTreeCollection {
             );
         }
 
-        // Save composite indexes
-        {
+        // Save composite indexes. Disk-first composites are authoritative in
+        // their own `.mcidx` files (persisted by the sync tick / shutdown
+        // via persist_disk_indexes) — writing the `.cidx` cache from their
+        // empty in-RAM trees would clobber it with nothing.
+        if !self.storage.is_disk_first() {
             let ci = self.composite_indexes.read();
             if !ci.is_empty() {
                 let cidx_path = self.data_dir.join(format!("{}.cidx", self.name));
@@ -2969,6 +3011,19 @@ impl BTreeCollection {
             }
         }
 
+        // Disk-first collections keep composite entries in an mmap'd
+        // `.mcidx` (write overlay only resident), like field indexes'
+        // `.mfidx`; in-RAM collections keep the BTreeMap variant.
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut idx = if self.storage.is_disk_first() {
+            let mpath = self
+                .data_dir
+                .join(format!("{}.{}.mcidx", self.name, name));
+            CompositeIndex::new_disk(fields, mpath)
+        } else {
+            CompositeIndex::new(fields)
+        };
+        #[cfg(target_arch = "wasm32")]
         let mut idx = CompositeIndex::new(fields);
 
         // Backfill
@@ -2979,6 +3034,8 @@ impl BTreeCollection {
             }
             Ok(true)
         })?;
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = idx.persist_disk();
 
         let mut ci = self.composite_indexes.write();
         ci.push(idx);
@@ -4408,6 +4465,64 @@ mod tests {
         // also can't fully satisfy. Should return None.
         let result = col.find_oxiwire_bytes(&query, &FindOptions::default());
         assert!(result.is_none(), "mixed-op queries should fall back");
+    }
+
+    /// Disk-first composites live in `.mcidx`: created there, reopened from
+    /// the mmap, and mutations (overlay + tombstones) survive a
+    /// persist/reopen cycle. (OXIDB_DISK_FIRST defaults ON, so `open` here
+    /// builds the disk variant.)
+    #[test]
+    fn disk_first_composite_survives_reopen_and_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let desc_by_salary = FindOptions {
+            sort: Some(vec![("salary".to_string(), crate::query::SortOrder::Desc)]),
+            skip: None,
+            limit: Some(3),
+        };
+        {
+            let col = BTreeCollection::open("mc", dir.path(), None).unwrap();
+            for i in 0..50i64 {
+                let dept = if i % 2 == 0 { "eng" } else { "ops" };
+                col.insert(json!({"dept": dept, "salary": i * 10}))
+                    .unwrap();
+            }
+            col.create_composite_index(vec!["dept".to_string(), "salary".to_string()])
+                .unwrap();
+            assert!(
+                dir.path().join("mc.dept_salary.mcidx").exists(),
+                "disk-first composite must persist to .mcidx at creation"
+            );
+            let res = col
+                .find_with_options(&json!({"dept": "eng"}), &desc_by_salary)
+                .unwrap();
+            assert_eq!(res.len(), 3);
+            assert_eq!(res[0]["salary"], 480);
+            col.sync_writes().unwrap();
+        }
+        {
+            // Reopen: the composite comes back from the mmap and serves the
+            // same query; a delete tombstones its entry.
+            let col = BTreeCollection::open("mc", dir.path(), None).unwrap();
+            let res = col
+                .find_with_options(&json!({"dept": "eng"}), &desc_by_salary)
+                .unwrap();
+            assert_eq!(res[0]["salary"], 480);
+            let deleted = col.delete(&json!({"salary": 480}), None).unwrap();
+            assert_eq!(deleted.len(), 1);
+            let res = col
+                .find_with_options(&json!({"dept": "eng"}), &desc_by_salary)
+                .unwrap();
+            assert_eq!(res[0]["salary"], 460);
+            col.sync_writes().unwrap();
+        }
+        {
+            // Third open: the tombstone was folded into the rewritten file.
+            let col = BTreeCollection::open("mc", dir.path(), None).unwrap();
+            let res = col
+                .find_with_options(&json!({"dept": "eng"}), &desc_by_salary)
+                .unwrap();
+            assert_eq!(res[0]["salary"], 460);
+        }
     }
 
     /// Cold path — doc_cache evicted, bytes_cache empty → must read
