@@ -185,6 +185,7 @@ const navGroups: {
     icon: 'database',
     items: [
       { href: '/sql', label: 'SQL Reference', icon: 'database' },
+      { href: '/sql-internals', label: 'How It Works', icon: 'book' },
       { href: '/procedures', label: 'Stored Procedures', icon: 'code' },
     ],
   },

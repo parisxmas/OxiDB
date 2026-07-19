@@ -10,7 +10,7 @@ export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<section class="section">
   <div class="container">
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg> SQL Engine</h2>
-    <p class="section-desc">A full relational SQL engine mounted alongside the document engine in the same process. It owns entirely separate files &mdash; a collection name and a table name never collide. Off by default; zero cost when unused.</p>
+    <p class="section-desc">A full relational SQL engine mounted alongside the document engine in the same process. It owns entirely separate files &mdash; a collection name and a table name never collide. Off by default; zero cost when unused. For the internals &mdash; the life of a query, the transaction model, crash-atomic checkpoints, instant ALTER &mdash; read <a href="/sql-internals/">How the SQL Engine Works</a>.</p>
 
     <h3>Enable it</h3>
     <pre><code class="lang-bash"><span class="co"># Server: set OXIDB_SQL=1</span>
