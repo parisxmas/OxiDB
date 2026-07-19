@@ -16,6 +16,11 @@ use serde_json::{Value, json};
 #[derive(Default)]
 struct Buckets {
     documents: u64,
+    /// The mmap'd portion of `documents`: `.bdat`/`.bopts` files written by
+    /// disk-first collections (`OXIDB_DISK_FIRST`). Counted INSIDE
+    /// `documents` too — this is a breakdown, not a separate bucket — so the
+    /// dashboard can say "and this much of it is not resident".
+    documents_mmap: u64,
     sql: u64,
     tsdb: u64,
     blobs: u64,
@@ -51,6 +56,7 @@ pub fn snapshot_at(root: &Path) -> Value {
         "total_bytes": total,
         "engines": {
             "documents": b.documents,
+            "documents_mmap": b.documents_mmap,
             "sql": b.sql,
             "tsdb": b.tsdb,
             "blobs": b.blobs,
@@ -73,7 +79,20 @@ fn walk(root: &Path, dir: &Path, b: &mut Buckets) {
         if meta.is_dir() {
             walk(root, &path, b);
         } else {
-            *bucket_for(root, &path, b) += meta.len();
+            let len = meta.len();
+            let bucket = bucket_for(root, &path, b);
+            *bucket += len;
+            // Breakdown: disk-first document files (never a marker dir, so
+            // only reachable when bucket_for chose `documents`).
+            let is_docs = std::ptr::eq(bucket as *const u64, &b.documents as *const u64);
+            if is_docs
+                && matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("bdat") | Some("bopts")
+                )
+            {
+                b.documents_mmap += len;
+            }
         }
     }
 }
@@ -122,6 +141,8 @@ mod tests {
         let r = dir.path();
         put(r, "oxidb/orders.dat", 100); // document collection (named db)
         put(r, "oxidb/orders.wal", 10);
+        put(r, "oxidb/readings.bdat", 40); // disk-first collection (mmap'd)
+        put(r, "oxidb/readings.bopts", 1);
         put(r, "oxidb/sql/gen.1/products.rdat", 200); // SQL engine
         put(r, "analytics/sql/wal/live.wal", 30); // per-db SQL (ADR-0012)
         put(r, "oxidb/tsdb/blocks.1.tsb", 300); // TSDB
@@ -136,7 +157,8 @@ mod tests {
 
         let v = snapshot_at(r);
         let e = &v["engines"];
-        assert_eq!(e["documents"], 110, "collection data+wal only");
+        assert_eq!(e["documents"], 151, "collection data+wal+disk-first files");
+        assert_eq!(e["documents_mmap"], 41, "the mmap'd (.bdat/.bopts) breakdown");
         assert_eq!(e["sql"], 230, "both databases' sql dirs");
         assert_eq!(e["tsdb"], 300);
         assert_eq!(e["blobs"], 400);
@@ -145,6 +167,9 @@ mod tests {
         assert_eq!(e["messaging"], 100, "_mqtt + _amqp substrates");
         assert_eq!(e["pitr_archive"], 80);
         assert_eq!(e["system"], 95, "_auth + _profile");
-        assert_eq!(v["total_bytes"], 100 + 10 + 200 + 30 + 300 + 400 + 50 + 60 + 70 + 30 + 80 + 90 + 5);
+        assert_eq!(
+            v["total_bytes"],
+            100 + 10 + 41 + 200 + 30 + 300 + 400 + 50 + 60 + 70 + 30 + 80 + 90 + 5
+        );
     }
 }

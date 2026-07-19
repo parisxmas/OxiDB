@@ -28,6 +28,9 @@ services:
       # this demo's ~130 MB/day that would checkpoint twice a day, so cap it
       # lower and keep the ceiling obvious.
       OXIDB_WAL_CHECKPOINT_BYTES: "16777216"
+      # Documents live in an mmap'd file; only a 24 B/doc offset index is
+      # resident. RSS no longer scales with the retention window.
+      OXIDB_DISK_FIRST: "1"
     volumes:
       - oxidb-data:/data
     restart: unless-stopped

@@ -820,9 +820,15 @@ const DISK_NAMES = { documents:'document', sql:'SQL', tsdb:'time-series', blobs:
 const diskLine = u => {
   if (!u.diskEngines) return '';
   const parts = Object.entries(u.diskEngines)
-    .filter(([, v]) => v > 0)
+    .filter(([k, v]) => v > 0 && k !== 'documentsMmap')
     .sort((a, b) => b[1] - a[1])
-    .map(([k, v]) => `${DISK_NAMES[k] ?? k} ${fmtB(v)}`);
+    .map(([k, v]) => {
+      // Disk-first documents live in an mmap'd file, not resident memory —
+      // the honest annotation behind a small RSS next to a large dataset.
+      const label = k === 'documents' && u.docsMmapBytes > 0
+        ? `document ${fmtB(v)} (disk-first, mmap)` : `${DISK_NAMES[k] ?? k} ${fmtB(v)}`;
+      return label;
+    });
   return parts.length ? `<div class="res-meta">on disk: ${parts.join(' · ')}</div>` : '';
 };
 

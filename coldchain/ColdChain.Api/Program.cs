@@ -285,6 +285,8 @@ app.MapGet("/resources", async (OxiConnection oxi) =>
             Threads = I("threads"),
             UptimeSeconds = I("uptime_s"),
             DiskTotalBytes = B(disk, "total_bytes"),
+            // How much of `documents` is mmap'd disk-first data (not resident).
+            DocsMmapBytes = B(engines, "documents_mmap"),
             DiskEngines = new
             {
                 Documents = B(engines, "documents"),
