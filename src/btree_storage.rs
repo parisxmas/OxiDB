@@ -237,9 +237,21 @@ fn disk_compress_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        !std::env::var("OXIDB_DISK_UNCOMPRESSED")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
-            .unwrap_or(false)
+        // Uncompressed is the DEFAULT since 0.38.9: per-record zstd cost the
+        // 1M-doc bench 4x on aggregations and 4x on index builds (every scan
+        // decompresses every record), for ~40% less disk. Compression is
+        // opt-in via OXIDB_DISK_COMPRESSED; the legacy OXIDB_DISK_UNCOMPRESSED
+        // flag is still honored (it now just states the default, and keeps
+        // winning if both are set). Existing records are self-describing
+        // (magic-byte sniffing), so flipping needs no migration.
+        let truthy = |v: &str| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on");
+        let force_off = std::env::var("OXIDB_DISK_UNCOMPRESSED")
+            .map(|v| truthy(&v))
+            .unwrap_or(false);
+        let opt_in = std::env::var("OXIDB_DISK_COMPRESSED")
+            .map(|v| truthy(&v))
+            .unwrap_or(false);
+        opt_in && !force_off
     })
 }
 

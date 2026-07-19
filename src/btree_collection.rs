@@ -2168,8 +2168,12 @@ impl BTreeCollection {
 
         let query = query::parse_query(query_json)?;
 
-        // Phase 1: Find matching docs (read lock on indexes)
-        let mut matches: Vec<(DocumentId, Value)> = Vec::new();
+        // Phase 1: Find matching docs (read lock on indexes). Keep each
+        // match's encoded bytes + decoded Value: phase 2 re-reads under the
+        // write locks for correctness, but when the bytes are unchanged (the
+        // overwhelmingly common case) a cheap memcmp lets it reuse the
+        // phase-1 decode instead of decoding every document twice.
+        let mut matches: Vec<(DocumentId, Vec<u8>, Arc<Value>)> = Vec::new();
         {
             let fi = self.field_indexes.read();
             let mut lazy_handled = false;
@@ -2177,10 +2181,10 @@ impl BTreeCollection {
                 let skip_post_filter = query::is_fully_indexed(&query, &fi);
                 let lim = limit.unwrap();
                 let lazy_result = query::execute_indexed_lazy(&query, &fi, &mut |id| {
-                    if self.storage.contains_key(id) {
+                    if let Some(bytes) = self.storage.get(id) {
                         if let Some(arc) = self.load_doc_arc(id) {
                             if skip_post_filter || query::matches_value(&query, &arc) {
-                                matches.push((id, (*arc).clone()));
+                                matches.push((id, bytes, arc));
                                 if matches.len() >= lim {
                                     return false;
                                 }
@@ -2201,10 +2205,10 @@ impl BTreeCollection {
 
                 if let Some(ref indexed_ids) = candidate_ids {
                     for &id in indexed_ids {
-                        if self.storage.contains_key(id) {
-                            if let Some(data) = self.read_doc(id)? {
+                        if let Some(bytes) = self.storage.get(id) {
+                            if let Some(data) = self.load_doc_arc(id) {
                                 if query::matches_value(&query, &data) {
-                                    matches.push((id, data));
+                                    matches.push((id, bytes, data));
                                     if limit.is_some_and(|l| matches.len() >= l) {
                                         break;
                                     }
@@ -2218,9 +2222,11 @@ impl BTreeCollection {
                     // B-tree cursor scan
                     self.for_each_doc_arc_while(|id, arc| {
                         if query::matches_value(&query, arc) {
-                            matches.push((id, (**arc).clone()));
-                            if limit.is_some_and(|l| matches.len() >= l) {
-                                return Ok(false);
+                            if let Some(bytes) = self.storage.get(id) {
+                                matches.push((id, bytes, arc.clone()));
+                                if limit.is_some_and(|l| matches.len() >= l) {
+                                    return Ok(false);
+                                }
                             }
                         }
                         Ok(true)
@@ -2237,8 +2243,7 @@ impl BTreeCollection {
         // target is engine-locked. Surfaces before we prepare any
         // write so the rejection is clean and atomic — no partial
         // application.
-        self.check_worm_for_ids(matches.iter().map(|(id, _)| *id))?;
-        let matched_ids: Vec<DocumentId> = matches.into_iter().map(|(id, _)| id).collect();
+        self.check_worm_for_ids(matches.iter().map(|(id, _, _)| *id))?;
 
         // Phase 2+3 (merged): take the write locks, then RE-READ each
         // matched doc and compute the update against its CURRENT content.
@@ -2251,7 +2256,7 @@ impl BTreeCollection {
         // locks also makes the `_version` bump a true atomic RMW.
         struct UpdateOp {
             id: DocumentId,
-            old_data: Value,
+            old_data: Arc<Value>,
             new_data: Value,
             new_bytes: Vec<u8>,
         }
@@ -2261,20 +2266,31 @@ impl BTreeCollection {
         let mut ti = self.text_index.write();
         let mut vi = self.vector_indexes.write();
 
-        let mut ops = Vec::with_capacity(matched_ids.len());
-        for id in matched_ids {
+        // The per-doc compute (clone, apply the update, re-encode) is pure
+        // and dominates bulk updates — fan it out. Order is preserved, so
+        // WAL ordering and the returned id order are unchanged.
+        let compute = |(id, phase1_bytes, phase1_value): (DocumentId, Vec<u8>, Arc<Value>)|
+         -> Result<Option<UpdateOp>> {
             // Re-read under the write locks; storage is the source of truth.
             let Some(cur_bytes) = self.storage.get(id) else {
-                continue; // deleted since phase 1 — do not resurrect
+                return Ok(None); // deleted since phase 1 — do not resurrect
             };
-            let current = codec::decode_doc(&cur_bytes)?;
-            // Re-check the predicate: a concurrent update may have moved
-            // the doc out of the query's result set.
-            if !query::matches_value(&query, &current) {
-                continue;
-            }
+            // Unchanged bytes (no concurrent writer touched the doc — the
+            // common case) reuse phase 1's decode; only a changed doc pays
+            // a second decode.
+            let current: Arc<Value> = if cur_bytes == phase1_bytes {
+                phase1_value
+            } else {
+                let decoded = codec::decode_doc(&cur_bytes)?;
+                // Re-check the predicate: a concurrent update may have moved
+                // the doc out of the query's result set.
+                if !query::matches_value(&query, &decoded) {
+                    return Ok(None);
+                }
+                Arc::new(decoded)
+            };
 
-            let mut new_data = current.clone();
+            let mut new_data = (*current).clone();
             crate::update::apply_update(&mut new_data, update_json)?;
 
             let old_version = current
@@ -2288,13 +2304,26 @@ impl BTreeCollection {
 
             let new_bytes = codec::encode_doc(&new_data)?;
 
-            ops.push(UpdateOp {
+            Ok(Some(UpdateOp {
                 id,
                 old_data: current,
                 new_data,
                 new_bytes,
-            });
-        }
+            }))
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let computed: Result<Vec<Option<UpdateOp>>> = {
+            use rayon::prelude::*;
+            if matches.len() > 64 {
+                matches.into_par_iter().map(compute).collect()
+            } else {
+                matches.into_iter().map(compute).collect()
+            }
+        };
+        #[cfg(target_arch = "wasm32")]
+        let computed: Result<Vec<Option<UpdateOp>>> =
+            matches.into_iter().map(compute).collect();
+        let ops: Vec<UpdateOp> = computed?.into_iter().flatten().collect();
 
         if ops.is_empty() {
             return Ok(Vec::new());
@@ -2339,13 +2368,54 @@ impl BTreeCollection {
             self.wal_log_batch(&wal_entries)?;
         }
 
+        // Which document paths can this update touch? Indexes over
+        // unrelated fields need no maintenance at all — the bench's
+        // 50K-doc $set paid 11 field resolves + 3 composite key extractions
+        // per document for indexes the update could never change. `None`
+        // (an unrecognized operator) falls back to maintaining everything.
+        let changed_paths: Option<Vec<String>> = (|| {
+            let mut paths: Vec<String> = vec!["_version".to_string()];
+            for (op_name, arg) in update_obj {
+                match op_name.as_str() {
+                    "$set" | "$unset" | "$inc" | "$mul" | "$min" | "$max"
+                    | "$currentDate" | "$push" | "$pull" | "$addToSet" | "$pop" => {
+                        paths.extend(arg.as_object()?.keys().cloned());
+                    }
+                    "$rename" => {
+                        let obj = arg.as_object()?;
+                        paths.extend(obj.keys().cloned());
+                        paths.extend(obj.values().filter_map(|v| v.as_str().map(String::from)));
+                    }
+                    _ => return None,
+                }
+            }
+            Some(paths)
+        })();
+        // A path affects an index field when either is a prefix of the other
+        // (dot-separated): $set on "a" rewrites "a.b", $set on "a.b" changes "a".
+        let affects = |field: &str| -> bool {
+            match &changed_paths {
+                None => true,
+                Some(paths) => paths.iter().any(|p| {
+                    p == field
+                        || p.strip_prefix(field).is_some_and(|r| r.starts_with('.'))
+                        || field.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with('.'))
+                }),
+            }
+        };
+
         let mut updated_ids = Vec::with_capacity(ops.len());
+        let bulk = ops.len() > 64;
         for op in ops {
             // Update B-tree in-place (replace value)
             self.storage.insert(op.id, op.new_bytes);
 
-            // Update field indexes — only for fields whose value changed
+            // Update field indexes — only those the update can touch, and
+            // only when the value actually changed
             for idx in fi.values_mut() {
+                if !affects(&idx.field) {
+                    continue;
+                }
                 let old_val = crate::collection::resolve_field_in_value(&op.old_data, &idx.field);
                 let new_val = crate::collection::resolve_field_in_value(&op.new_data, &idx.field);
                 if old_val != new_val {
@@ -2354,8 +2424,10 @@ impl BTreeCollection {
                 }
             }
             for idx in ci.iter_mut() {
-                idx.remove_value(op.id, &op.old_data);
-                idx.insert_value(op.id, &op.new_data);
+                if !idx.fields.iter().any(|f| affects(f)) {
+                    continue;
+                }
+                idx.update_value(op.id, &op.old_data, &op.new_data);
             }
             if let Some(ref mut text_idx) = *ti {
                 text_idx.index_doc(op.id, &op.new_data);
@@ -2366,7 +2438,14 @@ impl BTreeCollection {
             }
 
             self.invalidate_bytes_cache(op.id);
-            self.doc_cache.put(op.id, Arc::new(op.new_data));
+            // Small updates keep the cache warm (read-after-write); bulk
+            // updates would just churn the LRU and evict genuinely hot
+            // entries, so they invalidate instead.
+            if bulk {
+                self.doc_cache.remove(op.id);
+            } else {
+                self.doc_cache.put(op.id, Arc::new(op.new_data));
+            }
             updated_ids.push(op.id);
         }
         if !updated_ids.is_empty() {
@@ -2484,8 +2563,7 @@ impl BTreeCollection {
             }
         }
         for idx in ci.iter_mut() {
-            idx.remove_value(id, &old_data);
-            idx.insert_value(id, &new_data);
+            idx.update_value(id, &old_data, &new_data);
         }
         if let Some(ref mut text_idx) = *ti {
             text_idx.index_doc(id, &new_data);

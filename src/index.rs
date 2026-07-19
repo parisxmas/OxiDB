@@ -678,6 +678,32 @@ impl CompositeIndex {
         }
     }
 
+    /// Re-key a document after an update — a no-op when none of this
+    /// composite's fields changed. Callers used to do an unconditional
+    /// remove+insert, which on the disk-backed variant meant a tombstone
+    /// plus an overlay entry per document for indexes the update never
+    /// touched (the 1M-doc bench's UpdateMany paid this three times over).
+    pub fn update_value(&mut self, id: DocumentId, old_data: &Value, new_data: &Value) {
+        let old_key = self.extract_key_from_value(old_data);
+        let new_key = self.extract_key_from_value(new_data);
+        if old_key == new_key {
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(m) = &mut self.disk {
+            m.remove_key(id, old_key);
+            m.insert_key(id, new_key);
+            return;
+        }
+        if let Some(set) = self.tree.get_mut(&old_key) {
+            set.remove(&id);
+            if set.is_empty() {
+                self.tree.remove(&old_key);
+            }
+        }
+        self.tree.entry(new_key).or_default().insert(id);
+    }
+
     /// Remove using a &Value directly — avoids constructing a Document.
     pub fn remove_value(&mut self, id: DocumentId, data: &Value) {
         let key = self.extract_key_from_value(data);
