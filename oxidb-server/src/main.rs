@@ -1112,6 +1112,11 @@ FLAGS:
 CORE:
     OXIDB_ADDR             listen address           (default 127.0.0.1:4444)
     OXIDB_DATA             data directory           (default ./oxidb_data)
+    OXIDB_DISK_FIRST       document bodies in an mmap'd file, only a ~24 B/doc
+                           offset index resident — RSS does not scale with the
+                           dataset (default ON; set 0 for always-resident,
+                           fastest-read mode; existing collections keep their
+                           format either way)
     OXIDB_POOL_SIZE        worker threads           (default 4)
     OXIDB_IDLE_TIMEOUT     idle disconnect secs     (default 30, 0 = never)
 

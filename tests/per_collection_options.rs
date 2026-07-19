@@ -15,12 +15,6 @@ fn file(dir: &std::path::Path, name: &str) -> bool {
 
 #[test]
 fn mixed_disk_first_and_in_ram_collections_in_one_engine() {
-    // Guard: this test is only meaningful when the process default is in-RAM.
-    if std::env::var("OXIDB_DISK_FIRST").is_ok() {
-        eprintln!("skipping: OXIDB_DISK_FIRST is set");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     {
         let db = OxiDb::open(dir.path()).unwrap();
@@ -36,7 +30,18 @@ fn mixed_disk_first_and_in_ram_collections_in_one_engine() {
         )
         .unwrap();
 
-        // "small": default (in-RAM) — created implicitly by first insert.
+        // "small": explicitly in-RAM. (Was "the default" until disk-first
+        // BECAME the default; the point of this test is that the storage
+        // shape is per-collection, so both modes are pinned explicitly.)
+        db.create_collection_with_options(
+            "small",
+            StorageOptions {
+                disk_first: false,
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap();
+
         for i in 0..500u64 {
             db.insert("fast", json!({ "k": i, "v": i * 2 })).unwrap();
             db.insert("small", json!({ "k": i, "v": i * 3 })).unwrap();

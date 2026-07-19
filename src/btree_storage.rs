@@ -19,8 +19,8 @@
 //!   ... last child_page follows after last entry
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // On native targets the storage map is `scc::HashMap` (lock-free, per-bucket
 // locking). On `wasm32-unknown-unknown` scc is unusable: its first bucket-array
@@ -201,15 +201,20 @@ pub struct BTreeStorage {
     opts: StorageOptions,
 }
 
-/// Whether disk-first storage is enabled (env `OXIDB_DISK_FIRST` truthy).
-/// Read once. Off by default — the in-RAM path is unchanged.
+/// Whether disk-first storage is enabled. **ON by default** since 0.38:
+/// resident memory should not scale with the dataset out of the box. Set
+/// `OXIDB_DISK_FIRST=0` for the old always-resident mode (fastest point
+/// reads, RAM proportional to data). Read once. Existing collections keep
+/// whichever format they were created with — the on-disk format (and
+/// `.bopts`) is authoritative over this flag, so flipping it never
+/// reinterprets existing data.
 #[cfg(not(target_arch = "wasm32"))]
 fn disk_first_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("OXIDB_DISK_FIRST")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+        !std::env::var("OXIDB_DISK_FIRST")
+            .map(|v| v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
             .unwrap_or(false)
     })
 }
@@ -306,11 +311,13 @@ pub struct StorageOptions {
 }
 
 impl Default for StorageOptions {
-    /// In-RAM, compressed, auto-compaction on with the standard thresholds —
-    /// matches the engine's defaults when no env vars are set.
+    /// Disk-first, compressed, auto-compaction on with the standard
+    /// thresholds — matches the engine's defaults when no env vars are set.
+    /// (In-memory-mode and wasm collections go through `new_in_memory`,
+    /// which does not consult these options.)
     fn default() -> Self {
         Self {
-            disk_first: false,
+            disk_first: true,
             compress: true,
             auto_compact: true,
             compact_min_bytes: 4 * 1024 * 1024,

@@ -95,6 +95,7 @@ Opt-in via `OXIDB_PITR`. `ArchiveSequencer` (`pitr.rs`) hands every durable WAL 
 Length-prefixed JSON over TCP (max 16 MiB). Auth via SCRAM-SHA-256. RBAC roles: Admin, ReadWrite, Read. Configurable via env vars:
 - `OXIDB_ADDR` (default `127.0.0.1:4444`)
 - `OXIDB_DATA` (default `./oxidb_data`)
+- `OXIDB_DISK_FIRST` (default ON since 0.38-line: document bodies live in an mmap'd `.bdat` with only a ~24 B/doc offset index resident; `0` restores the always-resident `.btree` mode. Existing collections keep their created format — `.bopts`/on-disk format is authoritative over the env)
 - `OXIDB_POOL_SIZE` (default 4 worker threads)
 - `OXIDB_IDLE_TIMEOUT` (default 30s, 0 = never)
 - `OXIDB_AUDIT` (default off; set to `true`/`1` to enable audit log)

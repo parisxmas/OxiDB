@@ -43,6 +43,7 @@ export default function Page() {
           <tr><td><code>OXIDB_DATA</code></td><td><code>./oxidb_data</code></td><td>Data directory (also holds <code>raft_meta.json</code> + <code>raft_log.jsonl</code>)</td></tr>
           <tr><td><code>OXIDB_POOL_SIZE</code></td><td><code>4</code></td><td>Worker thread count</td></tr>
           <tr><td><code>OXIDB_IDLE_TIMEOUT</code></td><td><code>30</code></td><td>Connection timeout (seconds, 0 = never)</td></tr>
+          <tr><td><code>OXIDB_DISK_FIRST</code></td><td><code>1</code> (on)</td><td>Document bodies in an mmap'd file; only a ~24&nbsp;B/doc offset index stays resident, so RSS does not scale with the dataset. <code>0</code> = always-resident mode (fastest point reads). Existing collections keep their format.</td></tr>
           <tr><td><code>OXIDB_WAL_CHECKPOINT_BYTES</code></td><td><code>67108864</code></td><td>Checkpoint the document WAL online past this size (64&nbsp;MiB; <code>0</code> = only at shutdown)</td></tr>
           <tr><td colspan="3" style="padding-top:10px;color:var(--text-mute);font-family:var(--font-mono);font-size:11px;letter-spacing:0.16em;text-transform:uppercase">Protocol listeners (off unless set)</td></tr>
           <tr><td><code>OXIDB_MQTT_PORT</code></td><td>—</td><td><a href="/mqtt/">MQTT 3.1.1 broker</a> (+ <code>OXIDB_MQTT_USER</code>/<code>_PASSWORD</code>, <code>OXIDB_MQTT_PERSIST</code>)</td></tr>

@@ -45,13 +45,21 @@ fn encrypted_data_not_plain_text() {
         .unwrap();
     drop(db);
 
-    // Read the raw .dat file — it should NOT contain the plaintext
-    let dat = std::fs::read(dir.path().join("secrets.btree")).unwrap();
-    let dat_str = String::from_utf8_lossy(&dat);
-    assert!(
-        !dat_str.contains("super_secret_123"),
-        "plaintext found in encrypted data file"
-    );
+    // No file the engine wrote may contain the plaintext — data file
+    // (.bdat under the disk-first default, .btree in-RAM), WAL, indexes,
+    // all of it. Scanning everything also keeps this test true whenever a
+    // new file type appears.
+    for entry in std::fs::read_dir(dir.path()).unwrap().flatten() {
+        if entry.path() == key_path {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path()).unwrap_or_default();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("super_secret_123"),
+            "plaintext found in {}",
+            entry.path().display()
+        );
+    }
 }
 
 /// Test that data is accessible without encryption key when not encrypted.
