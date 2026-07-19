@@ -1,0 +1,81 @@
+import type { Metadata } from "next"
+
+export const metadata: Metadata = {
+  title: "How the Document Engine Works",
+  description:
+    "A walk through OxiDB's document engine internals: the write path and group-commit fsync, index selection, disk-first storage, online WAL checkpointing, OCC transactions with pessimistic locks, TTL, PITR — and the crash-test discipline behind the claims.",
+}
+
+export default function Page() {
+  return <div dangerouslySetInnerHTML={{ __html: `<section class="section">
+  <div class="container">
+    <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> How the Document Engine Works</h2>
+
+    <p class="section-desc">The document engine is OxiDB's default engine: JSON documents in collections, MongoDB-style queries, no schema. This article walks through what actually happens under an <code>insert</code> and a <code>find</code> — the write path and its fsync contract, how queries pick indexes, where document bytes physically live, how the WAL stays bounded while the server runs, what the transactions really guarantee — and the crash-test discipline that keeps every one of those claims honest. Companion article for the relational side: <a href="/sql-internals/">How the SQL Engine Works</a>.</p>
+
+    <h3>The shape of the thing</h3>
+    <p>One engine instance per database. Collections are created implicitly on first insert and are independent of each other: each owns its WAL, its storage, its indexes, and its caches, so writes to different collections never contend. Within a collection, storage is a concurrent map with bucket-level locking — multiple threads insert and read in parallel without a collection-wide writer lock.</p>
+
+    <h3>Life of a write</h3>
+    <p>An acknowledged write has exactly one meaning: <em>it is on disk</em>. The path that enforces it:</p>
+    <ul>
+      <li><strong>1. WAL append.</strong> The document is encoded and appended to the collection's write-ahead log as a CRC-framed, sequence-numbered record. Appends from concurrent writers interleave freely.</li>
+      <li><strong>2. Apply.</strong> The document lands in the in-memory structures — storage, every index, the version counter. Steps 1 and 2 are bracketed by a shared <em>apply barrier</em>: a checkpoint that wants to seal the WAL waits for in-flight writers to finish their apply, which is the invariant that makes online checkpointing safe (below).</li>
+      <li><strong>3. Group-commit fsync.</strong> The ack waits for durability, but not for a private fsync. Concurrent writers share one: the first caller becomes the leader, snapshots the covered sequence, and flushes <em>outside</em> the lock — appends keep flowing while the disk works, which is exactly what lets the next batch build up. A caller whose append was already covered by someone else's flush returns without a syscall. On one connection you get clean per-write durability; on fifty, the fsyncs coalesce and throughput scales.</li>
+    </ul>
+
+    <h3>Life of a query</h3>
+    <p>A query is a small operator tree — <code>$eq</code>, <code>$gt</code>, <code>$in</code>, <code>$regex</code>, <code>$elemMatch</code>, <code>$and</code>/<code>$or</code>/<code>$nor</code>, <code>$expr</code> and friends. Execution is mechanical, not cost-based:</p>
+    <ul>
+      <li><strong>Index selection.</strong> Indexed fields store values in a single total order — <code>Null &lt; Bool &lt; Number &lt; DateTime &lt; String</code> — with ISO-8601 / RFC 3339 / date-like strings auto-detected and stored as epoch milliseconds, so a date range query works no matter how the application serialized its timestamps. Equality and range predicates on an indexed field collapse to B-tree range scans; composite indexes serve multi-field prefixes.</li>
+      <li><strong>Index-backed sort</strong> walks the index in order and stops at LIMIT — O(limit), not O(n&nbsp;log&nbsp;n). <strong>Index-only count</strong> answers from set sizes without touching a single document. <code>update_one</code>/<code>delete_one</code> stop at the first match.</li>
+      <li><strong>Honest post-filters.</strong> Some operators cannot use an index by nature (<code>$elemMatch</code>, <code>$not</code>, <code>$all</code>, <code>$size</code>, <code>$type</code>, <code>$mod</code>, <code>$nor</code>, <code>$expr</code>) — they run as filters over the candidate set, and <code>explain</code> tells you exactly which ones did.</li>
+    </ul>
+    <p>The aggregation pipeline (<code>$match</code>, <code>$group</code>, <code>$lookup</code>, <code>$facet</code>, <code>$setWindowFields</code>, and the time-series trio <code>$ohlcv</code> &rarr; <code>$densify</code> &rarr; <code>$fill</code>) executes stage by stage over the same machinery; <code>$match</code> heads use the same index paths a find does.</p>
+
+    <h3>Where documents physically live</h3>
+    <p>Since v0.38, <strong>disk-first is the default</strong>: document bytes live in an append-only, zstd-compressed, memory-mapped data file, and RAM holds only a ~24-byte-per-document offset index plus a bounded LRU cache of hot decoded documents. Resident memory tracks your working set, not your dataset — measured on a live 48-hour ingest workload, 489&nbsp;MB resident became ~35&nbsp;MB. Updates and deletes leave dead space that automatic compaction reclaims once it crosses a dead-space threshold. <code>OXIDB_DISK_FIRST=0</code> restores the fully-resident mode (fastest point reads, RAM proportional to data), and the choice is <em>per collection</em>, recorded next to the data — the on-disk format is authoritative over the environment, so flipping the flag never reinterprets existing collections.</p>
+    <p>Either way, the durable tree snapshot is written the same way: serialize to a temp file, fsync, atomically rename over the old snapshot. A crash mid-write leaves the previous snapshot intact. (A side effect you can watch on a dashboard: during the write, old and new coexist, so a disk-usage graph "breathes" by up to the snapshot size and settles at the rename.)</p>
+
+    <h3>Keeping the WAL bounded while the server runs</h3>
+    <p>A WAL that only truncates at graceful shutdown is unbounded for a server that runs for months. But truncating a live WAL naively <em>loses writes</em>: a writer appends its record before it applies, so a snapshot taken concurrently can miss a document whose record is about to be erased — measured, that cost ~3 in 2000 acknowledged writes. The engine therefore <strong>seals instead of truncating</strong>:</p>
+    <ul>
+      <li>Take the apply barrier exclusively for an instant — every in-flight writer finishes its apply, new ones wait <em>across a single rename</em>, nothing more.</li>
+      <li><code>seal()</code>: the live WAL is atomically renamed to a numbered segment; a fresh empty one takes its place. Every record in the sealed segment is now, by construction, already applied.</li>
+      <li>Writes resume. <em>Then</em> the snapshot is persisted — it necessarily covers the sealed segment — and the segment is retired.</li>
+    </ul>
+    <p>Every crash point is safe because recovery replays sealed segments as well as the live WAL, idempotently by document id: crash before the persist and the segment replays onto the old snapshot; crash between persist and retire and it replays onto the new one, harmlessly. This fires automatically past <code>OXIDB_WAL_CHECKPOINT_BYTES</code> (default 64&nbsp;MiB).</p>
+    <p class="note" style="border-left:2px solid var(--border);padding:2px 0 2px 15px;color:var(--text-mute)">One honest war story: the segment scanner once had a fast path whose sentinel file the checkpoint itself deleted — after which later segments were silently never retired <em>and never replayed</em>. It was caught because a demo dashboard's disk graph refused to behave, and it is why the sentinel is now a maintained invariant with a crash-replay regression test that was red before the fix. Claims here are only as good as the tests that pin them.</p>
+
+    <h3>Transactions: optimistic by default, pessimistic where it counts</h3>
+    <p>Transactions run OCC — optimistic concurrency control — with a three-phase commit:</p>
+    <ul>
+      <li><strong>Buffer.</strong> A transaction's writes queue up privately; its reads record <code>(document, version)</code> pairs into a read set. Nothing touches shared state.</li>
+      <li><strong>Validate.</strong> At commit, the involved collections lock <em>in sorted order</em> (a BTreeSet walk — two transactions can never lock in opposite orders, so deadlock is structurally impossible), and every read-set version is compared against the current one. A document changed under you &rarr; the transaction aborts and the application retries.</li>
+      <li><strong>Commit.</strong> The buffered writes apply and go durable through the same WAL + group-commit path as everything else — concurrent committers share fsyncs.</li>
+    </ul>
+    <p>OCC retries hurt exactly one workload: a <em>hot document</em> everyone updates (an exchange's order book account, an inventory counter). For that there is <code>find_for_update</code> — real pessimistic per-document locks taken inside a transaction, acquired in sorted id order, re-reading after acquisition so the recorded versions are the locked ones, held to commit, with lock-timeout as the deadlock answer. Contenders queue instead of retry-storming.</p>
+    <p>What this adds up to, stated precisely: committed transactions are <strong>serializable with respect to the items they read and wrote</strong>; phantoms and torn reads for non-transactional observers are admitted. The exact guarantee and its anomaly scorecard live in <code>docs/isolation.md</code> — and a characterization test suite pins the document so the code cannot drift from it silently.</p>
+
+    <h3>TTL: real deletion on a schedule</h3>
+    <p>A TTL index (<code>create_ttl_index(collection, field, expireAfterSeconds)</code>) is a normal field index plus a rule. A per-database sweeper thread ticks every second, computes <code>now &minus; expireAfterSeconds</code>, and range-scans the index — O(expired + log&nbsp;n), never a table scan. One subtlety worth naming: the range's lower bound is the <em>DateTime type floor</em>, not unbounded — in a total order where numbers sort below dates, an unbounded range would sweep in documents whose field is a number and delete them regardless of expiry. Eviction removes the real documents: storage, caches, every index, full-text entries. RAM frees immediately; disk follows at the next snapshot. Deletion isn't WAL-logged — if a crash intervenes before the snapshot, recovery resurrects the expired documents and the next sweep, one second later, removes them again.</p>
+
+    <h3>Search, vectors, and the background worker</h3>
+    <p>Full-text indexing is asynchronous by design: writes hand indexing jobs to a background worker over a bounded channel, so ingest latency never pays for tokenization. The index handles HTML, XML, JSON, PDF, DOCX, XLSX — and images via OCR when compiled in — with TF-IDF ranking. Vector indexes ride the same collection machinery for similarity search. Both are additional indexes over the same documents, not separate stores.</p>
+
+    <h3>Encryption, all the way down</h3>
+    <p>At-rest encryption (AES-GCM) sits at the storage layer, below everything above: data files, snapshots, and the WAL all encrypt when a key is supplied, and cost nothing when one is not. The test for it does not check a file — it scans <em>every file the engine writes</em> for plaintext, so a new file format cannot silently ship unencrypted.</p>
+
+    <h3>Point-in-time recovery</h3>
+    <p>PITR is opt-in (<code>OXIDB_PITR</code>) and zero-cost when off. On, every durable WAL write receives a global, monotonic, wall-clock-stamped sequence number, carried in the WAL's v2 record format. Sealed segments — the same ones online checkpointing produces — become the archive stream: a background archiver copies them, byte-verbatim with a trailer, into <code>_archive/</code> under a self-healing manifest, and owns their retirement. <code>restore_to_point</code> extracts a base backup and replays the archive forward to a GSN, a timestamp, or latest, cutting at transaction boundaries so a restore is never half a transaction.</p>
+
+    <h3>Scaling out</h3>
+    <p>Multiple isolated databases live under one server (<code>use_db</code>, per-database TTL and alert threads, per-database SQL engines). In cluster mode, writes replicate through Raft. And unlike SQL — which routes whole statements to one backend — document operations carry a collection and a shard key, so <a href="/clustering/">oxipool</a> can genuinely shard them: scatter, gather, and merge across shard groups, aggregations included.</p>
+
+    <h3>Proof over promises</h3>
+    <p>The engine's durability claims are enforced by a specific discipline: <strong>crash tests SIGKILL a subprocess</strong>, never drop a handle — because a graceful shutdown persists everything and hides exactly the bugs that matter. Where a race window is microseconds wide, a test hook widens it so the test fails deterministically without the guard rather than passing by luck. Fault-injection suites (fsync failures, partitions, process kills mid-commit) have each found at least one real bug; each is fixed and pinned by a regression test. The same engine, same defaults, runs a published 24-of-24 win against MongoDB on a 1M-document benchmark — and the crash suites run against the same configuration that benchmark does.</p>
+
+    <p>The query surface itself — operators, aggregation stages, index types — lives on the <a href="/queries/">Queries</a>, <a href="/aggregation/">Aggregation</a> and <a href="/indexes/">Indexes</a> pages; the transaction wire API is on <a href="/transactions/">Transactions</a>.</p>
+  </div>
+</section>` }} />
+}

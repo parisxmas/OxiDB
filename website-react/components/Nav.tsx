@@ -172,6 +172,7 @@ const navGroups: {
     icon: 'file',
     items: [
       { href: '/queries', label: 'Queries', icon: 'search' },
+      { href: '/document-internals', label: 'How It Works', icon: 'book' },
       { href: '/updates', label: 'Updates', icon: 'edit' },
       { href: '/aggregation', label: 'Aggregation', icon: 'activity' },
       { href: '/indexes', label: 'Indexes', icon: 'list' },

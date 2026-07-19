@@ -9,7 +9,7 @@ export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<section id="queries" class="section">
   <div class="container">
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Query Operators</h2>
-    <p class="section-desc">MongoDB-compatible query language with JSON syntax. Dot notation for nested fields.</p>
+    <p class="section-desc">MongoDB-compatible query language with JSON syntax. Dot notation for nested fields. For the internals &mdash; the write path and its fsync contract, index selection, disk-first storage, OCC transactions &mdash; read <a href="/document-internals/">How the Document Engine Works</a>.</p>
 
     <h3>Comparison</h3>
     <div class="table-wrap">
