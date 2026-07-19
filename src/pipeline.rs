@@ -3439,61 +3439,96 @@ pub(crate) fn try_composite_covered_group(
             lo: std::ops::Bound<IndexValue>,
             hi: std::ops::Bound<IndexValue>,
         },
+        /// Equality prefix + range filter, e.g. {region: "EU", ts: {$gte, $lt}}.
+        /// The lower bound must be bounded: with $lt/$lte alone a Null range
+        /// slot is "in bounds", and the composite cannot tell a missing field
+        /// (which matches_value rejects) from an explicit null (which it
+        /// accepts) — no cheap intersection count exists to cross-check the
+        /// disagreement away, so we forbid the shape that could produce it.
+        /// A bounded lower bound excludes Null on every path.
+        EqRange {
+            eq_field: String,
+            eq_value: IndexValue,
+            range_field: String,
+            lo: std::ops::Bound<IndexValue>,
+            hi: std::ops::Bound<IndexValue>,
+        },
     }
     let match_plan: MatchPlan = match match_query {
         None => MatchPlan::All,
         Some(q) => {
             use std::ops::Bound;
             let parsed = query::parse_query(q).ok()?;
-            if let Some(eqs) = query::extract_eq_conditions(&parsed) {
-                let fields: Vec<String> = eqs.keys().cloned().collect();
-                if eqs.len() != 1 || !query::is_eq_only_on(&parsed, &fields) {
+            // One pass over the (flat) conditions: collect at most one
+            // equality and at most one range field; anything else declines.
+            let conds: Vec<&query::Query> = match &parsed {
+                query::Query::All => Vec::new(),
+                query::Query::Field { .. } => vec![&parsed],
+                query::Query::And(subs) => subs.iter().collect(),
+                _ => return None,
+            };
+            let mut eq: Option<(String, IndexValue)> = None;
+            let mut range_field: Option<&str> = None;
+            let mut lo: Bound<IndexValue> = Bound::Unbounded;
+            let mut hi: Bound<IndexValue> = Bound::Unbounded;
+            for c in conds {
+                let query::Query::Field { field, op } = c else {
                     return None;
-                }
-                let (f, iv) = eqs.into_iter().next().expect("len checked above");
-                MatchPlan::Eq(f, iv)
-            } else {
-                // Pure single-field range: Field with a range op, or And of
-                // range ops all on the same field.
-                let conds: Vec<&query::Query> = match &parsed {
-                    query::Query::Field { .. } => vec![&parsed],
-                    query::Query::And(subs) => subs.iter().collect(),
-                    _ => return None,
                 };
-                if conds.is_empty() {
-                    return None;
-                }
-                let mut range_field: Option<&str> = None;
-                let mut lo: Bound<IndexValue> = Bound::Unbounded;
-                let mut hi: Bound<IndexValue> = Bound::Unbounded;
-                for c in conds {
-                    let query::Query::Field { field, op } = c else {
-                        return None;
-                    };
-                    if range_field.is_some_and(|rf| rf != field) {
-                        return None;
+                match op {
+                    query::QueryOp::Eq(v) => {
+                        if eq.is_some() {
+                            return None; // multi-eq prefixes: future work
+                        }
+                        eq = Some((field.clone(), v.clone()));
                     }
-                    range_field = Some(field);
-                    match op {
-                        query::QueryOp::Gt(v) if matches!(lo, Bound::Unbounded) => {
-                            lo = Bound::Excluded(v.clone());
-                        }
-                        query::QueryOp::Gte(v) if matches!(lo, Bound::Unbounded) => {
-                            lo = Bound::Included(v.clone());
-                        }
-                        query::QueryOp::Lt(v) if matches!(hi, Bound::Unbounded) => {
-                            hi = Bound::Excluded(v.clone());
-                        }
-                        query::QueryOp::Lte(v) if matches!(hi, Bound::Unbounded) => {
-                            hi = Bound::Included(v.clone());
-                        }
-                        _ => return None,
+                    query::QueryOp::Gt(v) | query::QueryOp::Gte(v)
+                        if matches!(lo, Bound::Unbounded)
+                            && range_field.is_none_or(|rf| rf == field) =>
+                    {
+                        range_field = Some(field);
+                        lo = if matches!(op, query::QueryOp::Gt(_)) {
+                            Bound::Excluded(v.clone())
+                        } else {
+                            Bound::Included(v.clone())
+                        };
                     }
+                    query::QueryOp::Lt(v) | query::QueryOp::Lte(v)
+                        if matches!(hi, Bound::Unbounded)
+                            && range_field.is_none_or(|rf| rf == field) =>
+                    {
+                        range_field = Some(field);
+                        hi = if matches!(op, query::QueryOp::Lt(_)) {
+                            Bound::Excluded(v.clone())
+                        } else {
+                            Bound::Included(v.clone())
+                        };
+                    }
+                    _ => return None,
                 }
-                MatchPlan::Range {
-                    field: range_field?.to_string(),
+            }
+            if eq.as_ref().is_some_and(|(ef, _)| range_field == Some(ef.as_str())) {
+                return None; // eq and range on the same field: not a shape we cover
+            }
+            match (eq, range_field) {
+                (None, None) => MatchPlan::All,
+                (Some((f, iv)), None) => MatchPlan::Eq(f, iv),
+                (None, Some(rf)) => MatchPlan::Range {
+                    field: rf.to_string(),
                     lo,
                     hi,
+                },
+                (Some((ef, eiv)), Some(rf)) => {
+                    if matches!(lo, Bound::Unbounded) {
+                        return None; // see EqRange doc comment
+                    }
+                    MatchPlan::EqRange {
+                        eq_field: ef,
+                        eq_value: eiv,
+                        range_field: rf.to_string(),
+                        lo,
+                        hi,
+                    }
                 }
             }
         }
@@ -3505,13 +3540,25 @@ pub(crate) fn try_composite_covered_group(
             std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
         }
     }
+    // What the walk's id count must equal. For Range it is the POST-filter
+    // count (cross-checked against the range field's index); for EqRange it
+    // is the PRE-filter prefix total (cross-checked against the eq field's
+    // index) — the range filter itself then only reads already-verified
+    // slot values, and a bounded lower bound rules out the one case the
+    // verified slots can't decide (missing vs explicit-null, both Null).
     let expected_ids: usize = match &match_plan {
         MatchPlan::All => total_docs,
         MatchPlan::Eq(mf, miv) => field_indexes?.get(mf)?.count_eq(miv),
         MatchPlan::Range { field, lo, hi } => {
             field_indexes?.get(field)?.count_range(bound_ref(lo), bound_ref(hi))
         }
+        MatchPlan::EqRange {
+            eq_field, eq_value, ..
+        } => field_indexes?.get(eq_field)?.count_eq(eq_value),
     };
+    // Range skips entries outside the bounds; only the pure-Range plan
+    // excludes them from the verified count as well.
+    let count_before_range_skip = !matches!(match_plan, MatchPlan::Range { .. });
 
     let group_field = match key {
         GroupKey::Single(Expression::FieldRef(field)) => field.as_str(),
@@ -3533,20 +3580,28 @@ pub(crate) fn try_composite_covered_group(
     // field materialized in ANY slot; and every accumulator-referenced field
     // materialized in SOME slot.
     let group_slot = match &match_plan {
-        MatchPlan::Eq(..) => 1,
+        MatchPlan::Eq(..) | MatchPlan::EqRange { .. } => 1,
         _ => 0,
     };
     let found = composite_indexes.iter().find_map(|ci| {
-        if let MatchPlan::Eq(mf, _) = &match_plan {
-            if ci.fields.first() != Some(mf) {
-                return None;
+        match &match_plan {
+            MatchPlan::Eq(mf, _) => {
+                if ci.fields.first() != Some(mf) {
+                    return None;
+                }
             }
+            MatchPlan::EqRange { eq_field, .. } => {
+                if ci.fields.first() != Some(eq_field) {
+                    return None;
+                }
+            }
+            _ => {}
         }
         if ci.fields.get(group_slot).map(String::as_str) != Some(group_field) {
             return None;
         }
         let range_slot = match &match_plan {
-            MatchPlan::Range { field, .. } => {
+            MatchPlan::Range { field, .. } | MatchPlan::EqRange { range_field: field, .. } => {
                 Some(ci.fields.iter().position(|cf| cf == field)?)
             }
             _ => None,
@@ -3577,7 +3632,7 @@ pub(crate) fn try_composite_covered_group(
     let in_bounds = |v: &IndexValue| -> bool {
         use std::ops::Bound;
         let (lo, hi) = match &match_plan {
-            MatchPlan::Range { lo, hi, .. } => (lo, hi),
+            MatchPlan::Range { lo, hi, .. } | MatchPlan::EqRange { lo, hi, .. } => (lo, hi),
             _ => return true,
         };
         (match lo {
@@ -3622,9 +3677,12 @@ pub(crate) fn try_composite_covered_group(
         if n == 0 {
             return true;
         }
+        if count_before_range_skip {
+            walked_ids += n;
+        }
         if let Some(rs) = range_slot {
             if !in_bounds(&slots[rs]) {
-                return true; // outside the $match range: skip, don't count
+                return true; // outside the $match range: skip
             }
         }
         let g = &slots[group_slot];
@@ -3632,7 +3690,9 @@ pub(crate) fn try_composite_covered_group(
             bail = true;
             return false;
         }
-        walked_ids += n;
+        if !count_before_range_skip {
+            walked_ids += n;
+        }
 
         let starts_new_group = match &current {
             Some((cur_g, _)) => cur_g != g,
@@ -3701,7 +3761,7 @@ pub(crate) fn try_composite_covered_group(
     };
 
     match &match_plan {
-        MatchPlan::Eq(_, miv) => {
+        MatchPlan::Eq(_, miv) | MatchPlan::EqRange { eq_value: miv, .. } => {
             ci.for_each_prefix_entries(std::slice::from_ref(miv), &mut visit)
         }
         MatchPlan::All | MatchPlan::Range { .. } => ci.for_each_entry(&mut visit),
@@ -5640,11 +5700,12 @@ mod tests {
         assert!(
             try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None).is_none()
         );
-        // A leading $match disqualifies the full-scan-only fast path.
+        // An EMPTY leading $match is a full scan — still covered, and it
+        // must agree with the no-match invocation.
         let ci = composite_from_docs(&["dept", "salary"], &docs);
-        assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, Some(&json!({})), None)
-                .is_none()
+        assert_eq!(
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, Some(&json!({})), None),
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None),
         );
         // Index/storage disagreement (walked ids != total docs) must bail.
         assert!(
@@ -5823,11 +5884,14 @@ mod tests {
             )
             .is_none()
         );
-        // …declines when the match is not a pure single equality…
+        // …declines on match shapes the covered path cannot serve: a range
+        // on a field that is not the group-slot layout's range (the group
+        // field must sit at slot 0 for a pure range), two equalities, and
+        // an eq+range whose lower bound is unbounded.
         for bad_match in [
             json!({"region": {"$gt": "A"}}),
             json!({"region": "EU", "dept": "a"}),
-            json!({"region": "EU", "salary": {"$gte": 1}}),
+            json!({"region": "EU", "salary": {"$lte": 10}}),
         ] {
             let p = Pipeline::parse(&json!([
                 {"$match": bad_match},
@@ -5953,6 +6017,35 @@ mod tests {
             let expected = p.execute_from(0, docs, &no_lookup).unwrap();
             assert_eq!(got, expected);
         }
+    }
+
+    #[test]
+    fn covered_group_eq_plus_range_matches_hash_path() {
+        // {region eq} + {ts range} + group by dept, all covered by a
+        // (region, dept, ts, salary) composite. Includes out-of-window docs,
+        // a missing-ts doc inside the prefix (bounded lower bound excludes
+        // it on both paths), a missing-dept doc (null group), and other
+        // regions.
+        let docs = vec![
+            json!({"region": "EU", "dept": "eng", "ts": 100, "salary": 10}),
+            json!({"region": "EU", "dept": "eng", "ts": 150, "salary": 20}),
+            json!({"region": "EU", "dept": "eng", "ts": 999, "salary": 500}), // out of window
+            json!({"region": "EU", "dept": "ops", "ts": 120, "salary": 5.5}),
+            json!({"region": "EU", "dept": "ops", "salary": 7}), // ts missing
+            json!({"region": "EU", "ts": 130, "salary": 3}),     // dept missing
+            json!({"region": "US", "dept": "eng", "ts": 110, "salary": 999}), // other region
+        ];
+        assert_match_covered_matches_hash(
+            json!({"region": "EU", "ts": {"$gte": 100, "$lt": 200}}),
+            json!({
+                "_id": "$dept",
+                "n": {"$sum": 1},
+                "total": {"$sum": "$salary"},
+                "avg": {"$avg": "$salary"},
+            }),
+            &["region", "dept", "ts", "salary"],
+            docs,
+        );
     }
 
     #[test]
