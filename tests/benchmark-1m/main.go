@@ -269,10 +269,17 @@ func main() {
 	fmt.Println("═══ Phase 2: Create indexes ═══")
 
 	indexFields := []string{"emp_id", "department", "region", "status", "salary", "age", "hired_year", "city"}
+	// Compound indexes created on BOTH engines: OxiDB answers full-collection
+	// $group aggregations straight from these (covered aggregation); MongoDB
+	// gets the identical compound indexes to use however it can.
+	compositeFields := [][]string{{"department", "salary"}, {"city", "salary"}}
 
 	t0 = time.Now()
 	for _, f := range indexFields {
 		oxi.CreateIndex(coll, f)
+	}
+	for _, fs := range compositeFields {
+		oxi.CreateCompositeIndex(coll, fs)
 	}
 	oxiIdx := time.Since(t0)
 
@@ -282,9 +289,17 @@ func main() {
 			Keys: bson.D{{Key: f, Value: 1}},
 		})
 	}
+	for _, fs := range compositeFields {
+		keys := bson.D{}
+		for _, f := range fs {
+			keys = append(keys, bson.E{Key: f, Value: 1})
+		}
+		mcoll.Indexes().CreateOne(ctx, mongo.IndexModel{Keys: keys})
+	}
 	monIdx := time.Since(t0)
 
-	record("INDEX", fmt.Sprintf("%d indexes", len(indexFields)), oxiIdx, monIdx, len(indexFields), len(indexFields), nil, nil)
+	nIdx := len(indexFields) + len(compositeFields)
+	record("INDEX", fmt.Sprintf("%d indexes (8 single + 2 compound)", nIdx), oxiIdx, monIdx, nIdx, nIdx, nil, nil)
 	fmt.Println()
 
 	// ════════════════════════════════════════════════════════════════

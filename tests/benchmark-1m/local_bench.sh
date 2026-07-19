@@ -55,7 +55,11 @@ sleep 2
 
 # Check both are running
 echo "Checking connections..."
-mongosh --port $MONGO_PORT --eval "db.adminCommand('ping')" --quiet 2>/dev/null || { echo "MongoDB not running!"; exit 1; }
+if command -v mongosh >/dev/null 2>&1; then
+    mongosh --port $MONGO_PORT --eval "db.adminCommand('ping')" --quiet 2>/dev/null || { echo "MongoDB not running!"; exit 1; }
+else
+    bash -c "echo > /dev/tcp/127.0.0.1/$MONGO_PORT" 2>/dev/null || { echo "MongoDB not running!"; exit 1; }
+fi
 echo "  MongoDB: OK (PID: $MONGO_PID)"
 
 # Quick TCP check for OxiDB

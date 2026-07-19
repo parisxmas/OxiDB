@@ -573,6 +573,18 @@ impl CompositeIndex {
         CompositeKey(values)
     }
 
+    /// Iterate every (key values, doc_ids) entry in ascending key order —
+    /// entries sharing a first slot value are contiguous, so a single pass
+    /// yields group runs. The callback returns `false` to stop early. Used by
+    /// the covered-aggregation fast path.
+    pub fn for_each_entry<F: FnMut(&[IndexValue], &DocIdSet) -> bool>(&self, mut f: F) {
+        for (key, ids) in &self.tree {
+            if !f(&key.0, ids) {
+                return;
+            }
+        }
+    }
+
     pub fn insert(&mut self, doc: &Document) {
         let key = self.extract_key(doc);
         self.tree.entry(key).or_default().insert(doc.id);

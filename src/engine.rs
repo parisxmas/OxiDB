@@ -2152,8 +2152,24 @@ impl OxiDb {
                 leading_match,
             ) {
                 pipeline.execute_from(next_idx, index_result, &lookup_fn)?
-            } else {
+            } else if let Some(covered) = {
+                // Covered composite-index aggregation: $sum/$avg/$min/$max
+                // over fields materialized in a composite index whose first
+                // slot is the group key — answered without touching any
+                // document (matters most in disk-first, where each doc read
+                // is an mmap access + decode).
                 drop(fi);
+                let ci = col.composite_indexes();
+                crate::pipeline::try_composite_covered_group(
+                    group_key,
+                    accumulators,
+                    &ci,
+                    col.count(),
+                    leading_match,
+                )
+            } {
+                pipeline.execute_from(next_idx, covered, &lookup_fn)?
+            } else {
                 let group_result =
                     col.aggregate_streaming(leading_match, group_key, accumulators)?;
                 // Continue with remaining pipeline stages on the small group result

@@ -1,0 +1,146 @@
+[
+  {
+    "category": "INSERT",
+    "name": "1000000 docs (batch 5000)",
+    "oxidb_ms": 5333989500,
+    "mongodb_ms": 4980196084,
+    "oxidb_count": 1000000,
+    "mongodb_count": 1000000
+  },
+  {
+    "category": "INDEX",
+    "name": "10 indexes (8 single + 2 compound)",
+    "oxidb_ms": 5955611958,
+    "mongodb_ms": 6198869542,
+    "oxidb_count": 10,
+    "mongodb_count": 10
+  },
+  {
+    "category": "QUERY",
+    "name": "Exact match (indexed)",
+    "oxidb_ms": 165917,
+    "mongodb_ms": 7171208,
+    "oxidb_count": 1,
+    "mongodb_count": 1
+  },
+  {
+    "category": "QUERY",
+    "name": "Equality (indexed)",
+    "oxidb_ms": 507676625,
+    "mongodb_ms": 474440792,
+    "oxidb_count": 124735,
+    "mongodb_count": 124780
+  },
+  {
+    "category": "QUERY",
+    "name": "Range (indexed)",
+    "oxidb_ms": 1227128792,
+    "mongodb_ms": 1230223791,
+    "oxidb_count": 295204,
+    "mongodb_count": 293787
+  },
+  {
+    "category": "QUERY",
+    "name": "Range + equality",
+    "oxidb_ms": 260750209,
+    "mongodb_ms": 237863708,
+    "oxidb_count": 31922,
+    "mongodb_count": 32083
+  },
+  {
+    "category": "QUERY",
+    "name": "Multi-condition AND",
+    "oxidb_ms": 167966292,
+    "mongodb_ms": 190987584,
+    "oxidb_count": 24865,
+    "mongodb_count": 25000
+  },
+  {
+    "category": "QUERY",
+    "name": "Unindexed scan (rating)",
+    "oxidb_ms": 579526250,
+    "mongodb_ms": 589144875,
+    "oxidb_count": 124657,
+    "mongodb_count": 124758
+  },
+  {
+    "category": "QUERY",
+    "name": "find_one (indexed)",
+    "oxidb_ms": 205042,
+    "mongodb_ms": 1607875,
+    "oxidb_count": 1,
+    "mongodb_count": 1
+  },
+  {
+    "category": "QUERY",
+    "name": "Count (indexed)",
+    "oxidb_ms": 5238500,
+    "mongodb_ms": 10598917,
+    "oxidb_count": 124735,
+    "mongodb_count": 124780
+  },
+  {
+    "category": "QUERY",
+    "name": "Sort + limit 10 (indexed)",
+    "oxidb_ms": 435417,
+    "mongodb_ms": 820292,
+    "oxidb_count": 10,
+    "mongodb_count": 10
+  },
+  {
+    "category": "UPDATE",
+    "name": "UpdateOne (indexed)",
+    "oxidb_ms": 4767209,
+    "mongodb_ms": 610708,
+    "oxidb_count": 1,
+    "mongodb_count": 1
+  },
+  {
+    "category": "UPDATE",
+    "name": "UpdateMany (bulk)",
+    "oxidb_ms": 720149375,
+    "mongodb_ms": 306300375,
+    "oxidb_count": 41905,
+    "mongodb_count": 41730
+  },
+  {
+    "category": "AGGREGATE",
+    "name": "Group by dept + avg salary",
+    "oxidb_ms": 36642458,
+    "mongodb_ms": 288946917,
+    "oxidb_count": 8,
+    "mongodb_count": 8
+  },
+  {
+    "category": "AGGREGATE",
+    "name": "Match region + group dept",
+    "oxidb_ms": 100083834,
+    "mongodb_ms": 86853250,
+    "oxidb_count": 8,
+    "mongodb_count": 8
+  },
+  {
+    "category": "AGGREGATE",
+    "name": "Group by city + full stats",
+    "oxidb_ms": 52298583,
+    "mongodb_ms": 304769000,
+    "oxidb_count": 8,
+    "mongodb_count": 8
+  },
+  {
+    "category": "CONCURRENT",
+    "name": "find_one (1000 ops, 10 workers)",
+    "oxidb_ms": 13628917,
+    "mongodb_ms": 15116958,
+    "oxidb_count": 1000,
+    "mongodb_count": 1000
+  },
+  {
+    "category": "DELETE",
+    "name": "DeleteMany (status=onleave)",
+    "oxidb_ms": 3631967667,
+    "mongodb_ms": 3708382875,
+    "oxidb_count": 333933,
+    "mongodb_count": 333145
+  }
+]

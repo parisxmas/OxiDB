@@ -3375,6 +3375,209 @@ pub(crate) fn try_index_only_count(
     Some(results)
 }
 
+/// Covered composite-index `$group` — index-only aggregation with value
+/// accumulators. When the pipeline is a full-collection `$group` (no leading
+/// `$match`) whose key is a single field and whose `$sum`/`$avg`/`$min`/`$max`
+/// accumulators only reference fields materialized in ONE composite index
+/// with the group field as its first slot, the whole stage is answered by
+/// walking the composite B-tree: per entry we have the full value tuple and
+/// the doc count, so `sum += value × count` — **no document is read or
+/// decoded**. The tree is sorted by (group, ...), so groups arrive as
+/// contiguous runs in a single pass.
+///
+/// Correctness contract: must return exactly what the hashing path over the
+/// decoded documents would. The per-slot IndexValue tells us the original
+/// JSON type losslessly for Null/Bool/Integer/Float and plain strings; the
+/// two lossy encodings force a bail-out (`None` → fallback):
+/// - `DateTime` — a date-looking *string* in the document was stored as
+///   epoch-ms; `_id`/`$min`/`$max` must surface the original string, which
+///   the index no longer has. (For `$sum`/`$avg` a DateTime slot is merely
+///   *skipped*, matching `eval_num`'s None for strings.)
+/// - Strings starting with `[`/`{` — arrays/objects are indexed as their
+///   serialization; indistinguishable from a real string, so bail.
+///
+/// Known accepted quirk (same as the single-field index fast paths): an
+/// `Integer(n)` and `Float(n.0)` group value collapse into one B-tree key,
+/// while the hashing path keeps `1` and `1.0` as distinct groups.
+pub(crate) fn try_composite_covered_group(
+    key: &GroupKey,
+    accumulators: &[(String, Accumulator)],
+    composite_indexes: &[crate::index::CompositeIndex],
+    total_docs: usize,
+    match_query: Option<&Value>,
+) -> Option<Vec<Value>> {
+    // Only full collection scans (no $match filter).
+    if match_query.is_some() {
+        return None;
+    }
+    let group_field = match key {
+        GroupKey::Single(Expression::FieldRef(field)) => field.as_str(),
+        _ => return None,
+    };
+
+    // Which slot each accumulator reads (None = count-like, no slot).
+    enum CovAcc {
+        Count,
+        SumLit(f64),
+        SumField(usize),
+        AvgField(usize),
+        MinField(usize),
+        MaxField(usize),
+    }
+
+    // Find a composite index whose first slot is the group field and which
+    // materializes every accumulator-referenced field.
+    let found = composite_indexes.iter().find_map(|ci| {
+        if ci.fields.first().map(String::as_str) != Some(group_field) {
+            return None;
+        }
+        let slot_of = |f: &str| ci.fields.iter().position(|cf| cf == f);
+        let mut plan = Vec::with_capacity(accumulators.len());
+        for (_, acc) in accumulators {
+            let cov = match acc {
+                Accumulator::Count => CovAcc::Count,
+                Accumulator::Sum(Expression::Literal(Value::Number(n))) => {
+                    CovAcc::SumLit(n.as_f64()?)
+                }
+                Accumulator::Sum(Expression::FieldRef(f)) => CovAcc::SumField(slot_of(f)?),
+                Accumulator::Avg(Expression::FieldRef(f)) => CovAcc::AvgField(slot_of(f)?),
+                Accumulator::Min(Expression::FieldRef(f)) => CovAcc::MinField(slot_of(f)?),
+                Accumulator::Max(Expression::FieldRef(f)) => CovAcc::MaxField(slot_of(f)?),
+                _ => return None,
+            };
+            plan.push(cov);
+        }
+        Some((ci, plan))
+    });
+    let (ci, plan) = found?;
+
+    // A slot value the covered path cannot surface faithfully as a result
+    // value (`_id`, `$min`, `$max`).
+    let lossy = |v: &IndexValue| match v {
+        IndexValue::DateTime(_) => true,
+        IndexValue::String(s) => s.starts_with('[') || s.starts_with('{'),
+        _ => false,
+    };
+
+    let fresh_states = || -> Vec<AccumulatorState> {
+        plan.iter()
+            .map(|cov| match cov {
+                CovAcc::Count => AccumulatorState::Count(0),
+                CovAcc::SumLit(_) | CovAcc::SumField(_) => AccumulatorState::Sum(0.0),
+                CovAcc::AvgField(_) => AccumulatorState::Avg { sum: 0.0, count: 0 },
+                CovAcc::MinField(_) => AccumulatorState::Min(None),
+                CovAcc::MaxField(_) => AccumulatorState::Max(None),
+            })
+            .collect()
+    };
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut current: Option<(IndexValue, Vec<AccumulatorState>)> = None;
+    let mut walked_ids: usize = 0;
+    let mut bail = false;
+
+    let flush = |group: IndexValue, states: Vec<AccumulatorState>, out: &mut Vec<Value>| {
+        let mut doc = Map::new();
+        doc.insert("_id".to_string(), group.to_json());
+        for ((name, _), state) in accumulators.iter().zip(states) {
+            doc.insert(name.clone(), finalize_accumulator(state));
+        }
+        out.push(Value::Object(doc));
+    };
+
+    ci.for_each_entry(|slots, doc_ids| {
+        let n = doc_ids.len();
+        if n == 0 {
+            return true;
+        }
+        let g = &slots[0];
+        if lossy(g) {
+            bail = true;
+            return false;
+        }
+        walked_ids += n;
+
+        let starts_new_group = match &current {
+            Some((cur_g, _)) => cur_g != g,
+            None => true,
+        };
+        if starts_new_group {
+            if let Some((done_g, done_states)) = current.take() {
+                flush(done_g, done_states, &mut results);
+            }
+            current = Some((g.clone(), fresh_states()));
+        }
+        let states = &mut current.as_mut().expect("set above").1;
+
+        for (cov, state) in plan.iter().zip(states.iter_mut()) {
+            match (cov, state) {
+                (CovAcc::Count, AccumulatorState::Count(c)) => *c += n as u64,
+                (CovAcc::SumLit(lit), AccumulatorState::Sum(s)) => *s += lit * n as f64,
+                (CovAcc::SumField(slot), AccumulatorState::Sum(s)) => match &slots[*slot] {
+                    IndexValue::Integer(i) => *s += *i as f64 * n as f64,
+                    IndexValue::Float(f) => *s += f * n as f64,
+                    // Null/Bool/DateTime/String: eval_num over the document
+                    // yields None for these — the hashing path skips them.
+                    _ => {}
+                },
+                (CovAcc::AvgField(slot), AccumulatorState::Avg { sum, count }) => {
+                    match &slots[*slot] {
+                        IndexValue::Integer(i) => {
+                            *sum += *i as f64 * n as f64;
+                            *count += n as u64;
+                        }
+                        IndexValue::Float(f) => {
+                            *sum += f * n as f64;
+                            *count += n as u64;
+                        }
+                        _ => {}
+                    }
+                }
+                (CovAcc::MinField(slot), AccumulatorState::Min(cur)) => {
+                    let v = &slots[*slot];
+                    if !matches!(v, IndexValue::Null) {
+                        if lossy(v) {
+                            bail = true;
+                            return false;
+                        }
+                        if cur.as_ref().is_none_or(|(_, cur_iv)| v < cur_iv) {
+                            *cur = Some((v.to_json(), v.clone()));
+                        }
+                    }
+                }
+                (CovAcc::MaxField(slot), AccumulatorState::Max(cur)) => {
+                    let v = &slots[*slot];
+                    if !matches!(v, IndexValue::Null) {
+                        if lossy(v) {
+                            bail = true;
+                            return false;
+                        }
+                        if cur.as_ref().is_none_or(|(_, cur_iv)| v > cur_iv) {
+                            *cur = Some((v.to_json(), v.clone()));
+                        }
+                    }
+                }
+                _ => unreachable!("plan and states are built in lockstep"),
+            }
+        }
+        true
+    });
+
+    if bail {
+        return None;
+    }
+    // Every live document must be accounted for exactly once — the composite
+    // index keys every doc (missing fields index as Null). A mismatch means
+    // the index and storage disagree; fall back rather than guess.
+    if walked_ids != total_docs {
+        return None;
+    }
+    if let Some((done_g, done_states)) = current.take() {
+        flush(done_g, done_states, &mut results);
+    }
+    Some(results)
+}
+
 /// Try to execute a $group stage using field indexes instead of hashing all docs.
 ///
 /// **Count-only fast path** (Opt 4): When the group key is a single FieldRef and
@@ -4891,10 +5094,10 @@ mod tests {
     #[test]
     fn ohlcv_skips_unparseable_docs_and_accepts_epoch_ms() {
         let docs = vec![
-            json!({"ts": 1767225600000i64, "price": 10}),  // epoch ms + int price
-            json!({"ts": "not a date", "price": 11.0}),     // skipped
-            json!({"price": 12.0}),                          // no ts: skipped
-            json!({"ts": "2026-01-01T00:00:20Z"}),          // no price: skipped
+            json!({"ts": 1767225600000i64, "price": 10}), // epoch ms + int price
+            json!({"ts": "not a date", "price": 11.0}),   // skipped
+            json!({"price": 12.0}),                       // no ts: skipped
+            json!({"ts": "2026-01-01T00:00:20Z"}),        // no price: skipped
         ];
         let p = Pipeline::parse(&json!([
             {"$ohlcv": {"time": "ts", "interval": "1m", "price": "price"}}
@@ -5183,6 +5386,159 @@ mod tests {
         // distinct guard, not the `<` guard, is what rejects this.
         let result = try_index_only_count(&key, &accs, &field_indexes, 2, None);
         assert!(result.is_none());
+    }
+
+    /// Build a composite index over `fields` from `docs` (doc id = position).
+    fn composite_from_docs(fields: &[&str], docs: &[Value]) -> crate::index::CompositeIndex {
+        let mut ci =
+            crate::index::CompositeIndex::new(fields.iter().map(|f| f.to_string()).collect());
+        for (i, doc) in docs.iter().enumerate() {
+            ci.insert_value(i as u64, doc);
+        }
+        ci
+    }
+
+    /// The covered composite path must return exactly what the hashing path
+    /// returns (as a set — group order is unspecified in both).
+    fn assert_covered_matches_hash(group_spec: Value, fields: &[&str], docs: Vec<Value>) {
+        let pipeline_json = json!([{ "$group": group_spec }]);
+        let p = Pipeline::parse(&pipeline_json).unwrap();
+        let (key, accs, _) = p.try_streaming_group(0).expect("bare $group is streamable");
+
+        let ci = composite_from_docs(fields, &docs);
+        let covered =
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), docs.len(), None)
+                .expect("covered path should apply");
+
+        let mut expected = p.execute_from(0, docs, &no_lookup).unwrap();
+        let mut got = covered;
+        let sort_key = |d: &Value| d["_id"].to_string();
+        expected.sort_by_key(sort_key);
+        got.sort_by_key(sort_key);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn covered_group_matches_hash_path() {
+        // Two groups + a doc missing the group field (null group) + a doc
+        // missing the value field (skipped by sum/avg/min/max, counted by
+        // count) + int/float mix in values.
+        let docs = vec![
+            json!({"dept": "eng", "salary": 100}),
+            json!({"dept": "eng", "salary": 150.5}),
+            json!({"dept": "eng"}),
+            json!({"dept": "ops", "salary": 80}),
+            json!({"dept": "ops", "salary": 80}),
+            json!({"salary": 999}),
+            json!({"dept": "ops", "salary": null}),
+        ];
+        assert_covered_matches_hash(
+            json!({
+                "_id": "$dept",
+                "count": {"$sum": 1},
+                "n": {"$sum": "$salary"},
+                "avg": {"$avg": "$salary"},
+                "lo": {"$min": "$salary"},
+                "hi": {"$max": "$salary"},
+            }),
+            &["dept", "salary"],
+            docs,
+        );
+    }
+
+    #[test]
+    fn covered_group_three_slot_composite() {
+        // (dept, salary, age): age is NOT sorted within a dept run (entries
+        // sort by salary first), so min/max over the third slot must compare
+        // every entry rather than trust position.
+        let docs = vec![
+            json!({"dept": "a", "salary": 1, "age": 50}),
+            json!({"dept": "a", "salary": 2, "age": 10}),
+            json!({"dept": "a", "salary": 3, "age": 30}),
+            json!({"dept": "b", "salary": 9, "age": 20}),
+        ];
+        assert_covered_matches_hash(
+            json!({
+                "_id": "$dept",
+                "avg_sal": {"$avg": "$salary"},
+                "oldest": {"$max": "$age"},
+                "youngest": {"$min": "$age"},
+            }),
+            &["dept", "salary", "age"],
+            docs,
+        );
+    }
+
+    #[test]
+    fn covered_group_declines_without_matching_composite() {
+        let docs = vec![json!({"dept": "a", "salary": 1})];
+        let p = Pipeline::parse(&json!([{"$group": {"_id": "$dept", "s": {"$sum": "$salary"}}}]))
+            .unwrap();
+        let (key, accs, _) = p.try_streaming_group(0).unwrap();
+
+        // Composite exists but group field is not the FIRST slot.
+        let ci = composite_from_docs(&["salary", "dept"], &docs);
+        assert!(
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None).is_none()
+        );
+        // Composite's first slot matches but the value field is not covered.
+        let ci = composite_from_docs(&["dept", "age"], &docs);
+        assert!(
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None).is_none()
+        );
+        // A leading $match disqualifies the full-scan-only fast path.
+        let ci = composite_from_docs(&["dept", "salary"], &docs);
+        assert!(
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, Some(&json!({})))
+                .is_none()
+        );
+        // Index/storage disagreement (walked ids != total docs) must bail.
+        assert!(
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None).is_none()
+        );
+    }
+
+    #[test]
+    fn covered_group_bails_on_lossy_slot_values() {
+        let p = Pipeline::parse(&json!([{"$group": {"_id": "$dept", "s": {"$sum": "$salary"}}}]))
+            .unwrap();
+        let (key, accs, _) = p.try_streaming_group(0).unwrap();
+
+        // Date-looking group value: index stores DateTime(ms); the original
+        // string is gone, so `_id` cannot be reproduced — bail.
+        let docs = vec![json!({"dept": "2026-01-01", "salary": 1})];
+        let ci = composite_from_docs(&["dept", "salary"], &docs);
+        assert!(
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None).is_none()
+        );
+
+        // Array group value: indexed as its serialization ("[1]"), which a
+        // real string could also be — bail.
+        let docs = vec![json!({"dept": [1], "salary": 1})];
+        let ci = composite_from_docs(&["dept", "salary"], &docs);
+        assert!(
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None).is_none()
+        );
+
+        // DateTime in a $min/$max slot: hash path would surface the original
+        // string — bail. For $sum-only the same slot is merely skipped
+        // (eval_num returns None for strings) and the path stays usable.
+        let docs = vec![
+            json!({"dept": "a", "salary": 5}),
+            json!({"dept": "a", "salary": "2026-01-01"}),
+        ];
+        let ci = composite_from_docs(&["dept", "salary"], &docs);
+        let p_min =
+            Pipeline::parse(&json!([{"$group": {"_id": "$dept", "m": {"$min": "$salary"}}}]))
+                .unwrap();
+        let (key_min, accs_min, _) = p_min.try_streaming_group(0).unwrap();
+        assert!(
+            try_composite_covered_group(key_min, accs_min, std::slice::from_ref(&ci), 2, None)
+                .is_none()
+        );
+        let sum_only =
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None).unwrap();
+        assert_eq!(sum_only, vec![json!({"_id": "a", "s": 5})]);
     }
 
     #[test]

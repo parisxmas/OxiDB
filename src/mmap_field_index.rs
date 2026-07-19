@@ -490,24 +490,36 @@ impl MmapFieldIndex {
             return DocIdSet::Empty;
         };
         let mut set = self.mmap_entry_docids(idx);
-        // Remove tombstoned doc IDs
-        for (doc_id, removed_vals) in &self.removed {
-            if removed_vals.iter().any(|v| v == value) {
-                set.remove(doc_id);
-            }
-        }
+        self.apply_tombstones(value, &mut set);
         set
     }
 
-    /// Iterate mmap entries in a range [start_idx..end_idx), filtering tombstones.
     /// Drop tombstoned doc ids from a materialized mmap entry's set. The one
     /// place tombstone-filtering semantics live — range reads and the lazy
     /// iterators must agree.
+    ///
+    /// Probes THIS entry's (few) ids against the tombstone map — O(|ids|)
+    /// hash lookups — instead of scanning every tombstoned doc per entry.
+    /// The old inverted shape was O(entries × tombstones): a mass delete
+    /// (hundreds of thousands of tombstones) followed by any persist or
+    /// range read ground a 1M-entry index for tens of minutes, memcmp-bound
+    /// (the background sync thread pegged a core "flushing" — found via
+    /// thread sampling after a 1M-doc DeleteMany bench).
     fn apply_tombstones(&self, val: &IndexValue, ids: &mut DocIdSet) {
-        for (doc_id, removed_vals) in &self.removed {
-            if removed_vals.iter().any(|v| v == val) {
-                ids.remove(doc_id);
-            }
+        if self.removed.is_empty() {
+            return;
+        }
+        let doomed: Vec<DocumentId> = ids
+            .iter()
+            .filter(|id| {
+                self.removed
+                    .get(id)
+                    .is_some_and(|vals| vals.iter().any(|v| v == val))
+            })
+            .copied()
+            .collect();
+        for id in doomed {
+            ids.remove(&id);
         }
     }
 
@@ -672,12 +684,7 @@ impl MmapFieldIndex {
                 if let Some(val) = self.mmap_entry_value(i) {
                     if &val != value {
                         let mut ids = self.mmap_entry_docids(i);
-                        // Apply tombstones
-                        for (doc_id, removed_vals) in &self.removed {
-                            if removed_vals.iter().any(|v| v == &val) {
-                                ids.remove(doc_id);
-                            }
-                        }
+                        self.apply_tombstones(&val, &mut ids);
                         result.extend(&ids);
                     }
                 }
@@ -836,11 +843,7 @@ impl MmapFieldIndex {
                 if let Some(val) = self.mmap_entry_value(i) {
                     if &val != value {
                         let mut ids = self.mmap_entry_docids(i);
-                        for (doc_id, removed_vals) in &self.removed {
-                            if removed_vals.iter().any(|v| v == &val) {
-                                ids.remove(doc_id);
-                            }
-                        }
+                        self.apply_tombstones(&val, &mut ids);
                         for &id in &ids {
                             if !f(id) {
                                 return;
@@ -973,6 +976,17 @@ impl MmapFieldIndex {
     /// Write the complete index (mmap + overlay merged) to a `.fidx` v2 file.
     pub fn persist(&mut self) -> io::Result<()> {
         if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        // Clean index: the mmap'd file already reflects this exact state —
+        // skip the full merge + rewrite. The periodic sync thread calls this
+        // once a second for every disk-backed index; without the guard it
+        // rewrote every (unchanged) multi-MB index file each tick.
+        if self.mmap.is_some()
+            && self.overlay.is_empty()
+            && self.removed.is_empty()
+            && self.path.exists()
+        {
             return Ok(());
         }
 
