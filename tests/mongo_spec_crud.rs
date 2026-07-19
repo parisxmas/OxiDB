@@ -147,6 +147,11 @@ const KNOWN_FAILURES: &[(&str, &str, &str)] = &[
         "OxiDB assigns document ids itself; a client-supplied _id is not a \
          unique key, so duplicate-_id inserts do not error",
     ),
+    (
+        "bulkWrite.json",
+        "BulkWrite continue-on-error behavior with unordered",
+        "same client-_id-uniqueness divergence as insertMany",
+    ),
 ];
 
 #[derive(Default)]
@@ -204,8 +209,8 @@ impl Runner {
     /// Arguments we understand or can safely ignore, per operation.
     fn check_args(op: &str, args: &Map<String, Value>) -> Option<String> {
         let allowed: &[&str] = match op {
-            "find" => &["filter", "sort", "limit", "skip", "batchSize", "comment", "hint"],
-            "findOne" => &["filter", "sort", "comment", "hint"],
+            "find" => &["filter", "sort", "limit", "skip", "batchSize", "comment", "hint", "projection"],
+            "findOne" => &["filter", "sort", "comment", "hint", "projection"],
             "insertOne" => &["document", "comment"],
             "insertMany" => &["documents", "ordered", "comment"],
             "updateOne" | "updateMany" => &["filter", "update", "comment", "upsert"],
@@ -213,6 +218,13 @@ impl Runner {
             "countDocuments" => &["filter", "comment", "skip", "limit"],
             "estimatedDocumentCount" => &["comment", "maxTimeMS"],
             "aggregate" => &["pipeline", "comment", "batchSize", "allowDiskUse"],
+            "count" => &["filter", "comment", "skip", "limit"],
+            "bulkWrite" => &["requests", "ordered", "comment"],
+            "distinct" => &["fieldName", "filter", "comment"],
+            "replaceOne" => &["filter", "replacement", "comment"],
+            "findOneAndUpdate" => &["filter", "update", "returnDocument", "sort", "comment", "projection"],
+            "findOneAndReplace" => &["filter", "replacement", "returnDocument", "sort", "comment", "projection"],
+            "findOneAndDelete" => &["filter", "sort", "comment", "projection"],
             _ => return Some(format!("op:{op}")),
         };
         for k in args.keys() {
@@ -224,6 +236,111 @@ impl Runner {
             return Some("arg:upsert".into());
         }
         None
+    }
+
+    /// Pick the single doc an *AndModify/replaceOne op targets (engine
+    /// form, honoring `sort`), or None when nothing matches.
+    fn pick_target(
+        &self,
+        coll: &str,
+        filter: &Value,
+        args: &Map<String, Value>,
+    ) -> Result<Option<Value>, String> {
+        if args.get("sort").is_some() {
+            let mut opts = Self::find_options(args)?;
+            opts.limit = Some(1);
+            self.db
+                .find_with_options(coll, filter, &opts)
+                .map(|mut v| if v.is_empty() { None } else { Some(v.remove(0)) })
+                .map_err(|e| e.to_string())
+        } else {
+            self.db.find_one(coll, filter).map_err(|e| e.to_string())
+        }
+    }
+
+    /// Spec-mandated client-side validation plus an emulation limit:
+    /// atomic modifiers ($-keys) in a replacement must error; literal
+    /// dotted top-level keys cannot be represented through our $set-based
+    /// emulation (the engine reads dots as paths), so they skip.
+    fn replacement_check(replacement: &Value) -> Option<OpOutcome> {
+        let keys: Vec<&String> = replacement
+            .as_object()
+            .map(|o| o.keys().collect())
+            .unwrap_or_default();
+        if keys.iter().any(|k| k.starts_with('$')) {
+            return Some(OpOutcome::Err(
+                "replacement document must not contain atomic modifiers".into(),
+            ));
+        }
+        if keys.iter().any(|k| k.contains('.')) {
+            return Some(OpOutcome::Skip("replacement:dotted-key".into()));
+        }
+        None
+    }
+
+    /// Emulate a full-document replace as $set(all replacement fields) +
+    /// $unset(fields the replacement dropped). A replacement without `_id`
+    /// keeps the original one (MongoDB semantics), so the shim field is
+    /// preserved unless the replacement supplies its own.
+    fn replace_doc(&self, coll: &str, old: &Value, replacement: &Value) -> Result<(), String> {
+        let engine_id = old.get("_id").cloned().unwrap_or(Value::Null);
+        let repl = to_engine(replacement);
+        let repl_obj = repl.as_object().cloned().unwrap_or_default();
+        let mut unset = Map::new();
+        for k in old.as_object().map(|o| o.keys()).into_iter().flatten() {
+            if k == "_id" || k == "_version" {
+                continue;
+            }
+            if k == MID && !repl_obj.contains_key(MID) {
+                continue; // replacement without _id keeps the original
+            }
+            if !repl_obj.contains_key(k) {
+                unset.insert(k.clone(), json!(""));
+            }
+        }
+        let mut update = Map::new();
+        if !repl_obj.is_empty() {
+            update.insert("$set".into(), Value::Object(repl_obj));
+        }
+        if !unset.is_empty() {
+            update.insert("$unset".into(), Value::Object(unset));
+        }
+        if update.is_empty() {
+            return Ok(()); // empty replacement of an already-empty doc
+        }
+        self.db
+            .update_one(coll, &json!({ "_id": engine_id }), &Value::Object(update))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Apply a simple projection (top-level inclusion or exclusion lists;
+    /// `_id` included by default, excludable). Dotted paths and operator
+    /// projections ($slice/$elemMatch) are not attempted — caller skips.
+    fn project(doc: &Value, projection: &Value) -> Option<Value> {
+        let proj = projection.as_object()?;
+        if proj.keys().any(|k| k.contains('.') || k.starts_with('$'))
+            || proj.values().any(|v| v.is_object())
+        {
+            return None;
+        }
+        let truthy = |v: &Value| v.as_i64().map(|n| n != 0).or(v.as_bool()).unwrap_or(false);
+        let inclusion = proj.iter().any(|(k, v)| k != "_id" && truthy(v));
+        let obj = doc.as_object()?;
+        let mut out = Map::new();
+        for (k, v) in obj {
+            let keep = if k == "_id" {
+                proj.get("_id").map(truthy).unwrap_or(true)
+            } else if inclusion {
+                proj.get(k).map(truthy).unwrap_or(false)
+            } else {
+                !proj.contains_key(k)
+            };
+            if keep {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        Some(Value::Object(out))
     }
 
     fn run_op(&mut self, op: &Value) -> OpOutcome {
@@ -279,14 +396,34 @@ impl Runner {
                     Err(e) => return OpOutcome::Skip(e),
                 };
                 match self.db.find_with_options(&coll, &filter(), &opts) {
-                    Ok(docs) => OpOutcome::Ok(Some(Value::Array(
-                        docs.iter().map(from_engine).collect(),
-                    ))),
+                    Ok(docs) => {
+                        let mut out: Vec<Value> = docs.iter().map(from_engine).collect();
+                        if let Some(proj) = args.get("projection") {
+                            let mut projected = Vec::with_capacity(out.len());
+                            for d in &out {
+                                match Self::project(d, proj) {
+                                    Some(p) => projected.push(p),
+                                    None => return OpOutcome::Skip("projection:complex".into()),
+                                }
+                            }
+                            out = projected;
+                        }
+                        OpOutcome::Ok(Some(Value::Array(out)))
+                    }
                     Err(e) => OpOutcome::Err(e.to_string()),
                 }
             }
             "findOne" => match self.db.find_one(&coll, &filter()) {
-                Ok(Some(d)) => OpOutcome::Ok(Some(from_engine(&d))),
+                Ok(Some(d)) => {
+                    let d = from_engine(&d);
+                    match args.get("projection") {
+                        None => OpOutcome::Ok(Some(d)),
+                        Some(proj) => match Self::project(&d, proj) {
+                            Some(p) => OpOutcome::Ok(Some(p)),
+                            None => OpOutcome::Skip("projection:complex".into()),
+                        },
+                    }
+                }
                 Ok(None) => OpOutcome::Ok(Some(Value::Null)),
                 Err(e) => OpOutcome::Err(e.to_string()),
             },
@@ -360,6 +497,183 @@ impl Runner {
                     ))),
                     Err(e) => OpOutcome::Err(e.to_string()),
                 }
+            }
+            "count" => match self.db.count(&coll, &filter()) {
+                Ok(mut n) => {
+                    if let Some(sk) = args.get("skip").and_then(|v| v.as_u64()) {
+                        n = n.saturating_sub(sk as usize);
+                    }
+                    if let Some(l) = args.get("limit").and_then(|v| v.as_u64()) {
+                        n = n.min(l as usize);
+                    }
+                    OpOutcome::Ok(Some(json!(n)))
+                }
+                Err(e) => OpOutcome::Err(e.to_string()),
+            },
+            "distinct" => {
+                let Some(field) = args.get("fieldName").and_then(|v| v.as_str()) else {
+                    return OpOutcome::Skip("missing fieldName".into());
+                };
+                let field: String = field
+                    .split('.')
+                    .map(|seg| if seg == "_id" { MID } else { seg })
+                    .collect::<Vec<_>>()
+                    .join(".");
+                match self.db.find(&coll, &filter()) {
+                    Ok(docs) => {
+                        let mut out: Vec<Value> = Vec::new();
+                        for d in &docs {
+                            let mut cur = Some(d);
+                            for seg in field.split('.') {
+                                cur = cur.and_then(|c| c.get(seg));
+                            }
+                            if let Some(v) = cur {
+                                let v = rename_keys(v, MID, "_id");
+                                if !out.iter().any(|x| matches(x, Some(&v))) {
+                                    out.push(v);
+                                }
+                            }
+                        }
+                        OpOutcome::Ok(Some(Value::Array(out)))
+                    }
+                    Err(e) => OpOutcome::Err(e.to_string()),
+                }
+            }
+            "replaceOne" => {
+                let Some(replacement) = args.get("replacement") else {
+                    return OpOutcome::Skip("missing replacement".into());
+                };
+                if let Some(out) = Self::replacement_check(replacement) {
+                    return out;
+                }
+                match self.pick_target(&coll, &filter(), args) {
+                    Err(e) => OpOutcome::Err(e),
+                    Ok(None) => OpOutcome::Ok(Some(json!({
+                        "matchedCount": 0, "modifiedCount": 0, "upsertedCount": 0
+                    }))),
+                    Ok(Some(old)) => match self.replace_doc(&coll, &old, replacement) {
+                        Ok(()) => OpOutcome::Ok(Some(json!({
+                            "matchedCount": 1, "modifiedCount": 1, "upsertedCount": 0
+                        }))),
+                        Err(e) => OpOutcome::Err(e),
+                    },
+                }
+            }
+            "findOneAndUpdate" | "findOneAndReplace" | "findOneAndDelete" => {
+                let target = match self.pick_target(&coll, &filter(), args) {
+                    Err(e) => return OpOutcome::Err(e),
+                    Ok(t) => t,
+                };
+                let Some(pre) = target else {
+                    return OpOutcome::Ok(Some(Value::Null));
+                };
+                let engine_id = pre.get("_id").cloned().unwrap_or(Value::Null);
+                let id_query = json!({ "_id": engine_id });
+                let after = args.get("returnDocument").and_then(|v| v.as_str())
+                    == Some("After");
+                let applied: Result<(), String> = match name {
+                    "findOneAndUpdate" => {
+                        let Some(update) = args.get("update") else {
+                            return OpOutcome::Skip("missing update".into());
+                        };
+                        if update.is_array() {
+                            return OpOutcome::Skip("update:pipeline".into());
+                        }
+                        self.db
+                            .update_one(&coll, &id_query, &to_engine(update))
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }
+                    "findOneAndReplace" => {
+                        let Some(replacement) = args.get("replacement") else {
+                            return OpOutcome::Skip("missing replacement".into());
+                        };
+                        if let Some(out) = Self::replacement_check(replacement) {
+                            return out;
+                        }
+                        self.replace_doc(&coll, &pre, replacement)
+                    }
+                    _ => self
+                        .db
+                        .delete_one(&coll, &id_query)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                };
+                if let Err(e) = applied {
+                    return OpOutcome::Err(e);
+                }
+                let returned = if name == "findOneAndDelete" || !after {
+                    from_engine(&pre)
+                } else {
+                    match self.db.find_one(&coll, &id_query) {
+                        Ok(Some(d)) => from_engine(&d),
+                        Ok(None) => Value::Null,
+                        Err(e) => return OpOutcome::Err(e.to_string()),
+                    }
+                };
+                let returned = match args.get("projection") {
+                    Some(proj) if !returned.is_null() => match Self::project(&returned, proj) {
+                        Some(p) => p,
+                        None => return OpOutcome::Skip("projection:complex".into()),
+                    },
+                    _ => returned,
+                };
+                OpOutcome::Ok(Some(returned))
+            }
+            "bulkWrite" => {
+                let Some(requests) = args.get("requests").and_then(|v| v.as_array()) else {
+                    return OpOutcome::Skip("missing requests".into());
+                };
+                // A standalone bulkWrite IS the sequential application of
+                // its sub-operations; decompose and reuse the single-op
+                // paths, accumulating the unified result counters.
+                let (mut ins, mut mat, mut modc, mut del) = (0u64, 0u64, 0u64, 0u64);
+                let mut inserted_ids = Map::new();
+                for (i, req) in requests.iter().enumerate() {
+                    let Some(obj) = req.as_object() else {
+                        return OpOutcome::Skip("bulk:bad-request".into());
+                    };
+                    let Some((sub_name, sub_args)) = obj.iter().next() else {
+                        return OpOutcome::Skip("bulk:empty-request".into());
+                    };
+                    let sub = json!({
+                        "name": sub_name,
+                        "object": op["object"],
+                        "arguments": sub_args,
+                    });
+                    match self.run_op(&sub) {
+                        OpOutcome::Skip(r) => return OpOutcome::Skip(format!("bulk:{r}")),
+                        OpOutcome::Err(e) => return OpOutcome::Err(e),
+                        OpOutcome::Ok(res) => {
+                            let res = res.unwrap_or(Value::Null);
+                            match sub_name.as_str() {
+                                "insertOne" => {
+                                    ins += 1;
+                                    if let Some(id) = res.get("insertedId") {
+                                        inserted_ids.insert(i.to_string(), id.clone());
+                                    }
+                                }
+                                "updateOne" | "updateMany" | "replaceOne" => {
+                                    mat += res["matchedCount"].as_u64().unwrap_or(0);
+                                    modc += res["modifiedCount"].as_u64().unwrap_or(0);
+                                }
+                                "deleteOne" | "deleteMany" => {
+                                    del += res["deletedCount"].as_u64().unwrap_or(0);
+                                }
+                                _ => return OpOutcome::Skip(format!("bulk:op:{sub_name}")),
+                            }
+                        }
+                    }
+                }
+                OpOutcome::Ok(Some(json!({
+                    "insertedCount": ins,
+                    "matchedCount": mat,
+                    "modifiedCount": modc,
+                    "deletedCount": del,
+                    "upsertedCount": 0,
+                    "insertedIds": Value::Object(inserted_ids),
+                    "upsertedIds": {},
+                })))
             }
             other => OpOutcome::Skip(format!("op:{other}")),
         }
