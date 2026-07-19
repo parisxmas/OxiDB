@@ -36,9 +36,12 @@
   --font-mono: 'Geist Mono', 'SF Mono', 'JetBrains Mono', ui-monospace, Consolas, Menlo, monospace;
   --font-serif: 'Instrument Serif', 'Iowan Old Style', 'Times New Roman', serif;
 
-  /* Fluid content column: pages fill the viewport (minus the nav), no
-     pixel cap. Inner reading blocks set their own rem-based widths. */
-  --max-width: 100%;
+  /* Fluid content column, capped in CHARACTERS, not pixels: fills the
+     viewport on small screens, and on wide monitors stops where a line of
+     prose stays readable (~85ch covers this site's code-heavy pages;
+     roughly the old comfortable width, but unit-based). Workspace pages
+     (the bug tracker) opt out to full width with .container-wide. */
+  --max-width: min(100%, 85ch);
   --radius: 6px;
   --radius-sm: 4px;
 }
