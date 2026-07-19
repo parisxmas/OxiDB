@@ -16,7 +16,7 @@ export default function Page() {
     <p class="sub"><strong>OxiDB is a single, small binary</strong> that speaks every data model your application needs. Query documents with MongoDB-style JSON or a <strong>full SQL engine</strong>, record metrics in a built-in <strong>time-series</strong> store, cache in a <strong>Redis-compatible</strong> key-value layer, publish over <strong>MQTT</strong>, queue work over <strong>AMQP (RabbitMQ)</strong>, and keep files in <strong>S3-compatible</strong> object storage &mdash; with <strong>full-text &amp; vector search</strong> across all of it. ACID transactions, Raft replication, and encryption at rest are built in. Embed it in your process, or run it as a server.</p>
     <div class="hero-actions">
       <a href="/quickstart/" class="btn btn-primary">Get Started</a>
-      <a href="/downloads/" class="btn btn-secondary">Downloads v0.36.0</a>
+      <a href="/downloads/" class="btn btn-secondary">Downloads</a>
     </div>
     <div class="hero-install">
       <code>one 20 MB binary &middot; zero dependencies &middot; embed or run as a server</code>
