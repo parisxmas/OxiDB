@@ -11,12 +11,39 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.38.0 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.38.0</h3>
+        <span class="version-date">2026-07-19</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Changed &mdash; disk-first document storage is the default</h4>
+        <ul>
+          <li><strong>Resident memory no longer scales with your data.</strong> Document bodies now live in an mmap'd, zstd-compressed file with only a ~24&nbsp;B/doc offset index in RAM; the OS page cache holds the hot part and gives it back under pressure. Measured on a live 48-hour IoT workload: <strong>489&nbsp;MB resident &rarr; ~35&nbsp;MB</strong>, with identical indexed-read throughput and a ~17% write cost. <code>OXIDB_DISK_FIRST=0</code> restores the always-resident mode; existing collections keep the format they were created with, so upgrading never reinterprets data. The entire test fleet now runs against disk-first, including the SIGKILL crash suites, and encryption at rest was re-verified against every file the engine writes.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; SQL</h4>
+        <ul>
+          <li><strong><code>SELECT ... FOR UPDATE</code> takes real row locks.</strong> It used to parse and silently not lock. Matched rows are now pessimistically locked until commit/rollback; concurrent <code>UPDATE</code>/<code>DELETE</code>/<code>FOR UPDATE</code> on them block (up to <code>OXIDB_SQL_LOCK_TIMEOUT_MS</code>, default 5000 &mdash; also how a deadlock resolves). Plain <code>UPDATE</code>/<code>DELETE</code> lock their rows too, closing the engine's lost-update window: two concurrent read-modify-write transactions on one row now serialize. Shapes that cannot lock base rows (joins, aggregates, <code>DISTINCT</code>, set ops, views, derived tables, <code>FOR SHARE</code>) are refused with a clear error, never accepted without the lock &mdash; and <code>FOR UPDATE</code> classifies as a <em>write</em>, so oxipool never routes it to a replica. <a href="/sql/">Details</a>.</li>
+          <li><strong><code>{"cmd": "disk_usage"}</code></strong> &mdash; per-engine on-disk footprint of the data directory in one call (documents incl. the mmap'd share, SQL, time-series, blobs, OxiMem, MQTT/AMQP substrates, full-text, PITR archive, system).</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed &mdash; a WAL durability bug</h4>
+        <ul>
+          <li><strong>Sealed WAL segments after the first were invisible.</strong> The segment scanner's fast path assumed <code>.0</code> always exists, but the first online checkpoint deleted it &mdash; after which later segments were never retired (unbounded disk growth) and, far worse, <strong>never replayed at recovery</strong>: a crash between a seal and its persist lost the acknowledged writes in that segment. <code>.0</code> is now a permanent empty sentinel, every checkpoint retires all covered segments (data dirs the old bug left behind self-heal), and three regression tests pin it &mdash; the crash-replay test was red before the fix.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.37.0 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.37.0</h3>
         <span class="version-date">2026-07-17</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Added &mdash; AMQP: the RabbitMQ protocol</h4>
