@@ -722,6 +722,27 @@ impl CompositeIndex {
         result
     }
 
+    /// Iterate prefix-matching (key values, doc_ids) entries in ascending
+    /// order. Entries sharing the slot value right after the prefix are
+    /// contiguous. The callback returns `false` to stop early. Used by the
+    /// covered-aggregation fast path when a leading equality `$match` pins
+    /// the prefix.
+    pub fn for_each_prefix_entries<F: FnMut(&[IndexValue], &DocIdSet) -> bool>(
+        &self,
+        prefix: &[IndexValue],
+        mut f: F,
+    ) {
+        let start = CompositeKey(prefix.to_vec());
+        for (key, ids) in self.tree.range(start..) {
+            if key.0.len() < prefix.len() || key.0[..prefix.len()] != *prefix {
+                break;
+            }
+            if !f(&key.0, ids) {
+                return;
+            }
+        }
+    }
+
     /// Iterate prefix-matching entries in ascending order, calling `f` for each DocumentId.
     /// Entries are yielded in the natural BTreeMap order of the remaining (non-prefix) fields.
     /// Return `false` from `f` to stop early.

@@ -3376,14 +3376,16 @@ pub(crate) fn try_index_only_count(
 }
 
 /// Covered composite-index `$group` — index-only aggregation with value
-/// accumulators. When the pipeline is a full-collection `$group` (no leading
-/// `$match`) whose key is a single field and whose `$sum`/`$avg`/`$min`/`$max`
-/// accumulators only reference fields materialized in ONE composite index
-/// with the group field as its first slot, the whole stage is answered by
-/// walking the composite B-tree: per entry we have the full value tuple and
-/// the doc count, so `sum += value × count` — **no document is read or
-/// decoded**. The tree is sorted by (group, ...), so groups arrive as
-/// contiguous runs in a single pass.
+/// accumulators. When the pipeline is `[$match?] → $group` with a
+/// single-field group key, the `$match` (when present) a single equality on
+/// the composite's first slot, and every `$sum`/`$avg`/`$min`/`$max`
+/// accumulator referencing a field materialized in ONE composite index
+/// (group field in the slot right after the match prefix), the whole stage
+/// is answered by walking the composite B-tree — the prefix range when a
+/// match pins it, all entries otherwise. Per entry we have the full value
+/// tuple and the doc count, so `sum += value × count` — **no document is
+/// read or decoded**. Entries are sorted, so groups arrive as contiguous
+/// runs in a single pass.
 ///
 /// Correctness contract: must return exactly what the hashing path over the
 /// decoded documents would. The per-slot IndexValue tells us the original
@@ -3405,11 +3407,46 @@ pub(crate) fn try_composite_covered_group(
     composite_indexes: &[crate::index::CompositeIndex],
     total_docs: usize,
     match_query: Option<&Value>,
+    field_indexes: Option<&HashMap<String, PagedFieldIndex>>,
 ) -> Option<Vec<Value>> {
-    // Only full collection scans (no $match filter).
-    if match_query.is_some() {
-        return None;
+    // A slot value the covered path cannot surface (or look up) faithfully.
+    fn lossy_iv(v: &IndexValue) -> bool {
+        match v {
+            IndexValue::DateTime(_) => true,
+            IndexValue::String(s) => s.starts_with('[') || s.starts_with('{'),
+            _ => false,
+        }
     }
+
+    // A leading $match participates when it is a single equality on the
+    // composite's FIRST slot: the walk then covers exactly that prefix
+    // range. The expected doc count comes from the match field's own
+    // single-field index (count_eq) — a cheap cross-check standing in for
+    // the full-scan variant's walked==total guard; no such index → decline.
+    let match_eq: Option<(String, IndexValue)> = match match_query {
+        None => None,
+        Some(q) => {
+            let parsed = query::parse_query(q).ok()?;
+            let eqs = query::extract_eq_conditions(&parsed)?;
+            if eqs.len() != 1 {
+                return None;
+            }
+            let fields: Vec<String> = eqs.keys().cloned().collect();
+            if !query::is_eq_only_on(&parsed, &fields) {
+                return None;
+            }
+            let (f, iv) = eqs.into_iter().next().expect("len checked above");
+            if lossy_iv(&iv) {
+                return None;
+            }
+            Some((f, iv))
+        }
+    };
+    let expected_ids: usize = match &match_eq {
+        None => total_docs,
+        Some((mf, miv)) => field_indexes?.get(mf)?.count_eq(miv),
+    };
+
     let group_field = match key {
         GroupKey::Single(Expression::FieldRef(field)) => field.as_str(),
         _ => return None,
@@ -3425,10 +3462,17 @@ pub(crate) fn try_composite_covered_group(
         MaxField(usize),
     }
 
-    // Find a composite index whose first slot is the group field and which
-    // materializes every accumulator-referenced field.
+    // Find a composite index whose slot layout fits: the (optional) match
+    // field first, the group field right after, and every
+    // accumulator-referenced field materialized in SOME slot.
+    let group_slot = match_eq.iter().len(); // 0 without a match, 1 with
     let found = composite_indexes.iter().find_map(|ci| {
-        if ci.fields.first().map(String::as_str) != Some(group_field) {
+        if let Some((mf, _)) = &match_eq {
+            if ci.fields.first() != Some(mf) {
+                return None;
+            }
+        }
+        if ci.fields.get(group_slot).map(String::as_str) != Some(group_field) {
             return None;
         }
         let slot_of = |f: &str| ci.fields.iter().position(|cf| cf == f);
@@ -3450,14 +3494,6 @@ pub(crate) fn try_composite_covered_group(
         Some((ci, plan))
     });
     let (ci, plan) = found?;
-
-    // A slot value the covered path cannot surface faithfully as a result
-    // value (`_id`, `$min`, `$max`).
-    let lossy = |v: &IndexValue| match v {
-        IndexValue::DateTime(_) => true,
-        IndexValue::String(s) => s.starts_with('[') || s.starts_with('{'),
-        _ => false,
-    };
 
     let fresh_states = || -> Vec<AccumulatorState> {
         plan.iter()
@@ -3485,13 +3521,13 @@ pub(crate) fn try_composite_covered_group(
         out.push(Value::Object(doc));
     };
 
-    ci.for_each_entry(|slots, doc_ids| {
+    let mut visit = |slots: &[IndexValue], doc_ids: &crate::index::DocIdSet| -> bool {
         let n = doc_ids.len();
         if n == 0 {
             return true;
         }
-        let g = &slots[0];
-        if lossy(g) {
+        let g = &slots[group_slot];
+        if lossy_iv(g) {
             bail = true;
             return false;
         }
@@ -3536,7 +3572,7 @@ pub(crate) fn try_composite_covered_group(
                 (CovAcc::MinField(slot), AccumulatorState::Min(cur)) => {
                     let v = &slots[*slot];
                     if !matches!(v, IndexValue::Null) {
-                        if lossy(v) {
+                        if lossy_iv(v) {
                             bail = true;
                             return false;
                         }
@@ -3548,7 +3584,7 @@ pub(crate) fn try_composite_covered_group(
                 (CovAcc::MaxField(slot), AccumulatorState::Max(cur)) => {
                     let v = &slots[*slot];
                     if !matches!(v, IndexValue::Null) {
-                        if lossy(v) {
+                        if lossy_iv(v) {
                             bail = true;
                             return false;
                         }
@@ -3561,15 +3597,23 @@ pub(crate) fn try_composite_covered_group(
             }
         }
         true
-    });
+    };
+
+    match &match_eq {
+        None => ci.for_each_entry(&mut visit),
+        Some((_, miv)) => ci.for_each_prefix_entries(std::slice::from_ref(miv), &mut visit),
+    }
 
     if bail {
         return None;
     }
-    // Every live document must be accounted for exactly once — the composite
-    // index keys every doc (missing fields index as Null). A mismatch means
-    // the index and storage disagree; fall back rather than guess.
-    if walked_ids != total_docs {
+    // Every doc the stage should see must be accounted for exactly once —
+    // the composite index keys every doc (missing fields index as Null).
+    // Full scan: walked must equal the collection's doc count. With a
+    // $match: walked must equal the match field's own single-field index
+    // count for that value. A mismatch means the indexes and storage
+    // disagree; fall back rather than guess.
+    if walked_ids != expected_ids {
         return None;
     }
     if let Some((done_g, done_states)) = current.take() {
@@ -5407,8 +5451,15 @@ mod tests {
 
         let ci = composite_from_docs(fields, &docs);
         let covered =
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), docs.len(), None)
-                .expect("covered path should apply");
+            try_composite_covered_group(
+                key,
+                accs,
+                std::slice::from_ref(&ci),
+                docs.len(),
+                None,
+                None,
+            )
+            .expect("covered path should apply");
 
         let mut expected = p.execute_from(0, docs, &no_lookup).unwrap();
         let mut got = covered;
@@ -5479,22 +5530,22 @@ mod tests {
         // Composite exists but group field is not the FIRST slot.
         let ci = composite_from_docs(&["salary", "dept"], &docs);
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None).is_none()
         );
         // Composite's first slot matches but the value field is not covered.
         let ci = composite_from_docs(&["dept", "age"], &docs);
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None).is_none()
         );
         // A leading $match disqualifies the full-scan-only fast path.
         let ci = composite_from_docs(&["dept", "salary"], &docs);
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, Some(&json!({})))
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, Some(&json!({})), None)
                 .is_none()
         );
         // Index/storage disagreement (walked ids != total docs) must bail.
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None, None).is_none()
         );
     }
 
@@ -5509,7 +5560,7 @@ mod tests {
         let docs = vec![json!({"dept": "2026-01-01", "salary": 1})];
         let ci = composite_from_docs(&["dept", "salary"], &docs);
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None).is_none()
         );
 
         // Array group value: indexed as its serialization ("[1]"), which a
@@ -5517,7 +5568,7 @@ mod tests {
         let docs = vec![json!({"dept": [1], "salary": 1})];
         let ci = composite_from_docs(&["dept", "salary"], &docs);
         assert!(
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None).is_none()
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 1, None, None).is_none()
         );
 
         // DateTime in a $min/$max slot: hash path would surface the original
@@ -5533,12 +5584,210 @@ mod tests {
                 .unwrap();
         let (key_min, accs_min, _) = p_min.try_streaming_group(0).unwrap();
         assert!(
-            try_composite_covered_group(key_min, accs_min, std::slice::from_ref(&ci), 2, None)
+            try_composite_covered_group(key_min, accs_min, std::slice::from_ref(&ci), 2, None, None)
                 .is_none()
         );
         let sum_only =
-            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None).unwrap();
+            try_composite_covered_group(key, accs, std::slice::from_ref(&ci), 2, None, None).unwrap();
         assert_eq!(sum_only, vec![json!({"_id": "a", "s": 5})]);
+    }
+
+    /// Build a single-field index over `field` from `docs` (doc id = position).
+    fn field_index_from_docs(field: &str, docs: &[Value]) -> HashMap<String, PagedFieldIndex> {
+        let mut fi = PagedFieldIndex::new(field.to_string());
+        for (i, doc) in docs.iter().enumerate() {
+            fi.insert_value(i as u64, doc);
+        }
+        let mut map = HashMap::new();
+        map.insert(field.to_string(), fi);
+        map
+    }
+
+    /// $match-prefixed covered path must return exactly what the real
+    /// pipeline ($match stage + hashing $group) returns.
+    fn assert_match_covered_matches_hash(
+        match_spec: Value,
+        group_spec: Value,
+        ci_fields: &[&str],
+        docs: Vec<Value>,
+    ) {
+        let match_field = match_spec
+            .as_object()
+            .and_then(|o| o.keys().next().cloned())
+            .expect("match spec has a field");
+        let pipeline_json = json!([{ "$match": match_spec }, { "$group": group_spec }]);
+        let p = Pipeline::parse(&pipeline_json).unwrap();
+        let (leading_match, start_idx) = p.take_leading_match();
+        let (key, accs, _) = p
+            .try_streaming_group(start_idx)
+            .expect("$match+$group is streamable");
+
+        let ci = composite_from_docs(ci_fields, &docs);
+        let fi = field_index_from_docs(&match_field, &docs);
+        let covered = try_composite_covered_group(
+            key,
+            accs,
+            std::slice::from_ref(&ci),
+            docs.len(),
+            leading_match,
+            Some(&fi),
+        )
+        .expect("match-covered path should apply");
+
+        let mut expected = p.execute_from(0, docs, &no_lookup).unwrap();
+        let mut got = covered;
+        let sort_key = |d: &Value| d["_id"].to_string();
+        expected.sort_by_key(sort_key);
+        got.sort_by_key(sort_key);
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn covered_group_with_match_prefix_matches_hash_path() {
+        let docs = vec![
+            json!({"region": "EU", "dept": "eng", "salary": 100}),
+            json!({"region": "EU", "dept": "eng", "salary": 200}),
+            json!({"region": "EU", "dept": "ops", "salary": 50.5}),
+            json!({"region": "US", "dept": "eng", "salary": 999}),
+            json!({"region": "EU", "dept": "eng"}), // missing salary
+            json!({"region": "EU", "salary": 7}),   // missing dept → null group
+            json!({"dept": "eng", "salary": 1}),    // missing region → excluded
+        ];
+        assert_match_covered_matches_hash(
+            json!({"region": "EU"}),
+            json!({
+                "_id": "$dept",
+                "headcount": {"$sum": 1},
+                "total": {"$sum": "$salary"},
+                "avg": {"$avg": "$salary"},
+            }),
+            &["region", "dept", "salary"],
+            docs,
+        );
+    }
+
+    #[test]
+    fn covered_group_with_match_declines_unsupported_shapes() {
+        let docs = vec![
+            json!({"region": "EU", "dept": "a", "salary": 1}),
+            json!({"region": "US", "dept": "b", "salary": 2}),
+        ];
+        let ci = composite_from_docs(&["region", "dept", "salary"], &docs);
+        let fi = field_index_from_docs("region", &docs);
+
+        let p = Pipeline::parse(&json!([
+            {"$match": {"region": "EU"}},
+            {"$group": {"_id": "$dept", "s": {"$sum": "$salary"}}}
+        ]))
+        .unwrap();
+        let (leading_match, start_idx) = p.take_leading_match();
+        let (key, accs, _) = p.try_streaming_group(start_idx).unwrap();
+
+        // Works with the cross-check index present…
+        assert!(
+            try_composite_covered_group(
+                key,
+                accs,
+                std::slice::from_ref(&ci),
+                2,
+                leading_match,
+                Some(&fi)
+            )
+            .is_some()
+        );
+        // …declines without a single-field index on the match field (no
+        // count cross-check possible)…
+        assert!(
+            try_composite_covered_group(
+                key,
+                accs,
+                std::slice::from_ref(&ci),
+                2,
+                leading_match,
+                None
+            )
+            .is_none()
+        );
+        let empty_fi: HashMap<String, PagedFieldIndex> = HashMap::new();
+        assert!(
+            try_composite_covered_group(
+                key,
+                accs,
+                std::slice::from_ref(&ci),
+                2,
+                leading_match,
+                Some(&empty_fi)
+            )
+            .is_none()
+        );
+        // …declines when the match is not a pure single equality…
+        for bad_match in [
+            json!({"region": {"$gt": "A"}}),
+            json!({"region": "EU", "dept": "a"}),
+            json!({"region": "EU", "salary": {"$gte": 1}}),
+        ] {
+            let p = Pipeline::parse(&json!([
+                {"$match": bad_match},
+                {"$group": {"_id": "$dept", "s": {"$sum": "$salary"}}}
+            ]))
+            .unwrap();
+            let (lm, si) = p.take_leading_match();
+            let (k, a, _) = p.try_streaming_group(si).unwrap();
+            assert!(
+                try_composite_covered_group(
+                    k,
+                    a,
+                    std::slice::from_ref(&ci),
+                    2,
+                    lm,
+                    Some(&fi)
+                )
+                .is_none()
+            );
+        }
+        // …and declines when the group field is not the slot right after
+        // the match prefix.
+        let ci_wrong = composite_from_docs(&["region", "salary", "dept"], &docs);
+        assert!(
+            try_composite_covered_group(
+                key,
+                accs,
+                std::slice::from_ref(&ci_wrong),
+                2,
+                leading_match,
+                Some(&fi)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn covered_group_match_on_null_declines_via_count_cross_check() {
+        // {region: null} matches docs MISSING the field too (hash path), but
+        // a single-field index only holds docs that HAVE the field — the
+        // count cross-check must catch the disagreement and decline.
+        let docs = vec![
+            json!({"dept": "a", "salary": 1}),                 // region missing
+            json!({"region": null, "dept": "a", "salary": 2}), // explicit null
+            json!({"region": "EU", "dept": "b", "salary": 3}),
+        ];
+        let ci = composite_from_docs(&["region", "dept", "salary"], &docs);
+        let fi = field_index_from_docs("region", &docs);
+        let p = Pipeline::parse(&json!([
+            {"$match": {"region": null}},
+            {"$group": {"_id": "$dept", "s": {"$sum": "$salary"}}}
+        ]))
+        .unwrap();
+        let (lm, si) = p.take_leading_match();
+        let (k, a, _) = p.try_streaming_group(si).unwrap();
+        let covered =
+            try_composite_covered_group(k, a, std::slice::from_ref(&ci), 3, lm, Some(&fi));
+        if let Some(got) = covered {
+            // If the engine's index semantics ever make this coverable, it
+            // must agree with the real pipeline byte-for-byte.
+            let expected = p.execute_from(0, docs, &no_lookup).unwrap();
+            assert_eq!(got, expected);
+        }
     }
 
     #[test]

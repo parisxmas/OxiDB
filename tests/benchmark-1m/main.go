@@ -272,7 +272,7 @@ func main() {
 	// Compound indexes created on BOTH engines: OxiDB answers full-collection
 	// $group aggregations straight from these (covered aggregation); MongoDB
 	// gets the identical compound indexes to use however it can.
-	compositeFields := [][]string{{"department", "salary"}, {"city", "salary"}}
+	compositeFields := [][]string{{"department", "salary"}, {"city", "salary"}, {"region", "department", "salary"}}
 
 	t0 = time.Now()
 	for _, f := range indexFields {
@@ -299,7 +299,7 @@ func main() {
 	monIdx := time.Since(t0)
 
 	nIdx := len(indexFields) + len(compositeFields)
-	record("INDEX", fmt.Sprintf("%d indexes (8 single + 2 compound)", nIdx), oxiIdx, monIdx, nIdx, nIdx, nil, nil)
+	record("INDEX", fmt.Sprintf("%d indexes (8 single + 3 compound)", nIdx), oxiIdx, monIdx, nIdx, nIdx, nil, nil)
 	fmt.Println()
 
 	// ════════════════════════════════════════════════════════════════
