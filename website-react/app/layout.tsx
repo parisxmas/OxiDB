@@ -20,7 +20,7 @@ export const metadata: Metadata = {
   openGraph: {
     title: 'OxiDB - Fast Multi-Model Database',
     description:
-      'MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.37.0.',
+      'MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.38.0.',
     url: 'https://oxidb.baltavista.com',
     siteName: 'OxiDB',
     type: 'website',
@@ -29,7 +29,7 @@ export const metadata: Metadata = {
         url: '/og-card.png?v=0352',
         width: 1200,
         height: 630,
-        alt: 'OxiDB v0.37.0 — multi-model: documents, SQL, time-series, Redis, MQTT, AMQP, S3. One binary.',
+        alt: 'OxiDB v0.38.0 — multi-model: documents, SQL, time-series, Redis, MQTT, AMQP, S3. One binary.',
       },
     ],
   },
@@ -37,7 +37,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: 'OxiDB - Fast Multi-Model Database',
     description:
-      'MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.37.0.',
+      'MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.38.0.',
     images: ['/og-card.png?v=0352'],
   },
   icons: {

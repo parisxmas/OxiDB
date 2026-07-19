@@ -7,7 +7,7 @@ export const metadata: Metadata = {
 export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<header class="hero">
   <div class="container">
-    <p class="hero-kicker"><span class="hero-pulse"></span>v0.37 &middot; AMQP &mdash; the RabbitMQ protocol &middot; MQTT bridge &middot; faster than RabbitMQ on 5 of 6 benchmarks &middot; online WAL checkpointing</p>
+    <p class="hero-kicker"><span class="hero-pulse"></span>v0.38 &middot; disk-first by default &mdash; RSS no longer scales with your data &middot; real SELECT FOR UPDATE &middot; AMQP (RabbitMQ protocol)</p>
     <div class="hero-lockup">
       <img src="/oxidb-logo.svg" class="hero-logo" alt="OxiDB logo" width="96" height="96" />
       <h1>OxiDB</h1>
