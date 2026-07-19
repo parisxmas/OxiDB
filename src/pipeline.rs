@@ -3418,33 +3418,99 @@ pub(crate) fn try_composite_covered_group(
         }
     }
 
-    // A leading $match participates when it is a single equality on the
-    // composite's FIRST slot: the walk then covers exactly that prefix
-    // range. The expected doc count comes from the match field's own
-    // single-field index (count_eq) — a cheap cross-check standing in for
+    // A leading $match participates in two shapes: a single equality on the
+    // composite's FIRST slot (the walk covers exactly that prefix range), or
+    // a pure range on ONE materialized field (full walk, entries outside the
+    // bounds skipped). Match values/bounds need no lossiness guard — both
+    // the index and matches_value compare through IndexValue, so the
+    // semantics agree by construction; only OUTPUT slots must be lossless.
+    //
+    // The expected doc count comes from the match field's own single-field
+    // index (count_eq / count_range) — a cheap cross-check standing in for
     // the full-scan variant's walked==total guard; no such index → decline.
-    let match_eq: Option<(String, IndexValue)> = match match_query {
-        None => None,
+    // It also catches the {f: null} / missing-field divergence: matches_value
+    // treats missing specially, single-field indexes don't hold missing docs,
+    // composites key them as Null — any disagreement fails the count check.
+    enum MatchPlan {
+        All,
+        Eq(String, IndexValue),
+        Range {
+            field: String,
+            lo: std::ops::Bound<IndexValue>,
+            hi: std::ops::Bound<IndexValue>,
+        },
+    }
+    let match_plan: MatchPlan = match match_query {
+        None => MatchPlan::All,
         Some(q) => {
+            use std::ops::Bound;
             let parsed = query::parse_query(q).ok()?;
-            let eqs = query::extract_eq_conditions(&parsed)?;
-            if eqs.len() != 1 {
-                return None;
+            if let Some(eqs) = query::extract_eq_conditions(&parsed) {
+                let fields: Vec<String> = eqs.keys().cloned().collect();
+                if eqs.len() != 1 || !query::is_eq_only_on(&parsed, &fields) {
+                    return None;
+                }
+                let (f, iv) = eqs.into_iter().next().expect("len checked above");
+                MatchPlan::Eq(f, iv)
+            } else {
+                // Pure single-field range: Field with a range op, or And of
+                // range ops all on the same field.
+                let conds: Vec<&query::Query> = match &parsed {
+                    query::Query::Field { .. } => vec![&parsed],
+                    query::Query::And(subs) => subs.iter().collect(),
+                    _ => return None,
+                };
+                if conds.is_empty() {
+                    return None;
+                }
+                let mut range_field: Option<&str> = None;
+                let mut lo: Bound<IndexValue> = Bound::Unbounded;
+                let mut hi: Bound<IndexValue> = Bound::Unbounded;
+                for c in conds {
+                    let query::Query::Field { field, op } = c else {
+                        return None;
+                    };
+                    if range_field.is_some_and(|rf| rf != field) {
+                        return None;
+                    }
+                    range_field = Some(field);
+                    match op {
+                        query::QueryOp::Gt(v) if matches!(lo, Bound::Unbounded) => {
+                            lo = Bound::Excluded(v.clone());
+                        }
+                        query::QueryOp::Gte(v) if matches!(lo, Bound::Unbounded) => {
+                            lo = Bound::Included(v.clone());
+                        }
+                        query::QueryOp::Lt(v) if matches!(hi, Bound::Unbounded) => {
+                            hi = Bound::Excluded(v.clone());
+                        }
+                        query::QueryOp::Lte(v) if matches!(hi, Bound::Unbounded) => {
+                            hi = Bound::Included(v.clone());
+                        }
+                        _ => return None,
+                    }
+                }
+                MatchPlan::Range {
+                    field: range_field?.to_string(),
+                    lo,
+                    hi,
+                }
             }
-            let fields: Vec<String> = eqs.keys().cloned().collect();
-            if !query::is_eq_only_on(&parsed, &fields) {
-                return None;
-            }
-            let (f, iv) = eqs.into_iter().next().expect("len checked above");
-            if lossy_iv(&iv) {
-                return None;
-            }
-            Some((f, iv))
         }
     };
-    let expected_ids: usize = match &match_eq {
-        None => total_docs,
-        Some((mf, miv)) => field_indexes?.get(mf)?.count_eq(miv),
+    fn bound_ref(b: &std::ops::Bound<IndexValue>) -> std::ops::Bound<&IndexValue> {
+        match b {
+            std::ops::Bound::Included(v) => std::ops::Bound::Included(v),
+            std::ops::Bound::Excluded(v) => std::ops::Bound::Excluded(v),
+            std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        }
+    }
+    let expected_ids: usize = match &match_plan {
+        MatchPlan::All => total_docs,
+        MatchPlan::Eq(mf, miv) => field_indexes?.get(mf)?.count_eq(miv),
+        MatchPlan::Range { field, lo, hi } => {
+            field_indexes?.get(field)?.count_range(bound_ref(lo), bound_ref(hi))
+        }
     };
 
     let group_field = match key {
@@ -3462,12 +3528,16 @@ pub(crate) fn try_composite_covered_group(
         MaxField(usize),
     }
 
-    // Find a composite index whose slot layout fits: the (optional) match
-    // field first, the group field right after, and every
-    // accumulator-referenced field materialized in SOME slot.
-    let group_slot = match_eq.iter().len(); // 0 without a match, 1 with
+    // Find a composite index whose slot layout fits: an equality match field
+    // first (when present) with the group field right after; a range match
+    // field materialized in ANY slot; and every accumulator-referenced field
+    // materialized in SOME slot.
+    let group_slot = match &match_plan {
+        MatchPlan::Eq(..) => 1,
+        _ => 0,
+    };
     let found = composite_indexes.iter().find_map(|ci| {
-        if let Some((mf, _)) = &match_eq {
+        if let MatchPlan::Eq(mf, _) = &match_plan {
             if ci.fields.first() != Some(mf) {
                 return None;
             }
@@ -3475,6 +3545,12 @@ pub(crate) fn try_composite_covered_group(
         if ci.fields.get(group_slot).map(String::as_str) != Some(group_field) {
             return None;
         }
+        let range_slot = match &match_plan {
+            MatchPlan::Range { field, .. } => {
+                Some(ci.fields.iter().position(|cf| cf == field)?)
+            }
+            _ => None,
+        };
         let slot_of = |f: &str| ci.fields.iter().position(|cf| cf == f);
         let mut plan = Vec::with_capacity(accumulators.len());
         for (_, acc) in accumulators {
@@ -3491,9 +3567,29 @@ pub(crate) fn try_composite_covered_group(
             };
             plan.push(cov);
         }
-        Some((ci, plan))
+        Some((ci, plan, range_slot))
     });
-    let (ci, plan) = found?;
+    let (ci, plan, range_slot) = found?;
+
+    // In-bounds test for the range match, shared by the walk. Same
+    // IndexValue ordering as the single-field index's count_range, so the
+    // guard below compares like with like.
+    let in_bounds = |v: &IndexValue| -> bool {
+        use std::ops::Bound;
+        let (lo, hi) = match &match_plan {
+            MatchPlan::Range { lo, hi, .. } => (lo, hi),
+            _ => return true,
+        };
+        (match lo {
+            Bound::Unbounded => true,
+            Bound::Included(b) => v >= b,
+            Bound::Excluded(b) => v > b,
+        }) && (match hi {
+            Bound::Unbounded => true,
+            Bound::Included(b) => v <= b,
+            Bound::Excluded(b) => v < b,
+        })
+    };
 
     let fresh_states = || -> Vec<AccumulatorState> {
         plan.iter()
@@ -3525,6 +3621,11 @@ pub(crate) fn try_composite_covered_group(
         let n = doc_ids.len();
         if n == 0 {
             return true;
+        }
+        if let Some(rs) = range_slot {
+            if !in_bounds(&slots[rs]) {
+                return true; // outside the $match range: skip, don't count
+            }
         }
         let g = &slots[group_slot];
         if lossy_iv(g) {
@@ -3599,9 +3700,11 @@ pub(crate) fn try_composite_covered_group(
         true
     };
 
-    match &match_eq {
-        None => ci.for_each_entry(&mut visit),
-        Some((_, miv)) => ci.for_each_prefix_entries(std::slice::from_ref(miv), &mut visit),
+    match &match_plan {
+        MatchPlan::Eq(_, miv) => {
+            ci.for_each_prefix_entries(std::slice::from_ref(miv), &mut visit)
+        }
+        MatchPlan::All | MatchPlan::Range { .. } => ci.for_each_entry(&mut visit),
     }
 
     if bail {
@@ -5758,6 +5861,147 @@ mod tests {
                 Some(&fi)
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn covered_group_with_range_match_matches_hash_path() {
+        // Time-series shape: group by symbol over a time window. Window
+        // bounds exclude some entries; one doc misses the value field; one
+        // misses the group field (null group inside the window).
+        let docs = vec![
+            json!({"sym": "BTC", "ts": 100, "price": 10}),
+            json!({"sym": "BTC", "ts": 150, "price": 20}),
+            json!({"sym": "BTC", "ts": 999, "price": 500}), // outside window
+            json!({"sym": "ETH", "ts": 120, "price": 5.5}),
+            json!({"sym": "ETH", "ts": 130}),               // no price
+            json!({"ts": 140, "price": 7}),                 // no sym → null group
+            json!({"sym": "SOL", "ts": 10, "price": 3}),    // before window
+        ];
+        assert_match_covered_matches_hash(
+            json!({"ts": {"$gte": 100, "$lt": 200}}),
+            json!({
+                "_id": "$sym",
+                "n": {"$sum": 1},
+                "vol": {"$sum": "$price"},
+                "avg": {"$avg": "$price"},
+                "hi": {"$max": "$price"},
+            }),
+            &["sym", "ts", "price"],
+            docs,
+        );
+    }
+
+    #[test]
+    fn covered_group_range_match_on_date_strings_matches_hash_path() {
+        // ISO date strings index as DateTime(ms); the bounds do too. Both
+        // matches_value and the covered walk compare through IndexValue, so
+        // the window semantics must agree end to end.
+        let docs = vec![
+            json!({"sym": "BTC", "ts": "2026-01-01T00:00:00Z", "price": 10}),
+            json!({"sym": "BTC", "ts": "2026-01-01T00:05:00Z", "price": 30}),
+            json!({"sym": "BTC", "ts": "2026-01-02T00:00:00Z", "price": 99}), // next day
+            json!({"sym": "ETH", "ts": "2026-01-01T12:00:00Z", "price": 4}),
+        ];
+        assert_match_covered_matches_hash(
+            json!({"ts": {"$gte": "2026-01-01T00:00:00Z", "$lt": "2026-01-02T00:00:00Z"}}),
+            json!({"_id": "$sym", "n": {"$sum": 1}, "avg": {"$avg": "$price"}}),
+            &["sym", "ts", "price"],
+            docs,
+        );
+    }
+
+    #[test]
+    fn covered_group_half_open_range_and_missing_field_docs() {
+        let group = json!({"_id": "$sym", "n": {"$sum": 1}, "s": {"$sum": "$price"}});
+
+        // Explicit-null ts: IndexValue ordering has Null < numbers, and BOTH
+        // matches_value and the index paths compare through IndexValue, so a
+        // {$lt} window includes it consistently everywhere — parity holds.
+        let docs = vec![
+            json!({"sym": "A", "ts": 100, "price": 1}),
+            json!({"sym": "A", "ts": null, "price": 2}),
+            json!({"sym": "B", "ts": 500, "price": 4}), // outside
+        ];
+        assert_match_covered_matches_hash(
+            json!({"ts": {"$lt": 200}}),
+            group.clone(),
+            &["sym", "ts", "price"],
+            docs,
+        );
+
+        // MISSING ts under a {$lt} window: matches_value excludes it, but
+        // the composite keys it as Null (inside the window). The count
+        // cross-check (single-field ts index has no entry for the missing
+        // doc) must catch the disagreement — decline, or agree exactly.
+        let docs = vec![
+            json!({"sym": "A", "ts": 100, "price": 1}),
+            json!({"sym": "A", "price": 2}), // ts missing
+        ];
+        let p = Pipeline::parse(&json!([
+            {"$match": {"ts": {"$lt": 200}}},
+            {"$group": &group}
+        ]))
+        .unwrap();
+        let (lm, si) = p.take_leading_match();
+        let (k, a, _) = p.try_streaming_group(si).unwrap();
+        let ci = composite_from_docs(&["sym", "ts", "price"], &docs);
+        let fi = field_index_from_docs("ts", &docs);
+        let covered =
+            try_composite_covered_group(k, a, std::slice::from_ref(&ci), 2, lm, Some(&fi));
+        if let Some(got) = covered {
+            let expected = p.execute_from(0, docs, &no_lookup).unwrap();
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn covered_group_range_match_declines_unsupported_shapes() {
+        let docs = vec![
+            json!({"sym": "A", "ts": 100, "price": 1, "other": 5}),
+            json!({"sym": "B", "ts": 200, "price": 2, "other": 6}),
+        ];
+        let ci = composite_from_docs(&["sym", "ts", "price"], &docs);
+        let fi = field_index_from_docs("ts", &docs);
+
+        let mk = |match_spec: Value| {
+            Pipeline::parse(&json!([
+                {"$match": match_spec},
+                {"$group": {"_id": "$sym", "s": {"$sum": "$price"}}}
+            ]))
+            .unwrap()
+        };
+
+        // Range on a field the composite does not materialize.
+        let p = mk(json!({"other": {"$gte": 1}}));
+        let (lm, si) = p.take_leading_match();
+        let (k, a, _) = p.try_streaming_group(si).unwrap();
+        let fi_other = field_index_from_docs("other", &docs);
+        assert!(
+            try_composite_covered_group(
+                k,
+                a,
+                std::slice::from_ref(&ci),
+                2,
+                lm,
+                Some(&fi_other)
+            )
+            .is_none()
+        );
+        // Ranges on two different fields.
+        let p = mk(json!({"ts": {"$gte": 1}, "other": {"$lt": 10}}));
+        let (lm, si) = p.take_leading_match();
+        let (k, a, _) = p.try_streaming_group(si).unwrap();
+        assert!(
+            try_composite_covered_group(k, a, std::slice::from_ref(&ci), 2, lm, Some(&fi))
+                .is_none()
+        );
+        // No single-field index on the range field → no cross-check.
+        let p = mk(json!({"ts": {"$gte": 1}}));
+        let (lm, si) = p.take_leading_match();
+        let (k, a, _) = p.try_streaming_group(si).unwrap();
+        assert!(
+            try_composite_covered_group(k, a, std::slice::from_ref(&ci), 2, lm, None).is_none()
         );
     }
 
