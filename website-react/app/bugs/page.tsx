@@ -242,7 +242,7 @@ export default function BugsPage() {
 
   return (
     <section className="section">
-      <div className="container">
+      <div className="container bug-wide">
         <h2>
           <svg
             className="section-icon"
@@ -492,6 +492,9 @@ export default function BugsPage() {
 function BugStyles() {
   return (
     <style>{`
+      /* This page is a workspace, not an article: let it breathe wider than
+         the site's 960px reading column. */
+      .container.bug-wide { max-width: 1300px; }
       .bug-authbar { display:flex; align-items:center; gap:.75rem; flex-wrap:wrap;
         margin:1.25rem 0; padding:.75rem 1rem; border:1px solid var(--border,#e5e7eb);
         border-radius:12px; background:var(--card,rgba(127,127,127,.04)); }
@@ -517,7 +520,7 @@ function BugStyles() {
       .bug-tab { padding:.45rem .95rem; background:transparent; border:0;
         color:inherit; cursor:pointer; font:inherit; opacity:.7; }
       .bug-tab.active { background:var(--accent,#2563eb); color:#fff; opacity:1; }
-      .bug-search { max-width:240px; }
+      .bug-search { max-width:340px; flex:1 1 240px; }
       .bug-list { list-style:none; padding:0; margin:0;
         border:1px solid var(--border,#e5e7eb); border-radius:12px; overflow:hidden; }
       .bug-item { display:flex; align-items:center; gap:.9rem; padding:.85rem 1rem;
