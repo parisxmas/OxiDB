@@ -2173,7 +2173,7 @@ impl BTreeCollection {
         // write locks for correctness, but when the bytes are unchanged (the
         // overwhelmingly common case) a cheap memcmp lets it reuse the
         // phase-1 decode instead of decoding every document twice.
-        let mut matches: Vec<(DocumentId, Vec<u8>, Arc<Value>)> = Vec::new();
+        let mut matches: Vec<(DocumentId, Vec<u8>, Option<Arc<Value>>)> = Vec::new();
         {
             let fi = self.field_indexes.read();
             let mut lazy_handled = false;
@@ -2184,7 +2184,7 @@ impl BTreeCollection {
                     if let Some(bytes) = self.storage.get(id) {
                         if let Some(arc) = self.load_doc_arc(id) {
                             if skip_post_filter || query::matches_value(&query, &arc) {
-                                matches.push((id, bytes, arc));
+                                matches.push((id, bytes, Some(arc)));
                                 if matches.len() >= lim {
                                     return false;
                                 }
@@ -2204,14 +2204,28 @@ impl BTreeCollection {
                 drop(ci);
 
                 if let Some(ref indexed_ids) = candidate_ids {
+                    // Match on the RAW bytes — no per-candidate decode, no
+                    // doc-cache churn. Fully-indexed queries need no
+                    // post-filter at all (the candidate set is exact, the
+                    // same contract find paths rely on); phase 2 decodes
+                    // the matches in parallel.
+                    let skip_post_filter = query::is_fully_indexed(&query, &fi);
                     for &id in indexed_ids {
                         if let Some(bytes) = self.storage.get(id) {
-                            if let Some(data) = self.load_doc_arc(id) {
-                                if query::matches_value(&query, &data) {
-                                    matches.push((id, bytes, data));
-                                    if limit.is_some_and(|l| matches.len() >= l) {
-                                        break;
-                                    }
+                            let matched = skip_post_filter
+                                || match query::matches_raw_jsonb(&query, &bytes) {
+                                    Some(m) => m,
+                                    // Legacy JSON text / unsupported op:
+                                    // decode this one candidate.
+                                    None => query::matches_value(
+                                        &query,
+                                        &codec::decode_doc(&bytes)?,
+                                    ),
+                                };
+                            if matched {
+                                matches.push((id, bytes, None));
+                                if limit.is_some_and(|l| matches.len() >= l) {
+                                    break;
                                 }
                             }
                         }
@@ -2223,7 +2237,7 @@ impl BTreeCollection {
                     self.for_each_doc_arc_while(|id, arc| {
                         if query::matches_value(&query, arc) {
                             if let Some(bytes) = self.storage.get(id) {
-                                matches.push((id, bytes, arc.clone()));
+                                matches.push((id, bytes, Some(arc.clone())));
                                 if limit.is_some_and(|l| matches.len() >= l) {
                                     return Ok(false);
                                 }
@@ -2269,7 +2283,7 @@ impl BTreeCollection {
         // The per-doc compute (clone, apply the update, re-encode) is pure
         // and dominates bulk updates — fan it out. Order is preserved, so
         // WAL ordering and the returned id order are unchanged.
-        let compute = |(id, phase1_bytes, phase1_value): (DocumentId, Vec<u8>, Arc<Value>)|
+        let compute = |(id, phase1_bytes, phase1_value): (DocumentId, Vec<u8>, Option<Arc<Value>>)|
          -> Result<Option<UpdateOp>> {
             // Re-read under the write locks; storage is the source of truth.
             let Some(cur_bytes) = self.storage.get(id) else {
@@ -2279,7 +2293,12 @@ impl BTreeCollection {
             // common case) reuse phase 1's decode; only a changed doc pays
             // a second decode.
             let current: Arc<Value> = if cur_bytes == phase1_bytes {
-                phase1_value
+                match phase1_value {
+                    Some(v) => v,
+                    // Raw-matched in phase 1: the verdict stands (same
+                    // bytes); this is the first and only decode.
+                    None => Arc::new(codec::decode_doc(&cur_bytes)?),
+                }
             } else {
                 let decoded = codec::decode_doc(&cur_bytes)?;
                 // Re-check the predicate: a concurrent update may have moved
