@@ -258,7 +258,7 @@ impl Runner {
             "findOne" => &["filter", "sort", "comment", "hint", "projection"],
             "insertOne" => &["document", "comment"],
             "insertMany" => &["documents", "ordered", "comment"],
-            "updateOne" | "updateMany" => &["filter", "update", "comment", "upsert"],
+            "updateOne" | "updateMany" => &["filter", "update", "comment", "upsert", "arrayFilters"],
             "deleteOne" | "deleteMany" => &["filter", "comment"],
             "countDocuments" => &["filter", "comment", "skip", "limit"],
             "estimatedDocumentCount" => &["comment", "maxTimeMS"],
@@ -267,8 +267,8 @@ impl Runner {
             "bulkWrite" => &["requests", "ordered", "comment"],
             "distinct" => &["fieldName", "filter", "comment"],
             "replaceOne" => &["filter", "replacement", "comment"],
-            "findOneAndUpdate" => &["filter", "update", "returnDocument", "sort", "comment", "projection", "upsert"],
-            "findOneAndReplace" => &["filter", "replacement", "returnDocument", "sort", "comment", "projection"],
+            "findOneAndUpdate" => &["filter", "update", "returnDocument", "sort", "comment", "projection", "upsert", "arrayFilters"],
+            "findOneAndReplace" => &["filter", "replacement", "returnDocument", "sort", "comment", "projection", "upsert"],
             "findOneAndDelete" => &["filter", "sort", "comment", "projection"],
             _ => return Some(format!("op:{op}")),
         };
@@ -483,7 +483,8 @@ impl Runner {
                 };
                 let upsert = args.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
                 let multi = name == "updateMany";
-                match self.db.update_with_upsert(&coll, &filter(), &update, multi, upsert) {
+                let af = args.get("arrayFilters").map(to_engine);
+                match self.db.update_full(&coll, &filter(), &update, multi, upsert, af.as_ref()) {
                     Ok((matched, modified, None)) => OpOutcome::Ok(Some(json!({
                         "matchedCount": matched, "modifiedCount": modified, "upsertedCount": 0
                     }))),
@@ -624,6 +625,44 @@ impl Runner {
                     Ok(t) => t,
                 };
                 let Some(pre) = target else {
+                    if name == "findOneAndReplace"
+                        && args.get("upsert").and_then(|v| v.as_bool()) == Some(true)
+                    {
+                        let Some(replacement) = args.get("replacement") else {
+                            return OpOutcome::Skip("missing replacement".into());
+                        };
+                        if let Some(out) = Self::replacement_check(replacement) {
+                            return out;
+                        }
+                        // MongoDB inserts the replacement; a filter-equality
+                        // _id fills in when the replacement lacks one.
+                        let mut doc = to_engine(replacement);
+                        if doc.get(MID).is_none() {
+                            if let Some(fid) = args.get("filter").and_then(|f| f.get("_id")) {
+                                if !fid.is_object() || fid.get("$eq").is_some() {
+                                    let v = fid.get("$eq").unwrap_or(fid).clone();
+                                    if let Some(obj) = doc.as_object_mut() {
+                                        obj.insert(MID.to_string(), v);
+                                    }
+                                }
+                            }
+                        }
+                        return match self.db.insert(&coll, doc) {
+                            Err(e) => OpOutcome::Err(e.to_string()),
+                            Ok(id) => {
+                                let after = args.get("returnDocument").and_then(|v| v.as_str())
+                                    == Some("After");
+                                if !after {
+                                    return OpOutcome::Ok(Some(Value::Null));
+                                }
+                                match self.db.find_one(&coll, &json!({ "_id": id })) {
+                                    Ok(Some(d)) => OpOutcome::Ok(Some(from_engine(&d))),
+                                    Ok(None) => OpOutcome::Ok(Some(Value::Null)),
+                                    Err(e) => OpOutcome::Err(e.to_string()),
+                                }
+                            }
+                        };
+                    }
                     if name == "findOneAndUpdate"
                         && args.get("upsert").and_then(|v| v.as_bool()) == Some(true)
                     {
@@ -684,8 +723,9 @@ impl Runner {
                         } else {
                             to_engine(update)
                         };
+                        let af = args.get("arrayFilters").map(to_engine);
                         self.db
-                            .update_one(&coll, &id_query, &update)
+                            .update_full(&coll, &id_query, &update, false, false, af.as_ref())
                             .map(|_| ())
                             .map_err(|e| e.to_string())
                     }

@@ -2155,7 +2155,7 @@ impl BTreeCollection {
         update_json: &Value,
         limit: Option<usize>,
     ) -> Result<Vec<DocumentId>> {
-        self.update_upsert(query_json, update_json, limit, false)
+        self.update_upsert_filtered(query_json, update_json, limit, false, None)
             .map(|(_, ids, _)| ids)
     }
 
@@ -2216,6 +2216,20 @@ impl BTreeCollection {
         update_json: &Value,
         limit: Option<usize>,
         upsert: bool,
+    ) -> Result<(u64, Vec<DocumentId>, Option<DocumentId>)> {
+        self.update_upsert_filtered(query_json, update_json, limit, upsert, None)
+    }
+
+    /// `update_upsert` plus MongoDB `arrayFilters`: `$[ident]`/`$[]`
+    /// placeholders in operator paths are expanded per matched document
+    /// against the given element filters.
+    pub fn update_upsert_filtered(
+        &self,
+        query_json: &Value,
+        update_json: &Value,
+        limit: Option<usize>,
+        upsert: bool,
+        array_filters: Option<&Value>,
     ) -> Result<(u64, Vec<DocumentId>, Option<DocumentId>)> {
         // In flight: WAL record written, tree not updated yet — see insert().
         let _in_flight = self.apply_barrier.read();
@@ -2430,6 +2444,9 @@ impl BTreeCollection {
             let mut new_data = (*current).clone();
             if pipeline_mode {
                 crate::pipeline::apply_update_pipeline(&mut new_data, update_json)?;
+            } else if let Some(af) = array_filters {
+                let expanded = crate::update::expand_array_filters(&new_data, update_json, af)?;
+                crate::update::apply_update(&mut new_data, &expanded)?;
             } else {
                 crate::update::apply_update(&mut new_data, update_json)?;
             }
@@ -4816,6 +4833,74 @@ mod tests {
             .unwrap();
         assert!(ids.is_empty() && upserted.is_none());
         assert!(col.find_one(&json!({"sku": "ZZ"})).unwrap().is_none());
+    }
+
+    #[test]
+    fn array_filters_update_positional_elements() {
+        let col = new_btree_collection("array_filters");
+        col.insert(json!({"k": 1, "y": [{"b": 3}, {"b": 1}], "z": [1, 2, 3]}))
+            .unwrap();
+        col.insert(json!({"k": 2, "y": [{"b": 1, "c": [{"d": 1}, {"d": 9}]}]}))
+            .unwrap();
+
+        // Single identifier: only elements matching {i.b: 1} are set.
+        let (m, ids, _) = col
+            .update_upsert_filtered(
+                &json!({"k": 1}),
+                &json!({"$set": {"y.$[i].b": 2}}),
+                None,
+                false,
+                Some(&json!([{"i.b": 1}])),
+            )
+            .unwrap();
+        assert_eq!((m, ids.len()), (1, 1));
+        let d = col.find_one(&json!({"k": 1})).unwrap().unwrap();
+        assert_eq!(d["y"], json!([{"b": 3}, {"b": 2}]));
+
+        // $[] hits every element.
+        col.update_upsert_filtered(
+            &json!({"k": 1}),
+            &json!({"$inc": {"z.$[]": 10}}),
+            None,
+            false,
+            Some(&json!([])),
+        )
+        .unwrap();
+        let d = col.find_one(&json!({"k": 1})).unwrap().unwrap();
+        assert_eq!(d["z"], json!([11, 12, 13]));
+
+        // Nested identifiers multiply out: y.$[i].c.$[j].d.
+        col.update_upsert_filtered(
+            &json!({"k": 2}),
+            &json!({"$set": {"y.$[i].c.$[j].d": 0}}),
+            None,
+            false,
+            Some(&json!([{"i.b": 1}, {"j.d": 9}])),
+        )
+        .unwrap();
+        let d = col.find_one(&json!({"k": 2})).unwrap().unwrap();
+        assert_eq!(d["y"][0]["c"], json!([{"d": 1}, {"d": 0}]));
+
+        // Unknown identifier errors; no-match filter is a matched no-op.
+        assert!(col
+            .update_upsert_filtered(
+                &json!({"k": 1}),
+                &json!({"$set": {"y.$[nope].b": 5}}),
+                None,
+                false,
+                Some(&json!([{"i.b": 1}])),
+            )
+            .is_err());
+        let (m, ids, _) = col
+            .update_upsert_filtered(
+                &json!({"k": 1}),
+                &json!({"$set": {"y.$[i].b": 7}}),
+                None,
+                false,
+                Some(&json!([{"i.b": 999}])),
+            )
+            .unwrap();
+        assert_eq!((m, ids.len()), (1, 0));
     }
 
     /// Disk-first composites live in `.mcidx`: created there, reopened from

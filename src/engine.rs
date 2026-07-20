@@ -1859,6 +1859,19 @@ impl OxiDb {
         multi: bool,
         upsert: bool,
     ) -> Result<(u64, u64, Option<DocumentId>)> {
+        self.update_full(collection, query, update, multi, upsert, None)
+    }
+
+    /// `update_with_upsert` plus optional MongoDB `arrayFilters`.
+    pub fn update_full(
+        &self,
+        collection: &str,
+        query: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+        array_filters: Option<&Value>,
+    ) -> Result<(u64, u64, Option<DocumentId>)> {
         let col = self.get_or_create_collection(collection)?;
         // Shared commit lock: direct writes run concurrently with each
         // other but never inside a transaction commit's validate→apply
@@ -1866,7 +1879,8 @@ impl OxiDb {
         // bumps could be blindly overwritten by the commit's apply.
         let _occ_guard = self.commit_lock.read();
         let limit = if multi { None } else { Some(1) };
-        let (matched, ids, upserted) = col.update_upsert(query, update, limit, upsert)?;
+        let (matched, ids, upserted) =
+            col.update_upsert_filtered(query, update, limit, upsert, array_filters)?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {

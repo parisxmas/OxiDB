@@ -500,7 +500,8 @@ fn handle_request_session_inner(
                 }
             } else {
                 let upsert = request.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
-                match db.update_with_upsert(col, query, update, true, upsert) {
+                let af = request.get("array_filters").or_else(|| request.get("arrayFilters"));
+                match db.update_full(col, query, update, true, upsert, af) {
                     Ok((_, count, upserted)) => match upserted {
                         Some(id) => ok_bytes(json!({ "modified": count, "upserted_id": id })),
                         None => ok_bytes(json!({ "modified": count })),
@@ -530,7 +531,8 @@ fn handle_request_session_inner(
                 }
             } else {
                 let upsert = request.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
-                match db.update_with_upsert(col, query, update, false, upsert) {
+                let af = request.get("array_filters").or_else(|| request.get("arrayFilters"));
+                match db.update_full(col, query, update, false, upsert, af) {
                     Ok((_, count, upserted)) => match upserted {
                         Some(id) => ok_bytes(json!({ "modified": count, "upserted_id": id })),
                         None => ok_bytes(json!({ "modified": count })),

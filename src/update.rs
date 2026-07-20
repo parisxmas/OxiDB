@@ -416,6 +416,133 @@ fn number_to_value(n: f64) -> Value {
 // Tests
 // ===========================================================================
 
+
+/// Expand `arrayFilters` placeholders in an update document against a
+/// concrete target document: every operator key containing `$[ident]` (or
+/// the all-elements `$[]`) is rewritten into zero or more keys with real
+/// array indices, chosen by matching each element — wrapped as
+/// `{ident: element}` — against the corresponding filter. Nested
+/// placeholders multiply out. Keys whose placeholders match nothing are
+/// dropped (that operator becomes a no-op for this document, as in
+/// MongoDB).
+pub(crate) fn expand_array_filters(
+    doc: &Value,
+    update: &Value,
+    filters: &Value,
+) -> Result<Value> {
+    use crate::query;
+    // ident -> parsed element filter
+    let mut fmap: std::collections::HashMap<String, query::Query> =
+        std::collections::HashMap::new();
+    for f in filters.as_array().into_iter().flatten() {
+        let obj = f
+            .as_object()
+            .ok_or_else(|| Error::InvalidQuery("arrayFilters entries must be documents".into()))?;
+        let ident = obj
+            .keys()
+            .next()
+            .map(|k| k.split('.').next().unwrap_or(k).to_string())
+            .ok_or_else(|| Error::InvalidQuery("empty arrayFilters entry".into()))?;
+        if obj
+            .keys()
+            .any(|k| k.split('.').next() != Some(ident.as_str()))
+        {
+            return Err(Error::InvalidQuery(
+                "an arrayFilters entry must use a single identifier".into(),
+            ));
+        }
+        fmap.insert(ident, query::parse_query(f)?);
+    }
+
+    fn expand_key(
+        doc: &Value,
+        key: &str,
+        fmap: &std::collections::HashMap<String, crate::query::Query>,
+    ) -> Result<Vec<String>> {
+        use crate::query;
+        // (concrete path so far, current position in the doc)
+        let mut frontier: Vec<(String, Option<Value>)> =
+            vec![(String::new(), Some(doc.clone()))];
+        for seg in key.split('.') {
+            let mut next = Vec::new();
+            let ident: Option<&str> = seg
+                .strip_prefix("$[")
+                .and_then(|r| r.strip_suffix(']'));
+            for (path, cur) in frontier {
+                match ident {
+                    None => {
+                        let np = if path.is_empty() {
+                            seg.to_string()
+                        } else {
+                            format!("{path}.{seg}")
+                        };
+                        let nv = cur.as_ref().and_then(|c| c.get(seg)).cloned();
+                        next.push((np, nv));
+                    }
+                    Some(id) => {
+                        let Some(arr) = cur.as_ref().and_then(|c| c.as_array()) else {
+                            continue; // placeholder on a non-array: no match
+                        };
+                        let filter = if id.is_empty() {
+                            None // $[] — every element
+                        } else {
+                            Some(fmap.get(id).ok_or_else(|| {
+                                Error::InvalidQuery(format!(
+                                    "no arrayFilters entry for identifier '{id}'"
+                                ))
+                            })?)
+                        };
+                        for (i, elem) in arr.iter().enumerate() {
+                            let matched = match filter {
+                                None => true,
+                                Some(q) => {
+                                    let wrapper = serde_json::json!({ id: elem });
+                                    query::matches_value(q, &wrapper)
+                                }
+                            };
+                            if matched {
+                                let np = if path.is_empty() {
+                                    i.to_string()
+                                } else {
+                                    format!("{path}.{i}")
+                                };
+                                next.push((np, Some(elem.clone())));
+                            }
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        Ok(frontier.into_iter().map(|(p, _)| p).collect())
+    }
+
+    let update_obj = update
+        .as_object()
+        .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
+    let mut out = serde_json::Map::new();
+    for (op, fields) in update_obj {
+        let Some(fobj) = fields.as_object() else {
+            out.insert(op.clone(), fields.clone());
+            continue;
+        };
+        let mut nf = serde_json::Map::new();
+        for (k, v) in fobj {
+            if k.contains("$[") {
+                for concrete in expand_key(doc, k, &fmap)? {
+                    nf.insert(concrete, v.clone());
+                }
+            } else {
+                nf.insert(k.clone(), v.clone());
+            }
+        }
+        if !nf.is_empty() {
+            out.insert(op.clone(), Value::Object(nf));
+        }
+    }
+    Ok(Value::Object(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
