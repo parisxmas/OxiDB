@@ -53,15 +53,60 @@ fn to_engine(v: &Value) -> Value {
     rename_keys(v, "_id", MID)
 }
 
+/// Pipeline-style updates: the engine preserves ITS `_id`; MongoDB's
+/// _id-immutability must also cover the shimmed client id, so append a
+/// stage that carries `__mid` across $replaceRoot/$project. (Spec documents
+/// always have an _id, so the reference never evaluates to null.)
+fn to_engine_pipeline(update: &Value) -> Option<Value> {
+    // Field-path escape-hatch expressions our evaluator doesn't implement.
+    let txt = update.to_string();
+    if ["$setField", "$getField", "$literal", "$$ROOT"].iter().any(|t| txt.contains(t)) {
+        return None;
+    }
+    let stages: Vec<Value> = update
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|st| {
+                    let st = to_engine(st);
+                    // MongoDB keeps _id through $project unless _id: 0; the
+                    // shimmed client id must survive the same way.
+                    if let Some(proj) = st.get("$project").and_then(|p| p.as_object()) {
+                        if !proj.contains_key(MID) {
+                            let mut proj = proj.clone();
+                            proj.insert(MID.to_string(), json!(1));
+                            return json!({ "$project": proj });
+                        }
+                    }
+                    st
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Value::Array(stages))
+}
+
 /// Document coming OUT of the engine: drop engine bookkeeping (root `_id`,
 /// root `_version`), then surface `__mid` as `_id` again.
 fn from_engine(v: &Value) -> Value {
+    let engine_id = v.get("_id").cloned();
     let mut v = v.clone();
     if let Some(obj) = v.as_object_mut() {
         obj.remove("_id");
         obj.remove("_version");
     }
-    rename_keys(&v, MID, "_id")
+    let mut out = rename_keys(&v, MID, "_id");
+    // A pipeline update ($replaceRoot) may have dropped the shimmed client
+    // id; surface the engine id so the document still HAS an _id, like a
+    // real MongoDB document always does.
+    if let Some(obj) = out.as_object_mut() {
+        if !obj.contains_key("_id") {
+            if let Some(id) = engine_id {
+                obj.insert("_id".to_string(), id);
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -428,10 +473,14 @@ impl Runner {
                 let Some(update) = args.get("update") else {
                     return OpOutcome::Skip("missing update".into());
                 };
-                if update.is_array() {
-                    return OpOutcome::Skip("update:pipeline".into());
-                }
-                let update = to_engine(update);
+                let update = if update.is_array() {
+                    match to_engine_pipeline(update) {
+                        Some(u) => u,
+                        None => return OpOutcome::Skip("expr:fieldpath-escape".into()),
+                    }
+                } else {
+                    to_engine(update)
+                };
                 let upsert = args.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
                 let multi = name == "updateMany";
                 match self.db.update_with_upsert(&coll, &filter(), &update, multi, upsert) {
@@ -581,13 +630,20 @@ impl Runner {
                         let Some(update) = args.get("update") else {
                             return OpOutcome::Skip("missing update".into());
                         };
-                        if update.is_array() {
-                            return OpOutcome::Skip("update:pipeline".into());
-                        }
+                        let update = if update.is_array() {
+                            match to_engine_pipeline(update) {
+                                Some(u) => u,
+                                None => {
+                                    return OpOutcome::Skip("expr:fieldpath-escape".into());
+                                }
+                            }
+                        } else {
+                            to_engine(update)
+                        };
                         return match self.db.update_with_upsert(
                             &coll,
                             &filter(),
-                            &to_engine(update),
+                            &update,
                             false,
                             true,
                         ) {
@@ -618,11 +674,18 @@ impl Runner {
                         let Some(update) = args.get("update") else {
                             return OpOutcome::Skip("missing update".into());
                         };
-                        if update.is_array() {
-                            return OpOutcome::Skip("update:pipeline".into());
-                        }
+                        let update = if update.is_array() {
+                            match to_engine_pipeline(update) {
+                                Some(u) => u,
+                                None => {
+                                    return OpOutcome::Skip("expr:fieldpath-escape".into());
+                                }
+                            }
+                        } else {
+                            to_engine(update)
+                        };
                         self.db
-                            .update_one(&coll, &id_query, &to_engine(update))
+                            .update_one(&coll, &id_query, &update)
                             .map(|_| ())
                             .map_err(|e| e.to_string())
                     }

@@ -2219,10 +2219,18 @@ impl BTreeCollection {
     ) -> Result<(u64, Vec<DocumentId>, Option<DocumentId>)> {
         // In flight: WAL record written, tree not updated yet — see insert().
         let _in_flight = self.apply_barrier.read();
-        let update_obj = update_json
-            .as_object()
-            .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
-        if update_obj.is_empty() {
+        // An ARRAY update is a MongoDB pipeline-style update ($set/$unset/
+        // $project/$replaceRoot stages with aggregation expressions).
+        let pipeline_mode = update_json.is_array();
+        let empty_update = serde_json::Map::new();
+        let update_obj = if pipeline_mode {
+            &empty_update
+        } else {
+            update_json
+                .as_object()
+                .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?
+        };
+        if !pipeline_mode && update_obj.is_empty() {
             return Err(Error::InvalidQuery(
                 "update must contain at least one operator".into(),
             ));
@@ -2232,7 +2240,9 @@ impl BTreeCollection {
         // update path MongoDB ignores it. Strip it here (the upsert insert
         // below works from the original `update_json`).
         let stripped;
-        let update_json: &Value = if update_obj.contains_key("$setOnInsert") {
+        let update_json: &Value = if pipeline_mode {
+            update_json
+        } else if update_obj.contains_key("$setOnInsert") {
             let mut u = update_obj.clone();
             u.remove("$setOnInsert");
             if u.is_empty() {
@@ -2244,9 +2254,6 @@ impl BTreeCollection {
         } else {
             update_json
         };
-        let update_obj = update_json.as_object().expect("still an object");
-        let _ = update_obj;
-
         let query = query::parse_query(query_json)?;
 
         // Phase 1: Find matching docs (read lock on indexes). Keep each
@@ -2339,6 +2346,11 @@ impl BTreeCollection {
                 // checkpoint waits for the write side would deadlock.
                 drop(_in_flight);
                 let mut doc = Self::upsert_base_doc(query_json);
+                if pipeline_mode {
+                    crate::pipeline::apply_update_pipeline(&mut doc, original_update)?;
+                    let id = self.insert(doc)?;
+                    return Ok((0, Vec::new(), Some(id)));
+                }
                 let mut eff = original_update.as_object().cloned().unwrap_or_default();
                 if let Some(soi) = eff.remove("$setOnInsert") {
                     let set = eff
@@ -2416,7 +2428,11 @@ impl BTreeCollection {
             };
 
             let mut new_data = (*current).clone();
-            crate::update::apply_update(&mut new_data, update_json)?;
+            if pipeline_mode {
+                crate::pipeline::apply_update_pipeline(&mut new_data, update_json)?;
+            } else {
+                crate::update::apply_update(&mut new_data, update_json)?;
+            }
             if new_data == *current {
                 // Byte-identical result: matched, not modified. Signal with
                 // an empty new_bytes sentinel so the apply loop skips it.
@@ -2619,10 +2635,18 @@ impl BTreeCollection {
     ) -> Result<Option<Value>> {
         // In flight: WAL record written, tree not updated yet — see insert().
         let _in_flight = self.apply_barrier.read();
-        let update_obj = update_json
-            .as_object()
-            .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
-        if update_obj.is_empty() {
+        // An ARRAY update is a MongoDB pipeline-style update ($set/$unset/
+        // $project/$replaceRoot stages with aggregation expressions).
+        let pipeline_mode = update_json.is_array();
+        let empty_update = serde_json::Map::new();
+        let update_obj = if pipeline_mode {
+            &empty_update
+        } else {
+            update_json
+                .as_object()
+                .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?
+        };
+        if !pipeline_mode && update_obj.is_empty() {
             return Err(Error::InvalidQuery(
                 "update must contain at least one operator".into(),
             ));
@@ -2632,7 +2656,9 @@ impl BTreeCollection {
         // update path MongoDB ignores it. Strip it here (the upsert insert
         // below works from the original `update_json`).
         let stripped;
-        let update_json: &Value = if update_obj.contains_key("$setOnInsert") {
+        let update_json: &Value = if pipeline_mode {
+            update_json
+        } else if update_obj.contains_key("$setOnInsert") {
             let mut u = update_obj.clone();
             u.remove("$setOnInsert");
             if u.is_empty() {
@@ -3786,10 +3812,18 @@ impl BTreeCollection {
         tx_id: u64,
         staged: &mut std::collections::HashMap<DocumentId, Value>,
     ) -> Result<Vec<crate::collection::PreparedMutation>> {
-        let update_obj = update_json
-            .as_object()
-            .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?;
-        if update_obj.is_empty() {
+        // An ARRAY update is a MongoDB pipeline-style update ($set/$unset/
+        // $project/$replaceRoot stages with aggregation expressions).
+        let pipeline_mode = update_json.is_array();
+        let empty_update = serde_json::Map::new();
+        let update_obj = if pipeline_mode {
+            &empty_update
+        } else {
+            update_json
+                .as_object()
+                .ok_or_else(|| Error::InvalidQuery("update must be an object".into()))?
+        };
+        if !pipeline_mode && update_obj.is_empty() {
             return Err(Error::InvalidQuery(
                 "update must contain at least one operator".into(),
             ));
@@ -3799,7 +3833,9 @@ impl BTreeCollection {
         // update path MongoDB ignores it. Strip it here (the upsert insert
         // below works from the original `update_json`).
         let stripped;
-        let update_json: &Value = if update_obj.contains_key("$setOnInsert") {
+        let update_json: &Value = if pipeline_mode {
+            update_json
+        } else if update_obj.contains_key("$setOnInsert") {
             let mut u = update_obj.clone();
             u.remove("$setOnInsert");
             if u.is_empty() {
@@ -3811,9 +3847,6 @@ impl BTreeCollection {
         } else {
             update_json
         };
-        let update_obj = update_json.as_object().expect("still an object");
-        let _ = update_obj;
-
         let query = query::parse_query(query_json)?;
         let fi = self.field_indexes.read();
         let ci = self.composite_indexes.read();

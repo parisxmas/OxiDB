@@ -3375,6 +3375,160 @@ pub(crate) fn try_index_only_count(
     Some(results)
 }
 
+/// Apply a MongoDB *pipeline-style update* — `update: [stage, ...]` — to a
+/// single document, in place. Only the stages MongoDB allows in update
+/// pipelines are accepted: `$set`/`$addFields`, `$unset`, `$project`,
+/// `$replaceRoot`/`$replaceWith`; anything else is an error. Expressions go
+/// through the aggregation expression evaluator, so `"$field"` references,
+/// operators, and literals all behave as in pipelines. The document's `_id`
+/// is preserved across every stage (MongoDB's _id immutability).
+pub(crate) fn apply_update_pipeline(doc: &mut Value, stages: &Value) -> Result<()> {
+    fn set_path(doc: &mut Value, path: &str, val: Value) {
+        let parts: Vec<&str> = path.split('.').collect();
+        let mut cur = doc;
+        for (i, part) in parts.iter().enumerate() {
+            if !cur.is_object() {
+                *cur = Value::Object(Map::new());
+            }
+            let obj = cur.as_object_mut().expect("just ensured");
+            if i == parts.len() - 1 {
+                obj.insert(part.to_string(), val);
+                return;
+            }
+            cur = obj
+                .entry(part.to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+        }
+    }
+    fn remove_path(doc: &mut Value, path: &str) {
+        let parts: Vec<&str> = path.split('.').collect();
+        let mut cur = doc;
+        for (i, part) in parts.iter().enumerate() {
+            let Some(obj) = cur.as_object_mut() else { return };
+            if i == parts.len() - 1 {
+                obj.remove(*part);
+                return;
+            }
+            match obj.get_mut(*part) {
+                Some(next) => cur = next,
+                None => return,
+            }
+        }
+    }
+
+    let stages = stages
+        .as_array()
+        .ok_or_else(|| Error::InvalidQuery("pipeline update must be an array".into()))?;
+    let kept_id = doc.get("_id").cloned();
+    for st in stages {
+        let Some((name, arg)) = st.as_object().filter(|o| o.len() == 1).and_then(|o| o.iter().next())
+        else {
+            return Err(Error::InvalidQuery(
+                "each update pipeline stage must be a single-key object".into(),
+            ));
+        };
+        match name.as_str() {
+            "$set" | "$addFields" => {
+                let fields = arg.as_object().ok_or_else(|| {
+                    Error::InvalidQuery(format!("{name} requires an object"))
+                })?;
+                // Evaluate against the PRE-stage document, then assign.
+                let mut computed = Vec::with_capacity(fields.len());
+                for (path, expr_json) in fields {
+                    let expr = parse_expression(expr_json)?;
+                    computed.push((path.clone(), expr.eval(doc)));
+                }
+                for (path, v) in computed {
+                    set_path(doc, &path, v);
+                }
+            }
+            "$unset" => {
+                let paths: Vec<String> = match arg {
+                    Value::String(p) => vec![p.clone()],
+                    Value::Array(a) => a
+                        .iter()
+                        .map(|v| {
+                            v.as_str().map(String::from).ok_or_else(|| {
+                                Error::InvalidQuery("$unset paths must be strings".into())
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                    _ => {
+                        return Err(Error::InvalidQuery(
+                            "$unset requires a string or array of strings".into(),
+                        ));
+                    }
+                };
+                for p in paths {
+                    remove_path(doc, &p);
+                }
+            }
+            "$replaceRoot" | "$replaceWith" => {
+                let expr_json = if name == "$replaceRoot" {
+                    arg.get("newRoot").ok_or_else(|| {
+                        Error::InvalidQuery("$replaceRoot requires newRoot".into())
+                    })?
+                } else {
+                    arg
+                };
+                let new_root = parse_expression(expr_json)?.eval(doc);
+                if !new_root.is_object() {
+                    return Err(Error::InvalidQuery(
+                        "$replaceRoot newRoot must evaluate to a document".into(),
+                    ));
+                }
+                *doc = new_root;
+            }
+            "$project" => {
+                let fields = arg.as_object().ok_or_else(|| {
+                    Error::InvalidQuery("$project requires an object".into())
+                })?;
+                let truthy = |v: &Value| {
+                    v.as_i64().map(|n| n != 0).or(v.as_bool()).unwrap_or(false)
+                };
+                let inclusion = fields
+                    .iter()
+                    .any(|(k, v)| k != "_id" && (truthy(v) || v.is_object() || v.is_string()));
+                let src = doc.clone();
+                let src_obj = src.as_object().cloned().unwrap_or_default();
+                let mut out = Map::new();
+                for (k, v) in src_obj.iter() {
+                    let keep = if k == "_id" {
+                        fields.get("_id").map(truthy).unwrap_or(true)
+                    } else if inclusion {
+                        fields.get(k).is_some_and(truthy)
+                    } else {
+                        !fields.contains_key(k)
+                    };
+                    if keep {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+                // Computed projections ({f: <expr>} that is not a 0/1 flag).
+                for (k, v) in fields {
+                    if k == "_id" || truthy(v) || matches!(v, Value::Number(_) | Value::Bool(_)) {
+                        continue;
+                    }
+                    out.insert(k.clone(), parse_expression(v)?.eval(&src));
+                }
+                *doc = Value::Object(out);
+            }
+            other => {
+                return Err(Error::InvalidQuery(format!(
+                    "stage {other} is not allowed in an update pipeline"
+                )));
+            }
+        }
+        // _id is immutable: restore it after every stage.
+        if let Some(id) = &kept_id {
+            if let Some(obj) = doc.as_object_mut() {
+                obj.insert("_id".to_string(), id.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Covered composite-index `$group` — index-only aggregation with value
 /// accumulators. When the pipeline is `[$match?] → $group` with a
 /// single-field group key, the `$match` (when present) a single equality on
