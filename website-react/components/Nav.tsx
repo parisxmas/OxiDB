@@ -232,6 +232,7 @@ const navGroups: {
       { href: '/dotnet-examples', label: '.NET / EF Core', icon: 'hash' },
       { href: '/go-examples', label: 'Go Examples', icon: 'terminal' },
       { href: '/python-examples', label: 'Python Examples', icon: 'terminal' },
+      { href: '/testing', label: 'How It\'s Tested', icon: 'target' },
       { href: '/changelog', label: 'Changelog', icon: 'clock' },
       { href: '/bugs', label: 'Bug Reports', icon: 'bug' },
       { href: '/license', label: 'License', icon: 'file' },
