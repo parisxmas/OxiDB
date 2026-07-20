@@ -222,7 +222,7 @@ impl Runner {
             "bulkWrite" => &["requests", "ordered", "comment"],
             "distinct" => &["fieldName", "filter", "comment"],
             "replaceOne" => &["filter", "replacement", "comment"],
-            "findOneAndUpdate" => &["filter", "update", "returnDocument", "sort", "comment", "projection"],
+            "findOneAndUpdate" => &["filter", "update", "returnDocument", "sort", "comment", "projection", "upsert"],
             "findOneAndReplace" => &["filter", "replacement", "returnDocument", "sort", "comment", "projection"],
             "findOneAndDelete" => &["filter", "sort", "comment", "projection"],
             _ => return Some(format!("op:{op}")),
@@ -231,9 +231,6 @@ impl Runner {
             if !allowed.contains(&k.as_str()) {
                 return Some(format!("arg:{op}.{k}"));
             }
-        }
-        if args.get("upsert").and_then(|v| v.as_bool()) == Some(true) {
-            return Some("arg:upsert".into());
         }
         None
     }
@@ -435,15 +432,28 @@ impl Runner {
                     return OpOutcome::Skip("update:pipeline".into());
                 }
                 let update = to_engine(update);
-                let r = if name == "updateOne" {
-                    self.db.update_one(&coll, &filter(), &update)
-                } else {
-                    self.db.update(&coll, &filter(), &update)
-                };
-                match r {
-                    Ok(n) => OpOutcome::Ok(Some(json!({
-                        "matchedCount": n, "modifiedCount": n, "upsertedCount": 0
+                let upsert = args.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
+                let multi = name == "updateMany";
+                match self.db.update_with_upsert(&coll, &filter(), &update, multi, upsert) {
+                    Ok((matched, modified, None)) => OpOutcome::Ok(Some(json!({
+                        "matchedCount": matched, "modifiedCount": modified, "upsertedCount": 0
                     }))),
+                    Ok((_, _, Some(id))) => {
+                        // upsertedId reports the document's _id: the shimmed
+                        // client one when the filter seeded it, else the
+                        // engine-assigned id.
+                        let doc = self
+                            .db
+                            .find_one(&coll, &json!({ "_id": id }))
+                            .ok()
+                            .flatten()
+                            .unwrap_or(Value::Null);
+                        let upserted_id = doc.get(MID).cloned().unwrap_or(json!(id));
+                        OpOutcome::Ok(Some(json!({
+                            "matchedCount": 0, "modifiedCount": 0,
+                            "upsertedCount": 1, "upsertedId": upserted_id
+                        })))
+                    }
                     Err(e) => OpOutcome::Err(e.to_string()),
                 }
             }
@@ -565,6 +575,38 @@ impl Runner {
                     Ok(t) => t,
                 };
                 let Some(pre) = target else {
+                    if name == "findOneAndUpdate"
+                        && args.get("upsert").and_then(|v| v.as_bool()) == Some(true)
+                    {
+                        let Some(update) = args.get("update") else {
+                            return OpOutcome::Skip("missing update".into());
+                        };
+                        if update.is_array() {
+                            return OpOutcome::Skip("update:pipeline".into());
+                        }
+                        return match self.db.update_with_upsert(
+                            &coll,
+                            &filter(),
+                            &to_engine(update),
+                            false,
+                            true,
+                        ) {
+                            Err(e) => OpOutcome::Err(e.to_string()),
+                            Ok((_, _, Some(id))) => {
+                                let after = args.get("returnDocument").and_then(|v| v.as_str())
+                                    == Some("After");
+                                if !after {
+                                    return OpOutcome::Ok(Some(Value::Null));
+                                }
+                                match self.db.find_one(&coll, &json!({ "_id": id })) {
+                                    Ok(Some(d)) => OpOutcome::Ok(Some(from_engine(&d))),
+                                    Ok(None) => OpOutcome::Ok(Some(Value::Null)),
+                                    Err(e) => OpOutcome::Err(e.to_string()),
+                                }
+                            }
+                            Ok((_, _, None)) => OpOutcome::Ok(Some(Value::Null)),
+                        };
+                    }
                     return OpOutcome::Ok(Some(Value::Null));
                 };
                 let engine_id = pre.get("_id").cloned().unwrap_or(Value::Null);
@@ -627,8 +669,10 @@ impl Runner {
                 // A standalone bulkWrite IS the sequential application of
                 // its sub-operations; decompose and reuse the single-op
                 // paths, accumulating the unified result counters.
-                let (mut ins, mut mat, mut modc, mut del) = (0u64, 0u64, 0u64, 0u64);
+                let (mut ins, mut mat, mut modc, mut del, mut ups) =
+                    (0u64, 0u64, 0u64, 0u64, 0u64);
                 let mut inserted_ids = Map::new();
+                let mut upserted_ids = Map::new();
                 for (i, req) in requests.iter().enumerate() {
                     let Some(obj) = req.as_object() else {
                         return OpOutcome::Skip("bulk:bad-request".into());
@@ -656,6 +700,10 @@ impl Runner {
                                 "updateOne" | "updateMany" | "replaceOne" => {
                                     mat += res["matchedCount"].as_u64().unwrap_or(0);
                                     modc += res["modifiedCount"].as_u64().unwrap_or(0);
+                                    if let Some(id) = res.get("upsertedId") {
+                                        ups += 1;
+                                        upserted_ids.insert(i.to_string(), id.clone());
+                                    }
                                 }
                                 "deleteOne" | "deleteMany" => {
                                     del += res["deletedCount"].as_u64().unwrap_or(0);
@@ -670,9 +718,9 @@ impl Runner {
                     "matchedCount": mat,
                     "modifiedCount": modc,
                     "deletedCount": del,
-                    "upsertedCount": 0,
+                    "upsertedCount": ups,
                     "insertedIds": Value::Object(inserted_ids),
-                    "upsertedIds": {},
+                    "upsertedIds": Value::Object(upserted_ids),
                 })))
             }
             other => OpOutcome::Skip(format!("op:{other}")),

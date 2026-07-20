@@ -1843,13 +1843,30 @@ impl OxiDb {
     }
 
     pub fn update(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {
+        self.update_with_upsert(collection, query, update, true, false)
+            .map(|(_, n, _)| n)
+    }
+
+    /// `update` with MongoDB-style upsert: when nothing matches and `upsert`
+    /// is set, insert a document synthesized from the filter's equality
+    /// conditions with the update applied ($setOnInsert included). Returns
+    /// (matched count, modified count, upserted id).
+    pub fn update_with_upsert(
+        &self,
+        collection: &str,
+        query: &Value,
+        update: &Value,
+        multi: bool,
+        upsert: bool,
+    ) -> Result<(u64, u64, Option<DocumentId>)> {
         let col = self.get_or_create_collection(collection)?;
         // Shared commit lock: direct writes run concurrently with each
         // other but never inside a transaction commit's validate→apply
         // window (which holds the write side) — otherwise the version this
         // bumps could be blindly overwritten by the commit's apply.
         let _occ_guard = self.commit_lock.read();
-        let ids = col.update(query, update, None)?;
+        let limit = if multi { None } else { Some(1) };
+        let (matched, ids, upserted) = col.update_upsert(query, update, limit, upsert)?;
         if self.change_broker.has_subscribers() {
             for &id in &ids {
                 self.change_broker.emit(ChangeEvent {
@@ -1862,7 +1879,19 @@ impl OxiDb {
                 });
             }
         }
-        Ok(ids.len() as u64)
+        if let Some(id) = upserted {
+            if self.change_broker.has_subscribers() {
+                self.change_broker.emit(ChangeEvent {
+                    token: 0,
+                    operation: OperationType::Insert,
+                    collection: collection.to_string(),
+                    doc_id: id,
+                    document: None,
+                    tx_id: None,
+                });
+            }
+        }
+        Ok((matched, ids.len() as u64, upserted))
     }
 
     pub fn update_one(&self, collection: &str, query: &Value, update: &Value) -> Result<u64> {

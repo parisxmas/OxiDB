@@ -2155,6 +2155,68 @@ impl BTreeCollection {
         update_json: &Value,
         limit: Option<usize>,
     ) -> Result<Vec<DocumentId>> {
+        self.update_upsert(query_json, update_json, limit, false)
+            .map(|(_, ids, _)| ids)
+    }
+
+    /// Build the document an upsert inserts when nothing matched: the
+    /// filter's equality conditions (plain `{f: v}` and `{f: {"$eq": v}}`,
+    /// dotted paths included) seeded into an empty document — MongoDB's
+    /// upsert seeding rule. Operator-only conditions contribute nothing.
+    fn upsert_base_doc(query_json: &Value) -> Value {
+        fn set_dotted(doc: &mut Value, path: &str, val: Value) {
+            let mut cur = doc;
+            let parts: Vec<&str> = path.split('.').collect();
+            for (i, part) in parts.iter().enumerate() {
+                let obj = match cur.as_object_mut() {
+                    Some(o) => o,
+                    None => return,
+                };
+                if i == parts.len() - 1 {
+                    obj.insert(part.to_string(), val);
+                    return;
+                }
+                cur = obj
+                    .entry(part.to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            }
+        }
+        let mut base = serde_json::json!({});
+        if let Some(obj) = query_json.as_object() {
+            for (k, v) in obj {
+                if k.starts_with('$') {
+                    continue;
+                }
+                let val = match v {
+                    Value::Object(m) if m.keys().any(|ok| ok.starts_with('$')) => {
+                        match m.get("$eq") {
+                            Some(e) => e.clone(),
+                            None => continue,
+                        }
+                    }
+                    other => other.clone(),
+                };
+                set_dotted(&mut base, k, val);
+            }
+        }
+        base
+    }
+
+    /// `update` with MongoDB upsert semantics: when `upsert` is true and no
+    /// document matches, insert one synthesized from the filter's equality
+    /// conditions with the update applied on top ($setOnInsert applies here
+    /// and ONLY here — on the update path it is ignored, as in MongoDB).
+    /// Returns (matched count, modified ids, upserted id). A match whose
+    /// update leaves the document byte-identical counts as matched but is
+    /// NOT written (no WAL, no version bump, no index work) — MongoDB's
+    /// matched/modified distinction, and a free no-op-update fast path.
+    pub fn update_upsert(
+        &self,
+        query_json: &Value,
+        update_json: &Value,
+        limit: Option<usize>,
+        upsert: bool,
+    ) -> Result<(u64, Vec<DocumentId>, Option<DocumentId>)> {
         // In flight: WAL record written, tree not updated yet — see insert().
         let _in_flight = self.apply_barrier.read();
         let update_obj = update_json
@@ -2165,6 +2227,25 @@ impl BTreeCollection {
                 "update must contain at least one operator".into(),
             ));
         }
+        let original_update: &Value = update_json;
+        // $setOnInsert only acts when an upsert actually inserts; on the
+        // update path MongoDB ignores it. Strip it here (the upsert insert
+        // below works from the original `update_json`).
+        let stripped;
+        let update_json: &Value = if update_obj.contains_key("$setOnInsert") {
+            let mut u = update_obj.clone();
+            u.remove("$setOnInsert");
+            if u.is_empty() {
+                // Update was $setOnInsert-only: a plain update is a no-op.
+                u.insert("$set".into(), serde_json::json!({}));
+            }
+            stripped = Value::Object(u);
+            &stripped
+        } else {
+            update_json
+        };
+        let update_obj = update_json.as_object().expect("still an object");
+        let _ = update_obj;
 
         let query = query::parse_query(query_json)?;
 
@@ -2250,7 +2331,32 @@ impl BTreeCollection {
         } // fi read lock released (if not already dropped)
 
         if matches.is_empty() {
-            return Ok(Vec::new());
+            if upsert {
+                // Nothing matched: synthesize from the filter's equalities,
+                // apply the update (with $setOnInsert folded in), insert.
+                // Drop the in-flight guard first — insert() takes its own
+                // read on the apply barrier, and a re-entrant read while a
+                // checkpoint waits for the write side would deadlock.
+                drop(_in_flight);
+                let mut doc = Self::upsert_base_doc(query_json);
+                let mut eff = original_update.as_object().cloned().unwrap_or_default();
+                if let Some(soi) = eff.remove("$setOnInsert") {
+                    let set = eff
+                        .entry("$set".to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let (Some(sm), Some(soim)) = (set.as_object_mut(), soi.as_object()) {
+                        for (k, v) in soim {
+                            sm.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                if !eff.is_empty() {
+                    crate::update::apply_update(&mut doc, &Value::Object(eff))?;
+                }
+                let id = self.insert(doc)?;
+                return Ok((0, Vec::new(), Some(id)));
+            }
+            return Ok((0, Vec::new(), None));
         }
 
         // WORM phase 2 gate: refuse the entire update batch if any
@@ -2311,6 +2417,16 @@ impl BTreeCollection {
 
             let mut new_data = (*current).clone();
             crate::update::apply_update(&mut new_data, update_json)?;
+            if new_data == *current {
+                // Byte-identical result: matched, not modified. Signal with
+                // an empty new_bytes sentinel so the apply loop skips it.
+                return Ok(Some(UpdateOp {
+                    id,
+                    old_data: current,
+                    new_data,
+                    new_bytes: Vec::new(),
+                }));
+            }
 
             let old_version = current
                 .get("_version")
@@ -2343,9 +2459,16 @@ impl BTreeCollection {
         let computed: Result<Vec<Option<UpdateOp>>> =
             matches.into_iter().map(compute).collect();
         let ops: Vec<UpdateOp> = computed?.into_iter().flatten().collect();
+        let matched = ops.len() as u64;
+        let ops: Vec<UpdateOp> = ops.into_iter().filter(|op| !op.new_bytes.is_empty()).collect();
 
         if ops.is_empty() {
-            return Ok(Vec::new());
+            // Either every match was a no-op update (matched > 0) or every
+            // matched doc vanished between the phases. In neither case do we
+            // upsert here: real matches forbid it semantically, and the
+            // vanished-race would need the index write locks released first
+            // — the pre-lock no-match path above owns the upsert.
+            return Ok((matched, Vec::new(), None));
         }
 
         // Unique constraint check under write lock — against the index AND
@@ -2471,7 +2594,7 @@ impl BTreeCollection {
             self.dirty.store(true, Ordering::Release);
         }
 
-        Ok(updated_ids)
+        Ok((matched, updated_ids, None))
     }
 
     /// Atomically find ONE document matching `query`, apply `update` to
@@ -2504,6 +2627,25 @@ impl BTreeCollection {
                 "update must contain at least one operator".into(),
             ));
         }
+        let original_update: &Value = update_json;
+        // $setOnInsert only acts when an upsert actually inserts; on the
+        // update path MongoDB ignores it. Strip it here (the upsert insert
+        // below works from the original `update_json`).
+        let stripped;
+        let update_json: &Value = if update_obj.contains_key("$setOnInsert") {
+            let mut u = update_obj.clone();
+            u.remove("$setOnInsert");
+            if u.is_empty() {
+                // Update was $setOnInsert-only: a plain update is a no-op.
+                u.insert("$set".into(), serde_json::json!({}));
+            }
+            stripped = Value::Object(u);
+            &stripped
+        } else {
+            update_json
+        };
+        let update_obj = update_json.as_object().expect("still an object");
+        let _ = update_obj;
         let query = query::parse_query(query_json)?;
 
         // Take the write locks FIRST, then find — the read-modify-write
@@ -3652,6 +3794,25 @@ impl BTreeCollection {
                 "update must contain at least one operator".into(),
             ));
         }
+        let original_update: &Value = update_json;
+        // $setOnInsert only acts when an upsert actually inserts; on the
+        // update path MongoDB ignores it. Strip it here (the upsert insert
+        // below works from the original `update_json`).
+        let stripped;
+        let update_json: &Value = if update_obj.contains_key("$setOnInsert") {
+            let mut u = update_obj.clone();
+            u.remove("$setOnInsert");
+            if u.is_empty() {
+                // Update was $setOnInsert-only: a plain update is a no-op.
+                u.insert("$set".into(), serde_json::json!({}));
+            }
+            stripped = Value::Object(u);
+            &stripped
+        } else {
+            update_json
+        };
+        let update_obj = update_json.as_object().expect("still an object");
+        let _ = update_obj;
 
         let query = query::parse_query(query_json)?;
         let fi = self.field_indexes.read();
@@ -4562,6 +4723,66 @@ mod tests {
         // also can't fully satisfy. Should return None.
         let result = col.find_oxiwire_bytes(&query, &FindOptions::default());
         assert!(result.is_none(), "mixed-op queries should fall back");
+    }
+
+    #[test]
+    fn upsert_inserts_from_filter_equalities() {
+        let col = new_btree_collection("upsert_basic");
+        // No match: seed from {sku, "meta.region", $eq} + update on top;
+        // $setOnInsert applies on the insert path.
+        let (_, ids, upserted) = col
+            .update_upsert(
+                &json!({"sku": "A1", "meta.region": "EU", "n": {"$eq": 5}, "x": {"$gt": 3}}),
+                &json!({"$set": {"price": 10}, "$inc": {"n": 1}, "$setOnInsert": {"first": true}}),
+                Some(1),
+                true,
+            )
+            .unwrap();
+        assert!(ids.is_empty());
+        let id = upserted.expect("inserted");
+        let doc = col.find_one(&json!({"sku": "A1"})).unwrap().unwrap();
+        assert_eq!(doc["_id"].as_u64().unwrap(), id);
+        assert_eq!(doc["meta"]["region"], "EU");
+        assert_eq!(doc["n"], 6); // $eq seed 5, then $inc 1
+        assert_eq!(doc["price"], 10);
+        assert_eq!(doc["first"], true);
+        assert!(doc.get("x").is_none()); // $gt contributes nothing
+
+        // Match exists now: same call must UPDATE, not insert, and
+        // $setOnInsert must be ignored on the update path.
+        let (matched, ids, upserted) = col
+            .update_upsert(
+                &json!({"sku": "A1"}),
+                &json!({"$inc": {"n": 1}, "$setOnInsert": {"first": false}}),
+                Some(1),
+                true,
+            )
+            .unwrap();
+        assert_eq!((matched, ids.len()), (1, 1));
+        assert!(upserted.is_none());
+        let doc = col.find_one(&json!({"sku": "A1"})).unwrap().unwrap();
+        assert_eq!(doc["n"], 7);
+        assert_eq!(doc["first"], true); // untouched
+
+        // $setOnInsert-only update on a match: complete no-op, no error.
+        let (matched, modified, upserted) = col
+            .update_upsert(
+                &json!({"sku": "A1"}),
+                &json!({"$setOnInsert": {"first": false}}),
+                Some(1),
+                true,
+            )
+            .unwrap();
+        assert_eq!((matched, modified.len()), (1, 0)); // matched, not modified
+        assert!(upserted.is_none());
+        assert_eq!(col.find_one(&json!({"sku": "A1"})).unwrap().unwrap()["first"], true);
+
+        // Without upsert nothing is inserted.
+        let (_, ids, upserted) = col
+            .update_upsert(&json!({"sku": "ZZ"}), &json!({"$set": {"a": 1}}), Some(1), false)
+            .unwrap();
+        assert!(ids.is_empty() && upserted.is_none());
+        assert!(col.find_one(&json!({"sku": "ZZ"})).unwrap().is_none());
     }
 
     /// Disk-first composites live in `.mcidx`: created there, reopened from

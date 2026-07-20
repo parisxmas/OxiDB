@@ -499,8 +499,12 @@ fn handle_request_session_inner(
                     Err(e) => err_bytes(&e.to_string()),
                 }
             } else {
-                match db.update(col, query, update) {
-                    Ok(count) => ok_bytes(json!({ "modified": count })),
+                let upsert = request.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
+                match db.update_with_upsert(col, query, update, true, upsert) {
+                    Ok((_, count, upserted)) => match upserted {
+                        Some(id) => ok_bytes(json!({ "modified": count, "upserted_id": id })),
+                        None => ok_bytes(json!({ "modified": count })),
+                    },
                     Err(e) => err_bytes(&e.to_string()),
                 }
             }
@@ -525,8 +529,12 @@ fn handle_request_session_inner(
                     Err(e) => err_bytes(&e.to_string()),
                 }
             } else {
-                match db.update_one(col, query, update) {
-                    Ok(count) => ok_bytes(json!({ "modified": count })),
+                let upsert = request.get("upsert").and_then(|v| v.as_bool()).unwrap_or(false);
+                match db.update_with_upsert(col, query, update, false, upsert) {
+                    Ok((_, count, upserted)) => match upserted {
+                        Some(id) => ok_bytes(json!({ "modified": count, "upserted_id": id })),
+                        None => ok_bytes(json!({ "modified": count })),
+                    },
                     Err(e) => err_bytes(&e.to_string()),
                 }
             }
