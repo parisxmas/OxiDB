@@ -62,6 +62,11 @@ pub enum SqlError {
     #[error("duplicate key: {0}")]
     DuplicateKey(String),
 
+    /// A write would violate a FOREIGN KEY constraint (a child row with no
+    /// parent, or deleting/updating a parent that children still reference).
+    #[error("foreign key violation: {0}")]
+    ForeignKeyViolation(String),
+
     /// A referenced view does not exist.
     #[error("no such view: {0}")]
     NoSuchView(String),

@@ -525,6 +525,178 @@ fn coerce_call_arg(v: Value, ty: SqlType, pname: &str) -> Result<Value> {
     Ok(coerced)
 }
 
+// ── FOREIGN KEY enforcement ─────────────────────────────────────────────────
+//
+// Basic single-column referential integrity. Child side (INSERT/UPDATE): a
+// non-NULL foreign-key value must find its parent row. Parent side (DELETE):
+// honour ON DELETE NO ACTION/RESTRICT (reject), CASCADE (delete children), or
+// SET NULL (null children). Parent side (UPDATE of a referenced key): reject
+// while children still point at the old value. Multi-column FKs are parsed but
+// not represented, so not enforced (documented).
+
+/// The parent column an FK references — explicit, or the parent's PRIMARY KEY
+/// when the FK wrote `REFERENCES parent` without naming a column.
+fn fk_parent_column<S: Store>(store: &S, fk: &crate::catalog::ForeignKey) -> Result<String> {
+    if !fk.parent_column.is_empty() {
+        return Ok(fk.parent_column.clone());
+    }
+    let pdef = store
+        .table_def(&fk.parent_table)
+        .ok_or_else(|| SqlError::NoSuchTable(fk.parent_table.clone()))?;
+    pdef.columns
+        .iter()
+        .find(|c| c.primary_key)
+        .map(|c| c.name.clone())
+        .ok_or_else(|| {
+            SqlError::Unsupported(format!(
+                "FOREIGN KEY references {} which has no PRIMARY KEY",
+                fk.parent_table
+            ))
+        })
+}
+
+fn fk_col_pos(def: &crate::catalog::Table, col: &str) -> Result<usize> {
+    def.columns
+        .iter()
+        .position(|c| c.name == col)
+        .ok_or_else(|| SqlError::NoSuchColumn(col.to_string()))
+}
+
+/// Rows of `table` whose `column` equals `value` — index-accelerated when an
+/// index on `column` exists, else a scan.
+fn fk_rows_where_eq<S: Store>(
+    store: &S,
+    table: &str,
+    column: &str,
+    value: &Value,
+) -> Result<crate::store::Rows> {
+    if let Some(rows) = store.index_lookup_eq(table, &[(column.to_string(), value.clone())])? {
+        return Ok(rows);
+    }
+    let def = store
+        .table_def(table)
+        .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+    let pos = fk_col_pos(&def, column)?;
+    Ok(store
+        .scan(table)?
+        .into_iter()
+        .filter(|(_, cells)| cells.get(pos).is_some_and(|v| v == value))
+        .collect())
+}
+
+/// Child side: every non-NULL foreign-key value in `cells` must find its
+/// parent row. Called before an INSERT or UPDATE writes the row.
+fn check_fk_children<S: Store>(
+    store: &S,
+    def: &crate::catalog::Table,
+    cells: &[Value],
+) -> Result<()> {
+    for fk in &def.foreign_keys {
+        let Ok(pos) = fk_col_pos(def, &fk.column) else {
+            continue;
+        };
+        let val = &cells[pos];
+        if matches!(val, Value::Null) {
+            continue; // a NULL foreign key references nothing (standard SQL)
+        }
+        let pcol = fk_parent_column(store, fk)?;
+        if fk_rows_where_eq(store, &fk.parent_table, &pcol, val)?.is_empty() {
+            return Err(SqlError::ForeignKeyViolation(format!(
+                "{}.{} = {:?} has no matching row in {}.{}",
+                def.name, fk.column, val, fk.parent_table, pcol
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// (child table def, fk) for every FK in the catalog referencing `parent`.
+fn referencing_fks<S: Store>(
+    store: &S,
+    parent: &str,
+) -> Vec<(crate::catalog::Table, crate::catalog::ForeignKey)> {
+    let mut out = Vec::new();
+    for t in store.list_tables() {
+        for fk in &t.foreign_keys {
+            if fk.parent_table.eq_ignore_ascii_case(parent) {
+                out.push((t.clone(), fk.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Parent side on DELETE: honour each referencing FK's ON DELETE action for a
+/// parent row being removed. Recurses so a CASCADE chain is fully applied.
+fn enforce_fk_on_delete<S: Store>(
+    store: &S,
+    parent_def: &crate::catalog::Table,
+    parent_cells: &[Value],
+) -> Result<()> {
+    for (child_def, fk) in referencing_fks(store, &parent_def.name) {
+        let pcol = fk_parent_column(store, &fk)?;
+        let refval = &parent_cells[fk_col_pos(parent_def, &pcol)?];
+        if matches!(refval, Value::Null) {
+            continue;
+        }
+        let children = fk_rows_where_eq(store, &child_def.name, &fk.column, refval)?;
+        if children.is_empty() {
+            continue;
+        }
+        match fk.on_delete {
+            crate::catalog::FkAction::NoAction => {
+                return Err(SqlError::ForeignKeyViolation(format!(
+                    "{} row(s) in {} still reference {}.{} = {:?}",
+                    children.len(),
+                    child_def.name,
+                    parent_def.name,
+                    pcol,
+                    refval
+                )));
+            }
+            crate::catalog::FkAction::Cascade => {
+                for (rid, cells) in children {
+                    enforce_fk_on_delete(store, &child_def, &cells)?; // chain
+                    store.delete(&child_def.name, rid)?;
+                }
+            }
+            crate::catalog::FkAction::SetNull => {
+                let cpos = fk_col_pos(&child_def, &fk.column)?;
+                for (rid, mut cells) in children {
+                    cells[cpos] = Value::Null;
+                    store.update_row(&child_def.name, rid, cells)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parent side on UPDATE: restrict changing a referenced key while children
+/// still point at the old value (basic: NO ACTION/RESTRICT for updates).
+fn enforce_fk_on_parent_update<S: Store>(
+    store: &S,
+    parent_def: &crate::catalog::Table,
+    old_cells: &[Value],
+    new_cells: &[Value],
+) -> Result<()> {
+    for (child_def, fk) in referencing_fks(store, &parent_def.name) {
+        let pcol = fk_parent_column(store, &fk)?;
+        let ppos = fk_col_pos(parent_def, &pcol)?;
+        let (oldv, newv) = (&old_cells[ppos], &new_cells[ppos]);
+        if oldv == newv || matches!(oldv, Value::Null) {
+            continue; // referenced value unchanged (or was NULL)
+        }
+        if !fk_rows_where_eq(store, &child_def.name, &fk.column, oldv)?.is_empty() {
+            return Err(SqlError::ForeignKeyViolation(format!(
+                "cannot change {}.{} from {:?} — row(s) in {} reference it",
+                parent_def.name, pcol, oldv, child_def.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn exec_insert<S: Store>(
     store: &S,
     table: &str,
@@ -599,6 +771,14 @@ fn exec_insert<S: Store>(
                 }
             }
             last_insert_id = Some(next - 1);
+        }
+    }
+
+    // FOREIGN KEY: every row's parents must exist before any row is written,
+    // so a rejected row leaves the whole INSERT unapplied.
+    if !def.foreign_keys.is_empty() {
+        for cells in &all_cells {
+            check_fk_children(store, &def, cells)?;
         }
     }
 
@@ -714,6 +894,12 @@ fn exec_update<S: Store>(
         if returning.is_some() {
             touched.push(new_cells.clone());
         }
+        // FOREIGN KEY: the updated row's parents must exist (child side), and a
+        // referenced key can't change while children point at the old value.
+        if !def.foreign_keys.is_empty() {
+            check_fk_children(store, &def, &new_cells)?;
+        }
+        enforce_fk_on_parent_update(store, &def, &cells, &new_cells)?;
         store.update_row(table, row_id, new_cells)?;
         affected += 1;
     }
@@ -896,6 +1082,8 @@ fn exec_delete<S: Store>(
     let mut affected = 0;
     let mut touched: Vec<Vec<Value>> = Vec::new();
     for (row_id, cells) in to_delete {
+        // FOREIGN KEY (parent side): apply ON DELETE before removing the row.
+        enforce_fk_on_delete(store, &def, &cells)?;
         if store.delete(table, row_id)? {
             affected += 1;
             if returning.is_some() {
@@ -2273,10 +2461,12 @@ fn decorrelate_exists<S: Store>(
         return Ok(None);
     }
     match sel.projection.as_slice() {
-        [SelectItem::Expr {
-            expr: Expr::Literal(Value::Int(1)),
-            ..
-        }] => {}
+        [
+            SelectItem::Expr {
+                expr: Expr::Literal(Value::Int(1)),
+                ..
+            },
+        ] => {}
         _ => return Ok(None),
     }
     // Find the correlation equality among the WHERE's top-level conjuncts.

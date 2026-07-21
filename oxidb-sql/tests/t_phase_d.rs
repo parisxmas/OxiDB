@@ -118,17 +118,23 @@ fn decimal_and_blob_types() {
 }
 
 #[test]
-fn foreign_key_syntax_tolerated() {
+fn foreign_key_parsed_and_enforced() {
     let (_d, db) = open();
     db.execute("CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
-    // Column-level and table-level FK syntax both parse (not enforced).
+    // Column-level and table-level FK syntax both parse.
     db.execute("CREATE TABLE b (id INT PRIMARY KEY, a_id INT REFERENCES a(id))")
         .unwrap();
     db.execute(
         "CREATE TABLE c (id INT PRIMARY KEY, a_id INT, FOREIGN KEY (a_id) REFERENCES a(id))",
     )
     .unwrap();
-    db.execute("INSERT INTO b VALUES (1, 999)").unwrap(); // no enforcement
+    db.execute("INSERT INTO a VALUES (1)").unwrap();
+    // Enforced (both the column-level and table-level forms) — full coverage
+    // lives in tests/t_foreign_keys.rs.
+    db.execute("INSERT INTO b VALUES (1, 1)").unwrap();
+    assert!(db.execute("INSERT INTO b VALUES (2, 999)").is_err());
+    db.execute("INSERT INTO c VALUES (1, 1)").unwrap();
+    assert!(db.execute("INSERT INTO c VALUES (2, 999)").is_err());
 }
 
 #[test]
@@ -687,8 +693,8 @@ fn drop_column_disk_first_reopen() {
     let opts = SqlOptions {
         disk_first: true,
         checkpoint_bytes: 0,
-            ..SqlOptions::default()
-        };
+        ..SqlOptions::default()
+    };
     let dir = tempfile::tempdir().unwrap();
     let db = SqlEngine::open_with_options(dir.path(), opts.clone()).unwrap();
     db.execute("CREATE TABLE u (id INT PRIMARY KEY, a TEXT, b INT)")
@@ -724,8 +730,8 @@ fn checkpoint_compacts_disk_first() {
     let opts = SqlOptions {
         disk_first: true,
         checkpoint_bytes: 0,
-            ..SqlOptions::default()
-        };
+        ..SqlOptions::default()
+    };
     let dir = tempfile::tempdir().unwrap();
     let db = SqlEngine::open_with_options(dir.path(), opts.clone()).unwrap();
     db.execute("CREATE TABLE u (id INT PRIMARY KEY, big TEXT, keep INT)")

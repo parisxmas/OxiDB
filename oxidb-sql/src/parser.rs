@@ -889,14 +889,52 @@ fn translate_call(func: sp::Function, p: &mut usize) -> Result<Statement> {
     Ok(Statement::Call { name, args })
 }
 
+/// Map a sqlparser `ON DELETE`/`ON UPDATE` action to our enforced set.
+/// `RESTRICT`, `NO ACTION`, `SET DEFAULT` and an absent action all collapse to
+/// `NoAction` (restrict) — the safe default that never orphans or corrupts.
+fn fk_action(a: &Option<sp::ReferentialAction>) -> crate::catalog::FkAction {
+    use crate::catalog::FkAction;
+    match a {
+        Some(sp::ReferentialAction::Cascade) => FkAction::Cascade,
+        Some(sp::ReferentialAction::SetNull) => FkAction::SetNull,
+        _ => FkAction::NoAction,
+    }
+}
+
 fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
     let mut pk_col: Option<String> = None;
     let mut unique_cols: Vec<String> = Vec::new();
+    let mut fks: Vec<crate::catalog::ForeignKey> = Vec::new();
     for c in &ct.constraints {
         match c {
-            // Accepted and ignored (documented): referential integrity is
-            // not enforced in v1, but EF/PG-style DDL must parse.
-            sp::TableConstraint::ForeignKey { .. } => {}
+            // Single-column FOREIGN KEY is captured and enforced; a composite
+            // (multi-column) FK is accepted and not enforced (documented), so
+            // EF/PG DDL with composite keys still creates.
+            sp::TableConstraint::ForeignKey {
+                columns,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                ..
+            } => {
+                if let [col] = columns.as_slice() {
+                    if referred_columns.len() <= 1 {
+                        fks.push(crate::catalog::ForeignKey {
+                            column: col.value.clone(),
+                            parent_table: object_name_to_string(foreign_table)?,
+                            // Empty referred column => resolve to the parent's
+                            // PRIMARY KEY at enforcement time.
+                            parent_column: referred_columns
+                                .first()
+                                .map(|c| c.value.clone())
+                                .unwrap_or_default(),
+                            on_delete: fk_action(on_delete),
+                            on_update: fk_action(on_update),
+                        });
+                    }
+                }
+            }
             // Table-level `[CONSTRAINT name] PRIMARY KEY (col)` — the form
             // EF Core migrations and pg_dump emit. A single column gets full
             // PK semantics; composite keys are accepted and not enforced
@@ -951,8 +989,33 @@ fn translate_create_table(ct: sp::CreateTable) -> Result<Statement> {
             )));
         }
     }
+    // Column-level `col ... REFERENCES parent(pcol)` — single-column FKs.
+    for col in &ct.columns {
+        for opt in &col.options {
+            if let sp::ColumnOption::ForeignKey {
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                ..
+            } = &opt.option
+                && referred_columns.len() <= 1
+            {
+                fks.push(crate::catalog::ForeignKey {
+                    column: col.name.value.clone(),
+                    parent_table: object_name_to_string(foreign_table)?,
+                    parent_column: referred_columns
+                        .first()
+                        .map(|c| c.value.clone())
+                        .unwrap_or_default(),
+                    on_delete: fk_action(on_delete),
+                    on_update: fk_action(on_update),
+                });
+            }
+        }
+    }
     Ok(Statement::CreateTable {
-        table: Table::new(name, columns),
+        table: Table::new(name, columns).with_foreign_keys(fks),
         if_not_exists: ct.if_not_exists,
     })
 }

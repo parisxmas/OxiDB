@@ -80,11 +80,43 @@ impl Column {
     }
 }
 
+/// Referential action for a FOREIGN KEY's `ON DELETE` / `ON UPDATE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FkAction {
+    /// Reject the parent change while a child still references it. SQL
+    /// `NO ACTION` and `RESTRICT` are treated identically here.
+    #[default]
+    NoAction,
+    /// `ON DELETE CASCADE`: delete the referencing child rows too.
+    Cascade,
+    /// `ON DELETE SET NULL`: null out the child's referencing column.
+    SetNull,
+}
+
+/// A single-column FOREIGN KEY: `column` in this table references
+/// `parent_table(parent_column)`. Enforced on the child (INSERT/UPDATE must
+/// find the parent) and on the parent (DELETE honours `on_delete`; changing a
+/// referenced key is restricted). Multi-column foreign keys are accepted at
+/// parse time but not represented here — they are not enforced (documented).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForeignKey {
+    pub column: String,
+    pub parent_table: String,
+    pub parent_column: String,
+    #[serde(default)]
+    pub on_delete: FkAction,
+    #[serde(default)]
+    pub on_update: FkAction,
+}
+
 /// A table definition: an ordered list of typed columns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
+    /// Single-column FOREIGN KEY constraints. Empty for old catalogs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 impl Table {
@@ -92,7 +124,14 @@ impl Table {
         Table {
             name: name.into(),
             columns,
+            foreign_keys: Vec::new(),
         }
+    }
+
+    /// Attach foreign-key constraints (builder form used by the parser).
+    pub fn with_foreign_keys(mut self, fks: Vec<ForeignKey>) -> Self {
+        self.foreign_keys = fks;
+        self
     }
 
     /// Number of *physical* columns; a stored row has exactly this many cells.
@@ -135,6 +174,7 @@ impl Table {
                     .filter(|c| !c.dropped)
                     .cloned()
                     .collect(),
+                foreign_keys: self.foreign_keys.clone(),
             })
         } else {
             Cow::Borrowed(self)
@@ -488,27 +528,31 @@ mod tests {
     fn row_validation() {
         let t = users_table();
         // good row
-        assert!(t
-            .validate_row(&[Value::Int(1), Value::Text("ada".into()), Value::Int(30)])
-            .is_ok());
+        assert!(
+            t.validate_row(&[Value::Int(1), Value::Text("ada".into()), Value::Int(30)])
+                .is_ok()
+        );
         // wrong arity
         assert!(t.validate_row(&[Value::Int(1)]).is_err());
         // NOT NULL violation on name
-        assert!(t
-            .validate_row(&[Value::Int(1), Value::Null, Value::Int(30)])
-            .is_err());
+        assert!(
+            t.validate_row(&[Value::Int(1), Value::Null, Value::Int(30)])
+                .is_err()
+        );
         // nullable age accepts NULL
-        assert!(t
-            .validate_row(&[Value::Int(1), Value::Text("ada".into()), Value::Null])
-            .is_ok());
+        assert!(
+            t.validate_row(&[Value::Int(1), Value::Text("ada".into()), Value::Null])
+                .is_ok()
+        );
         // type mismatch on id
-        assert!(t
-            .validate_row(&[
+        assert!(
+            t.validate_row(&[
                 Value::Text("x".into()),
                 Value::Text("ada".into()),
                 Value::Int(30)
             ])
-            .is_err());
+            .is_err()
+        );
     }
 }
 
