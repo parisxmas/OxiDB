@@ -106,6 +106,19 @@ pub(crate) trait Store {
     }
     fn update_row(&self, table: &str, row_id: u64, cells: Vec<Value>) -> Result<()>;
     fn delete(&self, table: &str, row_id: u64) -> Result<bool>;
+    /// Delete many rows of one table as a single durable unit (one WAL fsync
+    /// where the implementation supports it). Returns rows deleted. The default
+    /// falls back to per-row `delete`; the engine overrides it to batch — this
+    /// is what makes `ON DELETE CASCADE` one fsync instead of one per child.
+    fn delete_many(&self, table: &str, row_ids: &[u64]) -> Result<usize> {
+        let mut n = 0;
+        for &id in row_ids {
+            if self.delete(table, id)? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
     /// Pessimistically lock `row_ids` of `table` for this store's lock owner
     /// (the enclosing transaction, or the autocommit statement), blocking up
     /// to the engine's lock timeout on contention. Held until commit/rollback

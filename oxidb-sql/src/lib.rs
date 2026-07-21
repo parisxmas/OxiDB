@@ -36,7 +36,7 @@ pub use catalog::{Column, IndexDef, Table};
 pub use decimal::Decimal;
 pub use error::{Result, SqlError};
 pub use parser::{
-    parse_database_statement, parse_user_statement, DatabaseStatement, UserStatement,
+    DatabaseStatement, UserStatement, parse_database_statement, parse_user_statement,
 };
 pub use types::{SqlType, Value};
 
@@ -1100,6 +1100,46 @@ impl SqlEngine {
             inner.disk_first,
         );
         Ok(true)
+    }
+
+    /// Delete many rows of one table as a single durable unit — one
+    /// `WalRecord::Batch` (one fsync), applied all-or-nothing. This is what
+    /// makes `ON DELETE CASCADE` cost one fsync for the whole child set instead
+    /// of one per child. Missing ids are skipped (delete is idempotent).
+    pub fn delete_many(&self, table: &str, row_ids: &[u64]) -> Result<usize> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.catalog.contains(table) {
+            return Err(SqlError::NoSuchTable(table.to_string()));
+        }
+        let present: Vec<u64> = {
+            let state = inner.tables.get(table);
+            row_ids
+                .iter()
+                .copied()
+                .filter(|&id| state.map(|s| s.rows.contains(id)).unwrap_or(false))
+                .collect()
+        };
+        if present.is_empty() {
+            return Ok(0);
+        }
+        let ops: Vec<WalRecord> = present
+            .iter()
+            .map(|&row_id| WalRecord::Delete {
+                table: table.to_string(),
+                row_id,
+            })
+            .collect();
+        let n = ops.len();
+        let rec = WalRecord::Batch(ops);
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
+        Ok(n)
     }
 
     /// Return all live rows of a table as `(row_id, cells)`, ordered by `row_id`.
@@ -2210,6 +2250,9 @@ impl Store for SqlEngine {
     fn delete(&self, table: &str, row_id: u64) -> Result<bool> {
         SqlEngine::delete(self, table, row_id)
     }
+    fn delete_many(&self, table: &str, row_ids: &[u64]) -> Result<usize> {
+        SqlEngine::delete_many(self, table, row_ids)
+    }
     fn create_table(&self, table: Table) -> Result<()> {
         SqlEngine::create_table(self, table)
     }
@@ -2607,9 +2650,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = SqlEngine::open(dir.path()).unwrap();
         db.create_table(users()).unwrap();
-        assert!(db
-            .insert("users", vec![Value::Int(1), Value::Null])
-            .is_err());
+        assert!(
+            db.insert("users", vec![Value::Int(1), Value::Null])
+                .is_err()
+        );
         assert!(db.insert("users", vec![Value::Int(1)]).is_err());
     }
 }

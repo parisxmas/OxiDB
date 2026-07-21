@@ -655,10 +655,14 @@ fn enforce_fk_on_delete<S: Store>(
                 )));
             }
             crate::catalog::FkAction::Cascade => {
-                for (rid, cells) in children {
-                    enforce_fk_on_delete(store, &child_def, &cells)?; // chain
-                    store.delete(&child_def.name, rid)?;
+                // Resolve any grandchildren (cascade chain) first, then delete
+                // this whole level as one durable batch — one fsync for the
+                // child set, not one per child (the cascade hot path).
+                for (_, cells) in &children {
+                    enforce_fk_on_delete(store, &child_def, cells)?;
                 }
+                let ids: Vec<u64> = children.iter().map(|(rid, _)| *rid).collect();
+                store.delete_many(&child_def.name, &ids)?;
             }
             crate::catalog::FkAction::SetNull => {
                 let cpos = fk_col_pos(&child_def, &fk.column)?;
