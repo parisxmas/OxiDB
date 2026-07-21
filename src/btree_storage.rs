@@ -244,7 +244,8 @@ fn disk_compress_enabled() -> bool {
         // flag is still honored (it now just states the default, and keeps
         // winning if both are set). Existing records are self-describing
         // (magic-byte sniffing), so flipping needs no migration.
-        let truthy = |v: &str| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on");
+        let truthy =
+            |v: &str| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on");
         let force_off = std::env::var("OXIDB_DISK_UNCOMPRESSED")
             .map(|v| truthy(&v))
             .unwrap_or(false);
@@ -661,7 +662,7 @@ impl BTreeStorage {
             if let Ok(doc) = crate::codec::decode_doc(&bytes) {
                 if let Some(id) = doc.get("_id").and_then(|v| v.as_u64()) {
                     let _ = index.upsert_sync(id, loc);
-                    total += loc.length as u64;
+                    total += loc.length() as u64;
                 }
             }
             Ok(())
@@ -847,7 +848,7 @@ impl BTreeStorage {
                     if let Some(old) = old_loc {
                         let _ = data.mark_deleted_no_sync(old);
                         self.total_bytes
-                            .fetch_sub(old.length as u64, Ordering::AcqRel);
+                            .fetch_sub(old.length() as u64, Ordering::AcqRel);
                     }
                     // Account in on-disk (compressed) units — `open_disk` and
                     // `compact` rebuild this counter from `loc.length`, and
@@ -856,7 +857,7 @@ impl BTreeStorage {
                     // overstated live bytes and could pin the dead ratio at
                     // ≤ 0, permanently suppressing auto-compaction.
                     self.total_bytes
-                        .fetch_add(new_loc.length as u64, Ordering::AcqRel);
+                        .fetch_add(new_loc.length() as u64, Ordering::AcqRel);
                 }
                 Err(e) => {
                     // The WAL still holds this write; recovery will reconcile.
@@ -911,7 +912,7 @@ impl BTreeStorage {
                 }
                 let _ = data.mark_deleted_no_sync(old);
                 self.total_bytes
-                    .fetch_sub(old.length as u64, Ordering::AcqRel);
+                    .fetch_sub(old.length() as u64, Ordering::AcqRel);
             }
             return None;
         }
@@ -1026,7 +1027,7 @@ impl BTreeStorage {
             };
             let new_loc = fresh.append_no_sync(&bytes)?;
             new_entries.push((*id, new_loc));
-            total += new_loc.length as u64;
+            total += new_loc.length() as u64;
         }
         fresh.sync()?;
         let new_size = fresh.file_size();
@@ -1290,7 +1291,7 @@ impl BTreeStorage {
                     for ((key, _value), loc) in entries.iter().zip(locs.iter()) {
                         let _ = d.index.upsert_sync(*key, *loc);
                         // On-disk units, like `insert()` — see comment there.
-                        added += loc.length as u64;
+                        added += loc.length() as u64;
                     }
                     self.total_bytes.fetch_add(added, Ordering::AcqRel);
                 }
@@ -1383,7 +1384,7 @@ impl BTreeStorage {
             // readahead-friendly sweep rather than random index-order page
             // faults. `for_each_payload` borrows directly from the mmap for
             // records needing no decode (zero-copy) and locks the mmap once.
-            items.sort_unstable_by_key(|(_, loc)| loc.offset);
+            items.sort_unstable_by_key(|(_, loc)| loc.offset());
             let locs: Vec<crate::storage::DocLocation> =
                 items.iter().map(|(_, loc)| *loc).collect();
             let mut cb_err: Option<Error> = None;

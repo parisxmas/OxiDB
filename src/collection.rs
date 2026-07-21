@@ -1975,7 +1975,11 @@ impl Collection {
         if file_size == 0 || num_threads <= 1 {
             return vec![(0, file_size)];
         }
-        let mut offsets: Vec<u64> = self.primary_index.values().map(|loc| loc.offset).collect();
+        let mut offsets: Vec<u64> = self
+            .primary_index
+            .values()
+            .map(|loc| loc.offset())
+            .collect();
         offsets.sort_unstable();
         let n = offsets.len();
         let mut boundaries = Vec::with_capacity(num_threads + 1);

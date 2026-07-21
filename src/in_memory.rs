@@ -12,6 +12,15 @@ use crate::wal::WalEntry;
 
 use std::path::{Path, PathBuf};
 
+/// Error for a record whose `(offset, length)` cannot be packed into the u64
+/// offset index (1 TiB file-offset / 16 MiB document ceiling).
+fn packed_limit_err() -> crate::error::Error {
+    crate::error::Error::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "record exceeds packed offset-index limits (1 TiB file offset / 16 MiB document)",
+    ))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::{HashMap, HashSet};
 
@@ -60,16 +69,19 @@ impl InMemStorage {
         let mut data = self.data.lock().unwrap();
         let offset = data.len() as u64;
         let length = doc_bytes.len() as u32;
+        if !DocLocation::fits(offset, length) {
+            return Err(packed_limit_err());
+        }
         data.push(RECORD_ACTIVE);
         data.extend_from_slice(&length.to_le_bytes());
         data.extend_from_slice(doc_bytes);
-        Ok(DocLocation { offset, length })
+        Ok(DocLocation::new(offset, length))
     }
 
     pub fn read(&self, loc: DocLocation) -> Result<Vec<u8>> {
         let data = self.data.lock().unwrap();
-        let start = (loc.offset + 5) as usize;
-        let end = start + loc.length as usize;
+        let start = (loc.offset() + 5) as usize;
+        let end = start + loc.length() as usize;
         if end > data.len() {
             return Err(crate::error::Error::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -87,12 +99,12 @@ impl InMemStorage {
         &self,
         locs: &mut [(usize, DocLocation)],
     ) -> Result<Vec<(usize, Vec<u8>)>> {
-        locs.sort_unstable_by_key(|&(_, loc)| loc.offset);
+        locs.sort_unstable_by_key(|&(_, loc)| loc.offset());
         let data = self.data.lock().unwrap();
         let mut results = Vec::with_capacity(locs.len());
         for &(idx, loc) in locs.iter() {
-            let start = (loc.offset + 5) as usize;
-            let end = start + loc.length as usize;
+            let start = (loc.offset() + 5) as usize;
+            let end = start + loc.length() as usize;
             results.push((idx, data[start..end].to_vec()));
         }
         Ok(results)
@@ -100,7 +112,7 @@ impl InMemStorage {
 
     pub fn mark_deleted(&self, loc: DocLocation) -> Result<()> {
         let mut data = self.data.lock().unwrap();
-        data[loc.offset as usize] = RECORD_DELETED;
+        data[loc.offset() as usize] = RECORD_DELETED;
         Ok(())
     }
 
@@ -110,6 +122,11 @@ impl InMemStorage {
 
     pub fn append_batch_no_sync(&self, items: &[&[u8]]) -> Result<Vec<DocLocation>> {
         let mut data = self.data.lock().unwrap();
+        // Validate up front so a rejected item can't leave a partial batch.
+        let end = data.len() as u64 + items.iter().map(|i| 5 + i.len() as u64).sum::<u64>();
+        if !DocLocation::fits(end, items.iter().map(|i| i.len()).max().unwrap_or(0) as u32) {
+            return Err(packed_limit_err());
+        }
         let mut locations = Vec::with_capacity(items.len());
         for &item in items {
             let offset = data.len() as u64;
@@ -117,7 +134,7 @@ impl InMemStorage {
             data.push(RECORD_ACTIVE);
             data.extend_from_slice(&length.to_le_bytes());
             data.extend_from_slice(item);
-            locations.push(DocLocation { offset, length });
+            locations.push(DocLocation::new(offset, length));
         }
         Ok(locations)
     }
@@ -128,6 +145,11 @@ impl InMemStorage {
         }
         let total: usize = items.iter().map(|i| 5 + i.len()).sum();
         let mut data = self.data.lock().unwrap();
+        // Validate up front so a rejected item can't leave a partial batch.
+        let end = data.len() as u64 + total as u64;
+        if !DocLocation::fits(end, items.iter().map(|i| i.len()).max().unwrap_or(0) as u32) {
+            return Err(packed_limit_err());
+        }
         data.reserve(total);
         let mut locations = Vec::with_capacity(items.len());
         for &item in items {
@@ -136,7 +158,7 @@ impl InMemStorage {
             data.push(RECORD_ACTIVE);
             data.extend_from_slice(&length.to_le_bytes());
             data.extend_from_slice(item);
-            locations.push(DocLocation { offset, length });
+            locations.push(DocLocation::new(offset, length));
         }
         Ok(locations)
     }
@@ -175,13 +197,7 @@ impl InMemStorage {
 
             if status == RECORD_ACTIVE {
                 let bytes = data[pos + 5..pos + 5 + length].to_vec();
-                results.push((
-                    DocLocation {
-                        offset: pos as u64,
-                        length: length as u32,
-                    },
-                    bytes,
-                ));
+                results.push((DocLocation::new(pos as u64, length as u32), bytes));
             }
 
             pos += 5 + length;
@@ -214,13 +230,7 @@ impl InMemStorage {
 
             if status == RECORD_ACTIVE {
                 let bytes = snapshot[pos + 5..pos + 5 + length].to_vec();
-                f(
-                    DocLocation {
-                        offset: pos as u64,
-                        length: length as u32,
-                    },
-                    bytes,
-                )?;
+                f(DocLocation::new(pos as u64, length as u32), bytes)?;
             }
 
             pos += 5 + length;

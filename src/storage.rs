@@ -1,8 +1,55 @@
-/// Location of a document in the data file.
-#[derive(Debug, Clone, Copy)]
-pub struct DocLocation {
-    pub offset: u64,
-    pub length: u32,
+/// Location of a document in the data file, packed into a single `u64` so the
+/// disk-first offset index costs 16 B/entry (u64 key + this) instead of 24 B —
+/// halving the resident index that scales linearly with the document count.
+///
+/// The byte offset lives in the high 40 bits (up to 1 TiB per data file) and
+/// the payload length in the low 24 bits (up to 16 MiB per document — the wire
+/// message ceiling). The append paths reject records that would exceed either
+/// bound (`DocLocation::fits`) rather than silently truncating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocLocation(u64);
+
+const DOCLOC_LEN_BITS: u32 = 24;
+const DOCLOC_LEN_MASK: u64 = (1u64 << DOCLOC_LEN_BITS) - 1;
+/// Largest representable payload length (16 MiB − 1).
+pub const DOCLOC_MAX_LENGTH: u32 = DOCLOC_LEN_MASK as u32;
+/// Largest representable byte offset (1 TiB − 1).
+pub const DOCLOC_MAX_OFFSET: u64 = (1u64 << (64 - DOCLOC_LEN_BITS)) - 1;
+
+impl DocLocation {
+    /// Pack `(offset, length)` into one word. Debug-asserts the bounds; write
+    /// paths must pre-check with [`DocLocation::fits`] and surface a real error
+    /// so an out-of-range record never truncates into a wrong read.
+    #[inline]
+    pub fn new(offset: u64, length: u32) -> Self {
+        debug_assert!(
+            offset <= DOCLOC_MAX_OFFSET,
+            "DocLocation offset {offset} exceeds the 40-bit (1 TiB) limit"
+        );
+        debug_assert!(
+            length <= DOCLOC_MAX_LENGTH,
+            "DocLocation length {length} exceeds the 24-bit (16 MiB) limit"
+        );
+        DocLocation((offset << DOCLOC_LEN_BITS) | (length as u64 & DOCLOC_LEN_MASK))
+    }
+
+    /// Whether `(offset, length)` can be represented without truncation.
+    #[inline]
+    pub fn fits(offset: u64, length: u32) -> bool {
+        offset <= DOCLOC_MAX_OFFSET && length <= DOCLOC_MAX_LENGTH
+    }
+
+    /// Byte offset of the record in the data file.
+    #[inline]
+    pub fn offset(&self) -> u64 {
+        self.0 >> DOCLOC_LEN_BITS
+    }
+
+    /// Payload length in bytes.
+    #[inline]
+    pub fn length(&self) -> u32 {
+        (self.0 & DOCLOC_LEN_MASK) as u32
+    }
 }
 
 // Everything below is native-only (filesystem, compression, mmap).
@@ -84,6 +131,14 @@ impl StorageInner {
     fn write_record(&mut self, payload: &[u8]) -> Result<DocLocation> {
         let offset = self.current_offset;
         let length = payload.len() as u32;
+        // The offset index packs (offset, length) into a single u64. Reject a
+        // record that cannot be represented rather than truncating it into a
+        // wrong location on read. Limits: 1 TiB per data file, 16 MiB per doc.
+        if !DocLocation::fits(offset, length) {
+            return Err(storage_corrupt(
+                "record exceeds packed offset-index limits (1 TiB file offset / 16 MiB document)",
+            ));
+        }
         let res = (|| -> Result<()> {
             self.file.seek(SeekFrom::End(0))?;
             self.file.write_all(&[RECORD_ACTIVE])?;
@@ -96,7 +151,7 @@ impl StorageInner {
             return Err(e);
         }
         self.current_offset += 1 + 4 + length as u64;
-        Ok(DocLocation { offset, length })
+        Ok(DocLocation::new(offset, length))
     }
 }
 
@@ -310,8 +365,8 @@ impl Storage {
     /// Read a document's bytes from the data file.
     pub fn read(&self, loc: DocLocation) -> Result<Vec<u8>> {
         let mut inner = self.inner.lock();
-        inner.file.seek(SeekFrom::Start(loc.offset + 5))?;
-        let mut buf = vec![0u8; loc.length as usize];
+        inner.file.seek(SeekFrom::Start(loc.offset() + 5))?;
+        let mut buf = vec![0u8; loc.length() as usize];
         inner.file.read_exact(&mut buf)?;
         drop(inner);
         self.decode_payload(&buf)
@@ -325,11 +380,11 @@ impl Storage {
         // 32-bit targets and let a corrupt DocLocation wrap back inside the
         // mmap bounds, returning the wrong bytes past the `<= mmap.len()` guard.
         let data_start_u64 = loc
-            .offset
+            .offset()
             .checked_add(5)
             .ok_or_else(|| storage_corrupt("document offset overflow"))?;
         let data_end_u64 = data_start_u64
-            .checked_add(loc.length as u64)
+            .checked_add(loc.length() as u64)
             .ok_or_else(|| storage_corrupt("document length overflow"))?;
 
         // Fast path: read from mmap (no syscall)
@@ -348,11 +403,11 @@ impl Storage {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            let mut buf = vec![0u8; loc.length as usize];
+            let mut buf = vec![0u8; loc.length() as usize];
             // read_exact_at, not read_at: a short read (stale DocLocation past
             // EOF) must error, not hand zero-filled bytes to the decoder —
             // the data file has no per-record CRC to catch it downstream.
-            self.read_file.read_exact_at(&mut buf, loc.offset + 5)?;
+            self.read_file.read_exact_at(&mut buf, loc.offset() + 5)?;
             self.decode_payload(&buf)
         }
         #[cfg(not(unix))]
@@ -390,11 +445,11 @@ impl Storage {
 
         for (i, loc) in locs.iter().enumerate() {
             let data_start = loc
-                .offset
+                .offset()
                 .checked_add(5)
                 .ok_or_else(|| storage_corrupt("document offset overflow"))?;
             let data_end = data_start
-                .checked_add(loc.length as u64)
+                .checked_add(loc.length() as u64)
                 .ok_or_else(|| storage_corrupt("document length overflow"))?;
 
             // Fast path: data is within the mmap.
@@ -421,8 +476,9 @@ impl Storage {
             {
                 use std::os::unix::fs::FileExt;
                 scratch.clear();
-                scratch.resize(loc.length as usize, 0);
-                self.read_file.read_exact_at(&mut scratch, loc.offset + 5)?;
+                scratch.resize(loc.length() as usize, 0);
+                self.read_file
+                    .read_exact_at(&mut scratch, loc.offset() + 5)?;
                 let decoded = self.decode_payload(&scratch)?;
                 if !f(i, &decoded)? {
                     return Ok(());
@@ -445,7 +501,7 @@ impl Storage {
         &self,
         locs: &mut [(usize, DocLocation)],
     ) -> Result<Vec<(usize, Vec<u8>)>> {
-        locs.sort_unstable_by_key(|&(_, loc)| loc.offset);
+        locs.sort_unstable_by_key(|&(_, loc)| loc.offset());
         let guard = self.read_mmap.read();
         let mmap_ref = guard.as_ref();
         let mmap_len = mmap_ref.map_or(0, |m| m.len());
@@ -455,11 +511,11 @@ impl Storage {
             // u64 + checked math, as in `read_lockfree`, so a truncated/wrapped
             // offset can't pass the mmap-bounds check and read wrong bytes.
             let data_start_u64 = loc
-                .offset
+                .offset()
                 .checked_add(5)
                 .ok_or_else(|| storage_corrupt("document offset overflow"))?;
             let data_end_u64 = data_start_u64
-                .checked_add(loc.length as u64)
+                .checked_add(loc.length() as u64)
                 .ok_or_else(|| storage_corrupt("document length overflow"))?;
 
             let decoded = if let Some(ref mmap) = mmap_ref {
@@ -482,8 +538,8 @@ impl Storage {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            let mut buf = vec![0u8; loc.length as usize];
-            self.read_file.read_exact_at(&mut buf, loc.offset + 5)?;
+            let mut buf = vec![0u8; loc.length() as usize];
+            self.read_file.read_exact_at(&mut buf, loc.offset() + 5)?;
             self.decode_payload(&buf)
         }
         #[cfg(not(unix))]
@@ -498,11 +554,11 @@ impl Storage {
         locs: &mut [(usize, DocLocation)],
     ) -> Result<Vec<(usize, Vec<u8>)>> {
         let mut inner = self.inner.lock();
-        locs.sort_unstable_by_key(|&(_, loc)| loc.offset);
+        locs.sort_unstable_by_key(|&(_, loc)| loc.offset());
         let mut results = Vec::with_capacity(locs.len());
         for &(idx, loc) in locs.iter() {
-            inner.file.seek(SeekFrom::Start(loc.offset + 5))?;
-            let mut buf = vec![0u8; loc.length as usize];
+            inner.file.seek(SeekFrom::Start(loc.offset() + 5))?;
+            let mut buf = vec![0u8; loc.length() as usize];
             inner.file.read_exact(&mut buf)?;
             results.push((idx, buf));
         }
@@ -516,7 +572,7 @@ impl Storage {
     /// Soft-delete a record by flipping its status byte.
     pub fn mark_deleted(&self, loc: DocLocation) -> Result<()> {
         let mut inner = self.inner.lock();
-        inner.file.seek(SeekFrom::Start(loc.offset))?;
+        inner.file.seek(SeekFrom::Start(loc.offset()))?;
         inner.file.write_all(&[RECORD_DELETED])?;
         inner.file.sync_data()?;
         Ok(())
@@ -647,10 +703,7 @@ impl Storage {
 
         let locations = relative_locations
             .into_iter()
-            .map(|(rel, length)| DocLocation {
-                offset: base_offset + rel,
-                length,
-            })
+            .map(|(rel, length)| DocLocation::new(base_offset + rel, length))
             .collect();
 
         Ok(locations)
@@ -659,7 +712,7 @@ impl Storage {
     /// Soft-delete without fsync (caller must call `sync()` after batch).
     pub fn mark_deleted_no_sync(&self, loc: DocLocation) -> Result<()> {
         let mut inner = self.inner.lock();
-        inner.file.seek(SeekFrom::Start(loc.offset))?;
+        inner.file.seek(SeekFrom::Start(loc.offset()))?;
         inner.file.write_all(&[RECORD_DELETED])?;
         Ok(())
     }
@@ -672,7 +725,7 @@ impl Storage {
         }
         let mut inner = self.inner.lock();
         for loc in locs {
-            inner.file.seek(SeekFrom::Start(loc.offset))?;
+            inner.file.seek(SeekFrom::Start(loc.offset()))?;
             inner.file.write_all(&[RECORD_DELETED])?;
         }
         Ok(())
@@ -745,13 +798,7 @@ impl Storage {
                 let mut data = vec![0u8; length as usize];
                 inner.file.read_exact(&mut data)?;
                 let plaintext = self.decode_payload(&data)?;
-                results.push((
-                    DocLocation {
-                        offset: pos,
-                        length,
-                    },
-                    plaintext,
-                ));
+                results.push((DocLocation::new(pos, length), plaintext));
             } else {
                 inner.file.seek(SeekFrom::Current(length as i64))?;
             }
@@ -794,13 +841,7 @@ impl Storage {
                 let plaintext = self.decode_payload(&data)?;
                 // Drop inner lock before callback (callback may need to read storage)
                 drop(inner);
-                f(
-                    DocLocation {
-                        offset: pos,
-                        length,
-                    },
-                    plaintext,
-                )?;
+                f(DocLocation::new(pos, length), plaintext)?;
                 inner = self.inner.lock();
                 // Re-seek to continue after this record
                 inner.file.seek(SeekFrom::Start(pos + 5 + length as u64))?;
@@ -927,6 +968,35 @@ mod tests {
     }
 
     #[test]
+    fn doclocation_packs_into_one_word() {
+        assert_eq!(
+            std::mem::size_of::<DocLocation>(),
+            8,
+            "DocLocation must be a single u64 (16 B/entry offset index, not 24 B)"
+        );
+        for (off, len) in [
+            (0u64, 0u32),
+            (5, 100),
+            (1u64 << 39, DOCLOC_MAX_LENGTH),
+            (DOCLOC_MAX_OFFSET, 0),
+            (DOCLOC_MAX_OFFSET, DOCLOC_MAX_LENGTH),
+        ] {
+            let d = DocLocation::new(off, len);
+            assert_eq!(d.offset(), off, "offset roundtrip for ({off}, {len})");
+            assert_eq!(d.length(), len, "length roundtrip for ({off}, {len})");
+        }
+        assert!(DocLocation::fits(DOCLOC_MAX_OFFSET, DOCLOC_MAX_LENGTH));
+        assert!(
+            !DocLocation::fits(DOCLOC_MAX_OFFSET + 1, 0),
+            "offset over 1 TiB rejected"
+        );
+        assert!(
+            !DocLocation::fits(0, DOCLOC_MAX_LENGTH + 1),
+            "doc over 16 MiB rejected"
+        );
+    }
+
+    #[test]
     fn append_and_read_roundtrip() {
         let dir = TempDir::new().unwrap();
         let storage = test_storage(&dir);
@@ -949,7 +1019,7 @@ mod tests {
         assert_eq!(raw.read(loc).unwrap(), payload, "uncompressed round-trip");
         // On-disk length == payload length (+ no shrink), i.e. not compressed.
         assert_eq!(
-            loc.length as usize,
+            loc.length() as usize,
             payload.len(),
             "stored raw, not zstd-shrunk"
         );
@@ -959,7 +1029,7 @@ mod tests {
         let comp = Storage::open_with_options(&cpath, None, true).unwrap();
         let cloc = comp.append(&payload).unwrap();
         assert!(
-            (cloc.length as usize) < payload.len(),
+            (cloc.length() as usize) < payload.len(),
             "compressed store shrinks it"
         );
 
@@ -1061,8 +1131,8 @@ mod tests {
         assert_eq!(storage.read(loc1).unwrap(), b"first");
         assert_eq!(storage.read(loc2).unwrap(), b"second");
         assert_eq!(storage.read(loc3).unwrap(), b"third");
-        assert_ne!(loc1.offset, loc2.offset);
-        assert_ne!(loc2.offset, loc3.offset);
+        assert_ne!(loc1.offset(), loc2.offset());
+        assert_ne!(loc2.offset(), loc3.offset());
     }
 
     #[test]

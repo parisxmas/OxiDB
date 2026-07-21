@@ -360,8 +360,7 @@ impl BTreeCollection {
                     .iter()
                     .filter(|i| i.index_type == "composite")
                 {
-                    let mpath =
-                        data_dir.join(format!("{}.{}.mcidx", name, info.fields.join("_")));
+                    let mpath = data_dir.join(format!("{}.{}.mcidx", name, info.fields.join("_")));
                     let idx = match CompositeIndex::open_disk(&mpath) {
                         Ok(idx) => idx,
                         Err(_) => {
@@ -2319,10 +2318,9 @@ impl BTreeCollection {
                                     Some(m) => m,
                                     // Legacy JSON text / unsupported op:
                                     // decode this one candidate.
-                                    None => query::matches_value(
-                                        &query,
-                                        &codec::decode_doc(&bytes)?,
-                                    ),
+                                    None => {
+                                        query::matches_value(&query, &codec::decode_doc(&bytes)?)
+                                    }
                                 };
                             if matched {
                                 matches.push((id, bytes, None));
@@ -2415,7 +2413,11 @@ impl BTreeCollection {
         // The per-doc compute (clone, apply the update, re-encode) is pure
         // and dominates bulk updates — fan it out. Order is preserved, so
         // WAL ordering and the returned id order are unchanged.
-        let compute = |(id, phase1_bytes, phase1_value): (DocumentId, Vec<u8>, Option<Arc<Value>>)|
+        let compute = |(id, phase1_bytes, phase1_value): (
+            DocumentId,
+            Vec<u8>,
+            Option<Arc<Value>>,
+        )|
          -> Result<Option<UpdateOp>> {
             // Re-read under the write locks; storage is the source of truth.
             let Some(cur_bytes) = self.storage.get(id) else {
@@ -2489,11 +2491,13 @@ impl BTreeCollection {
             }
         };
         #[cfg(target_arch = "wasm32")]
-        let computed: Result<Vec<Option<UpdateOp>>> =
-            matches.into_iter().map(compute).collect();
+        let computed: Result<Vec<Option<UpdateOp>>> = matches.into_iter().map(compute).collect();
         let ops: Vec<UpdateOp> = computed?.into_iter().flatten().collect();
         let matched = ops.len() as u64;
-        let ops: Vec<UpdateOp> = ops.into_iter().filter(|op| !op.new_bytes.is_empty()).collect();
+        let ops: Vec<UpdateOp> = ops
+            .into_iter()
+            .filter(|op| !op.new_bytes.is_empty())
+            .collect();
 
         if ops.is_empty() {
             // Either every match was a no-op update (matched > 0) or every
@@ -2552,8 +2556,8 @@ impl BTreeCollection {
             let mut paths: Vec<String> = vec!["_version".to_string()];
             for (op_name, arg) in update_obj {
                 match op_name.as_str() {
-                    "$set" | "$unset" | "$inc" | "$mul" | "$min" | "$max"
-                    | "$currentDate" | "$push" | "$pull" | "$addToSet" | "$pop" => {
+                    "$set" | "$unset" | "$inc" | "$mul" | "$min" | "$max" | "$currentDate"
+                    | "$push" | "$pull" | "$addToSet" | "$pop" => {
                         paths.extend(arg.as_object()?.keys().cloned());
                     }
                     "$rename" => {
@@ -2574,7 +2578,9 @@ impl BTreeCollection {
                 Some(paths) => paths.iter().any(|p| {
                     p == field
                         || p.strip_prefix(field).is_some_and(|r| r.starts_with('.'))
-                        || field.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with('.'))
+                        || field
+                            .strip_prefix(p.as_str())
+                            .is_some_and(|r| r.starts_with('.'))
                 }),
             }
         };
@@ -3298,9 +3304,7 @@ impl BTreeCollection {
         // `.mfidx`; in-RAM collections keep the BTreeMap variant.
         #[cfg(not(target_arch = "wasm32"))]
         let mut idx = if self.storage.is_disk_first() {
-            let mpath = self
-                .data_dir
-                .join(format!("{}.{}.mcidx", self.name, name));
+            let mpath = self.data_dir.join(format!("{}.{}.mcidx", self.name, name));
             CompositeIndex::new_disk(fields, mpath)
         } else {
             CompositeIndex::new(fields)
@@ -4825,11 +4829,19 @@ mod tests {
             .unwrap();
         assert_eq!((matched, modified.len()), (1, 0)); // matched, not modified
         assert!(upserted.is_none());
-        assert_eq!(col.find_one(&json!({"sku": "A1"})).unwrap().unwrap()["first"], true);
+        assert_eq!(
+            col.find_one(&json!({"sku": "A1"})).unwrap().unwrap()["first"],
+            true
+        );
 
         // Without upsert nothing is inserted.
         let (_, ids, upserted) = col
-            .update_upsert(&json!({"sku": "ZZ"}), &json!({"$set": {"a": 1}}), Some(1), false)
+            .update_upsert(
+                &json!({"sku": "ZZ"}),
+                &json!({"$set": {"a": 1}}),
+                Some(1),
+                false,
+            )
             .unwrap();
         assert!(ids.is_empty() && upserted.is_none());
         assert!(col.find_one(&json!({"sku": "ZZ"})).unwrap().is_none());
@@ -4882,15 +4894,16 @@ mod tests {
         assert_eq!(d["y"][0]["c"], json!([{"d": 1}, {"d": 0}]));
 
         // Unknown identifier errors; no-match filter is a matched no-op.
-        assert!(col
-            .update_upsert_filtered(
+        assert!(
+            col.update_upsert_filtered(
                 &json!({"k": 1}),
                 &json!({"$set": {"y.$[nope].b": 5}}),
                 None,
                 false,
                 Some(&json!([{"i.b": 1}])),
             )
-            .is_err());
+            .is_err()
+        );
         let (m, ids, _) = col
             .update_upsert_filtered(
                 &json!({"k": 1}),
@@ -4919,8 +4932,7 @@ mod tests {
             let col = BTreeCollection::open("mc", dir.path(), None).unwrap();
             for i in 0..50i64 {
                 let dept = if i % 2 == 0 { "eng" } else { "ops" };
-                col.insert(json!({"dept": dept, "salary": i * 10}))
-                    .unwrap();
+                col.insert(json!({"dept": dept, "salary": i * 10})).unwrap();
             }
             col.create_composite_index(vec!["dept".to_string(), "salary".to_string()])
                 .unwrap();
@@ -4959,6 +4971,44 @@ mod tests {
                 .unwrap();
             assert_eq!(res[0]["salary"], 460);
         }
+    }
+
+    /// Full-path TTL eviction on a disk-first collection whose date field
+    /// index has been persisted to and reopened from `.mfidx` — the exact
+    /// shape of a long-running ingest collection. Reproduces the case where
+    /// TTL silently evicted nothing on a large mmap-backed field index.
+    #[test]
+    fn ttl_evicts_on_disk_first_mmap_backed_index() {
+        let dir = tempfile::tempdir().unwrap();
+        // Old docs: `_at` far in the past (definitely > 1 day ago); recent
+        // docs: far in the future (definitely < 1 day ago). Robust to wall
+        // clock. Use the .NET round-trip format (7 fractional digits) the
+        // real ingest writes, exercising the string→DateTime detection.
+        {
+            let col = BTreeCollection::open("tt", dir.path(), None).unwrap();
+            for i in 0..40i64 {
+                col.insert(json!({"_at": format!("2020-01-01T00:00:{:02}.7620000Z", i)}))
+                    .unwrap();
+            }
+            for i in 0..10i64 {
+                col.insert(json!({"_at": format!("2099-01-01T00:00:{:02}.0000000Z", i)}))
+                    .unwrap();
+            }
+            // Persist the field index into the mmap `.mfidx` so the reopen
+            // below is served from disk, not an in-RAM overlay.
+            col.create_index("_at").unwrap();
+            col.sync_writes().unwrap();
+        }
+        // Reopen: `_at` index is now mmap-backed, like the live collection.
+        let col = BTreeCollection::open("tt", dir.path(), None).unwrap();
+        assert_eq!(col.count(), 50, "all docs present after reopen");
+
+        col.create_ttl_index("_at", 86400).unwrap(); // 1 day; evicts synchronously
+        let remaining = col.count();
+        assert_eq!(
+            remaining, 10,
+            "TTL must evict the 40 old docs from the mmap-backed index, keeping the 10 future ones"
+        );
     }
 
     /// Cold path — doc_cache evicted, bytes_cache empty → must read

@@ -4,7 +4,7 @@
 //! this module persists them to a `.pidx` file and memory-maps it.
 //! The OS manages which pages stay in RAM (hot) vs disk (cold).
 //!
-//! File format (v2):
+//! File format (v3):
 //! ```text
 //! [MAGIC: "OXPI" 4 bytes]
 //! [VERSION: u32 LE]
@@ -12,9 +12,15 @@
 //! [NEXT_ID: u64 LE]
 //! [DAT_FILE_SIZE: u64 LE]   -- .dat file size when .pidx was persisted
 //! [entries: sorted array of (doc_id: u64, offset: u64, length: u32, version: u64) ]
+//! -- fence section (v3) --
+//! [FENCE_STRIDE: u64 LE]    -- entries per fence sample
+//! [FENCE_COUNT: u64 LE]     -- number of samples = ceil(entry_count / stride)
+//! [fence: array of doc_id u64 LE]  -- doc_id at entry 0, stride, 2*stride, ...
 //! ```
 //!
-//! Each entry is 28 bytes. Lookups use binary search: O(log n).
+//! Each entry is 28 bytes. Lookups binary-search the resident fence in RAM to a
+//! single block, then binary-search that block on the mmap: O(log n) with ~1
+//! cold page fault instead of O(log n) faults (#4 fence over #5 mmap index).
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -28,15 +34,34 @@ use crate::document::DocumentId;
 use crate::storage::DocLocation;
 
 const MAGIC: &[u8; 4] = b"OXPI";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 const HEADER_SIZE: usize = 4 + 4 + 8 + 8 + 8; // magic + version + count + next_id + dat_file_size
 const ENTRY_SIZE: usize = 28; // doc_id(8) + offset(8) + length(4) + version(8)
 
-/// The immutable base layer: a memory-mapped sorted array of entries.
+/// Fence stride: one resident fence sample per this many mmap entries.
+/// The hybrid design (#4 sparse fence over #5 mmap'd index): the full
+/// `doc_id → location` index lives on disk (paged in on demand, so resident
+/// memory does not scale with the collection), while a small resident array of
+/// every `FENCE_STRIDE`-th doc_id lets a lookup binary-search in RAM down to a
+/// single block before touching the mmap — bounding cold-lookup page faults to
+/// ~1 instead of O(log n). At 128, each block is 128×28 B = 3.5 KiB (≤ 1 page)
+/// and the resident fence costs 8 B per 128 docs (~6 MiB for 100 M docs vs the
+/// ~1.6 GiB a fully-resident index would need).
+const FENCE_STRIDE: usize = 128;
+
+/// The immutable base layer: a memory-mapped sorted array of entries plus the
+/// resident fence built over it (`build#4`-over-`#5`).
 struct MmapBase {
     mmap: Option<Mmap>,
     entry_count: u64,
     next_id: u64,
+    /// Resident fence: `fence[k]` is the doc_id at mmap entry `k * fence_stride`.
+    /// Empty when there is no mmap base. Loaded once (sequential read) on open,
+    /// so startup stays O(fence) — not O(entries).
+    fence: Vec<u64>,
+    /// Stride the persisted `fence` was sampled at (read from the file, so a
+    /// future `FENCE_STRIDE` change can't misalign an existing `.pidx`).
+    fence_stride: usize,
 }
 
 /// A memory-mapped primary index. Zero startup cost -- the OS pages in data on demand.
@@ -77,6 +102,8 @@ impl MmapPrimaryIndex {
                         mmap: None,
                         entry_count: 0,
                         next_id: 1,
+                        fence: Vec::new(),
+                        fence_stride: FENCE_STRIDE,
                     }),
                     path: path.to_path_buf(),
                     overlay: parking_lot::RwLock::new(HashMap::new()),
@@ -89,12 +116,16 @@ impl MmapPrimaryIndex {
             let entry_count = u64::from_le_bytes(mmap[8..16].try_into().unwrap());
             let next_id = u64::from_le_bytes(mmap[16..24].try_into().unwrap());
             let dat_file_size = u64::from_le_bytes(mmap[24..32].try_into().unwrap());
+            // Load the resident fence (one sequential read of the tail section).
+            let (fence_stride, fence) = Self::read_fence(&mmap, entry_count);
 
             Ok(Self {
                 base: parking_lot::RwLock::new(MmapBase {
                     mmap: Some(mmap),
                     entry_count,
                     next_id,
+                    fence,
+                    fence_stride,
                 }),
                 path: path.to_path_buf(),
                 overlay: parking_lot::RwLock::new(HashMap::new()),
@@ -109,6 +140,8 @@ impl MmapPrimaryIndex {
                     mmap: None,
                     entry_count: 0,
                     next_id: 1,
+                    fence: Vec::new(),
+                    fence_stride: FENCE_STRIDE,
                 }),
                 path: path.to_path_buf(),
                 overlay: parking_lot::RwLock::new(HashMap::new()),
@@ -137,6 +170,8 @@ impl MmapPrimaryIndex {
                 mmap: None,
                 entry_count: 0,
                 next_id: 1,
+                fence: Vec::new(),
+                fence_stride: FENCE_STRIDE,
             }),
             path: PathBuf::new(),
             overlay: parking_lot::RwLock::new(HashMap::new()),
@@ -252,13 +287,7 @@ impl MmapPrimaryIndex {
             for i in 0..base.entry_count as usize {
                 let entry = Self::read_entry_from(mmap, i);
                 if !deleted.contains(&entry.0) && !overlay.contains_key(&entry.0) {
-                    result.push((
-                        entry.0,
-                        DocLocation {
-                            offset: entry.1,
-                            length: entry.2,
-                        },
-                    ));
+                    result.push((entry.0, DocLocation::new(entry.1, entry.2)));
                 }
             }
         }
@@ -286,7 +315,7 @@ impl MmapPrimaryIndex {
             for i in 0..base.entry_count as usize {
                 let (id, offset, length, version) = Self::read_entry_from(mmap, i);
                 if !deleted.contains(&id) && !overlay.contains_key(&id) {
-                    result.push((id, DocLocation { offset, length }, version));
+                    result.push((id, DocLocation::new(offset, length), version));
                 }
             }
         }
@@ -344,7 +373,7 @@ impl MmapPrimaryIndex {
 
         for (&doc_id, &(loc, _)) in overlay.iter() {
             if !deleted.contains(&doc_id) {
-                offsets.push(loc.offset);
+                offsets.push(loc.offset());
             }
         }
 
@@ -393,6 +422,13 @@ impl MmapPrimaryIndex {
                 writer.write_all(&length.to_le_bytes())?;
                 writer.write_all(&version.to_le_bytes())?;
             }
+            // Fence section (v3): stride, count, then every stride-th doc_id.
+            let fence = Self::build_fence(&all_entries);
+            writer.write_all(&(FENCE_STRIDE as u64).to_le_bytes())?;
+            writer.write_all(&(fence.len() as u64).to_le_bytes())?;
+            for &id in &fence {
+                writer.write_all(&id.to_le_bytes())?;
+            }
             writer.flush()?;
         }
         fs::rename(&tmp_path, &self.path)?;
@@ -401,12 +437,15 @@ impl MmapPrimaryIndex {
         let file = File::open(&self.path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let entry_count = all_entries.len() as u64;
+        let (fence_stride, fence) = Self::read_fence(&mmap, entry_count);
 
         {
             let mut base = self.base.write();
             base.mmap = Some(mmap);
             base.entry_count = entry_count;
             base.next_id = next_id;
+            base.fence = fence;
+            base.fence_stride = fence_stride;
         }
         self.overlay.write().clear();
         self.deleted.write().clear();
@@ -434,7 +473,7 @@ impl MmapPrimaryIndex {
             .iter()
             .map(|(&id, loc)| {
                 let version = versions.get(&id).copied().unwrap_or(1);
-                (id, loc.offset, loc.length, version)
+                (id, loc.offset(), loc.length(), version)
             })
             .collect();
         entries.sort_unstable_by_key(|e| e.0);
@@ -455,6 +494,13 @@ impl MmapPrimaryIndex {
                 writer.write_all(&offset.to_le_bytes())?;
                 writer.write_all(&length.to_le_bytes())?;
                 writer.write_all(&version.to_le_bytes())?;
+            }
+            // Fence section (v3) — keep every `.pidx` writer consistent.
+            let fence = Self::build_fence(&entries);
+            writer.write_all(&(FENCE_STRIDE as u64).to_le_bytes())?;
+            writer.write_all(&(fence.len() as u64).to_le_bytes())?;
+            for &id in &fence {
+                writer.write_all(&id.to_le_bytes())?;
             }
             writer.flush()?;
         }
@@ -499,20 +545,19 @@ impl MmapPrimaryIndex {
 
     fn mmap_lookup_base(base: &MmapBase, doc_id: DocumentId) -> Option<(DocLocation, u64)> {
         let mmap = base.mmap.as_ref()?;
-        let count = base.entry_count as usize;
-        if count == 0 {
+        if base.entry_count == 0 {
             return None;
         }
 
-        // Binary search on sorted doc_id array
-        let mut lo = 0usize;
-        let mut hi = count;
+        // Narrow to a single fence block in RAM, then binary-search that block
+        // on the mmap (touches ~1 page instead of one per probe).
+        let (mut lo, mut hi) = Self::fenced_range(base, doc_id)?;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let (id, offset, length, version) = Self::read_entry_from(mmap, mid);
-            match id.cmp(&doc_id) {
+            match Self::read_id_from(mmap, mid).cmp(&doc_id) {
                 std::cmp::Ordering::Equal => {
-                    return Some((DocLocation { offset, length }, version));
+                    let (_, offset, length, version) = Self::read_entry_from(mmap, mid);
+                    return Some((DocLocation::new(offset, length), version));
                 }
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
@@ -535,6 +580,60 @@ impl MmapPrimaryIndex {
         (doc_id, offset, length, version)
     }
 
+    /// Just the doc_id at `index` — used by the fenced block search so a probe
+    /// reads 8 B, not the whole 28 B entry.
+    #[inline]
+    fn read_id_from(mmap: &Mmap, index: usize) -> u64 {
+        let base = HEADER_SIZE + index * ENTRY_SIZE;
+        u64::from_le_bytes(mmap[base..base + 8].try_into().unwrap())
+    }
+
+    /// Sample every `FENCE_STRIDE`-th doc_id from a sorted entry list.
+    fn build_fence(entries: &[(u64, u64, u32, u64)]) -> Vec<u64> {
+        entries.iter().step_by(FENCE_STRIDE).map(|e| e.0).collect()
+    }
+
+    /// Read the persisted fence section (tail of the file, after the entry
+    /// table). Returns `(stride, fence)`; on an absent/truncated section falls
+    /// back to `(FENCE_STRIDE, empty)` so lookups do a plain full binary search.
+    fn read_fence(mmap: &Mmap, entry_count: u64) -> (usize, Vec<u64>) {
+        let off = HEADER_SIZE + entry_count as usize * ENTRY_SIZE;
+        let buf = &mmap[..];
+        if off + 16 > buf.len() {
+            return (FENCE_STRIDE, Vec::new());
+        }
+        let stride = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
+        let fence_count = u64::from_le_bytes(buf[off + 8..off + 16].try_into().unwrap()) as usize;
+        let data_start = off + 16;
+        if stride == 0 || data_start + fence_count.saturating_mul(8) > buf.len() {
+            return (FENCE_STRIDE, Vec::new());
+        }
+        let mut fence = Vec::with_capacity(fence_count);
+        for k in 0..fence_count {
+            let p = data_start + k * 8;
+            fence.push(u64::from_le_bytes(buf[p..p + 8].try_into().unwrap()));
+        }
+        (stride, fence)
+    }
+
+    /// The mmap entry range `[lo, hi)` that could contain `doc_id`, narrowed by
+    /// the resident fence. `None` when `doc_id` is below the first entry.
+    #[inline]
+    fn fenced_range(base: &MmapBase, doc_id: DocumentId) -> Option<(usize, usize)> {
+        let count = base.entry_count as usize;
+        if base.fence.is_empty() || base.fence_stride == 0 {
+            return Some((0, count));
+        }
+        // k = number of fence samples <= doc_id.
+        let k = base.fence.partition_point(|&d| d <= doc_id);
+        if k == 0 {
+            return None; // doc_id < first entry — cannot be present
+        }
+        let lo = (k - 1) * base.fence_stride;
+        let hi = (k * base.fence_stride).min(count);
+        Some((lo, hi))
+    }
+
     fn collect_all_entries(&self) -> Vec<(u64, u64, u32, u64)> {
         let base = self.base.read();
         let overlay = self.overlay.read();
@@ -547,7 +646,7 @@ impl MmapPrimaryIndex {
                 let (id, offset, length, version) = Self::read_entry_from(mmap, i);
                 if !deleted.contains(&id) {
                     if let Some(&(loc, ver)) = overlay.get(&id) {
-                        entries.push((id, loc.offset, loc.length, ver));
+                        entries.push((id, loc.offset(), loc.length(), ver));
                     } else {
                         entries.push((id, offset, length, version));
                     }
@@ -558,7 +657,7 @@ impl MmapPrimaryIndex {
         // New overlay entries (not in mmap)
         for (&id, &(loc, ver)) in overlay.iter() {
             if !deleted.contains(&id) && !Self::mmap_contains_base(&base, id) {
-                entries.push((id, loc.offset, loc.length, ver));
+                entries.push((id, loc.offset(), loc.length(), ver));
             }
         }
 
@@ -581,30 +680,9 @@ mod tests {
         assert_eq!(idx.len(), 0);
 
         // Insert some entries
-        idx.insert(
-            1,
-            DocLocation {
-                offset: 0,
-                length: 100,
-            },
-            1,
-        );
-        idx.insert(
-            5,
-            DocLocation {
-                offset: 100,
-                length: 200,
-            },
-            1,
-        );
-        idx.insert(
-            3,
-            DocLocation {
-                offset: 300,
-                length: 150,
-            },
-            1,
-        );
+        idx.insert(1, DocLocation::new(0, 100), 1);
+        idx.insert(5, DocLocation::new(100, 200), 1);
+        idx.insert(3, DocLocation::new(300, 150), 1);
 
         assert_eq!(idx.len(), 3);
         assert!(idx.contains(1));
@@ -617,8 +695,8 @@ mod tests {
         assert_eq!(idx2.len(), 3);
         assert_eq!(idx2.get_version(1), 1);
         let loc = idx2.get_location(5).unwrap();
-        assert_eq!(loc.offset, 100);
-        assert_eq!(loc.length, 200);
+        assert_eq!(loc.offset(), 100);
+        assert_eq!(loc.length(), 200);
 
         Ok(())
     }
@@ -629,22 +707,8 @@ mod tests {
         let path = dir.path().join("test.pidx");
 
         let idx = MmapPrimaryIndex::open(&path)?;
-        idx.insert(
-            1,
-            DocLocation {
-                offset: 0,
-                length: 100,
-            },
-            1,
-        );
-        idx.insert(
-            2,
-            DocLocation {
-                offset: 100,
-                length: 100,
-            },
-            1,
-        );
+        idx.insert(1, DocLocation::new(0, 100), 1);
+        idx.insert(2, DocLocation::new(100, 100), 1);
         idx.persist()?;
 
         let idx = MmapPrimaryIndex::open(&path)?;
@@ -657,14 +721,7 @@ mod tests {
         assert!(idx.contains(2));
 
         // Add new
-        idx.insert(
-            3,
-            DocLocation {
-                offset: 200,
-                length: 50,
-            },
-            1,
-        );
+        idx.insert(3, DocLocation::new(200, 50), 1);
         assert_eq!(idx.len(), 2);
 
         Ok(())
@@ -678,13 +735,7 @@ mod tests {
         let mut primary = HashMap::new();
         let mut versions = HashMap::new();
         for i in 0..10000u64 {
-            primary.insert(
-                i,
-                DocLocation {
-                    offset: i * 100,
-                    length: 90,
-                },
-            );
+            primary.insert(i, DocLocation::new(i * 100, 90));
             versions.insert(i, 1u64);
         }
 
@@ -698,8 +749,53 @@ mod tests {
         assert!(!idx.contains(10000));
 
         let loc = idx.get_location(7777).unwrap();
-        assert_eq!(loc.offset, 7777 * 100);
+        assert_eq!(loc.offset(), 7777 * 100);
 
+        Ok(())
+    }
+
+    #[test]
+    fn fenced_lookup_across_blocks_and_gaps() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("fenced.pidx");
+        // Non-contiguous ids (odd only) spanning many fence blocks.
+        let n = 5000u64;
+        let mut primary = HashMap::new();
+        let mut versions = HashMap::new();
+        for i in 0..n {
+            let id = i * 2 + 1; // 1, 3, 5, ...
+            primary.insert(id, DocLocation::new(id * 10, 42));
+            versions.insert(id, (i % 7) + 1);
+        }
+        let idx = MmapPrimaryIndex::rebuild_from_maps(&path, &primary, &versions, n * 2 + 1, 0)?;
+        assert_eq!(idx.len() as u64, n);
+
+        // The fence is populated, correctly strided, and anchored at the min id.
+        {
+            let base = idx.base.read();
+            assert!(!base.fence.is_empty(), "fence should be built on persist");
+            assert_eq!(base.fence_stride, FENCE_STRIDE);
+            let expected = (n as usize).div_ceil(FENCE_STRIDE);
+            assert_eq!(base.fence.len(), expected, "one sample per stride");
+            assert_eq!(base.fence[0], 1, "first sample is the smallest id");
+        }
+
+        // Every present id resolves through the fenced path; absent even ids and
+        // out-of-range ids return None.
+        for i in 0..n {
+            let id = i * 2 + 1;
+            let (loc, ver) = idx.get(id).expect("present id");
+            assert_eq!(loc.offset(), id * 10, "offset for {id}");
+            assert_eq!(loc.length(), 42, "length for {id}");
+            assert_eq!(ver, (i % 7) + 1, "version for {id}");
+            assert!(
+                idx.get(id - 1).is_none(),
+                "even id {} must be absent",
+                id - 1
+            );
+        }
+        assert!(idx.get(0).is_none(), "id below the first entry");
+        assert!(idx.get(n * 2 + 100).is_none(), "id above the last entry");
         Ok(())
     }
 
@@ -708,22 +804,8 @@ mod tests {
         let idx = MmapPrimaryIndex::new_in_memory();
         assert_eq!(idx.len(), 0);
 
-        idx.insert(
-            1,
-            DocLocation {
-                offset: 0,
-                length: 100,
-            },
-            1,
-        );
-        idx.insert(
-            2,
-            DocLocation {
-                offset: 100,
-                length: 200,
-            },
-            1,
-        );
+        idx.insert(1, DocLocation::new(0, 100), 1);
+        idx.insert(2, DocLocation::new(100, 200), 1);
         assert_eq!(idx.len(), 2);
         assert!(idx.contains(1));
 
@@ -742,22 +824,8 @@ mod tests {
         let path = dir.path().join("test.pidx");
 
         let idx = MmapPrimaryIndex::open(&path)?;
-        idx.insert(
-            1,
-            DocLocation {
-                offset: 0,
-                length: 100,
-            },
-            1,
-        );
-        idx.insert(
-            2,
-            DocLocation {
-                offset: 100,
-                length: 200,
-            },
-            1,
-        );
+        idx.insert(1, DocLocation::new(0, 100), 1);
+        idx.insert(2, DocLocation::new(100, 200), 1);
         idx.persist()?;
 
         // Overlay should be empty after persist
@@ -766,14 +834,7 @@ mod tests {
         assert!(idx.contains(2));
 
         // Add more
-        idx.insert(
-            3,
-            DocLocation {
-                offset: 200,
-                length: 50,
-            },
-            1,
-        );
+        idx.insert(3, DocLocation::new(200, 50), 1);
         assert_eq!(idx.len(), 3);
         idx.persist()?;
 
