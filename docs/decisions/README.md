@@ -47,3 +47,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0015](0015-durable-mqtt-qos.md) | Durable MQTT — persistent sessions and honest QoS 1 | Accepted |
 | [0016](0016-amqp-protocol.md) | AMQP 0-9-1 (RabbitMQ protocol) on the shared broker substrate | Accepted |
 | [0017](0017-mvcc-lite-read-snapshots.md) | MVCC-lite — read snapshots for the document engine | Accepted |
+| [0018](0018-offset-index-memory.md) | Shrinking the disk-first offset index (packed DocLocation + fenced mmap index) | Accepted (Phase 1); Phase 2 Proposed |
