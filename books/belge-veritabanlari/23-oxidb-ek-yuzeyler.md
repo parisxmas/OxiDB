@@ -124,6 +124,13 @@ okunur tutmak için, büyük ve gömülmesi sakıncalı veriyi belgeden ayırıp
 referansla işaret etmek. Böylece belgeleriniz küçük kalır, büyük nesneler ise
 onlara uygun, ayrı bir depoda verimli biçimde yönetilir.
 
+Burada anlattığımız, blob deposunun çekirdeğe gömülü yüzüdür; bu depoya bir ağ
+üzerinden, yaygın araçların doğrudan konuşabildiği tam bir bulut nesne deposu
+protokolüyle de erişilebilir. O uyumluluk katmanını — kova, anahtar ve etag
+kavramlarını bir HTTP arayüzüne taşıyan yüzeyi — otuz birinci bölümde ayrıntısıyla
+ele alacağız; burada yalnızca, aynı deponun iki kapısı olduğunu belirtmekle
+yetinelim.
+
 ## Dururken şifreleme: depolama sınırında koruma
 
 On dördüncü bölümde, şifrelemenin iki cephesinden söz etmiştik: aktarım sırasında

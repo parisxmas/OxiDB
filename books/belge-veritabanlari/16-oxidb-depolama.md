@@ -50,32 +50,14 @@ tanıdığımız iki felsefeyi — belleğe öncelikli ve diske öncelikli — b
 sunmasıdır. Bu iki kip, aynı çekirdek arayüzün arkasında, verinin nerede
 yaşadığına dair taban tabana farklı iki karar verir.
 
-### Belleğe öncelikli kip: varsayılan
+### Disk-öncelikli kip: varsayılan
 
-Varsayılan kipte, her belgenin baytları **bellekte yerleşik** olarak durur. Yani
-tüm koleksiyon, kelimenin tam anlamıyla, bellekteki o eş zamanlı eşlemenin içinde
-yaşar. Diske yazılan dosya — uzantısıyla anılırsa, `.btree` dosyası — yalnızca
-bu bellek içeriğinin periyodik bir **anlık görüntüsüdür**; veritabanı açıldığında
-bu dosya bütünüyle belleğe geri yüklenir. Bu yüzden OxiDB, varsayılan kipinde,
-aslında disk üzerinde kalıcılığa sahip bir **bellek-içi veritabanı** gibi
-davranır.
-
-Bunun sonucu, on üçüncü bölümün belleğe öncelikli felsefesinin tam karşılığıdır.
-Okumalar olağanüstü hızlıdır, çünkü her belge zaten bellektedir; hiçbir okuma
-diske gitmez. Bedeli ise belleğin **veriyle birlikte büyümesidir**: her belgenin
-baytları bellekte yer kapladığı için, milyon belgelik bir koleksiyon, yüzlerce
-megabayt yerleşik bellek tüketir. Bu, veri belleğe rahatça sığdığı sürece
-mükemmel bir tercihtir; ama veri büyüdükçe, bellek hem pahalı hem de sınırlayıcı
-bir kısıt haline gelir.
-
-### Disk-öncelikli kip: opsiyonel
-
-İkinci kip, on üçüncü bölümün diske öncelikli felsefesini hayata geçirir ve
-isteğe bağlı olarak açılır. Bu kipte, bellekte tüm belgeler değil, yalnızca
-küçük bir **kimlik-konum dizini** durur: her belgenin kimliğinden, o belgenin
-disk üzerindeki yerine — yani başlangıç konumu (offset) ve uzunluğa — giden,
-belge başına yalnızca birkaç düzine bayt tutan kompakt bir eşleme. Belgelerin
-asıl baytları ise, beşinci bölümdeki append-only felsefeyle yazılan bir veri
+OxiDB'nin varsayılan kipi, on üçüncü bölümün diske öncelikli felsefesini hayata
+geçirir. Bu kipte, bellekte tüm belgeler değil, yalnızca küçük bir
+**kimlik-konum dizini** durur: her belgenin kimliğinden, o belgenin disk
+üzerindeki yerine — yani başlangıç konumu (offset) ve uzunluğa — giden, belge
+başına yalnızca birkaç düzine bayt tutan kompakt bir eşleme. Belgelerin asıl
+baytları ise, beşinci bölümdeki append-only felsefeyle yazılan bir veri
 dosyasında — `.bdat` dosyasında — durur ve gerektiğinde oradan okunur.
 
 ![Disk-first: kimlik-konum dizini ve mmap'li veri dosyası.](sekiller/16c-diskfirst-dizin.svg){width=80%}
@@ -88,6 +70,24 @@ bölümlerde anlattığımız, append-only, mmap ile okunan, soft-delete ve sağ
 desteği olan sağlamlaşmış depolama bileşenini yeniden kullanır. Yani disk-öncelik,
 köklü bir yeniden yazım değil, var olan dayanıklı altyapının zarif bir biçimde
 yeniden kullanılmasıdır.
+
+### Belleğe öncelikli kip: opsiyonel
+
+İsteğe bağlı ikinci kipte, her belgenin baytları **bellekte yerleşik** olarak
+durur. Yani tüm koleksiyon, kelimenin tam anlamıyla, bellekteki o eş zamanlı
+eşlemenin içinde yaşar. Diske yazılan dosya — uzantısıyla anılırsa, `.btree`
+dosyası — yalnızca bu bellek içeriğinin periyodik bir **anlık görüntüsüdür**;
+veritabanı açıldığında bu dosya bütünüyle belleğe geri yüklenir. Bu yüzden OxiDB,
+bu kipe geçildiğinde, aslında disk üzerinde kalıcılığa sahip bir **bellek-içi
+veritabanı** gibi davranır.
+
+Bunun sonucu, on üçüncü bölümün belleğe öncelikli felsefesinin tam karşılığıdır.
+Okumalar olağanüstü hızlıdır, çünkü her belge zaten bellektedir; hiçbir okuma
+diske gitmez. Bedeli ise belleğin **veriyle birlikte büyümesidir**: her belgenin
+baytları bellekte yer kapladığı için, milyon belgelik bir koleksiyon, yüzlerce
+megabayt yerleşik bellek tüketir. Bu, veri belleğe rahatça sığdığı sürece
+mükemmel bir tercihtir; ama veri büyüdükçe, bellek hem pahalı hem de sınırlayıcı
+bir kısıt haline gelir.
 
 ## Dosyaların dili: .btree, .bdat ve .bopts
 
@@ -191,22 +191,25 @@ biçimde yapıldığında oldukça verimlidir.
 
 On üçüncü bölümde sıkıştırmanın yer-işlemci-sıfırkopya üçgenini tanıtmıştık;
 OxiDB'nin disk-öncelikli kipi, bu üçgenin tam bir uygulamasını sunar. `.bdat`
-dosyasındaki kayıtlar, hızlı ve dengeli bir sıkıştırma algoritmasıyla^[zstd (Zstandard) — Facebook tarafından geliştirilen, yüksek sıkıştırma oranını düşük işlemci maliyetiyle birleştiren, kayıpsız bir sıkıştırma algoritması; RFC 8878 olarak standartlaştırılmıştır.] sıkıştırılmış olarak ya da — isteğe bağlı bir tercihle —
-sıkıştırılmadan saklanabilir. Sıkıştırılmış saklama, diskte daha az yer kaplar,
-ama her okumada baytların açılmasını gerektirir. Sıkıştırılmamış saklama daha
-çok yer kaplar, ama on üçüncü bölümde tanıttığımız sıfır-kopya erişimi mümkün
-kılar: baytlar zaten ham haldeyse, belleğe yansıtılmış dosyadan doğrudan, hiç
-kopyalamadan ve açmadan kullanılabilir.
+dosyasındaki kayıtlar, varsayılan olarak sıkıştırılmadan, ham baytlarıyla
+saklanır; isteğe bağlı bir tercihle ise, hızlı ve dengeli bir sıkıştırma
+algoritmasıyla^[zstd (Zstandard) — Facebook tarafından geliştirilen, yüksek sıkıştırma oranını düşük işlemci maliyetiyle birleştiren, kayıpsız bir sıkıştırma algoritması; RFC 8878 olarak standartlaştırılmıştır.] sıkıştırılarak da saklanabilir. Sıkıştırılmamış
+saklama daha çok yer kaplar, ama on üçüncü bölümde tanıttığımız sıfır-kopya
+erişimi mümkün kılar: baytlar zaten ham haldeyse, belleğe yansıtılmış dosyadan
+doğrudan, hiç kopyalamadan ve açmadan kullanılabilir. Sıkıştırılmış saklama ise
+diskte daha az yer kaplar, ama her okumada baytların açılmasını gerektirir.
 
 Hangisinin kazandığı, on üçüncü bölümdeki ilkeye uyar: veriye bağlıdır.
 Gerçekten iyi sıkışan, seyrek taranan veri için sıkıştırma kazandırır; az sıkışan
 ama sık ve büyük taranan veri için sıkıştırmamak daha iyidir. OxiDB üzerinde
 yapılan ölçümler bu dengeyi somut biçimde gösterir: küçük, yapılandırılmış
 belgelerden oluşan tipik bir veri kümesinde, sıkıştırma diskte kayda değer bir
-yer kazandırmazken, her taramada belgeleri açma zorunluluğu büyük bir maliyet
-getiriyordu; sıkıştırmayı kapatmak, bu tür yükleri belirgin biçimde
-hızlandırıyordu. Bu, on üçüncü bölümün soyut ödünleşiminin gerçek bir sistemdeki
-yankısıdır.
+yer kazandırmazken, her taramada belgeleri açma zorunluluğu — kayıt kayıt açma
+maliyeti taramaları ve toplamaları kat kat yavaşlattığı için — büyük bir bedel
+getiriyordu. OxiDB, tam da bu yüzden, sıkıştırmayı varsayılan olarak kapalı tutar
+ve ham saklamayı yeğler; sıkıştırma, ancak veri gerçekten iyi sıkışıp seyrek
+tarandığında açılmaya değer bir tercihe dönüşür. Bu, on üçüncü bölümün soyut
+ödünleşiminin gerçek bir sistemdeki yankısıdır.
 
 ## Açılış ve kurtarmaya kısa bir bakış
 
@@ -223,9 +226,9 @@ uzlaştırır; ama bu, bir sonraki bölümün konusudur.
 Bu bölümde, OxiDB'nin depolama katmanını yakın plana aldık. Çekirdeğin, belgeleri
 bir kimlikten baytlara eşleyen, eş zamanlı erişime açık bir yapı olduğunu;
 belgelerin içeride zengin bir ikili biçimde tutulduğunu gördük. İki kipi tanıdık:
-tüm veriyi bellekte tutan, hızlı ama bellek-yoğun belleğe öncelikli varsayılanı;
-ve yalnızca kompakt bir dizini bellekte tutup veriyi mmap ile diskte bırakan,
-bellek-tutumlu disk-öncelikli kipi. Dosya uzantılarının (`.btree`, `.bdat`,
+yalnızca kompakt bir dizini bellekte tutup veriyi mmap ile diskte bırakan,
+bellek-tutumlu disk-öncelikli varsayılanı; ve tüm veriyi bellekte tutan, hızlı
+ama bellek-yoğun belleğe öncelikli opsiyonel kipi. Dosya uzantılarının (`.btree`, `.bdat`,
 `.bopts`) bu kipleri ve per-koleksiyon tercihleri nasıl kodladığını; belleğe
 yansıtmanın bellek ayak izini nasıl belirlediğini; append-only olmanın
 sonuçlarını; ve sıkıştırmanın somut ödünleşimini gördük.

@@ -109,6 +109,17 @@ disk-öncelikli kipte sayım gruplamalarını gereksiz yere yavaşlatıyordu. Bu
 yolun disk-öncelikli indeksleri de kapsayacak biçimde yeniden etkinleştirilmesi,
 o yükleri yeniden onlarca kat hızlandırdı.
 
+Aynı fikir, saymanın ötesine de geçer. Bir bileşik indeks, bir gruplamanın
+ihtiyaç duyduğu tüm alanları — hem gruplama anahtarını hem de toplanan değeri —
+kapsıyorsa, OxiDB o gruplamayı da belgelere hiç dokunmadan, yalnızca indeksi
+yürüyerek yanıtlayabilir: her grubun toplamını, ortalamasını, en küçüğünü ya da
+en büyüğünü indeksteki değerlerden doğrudan hesaplar. Bu kapsayan yol, gruplama
+tüm koleksiyonu tarasa da, bir koşulla — bileşik indeksin önekine binen bir
+süzgeçle — daraltılsa da işler; eşitlik öneki, saf aralık, eşitlik artı aralık ve
+çoklu-eşitlik biçimindeki süzgeçlerin hepsi bu kapsamaya girer. Toplama
+işleyicisini yirminci bölümde ele alırken, bu indeks-yalnız yola oradan da
+değineceğiz.
+
 ## İndeks destekli sıralama ve erken sonlanma
 
 Sekizinci bölümde, sıralı bir indeksin "şu alana göre sıralı ilk on kayıt"
@@ -141,7 +152,11 @@ bitişik-sıralı-dizi artı yazma-tamponu tasarımı, yalnızca farklı bir yer
 Bu kipte, indeksin sıralı dizisi bellekte değil, kendi belleğe yansıtılmış
 dosyasında — uzantısıyla anılırsa `.mfidx` dosyasında — durur ve gerektiğinde
 sayfa sayfa belleğe getirilir; bellekte yerleşik kalan tek şey, son yazmaları
-tutan o küçük yazma tamponudur. İkili arama, artık bu yansıtılmış dosya üzerinde
+tutan o küçük yazma tamponudur. Aynı düzen bileşik indeksler için de geçerlidir:
+onlar da disk-öncelikli kipte kendi belleğe yansıtılmış dosyalarında — `.mcidx`
+dosyalarında — yaşar, yalnızca güncel yazmaları tutan küçük tamponları bellekte
+kalır. Böylece hem tek alanlı hem çok alanlı indeksler, disk-öncelikli felsefeyi
+eksiksiz izler. İkili arama, artık bu yansıtılmış dosya üzerinde
 yürür; aranan değerin bulunduğu sayfalar işletim sistemi tarafından getirilir,
 bellek baskı altındayken yine sessizce geri atılabilir — tıpkı bir önceki bölümde
 belge gövdeleri için gördüğümüz gibi. Daha da önemlisi, veritabanı yeniden
@@ -197,7 +212,7 @@ tamponundan oluşan bellek-dostu bir yapıyla eşitlik, aralık ve sıralı geti
 birden desteklediğini; türler arası kesin sıralamanın ve tarihleri epoch-ms tam
 sayısına çeviren otomatik tanımanın bu sıralamayı belge verisine nasıl
 uyarladığını; bileşik indekslerin
-önek kuralını; indeksten doğrudan saymanın gücünü; indeks destekli sıralamayı ve
+önek kuralını; indeksten doğrudan saymanın ve toplamanın gücünü; indeks destekli sıralamayı ve
 erken sonlanmayı; disk-öncelikli kipte indekslerin de belleğe yansıtılarak
 bellekten çıkarıldığını; ve diğer indeks türlerini gördük. Bu arada, OxiDB'nin
 gelişiminden iki öğretici öyküyü — disk indekslerinde sayım kestirmesinin yeniden

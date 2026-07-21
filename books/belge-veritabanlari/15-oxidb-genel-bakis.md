@@ -88,8 +88,8 @@ içinde taşır.
 
 Bu koleksiyonun içine indiğimizde, beşinci ve altıncı bölümlerin somut
 karşılıklarını buluruz. **Depolama katmanı**, ikinci kısımda anlattığımız iki
-felsefeyi birden sunar: belleğe öncelikli varsayılan kip ile diske öncelikli
-opsiyonel kip. **Yazma-öncesi günlük**, altıncı bölümdeki dayanıklılık ve kurtarma
+felsefeyi birden sunar: bugün varsayılan olan diske öncelikli kip ile tüm veriyi
+bellekte tutan opsiyonel belleğe öncelikli kip. **Yazma-öncesi günlük**, altıncı bölümdeki dayanıklılık ve kurtarma
 mekanizmalarını — sağlama toplamları, denetim noktaları, çökmeden geri dönme —
 hayata geçirir.
 

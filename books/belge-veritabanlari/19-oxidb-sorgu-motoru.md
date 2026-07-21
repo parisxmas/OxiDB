@@ -53,17 +53,20 @@ gördüğümüz gibi kıyaslanamayacak kadar ucuzdur.
 
 Bu ikili sınıflandırmayı somutlaştırmakta yarar var; çünkü hangi operatörün
 hangi sınıfa düştüğü, OxiDB'nin yürütme planını doğrudan belirler. **İndeksli**
-sınıfa şunlar girer: eşitlik, eşitsizlik, dört yönlü aralık (büyük/büyük-eşit/
+sınıfa şunlar girer: eşitlik, dört yönlü aralık (büyük/büyük-eşit/
 küçük/küçük-eşit) ve üyelik. Bunların ortak yanı, bir alanın **tek bir değerine**
 ya da **bitişik bir değer aralığına** karşılık gelmeleri, yani bir B-ağacı
 indeksinde tek bir nokta ya da tek bir aralık olarak ifade edilebilmeleridir.
-**Süzgeç-yalnız** sınıfa ise listeye-koşullu-öğe-arama, "tümünü içerir", liste
-uzunluğu, alan türü, bölme kalanı, olumsuzlama, ne...ne bağı ve alanlar arası
-karşılaştırma girer. Bunların ortak yanı da, bir indeksin verdiği "şu değer şu
-belgelerde" eşlemesiyle yanıtlanamamalarıdır: bir liste uzunluğu indekste
-tutulmaz; bir olumsuzlama, indeksin sıralı yapısından yararlanamaz; alanlar arası
-bir karşılaştırma, tek bir alanın indeksiyle değil, belgenin iki alanının aynı
-anda görülmesiyle çözülür. Varlık koşulu da, kavramsal olarak indekslenebilir
+**Süzgeç-yalnız** sınıfa ise eşitsizlik (bir değere eşit *olmama*),
+listeye-koşullu-öğe-arama, "tümünü içerir", liste uzunluğu, alan türü, bölme
+kalanı, olumsuzlama, ne...ne bağı ve alanlar arası karşılaştırma girer. Bunların
+ortak yanı da, bir indeksin verdiği "şu değer şu belgelerde" eşlemesiyle
+yanıtlanamamalarıdır: bir liste uzunluğu indekste tutulmaz; bir olumsuzlama,
+indeksin sıralı yapısından yararlanamaz; bir eşitsizlik, o alanın hiç bulunmadığı
+belgeleri de kapsamak zorunda olduğu için — ki indeks yalnızca alanı taşıyan
+belgeleri tutar — indeksle tam karşılanamaz ve bu yüzden süzgeç tarafına düşer;
+alanlar arası bir karşılaştırma ise, tek bir alanın indeksiyle değil, belgenin
+iki alanının aynı anda görülmesiyle çözülür. Varlık koşulu da, kavramsal olarak indekslenebilir
 görünse de, OxiDB onu bu sürümde süzgeç tarafında değerlendirir. Bu ayrım keyfi
 değildir; her operatörün doğasından çıkar ve sorgu motorunun bütün plan mantığı
 bunun üzerine oturur.
@@ -153,6 +156,18 @@ yalnızca istenen sonuç sayısına (sınır kadar) indiren önemli bir eniyilem
 OxiDB hem tekil alan indekslerinde hem de bileşik (composite) indekslerde bu
 sıralı-gezinme yolunu kullanır.
 
+Bu sıralı-gezinme yolunun bile ilk biçimi, göründüğünden fazla iş yapıyordu:
+motor, bir üst sınır verilmiş olsa da koleksiyonun tümünü bir kez sayıyor ve
+sıralı düzeni baştan sona kuruyor, sınırı ancak ondan sonra uyguluyordu — yani
+"en yeni 20 kayıt" için bile bir milyon belgeyi dokunuyordu. Bu kitap yazılırken
+bu iki gizli maliyet de giderildi: sayım artık indeksin sayacından doğrudan, sabit
+zamanda okunuyor; sıralı gezinme ise gerçekten tembel (lazy) hale getirilerek
+yalnızca istenen sınır kadar girdiye dokunuyor. Etkisi ölçülebilirdi — böyle bir
+sorgu, milisaniyeler mertebesinden milisaniyenin çok altına indi. Bu da, sekizinci
+bölümde değindiğimiz "istenen sonuç sayısı kadar iş" hedefinin, ancak son gizli
+maliyetler de temizlendiğinde tam olarak yakalanabildiğini gösteren küçük bir
+derstir.
+
 ## Bayt düzeyinde süzme: çözmeden elemek
 
 Sekizinci bölümde, tarama ya da süzme sırasında gözden kaçan ama kritik bir
@@ -203,6 +218,16 @@ işin en pahalı kısmıdır ve bu yaklaşım onu çoğu belge için tümüyle o
 kaldırır. Bu, sekizinci bölümün "atacağın şeyi çözme" içgörüsünün gerçek bir
 sistemdeki, ölçülmüş karşılığıdır.
 
+Aynı bayt düzeyinde fikir, süzmenin ötesine — toplu güncellemelere — de taşındı.
+Bir güncelleme, önce süzgecine uyan belgeleri bulmak zorundadır; ve OxiDB, bu ilk
+eşleştirme fazını da, güncellenecek belgeyi baştan sona nesneye çözmeden, doğrudan
+ham ikili baytlar üzerinde yürütür. Böylece süzgece uymayan belgeler, güncelleme
+yolunda da hiç çözülmeden elenir; yalnızca gerçekten değişecek belgeler nesneye
+çevrilir. Bunun ölçülen etkisi çarpıcıdır: çok sayıda belgeyi tek hamlede
+güncelleyen toplu güncelleme iş yüklerinde, bu ham-bayt birinci-faz eşleştirmesi
+sayesinde OxiDB, olgun belge veritabanlarını geçebilir hale geldi — çünkü burada
+da işin en pahalı kısmı, çoğu belge için tümüyle ortadan kalkar.
+
 Bu tekniğin OxiDB'deki gelişim öyküsü de öğreticidir, çünkü doğru çözümün ilk
 denemede bulunmadığını gösterir. İlk bir deneme, belgeleri yine çözüyor ama bunu
 farklı bir biçimde yapıyordu; ölçümler bu denemenin aslında **yavaşlattığını**
@@ -227,6 +252,42 @@ bunu doğrudan uygular: tekil okuma, tekil güncelleme ve tekil silme işlemleri
 aradıkları ilk belgeyi bulduğu an dururlar; kalan belgeleri taramaya gerek
 yoktur. Bu, çok sayıda belge arasından tek bir kaydı bulup işlem yapmayı, tüm
 koleksiyonu gezmeden, hızlı hale getirir.
+
+## MongoDB uyumlu güncelleme anlamları
+
+Sorgu motoru yalnızca okumanın değil, güncellemenin de kalbindedir: bir
+güncelleme, önce hangi belgelerin değişeceğini bulmak için tam da bu bölümde
+anlattığımız süzme yollarını kullanır, sonra bulduklarına güncelleme kurallarını
+uygular. Bu kitap yazılırken OxiDB'nin güncelleme yüzeyi, yaygın belge veritabanı
+istemcilerinin beklediği anlamlarla — MongoDB'nin kendi uyum testleri OxiDB'ye
+karşı koşularak — hizalandı; bu hizalama, motora birkaç ince yetenek kazandırdı.
+
+Birincisi, **var-yoksa-ekle** (upsert) anlamıdır: bir güncelleme, süzgecine uyan
+hiçbir belge bulamazsa, isteğe bağlı olarak süzgeç ile güncellemeden türetilmiş
+yeni bir belgeyi ekleyebilir. Buna eşlik eden ince ama önemli bir ayrım, **kaç
+belgenin eşleştiği** ile **kaç belgenin gerçekten değiştiği** sayılarının ayrı
+ayrı bildirilmesidir; çünkü süzgece uyan bir belge, uygulanan güncelleme onun
+değerlerini zaten taşıdığı için hiç değişmemiş olabilir. Bu ayrım, çağıran tarafa
+"aradığım kayıt var mıydı, zaten güncel miydi, yoksa onu ben mi değiştirdim"
+sorusunu net biçimde yanıtlar.
+
+İkincisi, **pipeline biçiminde güncellemedir**. Sıradan bir güncelleme, alan alan
+operatörlerden oluşur; ama OxiDB, güncellemenin bir küçük dönüşüm hattı olarak da
+verilebilmesine izin verir — belgeyi bir dizi aşamadan (`$set`, `$unset`,
+`$project` ve kök belgeyi yeniden şekillendiren `$replaceRoot` gibi) geçirerek
+dönüştürmek. Bu, bir belgenin yeni değerini kendi eski alanlarından hesaplamak
+gibi, sıradan operatörlerin zor ifade ettiği güncellemeleri doğrudan yazılabilir
+kılar. Bir dürüstlük notu: `$replaceRoot`, yalnızca bu pipeline-biçimli
+güncellemenin içinde bir aşama olarak vardır; bir sonraki bölümde göreceğimiz
+bağımsız toplama pipeline'ında henüz bir aşama değildir.
+
+Üçüncüsü, **dizi süzgeçleridir** (arrayFilters). Bir belgenin içindeki bir dizinin
+yalnızca belirli koşullara uyan öğelerini güncellemek, klasik bir güçlüktür. OxiDB,
+konumsal dizi güncellemelerini destekler: bir güncelleme, bir dizinin tüm
+öğelerine ya da yalnızca adlandırılmış bir süzgece uyan öğelerine — `$[]` ve
+`$[ident]` biçimleriyle — uygulanabilir. Böylece "şu siparişin, durumu 'bekliyor'
+olan tüm satırlarını 'iptal' yap" gibi bir güncelleme, diziyi elle gezmeden, tek
+bir bildirimsel ifadeyle yazılır.
 
 ## Sunucu yoluyla ilişki
 
@@ -264,7 +325,9 @@ seçicilik temelli sıralamayı; indeks destekli sayım ve sıralamanın belgele
 dokunmadan yanıt veren iki hızlı yolunu; ve OxiDB'nin vitrin tekniği olan bayt
 düzeyinde süzmeyi — ikili biçimin kısmi çıkarımıyla eşleşmeyen belgeleri hiç
 çözmeden eleyerek hem belleği hem hızı iyileştiren yaklaşımı — gördük. Tekil
-işlemlerdeki erken sonlanmayı, sunucu yoluyla bütünleşmeyi ve bildirimsel
+işlemlerdeki erken sonlanmayı; sorgu motorunun güncellemenin de kalbinde oluşunu
+ve MongoDB uyumlu güncelleme anlamlarını — var-yoksa-ekle, pipeline biçiminde
+güncelleme ve dizi süzgeçleri; sunucu yoluyla bütünleşmeyi ve bildirimsel
 özgürlüğün bu motordaki yansımasını izledik.
 
 Buraya kadar hep tek tek belgeleri bulup süzmekle ilgilendik. Ama dokuzuncu

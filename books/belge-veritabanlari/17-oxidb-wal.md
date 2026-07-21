@@ -198,15 +198,45 @@ zorundadır. OxiDB'nin geliştirilmesinde, bu inceliğin gözden kaçtığı bir
 durumun nasıl bir kurtarma hatasına yol açtığı ve nasıl düzeltildiği, dayanıklılık
 mantığının ne kadar dikkat gerektirdiğinin iyi bir örneğidir.
 
+OxiDB, bu denetim noktasını, günlüğün canlı dosyası belli bir boyuta —
+`OXIDB_WAL_CHECKPOINT_BYTES` ile ayarlanabilen, varsayılan olarak altmış dört
+megabaytlık bir eşiğe — ulaştığında arka planda kendiliğinden tetikler; böylece
+aylarca kesintisiz çalışan bir sunucuda bile günlük sınırsızca büyümez. Asıl
+mesele, bu denetim noktasının **çevrimiçi** (online) olmasıdır: alınırken ne
+okumaları ne de yazmaları durdurur. Bu, "dünyayı durdurup" günlüğü toparlayan
+kaba bir bakım değildir; veritabanı denetim noktası boyunca sorgu ve yazma
+almaya devam eder.
+
+Bunu mümkün kılan, OxiDB'nin **kesip atmak yerine mühürlemek** (seal-not-truncate)
+diyebileceğimiz bir tasarım tercihidir. Naif bir yaklaşım, denetim noktasında
+günlüğü kısaltmak — asıl depoya yansımış kayıtları silip dosyayı kesmek —
+isterdi; ama bu tehlikelidir, çünkü bir yazma, günlük kaydını asıl depoya
+dokunmadan önce yazar; tam o aralıkta alınan bir anlık görüntü, henüz depoda
+görünmeyen ama günlükten kesilmiş bir değişikliği kaybedebilir. OxiDB bunun
+yerine günlüğü kesmez, **mühürler**. Yalnızca kısacık bir an için — uçuştaki
+yazmaların işini bitirip yeni yazmaların beklediği, atomik bir yeniden
+adlandırma süresince — bir engel (apply barrier) devreye girer; canlı günlük
+numaralı bir mühürlü segmente çevrilir ve yerine boş, taze bir günlük açılır.
+Engel hemen kalkar, yazmalar yeni günlüğe akmaya devam eder; asıl depoya alınan
+o yavaş anlık görüntü ise engel kalktıktan sonra, hiçbir yazmayı bekletmeden
+yazılır. Mühürlenen segmentteki her kayıt, tanım gereği artık asıl depodadır;
+anlık görüntü yazıldıktan sonra o segment güvenle bırakılabilir. Yazmaların
+duraksadığı tek an, o kısacık yeniden adlandırmadır — yavaş anlık görüntü değil.
+Her çökme noktası da güvenlidir, çünkü kurtarma yalnızca canlı günlüğü değil,
+mühürlü segmentleri de tabanın üzerine oynatır: anlık görüntü yazılmadan çökülürse
+segment eski taban üzerine, yazıldıktan sonra çökülürse yeni taban üzerine —
+etkisiz tekrarlanabilirlik sayesinde zararsızca — yeniden uygulanır.
+
 ## Günlüğün döndürülmesi ve mühürlü segmentler
 
-Denetim noktası, günlüğü çökmeye karşı dizginlemenin bir yoludur; ama OxiDB,
-noktasal kurtarmayı açan kullanıcılar için günlüğü silmek yerine **arşivlemek**
-ister. Bu durumda devreye, günlüğün döndürülmesi (rotation) girer. Canlı günlük
-belli bir boyuta ulaştığında, OxiDB onu güvenli bir biçimde kapatır: günlük
-kilidini tutarken, canlı dosyayı atomik bir yeniden adlandırma ile numaralı bir
-**mühürlü segmente** (sealed segment) çevirir ve yerine boş, taze bir canlı
-günlük açar. Bu atomikliğin önemi şudur: onaylanmış hiçbir yazma, mühürlenen
+Az önce gördüğümüz mühürleme, yalnızca denetim noktasını çevrimiçi kılmakla
+kalmaz; noktasal kurtarmanın da temelini atar. Denetim noktası, asıl depoya
+yansımış mühürlü segmentleri normalde bırakır; ama OxiDB, noktasal kurtarmayı
+açan kullanıcılar için onları silmek yerine **arşivlemek** ister. Günlüğün
+döndürülmesi (rotation) dediğimiz düzenin özü budur: canlı günlük belli bir
+boyuta ulaştığında güvenli bir biçimde kapatılır — günlük kilidini tutarken,
+canlı dosya atomik bir yeniden adlandırma ile numaralı bir **mühürlü segmente**
+(sealed segment) çevrilir ve yerine boş, taze bir canlı günlük açılır. Bu atomikliğin önemi şudur: onaylanmış hiçbir yazma, mühürlenen
 segment ile yeni canlı günlük arasındaki çatlağa düşemez; her kayıt ya birinde ya
 ötekindedir. Arka planda çalışan bir arşivleyici, bu mühürlü segmentleri verbatim
 olarak — baytı baytına — bir arşiv alanına kopyalar ve kendini onaran bir kayıt

@@ -42,6 +42,7 @@ case "$fmt" in
       --toc --number-sections --top-level-division=chapter \
       --pdf-engine=xelatex \
       --include-in-header=unicode-duzelt.tex \
+      --include-in-header=sayfa-basligi.tex \
       "${cover_opt[@]}" \
       -V classoption=oneside \
       -V mainfont="$mainfont" \

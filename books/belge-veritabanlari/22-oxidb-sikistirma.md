@@ -47,8 +47,10 @@ hangi konumunda durduğunu — bir anlık görüntü olarak çıkarır. Dizinde 
 her kimlik, tanımı gereği canlıdır; ölü kayıtların hiçbiri dizinde değildir, çünkü
 güncelleme ya da silme, dizini her zaman en son geçerli konuma (ya da yokluğa)
 çevirmiştir. İkinci adımda, bu canlı kayıtların her birinin baytları eski
-dosyadan okunur ve yan yana, sıkıştırılmış bir biçimde taze bir geçici dosyaya
-yazılır; her yazma, kaydın taze dosyadaki yeni konumunu döndürür ve yeni bir
+dosyadan okunur ve yan yana, taze bir geçici dosyaya yazılır — on altıncı
+bölümde gördüğümüz gibi, bugün bu baytlar varsayılan olarak sıkıştırılmadan,
+olduğu gibi kopyalanır; sıkıştırma yalnızca açıkça istendiğinde bu sırada
+uygulanır. Her yazma, kaydın taze dosyadaki yeni konumunu döndürür ve yeni bir
 kimlik-konum listesi böylece kurulur. Üçüncü adımda, geçici dosya tek bir atomik
 yeniden-adlandırmayla (rename) asıl dosyanın yerine geçer; eski dosya kapanır,
 kaynakları serbest kalır. Son adımda, dizin temizlenip yeni konumlarla baştan
@@ -160,6 +162,30 @@ sağlanmaz ve sıkıştırma boşuna tekrar tekrar tetiklenmez. Sistem, yalnızc
 alan yeniden birikip eşiği aştığında tekrar sıkıştırır. Bu eşikler ayarlanabilir
 ve on altıncı bölümde gördüğümüz gibi per-koleksiyon belirlenebilir; istenirse
 otomatik tetikleme tümüyle kapatılıp sıkıştırma elle yönetilebilir.
+
+## Kütlesel silmenin gizli tuzağı
+
+Otomatik tetikleyiciyi anlatırken, bu kitap yazılırken yakalanan öğretici bir
+hatadan söz etmek yerinde olur; çünkü append-only bir motorda ölü alanın en hızlı
+biriktiği an, tam da yüz binlerce belgenin bir anda silindiği andır. Silme,
+gördüğümüz gibi, kaydı fiziksel olarak çıkarmaz; onu ölü olarak işaretler. Bir
+koleksiyondan yüz binlerce belgeyi tek seferde sildiğinizde, geride yüz binlerce
+ölü işaret — mezar taşı (tombstone) — kalır ve bunların bir noktada süpürülüp
+alandan geri kazanılması gerekir.
+
+İlk uygulamada, bu süpürme işi ölü işaretlerin sayısıyla **ikinci dereceden**
+büyüyordu: her ölü kaydı ele alırken, geri kalanların tümü yeniden gözden
+geçiriliyordu; yani n silme, n-kare düzeyinde iş doğuruyordu. Küçük silmelerde bu
+fark edilmezdi, ama üç yüz binlik bir kütlesel silmede sonuç çarpıcıydı — arka
+plandaki bakım iş parçacığı, işlemciyi tam kapasite meşgul ederek yarım saati aşkın
+süre dönüp durdu. Bu, on altıncı bölümde değindiğimiz asimptotik maliyet
+kaygısının, sessizce arka planda pusuya yatmış bir örneğidir: doğru çalışan ama
+ölçekle kötü büyüyen bir kod yolu, yalnızca yeterince büyük bir girdi gelene dek
+kendini gizler. Çözüm, süpürme işini ölü kayıt sayısıyla **doğrusal** büyüyecek
+biçimde yeniden kurmaktı; böylece kütlesel bir silme, artık orantılı — ve kısa —
+bir bakım işine yol açar. Bu tür tuzakların ders verici yanı, ancak gerçek ölçekte
+ölçüm yapıldığında ortaya çıkmalarıdır; birim testlerinin küçük girdileri, ikinci
+dereceden bir eğriyi doğrusaldan asla ayırt edemez.
 
 ## Sıkıştırmanın bedeli ve dengesi
 

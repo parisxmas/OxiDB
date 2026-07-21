@@ -278,6 +278,12 @@ hızlı bir hatırlatma olarak düşünülmüştür.
 :   Her bilgiyi tek bir yerde tutarak çoğaltmayı önleme; ilişkisel modelin
     güncellemeyi ucuzlatan ilkesi.
 
+**Okuma anlık görüntüsü (read snapshot)**
+:   OxiDB'nin, yalnızca okuma yolunu değiştiren hafif çok-sürümlü (MVCC)
+    yaklaşımı; bir okuma, başladığı andaki tutarlı durumu görür ve süregelen
+    yazmalardan etkilenmez. Toplama varsayılan olarak bu sayede anlık-görüntü
+    tutarlıdır; okuyucular yazarları, yazarlar okuyucuları bekletmez.
+
 **OxiPool**
 :   OxiDB'nin sharding (parçalama) katmanı; bir koleksiyonu parça anahtarına
     göre birden çok bağımsız OxiDB düğümüne dağıtan ve sorguları dağıt-topla

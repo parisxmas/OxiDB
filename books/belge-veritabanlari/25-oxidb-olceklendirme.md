@@ -31,6 +31,14 @@ motorun tüm davranışı — depolama, indeks, sorgu — kümede de birebir ayn
 yalnızca yazmalar, uygulanmadan önce konsensüsten geçer. Küme, çekirdeğin üzerine
 eklenen bir replikasyon ve sıralama katmanıdır; çekirdeği değiştirmez.
 
+Yirmi dördüncü bölümde tanıştığımız çok-veritabanlı düzen, kümeye de taşınır. Bir
+yazma, ait olduğu veritabanına **kapsanarak** konsensüse verilir; böylece aynı
+düğümler üzerinde birçok yalıtık veritabanı yaşayabilir ve her yazma yalnızca kendi
+veritabanında uygulanır. Veritabanı oluşturma ve düşürme gibi tanım değişiklikleri
+de replikasyona girer, öyle ki her düğüm aynı veritabanı kümesini görür; süre dolumu
+ve uyarı gibi arka plan iş parçacıkları her veritabanı için ayrı çalışır; ve bir
+işlem, başladığı veritabanına bağlı kalır.
+
 Liderin çökmesi, on ikinci bölümde gördüğümüz failover sürecini tetikler: bir
 takipçi, çoğunluğun oyunu alarak yeni lider olur. Çoğunluğun büyüsü — herhangi iki
 çoğunluğun mutlaka kesişmesi — burada iki güvenceyi birden sağlar: aynı anda iki
@@ -57,6 +65,16 @@ tamamlanmış bir işlemin biriktirilmiş değişiklikleri, konsensüs katmanın
 bir bütün** olarak verilir; böylece işlemin tüm değişiklikleri ya birlikte
 replikasyona girer ya da hiçbiri girmez. İşlemin "ya hep ya hiç" niteliği, tek
 düğümden kümeye taşındığında da korunur.
+
+Bu doğrulama, tek bir noktada da durmadı; kümenin daha ince arıza kiplerine karşı
+da sınandı. Ağın simetrik olmayan biçimde bölündüğü — bir düğümün ötekini görüp
+ötekinin onu göremediği — durumlar zararsız kaldı; küme ya eski liderde birleşti ya
+da temiz bir seçimle yeni bir lider buldu. Seçim kararlılığını artırmak için kimi
+konsensüs uyarlamalarının başvurduğu bir ön-oylama adımının, OxiDB'nin bu
+kurulumunda gereksiz olduğu — onsuz da split-brain'in oluşmadığı — deneyle görüldü.
+Geriye dürüstçe açık kalan tek nokta, düğümlerin duvar saatlerinin birbirinden
+kayması durumudur; zamana dayalı kararların güvenilirliğini ilgilendiren bu konu,
+hâlâ dikkat isteyen bir açıktır.
 
 Bu gücün bedeli, on ikinci bölümde söylediğimizdir: her yazma, çoğunluğa ulaşıp
 onların onayını beklediği için bir gidiş-dönüş gecikmesi öder. Güçlü tutarlılık,
@@ -135,6 +153,15 @@ OxiDB'de henüz sınırlıdır; baskın yol, liderden geçen ve çoğunlukla mü
 güçlü tutarlı yoldur. Bunlar, sistemin olgunlaştıkça doldurabileceği boşluklardır;
 ama bir kitabın görevi, sistemin yapabildikleri kadar yapamadıklarını da dürüstçe
 göstermektir.
+
+Bir dürüstlük notu da, ilerideki bölümlerde tanıtacağımız ilişkisel SQL motoru
+içindir. SQL yazmaları da kümede konsensüs üzerinden replikasyona girer: sunucu,
+gelen bir ifadeyi ayrıştırıp onun bir yazma mı yoksa salt-okuma mı olduğunu belirler;
+yazma ifadeleri, tıpkı belge yazmaları gibi çoğunlukla mühürlenir, salt-`SELECT`
+sorguları ve ayrıştırılamayan ifadeler ise düğüm-yerel çalışır. Buna karşılık SQL,
+sharding'e **girmez**: OxiPool bir isteği parça anahtarına göre yönlendirir, oysa bir
+SQL isteğinin böyle bir anahtarı yoktur; bu yüzden SQL, parçalara dağıtılmaz, tek bir
+arka uca gider — salt-okuma ise bir kopyaya, değilse lidere.
 
 ## İkisini birleştirmek
 

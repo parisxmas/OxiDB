@@ -2,7 +2,7 @@ import type { Metadata } from "next"
 
 export const metadata: Metadata = {
   title: "Book",
-  description: `Her Şeyin Veritabanı — a free 235-page Turkish book by Barış AKIN on how a database works inside, from first principles to OxiDB's document, SQL and time-series engines. Download as PDF or EPUB.`,
+  description: `Her Şeyin Veritabanı — a free 240-page Turkish book by Barış AKIN on how a database works inside, from first principles to OxiDB's document, SQL and time-series engines. Download as PDF or EPUB.`,
 }
 
 export default function Page() {
@@ -19,7 +19,7 @@ export default function Page() {
       </div>
       <p class="release-notes">
         OxiDB: Belge, SQL ve Zaman Serisi Motorları, S3 Nesne Depolama ve OxiMem Anahtar-Değer Katmanı.
-        235 pages · 32 chapters + 2 appendices · ~83,000 words · 114 code examples, all verified against a running server.
+        240 pages · 32 chapters + 2 appendices · ~83,000 words · 114 code examples, all verified against a running server.
       </p>
 
       <div class="table-wrap">
@@ -32,15 +32,15 @@ export default function Page() {
               <td>PDF</td>
               <td><code>her-seyin-veritabani.pdf</code></td>
               <td>5.3 MB</td>
-              <td>235 pages, print-ready</td>
-              <td><a href="/kitap/her-seyin-veritabani.pdf?v=20260715b" class="dl-btn">Download</a></td>
+              <td>240 pages, print-ready</td>
+              <td><a href="/kitap/her-seyin-veritabani.pdf?v=20260721" class="dl-btn">Download</a></td>
             </tr>
             <tr>
               <td>EPUB</td>
               <td><code>her-seyin-veritabani.epub</code></td>
-              <td>965 KB</td>
+              <td>875 KB</td>
               <td>e-readers, reflowable</td>
-              <td><a href="/kitap/her-seyin-veritabani.epub?v=20260715b" class="dl-btn">Download</a></td>
+              <td><a href="/kitap/her-seyin-veritabani.epub?v=20260721" class="dl-btn">Download</a></td>
             </tr>
           </tbody>
         </table>

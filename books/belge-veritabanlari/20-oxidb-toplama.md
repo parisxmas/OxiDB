@@ -60,6 +60,16 @@ her grubun belge sayısını okur. Bu, dokuzuncu bölümde değindiğimiz "indek
 sayma gruplaması, belgelere dokunmadan yanıtlanabilir" fikrinin somut karşılığıdır
 ve ölçümlerde belirgin bir hız kazancı sağlar.
 
+Bu kestirme, yalnızca saymayla da sınırlı kalmadı. Bu kitap yazılırken, indeksin
+kapsadığı (covered) gruplama daha ileri götürüldü: eğer bir bileşik indeks hem
+grup anahtarını hem de toplanan alanı birlikte tutuyorsa, yalnızca sayma değil,
+toplama, ortalama, en büyük ve en küçük gibi biriktiriciler de tek bir belge
+çözülmeden, salt indeks yürüyüşüyle hesaplanabilir. On sekizinci bölümde
+değindiğimiz bu indeks-yalnız yol, tüm koleksiyonu kapsayan bir gruplamayı,
+gereken bütün değerler zaten indekste durduğu için belgelere hiç inmeden yanıtlar
+— disk-öncelikli kipte, belge gövdelerini bellekten hiç okumamak demek olan bu
+kazanç, bu bölümün sonunda döneceğimiz performans öyküsünün de bir parçasıdır.
+
 ## Çok-yönlü analiz: $facet
 
 Dokuzuncu bölümde çok-yönlü analizi, aynı süzülmüş veri kümesinden birden çok
@@ -126,8 +136,9 @@ işlevleri ve özellikle kaydırma için belirleyicidir — "bir önceki satır"
 anahtarlı satırlarda "öncesi"ni belirsiz bırakırdı.
 
 Asıl ayrıntı ise **çerçevededir** (window frame). Her satır için "çevresindeki
-pencere" dediğimiz şey, OxiDB'de belge sayısıyla tanımlanan bir çerçevedir:
-örneğin "kendisi ve önceki iki belge" ya da "bölümün başından bu satıra kadar".
+pencere" dediğimiz şey, en yalın biçimde belge sayısıyla tanımlanan bir
+çerçevedir: örneğin "kendisi ve önceki iki belge" ya da "bölümün başından bu
+satıra kadar".
 Çerçeve belirtilmezse varsayılan, bölümün tamamıdır. Motor, her satır için bu
 çerçevenin kapsadığı belgeleri belirler ve biriktiriciyi yalnızca o aralık
 üzerinde çalıştırır. "Bölümün başından bu satıra kadar" çerçevesiyle bir toplam,
@@ -135,14 +146,51 @@ kümülatif toplamı; "kendisi ve önceki k belge" çerçevesiyle bir ortalama,
 k+1 genişliğinde bir hareketli ortalamayı verir. Sıralama ve kaydırma işlevleri
 ise çerçeveye değil, satırın bölüm içindeki sıralı konumuna bakar.
 
-Burada dürüst bir sınır belirtmek gerekir: OxiDB'nin pencere çerçevesi **yalnızca
-belge sayısıyla** tanımlanır. Yani "son 7 günlük pencere" ya da "değeri şu aralıkta
-olan satırlar" gibi, çerçeveyi sıralama değerinin kendisine (zamana ya da bir
-büyüklüğe) göre tanımlayan **aralık ve zaman tabanlı çerçeveler** bu sürümde
-desteklenmez. Bunlar, belge-tabanlı çerçevenin doğal uzantılarıdır ve gelecekteki
-bir genişlemenin konusudur; ama kümülatif toplamdan hareketli ortalamaya, sıralama
-ve kaydırmaya kadar pencere fonksiyonlarının en sık kullanılan biçimleri,
-belge-tabanlı çerçeveyle bugün eksiksiz karşılanır.
+Bu belge-tabanlı çerçeve, uzun süre OxiDB'nin tek çerçeve türüydü; "son yedi
+günlük pencere" ya da "değeri şu aralıkta olan satırlar" gibi, çerçeveyi belge
+sayısına değil sıralama değerinin **kendisine** — bir zamana ya da bir büyüklüğe —
+göre tanımlayan **aralık tabanlı çerçeveler** eksikti. Bu kitap yazılırken bu
+boşluk da kapatıldı ve pencere çerçevesi artık iki biçimde verilebiliyor. Belge
+çerçevesi, satırın konumuna göre sayar — "kendisi ve önceki iki belge" gibi.
+**Aralık çerçevesi** ise sıralama alanının değerine göre bir alt ve üst sınır
+alır; isteğe bağlı bir zaman birimiyle, sıralama alanı bir tarih olduğunda "son
+yedi gün" gibi zaman pencerelerini de ifade eder. Böylece kümülatif toplam ve
+sabit-genişlikli hareketli ortalamadan, değer ve zaman ekseninde kayan pencerelere
+kadar pencere fonksiyonlarının en sık kullanılan biçimleri bugün eksiksiz
+karşılanır. Dürüst bir küçük sınır kalır: aralık çerçevesinin zaman birimleri
+sabit uzunlukludur — gün, saat, dakika gibi — ; ay, çeyrek, yıl gibi uzunluğu
+takvime göre değişen birimler, bu bölümün ileride değineceğimiz zaman-serisi
+aşamalarında olduğu gibi, burada da kapsam dışıdır.
+
+## Zaman-serisi aşamaları ve boşluksuz zincir
+
+OxiDB'nin toplama dağarcığı, gruplama ve pencere fonksiyonlarının yanında, bir de
+zamanla akan veriye — ölçümlere, tiklere, günlük kayıtlarına — özel bir aşama
+ailesi taşır; bunların çoğu da bu kitap yazılırken eklendi. Bu aşamalar, dokuzuncu
+bölümdeki toplama ilkelerinin zaman eksenine uygulanmış halidir.
+
+En temeli, **zaman kovalarına bölmedir**: belgeleri, bir zaman alanına göre eşit
+aralıklı kovalara (örneğin saatlik ya da günlük) toplayıp her kova için bir özet
+üretmek — üstelik hiç belge düşmeyen boş kovaları da sıfırla doldurarak, sonuç
+dizisinde delik bırakmadan. Bunun bir üstünde, borsa verisinin klasik biçimi olan
+**mum çubuğu** özeti durur: ham tik ya da işlem belgelerini, her zaman aralığı için
+açılış–en yüksek–en düşük–kapanış–hacim beşlisine çökerten aşama; birden çok
+sembolü ayrı bölümler olarak ele alır ve veri olmayan aralıklarda son bilinen
+değeri taşıyarak boşlukları örter.
+
+Bu aşamaların asıl gücü, **boşluksuz bir zincir** halinde birleşmelerinde ortaya
+çıkar. Gerçek zaman-serisi verisi seyrektir: bazı zaman noktalarında hiç ölçüm
+yoktur. OxiDB, bu boşlukları iki adımda kapatır. Önce, bir **yoğunlaştırma**
+aşaması, sayısal ya da tarih ekseninde eksik olan zaman noktaları için yeni
+belgeler üretir — ekseni sabit adımlarla doldurarak. Sonra, bir **doldurma**
+aşaması, bu yeni üretilmiş boş noktaların değerlerini anlamlı biçimde tamamlar:
+bir önceki bilinen değeri taşıyarak, iki bilinen değer arasında doğrusal ara
+değer hesaplayarak ya da sabit bir değer koyarak. Böylece mum çubuğundan
+yoğunlaştırmaya, oradan doldurmaya uzanan bir zincir — önce özetle, sonra ekseni
+doldur, en sonra değerleri tamamla — seyrek, delikli bir zaman serisini, hiç
+boşluğu olmayan düzgün bir seriye dönüştürür. Burada da dürüst bir sınır vardır:
+bu eksen adımları sabit uzunluklu zaman birimleriyle (gün, saat gibi) tanımlanır;
+ay ve üzeri, uzunluğu takvime göre değişen birimler henüz desteklenmez.
 
 ## Dürüst bir envanter: henüz olmayan aşamalar
 
@@ -199,9 +247,12 @@ dokuzuncu bölümdeki montaj hattını nasıl somutlaştırdığını; baştaki 
 alanları çözerek çalıştığını; sayma gruplamalarının indeksten doğrudan
 yanıtlandığını; çok-yönlü analizin aynı girdiyi birkaç açıdan tek geçişte
 özetlediğini; ve pencere fonksiyonlarının üç adımla — bölümle, kararlı sırala,
-belge-tabanlı çerçeve üzerinde biriktir — satırları koruyarak komşulardan değer
-türettiğini gördük. Çok-yönlü analizin pipeline yürütücüsünü kendi üzerine
-katlayan zarif uygulamasını, pencere çerçevesinin belge-tabanlı oluşunu ve henüz
+belge ya da aralık tabanlı çerçeve üzerinde biriktir — satırları koruyarak
+komşulardan değer türettiğini gördük. Zamanla akan veriye özel aşamaların — zaman
+kovalarına bölme, mum çubuğu özeti ve seyrek bir seriyi düzgünleştiren
+özetle-doldur-tamamla zincirinin — nasıl boşluksuz bir zaman serisi kurduğunu da
+izledik. Çok-yönlü analizin pipeline yürütücüsünü kendi üzerine katlayan zarif
+uygulamasını, pencere çerçevesinin belge ve aralık tabanlı iki biçimini ve henüz
 olmayan aşamaların dürüst envanterini izledik. Ayrıca disk-öncelikli kipte
 toplamanın performans gerçeğini ve onu iyileştiren iki düzeltmeyi — bu kitap
 yazılırken yapılan iki işi — dürüstçe gördük.

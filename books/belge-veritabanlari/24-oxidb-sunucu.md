@@ -129,6 +129,37 @@ var olsa bile, hiçbir rolün ona izni olmadığı için reddedilirdi. Bu, rol
 geçidinin dekoratif değil, gerçek bir kapı olduğunu — her komutun ondan açıkça
 geçmesi gerektiğini — gösterir.
 
+## Çok veritabanı: tek sunucuda yalıtılmış dünyalar
+
+Rol geçidini anlatırken, bir kullanıcının yetkilerinin veritabanı düzeyinde
+değişebildiğine değindik. Bunun altında, sunucunun tek bir veritabanına değil,
+birçok yalıtılmış veritabanına aynı anda ev sahipliği yapabilmesi yatar. Bir
+**veritabanı yöneticisi** (database manager), veri dizininin altındaki her alt
+dizini ayrı, kendi içine kapalı bir motor örneği olarak açar; her veritabanının
+kendi koleksiyonları, indeksleri, işlemleri ve dosyaları vardır ve biri
+diğerinden habersizdir. İki farklı veritabanında aynı adı taşıyan iki koleksiyon,
+birbirine hiç dokunmayan iki ayrı şeydir.
+
+Bu düzenin birkaç sabit noktası vardır. Adı ayrıca belirtilmeyen istekler,
+`oxidb` adlı **varsayılan veritabanına** gider; bu ad, alışkanlıktan gelen bir
+`postgres` takma adıyla da anılabilir. Sunucunun tümüne ait olan — kimlik ve
+denetim gibi — veriler ise, herhangi bir kullanıcı veritabanının içinde değil,
+ağacın tepesinde ayrı tutulur; böylece bir veritabanını düşürmek, sunucunun
+kimlik bilgilerini yanına almaz.
+
+Hattaki karşılığı da yalındır. Her istek, üzerinde çalışacağı veritabanını
+isteğe bağlı bir alanla belirtebilir; belirtmezse oturumun varsayılanı geçerli
+olur ve bu varsayılan, `use_db` ile değiştirilebilir — tıpkı ilişkisel bir kabukta
+bir veritabanına geçmek gibi. Veritabanlarını yönetmek için `create_database`,
+`drop_database` ve `list_databases` komutları vardır; aynı işlemler, SQL yüzünden
+`CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES` ve `USE` deyimleriyle de
+yapılabilir. İki yüz de aynı niyete varır. Yetkilendirme burada da işler:
+kullanıcılara veritabanı düzeyinde roller verilebilir ya da geri alınabilir,
+böylece aynı kimlik bir veritabanında yalnızca okuyabilirken bir başkasında
+yazabilir. Yeni bir veritabanı yaratmak ya da düşürmek ise, doğası gereği, yalnızca
+**yönetici** rolüne açıktır; bunlar, veriyle çalışmanın değil, sunucuyu
+biçimlendirmenin işlemleridir.
+
 ## Aktarım şifrelemesi ve denetim
 
 On dördüncü bölümün diğer iki katmanı da sunucuda karşımıza çıkar. **Aktarım
@@ -146,6 +177,39 @@ döndürülen eski kayıtlar isteğe bağlı olarak sıkıştırılabilir. Böyl
 sistemin uzun süre çalışmasını engelleyen, kontrolsüz büyüyen bir yük olmaktan
 çıkar; on dördüncü bölümdeki "denetim kayıtları yönetilmeli" ilkesinin somut
 karşılığıdır bu.
+
+## Gözlemlenebilirlik: açıklama, yavaş sorgu ve ölçümler
+
+Bir sunucu, yalnızca istekleri doğru işlemekle kalmaz; kendi davranışını dışarıya
+görünür de kılmalıdır. Çalışan bir sistemde "bu sorgu neden yavaş?" ya da "sunucu
+şu an ne kadar yükte?" sorularını yanıtlayamıyorsanız, onu işletmek karanlıkta
+yürümeye benzer. OxiDB, bu görünürlüğü üç ayrı pencereden sunar.
+
+Birincisi, bir sorgunun **nasıl** çalıştırılacağını önceden açıklayan bir
+komuttur. Bir bulma, sayma ya da toplama isteğini bu komutla sararsanız, motor
+onu çalıştırmadan önce seçtiği planı — hangi stratejiyi kullanacağını, bir indekse
+binip binmeyeceğini, kaç belgeyi inceleyip kaçını döndürmeyi beklediğini, indeksin
+elemediği hangi süzgeçlerin sonradan uygulanacağını — döndürür; üstelik gerçek bir
+koşunun zamanlamasını da ekler. On dokuzuncu bölümde sorgu motorunun indeks
+yollarını tartışırken, bu aracın verdiği türden bir bakış tam da işe yarar: bir
+sorgunun beklediğiniz indeksi kullanıp kullanmadığını, tahminde bulunmak yerine,
+doğrudan görürsünüz.
+
+İkincisi, yavaş sorguları kendiliğinden yakalayan bir **profilleyicidir**. Bir
+eşik süresi tanımlarsanız — "şu kadar milisaniyeden uzun süren her komutu kaydet"
+gibi — motor, bu eşiği aşan hat komutlarını ayrı bir profil koleksiyonuna işler.
+Bu koleksiyon, kendisini de bir yaşam-süresi (TTL) indeksiyle sınırlar; yani eski
+kayıtlar, belirli bir süre sonra kendiliğinden düşer ve profil verisi kontrolsüz
+büyümez. Böylece, hangi sorguların yavaş olduğunu ve ne sıklıkla yavaşladığını,
+üretim yükünü hiç durdurmadan, geriye dönük olarak inceleyebilirsiniz.
+
+Üçüncüsü, sunucunun anlık durumunu yaygın izleme araçlarının anladığı bir biçimde
+dışarı veren bir **ölçüm ucudur**. HTTP arayüzü üzerindeki belirli bir yol,
+sunucunun sayaçlarını — istek sayıları, gecikmeler ve benzeri metrikleri — endüstride
+standart hale gelmiş bir metin biçiminde sunar; böylece yaygın bir izleme yığını,
+bu ucu hiçbir uyarlama yapmadan toplayıp grafiğe dökebilir. Dikkat çekici yanı,
+bu yeteneğin dışarıdan hiçbir bağımlılık getirmemesidir: ölçümler, sunucunun
+zaten tuttuğu sayaçlardan doğrudan üretilir.
 
 ## İsteğin sunucudaki yolu
 
@@ -173,8 +237,11 @@ Bu bölümde, OxiDB'nin sunucu katmanını yakın plana aldık. Çerçeveleme so
 ve OxiWire protokolünün uzunluk-önekli, JSON ya da ikili biçimli mesajlarını;
 bağlantı havuzunu ve el sıkışmayı; SCRAM tabanlı kimlik doğrulamayı ve parolanın
 hattan hiç geçmemesini; üç rollü yetkilendirme geçidini ve onun gerçek bir kapı
-olduğunu; aktarım şifrelemesini ve döndürülebilen denetim günlüğünü; ve bir
-isteğin sunucudaki uçtan uca yolunu gördük. Tüm bunların, çekirdek motorun üzerine
+olduğunu; tek sunucuda yalıtılmış birçok veritabanını barındıran çok-veritabanı
+düzenini; sorgu planını açıklayan komuttan yavaş-sorgu profilleyicisine ve ölçüm
+ucuna uzanan gözlemlenebilirlik pencerelerini; aktarım şifrelemesini ve
+döndürülebilen denetim günlüğünü; ve bir isteğin sunucudaki uçtan uca yolunu
+gördük. Tüm bunların, çekirdek motorun üzerine
 giydirilmiş bir güvenlik ve iletişim kabuğu olduğunu da gördük.
 
 Şimdiye dek hep tek bir sunucu düğümünden söz ettik. Ama on ikinci bölümde

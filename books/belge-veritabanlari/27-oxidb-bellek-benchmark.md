@@ -13,11 +13,11 @@ sonuçlarıyla birlikte anlamaktır.
 ## Belleği yerleşik yığından çıkarma yolculuğu
 
 On üçüncü ve on altıncı bölümlerde, belleğe öncelikli bir veritabanının temel
-kısıtını görmüştük: yerleşik bellek, veriyle birlikte büyür. OxiDB'nin varsayılan
-kipi tam da böyledir ve küçük-orta ölçekte mükemmeldir; ama veri büyüdükçe bellek,
-hem pahalı hem de sınırlayıcı bir kısıt haline gelir. OxiDB'nin bellek
-optimizasyonu, bu kısıtı adım adım gevşetmenin hikâyesidir ve bu kitap yazılırken
-izlediğimiz bir yoldur.
+kısıtını görmüştük: yerleşik bellek, veriyle birlikte büyür. OxiDB'nin belleğe
+öncelikli kipi tam da böyledir ve küçük-orta ölçekte mükemmeldir; ama veri büyüdükçe
+bellek, hem pahalı hem de sınırlayıcı bir kısıt haline gelir. OxiDB'nin bellek
+optimizasyonu, bu kısıtı adım adım gevşetmenin — ve giderek disk-öncelikli kipi
+varsayılan yapmanın — hikâyesidir; bu kitap yazılırken izlediğimiz bir yoldur.
 
 Yol, etki sırasıyla şu durakları içerir. Önce **önbellekler bir bütçeyle
 sınırlandı**: on üçüncü bölümde anlattığımız gibi, kontrolsüz büyüyen önbellekler,
@@ -62,10 +62,11 @@ Aynı dürüstlük, **kalıcı bellek tüketimi** için de gereklidir; çünkü 
 tek yönlü değildir. Bu kitap yazılırken alınan ölçümlerde, bir milyon belgelik bir
 yük işlendikten sonraki an incelendiğinde, OxiDB'nin yerleşik belleği emsalininkinden
 bir miktar **yüksekti**; buna karşılık diskte kapladığı yer daha **azdı**. İlk bakışta
-çelişkili gibi görünen bu, aslında bu kitabın anlattığı iki ödünleşimin aynı anda
-çalışmasıdır: OxiDB'nin belleğe öncelikli varsayılan kipi hızı belleğe yaslar — bu
-yüzden o ölçümde bellek yüksekti — ama on altıncı bölümün sıkıştırması ve kompakt
-depolaması, diskte yer kazandırır. Yani "OxiDB daha az bellek kullanır" gibi tek
+çelişkili gibi görünen bu, aslında bu kitabın anlattığı iki gerçeğin aynı anda
+çalışmasıdır: tüm veriye dokunan böyle bir yük, dokunulan sayfaları işletim
+sisteminin belleğe çekmesine yol açar — bu yüzden o anlık ölçümde bellek yüksekti,
+ama bu, baskı altında geri alınabilen bir bellektir — buna karşılık on altıncı
+bölümün kompakt, ekle-yalnız depolaması, diskte yer kazandırır. Yani "OxiDB daha az bellek kullanır" gibi tek
 cümlelik bir iddia, koşulları söylenmeden eksiktir: hangi kip, hangi iş yükü,
 ölçümün hangi anı? Bu sorular yanıtlanmadan, bir bellek sayısı tek başına bir şey
 söylemez.
@@ -83,23 +84,33 @@ Aşağıda, OxiDB'nin nerede kazandığını, nerede berabere kaldığını ve n
 kaybettiğini — ve her birinin **neden** öyle olduğunu — bu kitabın anlattığı
 mekanizmalara bağlayarak göreceğiz.
 
-Sayısal sonucu da açıkça söyleyelim: bir milyon belgelik bu yirmi dört testlik
-karşılaştırmada, bu bölümün başındaki şekilde özetlendiği gibi, OxiDB testlerin
-tamamını önde kapattı. Ama bu rakamı baştan vurgulamamızın nedeni övünmek değil,
+Sayısal sonucu da açıkça söyleyelim: bir milyon belgelik bu on sekiz senaryoluk
+karşılaştırmada, bu bölümün başındaki şekilde özetlendiği gibi, OxiDB — bugün
+varsayılan olan disk-öncelikli, sıkıştırmasız kipte koşturulduğunda — senaryoların
+çoğunu önde kapattı. Bu niteleme baştan gereklidir: sonuç, hangi kipte ölçüldüğüne
+bağlıdır. Belge gövdelerinin kayıt kayıt sıkıştırıldığı eski çerçeve, taramaları ve
+toplamaları belirgin biçimde yavaşlatıyordu; sıkıştırmanın varsayılan olarak
+kapatılması, tabloyu tam da bu yüzden değiştirdi. Ama bu rakamı vurgulamamızın nedeni
+övünmek değil,
 tam tersine onu hemen ardından nitelemek: bu sonuç belirli koşullara — aynı
 makine, aynı veri, emsalin belleğinin sınırlandığı bir kurulum — bağlıdır ve asıl
 değeri, "kim kazandı" değil, "her bir sonucun altında hangi tercih yatıyor"
 sorusundadır.
 
 Bu sonucun bir geçmişi olduğunu da söylemek, "anlattığını gösterme" sözüne sadık
-kalmak için gereklidir. Aynı test paketi, bu kitabın anlattığı bellek ve hız
-çalışmaları yapılmadan önce daha dengeli bir tabloya işaret ediyordu; OxiDB bazı
-testlerde önde, bazılarında geride gidiyordu. Birbirini izleyen birkaç bilinçli
-mühendislik adımı — disk-öncelikli kipin perdesini aralayan sıkıştırmasız
-seçenek, indeksli saymanın disk indekslerinde yeniden etkinleştirilmesi, bayt
-düzeyinde süzme ve toplu boşaltmalı ekleme — geride kalınan testleri tek tek öne
-çevirdi. Yani bu temiz sonuç bir başlangıç hali değil, bu kitapta anlatılan
-ilkelerin ölçülebilir bir sonucudur; ve bir emsali ölçütle test etmenin asıl
+kalmak için gereklidir. Belleğe öncelikli varsayılanın egemen olduğu daha eski bir
+ölçümde, motor bu testlerin neredeyse tümünde öndeydi — ama bunu, tüm veriyi
+bellekte tutmanın yüksek bellek bedeliyle yapıyordu. Bu kitabın anlattığı bellek
+çalışmalarıyla varsayılan disk-öncelikli kipe geçildiğinde, terazi bir süre için
+bir miktar geri kaydı; çünkü artık veri bellekte değil, diskte, belleğe yansıtılmış
+haldeydi. Ardından birbirini izleyen birkaç bilinçli mühendislik adımı — disk-öncelikli
+kipin perdesini aralayan sıkıştırmasız seçenek, indeksli saymanın disk indekslerinde
+yeniden etkinleştirilmesi, bir bileşik indeksin kapsadığı toplamaların belgeye hiç
+dokunmadan yanıtlanması, sıralı-ilk-N yolunun neredeyse anlık hale getirilmesi, bayt
+düzeyinde süzme ve toplu boşaltmalı ekleme — geride kalınan testlerin çoğunu tek tek
+öne çevirdi. Yani bugünkü sonuç bir başlangıç hali değil, bu kitapta anlatılan
+ilkelerin ölçülebilir bir sonucudur; üstelik bu kez kazanç, düşük bellek ve dürüst
+dayanıklılık altında elde edilmiştir. Bir emsali ölçütle test etmenin asıl
 değeri de buradadır: nereye yatırım yapılacağını söyleyen bir pusula olması.
 Ölçütün ayrıca, ağ üzerinden değil, aynı ağ içinden — bağlantı maliyeti her iki
 taraf için de eşitlenecek biçimde — koşturulduğunu da belirtmek gerekir; çünkü tek
@@ -139,12 +150,16 @@ bir ödünleşime kadar izlenebilir.
 Birincisi, **tek bir belgenin güncellenmesidir**. OxiDB, varsayılan katı
 dayanıklılık kipinde her commit'i gerçekten diske boşalttığı için, tek bir
 güncelleme bir tam boşaltma — milisaniyeler mertebesinde bir maliyet — öder. Emsali,
-varsayılan ayarında bu boşaltmayı yapmadığı için çok daha hızlı görünür. Ama on
-yedinci bölümde gördüğümüz gibi, bu elma ile armuttur: OxiDB her tekil yazmayı
-gerçekten dayanıklı kılarken bir bedel öder, emsali o bedeli erteler. Gevşek kipe
-geçildiğinde — yani aynı dayanıklılık modeli seçildiğinde — OxiDB'nin tek belge
-güncellemesi, emsalini bile geçer. Yani buradaki "kayıp", bir performans
-yetersizliği değil, bir güvenlik tercihinin görünür maliyetidir.
+varsayılan ayarında bu boşaltmayı yapmadığı için ilk bakışta daha hızlı görünür. Ama
+on yedinci bölümde gördüğümüz gibi, bu elma ile armuttur: OxiDB her tekil yazmayı
+gerçekten dayanıklı kılarken bir bedel öder, emsali o bedeli erteler. İki sistem aynı
+dayanıklılık modeline getirildiğinde bu fark kapanır: OxiDB'nin tek belge
+güncellemesi emsaliyle başa baştır. Dahası, **toplu güncellemede** OxiDB artık öne
+geçmiştir; çünkü on dokuzuncu bölümde anlattığımız bayt düzeyinde tekniğin bir
+uzantısı olarak, toplu güncellemeler belgeyi baştan çözmek yerine ham ikili biçim
+üzerinde bir birinci-faz eşleştirme yapar ve bu, işi belirgin biçimde ucuzlatır. Yani
+buradaki "kayıp", bir performans yetersizliği değil, tekil ve katı bir yazmanın
+görünür maliyetidir; ölçek büyüdükçe ya da dayanıklılık eşitlendikçe silinir.
 
 İkincisi, **disk-öncelikli kipte, büyük ölçekte eşzamanlı tekil okumalardır**.
 On üçüncü bölümde gördüğümüz gibi, çalışma kümesi belleği aştığında, rastgele
@@ -157,10 +172,12 @@ erişimin gecikmesi.
 Üçüncüsü, **disk-öncelikli, sıkıştırılmış kipte tüm koleksiyonu tarayan
 toplamalardı**. Yirminci ve on altıncı bölümlerde anlattığımız gibi, toplama tüm
 belgelere dokunur; sıkıştırılmış kipte her belgenin açılması gerekir ve bu maliyet
-birikir. Ama bu, kitap yazılırken giderildi: indeksli sayma kestirmesinin disk
-indekslerinde yeniden etkinleştirilmesi ve sıkıştırmasız kip, bu yükleri büyük
-ölçüde hızlandırdı. Yani bu kayıp, bir kez teşhis edilip mekanizmaya bağlandıktan
-sonra, doğru tercihlerle büyük ölçüde kapandı.
+birikir. Ama bu, kitap yazılırken giderildi: sıkıştırmasız kip her belgeyi açma
+yükünü kaldırdı; indeksli sayma kestirmesi disk indekslerinde yeniden etkinleştirildi;
+ve bir bileşik indeksin kapsadığı toplamalar artık belgelere hiç dokunmadan, yalnızca
+indeks yürüyüşüyle yanıtlanıyor — öyle ki toplama satırlarının hepsi OxiDB'nin
+lehine döndü. Yani bu kayıp, bir kez teşhis edilip mekanizmaya bağlandıktan sonra,
+doğru tercihlerle kapandı.
 
 Bu üç kaybın ortak özelliği, hepsinin bu kitabın anlattığı bir ödünleşime
 dayanmasıdır: dayanıklılık-hız, bellek-gecikme, yer-işlemci. Hiçbiri açıklanamaz

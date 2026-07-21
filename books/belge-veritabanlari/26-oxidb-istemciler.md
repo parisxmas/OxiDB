@@ -58,6 +58,18 @@ sunucuya ağ üzerinden konuşur; bazı istemciler, tek bir arayüzün arkasınd
 kipi birden sunar, böylece uygulamanız gömülüden sunucuya geçerken kodunu
 değiştirmez.
 
+Bu dağarcık, birkaç dilin ötesine geçecek kadar geniştir. Python, hem sunucuya ağ
+üzerinden bağlanan hafif bir istemciyle hem de az önce anlattığımız C köprüsü
+üzerinden gömülü bir sürümle gelir. Go ve JavaScript kendi bağımlılıksız
+istemcilerini taşır; JavaScript istemcisi, birazdan değineceğimiz web yüzeyinin
+gerçek zamanlı abonelik kanalını — bir sorguya abone olup değişiklikleri dinlemeyi —
+da sarmalar. .NET tarafı tek bir kütüphane değil, bir ailedir: ağ ve gömülü
+istemcilerin yanında, dile gömülü sorgu, standart bir veri erişim katmanı ve tam bir
+nesne-ilişki eşleyici sağlayıcısı. Julia, bilinçli bir tercihle yalnızca belge yüzünü
+sunar. Daha da ötede, PHP için bir istemci ve WordPress'in veritabanı katmanının
+yerine geçebilen bir eklenti; ve mobil için, aynı C köprüsü üzerinden iOS ve Swift'e
+uzanan bir bağ vardır. Hepsi, aynı çekirdeğe farklı dillerden açılan kapılardır.
+
 İstemcilerin ortak özelliği, hepsinin aynı komut dağarcığını yansıtmasıdır; çünkü
 hepsi aynı çekirdeğe konuşur. Bu birörnekliğin somut bir örneği, bu kitap
 yazılırken yaşandı. OxiDB'ye yeni bir yetenek — koleksiyonları belirli depolama
@@ -100,7 +112,10 @@ ile bir konuya yayınlanan bir mesaj, anahtar-değer protokolünden o konuya abo
 olan bir istemci tarafından dinlenebilir; tersi de geçerlidir. Böylece bir sıcaklık
 sensörü MQTT ile veri yayınlarken, bir gösterge paneli aynı veriyi önbellek
 protokolüyle dinleyebilir — ikisi arasında köprü kuran ayrı bir bileşene gerek
-kalmadan.
+kalmadan. Aynı mesajlaşma ailesinde, daha ağır kurumsal kuyruk sistemlerinin
+konuştuğu bir başka protokol — AMQP, yani RabbitMQ'nun dili — de desteklenir;
+böylece o ekosistem için yazılmış istemciler de, dayanıklı kuyruk güvenceleriyle,
+OxiDB'ye değişmeden bağlanabilir.
 
 Üçüncü ve belki en geniş uyumluluk yüzü, **web yüzeyidir** ve dört parçadan
 oluşur. Birincisi, doğrudan bir **HTTP arayüzüdür**: belge ekleme, bulma, güncelleme,
@@ -121,6 +136,23 @@ OxiDB ile — gerçek zamanlı güncellemeler, kimlik doğrulama ve belge başı
 kurallarıyla — çalışmasını mümkün kılar. JavaScript istemcisi, tam da bu web yüzeyi
 üzerinden konuşur ve bağımlılıksız olacak biçimde, hem tarayıcıda hem sunucu
 tarafı çalışma ortamında çalışır.
+
+Bu üç yüz — anahtar-değer, mesajlaşma ve web — uyumluluğun en görünür örnekleridir;
+ama OxiDB'nin başka ekosistemlere uzanan yüzleri bunlarla sınırlı değildir. Belge
+motorunun kendisi, en yaygın belge veritabanının — MongoDB'nin — istek biçimini
+tanır: onun ekleme, bulma, güncelleme ve silme çağrılarını konuşan bir uyumluluk
+uyarlaması vardır ve bu uyum, MongoDB'nin kendi davranış testlerinin bir bölümünün
+OxiDB'ye karşı koşturulup geçmesiyle sınanmıştır. İlişkisel tarafta, sunucu kendini
+yaygın SQL istemcilerinin beklediği bir veritabanı adıyla da tanıtır; ve ilerideki
+bölümlerde tanıtacağımız SQL motoru, popüler bir nesne-ilişki eşleyicinin resmî
+uyumluluk testlerinin tamamını geçecek kadar eksiksiz konuşur. O motor ayrıca,
+sunucu içinde çalışan saklı yordamları iki dilde barındırır: doğrudan SQL metniyle
+yazılan gövdeler ve önceden derlenip küçük bir sanal makinede yürütülen bytecode
+yordamlar. Depolama tarafında, ilerideki bir bölümde ele alacağımız blob katmanı
+bir nesne-depolama (S3) HTTP arayüzü sunar; zaman-serisi motoru ise yaygın bir
+zaman-serisi veritabanının satır protokolünü anlar. Her biri kendi bölümünde
+incelenecek bu yüzlerin ortak fikri aynıdır: var olan araçları, yeniden yazmaya
+zorlamadan, olduğu gibi ağırlamak.
 
 ![Tek çekirdeğin üstündeki erişim katmanları: gömülü FFI, OxiWire ve uyumluluk yüzleri.](sekiller/26b-protokol-katmanlari.svg){width=85%}
 

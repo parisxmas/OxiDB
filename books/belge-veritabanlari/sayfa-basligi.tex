@@ -1,0 +1,30 @@
+% PDF (xelatex): her sayfanın üstüne bölüm başlığını, altına ortalanmış sayfa
+% numarasını basar. Harici paket (fancyhdr) gerektirmez; `book` sınıfının kendi
+% düşük seviyeli sayfa-stili mekanizmasını kullanır, böylece derleme taşınabilir
+% kalır. Kapak sayfası kapak.tex içinde \thispagestyle{empty} ile bunun dışında
+% tutulur; bölüm açılış sayfaları `book` sınıfının `plain` stilini kullanır ve
+% zaten alt-orta sayfa numarasını taşır.
+\makeatletter
+
+% Üstbilgide yalnızca bölüm başlığı görünsün: "Bölüm N." öneki ya da İngilizce
+% "Chapter" sözcüğü eklenmesin. \sectionmark boşaltılır ki sağ mark boş kalsın.
+\renewcommand{\chaptermark}[1]{\markboth{#1}{}}
+\renewcommand{\sectionmark}[1]{}
+
+% Numarasız bölümler (\chapter*: önsöz, Ek A, Ek B) \chaptermark'ı tetiklemez;
+% bu yüzden üstbilgi önceki bölümün başlığında takılı kalır. \@schapter'ı
+% yamayarak numarasız bölümlerin de kendi başlığını üstbilgiye yazmasını sağla.
+\let\orig@schapter\@schapter
+\renewcommand{\@schapter}[1]{\orig@schapter{#1}\markboth{#1}{}}
+
+% Özel sayfa stili: üst-orta bölüm başlığı, alt-orta sayfa numarası.
+\newcommand{\ps@kitap}{%
+  \renewcommand{\@oddfoot}{\hfil\thepage\hfil}%
+  \renewcommand{\@evenfoot}{\hfil\thepage\hfil}%
+  \renewcommand{\@oddhead}{\hfil{\small\itshape\leftmark}\hfil}%
+  \renewcommand{\@evenhead}{\hfil{\small\itshape\leftmark}\hfil}%
+  \let\@mkboth\markboth%
+}
+\pagestyle{kitap}
+
+\makeatother

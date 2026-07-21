@@ -68,11 +68,11 @@ echo -e "  Building oxidb-server (release)..."
 (cd "$PROJECT_ROOT" && cargo build --release -p oxidb-server 2>&1 | tail -1)
 
 OXIDB_MODE=memory \
-OXIDB_REDIS_PORT="$OXIDB_REDIS_PORT" \
+OXIDB_OXIMEM_PORT="$OXIDB_REDIS_PORT" \
 OXIDB_ADDR="127.0.0.1:${OXIDB_NATIVE_PORT}" \
 "$PROJECT_ROOT/target/release/oxidb-server" 2>/dev/null &
 OXIDB_PID=$!
-sleep 1
+sleep 2
 
 if ! kill -0 "$OXIDB_PID" 2>/dev/null; then
     echo -e "${RED}Failed to start OxiDB${NC}"
