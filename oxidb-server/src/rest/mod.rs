@@ -43,6 +43,8 @@ use crate::jwt;
 use crate::rules::{self, AuthContext, Operation};
 use crate::s3::http::{HttpRequest, HttpResponse, parse_request_from_reader};
 
+mod postgrest;
+
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
 
@@ -352,6 +354,28 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
             state,
             enforced_role,
         ));
+    }
+
+    // ── PostgREST-compatible surface (ADR-0019): /rest/v1/{table} ──────
+    // Auto-generated REST over the document engine — filters, select, order,
+    // and pagination live in the URL. Each request still runs through the
+    // security-rules layer (check_access) inside these handlers, OxiDB's
+    // row-level-security analog; role gating already happened via
+    // `rest_permitted` above. A "table" is a document collection.
+    match (req.method.as_str(), segments.as_slice()) {
+        ("GET", ["rest", "v1", table]) => {
+            return with_rest_cors(postgrest::handle_get(table, req, state, &auth_ctx));
+        }
+        ("POST", ["rest", "v1", table]) => {
+            return with_rest_cors(postgrest::handle_post(table, req, state, &auth_ctx));
+        }
+        ("PATCH", ["rest", "v1", table]) => {
+            return with_rest_cors(postgrest::handle_patch(table, req, state, &auth_ctx));
+        }
+        ("DELETE", ["rest", "v1", table]) => {
+            return with_rest_cors(postgrest::handle_delete(table, req, state, &auth_ctx));
+        }
+        _ => {}
     }
 
     // ── Protected endpoints ──────────────────────────────────────────
