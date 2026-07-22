@@ -122,13 +122,57 @@ fn sync_data_fast(file: &File) -> std::io::Result<()> {
     }
 }
 
+/// Opt-in WAL pre-allocation chunk, in bytes (0 = disabled). Set
+/// `OXIDB_SQL_WAL_PREALLOC=<MiB>` to enable: the WAL is then grown to a
+/// pre-sized, block-allocated file so an append writes *within* it and an
+/// `fdatasync` flushes only data, not the inode's size — the size-metadata
+/// write that makes a growing WAL's sync ~2x slower than PostgreSQL's
+/// (which recycles pre-sized 16 MiB segments). Off by default: the file then
+/// tracks the logical size exactly (leaner for many small multi-db WALs).
+fn prealloc_chunk_from_env() -> u64 {
+    std::env::var("OXIDB_SQL_WAL_PREALLOC")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mib| mib > 0)
+        .map(|mib| mib * 1024 * 1024)
+        .unwrap_or(0)
+}
+
+/// Grow the file's on-disk size to `cap`, allocating real blocks where the OS
+/// supports it (Linux `posix_fallocate`), so a later write inside `[0, cap)`
+/// touches no size metadata. Existing bytes are untouched; the newly-allocated
+/// tail reads as zeros — which recovery treats as end-of-log (a zero frame
+/// fails the CRC check). Falls back to a plain `set_len` (sparse) off Linux:
+/// correct everywhere, fast where WAL latency actually matters.
+#[cfg(all(unix, target_os = "linux"))]
+fn preallocate_to(file: &File, cap: u64) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, cap as libc::off_t) };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc).into());
+    }
+    Ok(())
+}
+#[cfg(not(all(unix, target_os = "linux")))]
+fn preallocate_to(file: &File, cap: u64) -> Result<()> {
+    file.set_len(cap)?;
+    Ok(())
+}
+
 /// Append-only WAL writer bound to `sql/wal/live.wal`.
 pub struct Wal {
     file: File,
     next_seq: u64,
     sync: SyncMode,
-    /// Current on-disk size (header + valid records) — drives auto-checkpoint.
+    /// Logical size — header + valid records (the write position). Drives
+    /// auto-checkpoint; equals the file size unless pre-allocation is on.
     bytes: u64,
+    /// Pre-allocation chunk in bytes (0 = disabled). See
+    /// [`prealloc_chunk_from_env`].
+    chunk: u64,
+    /// Pre-allocated on-disk size when `chunk > 0` (else unused). Appends stay
+    /// within it; it grows by `chunk` when the next frame would cross it.
+    capacity: u64,
 }
 
 impl Wal {
@@ -161,17 +205,32 @@ impl Wal {
             Self::write_header(&mut file)?;
             HEADER_LEN
         } else {
-            // Discard any torn tail so the next append starts from clean data.
+            // Discard any torn tail (or a prior pre-allocated zero region) so
+            // the pre-allocation below overlays clean zeros right after the
+            // last intact record.
             file.set_len(valid_end)?;
             valid_end
         };
-        file.seek(SeekFrom::End(0))?;
+        // With pre-allocation on, size the file ahead and position the writer
+        // at the *logical* end (not the file end — now the pre-allocated size).
+        let chunk = prealloc_chunk_from_env();
+        let capacity = if chunk > 0 {
+            let cap = ((bytes / chunk) + 1) * chunk;
+            preallocate_to(&file, cap)?;
+            file.seek(SeekFrom::Start(bytes))?;
+            cap
+        } else {
+            file.seek(SeekFrom::End(0))?;
+            0
+        };
 
         let wal = Wal {
             file,
             next_seq: max_seq + 1,
             sync: sync_mode_from_env(),
             bytes,
+            chunk,
+            capacity,
         };
         Ok((wal, records))
     }
@@ -280,23 +339,40 @@ impl Wal {
         frame.extend_from_slice(&seq_bytes);
         frame.extend_from_slice(&payload);
 
+        // Grow the pre-allocation if this frame would cross it, then write
+        // inside the pre-sized file at the logical write position — so the sync
+        // flushes data only, not the inode size.
+        let frame_len = frame.len() as u64;
+        if self.chunk > 0 {
+            if self.bytes + frame_len > self.capacity {
+                self.capacity = (((self.bytes + frame_len) / self.chunk) + 1) * self.chunk;
+                preallocate_to(&self.file, self.capacity)?;
+            }
+            self.file.seek(SeekFrom::Start(self.bytes))?;
+        }
         self.file.write_all(&frame)?;
         match self.sync {
             SyncMode::Full => self.file.sync_all()?,
             SyncMode::Data => sync_data_fast(&self.file)?,
         }
-        self.bytes += frame.len() as u64;
+        self.bytes += frame_len;
         Ok(seq)
     }
 
     /// Reset the WAL to an empty (header-only) state after a checkpoint has
     /// durably captured all prior records into the `.rdat` snapshots.
     pub fn truncate(&mut self) -> Result<()> {
+        // Truncate to nothing (dropping old records), rewrite the header, then
+        // re-establish the pre-allocated zero tail so appends stay in-place.
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         Self::write_header(&mut self.file)?;
-        self.file.seek(SeekFrom::End(0))?;
         self.bytes = HEADER_LEN;
+        if self.chunk > 0 {
+            self.capacity = self.chunk;
+            preallocate_to(&self.file, self.capacity)?;
+        }
+        self.file.seek(SeekFrom::Start(self.bytes))?;
         Ok(())
     }
 }
@@ -358,6 +434,42 @@ mod tests {
         let (_wal, replayed) = Wal::open_since(dir.path(), 0).unwrap();
         assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[0], rec_create());
+    }
+
+    #[test]
+    fn prealloc_writes_within_and_recovers() {
+        // SAFETY: sibling WAL tests are size-agnostic (they assert record
+        // counts, not file sizes), so a transient env here is benign under
+        // parallel execution.
+        unsafe { std::env::set_var("OXIDB_SQL_WAL_PREALLOC", "1") };
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("wal").join("live.wal");
+        {
+            let (mut wal, replayed) = Wal::open_since(dir.path(), 0).unwrap();
+            assert!(replayed.is_empty());
+            for _ in 0..5 {
+                wal.append(&rec_create()).unwrap();
+            }
+        }
+        // The file is pre-allocated far past the five tiny records.
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() >= 1024 * 1024,
+            "WAL pre-allocated to >= 1 MiB"
+        );
+        // Reopen: the zero tail after the records must not read back as records,
+        // and an append after recovery must still land correctly.
+        {
+            let (mut wal, replayed) = Wal::open_since(dir.path(), 0).unwrap();
+            assert_eq!(
+                replayed.len(),
+                5,
+                "records survive; pre-allocated zeros ignored"
+            );
+            wal.append(&rec_create()).unwrap();
+        }
+        let (_wal, replayed) = Wal::open_since(dir.path(), 0).unwrap();
+        assert_eq!(replayed.len(), 6);
+        unsafe { std::env::set_var("OXIDB_SQL_WAL_PREALLOC", "") };
     }
 
     #[test]
