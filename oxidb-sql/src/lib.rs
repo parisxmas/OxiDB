@@ -1142,6 +1142,47 @@ impl SqlEngine {
         Ok(n)
     }
 
+    /// Delete `(table, row_id)` pairs that may span several tables as one
+    /// durable `WalRecord::Batch` (one fsync), applied all-or-nothing. Used by
+    /// DELETE to commit a row and its whole ON DELETE CASCADE closure — parent
+    /// and children across tables — in a single fsync. Missing pairs are
+    /// skipped and duplicates (a shared cascade child) collapse to one delete.
+    pub fn delete_multi(&self, items: &[(String, u64)]) -> Result<usize> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut seen: std::collections::HashSet<(&str, u64)> = std::collections::HashSet::new();
+        let mut ops: Vec<WalRecord> = Vec::with_capacity(items.len());
+        for (table, id) in items {
+            if !inner.catalog.contains(table) {
+                return Err(SqlError::NoSuchTable(table.clone()));
+            }
+            let present = inner
+                .tables
+                .get(table.as_str())
+                .map(|s| s.rows.contains(*id))
+                .unwrap_or(false);
+            if present && seen.insert((table.as_str(), *id)) {
+                ops.push(WalRecord::Delete {
+                    table: table.clone(),
+                    row_id: *id,
+                });
+            }
+        }
+        if ops.is_empty() {
+            return Ok(0);
+        }
+        let n = ops.len();
+        let rec = WalRecord::Batch(ops);
+        let inner = &mut *inner;
+        inner.wal.append(&rec)?;
+        Self::apply_live(
+            &mut inner.catalog,
+            &mut inner.tables,
+            &rec,
+            inner.disk_first,
+        );
+        Ok(n)
+    }
+
     /// Return all live rows of a table as `(row_id, cells)`, ordered by `row_id`.
     pub fn scan(&self, table: &str) -> Result<Vec<(u64, Vec<Value>)>> {
         let inner = self.inner.lock().unwrap();
@@ -2252,6 +2293,9 @@ impl Store for SqlEngine {
     }
     fn delete_many(&self, table: &str, row_ids: &[u64]) -> Result<usize> {
         SqlEngine::delete_many(self, table, row_ids)
+    }
+    fn delete_multi(&self, items: &[(String, u64)]) -> Result<usize> {
+        SqlEngine::delete_multi(self, items)
     }
     fn create_table(&self, table: Table) -> Result<()> {
         SqlEngine::create_table(self, table)

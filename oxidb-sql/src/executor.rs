@@ -628,10 +628,16 @@ fn referencing_fks<S: Store>(
 
 /// Parent side on DELETE: honour each referencing FK's ON DELETE action for a
 /// parent row being removed. Recurses so a CASCADE chain is fully applied.
+/// Parent side on DELETE. NO ACTION/RESTRICT errors if referenced. CASCADE
+/// *collects* the referencing child rows (and, recursively, their descendants)
+/// into `dels` — the caller deletes the whole closure in one batch — so a
+/// cascade costs one fsync, not one per row. SET NULL nulls the child FK inline
+/// (rare; not part of the delete batch).
 fn enforce_fk_on_delete<S: Store>(
     store: &S,
     parent_def: &crate::catalog::Table,
     parent_cells: &[Value],
+    dels: &mut Vec<(String, u64)>,
 ) -> Result<()> {
     for (child_def, fk) in referencing_fks(store, &parent_def.name) {
         let pcol = fk_parent_column(store, &fk)?;
@@ -655,14 +661,10 @@ fn enforce_fk_on_delete<S: Store>(
                 )));
             }
             crate::catalog::FkAction::Cascade => {
-                // Resolve any grandchildren (cascade chain) first, then delete
-                // this whole level as one durable batch — one fsync for the
-                // child set, not one per child (the cascade hot path).
-                for (_, cells) in &children {
-                    enforce_fk_on_delete(store, &child_def, cells)?;
+                for (rid, cells) in &children {
+                    enforce_fk_on_delete(store, &child_def, cells, dels)?; // grandchildren
+                    dels.push((child_def.name.clone(), *rid));
                 }
-                let ids: Vec<u64> = children.iter().map(|(rid, _)| *rid).collect();
-                store.delete_many(&child_def.name, &ids)?;
             }
             crate::catalog::FkAction::SetNull => {
                 let cpos = fk_col_pos(&child_def, &fk.column)?;
@@ -1085,16 +1087,20 @@ fn exec_delete<S: Store>(
     }
     let mut affected = 0;
     let mut touched: Vec<Vec<Value>> = Vec::new();
+    // Collect every row to remove — the matched rows plus each one's ON DELETE
+    // CASCADE closure — so the whole DELETE commits in a single WAL fsync.
+    let mut dels: Vec<(String, u64)> = Vec::new();
     for (row_id, cells) in to_delete {
-        // FOREIGN KEY (parent side): apply ON DELETE before removing the row.
-        enforce_fk_on_delete(store, &def, &cells)?;
-        if store.delete(table, row_id)? {
-            affected += 1;
-            if returning.is_some() {
-                touched.push(cells);
-            }
+        // FK (parent side): RESTRICT errors here; CASCADE collects children
+        // into `dels`; SET NULL is applied inline.
+        enforce_fk_on_delete(store, &def, &cells, &mut dels)?;
+        dels.push((table.to_string(), row_id));
+        affected += 1;
+        if returning.is_some() {
+            touched.push(cells);
         }
     }
+    store.delete_multi(&dels)?;
     if let Some(items) = returning {
         return returning_result(&items, &def, &schema, touched, params);
     }

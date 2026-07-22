@@ -119,6 +119,19 @@ pub(crate) trait Store {
         }
         Ok(n)
     }
+    /// Delete `(table, row_id)` pairs that may span several tables as a single
+    /// durable unit (one WAL fsync where supported). This is what lets a DELETE
+    /// and its whole ON DELETE CASCADE closure — parent and children across
+    /// tables — commit in one fsync. The default falls back to per-row delete.
+    fn delete_multi(&self, items: &[(String, u64)]) -> Result<usize> {
+        let mut n = 0;
+        for (table, id) in items {
+            if self.delete(table, *id)? {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
     /// Pessimistically lock `row_ids` of `table` for this store's lock owner
     /// (the enclosing transaction, or the autocommit statement), blocking up
     /// to the engine's lock timeout on contention. Held until commit/rollback
