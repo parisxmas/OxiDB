@@ -54,7 +54,7 @@ use oxidb::query::{FindOptions, SortOrder};
 /// `GET /rest/v1/readings` can never dump an unbounded collection. Overridable
 /// via `OXIDB_PGRST_MAX_ROWS` (PostgREST's `db-max-rows`). A caller-supplied
 /// `limit` is honored up to this cap.
-fn max_rows() -> u64 {
+pub(super) fn max_rows() -> u64 {
     static CAP: OnceLock<u64> = OnceLock::new();
     *CAP.get_or_init(|| {
         std::env::var("OXIDB_PGRST_MAX_ROWS")
@@ -425,7 +425,7 @@ fn parse_order(spec: &str) -> PgResult<Vec<(String, SortOrder)>> {
 /// Column projection. `None` or `*` keeps whole documents; otherwise keeps the
 /// listed columns, honoring `alias:source` renames. Resource embedding
 /// (`col(...)`) is Phase 2 and rejected with a clear message.
-fn apply_select(docs: Vec<Value>, select: Option<&str>) -> PgResult<Vec<Value>> {
+pub(super) fn apply_select(docs: Vec<Value>, select: Option<&str>) -> PgResult<Vec<Value>> {
     let spec = match select {
         None => return Ok(docs),
         Some(s) if s.trim().is_empty() || s.trim() == "*" => return Ok(docs),
@@ -468,33 +468,34 @@ fn apply_select(docs: Vec<Value>, select: Option<&str>) -> PgResult<Vec<Value>> 
 // Resource embedding (Phase 2) — `select=*,related(cols)` → nested documents
 // ---------------------------------------------------------------------------
 
-/// A parsed top-level `select`: plain columns plus any resource embeds.
-struct SelectPlan {
+/// A parsed top-level `select`: plain columns plus any resource embeds. Shared
+/// with the SQL surface (`postgrest_sql`), whose `select` grammar is identical.
+pub(super) struct SelectPlan {
     /// `*` present — keep all parent fields (embeds are attached on top).
-    star: bool,
+    pub(super) star: bool,
     /// `(output_name, source_field)` plain projections.
-    cols: Vec<(String, String)>,
-    embeds: Vec<Embed>,
+    pub(super) cols: Vec<(String, String)>,
+    pub(super) embeds: Vec<Embed>,
 }
 
 /// One `related(childcols)` (or `alias:related!fk(childcols)`) embed.
-struct Embed {
+pub(super) struct Embed {
     /// Output key on the parent document (alias, else the target name).
-    out: String,
+    pub(super) out: String,
     /// The collection to pull related documents from.
-    target: String,
+    pub(super) target: String,
     /// Optional explicit foreign-key field (`!fk`). Direction is inferred:
     /// if a parent document carries this field it is a belongs-to (parent
     /// `fk` → target `_id`), otherwise a has-many (child `fk` → parent `_id`).
-    hint: Option<String>,
+    pub(super) hint: Option<String>,
     /// The nested `select` applied to each embedded document (plain columns
     /// only — nested embeds are a future phase).
-    child: Option<String>,
+    pub(super) child: Option<String>,
 }
 
 /// Parse a top-level `select` into a [`SelectPlan`]. Returns `None` for the
 /// pass-through cases (`None`, empty, or a bare `*`).
-fn parse_select_plan(select: Option<&str>) -> PgResult<Option<SelectPlan>> {
+pub(super) fn parse_select_plan(select: Option<&str>) -> PgResult<Option<SelectPlan>> {
     let spec = match select {
         None => return Ok(None),
         Some(s) if s.trim().is_empty() => return Ok(None),
@@ -663,7 +664,7 @@ fn resolve_embed(
 }
 
 /// Project one parent document per the plan (embeds are already attached).
-fn project_doc(doc: Value, plan: &SelectPlan) -> Value {
+pub(super) fn project_doc(doc: Value, plan: &SelectPlan) -> Value {
     if plan.star {
         return doc; // keep every parent field plus the attached embeds
     }
@@ -706,7 +707,7 @@ fn singular(name: &str) -> String {
 /// schemaless, so `id=eq.42` must decide 42 is a number: we try null/bool/int/
 /// float and fall back to string. A double-quoted value forces a string
 /// (`eq."42"`), matching PostgREST's quoting rule.
-fn coerce(s: &str) -> Value {
+pub(super) fn coerce(s: &str) -> Value {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
         return Value::String(s[1..s.len() - 1].to_string());
     }
@@ -734,14 +735,18 @@ fn parse_in_list(arg: &str) -> Vec<Value> {
         .collect()
 }
 
-/// PostgREST `like`/`ilike` patterns use `*` as the wildcard. Translate to an
-/// anchored regex, escaping regex metacharacters in the literal portions.
+/// Translate a `like`/`ilike` pattern to an anchored regex. Both SQL LIKE
+/// wildcards are honored — `%` (many) and `_` (single) — since the real
+/// `postgrest-js` client emits SQL-native patterns like `%foo%`; PostgREST's
+/// `*` alias for `%` is accepted too. Regex metacharacters in the literal
+/// portions are escaped.
 fn like_to_regex(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len() + 2);
     out.push('^');
     for ch in pattern.chars() {
         match ch {
-            '*' => out.push_str(".*"),
+            '%' | '*' => out.push_str(".*"),
+            '_' => out.push('.'),
             '\\' | '.' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' => {
                 out.push('\\');
                 out.push(ch);
@@ -767,7 +772,7 @@ fn to_update(body: Value) -> Value {
 
 /// Split a raw query string into decoded `(key, value)` pairs, preserving
 /// duplicate keys (`age=gt.10&age=lt.20`) — unlike a map-based parser.
-fn split_pairs(query: &str) -> Vec<(String, String)> {
+pub(super) fn split_pairs(query: &str) -> Vec<(String, String)> {
     if query.is_empty() {
         return Vec::new();
     }
@@ -783,7 +788,7 @@ fn split_pairs(query: &str) -> Vec<(String, String)> {
 
 /// Split on top-level commas, respecting parenthesis depth so that a nested
 /// `in.(1,2,3)` or `or(...)` is not split at its inner commas.
-fn split_top_commas(s: &str) -> Vec<&str> {
+pub(super) fn split_top_commas(s: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
@@ -804,7 +809,7 @@ fn split_top_commas(s: &str) -> Vec<&str> {
     out.into_iter().filter(|p| !p.is_empty()).collect()
 }
 
-fn wants_representation(req: &HttpRequest) -> bool {
+pub(super) fn wants_representation(req: &HttpRequest) -> bool {
     req.headers
         .get("prefer")
         .is_some_and(|v| v.to_ascii_lowercase().contains("return=representation"))
@@ -907,6 +912,10 @@ mod tests {
             q("name=ilike.jo*"),
             json!({"name": {"$regex": "^jo.*$", "$options": "i"}})
         );
+        // The real postgrest-js client emits SQL-native `%`/`_` wildcards
+        // (`%` arrives URL-encoded as `%25`, decoded before translation).
+        assert_eq!(q("name=like.%25jo%25"), json!({"name": {"$regex": "^.*jo.*$"}}));
+        assert_eq!(q("code=like.a_c"), json!({"code": {"$regex": "^a.c$"}}));
     }
 
     #[test]

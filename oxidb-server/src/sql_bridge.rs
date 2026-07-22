@@ -263,3 +263,31 @@ pub fn execute_json_in(
     let engine = engine_for(db_name)?;
     oxidb_sql::json::execute_json(&engine, sql, params, readonly)
 }
+
+/// True when the SQL engine is enabled and hosts a table named `table` in
+/// database `db_name`. Used by the PostgREST surface to decide whether
+/// `/rest/v1/{table}` targets a SQL table or a document collection. Returns
+/// `false` (never opens anything spuriously fatal) when SQL is disabled or the
+/// database has no SQL engine yet.
+pub fn sql_table_exists(db_name: &str, table: &str) -> bool {
+    engine_for(db_name)
+        .map(|e| e.table_def(table).is_some())
+        .unwrap_or(false)
+}
+
+/// The single-column foreign keys declared on `table` as
+/// `(local_column, parent_table, parent_column)`, for PostgREST resource
+/// embedding over the SQL engine. Empty when SQL is off or the table has none.
+pub fn sql_foreign_keys(db_name: &str, table: &str) -> Vec<(String, String, String)> {
+    let Ok(engine) = engine_for(db_name) else {
+        return Vec::new();
+    };
+    match engine.table_def(table) {
+        Some(t) => t
+            .foreign_keys
+            .into_iter()
+            .map(|fk| (fk.column, fk.parent_table, fk.parent_column))
+            .collect(),
+        None => Vec::new(),
+    }
+}

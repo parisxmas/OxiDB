@@ -1,0 +1,13 @@
+{
+  "name": "oxidb-postgrest-js-test",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Integration test: the real @supabase/postgrest-js client against OxiDB's PostgREST-compatible surface (ADR-0019)",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "@supabase/postgrest-js": "^1.19.4"
+  }
+}

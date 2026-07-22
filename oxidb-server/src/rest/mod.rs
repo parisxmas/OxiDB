@@ -44,6 +44,7 @@ use crate::rules::{self, AuthContext, Operation};
 use crate::s3::http::{HttpRequest, HttpResponse, parse_request_from_reader};
 
 mod postgrest;
+mod postgrest_sql;
 
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
@@ -362,20 +363,47 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // security-rules layer (check_access) inside these handlers, OxiDB's
     // row-level-security analog; role gating already happened via
     // `rest_permitted` above. A "table" is a document collection.
-    match (req.method.as_str(), segments.as_slice()) {
-        ("GET", ["rest", "v1", table]) => {
-            return with_rest_cors(postgrest::handle_get(table, req, state, &auth_ctx));
+    //
+    // Phase 2b: when SQL is enabled and `{table}` names a SQL table, the SAME
+    // grammar is served by the SQL engine instead (parameterized SQL). The
+    // architecture guarantees a collection and a SQL table never share a name,
+    // so this dispatch is unambiguous; SQL-off or a non-SQL name keeps the
+    // document path byte-for-byte.
+    {
+        let sql_db = db_name
+            .as_deref()
+            .unwrap_or(oxidb::database_manager::DEFAULT_DATABASE);
+        match (req.method.as_str(), segments.as_slice()) {
+            ("GET", ["rest", "v1", table]) => {
+                return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
+                    postgrest_sql::handle_get(sql_db, table, &req.query)
+                } else {
+                    postgrest::handle_get(table, req, state, &auth_ctx)
+                });
+            }
+            ("POST", ["rest", "v1", table]) => {
+                return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
+                    postgrest_sql::handle_post(sql_db, table, &req.body)
+                } else {
+                    postgrest::handle_post(table, req, state, &auth_ctx)
+                });
+            }
+            ("PATCH", ["rest", "v1", table]) => {
+                return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
+                    postgrest_sql::handle_patch(sql_db, table, &req.query, &req.body)
+                } else {
+                    postgrest::handle_patch(table, req, state, &auth_ctx)
+                });
+            }
+            ("DELETE", ["rest", "v1", table]) => {
+                return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
+                    postgrest_sql::handle_delete(sql_db, table, &req.query)
+                } else {
+                    postgrest::handle_delete(table, req, state, &auth_ctx)
+                });
+            }
+            _ => {}
         }
-        ("POST", ["rest", "v1", table]) => {
-            return with_rest_cors(postgrest::handle_post(table, req, state, &auth_ctx));
-        }
-        ("PATCH", ["rest", "v1", table]) => {
-            return with_rest_cors(postgrest::handle_patch(table, req, state, &auth_ctx));
-        }
-        ("DELETE", ["rest", "v1", table]) => {
-            return with_rest_cors(postgrest::handle_delete(table, req, state, &auth_ctx));
-        }
-        _ => {}
     }
 
     // ── Protected endpoints ──────────────────────────────────────────

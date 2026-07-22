@@ -1,6 +1,6 @@
 # ADR-0019: PostgREST-compatible auto-REST surface for the document engine
 
-**Status:** Accepted — Phase 1 (document engine: filters, select, order, pagination, full CRUD) + Phase 2a (**resource embedding** for the document engine, `select=*,related(cols)` via a `$lookup`-style stitch) landed & tested, 2026-07-22. Phase 2b (SQL/TSDB engines under the same grammar; SQL embedding via catalog foreign keys; nested embeds) **Proposed**, deferred.
+**Status:** Accepted — Phase 1 (document engine: filters, select, order, pagination, full CRUD) + Phase 2a (**resource embedding** for the document engine, `$lookup`-style stitch) + Phase 2b (**SQL engine under the same grammar** — parameterized CRUD routing) + Phase 2c (**SQL resource embedding** via catalog foreign keys) landed & tested, 2026-07-22. Remaining (write-representation over SQL; TSDB under the grammar; nested embeds) **Proposed**, deferred.
 **Supersedes:** —
 **Related:** [ADR-0012](0012-multi-database.md) (`?db=<name>` targeting, reused verbatim),
 [`oxidb-server/src/rest/postgrest.rs`](../../oxidb-server/src/rest/postgrest.rs) (the translation layer),
@@ -88,6 +88,30 @@ allow, it is safe to expose — the same reasoning that makes PostgREST safe.
   place the doc engine is *harder* than typed Postgres columns, hence the
   explicit quoting escape hatch.
 
+### SQL engine under the same grammar (Phase 2b, landed)
+
+When the SQL engine is enabled and `{table}` names a SQL table,
+`/rest/v1/{table}` is served by the SQL engine instead of the document engine
+(`oxidb-server/src/rest/postgrest_sql.rs`; dispatch via
+`sql_bridge::sql_table_exists`). The identical URL grammar is translated to
+**parameterized SQL** — `price=gt.100` → `WHERE price > ?`, `select=n:name` →
+`SELECT name AS n`, `order`/`limit`/`offset`, `in`/`is.null`/`like`/`ilike`,
+`or=(…)`/`and=(…)` — and CRUD maps to `INSERT`/`UPDATE`/`DELETE`. The SQL
+`{columns, rows}` result is reshaped into PostgREST's array-of-objects. Because
+a collection and a SQL table never share a name (architecture invariant), the
+dispatch is unambiguous and SQL-off is byte-for-byte the old document path.
+
+Two safety properties are specific to the SQL path:
+- **Values are always bound parameters** (`?`), never interpolated.
+- **Identifiers** (table/column/alias/order key) are validated against
+  `^[A-Za-z_][A-Za-z0-9_]*$` — they cannot be parameters, so this is the name
+  injection guard. `select=name,pri;ce` → `400`.
+
+Authorization on the SQL path is **RBAC only** (`rest_permitted` role gate +
+the engine's read-only enforcement on GET), not per-row security rules — SQL
+tables have no rules layer, exactly like the existing `/api/sql` endpoint. This
+is the one behavioral difference from the document path and is intentional.
+
 ## Options considered
 
 1. **A brand-new bespoke REST query language.** Rejected: throws away the
@@ -119,13 +143,29 @@ allow, it is safe to expose — the same reasoning that makes PostgREST safe.
   `related!fk(...)` hint names the FK field and lets the presence of that field
   on the parent decide the direction. This is a pragmatic convention, not full
   PostgREST catalog-FK parity — the honest cost of embedding on a schemaless
-  store. The SQL engine (Phase 2b) will infer joins from its real catalog FKs.
+  store. The SQL engine (Phase 2c) will infer joins from its real catalog FKs.
+
+**SQL resource embedding (Phase 2c, landed)**
+- `select=*,related(cols)` over a SQL table infers the relationship from the
+  **catalog foreign keys** (`sql_bridge::sql_foreign_keys`): a FK from the
+  current table → the target is a belongs-to (single object); a FK from the
+  target → the current table is a has-many (array); `related!fk(...)` names the
+  FK column explicitly. Each embed runs one **batched secondary query**
+  (`SELECT … WHERE fk IN (…)`, values bound) and is stitched in Rust — not a
+  JOIN, which avoids column-name collisions and reuses the row/projection code.
+  Unlike the document path's naming-convention inference, this is exact: the
+  join columns come from the declared FK. A missing relationship is a clear
+  `400` naming the tables and suggesting a `!fk` hint.
 
 **Negative / deferred**
 - **Nested embeds** (an embed inside an embed) are rejected (one level).
-- SQL/TSDB engines under the same `/rest/v1` grammar — Phase 2b.
-- Schemaless coercion can surprise (`zip=eq.007` → number 7); mitigated by
-  quoting, documented.
+- **Write-representation over SQL** (`Prefer: return=representation` echoing
+  inserted/updated rows) is deferred — SQL writes return minimal (`201 []` /
+  `200 []` / `204`).
+- TSDB under the same grammar.
+- Schemaless coercion (document path only) can surprise (`zip=eq.007` → number
+  7); mitigated by quoting, documented. The SQL path binds params by column
+  type and has no such ambiguity.
 - No `Range` **header** pagination yet (query-param `limit`/`offset` only), no
   `Accept: application/vnd.pgrst.object+json` single-object mode, no upsert
   (`Prefer: resolution=merge-duplicates`). All additive later.
@@ -136,9 +176,28 @@ allow, it is safe to expose — the same reasoning that makes PostgREST safe.
   logic nesting, duplicate-column ranges, `like`→regex, quoting, select/alias,
   select-plan split, embed alias + FK hint, unterminated-embed + nested-embed
   rejection, singularization, order, limit/offset).
-- End-to-end smoke test against a live server: array insert with
-  representation, `gt`+`select`+`order`+`Content-Range`, `or` groups, `like`,
-  `PATCH` (`$set` and `$inc` passthrough), `DELETE` `204`, `is.true`, error
-  shape (`{"message":…}` 400), the `read:false` → `403` security-rule gate,
-  and **embedding**: belongs-to (order → single customer), has-many (customer →
-  order array), `alias:t!fk(...)`, `*`+embed, and a dangling reference → `null`.
+- End-to-end smoke test against a live server (document engine): array insert
+  with representation, `gt`+`select`+`order`+`Content-Range`, `or` groups,
+  `like`, `PATCH` (`$set` and `$inc` passthrough), `DELETE` `204`, `is.true`,
+  error shape (`{"message":…}` 400), the `read:false` → `403` security-rule
+  gate, and **embedding**: belongs-to (order → single customer), has-many
+  (customer → order array), `alias:t!fk(...)`, `*`+embed, dangling ref → `null`.
+- 13 SQL-generation unit tests in `postgrest_sql.rs` (parameterization,
+  alias/order/paging, `in`/`is.null`/negation, `like`/`ilike`, `or` groups,
+  identifier-injection rejection, force-star for embeds, `where` builder,
+  row→object). End-to-end over a live SQL table: `CREATE TABLE`, `/rest/v1`
+  INSERT/SELECT(filter+select+order+Content-Range)/`or`/UPDATE/DELETE,
+  **co-existence** (a document collection `notes` still routes to the document
+  engine), and `select=name,pri;ce` → `400`.
+- SQL embedding (Phase 2c) end-to-end over a declared `orders.customer_id
+  REFERENCES customers(id)`: belongs-to (`orders?select=item,customers(name)`),
+  has-many (`customers?select=name,orders(item)`), alias + `!fk` hint, child
+  projection, and a no-FK pair → `400` with a hint suggestion.
+- **Real-client conformance** (`tests/postgrest-js-test/`): the unmodified
+  `@supabase/postgrest-js` client (the library `supabase-js` wraps) drives the
+  surface over **both engines** through one base URL — 18 assertions across
+  `gt`/`in`/`or`/`like`, ordering, embedding (belongs-to + has-many), and
+  insert/update/delete with `return=representation`, on document collections
+  *and* SQL tables. This run surfaced and fixed a real compatibility gap: the
+  client emits **SQL-native `%`/`_`** LIKE wildcards, so `like_to_regex` now
+  honors `%`/`_` in addition to PostgREST's `*` alias.
