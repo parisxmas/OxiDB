@@ -914,7 +914,10 @@ mod tests {
         );
         // The real postgrest-js client emits SQL-native `%`/`_` wildcards
         // (`%` arrives URL-encoded as `%25`, decoded before translation).
-        assert_eq!(q("name=like.%25jo%25"), json!({"name": {"$regex": "^.*jo.*$"}}));
+        assert_eq!(
+            q("name=like.%25jo%25"),
+            json!({"name": {"$regex": "^.*jo.*$"}})
+        );
         assert_eq!(q("code=like.a_c"), json!({"code": {"$regex": "^a.c$"}}));
     }
 

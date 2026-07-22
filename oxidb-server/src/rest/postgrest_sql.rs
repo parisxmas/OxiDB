@@ -27,8 +27,12 @@
 //! from the target → the current table is a has-many (array). An explicit
 //! `related!fk(...)` names the FK column. Each embed runs one batched secondary
 //! `SELECT … WHERE fk IN (…)` and is stitched in Rust (not a JOIN — avoids
-//! column-name collisions and reuses the row/projection code). Write
-//! representation over SQL is still a future phase.
+//! column-name collisions and reuses the row/projection code).
+//!
+//! `Prefer: return=representation` is honored on writes: INSERT/UPDATE/DELETE
+//! carry `RETURNING *`, and the affected rows (projected by `?select=`) are
+//! echoed back, matching what `postgrest-js`'s `.insert()/.update()/.delete()
+//! .select()` expects.
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,9 +40,9 @@ use serde_json::{Value, json};
 
 use super::postgrest::{
     Embed, apply_select, coerce, max_rows, parse_select_plan, project_doc, split_pairs,
-    split_top_commas,
+    split_top_commas, wants_representation,
 };
-use crate::s3::http::HttpResponse;
+use crate::s3::http::{HttpRequest, HttpResponse};
 
 type PgResult<T> = Result<T, (u16, String)>;
 
@@ -52,7 +56,8 @@ type PgResult<T> = Result<T, (u16, String)>;
 /// path: fetch the base rows with `SELECT *`, resolve each embed via a batched
 /// secondary query keyed on catalog foreign keys, then project in Rust. A plain
 /// `select` is projected at the SQL level (more efficient).
-pub(super) fn handle_get(db: &str, table: &str, query: &str) -> HttpResponse {
+pub(super) fn handle_get(db: &str, table: &str, req: &HttpRequest) -> HttpResponse {
+    let query = &req.query;
     let select = select_param(query);
     let plan = match parse_select_plan(select.as_deref()) {
         Ok(p) => p,
@@ -99,13 +104,13 @@ fn select_param(query: &str) -> Option<String> {
 }
 
 /// `POST /rest/v1/{table}` over a SQL table — one parameterized INSERT per row.
-/// Returns `201` with an empty array (minimal); write representation over SQL
-/// is a future phase.
-pub(super) fn handle_post(db: &str, table: &str, body: &[u8]) -> HttpResponse {
+/// With `Prefer: return=representation` each INSERT carries `RETURNING *`, and
+/// the created rows (projected by `?select=`) are echoed; otherwise `201 []`.
+pub(super) fn handle_post(db: &str, table: &str, req: &HttpRequest) -> HttpResponse {
     if let Err((s, m)) = ident(table) {
         return err(s, &m);
     }
-    let parsed = match serde_json::from_slice::<Value>(body) {
+    let parsed = match serde_json::from_slice::<Value>(&req.body) {
         Ok(v) => v,
         Err(_) => return err(400, "invalid JSON body"),
     };
@@ -117,6 +122,10 @@ pub(super) fn handle_post(db: &str, table: &str, body: &[u8]) -> HttpResponse {
     if rows.is_empty() {
         return err(400, "empty insert");
     }
+    let representation = wants_representation(req);
+    let returning = if representation { " RETURNING *" } else { "" };
+    let mut created = Vec::new();
+
     for row in &rows {
         let Value::Object(map) = row else {
             return err(400, "each row must be a JSON object");
@@ -136,25 +145,34 @@ pub(super) fn handle_post(db: &str, table: &str, body: &[u8]) -> HttpResponse {
             params.push(v.clone());
         }
         let sql = format!(
-            "INSERT INTO {table} ({}) VALUES ({})",
+            "INSERT INTO {table} ({}) VALUES ({}){returning}",
             cols.join(", "),
             placeholders.join(", ")
         );
-        if let Err(e) =
-            crate::sql_bridge::execute_json_in(db, &sql, Some(&Value::Array(params)), false)
-        {
-            return err(400, &e);
+        match crate::sql_bridge::execute_json_in(db, &sql, Some(&Value::Array(params)), false) {
+            Ok(res) if representation => created.extend(rows_to_objects(&res)),
+            Ok(_) => {}
+            Err(e) => return err(400, &e),
         }
     }
-    super::json_response(201, "Created", json!([]))
+
+    if !representation {
+        return super::json_response(201, "Created", json!([]));
+    }
+    match apply_select(created, select_param(&req.query).as_deref()) {
+        Ok(rows) => super::json_response(201, "Created", Value::Array(rows)),
+        Err((s, m)) => err(s, &m),
+    }
 }
 
 /// `PATCH /rest/v1/{table}?<filters>` over a SQL table — parameterized UPDATE.
-pub(super) fn handle_patch(db: &str, table: &str, query: &str, body: &[u8]) -> HttpResponse {
+/// With `Prefer: return=representation` the UPDATE carries `RETURNING *` and the
+/// modified rows (projected by `?select=`) are echoed; otherwise `200 []`.
+pub(super) fn handle_patch(db: &str, table: &str, req: &HttpRequest) -> HttpResponse {
     if let Err((s, m)) = ident(table) {
         return err(s, &m);
     }
-    let set = match serde_json::from_slice::<Value>(body) {
+    let set = match serde_json::from_slice::<Value>(&req.body) {
         Ok(Value::Object(m)) if !m.is_empty() => m,
         Ok(Value::Object(_)) => return err(400, "PATCH body has no columns"),
         Ok(_) => return err(400, "PATCH body must be a JSON object"),
@@ -170,30 +188,51 @@ pub(super) fn handle_patch(db: &str, table: &str, query: &str, body: &[u8]) -> H
         assignments.push(format!("{k} = ?"));
         params.push(v.clone());
     }
-    let (where_sql, mut where_params) = match build_where(query) {
+    let (where_sql, mut where_params) = match build_where(&req.query) {
         Ok(x) => x,
         Err((s, m)) => return err(s, &m),
     };
     params.append(&mut where_params);
 
-    let sql = format!("UPDATE {table} SET {}{}", assignments.join(", "), where_sql);
+    let representation = wants_representation(req);
+    let returning = if representation { " RETURNING *" } else { "" };
+    let sql = format!(
+        "UPDATE {table} SET {}{where_sql}{returning}",
+        assignments.join(", ")
+    );
     match crate::sql_bridge::execute_json_in(db, &sql, Some(&Value::Array(params)), false) {
+        Ok(res) if representation => {
+            match apply_select(rows_to_objects(&res), select_param(&req.query).as_deref()) {
+                Ok(rows) => super::json_response(200, "OK", Value::Array(rows)),
+                Err((s, m)) => err(s, &m),
+            }
+        }
         Ok(_) => super::json_response(200, "OK", json!([])),
         Err(e) => err(400, &e),
     }
 }
 
 /// `DELETE /rest/v1/{table}?<filters>` over a SQL table — parameterized DELETE.
-pub(super) fn handle_delete(db: &str, table: &str, query: &str) -> HttpResponse {
+/// With `Prefer: return=representation` the DELETE carries `RETURNING *` and the
+/// deleted rows (projected by `?select=`) are echoed; otherwise `204`.
+pub(super) fn handle_delete(db: &str, table: &str, req: &HttpRequest) -> HttpResponse {
     if let Err((s, m)) = ident(table) {
         return err(s, &m);
     }
-    let (where_sql, params) = match build_where(query) {
+    let (where_sql, params) = match build_where(&req.query) {
         Ok(x) => x,
         Err((s, m)) => return err(s, &m),
     };
-    let sql = format!("DELETE FROM {table}{where_sql}");
+    let representation = wants_representation(req);
+    let returning = if representation { " RETURNING *" } else { "" };
+    let sql = format!("DELETE FROM {table}{where_sql}{returning}");
     match crate::sql_bridge::execute_json_in(db, &sql, Some(&Value::Array(params)), false) {
+        Ok(res) if representation => {
+            match apply_select(rows_to_objects(&res), select_param(&req.query).as_deref()) {
+                Ok(rows) => super::json_response(200, "OK", Value::Array(rows)),
+                Err((s, m)) => err(s, &m),
+            }
+        }
         Ok(_) => super::json_response(204, "No Content", json!(null)),
         Err(e) => err(400, &e),
     }

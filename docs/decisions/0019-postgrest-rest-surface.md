@@ -1,6 +1,6 @@
 # ADR-0019: PostgREST-compatible auto-REST surface for the document engine
 
-**Status:** Accepted — Phase 1 (document engine: filters, select, order, pagination, full CRUD) + Phase 2a (**resource embedding** for the document engine, `$lookup`-style stitch) + Phase 2b (**SQL engine under the same grammar** — parameterized CRUD routing) + Phase 2c (**SQL resource embedding** via catalog foreign keys) landed & tested, 2026-07-22. Remaining (write-representation over SQL; TSDB under the grammar; nested embeds) **Proposed**, deferred.
+**Status:** Accepted — Phase 1 (document engine: filters, select, order, pagination, full CRUD) + Phase 2a (**resource embedding** for the document engine, `$lookup`-style stitch) + Phase 2b (**SQL engine under the same grammar** — parameterized CRUD routing) + Phase 2c (**SQL resource embedding** via catalog foreign keys) + **SQL write-representation** (`RETURNING *`) landed & tested, 2026-07-22, and verified against the real `@supabase/postgrest-js` client over both engines. Remaining (TSDB under the grammar; nested embeds) **Proposed**, deferred.
 **Supersedes:** —
 **Related:** [ADR-0012](0012-multi-database.md) (`?db=<name>` targeting, reused verbatim),
 [`oxidb-server/src/rest/postgrest.rs`](../../oxidb-server/src/rest/postgrest.rs) (the translation layer),
@@ -157,11 +157,17 @@ is the one behavioral difference from the document path and is intentional.
   join columns come from the declared FK. A missing relationship is a clear
   `400` naming the tables and suggesting a `!fk` hint.
 
+**SQL write-representation (landed)**
+- `Prefer: return=representation` on a SQL write appends `RETURNING *` to the
+  INSERT/UPDATE/DELETE; the affected rows (reshaped to objects, projected by
+  `?select=`) are echoed — `201`/`200` with the rows, matching
+  `postgrest-js`'s `.insert()/.update()/.delete().select()`. Without the header,
+  writes stay minimal (`201 []` / `200 []` / `204`). The engine's `RETURNING`
+  (already used by the EF/ADO.NET generated-key path) makes this exact — no
+  re-select race.
+
 **Negative / deferred**
 - **Nested embeds** (an embed inside an embed) are rejected (one level).
-- **Write-representation over SQL** (`Prefer: return=representation` echoing
-  inserted/updated rows) is deferred — SQL writes return minimal (`201 []` /
-  `200 []` / `204`).
 - TSDB under the same grammar.
 - Schemaless coercion (document path only) can surprise (`zip=eq.007` → number
   7); mitigated by quoting, documented. The SQL path binds params by column
@@ -195,9 +201,10 @@ is the one behavioral difference from the document path and is intentional.
   projection, and a no-FK pair → `400` with a hint suggestion.
 - **Real-client conformance** (`tests/postgrest-js-test/`): the unmodified
   `@supabase/postgrest-js` client (the library `supabase-js` wraps) drives the
-  surface over **both engines** through one base URL — 18 assertions across
+  surface over **both engines** through one base URL — 20 assertions across
   `gt`/`in`/`or`/`like`, ordering, embedding (belongs-to + has-many), and
-  insert/update/delete with `return=representation`, on document collections
-  *and* SQL tables. This run surfaced and fixed a real compatibility gap: the
-  client emits **SQL-native `%`/`_`** LIKE wildcards, so `like_to_regex` now
-  honors `%`/`_` in addition to PostgREST's `*` alias.
+  insert/update/delete with `return=representation` (including SQL writes
+  echoing rows via `RETURNING *`), on document collections *and* SQL tables.
+  This run surfaced and fixed a real compatibility gap: the client emits
+  **SQL-native `%`/`_`** LIKE wildcards, so `like_to_regex` now honors `%`/`_`
+  in addition to PostgREST's `*` alias.

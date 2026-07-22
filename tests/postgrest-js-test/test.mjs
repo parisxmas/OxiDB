@@ -118,7 +118,12 @@ console.log('\n# SQL engine (tables) via the SAME postgrest-js client')
   await sql('CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT)')
   await sql('CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, author_id INTEGER REFERENCES authors(id))')
 
-  await client.from('authors').insert([{ id: 1, name: 'Asimov' }, { id: 2, name: 'Le Guin' }])
+  // insert with .select() → write representation (RETURNING *)
+  const { data: insAuthors } = await client
+    .from('authors')
+    .insert([{ id: 1, name: 'Asimov' }, { id: 2, name: 'Le Guin' }])
+    .select('id,name')
+  eq(insAuthors, [{ id: 1, name: 'Asimov' }, { id: 2, name: 'Le Guin' }], 'SQL insert representation')
   await client.from('books').insert([
     { id: 10, title: 'Foundation', author_id: 1 },
     { id: 11, title: 'I, Robot', author_id: 1 },
@@ -142,13 +147,20 @@ console.log('\n# SQL engine (tables) via the SAME postgrest-js client')
   ok(hm.length === 1 && hm[0].name === 'Asimov', 'SQL embed has-many: row is Asimov')
   eq(hm[0].books.map((b) => b.title).sort(), ['Foundation', 'I, Robot'], 'SQL embed has-many: 2 books')
 
-  // update + delete over SQL
-  await client.from('books').update({ title: 'Foundation (rev)' }).eq('id', 10)
-  const { data: renamed } = await client.from('books').select('title').eq('id', 10)
-  eq(renamed, [{ title: 'Foundation (rev)' }], 'SQL update')
-  await client.from('books').delete().eq('id', 11)
+  // update with .select() → representation echoes the modified rows
+  const { data: upd } = await client
+    .from('books')
+    .update({ title: 'Foundation (rev)' })
+    .eq('id', 10)
+    .select('id,title')
+  eq(upd, [{ id: 10, title: 'Foundation (rev)' }], 'SQL update representation')
+
+  // delete with .select() → representation echoes the deleted rows
+  const { data: del } = await client.from('books').delete().eq('id', 11).select('id,title')
+  eq(del, [{ id: 11, title: 'I, Robot' }], 'SQL delete representation')
+
   const { data: remaining } = await client.from('books').select('id').eq('author_id', 1)
-  eq(remaining, [{ id: 10 }], 'SQL delete')
+  eq(remaining, [{ id: 10 }], 'SQL delete actually removed the row')
 }
 
 console.log(`\n✅ ALL ${passed} assertions passed — real @supabase/postgrest-js drives OxiDB (both engines) unmodified.`)

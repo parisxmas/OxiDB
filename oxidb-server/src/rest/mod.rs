@@ -376,28 +376,28 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         match (req.method.as_str(), segments.as_slice()) {
             ("GET", ["rest", "v1", table]) => {
                 return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
-                    postgrest_sql::handle_get(sql_db, table, &req.query)
+                    postgrest_sql::handle_get(sql_db, table, req)
                 } else {
                     postgrest::handle_get(table, req, state, &auth_ctx)
                 });
             }
             ("POST", ["rest", "v1", table]) => {
                 return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
-                    postgrest_sql::handle_post(sql_db, table, &req.body)
+                    postgrest_sql::handle_post(sql_db, table, req)
                 } else {
                     postgrest::handle_post(table, req, state, &auth_ctx)
                 });
             }
             ("PATCH", ["rest", "v1", table]) => {
                 return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
-                    postgrest_sql::handle_patch(sql_db, table, &req.query, &req.body)
+                    postgrest_sql::handle_patch(sql_db, table, req)
                 } else {
                     postgrest::handle_patch(table, req, state, &auth_ctx)
                 });
             }
             ("DELETE", ["rest", "v1", table]) => {
                 return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
-                    postgrest_sql::handle_delete(sql_db, table, &req.query)
+                    postgrest_sql::handle_delete(sql_db, table, req)
                 } else {
                     postgrest::handle_delete(table, req, state, &auth_ctx)
                 });
