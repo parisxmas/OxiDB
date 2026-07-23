@@ -1,0 +1,10 @@
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_OXIBASE_URL?: string;
+  readonly VITE_OXIBASE_REF?: string;
+  readonly VITE_OXIBASE_KEY?: string;
+}
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
