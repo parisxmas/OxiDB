@@ -279,6 +279,12 @@ impl BTreeCollection {
         // mmap'd `.mfidx` format (not the `.fidx` PagedFieldIndex cache), so
         // skip the cache and rebuild them disk-backed below.
         let disk_first = storage.is_disk_first();
+        // Crash recovery replayed WAL entries into `storage` but NOT into the
+        // persisted disk indexes (`.mfidx`/`.mcidx`), which were last written
+        // before the crash. Loading them as-is would leave indexed lookups
+        // silently missing the recovered rows. When any WAL entry was applied,
+        // rebuild the disk-backed indexes from the recovered documents.
+        let needs_reindex = applied > 0;
         let doc_count = storage.count() as u64;
         let fidx_path = data_dir.join(format!("{}.fidx", name));
         let loaded_field_indexes = if !persisted_indexes.is_empty() && !disk_first {
@@ -303,11 +309,17 @@ impl BTreeCollection {
                     if disk_first {
                         let mpath = data_dir.join(format!("{}.{}.mfidx", name, field));
                         // Reopen: mmap the persisted index (instant, empty
-                        // overlay, small resident). First creation / missing
-                        // file: build into the overlay from a scan, then persist.
-                        let idx = match PagedFieldIndex::open_disk(mpath.clone()) {
-                            Ok(idx) => idx,
-                            Err(_) => {
+                        // overlay, small resident). After crash recovery
+                        // (`needs_reindex`), or on a missing/corrupt file, build
+                        // from a scan of the recovered documents and persist.
+                        let opened = if needs_reindex {
+                            None
+                        } else {
+                            PagedFieldIndex::open_disk(mpath.clone()).ok()
+                        };
+                        let idx = match opened {
+                            Some(idx) => idx,
+                            None => {
                                 let mut idx =
                                     PagedFieldIndex::new_disk(field.clone(), info.unique, mpath);
                                 storage.scan_all_while(|_id, bytes| {
@@ -361,9 +373,14 @@ impl BTreeCollection {
                     .filter(|i| i.index_type == "composite")
                 {
                     let mpath = data_dir.join(format!("{}.{}.mcidx", name, info.fields.join("_")));
-                    let idx = match CompositeIndex::open_disk(&mpath) {
-                        Ok(idx) => idx,
-                        Err(_) => {
+                    let opened = if needs_reindex {
+                        None
+                    } else {
+                        CompositeIndex::open_disk(&mpath).ok()
+                    };
+                    let idx = match opened {
+                        Some(idx) => idx,
+                        None => {
                             let mut idx = CompositeIndex::new_disk(info.fields.clone(), mpath);
                             storage.scan_all_while(|_id, bytes| {
                                 if let Ok(doc) = crate::codec::decode_doc(bytes) {
@@ -4970,6 +4987,62 @@ mod tests {
                 .find_with_options(&json!({"dept": "eng"}), &desc_by_salary)
                 .unwrap();
             assert_eq!(res[0]["salary"], 460);
+        }
+    }
+
+    /// A disk-first field index must include rows recovered from the WAL after
+    /// a crash. Regression: WAL replay restored documents into storage but the
+    /// persisted `.mfidx` (written before the crash) was loaded as-is, so
+    /// indexed lookups silently missed the recovered rows (`find`/`find_one`
+    /// returned fewer/none). The crash is simulated by `mem::forget`, which
+    /// skips the graceful index flush while the per-write-fsync'd WAL survives.
+    #[test]
+    fn disk_first_field_index_recovers_wal_rows_after_crash() {
+        let opts = FindOptions {
+            sort: None,
+            skip: None,
+            limit: None,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // Clean baseline: one row + a persisted field index on `k`.
+        {
+            let col = BTreeCollection::open("t", dir.path(), None).unwrap();
+            col.insert(json!({"k": "a"})).unwrap();
+            col.create_index("k").unwrap();
+            col.sync_writes().unwrap();
+        }
+        // Crash: insert more, then drop the handle WITHOUT a graceful flush —
+        // the new rows live only in the fsync'd WAL, not in `.mfidx`.
+        {
+            let col = BTreeCollection::open("t", dir.path(), None).unwrap();
+            col.insert(json!({"k": "a"})).unwrap();
+            col.insert(json!({"k": "a"})).unwrap();
+            col.insert(json!({"k": "b"})).unwrap();
+            std::mem::forget(col); // simulate SIGKILL
+        }
+        // Recovery: WAL replay restores all four rows, and the field index must
+        // reflect them.
+        {
+            let col = BTreeCollection::open("t", dir.path(), None).unwrap();
+            assert_eq!(
+                col.find_with_options(&json!({}), &opts).unwrap().len(),
+                4,
+                "all rows recovered from WAL"
+            );
+            assert_eq!(
+                col.find_with_options(&json!({"k": "a"}), &opts).unwrap().len(),
+                3,
+                "indexed k=a must find every recovered row"
+            );
+            assert_eq!(
+                col.find_with_options(&json!({"k": "b"}), &opts).unwrap().len(),
+                1,
+                "indexed k=b must find the recovered row"
+            );
+            assert!(
+                col.find_one(&json!({"k": "b"})).unwrap().is_some(),
+                "find_one must not silently miss a recovered row"
+            );
         }
     }
 
