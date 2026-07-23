@@ -11,7 +11,6 @@ use oxidb_http::message::{HttpRequest, HttpResponse};
 use serde_json::{Value, json};
 
 use crate::crypto::{self, Claims};
-use crate::upstream::url_encode;
 use crate::{State, now_secs, resp};
 
 const KEY_EXPIRY_SECS: u64 = 10 * 365 * 86_400;
@@ -62,7 +61,7 @@ pub fn signup(req: &HttpRequest, state: &State) -> HttpResponse {
             return resp(403, json!({ "message": "a valid invite code is required" }));
         }
     }
-    if state.upstream.count("accounts", "").unwrap_or(0) >= max_accounts() {
+    if state.upstream.count("accounts", &json!({})).unwrap_or(0) >= max_accounts() {
         return resp(403, json!({ "message": "signups are closed" }));
     }
     let (Some(email), Some(password)) = (str_field(&body, "email"), str_field(&body, "password"))
@@ -75,8 +74,7 @@ pub fn signup(req: &HttpRequest, state: &State) -> HttpResponse {
             json!({ "message": format!("password must be at least {MIN_PASSWORD_LEN} characters") }),
         );
     }
-    let filter = format!("email=eq.{}", url_encode(&email));
-    match state.upstream.find("accounts", &filter) {
+    match state.upstream.find("accounts", &json!({ "email": email })) {
         Ok(existing) if !existing.is_empty() => {
             return resp(409, json!({ "message": "email already registered" }));
         }
@@ -110,8 +108,7 @@ pub fn login(req: &HttpRequest, state: &State) -> HttpResponse {
             json!({ "message": "too many failed attempts; try again later" }),
         );
     }
-    let filter = format!("email=eq.{}", url_encode(&email));
-    let account = match state.upstream.find("accounts", &filter) {
+    let account = match state.upstream.find("accounts", &json!({ "email": email })) {
         Ok(mut a) => a.pop(),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
@@ -137,8 +134,12 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let filter = format!("owner=eq.{}", url_encode(&owner));
-    if state.upstream.count("projects", &filter).unwrap_or(0) >= max_projects() {
+    if state
+        .upstream
+        .count("projects", &json!({ "owner": owner }))
+        .unwrap_or(0)
+        >= max_projects()
+    {
         return resp(
             403,
             json!({ "message": format!("project limit reached ({})", max_projects()) }),
@@ -185,8 +186,7 @@ pub fn list_projects(req: &HttpRequest, state: &State) -> HttpResponse {
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let filter = format!("owner=eq.{}", url_encode(&owner));
-    match state.upstream.find("projects", &filter) {
+    match state.upstream.find("projects", &json!({ "owner": owner })) {
         Ok(docs) => {
             let list: Vec<Value> = docs
                 .iter()
@@ -230,8 +230,9 @@ pub fn delete_project(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     }
     let _ = state.upstream.drop_database(project_ref);
-    let filter = format!("ref=eq.{}", url_encode(project_ref));
-    let _ = state.upstream.delete("projects", &filter);
+    let _ = state
+        .upstream
+        .delete("projects", &json!({ "ref": project_ref }));
     resp(200, json!({ "deleted": project_ref }))
 }
 
@@ -250,9 +251,9 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
     let new_iat = now_secs();
     let sealed = base64::engine::general_purpose::STANDARD
         .encode(crypto::seal(&state.seal_key, new_secret.as_bytes()));
-    let filter = format!("ref=eq.{}", url_encode(project_ref));
-    let patch = json!({ "secret_enc": sealed, "key_iat": new_iat });
-    if let Err(e) = state.upstream.update("projects", &filter, &patch) {
+    let query = json!({ "ref": project_ref });
+    let patch = json!({ "$set": { "secret_enc": sealed, "key_iat": new_iat } });
+    if let Err(e) = state.upstream.update("projects", &query, &patch) {
         return resp(
             502,
             json!({ "message": format!("failed to persist rotated secret: {e}") }),
@@ -269,12 +270,8 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
 // ---------------------------------------------------------------------------
 
 fn owned_project(state: &State, project_ref: &str, owner: &str) -> Result<Option<Value>, String> {
-    let filter = format!(
-        "ref=eq.{}&owner=eq.{}",
-        url_encode(project_ref),
-        url_encode(owner)
-    );
-    Ok(state.upstream.find("projects", &filter)?.into_iter().next())
+    let query = json!({ "ref": project_ref, "owner": owner });
+    Ok(state.upstream.find("projects", &query)?.into_iter().next())
 }
 
 fn meta(doc: &Value) -> (u64, u64, String) {

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 oxidb-http = { path = "../oxidb-http" }
+oxidb-client = { path = "../oxidb-client" }
 serde_json = "1"
 base64 = "0.22"
 hmac = "0.12"

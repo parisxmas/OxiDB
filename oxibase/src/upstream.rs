@@ -1,43 +1,75 @@
-//! The control plane's client to the data plane (`oxidb-server`). OxiBase is,
-//! architecturally, just an admin client of OxiDB (ADR-0021): it provisions
-//! tenant databases with `CREATE DATABASE` and stores its own state (accounts,
-//! projects) in a normal `oxibase` database over the PostgREST surface. All
-//! calls go over `oxidb-http::client`.
+//! The control plane's client to the data plane (`oxidb-server`) — now over
+//! OxiDB's **native OxiWire protocol** (ADR-0021 follow-up), not REST. OxiBase
+//! is an admin client of OxiDB: it provisions tenant databases with the
+//! `create_database` command and stores its own accounts/projects in an
+//! `oxibase` database. A single connection is reused behind a mutex and
+//! re-dialed (with SCRAM re-auth) on error.
 
-use oxidb_http::client;
-use serde_json::{Value, json};
+use std::sync::Mutex;
 
-use crate::crypto::{Claims, encode_jwt};
+use oxidb_client::Client;
+use serde_json::Value;
 
 /// The metadata database OxiBase keeps its accounts + projects in.
 pub const META_DB: &str = "oxibase";
 
 pub struct Upstream {
-    base: String,       // e.g. http://127.0.0.1:14580
-    jwt_secret: String, // shared OXIDB_JWT_SECRET — signs the admin token
+    addr: String,
+    user: Option<String>,
+    password: Option<String>,
+    conn: Mutex<Option<Client>>,
 }
 
 impl Upstream {
-    pub fn new(base: String, jwt_secret: String) -> Self {
+    /// `addr` is the wire server `host:port`. When `user`/`password` are set,
+    /// each connection authenticates with SCRAM; otherwise it relies on the
+    /// server having auth disabled (anonymous-admin).
+    pub fn new(addr: String, user: Option<String>, password: Option<String>) -> Self {
         Self {
-            base: base.trim_end_matches('/').to_string(),
-            jwt_secret,
+            addr,
+            user,
+            password,
+            conn: Mutex::new(None),
         }
     }
 
-    /// A short-lived admin JWT for the data plane (role=admin, signed with the
-    /// shared secret).
-    fn admin_token(&self) -> String {
-        let now = crate::now_secs();
-        encode_jwt(
-            &Claims {
-                sub: "oxibase".into(),
-                role: "admin".into(),
-                iat: now,
-                exp: now + 300,
-            },
-            &self.jwt_secret,
-        )
+    fn dial(&self) -> Result<Client, String> {
+        let mut c = Client::connect(&self.addr).map_err(|e| e.to_string())?;
+        if let (Some(u), Some(p)) = (&self.user, &self.password) {
+            c.authenticate(u, p)?;
+        }
+        Ok(c)
+    }
+
+    /// Run `f` on a live connection, re-dialing once on failure.
+    fn with_client<F, R>(&self, mut f: F) -> Result<R, String>
+    where
+        F: FnMut(&mut Client) -> Result<R, String>,
+    {
+        let mut guard = self.conn.lock().unwrap();
+        let mut last = String::from("no attempt");
+        for attempt in 0..2 {
+            if guard.is_none() {
+                match self.dial() {
+                    Ok(c) => *guard = Some(c),
+                    Err(e) => {
+                        last = e;
+                        continue;
+                    }
+                }
+            }
+            match f(guard.as_mut().unwrap()) {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    *guard = None; // force a reconnect on the next attempt
+                    last = e;
+                    if attempt == 1 {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(last)
     }
 
     /// Ensure the metadata database exists (idempotent).
@@ -51,132 +83,33 @@ impl Upstream {
         })
     }
 
-    /// `CREATE DATABASE <name>` via the SQL admin surface (works without the SQL
-    /// engine — database DDL is handled by the db-admin path).
     pub fn create_database(&self, name: &str) -> Result<(), String> {
-        let url = format!("{}/api/sql", self.base);
-        let body = json!({ "sql": format!("CREATE DATABASE {name}") });
-        let resp = client::post_json(&url, Some(&self.admin_token()), body.to_string().as_bytes())
-            .map_err(|e| e.to_string())?;
-        if resp.is_success() {
-            Ok(())
-        } else {
-            Err(error_message(&resp))
-        }
+        let name = name.to_string();
+        self.with_client(move |c| c.create_database(&name))
     }
 
     pub fn drop_database(&self, name: &str) -> Result<(), String> {
-        let url = format!("{}/api/sql", self.base);
-        let body = json!({ "sql": format!("DROP DATABASE {name}") });
-        let resp = client::post_json(&url, Some(&self.admin_token()), body.to_string().as_bytes())
-            .map_err(|e| e.to_string())?;
-        if resp.is_success() {
-            Ok(())
-        } else {
-            Err(error_message(&resp))
-        }
+        let name = name.to_string();
+        self.with_client(move |c| c.drop_database(&name))
     }
 
-    /// Insert a document into `META_DB.{col}`; returns the created row.
     pub fn insert(&self, col: &str, doc: &Value) -> Result<Value, String> {
-        let url = format!("{}/rest/v1/{col}?db={META_DB}", self.base);
-        let resp = client::request(
-            "POST",
-            &url,
-            &[
-                ("Content-Type", "application/json"),
-                ("Authorization", &format!("Bearer {}", self.admin_token())),
-                ("Prefer", "return=representation"),
-            ],
-            doc.to_string().as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-        if !resp.is_success() {
-            return Err(error_message(&resp));
-        }
-        let arr: Value = serde_json::from_slice(&resp.body).map_err(|e| e.to_string())?;
-        Ok(arr
-            .as_array()
-            .and_then(|a| a.first())
-            .cloned()
-            .unwrap_or(Value::Null))
+        self.with_client(|c| c.insert(META_DB, col, doc))
     }
 
-    /// Documents in `META_DB.{col}` matching a raw PostgREST filter query
-    /// (e.g. `email=eq.a%40b.com`).
-    pub fn find(&self, col: &str, filter: &str) -> Result<Vec<Value>, String> {
-        let sep = if filter.is_empty() { "" } else { "&" };
-        let url = format!("{}/rest/v1/{col}?db={META_DB}{sep}{filter}", self.base);
-        let resp = client::get(&url, Some(&self.admin_token())).map_err(|e| e.to_string())?;
-        if !resp.is_success() {
-            return Err(error_message(&resp));
-        }
-        let arr: Value = serde_json::from_slice(&resp.body).map_err(|e| e.to_string())?;
-        Ok(arr.as_array().cloned().unwrap_or_default())
+    pub fn find(&self, col: &str, query: &Value) -> Result<Vec<Value>, String> {
+        self.with_client(|c| c.find(META_DB, col, query))
     }
 
-    pub fn count(&self, col: &str, filter: &str) -> Result<usize, String> {
-        Ok(self.find(col, filter)?.len())
+    pub fn count(&self, col: &str, query: &Value) -> Result<usize, String> {
+        Ok(self.find(col, query)?.len())
     }
 
-    /// Patch documents in `META_DB.{col}` matching `filter`.
-    pub fn update(&self, col: &str, filter: &str, patch: &Value) -> Result<(), String> {
-        let sep = if filter.is_empty() { "" } else { "&" };
-        let url = format!("{}/rest/v1/{col}?db={META_DB}{sep}{filter}", self.base);
-        let resp = client::request(
-            "PATCH",
-            &url,
-            &[
-                ("Content-Type", "application/json"),
-                ("Authorization", &format!("Bearer {}", self.admin_token())),
-            ],
-            patch.to_string().as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-        if resp.is_success() {
-            Ok(())
-        } else {
-            Err(error_message(&resp))
-        }
+    pub fn update(&self, col: &str, query: &Value, update: &Value) -> Result<(), String> {
+        self.with_client(|c| c.update(META_DB, col, query, update))
     }
 
-    pub fn delete(&self, col: &str, filter: &str) -> Result<(), String> {
-        let sep = if filter.is_empty() { "" } else { "&" };
-        let url = format!("{}/rest/v1/{col}?db={META_DB}{sep}{filter}", self.base);
-        let resp = client::request(
-            "DELETE",
-            &url,
-            &[("Authorization", &format!("Bearer {}", self.admin_token()))],
-            &[],
-        )
-        .map_err(|e| e.to_string())?;
-        if resp.is_success() {
-            Ok(())
-        } else {
-            Err(error_message(&resp))
-        }
+    pub fn delete(&self, col: &str, query: &Value) -> Result<(), String> {
+        self.with_client(|c| c.delete(META_DB, col, query))
     }
-}
-
-fn error_message(resp: &client::Response) -> String {
-    serde_json::from_slice::<Value>(&resp.body)
-        .ok()
-        .and_then(|v| {
-            v.get("message")
-                .or_else(|| v.get("error"))
-                .and_then(|m| m.as_str().map(String::from))
-        })
-        .unwrap_or_else(|| format!("upstream error (status {})", resp.status))
-}
-
-/// Percent-encode a value for a PostgREST filter (`@`, `.`, spaces, etc.).
-pub fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'~' => out.push(b as char),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
