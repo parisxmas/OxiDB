@@ -195,6 +195,18 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     let db_name = parse_query_string(&req.query)
         .get("db")
         .map(|v| url_decode(v));
+    // Reserved control-plane stores (the OxiBase `oxibase` metadata database)
+    // are never served over the data plane — return the same "not found" as any
+    // other unreachable database, without confirming it exists.
+    if let Some(name) = &db_name {
+        if crate::tenant_auth::is_reserved_db(name) {
+            return with_rest_cors(json_response(
+                404,
+                "Not Found",
+                json!({"error": format!("database not found: {name}")}),
+            ));
+        }
+    }
     let scoped_state: RestState;
     let state = match &db_name {
         None => state,

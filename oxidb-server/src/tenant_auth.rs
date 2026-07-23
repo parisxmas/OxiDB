@@ -38,6 +38,17 @@ pub fn enabled() -> bool {
     )
 }
 
+/// Whether `db` names a reserved control-plane store that must never be served
+/// over the data-plane REST surface. The `oxibase` metadata database holds
+/// developer accounts (password hashes) and projects (sealed secrets); the
+/// control plane reaches it in-process over the wire, never via `?db=`. Only
+/// reserved when the platform is active — a plain OxiDB deployment may legitimately
+/// have a user database of that name. (`_`-prefixed global stores like `_auth`
+/// are already unreachable via `get_database`.)
+pub fn is_reserved_db(db: &str) -> bool {
+    enabled() && db == META_DB
+}
+
 /// The session-signing master secret lives only in the control plane; the data
 /// plane reads it here **solely** as a fallback for the seal key on a
 /// single-host deployment where `OXIDB_SEAL_KEY` is not set separately.
