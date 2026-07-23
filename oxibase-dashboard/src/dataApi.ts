@@ -66,6 +66,36 @@ export function findRows(ref: string, col: string, key: string, limit = 100): Pr
   return call("GET", ref, `/rest/v1/${encodeURIComponent(col)}?limit=${limit}`, key);
 }
 
+// ── Indexes ─────────────────────────────────────────────────────────────────
+export interface IndexInfo {
+  name: string;
+  index_type: string;
+  fields: string[];
+  unique: boolean;
+  expire_after_seconds?: number;
+}
+
+export type IndexSpec =
+  | { type: "field"; field: string }
+  | { type: "unique"; field: string }
+  | { type: "composite"; fields: string[] }
+  | { type: "ttl"; field: string; expireAfterSeconds: number };
+
+/** Indexes defined on a collection. */
+export function listIndexes(ref: string, col: string, key: string): Promise<IndexInfo[]> {
+  return call("GET", ref, `/api/${encodeURIComponent(col)}/indexes`, key);
+}
+
+/** Create an index. Indexes are immutable — to change one, drop it and recreate. */
+export function createIndex(ref: string, col: string, key: string, spec: IndexSpec): Promise<unknown> {
+  return call("POST", ref, `/api/${encodeURIComponent(col)}/indexes`, key, spec);
+}
+
+/** Drop an index by name. */
+export function dropIndex(ref: string, col: string, key: string, name: string): Promise<unknown> {
+  return call("DELETE", ref, `/api/${encodeURIComponent(col)}/indexes/${encodeURIComponent(name)}`, key);
+}
+
 /** Insert a document, returning the created row(s). */
 export function insertRow(ref: string, col: string, key: string, doc: unknown): Promise<Row[]> {
   return call("POST", ref, `/rest/v1/${encodeURIComponent(col)}`, key, doc, {
