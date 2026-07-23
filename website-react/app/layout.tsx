@@ -2,7 +2,10 @@ import type { Metadata } from 'next'
 import Nav from '@/components/Nav'
 import Footer from '@/components/Footer'
 import CodeEnhance from '@/components/CodeEnhance'
+import siteVersion from '@/site-version.json'
 import './globals.css'
+
+const V = siteVersion.version
 
 export const metadata: Metadata = {
   title: {
@@ -20,25 +23,18 @@ export const metadata: Metadata = {
   openGraph: {
     title: 'OxiDB - Fast Multi-Model Database',
     description:
-      'MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v0.38.0.',
+      `MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Sharded routing via oxipool. Persistent Raft replication. v${V}.`,
     url: 'https://oxidb.baltavista.com',
     siteName: 'OxiDB',
     type: 'website',
-    images: [
-      {
-        url: '/og-card.png?v=0352',
-        width: 1200,
-        height: 630,
-        alt: 'OxiDB v0.38.0 — multi-model: documents, SQL, time-series, Redis, MQTT, AMQP, S3. One binary.',
-      },
-    ],
+    // og:image is generated per page from `opengraph-image.tsx` (each page's
+    // own title + description) — no hand-made static card.
   },
   twitter: {
     card: 'summary_large_image',
     title: 'OxiDB - Fast Multi-Model Database',
     description:
-      'MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v0.38.0.',
-    images: ['/og-card.png?v=0352'],
+      `MongoDB-style JSON queries. ACID transactions. AMQP + MQTT brokers, bridged. Persistent Raft replication. v${V}.`,
   },
   icons: {
     icon: '/logo.png',
