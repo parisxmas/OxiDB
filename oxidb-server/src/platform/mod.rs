@@ -27,10 +27,13 @@
 //! POST   /platform/v1/projects/{ref}/keys/rotate [platform JWT] -> fresh keys (old ones die)
 //! ```
 //!
-//! Hardening: signup enforces a minimum password length; login has a per-email
-//! brute-force lockout; projects-per-account is capped
-//! (`OXIDB_PLATFORM_MAX_PROJECTS`); per-project secrets are cached and the cache
-//! is invalidated on rotate/delete so a revoked key can never keep verifying.
+//! Hardening: signup enforces a minimum password length, a per-actor rate limit
+//! (forwarded client IP, `OXIDB_PLATFORM_SIGNUP_RATE`), an optional invite code
+//! (`OXIDB_PLATFORM_SIGNUP_CODE`), and a global account ceiling
+//! (`OXIDB_PLATFORM_MAX_ACCOUNTS`); login has a per-email brute-force lockout;
+//! projects-per-account is capped (`OXIDB_PLATFORM_MAX_PROJECTS`); per-project
+//! secrets are cached and the cache is invalidated on rotate/delete so a revoked
+//! key can never keep verifying.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -57,6 +60,8 @@ const MIN_PASSWORD_LEN: usize = 8;
 const LOGIN_MAX_FAILS: u32 = 5;
 /// How long an email stays locked out after `LOGIN_MAX_FAILS` failures.
 const LOGIN_LOCKOUT_SECS: u64 = 300;
+/// Sliding window for the signup rate limit.
+const SIGNUP_WINDOW_SECS: u64 = 60;
 
 /// Cap on projects a single account may provision — a resource-exhaustion guard
 /// for the `shared` isolation model. Overridable via `OXIDB_PLATFORM_MAX_PROJECTS`.
@@ -65,6 +70,32 @@ fn max_projects() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(100)
+}
+
+/// Hard ceiling on total developer accounts (backstop against unbounded growth
+/// even under the rate limit). Overridable via `OXIDB_PLATFORM_MAX_ACCOUNTS`.
+fn max_accounts() -> usize {
+    std::env::var("OXIDB_PLATFORM_MAX_ACCOUNTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
+}
+
+/// Signups allowed per actor per [`SIGNUP_WINDOW_SECS`]. Overridable via
+/// `OXIDB_PLATFORM_SIGNUP_RATE`.
+fn signup_rate() -> u32 {
+    std::env::var("OXIDB_PLATFORM_SIGNUP_RATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+}
+
+/// An optional invite code that gates signup. When set, a signup body must
+/// carry a matching `code`. Unset ⇒ open signup (still rate-limited + capped).
+fn signup_code() -> Option<String> {
+    std::env::var("OXIDB_PLATFORM_SIGNUP_CODE")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +231,45 @@ fn login_clear(email: &str) {
 }
 
 // ---------------------------------------------------------------------------
+// Signup abuse guard (invite code + per-actor rate limit)
+// ---------------------------------------------------------------------------
+
+fn signup_limiter() -> &'static Mutex<HashMap<String, (u32, u64)>> {
+    static L: OnceLock<Mutex<HashMap<String, (u32, u64)>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Consume one signup token for `actor` in the current window; `false` when the
+/// rate is exceeded. Behind a reverse proxy the actor is the forwarded client
+/// IP; absent that, a single global bucket still bounds a flood.
+fn signup_allowed(actor: &str) -> bool {
+    let mut m = signup_limiter().lock().unwrap();
+    let now = now_secs();
+    let entry = m.entry(actor.to_string()).or_insert((0, now));
+    if now.saturating_sub(entry.1) >= SIGNUP_WINDOW_SECS {
+        *entry = (0, now); // window rolled over
+    }
+    if entry.0 >= signup_rate() {
+        return false;
+    }
+    entry.0 += 1;
+    true
+}
+
+/// The client's address for rate-limiting. Trusts the reverse proxy's forwarded
+/// headers (this server is meant to sit behind nginx/Cloudflare), falling back
+/// to a single `global` bucket when none are present.
+fn client_ip(req: &HttpRequest) -> String {
+    req.headers
+        .get("cf-connecting-ip")
+        .or_else(|| req.headers.get("x-forwarded-for"))
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "global".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -252,6 +322,27 @@ fn handle_signup(req: &HttpRequest, mgr: &DatabaseManager) -> HttpResponse {
     let Some(pdb) = platform_db(mgr) else {
         return resp(500, json!({ "message": "control-plane store unavailable" }));
     };
+
+    // ── Abuse guards, cheapest-and-broadest first ──────────────────────
+    // 1) Per-actor rate limit (also throttles invite-code guessing below).
+    if !signup_allowed(&client_ip(req)) {
+        return resp(
+            429,
+            json!({ "message": "signup rate limit exceeded; slow down" }),
+        );
+    }
+    let body = parse_body(req).unwrap_or_else(|_| json!({}));
+    // 2) Optional invite code gate (operator-controlled private signup).
+    if let Some(code) = signup_code() {
+        if body.get("code").and_then(|v| v.as_str()) != Some(code.as_str()) {
+            return resp(403, json!({ "message": "a valid invite code is required" }));
+        }
+    }
+    // 3) Global account ceiling (backstop).
+    if pdb.count("_auth_users", &json!({})).unwrap_or(0) >= max_accounts() {
+        return resp(403, json!({ "message": "signups are closed" }));
+    }
+
     let (email, password) = match credentials(req) {
         Ok(c) => c,
         Err(r) => return r,
@@ -701,6 +792,34 @@ mod tests {
         assert!(login_locked(email), "locked after MAX fails");
         login_clear(email); // a successful login clears it
         assert!(!login_locked(email));
+    }
+
+    #[test]
+    fn signup_rate_limit_trips() {
+        let actor = "203.0.113.7";
+        // Default rate is 5/window; the 6th is rejected.
+        for _ in 0..signup_rate() {
+            assert!(signup_allowed(actor));
+        }
+        assert!(!signup_allowed(actor), "over the rate → blocked");
+    }
+
+    #[test]
+    fn client_ip_prefers_forwarded_headers() {
+        let mut req = HttpRequest {
+            method: "POST".into(),
+            path: "/platform/v1/signup".into(),
+            query: String::new(),
+            headers: std::collections::HashMap::new(),
+            body: Vec::new(),
+        };
+        assert_eq!(client_ip(&req), "global");
+        req.headers
+            .insert("x-forwarded-for".into(), "198.51.100.9, 10.0.0.1".into());
+        assert_eq!(client_ip(&req), "198.51.100.9");
+        req.headers
+            .insert("cf-connecting-ip".into(), "198.51.100.42".into());
+        assert_eq!(client_ip(&req), "198.51.100.42", "CF header wins");
     }
 
     #[test]
