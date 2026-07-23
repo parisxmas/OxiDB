@@ -1780,6 +1780,10 @@ fn main() {
         .parse()
         .expect("OXIDB_HTTP_PORT must be a valid u16");
 
+    // Arm the process-global GELF logger (OXIDB_GELF_ADDR) so the REST layer
+    // logs every request. Idempotent + a no-op when GELF is unset.
+    oxidb_server::gelf::init_global();
+
     if http_port > 0 {
         let http_addr = format!("0.0.0.0:{http_port}");
         let http_db = Arc::clone(&state.db);

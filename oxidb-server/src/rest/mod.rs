@@ -165,7 +165,28 @@ fn handle_connection(mut stream: TcpStream, state: &RestState) {
             .get("connection")
             .is_some_and(|v| v.eq_ignore_ascii_case("close"));
 
+        let start = std::time::Instant::now();
         let resp = route_request(&req, state);
+        if crate::gelf::enabled() {
+            let ms = start.elapsed().as_millis().to_string();
+            let status = resp.status.to_string();
+            let level = match resp.status {
+                s if s >= 500 => crate::gelf::GelfLevel::Error,
+                s if s >= 400 => crate::gelf::GelfLevel::Warning,
+                _ => crate::gelf::GelfLevel::Informational,
+            };
+            crate::gelf::log(
+                level,
+                &format!("{} {}", req.method, req.path),
+                &[
+                    ("app", "oxidb-server"),
+                    ("method", req.method.as_str()),
+                    ("path", req.path.as_str()),
+                    ("status", status.as_str()),
+                    ("ms", ms.as_str()),
+                ],
+            );
+        }
         resp.write_to_keepalive(&mut stream, !wants_close);
 
         if wants_close {

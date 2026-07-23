@@ -67,3 +67,35 @@ impl GelfLogger {
         let _ = self.socket.send(payload.as_bytes());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Process-global logger — lets any subsystem (REST, wire) emit without
+// threading a handle through every state struct. Off (zero cost) unless
+// `OXIDB_GELF_ADDR` is set.
+// ---------------------------------------------------------------------------
+
+use std::sync::OnceLock;
+
+static GLOBAL: OnceLock<Option<GelfLogger>> = OnceLock::new();
+
+/// Initialize the global GELF logger from `OXIDB_GELF_ADDR` (idempotent).
+pub fn init_global() {
+    GLOBAL.get_or_init(|| {
+        std::env::var("OXIDB_GELF_ADDR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|addr| GelfLogger::new(&addr).ok())
+    });
+}
+
+/// Emit via the global logger. No-op when GELF is disabled.
+pub fn log(level: GelfLevel, short_message: &str, extra: &[(&str, &str)]) {
+    if let Some(Some(g)) = GLOBAL.get() {
+        g.send(level, short_message, extra);
+    }
+}
+
+/// `true` when a global logger is active — lets callers skip building fields.
+pub fn enabled() -> bool {
+    matches!(GLOBAL.get(), Some(Some(_)))
+}

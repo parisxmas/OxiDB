@@ -17,6 +17,7 @@
 //! plus the reused guard knobs `OXIDB_PLATFORM_SIGNUP_RATE/_CODE/MAX_ACCOUNTS/MAX_PROJECTS`.
 
 mod crypto;
+mod gelf;
 mod handlers;
 mod upstream;
 
@@ -70,8 +71,37 @@ fn main() {
         seal_key: crypto::derive_key(&seal_material),
     });
 
+    gelf::init(); // arm GELF (OXIDB_GELF_ADDR) — logs every request; no-op if unset
     eprintln!("[oxibase] control plane on {addr} → data plane {upstream_addr}");
-    let handler = move |req: &HttpRequest| route(req, &state);
+    let handler = move |req: &HttpRequest| {
+        let start = SystemTime::now();
+        let resp = route(req, &state);
+        if gelf::enabled() {
+            let ms = start
+                .elapsed()
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+                .to_string();
+            let status = resp.status.to_string();
+            let level = match resp.status {
+                s if s >= 500 => gelf::Level::Error,
+                s if s >= 400 => gelf::Level::Warning,
+                _ => gelf::Level::Info,
+            };
+            gelf::log(
+                level,
+                &format!("{} {}", req.method, req.path),
+                &[
+                    ("app", "oxibase"),
+                    ("method", req.method.as_str()),
+                    ("path", req.path.as_str()),
+                    ("status", status.as_str()),
+                    ("ms", ms.as_str()),
+                ],
+            );
+        }
+        resp
+    };
     if let Err(e) = oxidb_http::server::serve(&addr, 8, 256, handler) {
         eprintln!("[oxibase] FATAL: failed to bind {addr}: {e}");
         std::process::exit(1);

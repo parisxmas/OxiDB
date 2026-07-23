@@ -26,6 +26,10 @@ services:
       OXIDB_DATA: "/data"
       OXIDB_JWT_SECRET: "${OXIDB_JWT_SECRET}"   # guards the default-db / native path
       OXIDB_PGRST_MAX_ROWS: "${OXIDB_PGRST_MAX_ROWS:-1000}"
+      # GELF: ingest port (stores messages in the default db's _gelf_logs) +
+      # self-emit a message per REST request. Empty = off.
+      OXIDB_GELF_PORT: "${OXIDB_GELF_PORT:-}"
+      OXIDB_GELF_ADDR: "${OXIDB_GELF_SELF:-}"
     volumes:
       - oxidb-data:/data
     restart: unless-stopped
@@ -53,6 +57,9 @@ services:
       OXIDB_PROJECT_MAX_DOCUMENTS: "${OXIDB_PROJECT_MAX_DOCUMENTS:-10000}"
       # Google OAuth Web client ID — developer console sign-in (public value).
       OXIBASE_GOOGLE_CLIENT_ID: "${OXIBASE_GOOGLE_CLIENT_ID:-}"
+      # GELF: emit a message per control-plane request to the data plane's GELF
+      # port (e.g. data-plane:12201). Empty = off.
+      OXIDB_GELF_ADDR: "${OXIBASE_GELF_ADDR:-}"
     depends_on:
       - data-plane
     restart: unless-stopped
