@@ -368,8 +368,17 @@ pub fn run_query(series: &BTreeMap<SeriesKey, Series>, spec: &QuerySpec) -> Vec<
             tags: spec.group_tags.iter().cloned().zip(gvals).collect(),
             points: buckets
                 .into_iter()
-                .map(|(ts, acc)| GroupPoint {
-                    ts,
+                .map(|(bucket_ts, acc)| GroupPoint {
+                    // With an interval, the bucket key IS the real bucket-start
+                    // timestamp. Without one, every point lands in a single
+                    // synthetic bucket keyed by `spec.start` — which is usually an
+                    // unbounded default (`i64::MIN/2`) — so timestamp the
+                    // whole-range aggregate at its earliest actual point instead
+                    // of leaking that sentinel.
+                    ts: match spec.interval {
+                        Some(iv) if iv > 0 => bucket_ts,
+                        _ => acc.first_ts,
+                    },
                     value: acc.value(spec.agg),
                 })
                 .collect(),

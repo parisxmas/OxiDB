@@ -34,6 +34,8 @@ const ok = (c, m) => { if (c) { pass++; console.log("  ✓", m); } else { consol
   ok(!w.error, `TSDB write via .schema('tsdb') (${w.error?.message ?? ""})`);
   const { data, error } = await oxibase.schema("tsdb").from("cpu").select("usage").eq("host", "a");
   ok(!error && Array.isArray(data) && data.length >= 1, "TSDB read via .schema('tsdb') returns points");
+  ok(data?.[0]?.ts === ts, `TSDB point carries the real ts (got ${data?.[0]?.ts}, want ${ts})`);
+  ok(data?.[0]?.value === 0.5, "TSDB point carries the field value");
   console.log("    tsdb row:", JSON.stringify(data?.[0]));
 }
 
