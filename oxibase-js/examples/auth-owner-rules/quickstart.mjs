@@ -55,13 +55,15 @@ async function main() {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${SERVICE}` },
     body: JSON.stringify({
-      read: "auth.role == 'authenticated'",
+      // Row-level read: each user sees ONLY the rows they own — enforced by the
+      // server, no client filter needed.
+      read: "auth.username == doc.owner",
       create: "auth.username == newDoc.owner",
       update: "auth.username == doc.owner",
       delete: "auth.username == doc.owner",
     }),
   });
-  ok(rulesRes.ok, "rules installed (read: signed-in only; write: owner-only)");
+  ok(rulesRes.ok, "rules installed (read + write: owner-only, row-level)");
 
   // ── 2. Two end-users sign up against the PROJECT ────────────────────────────
   log("2. Alice and Bob sign up (project end-users)");
@@ -83,12 +85,12 @@ async function main() {
   ok(!(await bob.from(TASKS).insert({ title: "Ship release", owner: bobm, done: false })).error,
     "bob creates his own task");
 
-  // ── 4. Reads: signed-in users read the board; app scopes to "my tasks" ──────
-  log("4. Read the board, scoped per user");
-  const aTasks = (await alice.from(TASKS).select("title").eq("owner", alicem)).data ?? [];
-  const bTasks = (await bob.from(TASKS).select("title").eq("owner", bobm)).data ?? [];
-  ok(aTasks.length === 2, `alice sees her 2 tasks`);
-  ok(bTasks.length === 1, `bob sees his 1 task`);
+  // ── 4. Row-level reads: a plain select returns ONLY the caller's own rows ───
+  log("4. Read the board — the server filters each row (no client filter)");
+  const aTasks = (await alice.from(TASKS).select("title")).data ?? []; // no .eq!
+  const bTasks = (await bob.from(TASKS).select("title")).data ?? [];
+  ok(aTasks.length === 2, `alice's plain select returns only her 2 tasks`);
+  ok(bTasks.length === 1, `bob's plain select returns only his 1 task`);
 
   // ── 5. Writes are owner-scoped by the rules ─────────────────────────────────
   log("5. Cross-user writes are denied by the rules");
@@ -101,16 +103,16 @@ async function main() {
   ok(!(await bob.from(TASKS).delete().eq("title", "Ship release")).error,
     "bob deletes his OWN task");
 
-  // ── 6. The anon key (not a signed-in user) is shut out of the board ─────────
-  log("6. The anon key cannot read the signed-in-only board");
+  // ── 6. The anon key owns nothing, so it sees nothing ────────────────────────
+  log("6. The anon key sees no rows (owns none)");
   const anon = createClient(DATA, ANON, { ref: REF }); // never calls .auth
-  ok(!!(await anon.from(TASKS).select("*")).error, "anon key → denied (read rule needs 'authenticated')");
+  ok(((await anon.from(TASKS).select("*")).data ?? []).length === 0, "anon key → 0 rows");
 
   // ── 7. signOut reverts to the anon key ──────────────────────────────────────
   log("7. signOut reverts the session");
   alice.auth.signOut();
   ok(alice.auth.getSession() === null, "alice signed out");
-  ok(!!(await alice.from(TASKS).select("*")).error, "…and now reads as the anon key → denied");
+  ok(((await alice.from(TASKS).select("*")).data ?? []).length === 0, "…and now reads as the anon key → 0 rows");
 
   // ── 8. Cleanup (service_role bypasses rules) ────────────────────────────────
   log("8. Cleanup");

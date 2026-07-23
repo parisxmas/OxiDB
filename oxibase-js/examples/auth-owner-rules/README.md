@@ -22,7 +22,7 @@ Rules (installed once by the operator with the service_role key):
 
 | op | rule | effect |
 | --- | --- | --- |
-| read | `auth.role == 'authenticated'` | only signed-in users (not the anon key) |
+| read | `auth.username == doc.owner` | **row-level**: a plain `select` returns only the caller's own rows (the server filters each row) |
 | create | `auth.username == newDoc.owner` | may only create rows they own |
 | update | `auth.username == doc.owner` | may only edit their own (per row) |
 | delete | `auth.username == doc.owner` | may only delete their own (per row) |
@@ -61,8 +61,11 @@ await oxibase.from("tasks").insert({ title, owner: email });
 oxibase.auth.signOut();                              // back to the anon key
 ```
 
-## Scope note
+## Row-level reads
 
-Row-level **read** filtering ("see only my rows" on `select`) is done by the app
-(`.eq("owner", me)`): read rules are evaluated at the collection level. Owner-only
-**writes** (create/update/delete) are enforced per-row by the rules themselves.
+When a read rule references the row (`doc.<field>`), the server evaluates it
+**per returned row** and drops the ones the caller can't see — so a plain
+`select("*")` returns only the caller's own rows, no client filter needed (true
+RLS). Row-independent read rules (`true`, `auth.role == 'authenticated'`) are a
+one-shot collection gate as before. Note: per-row filtering paginates the
+visible set after fetching, bounded by `OXIDB_PGRST_MAX_ROWS`.

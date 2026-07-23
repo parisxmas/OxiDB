@@ -99,8 +99,9 @@ pub(super) fn handle_get(
     state: &RestState,
     auth: &AuthContext,
 ) -> HttpResponse {
-    if let Err(e) = rules::check_access(&state.db, col, Operation::Read, auth, None, None) {
-        return access_denied(e);
+    let read = rules::read_access(&state.db, col, auth);
+    if matches!(read, rules::ReadAccess::None) {
+        return access_denied(format!("access denied: read on '{col}' not allowed"));
     }
     let parsed = match parse(&req.query) {
         Ok(p) => p,
@@ -108,17 +109,35 @@ pub(super) fn handle_get(
     };
 
     let cap = max_rows();
-    let limit = Some(parsed.mods.limit.map_or(cap, |l| l.min(cap)));
+    // When the read rule filters per row, fetch the sorted candidate set and
+    // paginate AFTER filtering, so skip/limit apply to the rows the user can
+    // actually see (capped at max_rows). Otherwise let the engine paginate.
+    let filtering = matches!(read, rules::ReadAccess::Filter(_));
     let opts = FindOptions {
         sort: parsed.mods.order.clone(),
-        skip: parsed.mods.offset,
-        limit,
+        skip: if filtering { None } else { parsed.mods.offset },
+        limit: Some(if filtering {
+            cap
+        } else {
+            parsed.mods.limit.map_or(cap, |l| l.min(cap))
+        }),
     };
 
-    let docs = match state.db.find_with_options(col, &parsed.query, &opts) {
+    let mut docs = match state.db.find_with_options(col, &parsed.query, &opts) {
         Ok(d) => d,
         Err(_) => return err(500, "database error"),
     };
+    if let rules::ReadAccess::Filter(expr) = &read {
+        docs.retain(|d| rules::row_visible(expr, auth, d));
+        let off = parsed.mods.offset.unwrap_or(0) as usize;
+        let lim = parsed
+            .mods
+            .limit
+            .map(|l| l as usize)
+            .unwrap_or(cap as usize)
+            .min(cap as usize);
+        docs = docs.into_iter().skip(off).take(lim).collect();
+    }
     // Projection + resource embedding (Phase 2). Embeds pull related documents
     // from other collections and nest them, mapping PostgREST's `select=*,rel(…)`
     // onto a `$lookup`-style stitch.

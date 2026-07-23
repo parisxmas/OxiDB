@@ -219,6 +219,52 @@ pub fn check_access(
     }
 }
 
+/// The outcome of a read check that supports **row-level** filtering.
+pub enum ReadAccess {
+    /// Allowed with no per-row filtering (no rule, or a row-independent rule
+    /// that passed).
+    All,
+    /// Denied entirely (a row-independent rule that failed).
+    None,
+    /// Allowed, but each returned row must pass this rule expression.
+    Filter(String),
+}
+
+/// Decide read access for `collection`, enabling **row-level** filtering when
+/// the read rule references `doc.<field>` (true RLS: a user sees only the rows
+/// the rule admits). System collections and service_role/admin bypass; a
+/// collection with no rules is fully readable.
+pub fn read_access(db: &OxiDb, collection: &str, auth: &AuthContext) -> ReadAccess {
+    if collection.starts_with('_') {
+        return ReadAccess::All;
+    }
+    if matches!(
+        auth.role.as_deref().and_then(crate::auth::Role::from_str),
+        Some(crate::auth::Role::Admin)
+    ) {
+        return ReadAccess::All;
+    }
+    let rules = match get_rules(db, collection) {
+        Some(r) => r,
+        None => return ReadAccess::All, // no rules → reads stay open
+    };
+    let expr = rules.read.trim();
+    // A rule that references the row (`doc.<field>`) is evaluated per returned
+    // row; a row-independent rule is a one-shot collection gate.
+    if expr.contains("doc.") {
+        ReadAccess::Filter(expr.to_string())
+    } else if eval_rule_expr(expr, auth, None, None) {
+        ReadAccess::All
+    } else {
+        ReadAccess::None
+    }
+}
+
+/// Whether one row is visible under a read rule (the per-row RLS check).
+pub fn row_visible(rule: &str, auth: &AuthContext, row: &Value) -> bool {
+    eval_rule_expr(rule, auth, Some(row), None)
+}
+
 /// Evaluate a rule expression string. Returns true if access is granted.
 fn eval_rule_expr(
     expr: &str,
@@ -570,6 +616,40 @@ mod tests {
         let db = oxidb::OxiDb::open_in_memory().unwrap();
         let result = check_access(&db, "any_collection", Operation::Read, &anon(), None, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn read_access_filters_per_row() {
+        let db = oxidb::OxiDb::open_in_memory().unwrap();
+        // A row-dependent read rule → per-row Filter.
+        set_rules(
+            &db,
+            "tasks",
+            &json!({ "read": "auth.username == doc.owner", "create": "true", "update": "true", "delete": "true" }),
+        )
+        .unwrap();
+        let alice = AuthContext::from_claims("alice", "authenticated");
+        match read_access(&db, "tasks", &alice) {
+            ReadAccess::Filter(expr) => {
+                assert!(row_visible(&expr, &alice, &json!({ "owner": "alice", "t": 1 })));
+                assert!(!row_visible(&expr, &alice, &json!({ "owner": "bob", "t": 2 })));
+            }
+            _ => panic!("row-dependent read rule must yield a per-row Filter"),
+        }
+
+        // A row-independent rule is a one-shot gate.
+        set_rules(
+            &db,
+            "board",
+            &json!({ "read": "auth.role == 'authenticated'", "create": "true", "update": "true", "delete": "true" }),
+        )
+        .unwrap();
+        assert!(matches!(read_access(&db, "board", &alice), ReadAccess::All));
+        assert!(matches!(read_access(&db, "board", &anon()), ReadAccess::None));
+
+        // No rules → All; admin bypasses → All.
+        assert!(matches!(read_access(&db, "open", &anon()), ReadAccess::All));
+        assert!(matches!(read_access(&db, "tasks", &admin_auth()), ReadAccess::All));
     }
 
     #[test]

@@ -884,10 +884,18 @@ fn handle_find_with_rules(
     state: &RestState,
     auth: &AuthContext,
 ) -> Result<Value, (u16, &'static str)> {
-    // Check read access (without specific doc — collection-level check)
-    rules::check_access(&state.db, col, Operation::Read, auth, None, None)
-        .map_err(|_| (403, "access denied"))?;
-    handle_find(col, req, state)
+    // Read access, with per-row filtering when the rule references the row.
+    match rules::read_access(&state.db, col, auth) {
+        rules::ReadAccess::None => Err((403, "access denied")),
+        rules::ReadAccess::All => handle_find(col, req, state),
+        rules::ReadAccess::Filter(expr) => {
+            let mut v = handle_find(col, req, state)?;
+            if let Value::Array(arr) = &mut v {
+                arr.retain(|d| rules::row_visible(&expr, auth, d));
+            }
+            Ok(v)
+        }
+    }
 }
 
 fn handle_update_with_rules(
