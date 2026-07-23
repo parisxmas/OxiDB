@@ -48,4 +48,5 @@ Don't rewrite an old ADR — write a new one that references it
 | [0016](0016-amqp-protocol.md) | AMQP 0-9-1 (RabbitMQ protocol) on the shared broker substrate | Accepted |
 | [0017](0017-mvcc-lite-read-snapshots.md) | MVCC-lite — read snapshots for the document engine | Accepted |
 | [0018](0018-offset-index-memory.md) | Shrinking the disk-first offset index (packed DocLocation + fenced mmap index) | Accepted (Phase 1); Phase 2 Proposed |
-| [0019](0019-postgrest-rest-surface.md) | PostgREST-compatible auto-REST surface for the document engine | Accepted (Phase 1); Phase 2 Proposed |
+| [0019](0019-postgrest-rest-surface.md) | PostgREST-compatible auto-REST surface (document + SQL + TSDB engines) | Accepted (all phases landed) |
+| [0020](0020-oxibase-control-plane.md) | OxiBase — a control plane for multi-tenant provisioning | Proposed |
