@@ -457,6 +457,10 @@ pub struct OxiDb {
     /// database may hold. `0` = unlimited (the default). Set per-instance by the
     /// `DatabaseManager` for tenant databases; infrastructure databases stay 0.
     max_collections: AtomicUsize,
+    /// Max total number of documents across all *user* collections. `0` =
+    /// unlimited (the default). Enforced on the insert path; only tenant
+    /// databases arm it, so normal/embedded use pays nothing.
+    max_documents: AtomicUsize,
     in_memory: bool,
     /// Serializes the OCC commit critical section (version validation
     /// through apply). Without it, two transactions that both read a
@@ -605,6 +609,7 @@ impl OxiDb {
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             max_collections: AtomicUsize::new(0),
+            max_documents: AtomicUsize::new(0),
             in_memory: true,
             commit_lock: RwLock::new(()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -639,6 +644,7 @@ impl OxiDb {
             lazy_sync: AtomicBool::new(false),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             max_collections: AtomicUsize::new(0),
+            max_documents: AtomicUsize::new(0),
             in_memory: true,
             commit_lock: RwLock::new(()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -800,6 +806,7 @@ impl OxiDb {
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
             max_collections: AtomicUsize::new(0),
+            max_documents: AtomicUsize::new(0),
             in_memory: false,
             commit_lock: RwLock::new(()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -1456,6 +1463,45 @@ impl OxiDb {
         self.max_collections.load(Ordering::Acquire)
     }
 
+    /// Cap the total number of documents across all *user* collections.
+    /// `0` = unlimited.
+    pub fn set_max_documents(&self, max: usize) {
+        self.max_documents.store(max, Ordering::Release);
+    }
+
+    /// Returns the configured total-document cap (`0` = unlimited).
+    pub fn max_documents(&self) -> usize {
+        self.max_documents.load(Ordering::Acquire)
+    }
+
+    /// Total documents across all user collections (system `_` collections
+    /// excluded). Used to enforce the per-database document quota; bounded work
+    /// because the collection cap bounds how many collections exist.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn total_user_documents(&self) -> usize {
+        self.list_collections()
+            .iter()
+            .filter(|c| !c.starts_with('_'))
+            .map(|c| self.count(c, &json!({})).unwrap_or(0) as usize)
+            .sum()
+    }
+
+    /// Reject an insert of `adding` documents into `collection` when it would
+    /// push the database past its document cap. No-op when the cap is 0
+    /// (unlimited) or the target is a system collection (leading `_`), so engine
+    /// bookkeeping is never blocked by a tenant quota.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn enforce_document_limit(&self, collection: &str, adding: usize) -> Result<()> {
+        let max = self.max_documents.load(Ordering::Acquire);
+        if max == 0 || collection.starts_with('_') {
+            return Ok(());
+        }
+        if self.total_user_documents() + adding > max {
+            return Err(Error::DocumentLimitExceeded(max));
+        }
+        Ok(())
+    }
+
     /// Reject creating a *new* user collection when the cap is reached. Loading a
     /// collection that already exists (in memory or on disk) and any system
     /// collection (leading `_`) are always allowed, so quotas never lock a
@@ -1569,6 +1615,8 @@ impl OxiDb {
 
     pub fn insert(&self, collection: &str, doc: Value) -> Result<DocumentId> {
         let col = self.get_or_create_collection(collection)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.enforce_document_limit(collection, 1)?;
         let emit = self.change_broker.has_subscribers();
         let doc_clone = if emit { Some(doc.clone()) } else { None };
         // Shared commit lock (see update()): also the MVCC-lite snapshot
@@ -1599,6 +1647,8 @@ impl OxiDb {
         }
 
         let col = self.get_or_create_collection(collection)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.enforce_document_limit(collection, docs.len())?;
         let emit = self.change_broker.has_subscribers();
         // Shared commit lock — see insert(); also the snapshot boundary.
         let _occ_guard = self.commit_lock.read();
@@ -3964,6 +4014,25 @@ mod tests {
         // Raising the cap lets a new one through.
         db.set_max_collections(3);
         db.insert("c", json!({"x": 1})).unwrap();
+    }
+
+    #[test]
+    fn max_documents_caps_total_inserts() {
+        let db = temp_db();
+        db.set_max_documents(3);
+        db.insert("a", json!({"x": 1})).unwrap();
+        db.insert("b", json!({"x": 2})).unwrap(); // different collection, same quota
+        db.insert("a", json!({"x": 3})).unwrap();
+        // 4th document (across any collection) is rejected.
+        let e = db.insert("a", json!({"x": 4})).unwrap_err();
+        assert!(matches!(e, Error::DocumentLimitExceeded(3)));
+        // insert_many respects the remaining headroom too.
+        db.set_max_documents(5);
+        let e2 = db.insert_many("c", vec![json!({}), json!({}), json!({})]).unwrap_err();
+        assert!(matches!(e2, Error::DocumentLimitExceeded(5))); // 3 existing + 3 > 5
+        db.insert_many("c", vec![json!({}), json!({})]).unwrap(); // 3 + 2 = 5 ok
+        // System collections don't count against the quota.
+        db.insert("_meta", json!({"x": 1})).unwrap();
     }
 
     #[test]

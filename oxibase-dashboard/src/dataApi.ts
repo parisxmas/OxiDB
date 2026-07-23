@@ -61,6 +61,19 @@ export async function listCollections(ref: string, key: string): Promise<string[
   return (d.collections ?? []).filter((c) => !isSystemCollection(c));
 }
 
+/** Total documents across all (non-system) collections. */
+export async function countDocuments(ref: string, key: string): Promise<number> {
+  const cols = await listCollections(ref, key);
+  const counts = await Promise.all(
+    cols.map((c) =>
+      call<{ count: number }>("GET", ref, `/api/${encodeURIComponent(c)}/count`, key)
+        .then((r) => r.count ?? 0)
+        .catch(() => 0),
+    ),
+  );
+  return counts.reduce((a, b) => a + b, 0);
+}
+
 /** First `limit` rows of a collection. */
 export function findRows(ref: string, col: string, key: string, limit = 100): Promise<Row[]> {
   return call("GET", ref, `/rest/v1/${encodeURIComponent(col)}?limit=${limit}`, key);

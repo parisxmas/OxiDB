@@ -69,36 +69,36 @@ pub fn resolve_tenant(mgr: &DatabaseManager, segment: &str) -> Option<String> {
 /// plane owns the real numbers per plan; these are only the floor the data plane
 /// falls back to. Overridable via `OXIDB_PROJECT_DEFAULT_MAX_COLLECTIONS` /
 /// `OXIDB_PROJECT_DEFAULT_MAX_TABLES` (0 = unlimited).
-fn default_limit(env_key: &str) -> usize {
+fn default_limit(env_key: &str, fallback: usize) -> usize {
     std::env::var(env_key)
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(5)
+        .unwrap_or(fallback)
 }
 
-/// Per-project resource caps `(max_collections, max_tables)` for `db_ref`. The
-/// control plane writes `max_collections`/`max_tables` onto each project row
-/// (plan-based); the data plane reads them here and enforces at creation time —
-/// the only place it can, since collections/tables are created straight against
-/// the data plane and never pass through the control plane. `None` for the
-/// metadata db, an unknown ref, or when the platform is off (no quotas then).
-pub fn project_limits(mgr: &DatabaseManager, db_ref: &str) -> Option<(usize, usize)> {
+/// Per-project resource caps `(max_collections, max_tables, max_documents)` for
+/// `db_ref`. The control plane writes them onto each project row (plan-based);
+/// the data plane reads them here and enforces at creation/insert time — the
+/// only place it can, since collections/tables/documents are created straight
+/// against the data plane and never pass through the control plane. `None` for
+/// the metadata db, an unknown ref, or when the platform is off (no quotas).
+pub fn project_limits(mgr: &DatabaseManager, db_ref: &str) -> Option<(usize, usize, usize)> {
     if !enabled() || db_ref == META_DB {
         return None;
     }
     let pdb = mgr.get_database(META_DB).ok()?;
     let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
-    let mc = doc
-        .get("max_collections")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(|| default_limit("OXIDB_PROJECT_DEFAULT_MAX_COLLECTIONS"));
-    let mt = doc
-        .get("max_tables")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as usize)
-        .unwrap_or_else(|| default_limit("OXIDB_PROJECT_DEFAULT_MAX_TABLES"));
-    Some((mc, mt))
+    let field = |key: &str, default_env: &str, fallback: usize| {
+        doc.get(key)
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or_else(|| default_limit(default_env, fallback))
+    };
+    Some((
+        field("max_collections", "OXIDB_PROJECT_DEFAULT_MAX_COLLECTIONS", 5),
+        field("max_tables", "OXIDB_PROJECT_DEFAULT_MAX_TABLES", 5),
+        field("max_documents", "OXIDB_PROJECT_DEFAULT_MAX_DOCUMENTS", 10_000),
+    ))
 }
 
 /// The per-project ES256 **public** key (SEC1 uncompressed, 65 bytes) for

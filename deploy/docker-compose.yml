@@ -50,6 +50,7 @@ services:
       # The data plane reads these off the project row and enforces them.
       OXIDB_PROJECT_MAX_COLLECTIONS: "${OXIDB_PROJECT_MAX_COLLECTIONS:-5}"
       OXIDB_PROJECT_MAX_TABLES: "${OXIDB_PROJECT_MAX_TABLES:-5}"
+      OXIDB_PROJECT_MAX_DOCUMENTS: "${OXIDB_PROJECT_MAX_DOCUMENTS:-10000}"
       # Google OAuth Web client ID — developer console sign-in (public value).
       OXIBASE_GOOGLE_CLIENT_ID: "${OXIBASE_GOOGLE_CLIENT_ID:-}"
     depends_on:

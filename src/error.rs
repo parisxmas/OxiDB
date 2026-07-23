@@ -20,6 +20,9 @@ pub enum Error {
     #[error("collection limit reached ({0}) — cannot create another collection")]
     CollectionLimitExceeded(usize),
 
+    #[error("document limit reached ({0}) — cannot insert more documents")]
+    DocumentLimitExceeded(usize),
+
     #[error("index already exists: {0}")]
     IndexAlreadyExists(String),
 

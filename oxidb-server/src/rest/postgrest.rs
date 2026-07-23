@@ -191,9 +191,12 @@ pub(super) fn handle_post(
 
     let ids = match state.db.insert_many(col, docs) {
         Ok(ids) => ids,
-        // The tenant's per-project collection cap → 403, not a generic 500.
+        // The tenant's per-project caps → 403, not a generic 500.
         Err(oxidb::Error::CollectionLimitExceeded(_)) => {
             return err(403, "collection limit reached for this project");
+        }
+        Err(oxidb::Error::DocumentLimitExceeded(_)) => {
+            return err(403, "document limit reached for this project");
         }
         Err(_) => return err(500, "database error"),
     };

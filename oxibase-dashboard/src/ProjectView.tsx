@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { type Project, getProject, updateProjectLimits } from "./api.ts";
-import { listCollections, runSql } from "./dataApi.ts";
+import { listCollections, runSql, countDocuments } from "./dataApi.ts";
 import { DataBrowser } from "./DataBrowser.tsx";
 import { SqlTables } from "./SqlTables.tsx";
 import { SqlRunner } from "./SqlRunner.tsx";
@@ -85,22 +85,26 @@ function Quota({
 }) {
   const [cols, setCols] = useState<number | null>(null);
   const [tables, setTables] = useState<number | null>(null);
+  const [docs, setDocs] = useState<number | null>(null);
   const [editing, setEditing] = useState(false);
   const [mc, setMc] = useState(String(project.max_collections ?? 5));
   const [mt, setMt] = useState(String(project.max_tables ?? 5));
+  const [mdoc, setMdoc] = useState(String(project.max_documents ?? 10000));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const count = useCallback(async () => {
     try {
-      const [c, t] = await Promise.all([
+      const [c, t, d] = await Promise.all([
         listCollections(project.ref, apiKey).then((l) => l.length),
         runSql(project.ref, apiKey, "SHOW TABLES")
           .then((r) => r[0]?.rows?.length ?? 0)
           .catch(() => 0), // SQL engine may be off
+        countDocuments(project.ref, apiKey).catch(() => 0),
       ]);
       setCols(c);
       setTables(t);
+      setDocs(d);
     } catch {
       /* counts are best-effort */
     }
@@ -113,7 +117,8 @@ function Quota({
   useEffect(() => {
     setMc(String(project.max_collections ?? 5));
     setMt(String(project.max_tables ?? 5));
-  }, [project.max_collections, project.max_tables]);
+    setMdoc(String(project.max_documents ?? 10000));
+  }, [project.max_collections, project.max_tables, project.max_documents]);
 
   async function save() {
     setBusy(true);
@@ -122,6 +127,7 @@ function Quota({
       const updated = await updateProjectLimits(project.ref, {
         max_collections: Number(mc),
         max_tables: Number(mt),
+        max_documents: Number(mdoc),
       });
       onChange({ ...project, ...updated });
       setEditing(false);
@@ -177,6 +183,10 @@ function Quota({
             Max SQL tables
             <input type="number" min={0} value={mt} onChange={(e) => setMt(e.target.value)} style={{ width: 120 }} />
           </label>
+          <label className="small" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            Max documents
+            <input type="number" min={0} value={mdoc} onChange={(e) => setMdoc(e.target.value)} style={{ width: 120 }} />
+          </label>
           <button className="primary small" disabled={busy} onClick={save}>
             Save
           </button>
@@ -186,6 +196,7 @@ function Quota({
         <div className="row" style={{ gap: 20, flexWrap: "wrap" }}>
           {meter("Collections", cols, project.max_collections)}
           {meter("SQL tables", tables, project.max_tables)}
+          {meter("Documents", docs, project.max_documents)}
         </div>
       )}
       {err && <div className="error small" style={{ marginTop: 8 }}>{err}</div>}

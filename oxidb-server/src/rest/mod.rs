@@ -277,10 +277,11 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
                     // (owned by the control plane, read from the project row).
                     // The engine then rejects a new collection past the cap on
                     // every path; refreshing it per request reflects plan changes.
-                    if let Some((max_collections, _max_tables)) =
+                    if let Some((max_collections, _max_tables, max_documents)) =
                         crate::tenant_auth::project_limits(mgr, name)
                     {
                         db.set_max_collections(max_collections);
+                        db.set_max_documents(max_documents);
                     }
                     // `active` belongs to the listener's shared state; this
                     // per-request scope only redirects `db`.
@@ -850,7 +851,7 @@ fn handle_sql_endpoint(
     // so a CREATE TABLE past the cap is rejected. Non-tenant databases get no
     // limit (project_limits → None).
     if let (Some(name), Some(mgr)) = (db_name, &state.db_manager) {
-        if let Some((_max_collections, max_tables)) =
+        if let Some((_max_collections, max_tables, _max_documents)) =
             crate::tenant_auth::project_limits(mgr, name)
         {
             crate::sql_bridge::set_table_limit(name, max_tables);
@@ -1385,9 +1386,12 @@ fn url_decode(s: &str) -> String {
 
 fn db_err(e: oxidb::Error) -> (u16, &'static str) {
     match e {
-        // A tenant quota (OxiBase per-project collection cap) → 403, not 500.
+        // A tenant quota (OxiBase per-project caps) → 403, not 500.
         oxidb::Error::CollectionLimitExceeded(_) => {
             (403, "collection limit reached for this project")
+        }
+        oxidb::Error::DocumentLimitExceeded(_) => {
+            (403, "document limit reached for this project")
         }
         _ => (500, "database error"),
     }
