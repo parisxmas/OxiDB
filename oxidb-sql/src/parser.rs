@@ -1065,6 +1065,7 @@ fn single_index_column(cols: &[sp::IndexColumn], what: &str) -> Result<String> {
 fn translate_column(col: &sp::ColumnDef) -> Result<Column> {
     let ty = map_data_type(&col.data_type)?;
     let mut column = Column::new(col.name.value.clone(), ty);
+    column.max_len = char_max_len(&col.data_type);
     for opt in &col.options {
         match &opt.option {
             sp::ColumnOption::NotNull => column = column.not_null(),
@@ -1129,6 +1130,21 @@ fn translate_column(col: &sp::ColumnDef) -> Result<Column> {
         }
     }
     Ok(column)
+}
+
+/// The declared max length of a `VARCHAR(n)` / `CHAR(n)` / `NVARCHAR(n)` column,
+/// in characters. `None` for `TEXT`, `VARCHAR` (no length), `VARCHAR(MAX)`, or
+/// any non-string type — those stay unbounded.
+fn char_max_len(dt: &sp::DataType) -> Option<u32> {
+    use sp::DataType as D;
+    let len = match dt {
+        D::Varchar(l) | D::Char(l) | D::CharVarying(l) | D::Nvarchar(l) => l.as_ref()?,
+        _ => return None,
+    };
+    match len {
+        sp::CharacterLength::IntegerLength { length, .. } => u32::try_from(*length).ok(),
+        sp::CharacterLength::Max => None,
+    }
 }
 
 fn map_data_type(dt: &sp::DataType) -> Result<SqlType> {

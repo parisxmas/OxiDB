@@ -286,9 +286,15 @@ fn exec_show<S: Store>(store: &S, kind: ShowKind) -> Result<QueryResult> {
                     .columns
                     .iter()
                     .map(|c| {
+                        // Report the declared length so DESCRIBE round-trips
+                        // `VARCHAR(n)` instead of the bare storage type.
+                        let ty = match c.max_len {
+                            Some(n) => format!("VARCHAR({n})"),
+                            None => format!("{:?}", c.ty).to_uppercase(),
+                        };
                         vec![
                             text(&c.name),
-                            text(&format!("{:?}", c.ty).to_uppercase()),
+                            text(&ty),
                             Value::Bool(c.nullable),
                             Value::Bool(c.primary_key),
                             Value::Bool(c.auto_increment),

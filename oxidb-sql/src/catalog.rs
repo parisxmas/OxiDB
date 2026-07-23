@@ -37,6 +37,12 @@ pub struct Column {
     /// per SQL).
     #[serde(default)]
     pub unique: bool,
+    /// Declared max character length from `VARCHAR(n)` / `CHAR(n)` /
+    /// `NVARCHAR(n)`. Enforced on write — a longer string is rejected with
+    /// [`SqlError::ValueTooLong`]. `None` = unbounded `TEXT`. Old catalogs (and
+    /// non-string columns) deserialize as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_len: Option<u32>,
     /// Set by a metadata-only `ALTER TABLE DROP COLUMN`: the column keeps its
     /// physical slot in every stored row (so the drop rewrites nothing) but is
     /// invisible to queries — filtered out of the schema the executor sees.
@@ -59,6 +65,7 @@ impl Column {
             auto_increment: false,
             default_value: None,
             unique: false,
+            max_len: None,
             dropped: false,
         }
     }
@@ -245,6 +252,16 @@ impl Table {
                     "column {:?} expects {:?}, got incompatible value",
                     col.name, col.ty
                 )));
+            } else if let (Some(max), Value::Text(s)) = (col.max_len, cell) {
+                // VARCHAR(n)/CHAR(n) length is measured in characters, not bytes.
+                let got = s.chars().count();
+                if got as u64 > u64::from(max) {
+                    return Err(SqlError::ValueTooLong {
+                        column: col.name.clone(),
+                        max,
+                        got,
+                    });
+                }
             }
         }
         Ok(())

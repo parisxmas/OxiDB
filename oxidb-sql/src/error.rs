@@ -42,6 +42,15 @@ pub enum SqlError {
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),
 
+    /// A string value is longer than its column's declared `VARCHAR(n)` /
+    /// `CHAR(n)` length (Postgres SQLSTATE 22001).
+    #[error("value too long for column {column:?}: {got} characters exceeds the {max}-character limit")]
+    ValueTooLong {
+        column: String,
+        max: u32,
+        got: usize,
+    },
+
     /// The SQL text could not be parsed.
     #[error("sql parse error: {0}")]
     Parse(String),
