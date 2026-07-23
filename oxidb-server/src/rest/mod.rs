@@ -1001,6 +1001,14 @@ fn handle_set_rules(
     state: &RestState,
 ) -> Result<Value, (u16, &'static str)> {
     let body = parse_json_body(req)?;
+    // Reject a malformed expression with 400 (not a generic 500) so a typo can't
+    // be stored as a silent fail-closed rule. The dashboard mirrors this grammar
+    // and surfaces the precise per-field reason inline before ever POSTing.
+    for field in ["read", "create", "update", "delete"] {
+        if let Some(expr) = body[field].as_str() {
+            rules::validate_rule_expr(expr).map_err(|_| (400, "invalid rule expression"))?;
+        }
+    }
     rules::set_rules(&state.db, col, &body).map_err(|_| (500, "failed to set rules"))?;
     Ok(json!({"collection": col, "rules": "set"}))
 }

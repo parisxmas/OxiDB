@@ -89,18 +89,118 @@ pub struct RuleSet {
 // ---------------------------------------------------------------------------
 
 pub fn set_rules(db: &OxiDb, collection: &str, rules: &Value) -> Result<(), String> {
+    // Validate every rule expression against the grammar *before* persisting, so
+    // a typo can't silently become a fail-closed "deny all". An unknown term
+    // (e.g. `dytjuer`) resolves to null → falsy at eval time with no error; here
+    // we reject it up front with a clear message instead.
+    let read = rules["read"].as_str().unwrap_or("true");
+    let create = rules["create"].as_str().unwrap_or("true");
+    let update = rules["update"].as_str().unwrap_or("true");
+    let delete = rules["delete"].as_str().unwrap_or("true");
+    for (field, expr) in [
+        ("read", read),
+        ("create", create),
+        ("update", update),
+        ("delete", delete),
+    ] {
+        validate_rule_expr(expr).map_err(|e| format!("invalid `{field}` rule: {e}"))?;
+    }
     let rule_doc = json!({
         "collection": collection,
-        "read": rules["read"].as_str().unwrap_or("true"),
-        "create": rules["create"].as_str().unwrap_or("true"),
-        "update": rules["update"].as_str().unwrap_or("true"),
-        "delete": rules["delete"].as_str().unwrap_or("true"),
+        "read": read,
+        "create": create,
+        "update": update,
+        "delete": delete,
     });
     // Upsert: drop any existing rule(s) for this collection, then insert.
     remove_rules(db, collection);
     db.insert(RULES_COLLECTION, rule_doc)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Validate a rule expression against the same grammar [`eval_rule_expr`]
+/// interprets — mirroring its structure exactly, so anything accepted here
+/// evaluates meaningfully and anything the evaluator would silently treat as an
+/// unknown (falsy) term is rejected with a message. `Ok(())` = syntactically
+/// valid, `Err(msg)` = a term/shape the evaluator cannot make sense of.
+pub fn validate_rule_expr(expr: &str) -> Result<(), String> {
+    let e = expr.trim();
+    if e.is_empty() {
+        return Err("expression is empty".to_string());
+    }
+    if e == "true" || e == "false" {
+        return Ok(());
+    }
+    // Boolean combinators (same precedence + paren/string awareness as eval).
+    if let Some((l, r)) = split_logical(e, "||") {
+        validate_rule_expr(l)?;
+        return validate_rule_expr(r);
+    }
+    if let Some((l, r)) = split_logical(e, "&&") {
+        validate_rule_expr(l)?;
+        return validate_rule_expr(r);
+    }
+    if let Some(inner) = e.strip_prefix('!') {
+        return validate_rule_expr(inner.trim());
+    }
+    if e.starts_with('(') && e.ends_with(')') {
+        return validate_rule_expr(&e[1..e.len() - 1]);
+    }
+    // Comparison — both sides must be valid atoms.
+    for op in ["!=", "=="] {
+        if let Some((l, r)) = e.split_once(op) {
+            validate_atom(l.trim())?;
+            return validate_atom(r.trim());
+        }
+    }
+    // Bare atom (truthy check at eval time).
+    validate_atom(e)
+}
+
+/// Validate a single operand: a literal, `auth`, `auth.username`/`auth.role`, or
+/// `doc.<field path>`.
+fn validate_atom(tok: &str) -> Result<(), String> {
+    let t = tok.trim();
+    if t.is_empty() {
+        return Err("expected a value".to_string());
+    }
+    // String literal ('x' or "x").
+    if (t.starts_with('\'') && t.ends_with('\'') && t.len() >= 2)
+        || (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
+    {
+        return Ok(());
+    }
+    // Numeric literal.
+    if t.parse::<f64>().is_ok() {
+        return Ok(());
+    }
+    match t {
+        "true" | "false" | "null" | "auth" => return Ok(()),
+        _ => {}
+    }
+    if let Some(field) = t.strip_prefix("auth.") {
+        return match field {
+            "username" | "role" => Ok(()),
+            _ => Err(format!(
+                "unknown field `auth.{field}` (only auth.username and auth.role)"
+            )),
+        };
+    }
+    if let Some(field) = t.strip_prefix("doc.") {
+        let ok = !field.is_empty()
+            && field
+                .split('.')
+                .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_alphanumeric() || c == '_'));
+        return if ok {
+            Ok(())
+        } else {
+            Err(format!("invalid document field `doc.{field}`"))
+        };
+    }
+    Err(format!(
+        "unknown term `{t}` — use auth, auth.username, auth.role, doc.<field>, a 'string', true/false/null, or a number"
+    ))
 }
 
 pub fn get_rules(db: &OxiDb, collection: &str) -> Option<RuleSet> {
@@ -616,6 +716,36 @@ mod tests {
         let db = oxidb::OxiDb::open_in_memory().unwrap();
         let result = check_access(&db, "any_collection", Operation::Read, &anon(), None, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_rule_expr_accepts_grammar_and_rejects_typos() {
+        // Valid shapes across the whole grammar.
+        for ok in [
+            "true",
+            "false",
+            "auth",
+            "auth.role == 'admin'",
+            "auth.username == doc.owner",
+            "auth.role == 'authenticated' && doc.published == true",
+            "!(auth.username == doc.owner) || auth.role == 'admin'",
+            "doc.count != 0",
+            "doc.meta.owner_id == auth.username",
+        ] {
+            assert!(validate_rule_expr(ok).is_ok(), "should accept: {ok}");
+        }
+        // Typos / unknown terms / malformed shapes — must be rejected, not
+        // silently treated as a falsy unknown at eval time.
+        for bad in [
+            "dytjuer",                       // bare unknown term (the reported case)
+            "auth.name == 'x'",              // auth has only username/role
+            "auth.username = doc.owner",     // single '=' is not a comparison → unknown atom
+            "doc. == 'x'",                   // empty doc field
+            "",                              // empty
+            "admin && foo",                  // unknown atoms around &&
+        ] {
+            assert!(validate_rule_expr(bad).is_err(), "should reject: {bad:?}");
+        }
     }
 
     #[test]
