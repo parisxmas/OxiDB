@@ -75,3 +75,39 @@ export async function runSql(ref: string, key: string, sql: string): Promise<Sql
   const d = await call<{ results: SqlResult[] }>("POST", ref, "/api/sql", key, { sql });
   return d.results ?? [];
 }
+
+export interface SqlTable {
+  name: string;
+  rows: number;
+}
+
+/** A single result from a batch, or throw if the batch errored. */
+async function oneResult(ref: string, key: string, sql: string): Promise<SqlResult> {
+  const results = await runSql(ref, key, sql);
+  const r = results[results.length - 1];
+  if (!r) throw new Error("no result");
+  return r;
+}
+
+/** Tables in the project's **SQL engine** (distinct from document collections). */
+export async function listSqlTables(ref: string, key: string): Promise<SqlTable[]> {
+  const r = await oneResult(ref, key, "SHOW TABLES");
+  const rows = r.rows ?? [];
+  return rows.map((row) => ({ name: String(row[0]), rows: Number(row[1] ?? 0) }));
+}
+
+/** Column schema of a SQL table (DESCRIBE). */
+export function describeSqlTable(ref: string, key: string, table: string): Promise<SqlResult> {
+  return oneResult(ref, key, `DESCRIBE ${quoteIdent(table)}`);
+}
+
+/** First `limit` rows of a SQL table. */
+export function selectSqlRows(ref: string, key: string, table: string, limit = 100): Promise<SqlResult> {
+  return oneResult(ref, key, `SELECT * FROM ${quoteIdent(table)} LIMIT ${Math.max(1, limit | 0)}`);
+}
+
+// Table names come from SHOW TABLES (engine-validated identifiers), but quote
+// defensively so an unusual name can't break the statement.
+function quoteIdent(name: string): string {
+  return `"${name.replace(/"/g, '""')}"`;
+}

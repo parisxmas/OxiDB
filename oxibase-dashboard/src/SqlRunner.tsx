@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { type SqlResult, runSql } from "./dataApi.ts";
+import { ResultGrid } from "./SqlTables.tsx";
 
 const SAMPLE = `CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT);
 INSERT INTO notes (id, body) VALUES (1, 'hello from OxiBase');
@@ -79,31 +80,9 @@ function ResultBlock({ result }: { result: SqlResult }) {
       </div>
     );
   }
-  const cols = result.columns ?? [];
-  const rows = result.rows ?? [];
   return (
     <div className="result">
-      <div className="table-wrap">
-        <table className="grid-table">
-          <thead>
-            <tr>
-              {cols.map((c, i) => (
-                <th key={i}>{c}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row, ri) => (
-              <tr key={ri}>
-                {(row as unknown[]).map((v, ci) => (
-                  <td key={ci}>{v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v)}</td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <div className="muted small">{rows.length} row{rows.length === 1 ? "" : "s"}</div>
+      <ResultGrid result={result} emptyText="0 rows" />
     </div>
   );
 }

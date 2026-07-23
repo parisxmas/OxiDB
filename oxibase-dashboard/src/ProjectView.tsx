@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
 import { type Project, getProject } from "./api.ts";
 import { DataBrowser } from "./DataBrowser.tsx";
+import { SqlTables } from "./SqlTables.tsx";
 import { SqlRunner } from "./SqlRunner.tsx";
 
-type Tab = "tables" | "sql";
+type Tab = "collections" | "sqltables" | "sql";
 
 export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack: () => void }) {
   const [project, setProject] = useState<Project | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>("tables");
+  const [tab, setTab] = useState<Tab>("collections");
 
   useEffect(() => {
     getProject(projectRef)
@@ -31,8 +32,17 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
           <code className="ref">{projectRef}</code>
         </div>
         <div className="tabs">
-          <button className={tab === "tables" ? "tab active" : "tab"} onClick={() => setTab("tables")}>
-            Tables
+          <button
+            className={tab === "collections" ? "tab active" : "tab"}
+            onClick={() => setTab("collections")}
+          >
+            Collections
+          </button>
+          <button
+            className={tab === "sqltables" ? "tab active" : "tab"}
+            onClick={() => setTab("sqltables")}
+          >
+            SQL Tables
           </button>
           <button className={tab === "sql" ? "tab active" : "tab"} onClick={() => setTab("sql")}>
             SQL
@@ -43,8 +53,10 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
       {error && <div className="error">{error}</div>}
       {!key ? (
         <p className="muted">Loading project…</p>
-      ) : tab === "tables" ? (
+      ) : tab === "collections" ? (
         <DataBrowser projectRef={projectRef} apiKey={key} />
+      ) : tab === "sqltables" ? (
+        <SqlTables projectRef={projectRef} apiKey={key} />
       ) : (
         <SqlRunner projectRef={projectRef} apiKey={key} />
       )}

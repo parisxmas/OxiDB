@@ -14,12 +14,19 @@ grid) can be shared.
 - **Projects** — list, create (provisions an isolated tenant database), view/copy
   the `anon` + `service_role` keys, rotate keys, delete. **Open** a project to
   edit its data.
-- **Table editor** (`DataBrowser`) — browse the project's collections, view rows
-  in a grid, insert a JSON document, delete a row. Over the PostgREST surface
-  (`/rest/v1/{collection}?db=<ref>`).
-- **SQL runner** (`SqlRunner`) — run DDL/DML/`SELECT` batches against the
-  project's SQL engine (`/api/sql?db=<ref>`), results rendered as a grid.
-  Requires the data plane to run with `OXIDB_SQL=1`.
+A project opens with three tabs — the document and SQL engines are separate
+stores with separate objects:
+
+- **Collections** (`DataBrowser`) — the **document engine**. Browse collections,
+  view rows in a grid, insert a JSON document, delete a row. Over the PostgREST
+  surface (`/rest/v1/{collection}?db=<ref>`).
+- **SQL Tables** (`SqlTables`) — the **SQL engine**. Browse tables (`SHOW TABLES`
+  with row counts), view each table's rows and its schema (`DESCRIBE`), over
+  `/api/sql?db=<ref>`.
+- **SQL** (`SqlRunner`) — run ad-hoc DDL/DML/`SELECT` batches against the SQL
+  engine, results rendered as a grid.
+
+The SQL tabs require the data plane to run with `OXIDB_SQL=1`.
 
 Data-plane calls use the project's `service_role` key (this is the developer's
 own admin console).
