@@ -50,4 +50,4 @@ Don't rewrite an old ADR — write a new one that references it
 | [0018](0018-offset-index-memory.md) | Shrinking the disk-first offset index (packed DocLocation + fenced mmap index) | Accepted (Phase 1); Phase 2 Proposed |
 | [0019](0019-postgrest-rest-surface.md) | PostgREST-compatible auto-REST surface (document + SQL + TSDB engines) | Accepted (all phases landed) |
 | [0020](0020-oxibase-control-plane.md) | OxiBase — a control plane for multi-tenant provisioning | Proposed (skeleton landed in-server) |
-| [0021](0021-oxibase-separate-service.md) | OxiBase as a separate control-plane service (data plane keeps only the secret hook) | Proposed |
+| [0021](0021-oxibase-separate-service.md) | OxiBase as a separate control-plane service (data plane keeps only the secret hook) | Accepted |

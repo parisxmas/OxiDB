@@ -1,9 +1,13 @@
 # ADR-0021: OxiBase as a separate control-plane service
 
-**Status:** Proposed — 2026-07-23. Revises the deployment decision in ADR-0020
-(which put the control plane *inside* `oxidb-server` for the skeleton). The
-skeleton validated the design in-process; this ADR graduates it to a separate
-service before the dashboard/billing weight lands.
+**Status:** Accepted — 2026-07-23. Landed: seal-key separation (§4), the shared
+`oxidb-http` crate (server + client), and a working separate **`oxibase`**
+binary (control plane) proven two-process against `oxidb-server` (signup →
+provision → the data plane resolves the per-project secret from the shared
+store). The data plane no longer serves `/platform/v1`. Remaining cleanup: the
+now-dead in-server control-plane handler code is kept compiling for one step and
+will be deleted (reduce the module to `tenant_auth::project_secret`). Revises the
+deployment decision in ADR-0020 (control plane *inside* `oxidb-server`).
 **Supersedes:** the "not a new crate for v1" option in [ADR-0020](0020-oxibase-control-plane.md).
 **Related:** [ADR-0020](0020-oxibase-control-plane.md) (OxiBase design, secrets,
 key roles), [ADR-0012](0012-multi-database.md) (`DatabaseManager` + the Admin-only

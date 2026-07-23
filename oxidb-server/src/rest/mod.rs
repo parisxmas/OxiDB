@@ -241,14 +241,10 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         raw_segments.clone()
     };
 
-    // ── OxiBase control plane (ADR-0020): /platform/v1/* ────────────────
-    // Authenticated by the platform master secret (its own scheme), so it is
-    // handled before the data-plane JWT gate. `None` for non-platform paths.
-    if let Some(platform_resp) =
-        crate::platform::route(req, raw_segments.as_slice(), state.db_manager.as_deref())
-    {
-        return platform_resp;
-    }
+    // ── OxiBase control plane (ADR-0020/0021) ───────────────────────────
+    // The control plane now runs as a separate `oxibase` binary; the data
+    // plane keeps only the `platform::project_secret` hook (consulted in the
+    // JWT gate below) and no longer serves `/platform/v1` itself.
 
     // Top-level HELLO equivalent for REST: GET /v1/hello returns server info.
     // Same fields as the OxiWire HELLO so a REST-only client can discover

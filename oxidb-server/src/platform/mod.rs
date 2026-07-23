@@ -172,30 +172,45 @@ fn now_secs() -> u64 {
 // Data-plane hook: resolve a project's JWT secret
 // ---------------------------------------------------------------------------
 
-/// Cache of `ref → decrypted jwt_secret`, so a project's secret is not read and
-/// AES-decrypted from `_oxibase` on *every* authenticated data-plane request
-/// (a real per-request cost / mild DoS surface). Invalidated on rotate/delete.
-fn secret_cache() -> &'static Mutex<HashMap<String, String>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// The metadata database OxiBase records projects in (a normal database, so the
+/// out-of-process control plane can write it over the wire while the data plane
+/// reads it locally here — ADR-0021).
+const META_DB: &str = "oxibase";
+/// How long a resolved project secret stays cached. Bounded (not permanent
+/// invalidate) because the control plane runs in a separate process and cannot
+/// clear this cache on rotation; a rotated key thus takes effect within the TTL.
+const SECRET_CACHE_TTL_SECS: u64 = 5;
+
+/// Cache of `ref → (decrypted jwt_secret, cached_at)`, so a project's secret is
+/// not read and AES-decrypted from the metadata db on *every* authenticated
+/// data-plane request. Entries expire after [`SECRET_CACHE_TTL_SECS`].
+fn secret_cache() -> &'static Mutex<HashMap<String, (String, u64)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, u64)>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Drop a project's cached secret — called after rotation or deletion so a
-/// stale (revoked) secret can never keep verifying tokens.
+/// Drop a project's cached secret (used by the in-process handlers on rotate/
+/// delete; the separate control plane relies on the TTL instead).
 fn invalidate_secret(db_ref: &str) {
     secret_cache().lock().unwrap().remove(db_ref);
 }
 
 /// The per-project JWT secret for `db_ref`, if it names an OxiBase project.
 /// The REST listener calls this so a request to `?db=<ref>` is verified with
-/// that project's secret rather than the global `OXIDB_JWT_SECRET`.
+/// that project's secret rather than the global `OXIDB_JWT_SECRET`. Reads the
+/// `oxibase` metadata db locally and unseals with the seal key alone (never the
+/// session-signing master secret).
 pub fn project_secret(mgr: &DatabaseManager, db_ref: &str) -> Option<String> {
-    if let Some(cached) = secret_cache().lock().unwrap().get(db_ref).cloned() {
-        return Some(cached);
+    if db_ref == META_DB {
+        return None; // the platform's own store is not a tenant project
     }
-    // The data-plane hook (ADR-0021): unseal with the seal key alone — it never
-    // needs the master secret that signs developer sessions.
-    let pdb = platform_db(mgr)?;
+    let now = now_secs();
+    if let Some((secret, at)) = secret_cache().lock().unwrap().get(db_ref) {
+        if now.saturating_sub(*at) < SECRET_CACHE_TTL_SECS {
+            return Some(secret.clone());
+        }
+    }
+    let pdb = mgr.get_database(META_DB).ok()?;
     let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
     let sealed_b64 = doc.get("secret_enc")?.as_str()?;
     let sealed = base64::engine::general_purpose::STANDARD
@@ -206,7 +221,7 @@ pub fn project_secret(mgr: &DatabaseManager, db_ref: &str) -> Option<String> {
     secret_cache()
         .lock()
         .unwrap()
-        .insert(db_ref.to_string(), secret.clone());
+        .insert(db_ref.to_string(), (secret.clone(), now));
     Some(secret)
 }
 

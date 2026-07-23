@@ -1,0 +1,468 @@
+//! `/platform/v1/*` handlers. Same logic as the in-server skeleton, but storage
+//! goes through [`Upstream`](crate::upstream::Upstream) (REST to the data plane)
+//! instead of a local engine, and crypto is the crate's self-contained
+//! primitives.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+use base64::Engine;
+use oxidb_http::message::{HttpRequest, HttpResponse};
+use serde_json::{Value, json};
+
+use crate::crypto::{self, Claims};
+use crate::upstream::url_encode;
+use crate::{State, now_secs, resp};
+
+const KEY_EXPIRY_SECS: u64 = 10 * 365 * 86_400;
+const SESSION_EXPIRY_SECS: u64 = 86_400;
+const MIN_PASSWORD_LEN: usize = 8;
+const LOGIN_MAX_FAILS: u32 = 5;
+const LOGIN_LOCKOUT_SECS: u64 = 300;
+const SIGNUP_WINDOW_SECS: u64 = 60;
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+fn max_projects() -> usize {
+    env_usize("OXIDB_PLATFORM_MAX_PROJECTS", 100)
+}
+fn max_accounts() -> usize {
+    env_usize("OXIDB_PLATFORM_MAX_ACCOUNTS", 10_000)
+}
+fn signup_rate() -> u32 {
+    std::env::var("OXIDB_PLATFORM_SIGNUP_RATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+}
+fn signup_code() -> Option<String> {
+    std::env::var("OXIDB_PLATFORM_SIGNUP_CODE")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+// ---------------------------------------------------------------------------
+// Account handlers
+// ---------------------------------------------------------------------------
+
+pub fn signup(req: &HttpRequest, state: &State) -> HttpResponse {
+    if !signup_allowed(&client_ip(req)) {
+        return resp(
+            429,
+            json!({ "message": "signup rate limit exceeded; slow down" }),
+        );
+    }
+    let body = parse_body(req);
+    if let Some(code) = signup_code() {
+        if body.get("code").and_then(|v| v.as_str()) != Some(code.as_str()) {
+            return resp(403, json!({ "message": "a valid invite code is required" }));
+        }
+    }
+    if state.upstream.count("accounts", "").unwrap_or(0) >= max_accounts() {
+        return resp(403, json!({ "message": "signups are closed" }));
+    }
+    let (Some(email), Some(password)) = (str_field(&body, "email"), str_field(&body, "password"))
+    else {
+        return resp(400, json!({ "message": "email and password required" }));
+    };
+    if password.len() < MIN_PASSWORD_LEN {
+        return resp(
+            400,
+            json!({ "message": format!("password must be at least {MIN_PASSWORD_LEN} characters") }),
+        );
+    }
+    let filter = format!("email=eq.{}", url_encode(&email));
+    match state.upstream.find("accounts", &filter) {
+        Ok(existing) if !existing.is_empty() => {
+            return resp(409, json!({ "message": "email already registered" }));
+        }
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+        _ => {}
+    }
+    let pw_hash = match crypto::hash_password(&password) {
+        Ok(h) => h,
+        Err(e) => return resp(500, json!({ "message": e })),
+    };
+    let doc = json!({ "email": email, "pw_hash": pw_hash, "created_at": now_secs() });
+    if let Err(e) = state.upstream.insert("accounts", &doc) {
+        return resp(502, json!({ "message": format!("upstream: {e}") }));
+    }
+    let token = session_token(state, &email);
+    resp(
+        201,
+        json!({ "account": { "email": email }, "token": token }),
+    )
+}
+
+pub fn login(req: &HttpRequest, state: &State) -> HttpResponse {
+    let body = parse_body(req);
+    let (Some(email), Some(password)) = (str_field(&body, "email"), str_field(&body, "password"))
+    else {
+        return resp(400, json!({ "message": "email and password required" }));
+    };
+    if login_locked(&email) {
+        return resp(
+            429,
+            json!({ "message": "too many failed attempts; try again later" }),
+        );
+    }
+    let filter = format!("email=eq.{}", url_encode(&email));
+    let account = match state.upstream.find("accounts", &filter) {
+        Ok(mut a) => a.pop(),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let ok = account
+        .as_ref()
+        .and_then(|a| a.get("pw_hash").and_then(|v| v.as_str()))
+        .is_some_and(|h| crypto::verify_password(&password, h));
+    if ok {
+        login_clear(&email);
+        resp(200, json!({ "token": session_token(state, &email) }))
+    } else {
+        login_record_failure(&email);
+        resp(401, json!({ "message": "invalid credentials" }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Project handlers
+// ---------------------------------------------------------------------------
+
+pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    let filter = format!("owner=eq.{}", url_encode(&owner));
+    if state.upstream.count("projects", &filter).unwrap_or(0) >= max_projects() {
+        return resp(
+            403,
+            json!({ "message": format!("project limit reached ({})", max_projects()) }),
+        );
+    }
+    let body = parse_body(req);
+    let name = str_field(&body, "name").unwrap_or_default();
+    let project_ref = gen_ref();
+    let secret = gen_secret();
+    let created_at = now_secs();
+
+    if let Err(e) = state.upstream.create_database(&project_ref) {
+        return resp(
+            502,
+            json!({ "message": format!("provisioning failed: {e}") }),
+        );
+    }
+    let sealed = base64::engine::general_purpose::STANDARD
+        .encode(crypto::seal(&state.seal_key, secret.as_bytes()));
+    let doc = json!({
+        "ref": project_ref,
+        "owner": owner,
+        "name": name,
+        "secret_enc": sealed,
+        "isolation": "shared",
+        "created_at": created_at,
+        "key_iat": created_at,
+    });
+    if let Err(e) = state.upstream.insert("projects", &doc) {
+        let _ = state.upstream.drop_database(&project_ref);
+        return resp(
+            502,
+            json!({ "message": format!("failed to record project: {e}") }),
+        );
+    }
+    resp(
+        201,
+        project_view(&project_ref, &name, created_at, created_at, &secret, true),
+    )
+}
+
+pub fn list_projects(req: &HttpRequest, state: &State) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    let filter = format!("owner=eq.{}", url_encode(&owner));
+    match state.upstream.find("projects", &filter) {
+        Ok(docs) => {
+            let list: Vec<Value> = docs
+                .iter()
+                .map(|d| json!({ "ref": d.get("ref"), "name": d.get("name"), "created_at": d.get("created_at") }))
+                .collect();
+            resp(200, json!(list))
+        }
+        Err(e) => resp(502, json!({ "message": format!("upstream: {e}") })),
+    }
+}
+
+pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    let doc = match owned_project(state, project_ref, &owner) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let (created_at, key_iat, name) = meta(&doc);
+    let secret = match unseal_secret(state, &doc) {
+        Some(s) => s,
+        None => return resp(500, json!({ "message": "unseal failed" })),
+    };
+    resp(
+        200,
+        project_view(project_ref, &name, created_at, key_iat, &secret, true),
+    )
+}
+
+pub fn delete_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    match owned_project(state, project_ref, &owner) {
+        Ok(Some(_)) => {}
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    }
+    let _ = state.upstream.drop_database(project_ref);
+    let filter = format!("ref=eq.{}", url_encode(project_ref));
+    let _ = state.upstream.delete("projects", &filter);
+    resp(200, json!({ "deleted": project_ref }))
+}
+
+pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    let doc = match owned_project(state, project_ref, &owner) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let (created_at, _, name) = meta(&doc);
+    let new_secret = gen_secret();
+    let new_iat = now_secs();
+    let sealed = base64::engine::general_purpose::STANDARD
+        .encode(crypto::seal(&state.seal_key, new_secret.as_bytes()));
+    let filter = format!("ref=eq.{}", url_encode(project_ref));
+    let patch = json!({ "secret_enc": sealed, "key_iat": new_iat });
+    if let Err(e) = state.upstream.update("projects", &filter, &patch) {
+        return resp(
+            502,
+            json!({ "message": format!("failed to persist rotated secret: {e}") }),
+        );
+    }
+    resp(
+        200,
+        project_view(project_ref, &name, created_at, new_iat, &new_secret, true),
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn owned_project(state: &State, project_ref: &str, owner: &str) -> Result<Option<Value>, String> {
+    let filter = format!(
+        "ref=eq.{}&owner=eq.{}",
+        url_encode(project_ref),
+        url_encode(owner)
+    );
+    Ok(state.upstream.find("projects", &filter)?.into_iter().next())
+}
+
+fn meta(doc: &Value) -> (u64, u64, String) {
+    let created_at = doc.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    let key_iat = doc
+        .get("key_iat")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(created_at);
+    let name = doc
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    (created_at, key_iat, name)
+}
+
+fn unseal_secret(state: &State, doc: &Value) -> Option<String> {
+    let b64 = doc.get("secret_enc")?.as_str()?;
+    let sealed = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    String::from_utf8(crypto::unseal(&state.seal_key, &sealed)?).ok()
+}
+
+fn project_view(
+    project_ref: &str,
+    name: &str,
+    created_at: u64,
+    key_iat: u64,
+    secret: &str,
+    keys: bool,
+) -> Value {
+    let base = std::env::var("OXIDB_PLATFORM_BASE_URL").unwrap_or_default();
+    let url = if base.is_empty() {
+        json!(null)
+    } else {
+        json!(format!("{base}/rest/v1?db={project_ref}"))
+    };
+    let mut v = json!({
+        "ref": project_ref, "name": name, "db": project_ref,
+        "endpoint": "/rest/v1", "url": url, "isolation": "shared", "created_at": created_at,
+    });
+    if keys {
+        let o = v.as_object_mut().unwrap();
+        o.insert(
+            "anon_key".into(),
+            json!(mint_key(secret, project_ref, "read", key_iat)),
+        );
+        o.insert(
+            "service_role_key".into(),
+            json!(mint_key(secret, project_ref, "admin", key_iat)),
+        );
+    }
+    v
+}
+
+fn mint_key(secret: &str, project_ref: &str, role: &str, iat: u64) -> String {
+    crypto::encode_jwt(
+        &Claims {
+            sub: format!("{role}@{project_ref}"),
+            role: role.to_string(),
+            iat,
+            exp: iat + KEY_EXPIRY_SECS,
+        },
+        secret,
+    )
+}
+
+fn session_token(state: &State, email: &str) -> String {
+    let now = now_secs();
+    crypto::encode_jwt(
+        &Claims {
+            sub: email.to_string(),
+            role: "admin".into(),
+            iat: now,
+            exp: now + SESSION_EXPIRY_SECS,
+        },
+        &state.platform_secret,
+    )
+}
+
+fn authenticate(req: &HttpRequest, state: &State) -> Result<Claims, HttpResponse> {
+    let header = req
+        .headers
+        .get("authorization")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let token = header
+        .strip_prefix("Bearer ")
+        .or_else(|| header.strip_prefix("bearer "))
+        .ok_or_else(|| {
+            resp(
+                401,
+                json!({ "message": "missing Authorization: Bearer <platform token>" }),
+            )
+        })?;
+    crypto::decode_jwt(token, &state.platform_secret)
+        .map_err(|e| resp(401, json!({ "message": e })))
+}
+
+fn parse_body(req: &HttpRequest) -> Value {
+    if req.body.is_empty() {
+        return json!({});
+    }
+    serde_json::from_slice(&req.body).unwrap_or_else(|_| json!({}))
+}
+
+fn str_field(body: &Value, key: &str) -> Option<String> {
+    body.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
+fn gen_ref() -> String {
+    use rand::Rng;
+    const A: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rng();
+    (0..16)
+        .map(|_| A[rng.random_range(0..A.len())] as char)
+        .collect()
+}
+
+fn gen_secret() -> String {
+    use rand::Rng;
+    let mut b = [0u8; 32];
+    rand::rng().fill(&mut b);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+fn client_ip(req: &HttpRequest) -> String {
+    req.headers
+        .get("cf-connecting-ip")
+        .or_else(|| req.headers.get("x-forwarded-for"))
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "global".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// In-memory limiters
+// ---------------------------------------------------------------------------
+
+fn signup_limiter() -> &'static Mutex<HashMap<String, (u32, u64)>> {
+    static L: OnceLock<Mutex<HashMap<String, (u32, u64)>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn signup_allowed(actor: &str) -> bool {
+    let mut m = signup_limiter().lock().unwrap();
+    let now = now_secs();
+    let e = m.entry(actor.to_string()).or_insert((0, now));
+    if now.saturating_sub(e.1) >= SIGNUP_WINDOW_SECS {
+        *e = (0, now);
+    }
+    if e.0 >= signup_rate() {
+        return false;
+    }
+    e.0 += 1;
+    true
+}
+
+fn login_limiter() -> &'static Mutex<HashMap<String, (u32, u64)>> {
+    static L: OnceLock<Mutex<HashMap<String, (u32, u64)>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+fn login_locked(email: &str) -> bool {
+    let mut m = login_limiter().lock().unwrap();
+    match m.get(email).copied() {
+        Some((fails, first)) => {
+            if now_secs().saturating_sub(first) >= LOGIN_LOCKOUT_SECS {
+                m.remove(email);
+                false
+            } else {
+                fails >= LOGIN_MAX_FAILS
+            }
+        }
+        None => false,
+    }
+}
+fn login_record_failure(email: &str) {
+    let mut m = login_limiter().lock().unwrap();
+    let now = now_secs();
+    let e = m.entry(email.to_string()).or_insert((0, now));
+    if now.saturating_sub(e.1) >= LOGIN_LOCKOUT_SECS {
+        *e = (1, now);
+    } else {
+        e.0 += 1;
+    }
+}
+fn login_clear(email: &str) {
+    login_limiter().lock().unwrap().remove(email);
+}
