@@ -184,7 +184,7 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
             &name,
             created_at,
             created_at,
-            &ProjectSigner::Es256(priv_scalar),
+            &priv_scalar,
             true,
         ),
     )
@@ -218,13 +218,13 @@ pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let (created_at, key_iat, name) = meta(&doc);
-    let signer = match project_signer(state, &doc) {
+    let priv_scalar = match project_priv(state, &doc) {
         Some(s) => s,
         None => return resp(500, json!({ "message": "unseal failed" })),
     };
     resp(
         200,
-        project_view(project_ref, &name, created_at, key_iat, &signer, true),
+        project_view(project_ref, &name, created_at, key_iat, &priv_scalar, true),
     )
 }
 
@@ -305,7 +305,7 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
             &name,
             created_at,
             new_iat,
-            &ProjectSigner::Es256(priv_scalar),
+            &priv_scalar,
             true,
         ),
     )
@@ -334,30 +334,16 @@ fn meta(doc: &Value) -> (u64, u64, String) {
     (created_at, key_iat, name)
 }
 
-fn unseal_secret(state: &State, doc: &Value) -> Option<String> {
-    let b64 = doc.get("secret_enc")?.as_str()?;
-    let sealed = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-    String::from_utf8(crypto::unseal(&state.seal_key, &sealed)?).ok()
-}
-
 fn b64std(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-/// How a project's API-key tokens are signed. New projects use asymmetric
-/// ES256; projects created before the switch keep their sealed HS256 secret.
-enum ProjectSigner {
-    Es256(Vec<u8>), // private scalar
-    Hs256(String),  // legacy shared secret
-}
-
-fn project_signer(state: &State, doc: &Value) -> Option<ProjectSigner> {
-    if let Some(b64) = doc.get("priv_enc").and_then(|v| v.as_str()) {
-        let sealed = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-        let scalar = crypto::unseal(&state.seal_key, &sealed)?;
-        return Some(ProjectSigner::Es256(scalar));
-    }
-    Some(ProjectSigner::Hs256(unseal_secret(state, doc)?))
+/// A project's ES256 private scalar, unsealed. Projects always carry an
+/// asymmetric key; `None` only on a corrupt record.
+fn project_priv(state: &State, doc: &Value) -> Option<Vec<u8>> {
+    let b64 = doc.get("priv_enc")?.as_str()?;
+    let sealed = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    crypto::unseal(&state.seal_key, &sealed)
 }
 
 fn project_view(
@@ -365,7 +351,7 @@ fn project_view(
     name: &str,
     created_at: u64,
     key_iat: u64,
-    signer: &ProjectSigner,
+    priv_scalar: &[u8],
     keys: bool,
 ) -> Value {
     let base = std::env::var("OXIDB_PLATFORM_BASE_URL").unwrap_or_default();
@@ -382,27 +368,25 @@ fn project_view(
         let o = v.as_object_mut().unwrap();
         o.insert(
             "anon_key".into(),
-            json!(mint_key(signer, project_ref, "read", key_iat)),
+            json!(mint_key(priv_scalar, project_ref, "read", key_iat)),
         );
         o.insert(
             "service_role_key".into(),
-            json!(mint_key(signer, project_ref, "admin", key_iat)),
+            json!(mint_key(priv_scalar, project_ref, "admin", key_iat)),
         );
     }
     v
 }
 
-fn mint_key(signer: &ProjectSigner, project_ref: &str, role: &str, iat: u64) -> String {
+/// Mint an ES256 API-key token for a role (deterministic — stable across re-mint).
+fn mint_key(priv_scalar: &[u8], project_ref: &str, role: &str, iat: u64) -> String {
     let claims = Claims {
         sub: format!("{role}@{project_ref}"),
         role: role.to_string(),
         iat,
         exp: iat + KEY_EXPIRY_SECS,
     };
-    match signer {
-        ProjectSigner::Es256(scalar) => crypto::encode_jwt_es256(&claims, scalar).unwrap_or_default(),
-        ProjectSigner::Hs256(secret) => crypto::encode_jwt(&claims, secret),
-    }
+    crypto::encode_jwt_es256(&claims, priv_scalar).unwrap_or_default()
 }
 
 fn session_token(state: &State, email: &str) -> String {

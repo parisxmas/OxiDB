@@ -323,21 +323,16 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // Per-database secret (ADR-0020): a request targeting an OxiBase project
     // (`?db=<ref>`) is verified with that project's own JWT secret; everything
     // else uses the global `OXIDB_JWT_SECRET`.
-    // A project that uses asymmetric keys (ADR: JWKS/ES256) is verified with its
-    // public key alone — no seal key, no shared secret (the multi-node property).
-    // Otherwise fall back to the per-project HS256 secret, else the global one.
+    // An OxiBase project is verified with its ES256 public key alone — no seal
+    // key, no shared secret (the multi-node property). Everything else (native
+    // API, non-project databases) uses the global `OXIDB_JWT_SECRET`.
     let project_pubkey: Option<Vec<u8>> = match (&db_name, &state.db_manager) {
         (Some(name), Some(mgr)) if crate::tenant_auth::enabled() => {
             crate::tenant_auth::project_pubkey(mgr, name)
         }
         _ => None,
     };
-    let effective_secret: Option<String> = match (&db_name, &state.db_manager) {
-        (Some(name), Some(mgr)) if crate::tenant_auth::enabled() => {
-            crate::tenant_auth::project_secret(mgr, name).or_else(|| state.jwt_secret.clone())
-        }
-        _ => state.jwt_secret.clone(),
-    };
+    let effective_secret: Option<String> = state.jwt_secret.clone();
     let (auth_ctx, enforced_role) = if project_pubkey.is_some() || effective_secret.is_some() {
         let auth_header = req
             .headers

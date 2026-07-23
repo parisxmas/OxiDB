@@ -96,19 +96,23 @@ pub fn set_rules(db: &OxiDb, collection: &str, rules: &Value) -> Result<(), Stri
         "update": rules["update"].as_str().unwrap_or("true"),
         "delete": rules["delete"].as_str().unwrap_or("true"),
     });
-
-    // Upsert: delete existing rule then insert new one
-    let _ = db.delete(RULES_COLLECTION, &json!({"collection": collection}));
+    // Upsert: drop any existing rule(s) for this collection, then insert.
+    remove_rules(db, collection);
     db.insert(RULES_COLLECTION, rule_doc)
         .map_err(|e| e.to_string())?;
-    let _ = db.create_index(RULES_COLLECTION, "collection");
     Ok(())
 }
 
 pub fn get_rules(db: &OxiDb, collection: &str) -> Option<RuleSet> {
-    let doc = db
-        .find_one(RULES_COLLECTION, &json!({"collection": collection}))
-        .ok()??;
+    // Scan the (tiny) rules collection and filter in memory rather than relying
+    // on a secondary index over `collection`: that index could go stale across a
+    // restart, silently dropping rules (fail-closed) and letting duplicates
+    // accumulate. Pick the most recent row if duplicates exist.
+    let docs = db.find(RULES_COLLECTION, &json!({})).ok()?;
+    let doc = docs
+        .into_iter()
+        .rev()
+        .find(|d| d.get("collection").and_then(|v| v.as_str()) == Some(collection))?;
     Some(RuleSet {
         read: doc["read"].as_str().unwrap_or("true").to_string(),
         create: doc["create"].as_str().unwrap_or("true").to_string(),
@@ -118,9 +122,24 @@ pub fn get_rules(db: &OxiDb, collection: &str) -> Option<RuleSet> {
 }
 
 pub fn delete_rules(db: &OxiDb, collection: &str) -> Result<(), String> {
-    db.delete(RULES_COLLECTION, &json!({"collection": collection}))
-        .map_err(|e| e.to_string())?;
+    remove_rules(db, collection);
     Ok(())
+}
+
+/// Delete every rule row for `collection`, addressing each by its `_id`
+/// (primary key) after a full scan — so it works regardless of the state of any
+/// secondary index and also sweeps up duplicates.
+fn remove_rules(db: &OxiDb, collection: &str) {
+    let Ok(docs) = db.find(RULES_COLLECTION, &json!({})) else {
+        return;
+    };
+    for d in docs {
+        if d.get("collection").and_then(|v| v.as_str()) == Some(collection) {
+            if let Some(id) = d.get("_id") {
+                let _ = db.delete(RULES_COLLECTION, &json!({ "_id": id }));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
