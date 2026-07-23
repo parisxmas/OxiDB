@@ -2,7 +2,7 @@
 # OxiDB data plane (document + SQL + TSDB engines, REST + wire).
 # Build context is the repo root: `docker build -f deploy/Dockerfile.oxidb .`
 
-FROM rust:1-bookworm AS build
+FROM rust:1.89-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake clang pkg-config libssl-dev perl \
     && rm -rf /var/lib/apt/lists/*

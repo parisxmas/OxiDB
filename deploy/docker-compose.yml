@@ -4,6 +4,10 @@
 # Only the `web` edge is published to the host; the data/control planes and the
 # wire port stay on the internal network. Secrets come from .env (never committed).
 
+# Explicit project name so containers/volumes are `oxibase-*` regardless of the
+# compose file's directory — never colliding with another stack's project.
+name: oxibase
+
 services:
   # Data plane: document + SQL + TSDB engines, REST + wire. Owns the data volume;
   # the control plane reads/writes it over the wire. Holds NO project signing key
