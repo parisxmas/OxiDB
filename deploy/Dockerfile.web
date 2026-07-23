@@ -1,0 +1,19 @@
+# syntax=docker/dockerfile:1
+# The public edge: builds the OxiBase dashboard (static SPA) and serves it, and
+# reverse-proxies the control plane + data plane. Path-based tenants
+# (`/<slug>/rest/v1/…`) are routed to the data plane, which parses the tenant.
+# The dashboard is built same-origin (empty VITE_* → relative fetches), so no
+# host is baked into the bundle.
+
+FROM node:20-alpine AS dash
+WORKDIR /app
+COPY oxibase-dashboard/ ./
+ENV VITE_OXIBASE_URL="" VITE_OXIDB_URL=""
+RUN npm install --no-audit --no-fund && npm run build
+
+FROM nginx:1-alpine AS runtime
+COPY --from=dash /app/dist /usr/share/nginx/html
+# The nginx image runs envsubst over templates → conf.d at startup, filling
+# ${OXIBASE_HOST} from the environment (nginx's own $vars are preserved).
+COPY deploy/nginx.conf.template /etc/nginx/templates/default.conf.template
+EXPOSE 80

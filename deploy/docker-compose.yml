@@ -1,0 +1,63 @@
+# OxiBase stack. Copy .env.example → .env, fill the secrets + host, then:
+#   docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+#
+# Only the `web` edge is published to the host; the data/control planes and the
+# wire port stay on the internal network. Secrets come from .env (never committed).
+
+services:
+  # Data plane: document + SQL + TSDB engines, REST + wire. Owns the data volume;
+  # the control plane reads/writes it over the wire. Holds NO project signing key
+  # (it verifies end-user/API tokens with the projects' public keys alone).
+  data-plane:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.oxidb
+    image: oxidb-server:local
+    environment:
+      OXIDB_PLATFORM: "1"                 # enable tenant resolution + project verification
+      OXIDB_SQL: "1"
+      OXIDB_TSDB: "1"
+      OXIDB_ADDR: "0.0.0.0:4444"          # wire (internal only)
+      OXIDB_HTTP_PORT: "8087"             # REST (internal, behind nginx)
+      OXIDB_DATA: "/data"
+      OXIDB_JWT_SECRET: "${OXIDB_JWT_SECRET}"   # guards the default-db / native path
+      OXIDB_PGRST_MAX_ROWS: "${OXIDB_PGRST_MAX_ROWS:-1000}"
+    volumes:
+      - oxidb-data:/data
+    restart: unless-stopped
+
+  # Control plane: accounts, projects, per-project keys, end-user auth. Lean
+  # (no engine linked). Holds OXIDB_SEAL_KEY to sign project/user tokens.
+  oxibase:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.oxibase
+    image: oxibase:local
+    environment:
+      OXIBASE_ADDR: "0.0.0.0:4460"
+      OXIBASE_UPSTREAM: "data-plane:4444"
+      OXIDB_SEAL_KEY: "${OXIDB_SEAL_KEY}"
+      OXIDB_PLATFORM_SECRET: "${OXIDB_PLATFORM_SECRET}"
+      OXIDB_PLATFORM_BASE_URL: "${OXIBASE_PUBLIC_URL}"   # for the `url` field in project responses
+      OXIDB_PLATFORM_SIGNUP_RATE: "${OXIDB_PLATFORM_SIGNUP_RATE:-5}"
+    depends_on:
+      - data-plane
+    restart: unless-stopped
+
+  # Public edge: dashboard static + reverse proxy (path-based tenant routing).
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    image: oxibase-web:local
+    environment:
+      OXIBASE_HOST: "${OXIBASE_HOST}"
+    ports:
+      - "${WEB_PORT:-8090}:80"
+    depends_on:
+      - oxibase
+      - data-plane
+    restart: unless-stopped
+
+volumes:
+  oxidb-data:

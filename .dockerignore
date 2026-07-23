@@ -12,3 +12,20 @@ examples/spring-boot/
 oxidb-spring-boot-starter/
 *.md
 LICENSE
+# extra excludes for the dockerized server/dashboard build
+target-*
+**/target
+**/node_modules
+.claude
+**/.next
+**/dist
+website-react/
+oxidb-app/
+crypto-feeder/
+swift/
+OxiDMS/
+oxidb-vscode/
+book/
+wordpress/
+*.log
+.DS_Store

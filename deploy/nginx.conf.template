@@ -1,0 +1,45 @@
+# Public edge for OxiBase. `${OXIBASE_HOST}` is filled from the environment at
+# container start (nginx image envsubst); nginx's own $variables are preserved.
+# Terminate TLS in front of this (Cloudflare origin / your SNI terminator) and
+# point it at this container's :80.
+
+# Shared proxy headers — forward the real client IP so per-IP rate limiting and
+# audit see the caller (works behind Cloudflare via CF-Connecting-IP too).
+map $http_cf_connecting_ip $real_client { default $http_cf_connecting_ip; "" $remote_addr; }
+
+server {
+    listen 80 default_server;
+    server_name ${OXIBASE_HOST};
+
+    client_max_body_size 32m;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $real_client;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+
+    # ── Control plane (accounts, projects, per-project + end-user auth) ──
+    location /platform/v1/ {
+        proxy_pass http://oxibase:4460;
+    }
+
+    # ── Data plane — path-based tenant: /<tenant>/rest/v1/… and /<tenant>/api/…
+    location ~ ^/[^/]+/(rest/v1|api)(/|$) {
+        proxy_pass http://data-plane:8087;
+    }
+
+    # ── Data plane — non-tenant endpoints (default db, ?db=<ref>, health) ──
+    location ~ ^/(rest/v1|api|hello|metrics)(/|$) {
+        proxy_pass http://data-plane:8087;
+    }
+    location = /v1/hello {
+        proxy_pass http://data-plane:8087;
+    }
+
+    # ── Dashboard SPA (everything else) ──
+    location / {
+        root /usr/share/nginx/html;
+        try_files $uri $uri/ /index.html;
+    }
+}

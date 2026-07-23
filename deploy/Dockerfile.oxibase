@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1
+# OxiBase control plane (accounts, projects, per-project keys + end-user auth).
+# Links no database engine; talks to the data plane over the wire.
+# Build context is the repo root: `docker build -f deploy/Dockerfile.oxibase .`
+
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang pkg-config perl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p oxibase && \
+    cp target/release/oxibase /usr/local/bin/oxibase && \
+    strip /usr/local/bin/oxibase || true
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10002 oxibase
+COPY --from=build /usr/local/bin/oxibase /usr/local/bin/oxibase
+USER oxibase
+EXPOSE 4460
+ENTRYPOINT ["/usr/local/bin/oxibase"]

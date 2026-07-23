@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+# OxiDB data plane (document + SQL + TSDB engines, REST + wire).
+# Build context is the repo root: `docker build -f deploy/Dockerfile.oxidb .`
+
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang pkg-config libssl-dev perl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# Build only the server crate (+ its workspace deps). Release, then strip.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p oxidb-server && \
+    cp target/release/oxidb-server /usr/local/bin/oxidb-server && \
+    strip /usr/local/bin/oxidb-server || true
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 -m -d /data oxidb
+COPY --from=build /usr/local/bin/oxidb-server /usr/local/bin/oxidb-server
+USER oxidb
+# REST (8087) and wire (4444). Kept internal to the compose network by default.
+EXPOSE 8087 4444
+ENTRYPOINT ["/usr/local/bin/oxidb-server"]
