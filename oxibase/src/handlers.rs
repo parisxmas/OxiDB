@@ -35,6 +35,9 @@ fn max_projects() -> usize {
 fn max_accounts() -> usize {
     env_usize("OXIDB_PLATFORM_MAX_ACCOUNTS", 10_000)
 }
+fn max_users_per_project() -> usize {
+    env_usize("OXIDB_PLATFORM_MAX_USERS", 100_000)
+}
 fn signup_rate() -> u32 {
     std::env::var("OXIDB_PLATFORM_SIGNUP_RATE")
         .ok()
@@ -272,6 +275,12 @@ pub fn project_jwks(state: &State, project_ref: &str) -> HttpResponse {
 
 /// `POST /platform/v1/projects/{ref}/auth/signup` — create an end-user.
 pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    // Per-project + per-actor rate limit — one project's abuse can't throttle
+    // another's, and a single client can't flood the user table.
+    let actor = format!("{project_ref}:{}", client_ip(req));
+    if !signup_allowed(&actor) {
+        return resp(429, json!({ "message": "signup rate limit exceeded; slow down" }));
+    }
     let body = parse_body(req);
     let (Some(email), Some(password)) = (str_field(&body, "email"), str_field(&body, "password"))
     else {
@@ -288,6 +297,16 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    // Hard ceiling on a project's user directory (defense in depth over the rate
+    // limit) — `OXIDB_PLATFORM_MAX_USERS` per project.
+    if state
+        .upstream
+        .count("users", &json!({ "project_ref": project_ref }))
+        .unwrap_or(0)
+        >= max_users_per_project()
+    {
+        return resp(403, json!({ "message": "user limit reached for this project" }));
+    }
     match state
         .upstream
         .find("users", &json!({ "project_ref": project_ref, "email": email }))
@@ -324,6 +343,15 @@ pub fn end_user_login(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
     else {
         return resp(400, json!({ "message": "email and password required" }));
     };
+    // Brute-force lockout, scoped per (project, email) so an attacker guessing
+    // one project's user can't lock out the same email in another project.
+    let lock_key = format!("{project_ref}:{email}");
+    if login_locked(&lock_key) {
+        return resp(
+            429,
+            json!({ "message": "too many failed attempts; try again later" }),
+        );
+    }
     let pdoc = match project_by_ref(state, project_ref) {
         Ok(Some(d)) => d,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
@@ -341,8 +369,10 @@ pub fn end_user_login(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
         .and_then(|u| u.get("pw_hash").and_then(|v| v.as_str()))
         .is_some_and(|h| crypto::verify_password(&password, h));
     if !ok {
+        login_record_failure(&lock_key);
         return resp(401, json!({ "message": "invalid credentials" }));
     }
+    login_clear(&lock_key);
     match mint_user_token(state, &pdoc, &email) {
         Some(token) => resp(200, json!({ "token": token })),
         None => resp(500, json!({ "message": "failed to mint token" })),
