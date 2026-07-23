@@ -3,8 +3,9 @@ import { type Project, getProject } from "./api.ts";
 import { DataBrowser } from "./DataBrowser.tsx";
 import { SqlTables } from "./SqlTables.tsx";
 import { SqlRunner } from "./SqlRunner.tsx";
+import { RulesEditor } from "./RulesEditor.tsx";
 
-type Tab = "collections" | "sqltables" | "sql";
+type Tab = "collections" | "sqltables" | "sql" | "rules";
 
 export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack: () => void }) {
   const [project, setProject] = useState<Project | null>(null);
@@ -47,6 +48,9 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
           <button className={tab === "sql" ? "tab active" : "tab"} onClick={() => setTab("sql")}>
             SQL
           </button>
+          <button className={tab === "rules" ? "tab active" : "tab"} onClick={() => setTab("rules")}>
+            Rules
+          </button>
         </div>
       </div>
 
@@ -57,8 +61,10 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
         <DataBrowser projectRef={projectRef} apiKey={key} />
       ) : tab === "sqltables" ? (
         <SqlTables projectRef={projectRef} apiKey={key} />
-      ) : (
+      ) : tab === "sql" ? (
         <SqlRunner projectRef={projectRef} apiKey={key} />
+      ) : (
+        <RulesEditor projectRef={projectRef} apiKey={key} />
       )}
     </section>
   );

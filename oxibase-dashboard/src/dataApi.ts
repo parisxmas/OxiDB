@@ -76,6 +76,37 @@ export async function runSql(ref: string, key: string, sql: string): Promise<Sql
   return d.results ?? [];
 }
 
+/** The four rule expressions of a collection (OxiBase's RLS analog). */
+export interface Rules {
+  read: string;
+  create: string;
+  update: string;
+  delete: string;
+}
+
+/** Current rules for a collection, or `null` if none are defined (open reads;
+ *  anon writes denied by default). Admin key required. */
+export async function getRules(ref: string, col: string, key: string): Promise<Rules | null> {
+  const res = await fetch(withDb(ref, `/api/rules/${encodeURIComponent(col)}`), {
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  if (res.status === 404) return null;
+  const text = await res.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!res.ok) throw new Error((data && (data.message || data.error)) || `HTTP ${res.status}`);
+  return { read: data.read, create: data.create, update: data.update, delete: data.delete };
+}
+
+/** Set (upsert) the rules for a collection. Admin key required. */
+export function setRules(ref: string, col: string, key: string, rules: Rules): Promise<unknown> {
+  return call("POST", ref, `/api/rules/${encodeURIComponent(col)}`, key, rules);
+}
+
+/** Remove all rules from a collection (back to open reads / anon-write denied). */
+export function deleteRules(ref: string, col: string, key: string): Promise<unknown> {
+  return call("DELETE", ref, `/api/rules/${encodeURIComponent(col)}`, key);
+}
+
 export interface SqlTable {
   name: string;
   rows: number;

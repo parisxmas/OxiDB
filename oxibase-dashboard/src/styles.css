@@ -173,3 +173,20 @@ button:disabled { opacity: 0.55; cursor: default; }
   border-radius: 999px; padding: 1px 7px;
 }
 .coll.active .rowcount { background: var(--panel); }
+
+/* Rules editor */
+.badge { font-size: 11px; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
+.badge.on { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }
+.badge.off { background: var(--panel-2); color: var(--muted); }
+.presets { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.card.rules { display: grid; gap: 10px; }
+.rulefield { display: grid; grid-template-columns: 80px 1fr; align-items: center; gap: 10px; color: var(--text); }
+.rulefield > span { font-size: 13px; font-weight: 600; color: var(--muted); }
+.rulefield input {
+  width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  padding: 8px 10px; border-radius: 8px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px; outline: none;
+}
+.rulefield input:focus { border-color: var(--accent); }
+.rules .hint { margin: 4px 0 0; line-height: 1.6; }
+.rules .hint code { background: var(--panel-2); padding: 1px 5px; border-radius: 5px; font-size: 11px; }

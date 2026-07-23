@@ -25,6 +25,10 @@ stores with separate objects:
   `/api/sql?db=<ref>`.
 - **SQL** (`SqlRunner`) — run ad-hoc DDL/DML/`SELECT` batches against the SQL
   engine, results rendered as a grid.
+- **Rules** (`RulesEditor`) — view and edit a collection's security rules
+  (OxiBase's RLS analog): the `read/create/update/delete` boolean expressions,
+  with presets (Public, Public read-only, Signed-in only, Owner only). This is
+  what lets a browser-safe **anon** key write a collection (`POST /api/rules`).
 
 The SQL tabs require the data plane to run with `OXIDB_SQL=1`.
 
