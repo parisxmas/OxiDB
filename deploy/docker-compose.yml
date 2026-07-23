@@ -46,6 +46,10 @@ services:
       OXIDB_PLATFORM_SIGNUP_RATE: "${OXIDB_PLATFORM_SIGNUP_RATE:-5}"
       # Max projects a single developer account may create (default 100).
       OXIDB_PLATFORM_MAX_PROJECTS: "${OXIDB_PLATFORM_MAX_PROJECTS:-100}"
+      # Per-project resource quotas written onto each new project (plan-based).
+      # The data plane reads these off the project row and enforces them.
+      OXIDB_PROJECT_MAX_COLLECTIONS: "${OXIDB_PROJECT_MAX_COLLECTIONS:-5}"
+      OXIDB_PROJECT_MAX_TABLES: "${OXIDB_PROJECT_MAX_TABLES:-5}"
       # Google OAuth Web client ID — developer console sign-in (public value).
       OXIBASE_GOOGLE_CLIENT_ID: "${OXIBASE_GOOGLE_CLIENT_ID:-}"
     depends_on:

@@ -64,6 +64,43 @@ pub fn resolve_tenant(mgr: &DatabaseManager, segment: &str) -> Option<String> {
     doc.get("ref").and_then(|v| v.as_str()).map(String::from)
 }
 
+/// Default per-project resource caps, applied when a project row does not carry
+/// an explicit value (e.g. rows created before quotas existed). The control
+/// plane owns the real numbers per plan; these are only the floor the data plane
+/// falls back to. Overridable via `OXIDB_PROJECT_DEFAULT_MAX_COLLECTIONS` /
+/// `OXIDB_PROJECT_DEFAULT_MAX_TABLES` (0 = unlimited).
+fn default_limit(env_key: &str) -> usize {
+    std::env::var(env_key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5)
+}
+
+/// Per-project resource caps `(max_collections, max_tables)` for `db_ref`. The
+/// control plane writes `max_collections`/`max_tables` onto each project row
+/// (plan-based); the data plane reads them here and enforces at creation time —
+/// the only place it can, since collections/tables are created straight against
+/// the data plane and never pass through the control plane. `None` for the
+/// metadata db, an unknown ref, or when the platform is off (no quotas then).
+pub fn project_limits(mgr: &DatabaseManager, db_ref: &str) -> Option<(usize, usize)> {
+    if !enabled() || db_ref == META_DB {
+        return None;
+    }
+    let pdb = mgr.get_database(META_DB).ok()?;
+    let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
+    let mc = doc
+        .get("max_collections")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or_else(|| default_limit("OXIDB_PROJECT_DEFAULT_MAX_COLLECTIONS"));
+    let mt = doc
+        .get("max_tables")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or_else(|| default_limit("OXIDB_PROJECT_DEFAULT_MAX_TABLES"));
+    Some((mc, mt))
+}
+
 /// The per-project ES256 **public** key (SEC1 uncompressed, 65 bytes) for
 /// `db_ref`, if it names an OxiBase project. Read in the clear — no seal key,
 /// no secret — so a data-plane node verifies project tokens without holding any

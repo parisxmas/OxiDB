@@ -273,6 +273,15 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
             }
             Some(mgr) => match mgr.get_database(name) {
                 Ok(db) => {
+                    // Arm this tenant database with its OxiBase collection quota
+                    // (owned by the control plane, read from the project row).
+                    // The engine then rejects a new collection past the cap on
+                    // every path; refreshing it per request reflects plan changes.
+                    if let Some((max_collections, _max_tables)) =
+                        crate::tenant_auth::project_limits(mgr, name)
+                    {
+                        db.set_max_collections(max_collections);
+                    }
                     // `active` belongs to the listener's shared state; this
                     // per-request scope only redirects `db`.
                     scoped_state = RestState {
@@ -837,6 +846,16 @@ fn handle_sql_endpoint(
     }
 
     let db = db_name.unwrap_or(oxidb::database_manager::DEFAULT_DATABASE);
+    // Arm the tenant's SQL engine with its OxiBase table quota before executing,
+    // so a CREATE TABLE past the cap is rejected. Non-tenant databases get no
+    // limit (project_limits → None).
+    if let (Some(name), Some(mgr)) = (db_name, &state.db_manager) {
+        if let Some((_max_collections, max_tables)) =
+            crate::tenant_auth::project_limits(mgr, name)
+        {
+            crate::sql_bridge::set_table_limit(name, max_tables);
+        }
+    }
     match crate::sql_bridge::execute_json_in(db, sql, body.get("params"), readonly) {
         Ok(results) => json_response(200, "OK", json!({"results": results})),
         Err(msg) => json_response(400, "Bad Request", json!({"error": msg})),
@@ -1364,8 +1383,14 @@ fn url_decode(s: &str) -> String {
     result
 }
 
-fn db_err(_e: oxidb::Error) -> (u16, &'static str) {
-    (500, "database error")
+fn db_err(e: oxidb::Error) -> (u16, &'static str) {
+    match e {
+        // A tenant quota (OxiBase per-project collection cap) → 403, not 500.
+        oxidb::Error::CollectionLimitExceeded(_) => {
+            (403, "collection limit reached for this project")
+        }
+        _ => (500, "database error"),
+    }
 }
 
 fn json_response(status: u16, status_text: &'static str, body: Value) -> HttpResponse {

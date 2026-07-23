@@ -415,6 +415,9 @@ pub struct SqlEngine {
     row_locks: row_locks::RowLocks,
     /// See [`SqlOptions::lock_timeout_ms`].
     lock_timeout: std::time::Duration,
+    /// Max number of tables this engine may hold. `0` = unlimited (the default).
+    /// Set per-instance by the data plane for OxiBase tenant databases.
+    max_tables: std::sync::atomic::AtomicUsize,
 }
 
 thread_local! {
@@ -534,6 +537,7 @@ impl SqlEngine {
             stmt_cache: Mutex::new(std::collections::HashMap::new()),
             row_locks: row_locks::RowLocks::default(),
             lock_timeout: std::time::Duration::from_millis(opts.lock_timeout_ms),
+            max_tables: std::sync::atomic::AtomicUsize::new(0),
             inner: Mutex::new(Inner {
                 dir,
                 generation,
@@ -731,10 +735,24 @@ impl SqlEngine {
     }
 
     /// Create a new table. Errors if a table or view of the same name exists.
+    /// Cap the number of tables this engine may hold (`0` = unlimited). Set by
+    /// the data plane from a tenant project's OxiBase quota; refreshed per
+    /// request so plan changes take effect without a restart.
+    pub fn set_max_tables(&self, max: usize) {
+        self.max_tables
+            .store(max, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn create_table(&self, def: Table) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if inner.catalog.contains(&def.name) || inner.catalog.views.contains_key(&def.name) {
             return Err(SqlError::TableExists(def.name));
+        }
+        // Enforce the per-instance table cap (OxiBase tenant quota). Existing
+        // tables are unaffected; only creating a *new* one past the cap fails.
+        let max = self.max_tables.load(std::sync::atomic::Ordering::Acquire);
+        if max > 0 && inner.catalog.tables.len() >= max {
+            return Err(SqlError::TableLimitExceeded(max));
         }
         let rec = WalRecord::CreateTable(def);
         let inner = &mut *inner;

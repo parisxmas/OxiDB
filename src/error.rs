@@ -17,6 +17,9 @@ pub enum Error {
     #[error("collection already exists: {0}")]
     CollectionAlreadyExists(String),
 
+    #[error("collection limit reached ({0}) — cannot create another collection")]
+    CollectionLimitExceeded(usize),
+
     #[error("index already exists: {0}")]
     IndexAlreadyExists(String),
 

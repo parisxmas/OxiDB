@@ -128,6 +128,16 @@ fn engine_for(db_name: &str) -> Result<Arc<SqlEngine>, String> {
     Ok(arc)
 }
 
+/// Arm a database's SQL engine with a table cap (OxiBase per-project quota,
+/// `0` = unlimited). No-op when the SQL engine is disabled or the database has
+/// no engine yet (it will be created on first use, defaulting to unlimited until
+/// the next request re-applies the cap). Cheap enough to call per request.
+pub fn set_table_limit(db_name: &str, max: usize) {
+    if let Ok(engine) = engine_for(db_name) {
+        engine.set_max_tables(max);
+    }
+}
+
 /// Drop a database's SQL engine from the registry (its files go away with the
 /// database directory). Called by `drop_database`.
 pub fn forget_database(db_name: &str) {

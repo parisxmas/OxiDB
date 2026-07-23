@@ -30,6 +30,11 @@ pub enum SqlError {
     #[error("table already exists: {0}")]
     TableExists(String),
 
+    /// The database has reached its configured table cap (OxiBase per-project
+    /// quota). `0` = unlimited, so this is only ever raised when a cap is set.
+    #[error("table limit reached ({0}) — cannot create another table")]
+    TableLimitExceeded(usize),
+
     /// An index with this name already exists.
     #[error("index already exists: {0}")]
     IndexExists(String),

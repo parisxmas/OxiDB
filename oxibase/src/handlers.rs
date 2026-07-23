@@ -42,6 +42,14 @@ fn env_usize(key: &str, default: usize) -> usize {
 fn max_projects() -> usize {
     env_usize("OXIDB_PLATFORM_MAX_PROJECTS", 100)
 }
+/// Per-project resource caps written onto each new project (the plan's quota;
+/// the data plane reads and enforces them). Default 5, overridable via env.
+fn project_max_collections() -> usize {
+    env_usize("OXIDB_PROJECT_MAX_COLLECTIONS", 5)
+}
+fn project_max_tables() -> usize {
+    env_usize("OXIDB_PROJECT_MAX_TABLES", 5)
+}
 fn max_accounts() -> usize {
     env_usize("OXIDB_PLATFORM_MAX_ACCOUNTS", 10_000)
 }
@@ -259,6 +267,10 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
         "isolation": "shared",
         "created_at": created_at,
         "key_iat": created_at,
+        // Per-project resource quotas (plan-based). The data plane reads these
+        // from the project row and enforces them at collection/table creation.
+        "max_collections": project_max_collections(),
+        "max_tables": project_max_tables(),
     });
     if let Err(e) = state.upstream.insert("projects", &doc) {
         let _ = state.upstream.drop_database(&project_ref);

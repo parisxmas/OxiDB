@@ -453,6 +453,10 @@ pub struct OxiDb {
     #[cfg(not(target_arch = "wasm32"))]
     archiver_shutdown: Mutex<Option<mpsc::SyncSender<()>>>,
     cache_capacity: AtomicUsize,
+    /// Max number of *user* collections (names not starting with `_`) this
+    /// database may hold. `0` = unlimited (the default). Set per-instance by the
+    /// `DatabaseManager` for tenant databases; infrastructure databases stay 0.
+    max_collections: AtomicUsize,
     in_memory: bool,
     /// Serializes the OCC commit critical section (version validation
     /// through apply). Without it, two transactions that both read a
@@ -600,6 +604,7 @@ impl OxiDb {
             sync_shutdown: Mutex::new(None),
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
+            max_collections: AtomicUsize::new(0),
             in_memory: true,
             commit_lock: RwLock::new(()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -633,6 +638,7 @@ impl OxiDb {
             change_broker: ChangeStreamBroker::new(),
             lazy_sync: AtomicBool::new(false),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
+            max_collections: AtomicUsize::new(0),
             in_memory: true,
             commit_lock: RwLock::new(()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -793,6 +799,7 @@ impl OxiDb {
             sync_shutdown: Mutex::new(None),
             archiver_shutdown: Mutex::new(None),
             cache_capacity: AtomicUsize::new(crate::doc_cache::default_capacity()),
+            max_collections: AtomicUsize::new(0),
             in_memory: false,
             commit_lock: RwLock::new(()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -939,6 +946,8 @@ impl OxiDb {
             }
         }
         #[cfg(not(target_arch = "wasm32"))]
+        self.enforce_collection_limit(name)?;
+        #[cfg(not(target_arch = "wasm32"))]
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
         } else {
@@ -994,6 +1003,8 @@ impl OxiDb {
                 return Err(Error::CollectionAlreadyExists(name.to_string()));
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.enforce_collection_limit(name)?;
         #[cfg(not(target_arch = "wasm32"))]
         let col = if self.in_memory {
             BTreeCollection::open_in_memory(name)
@@ -1431,6 +1442,39 @@ impl OxiDb {
     /// Returns the current per-collection cache capacity.
     pub fn cache_capacity(&self) -> usize {
         self.cache_capacity.load(Ordering::Acquire)
+    }
+
+    /// Cap the number of *user* collections (names not starting with `_`) this
+    /// database may hold. `0` = unlimited. System collections and loading an
+    /// already-existing collection are never blocked.
+    pub fn set_max_collections(&self, max: usize) {
+        self.max_collections.store(max, Ordering::Release);
+    }
+
+    /// Returns the configured user-collection cap (`0` = unlimited).
+    pub fn max_collections(&self) -> usize {
+        self.max_collections.load(Ordering::Acquire)
+    }
+
+    /// Reject creating a *new* user collection when the cap is reached. Loading a
+    /// collection that already exists (in memory or on disk) and any system
+    /// collection (leading `_`) are always allowed, so quotas never lock a
+    /// tenant out of existing data or break engine bookkeeping.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn enforce_collection_limit(&self, name: &str) -> Result<()> {
+        let max = self.max_collections.load(Ordering::Acquire);
+        if max == 0 || name.starts_with('_') {
+            return Ok(());
+        }
+        let existing = self.list_collections();
+        if existing.iter().any(|c| c == name) {
+            return Ok(()); // already exists → a load, not a create
+        }
+        let user_count = existing.iter().filter(|c| !c.starts_with('_')).count();
+        if user_count >= max {
+            return Err(Error::CollectionLimitExceeded(max));
+        }
+        Ok(())
     }
 
     /// Drop a collection and its data.
@@ -3901,6 +3945,34 @@ mod tests {
     fn temp_db() -> OxiDb {
         let dir = tempdir().unwrap();
         OxiDb::open(dir.path()).unwrap()
+    }
+
+    #[test]
+    fn max_collections_caps_new_user_collections() {
+        let db = temp_db();
+        db.set_max_collections(2);
+        // Two user collections are fine.
+        db.insert("a", json!({"x": 1})).unwrap();
+        db.insert("b", json!({"x": 1})).unwrap();
+        // A third is rejected.
+        let e = db.insert("c", json!({"x": 1})).unwrap_err();
+        assert!(matches!(e, Error::CollectionLimitExceeded(2)));
+        // Existing collections still accept writes (a load, not a create).
+        db.insert("a", json!({"x": 2})).unwrap();
+        // System collections (leading `_`) are exempt from the cap.
+        db.insert("_meta", json!({"x": 1})).unwrap();
+        // Raising the cap lets a new one through.
+        db.set_max_collections(3);
+        db.insert("c", json!({"x": 1})).unwrap();
+    }
+
+    #[test]
+    fn max_collections_zero_is_unlimited() {
+        let db = temp_db(); // default cap is 0 = unlimited
+        for i in 0..12 {
+            db.insert(&format!("c{i}"), json!({"x": i})).unwrap();
+        }
+        assert_eq!(db.list_collections().len(), 12);
     }
 
     #[test]
