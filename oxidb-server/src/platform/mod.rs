@@ -12,6 +12,13 @@
 //! encrypted in the `_oxibase` system database — so a leaked project key is
 //! blast-radius-limited to one tenant (Supabase's model).
 //!
+//! Two distinct secrets (ADR-0021 boundary): `OXIDB_PLATFORM_SECRET` signs
+//! developer sessions (control-plane only); `OXIDB_SEAL_KEY` seals/unseals
+//! per-project secrets. The **data-plane hook** [`project_secret`] unseals with
+//! the seal key **alone** — it never needs the session-signing master secret.
+//! For the single-binary skeleton the seal key falls back to the master secret
+//! when `OXIDB_SEAL_KEY` is unset.
+//!
 //! Key roles: `anon` = a `read` JWT (safe in a browser); `service_role` =
 //! an `admin` JWT (bypasses rules — server-side only). Both are minted with a
 //! fixed `iat` (the project's creation time) so they are stable across reads.
@@ -120,10 +127,22 @@ fn master_secret() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The AES-GCM key that seals per-project secrets, derived from the master
-/// secret so no separate keyfile is needed.
-fn enc_key(master: &str) -> Arc<EncryptionKey> {
-    let digest = Sha256::digest(master.as_bytes());
+/// The AES-GCM key that seals per-project secrets. Prefers a **dedicated**
+/// `OXIDB_SEAL_KEY`, so the data plane can unseal a project secret without ever
+/// holding the session-signing master secret (ADR-0021's boundary) — falling
+/// back to deriving from the master secret for the single-binary skeleton.
+/// `None` when neither is configured.
+fn seal_key() -> Option<Arc<EncryptionKey>> {
+    let material = std::env::var("OXIDB_SEAL_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(master_secret)?;
+    Some(derive_key(&material))
+}
+
+/// Derive a 32-byte AES key from arbitrary key material (SHA-256).
+fn derive_key(material: &str) -> Arc<EncryptionKey> {
+    let digest = Sha256::digest(material.as_bytes());
     let mut key = [0u8; 32];
     key.copy_from_slice(&digest);
     EncryptionKey::from_bytes(&key)
@@ -174,14 +193,15 @@ pub fn project_secret(mgr: &DatabaseManager, db_ref: &str) -> Option<String> {
     if let Some(cached) = secret_cache().lock().unwrap().get(db_ref).cloned() {
         return Some(cached);
     }
-    let master = master_secret()?;
+    // The data-plane hook (ADR-0021): unseal with the seal key alone — it never
+    // needs the master secret that signs developer sessions.
     let pdb = platform_db(mgr)?;
     let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
     let sealed_b64 = doc.get("secret_enc")?.as_str()?;
     let sealed = base64::engine::general_purpose::STANDARD
         .decode(sealed_b64)
         .ok()?;
-    let plain = enc_key(&master).decrypt(&sealed).ok()?;
+    let plain = seal_key()?.decrypt(&sealed).ok()?;
     let secret = String::from_utf8(plain).ok()?;
     secret_cache()
         .lock()
@@ -405,7 +425,6 @@ fn handle_create_project(req: &HttpRequest, mgr: &DatabaseManager) -> HttpRespon
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let master = master_secret().unwrap();
     let Some(pdb) = platform_db(mgr) else {
         return resp(500, json!({ "message": "control-plane store unavailable" }));
     };
@@ -443,7 +462,10 @@ fn handle_create_project(req: &HttpRequest, mgr: &DatabaseManager) -> HttpRespon
         );
     }
 
-    let sealed = match enc_key(&master).encrypt(secret.as_bytes()) {
+    let Some(seal) = seal_key() else {
+        return resp(500, json!({ "message": "no seal key configured" }));
+    };
+    let sealed = match seal.encrypt(secret.as_bytes()) {
         Ok(s) => base64::engine::general_purpose::STANDARD.encode(s),
         Err(e) => return resp(500, json!({ "message": format!("seal failed: {e}") })),
     };
@@ -498,7 +520,9 @@ fn handle_get_project(req: &HttpRequest, mgr: &DatabaseManager, project_ref: &st
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let master = master_secret().unwrap();
+    let Some(seal) = seal_key() else {
+        return resp(500, json!({ "message": "no seal key configured" }));
+    };
     let Some(pdb) = platform_db(mgr) else {
         return resp(500, json!({ "message": "control-plane store unavailable" }));
     };
@@ -520,7 +544,7 @@ fn handle_get_project(req: &HttpRequest, mgr: &DatabaseManager, project_ref: &st
         return resp(500, json!({ "message": "corrupt project record" }));
     };
     let secret = match base64::engine::general_purpose::STANDARD.decode(sealed_b64) {
-        Ok(sealed) => match enc_key(&master).decrypt(&sealed) {
+        Ok(sealed) => match seal.decrypt(&sealed) {
             Ok(p) => String::from_utf8(p).unwrap_or_default(),
             Err(_) => return resp(500, json!({ "message": "unseal failed" })),
         },
@@ -569,7 +593,9 @@ fn handle_rotate_keys(req: &HttpRequest, mgr: &DatabaseManager, project_ref: &st
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let master = master_secret().unwrap();
+    let Some(seal) = seal_key() else {
+        return resp(500, json!({ "message": "no seal key configured" }));
+    };
     let Some(pdb) = platform_db(mgr) else {
         return resp(500, json!({ "message": "control-plane store unavailable" }));
     };
@@ -585,7 +611,7 @@ fn handle_rotate_keys(req: &HttpRequest, mgr: &DatabaseManager, project_ref: &st
 
     let new_secret = gen_secret();
     let new_iat = now_secs();
-    let sealed = match enc_key(&master).encrypt(new_secret.as_bytes()) {
+    let sealed = match seal.encrypt(new_secret.as_bytes()) {
         Ok(s) => base64::engine::general_purpose::STANDARD.encode(s),
         Err(e) => return resp(500, json!({ "message": format!("seal failed: {e}") })),
     };
@@ -776,9 +802,26 @@ mod tests {
 
     #[test]
     fn seal_roundtrip() {
-        let key = enc_key("master");
+        let key = derive_key("seal-material");
         let sealed = key.encrypt(b"project-secret").unwrap();
         assert_eq!(key.decrypt(&sealed).unwrap(), b"project-secret");
+    }
+
+    #[test]
+    fn only_the_seal_key_unseals() {
+        // ADR-0021: the data plane unseals with the SEAL key, independent of the
+        // master session-signing secret. A different key must fail to unseal.
+        let sealed = derive_key("seal-key-A").encrypt(b"tenant-secret").unwrap();
+        assert_eq!(
+            derive_key("seal-key-A").decrypt(&sealed).unwrap(),
+            b"tenant-secret"
+        );
+        assert!(
+            derive_key("master-signing-secret")
+                .decrypt(&sealed)
+                .is_err(),
+            "the session-signing secret must NOT be able to unseal"
+        );
     }
 
     #[test]
