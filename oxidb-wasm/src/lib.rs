@@ -1,6 +1,12 @@
 use serde_json::{Value, json};
 use std::sync::Arc;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
+use web_sys::{
+    FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetFileOptions,
+    FileSystemWritableFileStream, StorageManager,
+};
 
 use oxidb::OxiDb;
 use oxidb::locks::RwLock;
@@ -180,5 +186,98 @@ pub fn restore(image: &str) -> Result<(), JsValue> {
                 .map_err(|e| JsValue::from_str(&e.to_string()))?;
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// OPFS persistence (Origin Private File System)
+//
+// The engine core is in-memory (WASM has no filesystem), but the browser gives
+// every origin a private, persistent file store — OPFS. These helpers dump the
+// whole database image to a real OPFS file and restore it on the next load, so
+// data survives page reloads. Both are async (the main-thread OPFS API is
+// Promise-based) and return JS Promises.
+//
+// Usage:
+//   await init();               // create the in-memory database
+//   await oxidb.load_opfs();    // rehydrate from OPFS if a snapshot exists
+//   ... insert / update / delete ...
+//   await oxidb.persist_opfs(); // write a fresh snapshot (after writes / on unload)
+// ---------------------------------------------------------------------------
+
+/// The origin-private file the database image is snapshotted to.
+const OPFS_FILE: &str = "oxidb.json";
+
+/// Resolve the `StorageManager` from either a Window (main thread) or a
+/// WorkerGlobalScope, so persistence works on the page and in a worker.
+fn storage_manager() -> Result<StorageManager, JsValue> {
+    let global = js_sys::global();
+    if let Some(win) = global.dyn_ref::<web_sys::Window>() {
+        return Ok(win.navigator().storage());
+    }
+    if let Some(worker) = global.dyn_ref::<web_sys::WorkerGlobalScope>() {
+        return Ok(worker.navigator().storage());
+    }
+    Err(JsValue::from_str(
+        "OPFS unavailable: no Window or Worker global in this context",
+    ))
+}
+
+/// The OPFS root directory handle (`navigator.storage.getDirectory()`).
+async fn opfs_root() -> Result<FileSystemDirectoryHandle, JsValue> {
+    let dir = JsFuture::from(storage_manager()?.get_directory()).await?;
+    dir.dyn_into::<FileSystemDirectoryHandle>()
+}
+
+/// Snapshot the entire database to the origin-private OPFS file `oxidb.json`.
+/// Overwrites any previous snapshot. Call after writes (or on `beforeunload`).
+#[wasm_bindgen]
+pub async fn persist_opfs() -> Result<(), JsValue> {
+    let image = dump()?;
+    let root = opfs_root().await?;
+    let opts = FileSystemGetFileOptions::new();
+    opts.set_create(true);
+    let fh = JsFuture::from(root.get_file_handle_with_options(OPFS_FILE, &opts))
+        .await?
+        .dyn_into::<FileSystemFileHandle>()?;
+    let writable = JsFuture::from(fh.create_writable())
+        .await?
+        .dyn_into::<FileSystemWritableFileStream>()?;
+    JsFuture::from(writable.write_with_str(&image)?).await?;
+    JsFuture::from(writable.close()).await?;
+    Ok(())
+}
+
+/// Restore the database from the OPFS snapshot if one exists. Returns `true`
+/// when a snapshot was found and loaded, `false` when there was none (a first
+/// run). Call once after `init()`.
+#[wasm_bindgen]
+pub async fn load_opfs() -> Result<bool, JsValue> {
+    let root = opfs_root().await?;
+    // No `create` option → a missing file rejects; treat that as "nothing saved".
+    let fh = match JsFuture::from(root.get_file_handle(OPFS_FILE)).await {
+        Ok(v) => v.dyn_into::<FileSystemFileHandle>()?,
+        Err(_) => return Ok(false),
+    };
+    let file = JsFuture::from(fh.get_file())
+        .await?
+        .dyn_into::<web_sys::File>()?;
+    let text = JsFuture::from(file.text())
+        .await?
+        .as_string()
+        .ok_or_else(|| JsValue::from_str("OPFS snapshot is not text"))?;
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+    restore(&text)?;
+    Ok(true)
+}
+
+/// Delete the OPFS snapshot (a fresh start on the next load). Resolves whether
+/// or not a snapshot existed.
+#[wasm_bindgen]
+pub async fn clear_opfs() -> Result<(), JsValue> {
+    let root = opfs_root().await?;
+    let _ = JsFuture::from(root.remove_entry(OPFS_FILE)).await; // ignore "not found"
     Ok(())
 }

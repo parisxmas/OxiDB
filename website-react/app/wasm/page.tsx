@@ -2,14 +2,14 @@ import type { Metadata } from "next"
 
 export const metadata: Metadata = {
   title: "WebAssembly",
-  description: `Run OxiDB entirely in the browser via WebAssembly. No server needed — JSON queries and aggregation all work in-memory.`,
+  description: `Run OxiDB entirely in the browser via WebAssembly. No server needed — JSON queries and aggregation run in-memory, with optional OPFS persistence that survives page reloads.`,
 }
 
 export default function Page() {
   return <div dangerouslySetInnerHTML={{ __html: `<section class="section">
   <div class="container">
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> WebAssembly</h2>
-    <p class="section-desc">Run OxiDB entirely in the browser. No server needed &mdash; all data lives in memory within the WASM module. Supports MongoDB-style JSON queries, aggregation, and indexes.</p>
+    <p class="section-desc">Run OxiDB entirely in the browser. No server needed &mdash; data lives in memory within the WASM module and can be <strong>persisted to OPFS</strong> (the browser's Origin Private File System) so it survives page reloads. Supports MongoDB-style JSON queries, aggregation, and indexes.</p>
 
     <!-- Install -->
     <div class="doc-block">
@@ -143,6 +143,23 @@ const stats = JSON.parse(oxidb.aggregate('users', pipeline));</code></pre>
 oxidb.drop_collection('old_data');</code></pre>
     </div>
 
+    <!-- Persistence (OPFS) -->
+    <div class="doc-block">
+      <h3>Persist to the browser (OPFS)</h3>
+      <p>The engine core is in-memory, but the browser gives every origin a private, persistent file store &mdash; <strong>OPFS</strong> (Origin Private File System). <code>persist_opfs()</code> snapshots the whole database to a real origin-private file (<code>oxidb.json</code>); <code>load_opfs()</code> restores it on the next visit. Both are <strong>async</strong> (they return Promises).</p>
+      <pre><code>await init();               // load the WASM binary
+oxidb.init();               // create the in-memory database
+await oxidb.load_opfs();    // rehydrate from OPFS if a snapshot exists (first run: false)
+
+// ... insert / update / delete as usual ...
+oxidb.insert('tasks', JSON.stringify({ title: 'Buy milk', done: false }));
+
+await oxidb.persist_opfs();  // write a fresh snapshot to OPFS</code></pre>
+      <p>A common pattern is to reload on start and snapshot on unload:</p>
+      <pre><code>window.addEventListener('beforeunload', () =&gt; { oxidb.persist_opfs(); });</code></pre>
+      <p class="tip"><strong>Note:</strong> OPFS is available in all modern browsers (Chrome, Edge, Firefox, Safari 16.4+). The snapshot is a full image, so it is best suited to small/medium datasets; <code>clear_opfs()</code> deletes it for a fresh start.</p>
+    </div>
+
     <!-- Complete Example -->
     <div class="doc-block">
       <h3>Complete Example</h3>
@@ -204,6 +221,11 @@ oxidb.drop_collection('old_data');</code></pre>
             <tr><td><code>create_index(collection, field)</code></td><td>collection name, field name</td><td>&mdash;</td></tr>
             <tr><td><code>list_collections()</code></td><td>&mdash;</td><td>JSON array of names</td></tr>
             <tr><td><code>drop_collection(name)</code></td><td>collection name</td><td>&mdash;</td></tr>
+            <tr><td><code>dump()</code></td><td>&mdash;</td><td>JSON image string of the whole database</td></tr>
+            <tr><td><code>restore(imageStr)</code></td><td>image from <code>dump()</code></td><td>&mdash;</td></tr>
+            <tr><td><code>persist_opfs()</code></td><td>&mdash;</td><td>Promise&lt;void&gt; &mdash; snapshot to OPFS</td></tr>
+            <tr><td><code>load_opfs()</code></td><td>&mdash;</td><td>Promise&lt;boolean&gt; &mdash; restore from OPFS (false if none)</td></tr>
+            <tr><td><code>clear_opfs()</code></td><td>&mdash;</td><td>Promise&lt;void&gt; &mdash; delete the OPFS snapshot</td></tr>
           </tbody>
         </table>
       </div>
@@ -227,7 +249,7 @@ cd OxiDB/oxidb-wasm
     <div class="doc-block">
       <h3>Notes</h3>
       <ul>
-        <li>All data is <strong>in-memory only</strong> &mdash; does not persist across page reloads</li>
+        <li>Queries run against an <strong>in-memory</strong> engine; call <code>persist_opfs()</code> to snapshot to OPFS and <code>load_opfs()</code> to restore, so data <strong>survives page reloads</strong></li>
         <li>WASM binary is ~1.5 MB gzipped (~4.7 MB uncompressed)</li>
         <li>All queries run synchronously on the main thread</li>
         <li>Supports the same query operators and aggregation pipeline as native OxiDB</li>

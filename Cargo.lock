@@ -2660,13 +2660,16 @@ dependencies = [
 
 [[package]]
 name = "oxidb-wasm"
-version = "0.39.0"
+version = "0.39.1"
 dependencies = [
+ "js-sys",
  "oxidb",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
