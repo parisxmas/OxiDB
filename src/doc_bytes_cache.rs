@@ -56,14 +56,25 @@ pub fn default_capacity() -> usize {
     })
 }
 
+use crate::doc_cache::{CacheKey, compose, next_ns};
+
 #[inline]
-fn shard_for(id: DocumentId) -> usize {
-    (id & SHARD_MASK) as usize
+fn shard_for(key: CacheKey) -> usize {
+    ((key as u64) & SHARD_MASK) as usize
 }
 
-pub struct DocBytesCache {
+/// The single process-global encoded-bytes cache, shared by every collection
+/// under one memory budget (was per-collection, so total RSS scaled with the
+/// collection count).
+pub fn global() -> Arc<SharedBytes> {
+    use std::sync::OnceLock;
+    static G: OnceLock<Arc<SharedBytes>> = OnceLock::new();
+    Arc::clone(G.get_or_init(|| Arc::new(SharedBytes::new(default_capacity()))))
+}
+
+pub struct SharedBytes {
     per_shard_cap: AtomicUsize,
-    shards: Vec<Mutex<Option<LruCache<DocumentId, Arc<[u8]>>>>>,
+    shards: Vec<Mutex<Option<LruCache<CacheKey, Arc<[u8]>>>>>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -88,7 +99,7 @@ impl BytesCacheStats {
     }
 }
 
-impl DocBytesCache {
+impl SharedBytes {
     pub fn new(capacity: usize) -> Self {
         let per_shard = (capacity / NUM_SHARDS).max(1);
         let shards = (0..NUM_SHARDS).map(|_| Mutex::new(None)).collect();
@@ -104,10 +115,10 @@ impl DocBytesCache {
         NonZeroUsize::new(self.per_shard_cap.load(Ordering::Acquire).max(1)).unwrap()
     }
 
-    pub fn get(&self, id: DocumentId) -> Option<Arc<[u8]>> {
-        let mut shard = self.shards[shard_for(id)].lock();
+    pub fn get(&self, key: CacheKey) -> Option<Arc<[u8]>> {
+        let mut shard = self.shards[shard_for(key)].lock();
         let found = match shard.as_mut() {
-            Some(cache) => cache.get(&id).cloned(),
+            Some(cache) => cache.get(&key).cloned(),
             None => None,
         };
         drop(shard);
@@ -119,25 +130,25 @@ impl DocBytesCache {
         found
     }
 
-    pub fn put(&self, id: DocumentId, bytes: Arc<[u8]>) {
+    pub fn put(&self, key: CacheKey, bytes: Arc<[u8]>) {
         let cap = self.per_shard_cap();
-        let mut shard = self.shards[shard_for(id)].lock();
+        let mut shard = self.shards[shard_for(key)].lock();
         match shard.as_mut() {
             Some(cache) => {
-                cache.put(id, bytes);
+                cache.put(key, bytes);
             }
             None => {
                 let mut cache = LruCache::new(cap);
-                cache.put(id, bytes);
+                cache.put(key, bytes);
                 *shard = Some(cache);
             }
         }
     }
 
-    pub fn remove(&self, id: DocumentId) {
-        let mut shard = self.shards[shard_for(id)].lock();
+    pub fn remove(&self, key: CacheKey) {
+        let mut shard = self.shards[shard_for(key)].lock();
         if let Some(cache) = shard.as_mut() {
-            cache.pop(&id);
+            cache.pop(&key);
         }
     }
 
@@ -168,6 +179,52 @@ impl DocBytesCache {
     }
 }
 
+/// Per-collection facade over the shared global [`DocBytesCache`] — namespaces
+/// keys so all collections share one budget. `BTreeCollection`-facing API is
+/// unchanged (`DocumentId`-based).
+pub struct DocBytesCache {
+    inner: Arc<SharedBytes>,
+    ns: AtomicU64,
+}
+
+impl DocBytesCache {
+    pub fn new(_capacity: usize) -> Self {
+        Self {
+            inner: global(),
+            ns: AtomicU64::new(next_ns()),
+        }
+    }
+    #[inline]
+    fn key(&self, id: DocumentId) -> CacheKey {
+        compose(self.ns.load(Ordering::Relaxed), id)
+    }
+    pub fn get(&self, id: DocumentId) -> Option<Arc<[u8]>> {
+        self.inner.get(self.key(id))
+    }
+    pub fn put(&self, id: DocumentId, bytes: Arc<[u8]>) {
+        self.inner.put(self.key(id), bytes);
+    }
+    pub fn remove(&self, id: DocumentId) {
+        self.inner.remove(self.key(id));
+    }
+    /// Invalidate this collection's entries via a fresh namespace (LRU-evicted).
+    pub fn clear(&self) {
+        self.ns.store(next_ns(), Ordering::Relaxed);
+    }
+    pub fn resize(&self, capacity: usize) {
+        self.inner.resize(capacity);
+    }
+    pub fn stats(&self) -> BytesCacheStats {
+        self.inner.stats()
+    }
+}
+
+impl Default for DocBytesCache {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,11 +246,13 @@ mod tests {
 
     #[test]
     fn stats_track_hits_and_misses() {
-        let cache = DocBytesCache::new(32);
+        // Use the isolated shared storage directly — the facade's stats() reads
+        // the process-global cache, which other tests share.
+        let cache = SharedBytes::new(32);
         let bytes: Arc<[u8]> = Arc::from(vec![1u8]);
-        cache.put(1, Arc::clone(&bytes));
-        let _ = cache.get(1); // hit
-        let _ = cache.get(2); // miss
+        cache.put(1u128, Arc::clone(&bytes));
+        let _ = cache.get(1u128); // hit
+        let _ = cache.get(2u128); // miss
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
