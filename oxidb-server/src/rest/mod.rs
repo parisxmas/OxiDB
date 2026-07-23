@@ -190,11 +190,64 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         return with_rest_cors(json_response(204, "No Content", json!(null)));
     }
 
-    // ── Database targeting (ADR-0012): `?db=<name>` selects the database;
-    // no parameter keeps the default database exactly as before.
-    let db_name = parse_query_string(&req.query)
-        .get("db")
-        .map(|v| url_decode(v));
+    // ── Stable URL prefix (ADR-0003): strip a leading `/v1/`. Both `/v1/api/…`
+    // and the legacy bare `/api/…` resolve to the same handlers.
+    let mut segments: Vec<&str> = if raw_segments.first() == Some(&"v1") {
+        raw_segments[1..].to_vec()
+    } else {
+        raw_segments.clone()
+    };
+
+    // ── Path-based tenant (ADR-0012): `/<tenant>/rest/v1/…` or `/<tenant>/api/…`
+    // addresses a project by its ref OR slug. Resolve it to a database and route
+    // the remaining path exactly like an untenanted request. `?db=` still works
+    // and takes precedence.
+    let mut path_db: Option<String> = None;
+    {
+        const TOP: &[&str] = &["api", "rest", "hello", "metrics", "health"];
+        if segments.len() >= 2
+            && !TOP.contains(&segments[0])
+            && matches!(segments[1], "rest" | "api")
+        {
+            match &state.db_manager {
+                Some(mgr) => match crate::tenant_auth::resolve_tenant(mgr, segments[0]) {
+                    Some(db) => {
+                        path_db = Some(db);
+                        segments = segments[1..].to_vec();
+                    }
+                    None => {
+                        return with_rest_cors(json_response(
+                            404,
+                            "Not Found",
+                            json!({"error": "unknown tenant"}),
+                        ));
+                    }
+                },
+                None => {
+                    return with_rest_cors(json_response(
+                        400,
+                        "Bad Request",
+                        json!({"error": "path-based tenant routing is not available"}),
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Database targeting (ADR-0012): `?db=<name>` wins, else the path tenant;
+    // neither keeps the default database exactly as before. A `?db=` value that
+    // names a project by ref or slug is resolved to the project's database; a
+    // plain (non-project) database name passes through unchanged.
+    let db_name = match parse_query_string(&req.query).get("db").map(|v| url_decode(v)) {
+        Some(raw) => Some(
+            state
+                .db_manager
+                .as_ref()
+                .and_then(|mgr| crate::tenant_auth::resolve_tenant(mgr, &raw))
+                .unwrap_or(raw),
+        ),
+        None => path_db,
+    };
     // Reserved control-plane stores (the OxiBase `oxibase` metadata database)
     // are never served over the data plane — return the same "not found" as any
     // other unreachable database, without confirming it exists.
@@ -239,18 +292,6 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
                 }
             },
         },
-    };
-
-    // ── Phase 2 (ADR-0003): /v1/ is the 1.0 stable URL prefix. ──────────
-    // Both `/v1/api/...` and the legacy bare `/api/...` resolve to the
-    // same handlers during the deprecation window; see docs/format/compat-matrix.md.
-    // When a future major (2.0) ships, `/v1/api/...` continues working with
-    // 1.0 semantics, `/v2/api/...` gets the new semantics, and bare
-    // `/api/...` either redirects or errors per release notes.
-    let segments: Vec<&str> = if raw_segments.first() == Some(&"v1") {
-        raw_segments[1..].to_vec()
-    } else {
-        raw_segments.clone()
     };
 
     // ── OxiBase control plane (ADR-0020/0021) ───────────────────────────

@@ -42,6 +42,28 @@ pub fn is_reserved_db(db: &str) -> bool {
     enabled() && db == META_DB
 }
 
+/// Resolve a path-tenant segment (a project **ref or slug**) to the database
+/// name to target. With the platform off, the segment is taken as a database
+/// name directly (plain OxiDB multi-db). With it on, the segment is looked up in
+/// the `oxibase.projects` metadata by ref or slug and the project's ref (its
+/// database) is returned; an unknown segment yields `None` (→ 404).
+pub fn resolve_tenant(mgr: &DatabaseManager, segment: &str) -> Option<String> {
+    if !enabled() {
+        return Some(segment.to_string());
+    }
+    if segment == META_DB {
+        return None;
+    }
+    let pdb = mgr.get_database(META_DB).ok()?;
+    let doc = pdb
+        .find_one(
+            PROJECTS,
+            &json!({ "$or": [{ "ref": segment }, { "slug": segment }] }),
+        )
+        .ok()??;
+    doc.get("ref").and_then(|v| v.as_str()).map(String::from)
+}
+
 /// The per-project ES256 **public** key (SEC1 uncompressed, 65 bytes) for
 /// `db_ref`, if it names an OxiBase project. Read in the clear — no seal key,
 /// no secret — so a data-plane node verifies project tokens without holding any

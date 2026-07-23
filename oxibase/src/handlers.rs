@@ -164,6 +164,14 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
     let body = parse_body(req);
     let name = str_field(&body, "name").unwrap_or_default();
     let project_ref = gen_ref();
+    // A friendly, globally-unique slug for path-based addressing
+    // (`<host>/<slug>/rest/v1/…`). Prefer a caller-supplied `slug`, else derive
+    // one from the name, else fall back to the ref.
+    let slug_base = str_field(&body, "slug")
+        .and_then(|s| slugify(&s))
+        .or_else(|| slugify(&name))
+        .unwrap_or_else(|| project_ref.clone());
+    let slug = unique_slug(state, &slug_base);
     let (priv_scalar, pub_point) = crypto::gen_es256_keypair();
     let created_at = now_secs();
 
@@ -175,6 +183,7 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
     }
     let doc = json!({
         "ref": project_ref,
+        "slug": slug,
         "owner": owner,
         "name": name,
         // ES256 asymmetric keys: the public key is stored in the clear (it is
@@ -197,6 +206,7 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
         201,
         project_view(
             &project_ref,
+            &slug,
             &name,
             created_at,
             created_at,
@@ -215,7 +225,7 @@ pub fn list_projects(req: &HttpRequest, state: &State) -> HttpResponse {
         Ok(docs) => {
             let list: Vec<Value> = docs
                 .iter()
-                .map(|d| json!({ "ref": d.get("ref"), "name": d.get("name"), "created_at": d.get("created_at") }))
+                .map(|d| json!({ "ref": d.get("ref"), "slug": d.get("slug"), "name": d.get("name"), "created_at": d.get("created_at") }))
                 .collect();
             resp(200, json!(list))
         }
@@ -234,13 +244,14 @@ pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let (created_at, key_iat, name) = meta(&doc);
+    let slug = doc_slug(&doc, project_ref);
     let priv_scalar = match project_priv(state, &doc) {
         Some(s) => s,
         None => return resp(500, json!({ "message": "unseal failed" })),
     };
     resp(
         200,
-        project_view(project_ref, &name, created_at, key_iat, &priv_scalar, true),
+        project_view(project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true),
     )
 }
 
@@ -249,13 +260,14 @@ pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
 /// tokens with the public key alone. Legacy HS256 projects have no public key
 /// and return an empty set.
 pub fn project_jwks(state: &State, project_ref: &str) -> HttpResponse {
-    let doc = match state.upstream.find("projects", &json!({ "ref": project_ref })) {
-        Ok(mut d) => d.pop(),
+    let doc = match project_by_ref(state, project_ref) {
+        Ok(d) => d,
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let Some(doc) = doc else {
         return resp(404, json!({ "message": "project not found" }));
     };
+    let project_ref = doc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
     let Some(pub_b64) = doc.get("pubkey").and_then(|v| v.as_str()) else {
         return resp(200, json!({ "keys": [] }));
     };
@@ -307,6 +319,9 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    // Normalize to the canonical ref so a caller using the slug and one using the
+    // ref address the same user directory / sessions.
+    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
     // Hard ceiling on a project's user directory (defense in depth over the rate
     // limit) — `OXIDB_PLATFORM_MAX_USERS` per project.
     if state
@@ -370,6 +385,7 @@ pub fn end_user_login(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
     let user = match state
         .upstream
         .find("users", &json!({ "project_ref": project_ref, "email": email }))
@@ -401,6 +417,12 @@ pub fn end_user_refresh(req: &HttpRequest, state: &State, project_ref: &str) -> 
     let Some(refresh) = str_field(&body, "refresh_token") else {
         return resp(400, json!({ "message": "refresh_token required" }));
     };
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let project_ref = pdoc.get("ref").and_then(|v| v.as_str()).unwrap_or(project_ref);
     let hash = crypto::sha256_hex(refresh.as_bytes());
     let row = match state
         .upstream
@@ -422,11 +444,6 @@ pub fn end_user_refresh(req: &HttpRequest, state: &State, project_ref: &str) -> 
     let Some(email) = row.get("email").and_then(|v| v.as_str()) else {
         return resp(500, json!({ "message": "corrupt session" }));
     };
-    let pdoc = match project_by_ref(state, project_ref) {
-        Ok(Some(d)) => d,
-        Ok(None) => return resp(404, json!({ "message": "project not found" })),
-        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
-    };
     match issue_session(state, &pdoc, project_ref, email) {
         Some((token, new_refresh)) => {
             resp(200, json!({ "token": token, "refresh_token": new_refresh }))
@@ -436,12 +453,66 @@ pub fn end_user_refresh(req: &HttpRequest, state: &State, project_ref: &str) -> 
 }
 
 /// Look up a project by ref alone (no owner filter) — end-user auth is public.
-fn project_by_ref(state: &State, project_ref: &str) -> Result<Option<Value>, String> {
+/// Look up a project by its ref **or** slug — so every project-scoped URL
+/// (`/projects/{ref-or-slug}/…`, path-based data access) accepts either.
+fn project_by_ref(state: &State, ident: &str) -> Result<Option<Value>, String> {
     Ok(state
         .upstream
-        .find("projects", &json!({ "ref": project_ref }))?
+        .find(
+            "projects",
+            &json!({ "$or": [{ "ref": ident }, { "slug": ident }] }),
+        )?
         .into_iter()
         .next())
+}
+
+/// The project's slug, falling back to its ref for pre-slug records.
+fn doc_slug(doc: &Value, project_ref: &str) -> String {
+    doc.get("slug")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref)
+        .to_string()
+}
+
+/// A URL-safe slug from a project name: lowercase alphanumerics, other runs
+/// collapsed to single dashes. `None` if nothing usable remains.
+fn slugify(name: &str) -> Option<String> {
+    let mut s = String::new();
+    let mut prev_dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !s.is_empty() && !prev_dash {
+            s.push('-');
+            prev_dash = true;
+        }
+    }
+    let s = s.trim_end_matches('-').to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Make a slug globally unique and not a reserved path word (append `-2`, `-3`…).
+fn unique_slug(state: &State, base: &str) -> String {
+    const RESERVED: &[&str] = &[
+        "api", "rest", "hello", "metrics", "health", "platform", "v1", "oxibase", "postgres",
+        "oxidb", "sql", "auth",
+    ];
+    let mut candidate = base.to_string();
+    let mut n = 2u32;
+    loop {
+        let taken = RESERVED.contains(&candidate.as_str())
+            || state
+                .upstream
+                .count("projects", &json!({ "slug": candidate }))
+                .unwrap_or(0)
+                > 0;
+        if !taken {
+            return candidate;
+        }
+        candidate = format!("{base}-{n}");
+        n += 1;
+    }
 }
 
 /// Mint an ES256 end-user access token signed with the project's private key.
@@ -516,6 +587,7 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let (created_at, _, name) = meta(&doc);
+    let slug = doc_slug(&doc, project_ref);
     let (priv_scalar, pub_point) = crypto::gen_es256_keypair();
     let new_iat = now_secs();
     let query = json!({ "ref": project_ref });
@@ -534,6 +606,7 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         200,
         project_view(
             project_ref,
+            &slug,
             &name,
             created_at,
             new_iat,
@@ -578,8 +651,10 @@ fn project_priv(state: &State, doc: &Value) -> Option<Vec<u8>> {
     crypto::unseal(&state.seal_key, &sealed)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn project_view(
     project_ref: &str,
+    slug: &str,
     name: &str,
     created_at: u64,
     key_iat: u64,
@@ -587,14 +662,15 @@ fn project_view(
     keys: bool,
 ) -> Value {
     let base = std::env::var("OXIDB_PLATFORM_BASE_URL").unwrap_or_default();
+    // Path-based addressing is the friendly default: `<host>/<slug>/rest/v1`.
     let url = if base.is_empty() {
         json!(null)
     } else {
-        json!(format!("{base}/rest/v1?db={project_ref}"))
+        json!(format!("{base}/{slug}/rest/v1"))
     };
     let mut v = json!({
-        "ref": project_ref, "name": name, "db": project_ref,
-        "endpoint": "/rest/v1", "url": url, "isolation": "shared", "created_at": created_at,
+        "ref": project_ref, "slug": slug, "name": name, "db": project_ref,
+        "endpoint": format!("/{slug}/rest/v1"), "url": url, "isolation": "shared", "created_at": created_at,
     });
     if keys {
         let o = v.as_object_mut().unwrap();
@@ -738,4 +814,20 @@ fn login_record_failure(email: &str) {
 }
 fn login_clear(email: &str) {
     login_limiter().lock().unwrap().remove(email);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slugify;
+
+    #[test]
+    fn slugify_basics() {
+        assert_eq!(slugify("My Cool App").as_deref(), Some("my-cool-app"));
+        assert_eq!(slugify("  Hello,  World!  ").as_deref(), Some("hello-world"));
+        assert_eq!(slugify("Aa_Bb-Cc.99").as_deref(), Some("aa-bb-cc-99"));
+        assert_eq!(slugify("test123").as_deref(), Some("test123"));
+        assert_eq!(slugify("---"), None);
+        assert_eq!(slugify(""), None);
+        assert_eq!(slugify("日本語"), None); // no ascii alphanumerics → nothing usable
+    }
 }

@@ -28,6 +28,12 @@ export interface OxibaseOptions {
    * key). Required to use `oxibase.auth`.
    */
   authUrl?: string;
+  /**
+   * Address the project by **path** (`<url>/<ref>/rest/v1/…`) instead of the
+   * `?db=<ref>` query. Use this behind a single-domain, no-wildcard deployment
+   * (`oxibase.example.com/<slug>/…`). `ref` may be the project's ref or slug.
+   */
+  tenantInPath?: boolean;
 }
 
 export interface AuthResult {
@@ -147,9 +153,14 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     return res;
   }
 
-  // postgrest-js calls fetch with a string URL — add `?db=<ref>` then send.
+  // Two ways to address the project: put the ref/slug in the PATH
+  // (`<base>/<ref>/…`, tenantInPath) or as `?db=<ref>` (the default).
+  const pathTenant = opts.tenantInPath && ref ? `/${encodeURIComponent(ref)}` : "";
+
+  // postgrest-js calls fetch with a string URL — add `?db=<ref>` when not using
+  // path addressing, then send.
   const dbFetch: typeof fetch = (input, init) => {
-    if (ref && typeof input === "string") {
+    if (ref && !opts.tenantInPath && typeof input === "string") {
       const u = new URL(input);
       u.searchParams.set("db", ref);
       input = u.toString();
@@ -157,14 +168,14 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     return sendAuthed(input, init);
   };
 
-  const rest = new PostgrestClient(`${base}/rest/v1`, {
+  const rest = new PostgrestClient(`${base}${pathTenant}/rest/v1`, {
     headers: { Authorization: `Bearer ${key}`, ...extra },
     fetch: dbFetch,
   });
 
   async function sql(text: string, params?: unknown[]) {
-    const u = new URL(`${base}/api/sql`);
-    if (ref) u.searchParams.set("db", ref);
+    const u = new URL(`${base}${pathTenant}/api/sql`);
+    if (ref && !opts.tenantInPath) u.searchParams.set("db", ref);
     let r: Response;
     try {
       r = await sendAuthed(u.toString(), {
