@@ -47,10 +47,18 @@ async function call<T>(
   return data as T;
 }
 
-/** Collections in the project's document engine. */
+/**
+ * A collection the engine manages for its own bookkeeping (alerts, security
+ * rules, TTL/retention, profiling, full-text index …). These use a leading
+ * underscore by convention and aren't the developer's data, so — like Supabase
+ * hides its internal schemas — we keep them out of the dashboard.
+ */
+export const isSystemCollection = (name: string): boolean => name.startsWith("_");
+
+/** Collections in the project's document engine (system collections hidden). */
 export async function listCollections(ref: string, key: string): Promise<string[]> {
   const d = await call<{ collections: string[] }>("GET", ref, "/api/collections", key);
-  return d.collections ?? [];
+  return (d.collections ?? []).filter((c) => !isSystemCollection(c));
 }
 
 /** First `limit` rows of a collection. */
