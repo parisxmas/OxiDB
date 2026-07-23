@@ -1,0 +1,9 @@
+[package]
+name = "oxidb-http"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal, dependency-free HTTP request/response + blocking server and client, shared by oxidb-server and oxibase"
+license-file = "../LICENSE"
+repository = "https://github.com/parisxmas/OxiDB"
+
+[dependencies]

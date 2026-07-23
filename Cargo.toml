@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli", "oxidb-tail", "oxipool", "oxidb-wasm", "oxidb-agg-merge", "oxidb-sql", "oxidb-cobra", "oxidb-tsdb"]
+members = [".", "oxidb-server", "oxidb-client-ffi", "oxidb-embedded-ffi", "oxidb-cli", "oxidb-tail", "oxipool", "oxidb-wasm", "oxidb-agg-merge", "oxidb-sql", "oxidb-cobra", "oxidb-tsdb", "oxidb-http"]
 resolver = "3"
 
 [package]
