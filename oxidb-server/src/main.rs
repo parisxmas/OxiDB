@@ -1200,8 +1200,8 @@ fn main() {
             .unwrap_or(false);
 
     // GELF UDP logging (e.g. OXIDB_GELF_ADDR=192.0.2.100:12201)
-    let gelf = match env::var("OXIDB_GELF_ADDR") {
-        Ok(gelf_addr) => {
+    let gelf = match env::var("OXIDB_GELF_ADDR").ok().filter(|s| !s.is_empty()) {
+        Some(gelf_addr) => {
             let logger = GelfLogger::new(&gelf_addr).expect("failed to create GELF logger");
             eprintln!("GELF logging: enabled ({gelf_addr})");
             let logger = Arc::new(logger);
@@ -1212,7 +1212,7 @@ fn main() {
             );
             Some(logger)
         }
-        Err(_) => None,
+        None => None,
     };
 
     if verbose {
@@ -1842,8 +1842,7 @@ fn main() {
     }
 
     // GELF UDP ingestion listener (optional, enabled via OXIDB_GELF_PORT)
-    let gelf_port: u16 = env::var("OXIDB_GELF_PORT")
-        .unwrap_or_else(|_| "0".to_string())
+    let gelf_port: u16 = env::var("OXIDB_GELF_PORT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "0".to_string())
         .parse()
         .expect("OXIDB_GELF_PORT must be a valid u16");
 
@@ -1866,8 +1865,7 @@ fn main() {
 
     // MessagePack UDP ingestion listener (optional, via OXIDB_MSGPACK_PORT) — a
     // cheaper log sink (compact binary, no per-field auto-indexing).
-    let msgpack_port: u16 = env::var("OXIDB_MSGPACK_PORT")
-        .unwrap_or_else(|_| "0".to_string())
+    let msgpack_port: u16 = env::var("OXIDB_MSGPACK_PORT").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "0".to_string())
         .parse()
         .expect("OXIDB_MSGPACK_PORT must be a valid u16");
     if msgpack_port > 0 {
@@ -1946,8 +1944,8 @@ fn run_cluster_mode() {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
-    let gelf: Option<Arc<GelfLogger>> = match env::var("OXIDB_GELF_ADDR") {
-        Ok(gelf_addr) => {
+    let gelf: Option<Arc<GelfLogger>> = match env::var("OXIDB_GELF_ADDR").ok().filter(|s| !s.is_empty()) {
+        Some(gelf_addr) => {
             let logger = GelfLogger::new(&gelf_addr).expect("failed to create GELF logger");
             eprintln!("GELF logging: enabled ({gelf_addr})");
             let logger = Arc::new(logger);
@@ -1958,7 +1956,7 @@ fn run_cluster_mode() {
             );
             Some(logger)
         }
-        Err(_) => None,
+        None => None,
     };
 
     if verbose {
