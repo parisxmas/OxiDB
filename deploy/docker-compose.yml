@@ -53,7 +53,9 @@ services:
     environment:
       OXIBASE_HOST: "${OXIBASE_HOST}"
     ports:
-      - "${WEB_PORT:-8090}:80"
+      # Bind to localhost by default — put a TLS front (Cloudflare origin / your
+      # reverse proxy) in front of it. Set WEB_BIND=0.0.0.0 to expose directly.
+      - "${WEB_BIND:-127.0.0.1}:${WEB_PORT:-8090}:80"
     depends_on:
       - oxibase
       - data-plane
