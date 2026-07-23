@@ -1864,6 +1864,28 @@ fn main() {
         );
     }
 
+    // MessagePack UDP ingestion listener (optional, via OXIDB_MSGPACK_PORT) — a
+    // cheaper log sink (compact binary, no per-field auto-indexing).
+    let msgpack_port: u16 = env::var("OXIDB_MSGPACK_PORT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("OXIDB_MSGPACK_PORT must be a valid u16");
+    if msgpack_port > 0 {
+        let mpack_addr = format!("0.0.0.0:{msgpack_port}");
+        let mpack_collection =
+            env::var("OXIDB_MSGPACK_COLLECTION").unwrap_or_else(|_| "_msgpack_logs".to_string());
+        oxidb_server::msgpack_ingest::start_msgpack_listener(
+            &mpack_addr,
+            Arc::clone(&state.db),
+            mpack_collection.clone(),
+        );
+        server_log!(
+            state,
+            GelfLevel::Notice,
+            format!("MessagePack ingestion listening on {mpack_addr} → '{mpack_collection}'")
+        );
+    }
+
     // MQTT-only mode: skip the main OxiDB TCP listener
     if mqtt_only_mode {
         server_log!(

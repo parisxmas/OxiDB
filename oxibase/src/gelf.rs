@@ -16,18 +16,31 @@ pub enum Level {
     Info = 6,
 }
 
+/// Wire format for a log sink.
+enum Format {
+    /// GELF v1.1 JSON.
+    Gelf,
+    /// Compact MessagePack map (OxiDB's cheaper log ingest).
+    Msgpack,
+}
+
 struct Logger {
     socket: UdpSocket,
     host: String,
+    format: Format,
 }
 
 impl Logger {
-    fn new(addr: &str) -> Option<Self> {
+    fn new(addr: &str, format: Format) -> Option<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
         socket.set_nonblocking(true).ok()?;
         socket.connect(addr).ok()?;
         let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "oxibase".to_string());
-        Some(Self { socket, host })
+        Some(Self {
+            socket,
+            host,
+            format,
+        })
     }
 
     fn send(&self, level: Level, short_message: &str, extra: &[(&str, &str)]) {
@@ -35,42 +48,70 @@ impl Logger {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        let mut msg = json!({
-            "version": "1.1",
-            "host": self.host,
-            "short_message": short_message,
-            "timestamp": ts,
-            "level": level as u8,
-        });
-        if let Some(o) = msg.as_object_mut() {
-            for &(k, v) in extra {
-                o.insert(format!("_{k}"), Value::String(v.to_string()));
+        match self.format {
+            Format::Gelf => {
+                let mut msg = json!({
+                    "version": "1.1",
+                    "host": self.host,
+                    "short_message": short_message,
+                    "timestamp": ts,
+                    "level": level as u8,
+                });
+                if let Some(o) = msg.as_object_mut() {
+                    for &(k, v) in extra {
+                        o.insert(format!("_{k}"), Value::String(v.to_string()));
+                    }
+                }
+                let _ = self.socket.send(msg.to_string().as_bytes());
+            }
+            Format::Msgpack => {
+                let mut m = serde_json::Map::with_capacity(extra.len() + 4);
+                m.insert("host".into(), Value::String(self.host.clone()));
+                m.insert("short_message".into(), Value::String(short_message.to_string()));
+                m.insert("level".into(), json!(level as u8));
+                m.insert("ts".into(), json!(ts));
+                for &(k, v) in extra {
+                    m.insert(k.to_string(), Value::String(v.to_string()));
+                }
+                if let Ok(bytes) = rmp_serde::to_vec_named(&Value::Object(m)) {
+                    let _ = self.socket.send(&bytes);
+                }
             }
         }
-        let _ = self.socket.send(msg.to_string().as_bytes());
     }
 }
 
-static GLOBAL: OnceLock<Option<Logger>> = OnceLock::new();
+static GELF: OnceLock<Option<Logger>> = OnceLock::new();
+static MSGPACK: OnceLock<Option<Logger>> = OnceLock::new();
 
-/// Arm the global logger from `OXIDB_GELF_ADDR` (idempotent).
+/// Arm the global GELF (`OXIDB_GELF_ADDR`) and MessagePack (`OXIDB_MSGPACK_ADDR`)
+/// log sinks (idempotent). Either, both, or neither.
 pub fn init() {
-    GLOBAL.get_or_init(|| {
+    GELF.get_or_init(|| {
         std::env::var("OXIDB_GELF_ADDR")
             .ok()
             .filter(|s| !s.is_empty())
-            .and_then(|a| Logger::new(&a))
+            .and_then(|a| Logger::new(&a, Format::Gelf))
+    });
+    MSGPACK.get_or_init(|| {
+        std::env::var("OXIDB_MSGPACK_ADDR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|a| Logger::new(&a, Format::Msgpack))
     });
 }
 
-/// `true` when GELF is armed.
+/// `true` when at least one log sink is armed.
 pub fn enabled() -> bool {
-    matches!(GLOBAL.get(), Some(Some(_)))
+    matches!(GELF.get(), Some(Some(_))) || matches!(MSGPACK.get(), Some(Some(_)))
 }
 
-/// Emit a message. No-op when GELF is disabled.
+/// Emit to whichever sinks are armed. No-op when both are disabled.
 pub fn log(level: Level, short_message: &str, extra: &[(&str, &str)]) {
-    if let Some(Some(g)) = GLOBAL.get() {
+    if let Some(Some(g)) = GELF.get() {
         g.send(level, short_message, extra);
+    }
+    if let Some(Some(m)) = MSGPACK.get() {
+        m.send(level, short_message, extra);
     }
 }

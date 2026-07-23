@@ -30,6 +30,10 @@ services:
       # self-emit a message per REST request. Empty = off.
       OXIDB_GELF_PORT: "${OXIDB_GELF_PORT:-}"
       OXIDB_GELF_ADDR: "${OXIDB_GELF_SELF:-}"
+      # MessagePack: a cheaper log sink (compact binary, no per-field indexing)
+      # on its own port → _msgpack_logs. Empty = off.
+      OXIDB_MSGPACK_PORT: "${OXIDB_MSGPACK_PORT:-}"
+      OXIDB_MSGPACK_ADDR: "${OXIDB_MSGPACK_SELF:-}"
     volumes:
       - oxidb-data:/data
     restart: unless-stopped
@@ -60,6 +64,8 @@ services:
       # GELF: emit a message per control-plane request to the data plane's GELF
       # port (e.g. data-plane:12201). Empty = off.
       OXIDB_GELF_ADDR: "${OXIBASE_GELF_ADDR:-}"
+      # MessagePack: same, to the data plane's MessagePack port. Empty = off.
+      OXIDB_MSGPACK_ADDR: "${OXIBASE_MSGPACK_ADDR:-}"
     depends_on:
       - data-plane
     restart: unless-stopped
