@@ -243,7 +243,7 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
 
     // ── OxiBase control plane (ADR-0020/0021) ───────────────────────────
     // The control plane now runs as a separate `oxibase` binary; the data
-    // plane keeps only the `platform::project_secret` hook (consulted in the
+    // plane keeps only the `tenant_auth::project_secret` hook (consulted in the
     // JWT gate below) and no longer serves `/platform/v1` itself.
 
     // Top-level HELLO equivalent for REST: GET /v1/hello returns server info.
@@ -312,8 +312,8 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // (`?db=<ref>`) is verified with that project's own JWT secret; everything
     // else uses the global `OXIDB_JWT_SECRET`.
     let effective_secret: Option<String> = match (&db_name, &state.db_manager) {
-        (Some(name), Some(mgr)) if crate::platform::enabled() => {
-            crate::platform::project_secret(mgr, name).or_else(|| state.jwt_secret.clone())
+        (Some(name), Some(mgr)) if crate::tenant_auth::enabled() => {
+            crate::tenant_auth::project_secret(mgr, name).or_else(|| state.jwt_secret.clone())
         }
         _ => state.jwt_secret.clone(),
     };
