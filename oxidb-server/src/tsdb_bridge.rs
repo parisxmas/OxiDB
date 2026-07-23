@@ -165,8 +165,9 @@ fn registry() -> Option<&'static Registry> {
             if !env_truthy("OXIDB_TSDB") {
                 return None;
             }
-            let root =
-                PathBuf::from(std::env::var("OXIDB_DATA").unwrap_or_else(|_| "./oxidb_data".into()));
+            let root = PathBuf::from(
+                std::env::var("OXIDB_DATA").unwrap_or_else(|_| "./oxidb_data".into()),
+            );
             let default_dir = std::env::var("OXIDB_TSDB_DATA")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| root.join("tsdb"));
@@ -315,17 +316,26 @@ pub fn handle_tsdb(cmd: &str, request: &Value, readonly: bool, db_name: &str) ->
 }
 
 fn write_points(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
+    match write_points_core(engine, request) {
+        Ok(written) => ok_bytes(json!({ "written": written })),
+        Err(e) => err_bytes(&e),
+    }
+}
+
+/// Write the `points` array; returns the count. Shared by the wire handler and
+/// the PostgREST bridge ([`tsdb_write_json`]).
+fn write_points_core(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Result<usize, String> {
     let Some(points) = request.get("points").and_then(|v| v.as_array()) else {
-        return err_bytes("write requires a 'points' array");
+        return Err("write requires a 'points' array".to_string());
     };
     let mut db = engine.write().unwrap();
     let mut written = 0usize;
     for p in points {
         let Some(measurement) = p.get("measurement").and_then(|v| v.as_str()) else {
-            return err_bytes("each point needs a 'measurement'");
+            return Err("each point needs a 'measurement'".to_string());
         };
         let Some(ts) = p.get("ts").and_then(|v| v.as_i64()) else {
-            return err_bytes("each point needs an integer 'ts' (epoch ms)");
+            return Err("each point needs an integer 'ts' (epoch ms)".to_string());
         };
         let mut point = Point::new(measurement, ts);
         if let Some(tags) = p.get("tags").and_then(|v| v.as_object()) {
@@ -337,7 +347,7 @@ fn write_points(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
         }
         let fields = p.get("fields").and_then(|v| v.as_object());
         let Some(fields) = fields else {
-            return err_bytes("each point needs a 'fields' object");
+            return Err("each point needs a 'fields' object".to_string());
         };
         for (k, v) in fields {
             // JSON bool → boolean, integer → integer, string → text, else float.
@@ -354,7 +364,7 @@ fn write_points(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
         db.write(&point);
         written += 1;
     }
-    ok_bytes(json!({ "written": written }))
+    Ok(written)
 }
 
 /// Ingest InfluxDB line protocol from the `lp` field. Lines without a
@@ -379,11 +389,20 @@ fn write_line_protocol(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
 }
 
 fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
+    match query_core(engine, request) {
+        Ok(v) => ok_bytes(v),
+        Err(e) => err_bytes(&e),
+    }
+}
+
+/// Run a query and return the series array. Shared by the wire handler and the
+/// PostgREST bridge ([`tsdb_query_json`]).
+fn query_core(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Result<Value, String> {
     let Some(measurement) = request.get("measurement").and_then(|v| v.as_str()) else {
-        return err_bytes("query requires a 'measurement'");
+        return Err("query requires a 'measurement'".to_string());
     };
     let Some(field) = request.get("field").and_then(|v| v.as_str()) else {
-        return err_bytes("query requires a 'field'");
+        return Err("query requires a 'field'".to_string());
     };
     let tag_filters = request
         .get("tags")
@@ -402,9 +421,16 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
     let group_tags = request
         .get("group_by")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
-    let agg_str = request.get("agg").and_then(|v| v.as_str()).unwrap_or("mean");
+    let agg_str = request
+        .get("agg")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mean");
     let agg = match agg_str {
         "mean" | "avg" => Agg::Mean,
         "sum" => Agg::Sum,
@@ -417,7 +443,7 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
         "rate" => Agg::Rate,
         "percentile" | "quantile" => {
             let Some(p) = request.get("p").and_then(|v| v.as_f64()) else {
-                return err_bytes("percentile requires a 'p' (0..=100)");
+                return Err("percentile requires a 'p' (0..=100)".to_string());
             };
             Agg::Percentile(p)
         }
@@ -425,16 +451,25 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
         s if s.starts_with('p') && s[1..].parse::<f64>().is_ok() => {
             Agg::Percentile(s[1..].parse::<f64>().unwrap())
         }
-        other => return err_bytes(&format!("unknown agg: {other:?}")),
+        other => return Err(format!("unknown agg: {other:?}")),
     };
     let spec = QuerySpec {
         measurement: measurement.to_string(),
         field: field.to_string(),
         tag_filters,
-        start: request.get("start").and_then(|v| v.as_i64()).unwrap_or(i64::MIN / 2),
-        end: request.get("end").and_then(|v| v.as_i64()).unwrap_or(i64::MAX / 2),
+        start: request
+            .get("start")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i64::MIN / 2),
+        end: request
+            .get("end")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(i64::MAX / 2),
         group_tags,
-        interval: request.get("interval").and_then(|v| v.as_i64()).filter(|&i| i > 0),
+        interval: request
+            .get("interval")
+            .and_then(|v| v.as_i64())
+            .filter(|&i| i > 0),
         agg,
     };
     let db = engine.read().unwrap();
@@ -444,8 +479,11 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
             .query_str(&spec)
             .into_iter()
             .map(|r| {
-                let tags: serde_json::Map<String, Value> =
-                    r.tags.into_iter().map(|(k, v)| (k, Value::String(v))).collect();
+                let tags: serde_json::Map<String, Value> = r
+                    .tags
+                    .into_iter()
+                    .map(|(k, v)| (k, Value::String(v)))
+                    .collect();
                 json!({
                     "tags": tags,
                     "type": "string",
@@ -459,7 +497,7 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
                 })
             })
             .collect();
-        return ok_bytes(json!(out));
+        return Ok(json!(out));
     }
     let out: Vec<Value> = db
         .query(&spec)
@@ -479,5 +517,25 @@ fn query(engine: &Arc<RwLock<Tsdb>>, request: &Value) -> Vec<u8> {
             })
         })
         .collect();
-    ok_bytes(json!(out))
+    Ok(json!(out))
+}
+
+// ---------------------------------------------------------------------------
+// PostgREST bridge helpers (ADR-0019) — clean Result-returning entry points
+// ---------------------------------------------------------------------------
+
+/// Run a TSDB query for the PostgREST surface, returning the series array
+/// (`[{tags, type, points:[{ts,value}]}, …]`) or an error message. `request`
+/// is the same shape the `query` op accepts (measurement/field/tags/start/end/
+/// agg/interval/group_by).
+pub fn tsdb_query_json(db_name: &str, request: &Value) -> Result<Value, String> {
+    let engine = engine_for(db_name)?;
+    query_core(&engine, request)
+}
+
+/// Write points for the PostgREST surface, returning the count. `request` is
+/// the same shape the `write` op accepts (a `points` array).
+pub fn tsdb_write_json(db_name: &str, request: &Value) -> Result<usize, String> {
+    let engine = engine_for(db_name)?;
+    write_points_core(&engine, request)
 }

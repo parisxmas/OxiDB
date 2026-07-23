@@ -45,6 +45,7 @@ use crate::s3::http::{HttpRequest, HttpResponse, parse_request_from_reader};
 
 mod postgrest;
 mod postgrest_sql;
+mod postgrest_tsdb;
 
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
@@ -373,7 +374,27 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         let sql_db = db_name
             .as_deref()
             .unwrap_or(oxidb::database_manager::DEFAULT_DATABASE);
+        // PostgREST schema selection (`Accept-Profile`/`Content-Profile`, what
+        // postgrest-js `.schema('tsdb')` emits) picks the time-series engine.
+        // The default (no profile) keeps the SQL-if-table-exists-else-document
+        // dispatch below. A profile check beats existence-routing for TSDB,
+        // whose measurements only exist after the first write.
+        let profile = req
+            .headers
+            .get("accept-profile")
+            .or_else(|| req.headers.get("content-profile"))
+            .map(|s| s.as_str());
+        let is_tsdb = profile == Some("tsdb");
         match (req.method.as_str(), segments.as_slice()) {
+            ("GET", ["rest", "v1", m]) if is_tsdb => {
+                return with_rest_cors(postgrest_tsdb::handle_get(sql_db, m, req));
+            }
+            ("POST", ["rest", "v1", m]) if is_tsdb => {
+                return with_rest_cors(postgrest_tsdb::handle_post(sql_db, m, req));
+            }
+            ("PATCH" | "DELETE", ["rest", "v1", _]) if is_tsdb => {
+                return with_rest_cors(postgrest_tsdb::handle_unsupported());
+            }
             ("GET", ["rest", "v1", table]) => {
                 return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
                     postgrest_sql::handle_get(sql_db, table, req)

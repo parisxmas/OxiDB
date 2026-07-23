@@ -163,4 +163,27 @@ console.log('\n# SQL engine (tables) via the SAME postgrest-js client')
   eq(remaining, [{ id: 10 }], 'SQL delete actually removed the row')
 }
 
-console.log(`\n✅ ALL ${passed} assertions passed — real @supabase/postgrest-js drives OxiDB (both engines) unmodified.`)
+// ── TSDB engine (same client, .schema('tsdb') → Accept/Content-Profile) ─────
+console.log('\n# TSDB engine (time-series) via postgrest-js .schema("tsdb")')
+{
+  const tsdb = client.schema('tsdb')
+
+  // write points (Content-Profile: tsdb) — flat objects, string→tag, number→field
+  const { error: wErr } = await tsdb.from('cpu').insert([
+    { ts: 1000, host: 'web1', usage: 10 },
+    { ts: 2000, host: 'web1', usage: 20 },
+    { ts: 3000, host: 'web1', usage: 30 },
+  ])
+  ok(!wErr, `TSDB write ok (${wErr?.message ?? 'no error'})`)
+
+  // read (Accept-Profile: tsdb) — default agg=mean over the range for web1
+  const { data: mean } = await tsdb
+    .from('cpu')
+    .select('usage')
+    .eq('host', 'web1')
+    .gte('ts', 0)
+    .lt('ts', 10000)
+  eq(mean, [{ ts: 0, value: 20 }], 'TSDB mean aggregate via postgrest-js')
+}
+
+console.log(`\n✅ ALL ${passed} assertions passed — real @supabase/postgrest-js drives OxiDB (all three engines) unmodified.`)

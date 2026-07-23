@@ -1,6 +1,6 @@
 # ADR-0019: PostgREST-compatible auto-REST surface for the document engine
 
-**Status:** Accepted — Phase 1 (document engine: filters, select, order, pagination, full CRUD) + Phase 2a (**resource embedding** for the document engine, `$lookup`-style stitch) + Phase 2b (**SQL engine under the same grammar** — parameterized CRUD routing) + Phase 2c (**SQL resource embedding** via catalog foreign keys) + **SQL write-representation** (`RETURNING *`) landed & tested, 2026-07-22, and verified against the real `@supabase/postgrest-js` client over both engines. Remaining (TSDB under the grammar; nested embeds) **Proposed**, deferred.
+**Status:** Accepted — Phase 1 (document engine: filters, select, order, pagination, full CRUD) + Phase 2a (**resource embedding** for the document engine, `$lookup`-style stitch) + Phase 2b (**SQL engine under the same grammar** — parameterized CRUD routing) + Phase 2c (**SQL resource embedding** via catalog foreign keys) + **SQL write-representation** (`RETURNING *`) + Phase 2d (**TSDB under the same grammar**, selected by the `tsdb` schema profile) landed & tested, 2026-07-22/23, and verified against the real `@supabase/postgrest-js` client over **all three engines**. Remaining (nested embeds) **Proposed**, deferred.
 **Supersedes:** —
 **Related:** [ADR-0012](0012-multi-database.md) (`?db=<name>` targeting, reused verbatim),
 [`oxidb-server/src/rest/postgrest.rs`](../../oxidb-server/src/rest/postgrest.rs) (the translation layer),
@@ -112,6 +112,35 @@ the engine's read-only enforcement on GET), not per-row security rules — SQL
 tables have no rules layer, exactly like the existing `/api/sql` endpoint. This
 is the one behavioral difference from the document path and is intentional.
 
+### TSDB engine under the same grammar (Phase 2d, landed)
+
+The time-series engine (`oxidb-server/src/rest/postgrest_tsdb.rs`) is
+aggregation-shaped — measurement × tag-set × field, queried by field + tag
+filters + time range + aggregate — so the mapping is a deliberate, honest fit,
+not a 1:1 row translation.
+
+**Engine selection uses PostgREST's own schema mechanism.** A request carrying
+`Accept-Profile: tsdb` (reads) / `Content-Profile: tsdb` (writes) — exactly what
+`postgrest-js` emits for `.schema('tsdb')` — routes to the TSDB engine.
+Crucially, this is not existence-routing (used for SQL): a TSDB measurement only
+exists after its first write, so an existence check would misroute the first
+`POST`. The profile header is the right, PostgREST-native signal.
+
+- **Read** `GET /rest/v1/{measurement}`: `select=<field>` names the field
+  (required — TSDB aggregates one field at a time); a bare `tag=eq.value`
+  filters on a tag (equality only); `ts=gte./lt.` (or `time`) set `[start,end)`;
+  extension params `agg` (default `mean`, `p` for percentile), `interval`
+  (GROUP BY time) and `group_by` shape the aggregation. The series result is
+  **flattened to rows** (`{ts, value, <tags…>}`) so it looks like any other
+  PostgREST response; `order=ts.desc`/`limit` apply post-flatten.
+- **Write** `POST /rest/v1/{measurement}`: a flat `{ts, host:"web1", usage:0.5}`
+  maps `ts`/`time`→timestamp (default now), string values→tags,
+  numeric/bool→fields; a nested `{ts, tags, fields}` is honored verbatim.
+- **PATCH/DELETE** → `405`: the store is append-only; expire with retention.
+
+Authorization is RBAC-only (the `rest_permitted` gate), like the wire `tsdb`
+command; the engine is off unless `OXIDB_TSDB=1`.
+
 ## Options considered
 
 1. **A brand-new bespoke REST query language.** Rejected: throws away the
@@ -168,7 +197,6 @@ is the one behavioral difference from the document path and is intentional.
 
 **Negative / deferred**
 - **Nested embeds** (an embed inside an embed) are rejected (one level).
-- TSDB under the same grammar.
 - Schemaless coercion (document path only) can surprise (`zip=eq.007` → number
   7); mitigated by quoting, documented. The SQL path binds params by column
   type and has no such ambiguity.
@@ -199,12 +227,19 @@ is the one behavioral difference from the document path and is intentional.
   REFERENCES customers(id)`: belongs-to (`orders?select=item,customers(name)`),
   has-many (`customers?select=name,orders(item)`), alias + `!fk` hint, child
   projection, and a no-FK pair → `400` with a hint suggestion.
+- 10 TSDB grammar unit tests in `postgrest_tsdb.rs` (query build, field
+  required, tag-eq-only, agg/interval/group_by, order-by-ts-only, point flatten,
+  flat/nested write mapping). End-to-end over a live TSDB engine: write points,
+  `agg=mean` with `group_by`, bucketed `interval`, whole-range aggregate,
+  `PATCH`→`405`, missing-field→`400`, and co-existence (no profile → document
+  engine).
 - **Real-client conformance** (`tests/postgrest-js-test/`): the unmodified
   `@supabase/postgrest-js` client (the library `supabase-js` wraps) drives the
-  surface over **both engines** through one base URL — 20 assertions across
-  `gt`/`in`/`or`/`like`, ordering, embedding (belongs-to + has-many), and
+  surface over **all three engines** through one base URL — 22 assertions across
+  `gt`/`in`/`or`/`like`, ordering, embedding (belongs-to + has-many),
   insert/update/delete with `return=representation` (including SQL writes
-  echoing rows via `RETURNING *`), on document collections *and* SQL tables.
-  This run surfaced and fixed a real compatibility gap: the client emits
+  echoing rows via `RETURNING *`), on document collections *and* SQL tables,
+  plus `.schema('tsdb')` write + aggregate read on the time-series engine. This
+  run surfaced and fixed a real compatibility gap: the client emits
   **SQL-native `%`/`_`** LIKE wildcards, so `like_to_regex` now honors `%`/`_`
   in addition to PostgREST's `*` alias.
