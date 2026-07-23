@@ -163,6 +163,51 @@ console.log('\n# SQL engine (tables) via the SAME postgrest-js client')
   eq(remaining, [{ id: 10 }], 'SQL delete actually removed the row')
 }
 
+// ── Nested resource embedding (an embed inside an embed) ────────────────────
+console.log('\n# Nested embedding (both engines)')
+{
+  // Document: blogs → posts → comments (has-many at each level)
+  const { data: bl } = await client.from('blogs').insert([{ name: 'oxidb' }]).select()
+  const blogId = bl[0]._id
+  const { data: ps } = await client
+    .from('posts')
+    .insert([{ title: 'hello', blog_id: blogId }])
+    .select()
+  const postId = ps[0]._id
+  await client.from('comments').insert([
+    { text: 'nice', post_id: postId },
+    { text: 'great', post_id: postId },
+  ])
+  const { data: docNested } = await client
+    .from('blogs')
+    .select('name,posts(title,comments(text))')
+    .eq('name', 'oxidb')
+  ok(docNested.length === 1 && docNested[0].posts.length === 1, 'doc nested: blog → post')
+  eq(
+    docNested[0].posts[0].comments.map((c) => c.text).sort(),
+    ['great', 'nice'],
+    'doc nested: post → comments (2 levels deep)',
+  )
+
+  // SQL: authors → books → chapters, both joins inferred from catalog FKs
+  await sql('CREATE TABLE chapters (id INTEGER PRIMARY KEY, name TEXT, book_id INTEGER REFERENCES books(id))')
+  await client.from('chapters').insert([
+    { id: 1, name: 'Ch1', book_id: 10 },
+    { id: 2, name: 'Ch2', book_id: 10 },
+  ])
+  const { data: sqlNested } = await client
+    .from('authors')
+    .select('name,books(title,chapters(name))')
+    .eq('id', 1)
+  ok(sqlNested.length === 1, 'sql nested: author row')
+  const book = sqlNested[0].books.find((b) => b.title === 'Foundation (rev)')
+  eq(
+    book.chapters.map((c) => c.name).sort(),
+    ['Ch1', 'Ch2'],
+    'sql nested: book → chapters (2 levels, catalog FKs)',
+  )
+}
+
 // ── TSDB engine (same client, .schema('tsdb') → Accept/Content-Profile) ─────
 console.log('\n# TSDB engine (time-series) via postgrest-js .schema("tsdb")')
 {

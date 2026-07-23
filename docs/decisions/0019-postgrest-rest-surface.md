@@ -1,6 +1,6 @@
 # ADR-0019: PostgREST-compatible auto-REST surface for the document engine
 
-**Status:** Accepted — Phase 1 (document engine: filters, select, order, pagination, full CRUD) + Phase 2a (**resource embedding** for the document engine, `$lookup`-style stitch) + Phase 2b (**SQL engine under the same grammar** — parameterized CRUD routing) + Phase 2c (**SQL resource embedding** via catalog foreign keys) + **SQL write-representation** (`RETURNING *`) + Phase 2d (**TSDB under the same grammar**, selected by the `tsdb` schema profile) landed & tested, 2026-07-22/23, and verified against the real `@supabase/postgrest-js` client over **all three engines**. Remaining (nested embeds) **Proposed**, deferred.
+**Status:** Accepted — Phase 1 (document engine: filters, select, order, pagination, full CRUD) + Phase 2a (**resource embedding** for the document engine, `$lookup`-style stitch) + Phase 2b (**SQL engine under the same grammar** — parameterized CRUD routing) + Phase 2c (**SQL resource embedding** via catalog foreign keys) + **SQL write-representation** (`RETURNING *`) + Phase 2d (**TSDB under the same grammar**, selected by the `tsdb` schema profile) + Phase 2e (**nested resource embeds**, `a(b(c(…)))` to a bounded depth) landed & tested, 2026-07-22/23, and verified against the real `@supabase/postgrest-js` client over **all three engines**. The surface is functionally complete for the mapped grammar.
 **Supersedes:** —
 **Related:** [ADR-0012](0012-multi-database.md) (`?db=<name>` targeting, reused verbatim),
 [`oxidb-server/src/rest/postgrest.rs`](../../oxidb-server/src/rest/postgrest.rs) (the translation layer),
@@ -195,8 +195,15 @@ command; the engine is off unless `OXIDB_TSDB=1`.
   (already used by the EF/ADO.NET generated-key path) makes this exact — no
   re-select race.
 
+**Nested embeds (Phase 2e, landed)**
+- An embed's `select` may itself contain embeds
+  (`authors(name,books(title,chapters(name)))`). The child rows run back
+  through the same projection path at `depth + 1` — `project_top` (document) /
+  `project_sql` (SQL) — so each level reuses the exact belongs-to/has-many
+  resolution. A `MAX_EMBED_DEPTH` (5) guard bounds runaway or cyclic specs.
+
 **Negative / deferred**
-- **Nested embeds** (an embed inside an embed) are rejected (one level).
+- (No further deferrals for the mapped grammar.)
 - Schemaless coercion (document path only) can surprise (`zip=eq.007` → number
   7); mitigated by quoting, documented. The SQL path binds params by column
   type and has no such ambiguity.
@@ -235,11 +242,12 @@ command; the engine is off unless `OXIDB_TSDB=1`.
   engine).
 - **Real-client conformance** (`tests/postgrest-js-test/`): the unmodified
   `@supabase/postgrest-js` client (the library `supabase-js` wraps) drives the
-  surface over **all three engines** through one base URL — 22 assertions across
-  `gt`/`in`/`or`/`like`, ordering, embedding (belongs-to + has-many),
-  insert/update/delete with `return=representation` (including SQL writes
-  echoing rows via `RETURNING *`), on document collections *and* SQL tables,
-  plus `.schema('tsdb')` write + aggregate read on the time-series engine. This
+  surface over **all three engines** through one base URL — 26 assertions across
+  `gt`/`in`/`or`/`like`, ordering, embedding (belongs-to + has-many + **2-level
+  nested** on document and SQL), insert/update/delete with `return=representation`
+  (including SQL writes echoing rows via `RETURNING *`), on document collections
+  *and* SQL tables, plus `.schema('tsdb')` write + aggregate read on the
+  time-series engine. This
   run surfaced and fixed a real compatibility gap: the client emits
   **SQL-native `%`/`_`** LIKE wildcards, so `like_to_regex` now honors `%`/`_`
   in addition to PostgREST's `*` alias.

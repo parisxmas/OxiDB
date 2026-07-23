@@ -39,8 +39,8 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value, json};
 
 use super::postgrest::{
-    Embed, apply_select, coerce, max_rows, parse_select_plan, project_doc, split_pairs,
-    split_top_commas, wants_representation,
+    Embed, MAX_EMBED_DEPTH, apply_select, coerce, max_rows, parse_select_plan, project_doc,
+    split_pairs, split_top_commas, wants_representation,
 };
 use crate::s3::http::{HttpRequest, HttpResponse};
 
@@ -59,11 +59,10 @@ type PgResult<T> = Result<T, (u16, String)>;
 pub(super) fn handle_get(db: &str, table: &str, req: &HttpRequest) -> HttpResponse {
     let query = &req.query;
     let select = select_param(query);
-    let plan = match parse_select_plan(select.as_deref()) {
-        Ok(p) => p,
+    let has_embed = match parse_select_plan(select.as_deref()) {
+        Ok(p) => p.is_some_and(|p| !p.embeds.is_empty()),
         Err((s, m)) => return err(s, &m),
     };
-    let has_embed = plan.as_ref().is_some_and(|p| !p.embeds.is_empty());
 
     let force_star = has_embed;
     let (sql, params, offset) = match build_read(table, query, force_star) {
@@ -77,13 +76,11 @@ pub(super) fn handle_get(db: &str, table: &str, req: &HttpRequest) -> HttpRespon
     };
     let mut rows = rows_to_objects(&base);
 
-    if let Some(plan) = plan.filter(|p| !p.embeds.is_empty()) {
-        for embed in &plan.embeds {
-            if let Err((s, m)) = resolve_embed_sql(db, table, &mut rows, embed) {
-                return err(s, &m);
-            }
-        }
-        rows = rows.into_iter().map(|r| project_doc(r, &plan)).collect();
+    if has_embed {
+        rows = match project_sql(db, table, rows, select.as_deref(), 0) {
+            Ok(r) => r,
+            Err((s, m)) => return err(s, &m),
+        };
     }
 
     let n = rows.len();
@@ -488,11 +485,42 @@ enum Rel {
     },
 }
 
+/// Resolve every embed in `select` against the catalog and project the rows.
+/// Recursive: an embed's own `select` may contain further embeds
+/// (`authors(name,books(title))`), resolved at `depth + 1`.
+fn project_sql(
+    db: &str,
+    table: &str,
+    rows: Vec<Value>,
+    select: Option<&str>,
+    depth: usize,
+) -> PgResult<Vec<Value>> {
+    let plan = match parse_select_plan(select)? {
+        None => return apply_select(rows, select),
+        Some(p) => p,
+    };
+    if !plan.embeds.is_empty() && depth >= MAX_EMBED_DEPTH {
+        return Err((400, "resource embeds nested too deeply".to_string()));
+    }
+    let mut rows = rows;
+    for embed in &plan.embeds {
+        resolve_embed_sql(db, table, &mut rows, embed, depth)?;
+    }
+    Ok(rows.into_iter().map(|r| project_doc(r, &plan)).collect())
+}
+
 /// Attach one embed's related rows to every base row in place, running one
 /// batched secondary query keyed on the catalog foreign key that links the
 /// tables (a `$lookup`-style stitch rather than a JOIN — no column-name
-/// collisions, and `rows_to_objects`/projection are reused verbatim).
-fn resolve_embed_sql(db: &str, current: &str, rows: &mut [Value], embed: &Embed) -> PgResult<()> {
+/// collisions, and `rows_to_objects`/projection are reused verbatim). Child
+/// rows go through [`project_sql`] at `depth + 1`, enabling nested embeds.
+fn resolve_embed_sql(
+    db: &str,
+    current: &str,
+    rows: &mut [Value],
+    embed: &Embed,
+    depth: usize,
+) -> PgResult<()> {
     ident(&embed.target)?;
     let cur_fks = crate::sql_bridge::sql_foreign_keys(db, current);
     let tgt_fks = crate::sql_bridge::sql_foreign_keys(db, &embed.target);
@@ -553,7 +581,13 @@ fn resolve_embed_sql(db: &str, current: &str, rows: &mut [Value], embed: &Embed)
             let mut by_key: HashMap<String, Value> = HashMap::new();
             if !ids.is_empty() {
                 let full = fetch_in(db, &embed.target, &parent_col, ids)?;
-                let projected = apply_select(full.clone(), embed.child.as_deref())?;
+                let projected = project_sql(
+                    db,
+                    &embed.target,
+                    full.clone(),
+                    embed.child.as_deref(),
+                    depth + 1,
+                )?;
                 for (f, p) in full.iter().zip(projected) {
                     if let Some(kv) = f.get(&parent_col) {
                         by_key.insert(key(kv), p);
@@ -579,7 +613,13 @@ fn resolve_embed_sql(db: &str, current: &str, rows: &mut [Value], embed: &Embed)
             let mut groups: HashMap<String, Vec<Value>> = HashMap::new();
             if !keys.is_empty() {
                 let full = fetch_in(db, &embed.target, &child_col, keys)?;
-                let projected = apply_select(full.clone(), embed.child.as_deref())?;
+                let projected = project_sql(
+                    db,
+                    &embed.target,
+                    full.clone(),
+                    embed.child.as_deref(),
+                    depth + 1,
+                )?;
                 for (f, p) in full.iter().zip(projected) {
                     if let Some(cv) = f.get(&child_col) {
                         groups.entry(key(cv)).or_default().push(p);

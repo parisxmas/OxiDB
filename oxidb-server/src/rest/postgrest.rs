@@ -31,8 +31,9 @@
 //! `customers` doc when the order carries a `customer_id` (belongs-to), while
 //! `customer?select=*,orders(*)` embeds an array of `orders` whose `customer_id`
 //! points back (has-many). An explicit `related!fk(...)` names the foreign-key
-//! field when the naming convention does not apply. Nested embeds (embeds
-//! inside an embed) are a future phase.
+//! field when the naming convention does not apply. Embeds **nest**
+//! (`authors(name,books(title,reviews(stars)))`) up to [`MAX_EMBED_DEPTH`] — a
+//! child's `select` runs back through [`project_top`] at the next depth.
 //!
 //! Every request runs through [`rules::check_access`] exactly like the native
 //! `/api/{col}/documents` handlers — the security-rules layer is OxiDB's
@@ -121,7 +122,7 @@ pub(super) fn handle_get(
     // Projection + resource embedding (Phase 2). Embeds pull related documents
     // from other collections and nest them, mapping PostgREST's `select=*,rel(…)`
     // onto a `$lookup`-style stitch.
-    let docs = match project_top(state, col, docs, parsed.mods.select.as_deref()) {
+    let docs = match project_top(state, col, docs, parsed.mods.select.as_deref(), 0) {
         Ok(d) => d,
         Err((s, m)) => return err(s, &m),
     };
@@ -553,32 +554,43 @@ pub(super) fn parse_select_plan(select: Option<&str>) -> PgResult<Option<SelectP
     Ok(Some(plan))
 }
 
+/// How deep resource embeds may nest (`a(b(c(…)))`) — a guard against runaway
+/// or cyclic embed specs.
+pub(super) const MAX_EMBED_DEPTH: usize = 5;
+
 /// Top-level projection: resolve any embeds against the database, then project
 /// the parent columns. `parent_col` is the collection the parents came from
-/// (used to infer has-many foreign keys).
-fn project_top(
+/// (used to infer has-many foreign keys). `depth` bounds nested embeds.
+pub(super) fn project_top(
     state: &RestState,
     parent_col: &str,
     docs: Vec<Value>,
     select: Option<&str>,
+    depth: usize,
 ) -> PgResult<Vec<Value>> {
     let plan = match parse_select_plan(select)? {
         None => return apply_select(docs, select),
         Some(p) => p,
     };
+    if !plan.embeds.is_empty() && depth >= MAX_EMBED_DEPTH {
+        return Err((400, "resource embeds nested too deeply".to_string()));
+    }
     let mut docs = docs;
     for embed in &plan.embeds {
-        resolve_embed(state, parent_col, &mut docs, embed)?;
+        resolve_embed(state, parent_col, &mut docs, embed, depth)?;
     }
     Ok(docs.into_iter().map(|d| project_doc(d, &plan)).collect())
 }
 
-/// Attach one embed's related documents to every parent doc in place.
+/// Attach one embed's related documents to every parent doc in place. Child
+/// documents are themselves run through [`project_top`] at `depth + 1`, so an
+/// embed's `select` may contain further embeds (`customers(name,orders(item))`).
 fn resolve_embed(
     state: &RestState,
     parent_col: &str,
     docs: &mut [Value],
     embed: &Embed,
+    depth: usize,
 ) -> PgResult<()> {
     // Decide the foreign-key field and the relationship direction.
     let (fk, belongs_to) = match &embed.hint {
@@ -618,7 +630,13 @@ fn resolve_embed(
                 .db
                 .find(&embed.target, &json!({ "_id": { "$in": ids } }))
                 .unwrap_or_default();
-            let projected = apply_select(full.clone(), embed.child.as_deref())?;
+            let projected = project_top(
+                state,
+                &embed.target,
+                full.clone(),
+                embed.child.as_deref(),
+                depth + 1,
+            )?;
             for (f, p) in full.iter().zip(projected) {
                 if let Some(idv) = f.get("_id") {
                     by_id.insert(join_key(idv), p);
@@ -643,7 +661,13 @@ fn resolve_embed(
                 .db
                 .find(&embed.target, &json!({ &fk: { "$in": parent_ids } }))
                 .unwrap_or_default();
-            let projected = apply_select(full.clone(), embed.child.as_deref())?;
+            let projected = project_top(
+                state,
+                &embed.target,
+                full.clone(),
+                embed.child.as_deref(),
+                depth + 1,
+            )?;
             for (f, p) in full.iter().zip(projected) {
                 if let Some(fkv) = f.get(&fk) {
                     groups.entry(join_key(fkv)).or_default().push(p);
@@ -986,10 +1010,27 @@ mod tests {
     }
 
     #[test]
-    fn nested_child_embed_is_rejected() {
-        // A plain child projection must not itself contain an embed (one level).
+    fn apply_select_is_plain_only() {
+        // `apply_select` is the plain projector (used for write-representation);
+        // it rejects embeds. Nested embeds on the read path are handled by
+        // `project_top`'s recursion, not here.
         let docs = vec![json!({"a": 1})];
         assert!(apply_select(docs, Some("id,nested(x)")).is_err());
+    }
+
+    #[test]
+    fn select_plan_parses_nested_embed() {
+        // The child select string is kept verbatim; `project_top` re-parses it
+        // at the next depth, so nesting needs no special parse handling here.
+        let plan = parse_select_plan(Some("name,books(title,reviews(stars))"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.embeds.len(), 1);
+        assert_eq!(plan.embeds[0].target, "books");
+        assert_eq!(
+            plan.embeds[0].child.as_deref(),
+            Some("title,reviews(stars)")
+        );
     }
 
     #[test]
