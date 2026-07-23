@@ -1096,9 +1096,16 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str]) -> bool {
         ReadWrite => true,
         // Read is restricted to read-only operations: any GET, the read-only
         // aggregation POST, and SQL (SELECT-only, enforced by the SQL bridge).
+        // Writes to the PostgREST surface (`/rest/v1/{table}`) are also let
+        // through here so the per-collection security rules (`check_access`)
+        // can decide — anon-with-rules, the Supabase RLS model. A collection
+        // with no rule denies anon writes by default (see `rules::check_access`).
         Read => matches!(
             (method, segments),
-            ("GET", _) | ("POST", ["api", _, "aggregate"]) | ("POST", ["api", "sql"])
+            ("GET", _)
+                | ("POST", ["api", _, "aggregate"])
+                | ("POST", ["api", "sql"])
+                | ("POST" | "PATCH" | "DELETE", ["rest", "v1", _])
         ),
     }
 }

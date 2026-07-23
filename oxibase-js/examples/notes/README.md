@@ -7,18 +7,24 @@ against an OxiBase project using [`oxibase-js`](../../) — the same
 ## Run
 
 1. In the OxiBase dashboard, **Open a project → API keys** and copy the project
-   `ref` and a key.
+   `ref`, the **anon** key, and the **service_role** key.
 2. Configure the connection:
 
    ```bash
    cp .env.example .env
-   # edit .env: VITE_OXIBASE_URL, VITE_OXIBASE_REF, VITE_OXIBASE_KEY
+   # edit .env: VITE_OXIBASE_URL, VITE_OXIBASE_REF, VITE_OXIBASE_KEY (anon key)
    ```
 
    `.env` is gitignored — never commit real keys.
 
-3. Make sure the OxiDB data plane is running (this demo also uses the SQL engine
-   nowhere, so plain `oxidb-server` is enough), then:
+3. Install the security rule that lets the anon key write `demo_notes` (one time,
+   with the service_role key — see [Auth](#auth) below):
+
+   ```bash
+   OXIBASE_REF=<ref> OXIBASE_SERVICE_ROLE_KEY=<service_role key> node setup.mjs
+   ```
+
+4. Make sure the OxiDB data plane is running, then:
 
    ```bash
    npm install
@@ -28,12 +34,19 @@ against an OxiBase project using [`oxibase-js`](../../) — the same
 The app stores notes in a document collection (`demo_notes`), auto-created on the
 first insert.
 
-## Auth note
+## Auth
 
-This demo uses the **service_role** key so writes work directly from the browser
-— fine on localhost, **not** for production. In a real app, keep `service_role`
-server-side and use the browser-safe **anon** key together with security rules
-(the OxiBase RLS analog).
+This demo uses the browser-safe **anon** key (role `read`) — the correct,
+Supabase-style model. Two rules of the OxiBase data plane make that safe:
+
+- The anon key is **read-only by default**; anon **writes are denied** unless a
+  collection has a security rule that grants them (OxiBase's RLS analog).
+- `setup.mjs` installs a public rule on `demo_notes`
+  (`create/read/update/delete: "true"`) so this public demo can write. A real app
+  would scope it to the row owner, e.g. `update: "auth.uid == doc.user_id"`.
+
+The **service_role** key (role `admin`, bypasses rules) is used only by
+`setup.mjs`, server-side — it never reaches the browser bundle.
 
 ## How it connects
 

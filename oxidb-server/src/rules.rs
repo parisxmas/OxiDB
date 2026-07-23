@@ -149,7 +149,27 @@ pub fn check_access(
 
     let rules = match get_rules(db, collection) {
         Some(r) => r,
-        None => return Ok(()), // no rules defined → allow all
+        None => {
+            // No rules defined. Reads stay open and trusted roles keep full
+            // access (backward compatible). But a WRITE from a project's public
+            // anon key (role "read") is denied by default — a collection must
+            // opt into anonymous writes with an explicit rule (the Supabase RLS
+            // model). An open, no-auth server (role `None`) is unaffected.
+            let anon_write = !matches!(op, Operation::Read)
+                && matches!(
+                    auth.role.as_deref().and_then(crate::auth::Role::from_str),
+                    Some(crate::auth::Role::Read)
+                );
+            return if anon_write {
+                Err(format!(
+                    "access denied: {} on '{}' requires a security rule for anonymous access",
+                    op.as_str(),
+                    collection
+                ))
+            } else {
+                Ok(())
+            };
+        }
     };
 
     let expr = match op {
@@ -521,6 +541,61 @@ mod tests {
         let db = oxidb::OxiDb::open_in_memory().unwrap();
         let result = check_access(&db, "any_collection", Operation::Read, &anon(), None, None);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn anon_key_write_needs_a_rule() {
+        let db = oxidb::OxiDb::open_in_memory().unwrap();
+        // A project's public anon key carries role "read".
+        let anon_key = AuthContext::from_claims("read@proj", "read");
+        let service_role = AuthContext::from_claims("admin@proj", "admin");
+
+        // No rules on the collection:
+        // - anon-key READ is still allowed (reads stay open)
+        assert!(check_access(&db, "notes", Operation::Read, &anon_key, None, None).is_ok());
+        // - anon-key WRITES are denied by default (must opt in via a rule)
+        for op in [Operation::Create, Operation::Update, Operation::Delete] {
+            assert!(
+                check_access(&db, "notes", op, &anon_key, None, None).is_err(),
+                "anon {op:?} with no rule must be denied"
+            );
+        }
+        // - service_role (admin) writes are unaffected
+        assert!(check_access(&db, "notes", Operation::Create, &service_role, None, None).is_ok());
+        // - an open, no-auth server (role None) is unaffected
+        assert!(check_access(&db, "notes", Operation::Create, &anon(), None, None).is_ok());
+    }
+
+    #[test]
+    fn anon_key_write_allowed_when_rule_grants_it() {
+        let db = oxidb::OxiDb::open_in_memory().unwrap();
+        set_rules(
+            &db,
+            "public_notes",
+            &json!({ "read": "true", "create": "true", "update": "true", "delete": "true" }),
+        )
+        .unwrap();
+        let anon_key = AuthContext::from_claims("read@proj", "read");
+        for op in [
+            Operation::Read,
+            Operation::Create,
+            Operation::Update,
+            Operation::Delete,
+        ] {
+            assert!(
+                check_access(&db, "public_notes", op, &anon_key, None, None).is_ok(),
+                "rule create:true must allow anon {op:?}"
+            );
+        }
+
+        // A restrictive rule still denies the anon key.
+        set_rules(
+            &db,
+            "locked",
+            &json!({ "read": "true", "create": "false", "update": "false", "delete": "false" }),
+        )
+        .unwrap();
+        assert!(check_access(&db, "locked", Operation::Create, &anon_key, None, None).is_err());
     }
 
     #[test]
