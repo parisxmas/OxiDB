@@ -24,9 +24,16 @@
 //! GET    /platform/v1/projects   [platform JWT]     -> [{ref, name, created_at}]
 //! GET    /platform/v1/projects/{ref} [platform JWT] -> {ref, …, anon_key, service_role_key}
 //! DELETE /platform/v1/projects/{ref} [platform JWT] -> {deleted}
+//! POST   /platform/v1/projects/{ref}/keys/rotate [platform JWT] -> fresh keys (old ones die)
 //! ```
+//!
+//! Hardening: signup enforces a minimum password length; login has a per-email
+//! brute-force lockout; projects-per-account is capped
+//! (`OXIDB_PLATFORM_MAX_PROJECTS`); per-project secrets are cached and the cache
+//! is invalidated on rotate/delete so a revoked key can never keep verifying.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -44,6 +51,21 @@ const PROJECTS: &str = "projects";
 /// Developer *session* expiry is handled by `jwt::login` (24h) — sessions are
 /// short-lived by design, API keys are not.
 const KEY_EXPIRY_SECS: u64 = 10 * 365 * 86_400;
+/// Minimum developer password length at signup.
+const MIN_PASSWORD_LEN: usize = 8;
+/// Failed logins per email before a temporary lockout (brute-force guard).
+const LOGIN_MAX_FAILS: u32 = 5;
+/// How long an email stays locked out after `LOGIN_MAX_FAILS` failures.
+const LOGIN_LOCKOUT_SECS: u64 = 300;
+
+/// Cap on projects a single account may provision — a resource-exhaustion guard
+/// for the `shared` isolation model. Overridable via `OXIDB_PLATFORM_MAX_PROJECTS`.
+fn max_projects() -> usize {
+    std::env::var("OXIDB_PLATFORM_MAX_PROJECTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+}
 
 // ---------------------------------------------------------------------------
 // Enablement + secrets
@@ -100,10 +122,27 @@ fn now_secs() -> u64 {
 // Data-plane hook: resolve a project's JWT secret
 // ---------------------------------------------------------------------------
 
+/// Cache of `ref → decrypted jwt_secret`, so a project's secret is not read and
+/// AES-decrypted from `_oxibase` on *every* authenticated data-plane request
+/// (a real per-request cost / mild DoS surface). Invalidated on rotate/delete.
+fn secret_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Drop a project's cached secret — called after rotation or deletion so a
+/// stale (revoked) secret can never keep verifying tokens.
+fn invalidate_secret(db_ref: &str) {
+    secret_cache().lock().unwrap().remove(db_ref);
+}
+
 /// The per-project JWT secret for `db_ref`, if it names an OxiBase project.
 /// The REST listener calls this so a request to `?db=<ref>` is verified with
 /// that project's secret rather than the global `OXIDB_JWT_SECRET`.
 pub fn project_secret(mgr: &DatabaseManager, db_ref: &str) -> Option<String> {
+    if let Some(cached) = secret_cache().lock().unwrap().get(db_ref).cloned() {
+        return Some(cached);
+    }
     let master = master_secret()?;
     let pdb = platform_db(mgr)?;
     let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
@@ -112,7 +151,52 @@ pub fn project_secret(mgr: &DatabaseManager, db_ref: &str) -> Option<String> {
         .decode(sealed_b64)
         .ok()?;
     let plain = enc_key(&master).decrypt(&sealed).ok()?;
-    String::from_utf8(plain).ok()
+    let secret = String::from_utf8(plain).ok()?;
+    secret_cache()
+        .lock()
+        .unwrap()
+        .insert(db_ref.to_string(), secret.clone());
+    Some(secret)
+}
+
+// ---------------------------------------------------------------------------
+// Login brute-force limiter (in-memory, per email)
+// ---------------------------------------------------------------------------
+
+fn login_limiter() -> &'static Mutex<HashMap<String, (u32, u64)>> {
+    static L: OnceLock<Mutex<HashMap<String, (u32, u64)>>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// True while `email` is locked out after too many recent failures.
+fn login_locked(email: &str) -> bool {
+    let mut m = login_limiter().lock().unwrap();
+    match m.get(email).copied() {
+        Some((fails, first)) => {
+            if now_secs().saturating_sub(first) >= LOGIN_LOCKOUT_SECS {
+                m.remove(email); // window expired
+                false
+            } else {
+                fails >= LOGIN_MAX_FAILS
+            }
+        }
+        None => false,
+    }
+}
+
+fn login_record_failure(email: &str) {
+    let mut m = login_limiter().lock().unwrap();
+    let now = now_secs();
+    let entry = m.entry(email.to_string()).or_insert((0, now));
+    if now.saturating_sub(entry.1) >= LOGIN_LOCKOUT_SECS {
+        *entry = (1, now); // fresh window
+    } else {
+        entry.0 += 1;
+    }
+}
+
+fn login_clear(email: &str) {
+    login_limiter().lock().unwrap().remove(email);
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +234,9 @@ pub fn route(
         ("GET", ["platform", "v1", "projects"]) => handle_list_projects(req, mgr),
         ("GET", ["platform", "v1", "projects", r]) => handle_get_project(req, mgr, r),
         ("DELETE", ["platform", "v1", "projects", r]) => handle_delete_project(req, mgr, r),
+        ("POST", ["platform", "v1", "projects", r, "keys", "rotate"]) => {
+            handle_rotate_keys(req, mgr, r)
+        }
         _ => resp(404, json!({ "message": "no such platform route" })),
     })
 }
@@ -169,6 +256,12 @@ fn handle_signup(req: &HttpRequest, mgr: &DatabaseManager) -> HttpResponse {
         Ok(c) => c,
         Err(r) => return r,
     };
+    if password.len() < MIN_PASSWORD_LEN {
+        return resp(
+            400,
+            json!({ "message": format!("password must be at least {MIN_PASSWORD_LEN} characters") }),
+        );
+    }
     // Developers are admins of the projects they create; the account row lives
     // in the platform store's `_auth_users` (reusing the jwt user machinery).
     if let Err(e) = jwt::signup(&pdb, &email, &password, "admin") {
@@ -194,9 +287,21 @@ fn handle_login(req: &HttpRequest, mgr: &DatabaseManager) -> HttpResponse {
         Ok(c) => c,
         Err(r) => return r,
     };
+    if login_locked(&email) {
+        return resp(
+            429,
+            json!({ "message": "too many failed attempts; try again later" }),
+        );
+    }
     match jwt::login(&pdb, &email, &password, &master) {
-        Ok(token) => resp(200, json!({ "token": token })),
-        Err(e) => resp(401, json!({ "message": e })),
+        Ok(token) => {
+            login_clear(&email);
+            resp(200, json!({ "token": token }))
+        }
+        Err(e) => {
+            login_record_failure(&email);
+            resp(401, json!({ "message": e }))
+        }
     }
 }
 
@@ -219,6 +324,15 @@ fn handle_create_project(req: &HttpRequest, mgr: &DatabaseManager) -> HttpRespon
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Resource-exhaustion guard: cap projects per account.
+    let owned = pdb.count(PROJECTS, &json!({ "owner": owner })).unwrap_or(0);
+    if owned >= max_projects() {
+        return resp(
+            403,
+            json!({ "message": format!("project limit reached ({})", max_projects()) }),
+        );
+    }
 
     // Mint an unguessable ref that is not already a database.
     let mut project_ref = gen_ref();
@@ -249,6 +363,7 @@ fn handle_create_project(req: &HttpRequest, mgr: &DatabaseManager) -> HttpRespon
         "secret_enc": sealed,
         "isolation": "shared",
         "created_at": created_at,
+        "key_iat": created_at,
     });
     if pdb.insert(PROJECTS, doc).is_err() {
         let _ = mgr.drop_database(&project_ref);
@@ -258,7 +373,7 @@ fn handle_create_project(req: &HttpRequest, mgr: &DatabaseManager) -> HttpRespon
 
     resp(
         201,
-        project_view(&project_ref, &name, created_at, &secret, true),
+        project_view(&project_ref, &name, created_at, created_at, &secret, true),
     )
 }
 
@@ -304,6 +419,10 @@ fn handle_get_project(req: &HttpRequest, mgr: &DatabaseManager, project_ref: &st
         return resp(404, json!({ "message": "project not found" }));
     };
     let created_at = doc.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    let key_iat = doc
+        .get("key_iat")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(created_at);
     let name = doc.get("name").and_then(|v| v.as_str()).unwrap_or("");
     // Re-derive the keys from the stored (encrypted) secret.
     let Some(sealed_b64) = doc.get("secret_enc").and_then(|v| v.as_str()) else {
@@ -318,7 +437,7 @@ fn handle_get_project(req: &HttpRequest, mgr: &DatabaseManager, project_ref: &st
     };
     resp(
         200,
-        project_view(project_ref, name, created_at, &secret, true),
+        project_view(project_ref, name, created_at, key_iat, &secret, true),
     )
 }
 
@@ -346,7 +465,57 @@ fn handle_delete_project(
     crate::sql_bridge::forget_database(project_ref);
     crate::tsdb_bridge::forget_database(project_ref);
     let _ = pdb.delete(PROJECTS, &json!({ "ref": project_ref }));
+    invalidate_secret(project_ref);
     resp(200, json!({ "deleted": project_ref }))
+}
+
+/// `POST /platform/v1/projects/{ref}/keys/rotate` — generate a fresh project
+/// secret, re-mint both keys, and invalidate the cache. Every previously issued
+/// key for this project (anon + service_role) stops verifying immediately — the
+/// escape hatch for a leaked key.
+fn handle_rotate_keys(req: &HttpRequest, mgr: &DatabaseManager, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    let master = master_secret().unwrap();
+    let Some(pdb) = platform_db(mgr) else {
+        return resp(500, json!({ "message": "control-plane store unavailable" }));
+    };
+    let Some(doc) = pdb
+        .find_one(PROJECTS, &json!({ "ref": project_ref, "owner": owner }))
+        .ok()
+        .flatten()
+    else {
+        return resp(404, json!({ "message": "project not found" }));
+    };
+    let created_at = doc.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
+    let name = doc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
+    let new_secret = gen_secret();
+    let new_iat = now_secs();
+    let sealed = match enc_key(&master).encrypt(new_secret.as_bytes()) {
+        Ok(s) => base64::engine::general_purpose::STANDARD.encode(s),
+        Err(e) => return resp(500, json!({ "message": format!("seal failed: {e}") })),
+    };
+    if pdb
+        .update(
+            PROJECTS,
+            &json!({ "ref": project_ref }),
+            &json!({ "$set": { "secret_enc": sealed, "key_iat": new_iat } }),
+        )
+        .is_err()
+    {
+        return resp(
+            500,
+            json!({ "message": "failed to persist rotated secret" }),
+        );
+    }
+    invalidate_secret(project_ref); // old secret must stop verifying at once
+    resp(
+        200,
+        project_view(project_ref, name, created_at, new_iat, &new_secret, true),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +523,16 @@ fn handle_delete_project(
 // ---------------------------------------------------------------------------
 
 /// The public view of a project, optionally including the (secret) API keys.
-fn project_view(project_ref: &str, name: &str, created_at: u64, secret: &str, keys: bool) -> Value {
+/// `key_iat` is the `iat` the keys are minted with (the creation time, or the
+/// last rotation time) — fixing it keeps re-derived keys stable.
+fn project_view(
+    project_ref: &str,
+    name: &str,
+    created_at: u64,
+    key_iat: u64,
+    secret: &str,
+    keys: bool,
+) -> Value {
     let base = std::env::var("OXIDB_PLATFORM_BASE_URL").unwrap_or_default();
     let url = if base.is_empty() {
         json!(null)
@@ -374,11 +552,11 @@ fn project_view(project_ref: &str, name: &str, created_at: u64, secret: &str, ke
         let obj = v.as_object_mut().unwrap();
         obj.insert(
             "anon_key".into(),
-            json!(mint_key(secret, project_ref, "read", created_at)),
+            json!(mint_key(secret, project_ref, "read", key_iat)),
         );
         obj.insert(
             "service_role_key".into(),
-            json!(mint_key(secret, project_ref, "admin", created_at)),
+            json!(mint_key(secret, project_ref, "admin", key_iat)),
         );
     }
     v
@@ -510,5 +688,31 @@ mod tests {
         let key = enc_key("master");
         let sealed = key.encrypt(b"project-secret").unwrap();
         assert_eq!(key.decrypt(&sealed).unwrap(), b"project-secret");
+    }
+
+    #[test]
+    fn login_lockout_after_max_fails() {
+        let email = "lockme@example.com";
+        login_clear(email);
+        assert!(!login_locked(email));
+        for _ in 0..LOGIN_MAX_FAILS {
+            login_record_failure(email);
+        }
+        assert!(login_locked(email), "locked after MAX fails");
+        login_clear(email); // a successful login clears it
+        assert!(!login_locked(email));
+    }
+
+    #[test]
+    fn rotation_changes_the_signing_secret() {
+        // Keys minted under different secrets never cross-verify — the property
+        // that makes rotation a real revocation.
+        let iat = now_secs();
+        let old = mint_key("secret-A", "p", "admin", iat);
+        assert!(jwt::verify(&old, "secret-A").is_ok());
+        assert!(
+            jwt::verify(&old, "secret-B").is_err(),
+            "old key must not verify under the rotated secret"
+        );
     }
 }
