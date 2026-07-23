@@ -28,6 +28,7 @@ pub mod udp_ingest;
 
 pub mod jwt;
 pub mod metrics;
+pub mod platform;
 pub mod proc_stats;
 pub mod profiler;
 pub mod rest;

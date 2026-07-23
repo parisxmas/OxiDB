@@ -32,6 +32,14 @@ impl EncryptionKey {
         Ok(Arc::new(Self { cipher }))
     }
 
+    /// Build a key directly from 32 raw bytes (e.g. derived from a secret via
+    /// SHA-256), rather than a key file. Used by callers that hold a passphrase
+    /// instead of a keyfile, such as the OxiBase control plane (ADR-0020).
+    pub fn from_bytes(key: &[u8; 32]) -> Arc<Self> {
+        let cipher = Aes256Gcm::new_from_slice(key).expect("32-byte AES-256 key");
+        Arc::new(Self { cipher })
+    }
+
     /// Encrypt plaintext. Returns `[nonce:12][ciphertext+tag]`.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut nonce_bytes = [0u8; NONCE_LEN];

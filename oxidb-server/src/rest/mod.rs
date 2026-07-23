@@ -241,6 +241,15 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         raw_segments.clone()
     };
 
+    // ── OxiBase control plane (ADR-0020): /platform/v1/* ────────────────
+    // Authenticated by the platform master secret (its own scheme), so it is
+    // handled before the data-plane JWT gate. `None` for non-platform paths.
+    if let Some(platform_resp) =
+        crate::platform::route(req, raw_segments.as_slice(), state.db_manager.as_deref())
+    {
+        return platform_resp;
+    }
+
     // Top-level HELLO equivalent for REST: GET /v1/hello returns server info.
     // Same fields as the OxiWire HELLO so a REST-only client can discover
     // version + features without authenticating.
@@ -302,7 +311,17 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // configured). When it is `Some`, we gate every protected endpoint on the
     // caller's role below — without this, any valid token (even `read`) could
     // drop collections, rewrite security rules, or create stored procedures.
-    let (auth_ctx, enforced_role) = if let Some(ref secret) = state.jwt_secret {
+    //
+    // Per-database secret (ADR-0020): a request targeting an OxiBase project
+    // (`?db=<ref>`) is verified with that project's own JWT secret; everything
+    // else uses the global `OXIDB_JWT_SECRET`.
+    let effective_secret: Option<String> = match (&db_name, &state.db_manager) {
+        (Some(name), Some(mgr)) if crate::platform::enabled() => {
+            crate::platform::project_secret(mgr, name).or_else(|| state.jwt_secret.clone())
+        }
+        _ => state.jwt_secret.clone(),
+    };
+    let (auth_ctx, enforced_role) = if let Some(ref secret) = effective_secret {
         let auth_header = req
             .headers
             .get("authorization")
