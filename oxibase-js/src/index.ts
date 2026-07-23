@@ -33,8 +33,10 @@ export interface OxibaseOptions {
 export interface AuthResult {
   /** The signed-in user (present on signUp; may be absent on login). */
   user?: { email: string };
-  /** The session JWT now used by `.from()`/`.sql()` until `signOut()`. */
+  /** Short-lived access token now used by `.from()`/`.sql()` until `signOut()`. */
   token?: string;
+  /** Long-lived refresh token used to renew the access token without re-login. */
+  refreshToken?: string;
   error: string | null;
 }
 
@@ -44,10 +46,15 @@ export interface OxibaseAuth {
   signUp(credentials: { email: string; password: string }): Promise<AuthResult>;
   /** Log an end-user in and start their session. */
   signInWithPassword(credentials: { email: string; password: string }): Promise<AuthResult>;
+  /**
+   * Exchange the refresh token for a fresh access token (the refresh token is
+   * rotated). `.from()`/`.sql()` also do this automatically on a 401.
+   */
+  refreshSession(): Promise<AuthResult>;
   /** Drop the user session; `.from()` reverts to the client's original key. */
   signOut(): void;
-  /** The current session token, or `null` when running as the original key. */
-  getSession(): { token: string } | null;
+  /** The current session, or `null` when running as the original key. */
+  getSession(): { token: string; refreshToken: string } | null;
 }
 
 export interface SqlResult {
@@ -97,22 +104,57 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
   const base = url.replace(/\/+$/, "");
   const ref = opts.ref;
   const baseFetch = opts.fetch ?? fetch;
-  // The bearer token in force. Starts as the client's key (anon/service_role);
-  // `.auth` swaps in an end-user session token, `signOut()` reverts it.
+  // The tokens in force. `token` starts as the client's key (anon/service_role);
+  // `.auth` swaps in an end-user access token + refresh token.
   let token = key;
+  let refreshToken = "";
   const extra = opts.headers ?? {};
+  const authBase = opts.authUrl?.replace(/\/+$/, "");
+  const authEndpoint = (action: string) =>
+    `${authBase}/platform/v1/projects/${encodeURIComponent(ref ?? "")}/auth/${action}`;
 
-  // postgrest-js calls fetch with a string URL — add `?db=<ref>` and stamp the
-  // CURRENT token so a mid-session `.auth` login takes effect immediately.
+  // Renew the access token from the refresh token (rotated server-side).
+  async function tryRefresh(): Promise<boolean> {
+    if (!refreshToken || !authBase || !ref) return false;
+    let r: Response;
+    try {
+      r = await baseFetch(authEndpoint("refresh"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+    } catch {
+      return false;
+    }
+    const b = (await r.json().catch(() => null)) as { token?: string; refresh_token?: string } | null;
+    if (!r.ok || !b?.token) return false;
+    token = b.token;
+    if (b.refresh_token) refreshToken = b.refresh_token;
+    return true;
+  }
+
+  // Stamp the current access token, and on a 401 refresh once and retry.
+  async function sendAuthed(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const attempt = () => {
+      const headers = new Headers(init?.headers);
+      headers.set("Authorization", `Bearer ${token}`);
+      return baseFetch(input, { ...init, headers });
+    };
+    let res = await attempt();
+    if (res.status === 401 && refreshToken && (await tryRefresh())) {
+      res = await attempt();
+    }
+    return res;
+  }
+
+  // postgrest-js calls fetch with a string URL — add `?db=<ref>` then send.
   const dbFetch: typeof fetch = (input, init) => {
     if (ref && typeof input === "string") {
       const u = new URL(input);
       u.searchParams.set("db", ref);
       input = u.toString();
     }
-    const headers = new Headers(init?.headers);
-    headers.set("Authorization", `Bearer ${token}`);
-    return baseFetch(input, { ...init, headers });
+    return sendAuthed(input, init);
   };
 
   const rest = new PostgrestClient(`${base}/rest/v1`, {
@@ -125,9 +167,9 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     if (ref) u.searchParams.set("db", ref);
     let r: Response;
     try {
-      r = await baseFetch(u.toString(), {
+      r = await sendAuthed(u.toString(), {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...extra },
+        headers: { "Content-Type": "application/json", ...extra },
         body: JSON.stringify(params ? { sql: text, params } : { sql: text }),
       });
     } catch (e) {
@@ -139,12 +181,11 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
   }
 
   async function authCall(action: "signup" | "login", email: string, password: string): Promise<AuthResult> {
-    if (!opts.authUrl) return { error: "auth requires the `authUrl` option (the control-plane base)" };
+    if (!authBase) return { error: "auth requires the `authUrl` option (the control-plane base)" };
     if (!ref) return { error: "auth requires a project `ref`" };
-    const endpoint = `${opts.authUrl.replace(/\/+$/, "")}/platform/v1/projects/${encodeURIComponent(ref)}/auth/${action}`;
     let r: Response;
     try {
-      r = await baseFetch(endpoint, {
+      r = await baseFetch(authEndpoint(action), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
@@ -152,19 +193,25 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     } catch (e) {
       return { error: e instanceof Error ? e.message : String(e) };
     }
-    const body = (await r.json().catch(() => null)) as { user?: { email: string }; token?: string; message?: string } | null;
+    const body = (await r.json().catch(() => null)) as
+      | { user?: { email: string }; token?: string; refresh_token?: string; message?: string }
+      | null;
     if (!r.ok || !body?.token) return { error: body?.message ?? `HTTP ${r.status}` };
     token = body.token; // subsequent .from()/.sql() run as this user
-    return { user: body.user, token: body.token, error: null };
+    refreshToken = body.refresh_token ?? "";
+    return { user: body.user, token: body.token, refreshToken, error: null };
   }
 
   const auth: OxibaseAuth = {
     signUp: ({ email, password }) => authCall("signup", email, password),
     signInWithPassword: ({ email, password }) => authCall("login", email, password),
+    refreshSession: async () =>
+      (await tryRefresh()) ? { token, refreshToken, error: null } : { error: "refresh failed" },
     signOut: () => {
       token = key;
+      refreshToken = "";
     },
-    getSession: () => (token === key ? null : { token }),
+    getSession: () => (refreshToken ? { token, refreshToken } : null),
   };
 
   return {

@@ -17,6 +17,11 @@ by rules on the server, not the client.
   (no secret) and exposes `auth.username` (email) + `auth.role` to rules.
 - After login the client's `.from()` / `.sql()` run **as that user** until
   `signOut()`.
+- **Sessions**: signup/login return a short-lived **access token** plus a
+  long-lived **refresh token**. The client refreshes automatically on a 401, or
+  you can call `oxibase.auth.refreshSession()`. Refresh tokens are single-use
+  (rotated on every refresh — a replayed token is rejected) and stored hashed on
+  the server. Access lifetime is configurable via `OXIDB_PLATFORM_ACCESS_TTL`.
 
 Rules (installed once by the operator with the service_role key):
 

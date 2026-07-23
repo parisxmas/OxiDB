@@ -92,6 +92,17 @@ pub fn jwk_from_pub(pub_sec1: &[u8], kid: &str) -> Option<serde_json::Value> {
     }))
 }
 
+/// SHA-256 of `data` as lowercase hex — used to store refresh tokens hashed, so
+/// a leak of the metadata store never exposes usable tokens.
+pub fn sha256_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 pub fn encode_jwt(claims: &Claims, secret: &str) -> String {
     let header = b64url(br#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = format!(

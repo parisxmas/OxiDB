@@ -98,6 +98,9 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
         ("POST", ["platform", "v1", "projects", r, "auth", "login"]) => {
             handlers::end_user_login(req, state, r)
         }
+        ("POST", ["platform", "v1", "projects", r, "auth", "refresh"]) => {
+            handlers::end_user_refresh(req, state, r)
+        }
         ("DELETE", ["platform", "v1", "projects", r]) => handlers::delete_project(req, state, r),
         ("POST", ["platform", "v1", "projects", r, "keys", "rotate"]) => {
             handlers::rotate_keys(req, state, r)

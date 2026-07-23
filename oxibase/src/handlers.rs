@@ -15,9 +15,19 @@ use crate::{State, now_secs, resp};
 
 const KEY_EXPIRY_SECS: u64 = 10 * 365 * 86_400;
 const SESSION_EXPIRY_SECS: u64 = 86_400;
-/// End-user (project member) session lifetime — shorter than the long-lived API
-/// keys, longer than a developer console session.
-const END_USER_EXPIRY_SECS: u64 = 7 * 86_400;
+/// End-user **refresh** token lifetime.
+const REFRESH_EXPIRY_SECS: u64 = 30 * 86_400;
+
+/// End-user **access** token lifetime — short-lived; the client refreshes it
+/// with the long-lived refresh token. Configurable via `OXIDB_PLATFORM_ACCESS_TTL`
+/// (seconds, default 3600).
+fn access_expiry_secs() -> u64 {
+    std::env::var("OXIDB_PLATFORM_ACCESS_TTL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(3_600)
+}
 const MIN_PASSWORD_LEN: usize = 8;
 const LOGIN_MAX_FAILS: u32 = 5;
 const LOGIN_LOCKOUT_SECS: u64 = 300;
@@ -330,8 +340,11 @@ pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> H
     if let Err(e) = state.upstream.insert("users", &doc) {
         return resp(502, json!({ "message": format!("upstream: {e}") }));
     }
-    match mint_user_token(state, &pdoc, &email) {
-        Some(token) => resp(201, json!({ "user": { "email": email }, "token": token })),
+    match issue_session(state, &pdoc, project_ref, &email) {
+        Some((token, refresh)) => resp(
+            201,
+            json!({ "user": { "email": email }, "token": token, "refresh_token": refresh }),
+        ),
         None => resp(500, json!({ "message": "failed to mint token" })),
     }
 }
@@ -373,8 +386,51 @@ pub fn end_user_login(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
         return resp(401, json!({ "message": "invalid credentials" }));
     }
     login_clear(&lock_key);
-    match mint_user_token(state, &pdoc, &email) {
-        Some(token) => resp(200, json!({ "token": token })),
+    match issue_session(state, &pdoc, project_ref, &email) {
+        Some((token, refresh)) => resp(200, json!({ "token": token, "refresh_token": refresh })),
+        None => resp(500, json!({ "message": "failed to mint token" })),
+    }
+}
+
+/// `POST /platform/v1/projects/{ref}/auth/refresh` — exchange a refresh token
+/// for a fresh access token. The refresh token is **rotated** (single-use): the
+/// old one is revoked and a new one issued, so a stolen-and-replayed token is
+/// caught (both copies stop working after the first use).
+pub fn end_user_refresh(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let body = parse_body(req);
+    let Some(refresh) = str_field(&body, "refresh_token") else {
+        return resp(400, json!({ "message": "refresh_token required" }));
+    };
+    let hash = crypto::sha256_hex(refresh.as_bytes());
+    let row = match state
+        .upstream
+        .find("refresh_tokens", &json!({ "project_ref": project_ref, "token_hash": hash }))
+    {
+        Ok(mut v) => v.pop(),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let Some(row) = row else {
+        return resp(401, json!({ "message": "invalid refresh token" }));
+    };
+    // Consume the presented token regardless (rotation / expiry cleanup).
+    let _ = state
+        .upstream
+        .delete("refresh_tokens", &json!({ "token_hash": hash }));
+    if now_secs() > row.get("exp").and_then(|v| v.as_u64()).unwrap_or(0) {
+        return resp(401, json!({ "message": "refresh token expired" }));
+    }
+    let Some(email) = row.get("email").and_then(|v| v.as_str()) else {
+        return resp(500, json!({ "message": "corrupt session" }));
+    };
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    match issue_session(state, &pdoc, project_ref, email) {
+        Some((token, new_refresh)) => {
+            resp(200, json!({ "token": token, "refresh_token": new_refresh }))
+        }
         None => resp(500, json!({ "message": "failed to mint token" })),
     }
 }
@@ -388,7 +444,7 @@ fn project_by_ref(state: &State, project_ref: &str) -> Result<Option<Value>, Str
         .next())
 }
 
-/// Mint an ES256 end-user token signed with the project's private key.
+/// Mint an ES256 end-user access token signed with the project's private key.
 fn mint_user_token(state: &State, project_doc: &Value, email: &str) -> Option<String> {
     let priv_scalar = project_priv(state, project_doc)?;
     let now = now_secs();
@@ -397,10 +453,39 @@ fn mint_user_token(state: &State, project_doc: &Value, email: &str) -> Option<St
             sub: email.to_string(),
             role: "authenticated".to_string(),
             iat: now,
-            exp: now + END_USER_EXPIRY_SECS,
+            exp: now + access_expiry_secs(),
         },
         &priv_scalar,
     )
+}
+
+/// A random opaque token (refresh tokens are not JWTs — they are server-side
+/// session handles that can be revoked).
+fn gen_token() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 32];
+    rand::rng().fill_bytes(&mut b);
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+/// Issue a session: a short-lived access token + a stored (hashed) refresh
+/// token. Returns `(access_token, refresh_token)`.
+fn issue_session(
+    state: &State,
+    project_doc: &Value,
+    project_ref: &str,
+    email: &str,
+) -> Option<(String, String)> {
+    let access = mint_user_token(state, project_doc, email)?;
+    let refresh = gen_token();
+    let row = json!({
+        "project_ref": project_ref,
+        "email": email,
+        "token_hash": crypto::sha256_hex(refresh.as_bytes()),
+        "exp": now_secs() + REFRESH_EXPIRY_SECS,
+    });
+    state.upstream.insert("refresh_tokens", &row).ok()?;
+    Some((access, refresh))
 }
 
 pub fn delete_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
