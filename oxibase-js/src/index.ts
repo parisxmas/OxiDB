@@ -34,8 +34,21 @@ export interface SqlResult {
 }
 
 export interface OxibaseClient {
-  /** PostgREST query builder for a table/collection — the Supabase `.from()`. */
+  /**
+   * PostgREST query builder for a table/collection — the Supabase `.from()`.
+   *
+   * Engine dispatch (server-side, ADR-0019): if `name` is a **SQL table** the
+   * call is served by the SQL engine, otherwise by the **document engine** (a
+   * collection, auto-created on first insert). A collection and a SQL table
+   * never share a name, so this is unambiguous. For the **time-series engine**,
+   * use `.schema("tsdb").from(measurement)` instead.
+   */
   from: PostgrestClient["from"];
+  /**
+   * Select a PostgREST schema profile. `schema("tsdb")` routes `.from()` to the
+   * **time-series engine** (sends `Accept-Profile: tsdb`). Requires `OXIDB_TSDB=1`.
+   */
+  schema: PostgrestClient["schema"];
   /** PostgREST stored-procedure call — the Supabase `.rpc()` (if the server exposes it). */
   rpc: PostgrestClient["rpc"];
   /** Run SQL against the project's SQL engine (requires `OXIDB_SQL=1`). */
@@ -93,6 +106,7 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
 
   return {
     from: rest.from.bind(rest),
+    schema: rest.schema.bind(rest),
     rpc: rest.rpc.bind(rest),
     sql,
     rest,

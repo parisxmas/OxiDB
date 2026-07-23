@@ -44,9 +44,40 @@ await oxibase.from("notes").delete().eq("id", 1);
 const { results } = await oxibase.sql("SELECT count(*) FROM notes WHERE done = ?", [true]);
 ```
 
-`.from(t)` targets a **document collection** by default; if `t` names a **SQL
-table**, the same call is served by the SQL engine (dispatch is automatic and
-unambiguous — a collection and a SQL table never share a name).
+## Which engine? (document / SQL / time-series)
+
+OxiBase has three engines behind one URL. How you call decides which one serves
+the request:
+
+| Engine | How you reach it | Example |
+| --- | --- | --- |
+| **Document** (collections) | `.from(name)` where `name` is **not** a SQL table (the default). Collections are auto-created on first insert. | `oxibase.from("notes").select("*")` |
+| **SQL** (tables) | `.from(name)` where `name` **is** a SQL table, or `.sql(...)` directly. | `oxibase.from("orders").select("*")` · `oxibase.sql("SELECT …")` |
+| **Time-series** (measurements) | `.schema("tsdb").from(measurement)` — sends `Accept-Profile: tsdb`. | `oxibase.schema("tsdb").from("cpu").select("usage")` |
+
+Notes:
+
+- **Document vs SQL is by name, not a flag.** A collection and a SQL table can
+  never share a name, so dispatch is unambiguous — but that also means *you*
+  decide by how the object was created: `oxibase.sql("CREATE TABLE orders …")`
+  makes `orders` a SQL table (so `.from("orders")` is SQL); anything else is a
+  document collection. There is no per-request override for this pair.
+- **Time-series is explicit** via the schema profile, because a measurement
+  doesn't exist until its first write (so existence can't route it).
+- **The SQL and time-series engines are off by default** — start the data plane
+  with `OXIDB_SQL=1` / `OXIDB_TSDB=1`.
+
+**How to tell what lives where:**
+
+```ts
+// document collections:
+const cols = await (await fetch(`${oxibase.url}/api/collections?db=${oxibase.ref}`,
+  { headers: { Authorization: `Bearer ${KEY}` } })).json();   // { collections: [...] }
+// SQL tables:
+const { results } = await oxibase.sql("SHOW TABLES");          // rows of [table, rowCount]
+```
+
+In the OxiBase dashboard these are the **Collections** and **SQL Tables** tabs.
 
 ## Keys & permissions
 
