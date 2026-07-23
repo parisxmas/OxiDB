@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { type Project, getProject } from "./api.ts";
+import { useCallback, useEffect, useState } from "react";
+import { type Project, getProject, updateProjectLimits } from "./api.ts";
+import { listCollections, runSql } from "./dataApi.ts";
 import { DataBrowser } from "./DataBrowser.tsx";
 import { SqlTables } from "./SqlTables.tsx";
 import { SqlRunner } from "./SqlRunner.tsx";
@@ -55,6 +56,9 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
       </div>
 
       {error && <div className="error">{error}</div>}
+      {key && project && (
+        <Quota project={project} apiKey={key} onChange={setProject} />
+      )}
       {!key ? (
         <p className="muted">Loading project…</p>
       ) : tab === "collections" ? (
@@ -67,5 +71,124 @@ export function ProjectView({ projectRef, onBack }: { projectRef: string; onBack
         <RulesEditor projectRef={projectRef} apiKey={key} />
       )}
     </section>
+  );
+}
+
+function Quota({
+  project,
+  apiKey,
+  onChange,
+}: {
+  project: Project;
+  apiKey: string;
+  onChange: (p: Project) => void;
+}) {
+  const [cols, setCols] = useState<number | null>(null);
+  const [tables, setTables] = useState<number | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [mc, setMc] = useState(String(project.max_collections ?? 5));
+  const [mt, setMt] = useState(String(project.max_tables ?? 5));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const count = useCallback(async () => {
+    try {
+      const [c, t] = await Promise.all([
+        listCollections(project.ref, apiKey).then((l) => l.length),
+        runSql(project.ref, apiKey, "SHOW TABLES")
+          .then((r) => r[0]?.rows?.length ?? 0)
+          .catch(() => 0), // SQL engine may be off
+      ]);
+      setCols(c);
+      setTables(t);
+    } catch {
+      /* counts are best-effort */
+    }
+  }, [project.ref, apiKey]);
+
+  useEffect(() => {
+    count();
+  }, [count]);
+
+  useEffect(() => {
+    setMc(String(project.max_collections ?? 5));
+    setMt(String(project.max_tables ?? 5));
+  }, [project.max_collections, project.max_tables]);
+
+  async function save() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const updated = await updateProjectLimits(project.ref, {
+        max_collections: Number(mc),
+        max_tables: Number(mt),
+      });
+      onChange({ ...project, ...updated });
+      setEditing(false);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const meter = (label: string, used: number | null, limit?: number) => {
+    const cap = limit ?? 0;
+    const unlimited = cap === 0;
+    const u = used ?? 0;
+    const pct = unlimited ? 0 : Math.min(100, Math.round((u / cap) * 100));
+    const full = !unlimited && u >= cap;
+    return (
+      <div style={{ flex: 1, minWidth: 180 }}>
+        <div className="row between" style={{ marginBottom: 4 }}>
+          <span className="muted small">{label}</span>
+          <span className="small" style={{ color: full ? "#e5484d" : undefined }}>
+            {used === null ? "…" : u} / {unlimited ? "∞" : cap}
+          </span>
+        </div>
+        <div style={{ height: 6, borderRadius: 3, background: "#262d39", overflow: "hidden" }}>
+          <div
+            style={{
+              height: "100%",
+              width: `${unlimited ? 0 : pct}%`,
+              background: full ? "#e5484d" : "#e2784a",
+            }}
+          />
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="card" style={{ margin: "12px 0", padding: 14 }}>
+      <div className="row between" style={{ marginBottom: 10 }}>
+        <strong className="small">Usage &amp; quotas</strong>
+        <button className="ghost small" onClick={() => setEditing((e) => !e)}>
+          {editing ? "Cancel" : "Edit limits"}
+        </button>
+      </div>
+      {editing ? (
+        <div className="row" style={{ gap: 12, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <label className="small" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            Max collections
+            <input type="number" min={0} value={mc} onChange={(e) => setMc(e.target.value)} style={{ width: 120 }} />
+          </label>
+          <label className="small" style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            Max SQL tables
+            <input type="number" min={0} value={mt} onChange={(e) => setMt(e.target.value)} style={{ width: 120 }} />
+          </label>
+          <button className="primary small" disabled={busy} onClick={save}>
+            Save
+          </button>
+          <span className="muted small">0 = unlimited</span>
+        </div>
+      ) : (
+        <div className="row" style={{ gap: 20, flexWrap: "wrap" }}>
+          {meter("Collections", cols, project.max_collections)}
+          {meter("SQL tables", tables, project.max_tables)}
+        </div>
+      )}
+      {err && <div className="error small" style={{ marginTop: 8 }}>{err}</div>}
+    </div>
   );
 }

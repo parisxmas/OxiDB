@@ -10,6 +10,9 @@ export interface Project {
   url?: string | null;
   anon_key?: string;
   service_role_key?: string;
+  /** Resource quotas (0 = unlimited). */
+  max_collections?: number;
+  max_tables?: number;
 }
 
 const BASE: string = import.meta.env.VITE_OXIBASE_URL ?? "";
@@ -97,4 +100,12 @@ export function deleteProject(ref: string): Promise<unknown> {
 
 export function rotateKeys(ref: string): Promise<Project> {
   return req<Project>("POST", `/projects/${encodeURIComponent(ref)}/keys/rotate`);
+}
+
+/** Update a project's resource quotas (0 = unlimited). Owner only. */
+export function updateProjectLimits(
+  ref: string,
+  limits: { max_collections?: number; max_tables?: number },
+): Promise<Project> {
+  return req<Project>("PATCH", `/projects/${encodeURIComponent(ref)}/limits`, limits);
 }

@@ -289,6 +289,8 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
             created_at,
             &priv_scalar,
             true,
+            project_max_collections() as u64,
+            project_max_tables() as u64,
         ),
     )
 }
@@ -326,9 +328,12 @@ pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Some(s) => s,
         None => return resp(500, json!({ "message": "unseal failed" })),
     };
+    let (mc, mt) = doc_limits(&doc);
     resp(
         200,
-        project_view(project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true),
+        project_view(
+            project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true, mc, mt,
+        ),
     )
 }
 
@@ -664,6 +669,7 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let (created_at, _, name) = meta(&doc);
+    let (mc, mt) = doc_limits(&doc);
     let slug = doc_slug(&doc, project_ref);
     let (priv_scalar, pub_point) = crypto::gen_es256_keypair();
     let new_iat = now_secs();
@@ -689,6 +695,58 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
             new_iat,
             &priv_scalar,
             true,
+            mc,
+            mt,
+        ),
+    )
+}
+
+/// `PATCH /platform/v1/projects/{ref}/limits` — update a project's resource
+/// caps (owner only). Body: `{ "max_collections"?: n, "max_tables"?: n }`
+/// (`0` = unlimited). The data plane reads these per request, so the change
+/// takes effect on the next request without a restart.
+pub fn update_limits(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    let doc = match owned_project(state, project_ref, &owner) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let body = parse_body(req);
+    let (cur_mc, cur_mt) = doc_limits(&doc);
+    let mc = body
+        .get("max_collections")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(cur_mc);
+    let mt = body
+        .get("max_tables")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(cur_mt);
+    const CEIL: u64 = 100_000;
+    if mc > CEIL || mt > CEIL {
+        return resp(400, json!({ "message": format!("limits must be 0..={CEIL} (0 = unlimited)") }));
+    }
+    let query = json!({ "ref": project_ref });
+    let patch = json!({ "$set": { "max_collections": mc, "max_tables": mt } });
+    if let Err(e) = state.upstream.update("projects", &query, &patch) {
+        return resp(
+            502,
+            json!({ "message": format!("failed to update limits: {e}") }),
+        );
+    }
+    let (created_at, key_iat, name) = meta(&doc);
+    let slug = doc_slug(&doc, project_ref);
+    let priv_scalar = match project_priv(state, &doc) {
+        Some(s) => s,
+        None => return resp(500, json!({ "message": "unseal failed" })),
+    };
+    resp(
+        200,
+        project_view(
+            project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true, mc, mt,
         ),
     )
 }
@@ -728,6 +786,20 @@ fn project_priv(state: &State, doc: &Value) -> Option<Vec<u8>> {
     crypto::unseal(&state.seal_key, &sealed)
 }
 
+/// A project's resource caps, from its row (falling back to the configured
+/// defaults for rows created before quotas existed).
+fn doc_limits(doc: &Value) -> (u64, u64) {
+    let mc = doc
+        .get("max_collections")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| project_max_collections() as u64);
+    let mt = doc
+        .get("max_tables")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| project_max_tables() as u64);
+    (mc, mt)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_view(
     project_ref: &str,
@@ -737,6 +809,8 @@ fn project_view(
     key_iat: u64,
     priv_scalar: &[u8],
     keys: bool,
+    max_collections: u64,
+    max_tables: u64,
 ) -> Value {
     let base = std::env::var("OXIDB_PLATFORM_BASE_URL").unwrap_or_default();
     // Path-based addressing is the friendly default: `<host>/<slug>/rest/v1`.
@@ -748,6 +822,7 @@ fn project_view(
     let mut v = json!({
         "ref": project_ref, "slug": slug, "name": name, "db": project_ref,
         "endpoint": format!("/{slug}/rest/v1"), "url": url, "isolation": "shared", "created_at": created_at,
+        "max_collections": max_collections, "max_tables": max_tables,
     });
     if keys {
         let o = v.as_object_mut().unwrap();

@@ -107,6 +107,9 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
         ("POST", ["platform", "v1", "projects", r, "keys", "rotate"]) => {
             handlers::rotate_keys(req, state, r)
         }
+        ("PATCH", ["platform", "v1", "projects", r, "limits"]) => {
+            handlers::update_limits(req, state, r)
+        }
         _ => resp(404, json!({ "message": "no such platform route" })),
     }
 }
@@ -134,7 +137,7 @@ pub fn resp(status: u16, body: Value) -> HttpResponse {
         content_length_override: None,
     }
     .with_header("Access-Control-Allow-Origin", "*")
-    .with_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+    .with_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
     .with_header(
         "Access-Control-Allow-Headers",
         "Content-Type, Authorization",
