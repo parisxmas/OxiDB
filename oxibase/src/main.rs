@@ -90,6 +90,7 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
         ("POST", ["platform", "v1", "projects"]) => handlers::create_project(req, state),
         ("GET", ["platform", "v1", "projects"]) => handlers::list_projects(req, state),
         ("GET", ["platform", "v1", "projects", r]) => handlers::get_project(req, state, r),
+        ("GET", ["platform", "v1", "projects", r, "jwks"]) => handlers::project_jwks(state, r),
         ("DELETE", ["platform", "v1", "projects", r]) => handlers::delete_project(req, state, r),
         ("POST", ["platform", "v1", "projects", r, "keys", "rotate"]) => {
             handlers::rotate_keys(req, state, r)

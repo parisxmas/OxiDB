@@ -79,8 +79,12 @@ pub fn decode_jwt(token: &str, secret: &str) -> Result<Claims, &'static str> {
         return Err("invalid signature");
     }
 
-    // Decode payload
-    let payload_bytes = b64url_decode(parts[1]).ok_or("invalid base64")?;
+    claims_from_payload(parts[1])
+}
+
+/// Parse the payload segment and enforce expiry (shared by HS256 and ES256).
+fn claims_from_payload(payload_b64: &str) -> Result<Claims, &'static str> {
+    let payload_bytes = b64url_decode(payload_b64).ok_or("invalid base64")?;
     let payload: Value = serde_json::from_slice(&payload_bytes).map_err(|_| "invalid JSON")?;
 
     let now = SystemTime::now()
@@ -99,6 +103,26 @@ pub fn decode_jwt(token: &str, secret: &str) -> Result<Claims, &'static str> {
         iat: payload["iat"].as_u64().unwrap_or(0),
         exp,
     })
+}
+
+/// Verify an **ES256** (P-256 / ECDSA-SHA256) JWT with a SEC1 uncompressed
+/// public key (65 bytes). Used for OxiBase project tokens: data-plane nodes
+/// verify with the public key alone — no shared secret, no seal key.
+pub fn verify_es256(token: &str, pub_sec1: &[u8]) -> Result<Claims, &'static str> {
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err("invalid token format");
+    }
+    let vk = VerifyingKey::from_sec1_bytes(pub_sec1).map_err(|_| "bad public key")?;
+    let sig_bytes = b64url_decode(parts[2]).ok_or("invalid base64")?;
+    let sig = Signature::from_slice(&sig_bytes).map_err(|_| "invalid signature")?;
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    vk.verify(signing_input.as_bytes(), &sig)
+        .map_err(|_| "invalid signature")?;
+    claims_from_payload(parts[1])
 }
 
 // ---------------------------------------------------------------------------
@@ -287,5 +311,38 @@ mod tests {
         assert_eq!(extract_bearer("Bearer abc123"), Some("abc123"));
         assert_eq!(extract_bearer("bearer abc123"), Some("abc123"));
         assert_eq!(extract_bearer("Basic abc123"), None);
+    }
+
+    #[test]
+    fn es256_verifies_and_rejects_tamper_and_wrong_key() {
+        use p256::ecdsa::signature::Signer;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        let sk = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let point = sk.verifying_key().to_encoded_point(false);
+        let pubkey = point.as_bytes();
+
+        let header = b64url_encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+        let payload = b64url_encode(br#"{"sub":"read@proj","role":"read","iat":1,"exp":9999999999}"#);
+        let signing_input = format!("{header}.{payload}");
+        let sig: Signature = sk.sign(signing_input.as_bytes());
+        let sig_b = sig.to_bytes();
+        let token = format!("{signing_input}.{}", b64url_encode(sig_b.as_slice()));
+
+        // Valid token verifies.
+        let claims = verify_es256(&token, pubkey).unwrap();
+        assert_eq!(claims.sub, "read@proj");
+        assert_eq!(claims.role, "read");
+
+        // Tampered payload (role escalation) → rejected.
+        let bad_payload =
+            b64url_encode(br#"{"sub":"read@proj","role":"admin","iat":1,"exp":9999999999}"#);
+        let tampered = format!("{header}.{bad_payload}.{}", b64url_encode(sig_b.as_slice()));
+        assert!(verify_es256(&tampered, pubkey).is_err());
+
+        // Wrong public key → rejected.
+        let other = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let other_point = other.verifying_key().to_encoded_point(false);
+        assert!(verify_es256(&token, other_point.as_bytes()).is_err());
     }
 }

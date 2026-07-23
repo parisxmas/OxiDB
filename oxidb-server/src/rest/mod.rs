@@ -323,20 +323,34 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // Per-database secret (ADR-0020): a request targeting an OxiBase project
     // (`?db=<ref>`) is verified with that project's own JWT secret; everything
     // else uses the global `OXIDB_JWT_SECRET`.
+    // A project that uses asymmetric keys (ADR: JWKS/ES256) is verified with its
+    // public key alone — no seal key, no shared secret (the multi-node property).
+    // Otherwise fall back to the per-project HS256 secret, else the global one.
+    let project_pubkey: Option<Vec<u8>> = match (&db_name, &state.db_manager) {
+        (Some(name), Some(mgr)) if crate::tenant_auth::enabled() => {
+            crate::tenant_auth::project_pubkey(mgr, name)
+        }
+        _ => None,
+    };
     let effective_secret: Option<String> = match (&db_name, &state.db_manager) {
         (Some(name), Some(mgr)) if crate::tenant_auth::enabled() => {
             crate::tenant_auth::project_secret(mgr, name).or_else(|| state.jwt_secret.clone())
         }
         _ => state.jwt_secret.clone(),
     };
-    let (auth_ctx, enforced_role) = if let Some(ref secret) = effective_secret {
+    let (auth_ctx, enforced_role) = if project_pubkey.is_some() || effective_secret.is_some() {
         let auth_header = req
             .headers
             .get("authorization")
             .map(|s| s.as_str())
             .unwrap_or("");
         if let Some(token) = jwt::extract_bearer(auth_header) {
-            match jwt::verify(token, secret) {
+            let verified = if let Some(pubkey) = &project_pubkey {
+                jwt::verify_es256(token, pubkey)
+            } else {
+                jwt::verify(token, effective_secret.as_deref().unwrap_or(""))
+            };
+            match verified {
                 Ok(claims) => {
                     let role = auth::Role::from_str(&claims.role).unwrap_or(auth::Role::Read);
                     (

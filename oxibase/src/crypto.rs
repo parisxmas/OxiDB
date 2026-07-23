@@ -33,6 +33,65 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+// ---------------------------------------------------------------------------
+// JWT (ES256 / P-256) — asymmetric project keys. The control plane signs with a
+// per-project private key; data-plane nodes verify with the public key alone
+// (no shared secret, no seal key), so verification scales to many nodes and the
+// public key can be published as a JWK. Signing is RFC 6979 deterministic, so
+// re-minting the same claims yields byte-identical tokens (stable keys).
+// ---------------------------------------------------------------------------
+
+use p256::EncodedPoint;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature, SigningKey};
+
+/// A fresh P-256 keypair: `(private scalar [32B], public SEC1 uncompressed [65B])`.
+pub fn gen_es256_keypair() -> (Vec<u8>, Vec<u8>) {
+    loop {
+        let mut buf = [0u8; 32];
+        rand::rng().fill_bytes(&mut buf);
+        if let Ok(sk) = SigningKey::from_slice(&buf) {
+            let point = sk.verifying_key().to_encoded_point(false);
+            return (buf.to_vec(), point.as_bytes().to_vec());
+        }
+        // `buf` was >= the curve order or zero — astronomically rare; retry.
+    }
+}
+
+/// ES256-sign the standard claims with a P-256 private scalar. `None` if the
+/// scalar is malformed.
+pub fn encode_jwt_es256(claims: &Claims, priv_scalar: &[u8]) -> Option<String> {
+    let sk = SigningKey::from_slice(priv_scalar).ok()?;
+    let header = b64url(br#"{"alg":"ES256","typ":"JWT"}"#);
+    let payload = format!(
+        r#"{{"sub":{},"role":{},"iat":{},"exp":{}}}"#,
+        json_str(&claims.sub),
+        json_str(&claims.role),
+        claims.iat,
+        claims.exp
+    );
+    let payload = b64url(payload.as_bytes());
+    let signing_input = format!("{header}.{payload}");
+    let sig: Signature = sk.sign(signing_input.as_bytes());
+    Some(format!("{signing_input}.{}", b64url(&sig.to_bytes())))
+}
+
+/// The public key (SEC1 uncompressed 65B) as a JWK for a JWKS document.
+pub fn jwk_from_pub(pub_sec1: &[u8], kid: &str) -> Option<serde_json::Value> {
+    let point = EncodedPoint::from_bytes(pub_sec1).ok()?;
+    let x = point.x()?;
+    let y = point.y()?;
+    Some(serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "alg": "ES256",
+        "use": "sig",
+        "kid": kid,
+        "x": b64url(x.as_slice()),
+        "y": b64url(y.as_slice()),
+    }))
+}
+
 pub fn encode_jwt(claims: &Claims, secret: &str) -> String {
     let header = b64url(br#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = format!(

@@ -92,6 +92,21 @@ fn secret_cache() -> &'static Mutex<HashMap<String, (String, u64)>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The per-project ES256 **public** key (SEC1 uncompressed, 65 bytes) for
+/// `db_ref`, if it names an OxiBase project that uses asymmetric keys. Read in
+/// the clear — no seal key needed — which is what lets a data-plane node verify
+/// project tokens without holding any signing secret (the multi-node property).
+/// `None` for the metadata db, an unknown ref, or a legacy HS256 project.
+pub fn project_pubkey(mgr: &DatabaseManager, db_ref: &str) -> Option<Vec<u8>> {
+    if db_ref == META_DB {
+        return None;
+    }
+    let pdb = mgr.get_database(META_DB).ok()?;
+    let doc = pdb.find_one(PROJECTS, &json!({ "ref": db_ref })).ok()??;
+    let pub_b64 = doc.get("pubkey")?.as_str()?;
+    base64::engine::general_purpose::STANDARD.decode(pub_b64).ok()
+}
+
 /// The per-project JWT secret for `db_ref`, if it names an OxiBase project.
 /// `None` for the metadata db itself, an unknown ref, or when nothing is
 /// configured — the caller then falls back to the global `OXIDB_JWT_SECRET`.

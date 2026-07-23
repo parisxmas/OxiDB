@@ -148,7 +148,7 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
     let body = parse_body(req);
     let name = str_field(&body, "name").unwrap_or_default();
     let project_ref = gen_ref();
-    let secret = gen_secret();
+    let (priv_scalar, pub_point) = crypto::gen_es256_keypair();
     let created_at = now_secs();
 
     if let Err(e) = state.upstream.create_database(&project_ref) {
@@ -157,13 +157,15 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
             json!({ "message": format!("provisioning failed: {e}") }),
         );
     }
-    let sealed = base64::engine::general_purpose::STANDARD
-        .encode(crypto::seal(&state.seal_key, secret.as_bytes()));
     let doc = json!({
         "ref": project_ref,
         "owner": owner,
         "name": name,
-        "secret_enc": sealed,
+        // ES256 asymmetric keys: the public key is stored in the clear (it is
+        // public and lets data-plane nodes verify without the seal key), the
+        // private scalar is sealed.
+        "pubkey": b64std(&pub_point),
+        "priv_enc": b64std(&crypto::seal(&state.seal_key, &priv_scalar)),
         "isolation": "shared",
         "created_at": created_at,
         "key_iat": created_at,
@@ -177,7 +179,14 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
     }
     resp(
         201,
-        project_view(&project_ref, &name, created_at, created_at, &secret, true),
+        project_view(
+            &project_ref,
+            &name,
+            created_at,
+            created_at,
+            &ProjectSigner::Es256(priv_scalar),
+            true,
+        ),
     )
 }
 
@@ -209,14 +218,42 @@ pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let (created_at, key_iat, name) = meta(&doc);
-    let secret = match unseal_secret(state, &doc) {
+    let signer = match project_signer(state, &doc) {
         Some(s) => s,
         None => return resp(500, json!({ "message": "unseal failed" })),
     };
     resp(
         200,
-        project_view(project_ref, &name, created_at, key_iat, &secret, true),
+        project_view(project_ref, &name, created_at, key_iat, &signer, true),
     )
+}
+
+/// Public JWKS for a project: its ES256 verification key as a JWK set. No auth —
+/// a JWKS is meant to be world-readable so any party can verify the project's
+/// tokens with the public key alone. Legacy HS256 projects have no public key
+/// and return an empty set.
+pub fn project_jwks(state: &State, project_ref: &str) -> HttpResponse {
+    let doc = match state.upstream.find("projects", &json!({ "ref": project_ref })) {
+        Ok(mut d) => d.pop(),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let Some(doc) = doc else {
+        return resp(404, json!({ "message": "project not found" }));
+    };
+    let Some(pub_b64) = doc.get("pubkey").and_then(|v| v.as_str()) else {
+        return resp(200, json!({ "keys": [] }));
+    };
+    let Some(pub_point) = base64::engine::general_purpose::STANDARD.decode(pub_b64).ok() else {
+        return resp(500, json!({ "message": "malformed key" }));
+    };
+    let kid = format!(
+        "{project_ref}-{}",
+        doc.get("key_iat").and_then(|v| v.as_u64()).unwrap_or(0)
+    );
+    match crypto::jwk_from_pub(&pub_point, &kid) {
+        Some(jwk) => resp(200, json!({ "keys": [jwk] })),
+        None => resp(500, json!({ "message": "malformed key" })),
+    }
 }
 
 pub fn delete_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
@@ -247,21 +284,30 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let (created_at, _, name) = meta(&doc);
-    let new_secret = gen_secret();
+    let (priv_scalar, pub_point) = crypto::gen_es256_keypair();
     let new_iat = now_secs();
-    let sealed = base64::engine::general_purpose::STANDARD
-        .encode(crypto::seal(&state.seal_key, new_secret.as_bytes()));
     let query = json!({ "ref": project_ref });
-    let patch = json!({ "$set": { "secret_enc": sealed, "key_iat": new_iat } });
+    let patch = json!({ "$set": {
+        "pubkey": b64std(&pub_point),
+        "priv_enc": b64std(&crypto::seal(&state.seal_key, &priv_scalar)),
+        "key_iat": new_iat,
+    } });
     if let Err(e) = state.upstream.update("projects", &query, &patch) {
         return resp(
             502,
-            json!({ "message": format!("failed to persist rotated secret: {e}") }),
+            json!({ "message": format!("failed to persist rotated key: {e}") }),
         );
     }
     resp(
         200,
-        project_view(project_ref, &name, created_at, new_iat, &new_secret, true),
+        project_view(
+            project_ref,
+            &name,
+            created_at,
+            new_iat,
+            &ProjectSigner::Es256(priv_scalar),
+            true,
+        ),
     )
 }
 
@@ -294,12 +340,32 @@ fn unseal_secret(state: &State, doc: &Value) -> Option<String> {
     String::from_utf8(crypto::unseal(&state.seal_key, &sealed)?).ok()
 }
 
+fn b64std(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// How a project's API-key tokens are signed. New projects use asymmetric
+/// ES256; projects created before the switch keep their sealed HS256 secret.
+enum ProjectSigner {
+    Es256(Vec<u8>), // private scalar
+    Hs256(String),  // legacy shared secret
+}
+
+fn project_signer(state: &State, doc: &Value) -> Option<ProjectSigner> {
+    if let Some(b64) = doc.get("priv_enc").and_then(|v| v.as_str()) {
+        let sealed = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+        let scalar = crypto::unseal(&state.seal_key, &sealed)?;
+        return Some(ProjectSigner::Es256(scalar));
+    }
+    Some(ProjectSigner::Hs256(unseal_secret(state, doc)?))
+}
+
 fn project_view(
     project_ref: &str,
     name: &str,
     created_at: u64,
     key_iat: u64,
-    secret: &str,
+    signer: &ProjectSigner,
     keys: bool,
 ) -> Value {
     let base = std::env::var("OXIDB_PLATFORM_BASE_URL").unwrap_or_default();
@@ -316,26 +382,27 @@ fn project_view(
         let o = v.as_object_mut().unwrap();
         o.insert(
             "anon_key".into(),
-            json!(mint_key(secret, project_ref, "read", key_iat)),
+            json!(mint_key(signer, project_ref, "read", key_iat)),
         );
         o.insert(
             "service_role_key".into(),
-            json!(mint_key(secret, project_ref, "admin", key_iat)),
+            json!(mint_key(signer, project_ref, "admin", key_iat)),
         );
     }
     v
 }
 
-fn mint_key(secret: &str, project_ref: &str, role: &str, iat: u64) -> String {
-    crypto::encode_jwt(
-        &Claims {
-            sub: format!("{role}@{project_ref}"),
-            role: role.to_string(),
-            iat,
-            exp: iat + KEY_EXPIRY_SECS,
-        },
-        secret,
-    )
+fn mint_key(signer: &ProjectSigner, project_ref: &str, role: &str, iat: u64) -> String {
+    let claims = Claims {
+        sub: format!("{role}@{project_ref}"),
+        role: role.to_string(),
+        iat,
+        exp: iat + KEY_EXPIRY_SECS,
+    };
+    match signer {
+        ProjectSigner::Es256(scalar) => crypto::encode_jwt_es256(&claims, scalar).unwrap_or_default(),
+        ProjectSigner::Hs256(secret) => crypto::encode_jwt(&claims, secret),
+    }
 }
 
 fn session_token(state: &State, email: &str) -> String {
@@ -391,13 +458,6 @@ fn gen_ref() -> String {
     (0..16)
         .map(|_| A[rng.random_range(0..A.len())] as char)
         .collect()
-}
-
-fn gen_secret() -> String {
-    use rand::Rng;
-    let mut b = [0u8; 32];
-    rand::rng().fill(&mut b);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
 fn client_ip(req: &HttpRequest) -> String {

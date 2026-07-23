@@ -20,3 +20,4 @@ sha2 = "0.10"
 argon2 = "0.5"
 aes-gcm = "0.10"
 rand = "0.9"
+p256 = { version = "0.13", features = ["ecdsa"] }
