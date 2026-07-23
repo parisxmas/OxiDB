@@ -21,3 +21,6 @@ argon2 = "0.5"
 aes-gcm = "0.10"
 rand = "0.9"
 p256 = { version = "0.13", features = ["ecdsa"] }
+# Minimal blocking HTTPS client (pure-Rust rustls TLS) — used only to verify
+# Google ID tokens against Google's `tokeninfo` endpoint for developer sign-in.
+ureq = "2"

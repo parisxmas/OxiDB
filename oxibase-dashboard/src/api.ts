@@ -58,14 +58,25 @@ async function req<T>(
   return data as T;
 }
 
-export async function signup(email: string, password: string): Promise<void> {
-  const d = await req<{ token: string }>("POST", "/signup", { email, password }, false);
-  setSession(d.token, email);
+export interface PlatformConfig {
+  google_client_id?: string | null;
+  password_auth: boolean;
 }
 
-export async function login(email: string, password: string): Promise<void> {
-  const d = await req<{ token: string }>("POST", "/login", { email, password }, false);
-  setSession(d.token, email);
+/** Public bootstrap config — which auth methods the server has enabled. */
+export function fetchConfig(): Promise<PlatformConfig> {
+  return req<PlatformConfig>("GET", "/config", undefined, false);
+}
+
+/** Developer sign-in with a Google ID token (from Google Identity Services). */
+export async function authGoogle(credential: string): Promise<void> {
+  const d = await req<{ token: string; account?: { email?: string } }>(
+    "POST",
+    "/auth/google",
+    { credential },
+    false,
+  );
+  setSession(d.token, d.account?.email);
 }
 
 export function listProjects(): Promise<Project[]> {

@@ -61,84 +61,149 @@ fn signup_code() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Account handlers
+// Developer account handlers — Google sign-in only.
+//
+// Developer accounts authenticate exclusively with "Sign in with Google": the
+// browser obtains a Google ID token (JWT) via Google Identity Services and
+// POSTs it here. We verify it against Google, then find-or-create an account
+// keyed by the **verified** email. Because Google guarantees the email is
+// verified and one Google identity maps to one email, this gives one account
+// per person with no email-verification flow of our own and no way to spin up
+// duplicate password accounts.
 // ---------------------------------------------------------------------------
 
-pub fn signup(req: &HttpRequest, state: &State) -> HttpResponse {
-    if !signup_allowed(&client_ip(req)) {
-        return resp(
-            429,
-            json!({ "message": "signup rate limit exceeded; slow down" }),
-        );
+/// The Google OAuth **Web client ID** this deployment accepts tokens for
+/// (`aud`). When unset, Google sign-in is disabled and the endpoint 501s.
+fn google_client_id() -> Option<String> {
+    std::env::var("OXIBASE_GOOGLE_CLIENT_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// `GET /platform/v1/config` — public bootstrap config for the dashboard SPA:
+/// which auth methods are enabled. Contains no secrets (the client ID is public
+/// by design — it ships in the browser).
+pub fn config() -> HttpResponse {
+    resp(
+        200,
+        json!({
+            "google_client_id": google_client_id(),
+            "password_auth": false,
+        }),
+    )
+}
+
+struct GoogleIdentity {
+    email: String,
+    sub: String,
+    name: Option<String>,
+}
+
+/// Pure validation of the claims Google returns for an ID token: the audience
+/// must be *our* client ID, the issuer must be Google, and the email must be
+/// verified. Split out from the network fetch so it is unit-testable.
+fn check_google_claims(v: &Value, client_id: &str) -> Result<GoogleIdentity, String> {
+    if v.get("aud").and_then(|x| x.as_str()) != Some(client_id) {
+        return Err("token audience mismatch".into());
     }
+    let iss = v.get("iss").and_then(|x| x.as_str()).unwrap_or("");
+    if iss != "accounts.google.com" && iss != "https://accounts.google.com" {
+        return Err("unexpected token issuer".into());
+    }
+    let verified = match v.get("email_verified") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s == "true",
+        _ => false,
+    };
+    if !verified {
+        return Err("Google email is not verified".into());
+    }
+    let email = v
+        .get("email")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("no email in Google token")?
+        .to_lowercase();
+    let sub = v
+        .get("sub")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let name = v.get("name").and_then(|x| x.as_str()).map(String::from);
+    Ok(GoogleIdentity { email, sub, name })
+}
+
+/// Verify a Google ID token by asking Google's `tokeninfo` endpoint (Google
+/// checks the RS256 signature + expiry against its rotating keys), then apply
+/// [`check_google_claims`]. Suitable for a developer console's low sign-in
+/// volume; local JWKS verification is the path if this ever needs to scale.
+fn verify_google_credential(credential: &str, client_id: &str) -> Result<GoogleIdentity, String> {
+    let url = format!("https://oauth2.googleapis.com/tokeninfo?id_token={credential}");
+    let body = match ureq::get(&url).call() {
+        Ok(r) => r.into_string().map_err(|e| e.to_string())?,
+        // Google returns 400 for a bad/expired token.
+        Err(ureq::Error::Status(_, _)) => return Err("invalid Google credential".into()),
+        Err(e) => return Err(format!("could not reach Google to verify: {e}")),
+    };
+    let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    check_google_claims(&v, client_id)
+}
+
+/// `POST /platform/v1/auth/google` — developer sign-in with Google. Body:
+/// `{ "credential": "<Google ID token>" }`. Find-or-create by verified email.
+pub fn auth_google(req: &HttpRequest, state: &State) -> HttpResponse {
+    let Some(client_id) = google_client_id() else {
+        return resp(501, json!({ "message": "Google sign-in is not configured" }));
+    };
     let body = parse_body(req);
+    let Some(credential) = str_field(&body, "credential") else {
+        return resp(400, json!({ "message": "credential (Google ID token) required" }));
+    };
+    let ident = match verify_google_credential(&credential, &client_id) {
+        Ok(i) => i,
+        Err(e) => return resp(401, json!({ "message": e })),
+    };
+
+    // Existing account → sign in. Identity is already proven by Google, so no
+    // rate limit on the login path.
+    match state.upstream.find("accounts", &json!({ "email": ident.email })) {
+        Ok(existing) if !existing.is_empty() => {
+            return resp(
+                200,
+                json!({ "account": { "email": ident.email }, "token": session_token(state, &ident.email) }),
+            );
+        }
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+        _ => {}
+    }
+
+    // New account — apply the signup guards (per-IP rate limit, optional invite
+    // code, global account ceiling).
+    if !signup_allowed(&client_ip(req)) {
+        return resp(429, json!({ "message": "signup rate limit exceeded; slow down" }));
+    }
     if let Some(code) = signup_code() {
-        if body.get("code").and_then(|v| v.as_str()) != Some(code.as_str()) {
+        if str_field(&body, "code").as_deref() != Some(code.as_str()) {
             return resp(403, json!({ "message": "a valid invite code is required" }));
         }
     }
     if state.upstream.count("accounts", &json!({})).unwrap_or(0) >= max_accounts() {
         return resp(403, json!({ "message": "signups are closed" }));
     }
-    let (Some(email), Some(password)) = (str_field(&body, "email"), str_field(&body, "password"))
-    else {
-        return resp(400, json!({ "message": "email and password required" }));
-    };
-    if password.len() < MIN_PASSWORD_LEN {
-        return resp(
-            400,
-            json!({ "message": format!("password must be at least {MIN_PASSWORD_LEN} characters") }),
-        );
-    }
-    match state.upstream.find("accounts", &json!({ "email": email })) {
-        Ok(existing) if !existing.is_empty() => {
-            return resp(409, json!({ "message": "email already registered" }));
-        }
-        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
-        _ => {}
-    }
-    let pw_hash = match crypto::hash_password(&password) {
-        Ok(h) => h,
-        Err(e) => return resp(500, json!({ "message": e })),
-    };
-    let doc = json!({ "email": email, "pw_hash": pw_hash, "created_at": now_secs() });
+    let doc = json!({
+        "email": ident.email,
+        "provider": "google",
+        "google_sub": ident.sub,
+        "name": ident.name,
+        "created_at": now_secs(),
+    });
     if let Err(e) = state.upstream.insert("accounts", &doc) {
         return resp(502, json!({ "message": format!("upstream: {e}") }));
     }
-    let token = session_token(state, &email);
     resp(
         201,
-        json!({ "account": { "email": email }, "token": token }),
+        json!({ "account": { "email": ident.email }, "token": session_token(state, &ident.email) }),
     )
-}
-
-pub fn login(req: &HttpRequest, state: &State) -> HttpResponse {
-    let body = parse_body(req);
-    let (Some(email), Some(password)) = (str_field(&body, "email"), str_field(&body, "password"))
-    else {
-        return resp(400, json!({ "message": "email and password required" }));
-    };
-    if login_locked(&email) {
-        return resp(
-            429,
-            json!({ "message": "too many failed attempts; try again later" }),
-        );
-    }
-    let account = match state.upstream.find("accounts", &json!({ "email": email })) {
-        Ok(mut a) => a.pop(),
-        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
-    };
-    let ok = account
-        .as_ref()
-        .and_then(|a| a.get("pw_hash").and_then(|v| v.as_str()))
-        .is_some_and(|h| crypto::verify_password(&password, h));
-    if ok {
-        login_clear(&email);
-        resp(200, json!({ "token": session_token(state, &email) }))
-    } else {
-        login_record_failure(&email);
-        resp(401, json!({ "message": "invalid credentials" }))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -818,7 +883,44 @@ fn login_clear(email: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::slugify;
+    use super::{check_google_claims, slugify};
+    use serde_json::json;
+
+    #[test]
+    fn google_claims_accepts_verified_matching_audience() {
+        let v = json!({
+            "aud": "cid.apps.googleusercontent.com",
+            "iss": "https://accounts.google.com",
+            "email": "Dev@Example.com",
+            "email_verified": "true",
+            "sub": "1234567890",
+            "name": "Dev"
+        });
+        let id = check_google_claims(&v, "cid.apps.googleusercontent.com").unwrap();
+        assert_eq!(id.email, "dev@example.com"); // lowercased
+        assert_eq!(id.sub, "1234567890");
+    }
+
+    #[test]
+    fn google_claims_rejects_wrong_audience_unverified_or_bad_issuer() {
+        let base = json!({
+            "aud": "cid.apps.googleusercontent.com",
+            "iss": "https://accounts.google.com",
+            "email": "dev@example.com",
+            "email_verified": true,
+            "sub": "1"
+        });
+        // audience for a different client
+        assert!(check_google_claims(&base, "someone-else").is_err());
+        // unverified email
+        let mut unv = base.clone();
+        unv["email_verified"] = json!(false);
+        assert!(check_google_claims(&unv, "cid.apps.googleusercontent.com").is_err());
+        // forged issuer
+        let mut iss = base.clone();
+        iss["iss"] = json!("evil.example.com");
+        assert!(check_google_claims(&iss, "cid.apps.googleusercontent.com").is_err());
+    }
 
     #[test]
     fn slugify_basics() {

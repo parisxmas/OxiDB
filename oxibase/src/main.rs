@@ -85,8 +85,10 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
     let segs: Vec<&str> = req.path.trim_matches('/').split('/').collect();
     match (req.method.as_str(), segs.as_slice()) {
         ("GET", ["platform", "v1", "health"]) => resp(200, json!({ "status": "ok" })),
-        ("POST", ["platform", "v1", "signup"]) => handlers::signup(req, state),
-        ("POST", ["platform", "v1", "login"]) => handlers::login(req, state),
+        // Public bootstrap config for the dashboard (which auth methods exist).
+        ("GET", ["platform", "v1", "config"]) => handlers::config(),
+        // Developer sign-in — Google only.
+        ("POST", ["platform", "v1", "auth", "google"]) => handlers::auth_google(req, state),
         ("POST", ["platform", "v1", "projects"]) => handlers::create_project(req, state),
         ("GET", ["platform", "v1", "projects"]) => handlers::list_projects(req, state),
         ("GET", ["platform", "v1", "projects", r]) => handlers::get_project(req, state, r),

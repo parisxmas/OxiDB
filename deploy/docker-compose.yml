@@ -44,6 +44,8 @@ services:
       OXIDB_PLATFORM_SECRET: "${OXIDB_PLATFORM_SECRET}"
       OXIDB_PLATFORM_BASE_URL: "${OXIBASE_PUBLIC_URL}"   # for the `url` field in project responses
       OXIDB_PLATFORM_SIGNUP_RATE: "${OXIDB_PLATFORM_SIGNUP_RATE:-5}"
+      # Google OAuth Web client ID — developer console sign-in (public value).
+      OXIBASE_GOOGLE_CLIENT_ID: "${OXIBASE_GOOGLE_CLIENT_ID:-}"
     depends_on:
       - data-plane
     restart: unless-stopped
