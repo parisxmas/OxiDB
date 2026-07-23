@@ -118,3 +118,49 @@ button:disabled { opacity: 0.55; cursor: default; }
 .auth { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
 .auth-card { width: 100%; max-width: 360px; display: grid; gap: 14px; }
 .switch { text-align: center; color: var(--muted); font-size: 13px; }
+
+/* Tabs (ProjectView) */
+.tabs { display: flex; gap: 4px; }
+.tab {
+  background: transparent; border: 1px solid var(--border); color: var(--muted);
+  padding: 7px 14px;
+}
+.tab.active { background: var(--panel-2); color: var(--text); border-color: var(--accent); }
+.open { background: var(--panel-2); border-color: var(--border); color: var(--text); }
+.open:hover:not(:disabled) { border-color: var(--accent); }
+
+/* Table browser */
+.browser { display: grid; grid-template-columns: 200px 1fr; gap: 16px; margin-top: 16px; }
+.collections { display: grid; gap: 6px; align-content: start; }
+.side-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: 4px; }
+.coll {
+  text-align: left; background: transparent; border: 1px solid transparent; color: var(--text);
+  padding: 8px 10px; font-weight: 500; border-radius: 8px; overflow: hidden; text-overflow: ellipsis;
+}
+.coll:hover { background: var(--panel-2); }
+.coll.active { background: var(--panel-2); border-color: var(--accent); }
+.newcoll { margin-top: 8px; }
+.newcoll input { width: 100%; font-size: 13px; }
+.rows-pane { min-width: 0; }
+.add-row textarea, .sql-input {
+  width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+  border-radius: 8px; padding: 10px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px; resize: vertical; outline: none; box-sizing: border-box;
+}
+.add-row textarea:focus, .sql-input:focus { border-color: var(--accent); }
+
+/* Result grids */
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; margin-top: 10px; }
+.grid-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.grid-table th, .grid-table td {
+  text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+.grid-table th { background: var(--panel-2); color: var(--muted); font-weight: 600; position: sticky; top: 0; }
+.grid-table tbody tr:last-child td { border-bottom: none; }
+.grid-table td.rowdel { text-align: center; }
+.small { font-size: 12px; }
+.ghost.danger.small { padding: 2px 8px; }
+
+/* SQL runner */
+.sql { display: grid; gap: 12px; margin-top: 16px; }
+.result { display: grid; gap: 4px; }

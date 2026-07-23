@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { isAuthed, logout, currentEmail } from "./api.ts";
 import { Auth } from "./Auth.tsx";
-import { Projects } from "./Projects.tsx";
+import { Console } from "./Console.tsx";
 
 export default function App() {
   const [authed, setAuthed] = useState(isAuthed());
@@ -30,7 +30,7 @@ export default function App() {
         </div>
       </header>
       <main className="main">
-        <Projects />
+        <Console />
       </main>
     </div>
   );

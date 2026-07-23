@@ -5,28 +5,40 @@ The control-plane web UI for OxiBase — a **static React SPA** (React + TypeScr
 project provisioning; per ADR-0021 it is served as static assets (nginx/CDN) and
 never enters a Rust binary.
 
-Matches the OxiDB Studio (`oxidb-app`) stack so components (Monaco SQL editor,
-CRUD grid) can be shared as the table/SQL-editor pages land.
+Matches the OxiDB Studio (`oxidb-app`) stack so components (SQL editor, CRUD
+grid) can be shared.
 
-## v1 (this)
+## Features
 
 - **Auth** — signup / login against `/platform/v1`, session JWT in `localStorage`.
 - **Projects** — list, create (provisions an isolated tenant database), view/copy
-  the `anon` + `service_role` keys, rotate keys, delete.
+  the `anon` + `service_role` keys, rotate keys, delete. **Open** a project to
+  edit its data.
+- **Table editor** (`DataBrowser`) — browse the project's collections, view rows
+  in a grid, insert a JSON document, delete a row. Over the PostgREST surface
+  (`/rest/v1/{collection}?db=<ref>`).
+- **SQL runner** (`SqlRunner`) — run DDL/DML/`SELECT` batches against the
+  project's SQL engine (`/api/sql?db=<ref>`), results rendered as a grid.
+  Requires the data plane to run with `OXIDB_SQL=1`.
 
-Planned next: a **table editor** and **SQL runner** over the selected project's
-data plane (`/rest/v1?db=<ref>`) using the zero-dep `oxidb-js` SDK.
+Data-plane calls use the project's `service_role` key (this is the developer's
+own admin console).
 
 ## Develop
 
 ```bash
 npm install
-VITE_OXIBASE_URL=http://127.0.0.1:4460 npm run dev   # points at a local oxibase
+VITE_OXIBASE_URL=http://127.0.0.1:4460 \
+VITE_OXIDB_URL=http://127.0.0.1:8087 \
+  npm run dev
 ```
 
-`VITE_OXIBASE_URL` is the OxiBase API base; leave empty to call the same origin
-(when the dashboard is served behind the proxy that routes `/platform/*` to
-oxibase).
+- `VITE_OXIBASE_URL` — the OxiBase control-plane API base (auth + projects).
+- `VITE_OXIDB_URL` — the oxidb-server **data-plane** REST base (table/SQL editor).
+
+Leave either empty to call the same origin (when the dashboard is served behind a
+proxy that routes `/platform/*` to oxibase and `/rest/v1` + `/api/*` to the data
+plane).
 
 ## Build & deploy
 

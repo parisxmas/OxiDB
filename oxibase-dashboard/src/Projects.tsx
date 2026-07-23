@@ -8,7 +8,7 @@ import {
   rotateKeys,
 } from "./api.ts";
 
-export function Projects() {
+export function Projects({ onOpen }: { onOpen: (ref: string) => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -74,7 +74,7 @@ export function Projects() {
       ) : (
         <div className="grid">
           {projects.map((p) => (
-            <ProjectCard key={p.ref} project={p} onDeleted={refresh} />
+            <ProjectCard key={p.ref} project={p} onDeleted={refresh} onOpen={onOpen} />
           ))}
         </div>
       )}
@@ -82,7 +82,15 @@ export function Projects() {
   );
 }
 
-function ProjectCard({ project, onDeleted }: { project: Project; onDeleted: () => void }) {
+function ProjectCard({
+  project,
+  onDeleted,
+  onOpen,
+}: {
+  project: Project;
+  onDeleted: () => void;
+  onOpen: (ref: string) => void;
+}) {
   const [full, setFull] = useState<Project>(project);
   const [showKeys, setShowKeys] = useState(!!project.anon_key);
   const [busy, setBusy] = useState(false);
@@ -129,6 +137,9 @@ function ProjectCard({ project, onDeleted }: { project: Project; onDeleted: () =
           <code className="ref">{project.ref}</code>
         </div>
         <div className="actions">
+          <button className="open" onClick={() => onOpen(project.ref)} disabled={busy}>
+            Open
+          </button>
           <button className="ghost" onClick={toggleKeys} disabled={busy}>
             {showKeys ? "Hide keys" : "API keys"}
           </button>
