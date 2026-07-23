@@ -45,6 +45,8 @@ a:hover { text-decoration: underline; }
 
 .brand { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; font-size: 18px; }
 .logo { color: var(--accent); font-size: 20px; }
+.brand-logo { height: 30px; width: auto; display: block; }
+.auth-logo { height: 108px; width: auto; display: block; margin: 0 auto 4px; }
 
 /* Layout */
 .app { min-height: 100vh; }

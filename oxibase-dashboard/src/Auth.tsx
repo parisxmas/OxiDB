@@ -95,7 +95,7 @@ export function Auth({ onAuthed }: { onAuthed: () => void }) {
     <div className="auth">
       <div className="card auth-card">
         <div className="brand center">
-          <span className="logo">◇</span> OxiBase
+          <img src="/logo.svg" alt="OxiBase" className="auth-logo" />
         </div>
         <p className="muted center">Sign in to your control plane</p>
         <div

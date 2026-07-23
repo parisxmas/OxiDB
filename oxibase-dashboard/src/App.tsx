@@ -14,7 +14,7 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <span className="logo">◇</span> OxiBase
+          <img src="/logo-horizontal.svg" alt="OxiBase" className="brand-logo" />
         </div>
         <div className="who">
           <span className="email">{currentEmail()}</span>
