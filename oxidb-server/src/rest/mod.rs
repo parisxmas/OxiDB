@@ -1115,13 +1115,14 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str]) -> bool {
         Admin => true,
         // ReadWrite gets everything that is not admin-only.
         ReadWrite => true,
-        // Read is restricted to read-only operations: any GET, the read-only
-        // aggregation POST, and SQL (SELECT-only, enforced by the SQL bridge).
-        // Writes to the PostgREST surface (`/rest/v1/{table}`) are also let
-        // through here so the per-collection security rules (`check_access`)
-        // can decide — anon-with-rules, the Supabase RLS model. A collection
-        // with no rule denies anon writes by default (see `rules::check_access`).
-        Read => matches!(
+        // Read (the anon key) and Authenticated (a signed-in end-user) get the
+        // same coarse privileges: any GET, the read-only aggregation POST, and
+        // SQL (SELECT-only, enforced by the SQL bridge). Writes to the PostgREST
+        // surface (`/rest/v1/{table}`) are also let through here so the
+        // per-collection security rules (`check_access`) can decide — the
+        // Supabase RLS model. A collection with no rule denies these writes by
+        // default (see `rules::check_access`).
+        Read | Authenticated => matches!(
             (method, segments),
             ("GET", _)
                 | ("POST", ["api", _, "aggregate"])

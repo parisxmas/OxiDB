@@ -22,6 +22,32 @@ export interface OxibaseOptions {
   headers?: Record<string, string>;
   /** Custom fetch (e.g. for Node < 18 or a proxy). Defaults to global `fetch`. */
   fetch?: typeof fetch;
+  /**
+   * The OxiBase **control-plane** base URL, used only by `.auth` (end-user
+   * signup/login live on the control plane, which holds the project signing
+   * key). Required to use `oxibase.auth`.
+   */
+  authUrl?: string;
+}
+
+export interface AuthResult {
+  /** The signed-in user (present on signUp; may be absent on login). */
+  user?: { email: string };
+  /** The session JWT now used by `.from()`/`.sql()` until `signOut()`. */
+  token?: string;
+  error: string | null;
+}
+
+/** End-user auth for an OxiBase project — the Supabase `supabase.auth` analog. */
+export interface OxibaseAuth {
+  /** Register an end-user of this project and start their session. */
+  signUp(credentials: { email: string; password: string }): Promise<AuthResult>;
+  /** Log an end-user in and start their session. */
+  signInWithPassword(credentials: { email: string; password: string }): Promise<AuthResult>;
+  /** Drop the user session; `.from()` reverts to the client's original key. */
+  signOut(): void;
+  /** The current session token, or `null` when running as the original key. */
+  getSession(): { token: string } | null;
 }
 
 export interface SqlResult {
@@ -53,6 +79,8 @@ export interface OxibaseClient {
   rpc: PostgrestClient["rpc"];
   /** Run SQL against the project's SQL engine (requires `OXIDB_SQL=1`). */
   sql: (text: string, params?: unknown[]) => Promise<{ results: SqlResult[] | null; error: string | null }>;
+  /** End-user auth (signup/login) — see {@link OxibaseAuth}. Needs `authUrl`. */
+  auth: OxibaseAuth;
   /** The underlying postgrest-js client, if you need it directly. */
   rest: PostgrestClient;
   /** The data-plane base URL (without a trailing slash). */
@@ -69,22 +97,28 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
   const base = url.replace(/\/+$/, "");
   const ref = opts.ref;
   const baseFetch = opts.fetch ?? fetch;
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${key}`,
-    ...(opts.headers ?? {}),
-  };
+  // The bearer token in force. Starts as the client's key (anon/service_role);
+  // `.auth` swaps in an end-user session token, `signOut()` reverts it.
+  let token = key;
+  const extra = opts.headers ?? {};
 
-  // postgrest-js calls fetch with a string URL — rewrite it to add `?db=<ref>`.
+  // postgrest-js calls fetch with a string URL — add `?db=<ref>` and stamp the
+  // CURRENT token so a mid-session `.auth` login takes effect immediately.
   const dbFetch: typeof fetch = (input, init) => {
     if (ref && typeof input === "string") {
       const u = new URL(input);
       u.searchParams.set("db", ref);
       input = u.toString();
     }
-    return baseFetch(input, init);
+    const headers = new Headers(init?.headers);
+    headers.set("Authorization", `Bearer ${token}`);
+    return baseFetch(input, { ...init, headers });
   };
 
-  const rest = new PostgrestClient(`${base}/rest/v1`, { headers, fetch: dbFetch });
+  const rest = new PostgrestClient(`${base}/rest/v1`, {
+    headers: { Authorization: `Bearer ${key}`, ...extra },
+    fetch: dbFetch,
+  });
 
   async function sql(text: string, params?: unknown[]) {
     const u = new URL(`${base}/api/sql`);
@@ -93,7 +127,7 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     try {
       r = await baseFetch(u.toString(), {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...headers },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...extra },
         body: JSON.stringify(params ? { sql: text, params } : { sql: text }),
       });
     } catch (e) {
@@ -104,11 +138,41 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
     return { results: body?.results ?? [], error: null };
   }
 
+  async function authCall(action: "signup" | "login", email: string, password: string): Promise<AuthResult> {
+    if (!opts.authUrl) return { error: "auth requires the `authUrl` option (the control-plane base)" };
+    if (!ref) return { error: "auth requires a project `ref`" };
+    const endpoint = `${opts.authUrl.replace(/\/+$/, "")}/platform/v1/projects/${encodeURIComponent(ref)}/auth/${action}`;
+    let r: Response;
+    try {
+      r = await baseFetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+    } catch (e) {
+      return { error: e instanceof Error ? e.message : String(e) };
+    }
+    const body = (await r.json().catch(() => null)) as { user?: { email: string }; token?: string; message?: string } | null;
+    if (!r.ok || !body?.token) return { error: body?.message ?? `HTTP ${r.status}` };
+    token = body.token; // subsequent .from()/.sql() run as this user
+    return { user: body.user, token: body.token, error: null };
+  }
+
+  const auth: OxibaseAuth = {
+    signUp: ({ email, password }) => authCall("signup", email, password),
+    signInWithPassword: ({ email, password }) => authCall("login", email, password),
+    signOut: () => {
+      token = key;
+    },
+    getSession: () => (token === key ? null : { token }),
+  };
+
   return {
     from: rest.from.bind(rest),
     schema: rest.schema.bind(rest),
     rpc: rest.rpc.bind(rest),
     sql,
+    auth,
     rest,
     url: base,
     ref,

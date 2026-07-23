@@ -91,6 +91,13 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
         ("GET", ["platform", "v1", "projects"]) => handlers::list_projects(req, state),
         ("GET", ["platform", "v1", "projects", r]) => handlers::get_project(req, state, r),
         ("GET", ["platform", "v1", "projects", r, "jwks"]) => handlers::project_jwks(state, r),
+        // Public per-project end-user auth (an app's own users).
+        ("POST", ["platform", "v1", "projects", r, "auth", "signup"]) => {
+            handlers::end_user_signup(req, state, r)
+        }
+        ("POST", ["platform", "v1", "projects", r, "auth", "login"]) => {
+            handlers::end_user_login(req, state, r)
+        }
         ("DELETE", ["platform", "v1", "projects", r]) => handlers::delete_project(req, state, r),
         ("POST", ["platform", "v1", "projects", r, "keys", "rotate"]) => {
             handlers::rotate_keys(req, state, r)

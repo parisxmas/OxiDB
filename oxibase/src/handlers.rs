@@ -15,6 +15,9 @@ use crate::{State, now_secs, resp};
 
 const KEY_EXPIRY_SECS: u64 = 10 * 365 * 86_400;
 const SESSION_EXPIRY_SECS: u64 = 86_400;
+/// End-user (project member) session lifetime — shorter than the long-lived API
+/// keys, longer than a developer console session.
+const END_USER_EXPIRY_SECS: u64 = 7 * 86_400;
 const MIN_PASSWORD_LEN: usize = 8;
 const LOGIN_MAX_FAILS: u32 = 5;
 const LOGIN_LOCKOUT_SECS: u64 = 300;
@@ -254,6 +257,120 @@ pub fn project_jwks(state: &State, project_ref: &str) -> HttpResponse {
         Some(jwk) => resp(200, json!({ "keys": [jwk] })),
         None => resp(500, json!({ "message": "malformed key" })),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-project end-user auth (the Supabase GoTrue analog).
+//
+// Public endpoints — an app's own users sign themselves up against a project.
+// Users live in the reserved `oxibase` metadata db (collection `users`, scoped
+// by `project_ref`), never in a data-plane-readable collection. The token is
+// signed with the PROJECT's ES256 private key, so the data plane verifies it
+// with the project's public key alone and rules see `auth.username` (the email)
+// and `auth.role == "authenticated"`.
+// ---------------------------------------------------------------------------
+
+/// `POST /platform/v1/projects/{ref}/auth/signup` — create an end-user.
+pub fn end_user_signup(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let body = parse_body(req);
+    let (Some(email), Some(password)) = (str_field(&body, "email"), str_field(&body, "password"))
+    else {
+        return resp(400, json!({ "message": "email and password required" }));
+    };
+    if password.len() < MIN_PASSWORD_LEN {
+        return resp(
+            400,
+            json!({ "message": format!("password must be at least {MIN_PASSWORD_LEN} characters") }),
+        );
+    }
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    match state
+        .upstream
+        .find("users", &json!({ "project_ref": project_ref, "email": email }))
+    {
+        Ok(u) if !u.is_empty() => {
+            return resp(409, json!({ "message": "email already registered" }));
+        }
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+        _ => {}
+    }
+    let pw_hash = match crypto::hash_password(&password) {
+        Ok(h) => h,
+        Err(e) => return resp(500, json!({ "message": e })),
+    };
+    let doc = json!({
+        "project_ref": project_ref,
+        "email": email,
+        "pw_hash": pw_hash,
+        "created_at": now_secs(),
+    });
+    if let Err(e) = state.upstream.insert("users", &doc) {
+        return resp(502, json!({ "message": format!("upstream: {e}") }));
+    }
+    match mint_user_token(state, &pdoc, &email) {
+        Some(token) => resp(201, json!({ "user": { "email": email }, "token": token })),
+        None => resp(500, json!({ "message": "failed to mint token" })),
+    }
+}
+
+/// `POST /platform/v1/projects/{ref}/auth/login` — end-user login.
+pub fn end_user_login(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let body = parse_body(req);
+    let (Some(email), Some(password)) = (str_field(&body, "email"), str_field(&body, "password"))
+    else {
+        return resp(400, json!({ "message": "email and password required" }));
+    };
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let user = match state
+        .upstream
+        .find("users", &json!({ "project_ref": project_ref, "email": email }))
+    {
+        Ok(mut u) => u.pop(),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let ok = user
+        .as_ref()
+        .and_then(|u| u.get("pw_hash").and_then(|v| v.as_str()))
+        .is_some_and(|h| crypto::verify_password(&password, h));
+    if !ok {
+        return resp(401, json!({ "message": "invalid credentials" }));
+    }
+    match mint_user_token(state, &pdoc, &email) {
+        Some(token) => resp(200, json!({ "token": token })),
+        None => resp(500, json!({ "message": "failed to mint token" })),
+    }
+}
+
+/// Look up a project by ref alone (no owner filter) — end-user auth is public.
+fn project_by_ref(state: &State, project_ref: &str) -> Result<Option<Value>, String> {
+    Ok(state
+        .upstream
+        .find("projects", &json!({ "ref": project_ref }))?
+        .into_iter()
+        .next())
+}
+
+/// Mint an ES256 end-user token signed with the project's private key.
+fn mint_user_token(state: &State, project_doc: &Value, email: &str) -> Option<String> {
+    let priv_scalar = project_priv(state, project_doc)?;
+    let now = now_secs();
+    crypto::encode_jwt_es256(
+        &Claims {
+            sub: email.to_string(),
+            role: "authenticated".to_string(),
+            iat: now,
+            exp: now + END_USER_EXPIRY_SECS,
+        },
+        &priv_scalar,
+    )
 }
 
 pub fn delete_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {

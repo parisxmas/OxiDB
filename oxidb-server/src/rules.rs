@@ -166,22 +166,32 @@ pub fn check_access(
         return Ok(());
     }
 
+    // service_role / admin bypasses rules entirely — the Supabase service_role
+    // semantic: a trusted server-side key is not subject to per-row policy.
+    if matches!(
+        auth.role.as_deref().and_then(crate::auth::Role::from_str),
+        Some(crate::auth::Role::Admin)
+    ) {
+        return Ok(());
+    }
+
     let rules = match get_rules(db, collection) {
         Some(r) => r,
         None => {
             // No rules defined. Reads stay open and trusted roles keep full
-            // access (backward compatible). But a WRITE from a project's public
-            // anon key (role "read") is denied by default — a collection must
-            // opt into anonymous writes with an explicit rule (the Supabase RLS
-            // model). An open, no-auth server (role `None`) is unaffected.
-            let anon_write = !matches!(op, Operation::Read)
+            // access (backward compatible). But a WRITE from an untrusted tier —
+            // the public anon key (role "read") or a signed-in end-user (role
+            // "authenticated") — is denied by default: a collection must opt in
+            // with an explicit rule (the Supabase RLS model). An open, no-auth
+            // server (role `None`) is unaffected.
+            let unprivileged_write = !matches!(op, Operation::Read)
                 && matches!(
                     auth.role.as_deref().and_then(crate::auth::Role::from_str),
-                    Some(crate::auth::Role::Read)
+                    Some(crate::auth::Role::Read) | Some(crate::auth::Role::Authenticated)
                 );
-            return if anon_write {
+            return if unprivileged_write {
                 Err(format!(
-                    "access denied: {} on '{}' requires a security rule for anonymous access",
+                    "access denied: {} on '{}' requires a security rule",
                     op.as_str(),
                     collection
                 ))
@@ -660,12 +670,23 @@ mod tests {
         );
         assert!(result.is_err());
 
-        // Admin create → allowed
+        // Admin / service_role bypasses rules entirely (Supabase semantic):
+        // it is allowed even where the rule would deny (create requires admin,
+        // update is hard-`false`).
         let result = check_access(&db, "secrets", Operation::Create, &admin_auth(), None, None);
         assert!(result.is_ok());
-
-        // Update always denied
         let result = check_access(&db, "secrets", Operation::Update, &admin_auth(), None, None);
+        assert!(result.is_ok(), "service_role bypasses rules");
+
+        // A non-admin user is still bound by `update: "false"`.
+        let result = check_access(
+            &db,
+            "secrets",
+            Operation::Update,
+            &user_auth("alice"),
+            None,
+            None,
+        );
         assert!(result.is_err());
     }
 

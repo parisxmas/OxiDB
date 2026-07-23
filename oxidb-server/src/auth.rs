@@ -14,6 +14,11 @@ pub enum Role {
     Admin,
     ReadWrite,
     Read,
+    /// A signed-in **end-user** of an OxiBase project (a person, not a client
+    /// tier). Coarse privileges match `Read` — writes are let through to the
+    /// security rules — but the token carries the user's identity, so
+    /// `auth.username` / `auth.role == 'authenticated'` drive per-row rules.
+    Authenticated,
 }
 
 impl Role {
@@ -22,6 +27,7 @@ impl Role {
             Role::Admin => "admin",
             Role::ReadWrite => "readWrite",
             Role::Read => "read",
+            Role::Authenticated => "authenticated",
         }
     }
 
@@ -30,6 +36,7 @@ impl Role {
             "admin" => Some(Role::Admin),
             "readWrite" | "readwrite" => Some(Role::ReadWrite),
             "read" => Some(Role::Read),
+            "authenticated" => Some(Role::Authenticated),
             _ => None,
         }
     }

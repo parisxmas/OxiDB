@@ -57,7 +57,9 @@ pub fn is_permitted(role: Role, cmd: &str) -> bool {
                 | "use_db"
                 | "list_databases"
         ),
-        Role::Read => matches!(
+        // An end-user (Authenticated) has the same read-only wire privileges as
+        // Read; its writes go through the REST rules layer, not the raw wire.
+        Role::Read | Role::Authenticated => matches!(
             cmd,
             "ping"
                 | "find"
