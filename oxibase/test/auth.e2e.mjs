@@ -1,13 +1,16 @@
-// End-to-end check of per-project end-user OAuth against a running OxiBase.
+// End-to-end check of per-project end-user sign-in against a running OxiBase:
+// social OAuth (Google, GitHub) and passwordless magic links.
 //
 //   OXIBASE_URL=http://127.0.0.1:4460 \
 //   OXIDB_PLATFORM_SECRET=<the control plane's secret> \
-//   node oxibase/test/oauth.e2e.mjs
+//   [OXIBASE_MAIL_SINK=<the control plane's mail sink file>] \
+//   node oxibase/test/auth.e2e.mjs
 //
-// Everything up to the provider round-trip is covered: configuration, the
-// public discovery endpoint, the authorize redirect, the redirect allow-list,
-// and state validation on the callback. The code-for-token exchange itself
-// needs real provider credentials and is not exercised here.
+// For OAuth, everything up to the provider round-trip is covered: configuration,
+// the public discovery endpoint, the authorize redirect, the redirect allow-list
+// and state validation on the callback. The code-for-token exchange needs real
+// provider credentials and is not exercised here. Magic links are covered end to
+// end when the control plane runs with a mail sink.
 
 import { devToken, counter } from "./lib.mjs";
 
@@ -41,7 +44,7 @@ async function api(method, path, { body, auth = true, redirect = "manual" } = {}
   return { status: res.status, data, location: res.headers.get("location") };
 }
 
-console.log("# OxiBase end-user OAuth");
+console.log("# OxiBase end-user sign-in (OAuth + magic links)");
 
 // ── provision ───────────────────────────────────────────────────────────────
 const created = await api("POST", "/projects", { body: { name: "oauth e2e" } });
@@ -211,6 +214,113 @@ let stateBlob;
     { auth: false },
   );
   ok(r.status === 501, "clear: authorize for an unconfigured provider is 501");
+}
+
+// ── magic links ─────────────────────────────────────────────────────────────
+// The full round trip is only checkable when a mail transport is present. With
+// OXIBASE_MAIL_SINK the control plane appends each message to a file, so the
+// test can read back the link it just triggered.
+const SINK = process.env.OXIBASE_MAIL_SINK;
+{
+  const s = await api("GET", `/projects/${ref}/auth/settings`, { auth: false });
+  ok(s.data.magic_link === !!SINK, `settings: magic_link reflects the mail transport (${!!SINK})`);
+}
+{
+  const r = await api("POST", `/projects/${ref}/auth/magiclink`, {
+    auth: false,
+    body: { email: "someone@example.com", redirect_to: "https://evil.example.com/steal" },
+  });
+  ok(r.status === 403, "magic link: an unlisted redirect_to is refused");
+}
+{
+  const r = await api("POST", `/projects/${ref}/auth/magiclink`, {
+    auth: false,
+    body: { email: "someone@example.com" },
+  });
+  ok(r.status === 400, "magic link: redirect_to is required");
+}
+
+if (SINK) {
+  const { readFileSync, writeFileSync } = await import("node:fs");
+  const inbox = () =>
+    readFileSync(SINK, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+  writeFileSync(SINK, "");
+
+  const email = `magic${process.pid}@example.com`;
+  const dest = "https://app.example.com/callback";
+  const r = await api("POST", `/projects/${ref}/auth/magiclink`, {
+    auth: false,
+    body: { email, redirect_to: dest },
+  });
+  ok(r.status === 200, "magic link: request accepted");
+
+  // send_async runs on a thread; give it a moment to land in the sink.
+  let mail = [];
+  for (let i = 0; i < 40 && mail.length === 0; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    try {
+      mail = inbox();
+    } catch {
+      mail = [];
+    }
+  }
+  ok(mail.length === 1 && mail[0].to === email, "magic link: one message, to the right address");
+  const link = (mail[0].body.match(/https?:\/\/\S+/) ?? [])[0];
+  ok(!!link && link.includes("/auth/magiclink/verify?token="), "magic link: the mail carries the link");
+
+  // Following the link signs the user in and bounces to the app.
+  const followed = await fetch(link, { redirect: "manual" });
+  ok(followed.status === 302, "magic link: the link redirects");
+  const to = followed.headers.get("location") ?? "";
+  ok(to.startsWith(`${dest}#access_token=`), "magic link: lands on the app with a session in the fragment");
+  const params = new URLSearchParams(to.slice(to.indexOf("#") + 1));
+  const access = params.get("access_token");
+  ok(!!access && !!params.get("refresh_token"), "magic link: both tokens present");
+
+  // The session is real: it must be a project-signed token for that user.
+  const claims = JSON.parse(Buffer.from(access.split(".")[1], "base64url").toString());
+  ok(claims.sub === email, "magic link: the access token identifies the user");
+  ok(claims.role === "authenticated", "magic link: the token carries the authenticated role");
+
+  // Single use.
+  const again = await fetch(link, { redirect: "manual" });
+  ok(again.status === 400, "magic link: the link cannot be used twice");
+
+  // The user now exists and is verified — the click proved the address.
+  const users = await api("GET", `/projects/${ref}/users`);
+  const created = users.data.find((u) => u.email === email);
+  ok(!!created && created.verified === true, "magic link: created the user, already verified");
+
+  // The token is not just well-shaped — the data plane accepts it. (Signature
+  // verification happens there, against the project's public key.)
+  if (process.env.OXIBASE_DATA_URL) {
+    const r = await fetch(`${process.env.OXIBASE_DATA_URL}/rest/v1/notes?db=${ref}`, {
+      headers: { Authorization: `Bearer ${access}` },
+    });
+    ok(r.status === 200, `magic link: the data plane accepts the session (${r.status})`);
+    const tampered = access.slice(0, -3) + (access.endsWith("aaa") ? "bbb" : "aaa");
+    const bad = await fetch(`${process.env.OXIBASE_DATA_URL}/rest/v1/notes?db=${ref}`, {
+      headers: { Authorization: `Bearer ${tampered}` },
+    });
+    ok(bad.status === 401, "magic link: a tampered token is rejected there");
+  }
+
+  // Refresh works from a magic-link session like any other.
+  const refreshed = await api("POST", `/projects/${ref}/auth/refresh`, {
+    auth: false,
+    body: { refresh_token: params.get("refresh_token") },
+  });
+  ok(refreshed.status === 200 && refreshed.data.token, "magic link: the session refreshes");
+} else {
+  const r = await api("POST", `/projects/${ref}/auth/magiclink`, {
+    auth: false,
+    body: { email: "someone@example.com", redirect_to: "https://app.example.com/callback" },
+  });
+  ok(r.status === 501, "magic link: reports email is not configured (no mail transport)");
+  console.log("  … set OXIBASE_MAIL_SINK to exercise the full round trip");
 }
 
 // ── cleanup ─────────────────────────────────────────────────────────────────

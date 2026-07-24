@@ -326,6 +326,23 @@ else if (session) showApp();                         // signed in
 
 // already running Google Identity Services? skip the redirect entirely:
 await oxibase.auth.signInWithIdToken({ provider: "google", token: credential });`}</Code>
+          <p>
+            <strong>Magic links</strong> are passwordless sign-in and need no provider at all — just
+            one allowed redirect URL. The click both creates the account (if it is new) and verifies
+            the address, and lands on the same <code>getSessionFromUrl()</code> you use for OAuth:
+          </p>
+          <Code title="passwordless sign-in">{`await oxibase.auth.signInWithMagicLink({
+  email: "ada@example.com",
+  redirectTo: "https://app.example.com/callback",   // must be an allowed URL
+});
+// → "check your inbox for a sign-in link" (same answer for unknown addresses)
+
+// on the callback page, exactly as with OAuth:
+const session = oxibase.auth.getSessionFromUrl();`}</Code>
+          <p className="muted small">
+            Links last 15 minutes and work once — a second click is refused, so a link forwarded or
+            left in an inbox cannot start a new session.
+          </p>
           <p className="muted small">
             The session arrives in the URL <em>fragment</em>, so it never reaches a server log, and{" "}
             <code>getSessionFromUrl()</code> strips it from the address bar once adopted. A user who

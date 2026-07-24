@@ -11,6 +11,15 @@
 //!   OXIBASE_SMTP_USER      submission account (AUTH PLAIN)
 //!   OXIBASE_SMTP_PASSWORD
 //!   OXIBASE_MAIL_FROM      e.g. "OxiBase <noreply@example.com>" (default: user)
+//!
+//! For local development and tests there is a second transport:
+//!
+//!   OXIBASE_MAIL_SINK      append messages to this file instead of sending
+//!
+//! It takes precedence over the SMTP settings and enables the email flows with
+//! no mail server, so a test can read back the link it just triggered. Never
+//! set it in a deployment that sends real mail — every message, including
+//! single-use sign-in links, lands in that file in the clear.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -21,6 +30,18 @@ use base64::Engine as _;
 
 #[derive(Clone)]
 pub struct Mailer {
+    transport: Transport,
+}
+
+#[derive(Clone)]
+enum Transport {
+    Smtp(Smtp),
+    /// Dev/test: one JSON object per message, appended to a file.
+    File(std::path::PathBuf),
+}
+
+#[derive(Clone)]
+struct Smtp {
     host: String,
     port: u16,
     user: String,
@@ -31,9 +52,24 @@ pub struct Mailer {
 impl Mailer {
     /// Build from environment; `None` disables email flows.
     pub fn from_env() -> Option<Mailer> {
-        let host = std::env::var("OXIBASE_SMTP_HOST").ok().filter(|s| !s.is_empty())?;
-        let user = std::env::var("OXIBASE_SMTP_USER").ok().filter(|s| !s.is_empty())?;
-        let password = std::env::var("OXIBASE_SMTP_PASSWORD").ok().filter(|s| !s.is_empty())?;
+        if let Some(path) = std::env::var("OXIBASE_MAIL_SINK")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            eprintln!("[mail] SINK MODE — messages are written to {path}, not sent");
+            return Some(Mailer {
+                transport: Transport::File(path.into()),
+            });
+        }
+        let host = std::env::var("OXIBASE_SMTP_HOST")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let user = std::env::var("OXIBASE_SMTP_USER")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let password = std::env::var("OXIBASE_SMTP_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty())?;
         let port = std::env::var("OXIBASE_SMTP_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -42,9 +78,62 @@ impl Mailer {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| user.clone());
-        Some(Mailer { host, port, user, password, from })
+        Some(Mailer {
+            transport: Transport::Smtp(Smtp {
+                host,
+                port,
+                user,
+                password,
+                from,
+            }),
+        })
     }
 
+    /// Send a plain-text message. Blocking (a few round-trips to the local
+    /// mail server); callers spawn a thread when latency matters.
+    pub fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
+        // Recipient goes into SMTP verbatim — refuse anything that could
+        // smuggle commands or extra recipients.
+        if to.is_empty()
+            || to
+                .chars()
+                .any(|c| c.is_control() || c == '<' || c == '>' || c == ',')
+        {
+            return Err("invalid recipient address".into());
+        }
+        match &self.transport {
+            Transport::File(path) => Self::write_to_file(path, to, subject, body),
+            Transport::Smtp(smtp) => smtp.send(to, subject, body),
+        }
+    }
+
+    fn write_to_file(
+        path: &std::path::Path,
+        to: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<(), String> {
+        let line = serde_json::json!({ "to": to, "subject": subject, "body": body }).to_string();
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("mail sink: {e}"))?;
+        writeln!(f, "{line}").map_err(|e| format!("mail sink: {e}"))
+    }
+
+    /// `send` on a background thread — request handlers never wait on SMTP.
+    pub fn send_async(&self, to: String, subject: String, body: String) {
+        let mailer = self.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = mailer.send(&to, &subject, &body) {
+                eprintln!("[mail] send to {to} failed: {e}");
+            }
+        });
+    }
+}
+
+impl Smtp {
     /// The bare address inside `From:` (display names stripped).
     fn from_addr(&self) -> &str {
         match (self.from.find('<'), self.from.find('>')) {
@@ -53,16 +142,7 @@ impl Mailer {
         }
     }
 
-    /// Send a plain-text message. Blocking (a few round-trips to the local
-    /// mail server); callers spawn a thread when latency matters.
-    pub fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
-        // Recipient goes into SMTP verbatim — refuse anything that could
-        // smuggle commands or extra recipients.
-        if to.is_empty() || to.chars().any(|c| c.is_control() || c == '<' || c == '>' || c == ',')
-        {
-            return Err("invalid recipient address".into());
-        }
-
+    fn send(&self, to: &str, subject: &str, body: &str) -> Result<(), String> {
         let err = |stage: &str, e: String| format!("smtp {stage}: {e}");
 
         // TCP + implicit TLS.
@@ -98,7 +178,9 @@ impl Mailer {
                 if line.len() < 4 {
                     return Err(format!("short reply: {line:?}"));
                 }
-                code = line[..3].parse().map_err(|_| format!("bad reply: {line:?}"))?;
+                code = line[..3]
+                    .parse()
+                    .map_err(|_| format!("bad reply: {line:?}"))?;
                 if line.as_bytes()[3] != b'-' {
                     return Ok(code);
                 }
@@ -136,7 +218,13 @@ impl Mailer {
         // Dot-stuff body lines starting with '.' (RFC 5321 §4.5.2).
         let stuffed: String = body
             .lines()
-            .map(|l| if l.starts_with('.') { format!(".{l}\r\n") } else { format!("{l}\r\n") })
+            .map(|l| {
+                if l.starts_with('.') {
+                    format!(".{l}\r\n")
+                } else {
+                    format!("{l}\r\n")
+                }
+            })
             .collect();
         let msg_id: u64 = rand::random();
         let message = format!(
@@ -147,15 +235,5 @@ impl Mailer {
         // Best-effort close.
         let _ = reader.get_mut().write_all(b"QUIT\r\n");
         Ok(())
-    }
-
-    /// `send` on a background thread — request handlers never wait on SMTP.
-    pub fn send_async(&self, to: String, subject: String, body: String) {
-        let mailer = self.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = mailer.send(&to, &subject, &body) {
-                eprintln!("[mail] send to {to} failed: {e}");
-            }
-        });
     }
 }

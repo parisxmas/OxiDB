@@ -151,12 +151,14 @@ export function ProvidersPanel({ projectRef }: { projectRef: string }) {
 
   return (
     <div style={{ marginTop: 28 }}>
-      <h3 style={{ margin: "4px 0" }}>Social sign-in</h3>
+      <h3 style={{ margin: "4px 0" }}>Sign-in methods</h3>
       <p className="muted small">
-        Lets your users sign in with an account they already have:{" "}
-        <code>oxibase.auth.signInWithOAuth({"{ provider: 'github' }"})</code>. Someone who signs in
-        with a provider is matched to an existing account by verified email, so they land in one
-        account rather than two.
+        Beyond email + password: social sign-in with an account your users already have (
+        <code>oxibase.auth.signInWithOAuth({"{ provider: 'github' }"})</code>) and passwordless{" "}
+        <strong>magic links</strong> (<code>oxibase.auth.signInWithMagicLink({"{ email }"})</code>,
+        which needs no configuration beyond a redirect URL below). Someone signing in a new way is
+        matched to an existing account by verified email, so they land in one account rather than
+        two.
       </p>
 
       {error && <div className="error small">{error}</div>}
@@ -175,7 +177,8 @@ export function ProvidersPanel({ projectRef }: { projectRef: string }) {
               Where a completed sign-in may send the user, one per line. The session is handed over
               in the URL, so only these destinations are accepted. A trailing <code>*</code> allows
               any deeper path (<code>https://app.example.com/auth/*</code>) but can never widen the
-              host.
+              host. <strong>Magic links use this list too</strong> — passwordless sign-in needs at
+              least one entry.
             </p>
             <textarea
               className="sql-input"

@@ -1561,6 +1561,9 @@ pub fn auth_settings(state: &State, project_ref: &str) -> HttpResponse {
         200,
         json!({
             "password": true,
+            // Passwordless sign-in needs both a mail transport and somewhere to
+            // send the user back to.
+            "magic_link": state.mailer.is_some() && !redirect_urls(&pdoc).is_empty(),
             "providers": enabled,
             "google_client_id": provider_client_id(&pdoc, "google"),
         }),
@@ -1847,6 +1850,253 @@ fn oauth_session(
     }
 
     issue_session(state, pdoc, project_ref, &ident.email).ok_or("failed to mint token".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Magic links (passwordless sign-in)
+//
+// The user asks for a link, clicks it, and lands back in the app signed in —
+// no password anywhere. The click is what proves they control the address, so
+// a magic link doubles as a passwordless *signup*.
+//
+// The session goes to the app exactly as the OAuth callback does: on a
+// pre-registered redirect URL, in the fragment. The target is fixed and
+// validated when the mail is *sent*, not when the link is clicked, so a
+// tampered link can never redirect the session somewhere else.
+// ---------------------------------------------------------------------------
+
+/// A magic link is short-lived — long enough to switch to an inbox, not long
+/// enough to sit in one.
+const MAGIC_LINK_TTL_SECS: u64 = 900;
+
+/// `POST /platform/v1/projects/{ref}/auth/magiclink` — email a sign-in link.
+/// Body: `{ "email": "…", "redirect_to": "https://app/…" }`.
+///
+/// Always answers the same way once the request is well-formed, so it never
+/// reveals whether an address is registered.
+pub fn end_user_magiclink(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let body = parse_body(req);
+    let Some(email) = str_field(&body, "email") else {
+        return resp(400, json!({ "message": "email required" }));
+    };
+    let email = email.to_lowercase();
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
+
+    // Where the session will be handed over — checked before a link is minted,
+    // against the same allow-list the OAuth callback uses.
+    let Some(redirect_to) = str_field(&body, "redirect_to") else {
+        return resp(400, json!({ "message": "redirect_to is required" }));
+    };
+    if !oauth::redirect_allowed(&redirect_urls(&pdoc), &redirect_to) {
+        return resp(
+            403,
+            json!({ "message": "redirect_to is not in this project's allowed redirect URLs" }),
+        );
+    }
+    if state.mailer.is_none() {
+        return resp(
+            501,
+            json!({ "message": "email is not configured on this server" }),
+        );
+    }
+    // Sends mail on demand and can create a user — same guard as signup.
+    let actor = format!("{project_ref}:{}", client_ip(req));
+    if !signup_allowed(&actor) {
+        return resp(
+            429,
+            json!({ "message": "too many requests; try again shortly" }),
+        );
+    }
+
+    let ok = resp(
+        200,
+        json!({ "message": "check your inbox for a sign-in link" }),
+    );
+
+    let existing = match state.upstream.find(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+    ) {
+        Ok(mut v) => v.pop(),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    if existing.is_none() {
+        // Passwordless signup — refuse past the project's user ceiling, but say
+        // nothing that distinguishes "full" from "sent" to an outside caller.
+        if state
+            .upstream
+            .count("users", &json!({ "project_ref": project_ref }))
+            .unwrap_or(0)
+            >= max_users_per_project()
+        {
+            return ok;
+        }
+    }
+
+    let (plain, hash, exp) = one_time_token(MAGIC_LINK_TTL_SECS);
+    let fields = json!({
+        "magic_hash": hash,
+        "magic_exp": exp,
+        // The validated destination travels with the token, not in the link.
+        "magic_redirect": redirect_to,
+    });
+    let stored = match existing {
+        Some(_) => state.upstream.update(
+            "users",
+            &json!({ "project_ref": project_ref, "email": email }),
+            &json!({ "$set": fields }),
+        ),
+        None => {
+            let mut doc = json!({
+                "project_ref": project_ref,
+                "email": email,
+                // No password: clicking the link is the proof of ownership,
+                // and it is what marks the address verified.
+                "verified": false,
+                "created_at": now_secs(),
+            });
+            let obj = doc.as_object_mut().unwrap();
+            for (k, v) in fields.as_object().unwrap() {
+                obj.insert(k.clone(), v.clone());
+            }
+            state.upstream.insert("users", &doc).map(|_| ())
+        }
+    };
+    if let Err(e) = stored {
+        return resp(502, json!({ "message": format!("upstream: {e}") }));
+    }
+    send_magic_link_email(state, project_ref, &email, &plain);
+    ok
+}
+
+fn send_magic_link_email(state: &State, project_ref: &str, email: &str, token: &str) {
+    let Some(mailer) = &state.mailer else { return };
+    let link = format!(
+        "{}/platform/v1/projects/{}/auth/magiclink/verify?token={}",
+        public_base(),
+        project_ref,
+        token
+    );
+    mailer.send_async(
+        email.to_string(),
+        "Your sign-in link".into(),
+        format!(
+            "Click to sign in:\n\n  {link}\n\nThe link works once and expires in 15 minutes. If you didn't ask to sign in, ignore this message.\n"
+        ),
+    );
+}
+
+/// `GET /platform/v1/projects/{ref}/auth/magiclink/verify?token=…` — the link
+/// itself. Consumes the token and bounces to the app with a session.
+pub fn end_user_magiclink_verify(
+    req: &HttpRequest,
+    state: &State,
+    project_ref: &str,
+) -> HttpResponse {
+    let page = |status: u16, title: &str, detail: &str| {
+        HttpResponse {
+        status,
+        status_text: if status == 200 { "OK" } else { "Bad Request" },
+        content_type: "text/html; charset=utf-8".into(),
+        headers: Vec::new(),
+        body: format!(
+            "<!doctype html><meta charset=utf-8><title>{title}</title><body style=\"font-family:system-ui;display:grid;place-items:center;min-height:90vh\"><div style=\"text-align:center\"><h2>{title}</h2><p>{detail}</p></div>"
+        )
+        .into_bytes(),
+        content_length_override: None,
+    }
+    };
+    let Some(token) = query_param(req, "token").filter(|t| !t.is_empty()) else {
+        return page(400, "Missing token", "The sign-in link is incomplete.");
+    };
+    let pdoc = match project_by_ref(state, project_ref) {
+        Ok(Some(d)) => d,
+        Ok(None) => return page(404, "Unknown project", "This link is not valid here."),
+        Err(_) => return page(502, "Temporarily unavailable", "Please try again shortly."),
+    };
+    let project_ref = pdoc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(project_ref);
+
+    let hash = crypto::sha256_hex(token.as_bytes());
+    let user = match state.upstream.find(
+        "users",
+        &json!({ "project_ref": project_ref, "magic_hash": hash }),
+    ) {
+        Ok(mut v) => v.pop(),
+        Err(_) => return page(502, "Temporarily unavailable", "Please try again shortly."),
+    };
+    let Some(user) = user else {
+        return page(
+            400,
+            "Invalid link",
+            "This sign-in link is unknown or has already been used.",
+        );
+    };
+    let email = user
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    // Burn the token before minting anything: a link is single-use even if the
+    // steps below fail, and a double click cannot yield two sessions.
+    let _ = state.upstream.update(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+        &json!({ "$unset": { "magic_hash": "", "magic_exp": "", "magic_redirect": "" } }),
+    );
+
+    if now_secs() > user.get("magic_exp").and_then(|v| v.as_u64()).unwrap_or(0) {
+        return page(
+            400,
+            "Link expired",
+            "Sign-in links last 15 minutes — request a new one.",
+        );
+    }
+    let redirect_to = user
+        .get("magic_redirect")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // The destination was validated when the link was sent; re-check it, so a
+    // URL removed from the allow-list in the meantime stops working now.
+    if !oauth::redirect_allowed(&redirect_urls(&pdoc), &redirect_to) {
+        return page(
+            403,
+            "Destination no longer allowed",
+            "This project no longer accepts sign-ins to that address.",
+        );
+    }
+    // Clicking the link proves the address.
+    let _ = state.upstream.update(
+        "users",
+        &json!({ "project_ref": project_ref, "email": email }),
+        &json!({ "$set": { "verified": true } }),
+    );
+
+    match issue_session(state, &pdoc, project_ref, &email) {
+        Some((access, refresh)) => redirect(&oauth::redirect_with_session(
+            &redirect_to,
+            &access,
+            &refresh,
+            access_expiry_secs(),
+        )),
+        None => page(
+            500,
+            "Could not sign you in",
+            "Please request a new link and try again.",
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------

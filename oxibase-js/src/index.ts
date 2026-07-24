@@ -98,9 +98,20 @@ export interface OxibaseAuth {
    * tokens do not linger in the address bar or history.
    */
   getSessionFromUrl(url?: string): AuthResult | null;
+  /**
+   * Email a passwordless sign-in link. The user clicks it and arrives at
+   * `redirectTo` with a session in the fragment — pick it up there with
+   * {@link getSessionFromUrl}. Creates the account if it is new, and the click
+   * is what verifies the address. `redirectTo` must be an allowed redirect URL.
+   *
+   * Always resolves the same way for known and unknown addresses.
+   */
+  signInWithMagicLink(opts: { email: string; redirectTo?: string }): Promise<{ error: string | null }>;
   /** Which sign-in methods this project offers (public; no auth required). */
   getSettings(): Promise<{
     password: boolean;
+    /** Passwordless email sign-in is available. */
+    magicLink: boolean;
     providers: OAuthProvider[];
     googleClientId: string | null;
     error: string | null;
@@ -451,17 +462,35 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
       return { token, refreshToken, error: null };
     },
 
+    signInWithMagicLink: ({ email, redirectTo }) => {
+      const target = redirectTo ?? (typeof location !== "undefined" ? location.href : "");
+      if (!target) return Promise.resolve({ error: "redirectTo is required outside a browser" });
+      return authPost("magiclink", { email, redirect_to: target });
+    },
+
     getSettings: async () => {
-      const empty = { password: true, providers: [] as OAuthProvider[], googleClientId: null };
+      const empty = {
+        password: true,
+        magicLink: false,
+        providers: [] as OAuthProvider[],
+        googleClientId: null,
+      };
       if (!authBase || !ref) return { ...empty, error: "auth requires `authUrl` and a project `ref`" };
       try {
         const r = await baseFetch(authEndpoint("settings"));
         const b = (await r.json().catch(() => null)) as
-          | { password?: boolean; providers?: OAuthProvider[]; google_client_id?: string | null; message?: string }
+          | {
+              password?: boolean;
+              magic_link?: boolean;
+              providers?: OAuthProvider[];
+              google_client_id?: string | null;
+              message?: string;
+            }
           | null;
         if (!r.ok) return { ...empty, error: b?.message ?? `HTTP ${r.status}` };
         return {
           password: b?.password ?? true,
+          magicLink: b?.magic_link ?? false,
           providers: b?.providers ?? [],
           googleClientId: b?.google_client_id ?? null,
           error: null,

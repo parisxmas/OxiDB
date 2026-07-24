@@ -143,6 +143,13 @@ fn route(req: &HttpRequest, state: &State) -> HttpResponse {
         ("POST", ["platform", "v1", "projects", r, "auth", "refresh"]) => {
             handlers::end_user_refresh(req, state, r)
         }
+        // Passwordless sign-in: request a link, then the link itself.
+        ("POST", ["platform", "v1", "projects", r, "auth", "magiclink"]) => {
+            handlers::end_user_magiclink(req, state, r)
+        }
+        ("GET", ["platform", "v1", "projects", r, "auth", "magiclink", v]) if *v == "verify" => {
+            handlers::end_user_magiclink_verify(req, state, r)
+        }
         // Public: what sign-in methods this project offers.
         ("GET", ["platform", "v1", "projects", r, "auth", "settings"]) => {
             handlers::auth_settings(state, r)

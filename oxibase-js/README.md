@@ -107,6 +107,9 @@ const session = oxibase.auth.getSessionFromUrl();           // adopts + cleans t
 // or, with a Google ID token you already hold:
 await oxibase.auth.signInWithIdToken({ provider: "google", token: credential });
 
+// passwordless: email a one-time sign-in link (15 min, single use)
+await oxibase.auth.signInWithMagicLink({ email, redirectTo: "https://app/callback" });
+
 oxibase.auth.getSession();   // { token, refreshToken } | null
 oxibase.auth.signOut();      // back to the client's original key
 ```
