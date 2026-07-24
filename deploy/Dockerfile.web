@@ -11,8 +11,19 @@ COPY oxibase-dashboard/ ./
 ENV VITE_OXIBASE_URL="" VITE_OXIDB_URL=""
 RUN npm install --no-audit --no-fund && npm run build
 
+# oxibase-js, downloadable from the site (the repo is private, npm publish TBD):
+#   /oxibase-js.tgz     — npm-installable package (`npm install <url>`)
+#   /oxibase-js.esm.js  — zero-build browser ES module, deps bundled
+FROM node:20-alpine AS sdk
+WORKDIR /sdk
+COPY oxibase-js/ ./
+RUN npm install --no-audit --no-fund && npm run build \
+ && npm pack && mv oxibase-js-*.tgz oxibase-js.tgz \
+ && npx --yes esbuild src/index.ts --bundle --format=esm --minify --outfile=oxibase-js.esm.js
+
 FROM nginx:1-alpine AS runtime
 COPY --from=dash /app/dist /usr/share/nginx/html
+COPY --from=sdk /sdk/oxibase-js.tgz /sdk/oxibase-js.esm.js /usr/share/nginx/html/
 # The nginx image runs envsubst over templates → conf.d at startup, filling
 # ${OXIBASE_HOST} from the environment (nginx's own $vars are preserved).
 COPY deploy/nginx.conf.template /etc/nginx/templates/default.conf.template

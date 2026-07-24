@@ -35,12 +35,16 @@ use sha1::Digest;
 
 use crate::auth;
 use crate::jwt;
+use crate::rules::{self, AuthContext, Operation, ReadAccess};
 use oxidb::OxiDb;
 use oxidb::change_stream::{WatchFilter, WatchHandle};
 
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
-const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-5AB5DC11D685";
+// RFC 6455 §1.3 handshake GUID. This was a scrambled constant until 0.39.12 —
+// spec-compliant clients (browsers, `ws`, undici) verify Sec-WebSocket-Accept
+// and refused the connection; only non-validating clients ever connected.
+const WS_MAGIC: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 struct WsState {
     db: Arc<OxiDb>,
@@ -310,8 +314,77 @@ struct Subscription {
     #[allow(dead_code)]
     collection: Option<String>,
     query: Option<Value>,
+    /// Per-row read rule (RLS): an event's document must pass this expression
+    /// for the subscriber's auth context, or the event is not delivered.
+    /// Doc-less events (deletes) are dropped under a filter — delivering even
+    /// the id would leak row existence to a caller who can't read the row.
+    read_filter: Option<String>,
     /// The engine this watch was registered on (its database).
     db: Arc<OxiDb>,
+}
+
+/// Per-connection auth + database-pinning state.
+///
+/// A connection authenticated with an OxiBase **project key** (`auth` with a
+/// `"db"` field, verified against the project's ES256 public key) is pinned to
+/// that project's database: every later command runs there and may not target
+/// another `db`. Global-secret connections behave as before.
+struct ConnState {
+    auth_ctx: AuthContext,
+    enforced_role: Option<auth::Role>,
+    /// `(name, engine)` — set when the connection is bound to one database.
+    pinned: Option<(String, Arc<OxiDb>)>,
+}
+
+impl ConnState {
+    fn open() -> Self {
+        ConnState {
+            auth_ctx: AuthContext::anonymous(),
+            enforced_role: None,
+            pinned: None,
+        }
+    }
+}
+
+/// Handle an `auth` command: a global-secret token, or — with `"db"` — an
+/// OxiBase project key/user token verified with that project's ES256 public
+/// key. Returns the new connection state, or an error message.
+fn try_auth(cmd: &Value, state: &WsState) -> Result<ConnState, String> {
+    let token = cmd["token"].as_str().ok_or("missing 'token'")?;
+
+    if let Some(db_name) = cmd.get("db").and_then(|v| v.as_str()) {
+        // Project auth (ADR-0020): resolve ref-or-slug, verify with the
+        // project's public key alone, pin the connection to that database.
+        let mgr = state
+            .db_manager
+            .as_ref()
+            .ok_or("database targeting is not available")?;
+        if !crate::tenant_auth::enabled() {
+            return Err("project authentication is not available".to_string());
+        }
+        let db_ref = crate::tenant_auth::resolve_tenant(mgr, db_name)
+            .unwrap_or_else(|| db_name.to_string());
+        let pubkey = crate::tenant_auth::project_pubkey(mgr, &db_ref)
+            .ok_or_else(|| format!("unknown project: {db_name}"))?;
+        let claims = jwt::verify_es256(token, &pubkey).map_err(|e| e.to_string())?;
+        let db = mgr.get_database(&db_ref).map_err(|e| e.to_string())?;
+        Ok(ConnState {
+            enforced_role: Some(auth::Role::from_str(&claims.role).unwrap_or(auth::Role::Read)),
+            auth_ctx: AuthContext::from_claims(&claims.sub, &claims.role),
+            pinned: Some((db_ref, db)),
+        })
+    } else {
+        let secret = state
+            .jwt_secret
+            .as_ref()
+            .ok_or("auth is not enabled on this server")?;
+        let claims = jwt::verify(token, secret).map_err(|e| e.to_string())?;
+        Ok(ConnState {
+            enforced_role: Some(auth::Role::from_str(&claims.role).unwrap_or(auth::Role::Read)),
+            auth_ctx: AuthContext::from_claims(&claims.sub, &claims.role),
+            pinned: None,
+        })
+    }
 }
 
 fn handle_connection(mut stream: TcpStream, state: &WsState) {
@@ -321,49 +394,30 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
         return;
     }
 
-    // JWT auth: if enabled, require {"cmd": "auth", "token": "..."} as first message
-    let mut authenticated = state.jwt_secret.is_none(); // open if no secret
-    // The caller's role is enforced on every mutating command below. `None`
-    // means auth is disabled (open mode). When auth is on, the role from the
-    // verified token governs which commands are permitted — without this, a
-    // `read` token could insert/update/delete.
-    let mut enforced_role: Option<auth::Role> = None;
-    if !authenticated {
+    // JWT auth: if enabled, require {"cmd": "auth", "token": "...", ["db": "..."]}
+    // as the first message. When no global secret is set the connection starts
+    // open, but an `auth` command is still accepted at any time (OxiBase
+    // project keys authenticate per-database, independent of the global secret).
+    let mut conn = ConnState::open();
+    if state.jwt_secret.is_some() {
+        let mut authenticated = false;
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-        match read_frame(&mut stream) {
-            Some((0x01, payload)) => {
-                if let Ok(text) = std::str::from_utf8(&payload) {
-                    if let Ok(cmd) = serde_json::from_str::<Value>(text) {
-                        if cmd["cmd"].as_str() == Some("auth") {
-                            if let Some(token) = cmd["token"].as_str() {
-                                if let Some(ref secret) = state.jwt_secret {
-                                    match jwt::verify(token, secret) {
-                                        Ok(claims) => {
-                                            authenticated = true;
-                                            enforced_role = Some(
-                                                auth::Role::from_str(&claims.role)
-                                                    .unwrap_or(auth::Role::Read),
-                                            );
-                                            let _ = send_json(
-                                                &mut stream,
-                                                &json!({"ok": true, "data": "authenticated"}),
-                                            );
-                                        }
-                                        Err(e) => {
-                                            let _ = send_json(
-                                                &mut stream,
-                                                &json!({"ok": false, "error": e}),
-                                            );
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+        if let Some((0x01, payload)) = read_frame(&mut stream)
+            && let Ok(text) = std::str::from_utf8(&payload)
+            && let Ok(cmd) = serde_json::from_str::<Value>(text)
+            && cmd["cmd"].as_str() == Some("auth")
+        {
+            match try_auth(&cmd, state) {
+                Ok(c) => {
+                    conn = c;
+                    authenticated = true;
+                    let _ = send_json(&mut stream, &json!({"ok": true, "data": "authenticated"}));
+                }
+                Err(e) => {
+                    let _ = send_json(&mut stream, &json!({"ok": false, "error": e}));
+                    return;
                 }
             }
-            _ => {}
         }
         if !authenticated {
             let _ = send_json(
@@ -384,7 +438,7 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
                 // Text frame — parse JSON command
                 if let Ok(text) = std::str::from_utf8(&payload) {
                     if let Ok(cmd) = serde_json::from_str::<Value>(text) {
-                        let resp = handle_command(&cmd, state, &mut subscriptions, enforced_role);
+                        let resp = handle_command(&cmd, state, &mut subscriptions, &mut conn);
                         if !send_json(&mut stream, &resp) {
                             break;
                         }
@@ -420,6 +474,18 @@ fn handle_connection(mut stream: TcpStream, state: &WsState) {
         let mut dead_subs = Vec::new();
         for (sub_id, sub) in subscriptions.iter() {
             while let Ok(event) = sub.handle.rx.try_recv() {
+                // Per-row read rule (RLS): only doc-bearing events the caller
+                // may read are delivered; doc-less events are dropped entirely.
+                if let Some(rule) = &sub.read_filter {
+                    match &event.document {
+                        Some(doc) => {
+                            if !rules::row_visible(rule, &conn.auth_ctx, doc) {
+                                continue;
+                            }
+                        }
+                        None => continue,
+                    }
+                }
                 // If subscription has a query filter, check if the doc matches
                 if let Some(ref query) = sub.query {
                     if !query.as_object().map_or(true, |q| q.is_empty()) {
@@ -487,13 +553,32 @@ fn handle_command(
     cmd: &Value,
     state: &WsState,
     subs: &mut HashMap<String, Subscription>,
-    role: Option<auth::Role>,
+    conn: &mut ConnState,
 ) -> Value {
     let cmd_name = cmd["cmd"].as_str().unwrap_or("");
 
+    // (Re-)authentication at any time — this is how OxiBase project keys and
+    // end-user tokens authenticate on servers without a global secret.
+    if cmd_name == "auth" {
+        return match try_auth(cmd, state) {
+            Ok(c) => {
+                if !subs.is_empty() {
+                    // Existing subscriptions were authorized under the old
+                    // identity; drop them rather than leak under the new one.
+                    for (_, sub) in subs.drain() {
+                        sub.db.unwatch(sub.handle.id);
+                    }
+                }
+                *conn = c;
+                json!({"ok": true, "data": "authenticated"})
+            }
+            Err(e) => json!({"ok": false, "error": e}),
+        };
+    }
+
     // Authorization gate: when auth is enabled, mutating commands require a
     // ReadWrite (or Admin) role. Read-only commands are allowed for any role.
-    if let Some(role) = role {
+    if let Some(role) = conn.enforced_role {
         let is_mutating = matches!(cmd_name, "insert" | "update" | "delete");
         if is_mutating && role == auth::Role::Read {
             return json!({"ok": false, "error": "insufficient privileges: write operations require readWrite or admin"});
@@ -502,9 +587,19 @@ fn handle_command(
 
     // ── Database targeting (ADR-0012): a message's `"db"` field selects
     // the database; absent = the default database (backward compatible).
-    let db: Arc<OxiDb> = match cmd.get("db").and_then(|v| v.as_str()) {
-        None => Arc::clone(&state.db),
-        Some(name) => match &state.db_manager {
+    // A project-authenticated connection is pinned: commands run on the
+    // project's database and may not target any other.
+    let db: Arc<OxiDb> = match (&conn.pinned, cmd.get("db").and_then(|v| v.as_str())) {
+        (Some((_, db)), None) => Arc::clone(db),
+        (Some((name, db)), Some(requested)) => {
+            if requested == name {
+                Arc::clone(db)
+            } else {
+                return json!({"ok": false, "error": format!("connection is bound to database {name:?}")});
+            }
+        }
+        (None, None) => Arc::clone(&state.db),
+        (None, Some(name)) => match &state.db_manager {
             None => {
                 return json!({"ok": false, "error": "database targeting is not available"});
             }
@@ -514,6 +609,7 @@ fn handle_command(
             },
         },
     };
+    let auth_ctx = &conn.auth_ctx;
 
     match cmd_name {
         "ping" => json!({"ok": true, "data": "pong"}),
@@ -525,6 +621,30 @@ fn handle_command(
                 .and_then(|v| v.as_str())
                 .map(String::from);
             let query = cmd.get("query").cloned();
+
+            // Security rules (RLS): resolve the caller's read access for the
+            // collection once, at subscribe time. A non-admin token may not
+            // open an all-collections firehose — per-collection rules could
+            // not be applied to it.
+            let read_filter = match &collection {
+                Some(col) => match rules::read_access(&db, col, auth_ctx) {
+                    ReadAccess::All => None,
+                    ReadAccess::Filter(expr) => Some(expr),
+                    ReadAccess::None => {
+                        return json!({"ok": false, "error": format!("access denied: read on '{col}'")});
+                    }
+                },
+                None => {
+                    let privileged = matches!(
+                        conn.enforced_role,
+                        None | Some(auth::Role::Admin) | Some(auth::Role::ReadWrite)
+                    );
+                    if !privileged {
+                        return json!({"ok": false, "error": "subscribing without a 'collection' requires readWrite or admin"});
+                    }
+                    None
+                }
+            };
 
             let filter = match &collection {
                 Some(col) => WatchFilter::Collection(col.clone()),
@@ -540,6 +660,7 @@ fn handle_command(
                             handle,
                             collection,
                             query,
+                            read_filter,
                             db: Arc::clone(&db),
                         },
                     );
@@ -565,11 +686,26 @@ fn handle_command(
                 None => return json!({"ok": false, "error": "missing 'collection'"}),
             };
             if let Some(doc) = cmd.get("doc") {
+                if let Err(e) =
+                    rules::check_access(&db, col, Operation::Create, auth_ctx, None, Some(doc))
+                {
+                    return json!({"ok": false, "error": e});
+                }
                 match db.insert(col, doc.clone()) {
                     Ok(id) => json!({"ok": true, "data": {"id": id}}),
                     Err(e) => json!({"ok": false, "error": e.to_string()}),
                 }
             } else if let Some(docs) = cmd.get("docs").and_then(|v| v.as_array()) {
+                if let Err(e) = rules::check_access(
+                    &db,
+                    col,
+                    Operation::Create,
+                    auth_ctx,
+                    None,
+                    docs.first(),
+                ) {
+                    return json!({"ok": false, "error": e});
+                }
                 match db.insert_many(col, docs.clone()) {
                     Ok(ids) => json!({"ok": true, "data": {"ids": ids}}),
                     Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -587,7 +723,19 @@ fn handle_command(
             let empty = json!({});
             let query = cmd.get("query").unwrap_or(&empty);
             match db.find(col, query) {
-                Ok(docs) => json!({"ok": true, "data": docs}),
+                Ok(docs) => match rules::read_access(&db, col, auth_ctx) {
+                    ReadAccess::All => json!({"ok": true, "data": docs}),
+                    ReadAccess::None => {
+                        json!({"ok": false, "error": format!("access denied: read on '{col}'")})
+                    }
+                    ReadAccess::Filter(expr) => {
+                        let visible: Vec<Value> = docs
+                            .into_iter()
+                            .filter(|d| rules::row_visible(&expr, auth_ctx, d))
+                            .collect();
+                        json!({"ok": true, "data": visible})
+                    }
+                },
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
         }
@@ -600,7 +748,17 @@ fn handle_command(
             let empty = json!({});
             let query = cmd.get("query").unwrap_or(&empty);
             match db.find_one(col, query) {
-                Ok(doc) => json!({"ok": true, "data": doc}),
+                Ok(doc) => match rules::read_access(&db, col, auth_ctx) {
+                    ReadAccess::All => json!({"ok": true, "data": doc}),
+                    ReadAccess::None => {
+                        json!({"ok": false, "error": format!("access denied: read on '{col}'")})
+                    }
+                    ReadAccess::Filter(expr) => {
+                        let visible =
+                            doc.filter(|d| rules::row_visible(&expr, auth_ctx, d));
+                        json!({"ok": true, "data": visible})
+                    }
+                },
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
             }
         }
@@ -618,6 +776,10 @@ fn handle_command(
                 Some(u) => u,
                 None => return json!({"ok": false, "error": "missing 'update'"}),
             };
+            // Per-row rule check over the match set (REST parity).
+            if let Err(e) = check_write_rules(&db, col, Operation::Update, auth_ctx, query) {
+                return json!({"ok": false, "error": e});
+            }
             match db.update(col, query, update) {
                 Ok(n) => json!({"ok": true, "data": {"modified": n}}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -633,6 +795,9 @@ fn handle_command(
                 Some(q) => q,
                 None => return json!({"ok": false, "error": "missing 'query'"}),
             };
+            if let Err(e) = check_write_rules(&db, col, Operation::Delete, auth_ctx, query) {
+                return json!({"ok": false, "error": e});
+            }
             match db.delete(col, query) {
                 Ok(n) => json!({"ok": true, "data": {"deleted": n}}),
                 Err(e) => json!({"ok": false, "error": e.to_string()}),
@@ -646,13 +811,48 @@ fn handle_command(
             };
             let empty = json!({});
             let query = cmd.get("query").unwrap_or(&empty);
-            match db.count(col, query) {
-                Ok(n) => json!({"ok": true, "data": {"count": n}}),
-                Err(e) => json!({"ok": false, "error": e.to_string()}),
+            match rules::read_access(&db, col, auth_ctx) {
+                ReadAccess::None => {
+                    json!({"ok": false, "error": format!("access denied: read on '{col}'")})
+                }
+                ReadAccess::All => match db.count(col, query) {
+                    Ok(n) => json!({"ok": true, "data": {"count": n}}),
+                    Err(e) => json!({"ok": false, "error": e.to_string()}),
+                },
+                // A per-row rule means the caller's count is the count of rows
+                // it can see, not the collection's.
+                ReadAccess::Filter(expr) => match db.find(col, query) {
+                    Ok(docs) => {
+                        let n = docs
+                            .iter()
+                            .filter(|d| rules::row_visible(&expr, auth_ctx, d))
+                            .count();
+                        json!({"ok": true, "data": {"count": n}})
+                    }
+                    Err(e) => json!({"ok": false, "error": e.to_string()}),
+                },
             }
         }
 
         // (`sql` cmd removed alongside the SQL surface.)
         _ => json!({"ok": false, "error": format!("unknown command: {cmd_name}")}),
     }
+}
+
+/// Enforce a write-class rule (`update`/`delete`) over every document the
+/// query matches — the same per-row semantics the REST surface applies. The
+/// first denied row rejects the whole command.
+fn check_write_rules(
+    db: &OxiDb,
+    col: &str,
+    op: Operation,
+    auth_ctx: &AuthContext,
+    query: &Value,
+) -> Result<(), String> {
+    let docs = db.find(col, query).map_err(|e| e.to_string())?;
+    // Zero matches = zero writes; nothing to authorize (REST parity).
+    for doc in &docs {
+        rules::check_access(db, col, op, auth_ctx, Some(doc), None)?;
+    }
+    Ok(())
 }

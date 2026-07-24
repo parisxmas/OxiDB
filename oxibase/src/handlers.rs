@@ -53,6 +53,13 @@ fn project_max_tables() -> usize {
 fn project_max_documents() -> usize {
     env_usize("OXIDB_PROJECT_MAX_DOCUMENTS", 10_000)
 }
+/// Per-project blob-storage cap in bytes (default 100 MiB; 0 = unlimited).
+fn project_max_storage_bytes() -> u64 {
+    std::env::var("OXIDB_PROJECT_MAX_STORAGE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(104_857_600)
+}
 fn max_accounts() -> usize {
     env_usize("OXIDB_PLATFORM_MAX_ACCOUNTS", 10_000)
 }
@@ -276,6 +283,7 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
         "max_collections": project_max_collections(),
         "max_tables": project_max_tables(),
         "max_documents": project_max_documents(),
+        "max_storage_bytes": project_max_storage_bytes(),
     });
     if let Err(e) = state.upstream.insert("projects", &doc) {
         let _ = state.upstream.drop_database(&project_ref);
@@ -297,6 +305,7 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
             project_max_collections() as u64,
             project_max_tables() as u64,
             project_max_documents() as u64,
+            project_max_storage_bytes(),
         ),
     )
 }
@@ -334,11 +343,11 @@ pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Some(s) => s,
         None => return resp(500, json!({ "message": "unseal failed" })),
     };
-    let (mc, mt, md) = doc_limits(&doc);
+    let (mc, mt, md, ms) = doc_limits(&doc);
     resp(
         200,
         project_view(
-            project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true, mc, mt, md,
+            project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true, mc, mt, md, ms,
         ),
     )
 }
@@ -675,7 +684,7 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let (created_at, _, name) = meta(&doc);
-    let (mc, mt, md) = doc_limits(&doc);
+    let (mc, mt, md, ms) = doc_limits(&doc);
     let slug = doc_slug(&doc, project_ref);
     let (priv_scalar, pub_point) = crypto::gen_es256_keypair();
     let new_iat = now_secs();
@@ -704,6 +713,7 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
             mc,
             mt,
             md,
+            ms,
         ),
     )
 }
@@ -723,18 +733,19 @@ pub fn update_limits(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
     let body = parse_body(req);
-    let (cur_mc, cur_mt, cur_md) = doc_limits(&doc);
+    let (cur_mc, cur_mt, cur_md, cur_ms) = doc_limits(&doc);
     let field = |key: &str, cur: u64| body.get(key).and_then(|v| v.as_u64()).unwrap_or(cur);
     let mc = field("max_collections", cur_mc);
     let mt = field("max_tables", cur_mt);
     let md = field("max_documents", cur_md);
+    let ms = field("max_storage_bytes", cur_ms);
     const CEIL: u64 = 10_000_000;
-    if mc > 100_000 || mt > 100_000 || md > CEIL {
+    // Storage is bytes, not a count — allow up to 100 GiB.
+    if mc > 100_000 || mt > 100_000 || md > CEIL || ms > 107_374_182_400 {
         return resp(400, json!({ "message": "limit out of range (0 = unlimited)" }));
     }
     let query = json!({ "ref": project_ref });
-    let patch =
-        json!({ "$set": { "max_collections": mc, "max_tables": mt, "max_documents": md } });
+    let patch = json!({ "$set": { "max_collections": mc, "max_tables": mt, "max_documents": md, "max_storage_bytes": ms } });
     if let Err(e) = state.upstream.update("projects", &query, &patch) {
         return resp(
             502,
@@ -750,7 +761,7 @@ pub fn update_limits(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
     resp(
         200,
         project_view(
-            project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true, mc, mt, md,
+            project_ref, &slug, &name, created_at, key_iat, &priv_scalar, true, mc, mt, md, ms,
         ),
     )
 }
@@ -793,12 +804,13 @@ fn project_priv(state: &State, doc: &Value) -> Option<Vec<u8>> {
 /// A project's resource caps `(max_collections, max_tables, max_documents)`,
 /// from its row (falling back to the configured defaults for rows created
 /// before a given quota existed).
-fn doc_limits(doc: &Value) -> (u64, u64, u64) {
+fn doc_limits(doc: &Value) -> (u64, u64, u64, u64) {
     let get = |key: &str, default: u64| doc.get(key).and_then(|v| v.as_u64()).unwrap_or(default);
     (
         get("max_collections", project_max_collections() as u64),
         get("max_tables", project_max_tables() as u64),
         get("max_documents", project_max_documents() as u64),
+        get("max_storage_bytes", project_max_storage_bytes()),
     )
 }
 
@@ -814,6 +826,7 @@ fn project_view(
     max_collections: u64,
     max_tables: u64,
     max_documents: u64,
+    max_storage_bytes: u64,
 ) -> Value {
     let base = std::env::var("OXIDB_PLATFORM_BASE_URL").unwrap_or_default();
     // Path-based addressing is the friendly default: `<host>/<slug>/rest/v1`.
@@ -826,6 +839,7 @@ fn project_view(
         "ref": project_ref, "slug": slug, "name": name, "db": project_ref,
         "endpoint": format!("/{slug}/rest/v1"), "url": url, "isolation": "shared", "created_at": created_at,
         "max_collections": max_collections, "max_tables": max_tables, "max_documents": max_documents,
+        "max_storage_bytes": max_storage_bytes,
     });
     if keys {
         let o = v.as_object_mut().unwrap();

@@ -326,6 +326,99 @@ export function dropSqlTable(ref: string, key: string, table: string): Promise<S
   return runSql(ref, key, `DROP TABLE ${quoteIdent(table)}`);
 }
 
+// ── File storage (`/api/storage`) ───────────────────────────────────────────
+
+export interface StorageObject {
+  key: string;
+  bucket: string;
+  size: number;
+  content_type: string;
+  etag: string;
+  created_at: string;
+}
+
+/** Buckets of the project plus total stored bytes (the quota usage). */
+export function listBuckets(
+  ref: string,
+  key: string,
+): Promise<{ buckets: string[]; total_bytes: number }> {
+  return call("GET", ref, "/api/storage", key);
+}
+
+export function createBucket(ref: string, key: string, bucket: string): Promise<unknown> {
+  return call("POST", ref, `/api/storage/${encodeURIComponent(bucket)}`, key);
+}
+
+/** Delete an empty bucket (the server refuses while objects remain). */
+export function deleteBucket(ref: string, key: string, bucket: string): Promise<unknown> {
+  return call("DELETE", ref, `/api/storage/${encodeURIComponent(bucket)}`, key);
+}
+
+export async function listObjects(
+  ref: string,
+  key: string,
+  bucket: string,
+): Promise<StorageObject[]> {
+  const d = await call<{ objects: StorageObject[] }>(
+    "GET",
+    ref,
+    `/api/storage/${encodeURIComponent(bucket)}`,
+    key,
+  );
+  return d.objects ?? [];
+}
+
+const objectPath = (bucket: string, objKey: string) =>
+  `/api/storage/${encodeURIComponent(bucket)}/${objKey.split("/").map(encodeURIComponent).join("/")}`;
+
+/** Upload a file (raw bytes; its MIME type is stored and served back). */
+export async function uploadObject(
+  ref: string,
+  key: string,
+  bucket: string,
+  objKey: string,
+  file: Blob,
+): Promise<void> {
+  const res = await fetch(withDb(ref, objectPath(bucket, objKey)), {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": file.type || "application/octet-stream",
+    },
+    body: file,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    throw new Error((data && data.error) || `HTTP ${res.status}`);
+  }
+}
+
+/** Download an object as a Blob (stored Content-Type preserved). */
+export async function downloadObject(
+  ref: string,
+  key: string,
+  bucket: string,
+  objKey: string,
+): Promise<Blob> {
+  const res = await fetch(withDb(ref, objectPath(bucket, objKey)), {
+    headers: { Authorization: `Bearer ${key}` },
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => null);
+    throw new Error((data && data.error) || `HTTP ${res.status}`);
+  }
+  return res.blob();
+}
+
+export function deleteObject(
+  ref: string,
+  key: string,
+  bucket: string,
+  objKey: string,
+): Promise<unknown> {
+  return call("DELETE", ref, objectPath(bucket, objKey), key);
+}
+
 // Table names come from SHOW TABLES (engine-validated identifiers), but quote
 // defensively so an unusual name can't break the statement.
 function quoteIdent(name: string): string {

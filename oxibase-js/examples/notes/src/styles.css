@@ -27,6 +27,25 @@ body {
   font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 .app { max-width: 560px; margin: 48px auto; padding: 0 20px; }
+.app.wide { max-width: 1060px; }
+.panels { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: start; }
+@media (max-width: 860px) { .panels { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; }
+.panel h2 { font-size: 17px; margin: 0 0 12px; display: flex; align-items: baseline; gap: 8px; }
+.tag { font-size: 11px; font-weight: 500; }
+.addr-form { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
+.addr-form input {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 9px 11px; border-radius: 8px; font-size: 14px; outline: none;
+}
+.addr-form input:focus { border-color: var(--accent); }
+.addr-form .span2 { grid-column: span 2; }
+.table-wrap { overflow-x: auto; }
+.panel table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.panel th, .panel td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.panel th { color: var(--muted); font-weight: 600; }
+.panel tbody tr:last-child td { border-bottom: none; }
+.id { font-size: 12px; }
 h1 { font-size: 24px; margin: 0 0 4px; }
 .sub { margin: 0 0 24px; }
 .sub code { background: var(--panel); border: 1px solid var(--border); border-radius: 5px; padding: 1px 5px; font-size: 12px; }

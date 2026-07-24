@@ -1764,18 +1764,27 @@ impl OxiDb {
             prepared
         };
 
+        // Subscribers get the documents in their events (matching single
+        // `insert`): snapshot them before `prepared` is consumed. `keep_values`
+        // is forced on when `emit` is set, so the Values are real, not Null.
+        let emit_docs: Option<Vec<Value>> = if emit {
+            Some(prepared.iter().map(|(_, v, _)| v.clone()).collect())
+        } else {
+            None
+        };
+
         // Phase 3: Insert pre-serialized docs (fast: no serialization)
         let ids = col.insert_many_prepared(prepared)?;
 
         // Emit change events if needed
-        if emit {
-            for &id in &ids {
+        if let Some(docs) = emit_docs {
+            for (&id, doc) in ids.iter().zip(docs) {
                 self.change_broker.emit(ChangeEvent {
                     token: 0,
                     operation: OperationType::Insert,
                     collection: collection.to_string(),
                     doc_id: id,
-                    document: None,
+                    document: if doc.is_null() { None } else { Some(doc) },
                     tx_id: None,
                 });
             }

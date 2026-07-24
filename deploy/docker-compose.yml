@@ -23,6 +23,7 @@ services:
       OXIDB_TSDB: "1"
       OXIDB_ADDR: "0.0.0.0:4444"          # wire (internal only)
       OXIDB_HTTP_PORT: "8087"             # REST (internal, behind nginx)
+      OXIDB_WS_PORT: "8089"               # realtime WebSocket (internal, behind nginx /ws)
       OXIDB_DATA: "/data"
       OXIDB_JWT_SECRET: "${OXIDB_JWT_SECRET}"   # guards the default-db / native path
       OXIDB_PGRST_MAX_ROWS: "${OXIDB_PGRST_MAX_ROWS:-1000}"

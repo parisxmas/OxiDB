@@ -14,6 +14,7 @@ export interface Project {
   max_collections?: number;
   max_tables?: number;
   max_documents?: number;
+  max_storage_bytes?: number;
 }
 
 const BASE: string = import.meta.env.VITE_OXIBASE_URL ?? "";
@@ -106,7 +107,7 @@ export function rotateKeys(ref: string): Promise<Project> {
 /** Update a project's resource quotas (0 = unlimited). Owner only. */
 export function updateProjectLimits(
   ref: string,
-  limits: { max_collections?: number; max_tables?: number; max_documents?: number },
+  limits: { max_collections?: number; max_tables?: number; max_documents?: number; max_storage_bytes?: number },
 ): Promise<Project> {
   return req<Project>("PATCH", `/projects/${encodeURIComponent(ref)}/limits`, limits);
 }

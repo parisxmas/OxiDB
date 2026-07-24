@@ -34,6 +34,12 @@ export interface OxibaseOptions {
    * (`oxibase.example.com/<slug>/…`). `ref` may be the project's ref or slug.
    */
   tenantInPath?: boolean;
+  /**
+   * WebSocket endpoint for `.subscribe()`. Defaults to the data-plane URL with
+   * the scheme flipped to ws(s) and `/ws` appended (the standard deployment's
+   * proxy path). Point it at `ws://host:<OXIDB_WS_PORT>` for a direct server.
+   */
+  realtimeUrl?: string;
 }
 
 export interface AuthResult {
@@ -72,6 +78,74 @@ export interface SqlResult {
   ddl?: boolean;
 }
 
+/** One realtime change pushed by the server. */
+export interface ChangeEvent {
+  /** "insert" | "update" | "delete" */
+  op: string;
+  collection: string;
+  docId?: unknown;
+  /** The changed document (absent on deletes). */
+  doc?: Record<string, unknown> | null;
+}
+
+export interface SubscribeOptions {
+  /** Server-side equality filter: only events whose doc matches are pushed. */
+  query?: Record<string, unknown>;
+  /** Called on subscription errors (access denied, connection loss, …). */
+  onError?: (message: string) => void;
+}
+
+export interface RealtimeSubscription {
+  unsubscribe(): void;
+}
+
+/** Metadata of one stored object. */
+export interface StorageObject {
+  key: string;
+  bucket: string;
+  size: number;
+  content_type: string;
+  etag: string;
+  created_at: string;
+}
+
+/** Operations on one storage bucket — the Supabase `storage.from()` analog. */
+export interface StorageBucket {
+  /** Upload (or overwrite) an object. `data` may be a Blob/File, ArrayBuffer,
+   *  typed array, or string. Requires the service_role key (writes are
+   *  RBAC-gated). */
+  upload(
+    key: string,
+    data: Blob | ArrayBuffer | ArrayBufferView | string,
+    opts?: { contentType?: string },
+  ): Promise<{ data: StorageObject | null; error: string | null }>;
+  /** Download an object as a Blob (its stored Content-Type preserved). */
+  download(key: string): Promise<{ data: Blob | null; error: string | null }>;
+  /** List objects, optionally under a key prefix. */
+  list(opts?: {
+    prefix?: string;
+    limit?: number;
+  }): Promise<{ data: StorageObject[] | null; error: string | null }>;
+  /** Delete one object. */
+  remove(key: string): Promise<{ error: string | null }>;
+  /** The object's URL (requests to it still need the Authorization header). */
+  getUrl(key: string): string;
+}
+
+export interface OxibaseStorage {
+  /** Buckets in the project, plus total stored bytes (the quota usage). */
+  listBuckets(): Promise<{
+    data: { buckets: string[]; totalBytes: number } | null;
+    error: string | null;
+  }>;
+  /** Create a bucket explicitly (uploads also auto-create their bucket). */
+  createBucket(name: string): Promise<{ error: string | null }>;
+  /** Delete an empty bucket. */
+  deleteBucket(name: string): Promise<{ error: string | null }>;
+  /** Scope to one bucket. */
+  from(bucket: string): StorageBucket;
+}
+
 export interface OxibaseClient {
   /**
    * PostgREST query builder for a table/collection — the Supabase `.from()`.
@@ -92,6 +166,18 @@ export interface OxibaseClient {
   rpc: PostgrestClient["rpc"];
   /** Run SQL against the project's SQL engine (requires `OXIDB_SQL=1`). */
   sql: (text: string, params?: unknown[]) => Promise<{ results: SqlResult[] | null; error: string | null }>;
+  /**
+   * Subscribe to live changes of a collection (requires `OXIDB_WS_PORT` on the
+   * server). Events are pushed over one shared WebSocket; per-row read rules
+   * are enforced server-side (a caller only receives rows it may read).
+   */
+  subscribe: (
+    collection: string,
+    callback: (event: ChangeEvent) => void,
+    opts?: SubscribeOptions,
+  ) => RealtimeSubscription;
+  /** Per-project file storage (`/api/storage`) — see {@link OxibaseStorage}. */
+  storage: OxibaseStorage;
   /** End-user auth (signup/login) — see {@link OxibaseAuth}. Needs `authUrl`. */
   auth: OxibaseAuth;
   /** The underlying postgrest-js client, if you need it directly. */
@@ -214,22 +300,309 @@ export function createClient(url: string, key: string, opts: OxibaseOptions = {}
   }
 
   const auth: OxibaseAuth = {
-    signUp: ({ email, password }) => authCall("signup", email, password),
-    signInWithPassword: ({ email, password }) => authCall("login", email, password),
+    signUp: async (c) => {
+      const r = await authCall("signup", c.email, c.password);
+      if (!r.error) realtimeReset();
+      return r;
+    },
+    signInWithPassword: async (c) => {
+      const r = await authCall("login", c.email, c.password);
+      if (!r.error) realtimeReset();
+      return r;
+    },
     refreshSession: async () =>
       (await tryRefresh()) ? { token, refreshToken, error: null } : { error: "refresh failed" },
     signOut: () => {
       token = key;
       refreshToken = "";
+      realtimeReset();
     },
     getSession: () => (refreshToken ? { token, refreshToken } : null),
   };
+
+  // ── Realtime (`.subscribe`) ──────────────────────────────────────────────
+  // One shared WebSocket, lazily opened. The server processes commands
+  // sequentially per connection, so plain-`ok` replies are matched FIFO to the
+  // commands that caused them. Change events carry a subscription id.
+  const wsUrl =
+    opts.realtimeUrl ??
+    base.replace(/^http/, "ws") + (opts.tenantInPath && ref ? `/${encodeURIComponent(ref)}` : "") + "/ws";
+
+  interface SubEntry {
+    collection: string;
+    query?: Record<string, unknown>;
+    callback: (event: ChangeEvent) => void;
+    onError?: (message: string) => void;
+    active: boolean;
+  }
+  let ws: WebSocket | null = null;
+  let wsReady = false; // authenticated (or auth not required) and usable
+  let nextSubId = 1;
+  let retryMs = 500;
+  const subsById = new Map<string, SubEntry>();
+  // FIFO of handlers for the next plain (non-event) server replies.
+  let acks: Array<(ok: boolean, err?: string) => void> = [];
+
+  function realtimeReset() {
+    // Identity changed: drop the connection; live subscriptions re-subscribe
+    // under the new token on reconnect.
+    if (ws) {
+      const w = ws;
+      ws = null;
+      wsReady = false;
+      acks = [];
+      try {
+        w.close();
+      } catch {
+        /* already closed */
+      }
+      if (subsById.size > 0) wsConnect();
+    }
+  }
+
+  function wsSend(obj: Record<string, unknown>, onAck?: (ok: boolean, err?: string) => void) {
+    if (!ws || ws.readyState !== 1) return;
+    acks.push(onAck ?? (() => {}));
+    ws.send(JSON.stringify(obj));
+  }
+
+  function subscribeOne(id: string, sub: SubEntry) {
+    wsSend(
+      {
+        cmd: "subscribe",
+        id,
+        collection: sub.collection,
+        ...(sub.query ? { query: sub.query } : {}),
+        ...(ref ? { db: ref } : {}),
+      },
+      (ok, err) => {
+        if (!ok) {
+          sub.active = false;
+          sub.onError?.(err ?? "subscribe failed");
+        }
+      },
+    );
+  }
+
+  function wsConnect() {
+    if (ws) return;
+    let sock: WebSocket;
+    try {
+      sock = new WebSocket(wsUrl);
+    } catch (e) {
+      failAll(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    ws = sock;
+    wsReady = false;
+
+    sock.onopen = () => {
+      retryMs = 500;
+      // Authenticate first: project connections verify with the project's own
+      // key and get pinned to its database server-side.
+      wsSend({ cmd: "auth", token, ...(ref ? { db: ref } : {}) }, (ok, err) => {
+        if (!ok) {
+          // Open servers reject `auth` ("auth is not enabled") — usable as-is.
+          if (err && !/auth is not enabled/.test(err)) {
+            failAll(err);
+            try {
+              sock.close();
+            } catch {
+              /* ignore */
+            }
+            return;
+          }
+        }
+        wsReady = true;
+        for (const [id, sub] of subsById) {
+          if (sub.active) subscribeOne(id, sub);
+        }
+      });
+    };
+
+    sock.onmessage = (ev: MessageEvent) => {
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(String(ev.data));
+      } catch {
+        return;
+      }
+      if (msg.event === "change") {
+        const sub = subsById.get(String(msg.subscription));
+        if (sub && sub.active) {
+          sub.callback({
+            op: String(msg.op ?? ""),
+            collection: String(msg.collection ?? ""),
+            docId: msg.doc_id,
+            doc: (msg.doc as Record<string, unknown> | null) ?? undefined,
+          });
+        }
+        return;
+      }
+      const handler = acks.shift();
+      handler?.(msg.ok === true, typeof msg.error === "string" ? msg.error : undefined);
+    };
+
+    sock.onclose = () => {
+      if (ws !== sock) return; // superseded (reset)
+      ws = null;
+      wsReady = false;
+      acks = [];
+      if (subsById.size > 0) {
+        const delay = retryMs;
+        retryMs = Math.min(retryMs * 2, 15_000);
+        setTimeout(() => {
+          if (!ws && subsById.size > 0) wsConnect();
+        }, delay);
+      }
+    };
+    sock.onerror = () => {
+      /* onclose follows and handles retry */
+    };
+  }
+
+  function failAll(message: string) {
+    for (const sub of subsById.values()) {
+      if (sub.active) sub.onError?.(message);
+    }
+  }
+
+  // ── Storage (`.storage`) ─────────────────────────────────────────────────
+  const storageUrl = (path: string) => {
+    const u = new URL(`${base}${pathTenant}/api/storage${path}`);
+    if (ref && !opts.tenantInPath) u.searchParams.set("db", ref);
+    return u.toString();
+  };
+
+  async function storageJson<T>(
+    method: string,
+    path: string,
+    body?: BodyInit,
+    headers?: Record<string, string>,
+  ): Promise<{ data: T | null; error: string | null }> {
+    let r: Response;
+    try {
+      r = await sendAuthed(storageUrl(path), { method, body, headers });
+    } catch (e) {
+      return { data: null, error: e instanceof Error ? e.message : String(e) };
+    }
+    const j = (await r.json().catch(() => null)) as (T & { error?: string }) | null;
+    if (!r.ok) return { data: null, error: j?.error ?? `HTTP ${r.status}` };
+    return { data: j, error: null };
+  }
+
+  const storage: OxibaseStorage = {
+    async listBuckets() {
+      const { data, error } = await storageJson<{ buckets: string[]; total_bytes: number }>(
+        "GET",
+        "",
+      );
+      return {
+        data: data ? { buckets: data.buckets, totalBytes: data.total_bytes } : null,
+        error,
+      };
+    },
+    async createBucket(name) {
+      const { error } = await storageJson("POST", `/${encodeURIComponent(name)}`);
+      return { error };
+    },
+    async deleteBucket(name) {
+      const { error } = await storageJson("DELETE", `/${encodeURIComponent(name)}`);
+      return { error };
+    },
+    from(bucket) {
+      const b = encodeURIComponent(bucket);
+      const keyPath = (key: string) =>
+        `/${b}/${key.split("/").map(encodeURIComponent).join("/")}`;
+      return {
+        async upload(key, data, uploadOpts) {
+          const contentType =
+            uploadOpts?.contentType ??
+            (typeof Blob !== "undefined" && data instanceof Blob && data.type
+              ? data.type
+              : "application/octet-stream");
+          return storageJson<StorageObject>("PUT", keyPath(key), data as BodyInit, {
+            "Content-Type": contentType,
+          });
+        },
+        async download(key) {
+          let r: Response;
+          try {
+            r = await sendAuthed(storageUrl(keyPath(key)));
+          } catch (e) {
+            return { data: null, error: e instanceof Error ? e.message : String(e) };
+          }
+          if (!r.ok) {
+            const j = (await r.json().catch(() => null)) as { error?: string } | null;
+            return { data: null, error: j?.error ?? `HTTP ${r.status}` };
+          }
+          return { data: await r.blob(), error: null };
+        },
+        async list(listOpts) {
+          const q = new URLSearchParams();
+          if (listOpts?.prefix) q.set("prefix", listOpts.prefix);
+          if (listOpts?.limit) q.set("limit", String(listOpts.limit));
+          const qs = q.toString();
+          const { data, error } = await storageJson<{ objects: StorageObject[] }>(
+            "GET",
+            `/${b}${qs ? `?${qs}` : ""}`,
+          );
+          return { data: data?.objects ?? null, error };
+        },
+        async remove(key) {
+          const { error } = await storageJson("DELETE", keyPath(key));
+          return { error };
+        },
+        getUrl(key) {
+          return storageUrl(keyPath(key));
+        },
+      };
+    },
+  };
+
+  function subscribe(
+    collection: string,
+    callback: (event: ChangeEvent) => void,
+    subOpts: SubscribeOptions = {},
+  ): RealtimeSubscription {
+    const id = `sub${nextSubId++}`;
+    const entry: SubEntry = {
+      collection,
+      query: subOpts.query,
+      callback,
+      onError: subOpts.onError,
+      active: true,
+    };
+    subsById.set(id, entry);
+    if (ws && wsReady) subscribeOne(id, entry);
+    else wsConnect();
+    return {
+      unsubscribe() {
+        entry.active = false;
+        subsById.delete(id);
+        if (ws && wsReady) wsSend({ cmd: "unsubscribe", id });
+        if (subsById.size === 0 && ws) {
+          const w = ws;
+          ws = null;
+          wsReady = false;
+          acks = [];
+          try {
+            w.close();
+          } catch {
+            /* ignore */
+          }
+        }
+      },
+    };
+  }
 
   return {
     from: rest.from.bind(rest),
     schema: rest.schema.bind(rest),
     rpc: rest.rpc.bind(rest),
     sql,
+    subscribe,
+    storage,
     auth,
     rest,
     url: base,

@@ -185,6 +185,55 @@ button:disabled { opacity: 0.55; cursor: default; }
 }
 .coll.active .rowcount { background: var(--panel); }
 
+/* Docs (/docs — public JS tutorial) */
+.docs {
+  display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 32px;
+  max-width: 1080px; margin: 0 auto; padding: 28px 24px 80px;
+}
+@media (max-width: 800px) { .docs { grid-template-columns: 1fr; } .docs-toc { display: none; } }
+.docs-toc { position: sticky; top: 76px; align-self: start; display: grid; gap: 2px; }
+.toc-link {
+  color: var(--muted); font-size: 13px; padding: 5px 8px; border-radius: 6px;
+  text-decoration: none;
+}
+.toc-link:hover { color: var(--text); background: var(--panel-2); text-decoration: none; }
+.docs-body { min-width: 0; }
+.docs-body h1 { font-size: 28px; margin: 4px 0 10px; }
+.docs-body h2 {
+  font-size: 19px; margin: 40px 0 10px; padding-top: 12px;
+  border-top: 1px solid var(--border); scroll-margin-top: 76px;
+}
+.docs-body p, .docs-body li { line-height: 1.65; font-size: 14.5px; }
+.docs-body .lead { color: var(--muted); font-size: 15.5px; }
+.docs-body ul { padding-left: 22px; display: grid; gap: 6px; }
+.docs-body code {
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 5px;
+  padding: 1px 5px; font-size: 12.5px;
+}
+.docs-body a { text-decoration: underline; text-underline-offset: 2px; }
+.docs-body .note {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
+  border-radius: 8px; padding: 10px 14px; font-size: 13.5px;
+}
+.codeblock { position: relative; margin: 14px 0; }
+.codeblock pre {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 14px 16px; overflow-x: auto; margin: 0;
+  font-size: 12.5px; line-height: 1.55;
+}
+.codeblock pre code { background: none; border: none; padding: 0; font-size: inherit; }
+.codetitle {
+  position: absolute; top: -9px; left: 12px; background: var(--bg);
+  color: var(--muted); font-size: 11px; padding: 0 6px; border-radius: 4px;
+}
+.copybtn {
+  position: absolute; top: 8px; right: 8px; padding: 3px 10px; font-size: 11px;
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px;
+}
+.copybtn:hover { color: var(--text); border-color: var(--accent); }
+
 /* Rules editor */
 .badge { font-size: 11px; padding: 2px 9px; border-radius: 999px; white-space: nowrap; }
 .badge.on { background: color-mix(in srgb, var(--accent) 18%, transparent); color: var(--accent); }

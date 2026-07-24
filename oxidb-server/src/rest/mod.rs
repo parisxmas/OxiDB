@@ -46,6 +46,7 @@ use crate::s3::http::{HttpRequest, HttpResponse, parse_request_from_reader};
 mod postgrest;
 mod postgrest_sql;
 mod postgrest_tsdb;
+mod storage;
 
 const POOL_SIZE: usize = 64;
 const MAX_QUEUED: usize = 512;
@@ -464,6 +465,13 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
             state,
             enforced_role,
         ));
+    }
+
+    // ── Per-project file storage (`/api/storage/…`) ───────────────────
+    // Handled outside the generic match: downloads return raw bytes with the
+    // stored Content-Type, which the JSON-only match below cannot express.
+    if segments.len() >= 2 && segments[0] == "api" && segments[1] == "storage" {
+        return with_rest_cors(storage::handle(req, state, &segments[2..], db_name.as_deref()));
     }
 
     // ── PostgREST-compatible surface (ADR-0019): /rest/v1/{table} ──────
@@ -1223,6 +1231,7 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str]) -> bool {
         Read | Authenticated => matches!(
             (method, segments),
             ("GET", _)
+                | ("HEAD", ["api", "storage", ..])
                 | ("POST", ["api", _, "aggregate"])
                 | ("POST", ["api", "sql"])
                 | ("POST" | "PATCH" | "DELETE", ["rest", "v1", _])

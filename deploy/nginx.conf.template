@@ -37,6 +37,17 @@ server {
         proxy_pass http://data-plane:8087;
     }
 
+    # ── Data plane — realtime WebSocket (`oxibase-js` .subscribe) ──
+    # The WS listener speaks raw WebSocket on its own port; proxy the upgrade
+    # through and keep the tunnel open for long-lived subscriptions.
+    location = /ws {
+        proxy_pass http://data-plane:8089;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+    }
+
     # ── Dashboard SPA (everything else) ──
     location / {
         root /usr/share/nginx/html;

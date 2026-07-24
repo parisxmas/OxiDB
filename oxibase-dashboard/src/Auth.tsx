@@ -40,7 +40,7 @@ function loadGsi(): Promise<void> {
   });
 }
 
-export function Auth({ onAuthed }: { onAuthed: () => void }) {
+export function Auth({ onAuthed, onDocs }: { onAuthed: () => void; onDocs: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [showInfo, setShowInfo] = useState(false);
@@ -108,13 +108,16 @@ export function Auth({ onAuthed }: { onAuthed: () => void }) {
         <p className="muted center" style={{ fontSize: 12 }}>
           Developer accounts use Google sign-in.
         </p>
-        <div className="center" style={{ marginTop: 6 }}>
+        <div className="center" style={{ marginTop: 6, display: "flex", gap: 8, justifyContent: "center" }}>
           <button
             className="ghost small"
             onClick={() => setShowInfo((s) => !s)}
             aria-expanded={showInfo}
           >
             {showInfo ? "Hide" : "What is OxiBase?"}
+          </button>
+          <button className="ghost small" onClick={onDocs}>
+            JavaScript tutorial
           </button>
         </div>
       </div>
