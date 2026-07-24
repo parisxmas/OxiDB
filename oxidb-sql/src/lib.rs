@@ -655,8 +655,9 @@ impl SqlEngine {
                         // succeeds here (and on deterministic replay over the
                         // same data). Keep the original on the impossible
                         // failure rather than losing the cell.
-                        let cast =
-                            |v: &Value| executor::cast_value(v.clone(), *ty).unwrap_or_else(|_| v.clone());
+                        let cast = |v: &Value| {
+                            executor::cast_value(v.clone(), *ty).unwrap_or_else(|_| v.clone())
+                        };
                         def.columns[pos].ty = *ty;
                         def.columns[pos].max_len = *max_len;
                         if let Some(dv) = def.columns[pos].default_value.take() {
@@ -2286,6 +2287,81 @@ pub fn leaves_transaction_open(sql: &str) -> Result<bool> {
         }
     }
     Ok(open)
+}
+
+/// Every base table a statement reads or writes, in no particular order.
+///
+/// Used by the server to decide whether an untrusted caller may run a
+/// statement at all: a security rule is per table, and a query that joins
+/// three of them has to satisfy the rule of each. Derived tables and CTEs
+/// contribute their own inner references, not their alias.
+pub fn referenced_tables(sql: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for stmt in parser::parse(sql)? {
+        collect_statement_tables(&stmt, &mut out);
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn push_table(name: &str, out: &mut Vec<String>) {
+    if !name.is_empty() {
+        out.push(name.to_string());
+    }
+}
+
+fn collect_statement_tables(stmt: &ast::Statement, out: &mut Vec<String>) {
+    use ast::Statement as S;
+    match stmt {
+        S::Select(q) => collect_query_tables(q, out),
+        S::Insert { table, .. } => push_table(table, out),
+        S::Update { table, .. } => push_table(table, out),
+        S::Delete { table, .. } => push_table(table, out),
+        S::CreateTable { table, .. } => push_table(&table.name, out),
+        S::DropTable { name, .. } => push_table(name, out),
+        S::AlterTable { table, .. } => push_table(table, out),
+        S::CreateIndex { table, .. } => push_table(table, out),
+        // Anything else (transactions, SHOW, sequences, procedures) names no
+        // base table a rule could apply to.
+        _ => {}
+    }
+}
+
+fn collect_query_tables(q: &ast::SelectQuery, out: &mut Vec<String>) {
+    for cte in &q.ctes {
+        // A recursive CTE reads its anchor and its step; the CTE's own name is
+        // not a base table.
+        collect_body_tables(&cte.anchor, out);
+        collect_body_tables(&cte.step, out);
+    }
+    collect_body_tables(&q.body, out);
+}
+
+fn collect_body_tables(body: &ast::QueryBody, out: &mut Vec<String>) {
+    match body {
+        ast::QueryBody::Select(sel) => {
+            if let Some(from) = &sel.from {
+                collect_table_ref(from, out);
+            }
+            for join in &sel.joins {
+                collect_table_ref(&join.table, out);
+            }
+        }
+        ast::QueryBody::SetOp { left, right, .. } => {
+            collect_body_tables(left, out);
+            collect_body_tables(right, out);
+        }
+        ast::QueryBody::Values(_) => {}
+    }
+}
+
+fn collect_table_ref(t: &ast::TableRef, out: &mut Vec<String>) {
+    match &t.subquery {
+        // A derived table reads whatever is inside it; its alias is not a table.
+        Some(inner) => collect_query_tables(inner, out),
+        None => push_table(&t.name, out),
+    }
 }
 
 pub fn is_read_only(sql: &str) -> Result<bool> {

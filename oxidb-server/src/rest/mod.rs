@@ -521,12 +521,13 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // callers are restricted to SELECT statements by the SQL bridge.
     if let ("POST", ["api", "sql"]) = (req.method.as_str(), segments.as_slice()) {
         let readonly = enforced_role == Some(auth::Role::Read);
-        return with_rest_cors(handle_sql_endpoint(
+        return with_rest_cors(handle_sql_endpoint_gated(
             req,
             readonly,
             db_name.as_deref(),
             state,
             enforced_role,
+            &auth_ctx,
         ));
     }
 
@@ -583,6 +584,20 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // Handled outside the generic match: downloads return raw bytes with the
     // stored Content-Type, which the JSON-only match below cannot express.
     if segments.len() >= 2 && segments[0] == "api" && segments[1] == "storage" {
+        // A bucket is a named object like any other, so a rule on its name
+        // decides who may read it — the only way to keep stored files private
+        // from a key that ships in a browser.
+        if req.method == "GET" || req.method == "HEAD" {
+            if let Some(bucket) = segments.get(2) {
+                if let Err((status, msg)) = read_allowed(state, bucket, &auth_ctx) {
+                    return with_rest_cors(json_response(
+                        status,
+                        "Forbidden",
+                        json!({ "error": msg }),
+                    ));
+                }
+            }
+        }
         return with_rest_cors(storage::handle(
             req,
             state,
@@ -620,6 +635,13 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         let is_tsdb = profile == Some("tsdb");
         match (req.method.as_str(), segments.as_slice()) {
             ("GET", ["rest", "v1", m]) if is_tsdb => {
+                if let Err((status, msg)) = read_allowed(state, m, &auth_ctx) {
+                    return with_rest_cors(json_response(
+                        status,
+                        "Forbidden",
+                        json!({ "error": msg }),
+                    ));
+                }
                 return with_rest_cors(postgrest_tsdb::handle_get(sql_db, m, req));
             }
             ("POST", ["rest", "v1", m]) if is_tsdb => {
@@ -630,7 +652,14 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
             }
             ("GET", ["rest", "v1", table]) => {
                 return with_rest_cors(if crate::sql_bridge::sql_table_exists(sql_db, table) {
-                    postgrest_sql::handle_get(sql_db, table, req)
+                    // The document path applies rules inside its handler; the
+                    // SQL path has none of its own, so the same rule store is
+                    // consulted here by table name.
+                    if let Err((status, msg)) = read_allowed(state, table, &auth_ctx) {
+                        json_response(status, "Forbidden", json!({ "error": msg }))
+                    } else {
+                        postgrest_sql::handle_get(sql_db, table, req)
+                    }
                 } else {
                     postgrest::handle_get(table, req, state, &auth_ctx)
                 });
@@ -826,6 +855,28 @@ fn handle_count(
     Ok(json!({"count": n}))
 }
 
+/// May this caller read the named object?
+///
+/// The rules store is keyed by name across every engine — a collection, a SQL
+/// table, a time-series measurement, a storage bucket. Only the document
+/// engine can honour a *row-level* rule, so for the others a rule that filters
+/// per row is treated as a refusal rather than quietly ignored. No rule means
+/// readable, as it always has for documents.
+fn read_allowed(
+    state: &RestState,
+    name: &str,
+    auth: &AuthContext,
+) -> Result<(), (u16, &'static str)> {
+    match rules::read_access(&state.db, name, auth) {
+        rules::ReadAccess::All => Ok(()),
+        rules::ReadAccess::None => Err((403, "access denied: read on this object is not allowed")),
+        rules::ReadAccess::Filter(_) => Err((
+            403,
+            "access denied: a row-level read rule cannot be applied to this engine, so the read is refused",
+        )),
+    }
+}
+
 fn handle_aggregate(
     col: &str,
     req: &HttpRequest,
@@ -924,6 +975,51 @@ fn handle_drop_index(
 /// placeholders. Responds `{"results": [...]}` (one entry per statement) or
 /// 400 `{"error": "..."}` with the engine's message. Requires `OXIDB_SQL=1`
 /// on the server; the engine's data is entirely separate from collections.
+/// `/api/sql` with the read rules applied.
+///
+/// SQL has no per-row policy, so the gate is per *table*: an untrusted caller
+/// may only run a statement whose every referenced table it is allowed to
+/// read. A statement that cannot be parsed is refused for those callers rather
+/// than passed through unexamined — the engine would reject it anyway, and
+/// guessing is not a safe basis for an authorization decision.
+#[allow(clippy::too_many_arguments)]
+fn handle_sql_endpoint_gated(
+    req: &HttpRequest,
+    readonly: bool,
+    db_name: Option<&str>,
+    state: &RestState,
+    enforced_role: Option<auth::Role>,
+    auth: &AuthContext,
+) -> HttpResponse {
+    let untrusted = matches!(
+        enforced_role,
+        Some(auth::Role::Read) | Some(auth::Role::Authenticated)
+    );
+    if untrusted {
+        let sql = parse_json_body(req)
+            .ok()
+            .and_then(|b| b.get("sql").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or_default();
+        match oxidb_sql::referenced_tables(&sql) {
+            Ok(tables) => {
+                for table in tables {
+                    if let Err((status, msg)) = read_allowed(state, &table, auth) {
+                        return json_response(status, "Forbidden", json!({ "error": msg }));
+                    }
+                }
+            }
+            Err(_) => {
+                return json_response(
+                    400,
+                    "Bad Request",
+                    json!({ "error": "could not parse the statement" }),
+                );
+            }
+        }
+    }
+    handle_sql_endpoint(req, readonly, db_name, state, enforced_role)
+}
+
 fn handle_sql_endpoint(
     req: &HttpRequest,
     readonly: bool,
