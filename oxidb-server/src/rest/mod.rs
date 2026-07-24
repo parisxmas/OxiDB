@@ -487,8 +487,26 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         .or_else(|| req.headers.get("content-profile"))
         .map(|s| s.as_str())
         == Some("tsdb");
+    // Likewise for the SQL engine: `/rest/v1/{x}` writes are let through so the
+    // document rules can adjudicate them, and a SQL table has no rules either.
+    let sql_table_target = !tsdb_profile
+        && matches!(req.method.as_str(), "POST" | "PATCH" | "DELETE")
+        && match segments.as_slice() {
+            ["rest", "v1", table] => crate::sql_bridge::sql_table_exists(
+                db_name
+                    .as_deref()
+                    .unwrap_or(oxidb::database_manager::DEFAULT_DATABASE),
+                table,
+            ),
+            _ => false,
+        };
     if let Some(role) = enforced_role {
-        if !rest_permitted(role, req.method.as_str(), segments.as_slice(), tsdb_profile) {
+        if !rest_permitted(
+            role,
+            req.method.as_str(),
+            segments.as_slice(),
+            tsdb_profile || sql_table_target,
+        ) {
             return with_rest_cors(json_response(
                 403,
                 "Forbidden",
@@ -1290,7 +1308,9 @@ fn handle_alert_history(state: &RestState) -> Result<Value, (u16, &'static str)>
 ///   management (those are admin-only).
 /// - **Read** — only read-only endpoints (any `GET`, plus the read-only
 ///   `aggregate` POST).
-fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], tsdb_profile: bool) -> bool {
+/// `unruled_engine` marks a `/rest/v1/{x}` request bound for an engine with no
+/// per-row security rules — the time-series engine, or a SQL table.
+fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], unruled_engine: bool) -> bool {
     use auth::Role::*;
     if role == Admin {
         return true;
@@ -1327,12 +1347,15 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], tsdb_profil
         // Supabase RLS model. A collection with no rule denies these writes by
         // default (see `rules::check_access`).
         Read | Authenticated => {
-            // A write to `/rest/v1/{x}` under the **tsdb** profile is not
-            // governed by anything: the time-series engine has no per-row
-            // rules, so letting it through would mean the browser-safe anon key
-            // could append arbitrary points to a project's series. Reads stay
-            // open; writing needs a service_role key, like storage.
-            if tsdb_profile && method != "GET" {
+            // A write to `/rest/v1/{x}` is let through below so that the
+            // collection's security rules can adjudicate it. Two engines
+            // served by that same URL have no rules to adjudicate with — the
+            // time-series engine, and the SQL engine (whose authorization is
+            // RBAC-only). Letting those through would mean the browser-safe
+            // anon key could append arbitrary points, or insert into and
+            // delete from any table. Reads stay open; writing needs a
+            // service_role key, like storage.
+            if unruled_engine && method != "GET" {
                 return false;
             }
             matches!(
@@ -1351,6 +1374,40 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], tsdb_profil
 mod permission_tests {
     use super::rest_permitted;
     use crate::auth::Role;
+
+    #[test]
+    fn browser_keys_may_never_write_a_sql_table() {
+        // Same reasoning as the time-series case: SQL authorization is
+        // RBAC-only, so a write let through "for the rules to decide" would be
+        // decided by nothing. A published anon key could otherwise delete rows.
+        for role in [Role::Read, Role::Authenticated] {
+            assert!(rest_permitted(role, "GET", &["rest", "v1", "races"], true));
+            assert!(!rest_permitted(
+                role,
+                "POST",
+                &["rest", "v1", "races"],
+                true
+            ));
+            assert!(!rest_permitted(
+                role,
+                "DELETE",
+                &["rest", "v1", "races"],
+                true
+            ));
+            assert!(!rest_permitted(
+                role,
+                "PATCH",
+                &["rest", "v1", "races"],
+                true
+            ));
+        }
+        assert!(rest_permitted(
+            Role::ReadWrite,
+            "DELETE",
+            &["rest", "v1", "races"],
+            true
+        ));
+    }
 
     #[test]
     fn browser_keys_may_read_but_never_write_time_series() {
