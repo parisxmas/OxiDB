@@ -76,4 +76,29 @@ impl Upstream {
             .with(|c| c.delete(META_DB, col, query))
             .map_err(|e| e.to_string())
     }
+
+    /// Sorted, limited find in an arbitrary database (raw wire `find` with
+    /// options) — used to read the shared request-log sink in the default db.
+    pub fn find_sorted_in(
+        &self,
+        db: &str,
+        col: &str,
+        query: &Value,
+        sort: &Value,
+        limit: u64,
+    ) -> Result<Vec<Value>, String> {
+        self.pool
+            .with(|c| {
+                c.call(&serde_json::json!({
+                    "cmd": "find",
+                    "db": db,
+                    "collection": col,
+                    "query": query,
+                    "sort": sort,
+                    "limit": limit,
+                }))
+                .map(|d| d.as_array().cloned().unwrap_or_default())
+            })
+            .map_err(|e| e.to_string())
+    }
 }

@@ -164,3 +164,17 @@ export async function completePasswordReset(
   const data = await res.json().catch(() => null);
   if (!res.ok) throw new Error(data?.message ?? `HTTP ${res.status}`);
 }
+
+// ── Request logs (Logs tab) ─────────────────────────────────────────────────
+
+export interface LogRow {
+  ts: number;
+  method: string;
+  path: string;
+  status?: number;
+  ms?: number;
+}
+
+export function listProjectLogs(ref: string, limit = 100): Promise<LogRow[]> {
+  return req("GET", `/projects/${encodeURIComponent(ref)}/logs?limit=${limit}`);
+}

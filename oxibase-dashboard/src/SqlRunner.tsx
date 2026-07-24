@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { type SqlResult, runSql } from "./dataApi.ts";
 import { ResultGrid } from "./SqlTables.tsx";
+import { SqlEditor } from "./SqlEditor.tsx";
 
 const SAMPLE = `CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT);
 INSERT INTO notes (id, body) VALUES (1, 'hello from OxiBase');
@@ -25,25 +26,10 @@ export function SqlRunner({ projectRef, apiKey }: { projectRef: string; apiKey: 
     }
   }
 
-  function onKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-      e.preventDefault();
-      run();
-    }
-  }
-
   return (
     <div className="sql">
       <div className="card">
-        <textarea
-          className="sql-input"
-          value={sql}
-          onChange={(e) => setSql(e.target.value)}
-          onKeyDown={onKey}
-          rows={8}
-          spellCheck={false}
-          placeholder="SELECT * FROM …"
-        />
+        <SqlEditor value={sql} onChange={setSql} onRun={run} />
         <div className="row between" style={{ marginTop: 8 }}>
           <span className="muted small">⌘/Ctrl + Enter to run</span>
           <button className="primary" onClick={run} disabled={busy}>

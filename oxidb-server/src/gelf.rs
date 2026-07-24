@@ -108,6 +108,9 @@ impl MsgpackLogger {
         );
         m.insert("level".into(), serde_json::json!(level as u8));
         m.insert("ts".into(), serde_json::json!(ts));
+        // Epoch-ms twin of `ts` under the engine's TTL-index field name, so a
+        // retention policy on the sink collection can expire old log rows.
+        m.insert("_ts".into(), serde_json::json!((ts * 1000.0) as u64));
         for &(k, v) in extra {
             m.insert(k.to_string(), serde_json::Value::String(v.to_string()));
         }

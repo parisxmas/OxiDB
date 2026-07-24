@@ -6,6 +6,7 @@ import {
   listCollections,
   findRows,
   insertRow,
+  updateWhere,
   deleteWhere,
   listIndexes,
   createIndex,
@@ -99,6 +100,9 @@ function RowsTable({
   const [adding, setAdding] = useState(false);
   const [showIdx, setShowIdx] = useState(false);
   const [draft, setDraft] = useState('{\n  "name": "example"\n}');
+  // _id of the row being edited (JSON draft in `editDraft`), or null.
+  const [editing, setEditing] = useState<unknown | null>(null);
+  const [editDraft, setEditDraft] = useState("");
 
   async function refresh() {
     setLoading(true);
@@ -131,6 +135,32 @@ function RowsTable({
       const wasEmpty = rows.length === 0;
       await refresh();
       if (wasEmpty) onFirstInsert();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function startEdit(row: Row) {
+    // Engine bookkeeping fields stay out of the editable body.
+    const { _id, _version, ...rest } = row;
+    void _version;
+    setEditing(_id);
+    setEditDraft(JSON.stringify(rest, null, 2));
+    setAdding(false);
+  }
+
+  async function saveEdit() {
+    let doc: Record<string, unknown>;
+    try {
+      doc = JSON.parse(editDraft);
+    } catch {
+      setError("row must be valid JSON");
+      return;
+    }
+    try {
+      await updateWhere(projectRef, collection, apiKey, `_id=eq.${encodeURIComponent(String(editing))}`, doc);
+      setEditing(null);
+      await refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -185,6 +215,23 @@ function RowsTable({
         </div>
       )}
 
+      {editing !== null && (
+        <div className="card add-row">
+          <div className="muted small" style={{ marginBottom: 6 }}>
+            Editing document <code>_id = {String(editing)}</code> — the fields below are merged into the document (PATCH); removing a field here does not delete it.
+          </div>
+          <textarea value={editDraft} onChange={(e) => setEditDraft(e.target.value)} rows={7} spellCheck={false} />
+          <div className="row" style={{ justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
+            <button className="ghost" onClick={() => setEditing(null)}>
+              Cancel
+            </button>
+            <button className="primary" onClick={saveEdit}>
+              Save
+            </button>
+          </div>
+        </div>
+      )}
+
       {error && <div className="error">{error}</div>}
       {loading ? (
         <p className="muted">Loading…</p>
@@ -209,9 +256,14 @@ function RowsTable({
                   ))}
                   <td className="rowdel">
                     {r["_id"] !== undefined && (
-                      <button className="ghost danger small" onClick={() => del(r)}>
-                        ✕
-                      </button>
+                      <span className="row" style={{ gap: 4, justifyContent: "center" }}>
+                        <button className="ghost small" title="Edit document" onClick={() => startEdit(r)}>
+                          ✎
+                        </button>
+                        <button className="ghost danger small" title="Delete" onClick={() => del(r)}>
+                          ✕
+                        </button>
+                      </span>
                     )}
                   </td>
                 </tr>

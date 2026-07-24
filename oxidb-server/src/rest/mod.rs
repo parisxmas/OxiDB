@@ -176,6 +176,21 @@ fn handle_connection(mut stream: TcpStream, state: &RestState) {
                 s if s >= 400 => crate::gelf::GelfLevel::Warning,
                 _ => crate::gelf::GelfLevel::Informational,
             };
+            // The database the request targeted (`?db=<ref>` or a path-based
+            // tenant segment) — what lets a per-project log view filter its
+            // own traffic out of the shared sink. Logged as-given (ref or
+            // slug); readers match either.
+            let db = req
+                .query
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("db="))
+                .map(|v| v.to_string())
+                .or_else(|| {
+                    let mut segs = req.path.split('/').filter(|s| !s.is_empty());
+                    let first = segs.next()?;
+                    matches!(segs.next(), Some("rest" | "api")).then(|| first.to_string())
+                })
+                .unwrap_or_default();
             crate::gelf::log(
                 level,
                 &format!("{} {}", req.method, req.path),
@@ -185,6 +200,7 @@ fn handle_connection(mut stream: TcpStream, state: &RestState) {
                     ("path", req.path.as_str()),
                     ("status", status.as_str()),
                     ("ms", ms.as_str()),
+                    ("db", db.as_str()),
                 ],
             );
         }

@@ -1436,3 +1436,56 @@ pub fn admin_verify_user(
         Err(e) => resp(502, json!({ "message": format!("upstream: {e}") })),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-project request logs (developer console)
+// ---------------------------------------------------------------------------
+
+/// `GET /platform/v1/projects/{ref}/logs?limit=100` — the project's recent
+/// data-plane requests, read from the shared MessagePack log sink in the
+/// default database (`_msgpack_logs`, written when the data plane runs with
+/// `OXIDB_MSGPACK_PORT`/`OXIDB_MSGPACK_ADDR`). Owner-authenticated; filtered
+/// to rows whose logged `db` is this project's ref or slug.
+pub fn project_logs(req: &HttpRequest, state: &State, project_ref: &str) -> HttpResponse {
+    let owner = match authenticate(req, state) {
+        Ok(c) => c.sub,
+        Err(r) => return r,
+    };
+    let doc = match owned_project(state, project_ref, &owner) {
+        Ok(Some(d)) => d,
+        Ok(None) => return resp(404, json!({ "message": "project not found" })),
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let slug = doc_slug(&doc, project_ref);
+    let limit: u64 = req
+        .query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("limit="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+        .min(500);
+    let rows = match state.upstream.find_sorted_in(
+        "oxidb",
+        "_msgpack_logs",
+        &json!({ "db": { "$in": [project_ref, slug] } }),
+        &json!({ "ts": -1 }),
+        limit,
+    ) {
+        Ok(r) => r,
+        Err(e) if e.contains("not found") => Vec::new(), // sink not created yet
+        Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
+    };
+    let out: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "ts": r.get("ts"),
+                "method": r.get("method"),
+                "path": r.get("path"),
+                "status": r.get("status").and_then(|v| v.as_str()).and_then(|s| s.parse::<u16>().ok()),
+                "ms": r.get("ms").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()),
+            })
+        })
+        .collect();
+    resp(200, json!(out))
+}

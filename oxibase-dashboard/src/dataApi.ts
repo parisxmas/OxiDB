@@ -116,6 +116,17 @@ export function insertRow(ref: string, col: string, key: string, doc: unknown): 
   });
 }
 
+/** Update (PATCH) rows matching a raw PostgREST filter with a partial doc. */
+export function updateWhere(
+  ref: string,
+  col: string,
+  key: string,
+  filter: string,
+  doc: Record<string, unknown>,
+): Promise<unknown> {
+  return call("PATCH", ref, `/rest/v1/${encodeURIComponent(col)}?${filter}`, key, doc);
+}
+
 /** Delete rows matching a raw PostgREST filter, e.g. `_id=eq.5`. */
 export function deleteWhere(ref: string, col: string, key: string, filter: string): Promise<unknown> {
   return call("DELETE", ref, `/rest/v1/${encodeURIComponent(col)}?${filter}`, key);

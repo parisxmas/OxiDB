@@ -250,3 +250,10 @@ button:disabled { opacity: 0.55; cursor: default; }
 .rulefield input:focus { border-color: var(--accent); }
 .rules .hint { margin: 4px 0 0; line-height: 1.6; }
 .rules .hint code { background: var(--panel-2); padding: 1px 5px; border-radius: 5px; font-size: 11px; }
+
+/* CodeMirror SQL editor */
+.cm-wrap { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.cm-wrap .cm-editor { font-size: 13px; background: var(--panel-2); }
+.cm-wrap .cm-editor.cm-focused { outline: none; }
+.cm-wrap:focus-within { border-color: var(--accent); }
+.cm-wrap .cm-gutters { background: var(--panel-2); border-right: 1px solid var(--border); }
