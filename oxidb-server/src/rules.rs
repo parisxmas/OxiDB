@@ -255,6 +255,18 @@ fn remove_rules(db: &OxiDb, collection: &str) {
 /// - `doc`: the existing document (for read/update/delete), None for create
 /// - `new_doc`: the incoming document (for create/update), None for read/delete
 ///
+/// Is this an untrusted caller — the public anon key, or a signed-in end user?
+/// Those are the tiers a `_`-prefixed system collection must never be reachable
+/// from: the server keeps its own bookkeeping there (request logs, the slow
+/// query profile, alerts), those collections are exempt from the rules, and
+/// they do not count against a project's collection quota.
+fn untrusted(auth: &AuthContext) -> bool {
+    matches!(
+        auth.role.as_deref().and_then(crate::auth::Role::from_str),
+        Some(crate::auth::Role::Read) | Some(crate::auth::Role::Authenticated)
+    )
+}
+
 /// Returns `Ok(())` if allowed, `Err(message)` if denied.
 pub fn check_access(
     db: &OxiDb,
@@ -264,9 +276,18 @@ pub fn check_access(
     doc: Option<&Value>,
     new_doc: Option<&Value>,
 ) -> Result<(), String> {
-    // System collections are always accessible (no rules apply)
+    // System collections carry no rules — which is precisely why an untrusted
+    // key must not reach them. Skipping the rules was meant for the server's
+    // own bookkeeping, not for a browser: it let any anon key read the request
+    // log and create unlimited `_`-named collections outside the quota.
     if collection.starts_with('_') {
-        return Ok(());
+        return if untrusted(auth) {
+            Err(format!(
+                "access denied: '{collection}' is a system collection"
+            ))
+        } else {
+            Ok(())
+        };
     }
 
     // service_role / admin bypasses rules entirely — the Supabase service_role
@@ -349,7 +370,13 @@ pub enum ReadAccess {
 /// collection with no rules is fully readable.
 pub fn read_access(db: &OxiDb, collection: &str, auth: &AuthContext) -> ReadAccess {
     if collection.starts_with('_') {
-        return ReadAccess::All;
+        // See `check_access`: system collections are the server's own, and an
+        // untrusted key has no business reading them.
+        return if untrusted(auth) {
+            ReadAccess::None
+        } else {
+            ReadAccess::All
+        };
     }
     if matches!(
         auth.role.as_deref().and_then(crate::auth::Role::from_str),
@@ -569,6 +596,75 @@ fn is_truthy(val: &Value) -> bool {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod system_collection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn anon() -> AuthContext {
+        AuthContext::from_claims("anon@key", "read")
+    }
+    fn end_user() -> AuthContext {
+        AuthContext::from_claims("ada@example.com", "authenticated")
+    }
+    fn service() -> AuthContext {
+        AuthContext::from_claims("service", "admin")
+    }
+
+    #[test]
+    fn untrusted_keys_cannot_touch_system_collections() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        for auth in [anon(), end_user()] {
+            // Reads: the request log and slow-query profile live here.
+            assert!(matches!(
+                read_access(&db, "_profile", &auth),
+                ReadAccess::None
+            ));
+            // Writes: `_`-named collections skip the rules *and* the project's
+            // collection quota, so this was a way to fill a tenant's storage.
+            assert!(
+                check_access(
+                    &db,
+                    "_evil",
+                    Operation::Create,
+                    &auth,
+                    None,
+                    Some(&json!({"x": 1}))
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn the_server_and_service_role_still_reach_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = OxiDb::open(dir.path()).unwrap();
+        assert!(matches!(
+            read_access(&db, "_profile", &service()),
+            ReadAccess::All
+        ));
+        assert!(
+            check_access(
+                &db,
+                "_profile",
+                Operation::Create,
+                &service(),
+                None,
+                Some(&json!({}))
+            )
+            .is_ok()
+        );
+        // An open, no-auth server (no role at all) is unaffected.
+        let open = AuthContext::anonymous();
+        assert!(matches!(
+            read_access(&db, "_profile", &open),
+            ReadAccess::All
+        ));
+    }
+}
 
 #[cfg(test)]
 mod create_ownership_tests {

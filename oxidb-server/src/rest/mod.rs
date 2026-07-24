@@ -684,7 +684,7 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
         ("GET", ["api", col, "count"]) => handle_count(col, req, state),
 
         // Aggregation
-        ("POST", ["api", col, "aggregate"]) => handle_aggregate(col, req, state),
+        ("POST", ["api", col, "aggregate"]) => handle_aggregate(col, req, state, &auth_ctx),
 
         // Indexes
         ("GET", ["api", col, "indexes"]) => handle_list_indexes(col, state),
@@ -830,7 +830,29 @@ fn handle_aggregate(
     col: &str,
     req: &HttpRequest,
     state: &RestState,
+    auth: &AuthContext,
 ) -> Result<Value, (u16, &'static str)> {
+    // A pipeline reads the collection, so the read rule governs it — and this
+    // is the one read path that cannot simply filter its output, because
+    // $group and friends turn rows into something else. A rule that admits
+    // only some rows therefore cannot be honoured here at all, and the request
+    // is refused rather than answered from rows the caller may not see.
+    //
+    // Without this, `$group` over a collection whose read rule is
+    // `auth.username == doc.owner` returned every owner's values to anyone
+    // holding the public anon key.
+    match rules::read_access(&state.db, col, auth) {
+        rules::ReadAccess::All => {}
+        rules::ReadAccess::None => {
+            return Err((403, "access denied: read on this collection is not allowed"));
+        }
+        rules::ReadAccess::Filter(_) => {
+            return Err((
+                403,
+                "access denied: this collection has a row-level read rule, so it cannot be aggregated with this key",
+            ));
+        }
+    }
     let body = parse_json_body(req)?;
     let pipeline = body.get("pipeline").ok_or((400, "missing 'pipeline'"))?;
     let results = state.db.aggregate(col, pipeline).map_err(db_err)?;
@@ -1330,6 +1352,9 @@ fn rest_permitted(role: auth::Role, method: &str, segments: &[&str], unruled_eng
             | ("POST", ["api", "alerts"])
             | ("DELETE", ["api", "alerts", _])
             | ("POST", ["api", "alerts", _, "test"])
+            // The security policy itself: readable by the operator, not by the
+            // browser key it is written to constrain.
+            | ("GET", ["api", "rules", _])
     );
     if admin_only {
         return false;
