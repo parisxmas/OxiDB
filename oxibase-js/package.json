@@ -12,13 +12,19 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node test/e2e.mjs"
   },
   "keywords": ["oxibase", "oxidb", "postgrest", "database", "client"],
-  "license": "SEE LICENSE IN ../LICENSE",
+  "license": "MIT",
+  "homepage": "https://oxidb.baltavista.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/parisxmas/OxiDB.git",
+    "directory": "oxibase-js"
+  },
   "dependencies": {
     "@supabase/postgrest-js": "^1.19.4"
   },

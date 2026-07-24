@@ -1,6 +1,6 @@
 {
   "name": "oxidb",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "description": "OxiDB client for JavaScript/TypeScript — REST API, WebSocket real-time subscriptions, authentication",
   "main": "index.js",
   "types": "index.d.ts",
@@ -19,6 +19,9 @@
     "rest-api",
     "firebase-alternative"
   ],
+  "engines": {
+    "node": ">=22"
+  },
   "author": "OxiDB",
   "license": "MIT",
   "homepage": "https://github.com/parisxmas/OxiDB",

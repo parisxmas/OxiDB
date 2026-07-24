@@ -11,12 +11,54 @@ export default function Page() {
     <h2><svg class="section-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> Changelog</h2>
     <p class="section-desc">All notable changes to OxiDB, organized by version.</p>
 
+    <!-- v0.39.15 -->
+    <div class="version-block">
+      <div class="version-header">
+        <h3 class="version-tag">v0.39.15</h3>
+        <span class="version-date">2026-07-24</span>
+        <span class="version-badge latest">latest</span>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type fixed">Fixed &mdash; WebSocket handshake</h4>
+        <ul>
+          <li><strong>The server computed <code>Sec-WebSocket-Accept</code> with the wrong RFC&nbsp;6455 GUID</strong>, so every client that validates the accept hash &mdash; browsers, <code>ws</code>, <code>undici</code> &mdash; refused the connection, and only clients that skipped the check could connect. The GUID is now the RFC value, so native <code>WebSocket</code> works everywhere; the JavaScript client's hand-rolled Node WebSocket workaround is gone in favour of the platform one (<code>oxidb</code> npm 0.26.0, Node&nbsp;22+).</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; realtime subscriptions</h4>
+        <ul>
+          <li><strong>Live change streams over WebSocket, scoped to a tenant project.</strong> <code>{"cmd":"auth","token":&hellip;,"db":"&lt;ref&gt;"}</code> verifies against that project's ES256 key and pins the connection to that database.</li>
+          <li><strong>Security rules are enforced on the WebSocket surface too</strong>, at parity with REST: <code>find</code>/<code>count</code> filter per row, writes check per document, and a <code>subscribe</code> delivers an RLS-filtered event stream &mdash; an event whose document the caller may not see is dropped rather than leaking its id. Engine fix: <code>insert_many</code> emitted change events with no document body (the path every REST insert takes), so subscribers now receive the inserted document.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; per-project file storage and backup</h4>
+        <ul>
+          <li><strong><code>/api/storage</code></strong> &mdash; list buckets and objects, upload, download (original content type + ETag), delete, <code>HEAD</code> metadata. Isolation is per tenant database, a per-project storage quota is enforced at upload time, anonymous keys are read-only, and a non-empty bucket refuses to delete.</li>
+          <li><strong><code>POST /api/backup?db=&lt;ref&gt;</code></strong> (admin) streams a <code>tar.gz</code> of that database as an attachment. Stateless &mdash; nothing is retained server-side to expire or leak.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; SQL: <code>ALTER TABLE &hellip; ALTER COLUMN &hellip; TYPE</code></h4>
+        <ul>
+          <li>PostgreSQL <code>ALTER COLUMN c [SET DATA] TYPE t</code> and MySQL <code>MODIFY COLUMN</code>. Every row is dry-run cast first &mdash; an uncastable value or an over-length <code>VARCHAR(n)</code> aborts <em>before</em> anything reaches the WAL &mdash; then the column is rewritten in place, indexes rebuilt, and a checkpoint taken. Columns bound by PRIMARY KEY / AUTO_INCREMENT / UNIQUE / FOREIGN KEY are refused, since a cast can collide previously distinct keys.</li>
+        </ul>
+      </div>
+      <div class="change-group">
+        <h4 class="change-type added">Added &mdash; OxiBase</h4>
+        <ul>
+          <li><strong>Email-based end-user auth</strong> &mdash; address verification, password reset and administrative user management, delivered over real SMTP. Without SMTP configured, the previous behaviour is unchanged.</li>
+          <li><strong>Per-project request logs</strong> (the data plane tags each request with its target database; the control plane exposes a paged, filterable log endpoint) and <strong>TypeScript type generation</strong> &mdash; exact for SQL tables, inferred by sampling for document collections.</li>
+          <li><strong>Dashboard</strong>: Files, Logs and Users tabs; editable SQL tables (rows and columns, including retype and drop); document row editing; a CodeMirror SQL editor with OxiDB dialect highlighting; one-click backup.</li>
+        </ul>
+      </div>
+    </div>
+
     <!-- v0.39.10 -->
     <div class="version-block">
       <div class="version-header">
         <h3 class="version-tag">v0.39.10</h3>
         <span class="version-date">2026-07-23</span>
-        <span class="version-badge latest">latest</span>
       </div>
       <div class="change-group">
         <h4 class="change-type added">Added &mdash; OxiBase, a multi-tenant backend on top of OxiDB</h4>

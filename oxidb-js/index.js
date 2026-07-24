@@ -1,7 +1,7 @@
 /**
  * OxiDB JavaScript/TypeScript Client
  *
- * Works in Node.js (18+) and browsers. Zero dependencies.
+ * Works in Node.js (22+, for the global WebSocket) and browsers. Zero dependencies.
  * Supports REST API (CRUD, SQL, aggregation) and WebSocket (real-time subscriptions).
  *
  * @example
@@ -13,153 +13,6 @@
  */
 
 "use strict";
-
-// ---------------------------------------------------------------------------
-// Minimal WebSocket client for Node.js (no external dependencies)
-// Uses http upgrade + raw TCP frame reading/writing.
-// ---------------------------------------------------------------------------
-
-class NodeWebSocket {
-  constructor(url) {
-    this.readyState = 0; // CONNECTING
-    this.onopen = null;
-    this.onmessage = null;
-    this.onclose = null;
-    this.onerror = null;
-    this._socket = null;
-    this._connect(url);
-  }
-
-  _connect(url) {
-    const http = require("http");
-    const crypto = require("crypto");
-    const parsed = new URL(url);
-    const key = crypto.randomBytes(16).toString("base64");
-
-    const req = http.request({
-      hostname: parsed.hostname,
-      port: parsed.port,
-      path: parsed.pathname || "/",
-      headers: {
-        Connection: "Upgrade",
-        Upgrade: "websocket",
-        "Sec-WebSocket-Key": key,
-        "Sec-WebSocket-Version": "13",
-      },
-    });
-
-    req.on("upgrade", (_res, socket, _head) => {
-      this._socket = socket;
-      this.readyState = 1; // OPEN
-      if (this.onopen) this.onopen();
-      this._readLoop(socket);
-    });
-
-    req.on("error", (err) => {
-      this.readyState = 3;
-      if (this.onerror) this.onerror(err);
-    });
-
-    req.end();
-  }
-
-  _readLoop(socket) {
-    let buf = Buffer.alloc(0);
-
-    socket.on("data", (chunk) => {
-      buf = Buffer.concat([buf, chunk]);
-      while (buf.length >= 2) {
-        const opcode = buf[0] & 0x0f;
-        let payloadLen = buf[1] & 0x7f;
-        let offset = 2;
-
-        if (payloadLen === 126) {
-          if (buf.length < 4) return;
-          payloadLen = buf.readUInt16BE(2);
-          offset = 4;
-        } else if (payloadLen === 127) {
-          if (buf.length < 10) return;
-          payloadLen = Number(buf.readBigUInt64BE(2));
-          offset = 10;
-        }
-
-        if (buf.length < offset + payloadLen) return;
-
-        const payload = buf.subarray(offset, offset + payloadLen);
-        buf = buf.subarray(offset + payloadLen);
-
-        if (opcode === 0x01) {
-          // Text frame
-          if (this.onmessage) this.onmessage({ data: payload.toString() });
-        } else if (opcode === 0x08) {
-          // Close
-          this.readyState = 3;
-          socket.end();
-          if (this.onclose) this.onclose();
-          return;
-        } else if (opcode === 0x09) {
-          // Ping → Pong
-          this._writeFrame(0x0a, payload);
-        }
-      }
-    });
-
-    socket.on("close", () => {
-      this.readyState = 3;
-      if (this.onclose) this.onclose();
-    });
-
-    socket.on("error", () => {
-      this.readyState = 3;
-    });
-  }
-
-  send(data) {
-    if (this.readyState !== 1 || !this._socket) return;
-    const payload = Buffer.from(data);
-    const crypto = require("crypto");
-    const mask = crypto.randomBytes(4);
-    const masked = Buffer.alloc(payload.length);
-    for (let i = 0; i < payload.length; i++) {
-      masked[i] = payload[i] ^ mask[i % 4];
-    }
-    this._writeFrame(0x01, masked, mask);
-  }
-
-  _writeFrame(opcode, payload, mask) {
-    if (!this._socket) return;
-    const header = [];
-    header.push(0x80 | opcode); // FIN + opcode
-
-    const hasMask = mask ? 0x80 : 0;
-    if (payload.length < 126) {
-      header.push(hasMask | payload.length);
-    } else if (payload.length <= 65535) {
-      header.push(hasMask | 126);
-      header.push((payload.length >> 8) & 0xff);
-      header.push(payload.length & 0xff);
-    } else {
-      header.push(hasMask | 127);
-      const len = BigInt(payload.length);
-      for (let i = 7; i >= 0; i--) header.push(Number((len >> BigInt(i * 8)) & 0xffn));
-    }
-
-    if (mask) {
-      this._socket.write(Buffer.from([...header, ...mask, ...payload]));
-    } else {
-      this._socket.write(Buffer.concat([Buffer.from(header), payload]));
-    }
-  }
-
-  close() {
-    if (this.readyState === 1 && this._socket) {
-      this._writeFrame(0x08, Buffer.alloc(0));
-      this.readyState = 2; // CLOSING
-      this._socket.end();
-    }
-    this.readyState = 3;
-  }
-}
 
 class OxiDBError extends Error {
   constructor(message, status) {
@@ -453,7 +306,12 @@ class OxiDB {
   }
 
   _ensureWebSocket() {
-    if (this._ws && this._ws.readyState === 1 && this._wsReady) return this._wsReady;
+    // CONNECTING (0) counts as "already ensured": opening a second socket while
+    // the first is mid-handshake orphans it, and its onopen would then flush the
+    // queue into a socket that is not open yet.
+    if (this._ws && (this._ws.readyState === 0 || this._ws.readyState === 1) && this._wsReady) {
+      return this._wsReady;
+    }
 
     if (!this._wsUrl) {
       const u = new URL(this._baseUrl);
@@ -462,13 +320,13 @@ class OxiDB {
       this._wsUrl = `${wsProto}//${u.hostname}:${wsPort}`;
     }
 
-    // In browser, use native WebSocket. In Node.js, use built-in http upgrade.
-    if (typeof window !== "undefined" && typeof window.WebSocket !== "undefined") {
-      this._ws = new window.WebSocket(this._wsUrl);
-    } else {
-      // Node.js: manual WebSocket via http upgrade + raw frames
-      this._ws = new NodeWebSocket(this._wsUrl);
+    // Native WebSocket everywhere: browsers, and Node.js 22+ (global WebSocket).
+    if (typeof globalThis.WebSocket === "undefined") {
+      throw new OxiDBError(
+        "No WebSocket implementation available — Node.js 22+ or a browser is required for subscriptions",
+      );
     }
+    this._ws = new globalThis.WebSocket(this._wsUrl);
     this._wsAuthenticated = false;
 
     this._wsReady = new Promise((resolve, reject) => {
