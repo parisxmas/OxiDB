@@ -15,6 +15,8 @@ export interface Project {
   max_tables?: number;
   max_documents?: number;
   max_storage_bytes?: number;
+  /** REST requests per minute (0 = unlimited). */
+  max_requests_per_min?: number;
 }
 
 const BASE: string = import.meta.env.VITE_OXIBASE_URL ?? "";
@@ -55,10 +57,23 @@ async function req<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  let data: unknown = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    // Not JSON: an edge proxy or CDN answered instead of the control plane
+    // (a 502 page, a CDN challenge). Report that plainly rather than leaking a
+    // parser error like `Unexpected token '<'`.
+    if (res.status === 401) logout();
+    throw new Error(
+      `the control plane returned a non-JSON response (HTTP ${res.status})` +
+        (res.ok ? "" : " — it may be restarting; retry in a moment"),
+    );
+  }
   if (res.status === 401) logout();
   if (!res.ok) {
-    throw new Error((data && (data.message || data.error)) || `HTTP ${res.status}`);
+    const d = data as { message?: string; error?: string } | null;
+    throw new Error(d?.message || d?.error || `HTTP ${res.status}`);
   }
   return data as T;
 }
@@ -107,7 +122,13 @@ export function rotateKeys(ref: string): Promise<Project> {
 /** Update a project's resource quotas (0 = unlimited). Owner only. */
 export function updateProjectLimits(
   ref: string,
-  limits: { max_collections?: number; max_tables?: number; max_documents?: number; max_storage_bytes?: number },
+  limits: {
+    max_collections?: number;
+    max_tables?: number;
+    max_documents?: number;
+    max_storage_bytes?: number;
+    max_requests_per_min?: number;
+  },
 ): Promise<Project> {
   return req<Project>("PATCH", `/projects/${encodeURIComponent(ref)}/limits`, limits);
 }

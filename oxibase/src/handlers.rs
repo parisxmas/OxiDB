@@ -61,6 +61,16 @@ fn project_max_storage_bytes() -> u64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(104_857_600)
 }
+/// Per-project REST request cap, requests/minute. **0 = unlimited, the
+/// default**: throttling is something a deployment opts into, not a surprise an
+/// upgrade delivers under load.
+fn project_max_rpm() -> u64 {
+    std::env::var("OXIDB_PROJECT_MAX_RPM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 fn max_accounts() -> usize {
     env_usize("OXIDB_PLATFORM_MAX_ACCOUNTS", 10_000)
 }
@@ -241,6 +251,7 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
         "max_tables": project_max_tables(),
         "max_documents": project_max_documents(),
         "max_storage_bytes": project_max_storage_bytes(),
+        "max_requests_per_min": project_max_rpm(),
     });
     if let Err(e) = state.upstream.insert("projects", &doc) {
         let _ = state.upstream.drop_database(&project_ref);
@@ -259,10 +270,7 @@ pub fn create_project(req: &HttpRequest, state: &State) -> HttpResponse {
             created_at,
             &priv_scalar,
             true,
-            project_max_collections() as u64,
-            project_max_tables() as u64,
-            project_max_documents() as u64,
-            project_max_storage_bytes(),
+            Limits::defaults(),
         ),
     )
 }
@@ -289,18 +297,19 @@ pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let doc = match owned_project(state, project_ref, &owner) {
-        Ok(Some(d)) => d,
+    let (project_ref, doc) = match owned_project(state, project_ref, &owner) {
+        Ok(Some(v)) => v,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    let project_ref = project_ref.as_str();
     let (created_at, key_iat, name) = meta(&doc);
     let slug = doc_slug(&doc, project_ref);
     let priv_scalar = match project_priv(state, &doc) {
         Some(s) => s,
         None => return resp(500, json!({ "message": "unseal failed" })),
     };
-    let (mc, mt, md, ms) = doc_limits(&doc);
+    let limits = doc_limits(&doc);
     resp(
         200,
         project_view(
@@ -311,10 +320,7 @@ pub fn get_project(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
             key_iat,
             &priv_scalar,
             true,
-            mc,
-            mt,
-            md,
-            ms,
+            limits,
         ),
     )
 }
@@ -686,11 +692,12 @@ pub fn delete_project(req: &HttpRequest, state: &State, project_ref: &str) -> Ht
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    match owned_project(state, project_ref, &owner) {
-        Ok(Some(_)) => {}
+    let project_ref = match owned_project(state, project_ref, &owner) {
+        Ok(Some((r, _))) => r,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
-    }
+    };
+    let project_ref = project_ref.as_str();
     let _ = state.upstream.drop_database(project_ref);
     let _ = state
         .upstream
@@ -703,13 +710,14 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let doc = match owned_project(state, project_ref, &owner) {
-        Ok(Some(d)) => d,
+    let (project_ref, doc) = match owned_project(state, project_ref, &owner) {
+        Ok(Some(v)) => v,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    let project_ref = project_ref.as_str();
     let (created_at, _, name) = meta(&doc);
-    let (mc, mt, md, ms) = doc_limits(&doc);
+    let limits = doc_limits(&doc);
     let slug = doc_slug(&doc, project_ref);
     let (priv_scalar, pub_point) = crypto::gen_es256_keypair();
     let new_iat = now_secs();
@@ -735,10 +743,7 @@ pub fn rotate_keys(req: &HttpRequest, state: &State, project_ref: &str) -> HttpR
             new_iat,
             &priv_scalar,
             true,
-            mc,
-            mt,
-            md,
-            ms,
+            limits,
         ),
     )
 }
@@ -752,28 +757,45 @@ pub fn update_limits(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let doc = match owned_project(state, project_ref, &owner) {
-        Ok(Some(d)) => d,
+    let (project_ref, doc) = match owned_project(state, project_ref, &owner) {
+        Ok(Some(v)) => v,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    let project_ref = project_ref.as_str();
     let body = parse_body(req);
-    let (cur_mc, cur_mt, cur_md, cur_ms) = doc_limits(&doc);
+    let cur = doc_limits(&doc);
     let field = |key: &str, cur: u64| body.get(key).and_then(|v| v.as_u64()).unwrap_or(cur);
-    let mc = field("max_collections", cur_mc);
-    let mt = field("max_tables", cur_mt);
-    let md = field("max_documents", cur_md);
-    let ms = field("max_storage_bytes", cur_ms);
+    let limits = Limits {
+        collections: field("max_collections", cur.collections),
+        tables: field("max_tables", cur.tables),
+        documents: field("max_documents", cur.documents),
+        storage_bytes: field("max_storage_bytes", cur.storage_bytes),
+        rpm: field("max_requests_per_min", cur.rpm),
+    };
     const CEIL: u64 = 10_000_000;
-    // Storage is bytes, not a count — allow up to 100 GiB.
-    if mc > 100_000 || mt > 100_000 || md > CEIL || ms > 107_374_182_400 {
+    // Storage is bytes, not a count — allow up to 100 GiB. The request cap is a
+    // per-minute rate; a million a minute is already far past what one tenant
+    // should be able to ask of a shared process.
+    if limits.collections > 100_000
+        || limits.tables > 100_000
+        || limits.documents > CEIL
+        || limits.storage_bytes > 107_374_182_400
+        || limits.rpm > 1_000_000
+    {
         return resp(
             400,
             json!({ "message": "limit out of range (0 = unlimited)" }),
         );
     }
     let query = json!({ "ref": project_ref });
-    let patch = json!({ "$set": { "max_collections": mc, "max_tables": mt, "max_documents": md, "max_storage_bytes": ms } });
+    let patch = json!({ "$set": {
+        "max_collections": limits.collections,
+        "max_tables": limits.tables,
+        "max_documents": limits.documents,
+        "max_storage_bytes": limits.storage_bytes,
+        "max_requests_per_min": limits.rpm,
+    }});
     if let Err(e) = state.upstream.update("projects", &query, &patch) {
         return resp(
             502,
@@ -796,10 +818,7 @@ pub fn update_limits(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
             key_iat,
             &priv_scalar,
             true,
-            mc,
-            mt,
-            md,
-            ms,
+            limits,
         ),
     )
 }
@@ -808,9 +827,29 @@ pub fn update_limits(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn owned_project(state: &State, project_ref: &str, owner: &str) -> Result<Option<Value>, String> {
-    let query = json!({ "ref": project_ref, "owner": owner });
-    Ok(state.upstream.find("projects", &query)?.into_iter().next())
+/// The project `ident` (its **ref or slug**) if `owner` owns it, together with
+/// its canonical ref. Callers must key their writes on that returned ref: the
+/// path segment may be a slug, and a `{"ref": "<slug>"}` update silently
+/// matches nothing.
+fn owned_project(
+    state: &State,
+    ident: &str,
+    owner: &str,
+) -> Result<Option<(String, Value)>, String> {
+    let Some(doc) = project_by_ref(state, ident)? else {
+        return Ok(None);
+    };
+    if doc.get("owner").and_then(|v| v.as_str()) != Some(owner) {
+        // Not ours: answer exactly as for a missing project, so the endpoint
+        // does not confirm that someone else's project exists.
+        return Ok(None);
+    }
+    let canonical = doc
+        .get("ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or(ident)
+        .to_string();
+    Ok(Some((canonical, doc)))
 }
 
 fn meta(doc: &Value) -> (u64, u64, String) {
@@ -839,17 +878,43 @@ fn project_priv(state: &State, doc: &Value) -> Option<Vec<u8>> {
     crypto::unseal(&state.seal_key, &sealed)
 }
 
-/// A project's resource caps `(max_collections, max_tables, max_documents)`,
-/// from its row (falling back to the configured defaults for rows created
-/// before a given quota existed).
-fn doc_limits(doc: &Value) -> (u64, u64, u64, u64) {
+/// A project's resource caps. `0` means unlimited throughout.
+#[derive(Clone, Copy)]
+struct Limits {
+    collections: u64,
+    tables: u64,
+    documents: u64,
+    storage_bytes: u64,
+    /// REST requests per minute — the noisy-neighbour bound, enforced by the
+    /// data plane at the point a request is attributed to the project.
+    rpm: u64,
+}
+
+impl Limits {
+    /// The plan defaults a new project starts on.
+    fn defaults() -> Limits {
+        Limits {
+            collections: project_max_collections() as u64,
+            tables: project_max_tables() as u64,
+            documents: project_max_documents() as u64,
+            storage_bytes: project_max_storage_bytes(),
+            rpm: project_max_rpm(),
+        }
+    }
+}
+
+/// A project's caps from its row, falling back to the configured defaults for
+/// rows created before a given quota existed.
+fn doc_limits(doc: &Value) -> Limits {
+    let d = Limits::defaults();
     let get = |key: &str, default: u64| doc.get(key).and_then(|v| v.as_u64()).unwrap_or(default);
-    (
-        get("max_collections", project_max_collections() as u64),
-        get("max_tables", project_max_tables() as u64),
-        get("max_documents", project_max_documents() as u64),
-        get("max_storage_bytes", project_max_storage_bytes()),
-    )
+    Limits {
+        collections: get("max_collections", d.collections),
+        tables: get("max_tables", d.tables),
+        documents: get("max_documents", d.documents),
+        storage_bytes: get("max_storage_bytes", d.storage_bytes),
+        rpm: get("max_requests_per_min", d.rpm),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -861,10 +926,7 @@ fn project_view(
     key_iat: u64,
     priv_scalar: &[u8],
     keys: bool,
-    max_collections: u64,
-    max_tables: u64,
-    max_documents: u64,
-    max_storage_bytes: u64,
+    limits: Limits,
 ) -> Value {
     let base = std::env::var("OXIDB_PLATFORM_BASE_URL").unwrap_or_default();
     // Path-based addressing is the friendly default: `<host>/<slug>/rest/v1`.
@@ -876,8 +938,9 @@ fn project_view(
     let mut v = json!({
         "ref": project_ref, "slug": slug, "name": name, "db": project_ref,
         "endpoint": format!("/{slug}/rest/v1"), "url": url, "isolation": "shared", "created_at": created_at,
-        "max_collections": max_collections, "max_tables": max_tables, "max_documents": max_documents,
-        "max_storage_bytes": max_storage_bytes,
+        "max_collections": limits.collections, "max_tables": limits.tables,
+        "max_documents": limits.documents, "max_storage_bytes": limits.storage_bytes,
+        "max_requests_per_min": limits.rpm,
     });
     if keys {
         let o = v.as_object_mut().unwrap();
@@ -1445,11 +1508,12 @@ pub fn auth_providers_get(req: &HttpRequest, state: &State, project_ref: &str) -
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let pdoc = match owned_project(state, project_ref, &owner) {
-        Ok(Some(d)) => d,
+    let (project_ref, pdoc) = match owned_project(state, project_ref, &owner) {
+        Ok(Some(v)) => v,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    let project_ref = project_ref.as_str();
     let view = |name: &str| {
         json!({
             "client_id": provider_client_id(&pdoc, name),
@@ -1476,11 +1540,12 @@ pub fn auth_providers_set(req: &HttpRequest, state: &State, project_ref: &str) -
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    match owned_project(state, project_ref, &owner) {
-        Ok(Some(_)) => {}
+    let project_ref = match owned_project(state, project_ref, &owner) {
+        Ok(Some((r, _))) => r,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
-    }
+    };
+    let project_ref = project_ref.as_str();
     let body = parse_body(req);
     let mut set = serde_json::Map::new();
 
@@ -2109,11 +2174,12 @@ pub fn list_users(req: &HttpRequest, state: &State, project_ref: &str) -> HttpRe
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    match owned_project(state, project_ref, &owner) {
-        Ok(Some(_)) => {}
+    let project_ref = match owned_project(state, project_ref, &owner) {
+        Ok(Some((r, _))) => r,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
-    }
+    };
+    let project_ref = project_ref.as_str();
     match state
         .upstream
         .find("users", &json!({ "project_ref": project_ref }))
@@ -2147,11 +2213,12 @@ fn owned_user<'a>(
         Ok(c) => c.sub,
         Err(r) => return Err(r),
     };
-    match owned_project(state, project_ref, &owner) {
-        Ok(Some(_)) => {}
+    let project_ref = match owned_project(state, project_ref, &owner) {
+        Ok(Some((r, _))) => r,
         Ok(None) => return Err(resp(404, json!({ "message": "project not found" }))),
         Err(e) => return Err(resp(502, json!({ "message": format!("upstream: {e}") }))),
-    }
+    };
+    let project_ref = project_ref.as_str();
     let exists = state
         .upstream
         .find(
@@ -2268,11 +2335,12 @@ pub fn project_logs(req: &HttpRequest, state: &State, project_ref: &str) -> Http
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let doc = match owned_project(state, project_ref, &owner) {
-        Ok(Some(d)) => d,
+    let (project_ref, doc) = match owned_project(state, project_ref, &owner) {
+        Ok(Some(v)) => v,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    let project_ref = project_ref.as_str();
     let slug = doc_slug(&doc, project_ref);
     let qp = |key: &str| {
         req.query
@@ -2316,11 +2384,12 @@ pub fn project_types(req: &HttpRequest, state: &State, project_ref: &str) -> Htt
         Ok(c) => c.sub,
         Err(r) => return r,
     };
-    let doc = match owned_project(state, project_ref, &owner) {
-        Ok(Some(d)) => d,
+    let (project_ref, doc) = match owned_project(state, project_ref, &owner) {
+        Ok(Some(v)) => v,
         Ok(None) => return resp(404, json!({ "message": "project not found" })),
         Err(e) => return resp(502, json!({ "message": format!("upstream: {e}") })),
     };
+    let project_ref = project_ref.as_str();
     let name = doc
         .get("name")
         .and_then(|v| v.as_str())

@@ -27,6 +27,9 @@ services:
       OXIDB_DATA: "/data"
       OXIDB_JWT_SECRET: "${OXIDB_JWT_SECRET}"   # guards the default-db / native path
       OXIDB_PGRST_MAX_ROWS: "${OXIDB_PGRST_MAX_ROWS:-1000}"
+      # Fallback quotas for project rows that predate a given quota (the control
+      # plane writes the real numbers per project). 0 = unlimited.
+      OXIDB_PROJECT_DEFAULT_MAX_RPM: "${OXIDB_PROJECT_DEFAULT_MAX_RPM:-0}"
       # GELF: ingest port (stores messages in the default db's _gelf_logs) +
       # self-emit a message per REST request. Empty = off.
       OXIDB_GELF_PORT: "${OXIDB_GELF_PORT:-}"
@@ -62,6 +65,10 @@ services:
       OXIDB_PROJECT_MAX_COLLECTIONS: "${OXIDB_PROJECT_MAX_COLLECTIONS:-5}"
       OXIDB_PROJECT_MAX_TABLES: "${OXIDB_PROJECT_MAX_TABLES:-5}"
       OXIDB_PROJECT_MAX_DOCUMENTS: "${OXIDB_PROJECT_MAX_DOCUMENTS:-10000}"
+      # REST requests per minute per project (0 = unlimited, the default).
+      # This is the noisy-neighbour bound for shared isolation; the data plane
+      # enforces it and answers 429 + Retry-After past the cap.
+      OXIDB_PROJECT_MAX_RPM: "${OXIDB_PROJECT_MAX_RPM:-0}"
       # Google OAuth Web client ID — developer console sign-in (public value).
       OXIBASE_GOOGLE_CLIENT_ID: "${OXIBASE_GOOGLE_CLIENT_ID:-}"
       # SMTP submission (the deployment's mail server) — enables end-user email

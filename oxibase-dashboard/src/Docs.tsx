@@ -108,6 +108,12 @@ export function Docs({ onOpenConsole }: { onOpenConsole: () => void }) {
                 </li>
               </ul>
             </li>
+            <li>
+              <strong>Quotas</strong> — collections, SQL tables, documents, stored bytes and, if the
+              deployment sets one, a <strong>request rate</strong>. Past the rate a request comes
+              back <code>429</code> with a <code>Retry-After</code> header (seconds until the minute
+              rolls over); the console&apos;s <em>Usage &amp; quotas</em> panel shows every cap.
+            </li>
           </ul>
 
           {/* ── 2 ─────────────────────────────────────────────────────────── */}

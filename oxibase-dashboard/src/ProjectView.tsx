@@ -164,6 +164,7 @@ function Quota({
   const [mt, setMt] = useState(String(project.max_tables ?? 5));
   const [mdoc, setMdoc] = useState(String(project.max_documents ?? 10000));
   const [mstore, setMstore] = useState(String(Math.round((project.max_storage_bytes ?? 104857600) / (1024 * 1024))));
+  const [mrpm, setMrpm] = useState(String(project.max_requests_per_min ?? 0));
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -197,7 +198,14 @@ function Quota({
     setMt(String(project.max_tables ?? 5));
     setMdoc(String(project.max_documents ?? 10000));
     setMstore(String(Math.round((project.max_storage_bytes ?? 104857600) / (1024 * 1024))));
-  }, [project.max_collections, project.max_tables, project.max_documents, project.max_storage_bytes]);
+    setMrpm(String(project.max_requests_per_min ?? 0));
+  }, [
+    project.max_collections,
+    project.max_tables,
+    project.max_documents,
+    project.max_storage_bytes,
+    project.max_requests_per_min,
+  ]);
 
   async function save() {
     setBusy(true);
@@ -208,6 +216,7 @@ function Quota({
         max_tables: Number(mt),
         max_documents: Number(mdoc),
         max_storage_bytes: Math.round(Number(mstore) * 1024 * 1024),
+        max_requests_per_min: Number(mrpm),
       });
       onChange({ ...project, ...updated });
       setEditing(false);
@@ -271,6 +280,14 @@ function Quota({
             Max storage (MB)
             <input type="number" min={0} value={mstore} onChange={(e) => setMstore(e.target.value)} style={{ width: 120 }} />
           </label>
+          <label
+            className="small"
+            style={{ display: "flex", flexDirection: "column", gap: 4 }}
+            title="REST requests per minute for this project; further requests get 429 until the minute rolls over"
+          >
+            Requests / min
+            <input type="number" min={0} value={mrpm} onChange={(e) => setMrpm(e.target.value)} style={{ width: 120 }} />
+          </label>
           <button className="primary small" disabled={busy} onClick={save}>
             Save
           </button>
@@ -282,6 +299,14 @@ function Quota({
           {meter("SQL tables", tables, project.max_tables)}
           {meter("Documents", docs, project.max_documents)}
           {meter("Storage", storage, project.max_storage_bytes, true)}
+        </div>
+      )}
+      {!editing && (
+        <div className="muted small" style={{ marginTop: 10 }}>
+          Rate limit:{" "}
+          {project.max_requests_per_min
+            ? `${project.max_requests_per_min} requests/min — past that the project gets 429 until the minute rolls over`
+            : "unlimited"}
         </div>
       )}
       {err && <div className="error small" style={{ marginTop: 8 }}>{err}</div>}

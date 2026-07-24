@@ -276,7 +276,10 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // neither keeps the default database exactly as before. A `?db=` value that
     // names a project by ref or slug is resolved to the project's database; a
     // plain (non-project) database name passes through unchanged.
-    let db_name = match parse_query_string(&req.query).get("db").map(|v| url_decode(v)) {
+    let db_name = match parse_query_string(&req.query)
+        .get("db")
+        .map(|v| url_decode(v))
+    {
         Some(raw) => Some(
             state
                 .db_manager
@@ -315,11 +318,29 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
                     // (owned by the control plane, read from the project row).
                     // The engine then rejects a new collection past the cap on
                     // every path; refreshing it per request reflects plan changes.
-                    if let Some((max_collections, _max_tables, max_documents)) =
-                        crate::tenant_auth::project_limits(mgr, name)
-                    {
-                        db.set_max_collections(max_collections);
-                        db.set_max_documents(max_documents);
+                    if let Some(limits) = crate::tenant_auth::project_limits(mgr, name) {
+                        db.set_max_collections(limits.max_collections);
+                        db.set_max_documents(limits.max_documents);
+                        // Rate limit here, at the one point where a request is
+                        // attributed to a tenant, so every surface on this
+                        // listener (REST, /api, storage, SQL) is covered by the
+                        // single check — and refused before any work is done.
+                        if let Some(retry) =
+                            crate::tenant_auth::rate_limit_hit(name, limits.max_rpm)
+                        {
+                            return with_rest_cors(
+                                json_response(
+                                    429,
+                                    "Too Many Requests",
+                                    json!({
+                                        "error": "rate limit exceeded for this project",
+                                        "limit": limits.max_rpm,
+                                        "retry_after": retry,
+                                    }),
+                                )
+                                .with_header("Retry-After", &retry.to_string()),
+                            );
+                        }
                     }
                     // `active` belongs to the listener's shared state; this
                     // per-request scope only redirects `db`.
@@ -508,14 +529,25 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
                             "Content-Disposition".to_string(),
                             format!("attachment; filename=\"{name}-backup.tar.gz\""),
                         ),
-                        ("X-Backup-Collections".to_string(), info.collections.to_string()),
+                        (
+                            "X-Backup-Collections".to_string(),
+                            info.collections.to_string(),
+                        ),
                     ],
                     body: bytes,
                     content_length_override: None,
                 },
-                Err(e) => json_response(500, "Internal Server Error", json!({"error": e.to_string()})),
+                Err(e) => json_response(
+                    500,
+                    "Internal Server Error",
+                    json!({"error": e.to_string()}),
+                ),
             },
-            Err(e) => json_response(500, "Internal Server Error", json!({"error": e.to_string()})),
+            Err(e) => json_response(
+                500,
+                "Internal Server Error",
+                json!({"error": e.to_string()}),
+            ),
         };
         let _ = std::fs::remove_file(&tmp);
         return with_rest_cors(resp);
@@ -525,7 +557,12 @@ fn route_request(req: &HttpRequest, state: &RestState) -> HttpResponse {
     // Handled outside the generic match: downloads return raw bytes with the
     // stored Content-Type, which the JSON-only match below cannot express.
     if segments.len() >= 2 && segments[0] == "api" && segments[1] == "storage" {
-        return with_rest_cors(storage::handle(req, state, &segments[2..], db_name.as_deref()));
+        return with_rest_cors(storage::handle(
+            req,
+            state,
+            &segments[2..],
+            db_name.as_deref(),
+        ));
     }
 
     // ── PostgREST-compatible surface (ADR-0019): /rest/v1/{table} ──────
@@ -934,10 +971,8 @@ fn handle_sql_endpoint(
     // so a CREATE TABLE past the cap is rejected. Non-tenant databases get no
     // limit (project_limits → None).
     if let (Some(name), Some(mgr)) = (db_name, &state.db_manager) {
-        if let Some((_max_collections, max_tables, _max_documents)) =
-            crate::tenant_auth::project_limits(mgr, name)
-        {
-            crate::sql_bridge::set_table_limit(name, max_tables);
+        if let Some(limits) = crate::tenant_auth::project_limits(mgr, name) {
+            crate::sql_bridge::set_table_limit(name, limits.max_tables);
         }
     }
     match crate::sql_bridge::execute_json_in(db, sql, body.get("params"), readonly) {
@@ -1475,9 +1510,7 @@ fn db_err(e: oxidb::Error) -> (u16, &'static str) {
         oxidb::Error::CollectionLimitExceeded(_) => {
             (403, "collection limit reached for this project")
         }
-        oxidb::Error::DocumentLimitExceeded(_) => {
-            (403, "document limit reached for this project")
-        }
+        oxidb::Error::DocumentLimitExceeded(_) => (403, "document limit reached for this project"),
         _ => (500, "database error"),
     }
 }
